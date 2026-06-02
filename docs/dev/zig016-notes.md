@@ -50,3 +50,24 @@ isolation. Iterate until green. Do not hand back code you have not compiled.
 - `docs/planning/00-architecture.md` — canonical design + invention glossary (authority).
 - `docs/planning/01-substrate.md` .. `05-innovation.md` — detailed per-area design.
 - `docs/BRIEF.md` — mission + locked decisions.
+
+## CLEAN-ROOM / NO-LEGACY MANDATE (applies to every module — highest priority)
+Mizuchi is a **clean-room, modern, inventive** IRC daemon. Do NOT port legacy IRC behavior or copy
+ophion/charybdis/ratbox code. Every system is designed from first principles for an IRCX/IRCv3 + CRDT
+mesh world.
+
+**BANNED legacy — never implement, and remove if found:**
+- WALLOPS / OPERWALL  → use the **Event Spine** `.announce` category (oper subscriptions).
+- snomask `+s` user modes / `sendto_realops_snomask` → **Event Spine** typed events + IRCX EVENT subscriptions.
+- WEBIRC / IP-spoof gateways → web clients connect via **WebSocket** directly.
+- `/OPER` command, oper passwords, host/IP masks, RSA challenge → **oper = SASL auth only** (certfp EXTERNAL / SCRAM).
+- server `PASS` as authentication → **SASL** (PASS may only select a connection class, never authenticate).
+- LINKS / MAP (spanning-tree concepts) → **mesh introspection** over Suimyaku (no tree).
+- ident / RFC1413 lookups → dead protocol; identity = TLS certfp / SASL.
+- TS6 / netburst / SJOIN / text S2S → **Suimyaku** binary CRDT mesh only.
+- Embedded Python / CPython modules → **WASM plugins** (MizuWasm) or native Zig only. NO Python.
+- DCC special-casing, legacy STATS letter soup, ctcp-flood quirks → omit or modernize.
+
+**Positive mandate:** prefer IRCv3 (standard-replies, message-tags, batch, labeled-response, CHATHISTORY),
+IRCX (EVENT/PROP/ACCESS), CRDT-mesh-native semantics, typed events, capability tokens, and constant-time
+crypto. When a legacy feature has no modern equivalent, invent a principled one and name it — don't port.

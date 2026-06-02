@@ -69,3 +69,6 @@ name it and specify it well enough to build.
 - `docs/planning/05-innovation.md` — invented technologies + build/test/roadmap.
 
 Planning only; no production code until the design is settled and reviewed by Claude.
+
+## Clean-room / no-legacy mandate
+Every system is clean-room, modern, inventive — NO legacy ports. Banned: WALLOPS/OPERWALL, snomask +s, WEBIRC, /OPER passwords+hostmasks (oper=SASL certfp/SCRAM only), PASS-as-auth, LINKS/MAP, ident, TS6/SJOIN, Python modules. See docs/dev/zig016-notes.md "CLEAN-ROOM / NO-LEGACY MANDATE".
