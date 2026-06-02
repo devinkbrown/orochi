@@ -13,6 +13,8 @@ const dispatch = @import("dispatch.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
 const sasl = @import("../proto/sasl.zig");
+const names_reply = @import("../proto/names_reply.zig");
+const chanmode = @import("chanmode.zig");
 
 const irc_line = struct {
     pub const MAXPARA: usize = 15;
@@ -827,19 +829,46 @@ pub const LinuxServer = struct {
     }
 
     fn sendNames(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
-        var names_buf: [default_reply_bytes / 2]u8 = undefined;
-        var names = Buf{ .storage = &names_buf };
+        // Render NAMES via the names_reply module: each member carries its status
+        // prefixes (all of them when the requester negotiated multi-prefix, else
+        // only the highest) and optionally nick!user@host (userhost-in-names).
+        const max_members: usize = 128;
+        var members_buf: [max_members]names_reply.Member = undefined;
+        var prefix_buf: [max_members]chanmode.PrefixList = undefined;
+        var count: usize = 0;
 
-        var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
-        while (members.next()) |member| {
-            if (self.world.nickOf(member.*)) |nick| {
-                if (names.len != 0) try names.append(" ");
-                try names.append(nick);
-            }
+        var it = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        while (it.next()) |member| {
+            if (count >= max_members) break;
+            const nick = self.world.nickOf(member.*) orelse continue;
+            const modes = self.world.memberModes(channel, member.*) orelse world_model.MemberModes.empty();
+            prefix_buf[count] = modes.allPrefixes();
+            members_buf[count] = .{
+                .prefixes = prefix_buf[count].asSlice(),
+                .nick = nick,
+                .user = "user",
+                .host = default_host,
+            };
+            count += 1;
         }
 
-        try queueNumeric(conn, .RPL_NAMREPLY, &.{ "=", channel }, names.written());
-        try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
+        const caps = names_reply.RequesterCaps{
+            .multi_prefix = conn.session.hasCap(.multi_prefix),
+            .userhost_in_names = conn.session.hasCap(.userhost_in_names),
+        };
+
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        var lines_buf: [32]names_reply.NamesLine = undefined;
+        var sink = names_reply.NamesLineSink{ .lines = &lines_buf };
+        names_reply.writeNamesReplies(&out_buf, server_name, conn.session.displayName(), channel, members_buf[0..count], caps, &sink) catch {
+            // Oversized channel for this single pass: still close the list out.
+            try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
+            return;
+        };
+        for (sink.slice()) |line| {
+            try appendToConn(conn, line.bytes);
+            try appendToConn(conn, "\r\n");
+        }
     }
 };
 

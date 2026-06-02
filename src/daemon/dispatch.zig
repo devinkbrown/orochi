@@ -163,6 +163,8 @@ pub const CapId = enum(u6) {
     message_tags,
     echo_message,
     sasl,
+    multi_prefix,
+    userhost_in_names,
 };
 
 const CapSet = struct {
@@ -195,6 +197,8 @@ const cap_specs = [_]CapSpec{
     // EXTERNAL/SCRAM are implemented in proto/sasl.zig but not yet wired here;
     // advertising them would let a client pick a dead mechanism.
     .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN" },
+    .{ .id = .multi_prefix, .name = "multi-prefix" },
+    .{ .id = .userhost_in_names, .name = "userhost-in-names" },
 };
 
 const CapReplyKind = enum {
