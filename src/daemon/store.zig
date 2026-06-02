@@ -8,7 +8,10 @@ const std = @import("std");
 const record_header_len = 8;
 const payload_header_len = 10;
 const max_record_len = 16 * 1024 * 1024;
+const max_wal_len = 256 * 1024 * 1024;
 const tombstone_len = std.math.maxInt(u32);
+const meta_kind_next_seq: u8 = 0xFE;
+const meta_next_seq_payload_len = 9;
 
 pub const StoreError = error{
     BadRecord,
@@ -66,6 +69,8 @@ pub const MizuStore = struct {
     dir: std.Io.Dir,
     wal_path: []u8,
     snapshot_path: []u8,
+    wal_file: ?std.Io.File = null,
+    wal_offset: u64 = 0,
     maps: [family_count]KvMap,
     changefeed: ChangeFeed,
     next_seq: u64 = 1,
@@ -94,13 +99,14 @@ pub const MizuStore = struct {
         };
         errdefer store.deinit();
 
-        try store.replayFile(store.snapshot_path);
-        try store.replayFile(store.wal_path);
+        try store.replayFile(store.snapshot_path, .snapshot);
+        try store.replayFile(store.wal_path, .wal);
         try store.ensureWal();
         return store;
     }
 
     pub fn deinit(self: *MizuStore) void {
+        if (self.wal_file) |file| file.close(self.io);
         for (&self.maps) |*map| map.deinit();
         self.changefeed.deinit();
         self.allocator.free(self.wal_path);
@@ -131,19 +137,17 @@ pub const MizuStore = struct {
 
     /// Writes current state to a snapshot and truncates the WAL.
     pub fn snapshotAndTruncate(self: *MizuStore) !void {
-        const tmp_path = try std.mem.concat(self.allocator, u8, &.{ self.snapshot_path, ".tmp" });
-        defer self.allocator.free(tmp_path);
-
-        var snapshot = try self.dir.createFile(self.io, tmp_path, .{ .read = true, .truncate = true });
-        defer snapshot.close(self.io);
+        var snapshot = try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true });
+        defer snapshot.deinit(self.io);
 
         var offset: u64 = 0;
+        offset = try writeNextSeqRecordAt(self.io, snapshot.file, offset, self.allocator, self.next_seq);
         for (families) |store_family| {
             var it = self.maps[familyIndex(store_family)].map.iterator();
             while (it.next()) |entry| {
                 offset = try writeRecordAt(
                     self.io,
-                    snapshot,
+                    snapshot.file,
                     offset,
                     self.allocator,
                     .put,
@@ -153,16 +157,15 @@ pub const MizuStore = struct {
                 );
             }
         }
-        try snapshot.sync(self.io);
-        self.dir.deleteFile(self.io, self.snapshot_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        try self.dir.rename(tmp_path, self.dir, self.snapshot_path, self.io);
+        try snapshot.file.sync(self.io);
+        try snapshot.replace(self.io);
+        try self.syncDir();
 
-        var wal = try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = true });
-        defer wal.close(self.io);
+        const wal = self.wal_file.?;
+        try wal.setLength(self.io, 0);
         try wal.sync(self.io);
+        self.wal_offset = 0;
+        try self.syncDir();
     }
 
     pub fn changeCount(self: *const MizuStore) usize {
@@ -176,11 +179,18 @@ pub const MizuStore = struct {
     }
 
     fn ensureWal(self: *MizuStore) !void {
-        var file = try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
-        file.close(self.io);
+        if (self.wal_file) |_| return;
+        const file = try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
+        self.wal_file = file;
+        self.wal_offset = (try file.stat(self.io)).size;
     }
 
-    fn replayFile(self: *MizuStore, path: []const u8) !void {
+    const ReplayKind = enum {
+        snapshot,
+        wal,
+    };
+
+    fn replayFile(self: *MizuStore, path: []const u8, replay_kind: ReplayKind) !void {
         var file = self.dir.openFile(self.io, path, .{ .mode = .read_only, .allow_directory = false }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -189,27 +199,50 @@ pub const MizuStore = struct {
 
         const stat = try file.stat(self.io);
         if (stat.size == 0) return;
-        if (stat.size > max_record_len * 1024) return StoreError.RecordTooLarge;
+        if (replay_kind == .wal and stat.size > max_wal_len) return StoreError.RecordTooLarge;
 
-        const bytes = try self.allocator.alloc(u8, @intCast(stat.size));
-        defer self.allocator.free(bytes);
-        const read_len = try file.readPositionalAll(self.io, bytes, 0);
-        if (read_len != bytes.len) return StoreError.BadRecord;
+        var offset: u64 = 0;
+        var header: [record_header_len]u8 = undefined;
+        while (offset < stat.size) {
+            const record_offset = offset;
+            const header_len = try file.readPositionalAll(self.io, &header, offset);
+            if (header_len != header.len) {
+                if (replay_kind == .wal) return;
+                return StoreError.BadRecord;
+            }
+            offset += record_header_len;
 
-        var cursor: usize = 0;
-        while (cursor < bytes.len) {
-            if (bytes.len - cursor < record_header_len) return StoreError.BadRecord;
-            const payload_len = readU32(bytes[cursor..][0..4]);
-            const expected_sum = readU32(bytes[cursor + 4 ..][0..4]);
-            cursor += record_header_len;
+            const payload_len = readU32(header[0..4]);
+            const expected_sum = readU32(header[4..8]);
+            const record_end = offset + payload_len;
 
             if (payload_len > max_record_len) return StoreError.RecordTooLarge;
-            if (bytes.len - cursor < payload_len) return StoreError.BadRecord;
+            if (stat.size - offset < payload_len) {
+                if (replay_kind == .wal) return;
+                return StoreError.BadRecord;
+            }
 
-            const payload = bytes[cursor..][0..payload_len];
-            if (checksum(payload) != expected_sum) return StoreError.ChecksumMismatch;
-            try self.applyPayload(payload);
-            cursor += payload_len;
+            const payload = try self.allocator.alloc(u8, payload_len);
+            defer self.allocator.free(payload);
+            const read_len = try file.readPositionalAll(self.io, payload, offset);
+            if (read_len != payload.len) {
+                if (replay_kind == .wal) return;
+                return StoreError.BadRecord;
+            }
+            if (checksum(payload) != expected_sum) {
+                if (replay_kind == .wal and record_end == stat.size) return;
+                return StoreError.ChecksumMismatch;
+            }
+            self.applyPayload(payload) catch |err| switch (err) {
+                StoreError.BadRecord,
+                StoreError.UnknownFamily,
+                StoreError.UnknownRecordKind,
+                => if (replay_kind == .wal and record_end == stat.size) return else return err,
+                else => return err,
+            };
+            if (replay_kind == .wal and isMutationPayload(payload)) self.next_seq += 1;
+            offset = record_end;
+            if (offset <= record_offset) return StoreError.BadRecord;
         }
     }
 
@@ -220,14 +253,22 @@ pub const MizuStore = struct {
         key: []const u8,
         value: []const u8,
     ) !void {
-        var file = try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
-        defer file.close(self.io);
-        const offset = (try file.stat(self.io)).size;
-        _ = try writeRecordAt(self.io, file, offset, self.allocator, kind, store_family, key, value);
+        try self.ensureWal();
+        const file = self.wal_file.?;
+        const next_offset = try writeRecordAt(self.io, file, self.wal_offset, self.allocator, kind, store_family, key, value);
         try file.sync(self.io);
+        self.wal_offset = next_offset;
     }
 
     fn applyPayload(self: *MizuStore, payload: []const u8) !void {
+        if (payload.len == 0) return StoreError.BadRecord;
+
+        if (payload[0] == meta_kind_next_seq) {
+            if (payload.len != meta_next_seq_payload_len) return StoreError.BadRecord;
+            self.next_seq = readU64(payload[1..9]);
+            return;
+        }
+
         if (payload.len < payload_header_len) return StoreError.BadRecord;
 
         const kind: MutationKind = switch (payload[0]) {
@@ -278,27 +319,23 @@ pub const MizuStore = struct {
         });
         self.next_seq += 1;
     }
+
+    fn syncDir(self: *MizuStore) !void {
+        var dir_file = try self.dir.openFile(self.io, ".", .{ .mode = .read_only, .allow_directory = true });
+        defer dir_file.close(self.io);
+        try dir_file.sync(self.io);
+    }
 };
 
 const family_count = @typeInfo(Family).@"enum".fields.len;
-const families = [_]Family{ .accounts, .nicks, .chanregs, .bans, .memos, .vhosts, .props, .history };
+const families = std.enums.values(Family);
 
 fn familyIndex(store_family: Family) usize {
     return @intFromEnum(store_family);
 }
 
 fn decodeFamily(value: u8) ?Family {
-    return switch (value) {
-        @intFromEnum(Family.accounts) => .accounts,
-        @intFromEnum(Family.nicks) => .nicks,
-        @intFromEnum(Family.chanregs) => .chanregs,
-        @intFromEnum(Family.bans) => .bans,
-        @intFromEnum(Family.memos) => .memos,
-        @intFromEnum(Family.vhosts) => .vhosts,
-        @intFromEnum(Family.props) => .props,
-        @intFromEnum(Family.history) => .history,
-        else => null,
-    };
+    return std.enums.fromInt(Family, value);
 }
 
 fn initMaps(allocator: std.mem.Allocator) [family_count]KvMap {
@@ -336,9 +373,12 @@ const KvMap = struct {
             return;
         }
 
-        errdefer _ = self.map.remove(key);
         gop.key_ptr.* = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(gop.key_ptr.*);
+        errdefer {
+            const owned_key = gop.key_ptr.*;
+            _ = self.map.remove(owned_key);
+            self.allocator.free(owned_key);
+        }
         gop.value_ptr.* = try self.allocator.dupe(u8, value);
     }
 
@@ -470,6 +510,32 @@ fn writeRecordAt(
     return offset + record.len;
 }
 
+fn writeNextSeqRecordAt(
+    io: std.Io,
+    file: std.Io.File,
+    offset: u64,
+    allocator: std.mem.Allocator,
+    next_seq: u64,
+) !u64 {
+    const record = try allocator.alloc(u8, record_header_len + meta_next_seq_payload_len);
+    defer allocator.free(record);
+
+    writeU32(record[0..4], meta_next_seq_payload_len);
+    const payload = record[record_header_len..];
+    payload[0] = meta_kind_next_seq;
+    writeU64(payload[1..9], next_seq);
+    writeU32(record[4..][0..4], checksum(payload));
+
+    try file.writePositionalAll(io, record, offset);
+    return offset + record.len;
+}
+
+fn isMutationPayload(payload: []const u8) bool {
+    if (payload.len == 0) return false;
+    return payload[0] == @intFromEnum(MutationKind.put) or
+        payload[0] == @intFromEnum(MutationKind.delete);
+}
+
 fn checksum(payload: []const u8) u32 {
     return std.hash.Fnv1a_32.hash(payload);
 }
@@ -478,8 +544,16 @@ fn readU32(bytes: *const [4]u8) u32 {
     return std.mem.readInt(u32, bytes, .little);
 }
 
+fn readU64(bytes: *const [8]u8) u64 {
+    return std.mem.readInt(u64, bytes, .little);
+}
+
 fn writeU32(bytes: *[4]u8, value: u32) void {
     std.mem.writeInt(u32, bytes, value, .little);
+}
+
+fn writeU64(bytes: *[8]u8, value: u64) void {
+    std.mem.writeInt(u64, bytes, value, .little);
 }
 
 fn openTestStore(tmp: std.testing.TmpDir, name: []const u8) !MizuStore {
@@ -539,6 +613,7 @@ test "checksum mismatch is detected and rejected" {
         var store = try openTestStore(tmp, "bad.wal");
         defer store.deinit();
         try store.family(.accounts).put("alice", "ok");
+        try store.family(.accounts).put("bob", "still-ok");
     }
 
     var file = try tmp.dir.openFile(std.testing.io, "bad.wal", .{ .mode = .read_write, .allow_directory = false });
@@ -546,6 +621,50 @@ test "checksum mismatch is detected and rejected" {
     try file.writePositionalAll(std.testing.io, &.{0xAA}, 6);
 
     try std.testing.expectError(StoreError.ChecksumMismatch, openTestStore(tmp, "bad.wal"));
+}
+
+test "torn final WAL record is ignored after replaying valid prefix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "torn.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("alice", "ok");
+    }
+
+    var file = try tmp.dir.openFile(std.testing.io, "torn.wal", .{ .mode = .read_write, .allow_directory = false });
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    try file.writePositionalAll(std.testing.io, &.{ 1, 0, 0, 0 }, stat.size);
+    try file.sync(std.testing.io);
+
+    var store = try openTestStore(tmp, "torn.wal");
+    defer store.deinit();
+    try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
+}
+
+test "checksum-bad final WAL record is ignored after replaying valid prefix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "final-checksum.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("alice", "ok");
+    }
+
+    var file = try tmp.dir.openFile(std.testing.io, "final-checksum.wal", .{ .mode = .read_write, .allow_directory = false });
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    _ = try writeRecordAt(std.testing.io, file, stat.size, std.testing.allocator, .put, .accounts, "bob", "bad");
+    try file.writePositionalAll(std.testing.io, &.{0xAA}, stat.size + 6);
+    try file.sync(std.testing.io);
+
+    var store = try openTestStore(tmp, "final-checksum.wal");
+    defer store.deinit();
+    try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
+    try std.testing.expect(store.family(.accounts).get("bob") == null);
 }
 
 test "snapshot+truncate preserves data" {
@@ -566,6 +685,26 @@ test "snapshot+truncate preserves data" {
         try std.testing.expectEqualStrings("v1", store.family(.accounts).get("alice").?);
         try std.testing.expectEqualStrings("alice", store.family(.nicks).get("Alice").?);
         try std.testing.expectEqualStrings("v2", store.family(.accounts).get("bob").?);
+    }
+}
+
+test "changefeed sequence persists across snapshot reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "seq.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("alice", "v1");
+        try store.snapshotAndTruncate();
+    }
+    {
+        var store = try openTestStore(tmp, "seq.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("bob", "v2");
+        const mutation = store.changeAt(0).?;
+        try std.testing.expectEqual(@as(u64, 2), mutation.seq);
+        try std.testing.expectEqualStrings("bob", mutation.key);
     }
 }
 
