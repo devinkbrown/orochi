@@ -1,0 +1,11 @@
+//! LADON math substrate: logical clocks, delta-state CRDTs, and Merkle
+//! anti-entropy — the building blocks of the LADON mesh state model.
+pub const clock = @import("clock.zig");
+pub const crdt = @import("crdt.zig");
+pub const merkle = @import("merkle.zig");
+
+test {
+    _ = clock;
+    _ = crdt;
+    _ = merkle;
+}

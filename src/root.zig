@@ -12,8 +12,8 @@ pub const daemon = @import("daemon/root.zig");
 test {
     // 0.16 dropped refAllDeclsRecursive; reference each package so its tests run.
     std.testing.refAllDecls(@This());
-    _ = substrate.reactor;
-    _ = crypto.secret;
+    _ = substrate;
+    _ = crypto;
     _ = proto;
     _ = daemon;
 }
