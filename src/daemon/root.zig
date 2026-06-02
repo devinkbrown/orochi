@@ -10,6 +10,7 @@ pub const dispatch = @import("dispatch.zig");
 pub const registry = @import("registry.zig");
 pub const server = @import("server.zig");
 pub const store = @import("store.zig");
+pub const world = @import("world.zig");
 // gen:mods:end
 
 test {
@@ -20,6 +21,7 @@ test {
     _ = registry;
     _ = server;
     _ = store;
+    _ = world;
     // gen:tests:end
 }
 
