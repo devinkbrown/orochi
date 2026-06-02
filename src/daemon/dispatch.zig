@@ -649,7 +649,7 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
 }
 
 fn handlePing(ctx: DispatchCtx) DispatchError!void {
-    try ctx.replies.message(ctx.replies.server_name, "PONG", &.{ ctx.replies.server_name }, ctx.params()[0]);
+    try ctx.replies.message(ctx.replies.server_name, "PONG", &.{ctx.replies.server_name}, ctx.params()[0]);
 }
 
 fn handleNoop(_: DispatchCtx) DispatchError!void {}

@@ -267,7 +267,7 @@ pub const Cbb = struct {
 };
 
 pub const LadonHeader = struct {
-    @"type": u8,
+    type: u8,
     ctrl: u8,
     length: u16,
     stream_id: u24,
@@ -280,7 +280,7 @@ pub fn encodeHeader(out: []u8, header: LadonHeader) EncodeError!usize {
     if (out.len < ladon_header_len) return error.BufferTooSmall;
 
     var w = Cbb.init(out);
-    _ = try w.writeU8(header.@"type");
+    _ = try w.writeU8(header.type);
     _ = try w.writeU8(header.ctrl);
     _ = try w.writeU16Le(header.length);
     _ = try w.writeU24Le(header.stream_id);
@@ -294,7 +294,7 @@ pub fn decodeHeader(in: []const u8) DecodeError!LadonHeader {
 
     var r = Cbs.init(in[0..ladon_header_len]);
     return .{
-        .@"type" = try r.readU8(),
+        .type = try r.readU8(),
         .ctrl = try r.readU8(),
         .length = try r.readU16Le(),
         .stream_id = try r.readU24Le(),
@@ -441,7 +441,7 @@ test "canonical equal is byte equality for canonical encodings" {
 
 test "LADON header encode and decode" {
     const header = LadonHeader{
-        .@"type" = 0x23,
+        .type = 0x23,
         .ctrl = 0x45,
         .length = 0x1234,
         .stream_id = 0x00c0de,
@@ -453,7 +453,7 @@ test "LADON header encode and decode" {
     try std.testing.expectEqualSlices(u8, &.{ 0x23, 0x45, 0x34, 0x12, 0xde, 0xc0, 0x00, 0x07 }, &out);
 
     const decoded = try decodeHeader(&out);
-    try std.testing.expectEqual(header.@"type", decoded.@"type");
+    try std.testing.expectEqual(header.type, decoded.type);
     try std.testing.expectEqual(header.ctrl, decoded.ctrl);
     try std.testing.expectEqual(header.length, decoded.length);
     try std.testing.expectEqual(header.stream_id, decoded.stream_id);
@@ -463,7 +463,7 @@ test "LADON header encode and decode" {
 test "LADON header codec rejects short buffers" {
     var out: [ladon_header_len - 1]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, encodeHeader(&out, .{
-        .@"type" = 1,
+        .type = 1,
         .ctrl = 2,
         .length = 3,
         .stream_id = 4,

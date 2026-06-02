@@ -624,7 +624,7 @@ const coreModule = Module{
 
 const capModule = Module{
     .id = "cap",
-    .requires = &.{ "core" },
+    .requires = &.{"core"},
     .commands = &.{
         .{ .name = "PONG", .handler = pongHandler },
     },
@@ -669,7 +669,7 @@ test "registry dispatches known commands and reports unknown commands" {
 }
 
 test "registry checks command minimum parameters before calling handlers" {
-    const R = Registry(&.{ coreModule });
+    const R = Registry(&.{coreModule});
     var ctx = TestCtx{};
 
     const result = try R.dispatch(&ctx, "PING", &.{});
