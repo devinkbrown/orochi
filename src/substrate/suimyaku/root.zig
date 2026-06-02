@@ -6,6 +6,8 @@ pub const clock = @import("clock.zig");
 pub const convergence = @import("convergence.zig");
 pub const delta_codec = @import("delta_codec.zig");
 pub const goryu = @import("goryu.zig");
+pub const media = @import("media.zig");
+pub const membership_view = @import("membership_view.zig");
 pub const merkle = @import("merkle.zig");
 pub const state = @import("state.zig");
 // gen:mods:end
@@ -17,6 +19,8 @@ test {
     _ = convergence;
     _ = delta_codec;
     _ = goryu;
+    _ = media;
+    _ = membership_view;
     _ = merkle;
     _ = state;
     // gen:tests:end
