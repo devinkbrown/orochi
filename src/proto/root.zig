@@ -6,10 +6,12 @@
 pub const account_notify = @import("account_notify.zig");
 pub const away = @import("away.zig");
 pub const batch = @import("batch.zig");
+pub const batch_props = @import("batch_props.zig");
 pub const bot_mode = @import("bot_mode.zig");
 pub const cap = @import("cap.zig");
 pub const channel_rename = @import("channel_rename.zig");
 pub const chathistory = @import("chathistory.zig");
+pub const chathistory_props = @import("chathistory_props.zig");
 pub const chghost = @import("chghost.zig");
 pub const cloak = @import("cloak.zig");
 pub const coilpack = @import("coilpack.zig");
@@ -68,10 +70,12 @@ test {
     _ = account_notify;
     _ = away;
     _ = batch;
+    _ = batch_props;
     _ = bot_mode;
     _ = cap;
     _ = channel_rename;
     _ = chathistory;
+    _ = chathistory_props;
     _ = chghost;
     _ = cloak;
     _ = coilpack;
