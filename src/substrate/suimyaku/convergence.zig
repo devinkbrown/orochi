@@ -290,8 +290,9 @@ pub const Mesh = struct {
         var rounds: usize = 0;
         while (rounds < 16) : (rounds += 1) {
             if (self.allEqual()) return;
-            try self.fullStateRepairRound();
+            try self.repairRound(.{});
         }
+        return error.DidNotConverge;
     }
 
     pub fn expectConverged(self: *Mesh) !void {
@@ -464,30 +465,55 @@ pub const Mesh = struct {
         try to.state.merge(&delta.state);
     }
 
-    fn fullStateRepairRound(self: *Mesh) !void {
+    fn repairRound(self: *Mesh, strategy_config: anti_entropy.StrategyConfig) !void {
         var i: usize = 0;
         while (i < self.nodes.items.len) : (i += 1) {
             var j: usize = 0;
             while (j < self.nodes.items.len) : (j += 1) {
                 if (i == j) continue;
-                try self.planPair(i, j);
-                try self.nodes.items[i].state.merge(&self.nodes.items[j].state);
+                _ = try self.repairPair(i, j, strategy_config);
             }
         }
     }
 
-    fn planPair(self: *Mesh, local_idx: usize, remote_idx: usize) !void {
+    const RepairResult = struct {
+        strategy: anti_entropy.RepairStrategy,
+        pull_count: usize,
+        push_count: usize,
+    };
+
+    fn repairPair(self: *Mesh, local_idx: usize, remote_idx: usize, strategy_config: anti_entropy.StrategyConfig) !RepairResult {
         var local = anti_entropy.Lane.init(self.allocator, .memberships);
         defer local.deinit();
         var remote = anti_entropy.Lane.init(self.allocator, .memberships);
         defer remote.deinit();
-        try local.putHash("network-state", stateHash(&self.nodes.items[local_idx].state));
-        try remote.putHash("network-state", stateHash(&self.nodes.items[remote_idx].state));
+        try populateStateLane(&local, &self.nodes.items[local_idx].state);
+        try populateStateLane(&remote, &self.nodes.items[remote_idx].state);
 
-        const planner = anti_entropy.Planner.init(self.allocator, .{});
+        const planner = anti_entropy.Planner.init(self.allocator, strategy_config);
         var plan = try planner.plan(&local, &remote);
         defer plan.deinit();
-        _ = plan.strategy;
+
+        switch (plan.strategy) {
+            .delta_replay, .merkle_range_diff => {
+                try repairSelectedKeys(&self.nodes.items[local_idx].state, &self.nodes.items[remote_idx].state, plan.pull_keys);
+                try repairSelectedKeys(&self.nodes.items[remote_idx].state, &self.nodes.items[local_idx].state, plan.push_keys);
+            },
+            .full_resync => {
+                if (plan.pull_keys.len != 0) {
+                    try self.nodes.items[local_idx].state.merge(&self.nodes.items[remote_idx].state);
+                }
+                if (plan.push_keys.len != 0) {
+                    try self.nodes.items[remote_idx].state.merge(&self.nodes.items[local_idx].state);
+                }
+            },
+        }
+
+        return .{
+            .strategy = plan.strategy,
+            .pull_count = plan.pull_keys.len,
+            .push_count = plan.push_keys.len,
+        };
     }
 
     fn allEqual(self: *Mesh) bool {
@@ -525,21 +551,440 @@ fn cloneNetworkState(src: *const NetworkState) !NetworkState {
     return out;
 }
 
-fn stateHash(ns: *const NetworkState) anti_entropy.Hash {
-    var bytes: [128]u8 = undefined;
-    const summary = std.fmt.bufPrint(&bytes, "u:{} n:{} c:{} m:{} p:{} b:{} bm:{} t:{}", .{
-        ns.users.items.len,
-        ns.nick_claims.items.len,
-        ns.channels.items.len,
-        ns.memberships.entries.items.len,
-        ns.prefix_modes.items.len,
-        ns.bans.entries.items.len,
-        ns.ban_metadata.items.len,
-        ns.topics.items.len,
-    }) catch "";
+fn populateStateLane(lane: *anti_entropy.Lane, ns: *const NetworkState) !void {
+    var key_buf: [512]u8 = undefined;
 
+    for (ns.users.items) |entry| {
+        const key = try userKey(&key_buf, entry.uid);
+        try lane.putHash(key, hashUserEntry(entry));
+    }
+    for (ns.nick_claims.items) |claim| {
+        const key = try nickClaimKey(&key_buf, claim.nick, claim.uid);
+        try lane.putHash(key, hashNickClaim(claim));
+    }
+    for (ns.channels.items) |channel| {
+        const key = try channelKey(&key_buf, channel.name);
+        try lane.putHash(key, hashChannelRoot(channel));
+    }
+    for (ns.memberships.entries.items) |entry| {
+        const key = try membershipKey(&key_buf, entry.value);
+        try lane.putHash(key, hashMembershipEntry(entry));
+    }
+    try lane.putHash("memberships:cc", hashCausalContext(ns.memberships.cc));
+    for (ns.prefix_modes.items) |entry| {
+        const key = try prefixModeKey(&key_buf, entry.key);
+        try lane.putHash(key, hashPrefixModeEntry(entry));
+    }
+    for (ns.boolean_modes.items) |entry| {
+        const key = try booleanModeKey(&key_buf, entry.key);
+        try lane.putHash(key, hashBooleanModeEntry(entry));
+    }
+    for (ns.param_modes.items) |entry| {
+        const key = try paramModeKey(&key_buf, entry.key);
+        try lane.putHash(key, hashParamModeEntry(entry));
+    }
+    for (ns.bans.entries.items) |entry| {
+        const key = try banKey(&key_buf, entry.value);
+        try lane.putHash(key, hashBanSetEntry(entry));
+    }
+    try lane.putHash("bans:cc", hashCausalContext(ns.bans.cc));
+    for (ns.ban_metadata.items) |entry| {
+        const key = try banMetadataKey(&key_buf, entry.key);
+        try lane.putHash(key, hashBanMetadataEntry(entry));
+    }
+    for (ns.topics.items) |entry| {
+        const key = try topicKey(&key_buf, entry.channel);
+        try lane.putHash(key, hashTopicEntry(entry));
+    }
+}
+
+fn repairSelectedKeys(target: *NetworkState, source: *const NetworkState, keys: []const []const u8) !void {
+    if (keys.len == 0) return;
+
+    var sparse = NetworkState.init(target.allocator, source.replica_id, source.node_id);
+    defer sparse.deinit();
+
+    var key_buf: [512]u8 = undefined;
+
+    for (source.users.items) |entry| {
+        const key = try userKey(&key_buf, entry.uid);
+        if (containsKey(keys, key)) try sparse.users.append(sparse.allocator, entry);
+    }
+    for (source.nick_claims.items) |claim| {
+        const key = try nickClaimKey(&key_buf, claim.nick, claim.uid);
+        if (containsKey(keys, key)) try sparse.nick_claims.append(sparse.allocator, claim);
+    }
+    for (source.channels.items) |channel| {
+        const key = try channelKey(&key_buf, channel.name);
+        if (containsKey(keys, key)) try sparse.channels.append(sparse.allocator, channel);
+    }
+    if (hasKeyPrefix(keys, "memberships:")) {
+        var memberships = try source.memberships.clone();
+        errdefer memberships.deinit();
+        sparse.memberships.deinit();
+        sparse.memberships = memberships;
+    }
+    for (source.prefix_modes.items) |entry| {
+        const key = try prefixModeKey(&key_buf, entry.key);
+        if (containsKey(keys, key)) try sparse.prefix_modes.append(sparse.allocator, entry);
+    }
+    for (source.boolean_modes.items) |entry| {
+        const key = try booleanModeKey(&key_buf, entry.key);
+        if (containsKey(keys, key)) try sparse.boolean_modes.append(sparse.allocator, entry);
+    }
+    for (source.param_modes.items) |entry| {
+        const key = try paramModeKey(&key_buf, entry.key);
+        if (containsKey(keys, key)) try sparse.param_modes.append(sparse.allocator, entry);
+    }
+    if (hasKeyPrefix(keys, "bans:")) {
+        var bans = try source.bans.clone();
+        errdefer bans.deinit();
+        sparse.bans.deinit();
+        sparse.bans = bans;
+    }
+    for (source.ban_metadata.items) |entry| {
+        const key = try banMetadataKey(&key_buf, entry.key);
+        if (containsKey(keys, key)) try sparse.ban_metadata.append(sparse.allocator, entry);
+    }
+    for (source.topics.items) |entry| {
+        const key = try topicKey(&key_buf, entry.channel);
+        if (containsKey(keys, key)) try sparse.topics.append(sparse.allocator, entry);
+    }
+
+    try target.merge(&sparse);
+}
+
+fn containsKey(keys: []const []const u8, needle: []const u8) bool {
+    for (keys) |key| {
+        if (std.mem.eql(u8, key, needle)) return true;
+    }
+    return false;
+}
+
+fn hasKeyPrefix(keys: []const []const u8, prefix: []const u8) bool {
+    for (keys) |key| {
+        if (std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    return false;
+}
+
+fn stateHash(ns: *const NetworkState) anti_entropy.Hash {
+    var fold = StateHashFold.init();
+
+    for (ns.users.items) |entry| fold.add(hashUserEntry(entry));
+    for (ns.nick_claims.items) |claim| fold.add(hashNickClaim(claim));
+    for (ns.channels.items) |channel| fold.add(hashChannelRoot(channel));
+    for (ns.memberships.entries.items) |entry| fold.add(hashMembershipEntry(entry));
+    fold.add(hashCausalContext(ns.memberships.cc));
+    for (ns.prefix_modes.items) |entry| fold.add(hashPrefixModeEntry(entry));
+    for (ns.boolean_modes.items) |entry| fold.add(hashBooleanModeEntry(entry));
+    for (ns.param_modes.items) |entry| fold.add(hashParamModeEntry(entry));
+    for (ns.bans.entries.items) |entry| fold.add(hashBanSetEntry(entry));
+    fold.add(hashCausalContext(ns.bans.cc));
+    for (ns.ban_metadata.items) |entry| fold.add(hashBanMetadataEntry(entry));
+    for (ns.topics.items) |entry| fold.add(hashTopicEntry(entry));
+
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.network-state.v1");
+    updateU64(&h, ns.users.items.len);
+    updateU64(&h, ns.nick_claims.items.len);
+    updateU64(&h, ns.channels.items.len);
+    updateU64(&h, ns.memberships.entries.items.len);
+    updateU64(&h, ns.prefix_modes.items.len);
+    updateU64(&h, ns.boolean_modes.items.len);
+    updateU64(&h, ns.param_modes.items.len);
+    updateU64(&h, ns.bans.entries.items.len);
+    updateU64(&h, ns.ban_metadata.items.len);
+    updateU64(&h, ns.topics.items.len);
+    h.update(&fold.acc);
     var out: anti_entropy.Hash = undefined;
-    std.crypto.hash.sha2.Sha256.hash(summary, &out, .{});
+    h.final(&out);
+    return out;
+}
+
+const StateHashFold = struct {
+    acc: anti_entropy.Hash = [_]u8{0} ** 32,
+
+    fn init() StateHashFold {
+        return .{};
+    }
+
+    fn add(self: *StateHashFold, hash: anti_entropy.Hash) void {
+        for (&self.acc, hash) |*dst, byte| dst.* ^= byte;
+    }
+};
+
+fn userKey(buf: []u8, uid: state_mod.Uid) ![]const u8 {
+    return std.fmt.bufPrint(buf, "users:{s}", .{uid.asSlice()});
+}
+
+fn nickClaimKey(buf: []u8, nick: state_mod.Nick, uid: state_mod.Uid) ![]const u8 {
+    return std.fmt.bufPrint(buf, "nicks:{s}:{s}", .{ nick.asSlice(), uid.asSlice() });
+}
+
+fn channelKey(buf: []u8, channel: state_mod.ChannelName) ![]const u8 {
+    return std.fmt.bufPrint(buf, "channels:{s}", .{channel.asSlice()});
+}
+
+fn membershipKey(buf: []u8, key: state_mod.MembershipKey) ![]const u8 {
+    return std.fmt.bufPrint(buf, "memberships:{s}:{s}:{}", .{ key.channel.asSlice(), key.uid.asSlice(), key.session });
+}
+
+fn prefixModeKey(buf: []u8, key: state_mod.PrefixModeKey) ![]const u8 {
+    return std.fmt.bufPrint(buf, "prefix_modes:{s}:{s}:{c}", .{ key.channel.asSlice(), key.uid.asSlice(), key.mode });
+}
+
+fn booleanModeKey(buf: []u8, key: state_mod.BooleanModeKey) ![]const u8 {
+    return std.fmt.bufPrint(buf, "boolean_modes:{s}:{c}", .{ key.channel.asSlice(), key.mode });
+}
+
+fn paramModeKey(buf: []u8, key: state_mod.ParamModeKey) ![]const u8 {
+    return std.fmt.bufPrint(buf, "param_modes:{s}:{c}", .{ key.channel.asSlice(), key.mode });
+}
+
+fn banKey(buf: []u8, key: state_mod.BanKey) ![]const u8 {
+    return std.fmt.bufPrint(buf, "bans:{s}:{}:{s}", .{ key.channel.asSlice(), @intFromEnum(key.kind), key.mask.asSlice() });
+}
+
+fn banMetadataKey(buf: []u8, key: state_mod.BanKey) ![]const u8 {
+    return std.fmt.bufPrint(buf, "ban_metadata:{s}:{}:{s}", .{ key.channel.asSlice(), @intFromEnum(key.kind), key.mask.asSlice() });
+}
+
+fn topicKey(buf: []u8, channel: state_mod.ChannelName) ![]const u8 {
+    return std.fmt.bufPrint(buf, "topics:{s}", .{channel.asSlice()});
+}
+
+fn hashUserEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.user.v1");
+    updateInline(&h, entry.uid);
+    updateUserProfileRegister(&h, entry.profile);
+    updatePresenceRegister(&h, entry.presence);
+    return finalHash(&h);
+}
+
+fn hashNickClaim(claim: state_mod.NickClaim) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.nick.v1");
+    updateInline(&h, claim.nick);
+    updateInline(&h, claim.uid);
+    updateU64(&h, claim.authority);
+    updateHlc(&h, claim.hlc);
+    updateU64(&h, claim.node_id);
+    return finalHash(&h);
+}
+
+fn hashChannelRoot(channel: state_mod.ChannelRoot) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.channel.v1");
+    updateInline(&h, channel.name);
+    updateHlc(&h, channel.birth_hlc);
+    updateBool(&h, channel.has_birth);
+    updateU64(&h, channel.authority);
+    updateU64(&h, channel.node_id);
+    return finalHash(&h);
+}
+
+fn hashMembershipEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.membership.v1");
+    updateMembershipKey(&h, entry.value);
+    updateDotList(&h, entry.dots.items);
+    return finalHash(&h);
+}
+
+fn hashPrefixModeEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.prefix-mode.v1");
+    updatePrefixModeKey(&h, entry.key);
+    updateAuthToggle(&h, entry.toggle);
+    return finalHash(&h);
+}
+
+fn hashBooleanModeEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.boolean-mode.v1");
+    updateBooleanModeKey(&h, entry.key);
+    updateU8(&h, @intFromEnum(entry.toggle.policy));
+    updateBool(&h, entry.toggle.enabled);
+    updateHlc(&h, entry.toggle.hlc);
+    updateU64(&h, entry.toggle.node_id);
+    return finalHash(&h);
+}
+
+fn hashParamModeEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.param-mode.v1");
+    updateParamModeKey(&h, entry.key);
+    updateParamModeRegister(&h, entry.register);
+    return finalHash(&h);
+}
+
+fn hashBanSetEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.ban.v1");
+    updateBanKey(&h, entry.value);
+    updateDotList(&h, entry.dots.items);
+    return finalHash(&h);
+}
+
+fn hashBanMetadataEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.ban-metadata.v1");
+    updateBanKey(&h, entry.key);
+    updateBanMetadataRegister(&h, entry.register);
+    return finalHash(&h);
+}
+
+fn hashTopicEntry(entry: anytype) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.topic.v1");
+    updateInline(&h, entry.channel);
+    updateTopicRegister(&h, entry.register);
+    return finalHash(&h);
+}
+
+fn hashCausalContext(cc: anytype) anti_entropy.Hash {
+    var fold = StateHashFold.init();
+    var count: usize = 0;
+    var it = cc.dots.iterator();
+    while (it.next()) |entry| {
+        fold.add(hashDot(entry.key_ptr.*));
+        count += 1;
+    }
+
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.causal-context.v1");
+    updateU64(&h, count);
+    h.update(&fold.acc);
+    return finalHash(&h);
+}
+
+fn hashDot(dot: state_mod.Dot) anti_entropy.Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mizuchi.suimyaku.state.dot.v1");
+    updateU64(&h, dot.replica);
+    updateU64(&h, dot.counter);
+    return finalHash(&h);
+}
+
+fn updateUserProfileRegister(h: *std.crypto.hash.sha2.Sha256, register: anytype) void {
+    updateRegisterHeader(h, register);
+    if (register.value) |value| {
+        updateInline(h, value.nick);
+        updateInline(h, value.account);
+        updateInline(h, value.realname);
+    }
+}
+
+fn updatePresenceRegister(h: *std.crypto.hash.sha2.Sha256, register: anytype) void {
+    updateRegisterHeader(h, register);
+    if (register.value) |value| {
+        updateU64(h, value.expires_at_ms);
+        updateBool(h, value.tombstoned);
+    }
+}
+
+fn updateParamModeRegister(h: *std.crypto.hash.sha2.Sha256, register: anytype) void {
+    updateRegisterHeader(h, register);
+    if (register.value) |value| {
+        updateInline(h, value.value);
+        updateU64(h, value.authority);
+    }
+}
+
+fn updateBanMetadataRegister(h: *std.crypto.hash.sha2.Sha256, register: anytype) void {
+    updateRegisterHeader(h, register);
+    if (register.value) |value| {
+        updateInline(h, value.setter);
+        updateInline(h, value.reason);
+    }
+}
+
+fn updateTopicRegister(h: *std.crypto.hash.sha2.Sha256, register: anytype) void {
+    updateRegisterHeader(h, register);
+    if (register.value) |value| {
+        updateInline(h, value.text);
+        updateInline(h, value.setter);
+        updateHlc(h, value.hlc);
+    }
+}
+
+fn updateRegisterHeader(h: *std.crypto.hash.sha2.Sha256, register: anytype) void {
+    updateBool(h, register.value != null);
+    updateU64(h, register.timestamp);
+    updateU64(h, register.replica_id);
+}
+
+fn updateMembershipKey(h: *std.crypto.hash.sha2.Sha256, key: state_mod.MembershipKey) void {
+    updateInline(h, key.channel);
+    updateInline(h, key.uid);
+    updateU64(h, key.session);
+}
+
+fn updatePrefixModeKey(h: *std.crypto.hash.sha2.Sha256, key: state_mod.PrefixModeKey) void {
+    updateInline(h, key.channel);
+    updateInline(h, key.uid);
+    updateU8(h, key.mode);
+}
+
+fn updateBooleanModeKey(h: *std.crypto.hash.sha2.Sha256, key: state_mod.BooleanModeKey) void {
+    updateInline(h, key.channel);
+    updateU8(h, key.mode);
+}
+
+fn updateParamModeKey(h: *std.crypto.hash.sha2.Sha256, key: state_mod.ParamModeKey) void {
+    updateInline(h, key.channel);
+    updateU8(h, key.mode);
+}
+
+fn updateBanKey(h: *std.crypto.hash.sha2.Sha256, key: state_mod.BanKey) void {
+    updateInline(h, key.channel);
+    updateU8(h, @intFromEnum(key.kind));
+    updateInline(h, key.mask);
+}
+
+fn updateAuthToggle(h: *std.crypto.hash.sha2.Sha256, toggle: state_mod.AuthToggle) void {
+    updateBool(h, toggle.enabled);
+    updateU64(h, toggle.authority);
+    updateHlc(h, toggle.hlc);
+    updateU64(h, toggle.node_id);
+}
+
+fn updateDotList(h: *std.crypto.hash.sha2.Sha256, dots: []const state_mod.Dot) void {
+    var fold = StateHashFold.init();
+    for (dots) |dot| fold.add(hashDot(dot));
+    updateU64(h, dots.len);
+    h.update(&fold.acc);
+}
+
+fn updateInline(h: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    updateU64(h, value.len);
+    h.update(value.asSlice());
+}
+
+fn updateHlc(h: *std.crypto.hash.sha2.Sha256, value: Hlc) void {
+    updateU64(h, value.wall_ms);
+    updateU64(h, value.logical);
+}
+
+fn updateBool(h: *std.crypto.hash.sha2.Sha256, value: bool) void {
+    updateU8(h, if (value) 1 else 0);
+}
+
+fn updateU8(h: *std.crypto.hash.sha2.Sha256, value: u8) void {
+    h.update(&[_]u8{value});
+}
+
+fn updateU64(h: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .big);
+    h.update(&buf);
+}
+
+fn finalHash(h: *std.crypto.hash.sha2.Sha256) anti_entropy.Hash {
+    var out: anti_entropy.Hash = undefined;
+    h.final(&out);
     return out;
 }
 
@@ -562,6 +1007,7 @@ fn runConvergenceSeed(seed: u64, partitioned: bool) !void {
         try mesh.partitionFirstHalf();
         try mesh.runRandomWorkload(80);
         mesh.heal();
+        try std.testing.expect(!mesh.allEqual());
         try mesh.runRandomWorkload(40);
     } else {
         try mesh.runRandomWorkload(120);
@@ -642,4 +1088,106 @@ test "redelivering the same delta set twice is idempotent" {
     for (mesh.nodes.items, snapshots.items) |*node, *snapshot| {
         try std.testing.expect(NetworkState.eql(&node.state, snapshot));
     }
+}
+
+test "state hash includes equal-cardinality key value content" {
+    const allocator = std.testing.allocator;
+    const uid = try state_mod.Uid.init("001HASH");
+    const nick = try state_mod.Nick.init("hashnick");
+    const hlc = try Hlc.init(10, 0);
+
+    var a = NetworkState.init(allocator, 1, 100);
+    defer a.deinit();
+    var b = NetworkState.init(allocator, 1, 100);
+    defer b.deinit();
+
+    try a.upsertUser(uid, .{
+        .nick = nick,
+        .realname = try state_mod.ShortText.init("left"),
+    }, hlc, 10);
+    try b.upsertUser(uid, .{
+        .nick = nick,
+        .realname = try state_mod.ShortText.init("right"),
+    }, hlc, 10);
+
+    try std.testing.expect(!std.mem.eql(u8, &stateHash(&a), &stateHash(&b)));
+}
+
+test "anti-entropy repair uses delta replay pull and push keys" {
+    var mesh = try Mesh.init(std.testing.allocator, 0x0160_aed1, 2);
+    defer mesh.deinit();
+    try seedPlannerRepairPair(&mesh, 24, 1);
+
+    const result = try mesh.repairPair(0, 1, .{
+        .delta_replay_limit = 8,
+        .full_resync_threshold = 1024,
+    });
+
+    try std.testing.expectEqual(anti_entropy.RepairStrategy.delta_replay, result.strategy);
+    try std.testing.expect(result.pull_count != 0);
+    try std.testing.expect(result.push_count != 0);
+    try std.testing.expect(NetworkState.eql(&mesh.nodes.items[0].state, &mesh.nodes.items[1].state));
+}
+
+test "anti-entropy repair uses merkle range diff key sets" {
+    var mesh = try Mesh.init(std.testing.allocator, 0x0160_aed2, 2);
+    defer mesh.deinit();
+    try seedPlannerRepairPair(&mesh, 80, 12);
+
+    const result = try mesh.repairPair(0, 1, .{
+        .delta_replay_limit = 4,
+        .full_resync_threshold = 1024,
+    });
+
+    try std.testing.expectEqual(anti_entropy.RepairStrategy.merkle_range_diff, result.strategy);
+    try std.testing.expect(result.pull_count != 0);
+    try std.testing.expect(result.push_count != 0);
+    try std.testing.expect(NetworkState.eql(&mesh.nodes.items[0].state, &mesh.nodes.items[1].state));
+}
+
+test "anti-entropy repair uses full resync only when planned" {
+    var mesh = try Mesh.init(std.testing.allocator, 0x0160_aed3, 2);
+    defer mesh.deinit();
+    try seedPlannerRepairPair(&mesh, 4, 1);
+
+    const result = try mesh.repairPair(0, 1, .{
+        .delta_replay_limit = 8,
+        .full_resync_threshold = 1,
+    });
+
+    try std.testing.expectEqual(anti_entropy.RepairStrategy.full_resync, result.strategy);
+    try std.testing.expect(result.pull_count != 0);
+    try std.testing.expect(result.push_count != 0);
+    try std.testing.expect(NetworkState.eql(&mesh.nodes.items[0].state, &mesh.nodes.items[1].state));
+}
+
+fn seedPlannerRepairPair(mesh: *Mesh, common_count: usize, unique_per_side: usize) !void {
+    var i: usize = 0;
+    while (i < common_count) : (i += 1) {
+        try seedUser(mesh, 0, "C", i, "common");
+    }
+    try mesh.nodes.items[1].state.merge(&mesh.nodes.items[0].state);
+
+    i = 0;
+    while (i < unique_per_side) : (i += 1) {
+        try seedUser(mesh, 0, "L", i, "left");
+        try seedUser(mesh, 1, "R", i, "right");
+    }
+    try std.testing.expect(!NetworkState.eql(&mesh.nodes.items[0].state, &mesh.nodes.items[1].state));
+}
+
+fn seedUser(mesh: *Mesh, node_idx: usize, comptime prefix: []const u8, idx: usize, comptime realname: []const u8) !void {
+    var uid_buf: [32]u8 = undefined;
+    var nick_buf: [64]u8 = undefined;
+    const uid_text = try std.fmt.bufPrint(&uid_buf, "{s}UID{}", .{ prefix, idx });
+    const nick_text = try std.fmt.bufPrint(&nick_buf, "{s}nick{}", .{ prefix, idx });
+    const uid = try state_mod.Uid.init(uid_text);
+    const nick = try state_mod.Nick.init(nick_text);
+    const hlc = try mesh.nextHlc(node_idx);
+
+    try mesh.nodes.items[node_idx].state.upsertUser(uid, .{
+        .nick = nick,
+        .realname = try state_mod.ShortText.init(realname),
+    }, hlc, 10);
+    try mesh.nodes.items[node_idx].state.claimNick(nick, uid, 10, hlc);
 }

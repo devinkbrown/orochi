@@ -4,6 +4,7 @@
 //! randomness, and output storage.  The peer consumes decoded SUIMYAKU frames
 //! and writes encoded response frames into caller-provided buffers.
 const std = @import("std");
+const builtin = @import("builtin");
 const frame = @import("frame.zig");
 const coilpack = @import("coilpack.zig");
 const sign = @import("../crypto/sign.zig");
@@ -14,6 +15,7 @@ pub const protocol_major: u8 = 1;
 pub const protocol_minor: u8 = 1;
 pub const server_id_len = 3;
 pub const max_server_name_len = 255;
+pub const replay_guard_capacity = 64;
 pub const confirm_len = hash.HmacSha256.tag_len;
 pub const max_hello_payload_len = 1 + 1 + 2 + max_server_name_len +
     1 + server_id_len + 8 + 8 + sign.public_key_len;
@@ -71,14 +73,70 @@ pub const Options = struct {
     server_id: []const u8,
     capabilities: u64 = 0,
     epoch_ms: u64 = 0,
+    now_ms: u64,
+    epoch_skew_ms: u64,
     identity: *const sign.KeyPair,
     hybrid_kx: kx.HybridKx.KeyPair,
-    encapsulation_seed: ?([kx.HybridKx.encaps_seed_len]u8) = null,
+    entropy_io: ?std.Io = null,
+    replay_guard: *EpochReplayGuard,
+    // Test-only deterministic override. Reusing this ML-KEM encapsulation seed
+    // reuses the ML-KEM secret, so production callers must inject fresh RNG.
+    test_encapsulation_seed: ?([kx.HybridKx.encaps_seed_len]u8) = null,
+};
+
+pub const EpochReplayGuard = struct {
+    const Entry = struct {
+        sid: [server_id_len]u8 = [_]u8{0} ** server_id_len,
+        identity_public_key: sign.PublicKey = [_]u8{0} ** sign.public_key_len,
+        last_epoch_ms: u64 = 0,
+    };
+
+    entries: [replay_guard_capacity]Entry = [_]Entry{.{}} ** replay_guard_capacity,
+    len: usize = 0,
+
+    pub fn init() EpochReplayGuard {
+        return .{};
+    }
+
+    fn checkHello(self: *const EpochReplayGuard, remote: *const PeerInfo, now_ms: u64, skew_ms: u64) !void {
+        if (!epochInWindow(remote.epoch_ms, now_ms, skew_ms)) return error.EpochOutsideWindow;
+        if (self.find(remote)) |idx| {
+            if (remote.epoch_ms <= self.entries[idx].last_epoch_ms) return error.ReplayedEpoch;
+        }
+    }
+
+    fn rememberAuthenticated(self: *EpochReplayGuard, remote: *const PeerInfo) !void {
+        if (self.find(remote)) |idx| {
+            if (remote.epoch_ms <= self.entries[idx].last_epoch_ms) return error.ReplayedEpoch;
+            self.entries[idx].last_epoch_ms = remote.epoch_ms;
+            return;
+        }
+
+        if (self.len >= self.entries.len) return error.ReplayGuardFull;
+        self.entries[self.len] = .{
+            .sid = remote.server_id,
+            .identity_public_key = remote.identity_public_key,
+            .last_epoch_ms = remote.epoch_ms,
+        };
+        self.len += 1;
+    }
+
+    fn find(self: *const EpochReplayGuard, remote: *const PeerInfo) ?usize {
+        for (self.entries[0..self.len], 0..) |entry, idx| {
+            if (std.mem.eql(u8, &entry.sid, &remote.server_id) and
+                std.mem.eql(u8, &entry.identity_public_key, &remote.identity_public_key))
+            {
+                return idx;
+            }
+        }
+        return null;
+    }
 };
 
 const PeerInfo = struct {
     server_name: [max_server_name_len]u8 = [_]u8{0} ** max_server_name_len,
     server_name_len: u8 = 0,
+    protocol_minor: u8 = protocol_minor,
     server_id: [server_id_len]u8 = [_]u8{0} ** server_id_len,
     capabilities: u64 = 0,
     epoch_ms: u64 = 0,
@@ -114,7 +172,11 @@ pub const Peer = struct {
     remote: PeerInfo = .{},
     identity: *const sign.KeyPair,
     hybrid_kx: kx.HybridKx.KeyPair,
-    encapsulation_seed: ?([kx.HybridKx.encaps_seed_len]u8),
+    entropy_io: ?std.Io,
+    replay_guard: *EpochReplayGuard,
+    now_ms: u64,
+    epoch_skew_ms: u64,
+    test_encapsulation_seed: ?([kx.HybridKx.encaps_seed_len]u8),
     credit: frame.CreditWindow = frame.CreditWindow.init(),
     local_hello_hash: hash.Sha256.Digest = [_]u8{0} ** hash.Sha256.digest_len,
     remote_hello_hash: hash.Sha256.Digest = [_]u8{0} ** hash.Sha256.digest_len,
@@ -123,6 +185,9 @@ pub const Peer = struct {
     shared_secret: ?kx.SharedSecret = null,
 
     pub fn init(options: Options) !Peer {
+        if (!builtin.is_test and options.test_encapsulation_seed != null) return error.TestOnlySeed;
+        if (options.entropy_io == null and options.test_encapsulation_seed == null) return error.MissingEntropy;
+
         var local: PeerInfo = .{};
         try fillPeerInfo(
             &local,
@@ -137,7 +202,11 @@ pub const Peer = struct {
             .local = local,
             .identity = options.identity,
             .hybrid_kx = options.hybrid_kx,
-            .encapsulation_seed = options.encapsulation_seed,
+            .entropy_io = options.entropy_io,
+            .replay_guard = options.replay_guard,
+            .now_ms = options.now_ms,
+            .epoch_skew_ms = options.epoch_skew_ms,
+            .test_encapsulation_seed = options.test_encapsulation_seed,
         };
     }
 
@@ -231,7 +300,9 @@ pub const Peer = struct {
 
         self.remote = decodeHello(payload) catch return self.fail(out, "bad hello");
         self.remote_hello_hash = hash.Sha256.hash(payload);
-        if (!versionCompatible(payload)) return self.fail(out, "version mismatch");
+        self.replay_guard.checkHello(&self.remote, self.now_ms, self.epoch_skew_ms) catch {
+            return self.fail(out, "stale hello");
+        };
 
         self.role = chooseRole(&self.local, &self.remote);
         self.state = .hello_recv;
@@ -274,15 +345,11 @@ pub const Peer = struct {
                 self.initiator_auth.set(body);
                 const remote_share = try decodePublicShareBody(body);
                 var transcript = self.kxTranscript();
-                var seed = self.encapsulation_seed orelse return error.MissingEntropy;
-                defer secureZero(&seed);
-                var enc = try kx.HybridKx.encapsulateDeterministic(
-                    &self.hybrid_kx.x25519,
-                    remote_share,
-                    &transcript,
-                    &seed,
-                );
+                var enc = try self.encapsulateRemoteShare(remote_share, &transcript);
                 defer enc.wipe();
+                self.replay_guard.rememberAuthenticated(&self.remote) catch {
+                    return self.fail(out, "stale hello");
+                };
                 self.replaceSharedSecret(enc.shared_secret);
 
                 const send_len = try self.sendAuthEncapsulated(enc.share, out);
@@ -296,7 +363,11 @@ pub const Peer = struct {
                 self.responder_auth.set(body);
                 const remote_enc = try decodeEncapsulatedBody(body);
                 var transcript = self.kxTranscript();
-                const secret = try kx.HybridKx.decapsulate(&self.hybrid_kx, remote_enc, &transcript);
+                var secret = try kx.HybridKx.decapsulate(&self.hybrid_kx, remote_enc, &transcript);
+                errdefer secret.wipe();
+                self.replay_guard.rememberAuthenticated(&self.remote) catch {
+                    return self.fail(out, "stale hello");
+                };
                 self.replaceSharedSecret(secret);
 
                 const confirm = try self.computeConfirm();
@@ -363,6 +434,29 @@ pub const Peer = struct {
         @memcpy(payload[body.len..][0..sign.signature_len], &sig);
         secureZero(msg_buf[0..msg.len]);
         return emitFrame(.auth, payload[0 .. body.len + sign.signature_len], out);
+    }
+
+    fn encapsulateRemoteShare(
+        self: *Peer,
+        remote_share: kx.HybridKx.PublicShare,
+        transcript: []const u8,
+    ) !kx.HybridKx.Encapsulation {
+        if (self.test_encapsulation_seed) |*seed| {
+            return kx.HybridKx.encapsulateDeterministic(
+                &self.hybrid_kx.x25519,
+                remote_share,
+                transcript,
+                seed,
+            );
+        }
+
+        const io = self.entropy_io orelse return error.MissingEntropy;
+        return kx.HybridKx.encapsulate(
+            &self.hybrid_kx.x25519,
+            remote_share,
+            transcript,
+            io,
+        );
     }
 
     fn verifyAuthBody(self: *Peer, body: []const u8, sig: sign.Signature) !bool {
@@ -466,11 +560,21 @@ fn fillPeerInfo(
     info.identity_public_key = identity_public_key;
 }
 
+fn epochInWindow(epoch_ms: u64, now_ms: u64, skew_ms: u64) bool {
+    const min_epoch = if (now_ms > skew_ms) now_ms - skew_ms else 0;
+    const max_epoch = if (std.math.maxInt(u64) - now_ms < skew_ms)
+        std.math.maxInt(u64)
+    else
+        now_ms + skew_ms;
+    return epoch_ms >= min_epoch and epoch_ms <= max_epoch;
+}
+
+/// SUIMYAKU v1 negotiates down by minor version: a peer with the same major
+/// version is accepted, and the effective minor is `min(remote, local)`.
 fn decodeHello(payload: []const u8) !PeerInfo {
     var r = coilpack.Cbs.init(payload);
     const major = try r.readU8();
     const minor = try r.readU8();
-    _ = minor;
     if (major != protocol_major) return error.VersionMismatch;
     const name = try r.readBytes();
     const sid = try r.readBytes();
@@ -483,12 +587,8 @@ fn decodeHello(payload: []const u8) !PeerInfo {
 
     var info: PeerInfo = .{};
     try fillPeerInfo(&info, name, sid, caps, epoch_ms, pk);
+    info.protocol_minor = @min(minor, protocol_minor);
     return info;
-}
-
-fn versionCompatible(payload: []const u8) bool {
-    if (payload.len < 2) return false;
-    return payload[0] == protocol_major and payload[1] <= protocol_minor;
 }
 
 fn chooseRole(local: *const PeerInfo, remote: *const PeerInfo) Role {
@@ -609,6 +709,7 @@ fn deterministicHybrid(byte: u8) !kx.HybridKx.KeyPair {
 const TestPeer = struct {
     identity: sign.KeyPair = undefined,
     peer: Peer = undefined,
+    replay_guard: EpochReplayGuard = EpochReplayGuard.init(),
     initialized: bool = false,
 
     fn init(
@@ -618,6 +719,20 @@ const TestPeer = struct {
         sign_seed: sign.Seed,
         kx_seed_byte: u8,
         enc_seed_byte: u8,
+    ) !void {
+        try self.initWithEpoch(name, sid, sign_seed, kx_seed_byte, enc_seed_byte, 42, 42, 0);
+    }
+
+    fn initWithEpoch(
+        self: *TestPeer,
+        name: []const u8,
+        sid: []const u8,
+        sign_seed: sign.Seed,
+        kx_seed_byte: u8,
+        enc_seed_byte: u8,
+        epoch_ms: u64,
+        now_ms: u64,
+        epoch_skew_ms: u64,
     ) !void {
         self.identity = try sign.KeyPair.fromSeed(sign_seed);
         errdefer self.identity.deinit();
@@ -629,10 +744,13 @@ const TestPeer = struct {
             .server_name = name,
             .server_id = sid,
             .capabilities = 0x05,
-            .epoch_ms = 42,
+            .epoch_ms = epoch_ms,
+            .now_ms = now_ms,
+            .epoch_skew_ms = epoch_skew_ms,
             .identity = &self.identity,
             .hybrid_kx = hybrid,
-            .encapsulation_seed = enc_seed,
+            .replay_guard = &self.replay_guard,
+            .test_encapsulation_seed = enc_seed,
         });
         self.initialized = true;
     }
@@ -786,6 +904,197 @@ test "version mismatch is rejected" {
     }, &out);
     try std.testing.expectEqual(Event.closing, act.event);
     try std.testing.expectEqual(State.closing, left.peer.state);
+}
+
+test "newer minor version negotiates down in decodeHello" {
+    var left: TestPeer = .{};
+    try left.init(
+        "alpha.example.net",
+        "001",
+        hex("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f"),
+        0x91,
+        0xa1,
+    );
+    defer left.deinit();
+
+    var out: [2048]u8 = undefined;
+    _ = try left.peer.start(&out);
+
+    var payload: [max_hello_payload_len]u8 = undefined;
+    var w = coilpack.Cbb.init(&payload);
+    _ = try w.writeU8(protocol_major);
+    _ = try w.writeU8(protocol_minor + 1);
+    _ = try w.writeBytes("future.example.net");
+    _ = try w.writeBytes("002");
+    _ = try w.writeU64Le(0);
+    _ = try w.writeU64Le(42);
+    try writeAll(&w, &left.identity.public_key);
+
+    const act = try left.peer.feed(.{
+        .type = .hello,
+        .ctrl = frame.Ctrl.init(0, .control, false),
+        .payload = w.written(),
+    }, &out);
+    try std.testing.expectEqual(Event.send, act.event);
+    try std.testing.expectEqual(protocol_minor, left.peer.remote.protocol_minor);
+}
+
+test "hello epochs outside configured clock skew are rejected" {
+    var local_past: TestPeer = .{};
+    try local_past.initWithEpoch(
+        "alpha.example.net",
+        "001",
+        hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"),
+        0xb1,
+        0xc1,
+        1000,
+        1000,
+        50,
+    );
+    defer local_past.deinit();
+
+    var remote_past: TestPeer = .{};
+    try remote_past.initWithEpoch(
+        "beta.example.net",
+        "002",
+        hex("909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"),
+        0xb2,
+        0xc2,
+        949,
+        949,
+        0,
+    );
+    defer remote_past.deinit();
+
+    var remote_to_local: [4096]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const remote_hello = try remote_past.peer.start(&remote_to_local);
+    _ = try local_past.peer.start(&out);
+
+    const past_rejected = try local_past.peer.feed(
+        try frame.Frame.decode(remote_to_local[0..remote_hello.send_len]),
+        &out,
+    );
+    try std.testing.expectEqual(Event.closing, past_rejected.event);
+    try std.testing.expectEqual(State.closing, local_past.peer.state);
+
+    var local_future: TestPeer = .{};
+    try local_future.initWithEpoch(
+        "alpha.example.net",
+        "001",
+        hex("a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"),
+        0xd1,
+        0xe1,
+        1000,
+        1000,
+        50,
+    );
+    defer local_future.deinit();
+
+    var remote_future: TestPeer = .{};
+    try remote_future.initWithEpoch(
+        "beta.example.net",
+        "002",
+        hex("b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf"),
+        0xd2,
+        0xe2,
+        1051,
+        1051,
+        0,
+    );
+    defer remote_future.deinit();
+
+    const future_hello = try remote_future.peer.start(&remote_to_local);
+    _ = try local_future.peer.start(&out);
+
+    const future_rejected = try local_future.peer.feed(
+        try frame.Frame.decode(remote_to_local[0..future_hello.send_len]),
+        &out,
+    );
+    try std.testing.expectEqual(Event.closing, future_rejected.event);
+    try std.testing.expectEqual(State.closing, local_future.peer.state);
+}
+
+test "replayed hello and auth epoch is rejected" {
+    var left: TestPeer = .{};
+    try left.initWithEpoch(
+        "alpha.example.net",
+        "001",
+        hex("c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf"),
+        0xf1,
+        0x11,
+        2000,
+        2000,
+        100,
+    );
+    defer left.deinit();
+
+    var right: TestPeer = .{};
+    try right.initWithEpoch(
+        "beta.example.net",
+        "002",
+        hex("d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef"),
+        0xf2,
+        0x12,
+        2000,
+        2000,
+        100,
+    );
+    defer right.deinit();
+
+    var left_hello_buf: [4096]u8 = undefined;
+    var right_hello_buf: [4096]u8 = undefined;
+    var left_auth_buf: [4096]u8 = undefined;
+    var right_out: [4096]u8 = undefined;
+
+    const left_hello = try left.peer.start(&left_hello_buf);
+    const right_hello = try right.peer.start(&right_hello_buf);
+
+    const right_waits = try right.peer.feed(
+        try frame.Frame.decode(left_hello_buf[0..left_hello.send_len]),
+        &right_out,
+    );
+    try std.testing.expectEqual(Event.none, right_waits.event);
+
+    const left_auth = try left.peer.feed(
+        try frame.Frame.decode(right_hello_buf[0..right_hello.send_len]),
+        &left_auth_buf,
+    );
+    try std.testing.expectEqual(Event.send, left_auth.event);
+
+    const right_auth = try right.peer.feed(
+        try frame.Frame.decode(left_auth_buf[0..left_auth.send_len]),
+        &right_out,
+    );
+    try std.testing.expectEqual(Event.send, right_auth.event);
+
+    var right_replay: TestPeer = .{};
+    right_replay.replay_guard = right.replay_guard;
+    try right_replay.initWithEpoch(
+        "beta.example.net",
+        "002",
+        hex("e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"),
+        0xf3,
+        0x13,
+        2001,
+        2000,
+        100,
+    );
+    defer right_replay.deinit();
+
+    _ = try right_replay.peer.start(&right_out);
+    const replayed_hello = try right_replay.peer.feed(
+        try frame.Frame.decode(left_hello_buf[0..left_hello.send_len]),
+        &right_out,
+    );
+    try std.testing.expectEqual(Event.closing, replayed_hello.event);
+    try std.testing.expectEqual(State.closing, right_replay.peer.state);
+
+    const replayed_auth = try right_replay.peer.feed(
+        try frame.Frame.decode(left_auth_buf[0..left_auth.send_len]),
+        &right_out,
+    );
+    try std.testing.expectEqual(Event.dropped, replayed_auth.event);
 }
 
 test {

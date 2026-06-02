@@ -27,10 +27,33 @@ const access_version = "X1";
 const akick_version = "K1";
 const access_prefix = "chanaccess:";
 const akick_prefix = "chanakick:";
+const missing_account_salt: [salt_len]u8 = .{
+    0x6d, 0x69, 0x7a, 0x75, 0x63, 0x68, 0x69, 0x2d,
+    0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73,
+};
 
 pub const channel_access_family = store_mod.Family.props;
 
-pub const ServiceError = anyerror;
+const StorePutError = @typeInfo(@typeInfo(@TypeOf(MizuStore.put)).@"fn".return_type.?).error_union.error_set;
+const StoreDeleteError = @typeInfo(@typeInfo(@TypeOf(MizuStore.delete)).@"fn".return_type.?).error_union.error_set;
+const Pbkdf2Error = @typeInfo(@typeInfo(@TypeOf(std.crypto.pwhash.pbkdf2)).@"fn".return_type.?).error_union.error_set;
+
+pub const ServiceError = StorePutError || StoreDeleteError || Pbkdf2Error || error{
+    NotFound,
+    AuthFailed,
+    Forbidden,
+    AlreadyExists,
+    InvalidName,
+    InvalidChannel,
+    InvalidRecord,
+    InvalidPassword,
+    InvalidValue,
+    BufferTooSmall,
+};
+
+comptime {
+    if (@typeInfo(ServiceError).error_set == null) @compileError("ServiceError must remain concrete");
+}
 
 /// Optional integration hook for the daemon's SUIMYAKU state.
 pub const StateHook = struct {
@@ -203,7 +226,7 @@ pub const Services = struct {
         try hashPassword(&hash, password, &salt);
 
         const record = AccountRecord{
-            .name = try AccountName.init(key.asSlice()),
+            .name = AccountName.init(key.asSlice()) catch return error.InvalidName,
             .salt = salt,
             .hash = hash,
         };
@@ -213,7 +236,12 @@ pub const Services = struct {
     }
 
     pub fn identifyAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
-        const record = try self.loadAccount(name);
+        const key = try accountKey(name);
+        const value = self.store.family(.accounts).get(key.asSlice()) orelse {
+            try rejectMissingAccount(password);
+            return error.AuthFailed;
+        };
+        const record = try decodeAccount(value);
         try verifyPassword(record, password);
         return .{ .identified = .{ .name = record.name } };
     }
@@ -265,8 +293,8 @@ pub const Services = struct {
         self.store.io.randomSecure(&generation) catch self.store.io.random(&generation);
 
         const record = ChannelRecord{
-            .name = try ChannelName.init(channel_key.asSlice()),
-            .founder = try AccountName.init(founder_key.asSlice()),
+            .name = ChannelName.init(channel_key.asSlice()) catch return error.InvalidChannel,
+            .founder = AccountName.init(founder_key.asSlice()) catch return error.InvalidName,
             .generation = generation,
         };
         const encoded = try encodeChannel(record, scratch);
@@ -306,21 +334,13 @@ pub const Services = struct {
             .grant => {
                 try self.requireAccess(record, actor, .admin);
                 if (level == .founder) try self.requireAccess(record, actor, .founder);
-                const access = try self.putAccess(record, try AccountName.init(target_key.asSlice()), level, scratch);
+                const access = try self.putAccess(record, AccountName.init(target_key.asSlice()) catch return error.InvalidName, level, scratch);
                 return .{ .access = access.info() };
             },
             .revoke => {
                 try self.requireAccess(record, actor, .admin);
                 if (std.mem.eql(u8, target_key.asSlice(), record.founder.asSlice())) return error.Forbidden;
-                const existing = self.loadAccess(record, target_key.asSlice()) catch |err| switch (err) {
-                    error.NotFound => AccessRecord{
-                        .channel = record.name,
-                        .account = try AccountName.init(target_key.asSlice()),
-                        .generation = record.generation,
-                        .level = level,
-                    },
-                    else => return err,
-                };
+                const existing = try self.loadAccess(record, target_key.asSlice());
                 var key_buf: [key_max]u8 = undefined;
                 const key = try accessKey(record.name.asSlice(), target_key.asSlice(), &key_buf);
                 try self.store.delete(channel_access_family, key);
@@ -352,7 +372,7 @@ pub const Services = struct {
                     .channel = record.name,
                     .mask = clean_mask,
                     .generation = record.generation,
-                    .setter = try AccountName.init(actor_key.asSlice()),
+                    .setter = AccountName.init(actor_key.asSlice()) catch return error.InvalidName,
                     .reason = try validateReason(reason),
                 };
                 const encoded = try encodeAkick(akick, scratch);
@@ -363,15 +383,7 @@ pub const Services = struct {
             },
             .remove => {
                 try self.requireAccess(record, actor, .admin);
-                const existing = self.loadAkick(record, clean_mask.asSlice()) catch |err| switch (err) {
-                    error.NotFound => AkickRecord{
-                        .channel = record.name,
-                        .mask = clean_mask,
-                        .generation = record.generation,
-                        .setter = try AccountName.init((try accountKey(actor)).asSlice()),
-                    },
-                    else => return err,
-                };
+                const existing = try self.loadAkick(record, clean_mask.asSlice());
                 var key_buf: [key_max]u8 = undefined;
                 const key = try akickKey(record.name.asSlice(), clean_mask.asSlice(), &key_buf);
                 try self.store.delete(channel_access_family, key);
@@ -455,7 +467,10 @@ pub const Services = struct {
     fn requireAccess(self: *Services, channel: ChannelRecord, actor: []const u8, needed: AccessLevel) ServiceError!void {
         const actor_key = try accountKey(actor);
         if (std.mem.eql(u8, actor_key.asSlice(), channel.founder.asSlice())) return;
-        const access = try self.loadAccess(channel, actor_key.asSlice());
+        const access = self.loadAccess(channel, actor_key.asSlice()) catch |err| switch (err) {
+            error.NotFound => return error.Forbidden,
+            else => return err,
+        };
         if (!access.level.allows(needed)) return error.Forbidden;
     }
 };
@@ -468,23 +483,23 @@ fn validatePassword(password: []const u8) ServiceError!void {
 fn validateEmail(input: []const u8) ServiceError!Email {
     if (input.len == 0) return Email.empty();
     if (input.len > email_max or hasCtlOrSep(input)) return error.InvalidValue;
-    return Email.init(input);
+    return Email.init(input) catch error.InvalidValue;
 }
 
 fn validateReason(input: []const u8) ServiceError!Reason {
     if (input.len > reason_max or hasCtlOrSep(input)) return error.InvalidValue;
-    return Reason.init(input);
+    return Reason.init(input) catch error.InvalidValue;
 }
 
 fn validateNick(input: []const u8) ServiceError!NickName {
     if (input.len == 0 or input.len > nick_max or hasCtlOrSep(input)) return error.InvalidName;
     for (input) |byte| if (byte == ' ' or byte == ',') return error.InvalidName;
-    return NickName.init(input);
+    return NickName.init(input) catch error.InvalidName;
 }
 
 fn validateMask(input: []const u8) ServiceError!Mask {
     if (input.len == 0 or input.len > mask_max or hasCtlOrSep(input)) return error.InvalidValue;
-    return Mask.init(input);
+    return Mask.init(input) catch error.InvalidValue;
 }
 
 fn accountKey(input: []const u8) ServiceError!AccountName {
@@ -535,6 +550,12 @@ fn verifyPassword(record: AccountRecord, password: []const u8) ServiceError!void
     var candidate: [hash_len]u8 = undefined;
     try hashPassword(&candidate, password, &record.salt);
     if (!std.crypto.timing_safe.eql([hash_len]u8, candidate, record.hash)) return error.AuthFailed;
+}
+
+fn rejectMissingAccount(password: []const u8) ServiceError!void {
+    try validatePassword(password);
+    var candidate: [hash_len]u8 = undefined;
+    try hashPassword(&candidate, password, &missing_account_salt);
 }
 
 fn encodeAccount(record: AccountRecord, scratch: []u8) ServiceError![]const u8 {
@@ -722,6 +743,29 @@ test "wrong password is rejected" {
     try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", "wrong horse battery staple"));
 }
 
+test "missing identify collapses to auth failed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-missing-identify.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+
+    try std.testing.expectError(error.AuthFailed, services.identifyAccount("missing", "correct horse battery staple"));
+}
+
+test "corrupt account record is rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-corrupt-account.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+
+    try store.family(.accounts).put("alice", "A1|alice|not-a-salt|not-a-hash|0|");
+    try std.testing.expectError(error.InvalidRecord, services.identifyAccount("alice", "correct horse battery staple"));
+}
+
 test "account persists across store reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -764,6 +808,43 @@ test "channel register and access grant" {
 
     const queried = try services.channelAccess("#mizuchi", "bob", "bob", .query, .voice, &scratch);
     try std.testing.expectEqual(AccessLevel.op, queried.access.level);
+}
+
+test "non-admin channel mutations are forbidden" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-channel-forbidden.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
+    _ = try services.registerAccount("carol", "carol correct battery staple", &scratch);
+    _ = try services.registerChannel("#mizuchi", "alice", &scratch);
+
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#mizuchi", "bob", "carol", .grant, .op, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#mizuchi", "bob", "carol", .revoke, .op, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#mizuchi", "bob", "*!*@bad.test", .add, "bad", &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#mizuchi", "bob", "*!*@bad.test", .remove, "", &scratch));
+}
+
+test "missing access and akick removals return not found" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-channel-missing-remove.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
+    _ = try services.registerChannel("#mizuchi", "alice", &scratch);
+
+    try std.testing.expectError(error.NotFound, services.channelAccess("#mizuchi", "alice", "bob", .revoke, .op, &scratch));
+    try std.testing.expectError(error.NotFound, services.channelAkick("#mizuchi", "alice", "*!*@missing.test", .remove, "", &scratch));
 }
 
 test "drop account and channel" {

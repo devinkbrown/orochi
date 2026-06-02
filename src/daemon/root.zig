@@ -8,6 +8,7 @@ pub const client = @import("client.zig");
 pub const commands = @import("commands.zig");
 pub const config = @import("config.zig");
 pub const dispatch = @import("dispatch.zig");
+pub const event_spine = @import("event_spine.zig");
 pub const flood = @import("flood.zig");
 pub const oper = @import("oper.zig");
 pub const registry = @import("registry.zig");
@@ -24,6 +25,7 @@ test {
     _ = commands;
     _ = config;
     _ = dispatch;
+    _ = event_spine;
     _ = flood;
     _ = oper;
     _ = registry;

@@ -6,6 +6,7 @@
 //! timestamp. Redaction appends no destructive rewrite; the entry remains as a
 //! tombstone and query results hide its content.
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Blake3 = std.crypto.hash.Blake3;
 
@@ -69,6 +70,7 @@ pub const MessageRef = struct {
     msgid: []const u8,
     sender: []const u8,
     timestamp: Hlc,
+    /// Borrowed message bytes. Any append or redact invalidates previously returned slices.
     content: ?[]const u8,
     tombstone: bool,
 };
@@ -231,6 +233,8 @@ pub fn HistoryStore(
                 .tombstone = false,
             };
 
+            self.debugAssertContentRefs();
+
             return .{
                 .hash = hash,
                 .shared_content = shared_content,
@@ -256,6 +260,7 @@ pub fn HistoryStore(
             }
 
             if (redacted == 0) return error.NotFound;
+            self.debugAssertContentRefs();
             return redacted;
         }
 
@@ -277,6 +282,7 @@ pub fn HistoryStore(
             }
 
             if (redacted == 0) return error.NotFound;
+            self.debugAssertContentRefs();
             return redacted;
         }
 
@@ -404,6 +410,7 @@ pub fn HistoryStore(
         ) HistoryError![]const MessageRef {
             if (log.len == 0) return out[0..0];
             const take = @min(log.len, limit);
+            if (take == 0) return out[0..0];
             const pivot = findPivot(log, anchor);
             const desired_left = @min(pivot, (take - 1) / 2);
             var start = pivot - desired_left;
@@ -464,6 +471,45 @@ pub fn HistoryStore(
                 if (Hlc.compare(log.entry(i).timestamp, anchor) != .lt) return i;
             }
             return log.len - 1;
+        }
+
+        fn debugAssertContentRefs(self: *const Self) void {
+            if (builtin.mode != .Debug) return;
+
+            var content_it = self.contents.iterator();
+            while (content_it.next()) |content_entry| {
+                const live_refs = self.countLiveContentRefs(content_entry.key_ptr.*);
+                std.debug.assert(live_refs > 0);
+                std.debug.assert(live_refs == content_entry.value_ptr.refs);
+            }
+
+            var target_it = self.targets.iterator();
+            while (target_it.next()) |target_entry| {
+                const log = target_entry.value_ptr;
+                var i: usize = 0;
+                while (i < log.len) : (i += 1) {
+                    const item = log.entry(i);
+                    if (!item.tombstone) {
+                        std.debug.assert(self.contents.contains(item.hash));
+                    }
+                }
+            }
+        }
+
+        fn countLiveContentRefs(self: *const Self, hash: ContentHash) usize {
+            var refs: usize = 0;
+            var target_it = self.targets.iterator();
+            while (target_it.next()) |target_entry| {
+                const log = target_entry.value_ptr;
+                var i: usize = 0;
+                while (i < log.len) : (i += 1) {
+                    const item = log.entry(i);
+                    if (!item.tombstone and std.mem.eql(u8, &item.hash, &hash)) {
+                        refs += 1;
+                    }
+                }
+            }
+            return refs;
         }
     };
 }
@@ -529,6 +575,11 @@ fn appendTest(
     return store.append(.{ .kind = .channel, .name = "#zig" }, msgid, sender, try Hlc.init(ms, 0), content);
 }
 
+fn testContentRefs(store: *const TestStore, hash: ContentHash) usize {
+    const stored = store.contents.get(hash) orelse return 0;
+    return stored.refs;
+}
+
 test "append and query latest before and around" {
     var store = TestStore.init(std.testing.allocator);
     defer store.deinit();
@@ -580,6 +631,58 @@ test "dedupe by content hash shares retained content" {
     try std.testing.expectEqual(@as(usize, 2), latest.len);
     try std.testing.expectEqualStrings("same body", latest[0].content.?);
     try std.testing.expectEqualStrings("same body", latest[1].content.?);
+}
+
+test "dedupe survives redaction then eviction of identical content" {
+    var store = TestStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const first = try appendTest(&store, "m1", "alice", 1000, "same body");
+    const second = try appendTest(&store, "m2", "bob", 2000, "same body");
+
+    try std.testing.expect(std.mem.eql(u8, &first.hash, &second.hash));
+    try std.testing.expectEqual(@as(usize, 1), store.uniqueContentCount());
+    try std.testing.expectEqual(@as(usize, 2), testContentRefs(&store, first.hash));
+    try std.testing.expectEqual(@as(usize, 1), try store.redactByMsgid(.{ .kind = .channel, .name = "#zig" }, "m1"));
+    try std.testing.expectEqual(@as(usize, 1), store.uniqueContentCount());
+    try std.testing.expectEqual(@as(usize, 1), testContentRefs(&store, first.hash));
+
+    _ = try appendTest(&store, "m3", "alice", 3000, "three");
+    try std.testing.expectEqual(@as(usize, 1), try store.redactByMsgid(.{ .kind = .channel, .name = "#zig" }, "m3"));
+    _ = try appendTest(&store, "m4", "alice", 4000, "four");
+    try std.testing.expectEqual(@as(usize, 1), try store.redactByMsgid(.{ .kind = .channel, .name = "#zig" }, "m4"));
+    try std.testing.expectEqual(@as(usize, 1), store.uniqueContentCount());
+
+    _ = try appendTest(&store, "m5", "alice", 5000, "five");
+    try std.testing.expectEqual(@as(usize, 1), try store.redactByMsgid(.{ .kind = .channel, .name = "#zig" }, "m5"));
+    try std.testing.expectEqual(@as(usize, 1), store.uniqueContentCount());
+
+    const sixth = try appendTest(&store, "m6", "alice", 6000, "six");
+    try std.testing.expect(sixth.evicted);
+    try std.testing.expectEqual(@as(usize, 1), try store.redactByMsgid(.{ .kind = .channel, .name = "#zig" }, "m6"));
+    try std.testing.expectEqual(@as(usize, 0), store.uniqueContentCount());
+}
+
+test "redact by shared content hash tombstones all live entries" {
+    var store = TestStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const first = try appendTest(&store, "m1", "alice", 1000, "same body");
+    const second = try appendTest(&store, "m2", "bob", 2000, "same body");
+
+    try std.testing.expect(std.mem.eql(u8, &first.hash, &second.hash));
+    try std.testing.expectEqual(@as(usize, 1), store.uniqueContentCount());
+    try std.testing.expectEqual(@as(usize, 2), testContentRefs(&store, first.hash));
+    try std.testing.expectEqual(@as(usize, 2), try store.redactByHash(.{ .kind = .channel, .name = "#zig" }, first.hash));
+    try std.testing.expectEqual(@as(usize, 0), store.uniqueContentCount());
+
+    var out: [4]MessageRef = undefined;
+    const latest = try store.query(.{ .kind = .channel, .name = "#zig" }, .latest, 4, &out);
+    try std.testing.expectEqual(@as(usize, 2), latest.len);
+    try std.testing.expect(latest[0].tombstone);
+    try std.testing.expect(latest[0].content == null);
+    try std.testing.expect(latest[1].tombstone);
+    try std.testing.expect(latest[1].content == null);
 }
 
 test "redaction hides content but keeps tombstone" {

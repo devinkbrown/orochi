@@ -56,26 +56,26 @@ pub const Database = struct {
 
     pub fn init(bytes: []const u8) Error!Database {
         const metadata_start = findMetadataStart(bytes) orelse return Error.InvalidDatabase;
-        const meta_reader = ValueReader.init(bytes, metadata_start, bytes.len);
-        const root = try meta_reader.expectMap(metadata_start);
+        const bootstrap_reader = ValueReader.init(bytes, 0, bytes.len);
+        const bootstrap_root = try bootstrap_reader.expectMap(metadata_start);
 
-        const node_count_u64 = try meta_reader.getUnsigned(root, &.{"node_count"}) orelse
+        const bootstrap_node_count = try bootstrap_reader.getUnsigned(bootstrap_root, &.{"node_count"}) orelse
             return Error.InvalidDatabase;
-        const record_size_u64 = try meta_reader.getUnsigned(root, &.{"record_size"}) orelse
+        const bootstrap_record_size = try bootstrap_reader.getUnsigned(bootstrap_root, &.{"record_size"}) orelse
             return Error.InvalidDatabase;
-        const ip_version_u64 = try meta_reader.getUnsigned(root, &.{"ip_version"}) orelse
+        const bootstrap_ip_version = try bootstrap_reader.getUnsigned(bootstrap_root, &.{"ip_version"}) orelse
             return Error.InvalidDatabase;
 
-        if (node_count_u64 > std.math.maxInt(u32) or
-            record_size_u64 > std.math.maxInt(u16) or
-            ip_version_u64 > std.math.maxInt(u16))
+        if (bootstrap_node_count > std.math.maxInt(u32) or
+            bootstrap_record_size > std.math.maxInt(u16) or
+            bootstrap_ip_version > std.math.maxInt(u16))
         {
             return Error.InvalidDatabase;
         }
 
-        const node_count: u32 = @intCast(node_count_u64);
-        const record_size: u16 = @intCast(record_size_u64);
-        const ip_version: u16 = @intCast(ip_version_u64);
+        const node_count: u32 = @intCast(bootstrap_node_count);
+        const record_size: u16 = @intCast(bootstrap_record_size);
+        const ip_version: u16 = @intCast(bootstrap_ip_version);
 
         if (node_count == 0) return Error.InvalidDatabase;
         if (ip_version != 4 and ip_version != 6) return Error.UnsupportedDatabase;
@@ -92,6 +92,21 @@ pub const Database = struct {
         if (data_start > bytes.len) return Error.InvalidDatabase;
         for (bytes[search_tree_size..data_start]) |b| {
             if (b != 0) return Error.InvalidDatabase;
+        }
+
+        const meta_reader = ValueReader.init(bytes, data_start, bytes.len);
+        const root = try meta_reader.expectMap(metadata_start);
+        const node_count_u64 = try meta_reader.getUnsigned(root, &.{"node_count"}) orelse
+            return Error.InvalidDatabase;
+        const record_size_u64 = try meta_reader.getUnsigned(root, &.{"record_size"}) orelse
+            return Error.InvalidDatabase;
+        const ip_version_u64 = try meta_reader.getUnsigned(root, &.{"ip_version"}) orelse
+            return Error.InvalidDatabase;
+        if (node_count_u64 != bootstrap_node_count or
+            record_size_u64 != bootstrap_record_size or
+            ip_version_u64 != bootstrap_ip_version)
+        {
+            return Error.InvalidDatabase;
         }
 
         return .{
@@ -312,10 +327,10 @@ const ValueReader = struct {
         if (depth >= max_pointer_depth) return Error.InvalidDatabase;
 
         const ptr = field_value.pointer orelse return Error.InvalidDatabase;
+        if (ptr > std.math.maxInt(usize)) return Error.InvalidDatabase;
         const target = checkedAdd(self.base, @intCast(ptr)) orelse return Error.InvalidDatabase;
         if (target >= self.limit) return Error.InvalidDatabase;
         const decoded = try self.field(target);
-        if (decoded.value_type == .pointer) return Error.InvalidDatabase;
         return self.resolveField(decoded, depth + 1);
     }
 
@@ -607,6 +622,27 @@ fn appendNode24(out: *ByteList, left: u32, right: u32) !void {
     try out.append(@intCast(right & 0xff));
 }
 
+fn appendNode28(out: *ByteList, left: u32, right: u32) !void {
+    try out.append(@intCast((left >> 16) & 0xff));
+    try out.append(@intCast((left >> 8) & 0xff));
+    try out.append(@intCast(left & 0xff));
+    try out.append(@intCast((((left >> 24) & 0x0f) << 4) | ((right >> 24) & 0x0f)));
+    try out.append(@intCast((right >> 16) & 0xff));
+    try out.append(@intCast((right >> 8) & 0xff));
+    try out.append(@intCast(right & 0xff));
+}
+
+fn appendNode32(out: *ByteList, left: u32, right: u32) !void {
+    try out.append(@intCast((left >> 24) & 0xff));
+    try out.append(@intCast((left >> 16) & 0xff));
+    try out.append(@intCast((left >> 8) & 0xff));
+    try out.append(@intCast(left & 0xff));
+    try out.append(@intCast((right >> 24) & 0xff));
+    try out.append(@intCast((right >> 16) & 0xff));
+    try out.append(@intCast((right >> 8) & 0xff));
+    try out.append(@intCast(right & 0xff));
+}
+
 fn appendMetadata(out: *ByteList, node_count: u32, record_size: u16, ip_version: u16) !void {
     try out.appendSlice(metadata_marker);
     try appendMapHeader(out, 3);
@@ -649,6 +685,80 @@ test "lookup returns country and asn from synthetic IPv4 MMDB" {
     try std.testing.expectEqual(@as(?Lookup, null), try db.lookup(Ip.fromV4(1, 2, 3, 4)));
 }
 
+test "lookup resolves value pointers relative to data section start" {
+    var bytes = ByteList.init(std.testing.allocator);
+    defer bytes.deinit();
+
+    const record_pointer: u32 = 1 + data_separator_len;
+    try appendNode24(&bytes, 1, record_pointer);
+    try bytes.appendNTimes(0, data_separator_len);
+
+    const data_start = bytes.items.len;
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "country");
+    const target_abs = bytes.items.len + 2;
+    try appendPointer(&bytes, target_abs - data_start);
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "iso_code");
+    try appendString(&bytes, "CA");
+
+    try appendMetadata(&bytes, 1, 24, 4);
+
+    const db = try Database.init(bytes.items);
+    const result = try db.lookup(Ip.fromV4(128, 0, 0, 1)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "CA", result.country_iso.?);
+}
+
+test "node pointer reader handles 28-bit nibble-split records" {
+    var bytes = ByteList.init(std.testing.allocator);
+    defer bytes.deinit();
+
+    const left: u32 = 0x01020304;
+    const right: u32 = 0x0a0b0c0d;
+    try appendNode28(&bytes, left, right);
+
+    const db = Database{
+        .bytes = bytes.items,
+        .metadata = .{
+            .node_count = 1,
+            .record_size = 28,
+            .ip_version = 4,
+            .node_byte_size = 7,
+            .search_tree_size = 7,
+            .data_start = 23,
+            .metadata_start = bytes.items.len,
+        },
+    };
+
+    try std.testing.expectEqual(@as(u64, left), try db.nodePointer(0, 0));
+    try std.testing.expectEqual(@as(u64, right), try db.nodePointer(0, 1));
+}
+
+test "node pointer reader handles 32-bit records" {
+    var bytes = ByteList.init(std.testing.allocator);
+    defer bytes.deinit();
+
+    const left: u32 = 0x10203040;
+    const right: u32 = 0xa0b0c0d0;
+    try appendNode32(&bytes, left, right);
+
+    const db = Database{
+        .bytes = bytes.items,
+        .metadata = .{
+            .node_count = 1,
+            .record_size = 32,
+            .ip_version = 4,
+            .node_byte_size = 8,
+            .search_tree_size = 8,
+            .data_start = 24,
+            .metadata_start = bytes.items.len,
+        },
+    };
+
+    try std.testing.expectEqual(@as(u64, left), try db.nodePointer(0, 0));
+    try std.testing.expectEqual(@as(u64, right), try db.nodePointer(0, 1));
+}
+
 test "data decoder follows maps and rejects truncated values" {
     var bytes = ByteList.init(std.testing.allocator);
     defer bytes.deinit();
@@ -689,6 +799,40 @@ test "data decoder resolves data-section pointers" {
     try std.testing.expectEqualSlices(u8, "JP", value);
 }
 
+test "metadata reader resolves pointers from data-section base" {
+    var bytes = ByteList.init(std.testing.allocator);
+    defer bytes.deinit();
+
+    try bytes.appendNTimes(0, 5);
+    const data_start = bytes.items.len;
+    try appendString(&bytes, "meta-value");
+    const metadata_start = bytes.items.len;
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "description");
+    try appendPointer(&bytes, 0);
+
+    const reader = ValueReader.init(bytes.items, data_start, bytes.items.len);
+    const root = try reader.expectMap(metadata_start);
+    const value = try reader.getUtf8(root, &.{"description"}) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "meta-value", value);
+}
+
+test "data decoder rejects cyclic pointer chain through depth guard" {
+    var bytes = ByteList.init(std.testing.allocator);
+    defer bytes.deinit();
+
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "country");
+    const chain_offset = bytes.items.len + 2;
+    try appendPointer(&bytes, chain_offset);
+    try appendPointer(&bytes, chain_offset);
+
+    const reader = ValueReader.init(bytes.items, 0, bytes.items.len);
+    const root = try reader.expectMap(0);
+    try std.testing.expectError(Error.InvalidDatabase, reader.getUtf8(root, &.{"country"}));
+}
+
 test "metadata and tree bounds fail closed" {
     var bytes = ByteList.init(std.testing.allocator);
     defer bytes.deinit();
@@ -709,4 +853,29 @@ test "metadata and tree bounds fail closed" {
 
     const db = try Database.init(bytes.items);
     try std.testing.expectError(Error.InvalidDatabase, db.lookup(Ip.fromV4(1, 1, 1, 1)));
+}
+
+test "random garbage bytes never panic during init or lookup" {
+    var seed: u64 = 0x9e3779b97f4a7c15;
+    var buf: [256]u8 = undefined;
+
+    var case_index: usize = 0;
+    while (case_index < 512) : (case_index += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const len: usize = @intCast((seed >> 56) & 0xff);
+
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            buf[i] = @intCast((seed >> 32) & 0xff);
+        }
+
+        if (Database.init(buf[0..len])) |db| {
+            _ = db.lookup(Ip.fromV4(203, 0, 113, @intCast(case_index & 0xff))) catch {
+                continue;
+            };
+        } else |_| {
+            continue;
+        }
+    }
 }

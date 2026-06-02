@@ -266,6 +266,7 @@ pub const Seq64 = struct {
 };
 
 pub const Nonce96 = [12]u8;
+pub const AadMax = [13]u8;
 
 /// TLS 1.3 per-record nonce: static IV XOR (0x00000000 || seq_be64).
 pub fn nonce13(iv: Nonce96, seq: u64) Nonce96 {
@@ -294,6 +295,17 @@ pub const RecordCipherState = struct {
     iv: Nonce96,
     seq: Seq64 = .{},
 
+    pub const RecordParams = struct {
+        sequence: u64,
+        nonce: Nonce96,
+        aad: AadMax,
+        aad_len: usize,
+
+        pub fn aadSlice(self: *const RecordParams) []const u8 {
+            return self.aad[0..self.aad_len];
+        }
+    };
+
     pub fn init(version: ProtocolVersion, suite: CipherSuite, iv: Nonce96) TlsError!RecordCipherState {
         if (!isAllowed(version, suite)) return error.InvalidCipherSuite;
         return .{ .version = version, .suite = suite, .iv = iv };
@@ -308,8 +320,58 @@ pub const RecordCipherState = struct {
         };
     }
 
+    pub fn sealParams(
+        self: *RecordCipherState,
+        content_type: ContentType,
+        wire_version: u16,
+        length: u16,
+    ) TlsError!RecordParams {
+        return try self.nextParams(content_type, wire_version, length);
+    }
+
+    pub fn openParams(
+        self: *RecordCipherState,
+        content_type: ContentType,
+        wire_version: u16,
+        length: u16,
+    ) TlsError!RecordParams {
+        return try self.nextParams(content_type, wire_version, length);
+    }
+
+    fn nextParams(
+        self: *RecordCipherState,
+        content_type: ContentType,
+        wire_version: u16,
+        length: u16,
+    ) TlsError!RecordParams {
+        const sequence = try self.seq.next();
+        return try self.paramsFor(sequence, content_type, wire_version, length);
+    }
+
+    fn paramsFor(
+        self: RecordCipherState,
+        sequence: u64,
+        content_type: ContentType,
+        wire_version: u16,
+        length: u16,
+    ) TlsError!RecordParams {
+        var params = RecordParams{
+            .sequence = sequence,
+            .nonce = switch (self.version) {
+                .tls13 => nonce13(self.iv, sequence),
+                .tls12 => nonce12(self.iv, sequence),
+                .tls10, .tls11 => return error.InvalidVersion,
+            },
+            .aad = [_]u8{0} ** 13,
+            .aad_len = 0,
+        };
+        params.aad_len = try self.makeAad(sequence, content_type, wire_version, length, &params.aad);
+        return params;
+    }
+
     pub fn makeAad(
         self: RecordCipherState,
+        sequence: u64,
         content_type: ContentType,
         wire_version: u16,
         length: u16,
@@ -319,7 +381,7 @@ pub const RecordCipherState = struct {
         if (out.len < need) return error.OutputTooSmall;
         var n: usize = 0;
         if (self.version == .tls12) {
-            std.mem.writeInt(u64, out[0..8], self.seq.peek(), .big);
+            std.mem.writeInt(u64, out[0..8], sequence, .big);
             n = 8;
         }
         out[n] = @intFromEnum(content_type);
@@ -456,16 +518,24 @@ pub const CertificateVerifyContext = struct {
 
 pub const CertificateVerifier = struct {
     ptr: *anyopaque,
-    verifyFn: *const fn (*anyopaque, CertificateChain, CertificateVerifyContext) anyerror!void,
+    verifyFn: *const fn (*anyopaque, CertificateChain, CertificateVerifyContext) CertificateVerifyError!void,
 
     pub fn verify(
         self: CertificateVerifier,
         chain: CertificateChain,
         context: CertificateVerifyContext,
-    ) anyerror!void {
+    ) CertificateVerifyError!void {
         // TODO(x509): route to Mizuchi's DER/X.509 verifier module.
         try self.verifyFn(self.ptr, chain, context);
     }
+};
+
+pub const CertificateVerifyError = error{
+    CertificateInvalid,
+    NameMismatch,
+    Expired,
+    UntrustedRoot,
+    UnsupportedSigAlg,
 };
 
 pub const Tls13KeyScheduleError = TlsError || hash.HkdfError;
@@ -687,11 +757,48 @@ test "record cipher state derives TLS 1.2 and 1.3 nonces without network IO" {
     try std.testing.expectEqualSlices(u8, &nonce13(iv, 0), &(try tls13.nextNonce()));
 
     var tls12 = try RecordCipherState.init(.tls12, .tls_ecdhe_rsa_with_aes_128_gcm_sha256, iv);
-    try std.testing.expectEqualSlices(u8, &hex("101112130000000000000000"), &(try tls12.nextNonce()));
-    var aad: [13]u8 = undefined;
-    const aad_len = try tls12.makeAad(.handshake, tls12_wire_version, 17, &aad);
-    try std.testing.expectEqual(@as(usize, 13), aad_len);
-    try std.testing.expectEqualSlices(u8, &hex("00000000000000011603030011"), &aad);
+    const params = try tls12.sealParams(.handshake, tls12_wire_version, 17);
+    try std.testing.expectEqual(@as(u64, 0), params.sequence);
+    try std.testing.expectEqualSlices(u8, &hex("101112130000000000000000"), &params.nonce);
+    try std.testing.expectEqual(@as(usize, 13), params.aad_len);
+    try std.testing.expectEqualSlices(u8, &hex("00000000000000001603030011"), params.aadSlice());
+}
+
+test "TLS 1.2 record params keep AAD and nonce sequence aligned across round trips" {
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const key: [Aes128Gcm.key_length]u8 = [_]u8{0x42} ** Aes128Gcm.key_length;
+    const iv = hex("202122232425262728292a2b");
+    var sender = try RecordCipherState.init(.tls12, .tls_ecdhe_rsa_with_aes_128_gcm_sha256, iv);
+    var receiver = try RecordCipherState.init(.tls12, .tls_ecdhe_rsa_with_aes_128_gcm_sha256, iv);
+    const plaintexts = [_][]const u8{
+        "record-0",
+        "record-1 carries a different length",
+        "record-2 proves the state keeps advancing",
+        "record-3",
+    };
+
+    for (plaintexts, 0..) |plaintext, expected_sequence| {
+        const length: u16 = @intCast(plaintext.len);
+        const seal = try sender.sealParams(.application_data, tls12_wire_version, length);
+        const aad_sequence = std.mem.readInt(u64, seal.aad[0..8], .big);
+        const nonce_sequence = std.mem.readInt(u64, seal.nonce[4..12], .big);
+        try std.testing.expectEqual(@as(u64, @intCast(expected_sequence)), seal.sequence);
+        try std.testing.expectEqual(seal.sequence, aad_sequence);
+        try std.testing.expectEqual(seal.sequence, nonce_sequence);
+
+        var ciphertext: [64]u8 = undefined;
+        var tag: [Aes128Gcm.tag_length]u8 = undefined;
+        Aes128Gcm.encrypt(ciphertext[0..plaintext.len], &tag, plaintext, seal.aadSlice(), seal.nonce, key);
+
+        const open = try receiver.openParams(.application_data, tls12_wire_version, length);
+        try std.testing.expectEqual(seal.sequence, open.sequence);
+        try std.testing.expectEqualSlices(u8, seal.aadSlice(), open.aadSlice());
+        try std.testing.expectEqualSlices(u8, &seal.nonce, &open.nonce);
+
+        var decrypted: [64]u8 = undefined;
+        try Aes128Gcm.decrypt(decrypted[0..plaintext.len], ciphertext[0..plaintext.len], tag, open.aadSlice(), open.nonce, key);
+        try std.testing.expectEqualSlices(u8, plaintext, decrypted[0..plaintext.len]);
+    }
 }
 
 test "typed and runtime handshake transitions reject illegal order" {
