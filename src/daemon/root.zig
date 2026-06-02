@@ -9,6 +9,7 @@ pub const commands = @import("commands.zig");
 pub const config = @import("config.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const flood = @import("flood.zig");
+pub const oper = @import("oper.zig");
 pub const registry = @import("registry.zig");
 pub const server = @import("server.zig");
 pub const store = @import("store.zig");
@@ -23,6 +24,7 @@ test {
     _ = config;
     _ = dispatch;
     _ = flood;
+    _ = oper;
     _ = registry;
     _ = server;
     _ = store;

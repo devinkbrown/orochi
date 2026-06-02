@@ -6,9 +6,11 @@
 pub const away = @import("away.zig");
 pub const batch = @import("batch.zig");
 pub const cap = @import("cap.zig");
+pub const chathistory = @import("chathistory.zig");
 pub const cloak = @import("cloak.zig");
 pub const coilpack = @import("coilpack.zig");
 pub const ctcp = @import("ctcp.zig");
+pub const dns = @import("dns.zig");
 pub const extban = @import("extban.zig");
 pub const frame = @import("frame.zig");
 pub const irc_line = @import("irc_line.zig");
@@ -21,6 +23,7 @@ pub const sasl = @import("sasl.zig");
 pub const sts = @import("sts.zig");
 pub const tsumugi = @import("tsumugi.zig");
 pub const websocket = @import("websocket.zig");
+pub const who = @import("who.zig");
 // gen:mods:end
 
 /// Native server-to-server mesh protocol (replaces TS6 entirely).
@@ -34,9 +37,11 @@ test {
     _ = away;
     _ = batch;
     _ = cap;
+    _ = chathistory;
     _ = cloak;
     _ = coilpack;
     _ = ctcp;
+    _ = dns;
     _ = extban;
     _ = frame;
     _ = irc_line;
@@ -49,5 +54,6 @@ test {
     _ = sts;
     _ = tsumugi;
     _ = websocket;
+    _ = who;
     // gen:tests:end
 }
