@@ -74,3 +74,5 @@ Planning only; no production code until the design is settled and reviewed by Cl
 Every system is clean-room, modern, inventive — NO legacy ports. Banned: WALLOPS/OPERWALL, snomask +s, WEBIRC, /OPER passwords+hostmasks (oper=SASL certfp/SCRAM only), PASS-as-auth, LINKS/MAP, ident, TS6/SJOIN, Python modules. See docs/dev/zig016-notes.md "CLEAN-ROOM / NO-LEGACY MANDATE".
 
 Services are internalized native commands (REGISTER/IDENTIFY/CREGISTER/ACCESS/MEMO/...) with IRCv3 standard-replies — NOT pseudo-client bots.
+
+Cross-platform: targets linux/macos/bsd/windows (x86_64+aarch64). io_uring/kTLS are Linux fast-paths behind the Reactor seam; everything else portable via comptime target dispatch. See docs/dev/zig016-notes.md "CROSS-PLATFORM MANDATE".

@@ -77,3 +77,22 @@ server commands (REGISTER, IDENTIFY, GROUP, DROP, LOGOUT, CREGISTER, ACCESS, AKI
 with IRCv3 standard-replies (FAIL/WARN/NOTE) + structured numerics — NOT pseudo-client bots
 (no NickServ/ChanServ PRIVMSG targets). Like ophion's in-process services, but with cleaner messaging.
 The services.zig backend stays I/O-free (typed results); the daemon command layer wraps it natively.
+
+## CROSS-PLATFORM MANDATE (Linux, macOS, BSD, Windows)
+Mizuchi targets **x86_64/aarch64 on linux, macos, freebsd, and windows**. Write portable code:
+- NEVER call `std.os.linux.*` directly in portable modules. Gate OS-specifics behind
+  `comptime switch (@import("builtin").os.tag)`. Provide a portable fallback for every fast path.
+- **Reactor:** io_uring is a Linux-only fast path behind the `Reactor` seam. The portable backend is
+  poll/epoll (linux), kqueue (macos/bsd), IOCP/WSAPoll (windows). All daemon/protocol logic talks to
+  `Reactor`, never to a syscall directly.
+- **Monotonic time:** no `std.os.linux.clock_gettime` in portable code — use a `Reactor`-provided clock
+  (posix `clock_gettime` via std.c on mac/bsd, `QueryPerformanceCounter` on windows).
+- **Randomness:** getrandom (linux), arc4random_buf (mac/bsd), BCrypt/RtlGenRandom (windows) — dispatch
+  by target (see crypto/random.zig).
+- **Linux-only features** (io_uring, kTLS, buf_ring, eBPF, SCM_RIGHTS fd-passing) MUST be `comptime`
+  gated and have a portable degraded path; never break the build on non-linux targets.
+- Sockets: prefer `std.posix`/`std.net`; Windows needs the winsock path. Avoid raw `linux.fd_t` in
+  cross-platform signatures (use `std.posix.fd_t` / `std.posix.socket_t`).
+- CI/build must `zig build -Dtarget=` for: x86_64-linux, aarch64-linux, aarch64-macos, x86_64-windows,
+  x86_64-freebsd. A new module is not done until it at least COMPILES for all five (Linux-only paths
+  comptime-excluded elsewhere).
