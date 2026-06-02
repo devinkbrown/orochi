@@ -18,7 +18,7 @@ Always implement to the actual spec text; this table is the work map, not the sp
 | sasl-3.1 / sasl-3.2 | `proto/sasl.zig` (PLAIN/EXTERNAL/SCRAM-256) | ✅ |
 | account-registration | `daemon/services.zig` (REGISTER) | ✅ backend |
 | monitor | `proto/monitor.zig` | ✅ |
-| extended-monitor | `proto/monitor.zig` | 🔧 |
+| extended-monitor | `proto/extended_monitor.zig` | ✅ (wire into dispatch) |
 | away-notify | `proto/away.zig` | ✅ |
 | pre-away | `proto/away.zig` | 🔧 |
 | chghost | `proto/chghost.zig` | ✅ |
@@ -31,14 +31,14 @@ Always implement to the actual spec text; this table is the work map, not the sp
 | websocket | `proto/websocket.zig` | ✅ |
 | whox | `proto/who.zig` | ✅ |
 | account-extban | `proto/extban.zig` | 🔧 |
-| bot-mode | `proto/cap.zig` (+ usermode) | ⬜ |
+| bot-mode | `proto/bot_mode.zig` (RPL_WHOISBOT 335, BOT isupport) | ✅ (wire into dispatch) |
 | echo-message | `proto/echo_message.zig` | ✅ (wire into dispatch) |
 | extended-join | `proto/extended_join.zig` | ✅ (wire into dispatch) |
 | userhost-in-names / multi-prefix | `proto/names_reply.zig` | 🔧 (wave B) |
 | invite-notify | `proto/invite_notify.zig` | ✅ (wire into dispatch) |
 | channel-rename | channel commands | ⬜ |
 | no-implicit-names | registration | ⬜ |
-| utf8-only | `op_utf8`-style validation | ⬜ |
+| utf8only | `proto/utf8_only.zig` (strict UTF-8 + UTF8ONLY isupport + FAIL) | ✅ (wire into dispatch) |
 | metadata | overlaps IRCX PROP (`proto/ircx.zig`) — unify | ⬜ |
 | oper-tag | ties to clean-room `daemon/oper.zig` | ⬜ |
 | network-icon | cosmetic isupport token | ⬜ |

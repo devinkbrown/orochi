@@ -6,6 +6,7 @@
 pub const account_notify = @import("account_notify.zig");
 pub const away = @import("away.zig");
 pub const batch = @import("batch.zig");
+pub const bot_mode = @import("bot_mode.zig");
 pub const cap = @import("cap.zig");
 pub const channel_rename = @import("channel_rename.zig");
 pub const chathistory = @import("chathistory.zig");
@@ -17,11 +18,13 @@ pub const dns = @import("dns.zig");
 pub const echo_message = @import("echo_message.zig");
 pub const extban = @import("extban.zig");
 pub const extended_join = @import("extended_join.zig");
+pub const extended_monitor = @import("extended_monitor.zig");
 pub const frame = @import("frame.zig");
 pub const invite_notify = @import("invite_notify.zig");
 pub const irc_line = @import("irc_line.zig");
 pub const ircx = @import("ircx.zig");
 pub const isupport = @import("isupport.zig");
+pub const knock = @import("knock.zig");
 pub const list = @import("list.zig");
 pub const meshpass = @import("meshpass.zig");
 pub const metadata = @import("metadata.zig");
@@ -38,6 +41,7 @@ pub const sts = @import("sts.zig");
 pub const suimyaku_peer = @import("suimyaku_peer.zig");
 pub const tsumugi = @import("tsumugi.zig");
 pub const usermode = @import("usermode.zig");
+pub const utf8_only = @import("utf8_only.zig");
 pub const websocket = @import("websocket.zig");
 pub const who = @import("who.zig");
 // gen:mods:end
@@ -53,6 +57,7 @@ test {
     _ = account_notify;
     _ = away;
     _ = batch;
+    _ = bot_mode;
     _ = cap;
     _ = channel_rename;
     _ = chathistory;
@@ -64,11 +69,13 @@ test {
     _ = echo_message;
     _ = extban;
     _ = extended_join;
+    _ = extended_monitor;
     _ = frame;
     _ = invite_notify;
     _ = irc_line;
     _ = ircx;
     _ = isupport;
+    _ = knock;
     _ = list;
     _ = meshpass;
     _ = metadata;
@@ -85,6 +92,7 @@ test {
     _ = suimyaku_peer;
     _ = tsumugi;
     _ = usermode;
+    _ = utf8_only;
     _ = websocket;
     _ = who;
     // gen:tests:end
