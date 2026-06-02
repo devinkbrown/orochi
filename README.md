@@ -21,7 +21,7 @@ server-to-server protocol with the native **Suimyaku + Tsumugi** cryptographic m
   Merkle anti-entropy — over **Tsumugi** (紬) — a PQ-hybrid (X25519 + ML-KEM-768)
   forward-secret ratchet. No TS6.
 - **Safety as a type.** `Secret(T)` makes a data-dependent branch on secret bytes a
-  compile error; TLS is **1.3-only**.
+  compile error; TLS is **1.3 + a hardened 1.2 profile** (AEAD/ECDHE-only; no RSA key exchange, CBC, compression, or renegotiation).
 - **Trust through simulation.** Deterministic-simulation testing (the *Deterministic
   Ocean* harness) drives the CRDT mesh and crypto via injected clock/net/RNG, so any
   failure replays from a 64-bit seed.

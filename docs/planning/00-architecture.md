@@ -37,7 +37,7 @@ principled, not bigger**: one pure binary mesh protocol, one anti-entropy mechan
 mizuchi-substrate   reactor (Ringlane), allocators/arenas, lock-free queues,
                     data structures, Suimyaku math (CRDT/HLC/vclock/Merkle/sketches),
                     simulation runtime (Deterministic Ocean), Fault Loom
-mizuchi-crypto      primitives, TLS 1.3-only, X.509-min, Tsumugi v2, Secret(T)/ctcheck,
+mizuchi-crypto      primitives, TLS 1.3 + hardened 1.2, X.509-min, Tsumugi v2, Secret(T)/ctcheck,
                     capability keyring, session/upgrade capsules
 mizuchi-proto       IRC/IRCv3/IRCX/Suimyaku/Tsumugi schemas → generated codecs (Codec Loom),
                     canonical wire format (CoilPack), golden vectors

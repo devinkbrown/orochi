@@ -34,7 +34,7 @@ name it and specify it well enough to build.
    concurrency, allocators/arenas, the full data-structure kit, and the Suimyaku math
    substrate (CRDTs, vector/hybrid-logical clocks, Merkle delta sync, gossip).
    Reimagine these with comptime and Zig semantics — invent new primitives.
-2. **Crypto + TLS (opssl successor, Zig-native).** Modern, TLS 1.3-first,
+2. **Crypto + TLS (opssl successor, Zig-native).** Modern, TLS 1.3 + a hardened 1.2 profile,
    PQ-hybrid by default, constant-time *by construction* (ideally comptime-verified),
    plus the Tsumugi transport crypto. Invent where the design allows.
 3. **Daemon core + comptime module system + 100% feature parity** with ophion.
