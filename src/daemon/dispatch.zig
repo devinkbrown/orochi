@@ -153,7 +153,7 @@ const Client = struct {
     } = .{},
 };
 
-const CapId = enum(u6) {
+pub const CapId = enum(u6) {
     server_time,
     message_tags,
     echo_message,
@@ -378,6 +378,12 @@ pub const ClientSession = struct {
     pub fn displayName(self: *const ClientSession) []const u8 {
         const nick = self.client.identity.nick.slice();
         return if (nick.len == 0) "*" else nick;
+    }
+
+    /// Whether this client negotiated `id` via CAP. Lets the message path apply
+    /// per-recipient IRCv3 behavior (echo-message, extended-join, ...).
+    pub fn hasCap(self: *const ClientSession, id: CapId) bool {
+        return self.cap.negotiated.contains(id);
     }
 };
 

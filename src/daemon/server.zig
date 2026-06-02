@@ -744,6 +744,10 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
 
+        // IRCv3 echo-message: a sender that negotiated the cap also receives its
+        // own message back, byte-identical to what recipients see (`msg`).
+        const echo = conn.session.hasCap(.echo_message);
+
         if (world_model.isChannelName(target)) {
             if (!self.world.channelExists(target)) {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
@@ -754,6 +758,7 @@ pub const LinuxServer = struct {
                 return;
             }
             try self.broadcastChannel(target, msg, id);
+            if (echo) try self.deliver(id, msg);
             return;
         }
 
@@ -762,6 +767,7 @@ pub const LinuxServer = struct {
             return;
         };
         try self.deliver(clientIdFromWorld(recipient), msg);
+        if (echo) try self.deliver(id, msg);
     }
 
     fn handleTopic(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
