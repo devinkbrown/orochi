@@ -13,6 +13,7 @@ pub const event_spine = @import("event_spine.zig");
 pub const flood = @import("flood.zig");
 pub const oper = @import("oper.zig");
 pub const registry = @import("registry.zig");
+pub const sasl_bridge = @import("sasl_bridge.zig");
 pub const server = @import("server.zig");
 pub const services = @import("services.zig");
 pub const store = @import("store.zig");
@@ -32,6 +33,7 @@ test {
     _ = flood;
     _ = oper;
     _ = registry;
+    _ = sasl_bridge;
     _ = server;
     _ = services;
     _ = store;
