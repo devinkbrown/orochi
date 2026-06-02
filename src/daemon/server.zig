@@ -761,7 +761,8 @@ pub const LinuxServer = struct {
         try self.sendNames(conn, channel);
     }
 
-    /// MODE for channel member status modes (+o/-o, +v/-v, +h/-h). Channel flag
+    /// MODE for channel member status modes (+q/+o/+v, founder +Q is creation-
+    /// only) gated by tier rank, plus channel flag modes (i/m/n/t/s). Channel flag
     /// modes (+i/+m/+t/...) are not tracked in the world model yet and are
     /// ignored here; user-target MODE is not handled on this path.
     fn handleMode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -812,24 +813,31 @@ pub const LinuxServer = struct {
                     if (arg_index >= parsed.param_count) continue;
                     const target_nick = parsed.paramSlice()[arg_index];
                     arg_index += 1;
-                    // Granting founder/owner requires the setter to hold at least
-                    // that tier (only a founder may make a founder, etc.).
-                    if ((ch == 'Q' and !setter.contains(.founder)) or
-                        (ch == 'q' and !(setter.contains(.founder) or setter.contains(.owner))))
-                    {
-                        try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
-                        continue;
-                    }
-                    const target = self.world.findNick(target_nick) orelse {
-                        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
-                        continue;
-                    };
                     const mode: world_model.MemberMode = switch (ch) {
                         'Q' => .founder,
                         'q' => .owner,
                         'o' => .op,
                         'v' => .voice,
                         else => unreachable,
+                    };
+                    // Founder is singular and granted only at channel creation;
+                    // it cannot be handed out via MODE (a founder may still drop
+                    // or transfer their own via dedicated mechanisms later).
+                    if (mode == .founder and adding) {
+                        try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Founder is set at channel creation, not by MODE");
+                        continue;
+                    }
+                    // Authority: a member may only set/clear a status tier whose
+                    // rank is <= their own highest rank. So op manages op/voice,
+                    // owner manages owner/op/voice, founder manages all — and an
+                    // owner can NEVER strip a founder, nor an op an owner.
+                    if (setter.rank() < chanmode.rankOfMode(mode)) {
+                        try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Insufficient channel privilege for that mode");
+                        continue;
+                    }
+                    const target = self.world.findNick(target_nick) orelse {
+                        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+                        continue;
                     };
                     const changed = self.world.setMemberMode(channel, target, mode, adding) catch {
                         try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ target_nick, channel }, "They aren't on that channel");
@@ -916,7 +924,7 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel");
                 return;
             }
-            // +m moderated: only voiced (+v) or higher (+h/+o) may speak.
+            // +m moderated: only voiced (+v) or any operator tier may speak.
             if (self.world.channelHasFlag(target, .moderated)) {
                 const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
                 if (!mm.canSpeakModerated()) {

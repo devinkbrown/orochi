@@ -289,7 +289,28 @@ pub const MemberModes = struct {
     pub fn canSpeakModerated(self: MemberModes) bool {
         return self.contains(.voice) or self.isOperator();
     }
+
+    /// Authority rank of the highest tier held: founder 4 > owner 3 > op 2 >
+    /// voice 1 > none 0. Used to gate member-mode changes.
+    pub fn rank(self: MemberModes) u8 {
+        if (self.contains(.founder)) return 4;
+        if (self.contains(.owner)) return 3;
+        if (self.contains(.op)) return 2;
+        if (self.contains(.voice)) return 1;
+        return 0;
+    }
 };
+
+/// Authority rank of a single member tier (founder 4 .. voice 1). A member may
+/// only set/clear a tier whose rank is <= their own highest rank.
+pub fn rankOfMode(mode: MemberMode) u8 {
+    return switch (mode) {
+        .founder => 4,
+        .owner => 3,
+        .op => 2,
+        .voice => 1,
+    };
+}
 
 /// Apply a MODE change string plus parameter vector to channel state.
 pub fn apply(
@@ -728,4 +749,18 @@ test "bounded output and list storage" {
 
     var tiny_changes: [1]AppliedChange = undefined;
     try std.testing.expectError(error.TooManyChanges, parse("+nt", &.{}, &tiny_changes));
+}
+
+test "member tier rank ordering gates privilege (founder>owner>op>voice)" {
+    try std.testing.expectEqual(@as(u8, 0), MemberModes.empty().rank());
+    try std.testing.expectEqual(@as(u8, 1), MemberModes.fromModes(&.{.voice}).rank());
+    try std.testing.expectEqual(@as(u8, 2), MemberModes.fromModes(&.{.op}).rank());
+    try std.testing.expectEqual(@as(u8, 3), MemberModes.fromModes(&.{.owner}).rank());
+    try std.testing.expectEqual(@as(u8, 4), MemberModes.fromModes(&.{.founder}).rank());
+    // rankOfMode mirrors the tier ranks used to gate +Q/+q/+o/+v.
+    try std.testing.expectEqual(rankOfMode(.founder), MemberModes.fromModes(&.{.founder}).rank());
+    try std.testing.expectEqual(rankOfMode(.owner), MemberModes.fromModes(&.{.owner}).rank());
+    // An op (rank 2) cannot reach owner(3)/founder(4); an owner cannot reach founder.
+    try std.testing.expect(MemberModes.fromModes(&.{.op}).rank() < rankOfMode(.owner));
+    try std.testing.expect(MemberModes.fromModes(&.{.owner}).rank() < rankOfMode(.founder));
 }
