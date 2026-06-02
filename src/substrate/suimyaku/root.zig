@@ -6,6 +6,7 @@ pub const clock = @import("clock.zig");
 pub const convergence = @import("convergence.zig");
 pub const delta_codec = @import("delta_codec.zig");
 pub const goryu = @import("goryu.zig");
+pub const goryu_props = @import("goryu_props.zig");
 pub const media = @import("media.zig");
 pub const membership_view = @import("membership_view.zig");
 pub const merkle = @import("merkle.zig");
@@ -19,6 +20,7 @@ test {
     _ = convergence;
     _ = delta_codec;
     _ = goryu;
+    _ = goryu_props;
     _ = media;
     _ = membership_view;
     _ = merkle;

@@ -8,6 +8,7 @@ pub const io = @import("io/root.zig");
 pub const platform = @import("platform.zig");
 pub const queue = @import("queue.zig");
 pub const reactor = @import("reactor.zig");
+pub const sazanami_props = @import("sazanami_props.zig");
 pub const sazanami = @import("sazanami.zig");
 pub const sim = @import("sim.zig");
 pub const sketch = @import("sketch.zig");
@@ -28,6 +29,7 @@ test {
     _ = platform;
     _ = queue;
     _ = reactor;
+    _ = sazanami_props;
     _ = sazanami;
     _ = sim;
     _ = sketch;
