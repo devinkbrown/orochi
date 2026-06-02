@@ -77,7 +77,7 @@ mizuchi-tools       config validator, keygen, trace reader, capsule inspector,
   canonical name is **Codec Loom**, output format is **CoilPack**.)
 - **MeshPass** — Ed25519 admission/capability token (node key, realm, roles, expiry,
   allowed frame families, max fanout, media rights, revocation epoch).
-- **Witnessed SWIM** — gossip with signed suspicion evidence + witness quorum; no single
+- **Sazanami (Witnessed Sazanami-style gossip)** — gossip with signed suspicion evidence + witness quorum; no single
   node can force DEAD. HyParView-style active/passive views for large meshes.
 - **NickClaim** — MV-register nick uniqueness; collisions converge by **rename-to-UID**.
 - **CausalTags** — compact causal trace IDs `{origin, hlc, span, parent}` on every
@@ -140,7 +140,7 @@ SJOIN + MSEQ + HASHCHECK + RESYNC.
 | History / media presence | bounded OR-Log w/ HLC | pruned by retention watermark + Merkle roots |
 
 Tombstone GC: discard dots dominated by the **causal-stability frontier** across all
-live peers (SWIM membership must not falsely delete causality a recovering peer needs).
+live peers (Sazanami membership must not falsely delete causality a recovering peer needs).
 
 Partitions: a mesh does not netsplit like a tree. Local partitions keep accepting local
 actions under degraded-trust labels (CausalTags); on heal, CRDTs converge — no mass
@@ -151,7 +151,7 @@ unauthenticated local claims.
 
 M0 Bootline → M1 Reactor/Substrate → M2 IRC core → M3 IRCv3 core → M4 SASL+TLS1.3 →
 M5/M6 IRCX parity → M7 Services (+MizuStore) → M8–M11 Suimyaku/Tsumugi mesh
-(handshake → CRDT model → SWIM+Merkle → Tsumugi v2) → M12 Lotus history → M13 Media →
+(handshake → CRDT model → Sazanami+Merkle → Tsumugi v2) → M12 Lotus history → M13 Media →
 M14 MASQUE relay → M15 Helix upgrade → M16 hardening (XDP/Aegis/CapProof) → M17 RC soak.
 
 **M0 exit criterion:** `zig build` produces a booting binary that accepts a TCP client

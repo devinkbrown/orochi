@@ -39,7 +39,7 @@ name it and specify it well enough to build.
    plus the Tsumugi transport crypto. Invent where the design allows.
 3. **Daemon core + comptime module system + 100% feature parity** with ophion.
 4. **Suimyaku + Tsumugi mesh** as the only S2S protocol (no TS6). CRDT network state,
-   SWIM gossip, Merkle anti-entropy, Tsumugi frame crypto + ratchet. Innovate on the
+   Sazanami gossip, Merkle anti-entropy, Tsumugi frame crypto + ratchet. Innovate on the
    spec, don't just implement it.
 
 ## Hard constraints (few, deliberate)

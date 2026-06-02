@@ -5,10 +5,10 @@
 pub const io = @import("io/root.zig");
 pub const queue = @import("queue.zig");
 pub const reactor = @import("reactor.zig");
+pub const sazanami = @import("sazanami.zig");
 pub const sim = @import("sim.zig");
 pub const sketch = @import("sketch.zig");
 pub const suimyaku = @import("suimyaku/root.zig");
-pub const swim = @import("swim.zig");
 // gen:mods:end
 
 pub const Reactor = reactor.Reactor;
@@ -20,9 +20,9 @@ test {
     _ = io;
     _ = queue;
     _ = reactor;
+    _ = sazanami;
     _ = sim;
     _ = sketch;
     _ = suimyaku;
-    _ = swim;
     // gen:tests:end
 }

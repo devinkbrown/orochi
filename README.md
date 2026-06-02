@@ -17,7 +17,7 @@ server-to-server protocol with the native **Suimyaku + Tsumugi** cryptographic m
 - **Zig top to bottom, no C interop.** Substrate, crypto, daemon, and tooling are
   all Zig; `comptime` replaces ophion's MAPI module machinery and generates wire
   codecs and dispatch tables.
-- **Mesh, not tree.** **Suimyaku** (水脈) — a CRDT state mesh with SWIM gossip and
+- **Mesh, not tree.** **Suimyaku** (水脈) — a CRDT state mesh with Sazanami gossip and
   Merkle anti-entropy — over **Tsumugi** (紬) — a PQ-hybrid (X25519 + ML-KEM-768)
   forward-secret ratchet. No TS6.
 - **Safety as a type.** `Secret(T)` makes a data-dependent branch on secret bytes a
@@ -30,7 +30,7 @@ server-to-server protocol with the native **Suimyaku + Tsumugi** cryptographic m
 ## Architecture
 | Package | Role |
 |---|---|
-| `src/substrate` | Ringlane io_uring reactor, lock-free queues, allocators, and the Suimyaku math (HLC/vector clocks, delta-state CRDTs, Merkle sync, SWIM, sketches) + the Deterministic Ocean simulator |
+| `src/substrate` | Ringlane io_uring reactor, lock-free queues, allocators, and the Suimyaku math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Sazanami, sketches) + the Deterministic Ocean simulator |
 | `src/crypto` | `Secret(T)`, SHA-2/HMAC/HKDF, AEADs, X25519 + ML-KEM key schedule, Tsumugi ratchet |
 | `src/proto` | zero-copy IRCv3 parser, CoilPack wire codec, CAP FSM, Suimyaku frame layer, SASL |
 | `src/daemon` | SerpentRegistry (comptime modules), client/channel model, command dispatch, MizuStore, the M1 server |
