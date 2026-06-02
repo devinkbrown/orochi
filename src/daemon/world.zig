@@ -28,6 +28,7 @@ pub const WorldError = std.mem.Allocator.Error || error{
     NoSuchChannel,
     NotOnChannel,
     NoSuchNick,
+    UnsupportedMode,
 };
 
 pub const MessageTarget = union(enum) {
@@ -42,16 +43,21 @@ const MemberMap = std.AutoHashMap(ClientId, chanmode.MemberModes);
 pub const MemberIterator = MemberMap.KeyIterator;
 pub const MemberMode = chanmode.MemberMode;
 pub const MemberModes = chanmode.MemberModes;
+pub const ChannelMode = chanmode.ChannelMode;
 
 const Channel = struct {
     allocator: std.mem.Allocator,
     members: MemberMap,
     topic: ?[]u8 = null,
+    /// Channel-level modes. Flags (i/m/n/t/s) are used today; list modes
+    /// (b/e/I) carry no backing storage here yet, and key/limit are unset.
+    modes: chanmode.ChannelModes = chanmode.ChannelModes.empty(),
 
     fn init(allocator: std.mem.Allocator) Channel {
         return .{
             .allocator = allocator,
             .members = MemberMap.init(allocator),
+            .modes = chanmode.ChannelModes.empty(),
         };
     }
 
@@ -173,6 +179,57 @@ pub const World = struct {
         const before = entry.value_ptr.contains(mode);
         if (on) entry.value_ptr.add(mode) else entry.value_ptr.remove(mode);
         return before != on;
+    }
+
+    /// Whether channel flag `mode` (i/m/n/t/s) is set. False if no such channel.
+    pub fn channelHasFlag(self: *World, name: []const u8, mode: ChannelMode) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return channel.modes.containsFlag(mode);
+    }
+
+    /// Set or clear a channel flag mode (i/m/n/t/s). Returns true if it changed.
+    pub fn setChannelFlag(self: *World, name: []const u8, mode: ChannelMode, on: bool) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        const before = channel.modes.containsFlag(mode);
+        switch (mode) {
+            .invite_only => channel.modes.invite_only = on,
+            .moderated => channel.modes.moderated = on,
+            .no_external => channel.modes.no_external = on,
+            .topic_ops => channel.modes.topic_ops = on,
+            .secret => channel.modes.secret = on,
+            else => return error.UnsupportedMode, // not a flag mode (b/e/I/k/l)
+        }
+        return before != on;
+    }
+
+    /// Render the active channel flag modes as a "+imnt"-style string into `out`.
+    pub fn channelModeString(self: *World, name: []const u8, out: []u8) []const u8 {
+        const channel = self.channels.getPtr(name) orelse {
+            if (out.len >= 1) {
+                out[0] = '+';
+                return out[0..1];
+            }
+            return out[0..0];
+        };
+        var n: usize = 0;
+        if (n < out.len) {
+            out[n] = '+';
+            n += 1;
+        }
+        const flags = [_]struct { m: ChannelMode, c: u8 }{
+            .{ .m = .invite_only, .c = 'i' },
+            .{ .m = .moderated, .c = 'm' },
+            .{ .m = .no_external, .c = 'n' },
+            .{ .m = .topic_ops, .c = 't' },
+            .{ .m = .secret, .c = 's' },
+        };
+        for (flags) |f| {
+            if (channel.modes.containsFlag(f.m) and n < out.len) {
+                out[n] = f.c;
+                n += 1;
+            }
+        }
+        return out[0..n];
     }
 
     /// Part a channel, deleting it when the last member leaves.
@@ -399,4 +456,25 @@ test "setMemberMode adds and removes status and reports change" {
 
     try std.testing.expectError(error.NotOnChannel, world.setMemberMode("#x", ClientId{ .shard = 0, .slot = 9, .gen = 1 }, .op, true));
     try std.testing.expect(world.memberModes("#nope", a) == null);
+}
+
+test "channel flag modes set, query, and render" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try world.join("#x", a);
+
+    try std.testing.expect(!world.channelHasFlag("#x", .moderated));
+    try std.testing.expect(try world.setChannelFlag("#x", .moderated, true));
+    try std.testing.expect(try world.setChannelFlag("#x", .topic_ops, true));
+    try std.testing.expect(world.channelHasFlag("#x", .moderated));
+    // Idempotent set reports no change.
+    try std.testing.expect(!(try world.setChannelFlag("#x", .moderated, true)));
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("+mt", world.channelModeString("#x", &buf));
+
+    try std.testing.expect(try world.setChannelFlag("#x", .moderated, false));
+    try std.testing.expectEqualStrings("+t", world.channelModeString("#x", &buf));
+    try std.testing.expectError(error.NoSuchChannel, world.setChannelFlag("#nope", .secret, true));
 }

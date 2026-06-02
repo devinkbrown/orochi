@@ -647,22 +647,42 @@ pub const LinuxServer = struct {
             return;
         }
 
+        // A per-client fault (oversized reply, malformed param) must close only
+        // THAT connection — never escalate to runOnce and tear down the reactor.
+        self.dispatchRegistered(id, conn, &parsed, line) catch |err| switch (err) {
+            error.OutputTooSmall,
+            error.TextTooLong,
+            error.NoSpaceLeft,
+            error.OversizeLine,
+            error.LineTooLong,
+            => conn.closing = true,
+            else => return err, // infra (OOM, ring) bubbles up
+        };
+    }
+
+    fn dispatchRegistered(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        parsed: *const irc_line.LineView,
+        line: []const u8,
+    ) !void {
         if (std.ascii.eqlIgnoreCase(parsed.command, "JOIN")) {
-            try self.handleJoin(id, conn, &parsed);
+            try self.handleJoin(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PART")) {
-            try self.handlePart(id, conn, &parsed);
+            try self.handlePart(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NAMES")) {
-            try self.handleNames(conn, &parsed);
+            try self.handleNames(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MODE")) {
-            try self.handleMode(id, conn, &parsed);
+            try self.handleMode(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
-            try self.handleMessage(id, conn, &parsed, "PRIVMSG");
+            try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
-            try self.handleMessage(id, conn, &parsed, "NOTICE");
+            try self.handleMessage(id, conn, parsed, "NOTICE");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TOPIC")) {
-            try self.handleTopic(id, conn, &parsed);
+            try self.handleTopic(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
-            try self.handleQuit(id, conn, &parsed);
+            try self.handleQuit(id, conn, parsed);
         } else {
             var sink = QueueSink{ .conn = conn };
             try processLine(conn, line, &sink);
@@ -756,9 +776,11 @@ pub const LinuxServer = struct {
             return;
         }
 
-        // Query form: MODE #chan -> current channel modes (only "+" today).
+        // Query form: MODE #chan -> current channel flag modes.
         if (parsed.param_count == 1) {
-            try queueNumeric(conn, .RPL_CHANNELMODEIS, &.{channel}, "+");
+            var ms_buf: [16]u8 = undefined;
+            const ms = self.world.channelModeString(channel, &ms_buf);
+            try queueNumeric(conn, .RPL_CHANNELMODEIS, &.{channel}, ms);
             return;
         }
 
@@ -772,7 +794,9 @@ pub const LinuxServer = struct {
         }
 
         const mode_str = parsed.paramSlice()[1];
-        var applied_buf: [64]u8 = undefined;
+        // Sized generously; appends soft-fail (break) rather than erroring so a
+        // pathological toggle string ("+i-i+i...") truncates instead of faulting.
+        var applied_buf: [256]u8 = undefined;
         var applied = Buf{ .storage = &applied_buf };
         var targets_buf: [default_reply_bytes / 2]u8 = undefined;
         var targets = Buf{ .storage = &targets_buf };
@@ -805,15 +829,34 @@ pub const LinuxServer = struct {
                     if (changed) {
                         const want_sign: u8 = if (adding) '+' else '-';
                         if (emitted_sign != want_sign) {
-                            try applied.appendByte(want_sign);
+                            applied.appendByte(want_sign) catch break;
                             emitted_sign = want_sign;
                         }
-                        try applied.appendByte(ch);
-                        try targets.appendByte(' ');
-                        try targets.append(target_nick);
+                        applied.appendByte(ch) catch break;
+                        targets.appendByte(' ') catch break;
+                        targets.append(target_nick) catch break;
                     }
                 },
-                else => {}, // channel flag modes: not tracked yet
+                'i', 'm', 'n', 't', 's' => {
+                    const mode: world_model.ChannelMode = switch (ch) {
+                        'i' => .invite_only,
+                        'm' => .moderated,
+                        'n' => .no_external,
+                        't' => .topic_ops,
+                        's' => .secret,
+                        else => unreachable,
+                    };
+                    const changed = self.world.setChannelFlag(channel, mode, adding) catch continue;
+                    if (changed) {
+                        const want_sign: u8 = if (adding) '+' else '-';
+                        if (emitted_sign != want_sign) {
+                            applied.appendByte(want_sign) catch break;
+                            emitted_sign = want_sign;
+                        }
+                        applied.appendByte(ch) catch break;
+                    }
+                },
+                else => {}, // key/limit/list modes (k/l/b/e/I) not tracked yet
             }
         }
 
@@ -864,6 +907,14 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel");
                 return;
             }
+            // +m moderated: only voiced (+v) or higher (+h/+o) may speak.
+            if (self.world.channelHasFlag(target, .moderated)) {
+                const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+                if (!(mm.contains(.voice) or mm.contains(.halfop) or mm.contains(.op))) {
+                    try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
+                    return;
+                }
+            }
             try self.broadcastChannel(target, msg, id);
             if (echo) try self.deliver(id, msg);
             return;
@@ -894,8 +945,13 @@ pub const LinuxServer = struct {
             return;
         }
 
-        if (!self.world.isMember(channel, worldIdFromClient(id))) {
+        const topic_setter = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+            return;
+        };
+        // +t: only channel operators may change the topic.
+        if (self.world.channelHasFlag(channel, .topic_ops) and !topic_setter.contains(.op)) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
 
