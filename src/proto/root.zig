@@ -16,8 +16,10 @@ pub const coilpack = @import("coilpack.zig");
 pub const coilpack_props = @import("coilpack_props.zig");
 pub const ctcp = @import("ctcp.zig");
 pub const dns = @import("dns.zig");
+pub const dns_props = @import("dns_props.zig");
 pub const echo_message = @import("echo_message.zig");
 pub const extban = @import("extban.zig");
+pub const extban_props = @import("extban_props.zig");
 pub const extended_join = @import("extended_join.zig");
 pub const extended_monitor = @import("extended_monitor.zig");
 pub const frame = @import("frame.zig");
@@ -26,6 +28,7 @@ pub const invite_notify = @import("invite_notify.zig");
 pub const irc_line = @import("irc_line.zig");
 pub const irc_line_props = @import("irc_line_props.zig");
 pub const ircx = @import("ircx.zig");
+pub const ircx_props = @import("ircx_props.zig");
 pub const isupport = @import("isupport.zig");
 pub const knock = @import("knock.zig");
 pub const list = @import("list.zig");
@@ -46,6 +49,7 @@ pub const suimyaku_peer = @import("suimyaku_peer.zig");
 pub const tsumugi = @import("tsumugi.zig");
 pub const usermode = @import("usermode.zig");
 pub const utf8_only = @import("utf8_only.zig");
+pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
 pub const who = @import("who.zig");
 // gen:mods:end
@@ -71,8 +75,10 @@ test {
     _ = coilpack_props;
     _ = ctcp;
     _ = dns;
+    _ = dns_props;
     _ = echo_message;
     _ = extban;
+    _ = extban_props;
     _ = extended_join;
     _ = extended_monitor;
     _ = frame;
@@ -81,6 +87,7 @@ test {
     _ = irc_line;
     _ = irc_line_props;
     _ = ircx;
+    _ = ircx_props;
     _ = isupport;
     _ = knock;
     _ = list;
@@ -101,6 +108,7 @@ test {
     _ = tsumugi;
     _ = usermode;
     _ = utf8_only;
+    _ = websocket_props;
     _ = websocket;
     _ = who;
     // gen:tests:end
