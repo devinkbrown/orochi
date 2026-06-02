@@ -306,14 +306,17 @@ const default_host = "localhost";
 const Numeric = enum(u16) {
     RPL_NOTOPIC = 331,
     RPL_TOPIC = 332,
+    RPL_CHANNELMODEIS = 324,
     RPL_NAMREPLY = 353,
     RPL_ENDOFNAMES = 366,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHCHANNEL = 403,
     ERR_CANNOTSENDTOCHAN = 404,
     ERR_NICKNAMEINUSE = 433,
+    ERR_USERNOTINCHANNEL = 441,
     ERR_NOTONCHANNEL = 442,
     ERR_NEEDMOREPARAMS = 461,
+    ERR_CHANOPRIVSNEEDED = 482,
 };
 
 fn formatNumericCode(code: Numeric, buf: []u8) []const u8 {
@@ -650,6 +653,8 @@ pub const LinuxServer = struct {
             try self.handlePart(id, conn, &parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NAMES")) {
             try self.handleNames(conn, &parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MODE")) {
+            try self.handleMode(id, conn, &parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, &parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -734,6 +739,98 @@ pub const LinuxServer = struct {
             return;
         }
         try self.sendNames(conn, channel);
+    }
+
+    /// MODE for channel member status modes (+o/-o, +v/-v, +h/-h). Channel flag
+    /// modes (+i/+m/+t/...) are not tracked in the world model yet and are
+    /// ignored here; user-target MODE is not handled on this path.
+    fn handleMode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MODE"}, "Not enough parameters");
+            return;
+        }
+        const channel = parsed.paramSlice()[0];
+        if (!world_model.isChannelName(channel)) return;
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+
+        // Query form: MODE #chan -> current channel modes (only "+" today).
+        if (parsed.param_count == 1) {
+            try queueNumeric(conn, .RPL_CHANNELMODEIS, &.{channel}, "+");
+            return;
+        }
+
+        const setter = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+            return;
+        };
+        if (!setter.contains(.op)) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+            return;
+        }
+
+        const mode_str = parsed.paramSlice()[1];
+        var applied_buf: [64]u8 = undefined;
+        var applied = Buf{ .storage = &applied_buf };
+        var targets_buf: [default_reply_bytes / 2]u8 = undefined;
+        var targets = Buf{ .storage = &targets_buf };
+        var arg_index: usize = 2;
+        var adding = true;
+        var emitted_sign: u8 = 0;
+
+        for (mode_str) |ch| {
+            switch (ch) {
+                '+' => adding = true,
+                '-' => adding = false,
+                'o', 'v', 'h' => {
+                    if (arg_index >= parsed.param_count) continue;
+                    const target_nick = parsed.paramSlice()[arg_index];
+                    arg_index += 1;
+                    const target = self.world.findNick(target_nick) orelse {
+                        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+                        continue;
+                    };
+                    const mode: world_model.MemberMode = switch (ch) {
+                        'o' => .op,
+                        'v' => .voice,
+                        'h' => .halfop,
+                        else => unreachable,
+                    };
+                    const changed = self.world.setMemberMode(channel, target, mode, adding) catch {
+                        try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ target_nick, channel }, "They aren't on that channel");
+                        continue;
+                    };
+                    if (changed) {
+                        const want_sign: u8 = if (adding) '+' else '-';
+                        if (emitted_sign != want_sign) {
+                            try applied.appendByte(want_sign);
+                            emitted_sign = want_sign;
+                        }
+                        try applied.appendByte(ch);
+                        try targets.appendByte(' ');
+                        try targets.append(target_nick);
+                    }
+                },
+                else => {}, // channel flag modes: not tracked yet
+            }
+        }
+
+        if (applied.written().len == 0) return;
+
+        var prefix_buf: [256]u8 = undefined;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        var line = Buf{ .storage = &line_buf };
+        try line.append(":");
+        try line.append(try clientPrefix(conn, &prefix_buf));
+        try line.append(" MODE ");
+        try line.append(channel);
+        try line.appendByte(' ');
+        try line.append(applied.written());
+        try line.append(targets.written());
+        try line.append("\r\n");
+        try self.broadcastChannel(channel, line.written(), null);
     }
 
     fn handleMessage(
