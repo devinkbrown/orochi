@@ -11,6 +11,12 @@ pub const DEFAULT_MAX_SERVER_BYTES: usize = 255;
 pub const DEFAULT_MAX_REQUESTER_BYTES: usize = 64;
 pub const DEFAULT_MAX_NODE_BYTES: usize = 255;
 pub const DEFAULT_MAX_INFO_BYTES: usize = 256;
+/// Hop ceiling: bounds MAP indentation so attacker-influenced mesh data cannot
+/// amplify a u16 hop count into a multi-KB indent (DoS).
+pub const DEFAULT_MAX_HOPS: u16 = 64;
+/// Hard IRC line ceiling (excl. CRLF) so a single LINKS/MAP line can never
+/// exceed the protocol limit regardless of caller scratch size.
+pub const DEFAULT_MAX_LINE_BYTES: usize = 512;
 
 pub const LinksMapError = error{
     InvalidServerName,
@@ -21,6 +27,8 @@ pub const LinksMapError = error{
     NodeNameTooLong,
     InvalidInfo,
     InfoTooLong,
+    TooManyHops,
+    LineTooLong,
     OutputTooSmall,
 };
 
@@ -30,6 +38,8 @@ pub const Params = struct {
     max_requester_bytes: usize = DEFAULT_MAX_REQUESTER_BYTES,
     max_node_bytes: usize = DEFAULT_MAX_NODE_BYTES,
     max_info_bytes: usize = DEFAULT_MAX_INFO_BYTES,
+    max_hops: u16 = DEFAULT_MAX_HOPS,
+    max_line_bytes: usize = DEFAULT_MAX_LINE_BYTES,
 };
 
 /// One Suimyaku mesh node visible to LINKS/MAP.
@@ -61,7 +71,7 @@ pub fn writeLinksNodeWith(
     try validateContextWith(params, ctx);
     try validateNodeWith(params, node);
 
-    var b = LineBuilder.init(out);
+    var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_LINKS, ctx.server_name, ctx.requester);
     try b.spaceBytes(node.name);
     try b.spaceBytes("suimyaku");
@@ -91,7 +101,7 @@ pub fn writeLinksEndWith(
 ) LinksMapError![]const u8 {
     try validateContextWith(params, ctx);
 
-    var b = LineBuilder.init(out);
+    var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_ENDOFLINKS, ctx.server_name, ctx.requester);
     try b.spaceBytes("*");
     try b.spaceTrailing("End of Suimyaku LINKS");
@@ -151,7 +161,7 @@ pub fn writeMapNodeWith(
     try validateContextWith(params, ctx);
     try validateNodeWith(params, node);
 
-    var b = LineBuilder.init(out);
+    var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(if (first_line) .RPL_MAP else .RPL_MAPMORE, ctx.server_name, ctx.requester);
     try b.appendBytes(" :");
 
@@ -187,7 +197,7 @@ pub fn writeMapEndWith(
 ) LinksMapError![]const u8 {
     try validateContextWith(params, ctx);
 
-    var b = LineBuilder.init(out);
+    var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_MAPEND, ctx.server_name, ctx.requester);
     try b.spaceTrailing("End of Suimyaku MAP");
     try b.crlf();
@@ -228,6 +238,7 @@ pub fn validateNode(node: MeshNode) LinksMapError!void {
 pub fn validateNodeWith(comptime params: Params, node: MeshNode) LinksMapError!void {
     try validateNodeNameWith(params, node.name);
     try validateInfoWith(params, node.info);
+    if (node.hops > params.max_hops) return error.TooManyHops;
 }
 
 pub fn validateNodeName(name: []const u8) LinksMapError!void {
@@ -301,9 +312,10 @@ fn validInfoByte(ch: u8) bool {
 const LineBuilder = struct {
     out: []u8,
     len: usize = 0,
+    max: usize,
 
-    fn init(out: []u8) LineBuilder {
-        return .{ .out = out };
+    fn init(out: []u8, max_line_bytes: usize) LineBuilder {
+        return .{ .out = out, .max = @min(out.len, max_line_bytes) };
     }
 
     fn slice(self: *const LineBuilder) []const u8 {
@@ -357,12 +369,14 @@ const LineBuilder = struct {
 
     fn appendBytes(self: *LineBuilder, bytes: []const u8) LinksMapError!void {
         if (self.out.len - self.len < bytes.len) return error.OutputTooSmall;
+        if (self.max - self.len < bytes.len) return error.LineTooLong;
         @memcpy(self.out[self.len..][0..bytes.len], bytes);
         self.len += bytes.len;
     }
 
     fn appendByte(self: *LineBuilder, byte: u8) LinksMapError!void {
         if (self.out.len - self.len < 1) return error.OutputTooSmall;
+        if (self.max - self.len < 1) return error.LineTooLong;
         self.out[self.len] = byte;
         self.len += 1;
     }
@@ -507,4 +521,21 @@ test "malformed mesh node is rejected before sink emission" {
     try std.testing.expectError(error.InvalidNodeName, validateNodeName("bad node"));
     try std.testing.expectError(error.InvalidNodeName, validateNodeName("bad\rnode"));
     try std.testing.expectError(error.InvalidInfo, validateInfo("bad\rinfo"));
+}
+
+test "excessive hops are rejected (indent amplification guard)" {
+    var buf: [4096]u8 = undefined;
+    const ctx = ReplyContext{ .server_name = "mizuchi.local", .requester = "alice" };
+    // u16-max hops would otherwise render a ~128KB indent.
+    try std.testing.expectError(error.TooManyHops, writeMapNode(&buf, ctx, .{ .name = "n", .hops = 65535, .peers = 1 }, true));
+    // At/under the ceiling is accepted.
+    _ = try writeMapNode(&buf, ctx, .{ .name = "n", .hops = DEFAULT_MAX_HOPS, .peers = 1 }, true);
+}
+
+test "a single line cannot exceed the protocol limit even with a large scratch" {
+    var buf: [4096]u8 = undefined;
+    const ctx = ReplyContext{ .server_name = "mizuchi.local", .requester = "alice" };
+    // 256-byte info + indent pushes the line past 512 -> LineTooLong, not a giant line.
+    const info = [_]u8{'x'} ** 256;
+    try std.testing.expectError(error.LineTooLong, writeMapNodeWith(.{}, &buf, ctx, .{ .name = &([_]u8{'n'} ** 200), .hops = DEFAULT_MAX_HOPS, .peers = 1, .info = &info }, true));
 }

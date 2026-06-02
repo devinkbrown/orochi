@@ -698,10 +698,17 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
     const creds = sasl.parsePlain(raw) catch return saslFail(ctx, "SASL authentication failed");
     if (!checker.verify(creds)) return saslFail(ctx, "SASL authentication failed");
 
-    ctx.session.account_store.set(creds.authcid) catch return saslFail(ctx, "SASL authentication failed");
+    // Store the CANONICAL (ASCII-lowercased) account name, matching how the
+    // account store keys accounts (services.accountKey). Otherwise account()
+    // would report the client's claimed casing ("Alice") while authz uses the
+    // canonical form ("alice") — an identity mismatch.
+    if (creds.authcid.len > MAX_ACCOUNT_BYTES) return saslFail(ctx, "SASL authentication failed");
+    var account_buf: [MAX_ACCOUNT_BYTES]u8 = undefined;
+    const account = std.ascii.lowerString(account_buf[0..creds.authcid.len], creds.authcid);
+    ctx.session.account_store.set(account) catch return saslFail(ctx, "SASL authentication failed");
     ctx.session.logged_in = true;
     ctx.session.client.registration.sasl = .succeeded;
-    try ctx.replies.numeric(ctx.session, .RPL_LOGGEDIN, &.{ ctx.session.displayName(), creds.authcid }, "You are now logged in");
+    try ctx.replies.numeric(ctx.session, .RPL_LOGGEDIN, &.{ ctx.session.displayName(), account }, "You are now logged in");
     try ctx.replies.numeric(ctx.session, .RPL_SASLSUCCESS, &.{}, "SASL authentication successful");
 }
 

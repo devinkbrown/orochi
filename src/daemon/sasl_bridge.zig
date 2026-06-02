@@ -12,7 +12,13 @@ const services_mod = @import("services.zig");
 const Services = services_mod.Services;
 
 /// Adapter holding a `*Services`. Hand `checker()` to `ClientSession.sasl_plain`
-/// so AUTHENTICATE PLAIN verifies against the account store.
+/// (typically via `server.Config.sasl_checker`) so AUTHENTICATE PLAIN verifies
+/// against the account store.
+///
+/// LIFETIME: each connection copies the returned fat pointer, so this
+/// `ServicesPlainChecker` (and the `Services` + `MizuStore` it points at) MUST
+/// outlive every connection — own it in the same scope as the `Server`, never a
+/// stack temporary.
 pub const ServicesPlainChecker = struct {
     services: *Services,
 
@@ -22,6 +28,10 @@ pub const ServicesPlainChecker = struct {
 
     fn verify(ptr: *anyopaque, creds: sasl.PlainCredentials) bool {
         const self: *ServicesPlainChecker = @ptrCast(@alignCast(ptr));
+        // Defense-in-depth: refuse empty credentials at the adapter boundary so
+        // the guarantee is local here, not an emergent property of the account
+        // password policy downstream.
+        if (creds.authcid.len == 0 or creds.password.len == 0) return false;
         // Identity assumption (logging in as an account other than authcid) is
         // not supported: a non-empty authzid must equal authcid.
         if (creds.authzid.len != 0 and !std.mem.eql(u8, creds.authzid, creds.authcid)) return false;
