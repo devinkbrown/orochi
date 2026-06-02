@@ -5,6 +5,7 @@
 //! handlers, and writes replies into caller-owned storage for deterministic
 //! tests and reactor integration.
 const std = @import("std");
+const sasl = @import("../proto/sasl.zig");
 
 pub const DispatchError = error{
     ControlByte,
@@ -18,6 +19,7 @@ const MAX_PARAMS: usize = 15;
 const MAX_NICK_BYTES: usize = 64;
 const MAX_UID_BYTES: usize = 16;
 const MAX_REALNAME_BYTES: usize = 256;
+const MAX_ACCOUNT_BYTES: usize = 64;
 
 /// Parsed IRC line view. Slices borrow from the caller-owned input buffer.
 pub const LineView = struct {
@@ -86,6 +88,8 @@ const Numeric = enum(u16) {
     ERR_NOTREGISTERED = 451,
     ERR_NEEDMOREPARAMS = 461,
     ERR_ALREADYREGISTRED = 462,
+    RPL_LOGGEDIN = 900,
+    RPL_SASLSUCCESS = 903,
     ERR_SASLFAIL = 904,
     ERR_SASLABORTED = 906,
 };
@@ -135,6 +139,7 @@ const SaslState = enum {
     idle,
     authenticating,
     failed,
+    succeeded,
 };
 
 const Client = struct {
@@ -367,8 +372,21 @@ pub const ClientSession = struct {
     registration: RegistrationState = .{},
     cap: CapSession = .{},
 
+    /// SASL mechanism awaiting its credentials line (null = none selected).
+    sasl_pending: ?sasl.Mechanism = null,
+    /// Injected PLAIN verifier. The live server sets this to a services-backed
+    /// checker; left null (e.g. no account store yet) SASL PLAIN fails closed.
+    sasl_plain: ?sasl.PlainChecker = null,
+    account_store: FixedString(MAX_ACCOUNT_BYTES) = .{},
+    logged_in: bool = false,
+
     pub fn init() ClientSession {
         return .{};
+    }
+
+    /// Authenticated account name, or null when not logged in (SASL).
+    pub fn account(self: *const ClientSession) ?[]const u8 {
+        return if (self.logged_in) self.account_store.slice() else null;
     }
 
     pub fn registered(self: ClientSession) bool {
@@ -645,13 +663,52 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
 
     const payload = ctx.params()[0];
     if (std.mem.eql(u8, payload, "*")) {
+        ctx.session.sasl_pending = null;
         ctx.session.client.registration.sasl = .failed;
         try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
         return;
     }
 
-    ctx.session.client.registration.sasl = .authenticating;
-    try ctx.replies.message(null, "AUTHENTICATE", &.{"+"}, null);
+    // Phase 1 — mechanism selection. Only PLAIN is wired today; EXTERNAL/SCRAM
+    // arrive when the certfp/SCRAM checkers are plumbed in.
+    if (ctx.session.sasl_pending == null) {
+        const mech = sasl.Mechanism.parse(payload) orelse return saslFail(ctx, "Unsupported SASL mechanism");
+        if (mech != .plain) return saslFail(ctx, "Unsupported SASL mechanism");
+        ctx.session.sasl_pending = mech;
+        ctx.session.client.registration.sasl = .authenticating;
+        try ctx.replies.message(null, "AUTHENTICATE", &.{"+"}, null);
+        return;
+    }
+
+    // Phase 2 — credentials for the pending PLAIN mechanism.
+    ctx.session.sasl_pending = null;
+    const checker = ctx.session.sasl_plain orelse return saslFail(ctx, "SASL authentication failed");
+
+    var decode_buf: [sasl.MAX_AUTHENTICATE_PAYLOAD]u8 = undefined;
+    const raw = decodeAuthPayload(payload, &decode_buf) catch return saslFail(ctx, "SASL authentication failed");
+    const creds = sasl.parsePlain(raw) catch return saslFail(ctx, "SASL authentication failed");
+    if (!checker.verify(creds)) return saslFail(ctx, "SASL authentication failed");
+
+    ctx.session.account_store.set(creds.authcid) catch return saslFail(ctx, "SASL authentication failed");
+    ctx.session.logged_in = true;
+    ctx.session.client.registration.sasl = .succeeded;
+    try ctx.replies.numeric(ctx.session, .RPL_LOGGEDIN, &.{ ctx.session.displayName(), creds.authcid }, "You are now logged in");
+    try ctx.replies.numeric(ctx.session, .RPL_SASLSUCCESS, &.{}, "SASL authentication successful");
+}
+
+fn saslFail(ctx: DispatchCtx, message: []const u8) DispatchError!void {
+    ctx.session.sasl_pending = null;
+    ctx.session.client.registration.sasl = .failed;
+    try ctx.replies.numeric(ctx.session, .ERR_SASLFAIL, &.{}, message);
+}
+
+/// Decode a base64 AUTHENTICATE payload into `out`, rejecting oversize input.
+fn decodeAuthPayload(payload_b64: []const u8, out: []u8) ![]const u8 {
+    const decoder = std.base64.standard.Decoder;
+    const len = try decoder.calcSizeForSlice(payload_b64);
+    if (len > out.len) return error.OutputTooSmall;
+    try decoder.decode(out[0..len], payload_b64);
+    return out[0..len];
 }
 
 fn handlePing(ctx: DispatchCtx) DispatchError!void {
@@ -855,4 +912,56 @@ test "NICK containing a control byte is rejected" {
     try expectContains(replies.written(), " 432 * * :Erroneous nickname\r\n");
     try std.testing.expect(!session.registration.nick_seen);
     try std.testing.expectEqual(@as(usize, 0), session.client.identity.nick.slice().len);
+}
+
+const TestPlainChecker = struct {
+    fn verify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+        return std.mem.eql(u8, creds.authcid, "alice") and std.mem.eql(u8, creds.password, "secret");
+    }
+};
+
+test "sasl PLAIN exchange logs in and exposes the account" {
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE PLAIN");
+    try expectContains(replies.written(), "AUTHENTICATE +\r\n");
+    try std.testing.expect(session.sasl_pending != null);
+
+    var b64: [64]u8 = undefined;
+    const enc = std.base64.standard.Encoder.encode(&b64, "\x00alice\x00secret");
+    var linebuf: [128]u8 = undefined;
+    const line = try std.fmt.bufPrint(&linebuf, "AUTHENTICATE {s}", .{enc});
+
+    replies.clear();
+    try dispatchText(&session, &replies, line);
+    try std.testing.expectEqualStrings("alice", session.account().?);
+    try expectContains(replies.written(), " 900 ");
+    try expectContains(replies.written(), " 903 ");
+}
+
+test "sasl PLAIN rejects bad credentials and stays logged out" {
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE PLAIN");
+    var b64: [64]u8 = undefined;
+    const enc = std.base64.standard.Encoder.encode(&b64, "\x00alice\x00wrongpass");
+    var linebuf: [128]u8 = undefined;
+    const line = try std.fmt.bufPrint(&linebuf, "AUTHENTICATE {s}", .{enc});
+
+    replies.clear();
+    try dispatchText(&session, &replies, line);
+    try std.testing.expect(session.account() == null);
+    try expectContains(replies.written(), " 904 ");
 }
