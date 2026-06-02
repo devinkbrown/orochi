@@ -6,6 +6,7 @@
 //! reuse by tracking the process id before every generated stream.
 const std = @import("std");
 const Secret = @import("secret.zig").Secret;
+const platform = @import("../substrate/platform.zig");
 
 const ChaCha20 = std.crypto.stream.chacha.ChaCha20With64BitNonce;
 
@@ -32,18 +33,7 @@ pub const seed_len = key_len + nonce_len;
 /// short reads. This is the slow root entropy source; hot callers should keep a
 /// `Drbg` instance and use its fill methods.
 pub fn fillOsEntropy(buf: []u8) Error!void {
-    var filled: usize = 0;
-    while (filled < buf.len) {
-        const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return Error.RandomSourceFailed;
-                filled += rc;
-            },
-            .INTR => continue,
-            else => return Error.RandomSourceFailed,
-        }
-    }
+    platform.fillOsEntropy(buf) catch return Error.RandomSourceFailed;
 }
 
 /// Fast per-instance DRBG. The state is fork/snapshot-aware and rekeys after
@@ -53,7 +43,7 @@ pub const Drbg = struct {
     key: Secret([key_len]u8),
     nonce: [nonce_len]u8,
     counter: u64,
-    owner_pid: std.os.linux.pid_t,
+    owner_pid: i32,
 
     /// Seed a new DRBG from the OS CSPRNG.
     pub fn init() Error!Drbg {
@@ -61,7 +51,7 @@ pub const Drbg = struct {
             .key = Secret([key_len]u8).init([_]u8{0} ** key_len),
             .nonce = [_]u8{0} ** nonce_len,
             .counter = 0,
-            .owner_pid = std.os.linux.getpid(),
+            .owner_pid = platform.currentPid(),
         };
         try self.reseed();
         return self;
@@ -88,7 +78,7 @@ pub const Drbg = struct {
         self.key = Secret([key_len]u8).init(next_key);
         @memcpy(&self.nonce, seed[key_len..][0..nonce_len]);
         self.counter = 0;
-        self.owner_pid = std.os.linux.getpid();
+        self.owner_pid = platform.currentPid();
     }
 
     /// Fill public/non-secret bytes from the DRBG.
@@ -190,7 +180,7 @@ pub const Drbg = struct {
     }
 
     fn ensureCurrentProcess(self: *Drbg) Error!void {
-        const pid = std.os.linux.getpid();
+        const pid = platform.currentPid();
         if (self.owner_pid != pid) try self.reseed();
     }
 
@@ -236,7 +226,7 @@ fn testDrbg(seed: [seed_len]u8) Drbg {
         .key = Secret([key_len]u8).init(key),
         .nonce = nonce,
         .counter = 0,
-        .owner_pid = std.os.linux.getpid(),
+        .owner_pid = platform.currentPid(),
     };
 }
 
@@ -287,7 +277,7 @@ test "snapshot pid mismatch forces reseed before output" {
     rng.owner_pid = 0;
     var out: [16]u8 = undefined;
     try rng.fillPublic(&out);
-    try testing.expectEqual(std.os.linux.getpid(), rng.owner_pid);
+    try testing.expectEqual(platform.currentPid(), rng.owner_pid);
 }
 
 test "fillSecret writes through Secret backing storage" {

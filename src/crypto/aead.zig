@@ -16,6 +16,7 @@
 //! ergonomic key interop), so it can be compiled and tested in isolation.
 const std = @import("std");
 const Secret = @import("secret.zig").Secret;
+const platform = @import("../substrate/platform.zig");
 
 /// Errors surfaced by this layer.
 pub const Error = error{
@@ -117,15 +118,7 @@ pub const CounterNonce = struct {
 /// match the daemon's platform (see substrate/reactor.zig); the broader RNG
 /// strategy (per-worker DRBG, fork reseed) lives in the keyring layer.
 fn fillOsRandom(buf: []u8) error{RandomSourceFailed}!void {
-    var filled: usize = 0;
-    while (filled < buf.len) {
-        const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => filled += rc,
-            .INTR => continue,
-            else => return error.RandomSourceFailed,
-        }
-    }
+    platform.fillOsEntropy(buf) catch return error.RandomSourceFailed;
 }
 
 /// A typed AEAD over algorithm `alg`. Associated `Key`/`Nonce`/`Tag` types are

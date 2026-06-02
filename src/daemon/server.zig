@@ -417,7 +417,7 @@ const QueueSink = struct {
     }
 };
 
-pub const Server = struct {
+pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
     listener_fd: linux.fd_t,
@@ -428,7 +428,7 @@ pub const Server = struct {
 
     /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
     /// ring used for accept/recv/send completions.
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !LinuxServer {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
         const listener_fd = try createListener(config.host, config.port, config.backlog);
@@ -450,7 +450,7 @@ pub const Server = struct {
         };
     }
 
-    pub fn deinit(self: *Server) void {
+    pub fn deinit(self: *LinuxServer) void {
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) closeFd(slot.value.fd);
         }
@@ -462,7 +462,7 @@ pub const Server = struct {
     }
 
     /// Arm the accept SQE if needed. Submission is batched by `runOnce`.
-    pub fn armAccept(self: *Server) !void {
+    pub fn armAccept(self: *LinuxServer) !void {
         if (self.accept_armed) return;
         try self.ring.submitAccept(listener_token, self.listener_fd);
         self.accept_armed = true;
@@ -470,7 +470,7 @@ pub const Server = struct {
 
     /// Process at least one io_uring completion. Callers may loop this until
     /// their own stop condition is satisfied.
-    pub fn runOnce(self: *Server) !void {
+    pub fn runOnce(self: *LinuxServer) !void {
         try self.armAccept();
         _ = try self.ring.submitAndWait(1);
 
@@ -482,11 +482,11 @@ pub const Server = struct {
         _ = try self.ring.submit();
     }
 
-    pub fn boundPort(self: *Server) !u16 {
+    pub fn boundPort(self: *LinuxServer) !u16 {
         return socketPort(self.listener_fd);
     }
 
-    fn handleAccept(self: *Server, event: ringlane.AcceptEvent) !void {
+    fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
         if (!event.more) self.accept_armed = false;
         if (event.res < 0) return error.BadCompletion;
 
@@ -499,7 +499,7 @@ pub const Server = struct {
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
     }
 
-    fn handleRecv(self: *Server, event: ringlane.RecvEvent) !void {
+    fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
         conn.closing = event.res <= 0;
@@ -515,7 +515,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleSend(self: *Server, event: ringlane.SendEvent) !void {
+    fn handleSend(self: *LinuxServer, event: ringlane.SendEvent) !void {
         const conn = try self.connForToken(event.token);
         conn.send_armed = false;
         if (event.res < 0) {
@@ -535,7 +535,7 @@ pub const Server = struct {
         }
     }
 
-    fn deliver(self: *Server, id: client_model.ClientId, bytes: []const u8) !void {
+    fn deliver(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) !void {
         const conn = self.clients.get(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
         try appendToConn(conn, bytes);
@@ -543,7 +543,7 @@ pub const Server = struct {
     }
 
     fn broadcastChannel(
-        self: *Server,
+        self: *LinuxServer,
         channel: []const u8,
         bytes: []const u8,
         except: ?client_model.ClientId,
@@ -558,18 +558,18 @@ pub const Server = struct {
         }
     }
 
-    fn armSendIfNeeded(self: *Server, conn: *ConnState) !void {
+    fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
         if (conn.send_armed) return;
         if (conn.send_offset >= conn.send_len) return;
         try self.ring.submitSend(conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]);
         conn.send_armed = true;
     }
 
-    fn connForToken(self: *Server, token: RingFdToken) ServerError!*ConnState {
+    fn connForToken(self: *LinuxServer, token: RingFdToken) ServerError!*ConnState {
         return self.clients.get(idFromToken(token)) orelse error.ClientNotFound;
     }
 
-    fn closeConn(self: *Server, token: RingFdToken, reason: []const u8) !void {
+    fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
         if (self.clients.get(id)) |conn| {
             defer self.world.removeClient(worldIdFromClient(id));
@@ -579,7 +579,7 @@ pub const Server = struct {
         }
     }
 
-    fn broadcastQuit(self: *Server, id: client_model.ClientId, conn: *const ConnState, reason: []const u8) !void {
+    fn broadcastQuit(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, reason: []const u8) !void {
         if (self.world.nickOf(worldIdFromClient(id)) == null) return;
 
         var prefix_buf: [256]u8 = undefined;
@@ -594,7 +594,7 @@ pub const Server = struct {
         }
     }
 
-    fn feedBytes(self: *Server, id: client_model.ClientId, conn: *ConnState, bytes: []const u8) !void {
+    fn feedBytes(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, bytes: []const u8) !void {
         for (bytes) |byte| {
             if (conn.line_len == conn.line_buf.len) {
                 conn.closing = true;
@@ -612,7 +612,7 @@ pub const Server = struct {
         }
     }
 
-    fn processLiveLine(self: *Server, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+    fn processLiveLine(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
         const parsed = try irc_line.parseLine(line);
         const was_registered = conn.session.registered();
 
@@ -654,7 +654,7 @@ pub const Server = struct {
         }
     }
 
-    fn registerConnNick(self: *Server, id: client_model.ClientId, conn: *ConnState) !void {
+    fn registerConnNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
         const nick = conn.session.displayName();
         if (std.mem.eql(u8, nick, "*")) return;
         self.world.registerNick(nick, worldIdFromClient(id)) catch |err| switch (err) {
@@ -666,7 +666,7 @@ pub const Server = struct {
         };
     }
 
-    fn handleJoin(self: *Server, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    fn handleJoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"JOIN"}, "Not enough parameters");
             return;
@@ -688,7 +688,7 @@ pub const Server = struct {
         try self.sendNames(conn, channel);
     }
 
-    fn handlePart(self: *Server, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PART"}, "Not enough parameters");
             return;
@@ -712,7 +712,7 @@ pub const Server = struct {
         try self.world.part(channel, worldIdFromClient(id));
     }
 
-    fn handleNames(self: *Server, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"NAMES"}, "Not enough parameters");
             return;
@@ -727,7 +727,7 @@ pub const Server = struct {
     }
 
     fn handleMessage(
-        self: *Server,
+        self: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
         parsed: *const irc_line.LineView,
@@ -764,7 +764,7 @@ pub const Server = struct {
         try self.deliver(clientIdFromWorld(recipient), msg);
     }
 
-    fn handleTopic(self: *Server, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    fn handleTopic(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TOPIC"}, "Not enough parameters");
             return;
@@ -795,14 +795,14 @@ pub const Server = struct {
         try self.broadcastChannel(channel, msg, null);
     }
 
-    fn handleQuit(self: *Server, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const reason = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "Client quit";
         try self.broadcastQuit(id, conn, reason);
         self.world.removeClient(worldIdFromClient(id));
         conn.closing = true;
     }
 
-    fn sendTopicReply(self: *Server, conn: *ConnState, channel: []const u8) !void {
+    fn sendTopicReply(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         if (conn.session.registered()) {
             if (self.world.topic(channel)) |text| {
                 try queueNumeric(conn, .RPL_TOPIC, &.{channel}, text);
@@ -812,7 +812,7 @@ pub const Server = struct {
         }
     }
 
-    fn sendNames(self: *Server, conn: *ConnState, channel: []const u8) !void {
+    fn sendNames(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         var names_buf: [default_reply_bytes / 2]u8 = undefined;
         var names = Buf{ .storage = &names_buf };
 
@@ -829,8 +829,28 @@ pub const Server = struct {
     }
 };
 
+/// Public entry point. `LinuxServer` is the io_uring fast path; other targets
+/// get a stub whose `init` fails closed until a portable poll/kqueue backend
+/// lands (CROSS-PLATFORM MANDATE). main() already falls back to the DST boot
+/// banner when `init` returns error.Unsupported, so the daemon still links and
+/// runs its non-socket paths on macOS/BSD/Windows.
+pub const Server = if (builtin.os.tag == .linux) LinuxServer else PortableServer;
+
+const PortableServer = struct {
+    pub fn init(_: std.mem.Allocator, _: Config) ServerError!PortableServer {
+        return error.Unsupported;
+    }
+    pub fn deinit(_: *PortableServer) void {}
+    pub fn boundPort(_: *PortableServer) ServerError!u16 {
+        return error.Unsupported;
+    }
+    pub fn runOnce(_: *PortableServer) ServerError!void {
+        return error.Unsupported;
+    }
+};
+
 const CompletionHandler = struct {
-    server: *Server,
+    server: *LinuxServer,
     err: ?anyerror = null,
 
     fn onCompletion(self: *CompletionHandler, completion: ringlane.Completion) void {

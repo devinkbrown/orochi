@@ -6,6 +6,7 @@
 //! Ocean). Today the seam covers monotonic time; submit/poll/accept/recv/send
 //! land in M1 when Ringlane (io_uring) is implemented.
 const std = @import("std");
+const platform = @import("platform.zig");
 
 pub const Reactor = struct {
     ptr: *anyopaque,
@@ -32,12 +33,10 @@ pub const SystemReactor = struct {
     }
 
     fn nowMillis(_: *anyopaque) i64 {
-        // M1 will source time from the io_uring ring; for now read the
-        // monotonic clock directly (std.time lost its clock helpers in 0.16).
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
-        return @as(i64, @intCast(ts.sec)) * 1000 +
-            @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+        // M1 will source time from the io_uring ring; for now read the portable
+        // monotonic clock (std.time lost its clock helpers in 0.16). Routed
+        // through `platform` so non-Linux targets build (CROSS-PLATFORM MANDATE).
+        return platform.monotonicMillis();
     }
 
     const vtable = Reactor.VTable{ .nowMillis = nowMillis };

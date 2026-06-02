@@ -5,6 +5,7 @@
 pub const arena = @import("arena.zig");
 pub const geoip = @import("geoip.zig");
 pub const io = @import("io/root.zig");
+pub const platform = @import("platform.zig");
 pub const queue = @import("queue.zig");
 pub const reactor = @import("reactor.zig");
 pub const sazanami = @import("sazanami.zig");
@@ -24,6 +25,7 @@ test {
     _ = arena;
     _ = geoip;
     _ = io;
+    _ = platform;
     _ = queue;
     _ = reactor;
     _ = sazanami;
