@@ -4,6 +4,7 @@
 pub const anti_entropy = @import("anti_entropy.zig");
 pub const clock = @import("clock.zig");
 pub const convergence = @import("convergence.zig");
+pub const delta_codec = @import("delta_codec.zig");
 pub const goryu = @import("goryu.zig");
 pub const merkle = @import("merkle.zig");
 pub const state = @import("state.zig");
@@ -14,6 +15,7 @@ test {
     _ = anti_entropy;
     _ = clock;
     _ = convergence;
+    _ = delta_codec;
     _ = goryu;
     _ = merkle;
     _ = state;
