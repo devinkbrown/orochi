@@ -32,17 +32,17 @@ Always implement to the actual spec text; this table is the work map, not the sp
 | whox | `proto/who.zig` | ✅ |
 | account-extban | `proto/extban.zig` | 🔧 |
 | bot-mode | `proto/cap.zig` (+ usermode) | ⬜ |
-| echo-message | dispatch/`server.zig` | ⬜ |
-| extended-join | dispatch (account in JOIN) | ⬜ |
-| userhost-in-names / multi-prefix | NAMES path | ⬜ |
-| invite-notify | channel commands | ⬜ |
+| echo-message | `proto/echo_message.zig` | ✅ (wire into dispatch) |
+| extended-join | `proto/extended_join.zig` | ✅ (wire into dispatch) |
+| userhost-in-names / multi-prefix | `proto/names_reply.zig` | 🔧 (wave B) |
+| invite-notify | `proto/invite_notify.zig` | ✅ (wire into dispatch) |
 | channel-rename | channel commands | ⬜ |
 | no-implicit-names | registration | ⬜ |
 | utf8-only | `op_utf8`-style validation | ⬜ |
 | metadata | overlaps IRCX PROP (`proto/ircx.zig`) — unify | ⬜ |
 | oper-tag | ties to clean-room `daemon/oper.zig` | ⬜ |
 | network-icon | cosmetic isupport token | ⬜ |
-| account-notify | dispatch broadcast | ⬜ |
+| account-notify | `proto/account_notify.zig` | ✅ (wire into dispatch) |
 | **webirc** | — | ❌ removed (clean-room: WebSocket only) |
 | deprecated: tls (STARTTLS), sasl-dh-* | — | ❌ removed (TLS-native / modern SASL) |
 
