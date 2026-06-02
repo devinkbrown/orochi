@@ -1,4 +1,4 @@
-//! IRC network-state CRDTs for the LADON mesh.
+//! IRC network-state CRDTs for the SUIMYAKU mesh.
 //!
 //! This module models the daemon-visible IRC graph as mergeable state:
 //! users, nick claims, channels, memberships, modes, masks, and topics. It is
@@ -7,12 +7,12 @@
 const std = @import("std");
 
 const clock = @import("clock.zig");
-const crdt = @import("crdt.zig");
+const goryu = @import("goryu.zig");
 
 pub const Hlc = clock.Hlc;
-pub const Dot = crdt.Dot;
-pub const OrSet = crdt.OrSet;
-pub const LwwRegister = crdt.LwwRegister;
+pub const Dot = goryu.Dot;
+pub const OrSet = goryu.OrSet;
+pub const LwwRegister = goryu.LwwRegister;
 
 pub const Authority = u16;
 pub const NodeId = u64;
@@ -232,7 +232,7 @@ const TopicEntry = struct {
     register: LwwRegister(TopicValue) = LwwRegister(TopicValue).init(),
 };
 
-/// Complete IRC graph for one LADON replica.
+/// Complete IRC graph for one SUIMYAKU replica.
 pub const NetworkState = struct {
     const Self = @This();
     const MembershipSet = OrSet(MembershipKey);

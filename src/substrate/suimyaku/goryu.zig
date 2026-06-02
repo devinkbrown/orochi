@@ -1,4 +1,4 @@
-//! Delta-state CRDT families for the LADON mesh substrate.
+//! Delta-state CRDT families for the SUIMYAKU mesh substrate.
 //!
 //! This file is self-contained for orchestrator integration: it defines the
 //! local dot and causal context helpers used by the OR-Set and LWW register.

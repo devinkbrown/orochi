@@ -1,4 +1,4 @@
-//! LADON anti-entropy Merkle substrate.
+//! SUIMYAKU anti-entropy Merkle substrate.
 //!
 //! This module is pure state reconciliation logic: it stores `key -> value_hash`
 //! entries, computes deterministic keyspace Merkle roots, and descends only
@@ -45,7 +45,7 @@ pub const DiffResult = struct {
 ///
 /// `hash(prefix, bits)` returns the peer's subtree root for the key-hash prefix.
 /// `keys(prefix, bits, out)` appends peer keys in a terminal differing subtree.
-/// This lets a future LADON transport back the same diff walk with network
+/// This lets a future SUIMYAKU transport back the same diff walk with network
 /// probes instead of an in-memory `MerkleTree`.
 pub const NodeProbe = struct {
     ptr: *const anyopaque,
@@ -70,7 +70,7 @@ pub const NodeProbe = struct {
 /// Hashing uses SHA-256 with explicit domain tags for empty subtrees, leaves,
 /// and internal nodes. This is heavier than the eventual hot-path skeleton may
 /// need, but it gives deterministic collision-resistant fingerprints now and
-/// avoids cross-protocol hash reuse as LADON grows more frame families.
+/// avoids cross-protocol hash reuse as SUIMYAKU grows more frame families.
 pub const MerkleTree = struct {
     allocator: Allocator,
     entries: std.ArrayList(Entry) = .empty,
@@ -266,7 +266,7 @@ fn hashRange(entries: []const Entry, prefix: Hash, bits: u16) Hash {
 
 fn hashEmpty(prefix: Hash, bits: u16) Hash {
     var h = Sha256.init(.{});
-    h.update("mizuchi.ladon.merkle.empty.v1");
+    h.update("mizuchi.suimyaku.merkle.empty.v1");
     updateU16(&h, bits);
     h.update(&prefix);
     var out: Hash = undefined;
@@ -276,7 +276,7 @@ fn hashEmpty(prefix: Hash, bits: u16) Hash {
 
 fn hashLeaf(entry: Entry) Hash {
     var h = Sha256.init(.{});
-    h.update("mizuchi.ladon.merkle.leaf.v1");
+    h.update("mizuchi.suimyaku.merkle.leaf.v1");
     updateU64(&h, entry.key.len);
     h.update(entry.key);
     h.update(&entry.value_hash);
@@ -287,7 +287,7 @@ fn hashLeaf(entry: Entry) Hash {
 
 fn hashNode(prefix: Hash, bits: u16, left: Hash, right: Hash) Hash {
     var h = Sha256.init(.{});
-    h.update("mizuchi.ladon.merkle.node.v1");
+    h.update("mizuchi.suimyaku.merkle.node.v1");
     updateU16(&h, bits);
     h.update(&prefix);
     h.update(&left);
@@ -299,7 +299,7 @@ fn hashNode(prefix: Hash, bits: u16, left: Hash, right: Hash) Hash {
 
 fn hashBucket(entries: []const Entry, prefix: Hash, bits: u16, count: usize) Hash {
     var h = Sha256.init(.{});
-    h.update("mizuchi.ladon.merkle.bucket.v1");
+    h.update("mizuchi.suimyaku.merkle.bucket.v1");
     updateU16(&h, bits);
     updateU64(&h, count);
     h.update(&prefix);

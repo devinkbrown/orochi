@@ -7,7 +7,7 @@
 //! constant-time verify provided by std (no early-out, no caller branch on the
 //! secret comparison).
 //!
-//! Nonces follow the VEIL scheme (planning/02, "Frame crypto"): a 96-bit nonce
+//! Nonces follow the TSUMUGI scheme (planning/02, "Frame crypto"): a 96-bit nonce
 //! built from an 8-byte random base plus a big-endian u32 counter. The counter
 //! constructor refuses to wrap, turning nonce reuse into an explicit error
 //! before it can ever reach the cipher.
@@ -30,7 +30,7 @@ pub const Error = error{
 
 /// Supported AEAD algorithms. Each maps to a vetted std.crypto construction.
 pub const AeadAlg = enum {
-    /// RFC 8439 ChaCha20-Poly1305 (VEIL default; mobile/ARM friendly).
+    /// RFC 8439 ChaCha20-Poly1305 (TSUMUGI default; mobile/ARM friendly).
     chacha20_poly1305,
     /// AES-256-GCM (allowed when both peers advertise hardware support).
     aes256_gcm,
@@ -56,7 +56,7 @@ comptime {
     std.debug.assert(nonce_base_len + nonce_counter_len == @typeInfo(Nonce96).array.len);
 }
 
-/// Counter-based nonce source matching the VEIL frame scheme: an 8-byte random
+/// Counter-based nonce source matching the TSUMUGI frame scheme: an 8-byte random
 /// base concatenated with a big-endian u32 counter. The counter is monotonic
 /// and refuses to wrap, so each `next()` yields a distinct 96-bit nonce for the
 /// lifetime of the base. Rekey (new base) before the counter is exhausted.
@@ -72,7 +72,7 @@ pub const CounterNonce = struct {
     }
 
     /// Construct with an OS-CSPRNG-filled base. Use at key-establishment time.
-    /// The 64-bit base is non-secret wire data (it travels in the VEIL frame),
+    /// The 64-bit base is non-secret wire data (it travels in the TSUMUGI frame),
     /// but we still source it from the kernel CSPRNG so bases do not collide.
     pub fn random() error{RandomSourceFailed}!CounterNonce {
         var base: [nonce_base_len]u8 = undefined;
@@ -226,7 +226,7 @@ const AesGcm = Aead(.aes256_gcm);
 fn roundTrip(comptime A: type) !void {
     const key: A.Key = [_]u8{0xA5} ** A.key_length;
     const nonce: A.Nonce = [_]u8{0x07} ** A.nonce_length;
-    const aad = "ladon-outer-header|gen=1|kind=data";
+    const aad = "suimyaku-outer-header|gen=1|kind=data";
     const plaintext = "the quick brown fox jumps over the lazy dog";
 
     var aead = A.init(key);

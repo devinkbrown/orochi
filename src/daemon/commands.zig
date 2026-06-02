@@ -3,7 +3,7 @@
 //! `zig test src/daemon/commands.zig` makes `src/daemon` the module root, so
 //! this file keeps the small protocol/state surface it needs local while using
 //! the real client table in `client.zig`. The local state shape mirrors the
-//! committed LADON NetworkState API used by these handlers.
+//! committed SUIMYAKU NetworkState API used by these handlers.
 const std = @import("std");
 const client_model = @import("client.zig");
 
@@ -164,7 +164,7 @@ const TopicEntry = struct {
     value: TopicValue,
 };
 
-/// Minimal LADON-style network state used by this command surface.
+/// Minimal SUIMYAKU-style network state used by this command surface.
 pub const NetworkState = struct {
     allocator: std.mem.Allocator,
     node_id: u64,

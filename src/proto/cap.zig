@@ -43,7 +43,7 @@ pub const CapId = enum(u6) {
     typing,
     ophion_prop_notify,
     ophion_session_sync,
-    ophion_ladon_media,
+    ophion_suimyaku_media,
 };
 
 pub const CAP_COUNT: usize = @typeInfo(CapId).@"enum".fields.len;
@@ -403,7 +403,7 @@ const default_specs = [_]CapSpec{
     .{ .id = .typing, .name = "typing" },
     .{ .id = .ophion_prop_notify, .name = "ophion/prop-notify" },
     .{ .id = .ophion_session_sync, .name = "ophion/session-sync" },
-    .{ .id = .ophion_ladon_media, .name = "ophion/ladon-media" },
+    .{ .id = .ophion_suimyaku_media, .name = "ophion/suimyaku-media" },
 };
 
 fn parseRequestedSet(registry: CapRegistry, raw_list: []const u8) ?RequestedSet {

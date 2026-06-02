@@ -37,7 +37,7 @@ pub const FrameFamily = enum(u5) {
     sync = 1,
     irc_app = 2,
     capability = 3,
-    veil = 4,
+    tsumugi = 4,
     media = 5,
 };
 
@@ -168,7 +168,7 @@ pub fn hasRole(fields: Fields, role: Role) bool {
     return (fields.roles & roleBit(role)) != 0;
 }
 
-/// Return true when `fields` permits the given LADON frame family.
+/// Return true when `fields` permits the given SUIMYAKU frame family.
 pub fn mayUseFrameFamily(fields: Fields, family: FrameFamily) bool {
     return (fields.allowed_frame_families & frameFamilyBit(family)) != 0;
 }
@@ -307,7 +307,7 @@ fn sampleFields(node_pubkey: PublicKeyBytes) Fields {
         .roles = roles(&.{ .operator, .relay, .media }),
         .issued_ms = 1_000,
         .expiry_ms = 10_000,
-        .allowed_frame_families = frameFamilies(&.{ .control, .sync, .irc_app, .veil }),
+        .allowed_frame_families = frameFamilies(&.{ .control, .sync, .irc_app, .tsumugi }),
         .max_fanout = 8,
         .media_rights = mediaRights(&.{ .voice, .video }),
         .revocation_epoch = 3,

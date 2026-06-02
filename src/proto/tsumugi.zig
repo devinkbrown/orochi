@@ -1,7 +1,7 @@
-//! VEIL ratchet transport state.
+//! TSUMUGI ratchet transport state.
 //!
 //! This module implements the protocol-level symmetric ratchet used after the
-//! LADON/kx layer has already authenticated the peer and produced a shared
+//! SUIMYAKU/kx layer has already authenticated the peer and produced a shared
 //! hybrid root secret. It does not perform X25519, ML-KEM, or identity work.
 const std = @import("std");
 
@@ -54,17 +54,17 @@ pub const RekeySignal = struct {
 
 pub const SealOptions = struct {
     outer_header: []const u8,
-    frame_kind: frame.FrameType = .veil_ratchet,
+    frame_kind: frame.FrameType = .tsumugi_ratchet,
     current_epoch_seconds: u64 = 0,
 };
 
 pub const OpenOptions = struct {
     outer_header: []const u8,
-    frame_kind: frame.FrameType = .veil_ratchet,
+    frame_kind: frame.FrameType = .tsumugi_ratchet,
     current_epoch_seconds: u64 = 0,
 };
 
-/// Metadata for an encrypted VEIL_RATCHET payload. `ciphertext` lives in the
+/// Metadata for an encrypted TSUMUGI_RATCHET payload. `ciphertext` lives in the
 /// caller-owned output buffer passed to `seal`.
 pub const SealedFrame = struct {
     generation: u32,
@@ -89,7 +89,7 @@ pub const OpenedFrame = struct {
     rekey: RekeySignal,
 };
 
-/// Active VEIL symmetric ratchet. Key material is `Secret([32]u8)` through the
+/// Active TSUMUGI symmetric ratchet. Key material is `Secret([32]u8)` through the
 /// HKDF PRK type; public protocol counters and generation stay ordinary ints.
 pub const State = struct {
     root_key: RootKey,
@@ -106,7 +106,7 @@ pub const State = struct {
     send_counter_exhausted: bool = false,
     recv_counter_exhausted: bool = false,
 
-    /// Initialize VEIL from the root secret supplied by the kx layer. This is a
+    /// Initialize TSUMUGI from the root secret supplied by the kx layer. This is a
     /// symmetric chain split only; no DH or KEM work happens here.
     pub fn init(
         root_secret: [key_len]u8,
@@ -123,8 +123,8 @@ pub const State = struct {
         errdefer secureZero(&initiator_chain);
         errdefer secureZero(&responder_chain);
 
-        hkdfExpand(&root, "veil-init-send", &initiator_chain);
-        hkdfExpand(&root, "veil-resp-send", &responder_chain);
+        hkdfExpand(&root, "tsumugi-init-send", &initiator_chain);
+        hkdfExpand(&root, "tsumugi-resp-send", &responder_chain);
 
         const send_bytes = switch (role) {
             .initiator => initiator_chain,
@@ -176,14 +176,14 @@ pub const State = struct {
         self.* = fresh;
     }
 
-    /// Encrypt one complete inner LADON wire frame into `out`.
+    /// Encrypt one complete inner SUIMYAKU wire frame into `out`.
     pub fn seal(
         self: *State,
         options: SealOptions,
-        inner_ladon_frame: []const u8,
+        inner_suimyaku_frame: []const u8,
         out: []u8,
     ) Error!SealedFrame {
-        if (out.len < inner_ladon_frame.len) return error.BufferTooSmall;
+        if (out.len < inner_suimyaku_frame.len) return error.BufferTooSmall;
         if (options.outer_header.len != frame.header_len) return error.InvalidOuterHeader;
         if (self.send_counter_exhausted) return error.CounterExhausted;
 
@@ -204,8 +204,8 @@ pub const State = struct {
             options.frame_kind,
         );
 
-        const ciphertext = out[0..inner_ladon_frame.len];
-        const tag = sealAead(&msg_key, nonce, aad, inner_ladon_frame, ciphertext);
+        const ciphertext = out[0..inner_suimyaku_frame.len];
+        const tag = sealAead(&msg_key, nonce, aad, inner_suimyaku_frame, ciphertext);
 
         self.send_chain_key.wipe();
         self.send_chain_key = next_chain;
@@ -226,7 +226,7 @@ pub const State = struct {
         };
     }
 
-    /// Decrypt one encrypted VEIL frame. Receive-chain state and skipped-key
+    /// Decrypt one encrypted TSUMUGI frame. Receive-chain state and skipped-key
     /// cache mutations are committed only after AEAD authentication succeeds.
     pub fn open(
         self: *State,
@@ -355,8 +355,8 @@ fn deriveStep(chain: *const ChainKey, msg_key: *MessageKey, next_chain: *ChainKe
     errdefer secureZero(&msg_bytes);
     errdefer secureZero(&chain_bytes);
 
-    hkdfExpand(chain, "veil-msg", &msg_bytes);
-    hkdfExpand(chain, "veil-chain", &chain_bytes);
+    hkdfExpand(chain, "tsumugi-msg", &msg_bytes);
+    hkdfExpand(chain, "tsumugi-chain", &chain_bytes);
 
     msg_key.* = MessageKey.init(msg_bytes);
     next_chain.* = ChainKey.init(chain_bytes);
@@ -552,7 +552,7 @@ fn nonceBase(byte: u8) [nonce_base_len]u8 {
 fn testOuterHeader() [frame.header_len]u8 {
     var out: [frame.header_len]u8 = undefined;
     _ = (frame.Frame{
-        .type = .veil_ratchet,
+        .type = .tsumugi_ratchet,
         .ctrl = frame.Ctrl.init(0, .control, false),
     }).encode(&out) catch unreachable;
     return out;
@@ -572,7 +572,7 @@ test "in-order seal/open round-trip" {
     defer pair.responder.deinit();
 
     const outer = testOuterHeader();
-    const inner = "complete inner LADON frame bytes";
+    const inner = "complete inner SUIMYAKU frame bytes";
     const ct = try allocator.alloc(u8, inner.len);
     defer allocator.free(ct);
     const pt = try allocator.alloc(u8, inner.len);
@@ -705,7 +705,7 @@ test "max counter frame replay is rejected after successful open" {
     try testing.expectError(error.Replay, pair.responder.open(.{ .outer_header = &outer }, toEncrypted(sealed), &pt));
 }
 
-test "forward gap larger than VEIL_MAX_SKIP is rejected without commit" {
+test "forward gap larger than TSUMUGI_MAX_SKIP is rejected without commit" {
     const allocator = testing.allocator;
     var pair = try makePair();
     defer pair.initiator.deinit();
@@ -741,7 +741,7 @@ test "AAD binds frame kind generation and counter" {
     const sealed = try pair.initiator.seal(.{ .outer_header = &outer }, msg, &ct);
     try testing.expectError(error.AuthFailed, pair.responder.open(.{
         .outer_header = &outer,
-        .frame_kind = .veil_group_key,
+        .frame_kind = .tsumugi_group_key,
     }, toEncrypted(sealed), &pt));
     try testing.expectEqual(@as(u32, 0), pair.responder.recv_counter);
 
@@ -774,7 +774,7 @@ test "rekey schedule hooks signal frame and epoch rotation" {
     try testing.expect(by_epoch.rekey.epoch);
 }
 
-test "VEIL key fields use canonical inline-array Secret" {
+test "TSUMUGI key fields use canonical inline-array Secret" {
     const CanonicalSecret = @import("../crypto/secret.zig").Secret;
     comptime {
         if (RootKey != CanonicalSecret([key_len]u8)) @compileError("RootKey must use canonical Secret([32]u8)");

@@ -1,4 +1,4 @@
-//! LADON logical clock substrate.
+//! SUIMYAKU logical clock substrate.
 //!
 //! HLC gives mesh events a near-wall total order while dotted version vectors
 //! carry causal coverage for CRDT merge, repair, and conflict detection.

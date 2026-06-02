@@ -1,24 +1,24 @@
-//! Witnessed SWIM membership state machine (LADON mesh, planning/04).
+//! Witnessed SAZANAMI membership state machine (SUIMYAKU mesh, planning/04).
 //!
 //! Pure, deterministic failure detection. There is NO real networking and NO
 //! real clock here: the protocol period is driven by `tick(now_ms, rng_seed)`,
 //! and the probe target / witness selection is derived from the seed, so the
 //! whole thing replays identically under Deterministic Ocean (planning/00).
 //!
-//! This models the *decisions* of SWIM (Das/Gupta/Motivala) -- which probes to
+//! This models the *decisions* of SAZANAMI (Das/Gupta/Motivala) -- which probes to
 //! emit, when a node ages out of suspicion -- as returned values. The caller
-//! (the LADON peer actor, M-later) is responsible for turning a `Probe` into
+//! (the SUIMYAKU peer actor, M-later) is responsible for turning a `Probe` into
 //! real PING / PING_REQ frames and feeding observed events back in via the
 //! `applyAlive` / `applySuspect` / `applyDead` / `applyLeft` methods.
 //!
-//! Two SWIM correctness mechanisms are implemented:
+//! Two SAZANAMI correctness mechanisms are implemented:
 //!
 //!   1. **Incarnation numbers.** Suspicion and death carry the incarnation the
 //!      reporter believes the target is at. A target can *refute* a suspicion
 //!      by bumping its own incarnation; a higher incarnation always wins, so a
 //!      live node is never permanently buried by a stale rumor.
 //!
-//!   2. **Witnessed extension** (planning/04, "Witnessed SWIM"). Suspicion and
+//!   2. **Witnessed extension** (planning/04, "Witnessed SAZANAMI"). Suspicion and
 //!      dead reports carry the witness that observed them. A node only
 //!      transitions SUSPECT -> DEAD once a configurable *witness quorum* of
 //!      distinct witnesses agree (or the suspicion timer expires for a target
@@ -45,10 +45,10 @@ pub const Config = struct {
     protocol_period_ms: i64 = 1_000,
     /// How long a node may sit in SUSPECT before it is eligible for DEAD.
     suspicion_timeout_ms: i64 = 3_000,
-    /// Number of indirect-probe witnesses (the `k` in SWIM PING_REQ fanout).
+    /// Number of indirect-probe witnesses (the `k` in SAZANAMI PING_REQ fanout).
     indirect_probe_count: u8 = 3,
     /// Distinct witnesses required before SUSPECT -> DEAD. A value of 1 is
-    /// classic SWIM; >1 is the Witnessed extension. Must be >= 1.
+    /// classic SAZANAMI; >1 is the Witnessed extension. Must be >= 1.
     witness_quorum: u8 = 2,
 
     /// Returns a config with invalid fields snapped into a sane range, so a
@@ -120,7 +120,7 @@ const WitnessSet = struct {
 };
 
 /// What `tick` decided the caller should do this protocol period. The caller
-/// translates these into real LADON frames; nothing here performs I/O.
+/// translates these into real SUIMYAKU frames; nothing here performs I/O.
 pub const Probe = struct {
     /// Whether a direct PING should be sent at all (false when the mesh has no
     /// other reachable members to probe).
@@ -143,7 +143,7 @@ pub const Reaped = struct {
     incarnation: Incarnation,
 };
 
-/// Witnessed-SWIM membership table.
+/// Witnessed-SAZANAMI membership table.
 pub const Membership = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -231,7 +231,7 @@ pub const Membership = struct {
     ) !bool {
         if (node == self.self_id) {
             // Suspicion of ourselves: refute by bumping our incarnation above
-            // the rumor. This is the SWIM self-refutation path.
+            // the rumor. This is the SAZANAMI self-refutation path.
             if (incarnation >= self.self_incarnation) {
                 self.self_incarnation = incarnation + 1;
                 return true;

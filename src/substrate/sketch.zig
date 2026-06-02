@@ -1,7 +1,7 @@
-//! Probabilistic sketches for LADON anti-entropy planning.
+//! Probabilistic sketches for SUIMYAKU anti-entropy planning.
 //!
 //! Bloom filters and HyperLogLog counters are intentionally domain separated:
-//! callers provide a salt derived from the LADON frame type and mesh epoch so
+//! callers provide a salt derived from the SUIMYAKU frame type and mesh epoch so
 //! the same input hash cannot be reused across protocols or epochs.
 const std = @import("std");
 

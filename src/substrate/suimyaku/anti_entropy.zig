@@ -1,6 +1,6 @@
-//! LADON anti-entropy reconciliation planner.
+//! SUIMYAKU anti-entropy reconciliation planner.
 //!
-//! LADON repair is keyed by entity-family lanes: each lane fingerprints one
+//! SUIMYAKU repair is keyed by entity-family lanes: each lane fingerprints one
 //! family (`channel`, `ban`, `membership`, etc.) as a Merkle tree of
 //! `key -> value_hash`. The committed Merkle primitive exposes a half-diff:
 //! `diffProbe(local, remote)` returns keys that are remote-only or changed from
@@ -11,7 +11,7 @@
 const std = @import("std");
 
 const clock = @import("clock.zig");
-const crdt = @import("crdt.zig");
+const goryu = @import("goryu.zig");
 const merkle = @import("merkle.zig");
 
 const Allocator = std.mem.Allocator;
@@ -19,7 +19,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Hash = merkle.Hash;
 
-/// Coarse LADON entity family carried by an anti-entropy lane.
+/// Coarse SUIMYAKU entity family carried by an anti-entropy lane.
 pub const EntityFamily = enum {
     users,
     nicks,
@@ -216,7 +216,7 @@ pub const StabilityWatermark = struct {
     hlc: clock.Hlc,
 
     /// A dot is stable when every live peer's vector covered it.
-    pub fn containsDot(self: *const StabilityWatermark, dot: crdt.Dot) bool {
+    pub fn containsDot(self: *const StabilityWatermark, dot: goryu.Dot) bool {
         return self.causal.counter(dot.replica) >= dot.counter;
     }
 };

@@ -3,11 +3,11 @@
 //! CoilPack is Mizuchi's canonical, self-describing, signature-stable binary
 //! format. This file intentionally stays at the atom layer that Codec Loom
 //! will emit: little-endian fixed integers, minimal unsigned LEB128 varints,
-//! length-prefixed byte strings, booleans, and the fixed LADON frame header.
+//! length-prefixed byte strings, booleans, and the fixed SUIMYAKU frame header.
 const std = @import("std");
 
 pub const max_varint_bytes = 10;
-pub const ladon_header_len = 8;
+pub const suimyaku_header_len = 8;
 
 pub const DecodeError = error{
     Truncated,
@@ -266,7 +266,7 @@ pub const Cbb = struct {
     }
 };
 
-pub const LadonHeader = struct {
+pub const SuimyakuHeader = struct {
     type: u8,
     ctrl: u8,
     length: u16,
@@ -274,10 +274,10 @@ pub const LadonHeader = struct {
     hop: u8,
 };
 
-/// Encode the native 8-byte LADON frame header:
+/// Encode the native 8-byte SUIMYAKU frame header:
 /// type:u8, ctrl:u8, length:u16-LE, stream_id:u24-LE, hop:u8.
-pub fn encodeHeader(out: []u8, header: LadonHeader) EncodeError!usize {
-    if (out.len < ladon_header_len) return error.BufferTooSmall;
+pub fn encodeHeader(out: []u8, header: SuimyakuHeader) EncodeError!usize {
+    if (out.len < suimyaku_header_len) return error.BufferTooSmall;
 
     var w = Cbb.init(out);
     _ = try w.writeU8(header.type);
@@ -288,11 +288,11 @@ pub fn encodeHeader(out: []u8, header: LadonHeader) EncodeError!usize {
     return w.bytesWritten();
 }
 
-/// Decode the native 8-byte LADON frame header from the front of `in`.
-pub fn decodeHeader(in: []const u8) DecodeError!LadonHeader {
-    if (in.len < ladon_header_len) return error.Truncated;
+/// Decode the native 8-byte SUIMYAKU frame header from the front of `in`.
+pub fn decodeHeader(in: []const u8) DecodeError!SuimyakuHeader {
+    if (in.len < suimyaku_header_len) return error.Truncated;
 
-    var r = Cbs.init(in[0..ladon_header_len]);
+    var r = Cbs.init(in[0..suimyaku_header_len]);
     return .{
         .type = try r.readU8(),
         .ctrl = try r.readU8(),
@@ -439,8 +439,8 @@ test "canonical equal is byte equality for canonical encodings" {
     try std.testing.expect(!canonicalEqual(a.written(), &.{ 0xac, 0x82, 0x00 }));
 }
 
-test "LADON header encode and decode" {
-    const header = LadonHeader{
+test "SUIMYAKU header encode and decode" {
+    const header = SuimyakuHeader{
         .type = 0x23,
         .ctrl = 0x45,
         .length = 0x1234,
@@ -448,8 +448,8 @@ test "LADON header encode and decode" {
         .hop = 0x07,
     };
 
-    var out: [ladon_header_len]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, ladon_header_len), try encodeHeader(&out, header));
+    var out: [suimyaku_header_len]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, suimyaku_header_len), try encodeHeader(&out, header));
     try std.testing.expectEqualSlices(u8, &.{ 0x23, 0x45, 0x34, 0x12, 0xde, 0xc0, 0x00, 0x07 }, &out);
 
     const decoded = try decodeHeader(&out);
@@ -460,8 +460,8 @@ test "LADON header encode and decode" {
     try std.testing.expectEqual(header.hop, decoded.hop);
 }
 
-test "LADON header codec rejects short buffers" {
-    var out: [ladon_header_len - 1]u8 = undefined;
+test "SUIMYAKU header codec rejects short buffers" {
+    var out: [suimyaku_header_len - 1]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, encodeHeader(&out, .{
         .type = 1,
         .ctrl = 2,

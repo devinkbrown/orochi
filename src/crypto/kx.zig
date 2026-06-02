@@ -1,9 +1,9 @@
-//! VEIL/TLS key exchange and key schedule.
+//! TSUMUGI/TLS key exchange and key schedule.
 //!
 //! Zig 0.16 std was checked at `/usr/lib/zig/std/crypto`: ML-KEM is present
 //! as `std.crypto.kem.ml_kem.MLKem768`, so this file implements the real
 //! X25519 || ML-KEM-768 hybrid path. The hybrid combiner used here is Mizuchi's
-//! VEIL v2 HMAC-based KDF: `HMAC(label, x25519_ss || mlkem_ss || transcript)`.
+//! TSUMUGI v2 HMAC-based KDF: `HMAC(label, x25519_ss || mlkem_ss || transcript)`.
 //! No ML-KEM code is hand-rolled.
 const std = @import("std");
 const hash = @import("hash.zig");
@@ -29,7 +29,7 @@ pub const Role = enum {
     responder,
 };
 
-/// X25519 key exchange wrapper with VEIL's low-order shared-secret rejection.
+/// X25519 key exchange wrapper with TSUMUGI's low-order shared-secret rejection.
 pub const X25519Kx = struct {
     pub const public_len = StdX25519.public_length;
     pub const secret_len = StdX25519.secret_length;
@@ -176,7 +176,7 @@ pub const HybridKx = struct {
         var pq_ss = SharedSecret.init(pq_raw);
         defer pq_ss.wipe();
 
-        return extractHybrid("mizuchi-veil-v2 hybrid-kx", &x_ss, &pq_ss, transcript);
+        return extractHybrid("mizuchi-tsumugi-v2 hybrid-kx", &x_ss, &pq_ss, transcript);
     }
 
     fn finishEncapsulation(
@@ -195,12 +195,12 @@ pub const HybridKx = struct {
                 .x25519_public_key = local_x25519.public_key,
                 .mlkem_ciphertext = pq.ciphertext,
             },
-            .shared_secret = extractHybrid("mizuchi-veil-v2 hybrid-kx", &x_ss, &pq_ss, transcript),
+            .shared_secret = extractHybrid("mizuchi-tsumugi-v2 hybrid-kx", &x_ss, &pq_ss, transcript),
         };
     }
 };
 
-/// VEIL/TLS root and directional chain keys derived from a shared secret.
+/// TSUMUGI/TLS root and directional chain keys derived from a shared secret.
 pub const KeySchedule = struct {
     root: RootKey,
     send_chain: ChainKey,
@@ -212,12 +212,12 @@ pub const KeySchedule = struct {
         self.recv_chain.wipe();
     }
 
-    pub fn deriveVeilV2(
+    pub fn deriveTsumugiV2(
         role: Role,
         shared_secret: *const SharedSecret,
         transcript: []const u8,
     ) !KeySchedule {
-        return derive("mizuchi-veil-v2", role, shared_secret, transcript);
+        return derive("mizuchi-tsumugi-v2", role, shared_secret, transcript);
     }
 
     pub fn derive(
@@ -348,7 +348,7 @@ test "HybridKx X25519 plus ML-KEM-768 agreement" {
     var initiator_x = try X25519Kx.generateDeterministic(hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"));
     defer initiator_x.wipe();
 
-    const transcript = "ladon-auth-v2 transcript bytes";
+    const transcript = "suimyaku-auth-v2 transcript bytes";
     var enc_seed: [HybridKx.encaps_seed_len]u8 = undefined;
     @memset(&enc_seed, 0x43);
 
@@ -374,9 +374,9 @@ test "key-schedule determinism" {
     var shared = SharedSecret.init(hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
     defer shared.wipe();
 
-    var a = try KeySchedule.deriveVeilV2(.initiator, &shared, "transcript");
+    var a = try KeySchedule.deriveTsumugiV2(.initiator, &shared, "transcript");
     defer a.wipe();
-    var b = try KeySchedule.deriveVeilV2(.initiator, &shared, "transcript");
+    var b = try KeySchedule.deriveTsumugiV2(.initiator, &shared, "transcript");
     defer b.wipe();
 
     try std.testing.expectEqualSlices(u8, &a.root.declassify(), &b.root.declassify());
@@ -388,13 +388,13 @@ test "key-schedule domain separation" {
     var shared = SharedSecret.init(hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
     defer shared.wipe();
 
-    var veil = try KeySchedule.derive("mizuchi-veil-v2", .initiator, &shared, "transcript");
-    defer veil.wipe();
+    var tsumugi = try KeySchedule.derive("mizuchi-tsumugi-v2", .initiator, &shared, "transcript");
+    defer tsumugi.wipe();
     var tls = try KeySchedule.derive("mizuchi-tls13-v1", .initiator, &shared, "transcript");
     defer tls.wipe();
 
-    try std.testing.expect(!std.mem.eql(u8, &veil.root.declassify(), &tls.root.declassify()));
-    try std.testing.expect(!std.mem.eql(u8, &veil.send_chain.declassify(), &tls.send_chain.declassify()));
+    try std.testing.expect(!std.mem.eql(u8, &tsumugi.root.declassify(), &tls.root.declassify()));
+    try std.testing.expect(!std.mem.eql(u8, &tsumugi.send_chain.declassify(), &tls.send_chain.declassify()));
 }
 
 test {
