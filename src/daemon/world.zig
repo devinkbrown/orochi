@@ -147,13 +147,14 @@ pub const World = struct {
     /// Join a channel. Returns true when membership was newly added.
     pub fn join(self: *World, name: []const u8, client: ClientId) WorldError!bool {
         const channel = try self.ensureChannel(name);
-        // The first member to join a freshly-created channel founds it and gets
-        // operator status (+o); later joiners start with no status modes.
+        // The first member to join a freshly-created channel is its FOUNDER
+        // (Mizuchi founder tier +Q, prefix ~ — above ophion/IRCX owner); later
+        // joiners start with no status modes.
         const founding = channel.members.count() == 0;
         const member = try channel.members.getOrPut(client);
         if (!member.found_existing) {
             member.value_ptr.* = if (founding)
-                MemberModes.fromModes(&.{.op})
+                MemberModes.fromModes(&.{.founder})
             else
                 MemberModes.empty();
         }
@@ -432,9 +433,10 @@ test "first joiner founds the channel as operator; later joiners have no status"
     _ = try world.join("#x", founder);
     _ = try world.join("#x", second);
 
-    try std.testing.expect(world.memberModes("#x", founder).?.contains(.op));
-    try std.testing.expect(!world.memberModes("#x", second).?.contains(.op));
-    try std.testing.expectEqual(@as(u8, '@'), world.memberModes("#x", founder).?.highestPrefix());
+    try std.testing.expect(world.memberModes("#x", founder).?.contains(.founder));
+    try std.testing.expect(world.memberModes("#x", founder).?.isOperator());
+    try std.testing.expect(!world.memberModes("#x", second).?.contains(.founder));
+    try std.testing.expectEqual(@as(u8, '~'), world.memberModes("#x", founder).?.highestPrefix());
     try std.testing.expectEqual(@as(u8, 0), world.memberModes("#x", second).?.highestPrefix());
 }
 

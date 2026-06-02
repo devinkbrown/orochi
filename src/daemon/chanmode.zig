@@ -210,17 +210,22 @@ pub const ChannelModes = struct {
     }
 };
 
-/// Stable member prefix mode identifiers. Matches ophion: op (@) and voice (+)
-/// only — there is NO halfop membership tier (charybdis `+h`/`%` is not used,
-/// and IRCX `+h` is the HIDDEN channel mode, unrelated to member status).
-pub const MemberMode = enum(u1) {
+/// Stable member prefix mode identifiers. Builds on ophion + IRCX draft and
+/// adds a Mizuchi-native FOUNDER tier above owner:
+///   founder +Q ('~') > owner +q ('.') > op +o ('@') > voice +v ('+')
+/// → ISUPPORT PREFIX=(Qqov)~.@+. The channel creator is the founder (a single
+/// top authority that ops/owners cannot strip). No halfop tier (IRCX `+h` is the
+/// HIDDEN channel mode); IRCX ADMIN aliases OWNER (+q), not a separate wire mode.
+pub const MemberMode = enum(u3) {
     voice,
     op,
+    owner,
+    founder,
 };
 
 /// Inline prefix list returned by MemberModes.allPrefixes().
 pub const PrefixList = struct {
-    bytes: [2]u8 = [_]u8{0} ** 2,
+    bytes: [4]u8 = [_]u8{0} ** 4,
     len: u8 = 0,
 
     pub fn asSlice(self: *const PrefixList) []const u8 {
@@ -255,6 +260,8 @@ pub const MemberModes = struct {
     }
 
     pub fn highestPrefix(self: MemberModes) u8 {
+        if (self.contains(.founder)) return '~';
+        if (self.contains(.owner)) return '.';
         if (self.contains(.op)) return '@';
         if (self.contains(.voice)) return '+';
         return 0;
@@ -262,9 +269,25 @@ pub const MemberModes = struct {
 
     pub fn allPrefixes(self: MemberModes) PrefixList {
         var out = PrefixList{};
+        if (self.contains(.founder)) appendPrefix(&out, '~');
+        if (self.contains(.owner)) appendPrefix(&out, '.');
         if (self.contains(.op)) appendPrefix(&out, '@');
         if (self.contains(.voice)) appendPrefix(&out, '+');
         return out;
+    }
+
+    /// ISUPPORT PREFIX token: (Qqov)~.@+ — Mizuchi founder (~) above the
+    /// ophion/IRCX owner (.) / op (@) / voice (+) tiers.
+    pub const isupport_prefix = "(Qqov)~.@+";
+
+    /// Operator authority: op or any higher tier (owner/founder).
+    pub fn isOperator(self: MemberModes) bool {
+        return self.contains(.op) or self.contains(.owner) or self.contains(.founder);
+    }
+
+    /// May speak in a +m moderated channel: voice or any operator tier.
+    pub fn canSpeakModerated(self: MemberModes) bool {
+        return self.contains(.voice) or self.isOperator();
     }
 };
 
@@ -656,9 +679,17 @@ test "member prefix ranking and multi-prefix list" {
     try std.testing.expectEqual(@as(u8, '@'), member.highestPrefix());
     try std.testing.expectEqualStrings("@+", member.allPrefixes().asSlice());
 
+    member.add(.owner);
+    try std.testing.expectEqual(@as(u8, '.'), member.highestPrefix());
+    try std.testing.expectEqualStrings(".@+", member.allPrefixes().asSlice());
+
+    member.add(.founder);
+    try std.testing.expectEqual(@as(u8, '~'), member.highestPrefix());
+    try std.testing.expectEqualStrings("~.@+", member.allPrefixes().asSlice());
+
     member.remove(.op);
-    try std.testing.expectEqual(@as(u8, '+'), member.highestPrefix());
-    try std.testing.expectEqualStrings("+", member.allPrefixes().asSlice());
+    try std.testing.expectEqual(@as(u8, '~'), member.highestPrefix());
+    try std.testing.expectEqualStrings("~.+", member.allPrefixes().asSlice());
 }
 
 test "invalid input rejected before channel mutation" {

@@ -312,21 +312,21 @@ pub const ChannelModes = struct {
     }
 };
 
-// Wire channel-member status. Matches ophion: voice (+) and op (@) only — no
-// halfop tier (charybdis `%`/+h is unused; IRCX `+h` is the HIDDEN channel mode).
-// admin/owner are IRCX-style services tiers kept for future use, not wire modes.
+// Wire channel-member status, highest first: founder (+Q ~, Mizuchi) > owner
+// (+q ., ophion/IRCX) > op (+o @) > voice (+v +). No halfop tier (IRCX `+h` is
+// the HIDDEN channel mode). PREFIX=(Qqov)~.@+.
 pub const MemberPrefix = packed struct {
     voice: bool = false,
     op: bool = false,
-    admin: bool = false,
     owner: bool = false,
+    founder: bool = false,
     reserved: u4 = 0,
 
     pub const none: MemberPrefix = .{};
 
     pub fn rank(self: MemberPrefix) u8 {
-        if (self.owner) return 5;
-        if (self.admin) return 4;
+        if (self.founder) return 5;
+        if (self.owner) return 4;
         if (self.op) return 3;
         if (self.voice) return 1;
         return 0;

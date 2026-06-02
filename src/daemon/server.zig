@@ -788,7 +788,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
             return;
         };
-        if (!setter.contains(.op)) {
+        if (!setter.isOperator()) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
@@ -808,15 +808,25 @@ pub const LinuxServer = struct {
             switch (ch) {
                 '+' => adding = true,
                 '-' => adding = false,
-                'o', 'v' => {
+                'Q', 'q', 'o', 'v' => {
                     if (arg_index >= parsed.param_count) continue;
                     const target_nick = parsed.paramSlice()[arg_index];
                     arg_index += 1;
+                    // Granting founder/owner requires the setter to hold at least
+                    // that tier (only a founder may make a founder, etc.).
+                    if ((ch == 'Q' and !setter.contains(.founder)) or
+                        (ch == 'q' and !(setter.contains(.founder) or setter.contains(.owner))))
+                    {
+                        try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+                        continue;
+                    }
                     const target = self.world.findNick(target_nick) orelse {
                         try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
                         continue;
                     };
                     const mode: world_model.MemberMode = switch (ch) {
+                        'Q' => .founder,
+                        'q' => .owner,
                         'o' => .op,
                         'v' => .voice,
                         else => unreachable,
@@ -909,7 +919,7 @@ pub const LinuxServer = struct {
             // +m moderated: only voiced (+v) or higher (+h/+o) may speak.
             if (self.world.channelHasFlag(target, .moderated)) {
                 const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
-                if (!(mm.contains(.voice) or mm.contains(.op))) {
+                if (!mm.canSpeakModerated()) {
                     try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
                     return;
                 }
@@ -948,8 +958,8 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
             return;
         };
-        // +t: only channel operators may change the topic.
-        if (self.world.channelHasFlag(channel, .topic_ops) and !topic_setter.contains(.op)) {
+        // +t: only channel operators (op or higher) may change the topic.
+        if (self.world.channelHasFlag(channel, .topic_ops) and !topic_setter.isOperator()) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
