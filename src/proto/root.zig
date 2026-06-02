@@ -21,6 +21,7 @@ pub const msgtags = @import("msgtags.zig");
 pub const numeric = @import("numeric.zig");
 pub const sasl = @import("sasl.zig");
 pub const sts = @import("sts.zig");
+pub const suimyaku_peer = @import("suimyaku_peer.zig");
 pub const tsumugi = @import("tsumugi.zig");
 pub const websocket = @import("websocket.zig");
 pub const who = @import("who.zig");
@@ -52,6 +53,7 @@ test {
     _ = numeric;
     _ = sasl;
     _ = sts;
+    _ = suimyaku_peer;
     _ = tsumugi;
     _ = websocket;
     _ = who;
