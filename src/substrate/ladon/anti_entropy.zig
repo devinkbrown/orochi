@@ -163,10 +163,12 @@ pub const Planner = struct {
             .estimated_differing_keys = estimated_diff,
         });
 
-        const pull_keys = try cloneKeyList(self.allocator, pull.keys);
+        const pull_keys = pull.keys;
+        pull.keys = &.{};
         errdefer freeKeyList(self.allocator, pull_keys);
 
-        const push_keys = try cloneKeyList(self.allocator, push.keys);
+        const push_keys = push.keys;
+        push.keys = &.{};
         errdefer freeKeyList(self.allocator, push_keys);
 
         return .{
@@ -252,21 +254,6 @@ pub fn causalStabilityWatermark(peers: []const PeerFrontier) clock.VersionVector
     return watermark;
 }
 
-fn cloneKeyList(allocator: Allocator, keys: []const []u8) Allocator.Error![][]u8 {
-    var out: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (out.items) |key| allocator.free(key);
-        out.deinit(allocator);
-    }
-
-    for (keys) |key| {
-        const copy = try allocator.dupe(u8, key);
-        errdefer allocator.free(copy);
-        try out.append(allocator, copy);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
 fn freeKeyList(allocator: Allocator, keys: [][]u8) void {
     for (keys) |key| allocator.free(key);
     allocator.free(keys);
@@ -335,6 +322,24 @@ test "reciprocal planner pulls and pushes exactly the changed keys" {
         "chan:#ops:ban:2",
         "chan:#ops:mode",
     });
+}
+
+test "planner returns asymmetric pull and push key ownership without leaks" {
+    const allocator = std.testing.allocator;
+    var local = Lane.init(allocator, .memberships);
+    defer local.deinit();
+    var remote = Lane.init(allocator, .memberships);
+    defer remote.deinit();
+
+    try local.putHash("member:#ops:uid002", valueHash("local-only"));
+    try remote.putHash("member:#ops:uid003", valueHash("remote-only"));
+
+    const planner = Planner.init(allocator, .{});
+    var plan = try planner.plan(&local, &remote);
+    defer plan.deinit();
+
+    try expectKeys(plan.pull_keys, &.{"member:#ops:uid003"});
+    try expectKeys(plan.push_keys, &.{"member:#ops:uid002"});
 }
 
 test "identical lanes produce an empty plan" {

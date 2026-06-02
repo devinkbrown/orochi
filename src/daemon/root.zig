@@ -6,11 +6,17 @@ const substrate = @import("../substrate/root.zig");
 pub const registry = @import("registry.zig");
 pub const client = @import("client.zig");
 pub const dispatch = @import("dispatch.zig");
+pub const commands = @import("commands.zig");
+pub const store = @import("store.zig");
+pub const server = @import("server.zig");
 
 test {
     _ = registry;
     _ = client;
     _ = dispatch;
+    _ = commands;
+    _ = store;
+    _ = server;
 }
 
 pub const Daemon = struct {

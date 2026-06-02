@@ -3,8 +3,8 @@
 //! Zig 0.16 std was checked at `/usr/lib/zig/std/crypto`: ML-KEM is present
 //! as `std.crypto.kem.ml_kem.MLKem768`, so this file implements the real
 //! X25519 || ML-KEM-768 hybrid path. The hybrid combiner used here is Mizuchi's
-//! VEIL v2 construction: `HKDF-Extract(label, x25519_ss || mlkem_ss ||
-//! transcript)`. No ML-KEM code is hand-rolled.
+//! VEIL v2 HMAC-based KDF: `HMAC(label, x25519_ss || mlkem_ss || transcript)`.
+//! No ML-KEM code is hand-rolled.
 const std = @import("std");
 const hash = @import("hash.zig");
 const Secret = @import("secret.zig").Secret;
@@ -129,6 +129,10 @@ pub const HybridKx = struct {
     }
 
     pub fn generateDeterministic(seed: [seed_len]u8) !KeyPair {
+        comptime {
+            if (seed_len != X25519Kx.seed_len + MlKem.seed_length)
+                @compileError("HybridKx deterministic seed layout must be X25519 seed || ML-KEM seed");
+        }
         return .{
             .x25519 = try X25519Kx.generateDeterministic(seed[0..X25519Kx.seed_len].*),
             .mlkem = try MlKem.KeyPair.generateDeterministic(seed[X25519Kx.seed_len..].*),

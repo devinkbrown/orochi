@@ -7,6 +7,7 @@
 const std = @import("std");
 
 pub const DispatchError = error{
+    ControlByte,
     OutputTooSmall,
     TextTooLong,
 };
@@ -30,7 +31,7 @@ pub const LineView = struct {
 };
 
 /// Minimal parser used by this file's isolation tests.
-pub fn parseLine(input: []const u8) error{ EmptyLine, MissingCommand, TooManyParams }!LineView {
+pub fn parseLine(input: []const u8) error{ EmptyLine, EmbeddedNul, EmbeddedLineBreak, MissingCommand, TooManyParams }!LineView {
     var body = input;
     if (body.len >= 2 and body[body.len - 2] == '\r' and body[body.len - 1] == '\n') {
         body = body[0 .. body.len - 2];
@@ -38,6 +39,13 @@ pub fn parseLine(input: []const u8) error{ EmptyLine, MissingCommand, TooManyPar
         body = body[0 .. body.len - 1];
     }
     if (body.len == 0) return error.EmptyLine;
+    for (body) |ch| {
+        switch (ch) {
+            0 => return error.EmbeddedNul,
+            '\r', '\n' => return error.EmbeddedLineBreak,
+            else => {},
+        }
+    }
 
     var cursor = skipSpaces(body, 0);
     if (cursor >= body.len) return error.MissingCommand;
@@ -74,6 +82,7 @@ const Numeric = enum(u16) {
     RPL_ISUPPORT = 5,
     ERR_INVALIDCAPCMD = 410,
     ERR_UNKNOWNCOMMAND = 421,
+    ERR_ERRONEUSNICKNAME = 432,
     ERR_NOTREGISTERED = 451,
     ERR_NEEDMOREPARAMS = 461,
     ERR_ALREADYREGISTRED = 462,
@@ -99,6 +108,7 @@ fn FixedString(comptime capacity: usize) type {
         }
 
         fn set(self: *@This(), value: []const u8) DispatchError!void {
+            try requireNoControlBytes(value);
             if (value.len > capacity) return error.TextTooLong;
             @memcpy(self.bytes[0..value.len], value);
             self.len = value.len;
@@ -342,8 +352,8 @@ fn findSpace(bytes: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Registration flags that need to be tracked independently before `Client`
-/// grows its final component layout.
+/// Authoritative registration flags for local dispatch; `Client.registration`
+/// is a compatibility mirror kept in sync for component-facing state.
 pub const RegistrationState = struct {
     pass_seen: bool = false,
     nick_seen: bool = false,
@@ -397,6 +407,11 @@ pub const ReplyCtx = struct {
         params: []const []const u8,
         trailing: ?[]const u8,
     ) DispatchError!void {
+        if (prefix) |value| try requireNoControlBytes(value);
+        try requireNoControlBytes(command);
+        for (params) |param| try requireNoControlBytes(param);
+        if (trailing) |value| try requireNoControlBytes(value);
+
         if (prefix) |value| {
             try self.appendByte(':');
             try self.append(value);
@@ -435,6 +450,10 @@ pub const ReplyCtx = struct {
         params: []const []const u8,
         trailing: []const u8,
     ) DispatchError!void {
+        try requireNoControlBytes(target);
+        for (params) |param| try requireNoControlBytes(param);
+        try requireNoControlBytes(trailing);
+
         var code_buf: [3]u8 = undefined;
         try self.appendByte(':');
         try self.append(self.server_name);
@@ -552,7 +571,13 @@ fn handlePass(ctx: DispatchCtx) DispatchError!void {
 }
 
 fn handleNick(ctx: DispatchCtx) DispatchError!void {
-    try ctx.session.client.identity.nick.set(ctx.params()[0]);
+    const nick = ctx.params()[0];
+    if (hasControlByte(nick)) {
+        try ctx.replies.numeric(ctx.session, .ERR_ERRONEUSNICKNAME, &.{"*"}, "Erroneous nickname");
+        return;
+    }
+
+    try ctx.session.client.identity.nick.set(nick);
     ctx.session.registration.nick_seen = true;
     if (!ctx.session.registration.user_seen) {
         ctx.session.client.registration.prereg = .nick_seen;
@@ -566,6 +591,8 @@ fn handleUser(ctx: DispatchCtx) DispatchError!void {
     }
 
     const params = ctx.params();
+    try requireNoControlBytes(params[0]);
+    try requireNoControlBytes(params[3]);
     try ctx.session.client.identity.uid.set(params[0]);
     try ctx.session.client.identity.realname.set(params[3]);
     ctx.session.registration.user_seen = true;
@@ -654,6 +681,7 @@ fn emitUnknownCommand(
     replies: *ReplyCtx,
     command: []const u8,
 ) DispatchError!void {
+    try requireNoControlBytes(command);
     try replies.numeric(session, .ERR_UNKNOWNCOMMAND, &.{command}, "Unknown command");
 }
 
@@ -709,8 +737,19 @@ fn syncCapState(session: *ClientSession) void {
 }
 
 fn dispatchText(session: *ClientSession, replies: *ReplyCtx, text: []const u8) DispatchError!void {
-    const line = parseLine(text) catch unreachable;
+    const line = parseLine(text) catch return;
     try dispatchLine(session, replies, &line);
+}
+
+fn hasControlByte(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return true;
+    }
+    return false;
+}
+
+fn requireNoControlBytes(bytes: []const u8) DispatchError!void {
+    if (hasControlByte(bytes)) return error.ControlByte;
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
@@ -790,4 +829,24 @@ test "unknown command emits ERR_UNKNOWNCOMMAND" {
 
     try dispatchText(&session, &replies, "WAT");
     try expectContains(replies.written(), " 421 * WAT :Unknown command\r\n");
+}
+
+test "malformed text line is dropped without replies" {
+    var session = ClientSession.init();
+    var storage: [512]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "PING a\nb");
+    try std.testing.expectEqual(@as(usize, 0), replies.written().len);
+}
+
+test "NICK containing a control byte is rejected" {
+    var session = ClientSession.init();
+    var storage: [512]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "NICK bad\x01nick");
+    try expectContains(replies.written(), " 432 * * :Erroneous nickname\r\n");
+    try std.testing.expect(!session.registration.nick_seen);
+    try std.testing.expectEqual(@as(usize, 0), session.client.identity.nick.slice().len);
 }

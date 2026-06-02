@@ -6,6 +6,7 @@
 const std = @import("std");
 
 const frame = @import("frame.zig");
+const Secret = @import("../crypto/secret.zig").Secret;
 
 pub const max_skip: usize = 256;
 pub const rekey_frame_interval: u32 = 50_000;
@@ -16,25 +17,6 @@ const nonce_base_len = 8;
 const tag_len = 16;
 
 const ChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-
-fn Secret(comptime T: type) type {
-    return struct {
-        const Self = @This();
-        value: T,
-
-        fn init(value: T) Self {
-            return .{ .value = value };
-        }
-
-        fn declassify(self: *const Self) T {
-            return self.value;
-        }
-
-        fn wipe(self: *Self) void {
-            secureZero(std.mem.asBytes(&self.value));
-        }
-    };
-}
 
 pub const RootKey = Secret([key_len]u8);
 pub const ChainKey = Secret([key_len]u8);
@@ -188,8 +170,10 @@ pub const State = struct {
         generation: u32,
         current_epoch_seconds: u64,
     ) Error!void {
+        var fresh = try State.init(root_secret, role, nonce_base, generation, current_epoch_seconds);
+        errdefer fresh.deinit();
         self.deinit();
-        self.* = try State.init(root_secret, role, nonce_base, generation, current_epoch_seconds);
+        self.* = fresh;
     }
 
     /// Encrypt one complete inner LADON wire frame into `out`.
@@ -517,6 +501,7 @@ const SkippedKeys = struct {
         var i: usize = 0;
         while (i < staged.len) : (i += 1) {
             self.put(staged.entries[i].generation, staged.entries[i].counter, staged.entries[i].key);
+            staged.entries[i].key.wipe();
             staged.entries[i].present = false;
         }
     }
@@ -703,6 +688,23 @@ test "counter exhaustion forces rekey signal" {
     try testing.expectError(error.CounterExhausted, pair.initiator.seal(.{ .outer_header = &outer }, "x", &ct));
 }
 
+test "max counter frame replay is rejected after successful open" {
+    var pair = try makePair();
+    defer pair.initiator.deinit();
+    defer pair.responder.deinit();
+
+    const outer = testOuterHeader();
+    var ct: [1]u8 = undefined;
+    var pt: [1]u8 = undefined;
+    pair.initiator.send_counter = std.math.maxInt(u32);
+    pair.responder.recv_counter = std.math.maxInt(u32);
+
+    const sealed = try pair.initiator.seal(.{ .outer_header = &outer }, "x", &ct);
+    const opened = try pair.responder.open(.{ .outer_header = &outer }, toEncrypted(sealed), &pt);
+    try testing.expectEqualSlices(u8, "x", opened.plaintext);
+    try testing.expectError(error.Replay, pair.responder.open(.{ .outer_header = &outer }, toEncrypted(sealed), &pt));
+}
+
 test "forward gap larger than VEIL_MAX_SKIP is rejected without commit" {
     const allocator = testing.allocator;
     var pair = try makePair();
@@ -770,6 +772,15 @@ test "rekey schedule hooks signal frame and epoch rotation" {
         .current_epoch_seconds = 10 + rekey_epoch_seconds,
     }, "x", &ct);
     try testing.expect(by_epoch.rekey.epoch);
+}
+
+test "VEIL key fields use canonical inline-array Secret" {
+    const CanonicalSecret = @import("../crypto/secret.zig").Secret;
+    comptime {
+        if (RootKey != CanonicalSecret([key_len]u8)) @compileError("RootKey must use canonical Secret([32]u8)");
+        if (ChainKey != CanonicalSecret([key_len]u8)) @compileError("ChainKey must use canonical Secret([32]u8)");
+        if (MessageKey != CanonicalSecret([key_len]u8)) @compileError("MessageKey must use canonical Secret([32]u8)");
+    }
 }
 
 fn toEncrypted(sealed: SealedFrame) EncryptedFrame {
