@@ -22,7 +22,14 @@ pub fn Secret(comptime T: type) type {
         }
 
         /// Best-effort secure zeroization the optimizer must not elide.
+        ///
+        /// Rejected at comptime for pointer/slice `T`: `asBytes` would only zero
+        /// the slice header (ptr+len), never the pointed-to key bytes — a silent
+        /// no-op footgun. Wrap an inline array (`Secret([N]u8)`) or wipe the
+        /// backing buffer explicitly.
         pub fn wipe(self: *Self) void {
+            comptime if (@typeInfo(T) == .pointer)
+                @compileError("Secret(" ++ @typeName(T) ++ ").wipe cannot zero pointed-to bytes; wrap an array like Secret([N]u8)");
             const bytes = std.mem.asBytes(&self.value);
             for (bytes) |*b| {
                 const vp: *volatile u8 = @ptrCast(b);
