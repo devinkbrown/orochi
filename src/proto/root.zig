@@ -7,9 +7,12 @@ pub const cap = @import("cap.zig");
 pub const coilpack = @import("coilpack.zig");
 pub const frame = @import("frame.zig");
 pub const irc_line = @import("irc_line.zig");
+pub const ircx = @import("ircx.zig");
+pub const meshpass = @import("meshpass.zig");
 pub const numeric = @import("numeric.zig");
 pub const sasl = @import("sasl.zig");
 pub const tsumugi = @import("tsumugi.zig");
+pub const websocket = @import("websocket.zig");
 // gen:mods:end
 
 /// Native server-to-server mesh protocol (replaces TS6 entirely).
@@ -24,8 +27,11 @@ test {
     _ = coilpack;
     _ = frame;
     _ = irc_line;
+    _ = ircx;
+    _ = meshpass;
     _ = numeric;
     _ = sasl;
     _ = tsumugi;
+    _ = websocket;
     // gen:tests:end
 }

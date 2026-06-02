@@ -5,6 +5,9 @@ pub const aead = @import("aead.zig");
 pub const hash = @import("hash.zig");
 pub const kx = @import("kx.zig");
 pub const secret = @import("secret.zig");
+pub const sign = @import("sign.zig");
+pub const tls = @import("tls.zig");
+pub const x509 = @import("x509.zig");
 // gen:mods:end
 
 pub const Secret = secret.Secret;
@@ -15,5 +18,8 @@ test {
     _ = hash;
     _ = kx;
     _ = secret;
+    _ = sign;
+    _ = tls;
+    _ = x509;
     // gen:tests:end
 }
