@@ -38,7 +38,7 @@ pub const MessageTarget = union(enum) {
 
 const chanmode = @import("chanmode.zig");
 
-/// Per-member channel status modes (op/halfop/voice) keyed by client.
+/// Per-member channel status modes (op @, voice + — no halfop) keyed by client.
 const MemberMap = std.AutoHashMap(ClientId, chanmode.MemberModes);
 pub const MemberIterator = MemberMap.KeyIterator;
 pub const MemberMode = chanmode.MemberMode;

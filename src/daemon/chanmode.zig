@@ -210,16 +210,17 @@ pub const ChannelModes = struct {
     }
 };
 
-/// Stable member prefix mode identifiers.
-pub const MemberMode = enum(u2) {
+/// Stable member prefix mode identifiers. Matches ophion: op (@) and voice (+)
+/// only — there is NO halfop membership tier (charybdis `+h`/`%` is not used,
+/// and IRCX `+h` is the HIDDEN channel mode, unrelated to member status).
+pub const MemberMode = enum(u1) {
     voice,
-    halfop,
     op,
 };
 
 /// Inline prefix list returned by MemberModes.allPrefixes().
 pub const PrefixList = struct {
-    bytes: [3]u8 = [_]u8{0} ** 3,
+    bytes: [2]u8 = [_]u8{0} ** 2,
     len: u8 = 0,
 
     pub fn asSlice(self: *const PrefixList) []const u8 {
@@ -255,7 +256,6 @@ pub const MemberModes = struct {
 
     pub fn highestPrefix(self: MemberModes) u8 {
         if (self.contains(.op)) return '@';
-        if (self.contains(.halfop)) return '%';
         if (self.contains(.voice)) return '+';
         return 0;
     }
@@ -263,7 +263,6 @@ pub const MemberModes = struct {
     pub fn allPrefixes(self: MemberModes) PrefixList {
         var out = PrefixList{};
         if (self.contains(.op)) appendPrefix(&out, '@');
-        if (self.contains(.halfop)) appendPrefix(&out, '%');
         if (self.contains(.voice)) appendPrefix(&out, '+');
         return out;
     }
@@ -654,13 +653,12 @@ test "member prefix ranking and multi-prefix list" {
     try std.testing.expectEqualStrings("+", member.allPrefixes().asSlice());
 
     member.add(.op);
-    member.add(.halfop);
     try std.testing.expectEqual(@as(u8, '@'), member.highestPrefix());
-    try std.testing.expectEqualStrings("@%+", member.allPrefixes().asSlice());
+    try std.testing.expectEqualStrings("@+", member.allPrefixes().asSlice());
 
     member.remove(.op);
-    try std.testing.expectEqual(@as(u8, '%'), member.highestPrefix());
-    try std.testing.expectEqualStrings("%+", member.allPrefixes().asSlice());
+    try std.testing.expectEqual(@as(u8, '+'), member.highestPrefix());
+    try std.testing.expectEqualStrings("+", member.allPrefixes().asSlice());
 }
 
 test "invalid input rejected before channel mutation" {

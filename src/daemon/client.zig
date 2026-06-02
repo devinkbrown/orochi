@@ -312,13 +312,15 @@ pub const ChannelModes = struct {
     }
 };
 
+// Wire channel-member status. Matches ophion: voice (+) and op (@) only — no
+// halfop tier (charybdis `%`/+h is unused; IRCX `+h` is the HIDDEN channel mode).
+// admin/owner are IRCX-style services tiers kept for future use, not wire modes.
 pub const MemberPrefix = packed struct {
     voice: bool = false,
-    halfop: bool = false,
     op: bool = false,
     admin: bool = false,
     owner: bool = false,
-    reserved: u3 = 0,
+    reserved: u4 = 0,
 
     pub const none: MemberPrefix = .{};
 
@@ -326,7 +328,6 @@ pub const MemberPrefix = packed struct {
         if (self.owner) return 5;
         if (self.admin) return 4;
         if (self.op) return 3;
-        if (self.halfop) return 2;
         if (self.voice) return 1;
         return 0;
     }

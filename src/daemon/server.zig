@@ -808,7 +808,7 @@ pub const LinuxServer = struct {
             switch (ch) {
                 '+' => adding = true,
                 '-' => adding = false,
-                'o', 'v', 'h' => {
+                'o', 'v' => {
                     if (arg_index >= parsed.param_count) continue;
                     const target_nick = parsed.paramSlice()[arg_index];
                     arg_index += 1;
@@ -819,7 +819,6 @@ pub const LinuxServer = struct {
                     const mode: world_model.MemberMode = switch (ch) {
                         'o' => .op,
                         'v' => .voice,
-                        'h' => .halfop,
                         else => unreachable,
                     };
                     const changed = self.world.setMemberMode(channel, target, mode, adding) catch {
@@ -910,7 +909,7 @@ pub const LinuxServer = struct {
             // +m moderated: only voiced (+v) or higher (+h/+o) may speak.
             if (self.world.channelHasFlag(target, .moderated)) {
                 const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
-                if (!(mm.contains(.voice) or mm.contains(.halfop) or mm.contains(.op))) {
+                if (!(mm.contains(.voice) or mm.contains(.op))) {
                     try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
                     return;
                 }
