@@ -4,6 +4,7 @@
 pub const aead = @import("aead.zig");
 pub const hash = @import("hash.zig");
 pub const kx = @import("kx.zig");
+pub const random = @import("random.zig");
 pub const secret = @import("secret.zig");
 pub const sign = @import("sign.zig");
 pub const tls = @import("tls.zig");
@@ -17,6 +18,7 @@ test {
     _ = aead;
     _ = hash;
     _ = kx;
+    _ = random;
     _ = secret;
     _ = sign;
     _ = tls;

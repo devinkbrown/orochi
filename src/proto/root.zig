@@ -19,6 +19,7 @@ pub const ircx = @import("ircx.zig");
 pub const isupport = @import("isupport.zig");
 pub const list = @import("list.zig");
 pub const meshpass = @import("meshpass.zig");
+pub const metadata = @import("metadata.zig");
 pub const monitor = @import("monitor.zig");
 pub const msgedit = @import("msgedit.zig");
 pub const msgtags = @import("msgtags.zig");
@@ -30,6 +31,7 @@ pub const standard_replies = @import("standard_replies.zig");
 pub const sts = @import("sts.zig");
 pub const suimyaku_peer = @import("suimyaku_peer.zig");
 pub const tsumugi = @import("tsumugi.zig");
+pub const usermode = @import("usermode.zig");
 pub const websocket = @import("websocket.zig");
 pub const who = @import("who.zig");
 // gen:mods:end
@@ -58,6 +60,7 @@ test {
     _ = isupport;
     _ = list;
     _ = meshpass;
+    _ = metadata;
     _ = monitor;
     _ = msgedit;
     _ = msgtags;
@@ -69,6 +72,7 @@ test {
     _ = sts;
     _ = suimyaku_peer;
     _ = tsumugi;
+    _ = usermode;
     _ = websocket;
     _ = who;
     // gen:tests:end
