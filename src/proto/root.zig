@@ -5,6 +5,8 @@
 pub const irc_line = @import("irc_line.zig");
 pub const coilpack = @import("coilpack.zig");
 pub const numeric = @import("numeric.zig");
+pub const cap = @import("cap.zig");
+pub const frame = @import("frame.zig");
 
 /// Native server-to-server mesh protocol (replaces TS6 entirely).
 pub const s2s_protocol = "LADON";
@@ -16,4 +18,6 @@ test {
     _ = irc_line;
     _ = coilpack;
     _ = numeric;
+    _ = cap;
+    _ = frame;
 }

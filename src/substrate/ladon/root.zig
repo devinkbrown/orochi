@@ -3,9 +3,11 @@
 pub const clock = @import("clock.zig");
 pub const crdt = @import("crdt.zig");
 pub const merkle = @import("merkle.zig");
+pub const state = @import("state.zig");
 
 test {
     _ = clock;
     _ = crdt;
     _ = merkle;
+    _ = state;
 }

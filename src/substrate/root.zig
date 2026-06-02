@@ -7,6 +7,7 @@ pub const io = @import("io/root.zig");
 pub const sketch = @import("sketch.zig");
 pub const queue = @import("queue.zig");
 pub const swim = @import("swim.zig");
+pub const sim = @import("sim.zig");
 
 pub const Reactor = reactor.Reactor;
 pub const SystemReactor = reactor.SystemReactor;
@@ -19,4 +20,5 @@ test {
     _ = sketch;
     _ = queue;
     _ = swim;
+    _ = sim;
 }

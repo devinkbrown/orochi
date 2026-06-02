@@ -302,9 +302,17 @@ pub fn LwwRegister(comptime T: type) type {
         }
 
         fn wins(candidate: Self, current: Self) bool {
-            return candidate.timestamp > current.timestamp or
-                (candidate.timestamp == current.timestamp and
-                candidate.replica_id > current.replica_id);
+            if (candidate.timestamp != current.timestamp)
+                return candidate.timestamp > current.timestamp;
+            if (candidate.replica_id != current.replica_id)
+                return candidate.replica_id > current.replica_id;
+            // Final deterministic tiebreak on value bytes: concurrent writes that
+            // collide on (timestamp, replica_id) but carry different values must
+            // still converge to the SAME winner on every replica, or the register
+            // diverges (CRDT convergence-law violation found in review).
+            const cv = candidate.value orelse return false;
+            const uv = current.value orelse return true;
+            return std.mem.order(u8, std.mem.asBytes(&cv), std.mem.asBytes(&uv)) == .gt;
         }
     };
 }

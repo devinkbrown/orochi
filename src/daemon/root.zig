@@ -3,6 +3,14 @@
 const std = @import("std");
 const substrate = @import("../substrate/root.zig");
 
+pub const registry = @import("registry.zig");
+pub const client = @import("client.zig");
+
+test {
+    _ = registry;
+    _ = client;
+}
+
 pub const Daemon = struct {
     reactor: substrate.Reactor,
 
