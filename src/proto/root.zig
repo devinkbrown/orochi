@@ -31,6 +31,7 @@ pub const ircx = @import("ircx.zig");
 pub const ircx_props = @import("ircx_props.zig");
 pub const isupport = @import("isupport.zig");
 pub const knock = @import("knock.zig");
+pub const links_map = @import("links_map.zig");
 pub const list = @import("list.zig");
 pub const meshpass = @import("meshpass.zig");
 pub const metadata = @import("metadata.zig");
@@ -90,6 +91,7 @@ test {
     _ = ircx_props;
     _ = isupport;
     _ = knock;
+    _ = links_map;
     _ = list;
     _ = meshpass;
     _ = metadata;

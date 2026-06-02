@@ -12,6 +12,7 @@ pub const secret = @import("secret.zig");
 pub const sign_kat = @import("sign_kat.zig");
 pub const sign = @import("sign.zig");
 pub const tls = @import("tls.zig");
+pub const x509_props = @import("x509_props.zig");
 pub const x509 = @import("x509.zig");
 // gen:mods:end
 
@@ -30,6 +31,7 @@ test {
     _ = sign_kat;
     _ = sign;
     _ = tls;
+    _ = x509_props;
     _ = x509;
     // gen:tests:end
 }
