@@ -1,0 +1,28 @@
+//! mizuchi-daemon — core, SerpentRegistry (comptime modules), CapProof
+//! permission lattice, services, MizuStore, media. Skeleton; see planning/03.
+const std = @import("std");
+const substrate = @import("../substrate/root.zig");
+
+pub const Daemon = struct {
+    reactor: substrate.Reactor,
+
+    pub fn init(reactor: substrate.Reactor) Daemon {
+        return .{ .reactor = reactor };
+    }
+
+    /// M0 placeholder. M0 exit criterion: accept a TCP client and answer PING.
+    /// The Ringlane listener + IRC line parser land in M1/M2; today this proves
+    /// the boot path and the DST clock seam are wired end-to-end.
+    pub fn boot(self: *Daemon) void {
+        std.debug.print(
+            "mizuchi: boot ok (monotonic clock = {d} ms) — TCP listener: TODO (M1)\n",
+            .{self.reactor.nowMillis()},
+        );
+    }
+};
+
+test "daemon boots against the deterministic reactor" {
+    var sim = substrate.SimReactor.init(42);
+    var d = Daemon.init(sim.reactor());
+    try std.testing.expectEqual(@as(i64, 42), d.reactor.nowMillis());
+}

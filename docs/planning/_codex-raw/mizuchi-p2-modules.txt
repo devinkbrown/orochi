@@ -1,0 +1,38 @@
+You are a world-class cryptographic-engineering architect with 100% design freedom. Design — from
+scratch, in Zig — the CRYPTO + TLS + VEIL-TRANSPORT substrate for "Mizuchi", a clean-slate Zig
+successor to the ophion IRC daemon. This REPLACES the C library "opssl" entirely; NO C interop.
+Read the shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+
+MANDATE: invent. Use comptime to make crypto safer and faster than a C library can. The existing
+opssl is REFERENCE ONLY — study its primitives and design decisions, then design a better,
+Zig-native stack.
+
+Study (cite file:line):
+- opssl public headers: /home/kain/opssl/include/opssl/ (crypto.h, conn.h, ctx.h, types.h, cbs.h,
+  cert.h, opssl.h, err.h)
+- opssl crypto src for design decisions: /home/kain/opssl/src/crypto/ (skim representative files:
+  the X25519/Ed25519, AEAD, bignum/ECC, ML-KEM, HKDF/HMAC implementations)
+- opssl TLS src: /home/kain/opssl/src/tls/ (record, handshake, tls13, keysched, ktls)
+- VEIL spec: /home/kain/ophion/docs/protocols/veil-security.md (read fully)
+
+Produce a thorough design doc "02 — Zig-Native Crypto, TLS & VEIL":
+1. Primitive layer: SHA-2/3, HMAC, HKDF, AES-GCM (AES-NI dispatch), ChaCha20-Poly1305, X25519,
+   Ed25519, P-256/384, RSA-PSS (legacy verify only?), ML-KEM-768/1024. For each: how comptime +
+   Zig improve constant-time guarantees and hardware dispatch over the C version.
+2. CONSTANT-TIME BY CONSTRUCTION: propose a comptime/type-system scheme that makes data-dependent
+   branching on secrets a COMPILE ERROR (e.g. a Secret(T) wrapper with no comparison/branch ops;
+   ct_eq/ct_select only). This is a flagship invention — specify it concretely.
+3. TLS: 1.3-first (drop 1.2? justify), PQ-hybrid key exchange by default (X25519+ML-KEM), kTLS
+   offload, session export/import for live upgrade. State-machine design via comptime.
+4. X.509 / cert handling: what is the minimum needed; certfp; Ed25519 certs.
+5. VEIL transport crypto: faithfully summarize the VEIL spec, then design the Zig implementation —
+   Ed25519 mutual auth, X25519 forward secrecy, per-frame AEAD/HMAC, periodic ratchet (Signal-style
+   double ratchet? specify), replay protection, 0-RTT considerations. Map each to your primitives.
+6. RNG, key storage, zeroization (Zig defer + secure-wipe), fault-attack hardening.
+7. NOVEL TECHNOLOGIES: 3-6 new ideas (e.g. comptime-generated AEAD framing codecs, formally-shaped
+   constant-time proofs, capability-based key handles, hybrid-ratchet for mesh links). Name + spec.
+8. Risks & open questions (this is the highest-stakes component — be honest about audit needs).
+
+Include concrete Zig sketches (the Secret(T) type, an AEAD interface, the VEIL frame state machine).
+Be rigorous and bold; cite real opssl symbols + VEIL spec sections. PLANNING ONLY — do not modify
+any files.

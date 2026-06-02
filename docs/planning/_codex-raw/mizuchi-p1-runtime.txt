@@ -1,0 +1,38 @@
+You are a world-class systems architect with 100% design freedom. Design — from scratch, in Zig —
+the SYSTEMS SUBSTRATE for "Mizuchi", a clean-slate Zig successor to the ophion IRC daemon. This
+substrate REPLACES the C library "libop" entirely; there is NO C interop to preserve. Read the
+shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+
+MANDATE: invent. This is not a port. Use Zig comptime aggressively. Propose novel primitives where
+they help. The existing libop is REFERENCE ONLY — study it for what problems it solves and where it
+falls short, then design something better and more Zig-idiomatic.
+
+Study (cite file:line) what libop currently provides and how ophion uses it, then redesign:
+- libop headers: /home/kain/libop/include/ (op_event.h, op_iothread.h, op_thread_pool.h,
+  op_commio.h, op_sendbuf.h, op_rawbuf.h, op_ringbuf.h, op_mpmc.h, op_spsc.h, op_deque.h,
+  op_coro.h, op_async.h, op_atomic.h, op_arena.h, op_balloc.h, op_memory.h, op_htab.h, op_rbt.h,
+  op_skiplist.h, op_trie.h, op_itree.h, op_vec.h, op_bitset.h, op_cidr_tbl.h, op_str_intern.h,
+  op_simd_scan.h, op_ratelimit.h, op_crdt.h, op_vclock.h, op_hlc.h, op_merkle.h, op_bloom.h,
+  op_hll.h, op_graph.h, op_lru.h, op_pqueue.h)
+- a few libop src files to see real implementation quality: /home/kain/libop/src/
+- ophion consumers: /home/kain/ophion/ircd/ircd.c, listener.c, client.c, send.c, recv.c, worker.c
+
+Produce a thorough design doc "01 — Zig-Native Systems Substrate":
+1. Module layout of the Zig substrate library (a reusable package the daemon depends on).
+2. Event loop: io_uring design in Zig (SQ/CQ batching, multishot accept/recv, buf_rings, send_zc,
+   fixed files, DEFER_TASKRUN/SQPOLL). How comptime configures features per target/kernel.
+3. Concurrency: futex worker-pool, MPMC/SPSC queues, Treiber-style freelists — redesigned with
+   Zig atomics + comptime cache-line padding. The missed-wakeup-safe park/wake protocol.
+4. Memory: allocator architecture (per-connection arenas, slab/balloc, fixed hot-path buffers),
+   leveraging Zig's Allocator interface; ownership model.
+5. Data-structure kit: which structures, and which can be comptime-generic / generated.
+6. The LADON math substrate in Zig: CRDTs, vector clocks, hybrid logical clocks, Merkle trees,
+   Bloom/HLL — design the Zig APIs (these feed the mesh protocol). INVENT improvements over the C
+   versions (e.g. delta-state CRDTs, comptime-specialized merge, compact tombstone GC).
+7. NOVEL TECHNOLOGIES: propose 3-6 genuinely new substrate ideas a Zig+comptime design unlocks
+   (e.g. comptime-verified state-machine codegen, typed io_uring op pipelines, zero-cost
+   capability tokens, arena-scoped lifetimes enforced at comptime). Name and specify each.
+8. Risks & open questions.
+
+Include concrete Zig code sketches (comptime APIs, the event loop core, a CRDT type). Be bold and
+specific; cite real libop symbols you studied. PLANNING ONLY — do not modify any files.

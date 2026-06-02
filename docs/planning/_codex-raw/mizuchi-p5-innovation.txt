@@ -1,0 +1,47 @@
+You are a visionary systems researcher with 100% design freedom. Your job for "Mizuchi" — a
+clean-slate, fully Zig-native successor to the ophion IRC daemon (the daemon AND its substrate
+libraries are being rewritten in Zig) — is twofold: (1) HEAVILY INVENT new technologies that make
+this server categorically better than anything before it, and (2) define the build/test strategy
+and the phased delivery roadmap. Read the shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+
+Study for grounding (cite file:line):
+- Build: /home/kain/ophion/meson.build, /home/kain/libop/meson.build, /home/kain/opssl/meson.build
+- Tests: /home/kain/ophion/tests/ (note the Python harness), /home/kain/ophion/fuzz/
+- Live upgrade (a flagship ophion feature to preserve): /home/kain/ophion/ircd/restart.c,
+  session_migrate.c (read the upgrade memory concepts: kTLS/session-export based hot restart)
+- LADON/VEIL specs for context: /home/kain/ophion/docs/protocols/
+
+Produce a thorough design doc "05 — Invented Technologies, Build & Roadmap":
+
+PART 1 — INVENTION (go big, be concrete, name everything):
+1. Transport innovations: evaluate io_uring zero-copy, multishot, registered buffers; QUIC as a
+   client and/or mesh transport; eBPF/XDP fast paths; MASQUE/relay for NAT traversal in voice.
+2. Safety/correctness innovations unique to a Zig design: comptime-verified protocol state machines,
+   comptime-generated wire codecs from schemas, the Secret(T) constant-time discipline, a
+   deterministic-simulation testing harness (TigerBeetle-style) for the mesh + CRDTs, fault
+   injection, fuzz-by-construction.
+3. Live-upgrade reimagined: zero-downtime hot restart in Zig (fd handoff, kTLS migration, mesh
+   state handoff) — design it natively, better than ophion's shim approach.
+4. Observability: built-in tracing/metrics, causal trace IDs across the mesh, a structured event
+   bus.
+5. Any other genuinely novel ideas (a content-addressed history store for CHATHISTORY; verifiable
+   moderation; per-channel programmable policies; etc.). For EACH invention: name it, state the
+   problem it solves, sketch how it works, and note risk.
+
+PART 2 — BUILD & TEST:
+6. build.zig + build.zig.zon design for a multi-package Zig workspace (substrate, crypto, daemon).
+   Zig version pinning for pre-1.0 churn. Cross-compile x86-64 + ARM64 (gate Linux-only io_uring/
+   kTLS). Reproducible builds.
+7. Test strategy: zig std.testing units; deterministic simulation tests; protocol conformance
+   (IRCv3/IRCX golden tests); fuzzing the parser + LADON/VEIL wire format; coverage target 80%+;
+   CI matrix + sanitizers.
+
+PART 3 — ROADMAP:
+8. Phased milestone roadmap M0..MN, each with a crisp exit criterion (M0: zig build produces a
+   booting binary that accepts a TCP client and answers PING), through registration/channels,
+   IRCv3 core, SASL+TLS, IRCX parity, services, the LADON/VEIL mesh (sub-phased per the LADON
+   spec's phases), voice/video, and live upgrade. Effort (S/M/L) + key risk per milestone.
+9. Top-10 risk register (likelihood/impact/mitigation), including the "we are also writing our own
+   crypto and our own mesh CRDTs" risk.
+
+Be visionary but buildable; cite real symbols where grounding. PLANNING ONLY — do not modify files.
