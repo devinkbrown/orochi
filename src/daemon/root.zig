@@ -12,6 +12,7 @@ pub const flood = @import("flood.zig");
 pub const registry = @import("registry.zig");
 pub const server = @import("server.zig");
 pub const store = @import("store.zig");
+pub const whowas = @import("whowas.zig");
 pub const world = @import("world.zig");
 // gen:mods:end
 
@@ -25,6 +26,7 @@ test {
     _ = registry;
     _ = server;
     _ = store;
+    _ = whowas;
     _ = world;
     // gen:tests:end
 }
