@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const dispatch = @import("dispatch.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
+const sasl = @import("../proto/sasl.zig");
 
 const irc_line = struct {
     pub const MAXPARA: usize = 15;
@@ -354,6 +355,10 @@ pub const Config = struct {
     backlog: u31 = 128,
     ring_entries: u16 = 32,
     features: RingFeatureSet = RingFeatureSet.baseline,
+    /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
+    /// take on the account store's I/O lifecycle: a caller that has a store wires
+    /// `sasl_bridge.ServicesPlainChecker.checker()` here. Null = SASL fails closed.
+    sasl_checker: ?sasl.PlainChecker = null,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -496,6 +501,9 @@ pub const LinuxServer = struct {
         const id = try self.clients.alloc(ConnState.init(fd));
         const conn = self.clients.get(id).?;
         conn.token = try tokenFromId(id);
+        // Make the injected SASL verifier available before the client can send
+        // AUTHENTICATE (during CAP negotiation, pre-registration).
+        if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
     }
 
