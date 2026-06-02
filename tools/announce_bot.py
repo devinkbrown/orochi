@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Mizuchi announce bot — sits in #root on IRCXNet (eshmaki.me) and announces
-build stats, changelog, progress, and planning. Persistent: auto-reconnects, and
-watches the git repo to announce new commits as they land.
+"""Mizuchi announce bot — lives in #root on IRCXNet (eshmaki.me) and announces build
+stats, changelog, progress, and planning, with the feature set of a normal IRC bot:
+nick recovery (433), CTCP, rich !commands (channel + PM), admin/announce/raw/topic,
+auto-rejoin on KICK, uptime, periodic heartbeat, git commit watcher, auto-reconnect.
 
-Config via env: MIZ_SERVER, MIZ_PORT, MIZ_NICK, MIZ_CHANNEL, MIZ_REPO.
+Config via env: MIZ_SERVER MIZ_PORT MIZ_NICK MIZ_CHANNEL MIZ_REPO MIZ_ADMIN
 """
 import os, socket, time, subprocess, select, re
 
@@ -12,81 +13,94 @@ PORT    = int(os.environ.get("MIZ_PORT", "6667"))
 NICK    = os.environ.get("MIZ_NICK", "Mizuchi")
 CHANNEL = os.environ.get("MIZ_CHANNEL", "#root")
 REPO    = os.environ.get("MIZ_REPO", "/home/kain/mizuchi")
-POLL_SECS = 20
+ADMIN   = os.environ.get("MIZ_ADMIN", "")          # nick allowed to run admin cmds
+POLL_SECS = 15
+HEARTBEAT_SECS = 6 * 3600
+VERSION = "Mizuchi-announce 2.0 (Zig 0.16 IRC daemon build bot)"
+START = time.time()
 
-# IRC mIRC color codes
+# mIRC colors
 C = "\x03"; B = "\x02"; RST = "\x0f"
-CYAN, GREEN, YEL, GREY, MAG = C+"11", C+"03", C+"08", C+"14", C+"13"
+CYAN, GREEN, YEL, GREY, MAG, RED = C+"11", C+"03", C+"08", C+"14", C+"13", C+"04"
 
 
-def git(*args):
+def git(*a):
     try:
-        return subprocess.check_output(["git", "-C", REPO, *args],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(["git", "-C", REPO, *a], text=True,
+                                       stderr=subprocess.DEVNULL).strip()
     except Exception:
         return ""
 
 
 def module_count():
     try:
-        out = subprocess.check_output(
+        return subprocess.check_output(
             ["bash", "-lc", f"find {REPO}/src -name '*.zig' ! -name 'root.zig' | wc -l"],
-            text=True)
-        return out.strip()
+            text=True).strip()
     except Exception:
         return "?"
 
 
 def test_count():
-    # the integration commits embed "(NNN tests)" in their subject
-    subj = git("log", "-1", "--format=%s")
-    m = re.search(r"(\d+)\s+tests", subj)
-    return m.group(1) if m else "?"
+    m = re.search(r"(\d+)\s+tests?\s+(?:pass|green)", git("log", "-1", "--format=%s") + " " +
+                  git("log", "-1", "--format=%b"))
+    if m:
+        return m.group(1)
+    for s in git("log", "-15", "--format=%s").splitlines():
+        m = re.search(r"(\d+)\s+tests", s)
+        if m:
+            return m.group(1)
+    return "?"
 
 
 def head_line():
     return git("log", "-1", "--format=%h %s")
 
 
+def uptime():
+    s = int(time.time() - START)
+    d, s = divmod(s, 86400); h, s = divmod(s, 3600); m, s = divmod(s, 60)
+    return (f"{d}d " if d else "") + f"{h}h {m}m {s}s"
+
+
 def stats_lines():
     return [
-        f"{B}{CYAN}build{RST} :: modules={GREEN}{module_count()}{RST}  "
-        f"tests={GREEN}{test_count()} passing{RST}  "
-        f"commits={GREEN}{git('rev-list','--count','HEAD')}{RST}  "
-        f"zig 0.16",
+        f"{B}{CYAN}build{RST} :: modules={GREEN}{module_count()}{RST} "
+        f"tests={GREEN}{test_count()}{RST} commits={GREEN}{git('rev-list','--count','HEAD')}{RST} zig 0.16",
         f"{GREY}HEAD{RST} {head_line()}",
     ]
 
 
 def project_lines():
     return [
-        f"{B}{MAG}\U0001f409 Mizuchi{RST} (水蛟) — Zig-native successor to the ophion IRC daemon.",
-        f"Full IRCv3/IRCX + in-process services, voice/video — clean-room, no GPL lineage.",
-        f"S2S is {B}Suimyaku{RST} (水脈): a CRDT gossip mesh over {B}Tsumugi{RST} (紬): a "
-        f"PQ-hybrid forward-secret ratchet. No TS6.",
-        f"Built max-parallel with Claude+Codex; every wave audited by a zig-code-reviewer agent.",
-        f"repo: {REPO}  ·  origin: /home/kain/mizuchi.git",
+        f"{B}{MAG}\U0001f409 Mizuchi{RST} (水蛟) — Zig-native successor to the ophion IRC daemon. Running M2.",
+        f"Full IRCv3/IRCX + services; S2S = {B}Suimyaku{RST} (水脈 CRDT mesh) over {B}Tsumugi{RST} "
+        f"(紬 PQ-hybrid ratchet), gossip = {B}Sazanami{RST}. No TS6. Clean-room.",
+        f"Built max-parallel (Claude+Codex); every wave audited by a zig-code-reviewer agent.",
+        f"repo: {REPO}",
     ]
 
 
 ROADMAP = [
-    "M0 bootline ✔  ·  M1 server (Ringlane io_uring accept→PING)  ·  M2 IRC core",
-    "M3 IRCv3 caps · M4 TLS1.3+SASL · M5/6 IRCX parity · M7 services+MizuStore",
-    "M8-11 Suimyaku mesh (HELLO/AUTH→CRDT→SWIM+Merkle→Tsumugi ratchet)",
+    "M0 boot ✔ · M1 server ✔ · M2 multi-client chat ✔  ← here",
+    "M3 IRCv3 caps · M4 TLS(1.3+hardened 1.2)+SASL · M5/6 IRCX parity · M7 services+MizuStore",
+    "M8-11 Suimyaku mesh (HELLO/AUTH→CRDT→Sazanami+Merkle→Tsumugi ratchet)",
     "M12 Lotus history · M13 media · M15 Helix hot-upgrade · M17 RC soak",
 ]
 
-
-def changelog_lines(n=5):
-    log = git("log", f"-{n}", "--format=%h %s")
-    return [f"{GREY}{l}{RST}" for l in log.splitlines()] or ["(no commits)"]
+HELP = ("commands: !project !stats !tests !modules !commit !changelog !progress "
+        "!plan !uptime !version !ping !help" +
+        ("  | admin: !say !announce !topic !raw" if ADMIN else ""))
 
 
 class Bot:
     def __init__(self):
         self.sock = None
+        self.nick = NICK
         self.last_commit = git("rev-parse", "HEAD")
+        self.last_beat = time.time()
 
+    # ---- io ----
     def send(self, line):
         try:
             self.sock.sendall((line + "\r\n").encode("utf-8", "replace"))
@@ -95,30 +109,33 @@ class Bot:
 
     def msg(self, target, text):
         self.send(f"PRIVMSG {target} :{text}")
-        time.sleep(0.4)  # gentle anti-flood
+        time.sleep(0.4)  # anti-flood
+
+    def notice(self, target, text):
+        self.send(f"NOTICE {target} :{text}")
+        time.sleep(0.4)
 
     def announce(self, lines, target=None):
         for l in lines:
             self.msg(target or CHANNEL, l)
 
-    def connect(self):
-        self.sock = socket.create_connection((SERVER, PORT), timeout=30)
-        self.send(f"NICK {NICK}")
-        self.send(f"USER {NICK} 0 * :Mizuchi build announcer")
-
+    # ---- lifecycle ----
     def run(self):
         while True:
             try:
-                self.connect()
-                self.loop()
+                self.connect(); self.loop()
             except Exception as e:
                 print("disconnect:", e, flush=True)
-            time.sleep(6)  # reconnect backoff
+            time.sleep(6)
+
+    def connect(self):
+        self.nick = NICK
+        self.sock = socket.create_connection((SERVER, PORT), timeout=30)
+        self.send(f"NICK {self.nick}")
+        self.send(f"USER {NICK} 0 * :Mizuchi build announcer")
 
     def loop(self):
-        buf = b""
-        joined = False
-        last_poll = time.time()
+        buf = b""; joined = False
         while True:
             r, _, _ = select.select([self.sock], [], [], 2)
             if r:
@@ -127,49 +144,124 @@ class Bot:
                     raise ConnectionError("eof")
                 buf += data
                 while b"\r\n" in buf:
-                    line, buf = buf.split(b"\r\n", 1)
-                    self.handle(line.decode("utf-8", "replace"), lambda: None)
-                    s = line.decode("utf-8", "replace")
-                    if not joined and (" 001 " in s or " 376 " in s or " 422 " in s):
-                        self.send(f"JOIN {CHANNEL}")
-                        joined = True
-                        time.sleep(0.6)
-                        self.announce(project_lines())
-                        self.announce(stats_lines())
-            # poll git for new commits
-            if time.time() - last_poll > POLL_SECS:
-                last_poll = time.time()
-                if joined:
-                    cur = git("rev-parse", "HEAD")
-                    if cur and cur != self.last_commit:
-                        self.last_commit = cur
-                        self.msg(CHANNEL, f"{B}{GREEN}▶ new commit{RST} {head_line()}  "
-                                          f"[tests={test_count()} modules={module_count()}]")
+                    raw, buf = buf.split(b"\r\n", 1)
+                    s = raw.decode("utf-8", "replace")
+                    j = self.handle(s, joined)
+                    joined = joined or j
+            now = time.time()
+            if joined and now - self.last_beat > HEARTBEAT_SECS:
+                self.last_beat = now
+                self.announce(stats_lines())
+            if joined and now % 1 < 0.1:
+                pass
+            if joined:
+                cur = git("rev-parse", "HEAD")
+                if cur and cur != self.last_commit:
+                    self.last_commit = cur
+                    self.msg(CHANNEL, f"{B}{GREEN}▶ commit{RST} {head_line()}  "
+                                      f"[tests={test_count()} modules={module_count()}]")
+                    self.set_topic()
 
-    def handle(self, line, _):
+    def set_topic(self):
+        self.send(f"TOPIC {CHANNEL} :Mizuchi M2 · {git('rev-parse','--short','HEAD')} · "
+                  f"{test_count()} tests · {module_count()} modules · !help")
+
+    # ---- protocol ----
+    def handle(self, line, joined):
         if line.startswith("PING"):
-            self.send("PONG " + line.split(None, 1)[1])
-            return
-        # PRIVMSG command handling: :nick!u@h PRIVMSG #root :!cmd
-        m = re.match(r":(\S+?)!\S+ PRIVMSG (\S+) :(.*)", line)
+            self.send("PONG " + line.split(None, 1)[1]); return joined
+        parts = line.split()
+        if len(parts) >= 2:
+            code = parts[1]
+            # nick in use -> recover
+            if code in ("433", "436"):
+                self.nick = self.nick + "_"
+                self.send(f"NICK {self.nick}")
+                return joined
+            # welcome / end of motd -> join
+            if code in ("001", "376", "422") and not joined:
+                self.send(f"JOIN {CHANNEL}")
+                time.sleep(0.6)
+                self.announce(project_lines()); self.announce(stats_lines())
+                self.set_topic()
+                return True
+        # KICK us -> rejoin
+        m = re.match(r":\S+ KICK (\S+) " + re.escape(self.nick), line)
+        if m:
+            time.sleep(1); self.send(f"JOIN {m.group(1)}")
+            return joined
+        # PRIVMSG (commands + CTCP)
+        m = re.match(r":(\S+?)!(\S+) PRIVMSG (\S+) :(.*)", line)
         if not m:
-            return
-        nick, target, text = m.group(1), m.group(2), m.group(3).strip()
+            return joined
+        nick, userhost, target, text = m.group(1), m.group(2), m.group(3), m.group(4)
         reply = CHANNEL if target == CHANNEL else nick
-        cmd = text.lower()
-        if cmd in ("!stats", "!build"):
-            self.announce(stats_lines(), reply)
-        elif cmd == "!changelog":
-            self.announce(changelog_lines(), reply)
-        elif cmd in ("!progress", "!status"):
-            self.msg(reply, f"{B}M0{RST} in progress — substrate/crypto/proto/daemon green; "
-                            f"tests={test_count()}, modules={module_count()}. Next: M1 server.")
-        elif cmd in ("!plan", "!roadmap"):
-            self.announce([f"{YEL}{l}{RST}" for l in ROADMAP], reply)
-        elif cmd in ("!project", "!about"):
+        # CTCP
+        if text.startswith("\x01") and text.endswith("\x01"):
+            self.ctcp(nick, text.strip("\x01")); return joined
+        self.command(nick, reply, text.strip())
+        return joined
+
+    def ctcp(self, nick, body):
+        cmd = body.split(" ", 1)[0].upper()
+        arg = body[len(cmd):].strip()
+        if cmd == "VERSION":
+            self.notice(nick, f"\x01VERSION {VERSION}\x01")
+        elif cmd == "PING":
+            self.notice(nick, f"\x01PING {arg}\x01")
+        elif cmd == "TIME":
+            self.notice(nick, f"\x01TIME {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\x01")
+        elif cmd == "SOURCE":
+            self.notice(nick, f"\x01SOURCE {REPO}\x01")
+        elif cmd == "CLIENTINFO":
+            self.notice(nick, "\x01CLIENTINFO VERSION PING TIME SOURCE CLIENTINFO\x01")
+
+    def command(self, nick, reply, text):
+        if not text.startswith("!"):
+            return
+        cmd, _, arg = text[1:].partition(" ")
+        cmd = cmd.lower()
+        if cmd in ("help",):
+            self.msg(reply, HELP)
+        elif cmd in ("project", "about"):
             self.announce(project_lines(), reply)
-        elif cmd == "!help":
-            self.msg(reply, "commands: !project !stats !changelog !progress !plan !help")
+        elif cmd in ("stats", "build"):
+            self.announce(stats_lines(), reply)
+        elif cmd == "tests":
+            self.msg(reply, f"tests: {GREEN}{test_count()}{RST} passing")
+        elif cmd == "modules":
+            self.msg(reply, f"modules: {GREEN}{module_count()}{RST} Zig source files")
+        elif cmd in ("commit", "head"):
+            self.msg(reply, f"HEAD {head_line()}")
+        elif cmd == "changelog":
+            self.announce([f"{GREY}{l}{RST}" for l in git('log','-5','--format=%h %s').splitlines()] or ["(none)"], reply)
+        elif cmd in ("progress", "status"):
+            self.msg(reply, f"{B}M2{RST} reached — multi-client chat works. tests={test_count()}, "
+                            f"modules={module_count()}. Next: IRCv3 caps, TLS/SASL, Suimyaku S2S.")
+        elif cmd in ("plan", "roadmap"):
+            self.announce([f"{YEL}{l}{RST}" for l in ROADMAP], reply)
+        elif cmd == "uptime":
+            self.msg(reply, f"uptime: {uptime()}")
+        elif cmd == "version":
+            self.msg(reply, VERSION)
+        elif cmd == "ping":
+            self.msg(reply, "pong")
+        elif cmd in ("source",):
+            self.msg(reply, REPO)
+        # ---- admin ----
+        elif ADMIN and nick == ADMIN and cmd == "say":
+            tgt, _, body = arg.partition(" ")
+            if tgt and body:
+                self.msg(tgt, body)
+        elif ADMIN and nick == ADMIN and cmd in ("announce", "broadcast"):
+            if arg:
+                self.msg(CHANNEL, f"{B}{MAG}announce{RST} {arg}")
+        elif ADMIN and nick == ADMIN and cmd == "topic":
+            if arg:
+                self.send(f"TOPIC {CHANNEL} :{arg}")
+        elif ADMIN and nick == ADMIN and cmd == "raw":
+            if arg:
+                self.send(arg)
 
 
 if __name__ == "__main__":
