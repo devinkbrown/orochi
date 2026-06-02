@@ -191,7 +191,10 @@ const cap_specs = [_]CapSpec{
     .{ .id = .server_time, .name = "server-time" },
     .{ .id = .message_tags, .name = "message-tags" },
     .{ .id = .echo_message, .name = "echo-message" },
-    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN,EXTERNAL" },
+    // Advertise only what handleAuthenticate actually accepts (PLAIN today).
+    // EXTERNAL/SCRAM are implemented in proto/sasl.zig but not yet wired here;
+    // advertising them would let a client pick a dead mechanism.
+    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN" },
 };
 
 const CapReplyKind = enum {
@@ -674,6 +677,10 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
     if (ctx.session.sasl_pending == null) {
         const mech = sasl.Mechanism.parse(payload) orelse return saslFail(ctx, "Unsupported SASL mechanism");
         if (mech != .plain) return saslFail(ctx, "Unsupported SASL mechanism");
+        // Starting a fresh exchange clears any prior login so a re-auth can
+        // never leave logged_in set with a stale/failed account.
+        ctx.session.logged_in = false;
+        ctx.session.account_store.len = 0;
         ctx.session.sasl_pending = mech;
         ctx.session.client.registration.sasl = .authenticating;
         try ctx.replies.message(null, "AUTHENTICATE", &.{"+"}, null);
@@ -684,7 +691,9 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
     ctx.session.sasl_pending = null;
     const checker = ctx.session.sasl_plain orelse return saslFail(ctx, "SASL authentication failed");
 
-    var decode_buf: [sasl.MAX_AUTHENTICATE_PAYLOAD]u8 = undefined;
+    // Sized for a full line's worth of base64 (lines are capped upstream); a
+    // payload that still overflows fails closed via decodeAuthPayload.
+    var decode_buf: [sasl_decode_cap]u8 = undefined;
     const raw = decodeAuthPayload(payload, &decode_buf) catch return saslFail(ctx, "SASL authentication failed");
     const creds = sasl.parsePlain(raw) catch return saslFail(ctx, "SASL authentication failed");
     if (!checker.verify(creds)) return saslFail(ctx, "SASL authentication failed");
@@ -696,8 +705,14 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
     try ctx.replies.numeric(ctx.session, .RPL_SASLSUCCESS, &.{}, "SASL authentication successful");
 }
 
+/// Decoded-credential buffer cap: covers a full IRC line of base64 so legit
+/// PLAIN credentials never silently fail; oversize still fails closed.
+const sasl_decode_cap: usize = 8192;
+
 fn saslFail(ctx: DispatchCtx, message: []const u8) DispatchError!void {
     ctx.session.sasl_pending = null;
+    ctx.session.logged_in = false;
+    ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
     try ctx.replies.numeric(ctx.session, .ERR_SASLFAIL, &.{}, message);
 }

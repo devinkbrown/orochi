@@ -374,7 +374,11 @@ const ValueReader = struct {
 
         if (type_num == 0) {
             if (cursor >= self.limit or cursor >= self.bytes.len) return Error.InvalidDatabase;
-            type_num = self.bytes[cursor] + 7;
+            // Widen before adding: an extended-type byte >= 249 would overflow
+            // u8 and panic on hostile bytes (must fail closed, not crash).
+            const ext = @as(u16, self.bytes[cursor]) + 7;
+            if (ext > std.math.maxInt(u8)) return Error.UnsupportedDatabase;
+            type_num = @intCast(ext);
             cursor += 1;
         }
 

@@ -21,8 +21,11 @@
 //! real ring attempt `Ring.init` and `return error.SkipZigTest` on any setup
 //! error (EPERM/ENOSYS/etc.). The pure logic is always exercised.
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
-const IoUring = linux.IoUring;
+// io_uring is a Linux-only fast path; `void` off-Linux so the pure helpers in
+// this file (user_data codec, FdToken, RingFeatures, CQE decode) stay portable.
+const IoUring = if (builtin.os.tag == .linux) linux.IoUring else void;
 
 // ---------------------------------------------------------------------------
 // Feature gating (comptime Kernel persona)
@@ -314,7 +317,7 @@ pub fn isUnsupportedInitError(err: anyerror) bool {
 /// io_uring-backed reactor core. Thin wrapper over `std.os.linux.IoUring` that
 /// adds typed submission helpers and typed completion decoding. One `Ring` per
 /// shard is the intended deployment shape (planning/01 SQ policy).
-pub const Ring = struct {
+pub const Ring = if (builtin.os.tag == .linux) struct {
     inner: IoUring,
     features: RingFeatures,
 
@@ -423,6 +426,9 @@ pub const Ring = struct {
         var cqes: [default_cqe_batch]linux.io_uring_cqe = undefined;
         return self.reapCompletions(&cqes, 0, handler);
     }
+} else struct {
+    // io_uring reactor core is a Linux-only fast path; the pure user_data codec,
+    // FdToken, RingFeatures, and CQE decode above remain portable + tested.
 };
 
 fn dispatchCompletions(cqes: []const linux.io_uring_cqe, handler: anytype) ReapStats {
@@ -636,79 +642,90 @@ test "reapCompletions skipped-count observes undecodable CQEs" {
 
 /// Helper: init a baseline ring or skip the test if the environment forbids it.
 fn initOrSkip(features: RingFeatures) !Ring {
-    return Ring.init(8, features) catch |err| {
-        if (isUnsupportedInitError(err)) return error.SkipZigTest;
-        return err;
-    };
+    if (builtin.os.tag == .linux) {
+        return Ring.init(8, features) catch |err| {
+            if (isUnsupportedInitError(err)) return error.SkipZigTest;
+            return err;
+        };
+    }
+    return error.SkipZigTest;
 }
 
+// These tests exercise a live kernel ring; their bodies are comptime-excluded
+// off-Linux (where `Ring` is a stub) so the module cross-compiles for all targets.
 test "ring init/deinit and nop completion round-trip" {
-    var ring = try initOrSkip(RingFeatures.baseline);
-    defer ring.deinit();
+    if (builtin.os.tag == .linux) {
+        var ring = try initOrSkip(RingFeatures.baseline);
+        defer ring.deinit();
 
-    const tok: FdToken = .{ .slot = 1, .gen = 1 };
-    _ = try ring.inner.nop(try encodeUserData(.other, tok));
-    _ = try ring.submitAndWait(1);
+        const tok: FdToken = .{ .slot = 1, .gen = 1 };
+        _ = try ring.inner.nop(try encodeUserData(.other, tok));
+        _ = try ring.submitAndWait(1);
 
-    const Collector = struct {
-        seen: ?Completion = null,
-        fn onCompletion(self: *@This(), c: Completion) void {
-            self.seen = c;
-        }
-    };
-    var collector = Collector{};
-    var cqes: [4]linux.io_uring_cqe = undefined;
-    const stats = try ring.reapCompletions(&cqes, 0, &collector);
-    try testing.expectEqual(@as(u32, 1), stats.processed);
-    try testing.expectEqual(@as(u32, 0), stats.skipped);
-    try testing.expect(collector.seen != null);
-    try testing.expect(collector.seen.? == .other);
-    try testing.expect(tok.eql(collector.seen.?.other.token));
+        const Collector = struct {
+            seen: ?Completion = null,
+            fn onCompletion(self: *@This(), c: Completion) void {
+                self.seen = c;
+            }
+        };
+        var collector = Collector{};
+        var cqes: [4]linux.io_uring_cqe = undefined;
+        const stats = try ring.reapCompletions(&cqes, 0, &collector);
+        try testing.expectEqual(@as(u32, 1), stats.processed);
+        try testing.expectEqual(@as(u32, 0), stats.skipped);
+        try testing.expect(collector.seen != null);
+        try testing.expect(collector.seen.? == .other);
+        try testing.expect(tok.eql(collector.seen.?.other.token));
+    }
 }
 
 test "submitSend uses copy path and submitSendZc is feature gated" {
-    const tok: FdToken = .{ .slot = 5, .gen = 1 };
-    const buffer = "hello";
+    if (builtin.os.tag == .linux) {
+        const tok: FdToken = .{ .slot = 5, .gen = 1 };
+        const buffer = "hello";
 
-    var disabled: Ring = .{ .inner = undefined, .features = RingFeatures.baseline };
-    try testing.expectError(error.FeatureNotEnabled, disabled.submitSendZc(tok, 0, buffer));
+        var disabled: Ring = .{ .inner = undefined, .features = RingFeatures.baseline };
+        try testing.expectError(error.FeatureNotEnabled, disabled.submitSendZc(tok, 0, buffer));
 
-    var copy_ring = try initOrSkip(RingFeatures.baseline);
-    defer copy_ring.deinit();
-    try copy_ring.submitSend(tok, 0, buffer);
+        var copy_ring = try initOrSkip(RingFeatures.baseline);
+        defer copy_ring.deinit();
+        try copy_ring.submitSend(tok, 0, buffer);
 
-    var zc_ring = try initOrSkip(.{ .send_zc = true });
-    defer zc_ring.deinit();
-    try zc_ring.submitSendZc(tok, 0, buffer);
+        var zc_ring = try initOrSkip(.{ .send_zc = true });
+        defer zc_ring.deinit();
+        try zc_ring.submitSendZc(tok, 0, buffer);
+    }
 }
 
 test "submitTimeout fires and decodes as a timeout completion" {
-    var ring = try initOrSkip(RingFeatures.baseline);
-    defer ring.deinit();
+    if (builtin.os.tag == .linux) {
+        var ring = try initOrSkip(RingFeatures.baseline);
+        defer ring.deinit();
 
-    const tok: FdToken = .{ .slot = 2, .gen = 9 };
-    const ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 1_000_000 }; // 1ms
-    try ring.submitTimeout(tok, &ts);
-    _ = try ring.submitAndWait(1);
+        const tok: FdToken = .{ .slot = 2, .gen = 9 };
+        const ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 1_000_000 }; // 1ms
+        try ring.submitTimeout(tok, &ts);
+        _ = try ring.submitAndWait(1);
 
-    const Collector = struct {
-        kind: ?OpKind = null,
-        tok: ?FdToken = null,
-        fn onCompletion(self: *@This(), c: Completion) void {
-            self.kind = std.meta.activeTag(c);
-            self.tok = switch (c) {
-                .timeout => |t| t.token,
-                else => null,
-            };
-        }
-    };
-    var collector = Collector{};
-    const stats = try ring.poll(&collector);
-    try testing.expectEqual(@as(u32, 1), stats.processed);
-    try testing.expectEqual(@as(u32, 0), stats.skipped);
-    try testing.expectEqual(@as(?OpKind, .timeout), collector.kind);
-    try testing.expect(collector.tok != null);
-    try testing.expect(tok.eql(collector.tok.?));
+        const Collector = struct {
+            kind: ?OpKind = null,
+            tok: ?FdToken = null,
+            fn onCompletion(self: *@This(), c: Completion) void {
+                self.kind = std.meta.activeTag(c);
+                self.tok = switch (c) {
+                    .timeout => |t| t.token,
+                    else => null,
+                };
+            }
+        };
+        var collector = Collector{};
+        const stats = try ring.poll(&collector);
+        try testing.expectEqual(@as(u32, 1), stats.processed);
+        try testing.expectEqual(@as(u32, 0), stats.skipped);
+        try testing.expectEqual(@as(?OpKind, .timeout), collector.kind);
+        try testing.expect(collector.tok != null);
+        try testing.expect(tok.eql(collector.tok.?));
+    }
 }
 
 test {

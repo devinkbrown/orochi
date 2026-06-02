@@ -55,7 +55,9 @@ fn tsToMillis(sec: i64, nsec: i64) i64 {
 pub fn currentPid() i32 {
     return switch (os_tag) {
         .linux => @intCast(std.os.linux.getpid()),
-        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        // DWORD (u32) -> i32: @bitCast so a high pid can't trip the safe-build
+        // @intCast overflow check (fork detection is moot on Windows anyway).
+        .windows => @bitCast(std.os.windows.GetCurrentProcessId()),
         else => @intCast(std.c.getpid()),
     };
 }
@@ -87,13 +89,10 @@ pub fn fillOsEntropy(buf: []u8) EntropyError!void {
             }
         },
         else => {
-            // getentropy fills at most 256 bytes per call (macOS / *BSD libc).
-            var filled: usize = 0;
-            while (filled < buf.len) {
-                const want = @min(buf.len - filled, @as(usize, 256));
-                if (std.c.getentropy(buf.ptr + filled, want) != 0) return EntropyError.RandomSourceFailed;
-                filled += want;
-            }
+            // macOS / *BSD: arc4random_buf is the std-public CSPRNG (std.c
+            // exposes it for these targets, unlike getentropy which is `{}`).
+            // It always fills the whole buffer and cannot fail.
+            std.c.arc4random_buf(buf.ptr, buf.len);
         },
     }
 }

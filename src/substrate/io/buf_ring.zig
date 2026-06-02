@@ -7,8 +7,11 @@
 //! Zig std's Linux helpers; the invariants that matter to Mizuchi are tested
 //! without setting up a kernel ring.
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
-const IoUring = linux.IoUring;
+// io_uring is a Linux-only fast path; `void` off-Linux so this module compiles
+// for every target (the live wrapper below is comptime-gated to match).
+const IoUring = if (builtin.os.tag == .linux) linux.IoUring else void;
 
 /// Maximum number of entries accepted by io_uring provided-buffer rings.
 pub const max_buffer_count: u16 = 1 << 15;
@@ -54,7 +57,7 @@ pub const BufLease = struct {
 /// recvs with buffer selection, convert each CQE buffer id to a `BufLease`, then
 /// recycle exactly once. Tests avoid this wrapper because many CI sandboxes
 /// reject io_uring setup.
-pub const LiveBufRing = struct {
+pub const LiveBufRing = if (builtin.os.tag == .linux) struct {
     ring_fd: linux.fd_t,
     br: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
     entries: u16,
@@ -82,6 +85,9 @@ pub const LiveBufRing = struct {
         IoUring.buf_ring_add(self.br, buffer, buffer_id, mask, 0);
         IoUring.buf_ring_advance(self.br, 1);
     }
+} else struct {
+    // io_uring provided-buffer rings are a Linux-only fast path; off-Linux the
+    // pure BufRing(...) pool above is still portable and testable.
 };
 
 fn validateConfig(comptime buffer_size: usize, comptime buffer_count: u16) void {
