@@ -71,3 +71,9 @@ mesh world.
 **Positive mandate:** prefer IRCv3 (standard-replies, message-tags, batch, labeled-response, CHATHISTORY),
 IRCX (EVENT/PROP/ACCESS), CRDT-mesh-native semantics, typed events, capability tokens, and constant-time
 crypto. When a legacy feature has no modern equivalent, invent a principled one and name it — don't port.
+
+**Services = internalized native commands (no bots):** accounts/channels/memos are exposed as REAL
+server commands (REGISTER, IDENTIFY, GROUP, DROP, LOGOUT, CREGISTER, ACCESS, AKICK, MEMO, VHOST, ...)
+with IRCv3 standard-replies (FAIL/WARN/NOTE) + structured numerics — NOT pseudo-client bots
+(no NickServ/ChanServ PRIVMSG targets). Like ophion's in-process services, but with cleaner messaging.
+The services.zig backend stays I/O-free (typed results); the daemon command layer wraps it natively.
