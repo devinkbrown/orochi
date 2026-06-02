@@ -1,7 +1,14 @@
 Using `source-command-plan`; no files were modified.
 
-**04 — Protocol**
-Mizuchi is a clean break: IRC-compatible client line protocol on the front, native LADON/VEIL mesh on S2S, no TS6 bridge by default. The brief explicitly requires Zig-native rewrite, feature parity, no TS6, LADON+VEIL-only mesh, CRDT/SWIM/Merkle state, nick collision rename-to-UID, and constant-time crypto paths (`/home/kain/mizuchi/docs/BRIEF.md:3`, `:10`, `:14`, `:21`, `:32`, `:45`).
+**04 — Protocol (Suimyaku mesh)**
+
+> NAMING: Mizuchi's invented names supersede ophion's. **Suimyaku** = S2S CRDT
+> mesh (was LADON), **Tsumugi** = PQ ratchet (was VEIL), **Sazanami** = gossip
+> (was SWIM), **Goryu** = CRDT lib. Below, old names appear ONLY in citations to
+> ophion's superseded specs (overview.md / wire-protocol.md / veil-security.md);
+> Mizuchi's own systems use the new names.
+
+Mizuchi is a clean break: IRC-compatible client line protocol on the front, native **Suimyaku/Tsumugi** mesh on S2S, no TS6 bridge by default. The brief explicitly requires Zig-native rewrite, feature parity, no TS6, Suimyaku+Tsumugi-only mesh, Goryu-CRDT/Sazanami-gossip/Merkle state, nick collision rename-to-UID, and constant-time crypto paths (`/home/kain/mizuchi/docs/BRIEF.md:3`, `:10`, `:14`, `:21`, `:32`, `:45`).
 
 **Part A: Client Line**
 Existing Ophion parses mutable IRC lines into `MsgBuf` with fixed `MAXPARA=15`, tag array, origin, command, params, and cap-gated outbound tags (`include/msgbuf.h:30`, `:37`, `:50`, `:105`). `msgbuf_parse.c` is folded into `ircd/msgbuf.c`; `ircd/numeric.c` is absent, with numerics in `include/numeric.h`.
