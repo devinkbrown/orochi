@@ -166,17 +166,17 @@ RSA private keys are rejected for local config; RSA verify is accepted for publi
 
 OCSP/CRL are optional modules, not core substrate. Local CRL loading is fine; network OCSP fetch inside crypto code is not.
 
-**VEIL Transport**
+**Tsumugi Transport** (Mizuchi's PQ ratchet; "VEIL" below is the superseded ophion spec cited as inventory)
 
 Current VEIL summary: after LADON `AUTH`/`AUTH_OK`, both sides derive a shared X25519 secret; VEIL initializes root/send/recv chain keys, ephemeral X25519 keys, nonce base, and counters [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:19). Frames are `VEIL_HANDSHAKE`, `VEIL_HANDSHAKE_RESP`, `VEIL_RATCHET`, and optional `VEIL_GROUP_KEY` [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:10). Per-message keys are `HKDF-Expand(chain, "veil-msg")`; chains advance with `"veil-chain"` [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:59). Nonces are 8-byte base plus counter, and the counter is duplicated in the frame [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:68). Skipped keys tolerate reordering up to 256 frames and state commits only after AEAD success [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:85). Rotation is every 300 seconds or 50,000 decrypted frames, and state is serializable for hot upgrade [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:100).
 
-Mizuchi VEIL v2:
+Mizuchi **Tsumugi** (the PQ-hybrid ratchet that replaces VEIL; runs over the **Suimyaku** mesh that replaces LADON):
 
-Identity: Ed25519 long-term server identity signs `ladon-auth-v2 || server_id || x25519_pub || mlkem_pk || nonce || capabilities`.
+Identity: Ed25519 long-term server identity signs `suimyaku-auth-v2 || server_id || x25519_pub || mlkem_pk || nonce || capabilities`.
 
-Forward secrecy: initial root is `HKDF-Extract("mizuchi-veil-v2", X25519_ss || MLKEM_ss || transcript_hash)`.
+Forward secrecy: initial root is `HKDF-Extract("mizuchi-tsumugi-v2", X25519_ss || MLKEM_ss || transcript_hash)`.
 
-Frame crypto: ChaCha20-Poly1305 default; AES-GCM allowed only if both sides advertise hardware support. AAD is `LADON outer header || veil generation || counter || frame kind || sender id`.
+Frame crypto: ChaCha20-Poly1305 default; AES-GCM allowed only if both sides advertise hardware support. AAD is `Suimyaku outer header || tsumugi generation || counter || frame kind || sender id`.
 
 HMAC: derive `control_mac_key` for unencrypted control/restart frames. Encrypted data frames rely on AEAD tag; HMAC is not double-applied to ciphertext.
 
@@ -184,9 +184,9 @@ Ratchet: use a server-mesh hybrid ratchet, not full per-message Signal DH. Every
 
 Replay: `(generation, counter)` sliding window plus skipped-key cache. Skipped keys are single-use capability objects; consuming one zeroizes it.
 
-0-RTT: no state-changing LADON frame may be accepted before mutual auth and anti-replay epoch confirmation. Optional 0-RTT is limited to read-only liveness hints and must be ignored safely.
+0-RTT: no state-changing Suimyaku frame may be accepted before mutual auth and anti-replay epoch confirmation. Optional 0-RTT is limited to read-only liveness hints and must be ignored safely.
 
-VEIL state sketch:
+Tsumugi state sketch:
 
 ```zig
 pub const VeilStateTag = enum { cold, auth_sent, auth_ok, active, rotating, migrated };

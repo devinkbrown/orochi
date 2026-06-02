@@ -57,9 +57,12 @@ name it and specify it well enough to build.
 - ophion source: `/home/kain/ophion` (ircd/, modules/, include/)
 - libop (reference): `/home/kain/libop` (include/, src/)
 - opssl (reference): `/home/kain/opssl` (include/opssl/, src/)
-- LADON spec: `/home/kain/ophion/docs/protocols/ladon/`
-- VEIL spec: `/home/kain/ophion/docs/protocols/veil-security.md`
-- LADON media modules: `/home/kain/ophion/docs/reference/modules/m_ladon_*.md`
+# Reference specs below are ophion's OLD names, superseded in Mizuchi by the
+# invented names: LADON -> Suimyaku (S2S CRDT mesh), VEIL -> Tsumugi (PQ ratchet),
+# SWIM -> Sazanami (gossip), crdt -> Goryu. Cited only as historical inventory.
+- Suimyaku (was LADON) reference spec: `/home/kain/ophion/docs/protocols/ladon/`
+- Tsumugi (was VEIL) reference spec: `/home/kain/ophion/docs/protocols/veil-security.md`
+- Suimyaku media (was LADON) reference: `/home/kain/ophion/docs/reference/modules/m_ladon_*.md`
 
 ## Planning deliverables (this phase — Codex workers + Claude synthesis)
 - `docs/planning/01-substrate.md` — Zig-native systems substrate (libop successor).
