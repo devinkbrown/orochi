@@ -90,7 +90,7 @@ pub const RingFeatures = struct {
     /// separate from the probe itself makes the narrowing logic testable without
     /// a kernel.
     pub fn narrow(self: RingFeatures, caps: RingFeatures) RingFeatures {
-        return .{
+        var result: RingFeatures = .{
             .multishot_accept = self.multishot_accept and caps.multishot_accept,
             .multishot_recv = self.multishot_recv and caps.multishot_recv and caps.buf_ring,
             .buf_ring = self.buf_ring and caps.buf_ring,
@@ -99,6 +99,8 @@ pub const RingFeatures = struct {
             .defer_taskrun = self.defer_taskrun and caps.defer_taskrun,
             .sqpoll = self.sqpoll and caps.sqpoll,
         };
+        result.buf_ring = result.buf_ring or result.multishot_recv;
+        return result;
     }
 };
 
@@ -213,13 +215,22 @@ pub const RecvEvent = struct {
     buffer_id: ?u16,
 };
 
-/// A send completion. For zero-copy sends the kernel emits two CQEs; `notif` is
-/// set on the second (notification) CQE that releases the buffer.
+/// A send completion. Copy sends have copy semantics at submission time and do
+/// not need a release notification. Zero-copy sends emit a primary CQE plus a
+/// notification CQE; `more` on the primary zero-copy CQE means "notification
+/// pending, buffer still kernel-owned", not multishot continuation. Callers must
+/// use `bufferReleased()` instead of hand-rolling `more`/`notif` checks.
 pub const SendEvent = struct {
     token: FdToken,
     res: i32,
     more: bool,
     notif: bool,
+
+    /// Returns true only for the zero-copy notification CQE that releases the
+    /// caller-owned buffer back to user space.
+    pub fn bufferReleased(self: SendEvent) bool {
+        return self.notif;
+    }
 };
 
 /// A timeout completion. `res` is the raw CQE result (e.g. -ETIME on expiry).
@@ -276,6 +287,14 @@ pub fn decodeCompletion(cqe: linux.io_uring_cqe) error{UnknownOpKind}!Completion
 
 /// How many CQEs `reapCompletions` copies per call by default.
 pub const default_cqe_batch = 256;
+
+/// Observable result of a completion reaping pass.
+pub const ReapStats = struct {
+    /// CQEs successfully decoded and delivered to `handler.onCompletion`.
+    processed: u32,
+    /// CQEs copied from the kernel but skipped because `decodeCompletion` failed.
+    skipped: u32,
+};
 
 /// Errors that mean "this environment cannot run io_uring"; callers (and tests)
 /// can treat these as a clean skip rather than a hard failure.
@@ -353,16 +372,23 @@ pub const Ring = struct {
         _ = try self.inner.recv(ud, fd, .{ .buffer_selection = .{ .group_id = group_id, .len = 0 } }, 0);
     }
 
-    /// Queue a send of `buffer` on `fd` for `token`. Uses zero-copy send when
-    /// the feature is compiled in (the caller must keep `buffer` alive until the
-    /// notification CQE), else a normal copy send. Does not submit.
+    /// Queue a copy send of `buffer` on `fd` for `token`. The kernel copies the
+    /// bytes during submission, so the caller may free or reuse `buffer`
+    /// immediately after this SQE is submitted with `submit`/`submitAndWait`.
+    /// Does not use zero-copy even when `features.send_zc` is enabled.
     pub fn submitSend(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
         const ud = try encodeUserData(.send, token);
-        if (self.features.send_zc) {
-            _ = try self.inner.send_zc(ud, fd, buffer, 0, 0);
-        } else {
-            _ = try self.inner.send(ud, fd, buffer, 0);
-        }
+        _ = try self.inner.send(ud, fd, buffer, 0);
+    }
+
+    /// Queue a zero-copy send of `buffer` on `fd` for `token`. Requires
+    /// `features.send_zc`; otherwise returns `error.FeatureNotEnabled`. The
+    /// caller must keep `buffer` alive until the zero-copy notification CQE is
+    /// observed and `SendEvent.bufferReleased()` returns true. Does not submit.
+    pub fn submitSendZc(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
+        if (!self.features.send_zc) return error.FeatureNotEnabled;
+        const ud = try encodeUserData(.send, token);
+        _ = try self.inner.send_zc(ud, fd, buffer, 0, 0);
     }
 
     /// Queue a (relative, single-shot) timeout for `token` after `ns`
@@ -376,33 +402,41 @@ pub const Ring = struct {
     // --- completion reaping ------------------------------------------------
 
     /// Copy ready CQEs into `out`, decode each into a typed `Completion`, and
-    /// invoke `handler.onCompletion(Completion)` for each. Returns how many were
-    /// processed. `wait_nr` > 0 blocks for that many completions first.
+    /// invoke `handler.onCompletion(Completion)` for each. Returns processed and
+    /// skipped counts so corrupt or undecodable CQEs are observable. `wait_nr` >
+    /// 0 blocks for that many completions first.
     ///
-    /// CQEs that fail to decode (unknown op kind) are skipped rather than
-    /// crashing the loop; this is the attacker/corruption-resistant path.
+    /// CQEs that fail to decode (unknown op kind) increment `skipped` rather
+    /// than crashing the loop; this is the attacker/corruption-resistant path.
     pub fn reapCompletions(
         self: *Ring,
         out: []linux.io_uring_cqe,
         wait_nr: u32,
         handler: anytype,
-    ) !u32 {
+    ) !ReapStats {
         const n = try self.inner.copy_cqes(out, wait_nr);
-        var processed: u32 = 0;
-        for (out[0..n]) |cqe| {
-            const completion = decodeCompletion(cqe) catch continue;
-            handler.onCompletion(completion);
-            processed += 1;
-        }
-        return processed;
+        return dispatchCompletions(out[0..n], handler);
     }
 
     /// Non-blocking variant of `reapCompletions` over the default batch.
-    pub fn poll(self: *Ring, handler: anytype) !u32 {
+    pub fn poll(self: *Ring, handler: anytype) !ReapStats {
         var cqes: [default_cqe_batch]linux.io_uring_cqe = undefined;
         return self.reapCompletions(&cqes, 0, handler);
     }
 };
+
+fn dispatchCompletions(cqes: []const linux.io_uring_cqe, handler: anytype) ReapStats {
+    var stats: ReapStats = .{ .processed = 0, .skipped = 0 };
+    for (cqes) |cqe| {
+        const completion = decodeCompletion(cqe) catch {
+            stats.skipped += 1;
+            continue;
+        };
+        handler.onCompletion(completion);
+        stats.processed += 1;
+    }
+    return stats;
+}
 
 // ===========================================================================
 // Tests — pure logic always runs; ring tests skip when io_uring is unavailable.
@@ -489,6 +523,14 @@ test "RingFeatures.narrow fails closed against capabilities" {
     try testing.expect(!narrowed.buf_ring);
 }
 
+test "RingFeatures.narrow preserves buf_ring invariant for multishot recv" {
+    const want: RingFeatures = .{ .multishot_recv = true, .buf_ring = false };
+    const caps: RingFeatures = .{ .multishot_recv = true, .buf_ring = true };
+    const narrowed = want.narrow(caps);
+    try testing.expect(narrowed.multishot_recv);
+    try testing.expect(narrowed.buf_ring);
+}
+
 test "decodeCompletion produces typed events with flags" {
     const tok: FdToken = .{ .slot = 7, .gen = 3 };
 
@@ -513,6 +555,7 @@ test "decodeCompletion produces typed events with flags" {
     const snd = try decodeCompletion(send_cqe);
     try testing.expect(snd == .send);
     try testing.expect(snd.send.notif);
+    try testing.expect(snd.send.bufferReleased());
 
     // recv with a selected buffer id.
     const recv_cqe: linux.io_uring_cqe = .{
@@ -544,6 +587,51 @@ test "decodeCompletion skips corrupt CQE via error" {
     try testing.expectError(error.UnknownOpKind, decodeCompletion(bad_cqe));
 }
 
+test "SendEvent.bufferReleased reports only zero-copy notification release" {
+    const tok: FdToken = .{ .slot = 1, .gen = 2 };
+    const primary_zc: SendEvent = .{ .token = tok, .res = 16, .more = true, .notif = false };
+    const notif_zc: SendEvent = .{ .token = tok, .res = 0, .more = false, .notif = true };
+    const copy_send: SendEvent = .{ .token = tok, .res = 16, .more = false, .notif = false };
+
+    try testing.expect(!primary_zc.bufferReleased());
+    try testing.expect(notif_zc.bufferReleased());
+    try testing.expect(!copy_send.bufferReleased());
+}
+
+test "reapCompletions skipped-count observes undecodable CQEs" {
+    const tok: FdToken = .{ .slot = 7, .gen = 3 };
+    const cqes = [_]linux.io_uring_cqe{
+        .{
+            .user_data = try encodeUserData(.recv, tok),
+            .res = 42,
+            .flags = 0,
+        },
+        .{
+            .user_data = @as(u64, 0xFF) << OpKindShift,
+            .res = 0,
+            .flags = 0,
+        },
+        .{
+            .user_data = try encodeUserData(.timeout, tok),
+            .res = -62,
+            .flags = 0,
+        },
+    };
+
+    const Collector = struct {
+        seen: u32 = 0,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            _ = c;
+            self.seen += 1;
+        }
+    };
+    var collector = Collector{};
+    const stats = dispatchCompletions(&cqes, &collector);
+    try testing.expectEqual(@as(u32, 2), stats.processed);
+    try testing.expectEqual(@as(u32, 1), stats.skipped);
+    try testing.expectEqual(@as(u32, 2), collector.seen);
+}
+
 // --- live-ring tests: skip cleanly when io_uring is unavailable -------------
 
 /// Helper: init a baseline ring or skip the test if the environment forbids it.
@@ -570,11 +658,28 @@ test "ring init/deinit and nop completion round-trip" {
     };
     var collector = Collector{};
     var cqes: [4]linux.io_uring_cqe = undefined;
-    const n = try ring.reapCompletions(&cqes, 0, &collector);
-    try testing.expectEqual(@as(u32, 1), n);
+    const stats = try ring.reapCompletions(&cqes, 0, &collector);
+    try testing.expectEqual(@as(u32, 1), stats.processed);
+    try testing.expectEqual(@as(u32, 0), stats.skipped);
     try testing.expect(collector.seen != null);
     try testing.expect(collector.seen.? == .other);
     try testing.expect(tok.eql(collector.seen.?.other.token));
+}
+
+test "submitSend uses copy path and submitSendZc is feature gated" {
+    const tok: FdToken = .{ .slot = 5, .gen = 1 };
+    const buffer = "hello";
+
+    var disabled: Ring = .{ .inner = undefined, .features = RingFeatures.baseline };
+    try testing.expectError(error.FeatureNotEnabled, disabled.submitSendZc(tok, 0, buffer));
+
+    var copy_ring = try initOrSkip(RingFeatures.baseline);
+    defer copy_ring.deinit();
+    try copy_ring.submitSend(tok, 0, buffer);
+
+    var zc_ring = try initOrSkip(.{ .send_zc = true });
+    defer zc_ring.deinit();
+    try zc_ring.submitSendZc(tok, 0, buffer);
 }
 
 test "submitTimeout fires and decodes as a timeout completion" {
@@ -598,7 +703,9 @@ test "submitTimeout fires and decodes as a timeout completion" {
         }
     };
     var collector = Collector{};
-    _ = try ring.poll(&collector);
+    const stats = try ring.poll(&collector);
+    try testing.expectEqual(@as(u32, 1), stats.processed);
+    try testing.expectEqual(@as(u32, 0), stats.skipped);
     try testing.expectEqual(@as(?OpKind, .timeout), collector.kind);
     try testing.expect(collector.tok != null);
     try testing.expect(tok.eql(collector.tok.?));

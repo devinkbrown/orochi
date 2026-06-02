@@ -5,10 +5,12 @@ const substrate = @import("../substrate/root.zig");
 
 pub const registry = @import("registry.zig");
 pub const client = @import("client.zig");
+pub const dispatch = @import("dispatch.zig");
 
 test {
     _ = registry;
     _ = client;
+    _ = dispatch;
 }
 
 pub const Daemon = struct {

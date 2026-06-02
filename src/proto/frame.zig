@@ -460,7 +460,12 @@ pub fn gateFrame(established: bool, frame_type: FrameType) GateDecision {
 
 pub fn creditCost(frame: Frame) u32 {
     if (!frame.type.debitsCredit()) return 0;
-    return @intCast(frame.payload.len);
+    // Spec (transport-state.md): credit is charged over the full inner LADON
+    // frame size INCLUDING the 8-byte header, keeping sender/receiver accounting
+    // symmetric across peers. Clamp to the wire ceiling first so a hand-built
+    // oversize payload cannot truncate via @intCast and under-debit the window.
+    const clamped: u32 = @intCast(@min(frame.payload.len, max_payload_len));
+    return header_len + clamped;
 }
 
 /// Pure LADON credit-window accountant. Transport code is responsible for
@@ -601,28 +606,35 @@ test "credit debit and grant threshold behavior" {
     var window = CreditWindow.init();
     const data = [_]u8{0xaa} ** 8192;
     const frame = Frame{ .type = .irc_line, .ctrl = Ctrl.init(0, .normal, false), .payload = &data };
+    // Credit is charged over the full inner frame (header + payload), per spec.
+    const cost = creditCost(frame);
 
     try window.debitSend(frame);
-    try std.testing.expectEqual(default_credit_window - 8192, window.remote_available);
+    try std.testing.expectEqual(default_credit_window - cost, window.remote_available);
 
+    // First receive accumulates below the grant threshold.
     try std.testing.expectEqual(@as(?u32, null), try window.debitReceive(frame));
-    try std.testing.expectEqual(default_credit_window - 8192, window.local_available);
-    try std.testing.expectEqual(@as(u32, 8192), window.pending_grant);
+    try std.testing.expectEqual(default_credit_window - cost, window.local_available);
+    try std.testing.expectEqual(cost, window.pending_grant);
 
-    try std.testing.expectEqual(@as(?u32, credit_grant_threshold), try window.debitReceive(frame));
+    // Second receive crosses the 16 KiB grant threshold and flushes the grant.
+    const grant = try window.debitReceive(frame);
+    try std.testing.expectEqual(@as(?u32, cost * 2), grant);
     try std.testing.expectEqual(default_credit_window, window.local_available);
     try std.testing.expectEqual(@as(u32, 0), window.pending_grant);
 
-    try window.applyCredit(credit_grant_threshold);
-    try std.testing.expectEqual(default_credit_window + 8192, window.remote_available);
+    try window.applyCredit(grant.?);
+    try std.testing.expectEqual(default_credit_window - cost + cost * 2, window.remote_available);
 
+    // Control and VEIL frames never debit the window.
+    const before = window.remote_available;
     const control = Frame{ .type = .ping, .ctrl = Ctrl.init(0, .control, false), .payload = &data };
     try window.debitSend(control);
-    try std.testing.expectEqual(default_credit_window + 8192, window.remote_available);
+    try std.testing.expectEqual(before, window.remote_available);
 
     const veil = Frame{ .type = .veil_ratchet, .ctrl = Ctrl.init(0, .control, false), .payload = &data };
     try window.debitSend(veil);
-    try std.testing.expectEqual(default_credit_window + 8192, window.remote_available);
+    try std.testing.expectEqual(before, window.remote_available);
 }
 
 test "pre established gating accepts handshake control veil ping and credit only" {

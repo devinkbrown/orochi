@@ -242,6 +242,9 @@ pub const NetworkState = struct {
     replica_id: ReplicaId,
     node_id: NodeId,
     users: std.ArrayList(UserEntry) = .empty,
+    // Pruned on every insert/merge to the best claim per UID contender. Full
+    // causal-stability-gated pruning is the follow-up once mesh stability
+    // watermarks are available.
     nick_claims: std.ArrayList(NickClaim) = .empty,
     channels: std.ArrayList(ChannelRoot) = .empty,
     memberships: MembershipSet,
@@ -279,12 +282,12 @@ pub const NetworkState = struct {
     pub fn upsertUser(self: *Self, uid: Uid, profile: UserProfile, hlc: Hlc, authority: Authority) !void {
         const entry = try self.ensureUser(uid);
         _ = authority;
-        _ = entry.profile.set(profile, encodeHlc(hlc), self.node_id);
+        _ = entry.profile.set(profile, hlc.toU64(), self.node_id);
     }
 
     pub fn setPresence(self: *Self, uid: Uid, lease: PresenceLease, hlc: Hlc) !void {
         const entry = try self.ensureUser(uid);
-        _ = entry.presence.set(lease, encodeHlc(hlc), self.node_id);
+        _ = entry.presence.set(lease, hlc.toU64(), self.node_id);
     }
 
     pub fn claimNick(self: *Self, nick: Nick, uid: Uid, authority: Authority, hlc: Hlc) !void {
@@ -295,12 +298,12 @@ pub const NetworkState = struct {
             .hlc = hlc,
             .node_id = self.node_id,
         };
-        if (!containsNickClaim(self.nick_claims.items, claim)) {
-            try self.nick_claims.append(self.allocator, claim);
-        }
+        try self.insertNickClaim(claim);
     }
 
-    /// Resolve a nick MV-register. Losers are mapped to their UID, never killed.
+    /// Resolve a nick MV-register. Authority deliberately dominates recency;
+    /// equal-authority/equal-HLC conflicts use node/UID only as deterministic
+    /// winner keys, and losers are mapped to their UID rather than killed.
     pub fn resolveNick(self: *const Self, nick: Nick, uid: Uid) NickResolution {
         const winner = self.winningNickClaim(nick) orelse return .{
             .outcome = .absent,
@@ -407,11 +410,11 @@ pub const NetworkState = struct {
     pub fn setTopic(self: *Self, channel: ChannelName, text: TopicText, setter: Uid, hlc: Hlc) !void {
         const value = TopicValue{ .text = text, .setter = setter, .hlc = hlc };
         if (self.findTopicIndex(channel)) |idx| {
-            _ = self.topics.items[idx].register.set(value, encodeHlc(hlc), self.node_id);
+            _ = self.topics.items[idx].register.set(value, hlc.toU64(), self.node_id);
             return;
         }
         var entry = TopicEntry{ .channel = channel };
-        _ = entry.register.set(value, encodeHlc(hlc), self.node_id);
+        _ = entry.register.set(value, hlc.toU64(), self.node_id);
         try self.topics.append(self.allocator, entry);
     }
 
@@ -422,11 +425,7 @@ pub const NetworkState = struct {
             entry.presence.merge(other_user.presence);
         }
 
-        for (other.nick_claims.items) |claim| {
-            if (!containsNickClaim(self.nick_claims.items, claim)) {
-                try self.nick_claims.append(self.allocator, claim);
-            }
-        }
+        for (other.nick_claims.items) |claim| try self.insertNickClaim(claim);
 
         for (other.channels.items) |channel| {
             if (self.findChannelIndex(channel.name)) |idx| {
@@ -487,6 +486,25 @@ pub const NetworkState = struct {
         return false;
     }
 
+    fn insertNickClaim(self: *Self, claim: NickClaim) !void {
+        if (!containsNickClaim(self.nick_claims.items, claim)) {
+            try self.nick_claims.append(self.allocator, claim);
+        }
+        self.pruneNickClaimsForNick(claim.nick);
+    }
+
+    fn pruneNickClaimsForNick(self: *Self, nick: Nick) void {
+        const winner = self.winningNickClaim(nick) orelse return;
+        var write: usize = 0;
+        for (self.nick_claims.items) |claim| {
+            if (!Nick.eql(claim.nick, nick) or keepNickClaimAfterPrune(self.nick_claims.items, claim, winner)) {
+                self.nick_claims.items[write] = claim;
+                write += 1;
+            }
+        }
+        self.nick_claims.shrinkRetainingCapacity(write);
+    }
+
     fn findChannelIndex(self: *const Self, name: ChannelName) ?usize {
         for (self.channels.items, 0..) |entry, idx| {
             if (ChannelName.eql(entry.name, name)) return idx;
@@ -517,11 +535,11 @@ pub const NetworkState = struct {
 
     fn mergeBanMetadata(self: *Self, key: BanKey, metadata: BanMetadata, hlc: Hlc) !void {
         if (self.findBanMetadataIndex(key)) |idx| {
-            _ = self.ban_metadata.items[idx].register.set(metadata, encodeHlc(hlc), self.node_id);
+            _ = self.ban_metadata.items[idx].register.set(metadata, hlc.toU64(), self.node_id);
             return;
         }
         var entry = BanMetadataEntry{ .key = key };
-        _ = entry.register.set(metadata, encodeHlc(hlc), self.node_id);
+        _ = entry.register.set(metadata, hlc.toU64(), self.node_id);
         try self.ban_metadata.append(self.allocator, entry);
     }
 
@@ -562,7 +580,7 @@ pub const NetworkState = struct {
     fn mergeParamModes(self: *Self, other: *const Self) !void {
         for (other.param_modes.items) |entry| {
             if (self.findParamModeIndex(entry.key)) |idx| {
-                self.param_modes.items[idx].register.merge(entry.register);
+                mergeParamRegisters(&self.param_modes.items[idx].register, entry.register);
             } else {
                 try self.param_modes.append(self.allocator, entry);
             }
@@ -590,10 +608,6 @@ pub const NetworkState = struct {
     }
 };
 
-fn encodeHlc(hlc: Hlc) u64 {
-    return (@as(u64, hlc.wall_ms) << 16) | @as(u64, hlc.logical);
-}
-
 fn nickClaimWins(candidate: NickClaim, current: NickClaim) bool {
     if (candidate.authority != current.authority) return candidate.authority > current.authority;
     switch (Hlc.compare(candidate.hlc, current.hlc)) {
@@ -603,6 +617,18 @@ fn nickClaimWins(candidate: NickClaim, current: NickClaim) bool {
     }
     if (candidate.node_id != current.node_id) return candidate.node_id > current.node_id;
     return Uid.lessThan(candidate.uid, current.uid);
+}
+
+fn keepNickClaimAfterPrune(items: []const NickClaim, claim: NickClaim, winner: NickClaim) bool {
+    if (std.meta.eql(claim, winner)) return true;
+    if (Uid.eql(claim.uid, winner.uid)) return false;
+    for (items) |other| {
+        if (!Nick.eql(other.nick, claim.nick)) continue;
+        if (!Uid.eql(other.uid, claim.uid)) continue;
+        if (std.meta.eql(other, claim)) continue;
+        if (nickClaimWins(other, claim)) return false;
+    }
+    return true;
 }
 
 fn authToggleWins(candidate: AuthToggle, current: AuthToggle) bool {
@@ -633,18 +659,32 @@ fn paramWins(candidate: ParamModeValue, candidate_ts: u64, candidate_node: NodeI
     const current_value = current.value.?;
     if (candidate.authority != current_value.authority) return candidate.authority > current_value.authority;
     if (candidate_ts != current.timestamp) return candidate_ts > current.timestamp;
-    return candidate_node > current.replica_id;
+    if (candidate_node != current.replica_id) return candidate_node > current.replica_id;
+    return std.mem.order(u8, std.mem.asBytes(&candidate), std.mem.asBytes(&current_value)) == .gt;
 }
 
 fn mergeParamRegister(register: *LwwRegister(ParamModeValue), value: ParamModeValue, hlc: Hlc, node_id: NodeId) void {
-    const ts = encodeHlc(hlc);
+    const ts = hlc.toU64();
     if (paramWins(value, ts, node_id, register.*)) {
         register.* = .{ .value = value, .timestamp = ts, .replica_id = node_id };
     }
 }
 
+fn mergeParamRegisters(register: *LwwRegister(ParamModeValue), other: LwwRegister(ParamModeValue)) void {
+    const value = other.value orelse return;
+    if (paramWins(value, other.timestamp, other.replica_id, register.*)) {
+        register.* = other;
+    }
+}
+
 fn applyChannelBirth(root: *ChannelRoot, birth_hlc: Hlc, authority: Authority, node_id: NodeId) void {
-    if (!root.has_birth or Hlc.compare(birth_hlc, root.birth_hlc) == .lt) {
+    if (channelBirthWins(.{
+        .name = root.name,
+        .birth_hlc = birth_hlc,
+        .has_birth = true,
+        .authority = authority,
+        .node_id = node_id,
+    }, root.*)) {
         root.birth_hlc = birth_hlc;
         root.has_birth = true;
         root.authority = authority;
@@ -655,6 +695,18 @@ fn applyChannelBirth(root: *ChannelRoot, birth_hlc: Hlc, authority: Authority, n
 fn mergeChannelRoot(target: *ChannelRoot, other: ChannelRoot) void {
     if (!other.has_birth) return;
     applyChannelBirth(target, other.birth_hlc, other.authority, other.node_id);
+}
+
+fn channelBirthWins(candidate: ChannelRoot, current: ChannelRoot) bool {
+    if (!candidate.has_birth) return false;
+    if (!current.has_birth) return true;
+    switch (Hlc.compare(candidate.birth_hlc, current.birth_hlc)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (candidate.authority != current.authority) return candidate.authority > current.authority;
+    return candidate.node_id > current.node_id;
 }
 
 fn containsNickClaim(items: []const NickClaim, claim: NickClaim) bool {
@@ -863,6 +915,48 @@ test "channel birth timestamp converges to minimum HLC" {
     try std.testing.expectEqual(older, a.channelBirth(chan).?);
     try std.testing.expectEqual(older, b.channelBirth(chan).?);
     try std.testing.expect(NetworkState.eql(&a, &b));
+}
+
+test "channel birth HLC tie converges by authority and node id" {
+    const allocator = std.testing.allocator;
+    const chan = try ChannelName.init("#tie");
+    const birth = try makeHlc(1000, 7);
+
+    var a = NetworkState.init(allocator, 1, 10);
+    defer a.deinit();
+    var b = NetworkState.init(allocator, 2, 20);
+    defer b.deinit();
+
+    try a.createChannel(chan, birth, 10);
+    try b.createChannel(chan, birth, 20);
+    try a.merge(&b);
+    try b.merge(&a);
+
+    try std.testing.expect(NetworkState.eql(&a, &b));
+    try std.testing.expectEqual(@as(Authority, 20), a.channels.items[0].authority);
+    try std.testing.expectEqual(@as(NodeId, 20), a.channels.items[0].node_id);
+    try std.testing.expectEqual(a.channels.items[0], b.channels.items[0]);
+}
+
+test "param mode equal writer conflicts converge by value bytes" {
+    const allocator = std.testing.allocator;
+    const chan = try ChannelName.init("#params");
+    const key = ParamModeKey{ .channel = chan, .mode = 'k' };
+    const hlc = try makeHlc(3000, 1);
+
+    var a = NetworkState.init(allocator, 1, 77);
+    defer a.deinit();
+    var b = NetworkState.init(allocator, 2, 77);
+    defer b.deinit();
+
+    try a.setParamMode(key, try ModeParam.init("alpha"), 10, hlc);
+    try b.setParamMode(key, try ModeParam.init("omega"), 10, hlc);
+    try a.merge(&b);
+    try b.merge(&a);
+
+    try std.testing.expect(NetworkState.eql(&a, &b));
+    const value = a.param_modes.items[0].register.value.?;
+    try std.testing.expect(std.mem.eql(u8, "omega", value.value.asSlice()));
 }
 
 test "ban add and remove use observed-remove semantics" {

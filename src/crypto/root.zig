@@ -3,6 +3,7 @@
 pub const secret = @import("secret.zig");
 pub const hash = @import("hash.zig");
 pub const aead = @import("aead.zig");
+pub const kx = @import("kx.zig");
 
 pub const Secret = secret.Secret;
 
@@ -10,4 +11,5 @@ test {
     _ = secret;
     _ = hash;
     _ = aead;
+    _ = kx;
 }

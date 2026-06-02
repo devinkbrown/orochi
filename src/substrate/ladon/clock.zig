@@ -80,6 +80,16 @@ pub const Hlc = packed struct {
         return .eq;
     }
 
+    /// Encode to the LWW timestamp key in the same order as `compare`.
+    pub fn toU64(self: Hlc) u64 {
+        comptime {
+            std.debug.assert(@bitSizeOf(u48) == 48);
+            std.debug.assert(@bitSizeOf(u16) == 16);
+            std.debug.assert(@bitSizeOf(u48) + @bitSizeOf(u16) == @bitSizeOf(u64));
+        }
+        return (@as(u64, self.wall_ms) << @bitSizeOf(u16)) | @as(u64, self.logical);
+    }
+
     fn castWall(physical_ms: u64) Error!u48 {
         if (physical_ms > max_wall_ms) return error.WallTimeOutOfRange;
         return @intCast(physical_ms);

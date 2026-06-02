@@ -90,7 +90,7 @@ pub const Sim = struct {
     prng: std.Random.Pcg,
     next_seq: u64,
     events: EventQueue,
-    nodes: std.ArrayList(Node),
+    nodes: std.ArrayList(*Node),
     partitioned: std.ArrayList(bool),
     links: std.AutoHashMap(LinkKey, LinkConfig),
     event_log: std.ArrayList(EventRecord),
@@ -116,6 +116,9 @@ pub const Sim = struct {
         self.event_log.deinit(self.allocator);
         self.links.deinit();
         self.partitioned.deinit(self.allocator);
+        for (self.nodes.items) |node| {
+            self.allocator.destroy(node);
+        }
         self.nodes.deinit(self.allocator);
         self.events.deinit(self.allocator);
         self.* = undefined;
@@ -129,9 +132,12 @@ pub const Sim = struct {
     /// Register one virtual node and return its stable handle.
     pub fn registerNode(self: *Sim) !NodeHandle {
         const id: u32 = @intCast(self.nodes.items.len);
-        try self.nodes.append(self.allocator, .{
-            .reactor_backend = reactor_mod.SimReactor.init(self.clock_ms),
-        });
+        const node = try self.allocator.create(Node);
+        errdefer self.allocator.destroy(node);
+        node.* = .{ .reactor_backend = reactor_mod.SimReactor.init(self.clock_ms) };
+
+        try self.nodes.append(self.allocator, node);
+        errdefer _ = self.nodes.pop();
         try self.partitioned.append(self.allocator, false);
         return .{ .id = id };
     }
@@ -294,7 +300,7 @@ pub const Sim = struct {
     }
 
     fn syncNodeClocks(self: *Sim) void {
-        for (self.nodes.items) |*node| {
+        for (self.nodes.items) |node| {
             node.reactor_backend.clock_ms = self.clock_ms;
         }
     }
@@ -444,4 +450,24 @@ test "clock advances monotonically through the queue" {
     try std.testing.expectEqual(@as(i64, 3), events[0].due_ms);
     try std.testing.expectEqual(@as(i64, 7), events[1].due_ms);
     try std.testing.expectEqual(@as(i64, 10), events[2].due_ms);
+}
+
+test "node reactor remains valid after node storage grows" {
+    const allocator = std.testing.allocator;
+    var sim = Sim.init(allocator, 99);
+    defer sim.deinit();
+
+    const first = try sim.registerNode();
+    const reactor = try sim.nodeReactor(first);
+    try std.testing.expectEqual(@as(i64, 0), reactor.nowMillis());
+
+    var i: usize = 0;
+    while (i < 2048) : (i += 1) {
+        _ = try sim.registerNode();
+    }
+
+    try sim.scheduleTimer(first, 37, 1);
+    try std.testing.expect(try sim.step());
+    try std.testing.expectEqual(@as(i64, 37), sim.nowMillis());
+    try std.testing.expectEqual(@as(i64, 37), reactor.nowMillis());
 }
