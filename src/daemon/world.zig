@@ -35,8 +35,13 @@ pub const MessageTarget = union(enum) {
     nick: ClientId,
 };
 
-const MemberMap = std.AutoHashMap(ClientId, void);
+const chanmode = @import("chanmode.zig");
+
+/// Per-member channel status modes (op/halfop/voice) keyed by client.
+const MemberMap = std.AutoHashMap(ClientId, chanmode.MemberModes);
 pub const MemberIterator = MemberMap.KeyIterator;
+pub const MemberMode = chanmode.MemberMode;
+pub const MemberModes = chanmode.MemberModes;
 
 const Channel = struct {
     allocator: std.mem.Allocator,
@@ -136,11 +141,38 @@ pub const World = struct {
     /// Join a channel. Returns true when membership was newly added.
     pub fn join(self: *World, name: []const u8, client: ClientId) WorldError!bool {
         const channel = try self.ensureChannel(name);
+        // The first member to join a freshly-created channel founds it and gets
+        // operator status (+o); later joiners start with no status modes.
+        const founding = channel.members.count() == 0;
         const member = try channel.members.getOrPut(client);
         if (!member.found_existing) {
-            member.value_ptr.* = {};
+            member.value_ptr.* = if (founding)
+                MemberModes.fromModes(&.{.op})
+            else
+                MemberModes.empty();
         }
         return !member.found_existing;
+    }
+
+    /// Status modes for `client` in `name`, or null if not a member / no channel.
+    pub fn memberModes(self: *World, name: []const u8, client: ClientId) ?MemberModes {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.members.get(client);
+    }
+
+    /// Set or clear one status mode for a member. Returns true if it changed.
+    pub fn setMemberMode(
+        self: *World,
+        name: []const u8,
+        client: ClientId,
+        mode: MemberMode,
+        on: bool,
+    ) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        const entry = channel.members.getEntry(client) orelse return error.NotOnChannel;
+        const before = entry.value_ptr.contains(mode);
+        if (on) entry.value_ptr.add(mode) else entry.value_ptr.remove(mode);
+        return before != on;
     }
 
     /// Part a channel, deleting it when the last member leaves.
@@ -331,4 +363,40 @@ test "topics are owned and released" {
     try std.testing.expectEqualStrings("first topic", world.topic("#x").?);
     try world.setTopic("#x", "second topic");
     try std.testing.expectEqualStrings("second topic", world.topic("#x").?);
+}
+
+test "first joiner founds the channel as operator; later joiners have no status" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const founder = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const second = ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+
+    _ = try world.join("#x", founder);
+    _ = try world.join("#x", second);
+
+    try std.testing.expect(world.memberModes("#x", founder).?.contains(.op));
+    try std.testing.expect(!world.memberModes("#x", second).?.contains(.op));
+    try std.testing.expectEqual(@as(u8, '@'), world.memberModes("#x", founder).?.highestPrefix());
+    try std.testing.expectEqual(@as(u8, 0), world.memberModes("#x", second).?.highestPrefix());
+}
+
+test "setMemberMode adds and removes status and reports change" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const b = ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    _ = try world.join("#x", a); // a founds (op)
+    _ = try world.join("#x", b);
+
+    try std.testing.expect(try world.setMemberMode("#x", b, .voice, true));
+    try std.testing.expect(world.memberModes("#x", b).?.contains(.voice));
+    // Idempotent set reports no change.
+    try std.testing.expect(!(try world.setMemberMode("#x", b, .voice, true)));
+    try std.testing.expect(try world.setMemberMode("#x", b, .voice, false));
+    try std.testing.expect(!world.memberModes("#x", b).?.contains(.voice));
+
+    try std.testing.expectError(error.NotOnChannel, world.setMemberMode("#x", ClientId{ .shard = 0, .slot = 9, .gen = 1 }, .op, true));
+    try std.testing.expect(world.memberModes("#nope", a) == null);
 }
