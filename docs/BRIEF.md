@@ -71,7 +71,7 @@ name it and specify it well enough to build.
 Planning only; no production code until the design is settled and reviewed by Claude.
 
 ## Clean-room / no-legacy mandate
-Every system is clean-room, modern, inventive — NO legacy ports. Banned: WALLOPS/OPERWALL, snomask +s, WEBIRC, /OPER passwords+hostmasks (oper=SASL certfp/SCRAM only), PASS-as-auth, LINKS/MAP, ident, TS6/SJOIN, Python modules. See docs/dev/zig016-notes.md "CLEAN-ROOM / NO-LEGACY MANDATE".
+Every system is clean-room, modern, inventive — NO legacy ports. Banned: WALLOPS/OPERWALL, snomask +s, WEBIRC, /OPER passwords+hostmasks (oper=SASL certfp/SCRAM only), PASS-as-auth, ident, TS6/SJOIN, Python modules. (LINKS/MAP are KEPT — reimagined as Suimyaku mesh introspection, not a spanning tree.) See docs/dev/zig016-notes.md "CLEAN-ROOM / NO-LEGACY MANDATE".
 
 Services are internalized native commands (REGISTER/IDENTIFY/CREGISTER/ACCESS/MEMO/...) with IRCv3 standard-replies — NOT pseudo-client bots.
 

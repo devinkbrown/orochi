@@ -62,7 +62,8 @@ mesh world.
 - WEBIRC / IP-spoof gateways → web clients connect via **WebSocket** directly.
 - `/OPER` command, oper passwords, host/IP masks, RSA challenge → **oper = SASL auth only** (certfp EXTERNAL / SCRAM).
 - server `PASS` as authentication → **SASL** (PASS may only select a connection class, never authenticate).
-- LINKS / MAP (spanning-tree concepts) → **mesh introspection** over Suimyaku (no tree).
+- (NOT banned) **LINKS / MAP are KEPT** (user decision 2026-06-02) but reimagined: they render the
+  **Suimyaku mesh** (nodes/peers), NOT a TS6 spanning tree. Implement them as mesh introspection.
 - ident / RFC1413 lookups → dead protocol; identity = TLS certfp / SASL.
 - TS6 / netburst / SJOIN / text S2S → **Suimyaku** binary CRDT mesh only.
 - Embedded Python / CPython modules → **WASM plugins** (MizuWasm) or native Zig only. NO Python.

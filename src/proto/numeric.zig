@@ -12,9 +12,12 @@ pub const Numeric = enum(u16) {
     RPL_CREATED = 3,
     RPL_MYINFO = 4,
     RPL_ISUPPORT = 5,
-    // RPL_SNOMASK (8), RPL_REDIR (10), RPL_MAP/MAPMORE/MAPEND (15-17) removed:
-    // snomask, server-bounce, and MAP are BANNED (clean-room mandate). Oper
-    // notices ride the Event Spine; mesh shape is introspected over Suimyaku.
+    // RPL_SNOMASK (8) / RPL_REDIR (10) removed: snomask rides the Event Spine,
+    // server-bounce is gone. MAP is KEPT — reimagined to render the Suimyaku
+    // mesh topology (nodes/peers) rather than a TS6 spanning tree.
+    RPL_MAP = 15,
+    RPL_MAPMORE = 16,
+    RPL_MAPEND = 17,
     RPL_SAVENICK = 43,
 
     RPL_TRACELINK = 200,
@@ -114,8 +117,10 @@ pub const Numeric = enum(u16) {
     RPL_KILLDONE = 361,
     RPL_CLOSING = 362,
     RPL_CLOSEEND = 363,
-    // RPL_LINKS (364) / RPL_ENDOFLINKS (365) removed: LINKS is BANNED (no
-    // spanning tree) — mesh topology is introspected over Suimyaku.
+    // LINKS is KEPT — reimagined to list Suimyaku mesh peers (not a spanning
+    // tree). See also RPL_MAP (15-17).
+    RPL_LINKS = 364,
+    RPL_ENDOFLINKS = 365,
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
     RPL_ENDOFBANLIST = 368,
