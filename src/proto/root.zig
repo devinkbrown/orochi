@@ -9,7 +9,7 @@ pub const frame = @import("frame.zig");
 pub const irc_line = @import("irc_line.zig");
 pub const numeric = @import("numeric.zig");
 pub const sasl = @import("sasl.zig");
-pub const veil = @import("veil.zig");
+pub const tsumugi = @import("tsumugi.zig");
 // gen:mods:end
 
 /// Native server-to-server mesh protocol (replaces TS6 entirely).
@@ -26,6 +26,6 @@ test {
     _ = irc_line;
     _ = numeric;
     _ = sasl;
-    _ = veil;
+    _ = tsumugi;
     // gen:tests:end
 }

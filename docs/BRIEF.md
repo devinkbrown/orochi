@@ -4,12 +4,12 @@
 daemon. It is a **100% clean-slate, Zig-native** system: the daemon *and its entire
 substrate* (the libop systems library and the opssl crypto/TLS library) are
 **rewritten from scratch in Zig**. ophion, libop, and opssl are **reference only** —
-we mine them for the feature inventory, the hard-won lessons, and the LADON/VEIL
+we mine them for the feature inventory, the hard-won lessons, and the Suimyaku/Tsumugi
 conceptual foundation, then design something better.
 
 Mizuchi keeps ophion's full feature surface (IRCv3, IRCX, SASL, in-process
 services, WebSocket, CHATHISTORY, voice/video) and replaces the legacy **TS6** S2S
-protocol with the native **LADON + VEIL** cryptographic mesh.
+protocol with the native **Suimyaku + Tsumugi** cryptographic mesh.
 
 ## Mandate: 100% freedom — invent
 This is not a port. Every worker has license to **invent new technologies,
@@ -31,15 +31,15 @@ name it and specify it well enough to build.
 
 ## Scope of the rewrite (everything is ours)
 1. **Substrate (libop successor, Zig-native).** Event loop (io_uring), lock-free
-   concurrency, allocators/arenas, the full data-structure kit, and the LADON math
+   concurrency, allocators/arenas, the full data-structure kit, and the Suimyaku math
    substrate (CRDTs, vector/hybrid-logical clocks, Merkle delta sync, gossip).
    Reimagine these with comptime and Zig semantics — invent new primitives.
 2. **Crypto + TLS (opssl successor, Zig-native).** Modern, TLS 1.3-first,
    PQ-hybrid by default, constant-time *by construction* (ideally comptime-verified),
-   plus the VEIL transport crypto. Invent where the design allows.
+   plus the Tsumugi transport crypto. Invent where the design allows.
 3. **Daemon core + comptime module system + 100% feature parity** with ophion.
-4. **LADON + VEIL mesh** as the only S2S protocol (no TS6). CRDT network state,
-   SWIM gossip, Merkle anti-entropy, VEIL frame crypto + ratchet. Innovate on the
+4. **Suimyaku + Tsumugi mesh** as the only S2S protocol (no TS6). CRDT network state,
+   SWIM gossip, Merkle anti-entropy, Tsumugi frame crypto + ratchet. Innovate on the
    spec, don't just implement it.
 
 ## Hard constraints (few, deliberate)
@@ -47,7 +47,7 @@ name it and specify it well enough to build.
    ophion must have a target home.
 2. **Pin the Zig version** (`build.zig.zon` minimum_zig_version) — pre-1.0; upgrades
    are deliberate PRs.
-3. **No TS6.** LADON+VEIL only. Decide explicitly if a transitional bridge is worth
+3. **No TS6.** Suimyaku+Tsumugi only. Decide explicitly if a transitional bridge is worth
    it or it's a clean break.
 4. Nick collisions: **rename loser to its UID, never kill**.
 5. Constant-time crypto by construction; no data-dependent branches/memory in
@@ -63,9 +63,9 @@ name it and specify it well enough to build.
 
 ## Planning deliverables (this phase — Codex workers + Claude synthesis)
 - `docs/planning/01-substrate.md` — Zig-native systems substrate (libop successor).
-- `docs/planning/02-crypto-veil.md` — Zig-native crypto/TLS + VEIL (opssl successor).
+- `docs/planning/02-crypto-tsumugi.md` — Zig-native crypto/TLS + Tsumugi (opssl successor).
 - `docs/planning/03-daemon-modules.md` — daemon core, comptime modules, feature map.
-- `docs/planning/04-ladon-mesh.md` — client line protocol + LADON/VEIL mesh + CRDTs.
+- `docs/planning/04-suimyaku-mesh.md` — client line protocol + Suimyaku/Tsumugi mesh + CRDTs.
 - `docs/planning/05-innovation.md` — invented technologies + build/test/roadmap.
 
 Planning only; no production code until the design is settled and reviewed by Claude.
