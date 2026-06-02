@@ -261,8 +261,9 @@ pub const Permissions = struct {
     oper_class: ?OperClassName = null,
     services_access_bits: u128 = 0,
     ircx_flags: u128 = 0,
-    can_wallops: bool = false,
-    can_globops: bool = false,
+    // Oper broadcast reach is no longer a boolean perm: WALLOPS/GLOBOPS are
+    // BANNED (clean-room mandate). Opers receive notifications by subscribing
+    // to Event Spine categories (see daemon/event_spine.zig).
 };
 
 pub const Rate = struct {

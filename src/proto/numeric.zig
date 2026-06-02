@@ -12,11 +12,9 @@ pub const Numeric = enum(u16) {
     RPL_CREATED = 3,
     RPL_MYINFO = 4,
     RPL_ISUPPORT = 5,
-    RPL_SNOMASK = 8,
-    RPL_REDIR = 10,
-    RPL_MAP = 15,
-    RPL_MAPMORE = 16,
-    RPL_MAPEND = 17,
+    // RPL_SNOMASK (8), RPL_REDIR (10), RPL_MAP/MAPMORE/MAPEND (15-17) removed:
+    // snomask, server-bounce, and MAP are BANNED (clean-room mandate). Oper
+    // notices ride the Event Spine; mesh shape is introspected over Suimyaku.
     RPL_SAVENICK = 43,
 
     RPL_TRACELINK = 200,
@@ -116,8 +114,8 @@ pub const Numeric = enum(u16) {
     RPL_KILLDONE = 361,
     RPL_CLOSING = 362,
     RPL_CLOSEEND = 363,
-    RPL_LINKS = 364,
-    RPL_ENDOFLINKS = 365,
+    // RPL_LINKS (364) / RPL_ENDOFLINKS (365) removed: LINKS is BANNED (no
+    // spanning tree) — mesh topology is introspected over Suimyaku.
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
     RPL_ENDOFBANLIST = 368,
