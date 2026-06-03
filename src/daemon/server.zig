@@ -1932,6 +1932,82 @@ test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #x :hi\r\n", 200);
 }
 
+test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to-end" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // A founds #x -> A is FOUNDER (~). B joins -> no status.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #x\r\n");
+    try recvUntil(&a, " 353 ", 200); // NAMES
+    try recvUntil(&a, "~A", 200); // founder prefix on A
+    try writeAllFd(fd_b, "JOIN #x\r\n");
+    try recvUntil(&b, " 366 B #x ", 200);
+
+    // Founder ops B: MODE #x +o B -> broadcast +o.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #x +o B\r\n");
+    try recvUntil(&a, "MODE #x +o B", 200);
+
+    // A KICKs B (founder outranks op).
+    a.reset();
+    try writeAllFd(fd_a, "KICK #x B :bye\r\n");
+    try recvUntil(&a, "KICK #x B :bye", 200);
+
+    // WHOIS A -> 311 user line + 318 end.
+    a.reset();
+    try writeAllFd(fd_a, "WHOIS A\r\n");
+    try recvUntil(&a, " 311 A A alice ", 200);
+    try recvUntil(&a, " 318 A A ", 200);
+
+    // LIST -> #x present (322).
+    a.reset();
+    try writeAllFd(fd_a, "LIST\r\n");
+    try recvUntil(&a, " 322 A #x ", 200);
+
+    // WHO #x -> 352 + 315 end.
+    a.reset();
+    try writeAllFd(fd_a, "WHO #x\r\n");
+    try recvUntil(&a, " 315 A #x ", 200);
+
+    // ISON A B -> 303 lists A (B parted via kick but reconnect-less; A online).
+    a.reset();
+    try writeAllFd(fd_a, "ISON A B\r\n");
+    try recvUntil(&a, " 303 A :", 200);
+
+    // LUSERS -> 251, VERSION -> 351.
+    a.reset();
+    try writeAllFd(fd_a, "LUSERS\r\n");
+    try recvUntil(&a, " 251 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "VERSION\r\n");
+    try recvUntil(&a, " 351 A ", 200);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
