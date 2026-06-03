@@ -812,6 +812,8 @@ pub const LinuxServer = struct {
             try self.handleLinks(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MAP")) {
             try self.handleMap(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "KILL")) {
+            try self.handleKill(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
         } else {
@@ -1274,14 +1276,58 @@ pub const LinuxServer = struct {
         try self.deliver(clientIdFromWorld(target), full);
     }
 
+    /// KILL <nick> :<reason> — oper-only forced disconnect. Delivers a KILL line
+    /// then routes the victim through the graceful close-on-drain path (its
+    /// channels see a QUIT once the buffer flushes). Non-opers get 481.
+    fn handleKill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KILL"}, "Not enough parameters");
+            return;
+        }
+        const target_nick = parsed.paramSlice()[0];
+        const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "Killed";
+        const target_wid = self.world.findNick(target_nick) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+            return;
+        };
+        const tconn = self.clients.get(clientIdFromWorld(target_wid)) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+            return;
+        };
+
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const killer = conn.session.displayName();
+        const kill_line = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "KILL", &.{target_nick}, reason);
+        try self.deliver(clientIdFromWorld(target_wid), kill_line);
+
+        var err_buf: [default_reply_bytes]u8 = undefined;
+        const err_line = std.fmt.bufPrint(&err_buf, "ERROR :Closing Link: {s} (Killed ({s} ({s})))\r\n", .{ target_nick, killer, reason }) catch return error.OutputTooSmall;
+        try self.deliver(clientIdFromWorld(target_wid), err_line);
+
+        // Graceful close: the send-drain path fires QUIT to channels and frees
+        // the slot once the buffer flushes (mirrors a self-QUIT).
+        tconn.closing = true;
+        try self.armSendIfNeeded(tconn);
+    }
+
     /// LUSERS — network/user counters (251-255, 265/266).
     fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         const clients: u64 = @intCast(self.clients.len());
+        var opers: u64 = 0;
+        var oit = self.clients.iterator();
+        while (oit.next()) |entry| {
+            if (entry.value.session.isOper()) opers += 1;
+        }
         const counts = lusers.Counts{
             .users = clients,
             .invisible = 0,
             .servers = 1,
-            .opers = 0,
+            .opers = opers,
             .unknown = 0,
             .channels = @intCast(self.world.channelCount()),
             .local_clients = clients,
@@ -2275,6 +2321,11 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     a.reset();
     try writeAllFd(fd_a, "MAP\r\n");
     try recvUntil(&a, " 015 A ", 200);
+
+    // KILL: oper A kills B -> B receives a KILL line then is disconnected.
+    b.reset();
+    try writeAllFd(fd_a, "KILL B :spam\r\n");
+    try recvUntil(&b, "KILL B :spam\r\n", 200);
 }
 
 test {
