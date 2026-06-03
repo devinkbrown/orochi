@@ -535,6 +535,16 @@ pub const LinuxServer = struct {
         return socketPort(self.listener_fd);
     }
 
+    /// Run the reactor loop on the calling thread until `run` is cleared. Wakes
+    /// on each io_uring completion and re-checks the flag, so a client
+    /// disconnect (or any I/O) lets a requested shutdown take effect. (T1 of the
+    /// threading plan — docs/planning/06-threading.md.)
+    pub fn runThreaded(self: *LinuxServer, run: *std.atomic.Value(bool)) void {
+        while (run.load(.acquire)) {
+            self.runOnce() catch return;
+        }
+    }
+
     fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
         if (!event.more) self.accept_armed = false;
         if (event.res < 0) return error.BadCompletion;
@@ -1855,6 +1865,71 @@ test "live loopback two clients join channels and exchange messages" {
     b.reset();
     try writeAllFd(fd_a, "PRIVMSG B :hey\r\n");
     try pumpUntilContains(&server, &b, ":A!user@localhost PRIVMSG B :hey\r\n", 64);
+}
+
+/// Blocking read with a bounded poll budget (so a misbehaving server fails the
+/// test instead of hanging). Accumulates into `client` and returns when `needle`
+/// is present, or errors after ~3s.
+fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
+    var polls: usize = 0;
+    while (polls < max_polls) : (polls += 1) {
+        if (std.mem.indexOf(u8, client.written(), needle) != null) return;
+        var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+        if (ready == 0) continue;
+        if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+        if (client.len == client.buf.len) return error.OutputTooSmall;
+        const n = try readFd(client.fd, client.buf[client.len..]);
+        if (n == 0) return error.ConnectionReset;
+        client.len += n;
+    }
+    return error.TestTimeout;
+}
+
+test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    // Reactor on its own thread; the test thread is a real loopback client.
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    // Shutdown that can't hang: clear the flag, then a throwaway connection wakes
+    // the reactor (accept completion) so it observes the flag, then join.
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch |err| switch (err) {
+        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #x\r\n");
+    try recvUntil(&a, " 366 A #x ", 200);
+    try writeAllFd(fd_b, "JOIN #x\r\n");
+
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG #x :hi\r\n");
+    // Real username (alice) now flows through (not the old "user" placeholder).
+    try recvUntil(&b, ":A!alice@localhost PRIVMSG #x :hi\r\n", 200);
 }
 
 test {
