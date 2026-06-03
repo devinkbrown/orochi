@@ -29,6 +29,7 @@ pub const extended_join = @import("extended_join.zig");
 pub const extended_monitor = @import("extended_monitor.zig");
 pub const frame = @import("frame.zig");
 pub const frame_props = @import("frame_props.zig");
+pub const invite = @import("invite.zig");
 pub const invite_notify = @import("invite_notify.zig");
 pub const irc_line = @import("irc_line.zig");
 pub const irc_line_props = @import("irc_line_props.zig");
@@ -42,6 +43,7 @@ pub const knock = @import("knock.zig");
 pub const links_map = @import("links_map.zig");
 pub const list = @import("list.zig");
 pub const list_props = @import("list_props.zig");
+pub const listx = @import("listx.zig");
 pub const meshpass = @import("meshpass.zig");
 pub const meshpass_props = @import("meshpass_props.zig");
 pub const metadata = @import("metadata.zig");
@@ -68,6 +70,7 @@ pub const usermode = @import("usermode.zig");
 pub const utf8_only = @import("utf8_only.zig");
 pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
+pub const whisper = @import("whisper.zig");
 pub const who_props = @import("who_props.zig");
 pub const who = @import("who.zig");
 // gen:mods:end
@@ -106,6 +109,7 @@ test {
     _ = extended_monitor;
     _ = frame;
     _ = frame_props;
+    _ = invite;
     _ = invite_notify;
     _ = irc_line;
     _ = irc_line_props;
@@ -119,6 +123,7 @@ test {
     _ = links_map;
     _ = list;
     _ = list_props;
+    _ = listx;
     _ = meshpass;
     _ = meshpass_props;
     _ = metadata;
@@ -145,6 +150,7 @@ test {
     _ = utf8_only;
     _ = websocket_props;
     _ = websocket;
+    _ = whisper;
     _ = who_props;
     _ = who;
     // gen:tests:end
