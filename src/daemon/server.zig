@@ -22,6 +22,7 @@ const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
+const list = @import("../proto/list.zig");
 
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
@@ -40,6 +41,15 @@ const ConnLineSink = struct {
     // Narrow error set so it coerces into builder error sets (e.g. LusersError).
     pub fn send(self: *ConnLineSink, bytes: []const u8) error{OutputTooSmall}!void {
         appendToConn(self.conn, bytes) catch return error.OutputTooSmall;
+    }
+};
+
+/// Like ConnLineSink but appends CRLF (for builders whose lines omit it, e.g. LIST).
+const ConnLineSinkCRLF = struct {
+    conn: *ConnState,
+    pub fn send(self: *ConnLineSinkCRLF, bytes: []const u8) error{OutputTooSmall}!void {
+        appendToConn(self.conn, bytes) catch return error.OutputTooSmall;
+        appendToConn(self.conn, "\r\n") catch return error.OutputTooSmall;
     }
 };
 
@@ -719,6 +729,8 @@ pub const LinuxServer = struct {
             try self.handleInvite(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOIS")) {
             try self.handleWhois(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "LIST")) {
+            try self.handleList(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -1010,6 +1022,26 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         const line = ison_userhost.writeUserhostReply(&out_buf, server_name, conn.session.displayName(), targets[0..count]) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// LIST [<filters>] — RPL_LISTSTART/RPL_LIST/RPL_LISTEND. Secret (+s)
+    /// channels are hidden. Filters that fail to parse fall back to listing all.
+    fn handleList(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const request = list.parseList(parsed.paramSlice()) catch list.Request{};
+        const Adapter = struct {
+            it: world_model.World.ChannelViewIterator,
+            pub fn next(s: *@This()) ?list.ChannelInfo {
+                while (s.it.next()) |v| {
+                    if (v.secret) continue;
+                    return .{ .name = v.name, .users = @intCast(v.members), .topic = v.topic };
+                }
+                return null;
+            }
+        };
+        var adapter = Adapter{ .it = self.world.channelIterator() };
+        var scratch: [default_reply_bytes]u8 = undefined;
+        var sink = ConnLineSinkCRLF{ .conn = conn };
+        list.emitList(Adapter, &adapter, request, .{ .server_name = server_name, .requester = conn.session.displayName(), .now_seconds = 0 }, &scratch, &sink) catch return;
     }
 
     /// WHOIS [server] <nick> — full WHOIS sequence for a local user.

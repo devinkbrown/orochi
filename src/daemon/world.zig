@@ -255,6 +255,34 @@ pub const World = struct {
         return self.channels.count();
     }
 
+    /// Read-only view of a channel for LIST.
+    pub const ChannelView = struct {
+        name: []const u8,
+        members: usize,
+        topic: []const u8,
+        secret: bool,
+    };
+
+    pub const ChannelViewIterator = struct {
+        inner: std.StringHashMap(Channel).Iterator,
+
+        pub fn next(self: *ChannelViewIterator) ?ChannelView {
+            if (self.inner.next()) |entry| {
+                return .{
+                    .name = entry.key_ptr.*,
+                    .members = entry.value_ptr.members.count(),
+                    .topic = entry.value_ptr.topic orelse "",
+                    .secret = entry.value_ptr.modes.secret,
+                };
+            }
+            return null;
+        }
+    };
+
+    pub fn channelIterator(self: *World) ChannelViewIterator {
+        return .{ .inner = self.channels.iterator() };
+    }
+
     /// Fill `out` with the names of channels `client` is a member of (scan; no
     /// reverse index yet). Returns the count written, capped at `out.len`.
     /// Channel-name slices borrow from world storage and stay valid until the
