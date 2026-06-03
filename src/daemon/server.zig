@@ -939,7 +939,7 @@ pub const LinuxServer = struct {
             return;
         }
 
-        const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = "user", .host = default_host };
+        const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = default_host };
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, args.reason) catch return;
         try self.broadcastChannel(args.channel, msg, null);
@@ -1271,7 +1271,7 @@ fn formatMessage(
 fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
     return std.fmt.bufPrint(storage, "{s}!{s}@{s}", .{
         conn.session.displayName(),
-        "user",
+        conn.session.username(),
         default_host,
     }) catch return error.OutputTooSmall;
 }
