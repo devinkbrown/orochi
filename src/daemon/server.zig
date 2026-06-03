@@ -23,6 +23,7 @@ const serverinfo = @import("../proto/serverinfo.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const list = @import("../proto/list.zig");
+const who = @import("../proto/who.zig");
 
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
@@ -731,6 +732,8 @@ pub const LinuxServer = struct {
             try self.handleWhois(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "LIST")) {
             try self.handleList(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHO")) {
+            try self.handleWho(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -1022,6 +1025,66 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         const line = ison_userhost.writeUserhostReply(&out_buf, server_name, conn.session.displayName(), targets[0..count]) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// WHO <channel|nick> — RPL_WHOREPLY (352) per match + RPL_ENDOFWHO (315).
+    fn handleWho(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHO"}, "Not enough parameters");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+        const requester = conn.session.displayName();
+        var buf: [default_reply_bytes]u8 = undefined;
+
+        if (world_model.isChannelName(target) and self.world.channelExists(target)) {
+            var it = self.world.memberIterator(target) orelse return;
+            while (it.next()) |member| {
+                const nick = self.world.nickOf(member.*) orelse continue;
+                const mconn = self.clients.get(clientIdFromWorld(member.*));
+                const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
+                const ctx = who.ReplyContext{
+                    .server_name = server_name,
+                    .requester = requester,
+                    .target = target,
+                    .client = .{
+                        .nick = nick,
+                        .user = usernameOf(self, member.*),
+                        .host = default_host,
+                        .server = server_name,
+                        .realname = if (mconn) |c| c.session.realname() else nick,
+                        .account = if (mconn) |c| c.session.account() else null,
+                    },
+                    .member = .{ .channel = target, .channel_prefix = if (hp != 0) hp else null },
+                };
+                const line = who.writeWhoReply(&buf, ctx) catch continue;
+                try appendToConn(conn, line);
+                try appendToConn(conn, "\r\n");
+            }
+        } else if (self.world.findNick(target)) |wid| {
+            const mconn = self.clients.get(clientIdFromWorld(wid));
+            const ctx = who.ReplyContext{
+                .server_name = server_name,
+                .requester = requester,
+                .target = target,
+                .client = .{
+                    .nick = target,
+                    .user = usernameOf(self, wid),
+                    .host = default_host,
+                    .server = server_name,
+                    .realname = if (mconn) |c| c.session.realname() else target,
+                    .account = if (mconn) |c| c.session.account() else null,
+                },
+            };
+            if (who.writeWhoReply(&buf, ctx)) |line| {
+                try appendToConn(conn, line);
+                try appendToConn(conn, "\r\n");
+            } else |_| {}
+        }
+
+        const end = who.writeEndOfWho(&buf, server_name, requester, target) catch return;
+        try appendToConn(conn, end);
+        try appendToConn(conn, "\r\n");
     }
 
     /// LIST [<filters>] — RPL_LISTSTART/RPL_LIST/RPL_LISTEND. Secret (+s)
