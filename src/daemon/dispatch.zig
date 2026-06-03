@@ -20,6 +20,7 @@ const MAX_NICK_BYTES: usize = 64;
 const MAX_UID_BYTES: usize = 16;
 const MAX_REALNAME_BYTES: usize = 256;
 const MAX_ACCOUNT_BYTES: usize = 64;
+const MAX_AWAY_BYTES: usize = 256;
 
 /// Parsed IRC line view. Slices borrow from the caller-owned input buffer.
 pub const LineView = struct {
@@ -165,6 +166,8 @@ pub const CapId = enum(u6) {
     sasl,
     multi_prefix,
     userhost_in_names,
+    away_notify,
+    setname,
 };
 
 const CapSet = struct {
@@ -199,6 +202,8 @@ const cap_specs = [_]CapSpec{
     .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN" },
     .{ .id = .multi_prefix, .name = "multi-prefix" },
     .{ .id = .userhost_in_names, .name = "userhost-in-names" },
+    .{ .id = .away_notify, .name = "away-notify" },
+    .{ .id = .setname, .name = "setname" },
 };
 
 const CapReplyKind = enum {
@@ -387,8 +392,46 @@ pub const ClientSession = struct {
     account_store: FixedString(MAX_ACCOUNT_BYTES) = .{},
     logged_in: bool = false,
 
+    /// AWAY state (RFC 1459 / IRCv3 away-notify). `away_active` gates whether
+    /// `away_store` holds a live message; cleared by a parameterless AWAY.
+    away_store: FixedString(MAX_AWAY_BYTES) = .{},
+    away_active: bool = false,
+    /// Set once the client completes a successful OPER. Gates oper-only commands
+    /// (WALLOPS, REHASH, KILL, ...) and the RPL_WHOISOPERATOR line.
+    is_oper: bool = false,
+
     pub fn init() ClientSession {
         return .{};
+    }
+
+    /// The client's AWAY message, or null when not marked away.
+    pub fn awayMessage(self: *const ClientSession) ?[]const u8 {
+        return if (self.away_active) self.away_store.slice() else null;
+    }
+
+    /// Mark the client away with `text`, truncating to the buffer if needed.
+    pub fn setAway(self: *ClientSession, text: []const u8) void {
+        const n = @min(text.len, self.away_store.bytes.len);
+        @memcpy(self.away_store.bytes[0..n], text[0..n]);
+        self.away_store.len = n;
+        self.away_active = true;
+    }
+
+    /// Clear any away state (parameterless AWAY).
+    pub fn clearAway(self: *ClientSession) void {
+        self.away_store.len = 0;
+        self.away_active = false;
+    }
+
+    /// Replace the client's realname (IRCv3 SETNAME). Rejects control bytes and
+    /// over-length values via the underlying FixedString validation.
+    pub fn setRealname(self: *ClientSession, value: []const u8) DispatchError!void {
+        try self.client.identity.realname.set(value);
+    }
+
+    /// Whether the client has completed OPER authentication.
+    pub fn isOper(self: *const ClientSession) bool {
+        return self.is_oper;
     }
 
     /// Authenticated account name, or null when not logged in (SASL).

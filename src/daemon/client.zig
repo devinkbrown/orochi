@@ -503,6 +503,34 @@ pub fn Table(comptime T: type, comptime Id: type) type {
             return self.live_count;
         }
 
+        /// Iterates live entries, yielding `{ id, value }`. Stable across reads
+        /// (no mutation during iteration). Used by fan-out commands (WALLOPS,
+        /// away-notify, oper notices) that must reach every connected client.
+        pub const Entry = struct { id: Id, value: *T };
+
+        pub const Iterator = struct {
+            table: *Self,
+            cursor: usize = 0,
+
+            pub fn next(self: *Iterator) ?Entry {
+                while (self.cursor < self.table.slots.items.len) {
+                    const idx = self.cursor;
+                    self.cursor += 1;
+                    const slot = &self.table.slots.items[idx];
+                    if (!slot.occupied) continue;
+                    return .{
+                        .id = .{ .shard = self.table.shard, .slot = @intCast(idx), .gen = slot.gen },
+                        .value = &slot.value,
+                    };
+                }
+                return null;
+            }
+        };
+
+        pub fn iterator(self: *Self) Iterator {
+            return .{ .table = self };
+        }
+
         fn validSlot(self: *Self, id: Id) ?*Slot {
             if (id.eql(Id.invalid)) return null;
             if (id.shard != self.shard) return null;

@@ -357,6 +357,22 @@ const server_name = "mizuchi.local";
 const default_host = "localhost";
 
 const Numeric = enum(u16) {
+    RPL_MAP = 15,
+    RPL_MAPEND = 17,
+    RPL_LINKS = 364,
+    RPL_ENDOFLINKS = 365,
+    RPL_YOUREOPER = 381,
+    RPL_REHASHING = 382,
+    RPL_INFO = 371,
+    RPL_ENDOFINFO = 374,
+    RPL_INFOSTART = 373,
+    RPL_USERSSTART = 392,
+    RPL_USERS = 393,
+    RPL_ENDOFUSERS = 394,
+    RPL_NOUSERS = 395,
+    RPL_AWAY = 301,
+    RPL_UNAWAY = 305,
+    RPL_NOWAWAY = 306,
     RPL_NOTOPIC = 331,
     RPL_TOPIC = 332,
     RPL_CHANNELMODEIS = 324,
@@ -370,6 +386,8 @@ const Numeric = enum(u16) {
     ERR_USERONCHANNEL = 443,
     ERR_NOTONCHANNEL = 442,
     ERR_NEEDMOREPARAMS = 461,
+    ERR_PASSWDMISMATCH = 464,
+    ERR_NOPRIVILEGES = 481,
     ERR_CHANOPRIVSNEEDED = 482,
 };
 
@@ -489,6 +507,11 @@ pub const LinuxServer = struct {
     clients: ClientTable,
     world: world_model.World,
     accept_armed: bool = false,
+
+    /// Single configured operator credential (OPER <name> <pass>). Static for
+    /// now; a full oper-block table arrives with the config overhaul.
+    oper_name: []const u8 = "admin",
+    oper_pass: []const u8 = "mizuchi",
 
     /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
     /// ring used for accept/recv/send completions.
@@ -771,6 +794,26 @@ pub const LinuxServer = struct {
             try self.handleTopic(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
             try self.handleQuit(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "AWAY")) {
+            try self.handleAway(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SETNAME")) {
+            try self.handleSetname(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
+            try self.handleOper(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WALLOPS")) {
+            try self.handleWallops(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
+            try self.handleRehash(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "INFO")) {
+            try self.handleInfo(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "USERS")) {
+            try self.handleUsers(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "LINKS")) {
+            try self.handleLinks(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MAP")) {
+            try self.handleMap(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
+            // Client heartbeat reply; accepted, no response required.
         } else {
             var sink = QueueSink{ .conn = conn };
             try processLine(conn, line, &sink);
@@ -1179,6 +1222,7 @@ pub const LinuxServer = struct {
             .host = default_host,
             .realname = tconn.session.realname(),
             .account = tconn.session.account(),
+            .away = tconn.session.awayMessage(),
             .channels = memberships[0..nchan],
         };
         whois.writeWhois(&sink, server_name, conn.session.displayName(), subject) catch return;
@@ -1302,6 +1346,194 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// AWAY [:message] — RFC 1459 / IRCv3 away-notify. A parameter sets the away
+    /// message (RPL_NOWAWAY 306); a bare AWAY clears it (RPL_UNAWAY 305). When
+    /// the away-notify cap is negotiated by peers, an `AWAY` state change is
+    /// announced to all common-channel members.
+    fn handleAway(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const reason: ?[]const u8 = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
+            parsed.paramSlice()[0]
+        else
+            null;
+
+        if (reason) |text| {
+            conn.session.setAway(text);
+            try queueNumeric(conn, .RPL_NOWAWAY, &.{}, "You have been marked as being away");
+        } else {
+            conn.session.clearAway();
+            try queueNumeric(conn, .RPL_UNAWAY, &.{}, "You are no longer marked as being away");
+        }
+
+        // away-notify: announce to common-channel members who negotiated it.
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        const msg = try formatMessage(&msg_buf, prefix, "AWAY", &.{}, reason);
+        try self.notifyCommonChannels(id, msg, .away_notify, id);
+    }
+
+    /// SETNAME :<realname> — IRCv3 setname. Updates the GECOS and echoes the
+    /// change to the client and to setname-capable common-channel members.
+    fn handleSetname(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SETNAME"}, "Not enough parameters");
+            return;
+        }
+        const newname = parsed.paramSlice()[0];
+        conn.session.setRealname(newname) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SETNAME"}, "Realname too long");
+            return;
+        };
+
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        const msg = try formatMessage(&msg_buf, prefix, "SETNAME", &.{}, newname);
+        try self.deliver(id, msg); // echo to self
+        try self.notifyCommonChannels(id, msg, .setname, id);
+    }
+
+    /// OPER <name> <password> — elevate to IRC operator. Matches against the
+    /// single configured oper block; success sets the session oper flag, emits
+    /// RPL_YOUREOPER (381) and the +o umode reflection.
+    fn handleOper(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"OPER"}, "Not enough parameters");
+            return;
+        }
+        const name = parsed.paramSlice()[0];
+        const pass = parsed.paramSlice()[1];
+        if (!std.mem.eql(u8, name, self.oper_name) or !std.mem.eql(u8, pass, self.oper_pass)) {
+            try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Password incorrect");
+            return;
+        }
+        conn.session.is_oper = true;
+        try queueNumeric(conn, .RPL_YOUREOPER, &.{}, "You are now an IRC operator");
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        const nick = conn.session.displayName();
+        const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, "+o" }, null);
+        try appendToConn(conn, msg);
+    }
+
+    /// WALLOPS :<message> — oper-only broadcast to every operator. Non-opers get
+    /// ERR_NOPRIVILEGES (481).
+    fn handleWallops(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WALLOPS"}, "Not enough parameters");
+            return;
+        }
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        const msg = try formatMessage(&msg_buf, prefix, "WALLOPS", &.{}, parsed.paramSlice()[0]);
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            if (entry.value.session.isOper()) try self.deliver(entry.id, msg);
+        }
+    }
+
+    /// REHASH — oper-only configuration reload. The config store is static at
+    /// present, so this acknowledges with RPL_REHASHING (382) without I/O.
+    fn handleRehash(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        try queueNumeric(conn, .RPL_REHASHING, &.{"mizuchi.conf"}, "Rehashing");
+    }
+
+    /// INFO — RPL_INFO (371) lines bracketed by RPL_INFOSTART/RPL_ENDOFINFO.
+    fn handleInfo(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        const lines = [_][]const u8{
+            "Mizuchi IRC daemon — a clean-room Zig-native successor to ophion.",
+            "100% Zig, no C interop. Substrate + crypto + daemon.",
+            "Mesh protocol: Suimyaku (CRDT) + Sazanami (gossip) + Goryu (membership).",
+        };
+        try queueNumeric(conn, .RPL_INFOSTART, &.{}, server_name);
+        for (lines) |l| try queueNumeric(conn, .RPL_INFO, &.{}, l);
+        try queueNumeric(conn, .RPL_ENDOFINFO, &.{}, "End of /INFO list");
+    }
+
+    /// USERS — local user listing (RPL_USERSSTART/RPL_USERS/RPL_ENDOFUSERS).
+    fn handleUsers(self: *LinuxServer, conn: *ConnState) !void {
+        try queueNumeric(conn, .RPL_USERSSTART, &.{}, "UserID   Terminal  Host");
+        var any = false;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value.session.registered()) continue;
+            any = true;
+            var line_buf: [128]u8 = undefined;
+            const detail = std.fmt.bufPrint(&line_buf, "{s} {s} {s}", .{
+                entry.value.session.username(),
+                entry.value.session.displayName(),
+                default_host,
+            }) catch continue;
+            try queueNumeric(conn, .RPL_USERS, &.{}, detail);
+        }
+        if (!any) try queueNumeric(conn, .RPL_NOUSERS, &.{}, "Nobody logged in");
+        try queueNumeric(conn, .RPL_ENDOFUSERS, &.{}, "End of users");
+    }
+
+    /// LINKS — single-node mesh view: just this server (RPL_LINKS 364 /
+    /// RPL_ENDOFLINKS 365). Reimagined for Suimyaku once S2S lands.
+    fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        var line_buf: [128]u8 = undefined;
+        const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Mizuchi IRC daemon"}) catch return;
+        try queueNumeric(conn, .RPL_LINKS, &.{ server_name, server_name }, detail);
+        try queueNumeric(conn, .RPL_ENDOFLINKS, &.{"*"}, "End of /LINKS list");
+    }
+
+    /// MAP — network topology. Single node today (RPL_MAP 015 / RPL_MAPEND 017).
+    fn handleMap(self: *LinuxServer, conn: *ConnState) !void {
+        var line_buf: [160]u8 = undefined;
+        const detail = std.fmt.bufPrint(&line_buf, "{s} [Users: {d}]", .{
+            server_name,
+            self.clients.len(),
+        }) catch return;
+        try queueNumeric(conn, .RPL_MAP, &.{}, detail);
+        try queueNumeric(conn, .RPL_MAPEND, &.{}, "End of /MAP");
+    }
+
+    /// Fan a pre-built message out to every member of every channel `id` shares,
+    /// optionally gated on a negotiated capability, skipping `except`. Each
+    /// recipient is delivered at most once even across multiple shared channels.
+    fn notifyCommonChannels(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        msg: []const u8,
+        cap: ?dispatch.CapId,
+        except: client_model.ClientId,
+    ) !void {
+        var seen = std.AutoHashMap(u64, void).init(self.allocator);
+        defer seen.deinit();
+        var it = self.world.channels.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
+            var members = self.world.memberIterator(entry.key_ptr.*) orelse continue;
+            while (members.next()) |member| {
+                const mid = clientIdFromWorld(member.*);
+                if (mid.eql(except)) continue;
+                const key = @as(u64, @bitCast(mid));
+                if (seen.contains(key)) continue;
+                seen.put(key, {}) catch {};
+                const mconn = self.clients.get(mid) orelse continue;
+                if (cap) |c| {
+                    if (!mconn.session.hasCap(c)) continue;
+                }
+                try self.deliver(mid, msg);
+            }
+        }
+    }
+
     fn handleMessage(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -1352,6 +1584,16 @@ pub const LinuxServer = struct {
         };
         try self.deliver(clientIdFromWorld(recipient), msg);
         if (echo) try self.deliver(id, msg);
+
+        // RFC 1459: a PRIVMSG (not NOTICE) to an away user returns RPL_AWAY so
+        // the sender sees the auto-reply. NOTICE never auto-responds.
+        if (std.ascii.eqlIgnoreCase(command, "PRIVMSG")) {
+            if (self.clients.get(clientIdFromWorld(recipient))) |rconn| {
+                if (rconn.session.awayMessage()) |reason| {
+                    try queueNumeric(conn, .RPL_AWAY, &.{target}, reason);
+                }
+            }
+        }
     }
 
     fn handleTopic(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -1471,6 +1713,10 @@ const PortableServer = struct {
     pub fn runOnce(_: *PortableServer) ServerError!void {
         return error.Unsupported;
     }
+    /// Symbol parity with LinuxServer so the threaded end-to-end tests compile on
+    /// non-Linux targets. Never reached: `init` returns Unsupported first, so the
+    /// tests SkipZigTest before any thread is spawned.
+    pub fn runThreaded(_: *PortableServer, _: *std.atomic.Value(bool)) void {}
 };
 
 const CompletionHandler = struct {
@@ -1954,6 +2200,81 @@ test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to
     a.reset();
     try writeAllFd(fd_a, "ADMIN\r\n");
     try recvUntil(&a, " 256 A ", 200);
+}
+
+test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // B marks away -> 306; A PRIVMSGs B -> A sees RPL_AWAY (301).
+    b.reset();
+    try writeAllFd(fd_b, "AWAY :lunch\r\n");
+    try recvUntil(&b, " 306 B ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :hey\r\n");
+    try recvUntil(&a, " 301 A B :lunch\r\n", 200);
+    // B returns -> 305.
+    b.reset();
+    try writeAllFd(fd_b, "AWAY\r\n");
+    try recvUntil(&b, " 305 B ", 200);
+
+    // SETNAME echoes back to the sender.
+    a.reset();
+    try writeAllFd(fd_a, "SETNAME :Alice Liddell\r\n");
+    try recvUntil(&a, "SETNAME :Alice Liddell\r\n", 200);
+
+    // Non-oper WALLOPS -> 481; OPER with good creds -> 381; then WALLOPS reaches self.
+    a.reset();
+    try writeAllFd(fd_a, "WALLOPS :nope\r\n");
+    try recvUntil(&a, " 481 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "WALLOPS :hello opers\r\n");
+    try recvUntil(&a, "WALLOPS :hello opers\r\n", 200);
+    // REHASH now permitted (382).
+    a.reset();
+    try writeAllFd(fd_a, "REHASH\r\n");
+    try recvUntil(&a, " 382 A ", 200);
+
+    // INFO (371), USERS (392), LINKS (364), MAP (015).
+    a.reset();
+    try writeAllFd(fd_a, "INFO\r\n");
+    try recvUntil(&a, " 371 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "USERS\r\n");
+    try recvUntil(&a, " 392 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "LINKS\r\n");
+    try recvUntil(&a, " 364 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MAP\r\n");
+    try recvUntil(&a, " 015 A ", 200);
 }
 
 test {
