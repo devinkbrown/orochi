@@ -411,6 +411,12 @@ pub const ClientSession = struct {
         return if (u.len == 0) "user" else u;
     }
 
+    /// The client's realname (from USER), or the nick if unset.
+    pub fn realname(self: *const ClientSession) []const u8 {
+        const r = self.client.identity.realname.slice();
+        return if (r.len == 0) self.displayName() else r;
+    }
+
     /// Whether this client negotiated `id` via CAP. Lets the message path apply
     /// per-recipient IRCv3 behavior (echo-message, extended-join, ...).
     pub fn hasCap(self: *const ClientSession, id: CapId) bool {

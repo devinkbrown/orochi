@@ -21,6 +21,7 @@ const lusers = @import("../proto/lusers.zig");
 const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const invite = @import("../proto/invite.zig");
+const whois = @import("whois.zig");
 
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
@@ -716,6 +717,8 @@ pub const LinuxServer = struct {
             try self.handleVersion(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "INVITE")) {
             try self.handleInvite(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOIS")) {
+            try self.handleWhois(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -1007,6 +1010,55 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         const line = ison_userhost.writeUserhostReply(&out_buf, server_name, conn.session.displayName(), targets[0..count]) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// WHOIS [server] <nick> — full WHOIS sequence for a local user.
+    fn handleWhois(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHOIS"}, "Not enough parameters");
+            return;
+        }
+        // WHOIS [<server>] <nick>: the target is the last parameter.
+        const target_nick = parsed.paramSlice()[parsed.param_count - 1];
+        var storage: [default_reply_bytes * 2]u8 = undefined;
+        var lines_buf: [40]whois.WhoisLine = undefined;
+        var sink = whois.WhoisLineSink{ .lines = &lines_buf, .storage = &storage };
+
+        const target_wid = self.world.findNick(target_nick);
+        const target_conn: ?*ConnState = if (target_wid) |w| self.clients.get(clientIdFromWorld(w)) else null;
+        if (target_wid == null or target_conn == null) {
+            whois.writeNoSuchNick(&sink, server_name, conn.session.displayName(), target_nick) catch return;
+            for (sink.slice()) |line| try appendToConn(conn, line.bytes);
+            return;
+        }
+
+        // Channels the target is in, with their highest status prefix.
+        var chan_names: [32][]const u8 = undefined;
+        const nchan = self.world.channelsOf(target_wid.?, &chan_names);
+        var memberships: [32]whois.ChannelMembership = undefined;
+        var prefix_store: [32][1]u8 = undefined;
+        for (chan_names[0..nchan], 0..) |cn, i| {
+            const modes = self.world.memberModes(cn, target_wid.?) orelse world_model.MemberModes.empty();
+            const hp = modes.highestPrefix();
+            var pfx: []const u8 = "";
+            if (hp != 0) {
+                prefix_store[i][0] = hp;
+                pfx = prefix_store[i][0..1];
+            }
+            memberships[i] = .{ .prefix = pfx, .channel = cn };
+        }
+
+        const tconn = target_conn.?;
+        const subject = whois.WhoisSubject{
+            .nick = target_nick,
+            .user = tconn.session.username(),
+            .host = default_host,
+            .realname = tconn.session.realname(),
+            .account = tconn.session.account(),
+            .channels = memberships[0..nchan],
+        };
+        whois.writeWhois(&sink, server_name, conn.session.displayName(), subject) catch return;
+        for (sink.slice()) |line| try appendToConn(conn, line.bytes);
     }
 
     /// INVITE <nick> <channel> — invite a user; +i channels require op (no +g

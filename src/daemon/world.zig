@@ -255,6 +255,23 @@ pub const World = struct {
         return self.channels.count();
     }
 
+    /// Fill `out` with the names of channels `client` is a member of (scan; no
+    /// reverse index yet). Returns the count written, capped at `out.len`.
+    /// Channel-name slices borrow from world storage and stay valid until the
+    /// channel is removed.
+    pub fn channelsOf(self: *World, client: ClientId, out: [][]const u8) usize {
+        var n: usize = 0;
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            if (n >= out.len) break;
+            if (entry.value_ptr.members.contains(client)) {
+                out[n] = entry.key_ptr.*;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
     pub fn memberIterator(self: *World, name: []const u8) ?MemberIterator {
         const channel = self.channels.getPtr(name) orelse return null;
         return channel.members.keyIterator();
@@ -479,4 +496,27 @@ test "channel flag modes set, query, and render" {
     try std.testing.expect(try world.setChannelFlag("#x", .moderated, false));
     try std.testing.expectEqualStrings("+t", world.channelModeString("#x", &buf));
     try std.testing.expectError(error.NoSuchChannel, world.setChannelFlag("#nope", .secret, true));
+}
+
+test "channelsOf lists a client's channels" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const b = ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    _ = try world.join("#x", a);
+    _ = try world.join("#y", a);
+    _ = try world.join("#x", b);
+
+    var buf: [8][]const u8 = undefined;
+    const n = world.channelsOf(a, &buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    // both #x and #y present (order is map-dependent)
+    var seen_x = false;
+    var seen_y = false;
+    for (buf[0..n]) |c| {
+        if (std.mem.eql(u8, c, "#x")) seen_x = true;
+        if (std.mem.eql(u8, c, "#y")) seen_y = true;
+    }
+    try std.testing.expect(seen_x and seen_y);
+    try std.testing.expectEqual(@as(usize, 1), world.channelsOf(b, &buf));
 }
