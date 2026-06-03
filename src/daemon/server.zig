@@ -16,6 +16,12 @@ const sasl = @import("../proto/sasl.zig");
 const names_reply = @import("../proto/names_reply.zig");
 const chanmode = @import("chanmode.zig");
 const kick = @import("../proto/kick.zig");
+const ison_userhost = @import("../proto/ison_userhost.zig");
+
+/// ISON predicate: nicks are pre-filtered to online before the builder runs.
+fn alwaysOnline(_: []const u8) bool {
+    return true;
+}
 
 const irc_line = struct {
     pub const MAXPARA: usize = 15;
@@ -678,6 +684,10 @@ pub const LinuxServer = struct {
             try self.handleMode(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KICK")) {
             try self.handleKick(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ISON")) {
+            try self.handleIson(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "USERHOST")) {
+            try self.handleUserhost(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -934,6 +944,41 @@ pub const LinuxServer = struct {
         const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, args.reason) catch return;
         try self.broadcastChannel(args.channel, msg, null);
         self.world.part(args.channel, target) catch {};
+    }
+
+    /// ISON <nick>... — reply RPL_ISON (303) with the subset that is online.
+    fn handleIson(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        var online_buf: [32][]const u8 = undefined;
+        var count: usize = 0;
+        for (parsed.paramSlice()) |nick| {
+            if (count >= online_buf.len) break;
+            if (self.world.findNick(nick) != null) {
+                online_buf[count] = nick;
+                count += 1;
+            }
+        }
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        var lines_buf: [8]ison_userhost.ReplyLine = undefined;
+        var sink = ison_userhost.ReplyLineSink{ .lines = &lines_buf };
+        ison_userhost.writeIsonReplies(&out_buf, server_name, conn.session.displayName(), online_buf[0..count], alwaysOnline, &sink) catch return;
+        for (sink.slice()) |line| try appendToConn(conn, line.bytes);
+    }
+
+    /// USERHOST <nick>... (up to 5) — reply RPL_USERHOST (302).
+    fn handleUserhost(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        var targets: [ison_userhost.USERHOST_MAX_TARGETS]ison_userhost.UserhostTarget = undefined;
+        var count: usize = 0;
+        for (parsed.paramSlice()) |nick| {
+            if (count >= targets.len) break;
+            if (self.world.findNick(nick) == null) continue;
+            // Per-client oper/away and real user@host are not tracked yet (M2):
+            // use the daemon's placeholder identity, like clientPrefix.
+            targets[count] = .{ .nick = nick, .is_oper = false, .is_away = false, .user = "user", .host = default_host };
+            count += 1;
+        }
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        const line = ison_userhost.writeUserhostReply(&out_buf, server_name, conn.session.displayName(), targets[0..count]) catch return;
+        try appendToConn(conn, line);
     }
 
     fn handleMessage(
