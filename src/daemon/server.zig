@@ -1321,6 +1321,7 @@ pub const LinuxServer = struct {
             .realname = tconn.session.realname(),
             .account = tconn.session.account(),
             .away = tconn.session.awayMessage(),
+            .is_oper = tconn.session.isOper(),
             .channels = memberships[0..nchan],
         };
         whois.writeWhois(&sink, server_name, conn.session.displayName(), subject) catch return;
@@ -1706,8 +1707,12 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
-            if (!self.world.isMember(target, worldIdFromClient(id))) {
-                try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel");
+            // +n no-external-messages: a non-member may message the channel only
+            // when +n is unset (RFC 1459). Members always pass this gate.
+            if (!self.world.isMember(target, worldIdFromClient(id)) and
+                self.world.channelHasFlag(target, .no_external))
+            {
+                try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
                 return;
             }
             // +m moderated: only voiced (+v) or any operator tier may speak.
@@ -2429,6 +2434,10 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     a.reset();
     try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
     try recvUntil(&a, " 381 A ", 200);
+    // WHOIS now shows the operator line (313).
+    a.reset();
+    try writeAllFd(fd_a, "WHOIS A\r\n");
+    try recvUntil(&a, " 313 A A ", 200);
     a.reset();
     try writeAllFd(fd_a, "WALLOPS :hello opers\r\n");
     try recvUntil(&a, "WALLOPS :hello opers\r\n", 200);

@@ -46,7 +46,7 @@
 27. [x] JOIN enforce +i → ERR_INVITEONLYCHAN 473 (respect invite list)
 28. [x] JOIN enforce +b → ERR_BANNEDFROMCHAN 474 (respect +e)
 29. [x] JOIN with key param: `JOIN #c key`
-30. [ ] +n no-external-messages enforcement on PRIVMSG/NOTICE
+30. [x] +n no-external-messages enforcement on PRIVMSG/NOTICE
 31. [ ] +t already; verify +t list-mode echo in RPL_CHANNELMODEIS with params
 32. [ ] MODE query shows key/limit params to members only
 33. [ ] KNOCK (713/711/ERR_CHANOPEN; needs +i) `[~]` proto/knock.zig
@@ -122,7 +122,7 @@
 88. [ ] TRACE / ETRACE (200-262 family)
 89. [ ] SNOMASK / server notices (+s umode)
 90. [ ] OPER MODE +o user-umode reflection + RPL_UMODEIS
-91. [ ] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
+91. [x] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
 92. [ ] WALLOPS gated to +w umode recipients (not all opers)
 93. [ ] GRANT / privilege sets (oper.zig Privilege wiring)
 

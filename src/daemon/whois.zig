@@ -24,6 +24,7 @@ const whois_idle_code = numeric.Numeric.RPL_WHOISIDLE;
 const whois_channels_code = numeric.Numeric.RPL_WHOISCHANNELS;
 const whois_logged_in_code = numeric.Numeric.RPL_WHOISLOGGEDIN;
 const whois_bot_code = numeric.Numeric.RPL_WHOISBOT;
+const whois_operator_code = numeric.Numeric.RPL_WHOISOPERATOR;
 const away_code = numeric.Numeric.RPL_AWAY;
 const endofwhois_code = numeric.Numeric.RPL_ENDOFWHOIS;
 const nosuchnick_code = numeric.Numeric.ERR_NOSUCHNICK;
@@ -86,6 +87,7 @@ pub const WhoisSubject = struct {
     idle_secs: u64 = 0,
     signon_ts: u64 = 0,
     is_bot: bool = false,
+    is_oper: bool = false,
     away: ?[]const u8 = null,
     channels: []const ChannelMembership = &.{},
 };
@@ -164,6 +166,9 @@ pub fn writeWhoisWith(
     }
     if (subject.is_bot) {
         try writeWhoisBotLine(params, sink, server_name, requester_nick, subject.nick);
+    }
+    if (subject.is_oper) {
+        try writeWhoisOperatorLine(params, sink, server_name, requester_nick, subject.nick);
     }
     if (subject.away) |away_message| {
         try writeAwayLine(params, sink, server_name, requester_nick, subject.nick, away_message);
@@ -477,6 +482,22 @@ fn writeWhoisBotLine(
     try b.numericPrefix(whois_bot_code, server_name, requester_nick);
     try b.spaceParam(subject_nick);
     try b.spaceTrailing("is a bot");
+    try b.crlf();
+    try sink.commitLine(&b);
+}
+
+fn writeWhoisOperatorLine(
+    comptime params: Params,
+    sink: *WhoisLineSink,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    subject_nick: []const u8,
+) WhoisError!void {
+    var b = try sink.beginLine();
+    b.max_line_bytes = params.max_line_bytes;
+    try b.numericPrefix(whois_operator_code, server_name, requester_nick);
+    try b.spaceParam(subject_nick);
+    try b.spaceTrailing("is an IRC operator");
     try b.crlf();
     try sink.commitLine(&b);
 }
