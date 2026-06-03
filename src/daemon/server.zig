@@ -378,9 +378,15 @@ const Numeric = enum(u16) {
     RPL_CHANNELMODEIS = 324,
     RPL_NAMREPLY = 353,
     RPL_ENDOFNAMES = 366,
+    RPL_BANLIST = 367,
+    RPL_ENDOFBANLIST = 368,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHCHANNEL = 403,
     ERR_CANNOTSENDTOCHAN = 404,
+    ERR_CHANNELISFULL = 471,
+    ERR_INVITEONLYCHAN = 473,
+    ERR_BANNEDFROMCHAN = 474,
+    ERR_BADCHANNELKEY = 475,
     ERR_NICKNAMEINUSE = 433,
     ERR_USERNOTINCHANNEL = 441,
     ERR_USERONCHANNEL = 443,
@@ -834,6 +840,46 @@ pub const LinuxServer = struct {
         };
     }
 
+    /// Channel-mode gate for JOIN. Returns true (and emits the numeric) when the
+    /// join must be refused: +b ban (474), +i invite-only (473), +k bad key
+    /// (475), +l full (471). A pending INVITE bypasses ban and invite-only.
+    fn joinDenied(
+        self: *LinuxServer,
+        conn: *ConnState,
+        id: client_model.ClientId,
+        channel: []const u8,
+        supplied_key: ?[]const u8,
+    ) !bool {
+        const wid = worldIdFromClient(id);
+        const invited = self.world.hasInvite(channel, wid);
+
+        if (!invited) {
+            var mask_buf: [256]u8 = undefined;
+            const mask = try clientPrefix(conn, &mask_buf);
+            if (self.world.isBanned(channel, mask)) {
+                try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
+                return true;
+            }
+            if (self.world.channelHasFlag(channel, .invite_only)) {
+                try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
+                return true;
+            }
+        }
+        if (self.world.channelKey(channel)) |key| {
+            if (supplied_key == null or !std.mem.eql(u8, supplied_key.?, key)) {
+                try queueNumeric(conn, .ERR_BADCHANNELKEY, &.{channel}, "Cannot join channel (+k)");
+                return true;
+            }
+        }
+        if (self.world.channelLimit(channel)) |limit| {
+            if (self.world.memberCount(channel) >= limit) {
+                try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn handleJoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"JOIN"}, "Not enough parameters");
@@ -846,7 +892,15 @@ pub const LinuxServer = struct {
             return;
         }
 
-        _ = try self.world.join(channel, worldIdFromClient(id));
+        // Enforce channel modes only when joining an EXISTING channel as a new
+        // member. Creating a fresh channel (founder path) bypasses all gates.
+        const wid = worldIdFromClient(id);
+        if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
+            const supplied_key: ?[]const u8 = if (parsed.param_count >= 2) parsed.paramSlice()[1] else null;
+            if (try self.joinDenied(conn, id, channel, supplied_key)) return;
+        }
+
+        _ = try self.world.join(channel, wid);
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
@@ -894,10 +948,10 @@ pub const LinuxServer = struct {
         try self.sendNames(conn, channel);
     }
 
-    /// MODE for channel member status modes (+q/+o/+v, founder +Q is creation-
-    /// only) gated by tier rank, plus channel flag modes (i/m/n/t/s). Channel flag
-    /// modes (+i/+m/+t/...) are not tracked in the world model yet and are
-    /// ignored here; user-target MODE is not handled on this path.
+    /// MODE for channel member status modes (+Q/+q/+o/+v, founder +Q is creation-
+    /// only) gated by tier rank, flag modes (i/m/n/t/s), and parameterised modes
+    /// (+k key, +l limit, +b ban; `MODE #c b` lists bans). User-target MODE is not
+    /// handled on this path.
     fn handleMode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MODE"}, "Not enough parameters");
@@ -1006,7 +1060,49 @@ pub const LinuxServer = struct {
                         applied.appendByte(ch) catch break;
                     }
                 },
-                else => {}, // key/limit/list modes (k/l/b/e/I) not tracked yet
+                'k' => {
+                    if (adding) {
+                        if (arg_index >= parsed.param_count) continue;
+                        const key = parsed.paramSlice()[arg_index];
+                        arg_index += 1;
+                        self.world.setChannelKey(channel, key) catch continue;
+                        appendParamMode(&applied, &targets, &emitted_sign, '+', 'k', key);
+                    } else {
+                        self.world.setChannelKey(channel, null) catch continue;
+                        appendParamMode(&applied, &targets, &emitted_sign, '-', 'k', "*");
+                    }
+                },
+                'l' => {
+                    if (adding) {
+                        if (arg_index >= parsed.param_count) continue;
+                        const arg = parsed.paramSlice()[arg_index];
+                        arg_index += 1;
+                        const limit = std.fmt.parseInt(u32, arg, 10) catch continue;
+                        self.world.setChannelLimit(channel, limit) catch continue;
+                        appendParamMode(&applied, &targets, &emitted_sign, '+', 'l', arg);
+                    } else {
+                        self.world.setChannelLimit(channel, null) catch continue;
+                        appendModeLetter(&applied, &emitted_sign, '-', 'l');
+                    }
+                },
+                'b' => {
+                    // No argument => RPL_BANLIST query.
+                    if (arg_index >= parsed.param_count) {
+                        try self.sendBanList(conn, channel);
+                        continue;
+                    }
+                    const mask = parsed.paramSlice()[arg_index];
+                    arg_index += 1;
+                    const changed = if (adding)
+                        (self.world.addBan(channel, mask) catch continue)
+                    else
+                        (self.world.removeBan(channel, mask) catch continue);
+                    if (changed) {
+                        const sign: u8 = if (adding) '+' else '-';
+                        appendParamMode(&applied, &targets, &emitted_sign, sign, 'b', mask);
+                    }
+                },
+                else => {}, // e/I list modes not tracked yet
             }
         }
 
@@ -1261,6 +1357,9 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{args.nick}, "No such nick");
             return;
         };
+
+        // Record the invite so the target can bypass +i / +b on JOIN.
+        self.world.addInvite(args.channel, target) catch {};
 
         var num_buf: [default_reply_bytes]u8 = undefined;
         const inviting = invite.buildInvitingNumeric(&num_buf, server_name, conn.session.displayName(), args.nick, args.channel) catch return;
@@ -1695,6 +1794,16 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// RPL_BANLIST (367) for each +b mask, terminated by RPL_ENDOFBANLIST (368).
+    fn sendBanList(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        if (self.world.bansOf(channel)) |masks| {
+            for (masks) |mask| {
+                try queueNumeric(conn, .RPL_BANLIST, &.{ channel, mask }, "");
+            }
+        }
+        try queueNumeric(conn, .RPL_ENDOFBANLIST, &.{channel}, "End of channel ban list");
+    }
+
     fn sendNames(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         // Render NAMES via the names_reply module: each member carries its status
         // prefixes (all of them when the requester negotiated multi-prefix, else
@@ -1861,6 +1970,26 @@ fn queueNumeric(
     try out.append("\r\n");
 
     try appendToConn(conn, out.written());
+}
+
+/// Append a parameterised mode change (`+k key`, `+l 50`, `+b mask`) to the
+/// MODE echo accumulators: the letter goes into `applied` (with a sign flip when
+/// the run direction changes), the value into `targets` as ` <param>`. Buffers
+/// are generously sized; appends soft-fail rather than fault.
+fn appendParamMode(applied: *Buf, targets: *Buf, emitted_sign: *u8, sign: u8, letter: u8, param: []const u8) void {
+    appendModeLetter(applied, emitted_sign, sign, letter);
+    targets.appendByte(' ') catch return;
+    targets.append(param) catch return;
+}
+
+/// Append a bare mode letter (`-l`, `-k *`) to the MODE echo, flipping the sign
+/// prefix when the run direction changes.
+fn appendModeLetter(applied: *Buf, emitted_sign: *u8, sign: u8, letter: u8) void {
+    if (emitted_sign.* != sign) {
+        applied.appendByte(sign) catch return;
+        emitted_sign.* = sign;
+    }
+    applied.appendByte(letter) catch return;
 }
 
 fn formatMessage(
@@ -2326,6 +2455,87 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     b.reset();
     try writeAllFd(fd_a, "KILL B :spam\r\n");
     try recvUntil(&b, "KILL B :spam\r\n", 200);
+}
+
+test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // A founds #c, then sets a key.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #c\r\n");
+    try recvUntil(&a, " 366 A #c ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #c +k sesame\r\n");
+    try recvUntil(&a, "MODE #c +k sesame", 200);
+
+    // B joins without key -> 475; with the right key -> success.
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #c\r\n");
+    try recvUntil(&b, " 475 B #c ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #c sesame\r\n");
+    try recvUntil(&b, " 366 B #c ", 200);
+
+    // +l limit: A founds #l, sets +l 1 (A is the only member) -> B is full out.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #l\r\n");
+    try recvUntil(&a, " 366 A #l ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #l +l 1\r\n");
+    try recvUntil(&a, "MODE #l +l 1", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #l\r\n");
+    try recvUntil(&b, " 471 B #l ", 200);
+
+    // +b ban: A bans B, B parts and is refused re-entry (474, even with key).
+    a.reset();
+    try writeAllFd(fd_a, "MODE #c +b B!*@*\r\n");
+    try recvUntil(&a, "MODE #c +b B!*@*", 200);
+    b.reset();
+    try writeAllFd(fd_b, "PART #c\r\n");
+    try recvUntil(&b, "PART #c", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #c sesame\r\n");
+    try recvUntil(&b, " 474 B #c ", 200);
+
+    // INVITE lets the banned user back in (invite bypasses +b/+i).
+    a.reset();
+    try writeAllFd(fd_a, "INVITE B #c\r\n");
+    try recvUntil(&a, " 341 A B #c", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #c sesame\r\n");
+    try recvUntil(&b, " 366 B #c ", 200);
+
+    // Ban-list query: 367 entry + 368 end.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #c b\r\n");
+    try recvUntil(&a, " 367 A #c B!*@*", 200);
+    try recvUntil(&a, " 368 A #c ", 200);
 }
 
 test {

@@ -37,6 +37,7 @@ pub const MessageTarget = union(enum) {
 };
 
 const chanmode = @import("chanmode.zig");
+const listx = @import("../proto/listx.zig");
 
 /// Per-member channel status modes (op @, voice + — no halfop) keyed by client.
 const MemberMap = std.AutoHashMap(ClientId, chanmode.MemberModes);
@@ -49,9 +50,17 @@ const Channel = struct {
     allocator: std.mem.Allocator,
     members: MemberMap,
     topic: ?[]u8 = null,
-    /// Channel-level modes. Flags (i/m/n/t/s) are used today; list modes
-    /// (b/e/I) carry no backing storage here yet, and key/limit are unset.
+    /// Channel-level flag modes (i/m/n/t/s).
     modes: chanmode.ChannelModes = chanmode.ChannelModes.empty(),
+    /// +k key — allocator-owned heap (safe across HashMap rehash; never a
+    /// self-slice). Null = no key.
+    key: ?[]u8 = null,
+    /// +l member limit. Null = unlimited.
+    limit: ?u32 = null,
+    /// +b ban masks (nick!user@host globs), allocator-owned.
+    bans: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Pending invitations (INVITE) that satisfy +i, by client id.
+    invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
 
     fn init(allocator: std.mem.Allocator) Channel {
         return .{
@@ -63,6 +72,10 @@ const Channel = struct {
 
     fn deinit(self: *Channel) void {
         if (self.topic) |topic| self.allocator.free(topic);
+        if (self.key) |k| self.allocator.free(k);
+        for (self.bans.items) |b| self.allocator.free(b);
+        self.bans.deinit(self.allocator);
+        self.invites.deinit(self.allocator);
         self.members.deinit();
         self.* = undefined;
     }
@@ -201,6 +214,88 @@ pub const World = struct {
             else => return error.UnsupportedMode, // not a flag mode (b/e/I/k/l)
         }
         return before != on;
+    }
+
+    /// Set (`key != null`) or clear the +k channel key. New key is heap-owned;
+    /// any prior key is freed.
+    pub fn setChannelKey(self: *World, name: []const u8, key: ?[]const u8) WorldError!void {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        if (channel.key) |old| self.allocator.free(old);
+        channel.key = if (key) |k| try self.allocator.dupe(u8, k) else null;
+    }
+
+    pub fn channelKey(self: *World, name: []const u8) ?[]const u8 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.key;
+    }
+
+    /// Set (`limit != null`) or clear the +l member limit.
+    pub fn setChannelLimit(self: *World, name: []const u8, limit: ?u32) WorldError!void {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        channel.limit = limit;
+    }
+
+    pub fn channelLimit(self: *World, name: []const u8) ?u32 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.limit;
+    }
+
+    pub fn memberCount(self: *World, name: []const u8) usize {
+        const channel = self.channels.getPtr(name) orelse return 0;
+        return channel.members.count();
+    }
+
+    /// Add a +b ban mask. Returns true if newly added (false if already present).
+    pub fn addBan(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        for (channel.bans.items) |b| {
+            if (std.mem.eql(u8, b, mask)) return false;
+        }
+        const owned = try self.allocator.dupe(u8, mask);
+        errdefer self.allocator.free(owned);
+        try channel.bans.append(self.allocator, owned);
+        return true;
+    }
+
+    /// Remove a +b ban mask. Returns true if it existed.
+    pub fn removeBan(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        for (channel.bans.items, 0..) |b, idx| {
+            if (std.mem.eql(u8, b, mask)) {
+                self.allocator.free(b);
+                _ = channel.bans.orderedRemove(idx);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Ban masks for RPL_BANLIST, or null if no such channel.
+    pub fn bansOf(self: *World, name: []const u8) ?[]const []const u8 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.bans.items;
+    }
+
+    /// Whether `hostmask` (nick!user@host) matches any +b entry (case-insensitive
+    /// glob via listx.globMatch).
+    pub fn isBanned(self: *World, name: []const u8, hostmask: []const u8) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        for (channel.bans.items) |b| {
+            if (listx.globMatch(b, hostmask)) return true;
+        }
+        return false;
+    }
+
+    /// Record an INVITE so the target may bypass +i.
+    pub fn addInvite(self: *World, name: []const u8, client: ClientId) WorldError!void {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        try channel.invites.put(self.allocator, client, {});
+    }
+
+    /// Whether `client` holds a pending invite (does not consume it).
+    pub fn hasInvite(self: *World, name: []const u8, client: ClientId) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return channel.invites.contains(client);
     }
 
     /// Render the active channel flag modes as a "+imnt"-style string into `out`.
@@ -503,6 +598,45 @@ test "setMemberMode adds and removes status and reports change" {
 
     try std.testing.expectError(error.NotOnChannel, world.setMemberMode("#x", ClientId{ .shard = 0, .slot = 9, .gen = 1 }, .op, true));
     try std.testing.expect(world.memberModes("#nope", a) == null);
+}
+
+test "channel key, limit, bans, and invites with ownership" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const b = ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    _ = try world.join("#x", a);
+
+    // Key: set, replace (frees old), clear (frees).
+    try world.setChannelKey("#x", "first");
+    try std.testing.expectEqualStrings("first", world.channelKey("#x").?);
+    try world.setChannelKey("#x", "second");
+    try std.testing.expectEqualStrings("second", world.channelKey("#x").?);
+    try world.setChannelKey("#x", null);
+    try std.testing.expect(world.channelKey("#x") == null);
+
+    // Limit.
+    try std.testing.expect(world.channelLimit("#x") == null);
+    try world.setChannelLimit("#x", 42);
+    try std.testing.expectEqual(@as(?u32, 42), world.channelLimit("#x"));
+
+    // Bans: add (dedup), match (glob, case-insensitive), remove.
+    try std.testing.expect(try world.addBan("#x", "bad!*@*"));
+    try std.testing.expect(!(try world.addBan("#x", "bad!*@*"))); // dup
+    try std.testing.expect(world.isBanned("#x", "BAD!user@host"));
+    try std.testing.expect(!world.isBanned("#x", "good!user@host"));
+    try std.testing.expectEqual(@as(usize, 1), world.bansOf("#x").?.len);
+    try std.testing.expect(try world.removeBan("#x", "bad!*@*"));
+    try std.testing.expect(!world.isBanned("#x", "BAD!user@host"));
+
+    // Invites.
+    try std.testing.expect(!world.hasInvite("#x", b));
+    try world.addInvite("#x", b);
+    try std.testing.expect(world.hasInvite("#x", b));
+
+    // memberCount tracks membership.
+    try std.testing.expectEqual(@as(usize, 1), world.memberCount("#x"));
+    try std.testing.expectError(error.NoSuchChannel, world.setChannelKey("#nope", "k"));
 }
 
 test "channel flag modes set, query, and render" {

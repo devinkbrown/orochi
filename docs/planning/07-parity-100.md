@@ -33,19 +33,19 @@
 > Land as one wave: add owned key (heap, not self-slice — channels live in a
 > rehashing HashMap), limit (u32), invite list, ban/except/invex lists.
 
-17. [ ] MODE +k <key> set/unset (owned storage)
-18. [ ] MODE +l <limit> set/unset
-19. [ ] MODE +i toggle (already a flag) + invite-list recording via INVITE
-20. [ ] MODE +b <mask> add/remove (ban list storage)
+17. [x] MODE +k <key> set/unset (owned storage)
+18. [x] MODE +l <limit> set/unset
+19. [x] MODE +i toggle (already a flag) + invite-list recording via INVITE
+20. [x] MODE +b <mask> add/remove (ban list storage)
 21. [ ] MODE +e <mask> ban-exception list
 22. [ ] MODE +I <mask> invite-exception list
-23. [ ] RPL_BANLIST 367 / RPL_ENDOFBANLIST 368
+23. [x] RPL_BANLIST 367 / RPL_ENDOFBANLIST 368
 24. [ ] RPL_EXCEPTLIST 348 / 349, RPL_INVITELIST 346 / 347
-25. [ ] JOIN enforce +k → ERR_BADCHANNELKEY 475
-26. [ ] JOIN enforce +l → ERR_CHANNELISFULL 471
-27. [ ] JOIN enforce +i → ERR_INVITEONLYCHAN 473 (respect invite list)
-28. [ ] JOIN enforce +b → ERR_BANNEDFROMCHAN 474 (respect +e)
-29. [ ] JOIN with key param: `JOIN #c key`
+25. [x] JOIN enforce +k → ERR_BADCHANNELKEY 475
+26. [x] JOIN enforce +l → ERR_CHANNELISFULL 471
+27. [x] JOIN enforce +i → ERR_INVITEONLYCHAN 473 (respect invite list)
+28. [x] JOIN enforce +b → ERR_BANNEDFROMCHAN 474 (respect +e)
+29. [x] JOIN with key param: `JOIN #c key`
 30. [ ] +n no-external-messages enforcement on PRIVMSG/NOTICE
 31. [ ] +t already; verify +t list-mode echo in RPL_CHANNELMODEIS with params
 32. [ ] MODE query shows key/limit params to members only
