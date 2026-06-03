@@ -1671,16 +1671,6 @@ fn closeFd(fd: linux.fd_t) void {
     _ = linux.close(fd);
 }
 
-fn initServerOrSkip(allocator: std.mem.Allocator, config: Config) !Server {
-    // In-process live io_uring tests deadlock: the single-threaded runOnce loop
-    // interleaved against blocking client reads in the same process can stall.
-    // PING and end-to-end chat are verified OUT-OF-PROCESS instead (real daemon
-    // binary + a separate client, with timeouts). Skip the in-process live tests.
-    _ = allocator;
-    _ = config;
-    return error.SkipZigTest;
-}
-
 const TestSink = struct {
     storage: []u8,
     used: usize = 0,
@@ -1738,24 +1728,6 @@ const LiveClient = struct {
     }
 };
 
-fn pumpUntilContains(server: *Server, client: *LiveClient, needle: []const u8, max_iters: usize) !void {
-    var i: usize = 0;
-    while (i < max_iters) : (i += 1) {
-        try client.readAvailable();
-        if (std.mem.indexOf(u8, client.written(), needle) != null) return;
-        server.runOnce() catch |err| switch (err) {
-            error.Unsupported,
-            error.PermissionDenied,
-            error.SocketUnavailable,
-            => return error.SkipZigTest,
-            else => return err,
-        };
-    }
-
-    try client.readAvailable();
-    try expectContains(client.written(), needle);
-}
-
 test "processLine answers PING with bare PONG token" {
     const allocator = std.testing.allocator;
     _ = allocator;
@@ -1792,79 +1764,6 @@ test "processLine rejects malformed input without writing" {
 
     try std.testing.expectError(error.EmbeddedLineBreak, processLine(&conn, "PING :abc\nWHOIS kain", &sink));
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
-}
-
-test "live loopback server accepts TCP client and answers PING" {
-    var server = try initServerOrSkip(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
-    defer server.deinit();
-
-    const port = try server.boundPort();
-    const client_fd = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied,
-        error.SocketUnavailable,
-        error.ConnectionRefused,
-        => return error.SkipZigTest,
-        else => return err,
-    };
-    defer closeFd(client_fd);
-
-    try writeAllFd(client_fd, "PING :abc\r\n");
-
-    try server.runOnce(); // accept
-    try server.runOnce(); // recv + queue send
-    try server.runOnce(); // send completion
-
-    var buf: [128]u8 = undefined;
-    const n = try readFd(client_fd, &buf);
-    try std.testing.expectEqualStrings("PONG :abc\r\n", buf[0..n]);
-}
-
-test "live loopback two clients join channels and exchange messages" {
-    var server = try initServerOrSkip(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
-    defer server.deinit();
-
-    const port = try server.boundPort();
-    const fd_a = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied,
-        error.SocketUnavailable,
-        error.ConnectionRefused,
-        => return error.SkipZigTest,
-        else => return err,
-    };
-    defer closeFd(fd_a);
-
-    const fd_b = connectLoopback(port) catch |err| switch (err) {
-        error.PermissionDenied,
-        error.SocketUnavailable,
-        error.ConnectionRefused,
-        => return error.SkipZigTest,
-        else => return err,
-    };
-    defer closeFd(fd_b);
-
-    var a = LiveClient{ .fd = fd_a };
-    var b = LiveClient{ .fd = fd_b };
-
-    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :A\r\n");
-    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
-    try pumpUntilContains(&server, &a, " 001 A ", 64);
-    try pumpUntilContains(&server, &b, " 001 B ", 64);
-
-    a.reset();
-    b.reset();
-    try writeAllFd(fd_a, "JOIN #x\r\n");
-    try pumpUntilContains(&server, &a, " 366 A #x ", 64);
-    try writeAllFd(fd_b, "JOIN #x\r\n");
-    try pumpUntilContains(&server, &b, " 366 B #x ", 64);
-
-    a.reset();
-    b.reset();
-    try writeAllFd(fd_a, "PRIVMSG #x :hi\r\n");
-    try pumpUntilContains(&server, &b, ":A!user@localhost PRIVMSG #x :hi\r\n", 64);
-
-    b.reset();
-    try writeAllFd(fd_a, "PRIVMSG B :hey\r\n");
-    try pumpUntilContains(&server, &b, ":A!user@localhost PRIVMSG B :hey\r\n", 64);
 }
 
 /// Blocking read with a bounded poll budget (so a misbehaving server fails the
