@@ -44,12 +44,14 @@ pub const links_map = @import("links_map.zig");
 pub const list = @import("list.zig");
 pub const list_props = @import("list_props.zig");
 pub const listx = @import("listx.zig");
+pub const lusers = @import("lusers.zig");
 pub const meshpass = @import("meshpass.zig");
 pub const meshpass_props = @import("meshpass_props.zig");
 pub const metadata = @import("metadata.zig");
 pub const metadata_props = @import("metadata_props.zig");
 pub const monitor = @import("monitor.zig");
 pub const monitor_props = @import("monitor_props.zig");
+pub const motd = @import("motd.zig");
 pub const msgedit = @import("msgedit.zig");
 pub const msgtags = @import("msgtags.zig");
 pub const msgtags_props = @import("msgtags_props.zig");
@@ -60,6 +62,7 @@ pub const numeric = @import("numeric.zig");
 pub const read_marker = @import("read_marker.zig");
 pub const sasl_props = @import("sasl_props.zig");
 pub const sasl = @import("sasl.zig");
+pub const serverinfo = @import("serverinfo.zig");
 pub const standard_replies_props = @import("standard_replies_props.zig");
 pub const standard_replies = @import("standard_replies.zig");
 pub const sts = @import("sts.zig");
@@ -72,6 +75,7 @@ pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
 pub const whisper = @import("whisper.zig");
 pub const who_props = @import("who_props.zig");
+pub const whowas_reply = @import("whowas_reply.zig");
 pub const who = @import("who.zig");
 // gen:mods:end
 
@@ -124,12 +128,14 @@ test {
     _ = list;
     _ = list_props;
     _ = listx;
+    _ = lusers;
     _ = meshpass;
     _ = meshpass_props;
     _ = metadata;
     _ = metadata_props;
     _ = monitor;
     _ = monitor_props;
+    _ = motd;
     _ = msgedit;
     _ = msgtags;
     _ = msgtags_props;
@@ -140,6 +146,7 @@ test {
     _ = read_marker;
     _ = sasl_props;
     _ = sasl;
+    _ = serverinfo;
     _ = standard_replies_props;
     _ = standard_replies;
     _ = sts;
@@ -152,6 +159,7 @@ test {
     _ = websocket;
     _ = whisper;
     _ = who_props;
+    _ = whowas_reply;
     _ = who;
     // gen:tests:end
 }
