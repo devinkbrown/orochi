@@ -20,6 +20,7 @@ const ison_userhost = @import("../proto/ison_userhost.zig");
 const lusers = @import("../proto/lusers.zig");
 const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
+const invite = @import("../proto/invite.zig");
 
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
@@ -339,6 +340,7 @@ const Numeric = enum(u16) {
     ERR_CANNOTSENDTOCHAN = 404,
     ERR_NICKNAMEINUSE = 433,
     ERR_USERNOTINCHANNEL = 441,
+    ERR_USERONCHANNEL = 443,
     ERR_NOTONCHANNEL = 442,
     ERR_NEEDMOREPARAMS = 461,
     ERR_CHANOPRIVSNEEDED = 482,
@@ -712,6 +714,8 @@ pub const LinuxServer = struct {
             try self.handleMotd(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "VERSION")) {
             try self.handleVersion(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "INVITE")) {
+            try self.handleInvite(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -1003,6 +1007,51 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         const line = ison_userhost.writeUserhostReply(&out_buf, server_name, conn.session.displayName(), targets[0..count]) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// INVITE <nick> <channel> — invite a user; +i channels require op (no +g
+    /// free-invite mode yet). RPL_INVITING to inviter + INVITE line to target.
+    fn handleInvite(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const args = invite.parseInviteArgs(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"INVITE"}, "Not enough parameters");
+            return;
+        };
+        if (!self.world.channelExists(args.channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
+            return;
+        }
+        const inviter_modes = self.world.memberModes(args.channel, worldIdFromClient(id));
+        const target_wid = self.world.findNick(args.nick);
+        const result = invite.checkInvitePreconditions(.{
+            .on_channel = inviter_modes != null,
+            .is_operator = if (inviter_modes) |m| m.isOperator() else false,
+            .invite_only = self.world.channelHasFlag(args.channel, .invite_only),
+            .free_invite = false,
+            .target_on_channel = if (target_wid) |t| self.world.isMember(args.channel, t) else false,
+        });
+        switch (result) {
+            .allow => {},
+            .deny_not_on_channel => return queueNumeric(conn, .ERR_NOTONCHANNEL, &.{args.channel}, "You're not on that channel"),
+            .deny_user_on_channel => return queueNumeric(conn, .ERR_USERONCHANNEL, &.{ args.nick, args.channel }, "is already on channel"),
+            .deny_chan_op_privs_needed => return queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "You're not channel operator"),
+        }
+        const target = target_wid orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{args.nick}, "No such nick");
+            return;
+        };
+
+        var num_buf: [default_reply_bytes]u8 = undefined;
+        const inviting = invite.buildInvitingNumeric(&num_buf, server_name, conn.session.displayName(), args.nick, args.channel) catch return;
+        try appendToConn(conn, inviting);
+        try appendToConn(conn, "\r\n");
+
+        const prefix = invite.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = default_host };
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const target_line = invite.buildTargetInviteLine(&line_buf, prefix, args.nick, args.channel) catch return;
+        // deliver() expects a CRLF-terminated line; the builder omits it.
+        var full_buf: [default_reply_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&full_buf, "{s}\r\n", .{target_line}) catch return;
+        try self.deliver(clientIdFromWorld(target), full);
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
