@@ -17,11 +17,29 @@ const names_reply = @import("../proto/names_reply.zig");
 const chanmode = @import("chanmode.zig");
 const kick = @import("../proto/kick.zig");
 const ison_userhost = @import("../proto/ison_userhost.zig");
+const lusers = @import("../proto/lusers.zig");
+const motd = @import("../proto/motd.zig");
+const serverinfo = @import("../proto/serverinfo.zig");
 
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
     return true;
 }
+
+const server_version = "mizuchi-0.1";
+const motd_text = [_][]const u8{
+    "Welcome to Mizuchi — a clean-room, Zig-native IRCX/IRCv3 daemon.",
+    "Suimyaku mesh + Tsumugi forward-secret links.",
+};
+
+/// Sink adapter that writes complete (CRLF-terminated) builder lines to a conn.
+const ConnLineSink = struct {
+    conn: *ConnState,
+    // Narrow error set so it coerces into builder error sets (e.g. LusersError).
+    pub fn send(self: *ConnLineSink, bytes: []const u8) error{OutputTooSmall}!void {
+        appendToConn(self.conn, bytes) catch return error.OutputTooSmall;
+    }
+};
 
 const irc_line = struct {
     pub const MAXPARA: usize = 15;
@@ -688,6 +706,12 @@ pub const LinuxServer = struct {
             try self.handleIson(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "USERHOST")) {
             try self.handleUserhost(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "LUSERS")) {
+            try self.handleLusers(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MOTD")) {
+            try self.handleMotd(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "VERSION")) {
+            try self.handleVersion(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -978,6 +1002,54 @@ pub const LinuxServer = struct {
         }
         var out_buf: [default_reply_bytes]u8 = undefined;
         const line = ison_userhost.writeUserhostReply(&out_buf, server_name, conn.session.displayName(), targets[0..count]) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// LUSERS — network/user counters (251-255, 265/266).
+    fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
+        const clients: u64 = @intCast(self.clients.len());
+        const counts = lusers.Counts{
+            .users = clients,
+            .invisible = 0,
+            .servers = 1,
+            .opers = 0,
+            .unknown = 0,
+            .channels = @intCast(self.world.channelCount()),
+            .local_clients = clients,
+            .local_max = clients,
+            .global_clients = clients,
+            .global_max = clients,
+        };
+        var scratch: [default_reply_bytes]u8 = undefined;
+        var sink = ConnLineSink{ .conn = conn };
+        lusers.emit(.{ .server_name = server_name, .requester = conn.session.displayName() }, counts, &scratch, &sink) catch return;
+    }
+
+    /// MOTD (375/372/376).
+    fn handleMotd(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        var lines_buf: [8]motd.MotdLine = undefined;
+        var sink = motd.MotdLineSink{ .lines = &lines_buf };
+        motd.writeMotdRepliesForRequester(&out_buf, server_name, conn.session.displayName(), &motd_text, &sink) catch return;
+        for (sink.slice()) |line| {
+            try appendToConn(conn, line.bytes);
+            try appendToConn(conn, "\r\n");
+        }
+    }
+
+    /// VERSION (351).
+    fn handleVersion(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        const info = serverinfo.VersionInfo{
+            .version = server_version,
+            .build = "zig",
+            .reply_server = server_name,
+            .description = "Mizuchi IRC daemon",
+            .sid = "0MZ",
+        };
+        const line = serverinfo.writeVersionReply(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, info) catch return;
         try appendToConn(conn, line);
     }
 
