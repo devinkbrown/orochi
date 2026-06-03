@@ -24,6 +24,21 @@ const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const list = @import("../proto/list.zig");
 const who = @import("../proto/who.zig");
+const platform = @import("../substrate/platform.zig");
+
+/// Format the current wall-clock time as "YYYY-MM-DD HH:MM:SS UTC" for RPL_TIME.
+fn formatServerTime(buf: []u8) []const u8 {
+    const ms = platform.realtimeMillis();
+    const secs: u64 = @intCast(@divTrunc(ms, 1000));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
+        yd.year,              md.month.numeric(),      @as(u16, md.day_index) + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    }) catch "unknown";
+}
 
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
@@ -736,6 +751,10 @@ pub const LinuxServer = struct {
             try self.handleMotd(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "VERSION")) {
             try self.handleVersion(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TIME")) {
+            try self.handleTime(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ADMIN")) {
+            try self.handleAdmin(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "INVITE")) {
             try self.handleInvite(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOIS")) {
@@ -1242,6 +1261,30 @@ pub const LinuxServer = struct {
             try appendToConn(conn, line.bytes);
             try appendToConn(conn, "\r\n");
         }
+    }
+
+    /// TIME (391) — current wall-clock server time.
+    fn handleTime(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        var tbuf: [64]u8 = undefined;
+        const tstr = formatServerTime(&tbuf);
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        const line = serverinfo.writeTimeReply(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, server_name, tstr) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// ADMIN (256/257/258/259).
+    fn handleAdmin(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        var lines_buf: [4]serverinfo.ReplyLine = undefined;
+        var sink = serverinfo.ReplyLineSink{ .lines = &lines_buf };
+        serverinfo.writeAdminReplies(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, .{
+            .reply_server = server_name,
+            .location1 = "Mizuchi IRC network",
+            .email = "admin@mizuchi.local",
+        }, &sink) catch return;
+        for (sink.slice()) |line| try appendToConn(conn, line.bytes);
     }
 
     /// VERSION (351).
@@ -1905,6 +1948,12 @@ test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to
     a.reset();
     try writeAllFd(fd_a, "VERSION\r\n");
     try recvUntil(&a, " 351 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "TIME\r\n");
+    try recvUntil(&a, " 391 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "ADMIN\r\n");
+    try recvUntil(&a, " 256 A ", 200);
 }
 
 test {

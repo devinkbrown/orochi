@@ -18,6 +18,9 @@ pub const EntropyError = error{RandomSourceFailed};
 // stable advapi32 alias ourselves. Returns 0 (FALSE) on failure.
 extern "advapi32" fn SystemFunction036(buffer: [*]u8, length: u32) callconv(.winapi) u8;
 
+// Windows wall clock (std's kernel32 binding lacks this); declare the extern.
+extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
+
 /// Monotonic clock in milliseconds. Never wall-clock; safe for intervals and
 /// timeouts across suspend. Sourced per-target so no `std.os.linux` leaks into
 /// non-Linux builds.
@@ -47,6 +50,31 @@ pub fn monotonicMillis() i64 {
 
 fn tsToMillis(sec: i64, nsec: i64) i64 {
     return sec * 1000 + @divTrunc(nsec, 1_000_000);
+}
+
+/// Wall-clock (Unix epoch) time in milliseconds. Use for timestamps a client
+/// sees (server-time tags, TIME, signon, ban set-at); NOT for intervals.
+pub fn realtimeMillis() i64 {
+    switch (os_tag) {
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+            return tsToMillis(@intCast(ts.sec), @intCast(ts.nsec));
+        },
+        .windows => {
+            // Windows FILETIME epoch is 1601; convert 100ns ticks to Unix ms.
+            var ft: std.os.windows.FILETIME = undefined;
+            GetSystemTimeAsFileTime(&ft);
+            const ticks: u64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            const unix_100ns: i128 = @as(i128, ticks) - 116_444_736_000_000_000;
+            return @intCast(@divTrunc(unix_100ns, 10_000));
+        },
+        else => {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(std.posix.CLOCK.REALTIME, &ts);
+            return tsToMillis(@intCast(ts.sec), @intCast(ts.nsec));
+        },
+    }
 }
 
 /// Process id, used for fork/snapshot detection in the RNG layer. Returns the
@@ -114,4 +142,11 @@ test "fillOsEntropy yields non-zero bytes" {
     var any: bool = false;
     for (buf) |x| any = any or x != 0;
     try std.testing.expect(any);
+}
+
+test "realtime clock is a plausible Unix-epoch millisecond value" {
+    const ms = realtimeMillis();
+    // After 2020-01-01 and before year ~2100.
+    try std.testing.expect(ms > 1_577_836_800_000);
+    try std.testing.expect(ms < 4_102_444_800_000);
 }
