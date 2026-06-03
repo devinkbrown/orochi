@@ -15,6 +15,7 @@ const world_model = @import("world.zig");
 const sasl = @import("../proto/sasl.zig");
 const names_reply = @import("../proto/names_reply.zig");
 const chanmode = @import("chanmode.zig");
+const kick = @import("../proto/kick.zig");
 
 const irc_line = struct {
     pub const MAXPARA: usize = 15;
@@ -675,6 +676,8 @@ pub const LinuxServer = struct {
             try self.handleNames(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MODE")) {
             try self.handleMode(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "KICK")) {
+            try self.handleKick(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
             try self.handleMessage(id, conn, parsed, "PRIVMSG");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "NOTICE")) {
@@ -891,6 +894,46 @@ pub const LinuxServer = struct {
         try line.append(targets.written());
         try line.append("\r\n");
         try self.broadcastChannel(channel, line.written(), null);
+    }
+
+    /// KICK <channel> <user> [:reason]. Kicker must be op-or-higher and may not
+    /// kick a member who outranks them (tier rank). The target sees their own
+    /// kick (broadcast before removal).
+    fn handleKick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const args = kick.parseKickArgs(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KICK"}, "Not enough parameters");
+            return;
+        };
+        if (!self.world.channelExists(args.channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
+            return;
+        }
+        const kicker = self.world.memberModes(args.channel, worldIdFromClient(id)) orelse {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{args.channel}, "You're not on that channel");
+            return;
+        };
+        if (!kicker.isOperator()) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "You're not channel operator");
+            return;
+        }
+        const target = self.world.findNick(args.user) orelse {
+            try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ args.user, args.channel }, "They aren't on that channel");
+            return;
+        };
+        const target_mm = self.world.memberModes(args.channel, target) orelse {
+            try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ args.user, args.channel }, "They aren't on that channel");
+            return;
+        };
+        if (kicker.rank() < target_mm.rank()) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "Cannot kick a higher-ranked member");
+            return;
+        }
+
+        const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = "user", .host = default_host };
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, args.reason) catch return;
+        try self.broadcastChannel(args.channel, msg, null);
+        self.world.part(args.channel, target) catch {};
     }
 
     fn handleMessage(
