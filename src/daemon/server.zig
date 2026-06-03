@@ -970,10 +970,10 @@ pub const LinuxServer = struct {
         var count: usize = 0;
         for (parsed.paramSlice()) |nick| {
             if (count >= targets.len) break;
-            if (self.world.findNick(nick) == null) continue;
-            // Per-client oper/away and real user@host are not tracked yet (M2):
-            // use the daemon's placeholder identity, like clientPrefix.
-            targets[count] = .{ .nick = nick, .is_oper = false, .is_away = false, .user = "user", .host = default_host };
+            const wid = self.world.findNick(nick) orelse continue;
+            // oper/away and host are not tracked per-client yet (M2 placeholder);
+            // username is now the real USER-supplied value.
+            targets[count] = .{ .nick = nick, .is_oper = false, .is_away = false, .user = usernameOf(self, wid), .host = default_host };
             count += 1;
         }
         var out_buf: [default_reply_bytes]u8 = undefined;
@@ -1104,7 +1104,7 @@ pub const LinuxServer = struct {
             members_buf[count] = .{
                 .prefixes = prefix_buf[count].asSlice(),
                 .nick = nick,
-                .user = "user",
+                .user = usernameOf(self, member.*),
                 .host = default_host,
             };
             count += 1;
@@ -1184,6 +1184,12 @@ fn idFromToken(token: RingFdToken) client_model.ClientId {
 
 fn worldIdFromClient(id: client_model.ClientId) world_model.ClientId {
     return .{ .shard = id.shard, .slot = id.slot, .gen = id.gen };
+}
+
+/// The USER-supplied username of the member behind a world client id, or "user".
+fn usernameOf(self: *LinuxServer, world_id: world_model.ClientId) []const u8 {
+    if (self.clients.get(clientIdFromWorld(world_id))) |c| return c.session.username();
+    return "user";
 }
 
 fn clientIdFromWorld(id: world_model.ClientId) client_model.ClientId {
