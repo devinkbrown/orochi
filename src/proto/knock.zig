@@ -23,12 +23,12 @@ pub const DEFAULT_CHANNEL_PREFIXES: []const u8 = "#+&!";
 pub const RPL_KNOCK_CODE: u16 = 710;
 /// Local KNOCK delivery acknowledgement numeric not currently exported by `numeric.zig`.
 pub const RPL_KNOCKDLVR_CODE: u16 = 711;
-/// Local KNOCK throttle error numeric not currently exported by `numeric.zig`.
+/// ophion KNOCK error numerics (not in numeric.zig): 712 throttle, 713 channel
+/// is open (no need to knock), 714 already on channel, 715 KNOCK disabled.
 pub const ERR_TOOMANYKNOCK_CODE: u16 = 712;
-/// Local non-knockable channel error numeric not currently exported by `numeric.zig`.
-pub const ERR_CANNOTKNOCK_CODE: u16 = 713;
-/// Local already-on-channel KNOCK error numeric not currently exported by `numeric.zig`.
+pub const ERR_CHANOPEN_CODE: u16 = 713;
 pub const ERR_KNOCKONCHAN_CODE: u16 = 714;
+pub const ERR_KNOCKDISABLED_CODE: u16 = 715;
 
 pub const KnockError = error{
     MissingChannel,
@@ -136,8 +136,9 @@ pub const FailCode = enum {
 /// KNOCK numeric failures that are local to this module.
 pub const FailureNumeric = enum(u16) {
     ERR_TOOMANYKNOCK = ERR_TOOMANYKNOCK_CODE,
-    ERR_CANNOTKNOCK = ERR_CANNOTKNOCK_CODE,
+    ERR_CHANOPEN = ERR_CHANOPEN_CODE,
     ERR_KNOCKONCHAN = ERR_KNOCKONCHAN_CODE,
+    ERR_KNOCKDISABLED = ERR_KNOCKDISABLED_CODE,
 
     pub fn code(self: FailureNumeric) u16 {
         return @intFromEnum(self);
@@ -338,9 +339,9 @@ pub fn buildTooManyKnockNumeric(out: []u8, server_name: []const u8, recipient_ni
     return buildFailureNumeric(out, server_name, recipient_nick, channel, .ERR_TOOMANYKNOCK, "Too many KNOCKs for this channel");
 }
 
-/// Build `ERR_CANNOTKNOCK` 713.
-pub fn buildCannotKnockNumeric(out: []u8, server_name: []const u8, recipient_nick: []const u8, channel: []const u8) KnockError![]const u8 {
-    return buildFailureNumeric(out, server_name, recipient_nick, channel, .ERR_CANNOTKNOCK, "Cannot KNOCK on this channel");
+/// Build `ERR_CHANOPEN` 713 (channel is open, knocking pointless).
+pub fn buildChanOpenNumeric(out: []u8, server_name: []const u8, recipient_nick: []const u8, channel: []const u8) KnockError![]const u8 {
+    return buildFailureNumeric(out, server_name, recipient_nick, channel, .ERR_CHANOPEN, "Channel is open; no need to KNOCK");
 }
 
 /// Build `ERR_KNOCKONCHAN` 714.
@@ -414,8 +415,8 @@ pub fn buildTooManyKnockFail(out: []u8, channel: []const u8) KnockError![]const 
 }
 
 /// Build a standard-reply FAIL for non-knockable channels.
-pub fn buildCannotKnockFail(out: []u8, channel: []const u8) KnockError![]const u8 {
-    return buildFailLine(out, .CANNOT_KNOCK, channel, "Cannot KNOCK on this channel");
+pub fn buildChanOpenFail(out: []u8, channel: []const u8) KnockError![]const u8 {
+    return buildFailLine(out, .CANNOT_KNOCK, channel, "Channel is open; no need to KNOCK");
 }
 
 /// Build a standard-reply FAIL for users already joined to the channel.
@@ -647,8 +648,8 @@ test "failure numeric and fail builders" {
     const throttled = try buildTooManyKnockNumeric(&buf, "irc.example", "alice", "#secret");
     try std.testing.expectEqualStrings(":irc.example 712 alice #secret :Too many KNOCKs for this channel", throttled);
 
-    const cannot = try buildCannotKnockFail(&buf, "#secret");
-    try std.testing.expectEqualStrings("FAIL KNOCK CANNOT_KNOCK #secret :Cannot KNOCK on this channel", cannot);
+    const cannot = try buildChanOpenFail(&buf, "#secret");
+    try std.testing.expectEqualStrings("FAIL KNOCK CANNOT_KNOCK #secret :Channel is open; no need to KNOCK", cannot);
 
     const need_more = try buildNeedMoreParamsNumeric(&buf, "irc.example", "alice");
     try std.testing.expectEqualStrings(":irc.example 461 alice KNOCK :Not enough parameters", need_more);
@@ -694,7 +695,7 @@ test "buffer too small reported by builders" {
         .host = "host",
     }, "#secret", "invite me"));
     try std.testing.expectError(error.OutputTooSmall, buildKnockerAck(&small, "irc.example", "alice", "#secret"));
-    try std.testing.expectError(error.OutputTooSmall, buildCannotKnockFail(&small, "#secret"));
+    try std.testing.expectError(error.OutputTooSmall, buildChanOpenFail(&small, "#secret"));
 }
 
 test "invalid input rejected" {
@@ -728,5 +729,5 @@ test "invalid input rejected" {
         .user = "bad user",
         .host = "host",
     }, "#secret", ""));
-    try std.testing.expectError(error.InvalidDescription, buildFailureNumeric(&buf, "irc.example", "alice", "#secret", .ERR_CANNOTKNOCK, "bad\ndescription"));
+    try std.testing.expectError(error.InvalidDescription, buildFailureNumeric(&buf, "irc.example", "alice", "#secret", .ERR_CHANOPEN, "bad\ndescription"));
 }

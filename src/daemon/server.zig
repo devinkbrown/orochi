@@ -1073,7 +1073,9 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [32]names_reply.NamesLine = undefined;
         var sink = names_reply.NamesLineSink{ .lines = &lines_buf };
-        names_reply.writeNamesReplies(&out_buf, server_name, conn.session.displayName(), channel, members_buf[0..count], caps, &sink) catch {
+        // 353 visibility symbol: '@' for secret (+s), '=' otherwise.
+        const channel_status: u8 = if (self.world.channelHasFlag(channel, .secret)) '@' else '=';
+        names_reply.writeNamesReplies(&out_buf, server_name, conn.session.displayName(), channel, channel_status, members_buf[0..count], caps, &sink) catch {
             // Oversized channel for this single pass: still close the list out.
             try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
             return;

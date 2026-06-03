@@ -97,20 +97,23 @@ pub fn writeNamesReplies(
     server_name: []const u8,
     requester_nick: []const u8,
     channel: []const u8,
+    channel_status: u8,
     members: []const Member,
     caps: RequesterCaps,
     sink: *NamesLineSink,
 ) NamesReplyError!void {
-    return writeNamesRepliesWith(.{}, out, server_name, requester_nick, channel, members, caps, sink);
+    return writeNamesRepliesWith(.{}, out, server_name, requester_nick, channel, channel_status, members, caps, sink);
 }
 
-/// Write NAMES replies using caller-selected compile-time limits.
+/// Write NAMES replies using caller-selected compile-time limits. `channel_status`
+/// is the 353 visibility symbol: '=' public, '@' secret (+s), '*' private (+p).
 pub fn writeNamesRepliesWith(
     comptime params: Params,
     out: []u8,
     server_name: []const u8,
     requester_nick: []const u8,
     channel: []const u8,
+    channel_status: u8,
     members: []const Member,
     caps: RequesterCaps,
     sink: *NamesLineSink,
@@ -136,7 +139,7 @@ pub fn writeNamesRepliesWith(
 
         if (!line_open) {
             line_start = n;
-            line_len = try appendNamReplyHeader(out, &n, server_name, requester_nick, channel);
+            line_len = try appendNamReplyHeader(out, &n, server_name, requester_nick, channel, channel_status);
             names_in_line = 0;
             line_open = true;
         }
@@ -145,7 +148,7 @@ pub fn writeNamesRepliesWith(
         if (line_len + separator_len + token_len > params.max_line_bytes) {
             try sink.append(out[line_start .. line_start + line_len]);
             line_start = n;
-            line_len = try appendNamReplyHeader(out, &n, server_name, requester_nick, channel);
+            line_len = try appendNamReplyHeader(out, &n, server_name, requester_nick, channel, channel_status);
             names_in_line = 0;
         }
 
@@ -346,6 +349,7 @@ fn appendNamReplyHeader(
     server_name: []const u8,
     requester_nick: []const u8,
     channel: []const u8,
+    status: u8,
 ) NamesReplyError!usize {
     const start = n.*;
     var code_buf: [3]u8 = undefined;
@@ -357,7 +361,10 @@ fn appendNamReplyHeader(
     try append(out, n, code);
     try appendByte(out, n, ' ');
     try append(out, n, requester_nick);
-    try append(out, n, " = ");
+    // Channel visibility symbol: '=' public, '@' secret (+s), '*' private (+p).
+    try appendByte(out, n, ' ');
+    try appendByte(out, n, status);
+    try appendByte(out, n, ' ');
     try append(out, n, channel);
     try append(out, n, " :");
     return n.* - start;
@@ -480,6 +487,7 @@ test "names replies fold complete 353 lines and append 366" {
         "irc.example",
         "guest",
         "#test",
+        '=',
         &members,
         .{ .multi_prefix = true, .userhost_in_names = true },
         &sink,
@@ -503,7 +511,7 @@ test "names replies use bare nicks without IRCv3 caps" {
     var out: [192]u8 = undefined;
     var line_storage: [2]NamesLine = undefined;
     var sink = NamesLineSink{ .lines = &line_storage };
-    try writeNamesReplies(&out, "irc.example", "guest", "#test", &members, .{}, &sink);
+    try writeNamesReplies(&out, "irc.example", "guest", "#test", '=', &members, .{}, &sink);
 
     const lines = sink.slice();
     try std.testing.expectEqual(@as(usize, 2), lines.len);
@@ -516,7 +524,7 @@ test "empty member list emits only end of names" {
     var out: [96]u8 = undefined;
     var line_storage: [1]NamesLine = undefined;
     var sink = NamesLineSink{ .lines = &line_storage };
-    try writeNamesReplies(&out, "irc.example", "guest", "#empty", &members, .{}, &sink);
+    try writeNamesReplies(&out, "irc.example", "guest", "#empty", '=', &members, .{}, &sink);
 
     try std.testing.expectEqual(@as(usize, 1), sink.slice().len);
     try std.testing.expectEqualStrings(":irc.example 366 guest #empty :End of /NAMES list", sink.slice()[0].bytes);
@@ -532,7 +540,7 @@ test "output and line sink capacity errors are reported" {
     var enough_lines = NamesLineSink{ .lines = &enough_lines_storage };
     try std.testing.expectError(
         error.OutputTooSmall,
-        writeNamesReplies(&small_out, "irc.example", "guest", "#test", &members, .{}, &enough_lines),
+        writeNamesReplies(&small_out, "irc.example", "guest", "#test", '=', &members, .{}, &enough_lines),
     );
 
     var out: [128]u8 = undefined;
@@ -540,7 +548,7 @@ test "output and line sink capacity errors are reported" {
     var one_line = NamesLineSink{ .lines = &one_line_storage };
     try std.testing.expectError(
         error.TooManyRecipients,
-        writeNamesReplies(&out, "irc.example", "guest", "#test", &members, .{}, &one_line),
+        writeNamesReplies(&out, "irc.example", "guest", "#test", '=', &members, .{}, &one_line),
     );
 }
 
@@ -560,6 +568,7 @@ test "token too long for configured line size is rejected before overflow" {
             "irc.example",
             "guest",
             "#test",
+            '=',
             &members,
             .{ .multi_prefix = true },
             &sink,

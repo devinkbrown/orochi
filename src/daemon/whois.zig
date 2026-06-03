@@ -80,6 +80,9 @@ pub const WhoisSubject = struct {
     realname: []const u8,
     account: ?[]const u8 = null,
     server: ?[]const u8 = null,
+    /// Human server description for the RPL_WHOISSERVER (312) trailing — NOT the
+    /// server name (the param). RFC: "<nick> <server> :<server info>".
+    server_info: ?[]const u8 = null,
     idle_secs: u64 = 0,
     signon_ts: u64 = 0,
     is_bot: bool = false,
@@ -150,9 +153,10 @@ pub fn writeWhoisWith(
     try validateSubjectWith(params, subject);
 
     const subject_server = subject.server orelse server_name;
+    const subject_server_info = subject.server_info orelse "Mizuchi IRC daemon";
 
     try writeWhoisUserLine(params, sink, server_name, requester_nick, subject);
-    try writeWhoisServerLine(params, sink, server_name, requester_nick, subject.nick, subject_server);
+    try writeWhoisServerLine(params, sink, server_name, requester_nick, subject.nick, subject_server, subject_server_info);
     try writeWhoisIdleLine(params, sink, server_name, requester_nick, subject);
     try writeWhoisChannelLines(params, sink, server_name, requester_nick, subject.nick, subject.channels);
     if (subject.account) |account| {
@@ -356,13 +360,14 @@ fn writeWhoisServerLine(
     requester_nick: []const u8,
     subject_nick: []const u8,
     subject_server: []const u8,
+    subject_server_info: []const u8,
 ) WhoisError!void {
     var b = try sink.beginLine();
     b.max_line_bytes = params.max_line_bytes;
     try b.numericPrefix(whois_server_code, server_name, requester_nick);
     try b.spaceParam(subject_nick);
     try b.spaceParam(subject_server);
-    try b.spaceTrailing(subject_server);
+    try b.spaceTrailing(subject_server_info);
     try b.crlf();
     try sink.commitLine(&b);
 }
@@ -666,7 +671,7 @@ test "full WHOIS sequence emits every supported numeric in order" {
     const lines = sink.slice();
     try std.testing.expectEqual(@as(usize, 8), lines.len);
     try std.testing.expectEqualStrings(":irc.example 311 dan alice auser host.example * :Alice Example\r\n", lines[0].bytes);
-    try std.testing.expectEqualStrings(":irc.example 312 dan alice leaf.example :leaf.example\r\n", lines[1].bytes);
+    try std.testing.expectEqualStrings(":irc.example 312 dan alice leaf.example :Mizuchi IRC daemon\r\n", lines[1].bytes);
     try std.testing.expectEqualStrings(":irc.example 317 dan alice 42 1700000000 :seconds idle, signon time\r\n", lines[2].bytes);
     try std.testing.expectEqualStrings(":irc.example 319 dan alice :@#zig +#chat\r\n", lines[3].bytes);
     try std.testing.expectEqualStrings(":irc.example 330 dan alice alice-account :is logged in as\r\n", lines[4].bytes);
@@ -724,7 +729,7 @@ test "no account bot away or channels omits optional numerics" {
     const lines = sink.slice();
     try std.testing.expectEqual(@as(usize, 4), lines.len);
     try std.testing.expectEqualStrings(":irc.example 311 dan bob buser host.example * :Bob Example\r\n", lines[0].bytes);
-    try std.testing.expectEqualStrings(":irc.example 312 dan bob irc.example :irc.example\r\n", lines[1].bytes);
+    try std.testing.expectEqualStrings(":irc.example 312 dan bob irc.example :Mizuchi IRC daemon\r\n", lines[1].bytes);
     try std.testing.expectEqualStrings(":irc.example 317 dan bob 0 1 :seconds idle, signon time\r\n", lines[2].bytes);
     try std.testing.expectEqualStrings(":irc.example 318 dan bob :End of /WHOIS list\r\n", lines[3].bytes);
 }
