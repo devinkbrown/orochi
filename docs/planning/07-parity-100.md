@@ -114,7 +114,7 @@
 ## G. Oper & server management
 
 82. [x] STATS (l/o/u/c/i/k subset) — multiple RPL_STATS*
-83. [~] CONNECT / SQUIT (S2S; deferred to mesh)
+83. [~] CONNECT / SQUIT (S2S) — CONNECT [x] live (oper, io_uring connect op → outbound S2sLink handshake); live S2S listener [x] (inbound accept → S2sLink); SQUIT + already-linked guard + oper-visible CONNECT broadcast remain
 84. [x] DIE (oper shutdown)
 85. [x] RESTART (oper)
 86. [x] KLINE / DLINE / GLINE + UNKLINE (ban storage)
