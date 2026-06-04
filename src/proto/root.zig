@@ -75,6 +75,7 @@ pub const multiline = @import("multiline.zig");
 pub const multiline_props = @import("multiline_props.zig");
 pub const names_reply = @import("names_reply.zig");
 pub const numeric = @import("numeric.zig");
+pub const oper_privs = @import("oper_privs.zig");
 pub const read_marker = @import("read_marker.zig");
 pub const read_marker_store = @import("read_marker_store.zig");
 pub const sasl_mechrouter = @import("sasl_mechrouter.zig");
@@ -183,6 +184,7 @@ test {
     _ = multiline_props;
     _ = names_reply;
     _ = numeric;
+    _ = oper_privs;
     _ = read_marker;
     _ = read_marker_store;
     _ = sasl_mechrouter;

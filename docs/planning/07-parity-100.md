@@ -124,7 +124,7 @@
 90. [ ] OPER MODE +o user-umode reflection + RPL_UMODEIS
 91. [x] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
 92. [x] WALLOPS via Event Spine announce/BROADCAST (oper-visible event, not +w umode)
-93. [ ] GRANT / privilege sets (oper.zig Privilege wiring)
+93. [~] GRANT / privilege sets (oper.zig Privilege wiring)
 
 ## H. Mesh / S2S (Suimyaku — later milestones)
 
