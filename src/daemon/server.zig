@@ -3007,6 +3007,54 @@ pub const LinuxServer = struct {
         return info.secret;
     }
 
+    /// Computed/linked IRCX channel built-in property reads. These reflect live
+    /// channel state, not the generic PROP store: NAME (the channel), MEMBERCOUNT
+    /// (live count), MEMBERLIMIT (the +l limit). MEMBERKEY is the +k key and is
+    /// secret (write-only) so it is never returned here. Returns a value rendered
+    /// into `buf`, or null to fall through to the store.
+    fn channelBuiltinGet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, buf: []u8) ?[]const u8 {
+        if (entity.kind != .channel) return null;
+        if (std.ascii.eqlIgnoreCase(key, "NAME")) return entity.id;
+        if (std.ascii.eqlIgnoreCase(key, "MEMBERCOUNT")) {
+            return std.fmt.bufPrint(buf, "{d}", .{self.world.memberCount(entity.id)}) catch null;
+        }
+        if (std.ascii.eqlIgnoreCase(key, "MEMBERLIMIT")) {
+            const limit = self.world.channelLimit(entity.id) orelse return null;
+            return std.fmt.bufPrint(buf, "{d}", .{limit}) catch null;
+        }
+        return null;
+    }
+
+    /// Computed/linked IRCX channel built-in property writes. MEMBERKEY <-> +k
+    /// channel key; MEMBERLIMIT <-> +l limit. Returns true if the key is a linked
+    /// built-in (and was applied), false to fall through to the generic store.
+    /// Access is gated by the caller (propAccess == channel-op/owner).
+    fn channelBuiltinSet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, value: []const u8, deleting: bool) bool {
+        if (entity.kind != .channel) return false;
+        if (std.ascii.eqlIgnoreCase(key, "MEMBERKEY")) {
+            self.world.setChannelKey(entity.id, if (deleting) null else value) catch {};
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(key, "MEMBERLIMIT")) {
+            if (deleting) {
+                self.world.setChannelLimit(entity.id, null) catch {};
+            } else {
+                const limit = std.fmt.parseInt(u32, value, 10) catch return true;
+                self.world.setChannelLimit(entity.id, limit) catch {};
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn propEmitBuiltin(conn: *ConnState, entity: ircx_prop_store.Entity, key: []const u8, value: []const u8) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const ev = ircx_prop_store.EntryView{ .entity = entity, .key = key, .value = value, .owner = "*", .access = .user };
+        const line = ircx_prop_store.buildPropListReply(server_name, conn.session.displayName(), ev, &buf) catch return;
+        try appendToConn(conn, line);
+        try appendToConn(conn, "\r\n");
+    }
+
     fn propEmitEntry(conn: *ConnState, entry: ircx_prop_store.EntryView) !void {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = ircx_prop_store.buildPropListReply(server_name, conn.session.displayName(), entry, &buf) catch return;
@@ -3052,6 +3100,13 @@ pub const LinuxServer = struct {
                 while (it.next()) |key| {
                     if (key.len == 0) continue;
                     if (propIsSecret(q.entity, key) and !may_see_secret) continue;
+                    // Computed/linked built-ins (NAME/MEMBERCOUNT/MEMBERLIMIT)
+                    // reflect live channel state, ahead of the generic store.
+                    var bbuf: [64]u8 = undefined;
+                    if (self.channelBuiltinGet(q.entity, key, &bbuf)) |val| {
+                        try propEmitBuiltin(conn, q.entity, key, val);
+                        continue;
+                    }
                     if (self.props.getProp(q.entity, key)) |ev| {
                         try propEmitEntry(conn, ev);
                     } else |_| {}
@@ -3063,6 +3118,13 @@ pub const LinuxServer = struct {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Insufficient access to set property");
                     return;
                 };
+                // Linked built-ins (MEMBERKEY<->+k, MEMBERLIMIT<->+l) write through
+                // to live channel state instead of the generic store.
+                if (self.channelBuiltinSet(m.entity, m.key, m.value, false)) {
+                    try propEmitBuiltin(conn, m.entity, m.key, m.value);
+                    try propEmitEnd(conn, m.entity);
+                    return;
+                }
                 const setter = ircx_prop_store.Setter{ .id = conn.session.displayName(), .access = access };
                 const ev = self.props.setProp(m.entity, m.key, m.value, setter) catch {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Cannot set that property");
