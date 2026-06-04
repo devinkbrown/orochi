@@ -37,6 +37,7 @@ pub const MessageTarget = union(enum) {
 };
 
 const chanmode = @import("chanmode.zig");
+const chanmode_ext = @import("../proto/chanmode_ext.zig");
 const listx = @import("../proto/listx.zig");
 
 /// Per-member channel status modes (op @, voice + — no halfop) keyed by client.
@@ -68,6 +69,9 @@ const Channel = struct {
     /// +p private (shown but flagged) and +h IRCX HIDDEN (omitted from LIST).
     private: bool = false,
     hidden: bool = false,
+    /// IRCX extended channel flags (AUTHONLY/AUDITORIUM/NOWHISPER/etc.) that have
+    /// no slot in the base ChannelModes letter set.
+    ext_modes: chanmode_ext.ExtChannelFlags = chanmode_ext.ExtChannelFlags.empty(),
 
     fn init(allocator: std.mem.Allocator) Channel {
         return .{
@@ -210,6 +214,26 @@ pub const World = struct {
     pub fn channelHasFlag(self: *World, name: []const u8, mode: ChannelMode) bool {
         const channel = self.channels.getPtr(name) orelse return false;
         return channel.modes.containsFlag(mode);
+    }
+
+    /// Whether an IRCX extended channel flag is set.
+    pub fn channelHasExtFlag(self: *World, name: []const u8, flag: chanmode_ext.ExtChannelFlag) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return channel.ext_modes.has(flag);
+    }
+
+    /// The channel's IRCX extended flag set (empty if no such channel).
+    pub fn channelExtModes(self: *World, name: []const u8) chanmode_ext.ExtChannelFlags {
+        const channel = self.channels.getPtr(name) orelse return chanmode_ext.ExtChannelFlags.empty();
+        return channel.ext_modes;
+    }
+
+    /// Set or clear an IRCX extended channel flag. Returns true if it changed.
+    pub fn setChannelExtFlag(self: *World, name: []const u8, flag: chanmode_ext.ExtChannelFlag, on: bool) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        const before = channel.ext_modes.has(flag);
+        if (on) channel.ext_modes.set(flag) else channel.ext_modes.clear(flag);
+        return before != on;
     }
 
     /// Set or clear a channel flag mode (i/m/n/t/s). Returns true if it changed.

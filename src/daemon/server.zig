@@ -38,6 +38,8 @@ const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
+const chanmode_ext = @import("../proto/chanmode_ext.zig");
+const ircx_modex = @import("../proto/ircx_modex.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
@@ -485,6 +487,7 @@ const Numeric = enum(u16) {
     ERR_KEYINVALID = 767,
     ERR_KEYNOPERMISSION = 769,
     ERR_PROPDENIED = 918,
+    ERR_NOWHISPER = 923,
     RPL_ACCEPTLIST = 281,
     RPL_ENDOFACCEPT = 282,
     RPL_KNOCK = 710,
@@ -1137,6 +1140,8 @@ pub const LinuxServer = struct {
             try self.handleAccess(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "EVENT")) {
             try self.handleEvent(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MODEX")) {
+            try self.handleModex(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
@@ -1366,11 +1371,16 @@ pub const LinuxServer = struct {
             const key = self.world.channelKey(channel);
             const is_member = self.world.isMember(channel, worldIdFromClient(id));
 
-            var modes_buf: [24]u8 = undefined;
+            var modes_buf: [48]u8 = undefined;
             var mb = Buf{ .storage = &modes_buf };
             mb.append(flags) catch {};
             if (limit != null) mb.appendByte('l') catch {};
             if (key != null) mb.appendByte('k') catch {};
+            // Append IRCX extended flag letters (rendered "+abc"; drop the sign).
+            var ext_buf: [32]u8 = undefined;
+            if (chanmode_ext.renderModes(self.world.channelExtModes(channel), &ext_buf)) |ext_str| {
+                if (ext_str.len > 1) mb.append(ext_str[1..]) catch {};
+            } else |_| {}
 
             var parts: [4][]const u8 = undefined;
             var n: usize = 0;
@@ -1559,7 +1569,18 @@ pub const LinuxServer = struct {
                         (self.world.removeInvex(channel, mask) catch continue);
                     if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'I', mask);
                 },
-                else => {}, // remaining list/param modes not tracked yet
+                else => {
+                    // IRCX extended channel flags (AUTHONLY a, AUDITORIUM x,
+                    // NOWHISPER w, CLONEABLE d, KNOCK u, etc.) with no base-mode slot.
+                    if (chanmode_ext.letterToFlag(ch)) |flag| {
+                        if (chanmode_ext.requiresOper(flag) and !conn.session.isOper()) {
+                            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "That channel mode is operator-only");
+                            continue;
+                        }
+                        const changed = self.world.setChannelExtFlag(channel, flag, adding) catch continue;
+                        if (changed) appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
+                    }
+                },
             }
         }
 
@@ -2397,6 +2418,79 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// MODEX <#chan[,nick]> [+/-NAMED...] — IRCX named-mode front-end. Translates
+    /// named modes (AUTHONLY/OWNER/…) to mode letters and delegates to the regular
+    /// MODE engine (which gates + broadcasts). A bare MODEX queries active modes
+    /// (RPL_MODEXLIST 806 + RPL_MODEXEND 807).
+    fn handleModex(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        var changes_buf: [ircx_modex.DEFAULT_MAX_CHANGES]ircx_modex.ModeChange = undefined;
+        const req = ircx_modex.parseParams(parsed.paramSlice(), &changes_buf) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MODEX"}, "Invalid MODEX");
+            return;
+        };
+        const channel = req.target.channel;
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        if (req.changes.len == 0) {
+            // Query: collect active mode letters (base + IRCX-extended) as names.
+            const ctx = ircx_modex.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+            var names: [32][]const u8 = undefined;
+            var nn: usize = 0;
+            var flags_buf: [16]u8 = undefined;
+            const base = self.world.channelModeString(channel, &flags_buf);
+            var ext_buf: [32]u8 = undefined;
+            const ext = chanmode_ext.renderModes(self.world.channelExtModes(channel), &ext_buf) catch ext_buf[0..0];
+            for ([_][]const u8{ base, ext }) |letters| {
+                for (letters) |c| {
+                    if (c == '+' or c == '-') continue;
+                    if (ircx_modex.letterToName(c)) |name| {
+                        if (nn < names.len) {
+                            names[nn] = name;
+                            nn += 1;
+                        }
+                    } else |_| {}
+                }
+            }
+            var lbuf: [default_reply_bytes]u8 = undefined;
+            if (ircx_modex.writeModexList(&lbuf, ctx, channel, names[0..nn])) |line| {
+                try appendToConn(conn, line);
+            } else |_| {}
+            var ebuf: [default_reply_bytes]u8 = undefined;
+            if (ircx_modex.writeModexEnd(&ebuf, ctx, channel)) |line| {
+                try appendToConn(conn, line);
+            } else |_| {}
+            return;
+        }
+        // Set: synthesize an equivalent MODE line and delegate (reuses all gating,
+        // tier rules, and broadcast). Member-mode nicks become positional params,
+        // appended in the same order as their letters so handleMode aligns them.
+        var synth = irc_line.LineView{ .raw = "", .command = "MODE" };
+        synth.params[0] = channel;
+        synth.param_count = 1;
+        var ms_buf: [128]u8 = undefined;
+        var ms = Buf{ .storage = &ms_buf };
+        for (req.changes) |chg| {
+            if (chg.letter) |letter| {
+                ms.appendByte(chg.op.sign()) catch break;
+                ms.appendByte(letter) catch break;
+            }
+        }
+        synth.params[1] = ms.written();
+        synth.param_count = 2;
+        for (req.changes) |chg| {
+            if (chg.letter == null) continue;
+            if (chg.param) |p| {
+                if (synth.param_count < synth.params.len) {
+                    synth.params[synth.param_count] = p;
+                    synth.param_count += 1;
+                }
+            }
+        }
+        try self.handleMode(id, conn, &synth);
+    }
+
     /// EVENT <ADD|DEL|LIST> [category...] — IRCX Event Spine subscription control.
     /// Opers manage which oper-visible event categories they receive (the same
     /// CategoryMask that WALLOPS/KILL/oper-action publish through). Parsed
@@ -2649,6 +2743,11 @@ pub const LinuxServer = struct {
         }
         if (!self.world.isMember(args.channel, worldIdFromClient(id))) {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{args.channel}, "You're not on that channel");
+            return;
+        }
+        // +w NOWHISPER blocks channel whispers (IRCX ERR_NOWHISPER 923).
+        if (self.world.channelHasExtFlag(args.channel, .nowhisper)) {
+            try queueNumeric(conn, .ERR_NOWHISPER, &.{args.channel}, "Channel does not allow whispers (+w)");
             return;
         }
         const sender = whisper.Prefix{
@@ -4715,6 +4814,21 @@ test "threaded server: WHISPER delivers to channel co-member only" {
     a.reset();
     try writeAllFd(fd_a, "WHISPER #w Nobody :hi\r\n");
     try recvUntil(a, " 401 ", 200);
+    // Founder sets +w NOWHISPER (IRCX extended channel flag); whispers are blocked.
+    try writeAllFd(fd_a, "MODE #w +w\r\n");
+    try recvUntil(a, "MODE #w +w", 200);
+    a.reset();
+    try writeAllFd(fd_a, "WHISPER #w B :blocked\r\n");
+    try recvUntil(a, " 923 ", 200);
+    // MODEX named-mode front-end: set AUTHONLY (-> +a), then query lists it (806/807).
+    a.reset();
+    try writeAllFd(fd_a, "MODEX #w +AUTHONLY\r\n");
+    try recvUntil(a, "MODE #w +a", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODEX #w\r\n");
+    try recvUntil(a, " 806 ", 200);
+    try recvUntil(a, "AUTHONLY", 200);
+    try recvUntil(a, " 807 ", 200);
 }
 
 test "threaded server: PROP set/get gated by channel-op" {
