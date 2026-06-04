@@ -19,6 +19,7 @@ pub const merkle_props = @import("merkle_props.zig");
 pub const peer_link = @import("peer_link.zig");
 pub const state_props = @import("state_props.zig");
 pub const state = @import("state.zig");
+pub const uid_alloc = @import("uid_alloc.zig");
 // gen:mods:end
 
 test {
@@ -41,5 +42,6 @@ test {
     _ = peer_link;
     _ = state_props;
     _ = state;
+    _ = uid_alloc;
     // gen:tests:end
 }

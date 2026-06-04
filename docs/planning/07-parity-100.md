@@ -60,7 +60,7 @@
 38. [x] PRIVMSG/NOTICE comma-list of targets
 39. [x] Status-prefix targets (`PRIVMSG @#chan`, `+#chan`)
 40. [x] NICK change while registered (broadcast to common channels)
-41. [ ] Collision handling on NICK change (rename-to-UID, per memory)
+41. [~] Collision handling on NICK change (rename-to-UID, per memory)
 
 ## D. IRCX surface (draft-pfenning-04)
 
@@ -83,7 +83,7 @@
 55. [x] account-tag on messages
 56. [ ] account-notify on login/logout `[~]` proto/account_notify.zig
 57. [x] extended-join (account+realname in JOIN) `[~]` proto/extended_join.zig
-58. [ ] chghost `[~]` proto/chghost.zig
+58. [~] chghost `[~]` proto/chghost.zig
 59. [x] invite-notify `[~]` proto/invite_notify.zig
 60. [ ] echo-message already; verify for NOTICE + TAGMSG
 61. [ ] batch (netjoin/netsplit/chathistory) `[~]` proto/batch.zig
@@ -119,8 +119,8 @@
 85. [ ] RESTART (oper)
 86. [x] KLINE / DLINE / GLINE + UNKLINE (ban storage)
 87. [ ] TESTLINE / TESTMASK
-88. [ ] TRACE / ETRACE (200-262 family)
-89. [ ] SNOMASK / server notices (+s umode)
+88. [~] TRACE / ETRACE (200-262 family)
+89. [~] SNOMASK / server notices (+s umode)
 90. [ ] OPER MODE +o user-umode reflection + RPL_UMODEIS
 91. [x] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
 92. [x] WALLOPS via Event Spine announce/BROADCAST (oper-visible event, not +w umode)
