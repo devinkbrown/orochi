@@ -479,6 +479,7 @@ const Numeric = enum(u16) {
     RPL_METADATAEND = 762,
     ERR_KEYNOTSET = 766,
     ERR_KEYINVALID = 767,
+    ERR_KEYNOPERMISSION = 769,
     RPL_ACCEPTLIST = 281,
     RPL_ENDOFACCEPT = 282,
     RPL_KNOCK = 710,
@@ -1116,7 +1117,7 @@ pub const LinuxServer = struct {
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CHATHISTORY")) {
             try self.handleChathistory(conn, line);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "METADATA")) {
-            try self.handleMetadata(conn, parsed);
+            try self.handleMetadata(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
@@ -2369,9 +2370,22 @@ pub const LinuxServer = struct {
         try self.joinOne(id, conn, req.channel, null);
     }
 
+    /// Whether `conn` may mutate metadata on `target`: own nick (case-insensitive)
+    /// or a channel where the client holds operator status. Opers may write anywhere.
+    fn metadataCanWrite(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) bool {
+        if (conn.session.isOper()) return true;
+        // `*` is the IRCv3 metadata-2 alias for the requesting client itself.
+        if (std.mem.eql(u8, target, "*")) return true;
+        if (world_model.isChannelName(target)) {
+            const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse return false;
+            return mm.isOperator();
+        }
+        return std.ascii.eqlIgnoreCase(target, conn.session.displayName());
+    }
+
     /// METADATA <target> <GET|LIST|SET|CLEAR> [key [:value]] — IRCv3 metadata-2.
     /// Per-target key/value store; RPL_KEYVALUE (761) + RPL_METADATAEND (762).
-    fn handleMetadata(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    fn handleMetadata(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"METADATA"}, "Not enough parameters");
             return;
@@ -2396,6 +2410,13 @@ pub const LinuxServer = struct {
         } else if (std.ascii.eqlIgnoreCase(sub, "SET")) {
             if (parsed.param_count < 3) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"METADATA"}, "Not enough parameters");
+                return;
+            }
+            // Permission gate: a client may only mutate metadata on its own nick
+            // or on a channel where it holds operator status.
+            if (!self.metadataCanWrite(id, conn, target)) {
+                try queueNumeric(conn, .ERR_KEYNOPERMISSION, &.{ target, parsed.paramSlice()[2] }, "permission denied");
+                try queueNumeric(conn, .RPL_METADATAEND, &.{}, "end of metadata");
                 return;
             }
             const key = parsed.paramSlice()[2];
@@ -2460,8 +2481,14 @@ pub const LinuxServer = struct {
     fn statsLines(self: *LinuxServer, conn: *ConnState, kind: ban_db.Kind, code: Numeric) !void {
         var entries: [256]ban_db.Entry = undefined;
         const rows = self.bans_db.list(kind, &entries);
+        const label: []const u8 = switch (kind) {
+            .kline => "K",
+            .dline => "D",
+            .xline => "X",
+            .resv => "Q",
+        };
         for (rows) |e| {
-            try queueNumeric(conn, code, &.{ "K", e.mask, "*" }, e.reason);
+            try queueNumeric(conn, code, &.{ label, e.mask, "*" }, e.reason);
         }
     }
 
@@ -2860,8 +2887,13 @@ pub const LinuxServer = struct {
         parsed: *const irc_line.LineView,
         command: []const u8,
     ) !void {
+        // NOTICE must never generate an automatic error reply (ophion m_message.c):
+        // missing recipient/text is silently dropped to prevent bot reply loops.
+        const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
         if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{command}, "Not enough parameters");
+            if (!is_notice) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{command}, "Not enough parameters");
+            }
             return;
         }
         const text = parsed.paramSlice()[1];
@@ -3213,7 +3245,17 @@ const Buf = struct {
 };
 
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
-    if (conn.send_len + bytes.len > conn.send_buf.len) return error.OutputTooSmall;
+    if (conn.send_len + bytes.len > conn.send_buf.len) {
+        // Reclaim the already-sent prefix [0, send_offset) for a slow consumer
+        // by sliding the unsent tail to the front before giving up.
+        if (conn.send_offset > 0) {
+            const tail = conn.send_len - conn.send_offset;
+            std.mem.copyForwards(u8, conn.send_buf[0..tail], conn.send_buf[conn.send_offset..conn.send_len]);
+            conn.send_len = tail;
+            conn.send_offset = 0;
+        }
+        if (conn.send_len + bytes.len > conn.send_buf.len) return error.OutputTooSmall;
+    }
     @memcpy(conn.send_buf[conn.send_len .. conn.send_len + bytes.len], bytes);
     conn.send_len += bytes.len;
 }
@@ -4212,6 +4254,33 @@ test "threaded server: PRIVMSG multi-target delivery" {
     try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
 }
 
+test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    // A param-less NOTICE must be silently dropped; the trailing PING proves the
+    // server kept processing and that no 461 was interleaved.
+    try writeAllFd(fd_a, "NOTICE\r\nPING :tok\r\n");
+    try recvUntil(&a, "PONG :tok", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 461 ") == null);
+}
+
 test "threaded server: REDACT broadcast + KLINE oper event" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -4304,6 +4373,10 @@ test "threaded server: METADATA set then get" {
     a.reset();
     try writeAllFd(fd_a, "METADATA * GET url\r\n");
     try recvUntil(&a, " 761 A * url * :http://x", 200);
+    // Writing another user's metadata is denied (ERR_KEYNOPERMISSION 769).
+    a.reset();
+    try writeAllFd(fd_a, "METADATA Bob SET url :http://y\r\n");
+    try recvUntil(&a, " 769 A Bob url ", 200);
 }
 
 test "threaded server: WHOX field-selected reply" {
