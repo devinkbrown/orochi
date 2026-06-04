@@ -440,6 +440,12 @@ pub const ClientSession = struct {
         try self.client.identity.realname.set(value);
     }
 
+    /// Replace the client's nick (registered NICK change). Validation/collision
+    /// is the caller's responsibility; this only rewrites the inline buffer.
+    pub fn setNick(self: *ClientSession, value: []const u8) DispatchError!void {
+        try self.client.identity.nick.set(value);
+    }
+
     /// Whether the client has completed OPER authentication.
     pub fn isOper(self: *const ClientSession) bool {
         return self.is_oper;

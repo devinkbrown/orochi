@@ -425,6 +425,8 @@ const Numeric = enum(u16) {
     ERR_INVITEONLYCHAN = 473,
     ERR_BANNEDFROMCHAN = 474,
     ERR_BADCHANNELKEY = 475,
+    ERR_NONICKNAMEGIVEN = 431,
+    ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
     ERR_USERNOTINCHANNEL = 441,
     ERR_USERONCHANNEL = 443,
@@ -891,6 +893,8 @@ pub const LinuxServer = struct {
             try self.handleTopic(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
             try self.handleQuit(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "NICK")) {
+            try self.handleNickChange(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "AWAY")) {
             try self.handleAway(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SETNAME")) {
@@ -1807,6 +1811,66 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// NICK <newnick> — registered nick change. Validates, rejects collisions
+    /// (433), rewrites the world registry + session, then broadcasts
+    /// `:old!u@h NICK :new` to the client and every common-channel member.
+    /// MONITOR watchers see old offline / new online; the old identity is
+    /// recorded in WHOWAS.
+    fn handleNickChange(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NONICKNAMEGIVEN, &.{}, "No nickname given");
+            return;
+        }
+        const newnick = parsed.paramSlice()[0];
+        if (!isValidNick(newnick)) {
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{newnick}, "Erroneous nickname");
+            return;
+        }
+        const old = conn.session.displayName();
+        if (std.mem.eql(u8, old, newnick)) return; // no-op
+        const wid = worldIdFromClient(id);
+
+        // Reserve the new nick (frees the old mapping for this client).
+        self.world.registerNick(newnick, wid) catch |err| switch (err) {
+            error.NickInUse => {
+                try queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{newnick}, "Nickname is already in use");
+                return;
+            },
+            else => return err,
+        };
+
+        // Build the NICK line with the OLD prefix before rewriting the session.
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const old_prefix = try clientPrefix(conn, &prefix_buf);
+        const msg = try formatMessage(&msg_buf, old_prefix, "NICK", &.{}, newnick);
+
+        // Record the old identity, then rewrite the session nick.
+        self.recordWhowas(conn);
+        conn.session.setNick(newnick) catch {
+            // Should not happen (already validated); leave registry consistent.
+            return;
+        };
+
+        // Deliver to self + every common-channel member (dedup, except self once).
+        try self.deliver(id, msg);
+        try self.notifyCommonChannels(id, msg, null, id);
+
+        // MONITOR: old nick went away, new nick appeared.
+        self.monitorTransition(old, newnick) catch {};
+    }
+
+    /// MONITOR notify for a nick change: old offline, new online, WITHOUT
+    /// dropping the client's own subscriptions (unlike a disconnect).
+    fn monitorTransition(self: *LinuxServer, old: []const u8, new: []const u8) !void {
+        var replies_buf: [64]monitor.MonitorReply = undefined;
+        var storage: [default_reply_bytes]u8 = undefined;
+        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
+        self.monitor.setOffline(old, &sink) catch {};
+        self.monitor.setOnline(new, &sink) catch {};
+        try self.flushMonitorReplies(&sink);
+    }
+
     /// AWAY [:message] — RFC 1459 / IRCv3 away-notify. A parameter sets the away
     /// message (RPL_NOWAWAY 306); a bare AWAY clears it (RPL_UNAWAY 305). When
     /// the away-notify cap is negotiated by peers, an `AWAY` state change is
@@ -2360,6 +2424,20 @@ fn formatMessage(
     }
     try out.append("\r\n");
     return out.written();
+}
+
+/// RFC-ish nick validation: 1..64 bytes, no space/comma/'*'/'?'/'!'/'@'/'.' and
+/// not a channel-name lead char; first char not a digit or '-'.
+fn isValidNick(nick: []const u8) bool {
+    if (nick.len == 0 or nick.len > 64) return false;
+    if (nick[0] == '-' or (nick[0] >= '0' and nick[0] <= '9')) return false;
+    for (nick) |ch| {
+        switch (ch) {
+            ' ', ',', '*', '?', '!', '@', '.', '#', '&', '+', '~' => return false,
+            else => if (ch <= 32) return false,
+        }
+    }
+    return true;
 }
 
 fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
@@ -2966,6 +3044,52 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: registered NICK change broadcasts + collision" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #n\r\n");
+    try recvUntil(&a, " 366 A #n ", 200);
+    try writeAllFd(fd_b, "JOIN #n\r\n");
+    try recvUntil(&b, " 366 B #n ", 200);
+
+    // A changes nick -> B (common channel) and A both see the NICK line.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "NICK Alice2\r\n");
+    try recvUntil(&b, ":A!alice@localhost NICK :Alice2\r\n", 200);
+    try recvUntil(&a, "NICK :Alice2\r\n", 200);
+
+    // B cannot take the now-occupied nick -> 433.
+    b.reset();
+    try writeAllFd(fd_b, "NICK Alice2\r\n");
+    try recvUntil(&b, " 433 ", 200);
 }
 
 test "threaded server: IRCv3 extended-join per-recipient format" {

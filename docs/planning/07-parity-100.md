@@ -59,7 +59,7 @@
 37. [ ] PART comma-list of channels
 38. [ ] PRIVMSG/NOTICE comma-list of targets
 39. [ ] Status-prefix targets (`PRIVMSG @#chan`, `+#chan`)
-40. [ ] NICK change while registered (broadcast to common channels)
+40. [x] NICK change while registered (broadcast to common channels)
 41. [ ] Collision handling on NICK change (rename-to-UID, per memory)
 
 ## D. IRCX surface (draft-pfenning-04)
