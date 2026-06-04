@@ -90,7 +90,7 @@
 62. [ ] labeled-response (label → echo correlation)
 63. [ ] CAP NEW / CAP DEL dynamic advertisement
 64. [ ] STS policy advertisement `[~]` proto/sts.zig
-65. [ ] bot-mode (+B umode, WHOIS 335) `[~]` proto/bot_mode.zig
+65. [x] bot-mode (+B umode, WHOIS 335) `[~]` proto/bot_mode.zig
 66. [ ] multiline `[~]` proto/multiline.zig
 67. [ ] message-redaction / message-edit `[~]` proto/msgedit.zig
 68. [ ] read-marker `[~]` proto/read_marker.zig

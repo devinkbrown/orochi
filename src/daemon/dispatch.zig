@@ -6,6 +6,9 @@
 //! tests and reactor integration.
 const std = @import("std");
 const sasl = @import("../proto/sasl.zig");
+const usermode = @import("../proto/usermode.zig");
+
+pub const UserMode = usermode.UserMode;
 
 pub const DispatchError = error{
     ControlByte,
@@ -399,6 +402,8 @@ pub const ClientSession = struct {
     /// Set once the client completes a successful OPER. Gates oper-only commands
     /// (WALLOPS, REHASH, KILL, ...) and the RPL_WHOISOPERATOR line.
     is_oper: bool = false,
+    /// User modes (+i invisible, +B bot, ...). Set via MODE on the own nick.
+    umodes: usermode.UmodeSet = .{},
 
     pub fn init() ClientSession {
         return .{};
@@ -432,6 +437,48 @@ pub const ClientSession = struct {
     /// Whether the client has completed OPER authentication.
     pub fn isOper(self: *const ClientSession) bool {
         return self.is_oper;
+    }
+
+    /// Set or clear a user mode. Returns true if the set changed.
+    pub fn setUmode(self: *ClientSession, mode: usermode.UserMode, on: bool) bool {
+        const before = self.umodes.contains(mode);
+        if (on) self.umodes.add(mode) else self.umodes.remove(mode);
+        return before != on;
+    }
+
+    pub fn hasUmode(self: *const ClientSession, mode: usermode.UserMode) bool {
+        return self.umodes.contains(mode);
+    }
+
+    /// Whether the client flagged itself a bot (+B / IRCv3 bot-mode).
+    pub fn isBot(self: *const ClientSession) bool {
+        return self.umodes.contains(.bot);
+    }
+
+    /// Render active user modes as "+iB" into `out` (caller-owned, >= 9 bytes).
+    pub fn umodeString(self: *const ClientSession, out: []u8) []const u8 {
+        var n: usize = 0;
+        if (n < out.len) {
+            out[n] = '+';
+            n += 1;
+        }
+        const letters = [_]struct { m: usermode.UserMode, c: u8 }{
+            .{ .m = .invisible, .c = 'i' },
+            .{ .m = .bot, .c = 'B' },
+            .{ .m = .registered, .c = 'r' },
+            .{ .m = .secure_tls, .c = 'Z' },
+            .{ .m = .deaf, .c = 'D' },
+            .{ .m = .callerid, .c = 'g' },
+            .{ .m = .no_ctcp, .c = 'T' },
+            .{ .m = .cloaked, .c = 'x' },
+        };
+        for (letters) |l| {
+            if (self.umodes.contains(l.m) and n < out.len) {
+                out[n] = l.c;
+                n += 1;
+            }
+        }
+        return out[0..n];
     }
 
     /// Authenticated account name, or null when not logged in (SASL).
@@ -817,7 +864,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     try replies.numeric(session, .RPL_YOURHOST, &.{}, "Your host is mizuchi.local, running Mizuchi");
     try replies.numeric(session, .RPL_CREATED, &.{}, "This server was created for deterministic tests");
     try replies.numeric(session, .RPL_MYINFO, &.{ SERVER_NAME, "mizuchi-0.1", "io", "ov" }, "are supported by this server");
-    try replies.numeric(session, .RPL_ISUPPORT, &.{ "CHANTYPES=#", "NICKLEN=64", "CASEMAPPING=ascii" }, "are supported by this server");
+    try replies.numeric(session, .RPL_ISUPPORT, &.{ "CHANTYPES=#", "NICKLEN=64", "CASEMAPPING=ascii", "PREFIX=(Qqov)~.@+", "CHANMODES=beI,k,l,imnst", "BOT=B" }, "are supported by this server");
 }
 
 fn emitUnknownCommand(

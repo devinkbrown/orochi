@@ -376,6 +376,7 @@ const Numeric = enum(u16) {
     RPL_NOTOPIC = 331,
     RPL_TOPIC = 332,
     RPL_CHANNELMODEIS = 324,
+    RPL_UMODEIS = 221,
     RPL_NAMREPLY = 353,
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
@@ -393,6 +394,7 @@ const Numeric = enum(u16) {
     ERR_NOTONCHANNEL = 442,
     ERR_NEEDMOREPARAMS = 461,
     ERR_PASSWDMISMATCH = 464,
+    ERR_USERSDONTMATCH = 502,
     ERR_NOPRIVILEGES = 481,
     ERR_CHANOPRIVSNEEDED = 482,
 };
@@ -958,7 +960,11 @@ pub const LinuxServer = struct {
             return;
         }
         const channel = parsed.paramSlice()[0];
-        if (!world_model.isChannelName(channel)) return;
+        if (!world_model.isChannelName(channel)) {
+            // User-target MODE: only the client's own nick is settable.
+            try self.handleUserMode(conn, parsed, channel);
+            return;
+        }
         if (!self.world.channelExists(channel)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
@@ -1120,6 +1126,49 @@ pub const LinuxServer = struct {
         try line.append(targets.written());
         try line.append("\r\n");
         try self.broadcastChannel(channel, line.written(), null);
+    }
+
+    /// MODE <nick> [modes] — user modes. A client may only view/change its own
+    /// (ERR_USERSDONTMATCH 502 otherwise). Query form returns RPL_UMODEIS (221).
+    /// Supports +i invisible and +B bot today (IRCv3 bot-mode).
+    fn handleUserMode(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
+        _ = self;
+        if (!std.mem.eql(u8, target, conn.session.displayName())) {
+            try queueNumeric(conn, .ERR_USERSDONTMATCH, &.{}, "Cannot change mode for other users");
+            return;
+        }
+        // Query form: MODE <ownnick>.
+        if (parsed.param_count == 1) {
+            var ms_buf: [16]u8 = undefined;
+            try queueNumeric(conn, .RPL_UMODEIS, &.{}, conn.session.umodeString(&ms_buf));
+            return;
+        }
+
+        const mode_str = parsed.paramSlice()[1];
+        var applied_buf: [32]u8 = undefined;
+        var applied = Buf{ .storage = &applied_buf };
+        var adding = true;
+        var emitted_sign: u8 = 0;
+        for (mode_str) |ch| {
+            switch (ch) {
+                '+' => adding = true,
+                '-' => adding = false,
+                'i', 'B' => {
+                    const mode: dispatch.UserMode = if (ch == 'i') .invisible else .bot;
+                    if (conn.session.setUmode(mode, adding)) {
+                        appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
+                    }
+                },
+                else => {}, // other umodes (r/Z/D/g/T/x) are server-managed
+            }
+        }
+        if (applied.written().len == 0) return;
+
+        var prefix_buf: [256]u8 = undefined;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const nick = conn.session.displayName();
+        const msg = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "MODE", &.{ nick, applied.written() }, null);
+        try appendToConn(conn, msg);
     }
 
     /// KICK <channel> <user> [:reason]. Kicker must be op-or-higher and may not
@@ -1322,6 +1371,7 @@ pub const LinuxServer = struct {
             .account = tconn.session.account(),
             .away = tconn.session.awayMessage(),
             .is_oper = tconn.session.isOper(),
+            .is_bot = tconn.session.isBot(),
             .channels = memberships[0..nchan],
         };
         whois.writeWhois(&sink, server_name, conn.session.displayName(), subject) catch return;
@@ -2459,6 +2509,14 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     a.reset();
     try writeAllFd(fd_a, "MAP\r\n");
     try recvUntil(&a, " 015 A ", 200);
+
+    // Bot mode: B sets +B on itself -> MODE echo; WHOIS B shows 335.
+    b.reset();
+    try writeAllFd(fd_b, "MODE B +B\r\n");
+    try recvUntil(&b, "MODE B +B", 200);
+    a.reset();
+    try writeAllFd(fd_a, "WHOIS B\r\n");
+    try recvUntil(&a, " 335 A B ", 200);
 
     // KILL: oper A kills B -> B receives a KILL line then is disconnected.
     b.reset();
