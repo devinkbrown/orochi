@@ -537,6 +537,7 @@ const Numeric = enum(u16) {
     ERR_INVITEONLYCHAN = 473,
     ERR_BANNEDFROMCHAN = 474,
     ERR_BADCHANNELKEY = 475,
+    ERR_NEEDREGGEDNICK = 477,
     ERR_NONICKNAMEGIVEN = 431,
     ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
@@ -1427,6 +1428,13 @@ pub const LinuxServer = struct {
     ) !bool {
         const wid = worldIdFromClient(id);
         const invited = self.world.hasInvite(channel, wid);
+
+        // +a AUTHONLY (IRCX): only authenticated accounts may join, regardless of
+        // invite. Enforced before all other gates.
+        if (self.world.channelHasExtFlag(channel, .authonly) and conn.session.account() == null) {
+            try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{channel}, "Cannot join channel (+a) - you must be authenticated");
+            return true;
+        }
 
         var mask_buf: [256]u8 = undefined;
         const mask = try clientPrefix(conn, &mask_buf);
