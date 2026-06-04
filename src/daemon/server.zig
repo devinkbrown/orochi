@@ -480,6 +480,8 @@ const Numeric = enum(u16) {
     ERR_MONLISTFULL = 734,
     RPL_STATSUPTIME = 242,
     RPL_STATSOLINE = 243,
+    RPL_STATSKLINE = 216,
+    RPL_STATSDLINE = 225,
     RPL_ENDOFSTATS = 219,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHCHANNEL = 403,
@@ -2052,6 +2054,8 @@ pub const LinuxServer = struct {
                 // One static oper block (matches the OPER credential).
                 try queueNumeric(conn, .RPL_STATSOLINE, &.{ "O", "*@*", "*", self.oper_name, "0", "0" }, "");
             },
+            'k', 'K' => try self.statsLines(conn, .kline, .RPL_STATSKLINE),
+            'd', 'D' => try self.statsLines(conn, .dline, .RPL_STATSDLINE),
             else => {}, // other letters not implemented yet
         }
         try queueNumeric(conn, .RPL_ENDOFSTATS, &.{letter}, "End of /STATS report");
@@ -2263,6 +2267,15 @@ pub const LinuxServer = struct {
         const reply = help_db.buildHelpLookupReply(self.allocator, server_name, conn.session.displayName(), topic) catch return;
         defer self.allocator.free(reply);
         try appendToConn(conn, reply);
+    }
+
+    /// STATS k/d — list ban-lines of a kind (RPL_STATSKLINE/DLINE).
+    fn statsLines(self: *LinuxServer, conn: *ConnState, kind: ban_db.Kind, code: Numeric) !void {
+        var entries: [256]ban_db.Entry = undefined;
+        const rows = self.bans_db.list(kind, &entries);
+        for (rows) |e| {
+            try queueNumeric(conn, code, &.{ "K", e.mask, "*" }, e.reason);
+        }
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
