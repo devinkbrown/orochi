@@ -504,7 +504,9 @@ const Numeric = enum(u16) {
     ERR_KEYNOTSET = 766,
     ERR_KEYINVALID = 767,
     ERR_KEYNOPERMISSION = 769,
-    ERR_PROPDENIED = 918,
+    // IRCX draft: 913 IRCERR_NOACCESS ("insufficient privileges for operation").
+    // (918 is IRCERR_EVENTDUP — do not reuse it for PROP denial.)
+    ERR_NOACCESS = 913,
     ERR_NOWHISPER = 923,
     RPL_TESTLINE = 725,
     RPL_NOTESTLINE = 726,
@@ -2761,7 +2763,7 @@ pub const LinuxServer = struct {
     /// MODEX <#chan[,nick]> [+/-NAMED...] — IRCX named-mode front-end. Translates
     /// named modes (AUTHONLY/OWNER/…) to mode letters and delegates to the regular
     /// MODE engine (which gates + broadcasts). A bare MODEX queries active modes
-    /// (RPL_MODEXLIST 806 + RPL_MODEXEND 807).
+    /// (RPL_MODEXLIST 820 + RPL_MODEXEND 821).
     fn handleModex(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var changes_buf: [ircx_modex.DEFAULT_MAX_CHANGES]ircx_modex.ModeChange = undefined;
         const req = ircx_modex.parseParams(parsed.paramSlice(), &changes_buf) catch {
@@ -3045,12 +3047,12 @@ pub const LinuxServer = struct {
             },
             .set => |m| {
                 const access = self.propAccess(id, conn, m.entity) orelse {
-                    try queueNumeric(conn, .ERR_PROPDENIED, &.{m.entity.id}, "Insufficient access to set property");
+                    try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Insufficient access to set property");
                     return;
                 };
                 const setter = ircx_prop_store.Setter{ .id = conn.session.displayName(), .access = access };
                 const ev = self.props.setProp(m.entity, m.key, m.value, setter) catch {
-                    try queueNumeric(conn, .ERR_PROPDENIED, &.{m.entity.id}, "Cannot set that property");
+                    try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Cannot set that property");
                     return;
                 };
                 try propEmitEntry(conn, ev);
@@ -3058,7 +3060,7 @@ pub const LinuxServer = struct {
             },
             .delete => |k| {
                 if (self.propAccess(id, conn, k.entity) == null) {
-                    try queueNumeric(conn, .ERR_PROPDENIED, &.{k.entity.id}, "Insufficient access to delete property");
+                    try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Insufficient access to delete property");
                     return;
                 }
                 self.props.deleteProp(k.entity, k.key) catch {};
@@ -5204,15 +5206,15 @@ test "threaded server: WHISPER delivers to channel co-member only" {
     a.reset();
     try writeAllFd(fd_a, "WHISPER #w B :blocked\r\n");
     try recvUntil(a, " 923 ", 200);
-    // MODEX named-mode front-end: set AUTHONLY (-> +a), then query lists it (806/807).
+    // MODEX named-mode front-end: set AUTHONLY (-> +a), then query lists it (820/821).
     a.reset();
     try writeAllFd(fd_a, "MODEX #w +AUTHONLY\r\n");
     try recvUntil(a, "MODE #w +a", 200);
     a.reset();
     try writeAllFd(fd_a, "MODEX #w\r\n");
-    try recvUntil(a, " 806 ", 200);
+    try recvUntil(a, " 820 ", 200);
     try recvUntil(a, "AUTHONLY", 200);
-    try recvUntil(a, " 807 ", 200);
+    try recvUntil(a, " 821 ", 200);
 }
 
 test "threaded server: +x auditorium hides regular members in NAMES" {
@@ -5307,10 +5309,10 @@ test "threaded server: PROP set/get gated by channel-op" {
     a.reset();
     try writeAllFd(fd_a, "PROP #p SUBJECT\r\n");
     try recvUntil(a, " 818 A #p ", 200);
-    // B, not on the channel, cannot set channel props (ERR_PROPDENIED 918).
+    // B, not on the channel, cannot set channel props (ERR_NOACCESS 913).
     b.reset();
     try writeAllFd(fd_b, "PROP #p SUBJECT :nope\r\n");
-    try recvUntil(b, " 918 ", 200);
+    try recvUntil(b, " 913 ", 200);
     // A sets a SECRET key; B (no write access) must not be able to read it back —
     // the GET returns only the 819 end with no 818/value leak.
     a.reset();
