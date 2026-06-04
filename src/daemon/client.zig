@@ -503,6 +503,15 @@ pub fn Table(comptime T: type, comptime Id: type) type {
             return self.live_count;
         }
 
+        /// Pre-reserve slot capacity so the backing array never reallocates while
+        /// in use. Critical when `T` holds buffers referenced by in-flight async
+        /// I/O (e.g. io_uring recv/send into a ConnState): a realloc would move
+        /// those buffers and the kernel would write into freed memory. Callers
+        /// that reserve must also cap live entries at `n`.
+        pub fn reserve(self: *Self, n: usize) ModelError!void {
+            try self.slots.ensureTotalCapacity(self.allocator, n);
+        }
+
         /// Iterates live entries, yielding `{ id, value }`. Stable across reads
         /// (no mutation during iteration). Used by fan-out commands (WALLOPS,
         /// away-notify, oper notices) that must reach every connected client.

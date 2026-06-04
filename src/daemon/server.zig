@@ -478,6 +478,10 @@ pub const Config = struct {
     port: u16,
     backlog: u31 = 128,
     ring_entries: u16 = 32,
+    /// Hard cap on concurrent connections. The client table reserves this many
+    /// slots up front so ConnState buffers (targeted by in-flight io_uring I/O)
+    /// never move; accepts past the cap are refused.
+    max_clients: u31 = 1024,
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
     /// take on the account store's I/O lifecycle: a caller that has a store wires
@@ -581,12 +585,18 @@ pub const LinuxServer = struct {
         var whowas_store = try WhowasStore.init(allocator);
         errdefer whowas_store.deinit();
 
+        // Reserve the full connection table up front so ConnState buffers never
+        // move under in-flight io_uring I/O (a realloc would corrupt them).
+        var clients = ClientTable.init(allocator, 0);
+        errdefer clients.deinit();
+        try clients.reserve(config.max_clients);
+
         return .{
             .allocator = allocator,
             .config = config,
             .listener_fd = listener_fd,
             .ring = ring,
-            .clients = ClientTable.init(allocator, 0),
+            .clients = clients,
             .world = world_model.World.init(allocator),
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, 128),
@@ -648,6 +658,13 @@ pub const LinuxServer = struct {
 
         const fd: linux.fd_t = event.res;
         errdefer closeFd(fd);
+
+        // Refuse past the reserved cap: alloc beyond capacity would realloc the
+        // slot array and move ConnState buffers out from under in-flight I/O.
+        if (self.clients.len() >= self.config.max_clients) {
+            closeFd(fd);
+            return;
+        }
 
         const id = try self.clients.alloc(ConnState.init(fd));
         const conn = self.clients.get(id).?;
@@ -2086,9 +2103,23 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{command}, "Not enough parameters");
             return;
         }
-
-        const target = parsed.paramSlice()[0];
         const text = parsed.paramSlice()[1];
+        // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target.
+        var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
+        while (targets.next()) |target| {
+            if (target.len == 0) continue;
+            try self.messageOne(id, conn, command, target, text);
+        }
+    }
+
+    fn messageOne(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        command: []const u8,
+        target: []const u8,
+        text: []const u8,
+    ) !void {
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
@@ -3060,6 +3091,54 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: PRIVMSG multi-target delivery" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    // LiveClient carries an 8 KiB buffer; three on the stack alongside the
+    // Server (with its io_uring ring) overflow the test frame, so heap them.
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    const c = try alloc.create(LiveClient);
+    defer alloc.destroy(c);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    c.* = .{ .fd = fd_c };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try recvUntil(c, " 001 C ", 200);
+
+    // One PRIVMSG addressed to both B and C reaches each.
+    try writeAllFd(fd_a, "PRIVMSG B,C :hi both\r\n");
+    try recvUntil(b, ":A!alice@localhost PRIVMSG B :hi both\r\n", 200);
+    try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
 }
 
 test "threaded server: JOIN/PART comma-lists" {
