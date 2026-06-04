@@ -134,7 +134,7 @@
 97. [~] Cross-node channel membership convergence
 98. [~] Netsplit/netjoin batches
 99. [ ] /UPGRADE live migration (session_migrate analog)
-100. [ ] VEIL security layer handshake on peer links
+100. [~] VEIL security layer handshake on peer links
 
 ---
 
