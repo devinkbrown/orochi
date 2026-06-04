@@ -934,6 +934,32 @@ pub const LinuxServer = struct {
         try self.monitorOnline(nick);
     }
 
+    /// Broadcast a JOIN to every channel member, choosing the IRCv3 extended-join
+    /// form (`JOIN #c <account> :<realname>`) for recipients that negotiated the
+    /// cap and the plain form otherwise. Server-time is applied per recipient.
+    fn broadcastJoin(self: *LinuxServer, channel: []const u8, conn: *ConnState) !void {
+        var prefix_buf: [256]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        const account = conn.session.account() orelse "*";
+
+        var plain_buf: [default_reply_bytes]u8 = undefined;
+        const plain = try formatMessage(&plain_buf, prefix, "JOIN", &.{channel}, null);
+
+        var ext_buf: [default_reply_bytes]u8 = undefined;
+        const ext = try formatMessage(&ext_buf, prefix, "JOIN", &.{ channel, account }, conn.session.realname());
+
+        var tag_buf: [48]u8 = undefined;
+        const tag = serverTimeTag(&tag_buf);
+
+        var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        while (members.next()) |member| {
+            const mid = clientIdFromWorld(member.*);
+            const mconn = self.clients.get(mid) orelse continue;
+            const body = if (mconn.session.hasCap(.extended_join)) ext else plain;
+            try self.deliverTimed(mid, tag, body);
+        }
+    }
+
     /// Channel-mode gate for JOIN. Returns true (and emits the numeric) when the
     /// join must be refused: +b ban (474), +i invite-only (473), +k bad key
     /// (475), +l full (471). A pending INVITE bypasses ban and invite-only.
@@ -996,10 +1022,7 @@ pub const LinuxServer = struct {
 
         _ = try self.world.join(channel, wid);
 
-        var prefix_buf: [256]u8 = undefined;
-        var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "JOIN", &.{channel}, null);
-        try self.broadcastChannel(channel, msg, null);
+        try self.broadcastJoin(channel, conn);
         try self.sendTopicReply(conn, channel);
         try self.sendNames(conn, channel);
     }
@@ -2902,6 +2925,46 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: IRCv3 extended-join per-recipient format" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "CAP REQ :extended-join\r\n");
+    try recvUntil(&a, "ACK :extended-join", 200);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #e\r\n");
+    try recvUntil(&a, " 366 A #e ", 200);
+
+    // B joins; A (extended-join) sees the account + realname form (account "*"
+    // since B isn't logged in).
+    a.reset();
+    try writeAllFd(fd_b, "JOIN #e\r\n");
+    try recvUntil(&a, ":B!bob@localhost JOIN #e * :Bob\r\n", 200);
 }
 
 test "threaded server: MONITOR online/offline/list end-to-end" {

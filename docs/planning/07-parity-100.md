@@ -82,7 +82,7 @@
 54. [ ] message-tags relay (client tags passthrough)
 55. [ ] account-tag on messages
 56. [ ] account-notify on login/logout `[~]` proto/account_notify.zig
-57. [ ] extended-join (account+realname in JOIN) `[~]` proto/extended_join.zig
+57. [x] extended-join (account+realname in JOIN) `[~]` proto/extended_join.zig
 58. [ ] chghost `[~]` proto/chghost.zig
 59. [ ] invite-notify `[~]` proto/invite_notify.zig
 60. [ ] echo-message already; verify for NOTICE + TAGMSG
