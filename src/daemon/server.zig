@@ -65,6 +65,47 @@ fn serverTimeTag(buf: []u8) []const u8 {
     }) catch "";
 }
 
+/// The bare ISO-8601 server-time VALUE (no `@time=` key, no trailing space) for
+/// composing a multi-tag segment via buildTagPrefix.
+fn serverTimeValue(buf: []u8) []const u8 {
+    const ms = platform.realtimeMillis();
+    const secs: u64 = @intCast(@divTrunc(ms, 1000));
+    const millis: u16 = @intCast(@mod(ms, 1000));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        yd.year,              md.month.numeric(),      @as(u16, md.day_index) + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        millis,
+    }) catch "";
+}
+
+/// Assemble a per-recipient IRCv3 tag segment `@k=v;k=v ` (trailing space) from
+/// the tags available this event and the caps `session` negotiated. Returns ""
+/// when the recipient gets no tags. Only ONE `@`-segment is ever emitted, so
+/// server-time and account-tag coexist correctly (never two `@` blocks).
+fn buildTagPrefix(session: *const dispatch.ClientSession, tags: LinuxServer.MsgTags, out: []u8) []const u8 {
+    var b = Buf{ .storage = out };
+    var any = false;
+    if (tags.time_value.len != 0 and session.hasCap(.server_time)) {
+        b.append("@time=") catch return "";
+        b.append(tags.time_value) catch return "";
+        any = true;
+    }
+    if (session.hasCap(.account_tag)) {
+        if (tags.account) |acct| {
+            b.append(if (any) ";account=" else "@account=") catch return "";
+            b.append(acct) catch return "";
+            any = true;
+        }
+    }
+    if (!any) return "";
+    b.appendByte(' ') catch return "";
+    return b.written();
+}
+
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
     return true;
@@ -737,6 +778,45 @@ pub const LinuxServer = struct {
         try self.armSendIfNeeded(conn);
     }
 
+    /// Per-event message tags available to attach (server-time value WITHOUT the
+    /// `@time=` already formatted, and the sender's account if logged in). The
+    /// actual `@k=v;k=v ` segment is assembled PER RECIPIENT from the caps they
+    /// negotiated, so a client gets exactly the tags it asked for in one segment.
+    const MsgTags = struct {
+        time_value: []const u8, // ISO-8601, e.g. "2026-06-04T..Z" (no key)
+        account: ?[]const u8, // sender's account, or null when not logged in
+    };
+
+    /// Deliver `bytes` with an IRCv3 message-tag segment assembled for THIS
+    /// recipient: `@time=…;account=… ` including only the tags whose caps the
+    /// recipient negotiated. Used by the PRIVMSG/NOTICE/TAGMSG paths.
+    fn deliverTagged(self: *LinuxServer, id: client_model.ClientId, tags: MsgTags, bytes: []const u8) !void {
+        const conn = self.clients.get(id) orelse return error.ClientNotFound;
+        if (conn.closing) return;
+        var tagbuf: [128]u8 = undefined;
+        const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
+        if (prefix.len != 0) try appendToConn(conn, prefix);
+        try appendToConn(conn, bytes);
+        try self.armSendIfNeeded(conn);
+    }
+
+    fn broadcastChannelTagged(
+        self: *LinuxServer,
+        channel: []const u8,
+        tags: MsgTags,
+        bytes: []const u8,
+        except: ?client_model.ClientId,
+    ) !void {
+        var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        while (members.next()) |member| {
+            const mid = clientIdFromWorld(member.*);
+            if (except) |skip| {
+                if (mid.eql(skip)) continue;
+            }
+            try self.deliverTagged(mid, tags, bytes);
+        }
+    }
+
     fn broadcastChannel(
         self: *LinuxServer,
         channel: []const u8,
@@ -755,17 +835,16 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Like broadcastChannel but only to members whose status rank is >= min_rank
-    /// (STATUSMSG: `@#chan`, `+#chan`, ...). Server-time applied per recipient.
+    /// Like broadcastChannelTagged but only to members whose status rank is >=
+    /// min_rank (STATUSMSG: `@#chan`, `+#chan`, ...).
     fn broadcastChannelMinRank(
         self: *LinuxServer,
         channel: []const u8,
+        tags: MsgTags,
         bytes: []const u8,
         except: ?client_model.ClientId,
         min_rank: u8,
     ) !void {
-        var tag_buf: [48]u8 = undefined;
-        const tag = serverTimeTag(&tag_buf);
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         while (members.next()) |member| {
             const mm = self.world.memberModes(channel, member.*) orelse continue;
@@ -774,7 +853,7 @@ pub const LinuxServer = struct {
             if (except) |skip| {
                 if (id.eql(skip)) continue;
             }
-            try self.deliverTimed(id, tag, bytes);
+            try self.deliverTagged(id, tags, bytes);
         }
     }
 
@@ -2293,15 +2372,14 @@ pub const LinuxServer = struct {
                     return;
                 }
             }
+            var time_buf: [40]u8 = undefined;
+            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
             if (min_rank == 0) {
-                try self.broadcastChannel(chan, msg, id);
+                try self.broadcastChannelTagged(chan, ctags, msg, id);
             } else {
-                try self.broadcastChannelMinRank(chan, msg, id, min_rank);
+                try self.broadcastChannelMinRank(chan, ctags, msg, id, min_rank);
             }
-            if (echo) {
-                var tag_buf: [48]u8 = undefined;
-                try self.deliverTimed(id, serverTimeTag(&tag_buf), msg);
-            }
+            if (echo) try self.deliverTagged(id, ctags, msg);
             return;
         }
 
@@ -2309,10 +2387,10 @@ pub const LinuxServer = struct {
             if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
             return;
         };
-        var tag_buf: [48]u8 = undefined;
-        const tag = serverTimeTag(&tag_buf);
-        try self.deliverTimed(clientIdFromWorld(recipient), tag, msg);
-        if (echo) try self.deliverTimed(id, tag, msg);
+        var time_buf: [40]u8 = undefined;
+        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
+        try self.deliverTagged(clientIdFromWorld(recipient), dtags, msg);
+        if (echo) try self.deliverTagged(id, dtags, msg);
 
         // RFC 1459: a PRIVMSG (not NOTICE) to an away user returns RPL_AWAY so
         // the sender sees the auto-reply. NOTICE never auto-responds.
@@ -3251,6 +3329,29 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "buildTagPrefix assembles server-time + account into one tag segment" {
+    var session = dispatch.ClientSession.init();
+    const tags = LinuxServer.MsgTags{ .time_value = "2026-06-04T12:00:00.000Z", .account = "alice" };
+    var buf: [128]u8 = undefined;
+
+    // No caps -> no tag segment.
+    try std.testing.expectEqualStrings("", buildTagPrefix(&session, tags, &buf));
+
+    // server-time only.
+    session.addCap(.server_time);
+    try std.testing.expectEqualStrings("@time=2026-06-04T12:00:00.000Z ", buildTagPrefix(&session, tags, &buf));
+
+    // both caps -> single segment, semicolon-joined, trailing space.
+    session.addCap(.account_tag);
+    try std.testing.expectEqualStrings("@time=2026-06-04T12:00:00.000Z;account=alice ", buildTagPrefix(&session, tags, &buf));
+
+    // account-tag only, no account -> empty (nothing to add).
+    var s2 = dispatch.ClientSession.init();
+    s2.addCap(.account_tag);
+    const no_acct = LinuxServer.MsgTags{ .time_value = "", .account = null };
+    try std.testing.expectEqualStrings("", buildTagPrefix(&s2, no_acct, &buf));
 }
 
 test "threaded server: TAGMSG relays client tags to message-tags peers" {

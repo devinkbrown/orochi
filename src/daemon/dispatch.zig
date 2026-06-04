@@ -174,6 +174,7 @@ pub const CapId = enum(u6) {
     extended_join,
     account_notify,
     invite_notify,
+    account_tag,
 };
 
 const CapSet = struct {
@@ -212,6 +213,7 @@ const cap_specs = [_]CapSpec{
     .{ .id = .setname, .name = "setname" },
     .{ .id = .extended_join, .name = "extended-join" },
     .{ .id = .invite_notify, .name = "invite-notify" },
+    .{ .id = .account_tag, .name = "account-tag" },
     // account-notify is enumerated but not advertised: the only auth change is
     // SASL during pre-registration, before the client shares any channel, so
     // there is no post-join ACCOUNT event to deliver yet.
@@ -525,6 +527,12 @@ pub const ClientSession = struct {
     /// per-recipient IRCv3 behavior (echo-message, extended-join, ...).
     pub fn hasCap(self: *const ClientSession, id: CapId) bool {
         return self.cap.negotiated.contains(id);
+    }
+
+    /// Force-enable a negotiated cap (used by the server's internal SASL grant
+    /// and by tests; normal clients arrive here via CAP REQ).
+    pub fn addCap(self: *ClientSession, id: CapId) void {
+        self.cap.negotiated.add(id);
     }
 };
 
