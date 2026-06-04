@@ -72,14 +72,14 @@
 47. [x] LISTX extended LIST `[~]` proto/listx.zig
 48. [~] WHISPER channel-scoped private msg `[~]` proto/whisper.zig
 49. [x] +h HIDDEN channel mode (IRCX, NOT halfop)
-50. [ ] AUTH (IRCX auth package negotiation)
+50. [~] AUTH (IRCX auth package negotiation)
 51. [ ] IRCX command gating behind `CREATE`/ISIRCX state
 52. [ ] AUDITORIUM (+x) member-visibility semantics
 
 ## E. IRCv3 capabilities
 
 53. [x] server-time tag on all relayed messages (have realtimeMillis)
-54. [ ] message-tags relay (client tags passthrough)
+54. [~] message-tags relay (client tags passthrough)
 55. [x] account-tag on messages
 56. [~] account-notify on login/logout `[~]` proto/account_notify.zig
 57. [x] extended-join (account+realname in JOIN) `[~]` proto/extended_join.zig
@@ -103,7 +103,7 @@
 
 ## F. SASL & accounts
 
-75. [ ] SASL EXTERNAL (cert-based) — sasl.Dispatcher consolidation
+75. [~] SASL EXTERNAL (cert-based) — sasl.Dispatcher consolidation
 76. [x] SASL SCRAM-SHA-256 `[~]` proto/sasl.zig
 77. [x] SASL SCRAM-SHA-512 `[~]`
 78. [~] Advertise EXTERNAL/SCRAM once wired
