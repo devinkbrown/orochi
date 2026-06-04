@@ -66,7 +66,7 @@
 
 42. [ ] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
 43. [ ] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig
-44. [ ] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
+44. [~] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
 45. [~] PROP get/set on channel/user/member entities
 46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
 47. [ ] LISTX extended LIST `[~]` proto/listx.zig
@@ -91,7 +91,7 @@
 63. [~] CAP NEW / CAP DEL dynamic advertisement
 64. [ ] STS policy advertisement `[~]` proto/sts.zig
 65. [x] bot-mode (+B umode, WHOIS 335) `[~]` proto/bot_mode.zig
-66. [ ] multiline `[~]` proto/multiline.zig
+66. [~] multiline `[~]` proto/multiline.zig
 67. [ ] message-redaction / message-edit `[~]` proto/msgedit.zig
 68. [x] read-marker `[~]` proto/read_marker.zig
 69. [~] metadata `[~]` proto/metadata.zig

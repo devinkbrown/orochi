@@ -13,6 +13,7 @@ pub const media = @import("media.zig");
 pub const membership_view = @import("membership_view.zig");
 pub const merkle = @import("merkle.zig");
 pub const merkle_props = @import("merkle_props.zig");
+pub const peer_link = @import("peer_link.zig");
 pub const state_props = @import("state_props.zig");
 pub const state = @import("state.zig");
 // gen:mods:end
@@ -31,6 +32,7 @@ test {
     _ = membership_view;
     _ = merkle;
     _ = merkle_props;
+    _ = peer_link;
     _ = state_props;
     _ = state;
     // gen:tests:end
