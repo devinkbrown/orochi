@@ -21,6 +21,7 @@ pub const merkle_props = @import("merkle_props.zig");
 pub const nick_claim = @import("nick_claim.zig");
 pub const peer_link = @import("peer_link.zig");
 pub const route_table = @import("route_table.zig");
+pub const s2s_peer = @import("s2s_peer.zig");
 pub const server_registry = @import("server_registry.zig");
 pub const state_props = @import("state_props.zig");
 pub const state = @import("state.zig");
@@ -49,6 +50,7 @@ test {
     _ = nick_claim;
     _ = peer_link;
     _ = route_table;
+    _ = s2s_peer;
     _ = server_registry;
     _ = state_props;
     _ = state;
