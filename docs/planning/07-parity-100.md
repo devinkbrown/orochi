@@ -78,7 +78,7 @@
 
 ## E. IRCv3 capabilities
 
-53. [ ] server-time tag on all relayed messages (have realtimeMillis)
+53. [x] server-time tag on all relayed messages (have realtimeMillis)
 54. [ ] message-tags relay (client tags passthrough)
 55. [ ] account-tag on messages
 56. [ ] account-notify on login/logout `[~]` proto/account_notify.zig

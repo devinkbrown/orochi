@@ -46,6 +46,24 @@ fn formatServerTime(buf: []u8) []const u8 {
     }) catch "unknown";
 }
 
+/// IRCv3 server-time tag: `@time=2026-06-04T12:34:56.789Z ` (ISO-8601 UTC with
+/// millisecond precision, trailing space so it prepends directly before the ':'
+/// message prefix). Empty string on format failure (tag simply omitted).
+fn serverTimeTag(buf: []u8) []const u8 {
+    const ms = platform.realtimeMillis();
+    const secs: u64 = @intCast(@divTrunc(ms, 1000));
+    const millis: u16 = @intCast(@mod(ms, 1000));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "@time={d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z ", .{
+        yd.year,              md.month.numeric(),      @as(u16, md.day_index) + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        millis,
+    }) catch "";
+}
+
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
     return true;
@@ -662,19 +680,34 @@ pub const LinuxServer = struct {
         try self.armSendIfNeeded(conn);
     }
 
+    /// Deliver `bytes` (a complete `:prefix ...` line), prepending the IRCv3
+    /// server-time `tag` for recipients that negotiated the server-time cap.
+    /// `tag` is precomputed once per event so all recipients share a timestamp.
+    fn deliverTimed(self: *LinuxServer, id: client_model.ClientId, tag: []const u8, bytes: []const u8) !void {
+        const conn = self.clients.get(id) orelse return error.ClientNotFound;
+        if (conn.closing) return;
+        if (tag.len != 0 and conn.session.hasCap(.server_time)) {
+            try appendToConn(conn, tag);
+        }
+        try appendToConn(conn, bytes);
+        try self.armSendIfNeeded(conn);
+    }
+
     fn broadcastChannel(
         self: *LinuxServer,
         channel: []const u8,
         bytes: []const u8,
         except: ?client_model.ClientId,
     ) !void {
+        var tag_buf: [48]u8 = undefined;
+        const tag = serverTimeTag(&tag_buf);
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         while (members.next()) |member| {
             const id = clientIdFromWorld(member.*);
             if (except) |skip| {
                 if (id.eql(skip)) continue;
             }
-            try self.deliver(id, bytes);
+            try self.deliverTimed(id, tag, bytes);
         }
     }
 
@@ -1838,7 +1871,10 @@ pub const LinuxServer = struct {
                 }
             }
             try self.broadcastChannel(target, msg, id);
-            if (echo) try self.deliver(id, msg);
+            if (echo) {
+                var tag_buf: [48]u8 = undefined;
+                try self.deliverTimed(id, serverTimeTag(&tag_buf), msg);
+            }
             return;
         }
 
@@ -1846,8 +1882,10 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
             return;
         };
-        try self.deliver(clientIdFromWorld(recipient), msg);
-        if (echo) try self.deliver(id, msg);
+        var tag_buf: [48]u8 = undefined;
+        const tag = serverTimeTag(&tag_buf);
+        try self.deliverTimed(clientIdFromWorld(recipient), tag, msg);
+        if (echo) try self.deliverTimed(id, tag, msg);
 
         // RFC 1459: a PRIVMSG (not NOTICE) to an away user returns RPL_AWAY so
         // the sender sees the auto-reply. NOTICE never auto-responds.
@@ -2678,6 +2716,49 @@ test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
     try writeAllFd(fd_a, "WHOWAS B\r\n");
     try recvUntil(&a, " 314 A B ", 200);
     try recvUntil(&a, " 369 A B ", 200);
+}
+
+test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A negotiates server-time; B does not.
+    try writeAllFd(fd_a, "CAP REQ :server-time\r\n");
+    try recvUntil(&a, "ACK :server-time", 200);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #t\r\n");
+    try recvUntil(&a, " 366 A #t ", 200);
+    try writeAllFd(fd_b, "JOIN #t\r\n");
+    try recvUntil(&b, " 366 B #t ", 200);
+
+    // B messages the channel; A (cap holder) sees a @time= tag before the prefix.
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
+    try recvUntil(&a, "@time=", 200);
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
 }
 
 test {
