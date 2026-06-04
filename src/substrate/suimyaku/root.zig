@@ -10,9 +10,11 @@ pub const clock = @import("clock.zig");
 pub const conflict_resolver = @import("conflict_resolver.zig");
 pub const convergence = @import("convergence.zig");
 pub const delta_codec = @import("delta_codec.zig");
+pub const eg_walker = @import("eg_walker.zig");
 pub const goryu = @import("goryu.zig");
 pub const goryu_props = @import("goryu_props.zig");
 pub const gossip_round = @import("gossip_round.zig");
+pub const gossip_views = @import("gossip_views.zig");
 pub const link_session = @import("link_session.zig");
 pub const media = @import("media.zig");
 pub const membership_view = @import("membership_view.zig");
@@ -27,6 +29,7 @@ pub const s2s_peer = @import("s2s_peer.zig");
 pub const server_registry = @import("server_registry.zig");
 pub const state_props = @import("state_props.zig");
 pub const state = @import("state.zig");
+pub const swim = @import("swim.zig");
 pub const uid_alloc = @import("uid_alloc.zig");
 // gen:mods:end
 
@@ -41,9 +44,11 @@ test {
     _ = conflict_resolver;
     _ = convergence;
     _ = delta_codec;
+    _ = eg_walker;
     _ = goryu;
     _ = goryu_props;
     _ = gossip_round;
+    _ = gossip_views;
     _ = link_session;
     _ = media;
     _ = membership_view;
@@ -58,6 +63,7 @@ test {
     _ = server_registry;
     _ = state_props;
     _ = state;
+    _ = swim;
     _ = uid_alloc;
     // gen:tests:end
 }

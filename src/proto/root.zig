@@ -109,6 +109,7 @@ pub const sasl_scram_server = @import("sasl_scram_server.zig");
 pub const serverinfo = @import("serverinfo.zig");
 pub const services_alias = @import("services_alias.zig");
 pub const setname_chghost_notify = @import("setname_chghost_notify.zig");
+pub const signed_delta = @import("signed_delta.zig");
 pub const silence = @import("silence.zig");
 pub const snomask = @import("snomask.zig");
 pub const standard_replies_emit = @import("standard_replies_emit.zig");
@@ -248,6 +249,7 @@ test {
     _ = serverinfo;
     _ = services_alias;
     _ = setname_chghost_notify;
+    _ = signed_delta;
     _ = silence;
     _ = snomask;
     _ = standard_replies_emit;
