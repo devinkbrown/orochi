@@ -22,7 +22,7 @@
 9. [x] MAP (015/017, single-node)
 10. [x] PONG (accepted)
 11. [x] KILL (oper 481, graceful close-on-drain)
-12. [ ] WHOWAS (needs history store; daemon/whowas.zig exists) `[~]`
+12. [x] WHOWAS (needs history store; daemon/whowas.zig exists) `[~]`
 13. [ ] USERIP (oper; needs per-conn IP)
 14. [ ] SUMMON (446 disabled stub)
 15. [ ] TAGMSG (IRCv3 message-tags; needs tag relay)

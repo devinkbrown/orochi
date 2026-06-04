@@ -22,6 +22,12 @@ const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
+const whowas = @import("whowas.zig");
+const whowas_reply = @import("../proto/whowas_reply.zig");
+
+/// Bounded WHOWAS history ring shared by the live server. Field caps match the
+/// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
+const WhowasStore = whowas.Whowas(.{ .capacity = 256, .max_nick_len = 64, .max_user_len = 64 });
 const list = @import("../proto/list.zig");
 const who = @import("../proto/who.zig");
 const platform = @import("../substrate/platform.zig");
@@ -514,6 +520,7 @@ pub const LinuxServer = struct {
     ring: RingCore,
     clients: ClientTable,
     world: world_model.World,
+    whowas: WhowasStore,
     accept_armed: bool = false,
 
     /// Single configured operator credential (OPER <name> <pass>). Static for
@@ -535,6 +542,9 @@ pub const LinuxServer = struct {
         };
         errdefer ring.deinit();
 
+        var whowas_store = try WhowasStore.init(allocator);
+        errdefer whowas_store.deinit();
+
         return .{
             .allocator = allocator,
             .config = config,
@@ -542,6 +552,7 @@ pub const LinuxServer = struct {
             .ring = ring,
             .clients = ClientTable.init(allocator, 0),
             .world = world_model.World.init(allocator),
+            .whowas = whowas_store,
         };
     }
 
@@ -549,6 +560,7 @@ pub const LinuxServer = struct {
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) closeFd(slot.value.fd);
         }
+        self.whowas.deinit();
         self.world.deinit();
         self.clients.deinit();
         self.ring.deinit();
@@ -681,10 +693,30 @@ pub const LinuxServer = struct {
         const id = idFromToken(token);
         if (self.clients.get(id)) |conn| {
             defer self.world.removeClient(worldIdFromClient(id));
+            // Record only for abrupt drops: a clean QUIT already recorded (and
+            // removed the nick) in handleQuit, so skip to avoid a duplicate.
+            if (self.world.nickOf(worldIdFromClient(id)) != null) self.recordWhowas(conn);
             try self.broadcastQuit(id, conn, reason);
             closeFd(conn.fd);
             _ = self.clients.free(id);
         }
+    }
+
+    /// Snapshot a departing client's identity into the WHOWAS ring. The store
+    /// copies into fixed slots, so the borrowed session strings are safe to pass.
+    /// Best-effort: validation failures (e.g. over-length) are dropped.
+    fn recordWhowas(self: *LinuxServer, conn: *const ConnState) void {
+        if (!conn.session.registered()) return;
+        const nick = conn.session.displayName();
+        if (std.mem.eql(u8, nick, "*")) return;
+        self.whowas.addOnQuit(.{
+            .nick = nick,
+            .user = conn.session.username(),
+            .host = default_host,
+            .realname = conn.session.realname(),
+            .account = conn.session.account() orelse "",
+            .signoff_time = @divTrunc(platform.realtimeMillis(), 1000),
+        }) catch {};
     }
 
     fn broadcastQuit(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, reason: []const u8) !void {
@@ -822,6 +854,8 @@ pub const LinuxServer = struct {
             try self.handleMap(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KILL")) {
             try self.handleKill(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOWAS")) {
+            try self.handleWhowas(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
         } else {
@@ -1465,6 +1499,36 @@ pub const LinuxServer = struct {
         try self.armSendIfNeeded(tconn);
     }
 
+    /// WHOWAS <nick> [count] — historical identities from the ring, most-recent
+    /// first (314 + 312 signoff, 406 if none, 369 end).
+    fn handleWhowas(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHOWAS"}, "Not enough parameters");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+
+        var records: [16]whowas.Record = undefined;
+        const found = self.whowas.query(target, records.len, &records) catch records[0..0];
+        const n = found.len;
+
+        var entries: [16]whowas_reply.HistoryEntry = undefined;
+        for (found, 0..) |rec, i| {
+            entries[i] = .{
+                .nick = rec.nick,
+                .user = rec.user,
+                .host = rec.host,
+                .realname = rec.realname,
+                .signoff_time = rec.signoff_time,
+                .server = server_name,
+            };
+        }
+
+        var scratch: [default_reply_bytes]u8 = undefined;
+        var sink = ConnLineSink{ .conn = conn };
+        whowas_reply.emitWhowas(&scratch, server_name, conn.session.displayName(), target, entries[0..n], &sink) catch return;
+    }
+
     /// LUSERS — network/user counters (251-255, 265/266).
     fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         const clients: u64 = @intCast(self.clients.len());
@@ -1834,6 +1898,7 @@ pub const LinuxServer = struct {
 
     fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const reason = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "Client quit";
+        self.recordWhowas(conn); // before removeClient: snapshot the live identity
         try self.broadcastQuit(id, conn, reason);
         self.world.removeClient(worldIdFromClient(id));
         conn.closing = true;
@@ -2603,6 +2668,16 @@ test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
     try writeAllFd(fd_a, "MODE #c b\r\n");
     try recvUntil(&a, " 367 A #c B!*@*", 200);
     try recvUntil(&a, " 368 A #c ", 200);
+
+    // WHOWAS: B quits (A shares #c so sees the QUIT, after the whowas record is
+    // taken), then A WHOWAS B -> 314 user line + 369 end.
+    a.reset();
+    try writeAllFd(fd_b, "QUIT :gone\r\n");
+    try recvUntil(&a, "QUIT :gone", 200);
+    a.reset();
+    try writeAllFd(fd_a, "WHOWAS B\r\n");
+    try recvUntil(&a, " 314 A B ", 200);
+    try recvUntil(&a, " 369 A B ", 200);
 }
 
 test {
