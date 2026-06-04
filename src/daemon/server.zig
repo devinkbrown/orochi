@@ -26,6 +26,7 @@ const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
 const whowas_reply = @import("../proto/whowas_reply.zig");
 const monitor = @import("../proto/monitor.zig");
+const read_marker_store = @import("../proto/read_marker_store.zig");
 
 /// Bounded WHOWAS history ring shared by the live server. Field caps match the
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
@@ -611,6 +612,7 @@ pub const LinuxServer = struct {
     world: world_model.World,
     whowas: WhowasStore,
     monitor: monitor.MonitorStore,
+    read_markers: read_marker_store.DefaultStore,
     accept_armed: bool = false,
 
     /// Single configured operator credential (OPER <name> <pass>). Static for
@@ -652,6 +654,7 @@ pub const LinuxServer = struct {
             .world = world_model.World.init(allocator),
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, 128),
+            .read_markers = read_marker_store.DefaultStore.init(allocator),
             .start_ms = platform.monotonicMillis(),
         };
     }
@@ -660,6 +663,7 @@ pub const LinuxServer = struct {
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) closeFd(slot.value.fd);
         }
+        self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
         self.world.deinit();
@@ -1051,6 +1055,8 @@ pub const LinuxServer = struct {
             try self.handleKnock(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MONITOR")) {
             try self.handleMonitor(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MARKREAD")) {
+            try self.handleMarkread(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
             try self.handleStats(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TAGMSG")) {
@@ -1960,6 +1966,36 @@ pub const LinuxServer = struct {
             else => {}, // other letters not implemented yet
         }
         try queueNumeric(conn, .RPL_ENDOFSTATS, &.{letter}, "End of /STATS report");
+    }
+
+    /// MARKREAD <target> [timestamp=…] — IRCv3 read-marker. GET returns the
+    /// stored marker (or `*`); SET advances it (monotonic) and echoes it back.
+    /// Keyed by the client's account when logged in, else its nick.
+    fn handleMarkread(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const owner = conn.session.account() orelse conn.session.displayName();
+        const req = read_marker_store.parse(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MARKREAD"}, "Invalid MARKREAD parameters");
+            return;
+        };
+        var out_buf: [default_reply_bytes]u8 = undefined;
+        const line = switch (req) {
+            .get => |target| blk: {
+                const ts = self.read_markers.get(owner, target) catch null;
+                break :blk if (ts) |t|
+                    (read_marker_store.buildTimestampResponse(target, t, &out_buf) catch return)
+                else
+                    (read_marker_store.buildResponse(target, .unset, &out_buf) catch return);
+            },
+            .set => |sr| blk: {
+                const ts = switch (sr.marker) {
+                    .timestamp => |t| t,
+                    .unset => break :blk (read_marker_store.buildResponse(sr.target, .unset, &out_buf) catch return),
+                };
+                const res = self.read_markers.set(owner, sr.target, ts) catch return;
+                break :blk (read_marker_store.buildTimestampResponse(sr.target, res.timestamp, &out_buf) catch return);
+            },
+        };
+        try appendToConn(conn, line);
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
@@ -3697,6 +3733,36 @@ test "threaded server: PRIVMSG multi-target delivery" {
     try writeAllFd(fd_a, "PRIVMSG B,C :hi both\r\n");
     try recvUntil(b, ":A!alice@localhost PRIVMSG B :hi both\r\n", 200);
     try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
+}
+
+test "threaded server: MARKREAD set then get" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    // SET advances the marker and echoes it.
+    a.reset();
+    try writeAllFd(fd_a, "MARKREAD #c timestamp=2026-06-04T12:00:00.000Z\r\n");
+    try recvUntil(&a, "MARKREAD #c timestamp=2026-06-04T12:00:00.000Z\r\n", 200);
+    // GET returns the stored marker.
+    a.reset();
+    try writeAllFd(fd_a, "MARKREAD #c\r\n");
+    try recvUntil(&a, "MARKREAD #c timestamp=2026-06-04T12:00:00.000Z\r\n", 200);
 }
 
 test "threaded server: JOIN/PART comma-lists" {
