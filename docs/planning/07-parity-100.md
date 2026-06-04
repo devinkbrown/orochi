@@ -25,7 +25,7 @@
 12. [x] WHOWAS (needs history store; daemon/whowas.zig exists) `[~]`
 13. [ ] USERIP (oper; needs per-conn IP)
 14. [x] SUMMON (446 disabled stub)
-15. [ ] TAGMSG (IRCv3 message-tags; needs tag relay)
+15. [x] TAGMSG (IRCv3 message-tags; needs tag relay)
 16. [ ] NAMESX / UHNAMES (cap-driven NAMES formatting)
 
 ## B. Channel mode enforcement (world-model state wave)

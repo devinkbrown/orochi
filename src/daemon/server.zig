@@ -111,6 +111,9 @@ const irc_line = struct {
     pub const LineView = struct {
         raw: []const u8,
         prefix: ?[]const u8 = null,
+        /// IRCv3 client message-tags segment WITHOUT the leading '@' (null if
+        /// none). Relayed verbatim by TAGMSG to message-tags recipients.
+        tags_raw: ?[]const u8 = null,
         command: []const u8,
         params: [MAXPARA][]const u8 = [_][]const u8{""} ** MAXPARA,
         param_count: usize = 0,
@@ -136,7 +139,9 @@ const irc_line = struct {
         if (cursor >= body.len) return error.MissingCommand;
 
         if (body[cursor] == '@') {
-            cursor = skipSpaces(body, findSpace(body, cursor) orelse return error.MissingCommand);
+            const tag_end = findSpace(body, cursor) orelse return error.MissingCommand;
+            if (tag_end > cursor + 1) view.tags_raw = body[cursor + 1 .. tag_end];
+            cursor = skipSpaces(body, tag_end);
             if (cursor >= body.len) return error.MissingCommand;
         }
 
@@ -964,6 +969,8 @@ pub const LinuxServer = struct {
             try self.handleMonitor(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
             try self.handleStats(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TAGMSG")) {
+            try self.handleTagmsg(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -2167,6 +2174,41 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// TAGMSG <target> — IRCv3 message-tags: relay the sender's client tags (no
+    /// text body) to recipients that negotiated message-tags. A TAGMSG carrying
+    /// no tags is a no-op. Delivered untagged-by-server (the client `@tags`
+    /// segment is the whole tag set) — server-time-in-tags is a future merge.
+    fn handleTagmsg(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) return;
+        const tags = parsed.tags_raw orelse return; // nothing to relay
+        const target = parsed.paramSlice()[0];
+
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "@{s} :{s} TAGMSG {s}\r\n", .{
+            tags, try clientPrefix(conn, &prefix_buf), target,
+        }) catch return error.OutputTooSmall;
+        const echo = conn.session.hasCap(.echo_message);
+
+        if (world_model.isChannelName(target)) {
+            if (!self.world.channelExists(target)) return;
+            if (!self.world.isMember(target, worldIdFromClient(id))) return;
+            var members = self.world.memberIterator(target) orelse return;
+            while (members.next()) |member| {
+                const mid = clientIdFromWorld(member.*);
+                if (mid.eql(id) and !echo) continue;
+                const mconn = self.clients.get(mid) orelse continue;
+                if (!mconn.session.hasCap(.message_tags)) continue;
+                try self.deliver(mid, msg);
+            }
+            return;
+        }
+        const recipient = self.world.findNick(target) orelse return;
+        const rconn = self.clients.get(clientIdFromWorld(recipient)) orelse return;
+        if (rconn.session.hasCap(.message_tags)) try self.deliver(clientIdFromWorld(recipient), msg);
+        if (echo) try self.deliver(id, msg);
+    }
+
     fn handleMessage(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -3209,6 +3251,45 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: TAGMSG relays client tags to message-tags peers" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :message-tags\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #t\r\n");
+    try recvUntil(&a, " 366 A #t ", 200);
+    try writeAllFd(fd_b, "JOIN #t\r\n");
+    try recvUntil(&b, " 366 B #t ", 200);
+
+    // A's tagged TAGMSG is relayed verbatim to B (message-tags peer).
+    b.reset();
+    try writeAllFd(fd_a, "@+typing=active TAGMSG #t\r\n");
+    try recvUntil(&b, "@+typing=active :A!alice@localhost TAGMSG #t\r\n", 200);
 }
 
 test "threaded server: IRCv3 invite-notify to cap holders" {
