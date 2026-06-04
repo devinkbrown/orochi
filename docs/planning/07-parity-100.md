@@ -88,7 +88,7 @@
 60. [ ] echo-message already; verify for NOTICE + TAGMSG
 61. [ ] batch (netjoin/netsplit/chathistory) `[~]` proto/batch.zig
 62. [ ] labeled-response (label → echo correlation)
-63. [ ] CAP NEW / CAP DEL dynamic advertisement
+63. [~] CAP NEW / CAP DEL dynamic advertisement
 64. [ ] STS policy advertisement `[~]` proto/sts.zig
 65. [x] bot-mode (+B umode, WHOIS 335) `[~]` proto/bot_mode.zig
 66. [ ] multiline `[~]` proto/multiline.zig
