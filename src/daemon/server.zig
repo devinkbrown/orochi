@@ -6180,28 +6180,24 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     try std.testing.expect(peer.established());
     try std.testing.expect(peer.knownServers() >= 2);
 
-    // The oper can SQUIT the peer by its handshake-learned name. The server learns
-    // that name asynchronously (its recv of the peer's handshake), so retry until
-    // SQUIT resolves the name rather than racing the handshake completion.
-    var squit_ok = false;
-    var tries: usize = 0;
-    while (tries < 40 and !squit_ok) : (tries += 1) {
+    // Deterministic readiness gate (no timing race): LINKS is idempotent and only
+    // lists ESTABLISHED, handshake-NAMED peers. Poll it until 'remote.test'
+    // appears — that is the observable signal the server learned the peer — THEN
+    // SQUIT exactly once and require success. (Protocol convergence itself is
+    // proven by the deterministic byte-loopback tests; this is the socket/reactor
+    // integration smoke test, made non-flaky by gating on observable readiness.)
+    var learned = false;
+    var probes: usize = 0;
+    while (probes < 60 and !learned) : (probes += 1) {
         a.reset();
-        try writeAllFd(fd_a, "SQUIT remote.test\r\n");
-        var q: usize = 0;
-        while (q < 8 and !squit_ok) : (q += 1) {
-            var fds = [_]posix.pollfd{.{ .fd = fd_a, .events = linux.POLL.IN, .revents = 0 }};
-            const rr = posix.poll(&fds, 25) catch break;
-            if (rr != 0 and (fds[0].revents & linux.POLL.IN) != 0) {
-                if (a.len < a.buf.len) {
-                    const m = readFd(fd_a, a.buf[a.len..]) catch break;
-                    a.len += m;
-                }
-            }
-            if (std.mem.indexOf(u8, a.written(), "SQUIT complete") != null) squit_ok = true;
-        }
+        try writeAllFd(fd_a, "LINKS\r\n");
+        recvUntil(&a, " 365 ", 80) catch {};
+        if (std.mem.indexOf(u8, a.written(), "remote.test") != null) learned = true;
     }
-    try std.testing.expect(squit_ok);
+    try std.testing.expect(learned);
+    a.reset();
+    try writeAllFd(fd_a, "SQUIT remote.test\r\n");
+    try recvUntil(&a, "SQUIT complete", 200);
 }
 
 test {
