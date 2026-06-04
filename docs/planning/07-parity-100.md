@@ -64,7 +64,7 @@
 
 ## D. IRCX surface (draft-pfenning-04)
 
-42. [ ] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
+42. [~] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
 43. [ ] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig
 44. [~] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
 45. [~] PROP get/set on channel/user/member entities
@@ -108,7 +108,7 @@
 77. [x] SASL SCRAM-SHA-512 `[~]`
 78. [~] Advertise EXTERNAL/SCRAM once wired
 79. [~] ACCOUNT registration/identify path (services bridge)
-80. [ ] CERTFP (m_certfp / m_certadd)
+80. [~] CERTFP (m_certfp / m_certadd)
 81. [ ] WHOIS RPL_WHOISLOGGEDIN 330 / certfp 276
 
 ## G. Oper & server management
@@ -132,7 +132,7 @@
 95. [~] Server burst / state sync (Suimyaku CRDT)
 96. [~] Cross-node PRIVMSG routing
 97. [~] Cross-node channel membership convergence
-98. [ ] Netsplit/netjoin batches
+98. [~] Netsplit/netjoin batches
 99. [ ] /UPGRADE live migration (session_migrate analog)
 100. [ ] VEIL security layer handshake on peer links
 
