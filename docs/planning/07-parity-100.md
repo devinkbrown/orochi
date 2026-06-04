@@ -67,7 +67,7 @@
 42. [ ] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
 43. [ ] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig
 44. [ ] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
-45. [ ] PROP get/set on channel/user/member entities
+45. [~] PROP get/set on channel/user/member entities
 46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
 47. [ ] LISTX extended LIST `[~]` proto/listx.zig
 48. [ ] WHISPER channel-scoped private msg `[~]` proto/whisper.zig
@@ -106,7 +106,7 @@
 75. [ ] SASL EXTERNAL (cert-based) — sasl.Dispatcher consolidation
 76. [x] SASL SCRAM-SHA-256 `[~]` proto/sasl.zig
 77. [x] SASL SCRAM-SHA-512 `[~]`
-78. [ ] Advertise EXTERNAL/SCRAM once wired
+78. [~] Advertise EXTERNAL/SCRAM once wired
 79. [ ] ACCOUNT registration/identify path (services bridge)
 80. [ ] CERTFP (m_certfp / m_certadd)
 81. [ ] WHOIS RPL_WHOISLOGGEDIN 330 / certfp 276

@@ -14,6 +14,7 @@ pub const sim = @import("sim.zig");
 pub const sketch = @import("sketch.zig");
 pub const suimyaku = @import("suimyaku/root.zig");
 pub const timer = @import("timer.zig");
+pub const timer_wheel = @import("timer_wheel.zig");
 pub const utf8 = @import("utf8.zig");
 // gen:mods:end
 
@@ -35,6 +36,7 @@ test {
     _ = sketch;
     _ = suimyaku;
     _ = timer;
+    _ = timer_wheel;
     _ = utf8;
     // gen:tests:end
 }
