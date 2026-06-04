@@ -54,7 +54,7 @@
 
 ## C. Membership status & multi-target
 
-35. [ ] MODE multi-target/multi-flag batching (`+ov nick1 nick2`)
+35. [x] MODE multi-target/multi-flag batching (`+ov nick1 nick2`)
 36. [x] JOIN comma-list of channels (`JOIN #a,#b key1,key2`)
 37. [x] PART comma-list of channels
 38. [x] PRIVMSG/NOTICE comma-list of targets
@@ -85,7 +85,7 @@
 57. [x] extended-join (account+realname in JOIN) `[~]` proto/extended_join.zig
 58. [~] chghost `[~]` proto/chghost.zig
 59. [x] invite-notify `[~]` proto/invite_notify.zig
-60. [ ] echo-message already; verify for NOTICE + TAGMSG
+60. [x] echo-message already; verify for NOTICE + TAGMSG
 61. [ ] batch (netjoin/netsplit/chathistory) `[~]` proto/batch.zig
 62. [~] labeled-response (label → echo correlation)
 63. [~] CAP NEW / CAP DEL dynamic advertisement
@@ -109,7 +109,7 @@
 78. [~] Advertise EXTERNAL/SCRAM once wired
 79. [~] ACCOUNT registration/identify path (services bridge)
 80. [~] CERTFP (m_certfp / m_certadd)
-81. [ ] WHOIS RPL_WHOISLOGGEDIN 330 / certfp 276
+81. [x] WHOIS RPL_WHOISLOGGEDIN 330 / certfp 276
 
 ## G. Oper & server management
 
