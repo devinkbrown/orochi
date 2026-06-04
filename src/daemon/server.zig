@@ -1153,11 +1153,40 @@ pub const LinuxServer = struct {
             return;
         }
 
-        // Query form: MODE #chan -> current channel flag modes.
+        // Query form: MODE #chan -> RPL_CHANNELMODEIS. Per ophion channel_modes:
+        // the +l/+k LETTERS are shown to everyone, but their PARAM VALUES (limit,
+        // key) only to members. Param order matches letter order (l before k).
         if (parsed.param_count == 1) {
-            var ms_buf: [16]u8 = undefined;
-            const ms = self.world.channelModeString(channel, &ms_buf);
-            try queueNumeric(conn, .RPL_CHANNELMODEIS, &.{channel}, ms);
+            var flags_buf: [16]u8 = undefined;
+            const flags = self.world.channelModeString(channel, &flags_buf); // "+imnt"
+            const limit = self.world.channelLimit(channel);
+            const key = self.world.channelKey(channel);
+            const is_member = self.world.isMember(channel, worldIdFromClient(id));
+
+            var modes_buf: [24]u8 = undefined;
+            var mb = Buf{ .storage = &modes_buf };
+            mb.append(flags) catch {};
+            if (limit != null) mb.appendByte('l') catch {};
+            if (key != null) mb.appendByte('k') catch {};
+
+            var parts: [4][]const u8 = undefined;
+            var n: usize = 0;
+            parts[n] = channel;
+            n += 1;
+            parts[n] = mb.written();
+            n += 1;
+            var lim_buf: [16]u8 = undefined;
+            if (is_member) {
+                if (limit) |lv| {
+                    parts[n] = std.fmt.bufPrint(&lim_buf, "{d}", .{lv}) catch "0";
+                    n += 1;
+                }
+                if (key) |k| {
+                    parts[n] = k;
+                    n += 1;
+                }
+            }
+            try queueNumeric(conn, .RPL_CHANNELMODEIS, parts[0..n], "");
             return;
         }
 
@@ -1882,7 +1911,13 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{newnick}, "Erroneous nickname");
             return;
         }
-        const old = conn.session.displayName();
+        // Snapshot the old nick into a stack buffer: displayName() borrows the
+        // session's inline nick buffer, which setNick() overwrites below — so the
+        // post-setNick MONITOR transition must read this copy, not the alias.
+        var old_buf: [64]u8 = undefined;
+        const old_slice = conn.session.displayName();
+        @memcpy(old_buf[0..old_slice.len], old_slice);
+        const old = old_buf[0..old_slice.len];
         if (std.mem.eql(u8, old, newnick)) return; // no-op
         const wid = worldIdFromClient(id);
 
@@ -2151,6 +2186,11 @@ pub const LinuxServer = struct {
         // own message back, byte-identical to what recipients see (`msg`).
         const echo = conn.session.hasCap(.echo_message);
 
+        // RFC 1459 / ophion m_message.c: NOTICE must NEVER generate an error
+        // reply (prevents NOTICE/error ping-pong between bots and servers). All
+        // delivery-failure numerics below are suppressed for NOTICE.
+        const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
+
         // STATUSMSG: a leading prefix (~/./@/+) before a channel name restricts
         // delivery to members of that rank or higher. `chan` is the bare channel
         // for world lookups; `target` keeps the prefix for the displayed line.
@@ -2166,7 +2206,7 @@ pub const LinuxServer = struct {
 
         if (world_model.isChannelName(chan)) {
             if (!self.world.channelExists(chan)) {
-                try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
+                if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
             // +n no-external-messages: a non-member may message the channel only
@@ -2174,14 +2214,14 @@ pub const LinuxServer = struct {
             if (!self.world.isMember(chan, worldIdFromClient(id)) and
                 self.world.channelHasFlag(chan, .no_external))
             {
-                try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
+                if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
                 return;
             }
             // +m moderated: only voiced (+v) or any operator tier may speak.
             if (self.world.channelHasFlag(chan, .moderated)) {
                 const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
                 if (!mm.canSpeakModerated()) {
-                    try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
+                    if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
                     return;
                 }
             }
@@ -2190,7 +2230,7 @@ pub const LinuxServer = struct {
             if (min_rank > 0) {
                 const sm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
                 if (sm.rank() < 1) {
-                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{target}, "You're not channel operator");
+                    if (!is_notice) try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{target}, "You're not channel operator");
                     return;
                 }
             }
@@ -2207,7 +2247,7 @@ pub const LinuxServer = struct {
         }
 
         const recipient = self.world.findNick(target) orelse {
-            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+            if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
             return;
         };
         var tag_buf: [48]u8 = undefined;
