@@ -24,6 +24,7 @@ const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
 const whowas_reply = @import("../proto/whowas_reply.zig");
+const monitor = @import("../proto/monitor.zig");
 
 /// Bounded WHOWAS history ring shared by the live server. Field caps match the
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
@@ -409,6 +410,11 @@ const Numeric = enum(u16) {
     RPL_KNOCKDLVR = 711,
     ERR_CHANOPEN = 713,
     ERR_KNOCKONCHAN = 714,
+    RPL_MONONLINE = 730,
+    RPL_MONOFFLINE = 731,
+    RPL_MONLIST = 732,
+    RPL_ENDOFMONLIST = 733,
+    ERR_MONLISTFULL = 734,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHCHANNEL = 403,
     ERR_CANNOTSENDTOCHAN = 404,
@@ -543,6 +549,7 @@ pub const LinuxServer = struct {
     clients: ClientTable,
     world: world_model.World,
     whowas: WhowasStore,
+    monitor: monitor.MonitorStore,
     accept_armed: bool = false,
 
     /// Single configured operator credential (OPER <name> <pass>). Static for
@@ -575,6 +582,7 @@ pub const LinuxServer = struct {
             .clients = ClientTable.init(allocator, 0),
             .world = world_model.World.init(allocator),
             .whowas = whowas_store,
+            .monitor = monitor.MonitorStore.init(allocator, 128),
         };
     }
 
@@ -582,6 +590,7 @@ pub const LinuxServer = struct {
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) closeFd(slot.value.fd);
         }
+        self.monitor.deinit();
         self.whowas.deinit();
         self.world.deinit();
         self.clients.deinit();
@@ -733,6 +742,11 @@ pub const LinuxServer = struct {
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
             if (self.world.nickOf(worldIdFromClient(id)) != null) self.recordWhowas(conn);
+            // MONITOR: report this nick offline + drop its own subscriptions.
+            if (conn.session.registered()) {
+                const nick = conn.session.displayName();
+                if (!std.mem.eql(u8, nick, "*")) self.monitorOffline(id, nick) catch {};
+            }
             try self.broadcastQuit(id, conn, reason);
             closeFd(conn.fd);
             _ = self.clients.free(id);
@@ -895,6 +909,8 @@ pub const LinuxServer = struct {
             try self.handleWhowas(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KNOCK")) {
             try self.handleKnock(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MONITOR")) {
+            try self.handleMonitor(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
         } else {
@@ -910,9 +926,12 @@ pub const LinuxServer = struct {
             error.NickInUse => {
                 try queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{nick}, "Nickname is already in use");
                 conn.closing = true;
+                return;
             },
             else => return err,
         };
+        // Notify any MONITOR watchers that this nick just came online.
+        try self.monitorOnline(nick);
     }
 
     /// Channel-mode gate for JOIN. Returns true (and emits the numeric) when the
@@ -1607,6 +1626,51 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
     }
 
+    /// MONITOR +/-/C/L/S — IRCv3 contact notification. Targets' online/offline
+    /// transitions are reported (730/731); L lists (732/733), S reports status.
+    fn handleMonitor(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        var replies_buf: [64]monitor.MonitorReply = undefined;
+        var storage: [default_reply_bytes]u8 = undefined;
+        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
+        self.monitor.handle(monitorIdFromClient(id), parsed.paramSlice(), &sink) catch |err| switch (err) {
+            error.MissingParameter => return queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MONITOR"}, "Not enough parameters"),
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return, // InvalidTarget / TooManyReplies / OutputTooSmall: best-effort
+        };
+        try self.flushMonitorReplies(&sink);
+    }
+
+    /// Route each structured MONITOR reply to its destination watcher and arm
+    /// that connection's send (replies may target clients other than the caller).
+    fn flushMonitorReplies(self: *LinuxServer, sink: *const monitor.MonitorReplySink) !void {
+        for (sink.slice()) |reply| {
+            const wconn = self.clients.get(clientIdFromMonitor(reply.client)) orelse continue;
+            const trailing = if (reply.targets.len != 0) reply.targets else reply.text;
+            try queueNumeric(wconn, monitorNumeric(reply.numeric), &.{}, trailing);
+            try self.armSendIfNeeded(wconn);
+        }
+    }
+
+    /// Notify MONITOR watchers that `nick` just came online (on registration).
+    fn monitorOnline(self: *LinuxServer, nick: []const u8) !void {
+        var replies_buf: [64]monitor.MonitorReply = undefined;
+        var storage: [default_reply_bytes]u8 = undefined;
+        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
+        self.monitor.setOnline(nick, &sink) catch return;
+        try self.flushMonitorReplies(&sink);
+    }
+
+    /// Notify watchers that `nick` went offline, then drop the disconnecting
+    /// client's own monitor subscriptions.
+    fn monitorOffline(self: *LinuxServer, id: client_model.ClientId, nick: []const u8) !void {
+        var replies_buf: [64]monitor.MonitorReply = undefined;
+        var storage: [default_reply_bytes]u8 = undefined;
+        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
+        self.monitor.setOffline(nick, &sink) catch {};
+        self.flushMonitorReplies(&sink) catch {};
+        self.monitor.removeClient(monitorIdFromClient(id));
+    }
+
     /// LUSERS — network/user counters (251-255, 265/266).
     fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         const clients: u64 = @intCast(self.clients.len());
@@ -2119,6 +2183,26 @@ fn usernameOf(self: *LinuxServer, world_id: world_model.ClientId) []const u8 {
 
 fn clientIdFromWorld(id: world_model.ClientId) client_model.ClientId {
     return .{ .shard = id.shard, .slot = id.slot, .gen = id.gen };
+}
+
+/// MonitorStore keys clients by a flat u64; convert to/from the packed ClientId.
+fn monitorIdFromClient(id: client_model.ClientId) u64 {
+    return @bitCast(id);
+}
+
+fn clientIdFromMonitor(id: u64) client_model.ClientId {
+    return @bitCast(id);
+}
+
+/// Map a MonitorStore numeric to the live server's numeric enum.
+fn monitorNumeric(n: monitor.MonitorNumeric) Numeric {
+    return switch (n) {
+        .RPL_MONONLINE => .RPL_MONONLINE,
+        .RPL_MONOFFLINE => .RPL_MONOFFLINE,
+        .RPL_MONLIST => .RPL_MONLIST,
+        .RPL_ENDOFMONLIST => .RPL_ENDOFMONLIST,
+        .ERR_MONLISTFULL => .ERR_MONLISTFULL,
+    };
 }
 
 const Buf = struct {
@@ -2818,6 +2902,54 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: MONITOR online/offline/list end-to-end" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    // A monitors B while B is offline -> RPL_MONOFFLINE (731).
+    a.reset();
+    try writeAllFd(fd_a, "MONITOR + B\r\n");
+    try recvUntil(&a, " 731 A :B", 200);
+
+    // B connects and registers -> A is told B is online (730).
+    a.reset();
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try recvUntil(&a, " 730 A :B", 200);
+
+    // MONITOR L -> 732 list + 733 end.
+    a.reset();
+    try writeAllFd(fd_a, "MONITOR L\r\n");
+    try recvUntil(&a, " 732 A :B", 200);
+    try recvUntil(&a, " 733 A ", 200);
+
+    // B quits -> A is told B is offline (731).
+    a.reset();
+    try writeAllFd(fd_b, "QUIT :bye\r\n");
+    try recvUntil(&a, " 731 A :B", 200);
+    closeFd(fd_b);
 }
 
 test {

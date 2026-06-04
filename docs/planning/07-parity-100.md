@@ -95,7 +95,7 @@
 67. [ ] message-redaction / message-edit `[~]` proto/msgedit.zig
 68. [ ] read-marker `[~]` proto/read_marker.zig
 69. [ ] metadata `[~]` proto/metadata.zig
-70. [ ] monitor (MONITOR +/-/C/L/S; 730/731/732/733/734) `[~]` proto/monitor.zig
+70. [x] monitor (MONITOR +/-/C/L/S; 730/731/732/733/734) `[~]` proto/monitor.zig
 71. [ ] extended-monitor `[~]` proto/extended_monitor.zig
 72. [ ] utf8-only `[~]` proto/utf8_only.zig
 73. [ ] standard-replies (FAIL/WARN/NOTE) used on new error paths
