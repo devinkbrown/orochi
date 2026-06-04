@@ -130,8 +130,8 @@
 
 94. [~] LINKS/MAP reflect real mesh peers (Sazanami membership)
 95. [~] Server burst / state sync (Suimyaku CRDT)
-96. [ ] Cross-node PRIVMSG routing
-97. [ ] Cross-node channel membership convergence
+96. [~] Cross-node PRIVMSG routing
+97. [~] Cross-node channel membership convergence
 98. [ ] Netsplit/netjoin batches
 99. [ ] /UPGRADE live migration (session_migrate analog)
 100. [ ] VEIL security layer handshake on peer links
