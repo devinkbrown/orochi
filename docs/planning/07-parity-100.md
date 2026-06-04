@@ -23,7 +23,7 @@
 10. [x] PONG (accepted)
 11. [x] KILL (oper 481, graceful close-on-drain)
 12. [x] WHOWAS (needs history store; daemon/whowas.zig exists) `[~]`
-13. [ ] USERIP (oper; needs per-conn IP)
+13. [~] USERIP (oper; needs per-conn IP)
 14. [x] SUMMON (446 disabled stub)
 15. [x] TAGMSG (IRCv3 message-tags; needs tag relay)
 16. [~] NAMESX / UHNAMES (cap-driven NAMES formatting)
@@ -94,7 +94,7 @@
 66. [~] multiline `[~]` proto/multiline.zig
 67. [x] message-redaction / message-edit `[~]` proto/msgedit.zig
 68. [x] read-marker `[~]` proto/read_marker.zig
-69. [~] metadata `[~]` proto/metadata.zig
+69. [x] metadata `[~]` proto/metadata.zig
 70. [x] monitor (MONITOR +/-/C/L/S; 730/731/732/733/734) `[~]` proto/monitor.zig
 71. [~] extended-monitor `[~]` proto/extended_monitor.zig
 72. [ ] utf8-only `[~]` proto/utf8_only.zig

@@ -33,6 +33,7 @@ const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const ban_db = @import("ban_db.zig");
 const whox = @import("../proto/whox.zig");
+const metadata_store = @import("../proto/metadata_store.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
 const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
@@ -469,6 +470,10 @@ const Numeric = enum(u16) {
     RPL_ENDOFEXCEPTLIST = 349,
     RPL_SILELIST = 271,
     RPL_ENDOFSILELIST = 272,
+    RPL_KEYVALUE = 761,
+    RPL_METADATAEND = 762,
+    ERR_KEYNOTSET = 766,
+    ERR_KEYINVALID = 767,
     RPL_KNOCK = 710,
     RPL_KNOCKDLVR = 711,
     ERR_CHANOPEN = 713,
@@ -629,6 +634,7 @@ pub const LinuxServer = struct {
     silence: silence.Store,
     history: HistoryStore,
     bans_db: ban_db.Store,
+    metadata: metadata_store.DefaultStore,
     msg_seq: u64 = 0,
     accept_armed: bool = false,
 
@@ -675,6 +681,7 @@ pub const LinuxServer = struct {
             .silence = silence.Store.init(allocator),
             .history = HistoryStore.init(allocator),
             .bans_db = ban_db.Store.init(allocator, .{}),
+            .metadata = metadata_store.DefaultStore.init(allocator),
             .start_ms = platform.monotonicMillis(),
         };
     }
@@ -685,6 +692,7 @@ pub const LinuxServer = struct {
         }
         self.history.deinit();
         self.bans_db.deinit();
+        self.metadata.deinit();
         self.silence.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
@@ -1094,6 +1102,8 @@ pub const LinuxServer = struct {
             try self.handleHelp(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CHATHISTORY")) {
             try self.handleChathistory(conn, line);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "METADATA")) {
+            try self.handleMetadata(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REDACT")) {
             try self.handleRedact(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
@@ -2225,6 +2235,51 @@ pub const LinuxServer = struct {
         var nbuf: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "{s} {s}: {s}", .{ cmd, mask, if (removed) "removed" else "not found" }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
+    }
+
+    /// METADATA <target> <GET|LIST|SET|CLEAR> [key [:value]] — IRCv3 metadata-2.
+    /// Per-target key/value store; RPL_KEYVALUE (761) + RPL_METADATAEND (762).
+    fn handleMetadata(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"METADATA"}, "Not enough parameters");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+        const sub = parsed.paramSlice()[1];
+
+        if (std.ascii.eqlIgnoreCase(sub, "GET")) {
+            var i: usize = 2;
+            while (i < parsed.param_count) : (i += 1) {
+                const key = parsed.paramSlice()[i];
+                if (self.metadata.get(target, key)) |ev| {
+                    try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, ev.value);
+                } else |_| {
+                    try queueNumeric(conn, .ERR_KEYNOTSET, &.{ target, key }, "key not set");
+                }
+            }
+        } else if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            var views: [64]metadata_store.EntryView = undefined;
+            const all = self.metadata.list(target, &views) catch views[0..0];
+            for (all) |ev| try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, ev.key, "*" }, ev.value);
+        } else if (std.ascii.eqlIgnoreCase(sub, "SET")) {
+            if (parsed.param_count < 3) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"METADATA"}, "Not enough parameters");
+                return;
+            }
+            const key = parsed.paramSlice()[2];
+            if (parsed.param_count >= 4 and parsed.paramSlice()[3].len != 0) {
+                const value = parsed.paramSlice()[3];
+                _ = self.metadata.set(target, key, value) catch {
+                    try queueNumeric(conn, .ERR_KEYINVALID, &.{ target, key }, "invalid key");
+                    return;
+                };
+                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, value);
+            } else {
+                self.metadata.delete(target, key) catch {};
+                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, "");
+            }
+        }
+        try queueNumeric(conn, .RPL_METADATAEND, &.{}, "end of metadata");
     }
 
     /// REDACT <channel> <msgid> [:reason] — IRCv3 message-redaction. Tombstones
@@ -4058,6 +4113,34 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     a.reset();
     try writeAllFd(fd_a, "KLINE bad!*@* :spam\r\n");
     try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
+}
+
+test "threaded server: METADATA set then get" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "METADATA * SET url :http://x\r\n");
+    try recvUntil(&a, " 761 A * url ", 200);
+    try recvUntil(&a, " 762 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "METADATA * GET url\r\n");
+    try recvUntil(&a, " 761 A * url * :http://x", 200);
 }
 
 test "threaded server: WHOX field-selected reply" {
