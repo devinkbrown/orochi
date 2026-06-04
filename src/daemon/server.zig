@@ -41,6 +41,7 @@ const ircx_access_store = @import("../proto/ircx_access_store.zig");
 const chanmode_ext = @import("../proto/chanmode_ext.zig");
 const ircx_modex = @import("../proto/ircx_modex.zig");
 const auditorium = @import("../proto/auditorium.zig");
+const s2s_link = @import("s2s_link.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
@@ -445,6 +446,9 @@ const RingCore = ringlane.Ring;
 const RingFeatureSet = ringlane.RingFeatures;
 
 const listener_token: RingFdToken = .{ .slot = 0, .gen = 0 };
+/// Distinct accept token for the S2S listener so handleAccept can tell the two
+/// listeners apart (same accept op; disambiguated by slot).
+const s2s_listener_token: RingFdToken = .{ .slot = 1, .gen = 0 };
 const default_reply_bytes: usize = 8192;
 const default_recv_bytes: usize = 4096;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
@@ -578,6 +582,9 @@ pub const Config = struct {
     /// take on the account store's I/O lifecycle: a caller that has a store wires
     /// `sasl_bridge.ServicesPlainChecker.checker()` here. Null = SASL fails closed.
     sasl_checker: ?sasl.PlainChecker = null,
+    /// Optional server-to-server listener port (0 = disabled). Accepts on this
+    /// socket are driven as Suimyaku mesh peers via S2sLink, not IRC clients.
+    s2s_port: u16 = 0,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -594,6 +601,10 @@ pub const ConnState = struct {
     send_offset: usize = 0,
     send_armed: bool = false,
     closing: bool = false,
+    /// Non-null for server-to-server peer connections: inbound bytes drive this
+    /// Suimyaku link instead of the IRC line parser. Heap-owned (stable address
+    /// required by the link's self-referential clock); freed in closeConn/deinit.
+    s2s: ?*s2s_link.S2sLink = null,
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -662,6 +673,11 @@ pub const LinuxServer = struct {
     accepts: accept_list.AcceptList(.{}),
     msg_seq: u64 = 0,
     accept_armed: bool = false,
+    /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
+    /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
+    s2s_listener_fd: linux.fd_t = -1,
+    s2s_accept_armed: bool = false,
+    s2s_feed_seq: u64 = 0,
 
     /// Single configured operator credential (OPER <name> <pass>). Static for
     /// now; a full oper-block table arrives with the config overhaul.
@@ -677,6 +693,12 @@ pub const LinuxServer = struct {
 
         const listener_fd = try createListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
+
+        const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0)
+            try createListener(config.host, config.s2s_port, config.backlog)
+        else
+            -1;
+        errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
 
         var ring = RingCore.init(config.ring_entries, config.features) catch |err| {
             if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
@@ -697,6 +719,7 @@ pub const LinuxServer = struct {
             .allocator = allocator,
             .config = config,
             .listener_fd = listener_fd,
+            .s2s_listener_fd = s2s_listener_fd,
             .ring = ring,
             .clients = clients,
             .world = world_model.World.init(allocator),
@@ -716,8 +739,16 @@ pub const LinuxServer = struct {
 
     pub fn deinit(self: *LinuxServer) void {
         for (self.clients.slots.items) |*slot| {
-            if (slot.occupied) closeFd(slot.value.fd);
+            if (slot.occupied) {
+                if (slot.value.s2s) |link| {
+                    link.deinit();
+                    self.allocator.destroy(link);
+                    slot.value.s2s = null;
+                }
+                closeFd(slot.value.fd);
+            }
         }
+        if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
         self.history.deinit();
         self.bans_db.deinit();
         self.metadata.deinit();
@@ -737,9 +768,19 @@ pub const LinuxServer = struct {
 
     /// Arm the accept SQE if needed. Submission is batched by `runOnce`.
     pub fn armAccept(self: *LinuxServer) !void {
-        if (self.accept_armed) return;
-        try self.ring.submitAccept(listener_token, self.listener_fd);
-        self.accept_armed = true;
+        if (!self.accept_armed) {
+            try self.ring.submitAccept(listener_token, self.listener_fd);
+            self.accept_armed = true;
+        }
+        if (self.s2s_listener_fd >= 0 and !self.s2s_accept_armed) {
+            try self.ring.submitAccept(s2s_listener_token, self.s2s_listener_fd);
+            self.s2s_accept_armed = true;
+        }
+    }
+
+    pub fn s2sBoundPort(self: *LinuxServer) !u16 {
+        if (self.s2s_listener_fd < 0) return error.Unsupported;
+        return socketPort(self.s2s_listener_fd);
     }
 
     /// Process at least one io_uring completion. Callers may loop this until
@@ -772,7 +813,10 @@ pub const LinuxServer = struct {
     }
 
     fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
-        if (!event.more) self.accept_armed = false;
+        const is_s2s = event.token.slot == s2s_listener_token.slot;
+        if (!event.more) {
+            if (is_s2s) self.s2s_accept_armed = false else self.accept_armed = false;
+        }
         if (event.res < 0) return error.BadCompletion;
 
         const fd: linux.fd_t = event.res;
@@ -788,10 +832,48 @@ pub const LinuxServer = struct {
         const id = try self.clients.alloc(ConnState.init(fd));
         const conn = self.clients.get(id).?;
         conn.token = try tokenFromId(id);
+
+        if (is_s2s) {
+            // Server-to-server peer: stand up an S2sLink and wait for its inbound
+            // handshake (the connecting side opens it; we respond on recv).
+            const link = try self.allocator.create(s2s_link.S2sLink);
+            errdefer self.allocator.destroy(link);
+            try link.init(.{
+                .allocator = self.allocator,
+                .local_node_id = 1,
+                .remote_node_id = 0,
+                .local_sid = 1,
+                .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
+                .server_name = server_name,
+            });
+            conn.s2s = link;
+            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            return;
+        }
+
         // Make the injected SASL verifier available before the client can send
         // AUTHENTICATE (during CAP negotiation, pre-registration).
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+    }
+
+    /// Drive a server-to-server peer connection: feed inbound bytes to its
+    /// S2sLink and queue any outbound frames the link produced for sending.
+    fn driveS2s(self: *LinuxServer, conn: *ConnState, link: *s2s_link.S2sLink, bytes: []const u8) void {
+        self.s2s_feed_seq +%= 1;
+        const now: u64 = @intCast(@max(0, platform.monotonicMillis()));
+        link.feed(bytes, now, self.s2s_feed_seq) catch {
+            conn.closing = true;
+            return;
+        };
+        const out = link.outbound();
+        if (out.len != 0) {
+            appendToConn(conn, out) catch {
+                conn.closing = true;
+                return;
+            };
+            link.clearOutbound();
+        }
     }
 
     fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
@@ -799,7 +881,12 @@ pub const LinuxServer = struct {
         const conn = try self.connForToken(event.token);
         conn.closing = event.res <= 0;
         if (event.res > 0) {
-            try self.feedBytes(id, conn, conn.recv_buf[0..@as(usize, @intCast(event.res))]);
+            const chunk = conn.recv_buf[0..@as(usize, @intCast(event.res))];
+            if (conn.s2s) |link| {
+                self.driveS2s(conn, link, chunk);
+            } else {
+                try self.feedBytes(id, conn, chunk);
+            }
             try self.armSendIfNeeded(conn);
             if (!conn.closing) {
                 try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
@@ -943,6 +1030,15 @@ pub const LinuxServer = struct {
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
         if (self.clients.get(id)) |conn| {
+            // S2S peer: tear down the link, close, free the slot — no IRC quit path.
+            if (conn.s2s) |link| {
+                link.deinit();
+                self.allocator.destroy(link);
+                conn.s2s = null;
+                closeFd(conn.fd);
+                _ = self.clients.free(id);
+                return;
+            }
             defer self.world.removeClient(worldIdFromClient(id));
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
@@ -5694,6 +5790,67 @@ test "threaded server: MONITOR online/offline/list end-to-end" {
     try writeAllFd(fd_b, "QUIT :bye\r\n");
     try recvUntil(&a, " 731 A :B", 200);
     closeFd(fd_b);
+}
+
+test "threaded server: live S2S listener completes a peer handshake" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const s2s_port = server.s2sBoundPort() catch return error.SkipZigTest;
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(server.boundPort() catch 0)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Connect to the S2S port as a remote peer and drive a real S2sLink over the
+    // socket until our side reports the link established.
+    const fd = connectLoopback(s2s_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+
+    const alloc = std.testing.allocator;
+    const peer = try alloc.create(s2s_link.S2sLink);
+    defer alloc.destroy(peer);
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_sid = 2,
+        .local_epoch_ms = 2000,
+        .server_name = "peer.test",
+    });
+    defer peer.deinit();
+
+    var now: u64 = 1;
+    // The connecting side opens the handshake.
+    try peer.start(now);
+    if (peer.outbound().len != 0) {
+        try writeAllFd(fd, peer.outbound());
+        peer.clearOutbound();
+    }
+
+    var rx: [4096]u8 = undefined;
+    var polls: usize = 0;
+    while (polls < 200 and !peer.established()) : (polls += 1) {
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+        if (ready == 0) continue;
+        if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+        const n = try readFd(fd, &rx);
+        if (n == 0) return error.ConnectionReset;
+        now += 1;
+        try peer.feed(rx[0..n], now, 5);
+        if (peer.outbound().len != 0) {
+            try writeAllFd(fd, peer.outbound());
+            peer.clearOutbound();
+        }
+    }
+    try std.testing.expect(peer.established());
+    try std.testing.expect(peer.knownServers() >= 2);
 }
 
 test {
