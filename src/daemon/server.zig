@@ -4329,6 +4329,38 @@ test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
     try recvUntil(&a, "FAIL PRIVMSG INVALID_UTF8", 200);
 }
 
+test "threaded server: NAMES honors multi-prefix cap" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    // Negotiate multi-prefix, register, become founder of #m, then self-op so the
+    // member holds two tiers (~ founder + @ op).
+    try writeAllFd(fd_a, "CAP REQ :multi-prefix\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "JOIN #m\r\n");
+    try recvUntil(&a, " 366 A #m ", 200);
+    try writeAllFd(fd_a, "MODE #m +o A\r\n");
+    try recvUntil(&a, "MODE #m +o A", 200);
+    a.reset();
+    // With multi-prefix the NAMES entry carries every held prefix (~@), not just
+    // the highest.
+    try writeAllFd(fd_a, "NAMES #m\r\n");
+    try recvUntil(&a, "~@A", 200);
+}
+
 test "threaded server: REDACT broadcast + KLINE oper event" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,

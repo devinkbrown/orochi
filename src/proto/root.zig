@@ -91,7 +91,6 @@ pub const multiline = @import("multiline.zig");
 pub const multiline_props = @import("multiline_props.zig");
 pub const names_format = @import("names_format.zig");
 pub const names_reply = @import("names_reply.zig");
-pub const namesx = @import("namesx.zig");
 pub const netsplit_batch = @import("netsplit_batch.zig");
 pub const numeric = @import("numeric.zig");
 pub const oper_privs = @import("oper_privs.zig");
@@ -229,7 +228,6 @@ test {
     _ = multiline_props;
     _ = names_format;
     _ = names_reply;
-    _ = namesx;
     _ = netsplit_batch;
     _ = numeric;
     _ = oper_privs;
