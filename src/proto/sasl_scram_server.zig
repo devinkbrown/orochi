@@ -398,26 +398,9 @@ pub fn deriveCredentialFromPassword(
     iterations: u32,
 ) (AuthError || std.crypto.errors.WeakParametersError || std.crypto.errors.OutputTooLongError)!Credential {
     if (iterations == 0 or salt.len == 0 or salt.len > MAX_SALT) return error.InvalidCredential;
-    var salted_password: [digest_len]u8 = undefined;
-    try std.crypto.pwhash.pbkdf2(
-        &salted_password,
-        password,
-        salt,
-        iterations,
-        std.crypto.auth.hmac.sha2.HmacSha256,
-    );
-    defer secureZero(&salted_password);
-
-    var client_key = crypto_hash.HmacSha256.create(&salted_password, "Client Key");
-    defer secureZero(&client_key);
-    const stored_key = crypto_hash.Sha256.hash(&client_key);
-    const server_key = crypto_hash.HmacSha256.create(&salted_password, "Server Key");
-    return .{
-        .salt = salt,
-        .iterations = iterations,
-        .stored_key = stored_key,
-        .server_key = server_key,
-    };
+    // Single source of truth for the SCRAM KDF (PBKDF2 + "Client Key"/"Server
+    // Key" labels) lives in sasl.zig; delegate to avoid label/param drift.
+    return sasl.recordFromPassword(password, salt, iterations) catch return error.InvalidCredential;
 }
 
 const Attr = struct {
