@@ -2398,7 +2398,8 @@ pub const LinuxServer = struct {
             const line = whisper.buildWhisperLine(&line_buf, sender, args.channel, nick, args.text) catch continue;
             var crlf_buf: [default_reply_bytes]u8 = undefined;
             const out = std.fmt.bufPrint(&crlf_buf, "{s}\r\n", .{line}) catch continue;
-            try self.deliver(clientIdFromWorld(rwid), out);
+            // A single failed recipient (gone mid-dispatch) must not abort the rest.
+            self.deliver(clientIdFromWorld(rwid), out) catch continue;
         }
     }
 
