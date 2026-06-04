@@ -49,7 +49,7 @@
 30. [x] +n no-external-messages enforcement on PRIVMSG/NOTICE
 31. [ ] +t already; verify +t list-mode echo in RPL_CHANNELMODEIS with params
 32. [ ] MODE query shows key/limit params to members only
-33. [ ] KNOCK (713/711/ERR_CHANOPEN; needs +i) `[~]` proto/knock.zig
+33. [x] KNOCK (713/711/ERR_CHANOPEN; needs +i) `[~]` proto/knock.zig
 34. [ ] Channel +p private (distinct from +s secret) in LIST/WHOIS
 
 ## C. Membership status & multi-target

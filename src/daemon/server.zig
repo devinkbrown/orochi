@@ -405,6 +405,10 @@ const Numeric = enum(u16) {
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
     RPL_ENDOFBANLIST = 368,
+    RPL_KNOCK = 710,
+    RPL_KNOCKDLVR = 711,
+    ERR_CHANOPEN = 713,
+    ERR_KNOCKONCHAN = 714,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHCHANNEL = 403,
     ERR_CANNOTSENDTOCHAN = 404,
@@ -889,6 +893,8 @@ pub const LinuxServer = struct {
             try self.handleKill(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOWAS")) {
             try self.handleWhowas(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "KNOCK")) {
+            try self.handleKnock(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
         } else {
@@ -1560,6 +1566,45 @@ pub const LinuxServer = struct {
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
         whowas_reply.emitWhowas(&scratch, server_name, conn.session.displayName(), target, entries[0..n], &sink) catch return;
+    }
+
+    /// KNOCK <channel> [:reason] — ask for an invite to a +i channel. Channel
+    /// ops get RPL_KNOCK (710); the knocker gets RPL_KNOCKDLVR (711). Refused if
+    /// the channel is open (713) or the knocker is already a member (714).
+    fn handleKnock(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KNOCK"}, "Not enough parameters");
+            return;
+        }
+        const channel = parsed.paramSlice()[0];
+        const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "wants to join";
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const wid = worldIdFromClient(id);
+        if (self.world.isMember(channel, wid)) {
+            try queueNumeric(conn, .ERR_KNOCKONCHAN, &.{channel}, "You are already on that channel");
+            return;
+        }
+        if (!self.world.channelHasFlag(channel, .invite_only)) {
+            try queueNumeric(conn, .ERR_CHANOPEN, &.{channel}, "Channel is open");
+            return;
+        }
+
+        // Notify every operator-or-higher member.
+        var mask_buf: [256]u8 = undefined;
+        const mask = try clientPrefix(conn, &mask_buf);
+        var members = self.world.memberIterator(channel) orelse return;
+        while (members.next()) |member| {
+            const mm = self.world.memberModes(channel, member.*) orelse continue;
+            if (!mm.isOperator()) continue;
+            const op_id = clientIdFromWorld(member.*);
+            const opconn = self.clients.get(op_id) orelse continue;
+            try queueNumeric(opconn, .RPL_KNOCK, &.{ channel, mask }, reason);
+            try self.armSendIfNeeded(opconn);
+        }
+        try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
@@ -2706,6 +2751,20 @@ test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
     try writeAllFd(fd_a, "MODE #c b\r\n");
     try recvUntil(&a, " 367 A #c B!*@*", 200);
     try recvUntil(&a, " 368 A #c ", 200);
+
+    // KNOCK: A founds a fresh +i channel #i (B is not a member); B knocks ->
+    // A (op) gets 710, B gets 711. B stays in #c for the WHOWAS step below.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #i\r\n");
+    try recvUntil(&a, " 366 A #i ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #i +i\r\n");
+    try recvUntil(&a, "MODE #i +i", 200);
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_b, "KNOCK #i :let me in\r\n");
+    try recvUntil(&a, " 710 A #i ", 200);
+    try recvUntil(&b, " 711 B #i ", 200);
 
     // WHOWAS: B quits (A shares #c so sees the QUIT, after the whowas record is
     // taken), then A WHOWAS B -> 314 user line + 369 end.
