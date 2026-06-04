@@ -433,6 +433,7 @@ const Numeric = enum(u16) {
     ERR_NOTONCHANNEL = 442,
     ERR_NEEDMOREPARAMS = 461,
     ERR_PASSWDMISMATCH = 464,
+    ERR_SUMMONDISABLED = 445,
     ERR_USERSDONTMATCH = 502,
     ERR_NOPRIVILEGES = 481,
     ERR_CHANOPRIVSNEEDED = 482,
@@ -963,6 +964,8 @@ pub const LinuxServer = struct {
             try self.handleMonitor(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
             try self.handleStats(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
+            try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
         } else {
