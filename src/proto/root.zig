@@ -116,7 +116,6 @@ pub const standard_replies_props = @import("standard_replies_props.zig");
 pub const standard_replies = @import("standard_replies.zig");
 pub const sts_policy = @import("sts_policy.zig");
 pub const sts = @import("sts.zig");
-pub const suimyaku_peer = @import("suimyaku_peer.zig");
 pub const trace = @import("trace.zig");
 pub const tsumugi_props = @import("tsumugi_props.zig");
 pub const tsumugi = @import("tsumugi.zig");
@@ -256,7 +255,6 @@ test {
     _ = standard_replies;
     _ = sts_policy;
     _ = sts;
-    _ = suimyaku_peer;
     _ = trace;
     _ = tsumugi_props;
     _ = tsumugi;

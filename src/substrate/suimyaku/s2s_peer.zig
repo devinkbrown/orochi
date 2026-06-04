@@ -19,7 +19,6 @@ const Allocator = std.mem.Allocator;
 
 pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const NodeId = gossip_round.NodeId;
-pub const Sid = server_registry.Sid;
 
 const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 const handshake_version: u8 = 1;
@@ -52,7 +51,6 @@ pub const Options = struct {
     clock: peer_link.Clock,
     local_node_id: NodeId,
     remote_node_id: NodeId,
-    local_sid: Sid,
     local_epoch_ms: u64,
     server_name: []const u8,
     description: []const u8 = "",
@@ -63,7 +61,6 @@ pub const Options = struct {
 
 const Handshake = struct {
     node_id: NodeId,
-    sid: Sid,
     epoch_ms: u64,
     name: []const u8,
     description: []const u8,
@@ -78,12 +75,10 @@ pub const S2sPeer = struct {
     routes: route_table.RouteTable,
     local_node_id: NodeId,
     remote_node_id: NodeId,
-    local_sid: Sid,
     local_epoch_ms: u64,
     server_name: []u8,
     description: []u8,
     channel_name: []u8,
-    remote_sid: ?Sid = null,
     remote_epoch_ms: ?u64 = null,
     remote_name: []u8 = &.{},
     handshake_sent: bool = false,
@@ -104,7 +99,7 @@ pub const S2sPeer = struct {
         var registry = try server_registry.ServerRegistry.init(options.allocator, options.config.registry);
         errdefer registry.deinit();
         try registry.add(.{
-            .sid = options.local_sid,
+            .node_id = options.local_node_id,
             .name = server_name,
             .description = description,
             .last_seen_ms = try i64Ms(options.local_epoch_ms),
@@ -133,7 +128,6 @@ pub const S2sPeer = struct {
             .routes = routes,
             .local_node_id = options.local_node_id,
             .remote_node_id = options.remote_node_id,
-            .local_sid = options.local_sid,
             .local_epoch_ms = options.local_epoch_ms,
             .server_name = server_name,
             .description = description,
@@ -216,8 +210,10 @@ pub const S2sPeer = struct {
         return self.remote_name;
     }
 
-    pub fn remoteSid(self: *const S2sPeer) ?Sid {
-        return self.remote_sid;
+    /// The remote node id once learned from the handshake (null before).
+    pub fn remoteNodeId(self: *const S2sPeer) ?NodeId {
+        if (!self.established or self.remote_node_id == 0) return null;
+        return self.remote_node_id;
     }
 
     pub fn routeNickNode(self: *const S2sPeer, nick: []const u8) ?NodeId {
@@ -274,16 +270,15 @@ pub const S2sPeer = struct {
         errdefer self.allocator.free(owned_name);
 
         _ = try self.registry.addOrUpdate(.{
-            .sid = hs.sid,
+            .node_id = hs.node_id,
             .name = hs.name,
             .description = hs.description,
             .hopcount = 1,
-            .uplink = self.local_sid,
+            .uplink = self.local_node_id,
             .last_seen_ms = try i64Ms(now_ms),
         });
         try self.routes.setNickLocation(hs.name, hs.node_id);
 
-        self.remote_sid = hs.sid;
         self.remote_epoch_ms = hs.epoch_ms;
         self.allocator.free(self.remote_name);
         self.remote_name = owned_name;
@@ -292,7 +287,6 @@ pub const S2sPeer = struct {
     fn emitHandshake(self: *S2sPeer, sink: ByteSink) !void {
         const payload = try encodeHandshake(self.allocator, .{
             .node_id = self.local_node_id,
-            .sid = self.local_sid,
             .epoch_ms = self.local_epoch_ms,
             .name = self.server_name,
             .description = self.description,
@@ -339,7 +333,7 @@ pub const S2sPeer = struct {
 
     fn closeRemote(self: *S2sPeer) void {
         self.established = false;
-        if (self.remote_sid) |sid| _ = self.registry.remove(sid) catch false;
+        if (self.remote_node_id != 0) _ = self.registry.remove(self.remote_node_id) catch false;
         self.routes.removeNode(self.remote_node_id);
         self.session.link.close();
     }
@@ -362,7 +356,6 @@ fn encodeHandshake(allocator: Allocator, hs: Handshake) ![]u8 {
     try out.appendSlice(allocator, &handshake_magic);
     try out.append(allocator, handshake_version);
     try writeU64(&out, allocator, hs.node_id);
-    try writeU16(&out, allocator, hs.sid);
     try writeU64(&out, allocator, hs.epoch_ms);
     try writeBytes16(&out, allocator, hs.name);
     try writeBytes16(&out, allocator, hs.description);
@@ -377,7 +370,6 @@ fn decodeHandshake(bytes: []const u8) !Handshake {
     if (try r.readByte() != handshake_version) return error.UnsupportedHandshake;
     const out = Handshake{
         .node_id = try r.readU64(),
-        .sid = try r.readU16(),
         .epoch_ms = try r.readU64(),
         .name = try r.readBytes16(),
         .description = try r.readBytes16(),
@@ -607,7 +599,6 @@ fn newPeer(
     tc: *TestClock,
     local_node: NodeId,
     remote_node: NodeId,
-    local_sid: Sid,
     epoch: u64,
     name: []const u8,
 ) !S2sPeer {
@@ -617,7 +608,6 @@ fn newPeer(
         .clock = tc.clock(),
         .local_node_id = local_node,
         .remote_node_id = remote_node,
-        .local_sid = local_sid,
         .local_epoch_ms = epoch,
         .server_name = name,
         .description = "test",
@@ -644,9 +634,9 @@ test "two s2s peer drivers handshake and converge channel CRDT state" {
     discard(try b_state.localJoin(20, .{ .voice = true }, 12));
     discard(try b_state.localSetMode(.{ .topic_protected = true }, 13));
 
-    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1, 1000, "a.test");
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
     defer a.deinit();
-    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2, 2000, "b.test");
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2000, "b.test");
     defer b.deinit();
     var a_to_b = BufferSink{};
     defer a_to_b.deinit(allocator);
@@ -677,9 +667,9 @@ test "PING emits matching PONG" {
     defer a_state.deinit();
     var b_state = ChannelCrdt.init(allocator, 2);
     defer b_state.deinit();
-    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1, 10, "a.test");
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 10, "a.test");
     defer a.deinit();
-    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2, 20, "b.test");
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 20, "b.test");
     defer b.deinit();
     var a_to_b = BufferSink{};
     defer a_to_b.deinit(allocator);
@@ -699,9 +689,9 @@ test "partial inbound bytes are buffered until complete frame" {
     defer a_state.deinit();
     var b_state = ChannelCrdt.init(allocator, 2);
     defer b_state.deinit();
-    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1, 10, "a.test");
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 10, "a.test");
     defer a.deinit();
-    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 2, 20, "b.test");
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 20, "b.test");
     defer b.deinit();
     var a_to_b = BufferSink{};
     defer a_to_b.deinit(allocator);

@@ -12,7 +12,7 @@ pub const Hlc = clock.Hlc;
 pub const VersionVector = clock.VersionVector;
 pub const WireFamily = delta_codec.EntityFamily.channel_modes;
 
-pub const ReplicaId = u16;
+pub const ReplicaId = u64;
 pub const MemberId = u64;
 
 pub const Dot = struct {

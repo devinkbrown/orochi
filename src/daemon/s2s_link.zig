@@ -22,16 +22,15 @@ const channel_crdt = @import("../substrate/suimyaku/channel_crdt.zig");
 const peer_link = @import("../substrate/suimyaku/peer_link.zig");
 
 pub const NodeId = s2s_peer.NodeId;
-pub const Sid = s2s_peer.Sid;
 pub const ChannelCrdt = s2s_peer.ChannelCrdt;
 
-/// Caller-supplied identity/config for one S2S link. The CRDT replica id is
-/// derived from the local SID so each node owns a distinct lane.
+/// Caller-supplied identity/config for one S2S link. The sovereign node_id is the
+/// single mesh identity (no legacy server-id): it keys the registry and is the
+/// CRDT replica lane.
 pub const Options = struct {
     allocator: std.mem.Allocator,
     local_node_id: NodeId,
     remote_node_id: NodeId,
-    local_sid: Sid,
     local_epoch_ms: u64,
     server_name: []const u8,
     description: []const u8 = "",
@@ -75,7 +74,8 @@ pub const S2sLink = struct {
         };
         const state = try opts.allocator.create(ChannelCrdt);
         errdefer opts.allocator.destroy(state);
-        state.* = ChannelCrdt.init(opts.allocator, opts.local_sid);
+        // The CRDT replica lane is the sovereign node id (ReplicaId is u64).
+        state.* = ChannelCrdt.init(opts.allocator, opts.local_node_id);
         errdefer state.deinit();
         self.state = state;
 
@@ -85,7 +85,6 @@ pub const S2sLink = struct {
             .clock = .{ .ptr = self, .now_fn = clockNow },
             .local_node_id = opts.local_node_id,
             .remote_node_id = opts.remote_node_id,
-            .local_sid = opts.local_sid,
             .local_epoch_ms = opts.local_epoch_ms,
             .server_name = opts.server_name,
             .description = opts.description,
@@ -151,6 +150,11 @@ pub const S2sLink = struct {
         return self.peer.remoteName();
     }
 
+    /// The remote node id once learned from the handshake (null before).
+    pub fn remoteNodeId(self: *const S2sLink) ?NodeId {
+        return self.peer.remoteNodeId();
+    }
+
     pub fn knownServers(self: *const S2sLink) usize {
         return self.peer.registryCount();
     }
@@ -164,7 +168,6 @@ test "two links handshake and converge over a byte loopback" {
         .allocator = allocator,
         .local_node_id = 1,
         .remote_node_id = 2,
-        .local_sid = 1,
         .local_epoch_ms = 1000,
         .server_name = "a.mizuchi",
     });
@@ -175,7 +178,6 @@ test "two links handshake and converge over a byte loopback" {
         .allocator = allocator,
         .local_node_id = 2,
         .remote_node_id = 1,
-        .local_sid = 2,
         .local_epoch_ms = 1001,
         .server_name = "b.mizuchi",
     });
@@ -217,7 +219,6 @@ test "consumeOutbound drops a partial-send prefix" {
         .allocator = allocator,
         .local_node_id = 1,
         .remote_node_id = 2,
-        .local_sid = 1,
         .local_epoch_ms = 1000,
         .server_name = "a.mizuchi",
     });

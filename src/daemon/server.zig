@@ -599,11 +599,11 @@ pub const Config = struct {
     /// Optional server-to-server listener port (0 = disabled). Accepts on this
     /// socket are driven as Suimyaku mesh peers via S2sLink, not IRC clients.
     s2s_port: u16 = 0,
-    /// This node's mesh identity. The SID is the registry key and seeds the CRDT
-    /// replica lane, so it MUST be unique per node or two peers collide. The
-    /// node_id is the gossip/route identity. Distinct defaults are placeholders;
-    /// real deployments set both per server.
-    server_id: u16 = 1,
+    /// This node's sovereign mesh identity — the single id that keys the server
+    /// registry, the CRDT replica lane, and gossip/routing. No legacy server-id
+    /// (SID): one identity. MUST be unique per node and non-zero. The default is a
+    /// placeholder; real deployments set it per server (ultimately derived from
+    /// the node's public key).
     node_id: u64 = 1,
 };
 
@@ -869,7 +869,6 @@ pub const LinuxServer = struct {
                 .local_node_id = self.config.node_id,
                 // remote_node_id is learned from the inbound handshake.
                 .remote_node_id = 0,
-                .local_sid = self.config.server_id,
                 .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
                 .server_name = server_name,
             });
@@ -2658,7 +2657,6 @@ pub const LinuxServer = struct {
             .allocator = self.allocator,
             .local_node_id = self.config.node_id,
             .remote_node_id = 0,
-            .local_sid = self.config.server_id,
             .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
             .server_name = server_name,
         });
@@ -3322,7 +3320,6 @@ pub const LinuxServer = struct {
             .build = "zig",
             .reply_server = server_name,
             .description = "Mizuchi IRC daemon",
-            .sid = "0MZ",
         };
         const line = serverinfo.writeVersionReply(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, info) catch return;
         try appendToConn(conn, line);
@@ -5973,7 +5970,7 @@ test "threaded server: MONITOR online/offline/list end-to-end" {
 
 test "threaded server: live S2S listener completes a peer handshake" {
     // Non-default mesh identity exercises the config-driven SID/node id path.
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .server_id = 42, .node_id = 42 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .node_id = 42 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -5999,7 +5996,6 @@ test "threaded server: live S2S listener completes a peer handshake" {
         .allocator = alloc,
         .local_node_id = 2,
         .remote_node_id = 1,
-        .local_sid = 2,
         .local_epoch_ms = 2000,
         .server_name = "peer.test",
     });
@@ -6050,7 +6046,7 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     defer closeFd(listen_fd);
     const remote_port = socketPort(listen_fd) catch return error.SkipZigTest;
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .server_id = 1, .node_id = 1 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = 1 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -6098,7 +6094,6 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         .allocator = alloc,
         .local_node_id = 2,
         .remote_node_id = 1,
-        .local_sid = 2,
         .local_epoch_ms = 3000,
         .server_name = "remote.test",
     });

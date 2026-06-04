@@ -1,8 +1,8 @@
 //! Pure SUIMYAKU S2S peer-link state machine.
 //!
 //! This layer intentionally owns no sockets, queues, or heap storage. Callers
-//! drive it with authenticated peer epochs from `proto/suimyaku_peer.zig`, pass
-//! complete frame bytes in, and provide output buffers for any emitted bytes.
+//! (the `s2s_peer` driver) feed complete frame bytes in and provide output
+//! buffers for any emitted bytes.
 const std = @import("std");
 
 pub const State = enum {
@@ -107,9 +107,7 @@ pub const default_drain_timeout_ms: u64 = 5_000;
 pub const max_payload_len: usize = std.math.maxInt(u16);
 
 const magic = [_]u8{ 'S', 'P', 'L', 'K' };
-// Keep this equal to `src/proto/suimyaku_peer.zig`'s protocol_major. The file
-// must also pass standalone `zig test`, where importing back up to `src/proto`
-// is outside the module path.
+// Peer-link wire protocol major version.
 const version: u8 = 1;
 
 pub const header_len = magic.len + 1 + 1 + 8 + 8 + 8 + 4 + 4;

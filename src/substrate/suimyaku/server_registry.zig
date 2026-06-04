@@ -2,9 +2,13 @@
 //!
 //! This module tracks the bounded set of servers known to a mesh node. It is a
 //! pure state container: callers supply time, allocator, and render context.
+//!
+//! Identity is the sovereign `NodeId` (u64) — Mizuchi's mesh has no legacy TS6
+//! server-id (SID) concept; a node is known solely by its node id.
 const std = @import("std");
+const membership_view = @import("membership_view.zig");
 
-pub const Sid = u16;
+pub const NodeId = membership_view.NodeId;
 
 pub const Config = struct {
     max_nodes: usize = 512,
@@ -13,7 +17,6 @@ pub const Config = struct {
 
     pub fn validate(self: Config) Error!void {
         if (self.max_nodes == 0) return error.InvalidConfig;
-        if (self.max_nodes > std.math.maxInt(Sid)) return error.InvalidConfig;
         if (self.max_name_len == 0) return error.InvalidConfig;
     }
 };
@@ -29,20 +32,20 @@ pub const Error = std.mem.Allocator.Error || error{
 };
 
 pub const NodeInfo = struct {
-    sid: Sid,
+    node_id: NodeId,
     name: []const u8,
     description: []const u8 = "",
     hopcount: u16 = 0,
-    uplink: ?Sid = null,
+    uplink: ?NodeId = null,
     last_seen_ms: i64,
 };
 
 pub const Node = struct {
-    sid: Sid,
+    node_id: NodeId,
     name: []const u8,
     description: []const u8,
     hopcount: u16,
-    uplink: ?Sid,
+    uplink: ?NodeId,
     last_seen_ms: i64,
 };
 
@@ -102,7 +105,7 @@ pub const ServerRegistry = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     nodes: std.ArrayList(Node) = .empty,
-    by_sid: std.AutoHashMap(Sid, usize),
+    by_node: std.AutoHashMap(NodeId, usize),
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Error!ServerRegistry {
         try cfg.validate();
@@ -110,26 +113,26 @@ pub const ServerRegistry = struct {
         var nodes = try std.ArrayList(Node).initCapacity(allocator, cfg.max_nodes);
         errdefer nodes.deinit(allocator);
 
-        var by_sid = std.AutoHashMap(Sid, usize).init(allocator);
-        errdefer by_sid.deinit();
-        try by_sid.ensureTotalCapacity(@intCast(cfg.max_nodes));
+        var by_node = std.AutoHashMap(NodeId, usize).init(allocator);
+        errdefer by_node.deinit();
+        try by_node.ensureTotalCapacity(@intCast(cfg.max_nodes));
 
         return .{
             .allocator = allocator,
             .cfg = cfg,
             .nodes = nodes,
-            .by_sid = by_sid,
+            .by_node = by_node,
         };
     }
 
     pub fn deinit(self: *ServerRegistry) void {
         for (self.nodes.items) |node| self.freeNode(node);
         self.nodes.deinit(self.allocator);
-        self.by_sid.deinit();
+        self.by_node.deinit();
         self.* = .{
             .allocator = self.allocator,
             .cfg = self.cfg,
-            .by_sid = std.AutoHashMap(Sid, usize).init(self.allocator),
+            .by_node = std.AutoHashMap(NodeId, usize).init(self.allocator),
         };
     }
 
@@ -141,30 +144,30 @@ pub const ServerRegistry = struct {
         return self.nodes.items;
     }
 
-    pub fn get(self: *const ServerRegistry, sid: Sid) ?*const Node {
-        const idx = self.by_sid.get(sid) orelse return null;
+    pub fn get(self: *const ServerRegistry, node_id: NodeId) ?*const Node {
+        const idx = self.by_node.get(node_id) orelse return null;
         return &self.nodes.items[idx];
     }
 
-    pub fn contains(self: *const ServerRegistry, sid: Sid) bool {
-        return self.by_sid.contains(sid);
+    pub fn contains(self: *const ServerRegistry, node_id: NodeId) bool {
+        return self.by_node.contains(node_id);
     }
 
     pub fn add(self: *ServerRegistry, info: NodeInfo) Error!void {
         try self.validateInfo(info);
-        if (self.contains(info.sid)) return error.NodeExists;
+        if (self.contains(info.node_id)) return error.NodeExists;
         try self.insertNew(info);
     }
 
     pub fn update(self: *ServerRegistry, info: NodeInfo) Error!void {
         try self.validateInfo(info);
-        const idx = self.by_sid.get(info.sid) orelse return error.NodeNotFound;
+        const idx = self.by_node.get(info.node_id) orelse return error.NodeNotFound;
         try self.replaceAt(idx, info);
     }
 
     pub fn addOrUpdate(self: *ServerRegistry, info: NodeInfo) Error!UpsertResult {
         try self.validateInfo(info);
-        if (self.by_sid.get(info.sid)) |idx| {
+        if (self.by_node.get(info.node_id)) |idx| {
             try self.replaceAt(idx, info);
             return .updated;
         }
@@ -172,21 +175,21 @@ pub const ServerRegistry = struct {
         return .added;
     }
 
-    pub fn markSeen(self: *ServerRegistry, sid: Sid, last_seen_ms: i64) Error!bool {
-        if (!validSid(sid)) return error.InvalidNode;
-        const idx = self.by_sid.get(sid) orelse return false;
+    pub fn markSeen(self: *ServerRegistry, node_id: NodeId, last_seen_ms: i64) Error!bool {
+        if (!validNode(node_id)) return error.InvalidNode;
+        const idx = self.by_node.get(node_id) orelse return false;
         self.nodes.items[idx].last_seen_ms = last_seen_ms;
         return true;
     }
 
-    pub fn remove(self: *ServerRegistry, sid: Sid) Error!bool {
-        if (!validSid(sid)) return error.InvalidNode;
-        const idx = self.by_sid.get(sid) orelse return false;
+    pub fn remove(self: *ServerRegistry, node_id: NodeId) Error!bool {
+        if (!validNode(node_id)) return error.InvalidNode;
+        const idx = self.by_node.get(node_id) orelse return false;
         const old = self.nodes.orderedRemove(idx);
         self.freeNode(old);
 
         for (self.nodes.items) |*node| {
-            if (node.uplink == sid) {
+            if (node.uplink == node_id) {
                 node.uplink = null;
                 node.hopcount = 0;
             }
@@ -208,7 +211,7 @@ pub const ServerRegistry = struct {
         @memset(visited, false);
 
         for (self.nodes.items, 0..) |node, idx| {
-            if (node.uplink == null or self.by_sid.get(node.uplink.?) == null) {
+            if (node.uplink == null or self.by_node.get(node.uplink.?) == null) {
                 try self.appendTopologyFrom(idx, null, 0, visited, out);
             }
         }
@@ -224,8 +227,8 @@ pub const ServerRegistry = struct {
         ctx: RenderContext,
     ) Error!void {
         for (self.nodes.items) |node| {
-            const uplink_name = if (node.uplink) |sid|
-                if (self.get(sid)) |uplink| uplink.name else "*"
+            const uplink_name = if (node.uplink) |uplink_id|
+                if (self.get(uplink_id)) |uplink| uplink.name else "*"
             else
                 "*";
             try out.print(
@@ -257,16 +260,16 @@ pub const ServerRegistry = struct {
             try out.print(
                 allocator,
                 "{s} [{d}] {s}\r\n",
-                .{ entry.node.name, entry.node.sid, entry.node.description },
+                .{ entry.node.name, entry.node.node_id, entry.node.description },
             );
         }
         try out.print(allocator, ":{s} 017 {s} :End of /MAP\r\n", .{ ctx.source, ctx.target });
     }
 
     fn validateInfo(self: *const ServerRegistry, info: NodeInfo) Error!void {
-        if (!validSid(info.sid)) return error.InvalidNode;
+        if (!validNode(info.node_id)) return error.InvalidNode;
         if (info.uplink) |uplink| {
-            if (!validSid(uplink) or uplink == info.sid) return error.InvalidNode;
+            if (!validNode(uplink) or uplink == info.node_id) return error.InvalidNode;
         }
         if (info.name.len == 0 or info.name.len > self.cfg.max_name_len) return error.NameTooLong;
         if (info.description.len > self.cfg.max_description_len) return error.DescriptionTooLong;
@@ -278,7 +281,7 @@ pub const ServerRegistry = struct {
         const owned = try self.ownedNode(info);
         errdefer self.freeNode(owned);
         self.nodes.appendAssumeCapacity(owned);
-        self.by_sid.putAssumeCapacityNoClobber(info.sid, self.nodes.items.len - 1);
+        self.by_node.putAssumeCapacityNoClobber(info.node_id, self.nodes.items.len - 1);
     }
 
     fn replaceAt(self: *ServerRegistry, idx: usize, info: NodeInfo) Error!void {
@@ -294,7 +297,7 @@ pub const ServerRegistry = struct {
         const description = try self.allocator.dupe(u8, info.description);
         errdefer self.allocator.free(description);
         return .{
-            .sid = info.sid,
+            .node_id = info.node_id,
             .name = name,
             .description = description,
             .hopcount = info.hopcount,
@@ -309,9 +312,9 @@ pub const ServerRegistry = struct {
     }
 
     fn rebuildIndex(self: *ServerRegistry) void {
-        self.by_sid.clearRetainingCapacity();
+        self.by_node.clearRetainingCapacity();
         for (self.nodes.items, 0..) |node, idx| {
-            self.by_sid.putAssumeCapacityNoClobber(node.sid, idx);
+            self.by_node.putAssumeCapacityNoClobber(node.node_id, idx);
         }
     }
 
@@ -335,15 +338,15 @@ pub const ServerRegistry = struct {
         });
 
         for (self.nodes.items, 0..) |node, child_idx| {
-            if (node.uplink == self.nodes.items[idx].sid) {
+            if (node.uplink == self.nodes.items[idx].node_id) {
                 try self.appendTopologyFrom(child_idx, out_idx, depth + 1, visited, out);
             }
         }
     }
 };
 
-fn validSid(sid: Sid) bool {
-    return sid != 0;
+fn validNode(node_id: NodeId) bool {
+    return node_id != 0;
 }
 
 fn validLineAtom(text: []const u8) bool {
@@ -365,10 +368,10 @@ fn appendIndent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), depth: u1
     while (i < depth) : (i += 1) try out.appendSlice(allocator, "  ");
 }
 
-fn findTopologyParent(entries: []const TopologyEntry, uplink: ?Sid) ?usize {
-    const parent_sid = uplink orelse return null;
+fn findTopologyParent(entries: []const TopologyEntry, uplink: ?NodeId) ?usize {
+    const parent_id = uplink orelse return null;
     for (entries, 0..) |entry, idx| {
-        if (entry.node.sid == parent_sid) return idx;
+        if (entry.node.node_id == parent_id) return idx;
     }
     return null;
 }
@@ -382,13 +385,13 @@ test "add update and list known nodes" {
     defer registry.deinit();
 
     try registry.add(.{
-        .sid = 1,
+        .node_id = 1,
         .name = "irc.example.test",
         .description = "root",
         .last_seen_ms = 100,
     });
     try registry.add(.{
-        .sid = 2,
+        .node_id = 2,
         .name = "leaf.example.test",
         .description = "leaf",
         .hopcount = 1,
@@ -396,7 +399,7 @@ test "add update and list known nodes" {
         .last_seen_ms = 110,
     });
     try registry.update(.{
-        .sid = 2,
+        .node_id = 2,
         .name = "leaf.example.test",
         .description = "updated leaf",
         .hopcount = 1,
@@ -414,13 +417,13 @@ test "render LINKS and MAP numeric lines" {
     defer registry.deinit();
 
     _ = try registry.addOrUpdate(.{
-        .sid = 10,
+        .node_id = 10,
         .name = "alpha.net",
         .description = "Alpha Hub",
         .last_seen_ms = 100,
     });
     _ = try registry.addOrUpdate(.{
-        .sid = 11,
+        .node_id = 11,
         .name = "beta.net",
         .description = "Beta Leaf",
         .hopcount = 1,
@@ -428,7 +431,7 @@ test "render LINKS and MAP numeric lines" {
         .last_seen_ms = 101,
     });
     _ = try registry.addOrUpdate(.{
-        .sid = 12,
+        .node_id = 12,
         .name = "gamma.net",
         .description = "Gamma Leaf",
         .hopcount = 2,
@@ -456,13 +459,13 @@ test "remove on split detaches children without leaks" {
     var registry = try ServerRegistry.init(std.testing.allocator, .{ .max_nodes = 4 });
     defer registry.deinit();
 
-    try registry.add(.{ .sid = 1, .name = "root.net", .description = "Root", .last_seen_ms = 1 });
-    try registry.add(.{ .sid = 2, .name = "split.net", .description = "Split", .hopcount = 1, .uplink = 1, .last_seen_ms = 2 });
-    try registry.add(.{ .sid = 3, .name = "child.net", .description = "Child", .hopcount = 2, .uplink = 2, .last_seen_ms = 3 });
+    try registry.add(.{ .node_id = 1, .name = "root.net", .description = "Root", .last_seen_ms = 1 });
+    try registry.add(.{ .node_id = 2, .name = "split.net", .description = "Split", .hopcount = 1, .uplink = 1, .last_seen_ms = 2 });
+    try registry.add(.{ .node_id = 3, .name = "child.net", .description = "Child", .hopcount = 2, .uplink = 2, .last_seen_ms = 3 });
 
     try std.testing.expect(try registry.remove(2));
     try std.testing.expect(!registry.contains(2));
-    try std.testing.expectEqual(@as(?Sid, null), registry.get(3).?.uplink);
+    try std.testing.expectEqual(@as(?NodeId, null), registry.get(3).?.uplink);
     try std.testing.expectEqual(@as(u16, 0), registry.get(3).?.hopcount);
     try std.testing.expectEqual(@as(usize, 2), registry.count());
 }
@@ -471,16 +474,16 @@ test "topology view gives parent indexes" {
     var registry = try ServerRegistry.init(std.testing.allocator, .{ .max_nodes = 4 });
     defer registry.deinit();
 
-    try registry.add(.{ .sid = 1, .name = "root.net", .last_seen_ms = 1 });
-    try registry.add(.{ .sid = 2, .name = "leaf-a.net", .hopcount = 1, .uplink = 1, .last_seen_ms = 2 });
-    try registry.add(.{ .sid = 3, .name = "leaf-b.net", .hopcount = 1, .uplink = 1, .last_seen_ms = 3 });
+    try registry.add(.{ .node_id = 1, .name = "root.net", .last_seen_ms = 1 });
+    try registry.add(.{ .node_id = 2, .name = "leaf-a.net", .hopcount = 1, .uplink = 1, .last_seen_ms = 2 });
+    try registry.add(.{ .node_id = 3, .name = "leaf-b.net", .hopcount = 1, .uplink = 1, .last_seen_ms = 3 });
 
     var topo: std.ArrayList(TopologyEntry) = .empty;
     defer topo.deinit(std.testing.allocator);
     try registry.buildTopology(std.testing.allocator, &topo);
 
     try std.testing.expectEqual(@as(usize, 3), topo.items.len);
-    try std.testing.expectEqual(@as(Sid, 1), topo.items[0].node.sid);
+    try std.testing.expectEqual(@as(NodeId, 1), topo.items[0].node.node_id);
     try std.testing.expectEqual(@as(?usize, null), topo.items[0].parent_index);
     try std.testing.expectEqual(@as(?usize, 0), topo.items[1].parent_index);
     try std.testing.expectEqual(@as(?usize, 0), topo.items[2].parent_index);
@@ -496,10 +499,10 @@ test "bounds and validation reject bad input" {
     });
     defer registry.deinit();
 
-    try std.testing.expectError(error.InvalidNode, registry.add(.{ .sid = 0, .name = "bad", .last_seen_ms = 1 }));
-    try std.testing.expectError(error.NameTooLong, registry.add(.{ .sid = 1, .name = "too-long-name", .last_seen_ms = 1 }));
-    try std.testing.expectError(error.DescriptionTooLong, registry.add(.{ .sid = 1, .name = "ok.net", .description = "too long desc", .last_seen_ms = 1 }));
+    try std.testing.expectError(error.InvalidNode, registry.add(.{ .node_id = 0, .name = "bad", .last_seen_ms = 1 }));
+    try std.testing.expectError(error.NameTooLong, registry.add(.{ .node_id = 1, .name = "too-long-name", .last_seen_ms = 1 }));
+    try std.testing.expectError(error.DescriptionTooLong, registry.add(.{ .node_id = 1, .name = "ok.net", .description = "too long desc", .last_seen_ms = 1 }));
 
-    try registry.add(.{ .sid = 1, .name = "ok.net", .description = "ok", .last_seen_ms = 1 });
-    try std.testing.expectError(error.RegistryFull, registry.add(.{ .sid = 2, .name = "no.net", .last_seen_ms = 2 }));
+    try registry.add(.{ .node_id = 1, .name = "ok.net", .description = "ok", .last_seen_ms = 1 });
+    try std.testing.expectError(error.RegistryFull, registry.add(.{ .node_id = 2, .name = "no.net", .last_seen_ms = 2 }));
 }

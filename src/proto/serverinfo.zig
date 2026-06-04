@@ -23,8 +23,6 @@ pub const ServerInfoError = error{
     VersionTokenTooLong,
     InvalidDescription,
     DescriptionTooLong,
-    InvalidSid,
-    SidTooLong,
     InvalidTime,
     TimeTooLong,
     InvalidAdminInfo,
@@ -58,8 +56,6 @@ pub const VersionInfo = struct {
     branding: ?[]const u8 = null,
     reply_server: []const u8,
     description: []const u8,
-    ts_version: u16 = 1,
-    sid: []const u8,
 };
 
 /// Data rendered by ADMIN numerics.
@@ -98,7 +94,7 @@ pub const ReplyLineSink = struct {
 /// Build one Ophion-shaped RPL_VERSION (351) line.
 ///
 /// Wire format:
-/// `:<server> 351 <requester> <version>(<build>[,<branding>]). <reply-server> :<description> TS<n>ow <sid>\r\n`
+/// `:<server> 351 <requester> <version>(<build>[,<branding>]). <reply-server> :<description>\r\n`
 pub fn writeVersionReply(
     out: []u8,
     ctx: ReplyContext,
@@ -134,10 +130,6 @@ pub fn writeVersionReplyWith(
     try writer.appendBytes(info.reply_server);
     try writer.appendBytes(" :");
     try writer.appendBytes(info.description);
-    try writer.appendBytes(" TS");
-    try writer.appendUnsigned(info.ts_version);
-    try writer.appendBytes("ow ");
-    try writer.appendBytes(info.sid);
     try writer.crlf();
     return writer.slice();
 }
@@ -306,7 +298,6 @@ pub fn validateVersionInfoWith(comptime params: Params, info: VersionInfo) Serve
     if (info.branding) |branding| try validateTokenWith(params, branding);
     try validateServerNameWith(params, info.reply_server);
     try validateDescriptionWith(params, info.description);
-    try validateSidWith(params, info.sid);
 }
 
 pub fn validateTimeStringWith(comptime params: Params, time_string: []const u8) ServerInfoError!void {
@@ -363,14 +354,6 @@ fn validateDescriptionWith(comptime params: Params, description: []const u8) Ser
     }
 }
 
-fn validateSidWith(comptime params: Params, sid: []const u8) ServerInfoError!void {
-    if (sid.len == 0) return error.InvalidSid;
-    if (sid.len > params.max_token_bytes) return error.SidTooLong;
-    for (sid) |ch| {
-        if (!validTokenByte(ch)) return error.InvalidSid;
-    }
-}
-
 fn validateAdminValueWith(comptime params: Params, value: []const u8) ServerInfoError!void {
     if (value.len == 0) return error.InvalidAdminInfo;
     if (value.len > params.max_admin_bytes) return error.AdminInfoTooLong;
@@ -387,8 +370,7 @@ fn ensureCapacity(comptime params: Params, out: []u8, line_len: usize) ServerInf
 fn versionReplyLen(ctx: ReplyContext, info: VersionInfo) usize {
     const branding_len: usize = if (info.branding) |branding| 1 + branding.len else 0;
     return numericHeaderLen(ctx) + 1 + info.version.len + 1 + info.build.len + branding_len +
-        3 + info.reply_server.len + 2 + info.description.len + 3 + decimalLen(info.ts_version) +
-        3 + info.sid.len + 2;
+        3 + info.reply_server.len + 2 + info.description.len + 2;
 }
 
 fn adminRepliesLen(ctx: ReplyContext, info: AdminInfo) usize {
@@ -481,16 +463,6 @@ fn writeNumericHeader(
     try writer.appendBytes(ctx.requester);
 }
 
-fn decimalLen(value: u16) usize {
-    var current = value;
-    var len: usize = 1;
-    while (current >= 10) {
-        current /= 10;
-        len += 1;
-    }
-    return len;
-}
-
 fn validServerNameByte(ch: u8) bool {
     return switch (ch) {
         'A'...'Z', 'a'...'z', '0'...'9', '.', '-', '_', ':', '[', ']', '/' => true,
@@ -573,8 +545,6 @@ fn sampleVersion() VersionInfo {
         .build = "9f7c14a",
         .reply_server = "irc.example.test",
         .description = "Mizuchi IRCX daemon",
-        .ts_version = 1,
-        .sid = "001",
     };
 }
 
@@ -584,7 +554,7 @@ test "VERSION builds Ophion-shaped RPL_VERSION 351" {
     const line = try writeVersionReply(&out, sampleContext(), sampleVersion());
 
     try std.testing.expectEqualStrings(
-        ":irc.example.test 351 alice mizuchi(9f7c14a). irc.example.test :Mizuchi IRCX daemon TS1ow 001\r\n",
+        ":irc.example.test 351 alice mizuchi(9f7c14a). irc.example.test :Mizuchi IRCX daemon\r\n",
         line,
     );
 }
@@ -597,7 +567,7 @@ test "VERSION includes optional branding tag" {
     const line = try writeVersionReply(&out, sampleContext(), info);
 
     try std.testing.expectEqualStrings(
-        ":irc.example.test 351 alice mizuchi(9f7c14a,dev). irc.example.test :Mizuchi IRCX daemon TS1ow 001\r\n",
+        ":irc.example.test 351 alice mizuchi(9f7c14a,dev). irc.example.test :Mizuchi IRCX daemon\r\n",
         line,
     );
 }
@@ -699,7 +669,6 @@ test "validation rejects control bytes before output" {
             .build = "9f7c14a",
             .reply_server = "irc.example.test",
             .description = "bad\rdescription",
-            .sid = "001",
         }),
     );
 
