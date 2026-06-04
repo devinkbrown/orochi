@@ -2626,7 +2626,7 @@ pub const LinuxServer = struct {
         }
         const host = parsed.paramSlice()[0];
         const port = std.fmt.parseInt(u16, parsed.paramSlice()[1], 10) catch {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CONNECT"}, "Invalid port");
+            try self.noticeTo(conn, "CONNECT: illegal port number");
             return;
         };
         if (self.clients.len() >= self.config.max_clients) {
