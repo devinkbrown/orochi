@@ -2390,6 +2390,14 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Whether `key` on `entity` is an IRCX secret channel property (the *KEY
+    /// family), which must not be disclosed to clients lacking write access.
+    fn propIsSecret(entity: ircx_prop_store.Entity, key: []const u8) bool {
+        if (entity.kind != .channel) return false;
+        const info = ircx_prop_store.channelPropInfo(key) orelse return false;
+        return info.secret;
+    }
+
     fn propEmitEntry(conn: *ConnState, entry: ircx_prop_store.EntryView) !void {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = ircx_prop_store.buildPropListReply(server_name, conn.session.displayName(), entry, &buf) catch return;
@@ -2418,15 +2426,23 @@ pub const LinuxServer = struct {
         };
         switch (req) {
             .list => |entity| {
+                // Secret props (channel keys) are only visible to those who could
+                // write them — never leak OWNERKEY/HOSTKEY/MEMBERKEY to bystanders.
+                const may_see_secret = self.propAccess(id, conn, entity) != null;
                 var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
                 const rows = self.props.listProps(entity, &views) catch views[0..0];
-                for (rows) |ev| try propEmitEntry(conn, ev);
+                for (rows) |ev| {
+                    if (propIsSecret(entity, ev.key) and !may_see_secret) continue;
+                    try propEmitEntry(conn, ev);
+                }
                 try propEmitEnd(conn, entity);
             },
             .get => |q| {
+                const may_see_secret = self.propAccess(id, conn, q.entity) != null;
                 var it = std.mem.splitScalar(u8, q.keys, ',');
                 while (it.next()) |key| {
                     if (key.len == 0) continue;
+                    if (propIsSecret(q.entity, key) and !may_see_secret) continue;
                     if (self.props.getProp(q.entity, key)) |ev| {
                         try propEmitEntry(conn, ev);
                     } else |_| {}
@@ -4582,6 +4598,16 @@ test "threaded server: PROP set/get gated by channel-op" {
     b.reset();
     try writeAllFd(fd_b, "PROP #p SUBJECT :nope\r\n");
     try recvUntil(b, " 482 ", 200);
+    // A sets a SECRET key; B (no write access) must not be able to read it back —
+    // the GET returns only the 819 end with no 818/value leak.
+    a.reset();
+    try writeAllFd(fd_a, "PROP #p OWNERKEY :sekret\r\n");
+    try recvUntil(a, " 818 A #p ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "PROP #p OWNERKEY\r\n");
+    try recvUntil(b, " 819 B #p ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "sekret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {
