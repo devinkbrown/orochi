@@ -5284,6 +5284,12 @@ test "threaded server: +p private + +h hidden channel flags" {
     a.reset();
     try writeAllFd(fd_a, "MODE #ph\r\n");
     try recvUntil(&a, " 324 A #ph +ph", 200);
+    // +t topic-ops flag is echoed in RPL_CHANNELMODEIS too (item 31).
+    try writeAllFd(fd_a, "MODE #ph +t\r\n");
+    try recvUntil(&a, "MODE #ph +t", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #ph\r\n");
+    try recvUntil(&a, " 324 A #ph +t", 200);
     // hidden channel is omitted from LIST.
     a.reset();
     try writeAllFd(fd_a, "LIST\r\n");
