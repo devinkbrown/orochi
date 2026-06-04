@@ -27,6 +27,7 @@ const whowas = @import("whowas.zig");
 const whowas_reply = @import("../proto/whowas_reply.zig");
 const monitor = @import("../proto/monitor.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
+const silence = @import("../proto/silence.zig");
 
 /// Bounded WHOWAS history ring shared by the live server. Field caps match the
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
@@ -458,6 +459,8 @@ const Numeric = enum(u16) {
     RPL_ENDOFINVITELIST = 347,
     RPL_EXCEPTLIST = 348,
     RPL_ENDOFEXCEPTLIST = 349,
+    RPL_SILELIST = 271,
+    RPL_ENDOFSILELIST = 272,
     RPL_KNOCK = 710,
     RPL_KNOCKDLVR = 711,
     ERR_CHANOPEN = 713,
@@ -613,6 +616,7 @@ pub const LinuxServer = struct {
     whowas: WhowasStore,
     monitor: monitor.MonitorStore,
     read_markers: read_marker_store.DefaultStore,
+    silence: silence.Store,
     accept_armed: bool = false,
 
     /// Single configured operator credential (OPER <name> <pass>). Static for
@@ -655,6 +659,7 @@ pub const LinuxServer = struct {
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, 128),
             .read_markers = read_marker_store.DefaultStore.init(allocator),
+            .silence = silence.Store.init(allocator),
             .start_ms = platform.monotonicMillis(),
         };
     }
@@ -663,6 +668,7 @@ pub const LinuxServer = struct {
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) closeFd(slot.value.fd);
         }
+        self.silence.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
@@ -1057,6 +1063,8 @@ pub const LinuxServer = struct {
             try self.handleMonitor(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MARKREAD")) {
             try self.handleMarkread(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SILENCE")) {
+            try self.handleSilence(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
             try self.handleStats(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TAGMSG")) {
@@ -1998,6 +2006,37 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// SILENCE [+mask|-mask ...] — server-side ignore list. With no args (or a
+    /// query) it lists the caller's masks (RPL_SILELIST 271 / 272). Add/remove
+    /// ops are applied and echoed. Keyed by the caller's nick.
+    fn handleSilence(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const owner = conn.session.displayName();
+        if (parsed.param_count == 0) {
+            var lbuf: [default_reply_bytes]u8 = undefined;
+            const masks = self.silence.list(owner, &lbuf) catch "";
+            if (masks.len != 0) try queueNumeric(conn, .RPL_SILELIST, &.{masks}, "");
+            try queueNumeric(conn, .RPL_ENDOFSILELIST, &.{}, "End of SILENCE list");
+            return;
+        }
+        const req = silence.parse(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SILENCE"}, "Invalid SILENCE mask");
+            return;
+        };
+        var prefix_buf: [256]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        for (req.slice()) |op| {
+            const changed = switch (op.kind) {
+                .add => self.silence.add(owner, op.mask) catch continue,
+                .remove => self.silence.remove(owner, op.mask) catch continue,
+            };
+            if (!changed) continue;
+            var line_buf: [default_reply_bytes]u8 = undefined;
+            const sign: u8 = if (op.kind == .add) '+' else '-';
+            const line = std.fmt.bufPrint(&line_buf, ":{s} SILENCE {c}{s}\r\n", .{ prefix, sign, op.mask }) catch continue;
+            try appendToConn(conn, line);
+        }
+    }
+
     /// LUSERS — network/user counters (251-255, 265/266).
     fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         const clients: u64 = @intCast(self.clients.len());
@@ -2485,6 +2524,13 @@ pub const LinuxServer = struct {
             if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
             return;
         };
+        // SILENCE: if the recipient has silenced a mask matching the sender, drop
+        // the message silently (no error to the sender — ircu/charybdis behavior).
+        {
+            var smask_buf: [256]u8 = undefined;
+            const sender_mask = try clientPrefix(conn, &smask_buf);
+            if (self.silence.isSilenced(target, sender_mask)) return;
+        }
         var time_buf: [40]u8 = undefined;
         const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
         try self.deliverTagged(clientIdFromWorld(recipient), dtags, msg);
@@ -3733,6 +3779,38 @@ test "threaded server: PRIVMSG multi-target delivery" {
     try writeAllFd(fd_a, "PRIVMSG B,C :hi both\r\n");
     try recvUntil(b, ":A!alice@localhost PRIVMSG B :hi both\r\n", 200);
     try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
+}
+
+test "threaded server: SILENCE add/list/remove" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "SILENCE +B!*@*\r\n");
+    try recvUntil(&a, "SILENCE +B!*@*\r\n", 200);
+    a.reset();
+    try writeAllFd(fd_a, "SILENCE\r\n");
+    try recvUntil(&a, " 271 A B!*@*", 200);
+    try recvUntil(&a, " 272 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "SILENCE -B!*@*\r\n");
+    try recvUntil(&a, "SILENCE -B!*@*\r\n", 200);
 }
 
 test "threaded server: MARKREAD set then get" {
