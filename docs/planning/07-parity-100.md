@@ -118,7 +118,7 @@
 84. [x] DIE (oper shutdown)
 85. [x] RESTART (oper)
 86. [x] KLINE / DLINE / GLINE + UNKLINE (ban storage)
-87. [ ] TESTLINE / TESTMASK
+87. [x] TESTLINE / TESTMASK `[x]` live — oper tools: TESTLINE reports matching K/D-line (725/726), TESTMASK counts connected clients matching a mask (727)
 88. [x] TRACE / ETRACE (200-262 family)
 89. [~] SNOMASK / server notices (+s umode)
 90. [x] OPER MODE +o user-umode reflection + RPL_UMODEIS `[x]` live — umodeString emits +o when is_oper; RPL_UMODEIS (221) shows it

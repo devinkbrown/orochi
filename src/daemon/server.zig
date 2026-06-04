@@ -489,6 +489,9 @@ const Numeric = enum(u16) {
     ERR_KEYNOPERMISSION = 769,
     ERR_PROPDENIED = 918,
     ERR_NOWHISPER = 923,
+    RPL_TESTLINE = 725,
+    RPL_NOTESTLINE = 726,
+    RPL_TESTMASK = 727,
     RPL_ACCEPTLIST = 281,
     RPL_ENDOFACCEPT = 282,
     RPL_KNOCK = 710,
@@ -1143,6 +1146,10 @@ pub const LinuxServer = struct {
             try self.handleEvent(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MODEX")) {
             try self.handleModex(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTLINE")) {
+            try self.handleTestline(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTMASK")) {
+            try self.handleTestmask(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
@@ -2449,6 +2456,58 @@ pub const LinuxServer = struct {
             if (std.ascii.eqlIgnoreCase(token, c.code()) or std.ascii.eqlIgnoreCase(token, c.token())) return c;
         }
         return null;
+    }
+
+    /// TESTLINE <mask> — oper tool: report the first K/D-line whose mask matches
+    /// `mask` (RPL_TESTLINE 725) or RPL_NOTESTLINE 726 if none.
+    fn handleTestline(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
+            return;
+        }
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TESTLINE"}, "Not enough parameters");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+        var entries: [256]ban_db.Entry = undefined;
+        for ([_]ban_db.Kind{ .kline, .dline }) |kind| {
+            const rows = self.bans_db.list(kind, &entries);
+            for (rows) |e| {
+                if (ban_db.matches(kind, e.mask, target)) {
+                    const label: []const u8 = if (kind == .kline) "K" else "D";
+                    try queueNumeric(conn, .RPL_TESTLINE, &.{ label, e.mask }, e.reason);
+                    return;
+                }
+            }
+        }
+        try queueNumeric(conn, .RPL_NOTESTLINE, &.{target}, "No matching ban found");
+    }
+
+    /// TESTMASK <mask> — oper tool: count connected clients whose nick!user@host
+    /// matches `mask` (RPL_TESTMASK 727).
+    fn handleTestmask(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
+            return;
+        }
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TESTMASK"}, "Not enough parameters");
+            return;
+        }
+        const mask = parsed.paramSlice()[0];
+        var matched: u64 = 0;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (!c.session.registered()) continue;
+            var hm_buf: [320]u8 = undefined;
+            const hostmask = std.fmt.bufPrint(&hm_buf, "{s}!{s}@{s}", .{ c.session.displayName(), c.session.username(), default_host }) catch continue;
+            if (ban_db.matches(.kline, mask, hostmask)) matched += 1;
+        }
+        var cnt_buf: [24]u8 = undefined;
+        const cnt = std.fmt.bufPrint(&cnt_buf, "{d}", .{matched}) catch "0";
+        try queueNumeric(conn, .RPL_TESTMASK, &.{ mask, cnt }, "clients match");
     }
 
     /// MODEX <#chan[,nick]> [+/-NAMED...] — IRCX named-mode front-end. Translates
@@ -5132,6 +5191,18 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     try writeAllFd(fd_a, "TRACE\r\n");
     try recvUntil(&a, " 205 ", 200);
     try recvUntil(&a, " 262 ", 200);
+    // TESTLINE: a host matching the KLINE bad!*@* reports RPL_TESTLINE 725;
+    // a non-matching host reports RPL_NOTESTLINE 726.
+    a.reset();
+    try writeAllFd(fd_a, "TESTLINE bad!user@host\r\n");
+    try recvUntil(&a, " 725 ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "TESTLINE good!user@host\r\n");
+    try recvUntil(&a, " 726 ", 200);
+    // TESTMASK counts connected clients matching the mask (A itself matches).
+    a.reset();
+    try writeAllFd(fd_a, "TESTMASK *!*@localhost\r\n");
+    try recvUntil(&a, " 727 ", 200);
 }
 
 test "threaded server: ACCEPT add + list" {
