@@ -64,7 +64,7 @@
 
 ## D. IRCX surface (draft-pfenning-04)
 
-42. [~] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
+42. [x] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
 43. [ ] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig
 44. [~] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
 45. [~] PROP get/set on channel/user/member entities

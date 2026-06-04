@@ -35,6 +35,7 @@ const ban_db = @import("ban_db.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const accept_list = @import("../proto/accept_list.zig");
+const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
 const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
@@ -1110,6 +1111,8 @@ pub const LinuxServer = struct {
             try self.handleChathistory(conn, line);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "METADATA")) {
             try self.handleMetadata(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
+            try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCEPT")) {
             try self.handleAcceptCmd(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REDACT")) {
@@ -2271,6 +2274,16 @@ pub const LinuxServer = struct {
         const got = self.accepts.list(owner, &nicks) catch nicks[0..0];
         for (got) |n| try queueNumeric(conn, .RPL_ACCEPTLIST, &.{n}, "");
         try queueNumeric(conn, .RPL_ENDOFACCEPT, &.{}, "End of /ACCEPT list");
+    }
+
+    /// CREATE <channel> [modes] — IRCX channel creation (create-or-join as
+    /// founder). Delegates to the JOIN path after parsing the IRCX form.
+    fn handleCreate(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const req = ircx_create_cmd.parseParams(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CREATE"}, "Invalid CREATE");
+            return;
+        };
+        try self.joinOne(id, conn, req.channel, null);
     }
 
     /// METADATA <target> <GET|LIST|SET|CLEAR> [key [:value]] — IRCv3 metadata-2.
@@ -4230,6 +4243,31 @@ test "threaded server: WHOX field-selected reply" {
     try writeAllFd(fd_a, "WHO #w %cnuhs\r\n");
     try recvUntil(&a, " 354 A ", 200);
     try recvUntil(&a, " 315 A #w ", 200);
+}
+
+test "threaded server: CREATE makes founder channel" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "CREATE #cr\r\n");
+    try recvUntil(&a, " 366 A #cr ", 200);
+    try recvUntil(&a, "~A", 200);
 }
 
 test "threaded server: HELP topic + unknown" {
