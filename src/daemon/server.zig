@@ -508,6 +508,7 @@ const Numeric = enum(u16) {
     // (918 is IRCERR_EVENTDUP — do not reuse it for PROP denial.)
     ERR_NOACCESS = 913,
     ERR_NOWHISPER = 923,
+    RPL_IRCX = 800,
     RPL_TESTLINE = 725,
     RPL_NOTESTLINE = 726,
     RPL_TESTMASK = 727,
@@ -623,6 +624,9 @@ pub const ConnState = struct {
     send_offset: usize = 0,
     send_armed: bool = false,
     closing: bool = false,
+    /// IRCX opt-in: set true after the client sends `IRCX` (draft-pfenning §IRCX).
+    /// Gates IRCX-only behaviors; base RFC1459/IRCv3 always works regardless.
+    ircx: bool = false,
     /// Non-null for server-to-server peer connections: inbound bytes drive this
     /// Suimyaku link instead of the IRC line parser. Heap-owned (stable address
     /// required by the link's self-referential clock); freed in closeConn/deinit.
@@ -1290,6 +1294,10 @@ pub const LinuxServer = struct {
             try self.handleChathistory(conn, line);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "METADATA")) {
             try self.handleMetadata(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "IRCX")) {
+            try self.handleIrcx(conn, true);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ISIRCX")) {
+            try self.handleIrcx(conn, false);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHISPER")) {
             try self.handleWhisper(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PROP")) {
@@ -1549,6 +1557,11 @@ pub const LinuxServer = struct {
             return;
         }
         const channel = parsed.paramSlice()[0];
+        // `MODE ISIRCX` is the IRCX discovery form (draft-pfenning): reply RPL_IRCX.
+        if (std.ascii.eqlIgnoreCase(channel, "ISIRCX")) {
+            try self.handleIrcx(conn, false);
+            return;
+        }
         if (!world_model.isChannelName(channel)) {
             // User-target MODE: only the client's own nick is settable.
             try self.handleUserMode(conn, parsed, channel);
@@ -3067,6 +3080,18 @@ pub const LinuxServer = struct {
                 try propEmitEnd(conn, k.entity);
             },
         }
+    }
+
+    /// IRCX / ISIRCX — IRCX discovery + opt-in (draft-pfenning §IRCX). `IRCX`
+    /// enables IRCX mode for the session; `ISIRCX` only queries. Both reply with
+    /// RPL_IRCX (800): `<state> <version> <package-list> <maxmsg> <option-list>`.
+    /// Mizuchi advertises its SASL mechanisms as the package list.
+    fn handleIrcx(self: *LinuxServer, conn: *ConnState, enable: bool) !void {
+        _ = self;
+        if (enable) conn.ircx = true;
+        const state: []const u8 = if (conn.ircx) "1" else "0";
+        // version 0; package-list = advertised SASL mechs; maxmsg 512.
+        try queueNumeric(conn, .RPL_IRCX, &.{ state, "0", "PLAIN,SCRAM-SHA-256,SCRAM-SHA-512,EXTERNAL", "512" }, "*");
     }
 
     /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
@@ -5268,6 +5293,40 @@ test "threaded server: +x auditorium hides regular members in NAMES" {
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "C") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "~A") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "B") == null);
+}
+
+test "threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    // ISIRCX queries (state 0, not yet opted in).
+    a.reset();
+    try writeAllFd(fd_a, "ISIRCX\r\n");
+    try recvUntil(&a, " 800 A 0 0 ", 200);
+    // IRCX enables (state flips to 1) and reports the SASL package list.
+    a.reset();
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "SCRAM-SHA-256") != null);
+    // MODE ISIRCX is the discovery alias — now reports enabled.
+    a.reset();
+    try writeAllFd(fd_a, "MODE ISIRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
 }
 
 test "threaded server: PROP set/get gated by channel-op" {
