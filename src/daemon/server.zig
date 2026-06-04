@@ -2393,12 +2393,16 @@ pub const LinuxServer = struct {
         }
         const target = parsed.paramSlice()[0];
         const sub = parsed.paramSlice()[1];
+        // '*' is the IRCv3 metadata-2 alias for the requesting client. Key the
+        // store by the resolved nick so each client has its own namespace, while
+        // replies still echo the literal `target` the client sent.
+        const store_target = if (std.mem.eql(u8, target, "*")) conn.session.displayName() else target;
 
         if (std.ascii.eqlIgnoreCase(sub, "GET")) {
             var i: usize = 2;
             while (i < parsed.param_count) : (i += 1) {
                 const key = parsed.paramSlice()[i];
-                if (self.metadata.get(target, key)) |ev| {
+                if (self.metadata.get(store_target, key)) |ev| {
                     try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, ev.value);
                 } else |_| {
                     try queueNumeric(conn, .ERR_KEYNOTSET, &.{ target, key }, "key not set");
@@ -2406,7 +2410,7 @@ pub const LinuxServer = struct {
             }
         } else if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
             var views: [64]metadata_store.EntryView = undefined;
-            const all = self.metadata.list(target, &views) catch views[0..0];
+            const all = self.metadata.list(store_target, &views) catch views[0..0];
             for (all) |ev| try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, ev.key, "*" }, ev.value);
         } else if (std.ascii.eqlIgnoreCase(sub, "SET")) {
             if (parsed.param_count < 3) {
@@ -2423,13 +2427,13 @@ pub const LinuxServer = struct {
             const key = parsed.paramSlice()[2];
             if (parsed.param_count >= 4 and parsed.paramSlice()[3].len != 0) {
                 const value = parsed.paramSlice()[3];
-                _ = self.metadata.set(target, key, value) catch {
+                _ = self.metadata.set(store_target, key, value) catch {
                     try queueNumeric(conn, .ERR_KEYINVALID, &.{ target, key }, "invalid key");
                     return;
                 };
                 try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, value);
             } else {
-                self.metadata.delete(target, key) catch {};
+                self.metadata.delete(store_target, key) catch {};
                 try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, "");
             }
         }
@@ -3260,9 +3264,12 @@ const Buf = struct {
 
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     if (conn.send_len + bytes.len > conn.send_buf.len) {
-        // Reclaim the already-sent prefix [0, send_offset) for a slow consumer
-        // by sliding the unsent tail to the front before giving up.
-        if (conn.send_offset > 0) {
+        // Reclaim the already-sent prefix [0, send_offset) for a slow consumer by
+        // sliding the unsent tail to the front. NEVER do this while a send SQE is
+        // armed: the kernel is still reading send_buf[send_offset..send_len] for
+        // the in-flight zero-copy send, so moving those bytes would corrupt the
+        // wire. Appending fresh bytes at [send_len..] is always safe.
+        if (conn.send_offset > 0 and !conn.send_armed) {
             const tail = conn.send_len - conn.send_offset;
             std.mem.copyForwards(u8, conn.send_buf[0..tail], conn.send_buf[conn.send_offset..conn.send_len]);
             conn.send_len = tail;
@@ -4418,6 +4425,16 @@ test "threaded server: METADATA set then get" {
     a.reset();
     try writeAllFd(fd_a, "METADATA Bob SET url :http://y\r\n");
     try recvUntil(&a, " 769 A Bob url ", 200);
+    // A second client's `*` namespace is isolated from A's: B's GET misses (766),
+    // proving `*` resolves per-client rather than into one shared bucket.
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "METADATA * GET url\r\n");
+    try recvUntil(&b, " 766 B * url ", 200);
 }
 
 test "threaded server: WHOX field-selected reply" {

@@ -251,12 +251,11 @@ pub const S2sPeer = struct {
     }
 
     fn rememberRemote(self: *S2sPeer, hs: Handshake, now_ms: u64) !void {
-        self.remote_sid = hs.sid;
-        self.remote_epoch_ms = hs.epoch_ms;
+        // Run all fallible work first so a registry/route failure cannot leave a
+        // dangling self.remote_name. Only after everything succeeds do we swap in
+        // the freshly-duped name (transactional: old name freed last).
         const owned_name = try self.allocator.dupe(u8, hs.name);
         errdefer self.allocator.free(owned_name);
-        self.allocator.free(self.remote_name);
-        self.remote_name = owned_name;
 
         _ = try self.registry.addOrUpdate(.{
             .sid = hs.sid,
@@ -267,6 +266,11 @@ pub const S2sPeer = struct {
             .last_seen_ms = try i64Ms(now_ms),
         });
         try self.routes.setNickLocation(hs.name, hs.node_id);
+
+        self.remote_sid = hs.sid;
+        self.remote_epoch_ms = hs.epoch_ms;
+        self.allocator.free(self.remote_name);
+        self.remote_name = owned_name;
     }
 
     fn emitHandshake(self: *S2sPeer, sink: ByteSink) !void {
