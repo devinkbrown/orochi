@@ -36,6 +36,7 @@ const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
+const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
 const trace = @import("../proto/trace.zig");
 
@@ -1775,17 +1776,22 @@ pub const LinuxServer = struct {
     /// channels are hidden. Filters that fail to parse fall back to listing all.
     fn handleList(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const request = list.parseList(parsed.paramSlice()) catch list.Request{};
+        // ELIST extended filters (>N/<N/C/T/mask); empty set matches everything.
+        var filters = elist.parseParams(self.allocator, parsed.paramSlice()) catch elist.FilterSet{};
+        defer filters.deinit(self.allocator);
         const Adapter = struct {
             it: world_model.World.ChannelViewIterator,
+            filters: *const elist.FilterSet,
             pub fn next(s: *@This()) ?list.ChannelInfo {
                 while (s.it.next()) |v| {
                     if (v.secret) continue;
+                    if (!s.filters.matches(.{ .name = v.name, .users = @intCast(v.members), .created_ago = 0, .topic_age = 0 })) continue;
                     return .{ .name = v.name, .users = @intCast(v.members), .topic = v.topic };
                 }
                 return null;
             }
         };
-        var adapter = Adapter{ .it = self.world.channelIterator() };
+        var adapter = Adapter{ .it = self.world.channelIterator(), .filters = &filters };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSinkCRLF{ .conn = conn };
         list.emitList(Adapter, &adapter, request, .{ .server_name = server_name, .requester = conn.session.displayName(), .now_seconds = 0 }, &scratch, &sink) catch return;

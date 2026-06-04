@@ -69,7 +69,7 @@
 44. [~] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
 45. [~] PROP get/set on channel/user/member entities
 46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
-47. [ ] LISTX extended LIST `[~]` proto/listx.zig
+47. [x] LISTX extended LIST `[~]` proto/listx.zig
 48. [~] WHISPER channel-scoped private msg `[~]` proto/whisper.zig
 49. [ ] +h HIDDEN channel mode (IRCX, NOT halfop)
 50. [ ] AUTH (IRCX auth package negotiation)
