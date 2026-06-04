@@ -37,6 +37,7 @@ const ban_db = @import("ban_db.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
+const ircx_access_store = @import("../proto/ircx_access_store.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
@@ -647,6 +648,7 @@ pub const LinuxServer = struct {
     bans_db: ban_db.Store,
     metadata: metadata_store.DefaultStore,
     props: ircx_prop_store.DefaultStore,
+    access: ircx_access_store.AccessStore,
     /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
     shutdown: ?*std.atomic.Value(bool) = null,
     accepts: accept_list.AcceptList(.{}),
@@ -698,6 +700,7 @@ pub const LinuxServer = struct {
             .bans_db = ban_db.Store.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
             .props = ircx_prop_store.DefaultStore.init(allocator),
+            .access = ircx_access_store.AccessStore.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .start_ms = platform.monotonicMillis(),
         };
@@ -711,6 +714,7 @@ pub const LinuxServer = struct {
         self.bans_db.deinit();
         self.metadata.deinit();
         self.props.deinit();
+        self.access.deinit();
         self.accepts.deinit();
         self.silence.deinit();
         self.read_markers.deinit();
@@ -1128,6 +1132,8 @@ pub const LinuxServer = struct {
             try self.handleWhisper(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PROP")) {
             try self.handleProp(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCESS")) {
+            try self.handleAccess(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
@@ -2368,6 +2374,89 @@ pub const LinuxServer = struct {
             trace.emitTrace(ctx, &.{entry}, &scratch, &sink) catch {};
         }
         trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = server_name }}, &scratch, &sink) catch {};
+    }
+
+    /// Whether `conn` may view/manage the IRCX ACCESS list of `channel`: opers or
+    /// channel-operators only (access masks are operator-sensitive).
+    fn accessCanManage(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) bool {
+        if (conn.session.isOper()) return true;
+        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse return false;
+        return mm.isOperator();
+    }
+
+    /// ACCESS <channel> <ADD|DELETE|LIST|CLEAR> [LEVEL [mask [timeout] [:reason]]] —
+    /// IRCX per-channel access list (OWNER/HOST/VOICE/GRANT/DENY). Replies are
+    /// RPL_ACCESS{ADD 801,DELETE 802,START 803,ENTRY 804,END 805}. All operations
+    /// require channel-operator (or oper).
+    fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const req = ircx_access_store.parse(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCESS"}, "Invalid ACCESS");
+            return;
+        };
+        const ctx = ircx_access_store.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+        var buf: [default_reply_bytes]u8 = undefined;
+        switch (req) {
+            .list => |sel| {
+                if (!self.accessCanManage(id, conn, sel.channel)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{sel.channel}, "You're not channel operator");
+                    return;
+                }
+                if (ircx_access_store.buildAccessStart(&buf, ctx, sel.channel)) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+                var views: [ircx_access_store.DEFAULT_MAX_ENTRIES]ircx_access_store.EntryView = undefined;
+                const rows = self.access.listMatching(sel, &views) catch views[0..0];
+                for (rows) |ev| {
+                    var ebuf: [default_reply_bytes]u8 = undefined;
+                    const eln = ircx_access_store.buildAccessEntry(&ebuf, ctx, ev) catch continue;
+                    try appendToConn(conn, eln);
+                }
+                var endbuf: [default_reply_bytes]u8 = undefined;
+                if (ircx_access_store.buildAccessEnd(&endbuf, ctx, sel.channel)) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+            },
+            .add => |a| {
+                if (!self.accessCanManage(id, conn, a.channel)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{a.channel}, "You're not channel operator");
+                    return;
+                }
+                self.access.add(a.channel, a.level, a.mask, conn.session.displayName(), a.timeout) catch {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{a.channel}, "Cannot add ACCESS entry");
+                    return;
+                };
+                const ev = ircx_access_store.EntryView{
+                    .channel = a.channel,
+                    .level = a.level,
+                    .mask = a.mask,
+                    .set_by = conn.session.displayName(),
+                    .duration = a.timeout,
+                };
+                if (ircx_access_store.buildAccessAdd(&buf, ctx, ev)) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+            },
+            .delete => |d| {
+                if (!self.accessCanManage(id, conn, d.channel)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{d.channel}, "You're not channel operator");
+                    return;
+                }
+                _ = self.access.remove(d.channel, d.level, d.mask) catch false;
+                if (ircx_access_store.buildAccessDelete(&buf, ctx, d)) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+            },
+            .clear => |sel| {
+                if (!self.accessCanManage(id, conn, sel.channel)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{sel.channel}, "You're not channel operator");
+                    return;
+                }
+                _ = self.access.clear(sel) catch 0;
+                if (ircx_access_store.buildAccessEnd(&buf, ctx, sel.channel)) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+            },
+        }
     }
 
     /// Effective IRCX PROP access level for `conn` mutating `entity`, or null when
@@ -4608,6 +4697,55 @@ test "threaded server: PROP set/get gated by channel-op" {
     try recvUntil(b, " 819 B #p ", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "sekret") == null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
+}
+
+test "threaded server: ACCESS add/list/delete gated by channel-op" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #a\r\n");
+    try recvUntil(a, " 366 A #a ", 200);
+    // Founder A grants VOICE access, lists it, then deletes it (801/803-805/802).
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #a ADD VOICE *!*@trusted.example\r\n");
+    try recvUntil(a, " 801 A #a VOICE *!*@trusted.example", 200);
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #a LIST\r\n");
+    try recvUntil(a, " 803 A #a ", 200);
+    try recvUntil(a, " 804 A ", 200);
+    try recvUntil(a, " 805 A #a ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #a DELETE VOICE *!*@trusted.example\r\n");
+    try recvUntil(a, " 802 A #a VOICE *!*@trusted.example", 200);
+    // B (not a channel operator) cannot manage the access list (482).
+    b.reset();
+    try writeAllFd(fd_b, "ACCESS #a ADD VOICE *!*@x\r\n");
+    try recvUntil(b, " 482 ", 200);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {

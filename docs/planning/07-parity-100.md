@@ -66,7 +66,7 @@
 
 42. [x] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
 43. [~] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig
-44. [~] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
+44. [x] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[x]` live (801-805, channel-op gated, ircx_access_store)
 45. [x] PROP get/set on channel/user/member entities `[x]` live (818/819, channel-op/self gated, ircx_prop_store)
 46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
 47. [x] LISTX extended LIST `[~]` proto/listx.zig
