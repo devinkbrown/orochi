@@ -31,6 +31,7 @@ const silence = @import("../proto/silence.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
+const ban_db = @import("ban_db.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
 const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
@@ -624,6 +625,7 @@ pub const LinuxServer = struct {
     read_markers: read_marker_store.DefaultStore,
     silence: silence.Store,
     history: HistoryStore,
+    bans_db: ban_db.Store,
     msg_seq: u64 = 0,
     accept_armed: bool = false,
 
@@ -669,6 +671,7 @@ pub const LinuxServer = struct {
             .read_markers = read_marker_store.DefaultStore.init(allocator),
             .silence = silence.Store.init(allocator),
             .history = HistoryStore.init(allocator),
+            .bans_db = ban_db.Store.init(allocator, .{}),
             .start_ms = platform.monotonicMillis(),
         };
     }
@@ -678,6 +681,7 @@ pub const LinuxServer = struct {
             if (slot.occupied) closeFd(slot.value.fd);
         }
         self.history.deinit();
+        self.bans_db.deinit();
         self.silence.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
@@ -1065,6 +1069,14 @@ pub const LinuxServer = struct {
             try self.handleMap(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KILL")) {
             try self.handleKill(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "KLINE")) {
+            try self.handleAddLine(conn, parsed, .kline, "KLINE");
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "DLINE")) {
+            try self.handleAddLine(conn, parsed, .dline, "DLINE");
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "UNKLINE")) {
+            try self.handleRemoveLine(conn, parsed, .kline, "UNKLINE");
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "UNDLINE")) {
+            try self.handleRemoveLine(conn, parsed, .dline, "UNDLINE");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOWAS")) {
             try self.handleWhowas(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KNOCK")) {
@@ -1079,6 +1091,8 @@ pub const LinuxServer = struct {
             try self.handleHelp(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CHATHISTORY")) {
             try self.handleChathistory(conn, line);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "REDACT")) {
+            try self.handleRedact(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
             try self.handleStats(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TAGMSG")) {
@@ -2108,6 +2122,82 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes * 4]u8 = undefined;
         const batch = chathistory_cmd.writeBatch(&out_buf, "1", target, cmsgs[0..cn]) catch return;
         try appendToConn(conn, batch);
+    }
+
+    /// KLINE/DLINE <mask> [:reason] — oper-only ban-line add (stored in ban_db).
+    fn handleAddLine(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, kind: ban_db.Kind, cmd: []const u8) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{cmd}, "Not enough parameters");
+            return;
+        }
+        const mask = parsed.paramSlice()[0];
+        const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "No reason";
+        self.bans_db.add(.{
+            .kind = kind,
+            .mask = mask,
+            .reason = reason,
+            .set_by = conn.session.displayName(),
+            .set_at = platform.realtimeMillis(),
+            .duration_secs = 0,
+        }) catch {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Could not add ban line");
+            return;
+        };
+        var nbuf: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&nbuf, "Added {s} for {s}", .{ cmd, mask }) catch return;
+        try self.publishOperEvent(.oper_action, .notice, note);
+        try queueNumeric(conn, .RPL_YOUREOPER, &.{}, note); // ack to setter (NOTICE-style)
+    }
+
+    /// UNKLINE/UNDLINE <mask> — oper-only ban-line removal.
+    fn handleRemoveLine(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, kind: ban_db.Kind, cmd: []const u8) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{cmd}, "Not enough parameters");
+            return;
+        }
+        const mask = parsed.paramSlice()[0];
+        const removed = self.bans_db.remove(kind, mask);
+        var nbuf: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&nbuf, "{s} {s}: {s}", .{ cmd, mask, if (removed) "removed" else "not found" }) catch return;
+        try self.publishOperEvent(.oper_action, .notice, note);
+    }
+
+    /// REDACT <channel> <msgid> [:reason] — IRCv3 message-redaction. Tombstones
+    /// the message in the CHATHISTORY ring (filtered from future replay) and
+    /// broadcasts the redaction to the channel. Requires channel-operator.
+    fn handleRedact(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"REDACT"}, "Not enough parameters");
+            return;
+        }
+        const channel = parsed.paramSlice()[0];
+        const msgid = parsed.paramSlice()[1];
+        const reason = if (parsed.param_count >= 3) parsed.paramSlice()[2] else null;
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+            return;
+        };
+        if (!mm.isOperator()) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+            return;
+        }
+        self.history.redact(channel, msgid) catch {};
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "REDACT", &.{ channel, msgid }, reason);
+        try self.broadcastChannel(channel, msg, null);
     }
 
     /// HELP / HELPOP [topic] — static help topics (704/705/706, 524 if unknown).
@@ -3867,6 +3957,41 @@ test "threaded server: PRIVMSG multi-target delivery" {
     try writeAllFd(fd_a, "PRIVMSG B,C :hi both\r\n");
     try recvUntil(b, ":A!alice@localhost PRIVMSG B :hi both\r\n", 200);
     try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
+}
+
+test "threaded server: REDACT broadcast + KLINE oper event" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try writeAllFd(fd_a, "JOIN #r\r\n");
+    try recvUntil(&a, " 366 A #r ", 200);
+
+    // REDACT broadcasts to the channel (A is founder/op, sees its own).
+    a.reset();
+    try writeAllFd(fd_a, "REDACT #r 7 :gone\r\n");
+    try recvUntil(&a, "REDACT #r 7 :gone", 200);
+
+    // KLINE emits an oper-action Event Spine notice (A is subscribed).
+    a.reset();
+    try writeAllFd(fd_a, "KLINE bad!*@* :spam\r\n");
+    try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
 }
 
 test "threaded server: HELP topic + unknown" {
