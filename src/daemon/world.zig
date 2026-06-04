@@ -59,6 +59,10 @@ const Channel = struct {
     limit: ?u32 = null,
     /// +b ban masks (nick!user@host globs), allocator-owned.
     bans: std.ArrayListUnmanaged([]u8) = .empty,
+    /// +e ban-exception masks: a match here overrides a +b ban on JOIN.
+    exempts: std.ArrayListUnmanaged([]u8) = .empty,
+    /// +I invite-exception masks: a match here lets a user bypass +i on JOIN.
+    invex: std.ArrayListUnmanaged([]u8) = .empty,
     /// Pending invitations (INVITE) that satisfy +i, by client id.
     invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
 
@@ -75,6 +79,10 @@ const Channel = struct {
         if (self.key) |k| self.allocator.free(k);
         for (self.bans.items) |b| self.allocator.free(b);
         self.bans.deinit(self.allocator);
+        for (self.exempts.items) |e| self.allocator.free(e);
+        self.exempts.deinit(self.allocator);
+        for (self.invex.items) |i| self.allocator.free(i);
+        self.invex.deinit(self.allocator);
         self.invites.deinit(self.allocator);
         self.members.deinit();
         self.* = undefined;
@@ -276,14 +284,77 @@ pub const World = struct {
         return channel.bans.items;
     }
 
+    fn listAddMask(self: *World, list: *std.ArrayListUnmanaged([]u8), mask: []const u8) WorldError!bool {
+        for (list.items) |m| {
+            if (std.mem.eql(u8, m, mask)) return false;
+        }
+        const owned = try self.allocator.dupe(u8, mask);
+        errdefer self.allocator.free(owned);
+        try list.append(self.allocator, owned);
+        return true;
+    }
+
+    fn listRemoveMask(self: *World, list: *std.ArrayListUnmanaged([]u8), mask: []const u8) bool {
+        for (list.items, 0..) |m, idx| {
+            if (std.mem.eql(u8, m, mask)) {
+                self.allocator.free(m);
+                _ = list.orderedRemove(idx);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn listMatches(list: []const []const u8, hostmask: []const u8) bool {
+        for (list) |m| {
+            if (listx.globMatch(m, hostmask)) return true;
+        }
+        return false;
+    }
+
+    /// +e ban-exception list operations.
+    pub fn addExempt(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        return self.listAddMask(&channel.exempts, mask);
+    }
+    pub fn removeExempt(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        return self.listRemoveMask(&channel.exempts, mask);
+    }
+    pub fn exemptsOf(self: *World, name: []const u8) ?[]const []const u8 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.exempts.items;
+    }
+    pub fn isExempt(self: *World, name: []const u8, hostmask: []const u8) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return listMatches(channel.exempts.items, hostmask);
+    }
+
+    /// +I invite-exception list operations.
+    pub fn addInvex(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        return self.listAddMask(&channel.invex, mask);
+    }
+    pub fn removeInvex(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        return self.listRemoveMask(&channel.invex, mask);
+    }
+    pub fn invexOf(self: *World, name: []const u8) ?[]const []const u8 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.invex.items;
+    }
+    pub fn isInvexed(self: *World, name: []const u8, hostmask: []const u8) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return listMatches(channel.invex.items, hostmask);
+    }
+
     /// Whether `hostmask` (nick!user@host) matches any +b entry (case-insensitive
     /// glob via listx.globMatch).
     pub fn isBanned(self: *World, name: []const u8, hostmask: []const u8) bool {
         const channel = self.channels.getPtr(name) orelse return false;
-        for (channel.bans.items) |b| {
-            if (listx.globMatch(b, hostmask)) return true;
-        }
-        return false;
+        // A +e ban-exception match overrides any +b ban.
+        if (listMatches(channel.exempts.items, hostmask)) return false;
+        return listMatches(channel.bans.items, hostmask);
     }
 
     /// Record an INVITE so the target may bypass +i.
@@ -628,6 +699,19 @@ test "channel key, limit, bans, and invites with ownership" {
     try std.testing.expectEqual(@as(usize, 1), world.bansOf("#x").?.len);
     try std.testing.expect(try world.removeBan("#x", "bad!*@*"));
     try std.testing.expect(!world.isBanned("#x", "BAD!user@host"));
+
+    // +e exemption overrides a +b ban; +I invite-exception list is independent.
+    try std.testing.expect(try world.addBan("#x", "bad!*@*"));
+    try std.testing.expect(world.isBanned("#x", "bad!u@h"));
+    try std.testing.expect(try world.addExempt("#x", "bad!vip@*"));
+    try std.testing.expect(!world.isBanned("#x", "bad!vip@h")); // exempt wins
+    try std.testing.expect(world.isBanned("#x", "bad!other@h")); // still banned
+    try std.testing.expectEqual(@as(usize, 1), world.exemptsOf("#x").?.len);
+    try std.testing.expect(try world.removeExempt("#x", "bad!vip@*"));
+    try std.testing.expect(world.isBanned("#x", "bad!vip@h")); // ban back in force
+    try std.testing.expect(try world.addInvex("#x", "friend!*@*"));
+    try std.testing.expect(world.isInvexed("#x", "FRIEND!u@h"));
+    try std.testing.expectEqual(@as(usize, 1), world.invexOf("#x").?.len);
 
     // Invites.
     try std.testing.expect(!world.hasInvite("#x", b));
