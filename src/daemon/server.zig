@@ -1339,8 +1339,25 @@ pub const LinuxServer = struct {
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "PART", &.{channel}, reason);
-        try self.broadcastChannel(channel, msg, null);
-        try self.world.part(channel, worldIdFromClient(id));
+
+        // +x AUDITORIUM: a regular member's PART is only relayed to ops/voiced (and
+        // the parter itself), mirroring the JOIN relay gating.
+        const wid = worldIdFromClient(id);
+        const parter_rank = auditoriumRank(self.world.memberModes(channel, wid) orelse world_model.MemberModes.empty());
+        if (self.world.channelHasExtFlag(channel, .auditorium) and !auditorium.shouldRelayJoinPart(parter_rank)) {
+            var tag_buf: [48]u8 = undefined;
+            const tag = serverTimeTag(&tag_buf);
+            var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+            while (members.next()) |member| {
+                const is_self = member.*.eql(wid);
+                const mrank = auditoriumRank(self.world.memberModes(channel, member.*) orelse world_model.MemberModes.empty());
+                if (!is_self and !auditorium.shouldRelayJoinPart(mrank)) continue;
+                try self.deliverTimed(clientIdFromWorld(member.*), tag, msg);
+            }
+        } else {
+            try self.broadcastChannel(channel, msg, null);
+        }
+        try self.world.part(channel, wid);
     }
 
     fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
