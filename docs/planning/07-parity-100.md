@@ -74,7 +74,7 @@
 49. [x] +h HIDDEN channel mode (IRCX, NOT halfop)
 50. [~] AUTH (IRCX auth package negotiation)
 51. [ ] IRCX command gating behind `CREATE`/ISIRCX state
-52. [ ] AUDITORIUM (+x) member-visibility semantics
+52. [x] AUDITORIUM (+x) member-visibility semantics `[x]` live — NAMES hides regular members from each other (ops/voiced + self visible) via auditorium.zig predicates + the +x ext flag
 
 ## E. IRCv3 capabilities
 

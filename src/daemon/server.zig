@@ -40,6 +40,7 @@ const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
 const chanmode_ext = @import("../proto/chanmode_ext.zig");
 const ircx_modex = @import("../proto/ircx_modex.zig");
+const auditorium = @import("../proto/auditorium.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
@@ -3519,6 +3520,13 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, end_code, &.{channel}, end_text);
     }
 
+    /// Map a member's channel-status modes to an auditorium visibility rank.
+    fn auditoriumRank(mm: world_model.MemberModes) auditorium.Rank {
+        if (mm.isOperator()) return .op;
+        if (mm.contains(.voice)) return .voice;
+        return .regular;
+    }
+
     fn sendNames(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         // Render NAMES via the names_reply module: each member carries its status
         // prefixes (all of them when the requester negotiated multi-prefix, else
@@ -3528,11 +3536,24 @@ pub const LinuxServer = struct {
         var prefix_buf: [max_members]chanmode.PrefixList = undefined;
         var count: usize = 0;
 
+        // +x AUDITORIUM: regular members are hidden from each other; only ops and
+        // voiced members are visible (plus the viewer always sees themselves).
+        const is_auditorium = self.world.channelHasExtFlag(channel, .auditorium);
+        const viewer_wid = self.world.findNick(conn.session.displayName());
+        const viewer_rank = if (viewer_wid) |vw|
+            auditoriumRank(self.world.memberModes(channel, vw) orelse world_model.MemberModes.empty())
+        else
+            auditorium.Rank.regular;
+
         var it = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         while (it.next()) |member| {
             if (count >= max_members) break;
             const nick = self.world.nickOf(member.*) orelse continue;
             const modes = self.world.memberModes(channel, member.*) orelse world_model.MemberModes.empty();
+            if (is_auditorium) {
+                const is_self = if (viewer_wid) |vw| member.*.eql(vw) else false;
+                if (!is_self and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
+            }
             prefix_buf[count] = modes.allPrefixes();
             members_buf[count] = .{
                 .prefixes = prefix_buf[count].asSlice(),
@@ -4829,6 +4850,59 @@ test "threaded server: WHISPER delivers to channel co-member only" {
     try recvUntil(a, " 806 ", 200);
     try recvUntil(a, "AUTHONLY", 200);
     try recvUntil(a, " 807 ", 200);
+}
+
+test "threaded server: +x auditorium hides regular members in NAMES" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    const c = try alloc.create(LiveClient);
+    defer alloc.destroy(c);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    c.* = .{ .fd = fd_c };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try recvUntil(c, " 001 C ", 200);
+    try writeAllFd(fd_a, "JOIN #aud\r\n"); // A founder (op rank)
+    try recvUntil(a, " 366 A #aud ", 200);
+    try writeAllFd(fd_b, "JOIN #aud\r\n"); // B regular
+    try recvUntil(b, " 366 B #aud ", 200);
+    try writeAllFd(fd_c, "JOIN #aud\r\n"); // C regular
+    try recvUntil(c, " 366 C #aud ", 200);
+    try writeAllFd(fd_a, "MODE #aud +x\r\n");
+    try recvUntil(a, "MODE #aud +x", 200);
+    // C (regular) sees the founder A and itself, but NOT the other regular B.
+    c.reset();
+    try writeAllFd(fd_c, "NAMES #aud\r\n");
+    try recvUntil(c, " 366 C #aud ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "~A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "B") == null);
 }
 
 test "threaded server: PROP set/get gated by channel-op" {
