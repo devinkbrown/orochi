@@ -171,6 +171,9 @@ pub const Fsm = struct {
     application_traffic: ?TrafficSecrets = null,
     client_hs_keys: ?TrafficKeys = null,
     server_hs_keys: ?TrafficKeys = null,
+    // NOTE (TLS1.3 RFC8446 5.3): seq MUST reset to 0 on each key-epoch change.
+    // Only handshake records are sealed/opened today; reset these when wiring
+    // application-data records on the application_traffic keys.
     read_seq: u64 = 0,
     write_seq: u64 = 0,
 
@@ -394,7 +397,8 @@ pub const Fsm = struct {
         var fk = try Sha256.finishedKey(base);
         defer fk.wipe();
         const th = Sha256.transcriptHash(self.transcript[0..self.transcript_len]);
-        const vd = try Sha256.finishedVerifyData(&fk, &th);
+        var vd = try Sha256.finishedVerifyData(&fk, &th);
+        defer secureZero(&vd);
         try writeHandshake(allocator, out, .finished, &vd);
     }
 
@@ -405,8 +409,10 @@ pub const Fsm = struct {
         var fk = try Sha256.finishedKey(base);
         defer fk.wipe();
         const th = Sha256.transcriptHash(self.transcript[0..self.transcript_len]);
-        const expected = try Sha256.finishedVerifyData(&fk, &th);
-        if (!ctEql(&expected, body)) return error.FinishedMismatch;
+        var expected = try Sha256.finishedVerifyData(&fk, &th);
+        defer secureZero(&expected);
+        // Constant-time MAC compare via std (project invariant); body.len checked above.
+        if (!std.crypto.timing_safe.eql([Sha256.hash_len]u8, expected, body[0..Sha256.hash_len].*)) return error.FinishedMismatch;
     }
 
     fn sealHandshake(self: *Fsm, allocator: Allocator, plaintext: []const u8, from: Role) Error![]u8 {
@@ -583,13 +589,6 @@ fn writeU24(out: []u8, n: usize) void {
 
 fn readU24(bytes: []const u8) usize {
     return (@as(usize, bytes[0]) << 16) | (@as(usize, bytes[1]) << 8) | bytes[2];
-}
-
-fn ctEql(expected: *const [Sha256.hash_len]u8, actual: []const u8) bool {
-    if (actual.len != Sha256.hash_len) return false;
-    var diff: u8 = 0;
-    for (expected.*, actual) |a, b| diff |= a ^ b;
-    return diff == 0;
 }
 
 fn secureZero(buf: []u8) void {
