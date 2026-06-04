@@ -32,6 +32,7 @@ const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const ban_db = @import("ban_db.zig");
+const whox = @import("../proto/whox.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
 const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
@@ -1625,6 +1626,50 @@ pub const LinuxServer = struct {
     }
 
     /// WHO <channel|nick> — RPL_WHOREPLY (352) per match + RPL_ENDOFWHO (315).
+    /// WHOX channel reply: RPL_WHOSPCRPL (354) per member with only the requested
+    /// fields, then RPL_ENDOFWHO (315).
+    fn handleWhox(self: *LinuxServer, conn: *ConnState, target: []const u8, req: whox.Request) !void {
+        const requester = conn.session.displayName();
+        if (world_model.isChannelName(target) and self.world.channelExists(target)) {
+            var it = self.world.memberIterator(target) orelse return;
+            while (it.next()) |member| {
+                const nick = self.world.nickOf(member.*) orelse continue;
+                const mconn = self.clients.get(clientIdFromWorld(member.*));
+                const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
+                var flags_buf: [4]u8 = undefined;
+                var fl: usize = 0;
+                flags_buf[fl] = if (mconn != null and mconn.?.session.awayMessage() != null) 'G' else 'H';
+                fl += 1;
+                if (hp != 0) {
+                    flags_buf[fl] = hp;
+                    fl += 1;
+                }
+                const ctx = whox.ReplyContext{
+                    .server_name = server_name,
+                    .requester = requester,
+                    .request = req,
+                    .member = .{
+                        .channel = target,
+                        .user = usernameOf(self, member.*),
+                        .host = default_host,
+                        .server = server_name,
+                        .nick = nick,
+                        .flags = flags_buf[0..fl],
+                        .account = if (mconn) |c| (c.session.account() orelse "0") else "0",
+                        .realname = if (mconn) |c| c.session.realname() else nick,
+                    },
+                };
+                const line = whox.buildReply(self.allocator, ctx) catch continue;
+                defer self.allocator.free(line);
+                try appendToConn(conn, line);
+            }
+        }
+        var endbuf: [default_reply_bytes]u8 = undefined;
+        const end = who.writeEndOfWho(&endbuf, server_name, requester, target) catch return;
+        try appendToConn(conn, end);
+        try appendToConn(conn, "\r\n");
+    }
+
     fn handleWho(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHO"}, "Not enough parameters");
@@ -1633,6 +1678,14 @@ pub const LinuxServer = struct {
         const target = parsed.paramSlice()[0];
         const requester = conn.session.displayName();
         var buf: [default_reply_bytes]u8 = undefined;
+
+        // WHOX: `WHO <target> %<fields>[,token]` -> RPL_WHOSPCRPL (354).
+        if (parsed.param_count >= 2 and parsed.paramSlice()[1].len >= 1 and parsed.paramSlice()[1][0] == '%') {
+            if (whox.parse(parsed.paramSlice()[1])) |req| {
+                try self.handleWhox(conn, target, req);
+                return;
+            } else |_| {} // malformed selector: fall through to plain WHO
+        }
 
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
             var it = self.world.memberIterator(target) orelse return;
@@ -3992,6 +4045,33 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     a.reset();
     try writeAllFd(fd_a, "KLINE bad!*@* :spam\r\n");
     try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
+}
+
+test "threaded server: WHOX field-selected reply" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "JOIN #w\r\n");
+    try recvUntil(&a, " 366 A #w ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "WHO #w %cnuhs\r\n");
+    try recvUntil(&a, " 354 A ", 200);
+    try recvUntil(&a, " 315 A #w ", 200);
 }
 
 test "threaded server: HELP topic + unknown" {
