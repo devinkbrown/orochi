@@ -34,6 +34,7 @@ const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const ban_db = @import("ban_db.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
+const accept_list = @import("../proto/accept_list.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
 const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
@@ -474,6 +475,8 @@ const Numeric = enum(u16) {
     RPL_METADATAEND = 762,
     ERR_KEYNOTSET = 766,
     ERR_KEYINVALID = 767,
+    RPL_ACCEPTLIST = 281,
+    RPL_ENDOFACCEPT = 282,
     RPL_KNOCK = 710,
     RPL_KNOCKDLVR = 711,
     ERR_CHANOPEN = 713,
@@ -635,6 +638,7 @@ pub const LinuxServer = struct {
     history: HistoryStore,
     bans_db: ban_db.Store,
     metadata: metadata_store.DefaultStore,
+    accepts: accept_list.AcceptList(.{}),
     msg_seq: u64 = 0,
     accept_armed: bool = false,
 
@@ -682,6 +686,7 @@ pub const LinuxServer = struct {
             .history = HistoryStore.init(allocator),
             .bans_db = ban_db.Store.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
+            .accepts = accept_list.AcceptList(.{}).init(allocator),
             .start_ms = platform.monotonicMillis(),
         };
     }
@@ -693,6 +698,7 @@ pub const LinuxServer = struct {
         self.history.deinit();
         self.bans_db.deinit();
         self.metadata.deinit();
+        self.accepts.deinit();
         self.silence.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
@@ -1104,6 +1110,8 @@ pub const LinuxServer = struct {
             try self.handleChathistory(conn, line);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "METADATA")) {
             try self.handleMetadata(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCEPT")) {
+            try self.handleAcceptCmd(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REDACT")) {
             try self.handleRedact(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
@@ -2235,6 +2243,34 @@ pub const LinuxServer = struct {
         var nbuf: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "{s} {s}: {s}", .{ cmd, mask, if (removed) "removed" else "not found" }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
+    }
+
+    /// ACCEPT [+nick|-nick|*|...] — caller-id (+g) allow list. Bare/`*` lists
+    /// (RPL_ACCEPTLIST 281 / RPL_ENDOFACCEPT 282); +/- add/remove. Keyed by nick.
+    fn handleAcceptCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const owner = conn.session.displayName();
+        if (parsed.param_count == 0) {
+            try self.sendAcceptList(conn, owner);
+            return;
+        }
+        const cmd = accept_list.parse(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCEPT"}, "Invalid ACCEPT");
+            return;
+        };
+        for (cmd.slice()) |op| {
+            switch (op.action) {
+                .add => self.accepts.add(owner, op.nick) catch {},
+                .remove => self.accepts.remove(owner, op.nick) catch {},
+                .list => try self.sendAcceptList(conn, owner),
+            }
+        }
+    }
+
+    fn sendAcceptList(self: *LinuxServer, conn: *ConnState, owner: []const u8) !void {
+        var nicks: [64][]const u8 = undefined;
+        const got = self.accepts.list(owner, &nicks) catch nicks[0..0];
+        for (got) |n| try queueNumeric(conn, .RPL_ACCEPTLIST, &.{n}, "");
+        try queueNumeric(conn, .RPL_ENDOFACCEPT, &.{}, "End of /ACCEPT list");
     }
 
     /// METADATA <target> <GET|LIST|SET|CLEAR> [key [:value]] — IRCv3 metadata-2.
@@ -4113,6 +4149,32 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     a.reset();
     try writeAllFd(fd_a, "KLINE bad!*@* :spam\r\n");
     try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
+}
+
+test "threaded server: ACCEPT add + list" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "ACCEPT +bob\r\n");
+    a.reset();
+    try writeAllFd(fd_a, "ACCEPT\r\n");
+    try recvUntil(&a, " 281 A bob", 200);
+    try recvUntil(&a, " 282 A ", 200);
 }
 
 test "threaded server: METADATA set then get" {
