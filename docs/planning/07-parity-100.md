@@ -70,7 +70,7 @@
 45. [~] PROP get/set on channel/user/member entities
 46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
 47. [x] LISTX extended LIST `[~]` proto/listx.zig
-48. [~] WHISPER channel-scoped private msg `[~]` proto/whisper.zig
+48. [x] WHISPER channel-scoped private msg `[x]` live (sender+recipient must be on channel; 401/442)
 49. [x] +h HIDDEN channel mode (IRCX, NOT halfop)
 50. [~] AUTH (IRCX auth package negotiation)
 51. [ ] IRCX command gating behind `CREATE`/ISIRCX state

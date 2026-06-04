@@ -27,6 +27,7 @@ const whowas = @import("whowas.zig");
 const whowas_reply = @import("../proto/whowas_reply.zig");
 const monitor = @import("../proto/monitor.zig");
 const utf8_guard = @import("../proto/utf8_guard.zig");
+const whisper = @import("../proto/whisper.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
 const help_db = @import("../proto/help_db.zig");
@@ -1119,6 +1120,8 @@ pub const LinuxServer = struct {
             try self.handleChathistory(conn, line);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "METADATA")) {
             try self.handleMetadata(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHISPER")) {
+            try self.handleWhisper(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
@@ -2359,6 +2362,44 @@ pub const LinuxServer = struct {
             trace.emitTrace(ctx, &.{entry}, &scratch, &sink) catch {};
         }
         trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = server_name }}, &scratch, &sink) catch {};
+    }
+
+    /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
+    /// message. The sender must be on the channel; each recipient is delivered a
+    /// `:sender WHISPER <channel> <nick> :<text>` line only if also on the channel
+    /// (ERR_NOSUCHNICK 401 / ERR_NOTONCHANNEL 442 per failing recipient).
+    fn handleWhisper(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        var recipient_storage: [whisper.DEFAULT_MAX_RECIPIENTS][]const u8 = undefined;
+        const args = whisper.parseWhisperArgs(parsed.paramSlice(), &recipient_storage) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHISPER"}, "Not enough parameters");
+            return;
+        };
+        if (!self.world.channelExists(args.channel) or
+            !self.world.isMember(args.channel, worldIdFromClient(id)))
+        {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{args.channel}, "You're not on that channel");
+            return;
+        }
+        const sender = whisper.Prefix{
+            .nick = conn.session.displayName(),
+            .user = conn.session.username(),
+            .host = default_host,
+        };
+        for (args.recipients) |nick| {
+            const rwid = self.world.findNick(nick) orelse {
+                try queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick");
+                continue;
+            };
+            if (!self.world.isMember(args.channel, rwid)) {
+                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{ nick, args.channel }, "They aren't on that channel");
+                continue;
+            }
+            var line_buf: [default_reply_bytes]u8 = undefined;
+            const line = whisper.buildWhisperLine(&line_buf, sender, args.channel, nick, args.text) catch continue;
+            var crlf_buf: [default_reply_bytes]u8 = undefined;
+            const out = std.fmt.bufPrint(&crlf_buf, "{s}\r\n", .{line}) catch continue;
+            try self.deliver(clientIdFromWorld(rwid), out);
+        }
     }
 
     /// CREATE <channel> [modes] — IRCX channel creation (create-or-join as
@@ -4359,6 +4400,49 @@ test "threaded server: NAMES honors multi-prefix cap" {
     // the highest.
     try writeAllFd(fd_a, "NAMES #m\r\n");
     try recvUntil(&a, "~@A", 200);
+}
+
+test "threaded server: WHISPER delivers to channel co-member only" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #w\r\n");
+    try writeAllFd(fd_b, "JOIN #w\r\n");
+    try recvUntil(a, " 366 A #w ", 200);
+    try recvUntil(b, " 366 B #w ", 200);
+    b.reset();
+    // A whispers B on #w; B receives it.
+    try writeAllFd(fd_a, "WHISPER #w B :psst\r\n");
+    try recvUntil(b, ":A!alice@localhost WHISPER #w B :psst", 200);
+    // Whispering a nonexistent nick yields ERR_NOSUCHNICK (401).
+    a.reset();
+    try writeAllFd(fd_a, "WHISPER #w Nobody :hi\r\n");
+    try recvUntil(a, " 401 ", 200);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {
