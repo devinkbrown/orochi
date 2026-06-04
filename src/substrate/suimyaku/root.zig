@@ -20,6 +20,8 @@ pub const merkle = @import("merkle.zig");
 pub const merkle_props = @import("merkle_props.zig");
 pub const nick_claim = @import("nick_claim.zig");
 pub const peer_link = @import("peer_link.zig");
+pub const prolly = @import("prolly.zig");
+pub const riblt = @import("riblt.zig");
 pub const route_table = @import("route_table.zig");
 pub const s2s_peer = @import("s2s_peer.zig");
 pub const server_registry = @import("server_registry.zig");
@@ -49,6 +51,8 @@ test {
     _ = merkle_props;
     _ = nick_claim;
     _ = peer_link;
+    _ = prolly;
+    _ = riblt;
     _ = route_table;
     _ = s2s_peer;
     _ = server_registry;

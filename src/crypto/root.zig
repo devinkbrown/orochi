@@ -21,6 +21,7 @@ pub const tls = @import("tls.zig");
 pub const x509_props = @import("x509_props.zig");
 pub const x509_verify = @import("x509_verify.zig");
 pub const x509 = @import("x509.zig");
+pub const xwing = @import("xwing.zig");
 // gen:mods:end
 
 pub const Secret = secret.Secret;
@@ -47,5 +48,6 @@ test {
     _ = x509_props;
     _ = x509_verify;
     _ = x509;
+    _ = xwing;
     // gen:tests:end
 }
