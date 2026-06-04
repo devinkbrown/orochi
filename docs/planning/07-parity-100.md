@@ -104,7 +104,7 @@
 ## F. SASL & accounts
 
 75. [ ] SASL EXTERNAL (cert-based) — sasl.Dispatcher consolidation
-76. [ ] SASL SCRAM-SHA-256 `[~]` proto/sasl.zig
+76. [x] SASL SCRAM-SHA-256 `[~]` proto/sasl.zig
 77. [ ] SASL SCRAM-SHA-512 `[~]`
 78. [ ] Advertise EXTERNAL/SCRAM once wired
 79. [ ] ACCOUNT registration/identify path (services bridge)

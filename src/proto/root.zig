@@ -65,6 +65,7 @@ pub const numeric = @import("numeric.zig");
 pub const read_marker = @import("read_marker.zig");
 pub const sasl_props = @import("sasl_props.zig");
 pub const sasl = @import("sasl.zig");
+pub const sasl_scram_server = @import("sasl_scram_server.zig");
 pub const serverinfo = @import("serverinfo.zig");
 pub const standard_replies_props = @import("standard_replies_props.zig");
 pub const standard_replies = @import("standard_replies.zig");
@@ -152,6 +153,7 @@ test {
     _ = read_marker;
     _ = sasl_props;
     _ = sasl;
+    _ = sasl_scram_server;
     _ = serverinfo;
     _ = standard_replies_props;
     _ = standard_replies;
