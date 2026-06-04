@@ -1017,8 +1017,18 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"JOIN"}, "Not enough parameters");
             return;
         }
+        // `JOIN #a,#b key1,key2`: channels and keys are positional comma lists.
+        var channels = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
+        var keys = std.mem.splitScalar(u8, if (parsed.param_count >= 2) parsed.paramSlice()[1] else "", ',');
+        while (channels.next()) |channel| {
+            if (channel.len == 0) continue;
+            const key_part = keys.next() orelse "";
+            const key: ?[]const u8 = if (key_part.len != 0) key_part else null;
+            try self.joinOne(id, conn, channel, key);
+        }
+    }
 
-        const channel = parsed.paramSlice()[0];
+    fn joinOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, key: ?[]const u8) !void {
         if (!world_model.isChannelName(channel)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
@@ -1028,8 +1038,7 @@ pub const LinuxServer = struct {
         // member. Creating a fresh channel (founder path) bypasses all gates.
         const wid = worldIdFromClient(id);
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
-            const supplied_key: ?[]const u8 = if (parsed.param_count >= 2) parsed.paramSlice()[1] else null;
-            if (try self.joinDenied(conn, id, channel, supplied_key)) return;
+            if (try self.joinDenied(conn, id, channel, key)) return;
         }
 
         _ = try self.world.join(channel, wid);
@@ -1044,8 +1053,16 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PART"}, "Not enough parameters");
             return;
         }
+        const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else null;
+        // `PART #a,#b :reason`: comma-separated channel list, shared reason.
+        var channels = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
+        while (channels.next()) |channel| {
+            if (channel.len == 0) continue;
+            try self.partOne(id, conn, channel, reason);
+        }
+    }
 
-        const channel = parsed.paramSlice()[0];
+    fn partOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, reason: ?[]const u8) !void {
         if (!self.world.channelExists(channel)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
@@ -1055,7 +1072,6 @@ pub const LinuxServer = struct {
             return;
         }
 
-        const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else null;
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "PART", &.{channel}, reason);
@@ -3044,6 +3060,41 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: JOIN/PART comma-lists" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    // One JOIN with two channels -> both NAMES-end (366) arrive.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #x,#y\r\n");
+    try recvUntil(&a, " 366 A #x ", 200);
+    try recvUntil(&a, " 366 A #y ", 200);
+
+    // One PART with two channels -> both PART lines echoed back to A.
+    a.reset();
+    try writeAllFd(fd_a, "PART #x,#y :later\r\n");
+    try recvUntil(&a, "PART #x :later\r\n", 200);
+    try recvUntil(&a, "PART #y :later\r\n", 200);
 }
 
 test "threaded server: registered NICK change broadcasts + collision" {
