@@ -11,6 +11,7 @@ pub const convergence = @import("convergence.zig");
 pub const delta_codec = @import("delta_codec.zig");
 pub const goryu = @import("goryu.zig");
 pub const goryu_props = @import("goryu_props.zig");
+pub const gossip_round = @import("gossip_round.zig");
 pub const media = @import("media.zig");
 pub const membership_view = @import("membership_view.zig");
 pub const merkle = @import("merkle.zig");
@@ -32,6 +33,7 @@ test {
     _ = delta_codec;
     _ = goryu;
     _ = goryu_props;
+    _ = gossip_round;
     _ = media;
     _ = membership_view;
     _ = merkle;

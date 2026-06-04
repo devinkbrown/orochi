@@ -96,7 +96,7 @@
 68. [x] read-marker `[~]` proto/read_marker.zig
 69. [~] metadata `[~]` proto/metadata.zig
 70. [x] monitor (MONITOR +/-/C/L/S; 730/731/732/733/734) `[~]` proto/monitor.zig
-71. [ ] extended-monitor `[~]` proto/extended_monitor.zig
+71. [~] extended-monitor `[~]` proto/extended_monitor.zig
 72. [ ] utf8-only `[~]` proto/utf8_only.zig
 73. [~] standard-replies (FAIL/WARN/NOTE) used on new error paths
 74. [x] chathistory (needs msgstore) `[~]` proto/chathistory.zig
@@ -107,7 +107,7 @@
 76. [x] SASL SCRAM-SHA-256 `[~]` proto/sasl.zig
 77. [x] SASL SCRAM-SHA-512 `[~]`
 78. [~] Advertise EXTERNAL/SCRAM once wired
-79. [ ] ACCOUNT registration/identify path (services bridge)
+79. [~] ACCOUNT registration/identify path (services bridge)
 80. [ ] CERTFP (m_certfp / m_certadd)
 81. [ ] WHOIS RPL_WHOISLOGGEDIN 330 / certfp 276
 
@@ -128,7 +128,7 @@
 
 ## H. Mesh / S2S (Suimyaku — later milestones)
 
-94. [ ] LINKS/MAP reflect real mesh peers (Sazanami membership)
+94. [~] LINKS/MAP reflect real mesh peers (Sazanami membership)
 95. [~] Server burst / state sync (Suimyaku CRDT)
 96. [ ] Cross-node PRIVMSG routing
 97. [ ] Cross-node channel membership convergence
