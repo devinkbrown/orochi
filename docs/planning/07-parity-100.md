@@ -94,7 +94,7 @@
 66. [ ] multiline `[~]` proto/multiline.zig
 67. [ ] message-redaction / message-edit `[~]` proto/msgedit.zig
 68. [ ] read-marker `[~]` proto/read_marker.zig
-69. [ ] metadata `[~]` proto/metadata.zig
+69. [~] metadata `[~]` proto/metadata.zig
 70. [x] monitor (MONITOR +/-/C/L/S; 730/731/732/733/734) `[~]` proto/monitor.zig
 71. [ ] extended-monitor `[~]` proto/extended_monitor.zig
 72. [ ] utf8-only `[~]` proto/utf8_only.zig
@@ -105,7 +105,7 @@
 
 75. [ ] SASL EXTERNAL (cert-based) — sasl.Dispatcher consolidation
 76. [x] SASL SCRAM-SHA-256 `[~]` proto/sasl.zig
-77. [ ] SASL SCRAM-SHA-512 `[~]`
+77. [x] SASL SCRAM-SHA-512 `[~]`
 78. [ ] Advertise EXTERNAL/SCRAM once wired
 79. [ ] ACCOUNT registration/identify path (services bridge)
 80. [ ] CERTFP (m_certfp / m_certadd)
