@@ -452,6 +452,10 @@ const Numeric = enum(u16) {
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
     RPL_ENDOFBANLIST = 368,
+    RPL_INVITELIST = 346,
+    RPL_ENDOFINVITELIST = 347,
+    RPL_EXCEPTLIST = 348,
+    RPL_ENDOFEXCEPTLIST = 349,
     RPL_KNOCK = 710,
     RPL_KNOCKDLVR = 711,
     ERR_CHANOPEN = 713,
@@ -1114,14 +1118,16 @@ pub const LinuxServer = struct {
         const wid = worldIdFromClient(id);
         const invited = self.world.hasInvite(channel, wid);
 
+        var mask_buf: [256]u8 = undefined;
+        const mask = try clientPrefix(conn, &mask_buf);
         if (!invited) {
-            var mask_buf: [256]u8 = undefined;
-            const mask = try clientPrefix(conn, &mask_buf);
+            // +b ban (isBanned already honors +e exceptions) blocks the join.
             if (self.world.isBanned(channel, mask)) {
                 try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
                 return true;
             }
-            if (self.world.channelHasFlag(channel, .invite_only)) {
+            // +i blocks unless the user holds an invite OR matches a +I invex mask.
+            if (self.world.channelHasFlag(channel, .invite_only) and !self.world.isInvexed(channel, mask)) {
                 try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
                 return true;
             }
@@ -1409,7 +1415,35 @@ pub const LinuxServer = struct {
                         appendParamMode(&applied, &targets, &emitted_sign, sign, 'b', mask);
                     }
                 },
-                else => {}, // e/I list modes not tracked yet
+                'e' => {
+                    // No argument => RPL_EXCEPTLIST query (348/349).
+                    if (arg_index >= parsed.param_count) {
+                        try self.sendMaskList(conn, channel, self.world.exemptsOf(channel), .RPL_EXCEPTLIST, .RPL_ENDOFEXCEPTLIST, "End of channel exception list");
+                        continue;
+                    }
+                    const mask = parsed.paramSlice()[arg_index];
+                    arg_index += 1;
+                    const changed = if (adding)
+                        (self.world.addExempt(channel, mask) catch continue)
+                    else
+                        (self.world.removeExempt(channel, mask) catch continue);
+                    if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'e', mask);
+                },
+                'I' => {
+                    // No argument => RPL_INVITELIST query (346/347).
+                    if (arg_index >= parsed.param_count) {
+                        try self.sendMaskList(conn, channel, self.world.invexOf(channel), .RPL_INVITELIST, .RPL_ENDOFINVITELIST, "End of channel invite exception list");
+                        continue;
+                    }
+                    const mask = parsed.paramSlice()[arg_index];
+                    arg_index += 1;
+                    const changed = if (adding)
+                        (self.world.addInvex(channel, mask) catch continue)
+                    else
+                        (self.world.removeInvex(channel, mask) catch continue);
+                    if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'I', mask);
+                },
+                else => {}, // remaining list/param modes not tracked yet
             }
         }
 
@@ -2459,12 +2493,27 @@ pub const LinuxServer = struct {
 
     /// RPL_BANLIST (367) for each +b mask, terminated by RPL_ENDOFBANLIST (368).
     fn sendBanList(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
-        if (self.world.bansOf(channel)) |masks| {
-            for (masks) |mask| {
-                try queueNumeric(conn, .RPL_BANLIST, &.{ channel, mask }, "");
+        try self.sendMaskList(conn, channel, self.world.bansOf(channel), .RPL_BANLIST, .RPL_ENDOFBANLIST, "End of channel ban list");
+    }
+
+    /// Emit a channel mask list (one `list_code` per mask, then `end_code`).
+    /// Shared by +b (367/368), +e (348/349), +I (346/347).
+    fn sendMaskList(
+        self: *LinuxServer,
+        conn: *ConnState,
+        channel: []const u8,
+        masks: ?[]const []const u8,
+        list_code: Numeric,
+        end_code: Numeric,
+        end_text: []const u8,
+    ) !void {
+        _ = self;
+        if (masks) |entries| {
+            for (entries) |mask| {
+                try queueNumeric(conn, list_code, &.{ channel, mask }, "");
             }
         }
-        try queueNumeric(conn, .RPL_ENDOFBANLIST, &.{channel}, "End of channel ban list");
+        try queueNumeric(conn, end_code, &.{channel}, end_text);
     }
 
     fn sendNames(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
@@ -3391,6 +3440,66 @@ test "threaded server: TAGMSG relays client tags to message-tags peers" {
     b.reset();
     try writeAllFd(fd_a, "@+typing=active TAGMSG #t\r\n");
     try recvUntil(&b, "@+typing=active :A!alice@localhost TAGMSG #t\r\n", 200);
+}
+
+test "threaded server: +e/+I list queries + +I join bypass" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // A founds #p, sets +i, and a +I invite-exception matching B.
+    try writeAllFd(fd_a, "JOIN #p\r\n");
+    try recvUntil(&a, " 366 A #p ", 200);
+    try writeAllFd(fd_a, "MODE #p +i\r\n");
+    try recvUntil(&a, "MODE #p +i", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #p +I B!*@*\r\n");
+    try recvUntil(&a, "MODE #p +I B!*@*", 200);
+
+    // B (no invite) joins #p because it matches the +I mask.
+    try writeAllFd(fd_b, "JOIN #p\r\n");
+    try recvUntil(&b, " 366 B #p ", 200);
+
+    // +e list query: empty -> just 349; after +e -> 348 entry + 349.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #p e\r\n");
+    try recvUntil(&a, " 349 A #p ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #p +e x!*@*\r\n");
+    try recvUntil(&a, "MODE #p +e x!*@*", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #p e\r\n");
+    try recvUntil(&a, " 348 A #p x!*@*", 200);
+    try recvUntil(&a, " 349 A #p ", 200);
+
+    // +I list query -> 346 entry + 347.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #p I\r\n");
+    try recvUntil(&a, " 346 A #p B!*@*", 200);
+    try recvUntil(&a, " 347 A #p ", 200);
 }
 
 test "threaded server: IRCv3 invite-notify to cap holders" {

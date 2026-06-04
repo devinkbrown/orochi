@@ -37,10 +37,10 @@
 18. [x] MODE +l <limit> set/unset
 19. [x] MODE +i toggle (already a flag) + invite-list recording via INVITE
 20. [x] MODE +b <mask> add/remove (ban list storage)
-21. [ ] MODE +e <mask> ban-exception list
-22. [ ] MODE +I <mask> invite-exception list
+21. [x] MODE +e <mask> ban-exception list
+22. [x] MODE +I <mask> invite-exception list
 23. [x] RPL_BANLIST 367 / RPL_ENDOFBANLIST 368
-24. [ ] RPL_EXCEPTLIST 348 / 349, RPL_INVITELIST 346 / 347
+24. [x] RPL_EXCEPTLIST 348 / 349, RPL_INVITELIST 346 / 347
 25. [x] JOIN enforce +k → ERR_BADCHANNELKEY 475
 26. [x] JOIN enforce +l → ERR_CHANNELISFULL 471
 27. [x] JOIN enforce +i → ERR_INVITEONLYCHAN 473 (respect invite list)
