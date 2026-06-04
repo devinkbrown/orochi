@@ -29,6 +29,11 @@ const monitor = @import("../proto/monitor.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
 const help_db = @import("../proto/help_db.zig");
+const lotus = @import("../proto/lotus.zig");
+const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
+
+/// Live CHATHISTORY message store (per-channel ring).
+const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
 
 /// Bounded WHOWAS history ring shared by the live server. Field caps match the
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
@@ -618,6 +623,8 @@ pub const LinuxServer = struct {
     monitor: monitor.MonitorStore,
     read_markers: read_marker_store.DefaultStore,
     silence: silence.Store,
+    history: HistoryStore,
+    msg_seq: u64 = 0,
     accept_armed: bool = false,
 
     /// Single configured operator credential (OPER <name> <pass>). Static for
@@ -661,6 +668,7 @@ pub const LinuxServer = struct {
             .monitor = monitor.MonitorStore.init(allocator, 128),
             .read_markers = read_marker_store.DefaultStore.init(allocator),
             .silence = silence.Store.init(allocator),
+            .history = HistoryStore.init(allocator),
             .start_ms = platform.monotonicMillis(),
         };
     }
@@ -669,6 +677,7 @@ pub const LinuxServer = struct {
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) closeFd(slot.value.fd);
         }
+        self.history.deinit();
         self.silence.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
@@ -1068,6 +1077,8 @@ pub const LinuxServer = struct {
             try self.handleSilence(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "HELP") or std.ascii.eqlIgnoreCase(parsed.command, "HELPOP")) {
             try self.handleHelp(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CHATHISTORY")) {
+            try self.handleChathistory(conn, line);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
             try self.handleStats(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TAGMSG")) {
@@ -2040,6 +2051,65 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Record a channel message into the CHATHISTORY ring (Lotus). msgid is a
+    /// monotonic server counter; sender is the full nick!user@host prefix.
+    fn recordHistory(self: *LinuxServer, target: []const u8, conn: *ConnState, text: []const u8) void {
+        self.msg_seq += 1;
+        var id_buf: [24]u8 = undefined;
+        const msgid = std.fmt.bufPrint(&id_buf, "{d}", .{self.msg_seq}) catch return;
+        var prefix_buf: [256]u8 = undefined;
+        const sender = clientPrefix(conn, &prefix_buf) catch return;
+        const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+        _ = self.history.append(target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts }) catch {};
+    }
+
+    /// CHATHISTORY <sub> <target> <criteria...> <limit> — IRCv3 history replay.
+    /// Supports LATEST and BEFORE/AFTER with timestamp selectors over the Lotus
+    /// ring; emits a `chathistory` BATCH of PRIVMSG lines (msgid+server-time).
+    fn handleChathistory(self: *LinuxServer, conn: *ConnState, line: []const u8) !void {
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        const req = chathistory_cmd.parse(trimmed) catch return; // malformed: silent (FAIL TODO)
+        var buf: [64]lotus.Message = undefined;
+        var target: []const u8 = "";
+        var found: []const lotus.Message = buf[0..0];
+        switch (req) {
+            .latest => |r| {
+                target = r.target;
+                const n = @min(@as(usize, r.limit), buf.len);
+                found = self.history.latest(target, n, buf[0..n]) catch buf[0..0];
+            },
+            .before => |r| {
+                target = r.target;
+                const n = @min(@as(usize, r.limit), buf.len);
+                switch (r.selector) {
+                    .timestamp => |ts| found = self.history.before(target, ts, n, buf[0..n]) catch buf[0..0],
+                    .msgid => {},
+                }
+            },
+            .after => |r| {
+                target = r.target;
+                const n = @min(@as(usize, r.limit), buf.len);
+                switch (r.selector) {
+                    .timestamp => |ts| found = self.history.after(target, ts, n, buf[0..n]) catch buf[0..0],
+                    .msgid => {},
+                }
+            },
+            .between => |r| target = r.target,
+            .around => |r| target = r.target,
+        }
+
+        var cmsgs: [64]chathistory_cmd.Message = undefined;
+        var cn: usize = 0;
+        for (found) |m| {
+            if (m.tombstone) continue;
+            cmsgs[cn] = .{ .timestamp_ms = m.timestamp, .msgid = m.msgid, .sender = m.sender, .text = m.text };
+            cn += 1;
+        }
+        var out_buf: [default_reply_bytes * 4]u8 = undefined;
+        const batch = chathistory_cmd.writeBatch(&out_buf, "1", target, cmsgs[0..cn]) catch return;
+        try appendToConn(conn, batch);
+    }
+
     /// HELP / HELPOP [topic] — static help topics (704/705/706, 524 if unknown).
     /// Defaults to the HELP index topic when no argument is given.
     fn handleHelp(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -2532,6 +2602,9 @@ pub const LinuxServer = struct {
                 try self.broadcastChannelMinRank(chan, ctags, msg, id, min_rank);
             }
             if (echo) try self.deliverTagged(id, ctags, msg);
+            // Record into the CHATHISTORY ring (full status-prefix stripped: bare
+            // chan). Only the message body + sender prefix are stored.
+            if (min_rank == 0) self.recordHistory(chan, conn, text);
             return;
         }
 
@@ -3854,6 +3927,51 @@ test "threaded server: SILENCE add/list/remove" {
     a.reset();
     try writeAllFd(fd_a, "SILENCE -B!*@*\r\n");
     try recvUntil(&a, "SILENCE -B!*@*\r\n", 200);
+}
+
+test "threaded server: CHATHISTORY records + replays channel messages" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #h\r\n");
+    try recvUntil(&a, " 366 A #h ", 200);
+    try writeAllFd(fd_b, "JOIN #h\r\n");
+    try recvUntil(&b, " 366 B #h ", 200);
+
+    // B sends two channel messages (recorded into the CHATHISTORY ring).
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #h :msg-one\r\n");
+    try recvUntil(&a, "PRIVMSG #h :msg-one", 200);
+    try writeAllFd(fd_b, "PRIVMSG #h :msg-two\r\n");
+    try recvUntil(&a, "PRIVMSG #h :msg-two", 200);
+
+    // A replays: BATCH-wrapped history with both messages.
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY LATEST #h * 10\r\n");
+    try recvUntil(&a, "BATCH +1 chathistory #h", 200);
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-one", 200);
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
+    try recvUntil(&a, "BATCH -1", 200);
 }
 
 test "threaded server: MARKREAD set then get" {

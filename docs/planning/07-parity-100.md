@@ -99,7 +99,7 @@
 71. [ ] extended-monitor `[~]` proto/extended_monitor.zig
 72. [ ] utf8-only `[~]` proto/utf8_only.zig
 73. [ ] standard-replies (FAIL/WARN/NOTE) used on new error paths
-74. [ ] chathistory (needs msgstore) `[~]` proto/chathistory.zig
+74. [x] chathistory (needs msgstore) `[~]` proto/chathistory.zig
 
 ## F. SASL & accounts
 
