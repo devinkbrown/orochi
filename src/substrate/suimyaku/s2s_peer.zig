@@ -247,7 +247,14 @@ pub const S2sPeer = struct {
 
     fn recvHandshake(self: *S2sPeer, payload: []const u8, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {
         const hs = try decodeHandshake(payload);
-        if (hs.node_id != self.remote_node_id) return error.UnexpectedRemote;
+        // remote_node_id == 0 means "unknown peer" (an accepting/dialing side that
+        // does not know the remote's node id in advance): adopt it from the first
+        // handshake. Otherwise enforce the expected identity.
+        if (self.remote_node_id == 0) {
+            self.remote_node_id = hs.node_id;
+        } else if (hs.node_id != self.remote_node_id) {
+            return error.UnexpectedRemote;
+        }
 
         try self.rememberRemote(hs, now_ms);
         if (!self.handshake_sent) try self.emitHandshake(sink);

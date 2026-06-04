@@ -526,6 +526,7 @@ const Numeric = enum(u16) {
     RPL_STATSDLINE = 225,
     RPL_ENDOFSTATS = 219,
     ERR_NOSUCHNICK = 401,
+    ERR_NOSUCHSERVER = 402,
     ERR_NOSUCHCHANNEL = 403,
     ERR_CANNOTSENDTOCHAN = 404,
     ERR_CHANNELISFULL = 471,
@@ -1300,6 +1301,8 @@ pub const LinuxServer = struct {
             try self.handleModex(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CONNECT")) {
             try self.handleConnectCmd(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SQUIT")) {
+            try self.handleSquit(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTLINE")) {
             try self.handleTestline(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTMASK")) {
@@ -2665,6 +2668,36 @@ pub const LinuxServer = struct {
 
         try self.ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
         try self.noticeTo(conn, "CONNECT initiated");
+    }
+
+    /// SQUIT <server> [:reason] — oper command: tear down the S2S link to a peer
+    /// identified by its (handshake-learned) server name.
+    fn handleSquit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; SQUIT is for operators");
+            return;
+        }
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SQUIT"}, "Not enough parameters");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+        // Find the matching peer first, then close it (don't free a slot mid-iter).
+        var victim: ?RingFdToken = null;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const link = entry.value.s2s orelse continue;
+            if (std.ascii.eqlIgnoreCase(link.remoteName(), target)) {
+                victim = entry.value.token;
+                break;
+            }
+        }
+        if (victim) |tok| {
+            try self.closeConn(tok, "SQUIT");
+            try self.noticeTo(conn, "SQUIT complete");
+        } else {
+            try queueNumeric(conn, .ERR_NOSUCHSERVER, &.{target}, "No such server");
+        }
     }
 
     /// Send a server NOTICE to a single connection.
@@ -6090,6 +6123,29 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     }
     try std.testing.expect(peer.established());
     try std.testing.expect(peer.knownServers() >= 2);
+
+    // The oper can SQUIT the peer by its handshake-learned name. The server learns
+    // that name asynchronously (its recv of the peer's handshake), so retry until
+    // SQUIT resolves the name rather than racing the handshake completion.
+    var squit_ok = false;
+    var tries: usize = 0;
+    while (tries < 40 and !squit_ok) : (tries += 1) {
+        a.reset();
+        try writeAllFd(fd_a, "SQUIT remote.test\r\n");
+        var q: usize = 0;
+        while (q < 8 and !squit_ok) : (q += 1) {
+            var fds = [_]posix.pollfd{.{ .fd = fd_a, .events = linux.POLL.IN, .revents = 0 }};
+            const rr = posix.poll(&fds, 25) catch break;
+            if (rr != 0 and (fds[0].revents & linux.POLL.IN) != 0) {
+                if (a.len < a.buf.len) {
+                    const m = readFd(fd_a, a.buf[a.len..]) catch break;
+                    a.len += m;
+                }
+            }
+            if (std.mem.indexOf(u8, a.written(), "SQUIT complete") != null) squit_ok = true;
+        }
+    }
+    try std.testing.expect(squit_ok);
 }
 
 test {
