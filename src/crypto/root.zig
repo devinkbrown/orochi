@@ -15,6 +15,7 @@ pub const sign_kat = @import("sign_kat.zig");
 pub const sign = @import("sign.zig");
 pub const tls_kat = @import("tls_kat.zig");
 pub const tls_props = @import("tls_props.zig");
+pub const tls_record = @import("tls_record.zig");
 pub const tls = @import("tls.zig");
 pub const x509_props = @import("x509_props.zig");
 pub const x509 = @import("x509.zig");
@@ -38,6 +39,7 @@ test {
     _ = sign;
     _ = tls_kat;
     _ = tls_props;
+    _ = tls_record;
     _ = tls;
     _ = x509_props;
     _ = x509;

@@ -7,6 +7,7 @@ const substrate = @import("../substrate/root.zig");
 pub const ban_db = @import("ban_db.zig");
 pub const chanmode = @import("chanmode.zig");
 pub const client = @import("client.zig");
+pub const clone_detect = @import("clone_detect.zig");
 pub const commands = @import("commands.zig");
 pub const config = @import("config.zig");
 pub const dispatch = @import("dispatch.zig");
@@ -29,6 +30,7 @@ test {
     _ = ban_db;
     _ = chanmode;
     _ = client;
+    _ = clone_detect;
     _ = commands;
     _ = config;
     _ = dispatch;
