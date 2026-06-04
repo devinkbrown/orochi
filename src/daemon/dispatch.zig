@@ -7,6 +7,7 @@
 const std = @import("std");
 const sasl = @import("../proto/sasl.zig");
 const usermode = @import("../proto/usermode.zig");
+const event_spine = @import("event_spine.zig");
 
 pub const UserMode = usermode.UserMode;
 
@@ -414,6 +415,10 @@ pub const ClientSession = struct {
     is_oper: bool = false,
     /// User modes (+i invisible, +B bot, ...). Set via MODE on the own nick.
     umodes: usermode.UmodeSet = .{},
+    /// IRCX Event Spine subscription mask. WALLOPS/SNOMASK/oper notices are
+    /// delivered as typed events to sessions subscribed to the matching category
+    /// (replacing the legacy +w umode). Opers are subscribed on OPER.
+    event_mask: event_spine.CategoryMask = .{},
 
     pub fn init() ClientSession {
         return .{};
@@ -471,6 +476,16 @@ pub const ClientSession = struct {
         return self.umodes.contains(.bot);
     }
 
+    /// Whether the session is subscribed to an Event Spine category (oper notices).
+    pub fn subscribesTo(self: *const ClientSession, category: event_spine.EventCategory) bool {
+        return self.event_mask.contains(category);
+    }
+
+    /// Replace the session's Event Spine subscription mask.
+    pub fn setEventMask(self: *ClientSession, mask: event_spine.CategoryMask) void {
+        self.event_mask = mask;
+    }
+
     /// Render active user modes as "+iB" into `out` (caller-owned, >= 9 bytes).
     pub fn umodeString(self: *const ClientSession, out: []u8) []const u8 {
         var n: usize = 0;
@@ -487,7 +502,6 @@ pub const ClientSession = struct {
             .{ .m = .callerid, .c = 'g' },
             .{ .m = .no_ctcp, .c = 'T' },
             .{ .m = .cloaked, .c = 'x' },
-            .{ .m = .wallop, .c = 'w' },
         };
         for (letters) |l| {
             if (self.umodes.contains(l.m) and n < out.len) {

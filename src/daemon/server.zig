@@ -10,6 +10,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 const dispatch = @import("dispatch.zig");
+const event_spine = @import("event_spine.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
 const sasl = @import("../proto/sasl.zig");
@@ -1488,13 +1489,8 @@ pub const LinuxServer = struct {
             switch (ch) {
                 '+' => adding = true,
                 '-' => adding = false,
-                'i', 'B', 'w' => {
-                    const mode: dispatch.UserMode = switch (ch) {
-                        'i' => .invisible,
-                        'B' => .bot,
-                        'w' => .wallop,
-                        else => unreachable,
-                    };
+                'i', 'B' => {
+                    const mode: dispatch.UserMode = if (ch == 'i') .invisible else .bot;
                     if (conn.session.setUmode(mode, adding)) {
                         appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
                     }
@@ -2166,7 +2162,9 @@ pub const LinuxServer = struct {
             return;
         }
         conn.session.is_oper = true;
-        _ = conn.session.setUmode(.wallop, true); // opers receive WALLOPS by default (+w)
+        // Subscribe the new oper to all Event Spine categories — wallops, oper
+        // notices, kills, etc. arrive as typed events (IRCX EVENT model).
+        conn.session.setEventMask(event_spine.CategoryMask.all());
         try queueNumeric(conn, .RPL_YOUREOPER, &.{}, "You are now an IRC operator");
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
@@ -2187,15 +2185,25 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WALLOPS"}, "Not enough parameters");
             return;
         }
-        var prefix_buf: [256]u8 = undefined;
-        var msg_buf: [default_reply_bytes]u8 = undefined;
-        const prefix = try clientPrefix(conn, &prefix_buf);
-        const msg = try formatMessage(&msg_buf, prefix, "WALLOPS", &.{}, parsed.paramSlice()[0]);
-        // ophion: WALLOPS reaches everyone with +w (opers get +w on OPER; users
-        // may set it themselves), not just operators.
+        // IRCX (ophion m_ircx_event.c): WALLOPS is merged into the EVENT
+        // BROADCAST/announce category — an oper-visible typed event, not a +w
+        // umode. Build the event with the sender as subject and deliver the
+        // rendered `NOTE EVENT ANNOUNCE` to every announce-subscribed session.
+        var subj_buf: [256]u8 = undefined;
+        const subject = try clientPrefix(conn, &subj_buf);
+        var msg_buf: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ subject, parsed.paramSlice()[0] }) catch parsed.paramSlice()[0];
+        const event = event_spine.Event{
+            .category = .announce,
+            .severity = .notice,
+            .timestamp_ms = platform.realtimeMillis(),
+            .message = message,
+        };
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = event_spine.renderOperNote(.{ .server_name = server_name, .event = event }, &line_buf) catch return;
         var it = self.clients.iterator();
         while (it.next()) |entry| {
-            if (entry.value.session.hasUmode(.wallop)) try self.deliver(entry.id, msg);
+            if (entry.value.session.subscribesTo(.announce)) try self.deliver(entry.id, line);
         }
     }
 
@@ -3200,14 +3208,11 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     try writeAllFd(fd_a, "WHOIS A\r\n");
     try recvUntil(&a, " 313 A A ", 200);
     a.reset();
+    // WALLOPS is delivered as an oper-visible Event Spine announce: the oper A
+    // (subscribed on OPER) receives a NOTE EVENT ANNOUNCE carrying the message.
     try writeAllFd(fd_a, "WALLOPS :hello opers\r\n");
-    try recvUntil(&a, "WALLOPS :hello opers\r\n", 200);
-    // A non-oper who sets +w also receives WALLOPS.
-    try writeAllFd(fd_b, "MODE B +w\r\n");
-    try recvUntil(&b, "MODE B +w", 200);
-    b.reset();
-    try writeAllFd(fd_a, "WALLOPS :for +w users\r\n");
-    try recvUntil(&b, "WALLOPS :for +w users\r\n", 200);
+    try recvUntil(&a, "NOTE EVENT ANNOUNCE :", 200);
+    try recvUntil(&a, "hello opers", 200);
     // REHASH now permitted (382).
     a.reset();
     try writeAllFd(fd_a, "REHASH\r\n");

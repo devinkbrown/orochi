@@ -68,7 +68,7 @@
 43. [ ] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig
 44. [ ] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[~]` proto/ircx_saccess.zig
 45. [ ] PROP get/set on channel/user/member entities
-46. [ ] EVENT subscribe/unsubscribe (Event Spine wiring)
+46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
 47. [ ] LISTX extended LIST `[~]` proto/listx.zig
 48. [ ] WHISPER channel-scoped private msg `[~]` proto/whisper.zig
 49. [ ] +h HIDDEN channel mode (IRCX, NOT halfop)
@@ -123,7 +123,7 @@
 89. [ ] SNOMASK / server notices (+s umode)
 90. [ ] OPER MODE +o user-umode reflection + RPL_UMODEIS
 91. [x] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
-92. [x] WALLOPS gated to +w umode recipients (not all opers)
+92. [x] WALLOPS via Event Spine announce/BROADCAST (oper-visible event, not +w umode)
 93. [ ] GRANT / privilege sets (oper.zig Privilege wiring)
 
 ## H. Mesh / S2S (Suimyaku — later milestones)

@@ -17,7 +17,6 @@ pub const UserMode = enum(u4) {
     callerid,
     no_ctcp,
     cloaked,
-    wallop,
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
