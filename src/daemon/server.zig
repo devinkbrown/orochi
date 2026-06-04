@@ -508,6 +508,7 @@ const Numeric = enum(u16) {
     // (918 is IRCERR_EVENTDUP — do not reuse it for PROP denial.)
     ERR_NOACCESS = 913,
     ERR_NOWHISPER = 923,
+    ERR_BADVALUE = 906,
     RPL_IRCX = 800,
     RPL_TESTLINE = 725,
     RPL_NOTESTLINE = 726,
@@ -1171,6 +1172,22 @@ pub const LinuxServer = struct {
         const was_registered = conn.session.registered();
 
         if (!was_registered) {
+            // IRCX discovery must work BEFORE registration (draft-pfenning): an
+            // unregistered client probes support via IRCX/ISIRCX/MODE ISIRCX.
+            if (std.ascii.eqlIgnoreCase(parsed.command, "IRCX")) {
+                try self.handleIrcx(conn, true);
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(parsed.command, "ISIRCX")) {
+                try self.handleIrcx(conn, false);
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(parsed.command, "MODE") and
+                parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "ISIRCX"))
+            {
+                try self.handleIrcx(conn, false);
+                return;
+            }
             var sink = QueueSink{ .conn = conn };
             try processLine(conn, line, &sink);
             if (conn.session.registered()) {
@@ -3029,22 +3046,41 @@ pub const LinuxServer = struct {
     /// channel key; MEMBERLIMIT <-> +l limit. Returns true if the key is a linked
     /// built-in (and was applied), false to fall through to the generic store.
     /// Access is gated by the caller (propAccess == channel-op/owner).
-    fn channelBuiltinSet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, value: []const u8, deleting: bool) bool {
-        if (entity.kind != .channel) return false;
+    const BuiltinSet = enum { not_handled, applied, bad_value };
+
+    fn channelBuiltinSet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, value: []const u8, deleting: bool) BuiltinSet {
+        if (entity.kind != .channel) return .not_handled;
         if (std.ascii.eqlIgnoreCase(key, "MEMBERKEY")) {
-            self.world.setChannelKey(entity.id, if (deleting) null else value) catch {};
-            return true;
+            if (!deleting and value.len > 31) return .bad_value; // draft cap
+            self.world.setChannelKey(entity.id, if (deleting) null else value) catch return .bad_value;
+            return .applied;
         }
         if (std.ascii.eqlIgnoreCase(key, "MEMBERLIMIT")) {
             if (deleting) {
-                self.world.setChannelLimit(entity.id, null) catch {};
+                self.world.setChannelLimit(entity.id, null) catch return .bad_value;
             } else {
-                const limit = std.fmt.parseInt(u32, value, 10) catch return true;
-                self.world.setChannelLimit(entity.id, limit) catch {};
+                const limit = std.fmt.parseInt(u32, value, 10) catch return .bad_value;
+                self.world.setChannelLimit(entity.id, limit) catch return .bad_value;
             }
-            return true;
+            return .applied;
         }
-        return false;
+        return .not_handled;
+    }
+
+    /// Broadcast the equivalent MODE change after a PROP built-in linked to a
+    /// channel mode, so every member's mode view stays in sync (MEMBERKEY→+k,
+    /// MEMBERLIMIT→+l). Cleared values broadcast the `-` form.
+    fn broadcastBuiltinMode(self: *LinuxServer, conn: *ConnState, channel: []const u8, key: []const u8, value: []const u8, deleting: bool) !void {
+        const letter: u8 = if (std.ascii.eqlIgnoreCase(key, "MEMBERKEY")) 'k' else 'l';
+        var sign_buf = [_]u8{ if (deleting) '-' else '+', letter };
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const params: []const []const u8 = if (deleting)
+            &.{ channel, sign_buf[0..] }
+        else
+            &.{ channel, sign_buf[0..], value };
+        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "MODE", params, null);
+        try self.broadcastChannel(channel, msg, null);
     }
 
     fn propEmitBuiltin(conn: *ConnState, entity: ircx_prop_store.Entity, key: []const u8, value: []const u8) !void {
@@ -3119,11 +3155,20 @@ pub const LinuxServer = struct {
                     return;
                 };
                 // Linked built-ins (MEMBERKEY<->+k, MEMBERLIMIT<->+l) write through
-                // to live channel state instead of the generic store.
-                if (self.channelBuiltinSet(m.entity, m.key, m.value, false)) {
-                    try propEmitBuiltin(conn, m.entity, m.key, m.value);
-                    try propEmitEnd(conn, m.entity);
-                    return;
+                // to live channel state instead of the generic store, and broadcast
+                // the equivalent MODE so member mode views stay in sync.
+                switch (self.channelBuiltinSet(m.entity, m.key, m.value, false)) {
+                    .applied => {
+                        try self.broadcastBuiltinMode(conn, m.entity.id, m.key, m.value, false);
+                        try propEmitBuiltin(conn, m.entity, m.key, m.value);
+                        try propEmitEnd(conn, m.entity);
+                        return;
+                    },
+                    .bad_value => {
+                        try queueNumeric(conn, .ERR_BADVALUE, &.{ m.entity.id, m.key }, "Invalid property value");
+                        return;
+                    },
+                    .not_handled => {},
                 }
                 const setter = ircx_prop_store.Setter{ .id = conn.session.displayName(), .access = access };
                 const ev = self.props.setProp(m.entity, m.key, m.value, setter) catch {
