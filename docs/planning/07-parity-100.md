@@ -121,7 +121,7 @@
 87. [ ] TESTLINE / TESTMASK
 88. [x] TRACE / ETRACE (200-262 family)
 89. [~] SNOMASK / server notices (+s umode)
-90. [ ] OPER MODE +o user-umode reflection + RPL_UMODEIS
+90. [x] OPER MODE +o user-umode reflection + RPL_UMODEIS `[x]` live — umodeString emits +o when is_oper; RPL_UMODEIS (221) shows it
 91. [x] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
 92. [x] WALLOPS via Event Spine announce/BROADCAST (oper-visible event, not +w umode)
 93. [~] GRANT / privilege sets (oper.zig Privilege wiring)

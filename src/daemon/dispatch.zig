@@ -493,6 +493,11 @@ pub const ClientSession = struct {
             out[n] = '+';
             n += 1;
         }
+        // +o operator: derived from is_oper (set by OPER, not client-settable).
+        if (self.is_oper and n < out.len) {
+            out[n] = 'o';
+            n += 1;
+        }
         const letters = [_]struct { m: usermode.UserMode, c: u8 }{
             .{ .m = .invisible, .c = 'i' },
             .{ .m = .bot, .c = 'B' },

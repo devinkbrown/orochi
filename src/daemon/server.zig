@@ -5081,6 +5081,10 @@ test "threaded server: EVENT subscription managed by opers" {
     // OPER auto-subscribes to all categories; DEL KILL removes just that one.
     try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
     try recvUntil(&a, " 381 A ", 200);
+    // OPER reflects +o in the user mode query (RPL_UMODEIS 221).
+    a.reset();
+    try writeAllFd(fd_a, "MODE A\r\n");
+    try recvUntil(&a, " 221 A :+o", 200);
     try writeAllFd(fd_a, "EVENT DEL KILL\r\n");
     try recvUntil(&a, "EVENT LIST :End of event list", 200);
     a.reset();
