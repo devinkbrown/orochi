@@ -6,6 +6,7 @@ pub const aead_kat = @import("aead_kat.zig");
 pub const ed25519_batch = @import("ed25519_batch.zig");
 pub const hash = @import("hash.zig");
 pub const hash_kat = @import("hash_kat.zig");
+pub const hkdf_tls13 = @import("hkdf_tls13.zig");
 pub const kx_kat = @import("kx_kat.zig");
 pub const kx = @import("kx.zig");
 pub const random = @import("random.zig");
@@ -28,6 +29,7 @@ test {
     _ = ed25519_batch;
     _ = hash;
     _ = hash_kat;
+    _ = hkdf_tls13;
     _ = kx_kat;
     _ = kx;
     _ = random;

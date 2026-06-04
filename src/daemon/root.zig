@@ -12,6 +12,7 @@ pub const config = @import("config.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const event_spine = @import("event_spine.zig");
 pub const flood = @import("flood.zig");
+pub const flood_guard = @import("flood_guard.zig");
 pub const oper = @import("oper.zig");
 pub const registry = @import("registry.zig");
 pub const sasl_bridge = @import("sasl_bridge.zig");
@@ -33,6 +34,7 @@ test {
     _ = dispatch;
     _ = event_spine;
     _ = flood;
+    _ = flood_guard;
     _ = oper;
     _ = registry;
     _ = sasl_bridge;
