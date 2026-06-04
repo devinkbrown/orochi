@@ -36,6 +36,7 @@ const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
+const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
 const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .max_text = 512 });
@@ -1113,6 +1114,8 @@ pub const LinuxServer = struct {
             try self.handleMetadata(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
+            try self.handleTrace(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCEPT")) {
             try self.handleAcceptCmd(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REDACT")) {
@@ -2274,6 +2277,24 @@ pub const LinuxServer = struct {
         const got = self.accepts.list(owner, &nicks) catch nicks[0..0];
         for (got) |n| try queueNumeric(conn, .RPL_ACCEPTLIST, &.{n}, "");
         try queueNumeric(conn, .RPL_ENDOFACCEPT, &.{}, "End of /ACCEPT list");
+    }
+
+    /// TRACE — oper-only: RPL_TRACEUSER (205) per connected client + RPL_ENDOFTRACE (262).
+    fn handleTrace(self: *LinuxServer, conn: *ConnState) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        var scratch: [default_reply_bytes]u8 = undefined;
+        var sink = ConnLineSink{ .conn = conn };
+        const ctx = trace.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+        var it = self.clients.iterator();
+        while (it.next()) |e| {
+            if (!e.value.session.registered()) continue;
+            const entry = trace.TraceEntry{ .user = .{ .class = "users", .nick = e.value.session.displayName(), .ip = default_host, .connected_seconds = 0, .idle_seconds = 0 } };
+            trace.emitTrace(ctx, &.{entry}, &scratch, &sink) catch {};
+        }
+        trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = server_name }}, &scratch, &sink) catch {};
     }
 
     /// CREATE <channel> [modes] — IRCX channel creation (create-or-join as
@@ -4162,6 +4183,11 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     a.reset();
     try writeAllFd(fd_a, "KLINE bad!*@* :spam\r\n");
     try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
+    // TRACE -> 205 user line + 262 end.
+    a.reset();
+    try writeAllFd(fd_a, "TRACE\r\n");
+    try recvUntil(&a, " 205 ", 200);
+    try recvUntil(&a, " 262 ", 200);
 }
 
 test "threaded server: ACCEPT add + list" {

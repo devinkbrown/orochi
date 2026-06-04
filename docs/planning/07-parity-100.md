@@ -119,7 +119,7 @@
 85. [ ] RESTART (oper)
 86. [x] KLINE / DLINE / GLINE + UNKLINE (ban storage)
 87. [ ] TESTLINE / TESTMASK
-88. [~] TRACE / ETRACE (200-262 family)
+88. [x] TRACE / ETRACE (200-262 family)
 89. [~] SNOMASK / server notices (+s umode)
 90. [ ] OPER MODE +o user-umode reflection + RPL_UMODEIS
 91. [x] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
