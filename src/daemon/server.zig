@@ -749,6 +749,29 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Like broadcastChannel but only to members whose status rank is >= min_rank
+    /// (STATUSMSG: `@#chan`, `+#chan`, ...). Server-time applied per recipient.
+    fn broadcastChannelMinRank(
+        self: *LinuxServer,
+        channel: []const u8,
+        bytes: []const u8,
+        except: ?client_model.ClientId,
+        min_rank: u8,
+    ) !void {
+        var tag_buf: [48]u8 = undefined;
+        const tag = serverTimeTag(&tag_buf);
+        var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        while (members.next()) |member| {
+            const mm = self.world.memberModes(channel, member.*) orelse continue;
+            if (mm.rank() < min_rank) continue;
+            const id = clientIdFromWorld(member.*);
+            if (except) |skip| {
+                if (id.eql(skip)) continue;
+            }
+            try self.deliverTimed(id, tag, bytes);
+        }
+    }
+
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
         if (conn.send_armed) return;
         if (conn.send_offset >= conn.send_len) return;
@@ -2128,28 +2151,54 @@ pub const LinuxServer = struct {
         // own message back, byte-identical to what recipients see (`msg`).
         const echo = conn.session.hasCap(.echo_message);
 
-        if (world_model.isChannelName(target)) {
-            if (!self.world.channelExists(target)) {
+        // STATUSMSG: a leading prefix (~/./@/+) before a channel name restricts
+        // delivery to members of that rank or higher. `chan` is the bare channel
+        // for world lookups; `target` keeps the prefix for the displayed line.
+        var chan = target;
+        var min_rank: u8 = 0;
+        if (target.len >= 2) {
+            const r = statusPrefixRank(target[0]);
+            if (r > 0 and world_model.isChannelName(target[1..])) {
+                min_rank = r;
+                chan = target[1..];
+            }
+        }
+
+        if (world_model.isChannelName(chan)) {
+            if (!self.world.channelExists(chan)) {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
             // +n no-external-messages: a non-member may message the channel only
             // when +n is unset (RFC 1459). Members always pass this gate.
-            if (!self.world.isMember(target, worldIdFromClient(id)) and
-                self.world.channelHasFlag(target, .no_external))
+            if (!self.world.isMember(chan, worldIdFromClient(id)) and
+                self.world.channelHasFlag(chan, .no_external))
             {
                 try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
                 return;
             }
             // +m moderated: only voiced (+v) or any operator tier may speak.
-            if (self.world.channelHasFlag(target, .moderated)) {
-                const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+            if (self.world.channelHasFlag(chan, .moderated)) {
+                const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
                 if (!mm.canSpeakModerated()) {
                     try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
                     return;
                 }
             }
-            try self.broadcastChannel(target, msg, id);
+            // STATUSMSG sender gate (ophion m_message.c: is_chanop_voiced): only a
+            // member who is voiced-or-higher may send to a status-prefixed target.
+            if (min_rank > 0) {
+                const sm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+                if (sm.rank() < 1) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{target}, "You're not channel operator");
+                    return;
+                }
+            }
+            if (min_rank == 0) {
+                try self.broadcastChannel(chan, msg, id);
+            } else {
+                try self.broadcastChannelMinRank(chan, msg, id, min_rank);
+            }
             if (echo) {
                 var tag_buf: [48]u8 = undefined;
                 try self.deliverTimed(id, serverTimeTag(&tag_buf), msg);
@@ -2485,6 +2534,18 @@ fn isValidNick(nick: []const u8) bool {
         }
     }
     return true;
+}
+
+/// STATUSMSG prefix -> minimum member rank (founder 4 > owner 3 > op 2 > voice
+/// 1). 0 means the char is not a status prefix.
+fn statusPrefixRank(ch: u8) u8 {
+    return switch (ch) {
+        '~' => 4,
+        '.' => 3,
+        '@' => 2,
+        '+' => 1,
+        else => 0,
+    };
 }
 
 fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
@@ -3091,6 +3152,67 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: STATUSMSG @#chan rank filter + sender gate" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    const c = try alloc.create(LiveClient);
+    defer alloc.destroy(c);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    c.* = .{ .fd = fd_c };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try recvUntil(c, " 001 C ", 200);
+
+    // A founds #s; B and C join; A ops B.
+    try writeAllFd(fd_a, "JOIN #s\r\n");
+    try recvUntil(a, " 366 A #s ", 200);
+    try writeAllFd(fd_b, "JOIN #s\r\n");
+    try recvUntil(b, " 366 B #s ", 200);
+    try writeAllFd(fd_c, "JOIN #s\r\n");
+    try recvUntil(c, " 366 C #s ", 200);
+    try writeAllFd(fd_a, "MODE #s +o B\r\n");
+    try recvUntil(b, "MODE #s +o B", 200);
+
+    // A -> @#s reaches op B (rank filter); plain member C is excluded.
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG @#s :ops only\r\n");
+    try recvUntil(b, ":A!alice@localhost PRIVMSG @#s :ops only\r\n", 200);
+
+    // C (plain member) cannot send to a status-prefixed target -> 482.
+    c.reset();
+    try writeAllFd(fd_c, "PRIVMSG @#s :sneaky\r\n");
+    try recvUntil(c, " 482 C @#s ", 200);
 }
 
 test "threaded server: PRIVMSG multi-target delivery" {

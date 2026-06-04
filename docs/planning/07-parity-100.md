@@ -58,7 +58,7 @@
 36. [x] JOIN comma-list of channels (`JOIN #a,#b key1,key2`)
 37. [x] PART comma-list of channels
 38. [x] PRIVMSG/NOTICE comma-list of targets
-39. [ ] Status-prefix targets (`PRIVMSG @#chan`, `+#chan`)
+39. [x] Status-prefix targets (`PRIVMSG @#chan`, `+#chan`)
 40. [x] NICK change while registered (broadcast to common channels)
 41. [ ] Collision handling on NICK change (rename-to-UID, per memory)
 
