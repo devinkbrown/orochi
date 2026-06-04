@@ -65,6 +65,9 @@ const Channel = struct {
     invex: std.ArrayListUnmanaged([]u8) = .empty,
     /// Pending invitations (INVITE) that satisfy +i, by client id.
     invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
+    /// +p private (shown but flagged) and +h IRCX HIDDEN (omitted from LIST).
+    private: bool = false,
+    hidden: bool = false,
 
     fn init(allocator: std.mem.Allocator) Channel {
         return .{
@@ -248,6 +251,30 @@ pub const World = struct {
         return channel.limit;
     }
 
+    /// +p private channel flag.
+    pub fn setPrivate(self: *World, name: []const u8, on: bool) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        const before = channel.private;
+        channel.private = on;
+        return before != on;
+    }
+    pub fn isPrivate(self: *World, name: []const u8) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return channel.private;
+    }
+
+    /// +h IRCX HIDDEN channel flag (omit from LIST).
+    pub fn setHidden(self: *World, name: []const u8, on: bool) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        const before = channel.hidden;
+        channel.hidden = on;
+        return before != on;
+    }
+    pub fn isHidden(self: *World, name: []const u8) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return channel.hidden;
+    }
+
     pub fn memberCount(self: *World, name: []const u8) usize {
         const channel = self.channels.getPtr(name) orelse return 0;
         return channel.members.count();
@@ -396,6 +423,14 @@ pub const World = struct {
                 n += 1;
             }
         }
+        if (channel.private and n < out.len) {
+            out[n] = 'p';
+            n += 1;
+        }
+        if (channel.hidden and n < out.len) {
+            out[n] = 'h';
+            n += 1;
+        }
         return out[0..n];
     }
 
@@ -427,6 +462,7 @@ pub const World = struct {
         members: usize,
         topic: []const u8,
         secret: bool,
+        hidden: bool,
     };
 
     pub const ChannelViewIterator = struct {
@@ -439,6 +475,7 @@ pub const World = struct {
                     .members = entry.value_ptr.members.count(),
                     .topic = entry.value_ptr.topic orelse "",
                     .secret = entry.value_ptr.modes.secret,
+                    .hidden = entry.value_ptr.hidden,
                 };
             }
             return null;

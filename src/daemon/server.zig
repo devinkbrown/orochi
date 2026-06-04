@@ -1452,6 +1452,14 @@ pub const LinuxServer = struct {
                         applied.appendByte(ch) catch break;
                     }
                 },
+                'p', 'h' => {
+                    // +p private / +h IRCX HIDDEN (world.Channel flags, not chanmode).
+                    const changed = if (ch == 'p')
+                        (self.world.setPrivate(channel, adding) catch continue)
+                    else
+                        (self.world.setHidden(channel, adding) catch continue);
+                    if (changed) appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
+                },
                 'k' => {
                     if (adding) {
                         if (arg_index >= parsed.param_count) continue;
@@ -1784,7 +1792,7 @@ pub const LinuxServer = struct {
             filters: *const elist.FilterSet,
             pub fn next(s: *@This()) ?list.ChannelInfo {
                 while (s.it.next()) |v| {
-                    if (v.secret) continue;
+                    if (v.secret or v.hidden) continue;
                     if (!s.filters.matches(.{ .name = v.name, .users = @intCast(v.members), .created_ago = 0, .topic_age = 0 })) continue;
                     return .{ .name = v.name, .users = @intCast(v.members), .topic = v.topic };
                 }
@@ -4350,6 +4358,40 @@ test "threaded server: MODE multi-flag batching in one command" {
     a.reset();
     try writeAllFd(fd_a, "MODE #m +nt\r\n");
     try recvUntil(&a, "MODE #m +nt", 200);
+}
+
+test "threaded server: +p private + +h hidden channel flags" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "JOIN #ph\r\n");
+    try recvUntil(&a, " 366 A #ph ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #ph +ph\r\n");
+    try recvUntil(&a, "MODE #ph +ph", 200);
+    // query reflects both flags.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #ph\r\n");
+    try recvUntil(&a, " 324 A #ph +ph", 200);
+    // hidden channel is omitted from LIST.
+    a.reset();
+    try writeAllFd(fd_a, "LIST\r\n");
+    try recvUntil(&a, " 323 ", 200); // RPL_LISTEND arrives; #ph hidden
 }
 
 test "threaded server: CREATE makes founder channel" {

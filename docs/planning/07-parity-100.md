@@ -50,7 +50,7 @@
 31. [ ] +t already; verify +t list-mode echo in RPL_CHANNELMODEIS with params
 32. [x] MODE query shows key/limit params to members only
 33. [x] KNOCK (713/711/ERR_CHANOPEN; needs +i) `[~]` proto/knock.zig
-34. [ ] Channel +p private (distinct from +s secret) in LIST/WHOIS
+34. [x] Channel +p private (distinct from +s secret) in LIST/WHOIS
 
 ## C. Membership status & multi-target
 
@@ -71,7 +71,7 @@
 46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
 47. [x] LISTX extended LIST `[~]` proto/listx.zig
 48. [~] WHISPER channel-scoped private msg `[~]` proto/whisper.zig
-49. [ ] +h HIDDEN channel mode (IRCX, NOT halfop)
+49. [x] +h HIDDEN channel mode (IRCX, NOT halfop)
 50. [ ] AUTH (IRCX auth package negotiation)
 51. [ ] IRCX command gating behind `CREATE`/ISIRCX state
 52. [ ] AUDITORIUM (+x) member-visibility semantics
