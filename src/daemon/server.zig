@@ -1636,6 +1636,20 @@ pub const LinuxServer = struct {
         var full_buf: [default_reply_bytes]u8 = undefined;
         const full = std.fmt.bufPrint(&full_buf, "{s}\r\n", .{target_line}) catch return;
         try self.deliver(clientIdFromWorld(target), full);
+
+        // IRCv3 invite-notify (ophion m_invite.c): tell channel members who hold
+        // the cap, except the inviter — `:inviter!u@h INVITE <target> :<channel>`.
+        var notif_prefix: [256]u8 = undefined;
+        var notif_buf: [default_reply_bytes]u8 = undefined;
+        const notif = try formatMessage(&notif_buf, try clientPrefix(conn, &notif_prefix), "INVITE", &.{args.nick}, args.channel);
+        var members = self.world.memberIterator(args.channel) orelse return;
+        while (members.next()) |member| {
+            const mid = clientIdFromWorld(member.*);
+            if (mid.eql(id)) continue;
+            const mconn = self.clients.get(mid) orelse continue;
+            if (!mconn.session.hasCap(.invite_notify)) continue;
+            try self.deliver(mid, notif);
+        }
     }
 
     /// KILL <nick> :<reason> — oper-only forced disconnect. Delivers a KILL line
@@ -3192,6 +3206,60 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try writeAllFd(fd_b, "PRIVMSG #t :hello\r\n");
     try recvUntil(&a, "@time=", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
+}
+
+test "threaded server: IRCv3 invite-notify to cap holders" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    const c = try alloc.create(LiveClient);
+    defer alloc.destroy(c);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    c.* = .{ .fd = fd_c };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :invite-notify\r\n");
+    try recvUntil(b, "ACK :invite-notify", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(c, " 001 C ", 200);
+
+    // A founds #i, B (cap holder) joins.
+    try writeAllFd(fd_a, "JOIN #i\r\n");
+    try recvUntil(a, " 366 A #i ", 200);
+    try writeAllFd(fd_b, "JOIN #i\r\n");
+    try recvUntil(b, " 366 B #i ", 200);
+
+    // A invites C; B (member with invite-notify) sees the INVITE.
+    b.reset();
+    try writeAllFd(fd_a, "INVITE C #i\r\n");
+    try recvUntil(b, ":A!alice@localhost INVITE C :#i\r\n", 200);
 }
 
 test "threaded server: STATUSMSG @#chan rank filter + sender gate" {

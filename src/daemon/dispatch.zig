@@ -173,6 +173,7 @@ pub const CapId = enum(u6) {
     setname,
     extended_join,
     account_notify,
+    invite_notify,
 };
 
 const CapSet = struct {
@@ -210,6 +211,7 @@ const cap_specs = [_]CapSpec{
     .{ .id = .away_notify, .name = "away-notify" },
     .{ .id = .setname, .name = "setname" },
     .{ .id = .extended_join, .name = "extended-join" },
+    .{ .id = .invite_notify, .name = "invite-notify" },
     // account-notify is enumerated but not advertised: the only auth change is
     // SASL during pre-registration, before the client shares any channel, so
     // there is no post-join ACCOUNT event to deliver yet.
