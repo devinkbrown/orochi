@@ -145,6 +145,12 @@ pub const S2sLink = struct {
         return self.peer.routeNickNode(nick);
     }
 
+    /// The remote server's name once the handshake has been processed (empty
+    /// before establishment).
+    pub fn remoteName(self: *const S2sLink) []const u8 {
+        return self.peer.remoteName();
+    }
+
     pub fn knownServers(self: *const S2sLink) usize {
         return self.peer.registryCount();
     }

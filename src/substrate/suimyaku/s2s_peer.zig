@@ -211,6 +211,15 @@ pub const S2sPeer = struct {
         return self.registry.count();
     }
 
+    /// The remote server's name once learned from the handshake (empty before).
+    pub fn remoteName(self: *const S2sPeer) []const u8 {
+        return self.remote_name;
+    }
+
+    pub fn remoteSid(self: *const S2sPeer) ?Sid {
+        return self.remote_sid;
+    }
+
     pub fn routeNickNode(self: *const S2sPeer, nick: []const u8) ?NodeId {
         return self.routes.nickNode(nick);
     }

@@ -3522,10 +3522,20 @@ pub const LinuxServer = struct {
     /// LINKS — single-node mesh view: just this server (RPL_LINKS 364 /
     /// RPL_ENDOFLINKS 365). Reimagined for Suimyaku once S2S lands.
     fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
         var line_buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Mizuchi IRC daemon"}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ server_name, server_name }, detail);
+        // Reflect each established S2S peer as a 1-hop neighbour.
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const link = entry.value.s2s orelse continue;
+            if (!link.established()) continue;
+            const rname = link.remoteName();
+            if (rname.len == 0) continue;
+            var lbuf: [128]u8 = undefined;
+            const ldetail = std.fmt.bufPrint(&lbuf, "1 {s}", .{"Suimyaku peer"}) catch continue;
+            try queueNumeric(conn, .RPL_LINKS, &.{ rname, server_name }, ldetail);
+        }
         try queueNumeric(conn, .RPL_ENDOFLINKS, &.{"*"}, "End of /LINKS list");
     }
 
@@ -3537,6 +3547,15 @@ pub const LinuxServer = struct {
             self.clients.len(),
         }) catch return;
         try queueNumeric(conn, .RPL_MAP, &.{}, detail);
+        // Established S2S peers as child nodes of this server.
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const link = entry.value.s2s orelse continue;
+            if (!link.established() or link.remoteName().len == 0) continue;
+            var pbuf: [160]u8 = undefined;
+            const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{link.remoteName()}) catch continue;
+            try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
+        }
         try queueNumeric(conn, .RPL_MAPEND, &.{}, "End of /MAP");
     }
 
@@ -5979,6 +5998,17 @@ test "threaded server: live S2S listener completes a peer handshake" {
     }
     try std.testing.expect(peer.established());
     try std.testing.expect(peer.knownServers() >= 2);
+
+    // A local client's LINKS now reflects the established S2S peer by its name.
+    const fd_c = connectLoopback(server.boundPort() catch 0) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var c = LiveClient{ .fd = fd_c };
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&c, " 001 C ", 200);
+    c.reset();
+    try writeAllFd(fd_c, "LINKS\r\n");
+    try recvUntil(&c, " 365 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "peer.test") != null);
 }
 
 test "threaded server: oper CONNECT opens an outbound S2S link" {

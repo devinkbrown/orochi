@@ -128,7 +128,7 @@
 
 ## H. Mesh / S2S (Suimyaku — later milestones)
 
-94. [~] LINKS/MAP reflect real mesh peers (Sazanami membership)
+94. [x] LINKS/MAP reflect real mesh peers `[x]` live — LINKS (364) lists each established S2S peer by remoteName as a 1-hop neighbour; MAP (015) shows them as child nodes. (Multi-hop topology arrives with route-table propagation.)
 95. [~] Server burst / state sync (Suimyaku CRDT)
 96. [~] Cross-node PRIVMSG routing
 97. [~] Cross-node channel membership convergence
