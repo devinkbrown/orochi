@@ -1809,6 +1809,11 @@ pub const LinuxServer = struct {
         const err_line = std.fmt.bufPrint(&err_buf, "ERROR :Closing Link: {s} (Killed ({s} ({s})))\r\n", .{ target_nick, killer, reason }) catch return error.OutputTooSmall;
         try self.deliver(clientIdFromWorld(target_wid), err_line);
 
+        // Oper-visible KILL event through the Event Spine (kill category).
+        var kev_buf: [512]u8 = undefined;
+        const kev = std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s})", .{ killer, target_nick, reason }) catch reason;
+        try self.publishOperEvent(.kill, .warn, kev);
+
         // Graceful close: the send-drain path fires QUIT to channels and frees
         // the slot once the buffer flushes (mirrors a self-QUIT).
         tconn.closing = true;
@@ -2193,9 +2198,16 @@ pub const LinuxServer = struct {
         const subject = try clientPrefix(conn, &subj_buf);
         var msg_buf: [512]u8 = undefined;
         const message = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ subject, parsed.paramSlice()[0] }) catch parsed.paramSlice()[0];
+        try self.publishOperEvent(.announce, .notice, message);
+    }
+
+    /// Render a typed Event Spine event as `NOTE EVENT <CATEGORY>` and deliver it
+    /// to every session subscribed to that category (oper notices: wallops,
+    /// kills, connects, …). Replaces the legacy snote/wallops broadcast channels.
+    fn publishOperEvent(self: *LinuxServer, category: event_spine.EventCategory, severity: event_spine.EventSeverity, message: []const u8) !void {
         const event = event_spine.Event{
-            .category = .announce,
-            .severity = .notice,
+            .category = category,
+            .severity = severity,
             .timestamp_ms = platform.realtimeMillis(),
             .message = message,
         };
@@ -2203,7 +2215,7 @@ pub const LinuxServer = struct {
         const line = event_spine.renderOperNote(.{ .server_name = server_name, .event = event }, &line_buf) catch return;
         var it = self.clients.iterator();
         while (it.next()) |entry| {
-            if (entry.value.session.subscribesTo(.announce)) try self.deliver(entry.id, line);
+            if (entry.value.session.subscribesTo(category)) try self.deliver(entry.id, line);
         }
     }
 
@@ -3246,9 +3258,12 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     try recvUntil(&a, " 335 A B ", 200);
 
     // KILL: oper A kills B -> B receives a KILL line then is disconnected.
+    a.reset();
     b.reset();
     try writeAllFd(fd_a, "KILL B :spam\r\n");
     try recvUntil(&b, "KILL B :spam\r\n", 200);
+    // Oper A (subscribed) also sees the KILL as an Event Spine notice.
+    try recvUntil(&a, "NOTE EVENT KILL ", 200);
 }
 
 test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
