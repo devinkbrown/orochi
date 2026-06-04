@@ -109,6 +109,7 @@ pub const tsumugi_props = @import("tsumugi_props.zig");
 pub const tsumugi = @import("tsumugi.zig");
 pub const userip = @import("userip.zig");
 pub const usermode = @import("usermode.zig");
+pub const utf8_guard = @import("utf8_guard.zig");
 pub const utf8_only = @import("utf8_only.zig");
 pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
@@ -234,6 +235,7 @@ test {
     _ = tsumugi;
     _ = userip;
     _ = usermode;
+    _ = utf8_guard;
     _ = utf8_only;
     _ = websocket_props;
     _ = websocket;
