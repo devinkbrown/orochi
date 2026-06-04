@@ -87,7 +87,7 @@
 59. [x] invite-notify `[~]` proto/invite_notify.zig
 60. [ ] echo-message already; verify for NOTICE + TAGMSG
 61. [ ] batch (netjoin/netsplit/chathistory) `[~]` proto/batch.zig
-62. [ ] labeled-response (label → echo correlation)
+62. [~] labeled-response (label → echo correlation)
 63. [~] CAP NEW / CAP DEL dynamic advertisement
 64. [ ] STS policy advertisement `[~]` proto/sts.zig
 65. [x] bot-mode (+B umode, WHOIS 335) `[~]` proto/bot_mode.zig
@@ -129,7 +129,7 @@
 ## H. Mesh / S2S (Suimyaku — later milestones)
 
 94. [ ] LINKS/MAP reflect real mesh peers (Sazanami membership)
-95. [ ] Server burst / state sync (Suimyaku CRDT)
+95. [~] Server burst / state sync (Suimyaku CRDT)
 96. [ ] Cross-node PRIVMSG routing
 97. [ ] Cross-node channel membership convergence
 98. [ ] Netsplit/netjoin batches
