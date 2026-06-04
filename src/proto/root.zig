@@ -27,6 +27,7 @@ pub const ctcp_props = @import("ctcp_props.zig");
 pub const dns = @import("dns.zig");
 pub const dns_props = @import("dns_props.zig");
 pub const echo_message = @import("echo_message.zig");
+pub const extban_eval = @import("extban_eval.zig");
 pub const extban = @import("extban.zig");
 pub const extban_props = @import("extban_props.zig");
 pub const extended_join = @import("extended_join.zig");
@@ -134,6 +135,7 @@ test {
     _ = dns;
     _ = dns_props;
     _ = echo_message;
+    _ = extban_eval;
     _ = extban;
     _ = extban_props;
     _ = extended_join;
