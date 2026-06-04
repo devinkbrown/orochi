@@ -92,13 +92,13 @@
 64. [ ] STS policy advertisement `[~]` proto/sts.zig
 65. [x] bot-mode (+B umode, WHOIS 335) `[~]` proto/bot_mode.zig
 66. [~] multiline `[~]` proto/multiline.zig
-67. [ ] message-redaction / message-edit `[~]` proto/msgedit.zig
+67. [~] message-redaction / message-edit `[~]` proto/msgedit.zig
 68. [x] read-marker `[~]` proto/read_marker.zig
 69. [~] metadata `[~]` proto/metadata.zig
 70. [x] monitor (MONITOR +/-/C/L/S; 730/731/732/733/734) `[~]` proto/monitor.zig
 71. [ ] extended-monitor `[~]` proto/extended_monitor.zig
 72. [ ] utf8-only `[~]` proto/utf8_only.zig
-73. [ ] standard-replies (FAIL/WARN/NOTE) used on new error paths
+73. [~] standard-replies (FAIL/WARN/NOTE) used on new error paths
 74. [x] chathistory (needs msgstore) `[~]` proto/chathistory.zig
 
 ## F. SASL & accounts
