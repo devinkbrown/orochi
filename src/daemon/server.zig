@@ -830,6 +830,9 @@ pub const LinuxServer = struct {
         }
 
         const id = try self.clients.alloc(ConnState.init(fd));
+        // Free the slot on any later failure so a half-set-up accept never leaves
+        // an occupied slot (which deinit would then try to tear down).
+        errdefer _ = self.clients.free(id);
         const conn = self.clients.get(id).?;
         conn.token = try tokenFromId(id);
 
@@ -846,7 +849,11 @@ pub const LinuxServer = struct {
                 .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
                 .server_name = server_name,
             });
+            errdefer link.deinit();
             conn.s2s = link;
+            // Clear the dangling pointer before the slot is freed if submitRecv
+            // fails, so deinit can never observe a freed link.
+            errdefer conn.s2s = null;
             try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             return;
         }
@@ -3786,6 +3793,9 @@ const PortableServer = struct {
     }
     pub fn deinit(_: *PortableServer) void {}
     pub fn boundPort(_: *PortableServer) ServerError!u16 {
+        return error.Unsupported;
+    }
+    pub fn s2sBoundPort(_: *PortableServer) ServerError!u16 {
         return error.Unsupported;
     }
     pub fn runOnce(_: *PortableServer) ServerError!void {
