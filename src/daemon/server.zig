@@ -28,6 +28,7 @@ const whowas_reply = @import("../proto/whowas_reply.zig");
 const monitor = @import("../proto/monitor.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
+const help_db = @import("../proto/help_db.zig");
 
 /// Bounded WHOWAS history ring shared by the live server. Field caps match the
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
@@ -1065,6 +1066,8 @@ pub const LinuxServer = struct {
             try self.handleMarkread(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SILENCE")) {
             try self.handleSilence(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "HELP") or std.ascii.eqlIgnoreCase(parsed.command, "HELPOP")) {
+            try self.handleHelp(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
             try self.handleStats(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TAGMSG")) {
@@ -2035,6 +2038,18 @@ pub const LinuxServer = struct {
             const line = std.fmt.bufPrint(&line_buf, ":{s} SILENCE {c}{s}\r\n", .{ prefix, sign, op.mask }) catch continue;
             try appendToConn(conn, line);
         }
+    }
+
+    /// HELP / HELPOP [topic] — static help topics (704/705/706, 524 if unknown).
+    /// Defaults to the HELP index topic when no argument is given.
+    fn handleHelp(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const topic = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
+            parsed.paramSlice()[0]
+        else
+            "HELP";
+        const reply = help_db.buildHelpLookupReply(self.allocator, server_name, conn.session.displayName(), topic) catch return;
+        defer self.allocator.free(reply);
+        try appendToConn(conn, reply);
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
@@ -3779,6 +3794,34 @@ test "threaded server: PRIVMSG multi-target delivery" {
     try writeAllFd(fd_a, "PRIVMSG B,C :hi both\r\n");
     try recvUntil(b, ":A!alice@localhost PRIVMSG B :hi both\r\n", 200);
     try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
+}
+
+test "threaded server: HELP topic + unknown" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "HELP JOIN\r\n");
+    try recvUntil(&a, " 704 A JOIN ", 200);
+    try recvUntil(&a, " 706 A JOIN ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "HELP NOPE\r\n");
+    try recvUntil(&a, " 524 A NOPE ", 200);
 }
 
 test "threaded server: SILENCE add/list/remove" {
