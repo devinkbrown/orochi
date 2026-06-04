@@ -300,6 +300,7 @@ const ringlane = struct {
         recv = 2,
         send = 3,
         timeout = 4,
+        connect = 5,
     };
 
     pub const FdToken = struct {
@@ -330,6 +331,7 @@ const ringlane = struct {
             2 => .recv,
             3 => .send,
             4 => .timeout,
+            5 => .connect,
             else => return error.UnknownOpKind,
         };
         return .{
@@ -360,12 +362,18 @@ const ringlane = struct {
         notif: bool,
     };
 
+    pub const ConnectEvent = struct {
+        token: FdToken,
+        res: i32,
+    };
+
     pub const Completion = union(OpKind) {
         other: void,
         accept: AcceptEvent,
         recv: RecvEvent,
         send: SendEvent,
         timeout: void,
+        connect: ConnectEvent,
     };
 
     fn decodeCompletion(cqe: linux.io_uring_cqe) error{UnknownOpKind}!Completion {
@@ -382,6 +390,7 @@ const ringlane = struct {
                 .notif = (cqe.flags & linux.IORING_CQE_F_NOTIF) != 0,
             } },
             .timeout => .{ .timeout = {} },
+            .connect => .{ .connect = .{ .token = ud.token, .res = cqe.res } },
         };
     }
 
@@ -425,6 +434,10 @@ const ringlane = struct {
 
         pub fn submitRecv(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []u8) !void {
             _ = try self.inner.recv(try encodeUserData(.recv, token), fd, .{ .buffer = buffer }, 0);
+        }
+
+        pub fn submitConnect(self: *Ring, token: FdToken, fd: linux.fd_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t) !void {
+            _ = try self.inner.connect(try encodeUserData(.connect, token), fd, addr, addrlen);
         }
 
         pub fn submitSend(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
@@ -611,6 +624,9 @@ pub const ConnState = struct {
     /// Suimyaku link instead of the IRC line parser. Heap-owned (stable address
     /// required by the link's self-referential clock); freed in closeConn/deinit.
     s2s: ?*s2s_link.S2sLink = null,
+    /// Target address for an outbound S2S connect, kept here (the slot is stable)
+    /// so it outlives the in-flight IORING_OP_CONNECT submission.
+    s2s_connect_addr: posix.sockaddr.in = undefined,
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -888,6 +904,32 @@ pub const LinuxServer = struct {
             };
             link.clearOutbound();
         }
+    }
+
+    /// Completion for an outbound S2S connect: on success open the handshake from
+    /// our side and start receiving; on failure tear the peer down.
+    fn handleConnect(self: *LinuxServer, event: ringlane.ConnectEvent) !void {
+        const conn = self.connForToken(event.token) catch return;
+        if (event.res < 0) {
+            try self.closeConn(event.token, "S2S connect failed");
+            return;
+        }
+        const link = conn.s2s orelse return;
+        const now: u64 = @intCast(@max(0, platform.monotonicMillis()));
+        link.start(now) catch {
+            try self.closeConn(event.token, "S2S handshake failed");
+            return;
+        };
+        const out = link.outbound();
+        if (out.len != 0) {
+            appendToConn(conn, out) catch {
+                try self.closeConn(event.token, "S2S send overflow");
+                return;
+            };
+            link.clearOutbound();
+        }
+        try self.armSendIfNeeded(conn);
+        try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
     }
 
     fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
@@ -1256,6 +1298,8 @@ pub const LinuxServer = struct {
             try self.handleEvent(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MODEX")) {
             try self.handleModex(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CONNECT")) {
+            try self.handleConnectCmd(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTLINE")) {
             try self.handleTestline(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTMASK")) {
@@ -2568,6 +2612,69 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// CONNECT <host> <port> — oper command: open an outbound server-to-server
+    /// link to a peer. Creates a socket, stands up the outbound-side S2sLink, and
+    /// submits an async io_uring connect; the handshake opens on connect completion.
+    fn handleConnectCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; CONNECT is for operators");
+            return;
+        }
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CONNECT"}, "Not enough parameters");
+            return;
+        }
+        const host = parsed.paramSlice()[0];
+        const port = std.fmt.parseInt(u16, parsed.paramSlice()[1], 10) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CONNECT"}, "Invalid port");
+            return;
+        };
+        if (self.clients.len() >= self.config.max_clients) {
+            try self.noticeTo(conn, "CONNECT refused: connection table full");
+            return;
+        }
+        const fd = socketTcp() catch {
+            try self.noticeTo(conn, "CONNECT failed: cannot create socket");
+            return;
+        };
+        errdefer closeFd(fd);
+        const addr = sockaddrIn(host, port) catch {
+            try self.noticeTo(conn, "CONNECT failed: invalid host");
+            closeFd(fd);
+            return;
+        };
+        const id = try self.clients.alloc(ConnState.init(fd));
+        errdefer _ = self.clients.free(id);
+        const peer = self.clients.get(id).?;
+        peer.token = try tokenFromId(id);
+        peer.s2s_connect_addr = addr;
+
+        const link = try self.allocator.create(s2s_link.S2sLink);
+        errdefer self.allocator.destroy(link);
+        try link.init(.{
+            .allocator = self.allocator,
+            .local_node_id = self.config.node_id,
+            .remote_node_id = 0,
+            .local_sid = self.config.server_id,
+            .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
+            .server_name = server_name,
+        });
+        errdefer link.deinit();
+        peer.s2s = link;
+        errdefer peer.s2s = null;
+
+        try self.ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
+        try self.noticeTo(conn, "CONNECT initiated");
+    }
+
+    /// Send a server NOTICE to a single connection.
+    fn noticeTo(self: *LinuxServer, conn: *ConnState, text: []const u8) !void {
+        _ = self;
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ server_name, conn.session.displayName(), text }) catch return;
+        try appendToConn(conn, line);
+    }
+
     /// TESTLINE <mask> — oper tool: report the first K/D-line whose mask matches
     /// `mask` (RPL_TESTLINE 725) or RPL_NOTESTLINE 726 if none.
     fn handleTestline(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -3828,6 +3935,9 @@ const CompletionHandler = struct {
                 self.err = err;
             },
             .send => |event| self.server.handleSend(event) catch |err| {
+                self.err = err;
+            },
+            .connect => |event| self.server.handleConnect(event) catch |err| {
                 self.err = err;
             },
             .timeout, .other => {},
@@ -5864,6 +5974,87 @@ test "threaded server: live S2S listener completes a peer handshake" {
         try peer.feed(rx[0..n], now, 5);
         if (peer.outbound().len != 0) {
             try writeAllFd(fd, peer.outbound());
+            peer.clearOutbound();
+        }
+    }
+    try std.testing.expect(peer.established());
+    try std.testing.expect(peer.knownServers() >= 2);
+}
+
+test "threaded server: oper CONNECT opens an outbound S2S link" {
+    // A test-owned listener stands in for the remote peer; the server dials it.
+    const listen_fd = createListener("127.0.0.1", 0, 8) catch return error.SkipZigTest;
+    defer closeFd(listen_fd);
+    const remote_port = socketPort(listen_fd) catch return error.SkipZigTest;
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .server_id = 1, .node_id = 1 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Oper client issues CONNECT to the remote listener.
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    var cmd_buf: [64]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "CONNECT 127.0.0.1 {d}\r\n", .{remote_port});
+    try writeAllFd(fd_a, cmd);
+
+    // Accept the server's outbound connection on the test listener.
+    var poll_listen = [_]posix.pollfd{.{ .fd = listen_fd, .events = linux.POLL.IN, .revents = 0 }};
+    var waited: usize = 0;
+    while (waited < 200) : (waited += 1) {
+        const r = posix.poll(&poll_listen, 25) catch return error.Unexpected;
+        if (r != 0 and (poll_listen[0].revents & linux.POLL.IN) != 0) break;
+    }
+    const accept_rc = linux.accept4(listen_fd, null, null, 0);
+    const peer_fd: linux.fd_t = switch (posix.errno(accept_rc)) {
+        .SUCCESS => @intCast(accept_rc),
+        else => return error.SkipZigTest,
+    };
+    defer closeFd(peer_fd);
+
+    // Drive a responding S2sLink (no start — the server opened the handshake).
+    const alloc = std.testing.allocator;
+    const peer = try alloc.create(s2s_link.S2sLink);
+    defer alloc.destroy(peer);
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_sid = 2,
+        .local_epoch_ms = 3000,
+        .server_name = "remote.test",
+    });
+    defer peer.deinit();
+
+    var rx: [4096]u8 = undefined;
+    var now: u64 = 1;
+    var polls: usize = 0;
+    while (polls < 200 and !peer.established()) : (polls += 1) {
+        var fds = [_]posix.pollfd{.{ .fd = peer_fd, .events = linux.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+        if (ready == 0) continue;
+        if ((fds[0].revents & linux.POLL.IN) == 0) continue;
+        const n = try readFd(peer_fd, &rx);
+        if (n == 0) return error.ConnectionReset;
+        now += 1;
+        try peer.feed(rx[0..n], now, 3);
+        if (peer.outbound().len != 0) {
+            try writeAllFd(peer_fd, peer.outbound());
             peer.clearOutbound();
         }
     }
