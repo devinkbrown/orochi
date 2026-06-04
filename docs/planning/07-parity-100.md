@@ -97,7 +97,7 @@
 69. [x] metadata `[~]` proto/metadata.zig
 70. [x] monitor (MONITOR +/-/C/L/S; 730/731/732/733/734) `[~]` proto/monitor.zig
 71. [~] extended-monitor `[~]` proto/extended_monitor.zig
-72. [~] utf8-only `[~]` proto/utf8_only.zig
+72. [x] utf8-only (UTF8ONLY ISUPPORT + FAIL INVALID_UTF8 on PRIVMSG/TAGMSG) `[x]` live
 73. [~] standard-replies (FAIL/WARN/NOTE) used on new error paths
 74. [x] chathistory (needs msgstore) `[~]` proto/chathistory.zig
 

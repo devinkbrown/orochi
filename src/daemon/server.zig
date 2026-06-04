@@ -26,6 +26,7 @@ const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
 const whowas_reply = @import("../proto/whowas_reply.zig");
 const monitor = @import("../proto/monitor.zig");
+const utf8_guard = @import("../proto/utf8_guard.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
 const help_db = @import("../proto/help_db.zig");
@@ -2897,6 +2898,19 @@ pub const LinuxServer = struct {
             return;
         }
         const text = parsed.paramSlice()[1];
+        // utf8only: reject malformed UTF-8 bodies with a standard-replies FAIL and
+        // drop the message (ISUPPORT advertises UTF8ONLY). NOTICE stays silent.
+        if (!utf8_guard.isValidMessageBody(text)) {
+            if (!is_notice) {
+                var fail_buf: [128]u8 = undefined;
+                if (utf8_guard.buildInvalidUtf8Fail(&fail_buf, command)) |line| {
+                    var crlf: [160]u8 = undefined;
+                    const out = std.fmt.bufPrint(&crlf, "{s}\r\n", .{line}) catch return;
+                    try appendToConn(conn, out);
+                } else |_| {}
+            }
+            return;
+        }
         // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target.
         var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
         while (targets.next()) |target| {
@@ -4279,6 +4293,33 @@ test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
     try writeAllFd(fd_a, "NOTICE\r\nPING :tok\r\n");
     try recvUntil(&a, "PONG :tok", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 461 ") == null);
+}
+
+test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    // ISUPPORT advertises the UTF8ONLY token.
+    try recvUntil(&a, "UTF8ONLY", 200);
+    a.reset();
+    // Overlong-encoded slash (C0 AF) is invalid UTF-8 → FAIL ... INVALID_UTF8.
+    try writeAllFd(fd_a, "PRIVMSG A :bad\xC0\xAF\r\n");
+    try recvUntil(&a, "FAIL PRIVMSG INVALID_UTF8", 200);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {
