@@ -55,6 +55,7 @@ const HistoryStore = lotus.Lotus(.{ .max_targets = 512, .max_per_target = 256, .
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
 const WhowasStore = whowas.Whowas(.{ .capacity = 256, .max_nick_len = 64, .max_user_len = 64 });
 const list = @import("../proto/list.zig");
+const listx = @import("../proto/listx.zig");
 const who = @import("../proto/who.zig");
 const platform = @import("../substrate/platform.zig");
 
@@ -1256,6 +1257,8 @@ pub const LinuxServer = struct {
             try self.handleWhois(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "LIST")) {
             try self.handleList(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "LISTX")) {
+            try self.handleListx(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHO")) {
             try self.handleWho(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) {
@@ -2089,6 +2092,35 @@ pub const LinuxServer = struct {
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSinkCRLF{ .conn = conn };
         list.emitList(Adapter, &adapter, request, .{ .server_name = server_name, .requester = conn.session.displayName(), .now_seconds = 0 }, &scratch, &sink) catch return;
+    }
+
+    /// LISTX [<filter>] — IRCX extended channel list (811/812/817). Filter terms
+    /// (member-count, name/topic/subject mask, registered) per draft; time-based
+    /// terms degrade gracefully (no creation/topic timestamps tracked yet).
+    fn handleListx(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const request = listx.parse(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LISTX"}, "Invalid LISTX filter");
+            return;
+        };
+        const ctx = listx.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+        var buf: [default_reply_bytes]u8 = undefined;
+        if (listx.writeListxStart(&buf, ctx)) |line| try appendToConn(conn, line) else |_| {}
+        var it = self.world.channelIterator();
+        while (it.next()) |v| {
+            if (v.secret or v.hidden) continue;
+            const info = listx.ChannelInfo{
+                .name = v.name,
+                .members = @intCast(v.members),
+                .topic = v.topic,
+                .created_ms = 0,
+                .topic_ms = null,
+            };
+            if (!request.matches(info, 0)) continue;
+            var ebuf: [default_reply_bytes]u8 = undefined;
+            if (listx.writeListxEntry(&ebuf, ctx, info)) |line| try appendToConn(conn, line) else |_| {}
+        }
+        var endbuf: [default_reply_bytes]u8 = undefined;
+        if (listx.writeListxEnd(&endbuf, ctx)) |line| try appendToConn(conn, line) else |_| {}
     }
 
     /// WHOIS [server] <nick> — full WHOIS sequence for a local user.
