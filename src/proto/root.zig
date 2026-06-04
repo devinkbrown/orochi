@@ -13,6 +13,7 @@ pub const cap = @import("cap.zig");
 pub const cap_props = @import("cap_props.zig");
 pub const channel_rename = @import("channel_rename.zig");
 pub const chathistory = @import("chathistory.zig");
+pub const chathistory_cmd = @import("chathistory_cmd.zig");
 pub const chathistory_props = @import("chathistory_props.zig");
 pub const chghost = @import("chghost.zig");
 pub const cloak = @import("cloak.zig");
@@ -102,6 +103,7 @@ test {
     _ = cap_props;
     _ = channel_rename;
     _ = chathistory;
+    _ = chathistory_cmd;
     _ = chathistory_props;
     _ = chghost;
     _ = cloak;
