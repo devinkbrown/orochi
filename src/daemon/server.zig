@@ -585,6 +585,12 @@ pub const Config = struct {
     /// Optional server-to-server listener port (0 = disabled). Accepts on this
     /// socket are driven as Suimyaku mesh peers via S2sLink, not IRC clients.
     s2s_port: u16 = 0,
+    /// This node's mesh identity. The SID is the registry key and seeds the CRDT
+    /// replica lane, so it MUST be unique per node or two peers collide. The
+    /// node_id is the gossip/route identity. Distinct defaults are placeholders;
+    /// real deployments set both per server.
+    server_id: u16 = 1,
+    node_id: u64 = 1,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -843,9 +849,10 @@ pub const LinuxServer = struct {
             errdefer self.allocator.destroy(link);
             try link.init(.{
                 .allocator = self.allocator,
-                .local_node_id = 1,
+                .local_node_id = self.config.node_id,
+                // remote_node_id is learned from the inbound handshake.
                 .remote_node_id = 0,
-                .local_sid = 1,
+                .local_sid = self.config.server_id,
                 .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
                 .server_name = server_name,
             });
@@ -5803,7 +5810,8 @@ test "threaded server: MONITOR online/offline/list end-to-end" {
 }
 
 test "threaded server: live S2S listener completes a peer handshake" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0 }) catch |err| switch (err) {
+    // Non-default mesh identity exercises the config-driven SID/node id path.
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .server_id = 42, .node_id = 42 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
