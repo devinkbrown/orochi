@@ -1135,6 +1135,8 @@ pub const LinuxServer = struct {
             try self.handleProp(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCESS")) {
             try self.handleAccess(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "EVENT")) {
+            try self.handleEvent(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
@@ -2384,6 +2386,60 @@ pub const LinuxServer = struct {
             trace.emitTrace(ctx, &.{entry}, &scratch, &sink) catch {};
         }
         trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = server_name }}, &scratch, &sink) catch {};
+    }
+
+    /// Map an EVENT category token (code or tag) to a daemon EventCategory.
+    fn eventCategoryFromToken(token: []const u8) ?event_spine.EventCategory {
+        inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
+            const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+            if (std.ascii.eqlIgnoreCase(token, c.code()) or std.ascii.eqlIgnoreCase(token, c.token())) return c;
+        }
+        return null;
+    }
+
+    /// EVENT <ADD|DEL|LIST> [category...] — IRCX Event Spine subscription control.
+    /// Opers manage which oper-visible event categories they receive (the same
+    /// CategoryMask that WALLOPS/KILL/oper-action publish through). Parsed
+    /// daemon-native against the real event_spine (the ircx_event_cmd builder
+    /// carries its own proto-local mask facade that can't see daemon types).
+    fn handleEvent(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        _ = self;
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT is for operators");
+            return;
+        }
+        const params = parsed.paramSlice();
+        if (params.len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
+            return;
+        }
+        const is_add = std.ascii.eqlIgnoreCase(params[0], "ADD");
+        const is_del = std.ascii.eqlIgnoreCase(params[0], "DEL");
+        const is_list = std.ascii.eqlIgnoreCase(params[0], "LIST");
+        if (!is_add and !is_del and !is_list) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Invalid EVENT subcommand");
+            return;
+        }
+        if (!is_list) {
+            var mask = conn.session.event_mask;
+            for (params[1..]) |token| {
+                const cat = eventCategoryFromToken(token) orelse continue;
+                if (is_add) mask.add(cat) else mask.remove(cat);
+            }
+            conn.session.setEventMask(mask);
+        }
+        // Render the current subscription set as `EVENT LIST <CATEGORY>` lines.
+        const mask = conn.session.event_mask;
+        inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
+            const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+            if (mask.contains(c)) {
+                var lbuf: [128]u8 = undefined;
+                if (std.fmt.bufPrint(&lbuf, "EVENT LIST {s}\r\n", .{c.code()})) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+            }
+        }
+        try appendToConn(conn, "EVENT LIST :End of event list\r\n");
     }
 
     /// Whether `conn` may view/manage the IRCX ACCESS list of `channel`: opers or
@@ -4777,6 +4833,41 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
     try recvUntil(a, " 805 A #a ", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "evil.example") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 804 ") == null);
+}
+
+test "threaded server: EVENT subscription managed by opers" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    // Non-opers cannot use EVENT (ERR_NOPRIVILEGES 481).
+    a.reset();
+    try writeAllFd(fd_a, "EVENT LIST\r\n");
+    try recvUntil(&a, " 481 ", 200);
+    // OPER auto-subscribes to all categories; DEL KILL removes just that one.
+    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try writeAllFd(fd_a, "EVENT DEL KILL\r\n");
+    try recvUntil(&a, "EVENT LIST :End of event list", 200);
+    a.reset();
+    try writeAllFd(fd_a, "EVENT LIST\r\n");
+    try recvUntil(&a, "EVENT LIST :End of event list", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT LIST CONNECT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT LIST KILL") == null);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {

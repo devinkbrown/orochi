@@ -65,10 +65,10 @@
 ## D. IRCX surface (draft-pfenning-04)
 
 42. [x] CREATE `[~]` proto/ircx_create.zig — opt-in IRCX channel state
-43. [~] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig
+43. [~] MODEX (extended channel modes) `[~]` proto/ircx_modex.zig — BLOCKED: needs the IRCX extended channel modes (AUTHONLY/AUDITORIUM/NOWHISPER/CLONEABLE/…) added to world ChannelMode storage+enforcement first; wiring MODEX now would silently no-op those modes
 44. [x] ACCESS list (GRANT/DENY/OWNER/HOST/VOICE) `[x]` live (801-805, channel-op gated, ircx_access_store)
 45. [x] PROP get/set on channel/user/member entities `[x]` live (818/819, channel-op/self gated, ircx_prop_store)
-46. [~] EVENT subscribe/unsubscribe (Event Spine wiring)
+46. [x] EVENT subscribe/unsubscribe (Event Spine wiring) `[x]` live (oper-gated ADD/DEL/LIST over event_spine CategoryMask, daemon-native parse)
 47. [x] LISTX extended LIST `[~]` proto/listx.zig
 48. [x] WHISPER channel-scoped private msg `[x]` live (sender+recipient must be on channel; 401/442)
 49. [x] +h HIDDEN channel mode (IRCX, NOT halfop)
