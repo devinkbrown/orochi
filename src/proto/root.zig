@@ -49,6 +49,7 @@ pub const ircx_create_cmd = @import("ircx_create_cmd.zig");
 pub const ircx_create = @import("ircx_create.zig");
 pub const ircx_event_cmd = @import("ircx_event_cmd.zig");
 pub const ircx = @import("ircx.zig");
+pub const ircx_modex_cmd = @import("ircx_modex_cmd.zig");
 pub const ircx_modex = @import("ircx_modex.zig");
 pub const ircx_prop_cmd = @import("ircx_prop_cmd.zig");
 pub const ircx_props = @import("ircx_props.zig");
@@ -173,6 +174,7 @@ test {
     _ = ircx_create;
     _ = ircx_event_cmd;
     _ = ircx;
+    _ = ircx_modex_cmd;
     _ = ircx_modex;
     _ = ircx_prop_cmd;
     _ = ircx_props;
