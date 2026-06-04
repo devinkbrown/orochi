@@ -1201,8 +1201,23 @@ pub const LinuxServer = struct {
         var tag_buf: [48]u8 = undefined;
         const tag = serverTimeTag(&tag_buf);
 
+        // +x AUDITORIUM: a regular member's JOIN is only relayed to ops/voiced
+        // (and the joiner itself); ops/voiced joins are relayed to everyone.
+        const is_auditorium = self.world.channelHasExtFlag(channel, .auditorium);
+        const joiner_wid = self.world.findNick(conn.session.displayName());
+        const joiner_rank = if (joiner_wid) |jw|
+            auditoriumRank(self.world.memberModes(channel, jw) orelse world_model.MemberModes.empty())
+        else
+            auditorium.Rank.regular;
+        const relay_all = !is_auditorium or auditorium.shouldRelayJoinPart(joiner_rank);
+
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         while (members.next()) |member| {
+            if (!relay_all) {
+                const is_self = if (joiner_wid) |jw| member.*.eql(jw) else false;
+                const mrank = auditoriumRank(self.world.memberModes(channel, member.*) orelse world_model.MemberModes.empty());
+                if (!is_self and !auditorium.shouldRelayJoinPart(mrank)) continue;
+            }
             const mid = clientIdFromWorld(member.*);
             const mconn = self.clients.get(mid) orelse continue;
             const body = if (mconn.session.hasCap(.extended_join)) ext else plain;
