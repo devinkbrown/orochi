@@ -36,6 +36,7 @@ const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
+const userip = @import("../proto/userip.zig");
 const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
@@ -1116,6 +1117,8 @@ pub const LinuxServer = struct {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
             try self.handleTrace(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "USERIP")) {
+            try self.handleUserip(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCEPT")) {
             try self.handleAcceptCmd(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REDACT")) {
@@ -2277,6 +2280,33 @@ pub const LinuxServer = struct {
         const got = self.accepts.list(owner, &nicks) catch nicks[0..0];
         for (got) |n| try queueNumeric(conn, .RPL_ACCEPTLIST, &.{n}, "");
         try queueNumeric(conn, .RPL_ENDOFACCEPT, &.{}, "End of /ACCEPT list");
+    }
+
+    /// USERIP <nick>... — like USERHOST but shows IP (340).
+    fn handleUserip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"USERIP"}, "Not enough parameters");
+            return;
+        }
+        var targets: [5]userip.UseripTarget = undefined;
+        var n: usize = 0;
+        for (parsed.paramSlice()) |nick| {
+            if (n >= targets.len) break;
+            const wid = self.world.findNick(nick) orelse continue;
+            const c = self.clients.get(clientIdFromWorld(wid));
+            targets[n] = .{
+                .nick = nick,
+                .oper = if (c) |cc| cc.session.isOper() else false,
+                .away = if (c) |cc| cc.session.awayMessage() != null else false,
+                .user = usernameOf(self, wid),
+                .ip = default_host,
+            };
+            n += 1;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = userip.writeUseripReply(&buf, server_name, conn.session.displayName(), targets[0..n]) catch return;
+        try appendToConn(conn, line);
+        if (!std.mem.endsWith(u8, line, "\n")) try appendToConn(conn, "\r\n");
     }
 
     /// TRACE — oper-only: RPL_TRACEUSER (205) per connected client + RPL_ENDOFTRACE (262).
