@@ -36,6 +36,7 @@ const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const ban_db = @import("ban_db.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
+const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
@@ -645,6 +646,7 @@ pub const LinuxServer = struct {
     history: HistoryStore,
     bans_db: ban_db.Store,
     metadata: metadata_store.DefaultStore,
+    props: ircx_prop_store.DefaultStore,
     /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
     shutdown: ?*std.atomic.Value(bool) = null,
     accepts: accept_list.AcceptList(.{}),
@@ -695,6 +697,7 @@ pub const LinuxServer = struct {
             .history = HistoryStore.init(allocator),
             .bans_db = ban_db.Store.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
+            .props = ircx_prop_store.DefaultStore.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .start_ms = platform.monotonicMillis(),
         };
@@ -707,6 +710,7 @@ pub const LinuxServer = struct {
         self.history.deinit();
         self.bans_db.deinit();
         self.metadata.deinit();
+        self.props.deinit();
         self.accepts.deinit();
         self.silence.deinit();
         self.read_markers.deinit();
@@ -1122,6 +1126,8 @@ pub const LinuxServer = struct {
             try self.handleMetadata(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHISPER")) {
             try self.handleWhisper(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "PROP")) {
+            try self.handleProp(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CREATE")) {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
@@ -2362,6 +2368,93 @@ pub const LinuxServer = struct {
             trace.emitTrace(ctx, &.{entry}, &scratch, &sink) catch {};
         }
         trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = server_name }}, &scratch, &sink) catch {};
+    }
+
+    /// Effective IRCX PROP access level for `conn` mutating `entity`, or null when
+    /// the client may not write it. Opers act as sysop; channel/member props need
+    /// channel-operator; user props need self-ownership.
+    fn propAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, entity: ircx_prop_store.Entity) ?ircx_prop_store.AccessLevel {
+        if (conn.session.isOper()) return .sysop;
+        switch (entity.kind) {
+            .channel => {
+                const mm = self.world.memberModes(entity.id, worldIdFromClient(id)) orelse return null;
+                return if (mm.isOperator()) .owner else null;
+            },
+            .member => {
+                const split = std.mem.indexOfScalar(u8, entity.id, ':') orelse return null;
+                const chan = entity.id[0..split];
+                const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse return null;
+                return if (mm.isOperator()) .owner else null;
+            },
+            .user => return if (std.ascii.eqlIgnoreCase(entity.id, conn.session.displayName())) .member else null,
+        }
+    }
+
+    fn propEmitEntry(conn: *ConnState, entry: ircx_prop_store.EntryView) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = ircx_prop_store.buildPropListReply(server_name, conn.session.displayName(), entry, &buf) catch return;
+        try appendToConn(conn, line);
+        try appendToConn(conn, "\r\n");
+    }
+
+    fn propEmitEnd(conn: *ConnState, entity: ircx_prop_store.Entity) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = ircx_prop_store.buildPropEndReply(server_name, conn.session.displayName(), entity, &buf) catch return;
+        try appendToConn(conn, line);
+        try appendToConn(conn, "\r\n");
+    }
+
+    /// PROP <entity> [<key[,key]> [:<value>]] — IRCX property get/list/set/delete.
+    /// One param lists all; two gets keys; three sets (empty trailing deletes).
+    /// Replies are RPL_PROPLIST 818 + RPL_PROPEND 819. Writes are gated by
+    /// channel-operator (channel/member entities) or self (user entities).
+    fn handleProp(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // This parser folds the trailing param in without a flag; treating a 3rd
+        // param as "trailing present" lets parseParamsBounded map an empty value
+        // (`PROP e k :`) to delete and a non-empty value to set — both correct.
+        const req = ircx_prop_store.parseParamsBounded(.{}, parsed.paramSlice(), true) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PROP"}, "Invalid PROP");
+            return;
+        };
+        switch (req) {
+            .list => |entity| {
+                var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                const rows = self.props.listProps(entity, &views) catch views[0..0];
+                for (rows) |ev| try propEmitEntry(conn, ev);
+                try propEmitEnd(conn, entity);
+            },
+            .get => |q| {
+                var it = std.mem.splitScalar(u8, q.keys, ',');
+                while (it.next()) |key| {
+                    if (key.len == 0) continue;
+                    if (self.props.getProp(q.entity, key)) |ev| {
+                        try propEmitEntry(conn, ev);
+                    } else |_| {}
+                }
+                try propEmitEnd(conn, q.entity);
+            },
+            .set => |m| {
+                const access = self.propAccess(id, conn, m.entity) orelse {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{m.entity.id}, "Insufficient access to set property");
+                    return;
+                };
+                const setter = ircx_prop_store.Setter{ .id = conn.session.displayName(), .access = access };
+                const ev = self.props.setProp(m.entity, m.key, m.value, setter) catch {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{m.entity.id}, "Cannot set that property");
+                    return;
+                };
+                try propEmitEntry(conn, ev);
+                try propEmitEnd(conn, m.entity);
+            },
+            .delete => |k| {
+                if (self.propAccess(id, conn, k.entity) == null) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{k.entity.id}, "Insufficient access to delete property");
+                    return;
+                }
+                self.props.deleteProp(k.entity, k.key) catch {};
+                try propEmitEnd(conn, k.entity);
+            },
+        }
     }
 
     /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
@@ -4444,6 +4537,51 @@ test "threaded server: WHISPER delivers to channel co-member only" {
     a.reset();
     try writeAllFd(fd_a, "WHISPER #w Nobody :hi\r\n");
     try recvUntil(a, " 401 ", 200);
+}
+
+test "threaded server: PROP set/get gated by channel-op" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #p\r\n");
+    try recvUntil(a, " 366 A #p ", 200);
+    // Founder A sets a channel property and reads it back (818 + 819).
+    a.reset();
+    try writeAllFd(fd_a, "PROP #p SUBJECT :hello\r\n");
+    try recvUntil(a, " 818 A #p ", 200);
+    try recvUntil(a, " 819 A #p ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #p SUBJECT\r\n");
+    try recvUntil(a, " 818 A #p ", 200);
+    // B, not on the channel, cannot set channel props (ERR_CHANOPRIVSNEEDED 482).
+    b.reset();
+    try writeAllFd(fd_b, "PROP #p SUBJECT :nope\r\n");
+    try recvUntil(b, " 482 ", 200);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {
