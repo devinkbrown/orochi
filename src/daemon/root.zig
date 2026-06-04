@@ -16,6 +16,7 @@ pub const flood = @import("flood.zig");
 pub const flood_guard = @import("flood_guard.zig");
 pub const oper = @import("oper.zig");
 pub const registry = @import("registry.zig");
+pub const s2s_link = @import("s2s_link.zig");
 pub const sasl_bridge = @import("sasl_bridge.zig");
 pub const server = @import("server.zig");
 pub const services = @import("services.zig");
@@ -39,6 +40,7 @@ test {
     _ = flood_guard;
     _ = oper;
     _ = registry;
+    _ = s2s_link;
     _ = sasl_bridge;
     _ = server;
     _ = services;
