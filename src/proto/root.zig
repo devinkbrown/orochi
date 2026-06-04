@@ -111,6 +111,7 @@ pub const usermode = @import("usermode.zig");
 pub const utf8_only = @import("utf8_only.zig");
 pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
+pub const whisper_cmd = @import("whisper_cmd.zig");
 pub const whisper = @import("whisper.zig");
 pub const who_props = @import("who_props.zig");
 pub const whowas_reply = @import("whowas_reply.zig");
@@ -234,6 +235,7 @@ test {
     _ = utf8_only;
     _ = websocket_props;
     _ = websocket;
+    _ = whisper_cmd;
     _ = whisper;
     _ = who_props;
     _ = whowas_reply;
