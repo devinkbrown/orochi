@@ -123,7 +123,7 @@
 89. [ ] SNOMASK / server notices (+s umode)
 90. [ ] OPER MODE +o user-umode reflection + RPL_UMODEIS
 91. [x] WHOIS RPL_WHOISOPERATOR 313 (add `is_oper` to WhoisSubject)
-92. [ ] WALLOPS gated to +w umode recipients (not all opers)
+92. [x] WALLOPS gated to +w umode recipients (not all opers)
 93. [ ] GRANT / privilege sets (oper.zig Privilege wiring)
 
 ## H. Mesh / S2S (Suimyaku — later milestones)

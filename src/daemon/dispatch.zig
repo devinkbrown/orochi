@@ -487,6 +487,7 @@ pub const ClientSession = struct {
             .{ .m = .callerid, .c = 'g' },
             .{ .m = .no_ctcp, .c = 'T' },
             .{ .m = .cloaked, .c = 'x' },
+            .{ .m = .wallop, .c = 'w' },
         };
         for (letters) |l| {
             if (self.umodes.contains(l.m) and n < out.len) {

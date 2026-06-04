@@ -1488,8 +1488,13 @@ pub const LinuxServer = struct {
             switch (ch) {
                 '+' => adding = true,
                 '-' => adding = false,
-                'i', 'B' => {
-                    const mode: dispatch.UserMode = if (ch == 'i') .invisible else .bot;
+                'i', 'B', 'w' => {
+                    const mode: dispatch.UserMode = switch (ch) {
+                        'i' => .invisible,
+                        'B' => .bot,
+                        'w' => .wallop,
+                        else => unreachable,
+                    };
                     if (conn.session.setUmode(mode, adding)) {
                         appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
                     }
@@ -2161,6 +2166,7 @@ pub const LinuxServer = struct {
             return;
         }
         conn.session.is_oper = true;
+        _ = conn.session.setUmode(.wallop, true); // opers receive WALLOPS by default (+w)
         try queueNumeric(conn, .RPL_YOUREOPER, &.{}, "You are now an IRC operator");
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
@@ -2185,9 +2191,11 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
         const msg = try formatMessage(&msg_buf, prefix, "WALLOPS", &.{}, parsed.paramSlice()[0]);
+        // ophion: WALLOPS reaches everyone with +w (opers get +w on OPER; users
+        // may set it themselves), not just operators.
         var it = self.clients.iterator();
         while (it.next()) |entry| {
-            if (entry.value.session.isOper()) try self.deliver(entry.id, msg);
+            if (entry.value.session.hasUmode(.wallop)) try self.deliver(entry.id, msg);
         }
     }
 
@@ -3194,6 +3202,12 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     a.reset();
     try writeAllFd(fd_a, "WALLOPS :hello opers\r\n");
     try recvUntil(&a, "WALLOPS :hello opers\r\n", 200);
+    // A non-oper who sets +w also receives WALLOPS.
+    try writeAllFd(fd_b, "MODE B +w\r\n");
+    try recvUntil(&b, "MODE B +w", 200);
+    b.reset();
+    try writeAllFd(fd_a, "WALLOPS :for +w users\r\n");
+    try recvUntil(&b, "WALLOPS :for +w users\r\n", 200);
     // REHASH now permitted (382).
     a.reset();
     try writeAllFd(fd_a, "REHASH\r\n");
