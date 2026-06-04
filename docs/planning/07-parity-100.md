@@ -115,8 +115,8 @@
 
 82. [x] STATS (l/o/u/c/i/k subset) — multiple RPL_STATS*
 83. [ ] CONNECT / SQUIT (S2S; deferred to mesh)
-84. [ ] DIE (oper shutdown)
-85. [ ] RESTART (oper)
+84. [x] DIE (oper shutdown)
+85. [x] RESTART (oper)
 86. [x] KLINE / DLINE / GLINE + UNKLINE (ban storage)
 87. [ ] TESTLINE / TESTMASK
 88. [x] TRACE / ETRACE (200-262 family)

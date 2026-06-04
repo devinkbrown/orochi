@@ -641,6 +641,8 @@ pub const LinuxServer = struct {
     history: HistoryStore,
     bans_db: ban_db.Store,
     metadata: metadata_store.DefaultStore,
+    /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
+    shutdown: ?*std.atomic.Value(bool) = null,
     accepts: accept_list.AcceptList(.{}),
     msg_seq: u64 = 0,
     accept_armed: bool = false,
@@ -743,6 +745,7 @@ pub const LinuxServer = struct {
     /// disconnect (or any I/O) lets a requested shutdown take effect. (T1 of the
     /// threading plan — docs/planning/06-threading.md.)
     pub fn runThreaded(self: *LinuxServer, run: *std.atomic.Value(bool)) void {
+        self.shutdown = run; // expose to DIE/RESTART
         while (run.load(.acquire)) {
             self.runOnce() catch return;
         }
@@ -1117,6 +1120,8 @@ pub const LinuxServer = struct {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
             try self.handleTrace(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "DIE") or std.ascii.eqlIgnoreCase(parsed.command, "RESTART")) {
+            try self.handleDie(conn, parsed.command);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "USERIP")) {
             try self.handleUserip(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCEPT")) {
@@ -2307,6 +2312,19 @@ pub const LinuxServer = struct {
         const line = userip.writeUseripReply(&buf, server_name, conn.session.displayName(), targets[0..n]) catch return;
         try appendToConn(conn, line);
         if (!std.mem.endsWith(u8, line, "\n")) try appendToConn(conn, "\r\n");
+    }
+
+    /// DIE / RESTART — oper-only server shutdown. Clears the reactor run flag so
+    /// runThreaded exits after the current iteration.
+    fn handleDie(self: *LinuxServer, conn: *ConnState, cmd: []const u8) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        var nbuf: [128]u8 = undefined;
+        const note = std.fmt.bufPrint(&nbuf, "{s} requested by {s}", .{ cmd, conn.session.displayName() }) catch cmd;
+        try self.publishOperEvent(.oper_action, .critical, note);
+        if (self.shutdown) |flag| flag.store(false, .release);
     }
 
     /// TRACE — oper-only: RPL_TRACEUSER (205) per connected client + RPL_ENDOFTRACE (262).
