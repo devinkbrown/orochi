@@ -269,6 +269,40 @@ pub fn PropStore(comptime params: Params) type {
             self.entity_count = 0;
         }
 
+        /// Remove the channel entity and every member entity for `channel`, so a
+        /// recreated same-named channel never inherits stale (possibly secret)
+        /// properties. Scan-and-remove-one to avoid iterator invalidation.
+        pub fn clearChannel(self: *Self, channel: []const u8) void {
+            while (true) {
+                var found: ?[]const u8 = null;
+                var it = self.entities.iterator();
+                while (it.next()) |entry| {
+                    if (entityInChannel(entry.value_ptr.entity, channel)) {
+                        found = entry.key_ptr.*;
+                        break;
+                    }
+                }
+                const key = found orelse break;
+                if (self.entities.fetchRemove(key)) |kv| {
+                    self.allocator.free(kv.key);
+                    var state = kv.value;
+                    state.deinit(self.allocator);
+                    if (self.entity_count > 0) self.entity_count -= 1;
+                } else break;
+            }
+        }
+
+        fn entityInChannel(entity: Entity, channel: []const u8) bool {
+            return switch (entity.kind) {
+                .channel => std.ascii.eqlIgnoreCase(entity.id, channel),
+                .member => blk: {
+                    const split = std.mem.indexOfScalar(u8, entity.id, ':') orelse break :blk false;
+                    break :blk std.ascii.eqlIgnoreCase(entity.id[0..split], channel);
+                },
+                .user => false,
+            };
+        }
+
         pub fn setProp(self: *Self, entity: Entity, key: []const u8, value: []const u8, setter: Setter) PropError!EntryView {
             try validateEntity(entity, params.max_entity_id);
             try validateKeyWithLimit(key, params.max_key);

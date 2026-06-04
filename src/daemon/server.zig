@@ -484,6 +484,7 @@ const Numeric = enum(u16) {
     ERR_KEYNOTSET = 766,
     ERR_KEYINVALID = 767,
     ERR_KEYNOPERMISSION = 769,
+    ERR_PROPDENIED = 918,
     RPL_ACCEPTLIST = 281,
     RPL_ENDOFACCEPT = 282,
     RPL_KNOCK = 710,
@@ -1270,6 +1271,15 @@ pub const LinuxServer = struct {
         const wid = worldIdFromClient(id);
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
             if (try self.joinDenied(conn, id, channel, key)) return;
+        }
+
+        // Founder creating a brand-new channel: purge any orphaned IRCX state from
+        // a prior same-named incarnation so stale ACCESS DENY/GRANT entries or
+        // secret PROP keys can never bleed into the new channel.
+        const creating = !self.world.channelExists(channel);
+        if (creating) {
+            self.props.clearChannel(channel);
+            _ = self.access.clear(.{ .channel = channel }) catch {};
         }
 
         _ = try self.world.join(channel, wid);
@@ -2378,9 +2388,14 @@ pub const LinuxServer = struct {
 
     /// Whether `conn` may view/manage the IRCX ACCESS list of `channel`: opers or
     /// channel-operators only (access masks are operator-sensitive).
-    fn accessCanManage(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) bool {
+    fn accessCanManage(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, level: ?ircx_access_store.Level) bool {
         if (conn.session.isOper()) return true;
         const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse return false;
+        // OWNER-level entries may only be managed by an owner/founder (ophion
+        // m_ircx_access can_write_to_access_list); op suffices for HOST/VOICE/etc.
+        if (level) |lv| {
+            if (lv == .owner) return mm.contains(.owner) or mm.contains(.founder);
+        }
         return mm.isOperator();
     }
 
@@ -2397,7 +2412,7 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         switch (req) {
             .list => |sel| {
-                if (!self.accessCanManage(id, conn, sel.channel)) {
+                if (!self.accessCanManage(id, conn, sel.channel, sel.level)) {
                     try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{sel.channel}, "You're not channel operator");
                     return;
                 }
@@ -2417,7 +2432,7 @@ pub const LinuxServer = struct {
                 } else |_| {}
             },
             .add => |a| {
-                if (!self.accessCanManage(id, conn, a.channel)) {
+                if (!self.accessCanManage(id, conn, a.channel, a.level)) {
                     try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{a.channel}, "You're not channel operator");
                     return;
                 }
@@ -2437,7 +2452,7 @@ pub const LinuxServer = struct {
                 } else |_| {}
             },
             .delete => |d| {
-                if (!self.accessCanManage(id, conn, d.channel)) {
+                if (!self.accessCanManage(id, conn, d.channel, d.level)) {
                     try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{d.channel}, "You're not channel operator");
                     return;
                 }
@@ -2447,7 +2462,7 @@ pub const LinuxServer = struct {
                 } else |_| {}
             },
             .clear => |sel| {
-                if (!self.accessCanManage(id, conn, sel.channel)) {
+                if (!self.accessCanManage(id, conn, sel.channel, sel.level)) {
                     try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{sel.channel}, "You're not channel operator");
                     return;
                 }
@@ -2540,12 +2555,12 @@ pub const LinuxServer = struct {
             },
             .set => |m| {
                 const access = self.propAccess(id, conn, m.entity) orelse {
-                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{m.entity.id}, "Insufficient access to set property");
+                    try queueNumeric(conn, .ERR_PROPDENIED, &.{m.entity.id}, "Insufficient access to set property");
                     return;
                 };
                 const setter = ircx_prop_store.Setter{ .id = conn.session.displayName(), .access = access };
                 const ev = self.props.setProp(m.entity, m.key, m.value, setter) catch {
-                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{m.entity.id}, "Cannot set that property");
+                    try queueNumeric(conn, .ERR_PROPDENIED, &.{m.entity.id}, "Cannot set that property");
                     return;
                 };
                 try propEmitEntry(conn, ev);
@@ -2553,7 +2568,7 @@ pub const LinuxServer = struct {
             },
             .delete => |k| {
                 if (self.propAccess(id, conn, k.entity) == null) {
-                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{k.entity.id}, "Insufficient access to delete property");
+                    try queueNumeric(conn, .ERR_PROPDENIED, &.{k.entity.id}, "Insufficient access to delete property");
                     return;
                 }
                 self.props.deleteProp(k.entity, k.key) catch {};
@@ -2572,9 +2587,11 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHISPER"}, "Not enough parameters");
             return;
         };
-        if (!self.world.channelExists(args.channel) or
-            !self.world.isMember(args.channel, worldIdFromClient(id)))
-        {
+        if (!self.world.channelExists(args.channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
+            return;
+        }
+        if (!self.world.isMember(args.channel, worldIdFromClient(id))) {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{args.channel}, "You're not on that channel");
             return;
         }
@@ -2589,7 +2606,7 @@ pub const LinuxServer = struct {
                 continue;
             };
             if (!self.world.isMember(args.channel, rwid)) {
-                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{ nick, args.channel }, "They aren't on that channel");
+                try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ nick, args.channel }, "They aren't on that channel");
                 continue;
             }
             var line_buf: [default_reply_bytes]u8 = undefined;
@@ -4683,10 +4700,10 @@ test "threaded server: PROP set/get gated by channel-op" {
     a.reset();
     try writeAllFd(fd_a, "PROP #p SUBJECT\r\n");
     try recvUntil(a, " 818 A #p ", 200);
-    // B, not on the channel, cannot set channel props (ERR_CHANOPRIVSNEEDED 482).
+    // B, not on the channel, cannot set channel props (ERR_PROPDENIED 918).
     b.reset();
     try writeAllFd(fd_b, "PROP #p SUBJECT :nope\r\n");
-    try recvUntil(b, " 482 ", 200);
+    try recvUntil(b, " 918 ", 200);
     // A sets a SECRET key; B (no write access) must not be able to read it back —
     // the GET returns only the 819 end with no 818/value leak.
     a.reset();
@@ -4746,6 +4763,20 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
     b.reset();
     try writeAllFd(fd_b, "ACCESS #a ADD VOICE *!*@x\r\n");
     try recvUntil(b, " 482 ", 200);
+    // Channel-recycle: A seeds a DENY entry, parts (channel destroyed as sole
+    // member), then recreates #a — the stale DENY must NOT survive into the new
+    // incarnation (only 803 start + 805 end, no 804 entry line).
+    try writeAllFd(fd_a, "ACCESS #a ADD DENY *!*@evil.example\r\n");
+    try recvUntil(a, " 801 A #a DENY ", 200);
+    try writeAllFd(fd_a, "PART #a\r\n");
+    try recvUntil(a, "PART #a", 200);
+    try writeAllFd(fd_a, "JOIN #a\r\n");
+    try recvUntil(a, " 366 A #a ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #a LIST\r\n");
+    try recvUntil(a, " 805 A #a ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "evil.example") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 804 ") == null);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {
