@@ -415,6 +415,9 @@ const Numeric = enum(u16) {
     RPL_MONLIST = 732,
     RPL_ENDOFMONLIST = 733,
     ERR_MONLISTFULL = 734,
+    RPL_STATSUPTIME = 242,
+    RPL_STATSOLINE = 243,
+    RPL_ENDOFSTATS = 219,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHCHANNEL = 403,
     ERR_CANNOTSENDTOCHAN = 404,
@@ -556,6 +559,8 @@ pub const LinuxServer = struct {
     /// now; a full oper-block table arrives with the config overhaul.
     oper_name: []const u8 = "admin",
     oper_pass: []const u8 = "mizuchi",
+    /// Monotonic millis captured at init, for STATS u uptime.
+    start_ms: i64 = 0,
 
     /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
     /// ring used for accept/recv/send completions.
@@ -583,6 +588,7 @@ pub const LinuxServer = struct {
             .world = world_model.World.init(allocator),
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, 128),
+            .start_ms = platform.monotonicMillis(),
         };
     }
 
@@ -911,6 +917,8 @@ pub const LinuxServer = struct {
             try self.handleKnock(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MONITOR")) {
             try self.handleMonitor(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "STATS")) {
+            try self.handleStats(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
         } else {
@@ -1692,6 +1700,34 @@ pub const LinuxServer = struct {
         self.monitor.setOffline(nick, &sink) catch {};
         self.flushMonitorReplies(&sink) catch {};
         self.monitor.removeClient(monitorIdFromClient(id));
+    }
+
+    /// STATS <letter> — server statistics. Supports u (uptime, 242) and o (oper
+    /// blocks, 243). All queries terminate with RPL_ENDOFSTATS (219).
+    fn handleStats(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"STATS"}, "Not enough parameters");
+            return;
+        }
+        const letter = parsed.paramSlice()[0];
+        switch (letter[0]) {
+            'u' => {
+                const up_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(platform.monotonicMillis() - self.start_ms, 1000)));
+                const days = up_secs / 86_400;
+                const hours = (up_secs % 86_400) / 3600;
+                const mins = (up_secs % 3600) / 60;
+                const secs = up_secs % 60;
+                var buf: [96]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "Server Up {d} days {d:0>2}:{d:0>2}:{d:0>2}", .{ days, hours, mins, secs }) catch return;
+                try queueNumeric(conn, .RPL_STATSUPTIME, &.{}, text);
+            },
+            'o' => {
+                // One static oper block (matches the OPER credential).
+                try queueNumeric(conn, .RPL_STATSOLINE, &.{ "O", "*@*", "*", self.oper_name, "0", "0" }, "");
+            },
+            else => {}, // other letters not implemented yet
+        }
+        try queueNumeric(conn, .RPL_ENDOFSTATS, &.{letter}, "End of /STATS report");
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
@@ -2764,6 +2800,11 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     a.reset();
     try writeAllFd(fd_a, "MAP\r\n");
     try recvUntil(&a, " 015 A ", 200);
+    // STATS u -> uptime (242) + end (219).
+    a.reset();
+    try writeAllFd(fd_a, "STATS u\r\n");
+    try recvUntil(&a, " 242 A ", 200);
+    try recvUntil(&a, " 219 A u ", 200);
 
     // Bot mode: B sets +B on itself -> MODE echo; WHOIS B shows 335.
     b.reset();

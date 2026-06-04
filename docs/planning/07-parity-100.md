@@ -113,7 +113,7 @@
 
 ## G. Oper & server management
 
-82. [ ] STATS (l/o/u/c/i/k subset) — multiple RPL_STATS*
+82. [x] STATS (l/o/u/c/i/k subset) — multiple RPL_STATS*
 83. [ ] CONNECT / SQUIT (S2S; deferred to mesh)
 84. [ ] DIE (oper shutdown)
 85. [ ] RESTART (oper)
