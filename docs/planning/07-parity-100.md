@@ -81,7 +81,7 @@
 53. [x] server-time tag on all relayed messages (have realtimeMillis)
 54. [ ] message-tags relay (client tags passthrough)
 55. [x] account-tag on messages
-56. [ ] account-notify on login/logout `[~]` proto/account_notify.zig
+56. [~] account-notify on login/logout `[~]` proto/account_notify.zig
 57. [x] extended-join (account+realname in JOIN) `[~]` proto/extended_join.zig
 58. [~] chghost `[~]` proto/chghost.zig
 59. [x] invite-notify `[~]` proto/invite_notify.zig
@@ -89,7 +89,7 @@
 61. [ ] batch (netjoin/netsplit/chathistory) `[~]` proto/batch.zig
 62. [~] labeled-response (label → echo correlation)
 63. [~] CAP NEW / CAP DEL dynamic advertisement
-64. [ ] STS policy advertisement `[~]` proto/sts.zig
+64. [~] STS policy advertisement `[~]` proto/sts.zig
 65. [x] bot-mode (+B umode, WHOIS 335) `[~]` proto/bot_mode.zig
 66. [~] multiline `[~]` proto/multiline.zig
 67. [x] message-redaction / message-edit `[~]` proto/msgedit.zig
@@ -114,7 +114,7 @@
 ## G. Oper & server management
 
 82. [x] STATS (l/o/u/c/i/k subset) — multiple RPL_STATS*
-83. [ ] CONNECT / SQUIT (S2S; deferred to mesh)
+83. [~] CONNECT / SQUIT (S2S; deferred to mesh)
 84. [x] DIE (oper shutdown)
 85. [x] RESTART (oper)
 86. [x] KLINE / DLINE / GLINE + UNKLINE (ban storage)
