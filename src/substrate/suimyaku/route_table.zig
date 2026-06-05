@@ -101,6 +101,34 @@ const ChannelState = struct {
     }
 };
 
+/// One remote channel member's identity, for projecting NAMES/WHO. `nick` is
+/// owned by the route table; `status` reuses the MemberStatus bit layout
+/// (founder/owner/op/voice) so prefixes render; `hlc` drives last-writer-wins.
+pub const Member = struct {
+    nick: []u8,
+    node: NodeId,
+    status: u4,
+    hlc: u64,
+};
+
+/// Per-channel member roster (flat list — channels are bounded, and a flat list
+/// keeps ownership trivial: one owned nick per entry).
+const MemberList = struct {
+    entries: std.ArrayListUnmanaged(Member) = .empty,
+
+    fn deinit(self: *MemberList, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |m| allocator.free(m.nick);
+        self.entries.deinit(allocator);
+    }
+
+    fn find(self: *const MemberList, nick: []const u8) ?usize {
+        for (self.entries.items, 0..) |m, i| {
+            if (std.mem.eql(u8, m.nick, nick)) return i;
+        }
+        return null;
+    }
+};
+
 pub const RouteTable = struct {
     const Self = @This();
 
@@ -108,6 +136,10 @@ pub const RouteTable = struct {
     cfg: Config,
     nick_to_node: std.StringHashMap(NodeId),
     channels: std.StringHashMap(ChannelState),
+    /// channel name -> roster of remote members (nick + status), populated by
+    /// MEMBERSHIP propagation (see docs/planning/16). Independent of `channels`
+    /// (which is node-level routing) so identity churn never disturbs routing.
+    channel_members: std.StringHashMap(MemberList),
     nick_count: usize = 0,
     channel_count: usize = 0,
 
@@ -118,6 +150,7 @@ pub const RouteTable = struct {
             .cfg = cfg,
             .nick_to_node = std.StringHashMap(NodeId).init(allocator),
             .channels = std.StringHashMap(ChannelState).init(allocator),
+            .channel_members = std.StringHashMap(MemberList).init(allocator),
         };
     }
 
@@ -125,6 +158,7 @@ pub const RouteTable = struct {
         self.clear();
         self.nick_to_node.deinit();
         self.channels.deinit();
+        self.channel_members.deinit();
         self.* = undefined;
     }
 
@@ -139,6 +173,13 @@ pub const RouteTable = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.channels.clearRetainingCapacity();
+
+        var members = self.channel_members.iterator();
+        while (members.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.channel_members.clearRetainingCapacity();
 
         self.nick_count = 0;
         self.channel_count = 0;
@@ -222,9 +263,92 @@ pub const RouteTable = struct {
         self.channel_count -= 1;
     }
 
+    /// Apply a MEMBERSHIP event for a remote member, last-writer-wins by `hlc`.
+    /// `present` true = join/status upsert; false = part. Stale events (hlc <= the
+    /// stored one for this nick) are ignored, so out-of-order gossip converges.
+    pub fn applyMembership(
+        self: *Self,
+        chan: []const u8,
+        nick: []const u8,
+        node: NodeId,
+        status: u4,
+        hlc: u64,
+        present: bool,
+    ) Error!void {
+        try self.validateName(chan);
+        try self.validateName(nick);
+        try validateNode(node);
+
+        const list = try self.ensureMemberList(chan);
+        if (list.find(nick)) |idx| {
+            const cur = &list.entries.items[idx];
+            if (hlc <= cur.hlc) return; // stale; LWW keeps the newer event
+            if (present) {
+                cur.node = node;
+                cur.status = status;
+                cur.hlc = hlc;
+            } else {
+                self.allocator.free(cur.nick);
+                _ = list.entries.swapRemove(idx);
+                self.pruneIfEmpty(chan);
+            }
+            return;
+        }
+        if (!present) return; // part for an unknown member: nothing to do
+        if (list.entries.items.len >= self.cfg.max_nicks) return error.RouteTableFull;
+        const owned = try self.allocator.dupe(u8, nick);
+        errdefer self.allocator.free(owned);
+        try list.entries.append(self.allocator, .{ .nick = owned, .node = node, .status = status, .hlc = hlc });
+    }
+
+    /// Borrowed roster of remote members for `chan` (empty if none). Valid until
+    /// the next `applyMembership`/eviction touching this channel.
+    pub fn channelMembers(self: *const Self, chan: []const u8) []const Member {
+        const list = self.channel_members.getPtr(chan) orelse return &.{};
+        return list.entries.items;
+    }
+
+    fn ensureMemberList(self: *Self, chan: []const u8) Error!*MemberList {
+        if (self.channel_members.getPtr(chan)) |list| return list;
+        const owned = try self.allocator.dupe(u8, chan);
+        errdefer self.allocator.free(owned);
+        try self.channel_members.putNoClobber(owned, .{});
+        return self.channel_members.getPtr(chan).?;
+    }
+
+    fn pruneIfEmpty(self: *Self, chan: []const u8) void {
+        const entry = self.channel_members.getEntry(chan) orelse return;
+        if (entry.value_ptr.entries.items.len != 0) return;
+        const owned_key = entry.key_ptr.*;
+        entry.value_ptr.deinit(self.allocator);
+        self.channel_members.removeByPtr(entry.key_ptr);
+        self.allocator.free(owned_key);
+    }
+
     pub fn removeNode(self: *Self, node: NodeId) void {
         self.removeNodeNicks(node);
         self.removeNodeChannels(node);
+        self.removeNodeMembers(node);
+    }
+
+    /// Drop every remote member homed on a departed node (netsplit hygiene), and
+    /// remove any channel left with no remaining members.
+    fn removeNodeMembers(self: *Self, node: NodeId) void {
+        var empties: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer empties.deinit(self.allocator);
+        var it = self.channel_members.iterator();
+        while (it.next()) |entry| {
+            const list = entry.value_ptr;
+            var i: usize = 0;
+            while (i < list.entries.items.len) {
+                if (list.entries.items[i].node == node) {
+                    self.allocator.free(list.entries.items[i].nick);
+                    _ = list.entries.swapRemove(i);
+                } else i += 1;
+            }
+            if (list.entries.items.len == 0) empties.append(self.allocator, entry.key_ptr.*) catch {};
+        }
+        for (empties.items) |chan| self.pruneIfEmpty(chan);
     }
 
     pub fn nickCount(self: *const Self) usize {
@@ -372,4 +496,50 @@ test "no leak across clear, remove, and deinit paths" {
 
     try std.testing.expectEqual(@as(usize, 0), table.nickCount());
     try std.testing.expectEqual(@as(usize, 0), table.channelCount());
+}
+
+test "applyMembership tracks remote channel members with last-writer-wins" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    try table.applyMembership("#chat", "alice", 10, 0b0100, 1, true); // op
+    try table.applyMembership("#chat", "bob", 20, 0b0000, 1, true);
+    try std.testing.expectEqual(@as(usize, 2), table.channelMembers("#chat").len);
+
+    // A stale event (lower hlc) is ignored; a newer one updates status.
+    try table.applyMembership("#chat", "alice", 10, 0b0000, 0, true);
+    try table.applyMembership("#chat", "alice", 10, 0b0010, 5, true); // now voice
+    var alice_status: ?u4 = null;
+    for (table.channelMembers("#chat")) |m| {
+        if (std.mem.eql(u8, m.nick, "alice")) alice_status = m.status;
+    }
+    try std.testing.expectEqual(@as(u4, 0b0010), alice_status.?);
+}
+
+test "applyMembership part removes a member and prunes an empty channel" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    try table.applyMembership("#x", "alice", 10, 0, 1, true);
+    // Stale part (hlc <= current) does not remove.
+    try table.applyMembership("#x", "alice", 10, 0, 1, false);
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#x").len);
+    // Newer part removes; the now-empty channel is pruned.
+    try table.applyMembership("#x", "alice", 10, 0, 2, false);
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
+}
+
+test "removeNode evicts that node's remote members (netsplit hygiene)" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    try table.applyMembership("#chat", "alice", 10, 0, 1, true);
+    try table.applyMembership("#chat", "bob", 20, 0, 1, true);
+    table.removeNode(10);
+    const members = table.channelMembers("#chat");
+    try std.testing.expectEqual(@as(usize, 1), members.len);
+    try std.testing.expectEqualStrings("bob", members[0].nick);
+
+    table.removeNode(20); // last member gone -> channel pruned
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#chat").len);
 }
