@@ -80,7 +80,9 @@ pub fn inv(a: u8) Error!u8 {
 pub fn pow(a: u8, exponent: usize) u8 {
     if (exponent == 0) return 1;
     if (a == 0) return 0;
-    return tables.exp[(@as(usize, tables.log[a]) * exponent) % 255];
+    // Reduce the exponent mod 255 (the multiplicative order) BEFORE multiplying
+    // by the log, or `log[a] * exponent` overflows usize for large exponents.
+    return tables.exp[(@as(usize, tables.log[a]) * (exponent % 255)) % 255];
 }
 
 fn validateCounts(k: usize, m: usize) Error!void {

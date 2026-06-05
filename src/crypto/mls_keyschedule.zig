@@ -90,9 +90,10 @@ pub fn expandWithLabel(
     context: []const u8,
 ) void {
     const buf_size = kdfLabelSize(label, context);
-    // Stack-allocate up to 512 bytes; heap fallback not needed for typical MLS
-    // labels (<< 255 chars) and typical context sizes (<< 200 bytes).
-    var stack_buf: [512]u8 = undefined;
+    // Buffer sized to cover a realistic MLS GroupContext (with extensions). The
+    // assert is the documented hard precondition for this low-level primitive;
+    // all in-module callers pass <= 32-byte secrets / hashed contexts.
+    var stack_buf: [4096]u8 = undefined;
     std.debug.assert(buf_size <= stack_buf.len);
     const n = encodeKdfLabel(&stack_buf, @intCast(out.len), label, context);
     HkdfSha256.expand(out, stack_buf[0..n], secret.*);

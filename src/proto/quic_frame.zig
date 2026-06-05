@@ -219,9 +219,12 @@ pub fn decodeFrame(allocator: std.mem.Allocator, input: []const u8) !DecodedFram
             const largest = try takeVarInt(input, &pos);
             const delay = try takeVarInt(input, &pos);
             const range_count = try takeVarInt(input, &pos);
-            if (range_count > std.math.maxInt(usize)) return WireError.InvalidFrame;
             const first_range = try takeVarInt(input, &pos);
 
+            // Each ACK range needs >= 2 bytes on the wire (gap + len varints).
+            // Reject a count that cannot possibly fit the remaining input so a
+            // tiny packet cannot trigger a huge allocation.
+            if (range_count > (input.len - pos) / 2) return WireError.InvalidFrame;
             const ranges = try allocator.alloc(AckRange, @intCast(range_count));
             errdefer allocator.free(ranges);
             for (ranges) |*range| {

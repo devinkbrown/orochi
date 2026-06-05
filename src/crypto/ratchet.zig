@@ -187,11 +187,15 @@ pub const Ratchet = struct {
         try self.skipMessageKeys(header.n);
         if (header.n < self.nr) return error.DuplicateOrStaleMessage;
 
-        var chain = self.recv_chain orelse return error.MissingReceiveChain;
-        const message_key = chain.advance();
-        self.recv_chain = chain;
+        // Derive the message key from a COPY of the chain and verify before
+        // committing: a forged/corrupt in-order packet must not advance (and thus
+        // desync) the receive chain so the genuine packet stays decryptable.
+        var advanced = self.recv_chain orelse return error.MissingReceiveChain;
+        const message_key = advanced.advance();
+        const plaintext = try open(self.allocator, message_key, header, ciphertext, associated_data);
+        self.recv_chain = advanced;
         self.nr += 1;
-        return try open(self.allocator, message_key, header, ciphertext, associated_data);
+        return plaintext;
     }
 
     fn dhRatchet(self: *Ratchet, remote_pub: PublicKey, previous_send_count: u32) !void {
@@ -225,8 +229,11 @@ pub const Ratchet = struct {
         var chain = self.recv_chain orelse return error.MissingReceiveChain;
         const remote_pub = self.remote_pub orelse return error.MissingReceiveChain;
         while (self.nr < until) : (self.nr += 1) {
-            if (self.skipped.items.len >= self.max_skip) return error.SkipLimitExceeded;
             const key = chain.advance();
+            // Bound retained skipped keys independently of the per-gap limit by
+            // evicting the oldest, rather than rejecting an otherwise-valid gap
+            // once the store filled from earlier ratchet steps.
+            if (self.skipped.items.len >= self.max_skip) _ = self.skipped.orderedRemove(0);
             try self.skipped.append(self.allocator, .{
                 .dh_pub = remote_pub,
                 .n = self.nr,

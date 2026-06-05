@@ -150,19 +150,30 @@ pub fn labeledExpand(
     labeledExpandWithSuite(suite_id, out, prk, label, info);
 }
 
+// HPKE labeled KDF inputs (version label + suite id + label + ikm/info) are all
+// small and bounded, so build them in a fixed stack buffer — no allocator, no
+// page_allocator+catch-unreachable DoS/panic surface.
+const labeled_buf_len = 1024;
+
+fn concatInto(buf: []u8, parts: []const []const u8) []const u8 {
+    var n: usize = 0;
+    for (parts) |p| {
+        std.debug.assert(n + p.len <= buf.len);
+        @memcpy(buf[n..][0..p.len], p);
+        n += p.len;
+    }
+    return buf[0..n];
+}
+
 fn labeledExtractWithSuite(
     comptime label_suite_id: []const u8,
     salt: []const u8,
     label: []const u8,
     ikm: []const u8,
 ) [HkdfSha256.prk_length]u8 {
-    var labeled_ikm: std.ArrayList(u8) = .empty;
-    defer labeled_ikm.deinit(std.heap.page_allocator);
-    labeled_ikm.appendSlice(std.heap.page_allocator, hpke_version_label) catch unreachable;
-    labeled_ikm.appendSlice(std.heap.page_allocator, label_suite_id) catch unreachable;
-    labeled_ikm.appendSlice(std.heap.page_allocator, label) catch unreachable;
-    labeled_ikm.appendSlice(std.heap.page_allocator, ikm) catch unreachable;
-    return HkdfSha256.extract(salt, labeled_ikm.items);
+    var buf: [labeled_buf_len]u8 = undefined;
+    const labeled_ikm = concatInto(&buf, &.{ hpke_version_label, label_suite_id, label, ikm });
+    return HkdfSha256.extract(salt, labeled_ikm);
 }
 
 fn labeledExpandWithSuite(
@@ -173,16 +184,11 @@ fn labeledExpandWithSuite(
     info: []const u8,
 ) void {
     std.debug.assert(out.len <= std.math.maxInt(u16));
-    var labeled_info: std.ArrayList(u8) = .empty;
-    defer labeled_info.deinit(std.heap.page_allocator);
     var len_bytes: [2]u8 = undefined;
     std.mem.writeInt(u16, &len_bytes, @intCast(out.len), .big);
-    labeled_info.appendSlice(std.heap.page_allocator, &len_bytes) catch unreachable;
-    labeled_info.appendSlice(std.heap.page_allocator, hpke_version_label) catch unreachable;
-    labeled_info.appendSlice(std.heap.page_allocator, label_suite_id) catch unreachable;
-    labeled_info.appendSlice(std.heap.page_allocator, label) catch unreachable;
-    labeled_info.appendSlice(std.heap.page_allocator, info) catch unreachable;
-    HkdfSha256.expand(out, labeled_info.items, prk);
+    var buf: [labeled_buf_len]u8 = undefined;
+    const labeled_info = concatInto(&buf, &.{ &len_bytes, hpke_version_label, label_suite_id, label, info });
+    HkdfSha256.expand(out, labeled_info, prk);
 }
 
 pub const KeySchedule = struct {
