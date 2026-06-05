@@ -1520,13 +1520,35 @@ pub const LinuxServer = struct {
                 return true;
             }
         }
-        if (self.world.channelLimit(channel)) |limit| {
-            if (self.world.memberCount(channel) >= limit) {
-                try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
-                return true;
+        // NOTE: +l (full) is handled separately in joinOne so it can fall back to
+        // the IRCX +d auto-clone path; all the gates above are hard denials.
+        return false;
+    }
+
+    /// True when `channel` has a +l member limit and is at or over it.
+    fn isChannelFull(self: *LinuxServer, channel: []const u8) bool {
+        const limit = self.world.channelLimit(channel) orelse return false;
+        return self.world.memberCount(channel) >= limit;
+    }
+
+    /// IRCX CLONEABLE: resolve the channel a join should land on when `parent` is
+    /// +l-full and +d cloneable — the first `#parent<n>` clone that is joinable
+    /// (an existing non-full +E clone), creating a fresh clone if none is. The
+    /// returned name is written into `buf`. Null if no slot could be found.
+    fn resolveCloneTarget(self: *LinuxServer, parent: []const u8, buf: []u8) !?[]const u8 {
+        var n: u32 = 1;
+        while (n < 1000) : (n += 1) {
+            const name = std.fmt.bufPrint(buf, "{s}{d}", .{ parent, n }) catch return null;
+            if (!self.world.channelExists(name)) {
+                _ = self.world.cloneChannel(parent, name) catch return null;
+                return name;
+            }
+            // An existing clone with room takes the join; a full one is skipped.
+            if (self.world.channelHasExtFlag(name, .clone) and !self.isChannelFull(name)) {
+                return name;
             }
         }
-        return false;
+        return null;
     }
 
     fn handleJoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -1554,24 +1576,40 @@ pub const LinuxServer = struct {
         // Enforce channel modes only when joining an EXISTING channel as a new
         // member. Creating a fresh channel (founder path) bypasses all gates.
         const wid = worldIdFromClient(id);
+        var clone_buf: [160]u8 = undefined;
+        var join_target = channel;
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
             if (try self.joinDenied(conn, id, channel, key)) return;
+            // +l full: IRCX +d cloneable channels redirect the join to a clone;
+            // otherwise it is a hard 471.
+            if (self.isChannelFull(channel)) {
+                if (self.world.channelHasExtFlag(channel, .cloneable)) {
+                    join_target = (try self.resolveCloneTarget(channel, &clone_buf)) orelse {
+                        try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
+                        return;
+                    };
+                } else {
+                    try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
+                    return;
+                }
+            }
         }
 
         // Founder creating a brand-new channel: purge any orphaned IRCX state from
         // a prior same-named incarnation so stale ACCESS DENY/GRANT entries or
-        // secret PROP keys can never bleed into the new channel.
-        const creating = !self.world.channelExists(channel);
+        // secret PROP keys can never bleed into the new channel. (A clone target is
+        // already set up by cloneChannel, so it is never "creating" here.)
+        const creating = !self.world.channelExists(join_target);
         if (creating) {
-            self.props.clearChannel(channel);
-            _ = self.access.clear(.{ .channel = channel }) catch {};
+            self.props.clearChannel(join_target);
+            _ = self.access.clear(.{ .channel = join_target }) catch {};
         }
 
-        _ = try self.world.join(channel, wid);
+        _ = try self.world.join(join_target, wid);
 
-        try self.broadcastJoin(channel, conn);
-        try self.sendTopicReply(conn, channel);
-        try self.sendNames(conn, channel);
+        try self.broadcastJoin(join_target, conn);
+        try self.sendTopicReply(conn, join_target);
+        try self.sendNames(conn, join_target);
     }
 
     fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
