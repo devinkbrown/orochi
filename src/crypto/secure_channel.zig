@@ -1,0 +1,224 @@
+//! Secure channel: composes the shipped crypto primitives into an end-to-end
+//! encrypted session for the mesh.
+//!
+//!   1:1  — HPKE (X-Wing-style KEM here X25519) establishes a shared root, the
+//!          Signal-style double ratchet (`ratchet`) provides forward-secret,
+//!          self-healing per-frame AEAD. The relay never sees plaintext.
+//!   group — TreeKEM (`treekem`) derives a shared group secret that rekeys on
+//!          add/remove/update; the root secret keys a group AEAD.
+//!
+//! This is the crypto analog of `transport_stack.zig`/`media_session.zig`: a thin
+//! coordinator wiring independently-tested modules. Live wiring onto the S2S link
+//! waits on the Tsumugi handshake (task #2) which supplies node identity; this
+//! module is transport-agnostic and deterministic, so it slots into the DST
+//! harness now.
+const std = @import("std");
+
+const ratchet = @import("ratchet.zig");
+const hpke = @import("hpke.zig");
+const treekem = @import("treekem.zig");
+
+const X25519 = std.crypto.dh.X25519;
+
+pub const Header = ratchet.Header;
+pub const SealedMessage = ratchet.SealedMessage;
+pub const PublicKey = [X25519.public_length]u8;
+
+pub const default_max_skip = 256;
+
+/// Derive the ratchet's first "next" DH key pair deterministically from the
+/// shared root + a role label, so each side has a pre-staged pair for its first
+/// DH-ratchet step without an extra wire round-trip.
+fn deriveNextPair(shared: [32]u8, label: []const u8) !X25519.KeyPair {
+    var seed: [X25519.seed_length]u8 = undefined;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(&shared);
+    h.update(label);
+    h.final(&seed);
+    return X25519.KeyPair.generateDeterministic(seed);
+}
+
+/// A 1:1 forward-secret channel over the double ratchet, bootstrapped from an
+/// HPKE-encapsulated shared root so neither side ever transmits the root.
+pub const Channel = struct {
+    rx: ratchet.Ratchet,
+
+    /// Initiator: HPKE-encapsulate to the responder's public key, seed the
+    /// ratchet root from the shared secret, and start as "Alice". Returns the
+    /// channel plus the KEM `enc` value to hand to the responder out-of-band
+    /// (or in the first frame's preamble).
+    pub fn initiate(
+        allocator: std.mem.Allocator,
+        own_pair: X25519.KeyPair,
+        responder_pub: PublicKey,
+        eph_seed: [X25519.seed_length]u8,
+    ) !struct { channel: Channel, enc: hpke.Enc } {
+        const encapsulation = try hpke.encapDeterministic(responder_pub, eph_seed);
+        const root = ratchet.RootKey.init(encapsulation.shared_secret);
+        var r = try ratchet.Ratchet.initAlice(allocator, root, own_pair, responder_pub, default_max_skip);
+        r.setNextDhKeyPair(try deriveNextPair(encapsulation.shared_secret, "mz-next-initiator"));
+        return .{ .channel = .{ .rx = r }, .enc = encapsulation.enc };
+    }
+
+    /// Responder: HPKE-decapsulate `enc` with the matching secret to recover the
+    /// same root, and start as "Bob". `own_pair` must be the keypair whose public
+    /// key the initiator encapsulated to.
+    pub fn respond(
+        allocator: std.mem.Allocator,
+        own_pair: X25519.KeyPair,
+        enc: hpke.Enc,
+    ) !Channel {
+        const shared = try hpke.decap(enc, own_pair.secret_key);
+        const root = ratchet.RootKey.init(shared);
+        var b = ratchet.Ratchet.initBob(allocator, root, own_pair, default_max_skip);
+        b.setNextDhKeyPair(try deriveNextPair(shared, "mz-next-responder"));
+        return .{ .rx = b };
+    }
+
+    pub fn deinit(self: *Channel) void {
+        self.rx.deinit();
+    }
+
+    /// Encrypt one frame; the returned message's ciphertext is allocator-owned.
+    pub fn seal(self: *Channel, plaintext: []const u8, associated_data: []const u8) !SealedMessage {
+        return self.rx.encrypt(plaintext, associated_data);
+    }
+
+    /// Decrypt one frame; the returned plaintext is allocator-owned.
+    pub fn open(self: *Channel, header: Header, ciphertext: []const u8, associated_data: []const u8) ![]u8 {
+        return self.rx.decrypt(header, ciphertext, associated_data);
+    }
+};
+
+/// A group key agreement over TreeKEM. The root secret keys a group AEAD; any
+/// add/remove/update produces a new root all current members converge on.
+pub const SecureGroup = struct {
+    group: treekem.Group,
+
+    pub fn init(allocator: std.mem.Allocator, member_seeds: []const treekem.MemberSeed) !SecureGroup {
+        return .{ .group = try treekem.Group.init(allocator, member_seeds) };
+    }
+
+    pub fn deinit(self: *SecureGroup) void {
+        self.group.deinit();
+    }
+
+    /// Current group secret (use as / to derive the group AEAD key).
+    pub fn groupKey(self: *const SecureGroup) treekem.Secret {
+        return self.group.rootSecret();
+    }
+
+    pub fn update(self: *SecureGroup, member_id: treekem.MemberId) !treekem.Commit {
+        return self.group.update(member_id);
+    }
+
+    pub fn add(self: *SecureGroup, seed_value: treekem.MemberSeed) !treekem.Commit {
+        return self.group.add(seed_value);
+    }
+
+    pub fn remove(self: *SecureGroup, member_id: treekem.MemberId) !treekem.Commit {
+        return self.group.remove(member_id);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn pairFromSeed(b: u8) !X25519.KeyPair {
+    return X25519.KeyPair.generateDeterministic([_]u8{b} ** X25519.seed_length);
+}
+
+test "1:1 channel: HPKE bootstrap + ratchet round-trip both directions" {
+    const allocator = testing.allocator;
+    const alice_pair = try pairFromSeed(0x11);
+    const bob_pair = try pairFromSeed(0x22);
+
+    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key, [_]u8{0x33} ** X25519.seed_length);
+    var alice = setup.channel;
+    defer alice.deinit();
+    var bob = try Channel.respond(allocator, bob_pair, setup.enc);
+    defer bob.deinit();
+
+    // Alice -> Bob
+    var m1 = try alice.seal("hello bob", "ad");
+    defer m1.deinit(allocator);
+    const p1 = try bob.open(m1.header, m1.ciphertext, "ad");
+    defer allocator.free(p1);
+    try testing.expectEqualStrings("hello bob", p1);
+
+    // Bob -> Alice (a reply triggers the DH ratchet)
+    var m2 = try bob.seal("hi alice", "ad");
+    defer m2.deinit(allocator);
+    const p2 = try alice.open(m2.header, m2.ciphertext, "ad");
+    defer allocator.free(p2);
+    try testing.expectEqualStrings("hi alice", p2);
+}
+
+test "1:1 channel: tampered ciphertext is rejected" {
+    const allocator = testing.allocator;
+    const alice_pair = try pairFromSeed(0x44);
+    const bob_pair = try pairFromSeed(0x55);
+    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key, [_]u8{0x66} ** X25519.seed_length);
+    var alice = setup.channel;
+    defer alice.deinit();
+    var bob = try Channel.respond(allocator, bob_pair, setup.enc);
+    defer bob.deinit();
+
+    var m = try alice.seal("secret", "ad");
+    defer m.deinit(allocator);
+    m.ciphertext[0] ^= 0x01;
+    try testing.expectError(error.AuthenticationFailed, bob.open(m.header, m.ciphertext, "ad"));
+}
+
+test "1:1 channel: out-of-order delivery within the skip window" {
+    const allocator = testing.allocator;
+    const alice_pair = try pairFromSeed(0x77);
+    const bob_pair = try pairFromSeed(0x88);
+    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key, [_]u8{0x99} ** X25519.seed_length);
+    var alice = setup.channel;
+    defer alice.deinit();
+    var bob = try Channel.respond(allocator, bob_pair, setup.enc);
+    defer bob.deinit();
+
+    var m1 = try alice.seal("first", "");
+    defer m1.deinit(allocator);
+    var m2 = try alice.seal("second", "");
+    defer m2.deinit(allocator);
+
+    // Deliver the second message before the first.
+    const p2 = try bob.open(m2.header, m2.ciphertext, "");
+    defer allocator.free(p2);
+    try testing.expectEqualStrings("second", p2);
+    const p1 = try bob.open(m1.header, m1.ciphertext, "");
+    defer allocator.free(p1);
+    try testing.expectEqualStrings("first", p1);
+}
+
+test "group: all members share a key; rekey on remove evicts the removed member" {
+    const allocator = testing.allocator;
+    const seeds = [_]treekem.MemberSeed{
+        [_]u8{0xa1} ** treekem.member_seed_len,
+        [_]u8{0xa2} ** treekem.member_seed_len,
+        [_]u8{0xa3} ** treekem.member_seed_len,
+    };
+    var g = try SecureGroup.init(allocator, &seeds);
+    defer g.deinit();
+
+    const k0 = g.groupKey();
+
+    // An update changes the group key (forward secrecy on rekey). Member ids are
+    // 1-based in treekem.
+    var commit = try g.update(1);
+    defer commit.deinit();
+    const k1 = g.groupKey();
+    try testing.expect(!std.mem.eql(u8, &k0, &k1));
+
+    // A removed member's seed can no longer derive the post-removal key.
+    var rm = try g.remove(3);
+    defer rm.deinit();
+    const k2 = g.groupKey();
+    try testing.expect(!std.mem.eql(u8, &k1, &k2));
+}

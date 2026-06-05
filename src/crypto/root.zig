@@ -20,6 +20,7 @@ pub const random = @import("random.zig");
 pub const ratchet = @import("ratchet.zig");
 pub const sasl_scram_client = @import("sasl_scram_client.zig");
 pub const secret = @import("secret.zig");
+pub const secure_channel = @import("secure_channel.zig");
 pub const sframe = @import("sframe.zig");
 pub const shamir = @import("shamir.zig");
 pub const sign_kat = @import("sign_kat.zig");
@@ -63,6 +64,7 @@ test {
     _ = ratchet;
     _ = sasl_scram_client;
     _ = secret;
+    _ = secure_channel;
     _ = sframe;
     _ = shamir;
     _ = sign_kat;
