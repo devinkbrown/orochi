@@ -1,0 +1,749 @@
+//! Verifiable rateless anti-entropy over origin-signed channel CRDT deltas.
+const std = @import("std");
+
+const channel_crdt = @import("channel_crdt.zig");
+const clock = @import("clock.zig");
+const delta_codec = @import("delta_codec.zig");
+const prolly = @import("prolly.zig");
+const riblt = @import("riblt.zig");
+const signed_delta = @import("../../proto/signed_delta.zig");
+
+const Allocator = std.mem.Allocator;
+const Cid = signed_delta.Cid;
+const Hash = prolly.Hash;
+const SignedDelta = signed_delta.SignedDelta;
+const DeltaView = delta_codec.DeltaView(delta_codec.default_limits);
+
+const magic = [_]u8{ 'G', 'Y', 'S', '1' };
+const symbols_per_pump = 24;
+const max_symbols = 512;
+const max_requests = 512;
+const max_fills = 512;
+const max_scope_len = 4096;
+const max_op_len = delta_codec.default_limits.max_wire_bytes;
+
+pub const Error = Allocator.Error || error{
+    BadCid,
+    CapacityExceeded,
+    CounterOverflow,
+    InvalidMessage,
+    MessageTooLarge,
+    MissingDelta,
+    MissingNode,
+    VerificationFailed,
+    UnsupportedDeltaFamily,
+    InvalidChannelDelta,
+};
+
+pub const VerifyFn = *const fn (SignedDelta) bool;
+
+pub const Peer = struct {
+    root_hash: Hash,
+};
+
+const OwnedDelta = struct {
+    signed: SignedDelta,
+    scope: []u8,
+    op_bytes: []u8,
+
+    fn clone(allocator: Allocator, signed: SignedDelta) Error!OwnedDelta {
+        const expected = signed_delta.cid(signed.env);
+        if (!std.mem.eql(u8, &expected, &signed.cid)) return error.BadCid;
+
+        const scope = try allocator.dupe(u8, signed.env.scope);
+        errdefer allocator.free(scope);
+        const op_bytes = try allocator.dupe(u8, signed.env.op_bytes);
+        errdefer allocator.free(op_bytes);
+
+        var owned = signed;
+        owned.env.scope = scope;
+        owned.env.op_bytes = op_bytes;
+        return .{ .signed = owned, .scope = scope, .op_bytes = op_bytes };
+    }
+
+    fn deinit(self: *OwnedDelta, allocator: Allocator) void {
+        allocator.free(self.scope);
+        allocator.free(self.op_bytes);
+        self.* = undefined;
+    }
+};
+
+pub const GoryuSync = struct {
+    allocator: Allocator,
+    index: prolly.Tree,
+    store: std.AutoHashMap(Cid, OwnedDelta),
+    pending: std.AutoHashMap(Cid, OwnedDelta),
+    channel: channel_crdt.ChannelCrdt,
+
+    pub fn init(allocator: Allocator) GoryuSync {
+        return .{
+            .allocator = allocator,
+            .index = prolly.Tree.init(allocator),
+            .store = std.AutoHashMap(Cid, OwnedDelta).init(allocator),
+            .pending = std.AutoHashMap(Cid, OwnedDelta).init(allocator),
+            .channel = channel_crdt.ChannelCrdt.init(allocator, 0),
+        };
+    }
+
+    pub fn deinit(self: *GoryuSync) void {
+        deinitDeltaMap(self.allocator, &self.store);
+        deinitDeltaMap(self.allocator, &self.pending);
+        self.index.deinit();
+        self.channel.deinit();
+        self.* = undefined;
+    }
+
+    pub fn addLocalDelta(self: *GoryuSync, signed: SignedDelta) Error!void {
+        try self.putVerified(signed);
+    }
+
+    pub fn rootHash(self: *const GoryuSync) Hash {
+        return self.index.rootHash();
+    }
+
+    pub fn peer(self: *const GoryuSync) Peer {
+        return .{ .root_hash = self.rootHash() };
+    }
+
+    pub fn beginAntiEntropy(self: *GoryuSync, peer_info: Peer) Error!Session {
+        return Session.init(self, peer_info.root_hash);
+    }
+
+    pub fn applyVerified(self: *GoryuSync, verify_fn: VerifyFn) Error!usize {
+        var applied: usize = 0;
+        var it = self.pending.iterator();
+        while (it.next()) |entry| {
+            const cid = entry.key_ptr.*;
+            var owned = entry.value_ptr.*;
+            if (!verify_fn(owned.signed)) {
+                _ = self.pending.remove(cid);
+                owned.deinit(self.allocator);
+                return error.VerificationFailed;
+            }
+
+            try self.applySignedChannelDelta(owned.signed);
+            _ = self.pending.remove(cid);
+            try self.putOwned(owned);
+            applied += 1;
+        }
+        return applied;
+    }
+
+    pub fn dropTombstonesBelow(self: *GoryuSync, frontier: clock.VersionVector) Error!usize {
+        var dropped: usize = 0;
+        var to_remove: std.ArrayList(Cid) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.store.iterator();
+        while (it.next()) |entry| {
+            if (deltaStableTombstone(entry.value_ptr.signed, frontier)) {
+                try to_remove.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (to_remove.items) |cid| {
+            if (self.store.fetchRemove(cid)) |kv| {
+                var owned = kv.value;
+                owned.deinit(self.allocator);
+                _ = try self.index.remove(cid);
+                dropped += 1;
+            }
+        }
+        return dropped;
+    }
+
+    fn putVerified(self: *GoryuSync, signed: SignedDelta) Error!void {
+        if (self.store.contains(signed.cid)) return;
+        var owned = try OwnedDelta.clone(self.allocator, signed);
+        errdefer owned.deinit(self.allocator);
+        try self.putOwned(owned);
+    }
+
+    fn putOwned(self: *GoryuSync, owned: OwnedDelta) Error!void {
+        if (self.store.contains(owned.signed.cid)) {
+            var dupe = owned;
+            dupe.deinit(self.allocator);
+            return;
+        }
+        errdefer {
+            var rollback = owned;
+            rollback.deinit(self.allocator);
+        }
+        try self.index.insert(owned.signed.cid);
+        try self.store.put(owned.signed.cid, owned);
+    }
+
+    fn putPending(self: *GoryuSync, signed: SignedDelta) Error!void {
+        if (self.store.contains(signed.cid) or self.pending.contains(signed.cid)) return;
+        const owned = try OwnedDelta.clone(self.allocator, signed);
+        errdefer {
+            var rollback = owned;
+            rollback.deinit(self.allocator);
+        }
+        try self.pending.put(owned.signed.cid, owned);
+    }
+
+    fn applySignedChannelDelta(self: *GoryuSync, signed: SignedDelta) Error!void {
+        const view = DeltaView.decode(signed.env.op_bytes) catch return error.InvalidChannelDelta;
+        if (signed.env.family != @intFromEnum(view.family)) return error.InvalidChannelDelta;
+        if (signed.env.hlc != view.hlc.toU64()) return error.InvalidChannelDelta;
+
+        switch (view.family) {
+            .memberships => try applyMembershipDelta(self.allocator, &self.channel, &view),
+            else => return error.UnsupportedDeltaFamily,
+        }
+    }
+};
+
+pub const Session = struct {
+    owner: *GoryuSync,
+    peer_root: Hash,
+    encoder: riblt.Encoder,
+    decoder: riblt.Decoder,
+    decoded: bool = false,
+    received_symbols: usize = 0,
+    wanted: std.AutoHashMap(Cid, void),
+    fills: std.ArrayList(Cid) = .empty,
+
+    fn init(owner: *GoryuSync, peer_root: Hash) Error!Session {
+        var encoder = riblt.Encoder.init(owner.allocator);
+        errdefer encoder.deinit();
+        var decoder = riblt.Decoder.init(owner.allocator);
+        errdefer decoder.deinit();
+
+        for (owner.index.keys.items) |cid| {
+            try encoder.add(cid);
+            try decoder.addLocal(cid);
+        }
+
+        return .{
+            .owner = owner,
+            .peer_root = peer_root,
+            .encoder = encoder,
+            .decoder = decoder,
+            .wanted = std.AutoHashMap(Cid, void).init(owner.allocator),
+        };
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.encoder.deinit();
+        self.decoder.deinit();
+        self.wanted.deinit();
+        self.fills.deinit(self.owner.allocator);
+        self.* = undefined;
+    }
+
+    pub fn converged(self: *const Session) bool {
+        return std.mem.eql(u8, &self.peer_root, &self.owner.rootHash()) or
+            (self.decoded and self.wanted.count() == 0 and self.owner.pending.count() == 0);
+    }
+
+    pub fn applyVerified(self: *Session, verify_fn: VerifyFn) Error!usize {
+        const applied = try self.owner.applyVerified(verify_fn);
+        self.pruneWanted();
+        return applied;
+    }
+
+    /// Consume a peer frame and return the next deterministic frame. The caller
+    /// owns the returned buffer.
+    pub fn pump(self: *Session, bytes: []const u8) Error![]u8 {
+        if (bytes.len != 0) try self.consume(bytes);
+        if (self.converged()) return self.owner.allocator.alloc(u8, 0);
+
+        try self.tryDecode();
+
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.owner.allocator);
+        try writeFrame(self, &out);
+        return out.toOwnedSlice(self.owner.allocator);
+    }
+
+    fn consume(self: *Session, bytes: []const u8) Error!void {
+        var r = Reader{ .buf = bytes };
+        try r.expectMagic();
+
+        const symbol_count = try r.readU16();
+        const request_count = try r.readU16();
+        const fill_count = try r.readU16();
+        if (symbol_count > max_symbols or request_count > max_requests or fill_count > max_fills) {
+            return error.MessageTooLarge;
+        }
+
+        var i: usize = 0;
+        while (i < symbol_count) : (i += 1) {
+            try self.decoder.pushSymbol(.{
+                .seed = try r.readU64(),
+                .index = try r.readU64(),
+                .count = try r.readI64(),
+                .key_xor = try r.readArray(32),
+                .check_xor = try r.readU64(),
+            });
+            self.received_symbols += 1;
+        }
+
+        i = 0;
+        while (i < request_count) : (i += 1) {
+            const cid = try r.readArray(32);
+            if (self.owner.store.get(cid)) |stored| {
+                try self.fills.append(self.owner.allocator, stored.signed.cid);
+            }
+        }
+
+        i = 0;
+        while (i < fill_count) : (i += 1) {
+            try self.owner.putPending(try r.readSignedDelta());
+        }
+
+        if (!r.done()) return error.InvalidMessage;
+        self.pruneWanted();
+    }
+
+    fn tryDecode(self: *Session) Error!void {
+        if (self.decoded) return;
+        if (self.received_symbols == 0) return;
+        var result = (try self.decoder.tryDecode()) orelse return;
+        defer result.deinit();
+        self.decoded = true;
+
+        for (result.remote_only) |cid| {
+            if (!self.owner.store.contains(cid)) try self.wanted.put(cid, {});
+        }
+    }
+
+    fn pruneWanted(self: *Session) void {
+        var it = self.wanted.iterator();
+        while (it.next()) |entry| {
+            if (self.owner.store.contains(entry.key_ptr.*)) {
+                _ = self.wanted.remove(entry.key_ptr.*);
+            }
+        }
+    }
+};
+
+fn writeFrame(session: *Session, out: *std.ArrayList(u8)) Error!void {
+    try out.appendSlice(session.owner.allocator, &magic);
+    const header = out.items.len;
+    try out.appendNTimes(session.owner.allocator, 0, 6);
+
+    var symbol_count: u16 = 0;
+    if (!session.decoded) {
+        while (symbol_count < symbols_per_pump) : (symbol_count += 1) {
+            const sym = session.encoder.nextSymbol();
+            try writeSymbol(out, session.owner.allocator, sym);
+        }
+    }
+
+    var request_count: u16 = 0;
+    var req_it = session.wanted.iterator();
+    while (req_it.next()) |entry| {
+        try out.appendSlice(session.owner.allocator, &entry.key_ptr.*);
+        request_count += 1;
+    }
+
+    var fill_count: u16 = 0;
+    for (session.fills.items) |cid| {
+        if (session.owner.store.get(cid)) |stored| {
+            try writeSignedDelta(out, session.owner.allocator, stored.signed);
+            fill_count += 1;
+        }
+    }
+    session.fills.clearRetainingCapacity();
+
+    writeU16(out.items[header..][0..2], symbol_count);
+    writeU16(out.items[header + 2 ..][0..2], request_count);
+    writeU16(out.items[header + 4 ..][0..2], fill_count);
+}
+
+fn writeSymbol(out: *std.ArrayList(u8), allocator: Allocator, sym: riblt.CodedSymbol) Error!void {
+    try appendU64(out, allocator, sym.seed);
+    try appendU64(out, allocator, sym.index);
+    try appendI64(out, allocator, sym.count);
+    try out.appendSlice(allocator, &sym.key_xor);
+    try appendU64(out, allocator, sym.check_xor);
+}
+
+fn writeSignedDelta(out: *std.ArrayList(u8), allocator: Allocator, signed: SignedDelta) Error!void {
+    if (signed.env.scope.len > max_scope_len or signed.env.op_bytes.len > max_op_len) {
+        return error.MessageTooLarge;
+    }
+    try out.appendSlice(allocator, &signed.cid);
+    try out.appendSlice(allocator, &signed.env.origin_node);
+    try appendU64(out, allocator, signed.env.hlc);
+    try out.append(allocator, signed.env.family);
+    try appendU16(out, allocator, @intCast(signed.env.scope.len));
+    try appendU32(out, allocator, @intCast(signed.env.op_bytes.len));
+    try out.appendSlice(allocator, signed.env.scope);
+    try out.appendSlice(allocator, signed.env.op_bytes);
+    try out.appendSlice(allocator, &signed.signature);
+}
+
+const Reader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn done(self: *const Reader) bool {
+        return self.pos == self.buf.len;
+    }
+
+    fn expectMagic(self: *Reader) Error!void {
+        if (self.buf.len < magic.len or !std.mem.eql(u8, self.buf[0..magic.len], &magic)) {
+            return error.InvalidMessage;
+        }
+        self.pos = magic.len;
+    }
+
+    fn readArray(self: *Reader, comptime len: usize) Error![len]u8 {
+        if (self.pos + len > self.buf.len) return error.InvalidMessage;
+        var out: [len]u8 = undefined;
+        @memcpy(&out, self.buf[self.pos..][0..len]);
+        self.pos += len;
+        return out;
+    }
+
+    fn readU16(self: *Reader) Error!u16 {
+        return std.mem.readInt(u16, &(try self.readArray(2)), .little);
+    }
+
+    fn readU32(self: *Reader) Error!u32 {
+        return std.mem.readInt(u32, &(try self.readArray(4)), .little);
+    }
+
+    fn readU64(self: *Reader) Error!u64 {
+        return std.mem.readInt(u64, &(try self.readArray(8)), .little);
+    }
+
+    fn readI64(self: *Reader) Error!i64 {
+        return @bitCast(try self.readU64());
+    }
+
+    fn readBytes(self: *Reader, len: usize) Error![]const u8 {
+        if (self.pos + len > self.buf.len) return error.InvalidMessage;
+        const bytes = self.buf[self.pos..][0..len];
+        self.pos += len;
+        return bytes;
+    }
+
+    fn readSignedDelta(self: *Reader) Error!SignedDelta {
+        const cid = try self.readArray(32);
+        const origin_node = try self.readArray(20);
+        const hlc = try self.readU64();
+        const family = (try self.readArray(1))[0];
+        const scope_len = try self.readU16();
+        const op_len = try self.readU32();
+        if (scope_len > max_scope_len or op_len > max_op_len) return error.MessageTooLarge;
+        const scope = try self.readBytes(scope_len);
+        const op_bytes = try self.readBytes(op_len);
+        const signature = try self.readArray(signed_delta.signature_len);
+        return .{
+            .env = .{
+                .origin_node = origin_node,
+                .hlc = hlc,
+                .family = family,
+                .scope = scope,
+                .op_bytes = op_bytes,
+            },
+            .cid = cid,
+            .signature = signature,
+        };
+    }
+};
+
+fn applyMembershipDelta(allocator: Allocator, target: *channel_crdt.ChannelCrdt, view: *const DeltaView) Error!void {
+    if (view.entity_id.len != 8) return error.InvalidChannelDelta;
+    var incoming = channel_crdt.ChannelCrdt.init(allocator, target.replica_id);
+    errdefer incoming.deinit();
+    incoming.hlc = view.hlc;
+
+    var context = clock.VersionVector.init();
+    for (view.context[0..view.context_len]) |dot| try observeDot(&context, dot);
+    try incoming.vv.merge(&context);
+
+    var adds = std.ArrayList(@TypeOf(incoming.members.items[0].adds.items[0])).empty;
+    errdefer adds.deinit(allocator);
+    for (view.adds[0..view.adds_len]) |add| {
+        const dots = view.addDots(add);
+        if (dots.len != 1) return error.InvalidChannelDelta;
+        const decoded = try decodeMemberAdd(add.value);
+        if (decoded.dot.replica != dots[0].replica or decoded.dot.counter != dots[0].counter) {
+            return error.InvalidChannelDelta;
+        }
+        try adds.append(allocator, .{
+            .dot = .{ .replica_id = @intCast(decoded.dot.replica), .counter = decoded.dot.counter },
+            .hlc = decoded.hlc,
+            .status = decoded.status,
+        });
+    }
+
+    try incoming.members.append(allocator, .{
+        .member_id = std.mem.readInt(u64, view.entity_id[0..8], .little),
+        .adds = adds,
+        .context = context,
+    });
+    try target.merge(&incoming);
+    incoming.deinit();
+}
+
+fn deltaStableTombstone(signed: SignedDelta, frontier: clock.VersionVector) bool {
+    const view = DeltaView.decode(signed.env.op_bytes) catch return false;
+    if (view.adds_len != 0 or view.context_len == 0) return false;
+    for (view.context[0..view.context_len]) |dot| {
+        if (!frontier.contains(.{ .replica = dot.replica, .counter = dot.counter })) return false;
+    }
+    return true;
+}
+
+fn observeDot(vv: *clock.VersionVector, dot: delta_codec.Dot) clock.VersionVector.Error!void {
+    var single = clock.VersionVector.init();
+    single.entries[0] = .{ .replica = dot.replica, .counter = dot.counter };
+    single.len = 1;
+    try vv.merge(&single);
+}
+
+const MemberAdd = struct {
+    dot: delta_codec.Dot,
+    hlc: clock.Hlc,
+    status: channel_crdt.MemberStatus,
+};
+
+fn decodeMemberAdd(bytes: []const u8) Error!MemberAdd {
+    if (bytes.len != 25) return error.InvalidChannelDelta;
+    return .{
+        .dot = .{
+            .replica = std.mem.readInt(u64, bytes[0..8], .little),
+            .counter = std.mem.readInt(u64, bytes[8..16], .little),
+        },
+        .hlc = hlcFromKey(std.mem.readInt(u64, bytes[16..24], .little)),
+        .status = @bitCast(bytes[24]),
+    };
+}
+
+fn deinitDeltaMap(allocator: Allocator, map: *std.AutoHashMap(Cid, OwnedDelta)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+    map.deinit();
+}
+
+fn appendU16(out: *std.ArrayList(u8), allocator: Allocator, value: u16) Allocator.Error!void {
+    var buf: [2]u8 = undefined;
+    writeU16(&buf, value);
+    try out.appendSlice(allocator, &buf);
+}
+
+fn appendU32(out: *std.ArrayList(u8), allocator: Allocator, value: u32) Allocator.Error!void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .little);
+    try out.appendSlice(allocator, &buf);
+}
+
+fn appendU64(out: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .little);
+    try out.appendSlice(allocator, &buf);
+}
+
+fn appendI64(out: *std.ArrayList(u8), allocator: Allocator, value: i64) Allocator.Error!void {
+    try appendU64(out, allocator, @bitCast(value));
+}
+
+fn writeU16(out: *[2]u8, value: u16) void {
+    std.mem.writeInt(u16, out, value, .little);
+}
+
+fn hlcFromKey(key: u64) clock.Hlc {
+    return .{ .wall_ms = @intCast(key >> 16), .logical = @intCast(key & 0xffff) };
+}
+
+fn encodeMemberDelta(out: []u8, delta: *const channel_crdt.ChannelCrdt, member_id: channel_crdt.MemberId) ![]const u8 {
+    var entity: [8]u8 = undefined;
+    std.mem.writeInt(u64, &entity, member_id, .little);
+    var view = DeltaView{ .family = .memberships, .entity_id = &entity, .hlc = delta.hlc };
+
+    const entry = blk: {
+        for (delta.members.items) |item| if (item.member_id == member_id) break :blk item;
+        return error.InvalidChannelDelta;
+    };
+
+    for (entry.context.entries[0..entry.context.len]) |vv_entry| {
+        var counter: u64 = 1;
+        while (counter <= vv_entry.counter) : (counter += 1) {
+            view.context[view.context_len] = .{ .replica = vv_entry.replica, .counter = counter };
+            view.context_len += 1;
+        }
+    }
+    sortDots(view.context[0..view.context_len]);
+
+    var values: [delta_codec.default_limits.max_adds][25]u8 = undefined;
+    for (entry.adds.items, 0..) |add, idx| {
+        const dot = delta_codec.Dot{ .replica = add.dot.replica_id, .counter = add.dot.counter };
+        writeMemberAdd(values[idx][0..], dot, add.hlc, add.status);
+        view.add_dots[idx] = dot;
+        view.adds[idx] = .{ .value = values[idx][0..], .dots_start = idx, .dots_len = 1 };
+        view.adds_len += 1;
+        view.add_dots_len += 1;
+    }
+    sortAdds(&view, &values);
+
+    for (view.context[0..view.context_len]) |dot| {
+        if (dotIn(view.add_dots[0..view.add_dots_len], dot)) continue;
+        view.removes[view.removes_len] = dot;
+        view.removes_len += 1;
+    }
+    return view.encode(out);
+}
+
+fn writeMemberAdd(out: []u8, dot: delta_codec.Dot, hlc: clock.Hlc, status: channel_crdt.MemberStatus) void {
+    std.mem.writeInt(u64, out[0..8], dot.replica, .little);
+    std.mem.writeInt(u64, out[8..16], dot.counter, .little);
+    std.mem.writeInt(u64, out[16..24], hlc.toU64(), .little);
+    out[24] = @as(u8, @bitCast(status));
+}
+
+fn sortAdds(view: *DeltaView, values: *[delta_codec.default_limits.max_adds][25]u8) void {
+    var i: usize = 1;
+    while (i < view.adds_len) : (i += 1) {
+        var j = i;
+        while (j > 0 and std.mem.order(u8, view.adds[j].value, view.adds[j - 1].value) == .lt) : (j -= 1) {
+            std.mem.swap(DeltaView.Add, &view.adds[j], &view.adds[j - 1]);
+            std.mem.swap(delta_codec.Dot, &view.add_dots[j], &view.add_dots[j - 1]);
+            std.mem.swap([25]u8, &values[j], &values[j - 1]);
+            view.adds[j].value = values[j][0..];
+            view.adds[j - 1].value = values[j - 1][0..];
+            view.adds[j].dots_start = j;
+            view.adds[j - 1].dots_start = j - 1;
+        }
+    }
+}
+
+fn sortDots(dots: []delta_codec.Dot) void {
+    std.mem.sort(delta_codec.Dot, dots, {}, struct {
+        fn lessThan(_: void, a: delta_codec.Dot, b: delta_codec.Dot) bool {
+            if (a.replica != b.replica) return a.replica < b.replica;
+            return a.counter < b.counter;
+        }
+    }.lessThan);
+}
+
+fn dotIn(dots: []const delta_codec.Dot, dot: delta_codec.Dot) bool {
+    for (dots) |candidate| {
+        if (candidate.replica == dot.replica and candidate.counter == dot.counter) return true;
+    }
+    return false;
+}
+
+var test_pubkey: signed_delta.PublicKey = undefined;
+
+fn verifyTest(signed: SignedDelta) bool {
+    return signed_delta.verifyOne(signed, test_pubkey);
+}
+
+fn signChannelDelta(kp: *const signed_delta.KeyPair, op_bytes: []const u8, hlc: u64) !SignedDelta {
+    return signed_delta.sign(.{
+        .origin_node = signed_delta.nodeIdFromPublicKey(kp.public_key.toBytes()),
+        .hlc = hlc,
+        .family = @intFromEnum(delta_codec.EntityFamily.memberships),
+        .scope = "#goryu",
+        .op_bytes = op_bytes,
+    }, kp);
+}
+
+test "overlapping divergent stores converge through bounded pump loop" {
+    const allocator = std.testing.allocator;
+    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x51} ** signed_delta.seed_len);
+    test_pubkey = kp.public_key.toBytes();
+
+    var state_a = channel_crdt.ChannelCrdt.init(allocator, 1);
+    defer state_a.deinit();
+    var state_b = channel_crdt.ChannelCrdt.init(allocator, 2);
+    defer state_b.deinit();
+
+    var common = try state_a.localJoin(7, .{ .voice = true }, 10);
+    defer common.deinit();
+    try state_b.merge(&common);
+    var only_a = try state_a.localJoin(8, .{ .op = true }, 11);
+    defer only_a.deinit();
+    var only_b = try state_b.localJoin(9, .{ .founder = true }, 12);
+    defer only_b.deinit();
+
+    var buf_common: [1024]u8 = undefined;
+    const s_common = try signChannelDelta(&kp, try encodeMemberDelta(&buf_common, &common, 7), common.hlc.toU64());
+    var buf_a: [1024]u8 = undefined;
+    const s_a = try signChannelDelta(&kp, try encodeMemberDelta(&buf_a, &only_a, 8), only_a.hlc.toU64());
+    var buf_b: [1024]u8 = undefined;
+    const s_b = try signChannelDelta(&kp, try encodeMemberDelta(&buf_b, &only_b, 9), only_b.hlc.toU64());
+
+    var a = GoryuSync.init(allocator);
+    defer a.deinit();
+    var b = GoryuSync.init(allocator);
+    defer b.deinit();
+    try a.addLocalDelta(s_common);
+    try a.addLocalDelta(s_a);
+    try b.addLocalDelta(s_common);
+    try b.addLocalDelta(s_b);
+    try a.channel.merge(&state_a);
+    try b.channel.merge(&state_b);
+
+    var sa = try a.beginAntiEntropy(b.peer());
+    defer sa.deinit();
+    var sb = try b.beginAntiEntropy(a.peer());
+    defer sb.deinit();
+
+    var to_b = try sa.pump(&.{});
+    defer allocator.free(to_b);
+    var to_a = try sb.pump(&.{});
+    defer allocator.free(to_a);
+
+    var round: usize = 0;
+    while (!std.mem.eql(u8, &a.rootHash(), &b.rootHash()) and round < 32) : (round += 1) {
+        const next_b = try sa.pump(to_a);
+        defer allocator.free(next_b);
+        const next_a = try sb.pump(to_b);
+        defer allocator.free(next_a);
+        _ = try sa.applyVerified(verifyTest);
+        _ = try sb.applyVerified(verifyTest);
+        allocator.free(to_b);
+        allocator.free(to_a);
+        to_b = try allocator.dupe(u8, next_b);
+        to_a = try allocator.dupe(u8, next_a);
+    }
+
+    try std.testing.expect(sa.converged());
+    try std.testing.expect(sb.converged());
+    try std.testing.expectEqual(a.rootHash(), b.rootHash());
+    try std.testing.expect(channel_crdt.ChannelCrdt.eql(&a.channel, &b.channel));
+}
+
+test "identical stores exchange zero bytes" {
+    const allocator = std.testing.allocator;
+    var a = GoryuSync.init(allocator);
+    defer a.deinit();
+    var b = GoryuSync.init(allocator);
+    defer b.deinit();
+
+    var sa = try a.beginAntiEntropy(b.peer());
+    defer sa.deinit();
+    const out = try sa.pump(&.{});
+    defer allocator.free(out);
+    try std.testing.expect(sa.converged());
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "invalid signed delta is rejected and not applied" {
+    const allocator = std.testing.allocator;
+    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x52} ** signed_delta.seed_len);
+    test_pubkey = kp.public_key.toBytes();
+
+    var source = channel_crdt.ChannelCrdt.init(allocator, 1);
+    defer source.deinit();
+    var delta = try source.localJoin(42, .{ .voice = true }, 50);
+    defer delta.deinit();
+    var buf: [1024]u8 = undefined;
+    var bad = try signChannelDelta(&kp, try encodeMemberDelta(&buf, &delta, 42), delta.hlc.toU64());
+    bad.signature[0] ^= 0xff;
+
+    var sync = GoryuSync.init(allocator);
+    defer sync.deinit();
+    try sync.putPending(bad);
+    try std.testing.expectError(error.VerificationFailed, sync.applyVerified(verifyTest));
+    try std.testing.expect(!sync.channel.containsMember(42));
+    try std.testing.expectEqual(@as(usize, 0), sync.store.count());
+}

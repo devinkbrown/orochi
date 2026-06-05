@@ -13,6 +13,7 @@ pub const delta_codec = @import("delta_codec.zig");
 pub const eg_walker = @import("eg_walker.zig");
 pub const goryu = @import("goryu.zig");
 pub const goryu_props = @import("goryu_props.zig");
+pub const goryu_sync = @import("goryu_sync.zig");
 pub const gossip_round = @import("gossip_round.zig");
 pub const gossip_views = @import("gossip_views.zig");
 pub const link_session = @import("link_session.zig");
@@ -47,6 +48,7 @@ test {
     _ = eg_walker;
     _ = goryu;
     _ = goryu_props;
+    _ = goryu_sync;
     _ = gossip_round;
     _ = gossip_views;
     _ = link_session;
