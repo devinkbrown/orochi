@@ -49,6 +49,7 @@ pub const minhash = @import("minhash.zig");
 pub const multipath = @import("multipath.zig");
 pub const object_pool = @import("object_pool.zig");
 pub const opcodec_frame = @import("opcodec_frame.zig");
+pub const opvox_adpcm = @import("opvox_adpcm.zig");
 pub const pacing = @import("pacing.zig");
 pub const pairing_heap = @import("pairing_heap.zig");
 pub const pcm = @import("pcm.zig");
@@ -156,6 +157,7 @@ test {
     _ = multipath;
     _ = object_pool;
     _ = opcodec_frame;
+    _ = opvox_adpcm;
     _ = pacing;
     _ = pairing_heap;
     _ = pcm;
