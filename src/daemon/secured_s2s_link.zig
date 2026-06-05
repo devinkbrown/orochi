@@ -126,6 +126,18 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.channelMembers(channel) else &.{};
     }
 
+    pub fn remoteName(self: *const SecuredLink) []const u8 {
+        return if (self.inner) |l| l.remoteName() else "";
+    }
+
+    /// Announce a local member to the peer over the secured CRDT link (no-op until
+    /// established). Outbound bytes accumulate in `out`.
+    pub fn sendMembership(self: *SecuredLink, channel: []const u8, nick: []const u8, status: u4, hlc: u64, present: bool) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendMembership(channel, nick, status, hlc, present);
+        try self.drainInner();
+    }
+
     fn writeFramed(self: *SecuredLink, payload: []const u8) anyerror!void {
         var hdr: [4]u8 = undefined;
         std.mem.writeInt(u32, &hdr, @intCast(payload.len), .little);

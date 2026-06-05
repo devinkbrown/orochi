@@ -50,6 +50,9 @@ const userip = @import("../proto/userip.zig");
 const server_stats = @import("server_stats.zig");
 const activity = @import("../proto/activity.zig");
 const activity_subscriptions = @import("activity_subscriptions.zig");
+const node_identity = @import("node_identity.zig");
+const secured_s2s_link = @import("secured_s2s_link.zig");
+const tsumugi_hs = @import("../crypto/tsumugi_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
@@ -637,6 +640,13 @@ pub const Config = struct {
     /// time reads route through it instead of the system monotonic clock,
     /// enabling deterministic simulation (DST). Null = real clock (production).
     reactor: ?reactor_mod.Reactor = null,
+    /// Optional PQ-secured S2S: when both are set, server-to-server links run the
+    /// Tsumugi AKE (TOFU) before the CRDT stream. Null = plaintext S2S handshake
+    /// (backward compatible). `node_identity` is borrowed (owned by main); `io`
+    /// supplies the handshake CSPRNG.
+    node_identity: ?*const node_identity.NodeIdentity = null,
+    crypto_io: ?std.Io = null,
+    mesh_pass: []const u8 = "",
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -663,6 +673,10 @@ pub const ConnState = struct {
     /// Suimyaku link instead of the IRC line parser. Heap-owned (stable address
     /// required by the link's self-referential clock); freed in closeConn/deinit.
     s2s: ?*s2s_link.S2sLink = null,
+    /// Non-null for a PQ-SECURED S2S peer: the framed Tsumugi link drives inbound
+    /// bytes instead of `s2s`. Exactly one of `s2s`/`s2s_secured` is set per peer.
+    /// Heap-owned; freed in closeConn/deinit.
+    s2s_secured: ?*secured_s2s_link.SecuredLink = null,
     /// Target address for an outbound S2S connect, kept here (the slot is stable)
     /// so it outlives the in-flight IORING_OP_CONNECT submission.
     s2s_connect_addr: posix.sockaddr.in = undefined,
@@ -819,6 +833,11 @@ pub const LinuxServer = struct {
                     self.allocator.destroy(link);
                     slot.value.s2s = null;
                 }
+                if (slot.value.s2s_secured) |link| {
+                    link.deinit();
+                    self.allocator.destroy(link);
+                    slot.value.s2s_secured = null;
+                }
                 closeFd(slot.value.fd);
             }
         }
@@ -911,6 +930,27 @@ pub const LinuxServer = struct {
         const conn = self.clients.get(id).?;
         conn.token = try tokenFromId(id);
 
+        if (is_s2s and self.s2sSecured()) {
+            // PQ-secured peer: stand up a SecuredLink (responder). Its TOFU prekey
+            // preamble is already queued; send it and wait for the initiator's M1.
+            const link = try self.newSecuredLink(.responder);
+            errdefer {
+                link.deinit();
+                self.allocator.destroy(link);
+            }
+            conn.s2s_secured = link;
+            errdefer conn.s2s_secured = null;
+            const out = link.outbound();
+            if (out.len != 0) {
+                try appendToConn(conn, out);
+                link.clearOutbound();
+            }
+            try self.armSendIfNeeded(conn);
+            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.stats.onS2sAccept();
+            self.traceLog(.info, .s2s, "s2s secured peer accepted");
+            return;
+        }
         if (is_s2s) {
             // Server-to-server peer: stand up an S2sLink and wait for its inbound
             // handshake (the connecting side opens it; we respond on recv).
@@ -951,6 +991,66 @@ pub const LinuxServer = struct {
         return if (self.reactor) |r| r.nowMillis() else platform.monotonicMillis();
     }
 
+    /// Bands/features advertised by this node's S2S prekeys.
+    const s2s_bands: u128 = 0b1111;
+    const s2s_features: u128 = 0b1;
+
+    /// True when PQ-secured S2S is configured (node identity + a CSPRNG io).
+    fn s2sSecured(self: *const LinuxServer) bool {
+        return self.config.node_identity != null and self.config.crypto_io != null;
+    }
+
+    /// Build a heap-owned SecuredLink for `role`, using a freshly-derived prekey.
+    /// Validity uses the wall clock so the window is comparable across nodes.
+    fn newSecuredLink(self: *LinuxServer, role: secured_s2s_link.Role) !*secured_s2s_link.SecuredLink {
+        const ident = self.config.node_identity.?;
+        const wall: u64 = @intCast(@max(0, platform.realtimeMillis()));
+        // Back-date not_before so a peer that captured its verify-clock slightly
+        // earlier (connect/accept ordering + modest skew) still sees the prekey as
+        // valid; the validity window stays long via the ttl.
+        const not_before = wall -| (5 * 60 * 1000);
+        const prekey = try ident.signedPrekey(1, not_before, 24 * 60 * 60 * 1000, s2s_bands, s2s_features);
+        const link = try self.allocator.create(secured_s2s_link.SecuredLink);
+        errdefer self.allocator.destroy(link);
+        link.* = try secured_s2s_link.SecuredLink.init(.{
+            .allocator = self.allocator,
+            .role = role,
+            .identity = ident,
+            .local_prekey = prekey,
+            .cfg = .{
+                .realm = ident.realm,
+                .supported_bands = s2s_bands,
+                .supported_features = s2s_features,
+                .mesh_pass = self.config.mesh_pass,
+                .now_ms = wall,
+            },
+            .rng = self.config.crypto_io.?,
+            .server_name = server_name,
+            .local_epoch_ms = wall,
+        });
+        return link;
+    }
+
+    /// Drive a PQ-secured S2S peer: feed inbound bytes through the framed Tsumugi
+    /// link and queue its outbound. Logs the AKE establishment transition.
+    fn driveS2sSecured(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink, bytes: []const u8) void {
+        const was = link.established();
+        const now: u64 = @intCast(@max(0, self.nowMs()));
+        link.feed(bytes, now) catch {
+            conn.closing = true;
+            return;
+        };
+        const out = link.outbound();
+        if (out.len != 0) {
+            appendToConn(conn, out) catch {
+                conn.closing = true;
+                return;
+            };
+            link.clearOutbound();
+        }
+        if (!was and link.established()) self.traceLog(.info, .s2s, "s2s secured link established");
+    }
+
     fn driveS2s(self: *LinuxServer, conn: *ConnState, link: *s2s_link.S2sLink, bytes: []const u8) void {
         self.s2s_feed_seq +%= 1;
         const now: u64 = @intCast(@max(0, self.nowMs()));
@@ -974,6 +1074,12 @@ pub const LinuxServer = struct {
         const conn = self.connForToken(event.token) catch return;
         if (event.res < 0) {
             try self.closeConn(event.token, "S2S connect failed");
+            return;
+        }
+        if (conn.s2s_secured) |_| {
+            // Secured initiator: just listen — the responder sends its prekey
+            // preamble first, which drives the handshake on recv.
+            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             return;
         }
         const link = conn.s2s orelse return;
@@ -1001,7 +1107,9 @@ pub const LinuxServer = struct {
         if (event.res > 0) {
             const chunk = conn.recv_buf[0..@as(usize, @intCast(event.res))];
             self.stats.onBytesIn(chunk.len);
-            if (conn.s2s) |link| {
+            if (conn.s2s_secured) |link| {
+                self.driveS2sSecured(conn, link, chunk);
+            } else if (conn.s2s) |link| {
                 self.driveS2s(conn, link, chunk);
             } else {
                 try self.feedBytes(id, conn, chunk);
@@ -1151,6 +1259,15 @@ pub const LinuxServer = struct {
         const id = idFromToken(token);
         if (self.clients.get(id)) |conn| {
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
+            if (conn.s2s_secured) |link| {
+                link.deinit();
+                self.allocator.destroy(link);
+                conn.s2s_secured = null;
+                closeFd(conn.fd);
+                _ = self.clients.free(id);
+                self.stats.onClose(true);
+                return;
+            }
             if (conn.s2s) |link| {
                 link.deinit();
                 self.allocator.destroy(link);
@@ -1458,15 +1575,56 @@ pub const LinuxServer = struct {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         for (self.clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
-            const link = slot.value.s2s orelse continue;
-            if (!link.established()) continue;
-            link.sendMembership(channel, nick, status, hlc, present) catch continue;
-            const out = link.outbound();
-            if (out.len == 0) continue;
-            appendToConn(&slot.value, out) catch continue;
-            link.clearOutbound();
-            self.armSendIfNeeded(&slot.value) catch continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.sendMembership(channel, nick, status, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                link.sendMembership(channel, nick, status, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
         }
+    }
+
+    fn flushS2sOutbound(self: *LinuxServer, conn: *ConnState, out: []const u8) !void {
+        if (out.len == 0) return;
+        try appendToConn(conn, out);
+        try self.armSendIfNeeded(conn);
+    }
+
+    /// Append a peer's remote channel members into the NAMES buffer (deduped,
+    /// auditorium-filtered; host = origin server name). Returns the new count.
+    /// `members` is a borrowed roster from either link type.
+    fn addRemoteMembers(
+        self: *LinuxServer,
+        members_buf: []names_reply.Member,
+        prefix_buf: []chanmode.PrefixList,
+        count_in: usize,
+        is_auditorium: bool,
+        viewer_rank: auditorium.Rank,
+        remote_name: []const u8,
+        members: anytype,
+    ) usize {
+        _ = self;
+        var count = count_in;
+        for (members) |rm| {
+            if (count >= members_buf.len) break;
+            if (nameAlreadyListed(members_buf[0..count], rm.nick)) continue;
+            const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
+            if (is_auditorium and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
+            prefix_buf[count] = modes.allPrefixes();
+            members_buf[count] = .{
+                .prefixes = prefix_buf[count].asSlice(),
+                .nick = rm.nick,
+                .user = "mesh",
+                .host = if (remote_name.len != 0) remote_name else default_host,
+            };
+            count += 1;
+        }
+        return count;
     }
 
     fn broadcastJoin(self: *LinuxServer, channel: []const u8, conn: *ConnState) !void {
@@ -2908,6 +3066,21 @@ pub const LinuxServer = struct {
         const peer = self.clients.get(id).?;
         peer.token = try tokenFromId(id);
         peer.s2s_connect_addr = addr;
+
+        if (self.s2sSecured()) {
+            // PQ-secured initiator: waits (await_prekey) for the responder's TOFU
+            // preamble after the TCP connect completes — no output yet.
+            const link = try self.newSecuredLink(.initiator);
+            errdefer {
+                link.deinit();
+                self.allocator.destroy(link);
+            }
+            peer.s2s_secured = link;
+            errdefer peer.s2s_secured = null;
+            try self.ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
+            try self.noticeTo(conn, "CONNECT initiated (secured)");
+            return;
+        }
 
         const link = try self.allocator.create(s2s_link.S2sLink);
         errdefer self.allocator.destroy(link);
@@ -4519,22 +4692,10 @@ pub const LinuxServer = struct {
         for (self.clients.slots.items) |*slot| {
             if (count >= max_members) break;
             if (!slot.occupied) continue;
-            const link = slot.value.s2s orelse continue;
-            if (!link.established()) continue;
-            const remote_name = link.remoteName();
-            for (link.channelMembers(channel)) |rm| {
-                if (count >= max_members) break;
-                if (nameAlreadyListed(members_buf[0..count], rm.nick)) continue;
-                const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
-                if (is_auditorium and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
-                prefix_buf[count] = modes.allPrefixes();
-                members_buf[count] = .{
-                    .prefixes = prefix_buf[count].asSlice(),
-                    .nick = rm.nick,
-                    .user = "mesh",
-                    .host = if (remote_name.len != 0) remote_name else default_host,
-                };
-                count += 1;
+            if (slot.value.s2s_secured) |link| {
+                if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+            } else if (slot.value.s2s) |link| {
+                if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
             }
         }
 

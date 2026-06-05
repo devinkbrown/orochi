@@ -51,6 +51,26 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // PQ-secured S2S: if the config supplies node.secret_key, derive this node's
+    // Tsumugi identity and enable the secured handshake (TOFU) on S2S links. The
+    // identity outlives the server (the server borrows a pointer to it). Without a
+    // key, S2S stays plaintext (backward compatible).
+    var node_id_holder: ?mizuchi.daemon.node_identity.NodeIdentity = null;
+    defer if (node_id_holder) |*n| n.deinit();
+    if (held) |h| {
+        if (h.parsed.node.secret_key) |sk| {
+            if (mizuchi.daemon.node_identity.fromConfig(sk, h.parsed.mesh.realm)) |ident| {
+                node_id_holder = ident;
+                srv_cfg.node_identity = &node_id_holder.?;
+                srv_cfg.crypto_io = init.io;
+                if (h.parsed.mesh.mesh_pass) |mp| srv_cfg.mesh_pass = mp;
+                std.debug.print("mizuchi: PQ-secured S2S enabled (node identity configured)\n", .{});
+            } else |err| {
+                std.debug.print("mizuchi: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
+            }
+        }
+    }
+
     const Server = mizuchi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // io_uring unavailable (old kernel / sandbox): fall back to the DST boot banner.
