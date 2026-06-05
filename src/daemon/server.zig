@@ -630,6 +630,9 @@ pub const ConnState = struct {
     /// IRCX opt-in: set true after the client sends `IRCX` (draft-pfenning §IRCX).
     /// Gates IRCX-only behaviors; base RFC1459/IRCv3 always works regardless.
     ircx: bool = false,
+    /// IRCX +z GAG (sysop-set): the server silently discards this user's
+    /// PRIVMSG/NOTICE. Not client-settable.
+    gagged: bool = false,
     /// Non-null for server-to-server peer connections: inbound bytes drive this
     /// Suimyaku link instead of the IRC line parser. Heap-owned (stable address
     /// required by the link's self-referential clock); freed in closeConn/deinit.
@@ -1575,6 +1578,28 @@ pub const LinuxServer = struct {
         try self.sendNames(conn, channel);
     }
 
+    /// Apply IRCX +z/-z GAG to another user (operator-only; caller verified oper).
+    fn applyGag(self: *LinuxServer, conn: *ConnState, target_nick: []const u8, mode_str: []const u8) !void {
+        const twid = self.world.findNick(target_nick) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+            return;
+        };
+        const tconn = self.clients.get(clientIdFromWorld(twid)) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+            return;
+        };
+        var adding = true;
+        for (mode_str) |ch| switch (ch) {
+            '+' => adding = true,
+            '-' => adding = false,
+            'z' => tconn.gagged = adding,
+            else => {},
+        };
+        var buf: [128]u8 = undefined;
+        const reflect = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}z\r\n", .{ server_name, target_nick, if (tconn.gagged) "+" else "-" }) catch return;
+        try appendToConn(conn, reflect);
+    }
+
     /// MODE for channel member status modes (+Q/+q/+o/+v, founder +Q is creation-
     /// only) gated by tier rank, flag modes (i/m/n/t/s), and parameterised modes
     /// (+k key, +l limit, +b ban; `MODE #c b` lists bans). User-target MODE is not
@@ -1591,6 +1616,18 @@ pub const LinuxServer = struct {
             return;
         }
         if (!world_model.isChannelName(channel)) {
+            // IRCX +z GAG: an operator may set/clear GAG on ANOTHER user; the
+            // server then silently drops that user's messages. Other cross-user
+            // umode changes remain forbidden.
+            if (conn.session.isOper() and parsed.param_count >= 2 and
+                !std.mem.eql(u8, channel, conn.session.displayName()))
+            {
+                const ms = parsed.paramSlice()[1];
+                if (std.mem.indexOfScalar(u8, ms, 'z') != null) {
+                    try self.applyGag(conn, channel, ms);
+                    return;
+                }
+            }
             // User-target MODE: only the client's own nick is settable.
             try self.handleUserMode(conn, parsed, channel);
             return;
@@ -3836,6 +3873,8 @@ pub const LinuxServer = struct {
         parsed: *const irc_line.LineView,
         command: []const u8,
     ) !void {
+        // +z GAG (IRCX): the server silently discards a gagged user's messages.
+        if (conn.gagged) return;
         // NOTICE must never generate an automatic error reply (ophion m_message.c):
         // missing recipient/text is silently dropped to prevent bot reply loops.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
