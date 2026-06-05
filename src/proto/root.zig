@@ -130,6 +130,7 @@ pub const serverinfo = @import("serverinfo.zig");
 pub const services_alias = @import("services_alias.zig");
 pub const setname_chghost_notify = @import("setname_chghost_notify.zig");
 pub const signed_delta = @import("signed_delta.zig");
+pub const signed_object = @import("signed_object.zig");
 pub const silence = @import("silence.zig");
 pub const snomask = @import("snomask.zig");
 pub const socks5 = @import("socks5.zig");
@@ -294,6 +295,7 @@ test {
     _ = services_alias;
     _ = setname_chghost_notify;
     _ = signed_delta;
+    _ = signed_object;
     _ = silence;
     _ = snomask;
     _ = socks5;
