@@ -59,6 +59,7 @@ const list = @import("../proto/list.zig");
 const listx = @import("../proto/listx.zig");
 const who = @import("../proto/who.zig");
 const platform = @import("../substrate/platform.zig");
+const reactor_mod = @import("../substrate/reactor.zig");
 
 /// Format the current wall-clock time as "YYYY-MM-DD HH:MM:SS UTC" for RPL_TIME.
 fn formatServerTime(buf: []u8) []const u8 {
@@ -613,6 +614,10 @@ pub const Config = struct {
     /// placeholder; real deployments set it per server (ultimately derived from
     /// the node's public key).
     node_id: u64 = 1,
+    /// Optional reactor seam for time (and, later, I/O). When set, all daemon
+    /// time reads route through it instead of the system monotonic clock,
+    /// enabling deterministic simulation (DST). Null = real clock (production).
+    reactor: ?reactor_mod.Reactor = null,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -705,6 +710,8 @@ pub const LinuxServer = struct {
     metadata: metadata_store.DefaultStore,
     props: ircx_prop_store.DefaultStore,
     access: ircx_access_store.AccessStore,
+    /// Optional reactor seam (time/IO). Null = system monotonic clock.
+    reactor: ?reactor_mod.Reactor = null,
     /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
     shutdown: ?*std.atomic.Value(bool) = null,
     accepts: accept_list.AcceptList(.{}),
@@ -774,7 +781,8 @@ pub const LinuxServer = struct {
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
-            .start_ms = platform.monotonicMillis(),
+            .reactor = config.reactor,
+            .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
         };
     }
 
@@ -909,9 +917,15 @@ pub const LinuxServer = struct {
 
     /// Drive a server-to-server peer connection: feed inbound bytes to its
     /// S2sLink and queue any outbound frames the link produced for sending.
+    /// Monotonic time in ms, routed through the reactor seam when one is injected
+    /// (deterministic simulation), else the system monotonic clock.
+    fn nowMs(self: *const LinuxServer) i64 {
+        return if (self.reactor) |r| r.nowMillis() else platform.monotonicMillis();
+    }
+
     fn driveS2s(self: *LinuxServer, conn: *ConnState, link: *s2s_link.S2sLink, bytes: []const u8) void {
         self.s2s_feed_seq +%= 1;
-        const now: u64 = @intCast(@max(0, platform.monotonicMillis()));
+        const now: u64 = @intCast(@max(0, self.nowMs()));
         link.feed(bytes, now, self.s2s_feed_seq) catch {
             conn.closing = true;
             return;
@@ -935,7 +949,7 @@ pub const LinuxServer = struct {
             return;
         }
         const link = conn.s2s orelse return;
-        const now: u64 = @intCast(@max(0, platform.monotonicMillis()));
+        const now: u64 = @intCast(@max(0, self.nowMs()));
         link.start(now) catch {
             try self.closeConn(event.token, "S2S handshake failed");
             return;
@@ -2457,7 +2471,7 @@ pub const LinuxServer = struct {
         const letter = parsed.paramSlice()[0];
         switch (letter[0]) {
             'u' => {
-                const up_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(platform.monotonicMillis() - self.start_ms, 1000)));
+                const up_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(self.nowMs() - self.start_ms, 1000)));
                 const days = up_secs / 86_400;
                 const hours = (up_secs % 86_400) / 3600;
                 const mins = (up_secs % 3600) / 60;
@@ -2833,7 +2847,7 @@ pub const LinuxServer = struct {
     /// Record a structured event into the flight recorder (+ category filter).
     /// Never faults the hot path.
     fn traceLog(self: *LinuxServer, comptime level: tracelog.Level, category: tracelog.Category, msg: []const u8) void {
-        const now: u64 = @intCast(@max(0, platform.monotonicMillis()));
+        const now: u64 = @intCast(@max(0, self.nowMs()));
         tracelog.emit(.debug, level, &self.trace_filter, self.trace_recorder.sink(), category, now, 0, msg, &.{}) catch {};
     }
 
