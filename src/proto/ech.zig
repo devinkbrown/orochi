@@ -281,6 +281,10 @@ pub const ECHConfig = struct {
             ext_off += r.consumed;
         }
         off += ext_total_bytes;
+        // A config whose declared content_len exceeds the sum of its fields would
+        // otherwise let trailing bytes be silently skipped (list-level parser
+        // desync / smuggling). Require the inner content to be fully consumed.
+        if (off != inner.len) return error.TrailingBytes;
         const exts_owned = try ext_list.toOwnedSlice(allocator);
         errdefer {
             for (exts_owned) |e| allocator.free(e.data);

@@ -1,3 +1,12 @@
+//! Verifiable Random Function over Edwards25519 + SHA-512.
+//!
+//! NOTE: this is a BESPOKE Mizuchi VRF, NOT RFC 9381 ECVRF. It is internally
+//! consistent (prove/verify round-trip, deterministic beta, tamper-rejecting)
+//! and suitable for closed-mesh leader election, but it deliberately differs
+//! from RFC 9381 — custom suite string, a 128-bit challenge, hash-to-curve via
+//! plain try-and-increment, and a different challenge-generation point order
+//! without the spec's domain-separation octets. Do NOT treat its output as a
+//! standards-compliant ECVRF or expect interop with RFC 9381 implementations.
 const std = @import("std");
 
 const Sha512 = std.crypto.hash.sha2.Sha512;

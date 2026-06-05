@@ -57,13 +57,13 @@ pub const OrSet = struct {
         var add_it = other.adds.iterator();
         while (add_it.next()) |entry| {
             try self.adds.put(entry.key_ptr.*, entry.value_ptr.*);
-            self.bumpCounter(entry.key_ptr.*);
+            try self.bumpCounter(entry.key_ptr.*);
         }
 
         var remove_it = other.removes.iterator();
         while (remove_it.next()) |entry| {
             try self.removes.put(entry.key_ptr.*, {});
-            self.bumpCounter(entry.key_ptr.*);
+            try self.bumpCounter(entry.key_ptr.*);
         }
 
         var counter_it = other.counters.iterator();
@@ -128,10 +128,10 @@ pub const OrSet = struct {
         return true;
     }
 
-    fn bumpCounter(self: *Self, dot: Dot) void {
+    fn bumpCounter(self: *Self, dot: Dot) !void {
         const current = self.counters.get(dot.replica) orelse 0;
         if (current < dot.counter) {
-            self.counters.put(dot.replica, dot.counter) catch unreachable;
+            try self.counters.put(dot.replica, dot.counter);
         }
     }
 };
