@@ -72,6 +72,9 @@ const Channel = struct {
     /// IRCX extended channel flags (AUTHONLY/AUDITORIUM/NOWHISPER/etc.) that have
     /// no slot in the base ChannelModes letter set.
     ext_modes: chanmode_ext.ExtChannelFlags = chanmode_ext.ExtChannelFlags.empty(),
+    /// IRCX object id, assigned once at creation (0 = unset). Surfaced as the
+    /// channel OID built-in property.
+    oid: u32 = 0,
 
     fn init(allocator: std.mem.Allocator) Channel {
         return .{
@@ -108,6 +111,9 @@ pub const World = struct {
     channels: std.StringHashMap(Channel),
     nicks: std.StringHashMap(ClientId),
     client_nicks: std.AutoHashMap(ClientId, []u8),
+    /// Monotonic IRCX object-id source. Each newly-created channel gets the next
+    /// value; starts at 1 so 0 means "unset" (never a real OID).
+    next_oid: u32 = 1,
 
     pub fn init(allocator: std.mem.Allocator) World {
         return .{
@@ -273,6 +279,12 @@ pub const World = struct {
     pub fn channelLimit(self: *World, name: []const u8) ?u32 {
         const channel = self.channels.getPtr(name) orelse return null;
         return channel.limit;
+    }
+
+    /// The IRCX object id assigned to `name` at creation (null if no such channel).
+    pub fn channelOid(self: *World, name: []const u8) ?u32 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.oid;
     }
 
     /// +p private channel flag.
@@ -583,6 +595,8 @@ pub const World = struct {
         const owned_name = try self.allocator.dupe(u8, name);
         entry.key_ptr.* = owned_name;
         entry.value_ptr.* = Channel.init(self.allocator);
+        entry.value_ptr.oid = self.next_oid;
+        self.next_oid +%= 1;
         return entry.value_ptr;
     }
 
@@ -642,6 +656,29 @@ test "join part and membership cleanup" {
     try world.part("#x", b);
     try std.testing.expect(!world.channelExists("#x"));
     try std.testing.expectEqual(@as(usize, 0), world.channelCount());
+}
+
+test "channels receive monotonic, stable, unique IRCX object ids" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = testClient(1);
+    try std.testing.expect(try world.join("#first", a));
+    try std.testing.expect(try world.join("#second", a));
+
+    const oid1 = world.channelOid("#first").?;
+    const oid2 = world.channelOid("#second").?;
+    try std.testing.expectEqual(@as(u32, 1), oid1); // counter starts at 1
+    try std.testing.expectEqual(@as(u32, 2), oid2);
+    try std.testing.expect(oid1 != oid2);
+
+    // OID is stable across further membership churn on the same channel.
+    const b = testClient(2);
+    try std.testing.expect(try world.join("#first", b));
+    try std.testing.expectEqual(oid1, world.channelOid("#first").?);
+
+    // Unknown channel has no OID.
+    try std.testing.expect(world.channelOid("#nope") == null);
 }
 
 test "removeClient drops all channel memberships and nick ownership" {

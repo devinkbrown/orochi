@@ -3209,6 +3209,12 @@ pub const LinuxServer = struct {
     fn channelBuiltinGet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, buf: []u8) ?[]const u8 {
         if (entity.kind != .channel) return null;
         if (std.ascii.eqlIgnoreCase(key, "NAME")) return entity.id;
+        if (std.ascii.eqlIgnoreCase(key, "OID")) {
+            const oid = self.world.channelOid(entity.id) orelse return null;
+            if (oid == 0) return null;
+            // IRCX object id: '0' type prefix + 8 hex digits.
+            return std.fmt.bufPrint(buf, "0{x:0>8}", .{oid}) catch null;
+        }
         if (std.ascii.eqlIgnoreCase(key, "MEMBERCOUNT")) {
             return std.fmt.bufPrint(buf, "{d}", .{self.world.memberCount(entity.id)}) catch null;
         }
