@@ -93,6 +93,35 @@ def changed_files(rev: str = "HEAD") -> list[str]:
     return [l.strip() for l in out.splitlines() if l.strip()][:8]
 
 
+def commit_stat(rev: str = "HEAD") -> str:
+    """One-line diffstat like '7 files, +312/-40'."""
+    out = git("show", "--shortstat", "--format=", rev)
+    files = re.search(r"(\d+) files? changed", out)
+    ins = re.search(r"(\d+) insertions?", out)
+    dele = re.search(r"(\d+) deletions?", out)
+    parts = []
+    if files:
+        parts.append(f"{files.group(1)} files")
+    if ins:
+        parts.append(f"{GREEN}+{ins.group(1)}{RST}")
+    if dele:
+        parts.append(f"{RED}-{dele.group(1)}{RST}")
+    return ", ".join(parts) if parts else "no file changes"
+
+
+def loc_count() -> str:
+    try:
+        out = subprocess.check_output(
+            ["bash", "-lc",
+             f"find {REPO}/src -name '*.zig' ! -name 'root.zig' -exec cat {{}} + | wc -l"],
+            text=True,
+        ).strip()
+        n = int(out)
+        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
+    except Exception:
+        return "?"
+
+
 def uptime() -> str:
     s = int(time.time() - START)
     d, s = divmod(s, 86400)
@@ -104,8 +133,9 @@ def uptime() -> str:
 def stats_lines() -> list[str]:
     return [
         f"{B}{CYAN}build{RST} :: modules={GREEN}{module_count()}{RST} "
-        f"tests={GREEN}{test_count()}{RST} commits={GREEN}{git('rev-list','--count','HEAD')}{RST} zig 0.16",
-        f"{GREY}HEAD{RST} {head_line()}",
+        f"tests={GREEN}{test_count()}{RST} loc={GREEN}{loc_count()}{RST} "
+        f"commits={GREEN}{git('rev-list','--count','HEAD')}{RST} zig 0.16",
+        f"{GREY}HEAD{RST} {head_line()}  {GREY}({commit_stat()}){RST}",
     ]
 
 
@@ -140,6 +170,7 @@ class Bot:
         self.last_commit = git("rev-parse", "HEAD")
         self.last_beat = time.time()
         self.last_poll = 0.0
+        self.last_tests = -1
         self.outq: deque[str] = deque()
         self.last_send = 0.0
         self.caps: set[str] = set()
@@ -233,12 +264,28 @@ class Bot:
                 cur = git("rev-parse", "HEAD")
                 if cur and cur != self.last_commit:
                     self.last_commit = cur
+                    tc = test_count()
+                    self.msg(CHANNEL, f"{B}{GREEN}▶ commit{RST} {head_line()}")
                     self.msg(
                         CHANNEL,
-                        f"{B}{GREEN}▶ commit{RST} {head_line()}  "
-                        f"[tests={test_count()} modules={module_count()}]",
+                        f"   {GREY}{commit_stat(cur)}{RST} · tests={GREEN}{tc}{RST}"
+                        f"{self.tests_delta(tc)} · modules={GREEN}{module_count()}{RST} "
+                        f"· loc={GREEN}{loc_count()}{RST}",
                     )
                     self.set_topic()
+
+    def tests_delta(self, tc: str) -> str:
+        """Colored (+N)/(-N) arrow vs the previously announced test count."""
+        try:
+            n = int(tc)
+        except ValueError:
+            return ""
+        out = ""
+        if self.last_tests >= 0 and n != self.last_tests:
+            diff = n - self.last_tests
+            out = f" {GREEN}(+{diff}){RST}" if diff > 0 else f" {RED}({diff}){RST}"
+        self.last_tests = n
+        return out
 
     def set_topic(self) -> None:
         self.send_raw(
