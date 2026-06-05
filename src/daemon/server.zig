@@ -47,6 +47,7 @@ const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
+const server_stats = @import("server_stats.zig");
 const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
@@ -528,6 +529,7 @@ const Numeric = enum(u16) {
     RPL_MONLIST = 732,
     RPL_ENDOFMONLIST = 733,
     ERR_MONLISTFULL = 734,
+    RPL_STATSDEBUG = 249,
     RPL_STATSUPTIME = 242,
     RPL_STATSOLINE = 243,
     RPL_STATSKLINE = 216,
@@ -721,6 +723,9 @@ pub const LinuxServer = struct {
     /// dumped on oper DEBUG / crash) + per-category level filter.
     trace_recorder: tracelog.FlightRecorder(256) = .{},
     trace_filter: tracelog.CategoryFilter = tracelog.CategoryFilter.init(.info),
+    /// Observability: allocation-free runtime counters (totals + gauges), bumped
+    /// inline on the hot path and rendered on demand (STATS z / Prometheus).
+    stats: server_stats.Stats = .{},
     /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
     /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
     s2s_listener_fd: linux.fd_t = -1,
@@ -904,6 +909,7 @@ pub const LinuxServer = struct {
             // fails, so deinit can never observe a freed link.
             errdefer conn.s2s = null;
             try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.stats.onS2sAccept();
             self.traceLog(.info, .s2s, "s2s peer accepted");
             return;
         }
@@ -912,6 +918,7 @@ pub const LinuxServer = struct {
         // AUTHENTICATE (during CAP negotiation, pre-registration).
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        self.stats.onAccept();
         self.traceLog(.info, .net, "client accepted");
     }
 
@@ -972,6 +979,7 @@ pub const LinuxServer = struct {
         conn.closing = event.res <= 0;
         if (event.res > 0) {
             const chunk = conn.recv_buf[0..@as(usize, @intCast(event.res))];
+            self.stats.onBytesIn(chunk.len);
             if (conn.s2s) |link| {
                 self.driveS2s(conn, link, chunk);
             } else {
@@ -995,6 +1003,7 @@ pub const LinuxServer = struct {
             return;
         }
 
+        self.stats.onBytesOut(@as(usize, @intCast(event.res)));
         conn.send_offset += @as(usize, @intCast(event.res));
         if (conn.send_offset >= conn.send_len) {
             conn.send_offset = 0;
@@ -1127,8 +1136,11 @@ pub const LinuxServer = struct {
                 conn.s2s = null;
                 closeFd(conn.fd);
                 _ = self.clients.free(id);
+                self.stats.onClose(true);
                 return;
             }
+            self.stats.onClose(false);
+            self.stats.onQuit();
             defer self.world.removeClient(worldIdFromClient(id));
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
@@ -1180,6 +1192,7 @@ pub const LinuxServer = struct {
         for (bytes) |byte| {
             if (conn.line_len == conn.line_buf.len) {
                 conn.closing = true;
+                self.stats.onError();
                 return error.LineTooLong;
             }
             conn.line_buf[conn.line_len] = byte;
@@ -1188,6 +1201,7 @@ pub const LinuxServer = struct {
             if (conn.line_len >= 2 and
                 conn.line_buf[conn.line_len - 2] == '\r' and conn.line_buf[conn.line_len - 1] == '\n')
             {
+                self.stats.onLine();
                 try self.processLiveLine(id, conn, conn.line_buf[0..conn.line_len]);
                 conn.line_len = 0;
             }
@@ -2486,6 +2500,19 @@ pub const LinuxServer = struct {
             },
             'k', 'K' => try self.statsLines(conn, .kline, .RPL_STATSKLINE),
             'd', 'D' => try self.statsLines(conn, .dline, .RPL_STATSDLINE),
+            'z', 'Z' => {
+                // Runtime counters (RPL_STATSDEBUG 249), oper-only.
+                if (!conn.session.isOper()) {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; STATS z is for operators");
+                } else {
+                    const Ctx = struct { c: *ConnState };
+                    try self.stats.forEachLine(Ctx{ .c = conn }, struct {
+                        fn emit(cx: Ctx, line: []const u8) !void {
+                            try queueNumeric(cx.c, .RPL_STATSDEBUG, &.{}, line);
+                        }
+                    }.emit);
+                }
+            },
             else => {}, // other letters not implemented yet
         }
         try queueNumeric(conn, .RPL_ENDOFSTATS, &.{letter}, "End of /STATS report");
