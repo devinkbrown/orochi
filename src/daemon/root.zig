@@ -11,6 +11,7 @@ pub const clone_detect = @import("clone_detect.zig");
 pub const commands = @import("commands.zig");
 pub const config = @import("config.zig");
 pub const config_format = @import("config_format.zig");
+pub const config_schema = @import("config_schema.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const event_spine = @import("event_spine.zig");
 pub const flood = @import("flood.zig");
@@ -36,6 +37,7 @@ test {
     _ = commands;
     _ = config;
     _ = config_format;
+    _ = config_schema;
     _ = dispatch;
     _ = event_spine;
     _ = flood;
