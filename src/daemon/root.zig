@@ -27,6 +27,7 @@ pub const services = @import("services.zig");
 pub const store = @import("store.zig");
 pub const whois = @import("whois.zig");
 pub const whowas = @import("whowas.zig");
+pub const world_projection = @import("world_projection.zig");
 pub const world = @import("world.zig");
 // gen:mods:end
 
@@ -55,6 +56,7 @@ test {
     _ = store;
     _ = whois;
     _ = whowas;
+    _ = world_projection;
     _ = world;
     // gen:tests:end
 }
