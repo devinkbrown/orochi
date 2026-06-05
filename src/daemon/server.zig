@@ -3903,6 +3903,9 @@ pub const LinuxServer = struct {
         const prefix = try clientPrefix(conn, &prefix_buf);
         const msg = try formatMessage(&msg_buf, prefix, "AWAY", &.{}, reason);
         try self.notifyCommonChannels(id, msg, .away_notify, id);
+
+        // #33: feed the ACTIVITY stream a presence transition.
+        self.pushPresenceActivity(id, conn, if (reason != null) .away else .active);
     }
 
     /// SETNAME :<realname> — IRCv3 setname. Updates the GECOS and echoes the
@@ -4216,6 +4219,28 @@ pub const LinuxServer = struct {
             const cid = clientIdFromMonitor(sid);
             if (cid.eql(id)) continue;
             self.deliver(cid, line) catch continue;
+        }
+    }
+
+    /// Push a presence ActivityEvent to the activity-stream subscribers of every
+    /// channel the client is in (`:client ACTIVITY <#chan> presence <state>`),
+    /// on AWAY set/clear. Best-effort; skips the client itself.
+    fn pushPresenceActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, availability: activity.Availability) void {
+        var prefix_buf: [256]u8 = undefined;
+        const prefix = clientPrefix(conn, &prefix_buf) catch return;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        var it = self.world.channels.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
+            const chan = entry.key_ptr.*;
+            const subs = self.activity_subs.subscribers(chan);
+            if (subs.len == 0) continue;
+            const line = formatMessage(&line_buf, prefix, "ACTIVITY", &.{ chan, "presence", availability.token() }, null) catch continue;
+            for (subs) |sid| {
+                const cid = clientIdFromMonitor(sid);
+                if (cid.eql(id)) continue;
+                self.deliver(cid, line) catch continue;
+            }
         }
     }
 
