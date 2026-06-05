@@ -4136,8 +4136,11 @@ pub const LinuxServer = struct {
                 if (!mconn.session.hasCap(.message_tags)) continue;
                 try self.deliver(mid, msg);
             }
-            // #33: a +typing tag also feeds the ACTIVITY stream subscribers.
+            // #33: typing and reaction tags also feed the ACTIVITY stream.
             if (findTagValue(tags, "+typing")) |tv| self.pushTypingActivity(id, conn, target, tv) catch {};
+            if (findTagValue(tags, "+draft/react")) |rv| {
+                self.pushReactionActivity(id, conn, target, rv, findTagValue(tags, "+draft/reply")) catch {};
+            }
             return;
         }
         const recipient = self.world.findNick(target) orelse return;
@@ -4192,6 +4195,23 @@ pub const LinuxServer = struct {
         var prefix_buf: [256]u8 = undefined;
         var line_buf: [default_reply_bytes]u8 = undefined;
         const line = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "ACTIVITY", &.{ channel, "typing", state.token() }, null);
+        for (subs) |sid| {
+            const cid = clientIdFromMonitor(sid);
+            if (cid.eql(id)) continue;
+            self.deliver(cid, line) catch continue;
+        }
+    }
+
+    /// Push a reaction ActivityEvent (`:reactor ACTIVITY <#chan> react <msgid>
+    /// <reaction>`) to subscribers. Requires a `+draft/reply` target msgid; an
+    /// empty/oversized reaction is dropped.
+    fn pushReactionActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, react_value: []const u8, reply_target: ?[]const u8) !void {
+        const subs = self.activity_subs.subscribers(channel);
+        if (subs.len == 0) return;
+        const r = activity.Reaction.fromTags(react_value, reply_target) catch return;
+        var prefix_buf: [256]u8 = undefined;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "ACTIVITY", &.{ channel, "react", r.target_msgid, r.reaction }, null);
         for (subs) |sid| {
             const cid = clientIdFromMonitor(sid);
             if (cid.eql(id)) continue;
