@@ -10,6 +10,7 @@ pub const clock = @import("clock.zig");
 pub const conflict_resolver = @import("conflict_resolver.zig");
 pub const convergence = @import("convergence.zig");
 pub const delta_codec = @import("delta_codec.zig");
+pub const delta_journal = @import("delta_journal.zig");
 pub const eg_walker = @import("eg_walker.zig");
 pub const goryu = @import("goryu.zig");
 pub const goryu_props = @import("goryu_props.zig");
@@ -46,6 +47,7 @@ test {
     _ = conflict_resolver;
     _ = convergence;
     _ = delta_codec;
+    _ = delta_journal;
     _ = eg_walker;
     _ = goryu;
     _ = goryu_props;
