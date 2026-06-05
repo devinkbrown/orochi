@@ -3541,7 +3541,39 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CREATE"}, "Invalid CREATE");
             return;
         };
+        // IRCX clone-takeover (founder-reassign, non-destructive): an operator
+        // CREATEing an EXISTING channel takes founder status without evicting
+        // anyone; stale ACCESS/PROP state is purged. Everyone else (and CREATE of
+        // a fresh channel) falls through to the normal JOIN path.
+        if (conn.session.isOper() and self.world.channelExists(req.channel)) {
+            try self.operFounderTakeover(id, conn, req.channel);
+            return;
+        }
         try self.joinOne(id, conn, req.channel, null);
+    }
+
+    /// Grant founder (+Q) to an operator on an existing channel, joining them
+    /// first if needed (gate-bypassing, as a privileged takeover) and purging the
+    /// channel's stale ACCESS/PROP state. Members and their existing status modes
+    /// are left intact — nobody is kicked.
+    fn operFounderTakeover(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) !void {
+        const wid = worldIdFromClient(id);
+        if (!self.world.isMember(channel, wid)) {
+            _ = try self.world.join(channel, wid);
+            try self.broadcastJoin(channel, conn);
+        }
+        _ = self.world.setMemberMode(channel, wid, .founder, true) catch {};
+        // Wipe persistent ACCESS grants and channel PROPs (a fresh authority);
+        // member list and their op/voice status remain.
+        self.props.clearChannel(channel);
+        _ = self.access.clear(.{ .channel = channel }) catch {};
+        // Announce the founder grant to the channel (server-sourced MODE +Q nick).
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const nick = conn.session.displayName();
+        const msg = try formatMessage(&line_buf, server_name, "MODE", &.{ channel, "+Q", nick }, null);
+        try self.broadcastChannel(channel, msg, null);
+        try self.sendTopicReply(conn, channel);
+        try self.sendNames(conn, channel);
     }
 
     /// Whether `conn` may mutate metadata on `target`: own nick (case-insensitive)
