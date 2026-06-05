@@ -19,11 +19,13 @@ const Allocator = std.mem.Allocator;
 
 pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const NodeId = gossip_round.NodeId;
+pub const MemberInfo = route_table.Member;
 
 const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 const handshake_version: u8 = 1;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
+const membership_event = @import("../../proto/membership_event.zig");
 
 pub const ByteSink = struct {
     ptr: *anyopaque,
@@ -238,7 +240,44 @@ pub const S2sPeer = struct {
             },
             .PONG => self.pong_rx_count += 1,
             .QUIT => self.closeRemote(),
+            .MEMBERSHIP => try self.recvMembership(frame.payload),
         }
+    }
+
+    /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
+    /// malformed payload is dropped, never fatal to the link.
+    fn recvMembership(self: *S2sPeer, payload: []const u8) !void {
+        const ev = membership_event.decode(payload) catch return;
+        self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present) catch {};
+    }
+
+    /// Emit a MEMBERSHIP event to the peer announcing a local member's presence
+    /// (or departure) in `channel`. Best-effort; only meaningful once established.
+    pub fn sendMembership(
+        self: *S2sPeer,
+        sink: ByteSink,
+        channel: []const u8,
+        nick: []const u8,
+        status: u4,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        const ev = membership_event.MembershipEvent{
+            .present = present,
+            .status = status,
+            .origin_node = self.local_node_id,
+            .hlc = hlc,
+            .channel = channel,
+            .nick = nick,
+        };
+        var buf: [membership_event.max_channel_len + membership_event.max_nick_len + 32]u8 = undefined;
+        const wire = try membership_event.encode(ev, &buf);
+        try emitFrame(self.allocator, sink, .MEMBERSHIP, wire);
+    }
+
+    /// Remote members the peer has announced for `channel` (borrowed roster).
+    pub fn channelMembers(self: *const S2sPeer, channel: []const u8) []const route_table.Member {
+        return self.routes.channelMembers(channel);
     }
 
     fn recvHandshake(self: *S2sPeer, payload: []const u8, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {

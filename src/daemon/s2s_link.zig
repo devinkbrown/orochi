@@ -158,6 +158,25 @@ pub const S2sLink = struct {
     pub fn knownServers(self: *const S2sLink) usize {
         return self.peer.registryCount();
     }
+
+    /// Announce a local member's presence/departure in `channel` to the peer.
+    /// Outbound frames accumulate in `out`. Best-effort: only meaningful once the
+    /// link is established.
+    pub fn sendMembership(
+        self: *S2sLink,
+        channel: []const u8,
+        nick: []const u8,
+        status: u4,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present);
+    }
+
+    /// Remote members the peer has announced for `channel` (borrowed roster).
+    pub fn channelMembers(self: *const S2sLink, channel: []const u8) []const s2s_peer.MemberInfo {
+        return self.peer.channelMembers(channel);
+    }
 };
 
 test "two links handshake and converge over a byte loopback" {

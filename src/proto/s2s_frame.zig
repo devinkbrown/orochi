@@ -31,6 +31,7 @@ pub const FrameType = enum(u8) {
     PING = 0x05,
     PONG = 0x06,
     QUIT = 0x07,
+    MEMBERSHIP = 0x08,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -45,6 +46,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.PING) => .PING,
             @intFromEnum(FrameType.PONG) => .PONG,
             @intFromEnum(FrameType.QUIT) => .QUIT,
+            @intFromEnum(FrameType.MEMBERSHIP) => .MEMBERSHIP,
             else => null,
         };
     }
