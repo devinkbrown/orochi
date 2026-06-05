@@ -110,6 +110,7 @@ pub const numeric = @import("numeric.zig");
 pub const oper_privs = @import("oper_privs.zig");
 pub const opus_packet = @import("opus_packet.zig");
 pub const proxy_protocol = @import("proxy_protocol.zig");
+pub const quic_datagram = @import("quic_datagram.zig");
 pub const quic_frame = @import("quic_frame.zig");
 pub const quic_packet = @import("quic_packet.zig");
 pub const quic_tls = @import("quic_tls.zig");
@@ -275,6 +276,7 @@ test {
     _ = oper_privs;
     _ = opus_packet;
     _ = proxy_protocol;
+    _ = quic_datagram;
     _ = quic_frame;
     _ = quic_packet;
     _ = quic_tls;
