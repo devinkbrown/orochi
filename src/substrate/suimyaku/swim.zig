@@ -222,6 +222,13 @@ pub const Swim = struct {
         return .dead;
     }
 
+    /// Whether SWIM already tracks `node`. Distinguishes a genuinely-dead
+    /// member from an unknown one (both report `.dead` via `status`), so callers
+    /// can register a peer once without resurrecting suspects on every tick.
+    pub fn isMember(self: *const Swim, node: NodeId) bool {
+        return node == self.self_id or self.findMember(node) != null;
+    }
+
     fn applyDeltaAboutSelf(self: *Swim, delta: MembershipDelta) Error!void {
         switch (delta.state) {
             .alive => {
@@ -335,16 +342,20 @@ pub const Swim = struct {
         }
     }
 
+    /// Probe both alive and suspect members. Continuing to probe a suspect lets
+    /// this node accrue its own first-hand witness (a remote suspicion alone
+    /// stops nothing) so a quorum can actually form, and detects recovery when a
+    /// falsely-suspected node answers. Dead members are never re-probed.
     fn chooseProbeTarget(self: *Swim, rng: *Rng) ?usize {
         var count: usize = 0;
         for (self.members.items) |m| {
-            if (m.state == .alive) count += 1;
+            if (m.state != .dead) count += 1;
         }
         if (count == 0) return null;
 
         var pick = rng.index(count);
         for (self.members.items, 0..) |m, idx| {
-            if (m.state != .alive) continue;
+            if (m.state == .dead) continue;
             if (pick == 0) return idx;
             pick -= 1;
         }

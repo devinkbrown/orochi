@@ -21,6 +21,7 @@ pub const media = @import("media.zig");
 pub const membership_view = @import("membership_view.zig");
 pub const merkle = @import("merkle.zig");
 pub const merkle_props = @import("merkle_props.zig");
+pub const mesh = @import("mesh.zig");
 pub const nick_claim = @import("nick_claim.zig");
 pub const peer_link = @import("peer_link.zig");
 pub const prolly = @import("prolly.zig");
@@ -56,6 +57,7 @@ test {
     _ = membership_view;
     _ = merkle;
     _ = merkle_props;
+    _ = mesh;
     _ = nick_claim;
     _ = peer_link;
     _ = prolly;
