@@ -55,6 +55,7 @@ const secured_s2s_link = @import("secured_s2s_link.zig");
 const oper_mod = @import("oper.zig");
 const services_mod = @import("services.zig");
 const account_register = @import("../proto/account_register.zig");
+const sessions_mod = @import("sessions.zig");
 const tsumugi_hs = @import("../crypto/tsumugi_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
@@ -770,6 +771,8 @@ pub const LinuxServer = struct {
     stats: server_stats.Stats = .{},
     /// #33 ACTIVITY: per-channel real-time activity-stream subscribers.
     activity_subs: activity_subscriptions.SubscriptionStore,
+    /// Phase 3: per-account live session registry (multi-device / bouncer).
+    sessions: sessions_mod.SessionStore,
     /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
     /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
     s2s_listener_fd: linux.fd_t = -1,
@@ -832,6 +835,7 @@ pub const LinuxServer = struct {
             .access = ircx_access_store.AccessStore.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
+            .sessions = sessions_mod.SessionStore.init(allocator),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
             .reactor = config.reactor,
@@ -864,6 +868,7 @@ pub const LinuxServer = struct {
         self.accepts.deinit();
         self.silence.deinit();
         self.activity_subs.deinit();
+        self.sessions.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
@@ -1294,6 +1299,7 @@ pub const LinuxServer = struct {
             self.stats.onClose(false);
             self.stats.onQuit();
             self.activity_subs.removeClient(monitorIdFromClient(id));
+            _ = self.sessions.removeClient(monitorIdFromClient(id));
             defer self.world.removeClient(worldIdFromClient(id));
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
@@ -1389,6 +1395,7 @@ pub const LinuxServer = struct {
                 // SASL-only oper: elevate now if the (SASL-set) account is bound to
                 // an operator class. Emits 381 + MODE +o after the welcome burst.
                 try self.elevateOperFromAccount(conn);
+                self.trackSession(id, conn); // multi-session registry (SASL login)
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -1480,6 +1487,8 @@ pub const LinuxServer = struct {
             try self.handleDrop(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTINFO")) {
             try self.handleAccountInfo(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SESSION")) {
+            try self.handleSession(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
@@ -4219,6 +4228,7 @@ pub const LinuxServer = struct {
         const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ server_name, account }) catch return;
         try appendToConn(conn, line);
         try self.elevateOperFromAccount(conn);
+        self.trackSession(idFromToken(conn.token), conn);
     }
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
@@ -4238,6 +4248,7 @@ pub const LinuxServer = struct {
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ server_name, conn.session.displayName(), account }) catch return;
         try appendToConn(conn, line);
         try self.elevateOperFromAccount(conn);
+        self.trackSession(idFromToken(conn.token), conn);
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).
@@ -4284,6 +4295,60 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ server_name, conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// Generate a 16-byte session reclaim token from the daemon CSPRNG (zeroed
+    /// when no crypto_io is configured — reclaim then effectively disabled).
+    fn genSessionToken(self: *LinuxServer) sessions_mod.Token {
+        var t: sessions_mod.Token = [_]u8{0} ** 16;
+        if (self.config.crypto_io) |io| io.random(&t);
+        return t;
+    }
+
+    /// Register a live session for the client's account (once; keeps the token
+    /// stable). No-op if the client is not logged in. Called after account login.
+    fn trackSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        const account = conn.session.account() orelse return;
+        const cid = monitorIdFromClient(id);
+        for (self.sessions.sessions(account)) |s| {
+            if (s.client == cid) return; // already tracked
+        }
+        const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        _ = self.sessions.attach(account, cid, self.genSessionToken(), signon) catch {};
+    }
+
+    /// `SESSION [LIST|TOKEN]` — list the account's live sessions, or reveal this
+    /// session's reclaim token (to the owning session only).
+    fn handleSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const account = conn.session.account() orelse {
+            try self.noticeTo(conn, "SESSION: you are not logged in to an account");
+            return;
+        };
+        const cid = monitorIdFromClient(id);
+        const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
+        var buf: [default_reply_bytes]u8 = undefined;
+        if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
+            for (self.sessions.sessions(account)) |s| {
+                if (s.client != cid) continue;
+                const hex = std.fmt.bytesToHex(s.token, .lower);
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION TOKEN :{s}\r\n", .{ server_name, hex }) catch return;
+                try appendToConn(conn, line);
+                return;
+            }
+            try self.noticeTo(conn, "SESSION: no token for this session");
+            return;
+        }
+        // LIST (default): never reveal tokens here.
+        var idx: usize = 0;
+        for (self.sessions.sessions(account)) |s| {
+            idx += 1;
+            const current: []const u8 = if (s.client == cid) "*" else "-";
+            const state: []const u8 = if (s.attached) "attached" else "detached";
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION LIST :{s} #{d} signon={d} {s}\r\n", .{ server_name, current, idx, s.signon_ms, state }) catch continue;
+            try appendToConn(conn, line);
+        }
+        const end = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION :End of session list\r\n", .{server_name}) catch return;
+        try appendToConn(conn, end);
     }
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.

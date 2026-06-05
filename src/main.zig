@@ -51,6 +51,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // The platform CSPRNG is always available to the server (session reclaim
+    // tokens, etc.); PQ-secured S2S below is the only feature gated on a key.
+    srv_cfg.crypto_io = init.io;
+
     // PQ-secured S2S: if the config supplies node.secret_key, derive this node's
     // Tsumugi identity and enable the secured handshake (TOFU) on S2S links. The
     // identity outlives the server (the server borrows a pointer to it). Without a
@@ -62,7 +66,6 @@ pub fn main(init: std.process.Init) !void {
             if (mizuchi.daemon.node_identity.fromConfig(sk, h.parsed.mesh.realm)) |ident| {
                 node_id_holder = ident;
                 srv_cfg.node_identity = &node_id_holder.?;
-                srv_cfg.crypto_io = init.io;
                 if (h.parsed.mesh.mesh_pass) |mp| srv_cfg.mesh_pass = mp;
                 std.debug.print("mizuchi: PQ-secured S2S enabled (node identity configured)\n", .{});
             } else |err| {
