@@ -105,6 +105,7 @@ pub const xor_filter = @import("xor_filter.zig");
 pub const Reactor = reactor.Reactor;
 pub const SystemReactor = reactor.SystemReactor;
 pub const SimReactor = reactor.SimReactor;
+pub const SimNetReactor = reactor.SimNetReactor;
 
 test {
     // gen:tests:begin
