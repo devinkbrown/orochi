@@ -28,12 +28,14 @@ pub const Messages = struct {
 };
 
 pub const Session = struct {
+    allocator: std.mem.Allocator,
     target: []const u8,
     negotiating: bool,
     enabled: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator, target: []const u8) Session {
         return .{
+            .allocator = allocator,
             .target = target,
             .negotiating = true,
             .enabled = std.StringHashMap(void).init(allocator),
@@ -41,7 +43,24 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        // The session OWNS copies of its enabled cap names (they must not borrow
+        // Registry-owned memory, which can be unregistered out from under us).
+        var it = self.enabled.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
         self.enabled.deinit();
+    }
+
+    /// Enable a cap, taking an owned copy of the name (idempotent).
+    pub fn enable(self: *Session, name: []const u8) !void {
+        if (self.enabled.contains(name)) return;
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.enabled.put(owned, {});
+    }
+
+    /// Disable a cap, freeing the owned name copy.
+    pub fn disable(self: *Session, name: []const u8) void {
+        if (self.enabled.fetchRemove(name)) |kv| self.allocator.free(kv.key);
     }
 
     pub fn isEnabled(self: *const Session, name: []const u8) bool {
@@ -179,9 +198,9 @@ pub const Registry = struct {
             const parsed = parseRequestToken(raw).?;
             const cap = self.get(parsed.name).?;
             if (parsed.enable) {
-                try session.enabled.put(cap.name, {});
+                try session.enable(cap.name);
             } else {
-                _ = session.enabled.remove(cap.name);
+                session.disable(cap.name);
             }
         }
 

@@ -88,7 +88,10 @@ fn parseDigits(s: []const u8) error{InvalidDigits}!u64 {
     var result: u64 = 0;
     for (s) |ch| {
         if (ch < '0' or ch > '9') return error.InvalidDigits;
-        result = result * 10 + (ch - '0');
+        // Checked arithmetic: a hostile over-long digit string (e.g. an absurd
+        // CHATHISTORY limit) must NOT panic on u64 overflow — reject it.
+        result = std.math.mul(u64, result, 10) catch return error.InvalidDigits;
+        result = std.math.add(u64, result, ch - '0') catch return error.InvalidDigits;
     }
     return result;
 }
