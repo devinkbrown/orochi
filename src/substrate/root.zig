@@ -87,6 +87,7 @@ pub const timing_wheel = @import("timing_wheel.zig");
 pub const topk = @import("topk.zig");
 pub const trace = @import("trace.zig");
 pub const tracing = @import("tracing.zig");
+pub const transport_stack = @import("transport_stack.zig");
 pub const turn = @import("turn.zig");
 pub const twcc = @import("twcc.zig");
 pub const ulid = @import("ulid.zig");
@@ -191,6 +192,7 @@ test {
     _ = topk;
     _ = trace;
     _ = tracing;
+    _ = transport_stack;
     _ = turn;
     _ = twcc;
     _ = ulid;
