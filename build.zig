@@ -150,6 +150,28 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // `zig build wasm` — compile the OPVOX/OPVIS codecs to a freestanding WASM
+    // module for the in-browser client (#11/#32). Pure-integer + allocation-free,
+    // so it needs no WASI/libc; the JS side drives it through linear memory.
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm/opcodec_wasm.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    // The codecs depend only on std, so expose them as standalone wasm-targeted
+    // modules (the full mizuchi root pulls in io_uring/sockets and won't build
+    // freestanding).
+    const wasm_adpcm = b.createModule(.{ .root_source_file = b.path("src/substrate/opvox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall });
+    const wasm_opvis = b.createModule(.{ .root_source_file = b.path("src/substrate/opvis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall });
+    wasm_mod.addImport("opvox_adpcm", wasm_adpcm);
+    wasm_mod.addImport("opvis_delta", wasm_opvis);
+    const wasm = b.addExecutable(.{ .name = "opcodec", .root_module = wasm_mod });
+    wasm.entry = .disabled; // a library of exports, not an entry-point program
+    wasm.rdynamic = true; // keep the `export fn`s in the final module
+    const wasm_step = b.step("wasm", "Build the OPVOX/OPVIS codec WASM module");
+    wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
