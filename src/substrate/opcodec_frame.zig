@@ -255,12 +255,17 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
             } else if (fwd < win) {
                 // within forward window; fall through.
             } else if (behind > 0 and behind <= win) {
-                // seq is behind next_seq by at most one window → duplicate.
+                // seq is behind next_seq (already-consumed region). Only a true
+                // re-send of a slot still holding this exact seq is a duplicate;
+                // anything else is a distinct frame that arrived too late.
                 const idx = seq % window_cap;
                 const slot = &self.ring[idx];
-                _ = slot; // slot check below covers consumed case too
-                self.duplicate_count += 1;
-                return .duplicate;
+                if ((slot.state == .consumed or slot.state == .filled) and slot.frame.sequence == seq) {
+                    self.duplicate_count += 1;
+                    return .duplicate;
+                }
+                self.late_drop_count += 1;
+                return .late_drop;
             } else {
                 self.late_drop_count += 1;
                 return .late_drop;
@@ -312,6 +317,10 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
                 out_slice[count] = slot.frame;
                 slot.state = .consumed;
                 self.next_seq +%= 1;
+                // recovered_bits are indexed by offset from next_seq; sliding the
+                // window forward by one must slide the bitset down by one too,
+                // or stale bits would mask later sequences as "recovered".
+                self.shiftRecoveredBitsDown1();
                 count += 1;
             }
             return count;
@@ -380,6 +389,19 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
 
         fn clearRecoveredBits(self: *Self) void {
             @memset(&self.recovered_bits, 0);
+        }
+
+        /// Slide the whole recovered-bit set down by one offset (offset k → k-1,
+        /// offset 0 dropped). Called once per sequence consumed by `drain` so the
+        /// bits stay aligned to the advancing `next_seq`.
+        fn shiftRecoveredBitsDown1(self: *Self) void {
+            const n = self.recovered_bits.len;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var b: u8 = self.recovered_bits[i] >> 1;
+                if (i + 1 < n) b |= (self.recovered_bits[i + 1] & 1) << 7;
+                self.recovered_bits[i] = b;
+            }
         }
 
         // gap_count_incr is called from a const context in reportGaps; we need
@@ -679,6 +701,38 @@ test "reassembly: gap reporting identifies missing range" {
     try testing.expectEqual(@as(u32, 1), GapCollector.gaps[0].start);
     try testing.expectEqual(@as(u32, 3), GapCollector.gaps[0].end);
     try testing.expectEqual(@as(u32, 2), GapCollector.gaps[0].len());
+}
+
+test "reassembly: recovered bits do not leak past a drain" {
+    var rb = ReassemblyBuffer(128, 64).init(.{ .window = 16 });
+
+    // seq 0 real, seq 1 FEC-recovered, seq 2 real → all drain (next_seq → 3).
+    _ = rb.push(testFrame(64, 0, 0, 0, false, .raw, "a"));
+    rb.markRecovered(1);
+    _ = rb.push(testFrame(64, 0, 2, 200, false, .raw, "c"));
+    var out: [8]MediaFrame = undefined;
+    try testing.expectEqual(@as(usize, 3), rb.drain(&out));
+
+    // Now buffer seq 6: sequences 3,4,5 are a single contiguous gap. A stale
+    // recovered bit (set for seq 1 at offset 1) must NOT mask seq 4 here.
+    _ = rb.push(testFrame(64, 0, 6, 600, false, .raw, "g"));
+
+    const C = struct {
+        var gaps: [8]GapRange = undefined;
+        var count: usize = 0;
+        fn cb(g: GapRange) void {
+            if (count < gaps.len) {
+                gaps[count] = g;
+                count += 1;
+            }
+        }
+    };
+    C.count = 0;
+    rb.reportGaps(C.cb);
+
+    try testing.expectEqual(@as(usize, 1), C.count);
+    try testing.expectEqual(@as(u32, 3), C.gaps[0].start);
+    try testing.expectEqual(@as(u32, 6), C.gaps[0].end);
 }
 
 test "reassembly: multiple disjoint gaps reported" {

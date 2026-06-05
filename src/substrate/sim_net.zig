@@ -265,6 +265,9 @@ pub const Sim = struct {
         self.clock_ms = until_ms;
     }
 
+    /// Borrowed view of a node's delivered messages. The slice is only valid
+    /// until the next `step`/`run`/`send` touching this node, which may grow and
+    /// reallocate the backing list — re-fetch after any such call; do not retain.
     pub fn inbound(self: *const Sim, id: NodeId) ![]const Message {
         const node = self.nodes.getPtr(id) orelse return SimError.UnknownNode;
         return node.inbound.items;

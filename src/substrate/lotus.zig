@@ -181,11 +181,19 @@ pub const Dag = struct {
     }
 
     fn markAncestors(self: *const Dag, cid: Cid, known: *std.AutoHashMap(Cid, void)) !void {
-        if (known.contains(cid)) return;
-        const stored = self.events.get(cid) orelse return;
-
-        try known.put(cid, {});
-        for (stored.parents) |parent| try self.markAncestors(parent, known);
+        // Iterative DFS with an explicit work-stack: a deep causal chain would
+        // overflow the native stack with the recursive form.
+        var stack: std.ArrayList(Cid) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, cid);
+        while (stack.pop()) |cur| {
+            if (known.contains(cur)) continue;
+            const stored = self.events.get(cur) orelse continue;
+            try known.put(cur, {});
+            for (stored.parents) |parent| {
+                if (!known.contains(parent)) try stack.append(self.allocator, parent);
+            }
+        }
     }
 };
 

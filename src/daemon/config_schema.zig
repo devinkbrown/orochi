@@ -334,6 +334,14 @@ pub const DiagKind = enum { unknown_section, unknown_key, missing_required, type
 
 pub const Diagnostic = struct { loc: Loc, kind: DiagKind, message: []const u8 };
 
+/// Free the diagnostic messages (each allocated with the same allocator passed
+/// to `validate`) and the list. Messages are caller-owned because `diags`
+/// outlives `validate`'s internal arena, which is released on the failure path.
+pub fn freeDiagnostics(alloc: std.mem.Allocator, diags: *std.ArrayList(Diagnostic)) void {
+    for (diags.items) |d| alloc.free(d.message);
+    diags.deinit(alloc);
+}
+
 /// Full schema: a slice of section descriptors.
 pub const Schema = struct {
     sections: []const SectionDesc,
@@ -361,7 +369,7 @@ pub const Schema = struct {
             if (!ok) try diags.append(outer_alloc, .{
                 .loc = ps.loc,
                 .kind = .unknown_section,
-                .message = try std.fmt.allocPrint(a, "unknown section '{s}'", .{ps.name}),
+                .message = try std.fmt.allocPrint(outer_alloc, "unknown section '{s}'", .{ps.name}),
             });
         }
 
@@ -380,7 +388,7 @@ pub const Schema = struct {
                         try diags.append(outer_alloc, .{
                             .loc = loc,
                             .kind = .missing_required,
-                            .message = try std.fmt.allocPrint(a, "section '{s}': missing required key '{s}'", .{ sd.name, kd.name }),
+                            .message = try std.fmt.allocPrint(outer_alloc, "section '{s}': missing required key '{s}'", .{ sd.name, kd.name }),
                         });
                         continue;
                     }
@@ -401,7 +409,7 @@ pub const Schema = struct {
                     if (!known) try diags.append(outer_alloc, .{
                         .loc = e.value_ptr.loc,
                         .kind = .unknown_key,
-                        .message = try std.fmt.allocPrint(a, "section '{s}': unknown key '{s}'", .{ sd.name, key }),
+                        .message = try std.fmt.allocPrint(outer_alloc, "section '{s}': unknown key '{s}'", .{ sd.name, key }),
                     });
                 }
             }
@@ -436,15 +444,15 @@ fn coerceValue(
         .string => return CoercedValue{ .tag = .string, .data = .{ .string = rv.text } },
         .int => {
             const n = std.fmt.parseInt(i64, rv.text, 10) catch {
-                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(a, "key '{s}': expected integer, got '{s}'", .{ kd.name, rv.text }) });
+                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(da, "key '{s}': expected integer, got '{s}'", .{ kd.name, rv.text }) });
                 return null;
             };
             if (kd.int_min) |mn| if (n < mn) {
-                try diags.append(da, .{ .loc = rv.loc, .kind = .out_of_range, .message = try std.fmt.allocPrint(a, "key '{s}': {d} < min {d}", .{ kd.name, n, mn }) });
+                try diags.append(da, .{ .loc = rv.loc, .kind = .out_of_range, .message = try std.fmt.allocPrint(da, "key '{s}': {d} < min {d}", .{ kd.name, n, mn }) });
                 return null;
             };
             if (kd.int_max) |mx| if (n > mx) {
-                try diags.append(da, .{ .loc = rv.loc, .kind = .out_of_range, .message = try std.fmt.allocPrint(a, "key '{s}': {d} > max {d}", .{ kd.name, n, mx }) });
+                try diags.append(da, .{ .loc = rv.loc, .kind = .out_of_range, .message = try std.fmt.allocPrint(da, "key '{s}': {d} > max {d}", .{ kd.name, n, mx }) });
                 return null;
             };
             return CoercedValue{ .tag = .int, .data = .{ .int = n } };
@@ -452,31 +460,31 @@ fn coerceValue(
         .bool => {
             if (std.mem.eql(u8, rv.text, "true")) return CoercedValue{ .tag = .bool, .data = .{ .bool = true } };
             if (std.mem.eql(u8, rv.text, "false")) return CoercedValue{ .tag = .bool, .data = .{ .bool = false } };
-            try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(a, "key '{s}': expected bool, got '{s}'", .{ kd.name, rv.text }) });
+            try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(da, "key '{s}': expected bool, got '{s}'", .{ kd.name, rv.text }) });
             return null;
         },
         .duration => {
             const ms = parseDuration(rv.text) catch {
-                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(a, "key '{s}': invalid duration '{s}'", .{ kd.name, rv.text }) });
+                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(da, "key '{s}': invalid duration '{s}'", .{ kd.name, rv.text }) });
                 return null;
             };
             return CoercedValue{ .tag = .duration, .data = .{ .duration = ms } };
         },
         .size => {
             const bytes = parseSize(rv.text) catch {
-                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(a, "key '{s}': invalid size '{s}'", .{ kd.name, rv.text }) });
+                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(da, "key '{s}': invalid size '{s}'", .{ kd.name, rv.text }) });
                 return null;
             };
             return CoercedValue{ .tag = .size, .data = .{ .size = bytes } };
         },
         .@"enum" => {
             for (kd.allowed_enum) |al| if (std.mem.eql(u8, rv.text, al)) return CoercedValue{ .tag = .@"enum", .data = .{ .@"enum" = rv.text } };
-            try diags.append(da, .{ .loc = rv.loc, .kind = .bad_enum, .message = try std.fmt.allocPrint(a, "key '{s}': '{s}' not allowed", .{ kd.name, rv.text }) });
+            try diags.append(da, .{ .loc = rv.loc, .kind = .bad_enum, .message = try std.fmt.allocPrint(da, "key '{s}': '{s}' not allowed", .{ kd.name, rv.text }) });
             return null;
         },
         .list => {
             const items = parseList(a, rv.text) catch {
-                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(a, "key '{s}': invalid list", .{kd.name}) });
+                try diags.append(da, .{ .loc = rv.loc, .kind = .type_mismatch, .message = try std.fmt.allocPrint(da, "key '{s}': invalid list", .{kd.name}) });
                 return null;
             };
             return CoercedValue{ .tag = .list, .data = .{ .list = items } };
@@ -704,7 +712,7 @@ test "schema validation: full happy path with all value types" {
     var doc = try parse(alloc, input, null);
     defer doc.deinit();
     var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(alloc);
+    defer freeDiagnostics(alloc, &diags);
     var cfg = try schema.validate(&doc, alloc, &diags);
     defer cfg.deinit();
     try std.testing.expectEqualStrings("irc.mizuchi.test", cfg.getString("server", "name").?);
@@ -722,7 +730,7 @@ test "schema validation: unknown key" {
     var doc = try parse(alloc, "[s]\na = \"x\"\nunknown = 99", null);
     defer doc.deinit();
     var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(alloc);
+    defer freeDiagnostics(alloc, &diags);
     try std.testing.expectError(error.ValidationFailed, schema.validate(&doc, alloc, &diags));
     try std.testing.expectEqual(DiagKind.unknown_key, diags.items[0].kind);
 }
@@ -733,7 +741,7 @@ test "schema validation: missing required key" {
     var doc = try parse(alloc, "[s]\nport = 6667", null);
     defer doc.deinit();
     var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(alloc);
+    defer freeDiagnostics(alloc, &diags);
     try std.testing.expectError(error.ValidationFailed, schema.validate(&doc, alloc, &diags));
     var got_missing = false;
     for (diags.items) |d| if (d.kind == .missing_required) {
@@ -748,7 +756,7 @@ test "schema validation: type mismatch (int instead of bool)" {
     var doc = try parse(alloc, "[s]\ntls = 42", null);
     defer doc.deinit();
     var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(alloc);
+    defer freeDiagnostics(alloc, &diags);
     try std.testing.expectError(error.ValidationFailed, schema.validate(&doc, alloc, &diags));
     try std.testing.expectEqual(DiagKind.type_mismatch, diags.items[0].kind);
 }
@@ -764,7 +772,7 @@ test "schema validation: bad enum value with correct line number" {
     var doc = try parse(alloc, "# line 1\n\n[logging]\nlevel = verbose", null);
     defer doc.deinit();
     var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(alloc);
+    defer freeDiagnostics(alloc, &diags);
     try std.testing.expectError(error.ValidationFailed, schema.validate(&doc, alloc, &diags));
     try std.testing.expectEqual(DiagKind.bad_enum, diags.items[0].kind);
     try std.testing.expectEqual(@as(u32, 4), diags.items[0].loc.line);
@@ -781,7 +789,7 @@ test "schema validation: out-of-range int and defaults" {
         var doc = try parse(alloc, "[s]\nport = 99999", null);
         defer doc.deinit();
         var diags: std.ArrayList(Diagnostic) = .empty;
-        defer diags.deinit(alloc);
+        defer freeDiagnostics(alloc, &diags);
         try std.testing.expectError(error.ValidationFailed, schema.validate(&doc, alloc, &diags));
         try std.testing.expectEqual(DiagKind.out_of_range, diags.items[0].kind);
     }
@@ -790,7 +798,7 @@ test "schema validation: out-of-range int and defaults" {
         var doc = try parse(alloc, "[s]\nport = 6667", null);
         defer doc.deinit();
         var diags: std.ArrayList(Diagnostic) = .empty;
-        defer diags.deinit(alloc);
+        defer freeDiagnostics(alloc, &diags);
         var cfg = try schema.validate(&doc, alloc, &diags);
         defer cfg.deinit();
         try std.testing.expectEqual(false, cfg.getBool("s", "tls").?);
