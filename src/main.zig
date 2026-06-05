@@ -86,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
                 account_services = mizuchi.daemon.services.Services.init(&account_store.?, null);
                 account_checker = .{ .services = &account_services };
                 srv_cfg.sasl_checker = account_checker.checker();
+                srv_cfg.account_services = &account_services;
                 std.debug.print("mizuchi: SASL account store opened ({s})\n", .{db});
             } else |err| {
                 std.debug.print("mizuchi: account store error ({s}); SASL disabled\n", .{@errorName(err)});

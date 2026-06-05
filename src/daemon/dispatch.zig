@@ -522,6 +522,21 @@ pub const ClientSession = struct {
         return if (self.logged_in) self.account_store.slice() else null;
     }
 
+    /// Mark the session logged in as `account` (callers should pass the canonical
+    /// lowercased form). Truncates to the account-name capacity.
+    pub fn loginAs(self: *ClientSession, account_name: []const u8) void {
+        self.account_store.set(account_name) catch {
+            // Over-capacity: store the prefix that fits rather than failing login.
+            self.account_store.set(account_name[0..@min(account_name.len, MAX_ACCOUNT_BYTES)]) catch return;
+        };
+        self.logged_in = true;
+    }
+
+    pub fn logout(self: *ClientSession) void {
+        self.logged_in = false;
+        self.account_store.len = 0;
+    }
+
     pub fn registered(self: ClientSession) bool {
         return self.registration.registered;
     }

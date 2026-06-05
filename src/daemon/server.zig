@@ -53,6 +53,8 @@ const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
 const oper_mod = @import("oper.zig");
+const services_mod = @import("services.zig");
+const account_register = @import("../proto/account_register.zig");
 const tsumugi_hs = @import("../crypto/tsumugi_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
@@ -653,6 +655,9 @@ pub const Config = struct {
     /// Oper is SASL-only: a client is elevated on SASL login if its account has a
     /// binding here. Null/empty = no operators (the OPER command never grants).
     oper_registry: ?oper_mod.OperRegistry = null,
+    /// Account services (REGISTER/IDENTIFY/DROP/…) backed by the WAL store. Null =
+    /// account management disabled. Borrowed; outlives the server (owned by main).
+    account_services: ?*services_mod.Services = null,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -774,6 +779,8 @@ pub const LinuxServer = struct {
     /// Operator registry (account -> oper class), from config. Borrowed; outlives
     /// the server via the loaded config.
     oper_registry: ?oper_mod.OperRegistry = null,
+    /// Account services backend (borrowed; owned by main).
+    account_services: ?*services_mod.Services = null,
     /// Monotonic millis captured at init, for STATS u uptime.
     start_ms: i64 = 0,
 
@@ -826,6 +833,7 @@ pub const LinuxServer = struct {
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
             .oper_registry = config.oper_registry,
+            .account_services = config.account_services,
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
         };
@@ -1462,6 +1470,16 @@ pub const LinuxServer = struct {
             try self.handleAway(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SETNAME")) {
             try self.handleSetname(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
+            try self.handleRegister(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
+            try self.handleIdentify(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "LOGOUT")) {
+            try self.handleLogout(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "DROP")) {
+            try self.handleDrop(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTINFO")) {
+            try self.handleAccountInfo(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
@@ -4158,6 +4176,122 @@ pub const LinuxServer = struct {
         const nick = conn.session.displayName();
         const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, "+o" }, null);
         try appendToConn(conn, msg);
+    }
+
+    // --- Account command family (Phase 2) ----------------------------------
+
+    /// Map a services registration error to an IRCv3 standard-reply FAIL code.
+    fn registerFailCode(err: anyerror) []const u8 {
+        return switch (err) {
+            error.AlreadyExists => "ACCOUNT_EXISTS",
+            error.InvalidName => "BAD_ACCOUNT_NAME",
+            error.InvalidPassword => "INVALID_PASSWORD",
+            else => "TEMPORARILY_UNAVAILABLE",
+        };
+    }
+
+    /// Mark `conn` logged in as the canonical (lowercased) `account`.
+    fn loginSession(conn: *ConnState, account: []const u8) void {
+        var buf: [account_register.MAX_ACCOUNT_BYTES]u8 = undefined;
+        const n = @min(account.len, buf.len);
+        const lower = std.ascii.lowerString(buf[0..n], account[0..n]);
+        conn.session.loginAs(lower);
+    }
+
+    /// `REGISTER <account> <email|*> <password>` (IRCv3 draft/account-registration).
+    /// Immediate registration (no email verification step yet); logs the client in
+    /// and applies oper elevation if the account is bound in the registry.
+    fn handleRegister(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Account registration is unavailable");
+        if (parsed.param_count < 3) {
+            try self.failReply(conn, "REGISTER", "NEED_MORE_PARAMS", "Usage: REGISTER <account> <email|*> <password>");
+            return;
+        }
+        const account = parsed.paramSlice()[0];
+        const password = parsed.paramSlice()[2];
+        var scratch: [1024]u8 = undefined;
+        _ = svc.registerAccount(account, password, &scratch) catch |err| {
+            try self.failReply(conn, "REGISTER", registerFailCode(err), "Registration failed");
+            return;
+        };
+        loginSession(conn, account);
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ server_name, account }) catch return;
+        try appendToConn(conn, line);
+        try self.elevateOperFromAccount(conn);
+    }
+
+    /// `IDENTIFY <account> <password>` — authenticate to an existing account.
+    fn handleIdentify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"IDENTIFY"}, "Usage: IDENTIFY <account> <password>");
+            return;
+        }
+        const account = parsed.paramSlice()[0];
+        _ = svc.identifyAccount(account, parsed.paramSlice()[1]) catch {
+            try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
+            return;
+        };
+        loginSession(conn, account);
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ server_name, conn.session.displayName(), account }) catch return;
+        try appendToConn(conn, line);
+        try self.elevateOperFromAccount(conn);
+    }
+
+    /// `LOGOUT` — drop the session's account login (does not affect oper for now).
+    fn handleLogout(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
+        conn.session.logout();
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ server_name, conn.session.displayName() }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// `DROP <account> <password>` — delete an account (requires its password).
+    fn handleDrop(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "DROP", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"DROP"}, "Usage: DROP <account> <password>");
+            return;
+        }
+        const account = parsed.paramSlice()[0];
+        _ = svc.dropAccount(account, parsed.paramSlice()[1]) catch {
+            try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
+            return;
+        };
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ server_name, conn.session.displayName(), account }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// `ACCOUNTINFO [account]` — report account name + flags (self if omitted).
+    fn handleAccountInfo(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "ACCOUNTINFO", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const target = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
+            parsed.paramSlice()[0]
+        else
+            (conn.session.account() orelse {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCOUNTINFO"}, "Not logged in; specify an account");
+                return;
+            });
+        const result = svc.accountInfo(target) catch {
+            try self.failReply(conn, "ACCOUNTINFO", "ACCOUNT_UNKNOWN", "No such account");
+            return;
+        };
+        const info = result.account_info;
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ server_name, conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.
+    fn failReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
+        _ = self;
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "FAIL {s} {s} :{s}\r\n", .{ command, code, reason }) catch return;
+        try appendToConn(conn, line);
     }
 
     /// Render a typed Event Spine event as `NOTE EVENT <CATEGORY>` and deliver it
