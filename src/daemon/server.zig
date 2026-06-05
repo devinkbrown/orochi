@@ -1442,6 +1442,24 @@ pub const LinuxServer = struct {
     /// Broadcast a JOIN to every channel member, choosing the IRCv3 extended-join
     /// form (`JOIN #c <account> :<realname>`) for recipients that negotiated the
     /// cap and the plain form otherwise. Server-time is applied per recipient.
+    /// World projection (#6) producer: announce a local member's presence (or
+    /// departure) in `channel` to every established S2S peer. Best-effort — a full
+    /// link buffer or send-arm failure never faults the local membership change.
+    fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool) void {
+        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        for (self.clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const link = slot.value.s2s orelse continue;
+            if (!link.established()) continue;
+            link.sendMembership(channel, nick, status, hlc, present) catch continue;
+            const out = link.outbound();
+            if (out.len == 0) continue;
+            appendToConn(&slot.value, out) catch continue;
+            link.clearOutbound();
+            self.armSendIfNeeded(&slot.value) catch continue;
+        }
+    }
+
     fn broadcastJoin(self: *LinuxServer, channel: []const u8, conn: *ConnState) !void {
         var prefix_buf: [256]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
@@ -1610,6 +1628,11 @@ pub const LinuxServer = struct {
         try self.broadcastJoin(join_target, conn);
         try self.sendTopicReply(conn, join_target);
         try self.sendNames(conn, join_target);
+
+        // Propagate this membership to mesh peers (status = the joiner's modes,
+        // e.g. founder on a freshly created/cloned channel).
+        const jmodes = self.world.memberModes(join_target, wid) orelse world_model.MemberModes.empty();
+        self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true);
     }
 
     fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -1657,7 +1680,10 @@ pub const LinuxServer = struct {
         } else {
             try self.broadcastChannel(channel, msg, null);
         }
+        const parted_nick = conn.session.displayName();
         try self.world.part(channel, wid);
+        // Tell mesh peers this member left.
+        self.announceMembership(channel, parted_nick, 0, false);
     }
 
     fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -4377,6 +4403,32 @@ pub const LinuxServer = struct {
             count += 1;
         }
 
+        // World projection (#6): merge remote members announced by established S2S
+        // peers for this channel. Deduped against already-listed nicks; the stored
+        // u4 status IS the MemberModes bitset, so prefixes/auditorium rank apply
+        // uniformly. Host is the origin server name (placeholder user).
+        for (self.clients.slots.items) |*slot| {
+            if (count >= max_members) break;
+            if (!slot.occupied) continue;
+            const link = slot.value.s2s orelse continue;
+            if (!link.established()) continue;
+            const remote_name = link.remoteName();
+            for (link.channelMembers(channel)) |rm| {
+                if (count >= max_members) break;
+                if (nameAlreadyListed(members_buf[0..count], rm.nick)) continue;
+                const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
+                if (is_auditorium and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
+                prefix_buf[count] = modes.allPrefixes();
+                members_buf[count] = .{
+                    .prefixes = prefix_buf[count].asSlice(),
+                    .nick = rm.nick,
+                    .user = "mesh",
+                    .host = if (remote_name.len != 0) remote_name else default_host,
+                };
+                count += 1;
+            }
+        }
+
         const caps = names_reply.RequesterCaps{
             .multi_prefix = conn.session.hasCap(.multi_prefix),
             .userhost_in_names = conn.session.hasCap(.userhost_in_names),
@@ -4467,6 +4519,15 @@ fn worldIdFromClient(id: client_model.ClientId) world_model.ClientId {
 fn usernameOf(self: *LinuxServer, world_id: world_model.ClientId) []const u8 {
     if (self.clients.get(clientIdFromWorld(world_id))) |c| return c.session.username();
     return "user";
+}
+
+/// True if `nick` (ASCII case-insensitive) is already among the listed members —
+/// used to dedupe remote mesh members against local ones in NAMES.
+fn nameAlreadyListed(members: []const names_reply.Member, nick: []const u8) bool {
+    for (members) |m| {
+        if (std.ascii.eqlIgnoreCase(m.nick, nick)) return true;
+    }
+    return false;
 }
 
 fn clientIdFromWorld(id: world_model.ClientId) client_model.ClientId {

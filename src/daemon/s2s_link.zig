@@ -231,6 +231,58 @@ test "two links handshake and converge over a byte loopback" {
     try std.testing.expect(b.knownServers() >= 2);
 }
 
+test "MEMBERSHIP propagates a member across the link into channelMembers" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.mizuchi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.mizuchi" });
+    defer b.deinit();
+
+    // Establish, then A announces alice (op) on #chat; pump to B.
+    try a.start(10);
+    var now: u64 = 11;
+    try a.sendMembership("#chat", "alice", 0b0010, 100, true); // op bit
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    // B now sees alice on #chat as a remote member homed on node 1, with op status.
+    const members = b.channelMembers("#chat");
+    try std.testing.expectEqual(@as(usize, 1), members.len);
+    try std.testing.expectEqualStrings("alice", members[0].nick);
+    try std.testing.expectEqual(@as(u64, 1), members[0].node);
+    try std.testing.expectEqual(@as(u4, 0b0010), members[0].status);
+
+    // A part removes her on B too.
+    try a.sendMembership("#chat", "alice", 0, 101, false);
+    rounds = 0;
+    while (rounds < 16) : (rounds += 1) {
+        const a_out = a.outbound();
+        if (a_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        a.clearOutbound();
+        try b.feed(a_copy, now, 7);
+        now += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#chat").len);
+}
+
 test "consumeOutbound drops a partial-send prefix" {
     const allocator = std.testing.allocator;
     var link: S2sLink = undefined;
