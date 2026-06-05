@@ -8,6 +8,7 @@ pub const io = @import("io/root.zig");
 pub const ip_cidr = @import("ip_cidr.zig");
 pub const platform = @import("platform.zig");
 pub const queue = @import("queue.zig");
+pub const raptorq = @import("raptorq.zig");
 pub const reactor = @import("reactor.zig");
 pub const sazanami_props = @import("sazanami_props.zig");
 pub const sazanami = @import("sazanami.zig");
@@ -33,6 +34,7 @@ test {
     _ = ip_cidr;
     _ = platform;
     _ = queue;
+    _ = raptorq;
     _ = reactor;
     _ = sazanami_props;
     _ = sazanami;

@@ -18,6 +18,7 @@ pub const tls_kat = @import("tls_kat.zig");
 pub const tls_props = @import("tls_props.zig");
 pub const tls_record = @import("tls_record.zig");
 pub const tls = @import("tls.zig");
+pub const tsumugi_handshake = @import("tsumugi_handshake.zig");
 pub const x509_props = @import("x509_props.zig");
 pub const x509_verify = @import("x509_verify.zig");
 pub const x509 = @import("x509.zig");
@@ -45,6 +46,7 @@ test {
     _ = tls_props;
     _ = tls_record;
     _ = tls;
+    _ = tsumugi_handshake;
     _ = x509_props;
     _ = x509_verify;
     _ = x509;
