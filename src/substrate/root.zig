@@ -23,6 +23,7 @@ pub const cron = @import("cron.zig");
 pub const cuckoo = @import("cuckoo.zig");
 pub const ddsketch = @import("ddsketch.zig");
 pub const dtx = @import("dtx.zig");
+pub const egwalker = @import("egwalker.zig");
 pub const ewma = @import("ewma.zig");
 pub const fec_window = @import("fec_window.zig");
 pub const fenwick = @import("fenwick.zig");
@@ -133,6 +134,7 @@ test {
     _ = cuckoo;
     _ = ddsketch;
     _ = dtx;
+    _ = egwalker;
     _ = ewma;
     _ = fec_window;
     _ = fenwick;
