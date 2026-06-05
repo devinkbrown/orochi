@@ -27,9 +27,8 @@ pub const Schema = struct {
         .{ .section = "listen", .key = "ws", .kind = .port, .default = "0", .max = 65535 },
         .{ .section = "listen", .key = "webtransport", .kind = .port, .default = "0", .max = 65535 },
         .{ .section = "listen", .key = "s2s", .kind = .port, .default = "0", .max = 65535 },
-        .{ .section = "oper", .key = "name", .kind = .string, .required = true },
-        .{ .section = "oper", .key = "user", .kind = .string, .required = true },
-        .{ .section = "oper", .key = "password", .kind = .string, .required = true },
+        .{ .section = "oper", .key = "account", .kind = .string, .required = true },
+        .{ .section = "oper", .key = "class", .kind = .string, .default = "operator" },
         .{ .section = "mesh", .key = "realm", .kind = .string, .default = "local" },
         .{ .section = "mesh", .key = "trust_roots", .kind = .list },
         .{ .section = "mesh", .key = "mesh_pass", .kind = .string },
@@ -88,10 +87,12 @@ pub const Config = struct {
         s2s: u16 = 0,
     };
 
+    /// An operator binding. Mizuchi grants oper SASL-only: `account` is the SASL
+    /// account that is elevated on login (no password — SASL is the auth), and
+    /// `class` names its privilege class. There is no OPER-password credential.
     pub const Oper = struct {
-        name: []const u8 = "",
-        user: []const u8 = "",
-        password: []const u8 = "",
+        account: []const u8 = "",
+        class: []const u8 = "",
     };
 
     pub const Mesh = struct {
@@ -129,9 +130,8 @@ pub const Config = struct {
         if (self.node.secret_key) |value| allocator.free(value);
         allocator.free(self.listen.host);
         for (self.opers) |oper| {
-            allocator.free(oper.name);
-            allocator.free(oper.user);
-            allocator.free(oper.password);
+            allocator.free(oper.account);
+            allocator.free(oper.class);
         }
         allocator.free(self.opers);
         allocator.free(self.mesh.realm);
@@ -163,9 +163,8 @@ pub const Parser = struct {
         var opers: std.ArrayList(Config.Oper) = .empty;
         errdefer {
             for (opers.items) |oper| {
-                self.allocator.free(oper.name);
-                self.allocator.free(oper.user);
-                self.allocator.free(oper.password);
+                self.allocator.free(oper.account);
+                self.allocator.free(oper.class);
             }
             opers.deinit(self.allocator);
         }
@@ -220,14 +219,14 @@ pub const Parser = struct {
             return .oper;
         }
         if (std.mem.startsWith(u8, inner, "oper.")) {
-            const name = inner["oper.".len..];
-            if (name.len == 0) return self.fail(line, col + 1, "expected oper block name", .{});
-            try opers.append(self.allocator, .{ .name = try self.allocator.dupe(u8, name) });
+            const account = inner["oper.".len..];
+            if (account.len == 0) return self.fail(line, col + 1, "expected oper account name", .{});
+            try opers.append(self.allocator, .{ .account = try self.allocator.dupe(u8, account) });
             return .oper;
         }
         if (std.mem.startsWith(u8, inner, "oper ")) {
-            const name = try self.parseStringValue(std.mem.trim(u8, inner["oper ".len..], " \t"), line, col + 6);
-            try opers.append(self.allocator, .{ .name = name });
+            const account = try self.parseStringValue(std.mem.trim(u8, inner["oper ".len..], " \t"), line, col + 6);
+            try opers.append(self.allocator, .{ .account = account });
             return .oper;
         }
         return self.fail(line, col + 1, "unknown section '{s}'", .{inner});
@@ -282,7 +281,11 @@ pub const Parser = struct {
     }
 
     fn setOper(self: *Parser, line: usize, col: usize, key: []const u8, value: []const u8, oper: *Config.Oper) !void {
-        if (std.mem.eql(u8, key, "name")) replaceString(self.allocator, &oper.name, try self.parseStringValue(value, line, col)) else if (std.mem.eql(u8, key, "user")) replaceString(self.allocator, &oper.user, try self.parseStringValue(value, line, col)) else if (std.mem.eql(u8, key, "password")) replaceString(self.allocator, &oper.password, try self.parseStringValue(value, line, col));
+        if (std.mem.eql(u8, key, "account")) {
+            replaceString(self.allocator, &oper.account, try self.parseStringValue(value, line, col));
+        } else if (std.mem.eql(u8, key, "class")) {
+            replaceString(self.allocator, &oper.class, try self.parseStringValue(value, line, col));
+        }
     }
 
     fn setMesh(self: *Parser, line: usize, col: usize, key: []const u8, value: []const u8, mesh: *Config.Mesh) !void {
@@ -313,9 +316,7 @@ pub const Parser = struct {
         if (cfg.node.id == 0) return self.fail(1, 1, "missing required field [node].id", .{});
         if (cfg.listen.irc == 0) return self.fail(1, 1, "missing required field [listen].irc", .{});
         for (cfg.opers, 0..) |oper, i| {
-            if (oper.name.len == 0) return self.fail(1, 1, "missing required field [oper #{d}].name", .{i + 1});
-            if (oper.user.len == 0) return self.fail(1, 1, "missing required field [oper {s}].user", .{oper.name});
-            if (oper.password.len == 0) return self.fail(1, 1, "missing required field [oper {s}].password", .{oper.name});
+            if (oper.account.len == 0) return self.fail(1, 1, "missing required field [oper #{d}].account", .{i + 1});
         }
     }
 
@@ -469,10 +470,9 @@ pub fn render(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try out.print(allocator, "irc = {d}\nws = {d}\nwebtransport = {d}\ns2s = {d}\n", .{ cfg.listen.irc, cfg.listen.ws, cfg.listen.webtransport, cfg.listen.s2s });
     for (cfg.opers) |oper| {
         try out.print(allocator, "\n[oper ", .{});
-        try writeQuoted(allocator, &out, oper.name);
+        try writeQuoted(allocator, &out, oper.account);
         try out.print(allocator, "]\n", .{});
-        try writeKVString(allocator, &out, "user", oper.user);
-        try writeKVString(allocator, &out, "password", oper.password);
+        if (oper.class.len != 0) try writeKVString(allocator, &out, "class", oper.class);
     }
     try out.print(allocator, "\n[mesh]\n", .{});
     try writeKVString(allocator, &out, "realm", cfg.mesh.realm);
@@ -587,8 +587,7 @@ const sample_config =
     \\s2s = 7000
     \\
     \\[oper "root"]
-    \\user = "admin"
-    \\password = env:MIZUCHI_OPER_PASS
+    \\class = "netadmin"
     \\
     \\[mesh]
     \\realm = "earth"
@@ -629,7 +628,8 @@ test "parse sample config" {
     try std.testing.expectEqual(@as(u64, 42), cfg.node.id);
     try std.testing.expectEqual(@as(u16, 6667), cfg.listen.irc);
     try std.testing.expectEqual(@as(usize, 1), cfg.opers.len);
-    try std.testing.expectEqualStrings("oper-secret", cfg.opers[0].password);
+    try std.testing.expectEqualStrings("root", cfg.opers[0].account);
+    try std.testing.expectEqualStrings("netadmin", cfg.opers[0].class);
     try std.testing.expectEqualStrings("root-b", cfg.mesh.trust_roots[1]);
     try std.testing.expectEqual(@as(u64, 45_000), cfg.limits.handshake_timeout_ms);
     try std.testing.expect(cfg.media.enabled);
@@ -678,6 +678,6 @@ test "round trip render parses again" {
     var again = try parser2.parse();
     defer again.deinit(std.testing.allocator);
     try std.testing.expectEqual(cfg.node.id, again.node.id);
-    try std.testing.expectEqualStrings(cfg.opers[0].password, again.opers[0].password);
+    try std.testing.expectEqualStrings(cfg.opers[0].account, again.opers[0].account);
     try std.testing.expectEqualStrings(cfg.mesh.trust_roots[1], again.mesh.trust_roots[1]);
 }

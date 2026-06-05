@@ -52,6 +52,7 @@ const activity = @import("../proto/activity.zig");
 const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
+const oper_mod = @import("oper.zig");
 const tsumugi_hs = @import("../crypto/tsumugi_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
@@ -561,6 +562,7 @@ const Numeric = enum(u16) {
     ERR_USERSDONTMATCH = 502,
     ERR_NOPRIVILEGES = 481,
     ERR_CHANOPRIVSNEEDED = 482,
+    ERR_NOOPERHOST = 491,
     // IRCX residual 9xx error numerics (decision: adopt the draft taxonomy). Inert
     // until a handler emits them; 926/927 back the clone/CREATE conformance path.
     ERR_BADCOMMAND = 900,
@@ -647,6 +649,10 @@ pub const Config = struct {
     node_identity: ?*const node_identity.NodeIdentity = null,
     crypto_io: ?std.Io = null,
     mesh_pass: []const u8 = "",
+    /// Operator registry from config `[oper]` blocks (account -> class/privileges).
+    /// Oper is SASL-only: a client is elevated on SASL login if its account has a
+    /// binding here. Null/empty = no operators (the OPER command never grants).
+    oper_registry: ?oper_mod.OperRegistry = null,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -765,10 +771,9 @@ pub const LinuxServer = struct {
     s2s_accept_armed: bool = false,
     s2s_feed_seq: u64 = 0,
 
-    /// Single configured operator credential (OPER <name> <pass>). Static for
-    /// now; a full oper-block table arrives with the config overhaul.
-    oper_name: []const u8 = "admin",
-    oper_pass: []const u8 = "mizuchi",
+    /// Operator registry (account -> oper class), from config. Borrowed; outlives
+    /// the server via the loaded config.
+    oper_registry: ?oper_mod.OperRegistry = null,
     /// Monotonic millis captured at init, for STATS u uptime.
     start_ms: i64 = 0,
 
@@ -820,6 +825,7 @@ pub const LinuxServer = struct {
             .access = ircx_access_store.AccessStore.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
+            .oper_registry = config.oper_registry,
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
         };
@@ -1372,6 +1378,9 @@ pub const LinuxServer = struct {
             try processLine(conn, line, &sink);
             if (conn.session.registered()) {
                 try self.registerConnNick(id, conn);
+                // SASL-only oper: elevate now if the (SASL-set) account is bound to
+                // an operator class. Emits 381 + MODE +o after the welcome burst.
+                try self.elevateOperFromAccount(conn);
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -1455,8 +1464,6 @@ pub const LinuxServer = struct {
             try self.handleSetname(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WALLOPS")) {
-            try self.handleWallops(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
             try self.handleRehash(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "INFO")) {
@@ -2746,8 +2753,12 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .RPL_STATSUPTIME, &.{}, text);
             },
             'o' => {
-                // One static oper block (matches the OPER credential).
-                try queueNumeric(conn, .RPL_STATSOLINE, &.{ "O", "*@*", "*", self.oper_name, "0", "0" }, "");
+                // One RPL_STATSOLINE per configured oper binding (account -> class).
+                if (self.oper_registry) |reg| {
+                    for (reg.bindings) |b| {
+                        try queueNumeric(conn, .RPL_STATSOLINE, &.{ "O", b.account_name, "*", b.class_name, "0", "0" }, "");
+                    }
+                }
             },
             'k', 'K' => try self.statsLines(conn, .kline, .RPL_STATSKLINE),
             'd', 'D' => try self.statsLines(conn, .dline, .RPL_STATSDLINE),
@@ -3292,7 +3303,6 @@ pub const LinuxServer = struct {
     /// daemon-native against the real event_spine (the ircx_event_cmd builder
     /// carries its own proto-local mask facade that can't see daemon types).
     fn handleEvent(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        _ = self;
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT is for operators");
             return;
@@ -3300,6 +3310,21 @@ pub const LinuxServer = struct {
         const params = parsed.paramSlice();
         if (params.len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
+            return;
+        }
+        // EVENT BROADCAST :<message> — send an oper announce (the former WALLOPS,
+        // now folded into the Event Spine): delivered as NOTE EVENT ANNOUNCE to
+        // every announce-subscribed operator.
+        if (std.ascii.eqlIgnoreCase(params[0], "BROADCAST")) {
+            if (params.len < 2 or params[1].len == 0) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
+                return;
+            }
+            var subj_buf: [256]u8 = undefined;
+            const subject = try clientPrefix(conn, &subj_buf);
+            var msg_buf: [512]u8 = undefined;
+            const message = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ subject, params[1] }) catch params[1];
+            try self.publishOperEvent(.announce, .notice, message);
             return;
         }
         const is_add = std.ascii.eqlIgnoreCase(params[0], "ADD");
@@ -4105,21 +4130,26 @@ pub const LinuxServer = struct {
     /// OPER <name> <password> — elevate to IRC operator. Matches against the
     /// single configured oper block; success sets the session oper flag, emits
     /// RPL_YOUREOPER (381) and the +o umode reflection.
-    fn handleOper(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (parsed.param_count < 2) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"OPER"}, "Not enough parameters");
-            return;
-        }
-        const name = parsed.paramSlice()[0];
-        const pass = parsed.paramSlice()[1];
-        if (!std.mem.eql(u8, name, self.oper_name) or !std.mem.eql(u8, pass, self.oper_pass)) {
-            try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Password incorrect");
-            return;
-        }
+    fn handleOper(self: *LinuxServer, conn: *ConnState, _: *const irc_line.LineView) !void {
+        // OPER is disabled: Mizuchi grants operator status SASL-only. A client is
+        // elevated automatically on SASL login when its account has an `[oper]`
+        // binding (see elevateOperFromAccount). There is no password credential.
+        _ = self;
+        try queueNumeric(conn, .ERR_NOOPERHOST, &.{}, "OPER is disabled; authenticate via SASL (operator status is granted on login)");
+    }
+
+    /// SASL-only operator elevation: if `conn` is authenticated as an account with
+    /// an `[oper]` registry binding, grant operator status (RPL_YOUREOPER + the +o
+    /// reflection) and subscribe it to the Event Spine. Idempotent and silent when
+    /// the account is not an operator. Called after a successful SASL login.
+    fn elevateOperFromAccount(self: *LinuxServer, conn: *ConnState) !void {
+        if (conn.session.isOper()) return;
+        const registry = self.oper_registry orelse return;
+        const account = conn.session.account() orelse return;
+        _ = registry.elevate(.{ .name = account }) catch return; // not an operator: silent
         conn.session.is_oper = true;
-        self.traceLog(.notice, .oper, "operator authenticated");
-        // Subscribe the new oper to all Event Spine categories — wallops, oper
-        // notices, kills, etc. arrive as typed events (IRCX EVENT model).
+        self.traceLog(.notice, .oper, "operator elevated via SASL account");
+        // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events.
         conn.session.setEventMask(event_spine.CategoryMask.all());
         try queueNumeric(conn, .RPL_YOUREOPER, &.{}, "You are now an IRC operator");
         var prefix_buf: [256]u8 = undefined;
@@ -4128,28 +4158,6 @@ pub const LinuxServer = struct {
         const nick = conn.session.displayName();
         const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, "+o" }, null);
         try appendToConn(conn, msg);
-    }
-
-    /// WALLOPS :<message> — oper-only broadcast to every operator. Non-opers get
-    /// ERR_NOPRIVILEGES (481).
-    fn handleWallops(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
-        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WALLOPS"}, "Not enough parameters");
-            return;
-        }
-        // IRCX (ophion m_ircx_event.c): WALLOPS is merged into the EVENT
-        // BROADCAST/announce category — an oper-visible typed event, not a +w
-        // umode. Build the event with the sender as subject and deliver the
-        // rendered `NOTE EVENT ANNOUNCE` to every announce-subscribed session.
-        var subj_buf: [256]u8 = undefined;
-        const subject = try clientPrefix(conn, &subj_buf);
-        var msg_buf: [512]u8 = undefined;
-        const message = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ subject, parsed.paramSlice()[0] }) catch parsed.paramSlice()[0];
-        try self.publishOperEvent(.announce, .notice, message);
     }
 
     /// Render a typed Event Spine event as `NOTE EVENT <CATEGORY>` and deliver it
@@ -5056,6 +5064,41 @@ fn socketPort(fd: linux.fd_t) ServerError!u16 {
     return std.mem.bigToNative(u16, addr.port);
 }
 
+// --- SASL-oper test fixtures (oper is SASL-only) ---------------------------
+
+/// Test PLAIN verifier: accepts the account "admin" / password "mizuchi".
+fn testOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    return std.mem.eql(u8, creds.authcid, "admin") and std.mem.eql(u8, creds.password, "mizuchi");
+}
+var test_oper_anchor: u8 = 0;
+const test_oper_checker = sasl.PlainChecker{ .ptr = &test_oper_anchor, .verifyFn = testOperVerify };
+const test_oper_bindings = [_]oper_mod.OperBinding{
+    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
+};
+
+/// Config for the live oper tests: SASL PLAIN verifier + an oper binding for the
+/// "admin" account, so a client that SASL-authenticates as admin is elevated.
+fn operTestConfig(port: u16) Config {
+    return .{
+        .host = "127.0.0.1",
+        .port = port,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+    };
+}
+
+/// Drive a live client through SASL PLAIN as the "admin" oper account. Call
+/// before NICK/USER so the client is elevated automatically at registration.
+fn saslAdminPrelude(fd: linux.fd_t) ServerError!void {
+    var b64: [64]u8 = undefined;
+    const enc = std.base64.standard.Encoder.encode(&b64, "\x00admin\x00mizuchi");
+    var line: [128]u8 = undefined;
+    try writeAllFd(fd, "CAP REQ :sasl\r\n");
+    try writeAllFd(fd, "AUTHENTICATE PLAIN\r\n");
+    try writeAllFd(fd, std.fmt.bufPrint(&line, "AUTHENTICATE {s}\r\n", .{enc}) catch return error.OutputTooSmall);
+    try writeAllFd(fd, "CAP END\r\n");
+}
+
 fn connectLoopback(port: u16) ServerError!linux.fd_t {
     const fd = try socketTcp();
     errdefer closeFd(fd);
@@ -5336,8 +5379,8 @@ test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to
     try recvUntil(&a, " 256 A ", 200);
 }
 
-test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-end" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -5359,9 +5402,11 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
+    try saslAdminPrelude(fd_a); // A authenticates as the admin oper account
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&a, " 381 A ", 200); // A auto-elevated on SASL login
     try recvUntil(&b, " 001 B ", 200);
 
     // B marks away -> 306; A PRIVMSGs B -> A sees RPL_AWAY (301).
@@ -5381,21 +5426,18 @@ test "threaded server: AWAY/SETNAME/OPER/WALLOPS/INFO/USERS/LINKS/MAP end-to-end
     try writeAllFd(fd_a, "SETNAME :Alice Liddell\r\n");
     try recvUntil(&a, "SETNAME :Alice Liddell\r\n", 200);
 
-    // Non-oper WALLOPS -> 481; OPER with good creds -> 381; then WALLOPS reaches self.
-    a.reset();
-    try writeAllFd(fd_a, "WALLOPS :nope\r\n");
-    try recvUntil(&a, " 481 A ", 200);
-    a.reset();
-    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
-    try recvUntil(&a, " 381 A ", 200);
+    // A non-oper (B) cannot use EVENT -> 481 (wallops is folded into EVENT).
+    b.reset();
+    try writeAllFd(fd_b, "EVENT BROADCAST :nope\r\n");
+    try recvUntil(&b, " 481 B ", 200);
     // WHOIS now shows the operator line (313).
     a.reset();
     try writeAllFd(fd_a, "WHOIS A\r\n");
     try recvUntil(&a, " 313 A A ", 200);
     a.reset();
-    // WALLOPS is delivered as an oper-visible Event Spine announce: the oper A
-    // (subscribed on OPER) receives a NOTE EVENT ANNOUNCE carrying the message.
-    try writeAllFd(fd_a, "WALLOPS :hello opers\r\n");
+    // EVENT BROADCAST (the former WALLOPS) is delivered as an oper-visible Event
+    // Spine announce: A, subscribed on elevation, receives NOTE EVENT ANNOUNCE.
+    try writeAllFd(fd_a, "EVENT BROADCAST :hello opers\r\n");
     try recvUntil(&a, "NOTE EVENT ANNOUNCE :", 200);
     try recvUntil(&a, "hello opers", 200);
     // REHASH now permitted (382).
@@ -6070,7 +6112,7 @@ test "threaded server: +x auditorium hides regular members in NAMES" {
 }
 
 test "threaded server: oper DEBUG dumps the flight recorder" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -6086,15 +6128,15 @@ test "threaded server: oper DEBUG dumps the flight recorder" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
+    try saslAdminPrelude(fd_a);
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
-    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
-    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
     // DEBUG dumps the structured flight recorder; OPER just recorded an event.
     a.reset();
     try writeAllFd(fd_a, "DEBUG\r\n");
     try recvUntil(&a, "End of DEBUG flight recorder", 200);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "operator authenticated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "operator elevated via SASL account") != null);
 }
 
 test "threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800" {
@@ -6250,7 +6292,7 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
 }
 
 test "threaded server: EVENT subscription managed by opers" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -6266,16 +6308,22 @@ test "threaded server: EVENT subscription managed by opers" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
+    try saslAdminPrelude(fd_a);
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
-    // Non-opers cannot use EVENT (ERR_NOPRIVILEGES 481).
-    a.reset();
-    try writeAllFd(fd_a, "EVENT LIST\r\n");
-    try recvUntil(&a, " 481 ", 200);
-    // OPER auto-subscribes to all categories; DEL KILL removes just that one.
-    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
-    try recvUntil(&a, " 381 A ", 200);
-    // OPER reflects +o in the user mode query (RPL_UMODEIS 221).
+    try recvUntil(&a, " 381 A ", 200); // A auto-elevated on SASL login
+
+    // A non-oper (no SASL oper binding) cannot use EVENT (ERR_NOPRIVILEGES 481).
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "EVENT LIST\r\n");
+    try recvUntil(&b, " 481 ", 200);
+
+    // A is oper (auto-subscribed to all categories); DEL KILL removes just one.
+    // OPER status reflects +o in the user mode query (RPL_UMODEIS 221).
     a.reset();
     try writeAllFd(fd_a, "MODE A\r\n");
     try recvUntil(&a, " 221 A :+o", 200);
@@ -6289,7 +6337,7 @@ test "threaded server: EVENT subscription managed by opers" {
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -6305,10 +6353,10 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
+    try saslAdminPrelude(fd_a);
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
-    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
-    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
     try writeAllFd(fd_a, "JOIN #r\r\n");
     try recvUntil(&a, " 366 A #r ", 200);
 
@@ -6909,7 +6957,7 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     defer closeFd(listen_fd);
     const remote_port = socketPort(listen_fd) catch return error.SkipZigTest;
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = 1 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -6923,14 +6971,14 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         thr.join();
     }
 
-    // Oper client issues CONNECT to the remote listener.
+    // Oper client SASL-authenticates as the admin oper account, then CONNECTs.
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
+    try saslAdminPrelude(fd_a);
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
-    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
-    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
     var cmd_buf: [64]u8 = undefined;
     const cmd = try std.fmt.bufPrint(&cmd_buf, "CONNECT 127.0.0.1 {d}\r\n", .{remote_port});
     try writeAllFd(fd_a, cmd);

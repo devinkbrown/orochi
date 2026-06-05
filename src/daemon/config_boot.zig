@@ -9,6 +9,7 @@ const std = @import("std");
 
 const config_format = @import("config_format.zig");
 const server = @import("server.zig");
+const oper_mod = @import("oper.zig");
 
 /// Overlay non-empty/non-zero config values onto `base` (which carries defaults).
 /// `cfg`'s string fields (e.g. host) are borrowed — keep `cfg` alive as long as
@@ -31,8 +32,11 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
 pub const Loaded = struct {
     config: server.Config,
     parsed: config_format.Config,
+    /// Owned oper bindings backing `config.oper_registry` (strings borrow `parsed`).
+    oper_bindings: []oper_mod.OperBinding = &.{},
 
     pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
+        allocator.free(self.oper_bindings);
         self.parsed.deinit(allocator);
         self.* = undefined;
     }
@@ -47,7 +51,24 @@ pub fn loadFromText(
     var parser = config_format.Parser.init(allocator, text, resolver);
     var parsed = try parser.parse();
     errdefer parsed.deinit(allocator);
-    return .{ .config = mapToServerConfig(parsed, base), .parsed = parsed };
+
+    // Build the SASL-only operator registry from `[oper]` blocks (full privileges
+    // per class for now; fine-grained privileges are a future config addition).
+    const bindings = try allocator.alloc(oper_mod.OperBinding, parsed.opers.len);
+    errdefer allocator.free(bindings);
+    for (parsed.opers, 0..) |o, i| {
+        bindings[i] = .{
+            .account_name = o.account,
+            .class_name = if (o.class.len != 0) o.class else "operator",
+            .privileges = oper_mod.OperPrivileges.full,
+        };
+    }
+
+    var config = mapToServerConfig(parsed, base);
+    if (bindings.len != 0) {
+        config.oper_registry = try oper_mod.OperRegistry.init(bindings);
+    }
+    return .{ .config = config, .parsed = parsed, .oper_bindings = bindings };
 }
 
 // ---------------------------------------------------------------------------
