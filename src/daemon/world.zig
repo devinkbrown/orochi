@@ -287,6 +287,39 @@ pub const World = struct {
         return channel.oid;
     }
 
+    /// IRCX CLONE: create `dst` as a clone of template channel `src`, copying the
+    /// channel-level modes, limit, key, and ext flags (template-copy scope) and
+    /// marking the new channel `+E` (clone) but not `+d` (a clone is not itself a
+    /// cloneable template, so clones never recurse). Membership/topic/bans are NOT
+    /// copied — the clone starts empty with a fresh OID. Returns false if `dst`
+    /// already exists; `error.NoSuchChannel` if `src` does not.
+    pub fn cloneChannel(self: *World, src: []const u8, dst: []const u8) WorldError!bool {
+        if (self.channels.getPtr(src) == null) return error.NoSuchChannel;
+        if (self.channels.contains(dst)) return false;
+
+        // Snapshot the template fields BEFORE ensureChannel: getOrPut may rehash
+        // and invalidate a pointer into the map.
+        const tmpl = self.channels.getPtr(src).?;
+        const modes = tmpl.modes;
+        const limit = tmpl.limit;
+        const private = tmpl.private;
+        const hidden = tmpl.hidden;
+        var ext = tmpl.ext_modes;
+        const key_copy: ?[]u8 = if (tmpl.key) |k| try self.allocator.dupe(u8, k) else null;
+        errdefer if (key_copy) |k| self.allocator.free(k);
+
+        const clone = try self.ensureChannel(dst);
+        clone.modes = modes;
+        clone.limit = limit;
+        clone.private = private;
+        clone.hidden = hidden;
+        ext.set(.clone);
+        ext.clear(.cloneable);
+        clone.ext_modes = ext;
+        clone.key = key_copy;
+        return true;
+    }
+
     /// +p private channel flag.
     pub fn setPrivate(self: *World, name: []const u8, on: bool) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
@@ -679,6 +712,33 @@ test "channels receive monotonic, stable, unique IRCX object ids" {
 
     // Unknown channel has no OID.
     try std.testing.expect(world.channelOid("#nope") == null);
+}
+
+test "cloneChannel copies modes/limit/key and marks the clone +E with a fresh OID" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = testClient(1);
+    try std.testing.expect(try world.join("#tmpl", a));
+    try std.testing.expect(try world.setChannelFlag("#tmpl", .moderated, true));
+    try world.setChannelLimit("#tmpl", 42);
+    try world.setChannelKey("#tmpl", "sekret");
+    try std.testing.expect(try world.setChannelExtFlag("#tmpl", .cloneable, true));
+    const tmpl_oid = world.channelOid("#tmpl").?;
+
+    try std.testing.expect(try world.cloneChannel("#tmpl", "#tmpl1"));
+
+    // Modes/limit/key copied; clone is +E and not +d; OID is distinct; empty.
+    try std.testing.expect(world.channelHasFlag("#tmpl1", .moderated));
+    try std.testing.expectEqual(@as(?u32, 42), world.channelLimit("#tmpl1"));
+    try std.testing.expect(world.channelHasExtFlag("#tmpl1", .clone));
+    try std.testing.expect(!world.channelHasExtFlag("#tmpl1", .cloneable));
+    try std.testing.expect(world.channelOid("#tmpl1").? != tmpl_oid);
+    try std.testing.expectEqual(@as(usize, 0), world.memberCount("#tmpl1"));
+
+    // Cloning onto an existing name is a no-op (false); cloning a missing source errors.
+    try std.testing.expect(!try world.cloneChannel("#tmpl", "#tmpl1"));
+    try std.testing.expectError(error.NoSuchChannel, world.cloneChannel("#nope", "#x"));
 }
 
 test "removeClient drops all channel memberships and nick ownership" {
