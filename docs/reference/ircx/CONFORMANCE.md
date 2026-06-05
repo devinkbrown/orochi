@@ -90,3 +90,17 @@ alignment decision; fill residual 9xx error set.
 5. **CLONEABLE/CLONE** auto-clone + takeover protection.
 6. EVENT numeric/type alignment decision; OID decision; UTF8 IRCX prefixes.
 7. Fill the IRCX error-numeric set.
+
+## Locked decisions (task #20, 2026-06-05) and status
+
+These resolve the six open questions from `docs/planning/14-ircx-remainder.md`.
+
+| # | Decision | Status |
+|---|----------|--------|
+| 6a KNOCK gating | **Additive** — KNOCK accepted when `+i` OR `+u`; neither ⇒ 713 open. | ✅ DONE (`handleKnock`) |
+| 5 9xx numerics | **Adopt** the IRCX error taxonomy in the live `Numeric` enum (inert until emitted). | ✅ DONE (900/903/905/907/908/912/914/915/916/924/925/926/927) |
+| 6b NOFORMAT `+f` | **Advertise-only (path A)** — `+f` is settable and rendered in MODE; clients strip formatting. No relay/tag change. | ✅ satisfied by existing ext-MODE rendering |
+| 4 EVENT | **Document the Event-Spine divergence (path B)** — Mizuchi keeps the richer native event taxonomy (matches WALLOPS→Event-Spine); does not force-map 806–810/918–921. | 🟡 documented; native taxonomy stands |
+| 2 OID | **Adopt** real per-channel OIDs (8-hex, `0` prefix) + `World.next_oid`; CREATION timestamp follows. | ⬜ remaining (centralized in `world.ensureChannel`; clock threading for CREATION) |
+| 1 CLONEABLE/CLONE | **Adopt**, takeover **oper-only**; clone copies limit/key/modes into a `+E` `#chan<n>`. | ⬜ remaining (hot JOIN path `joinOne`; 926/927 now available) |
+| 3 UTF8 prefixes | **Do `%#`/`%&`/`&`/`'` first; DEFER `^`→hex** display (needs a transliteration layer) to a separate task. | ⬜ remaining (broad: `world.isChannelName` + ~8 callers) |

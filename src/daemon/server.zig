@@ -556,6 +556,21 @@ const Numeric = enum(u16) {
     ERR_USERSDONTMATCH = 502,
     ERR_NOPRIVILEGES = 481,
     ERR_CHANOPRIVSNEEDED = 482,
+    // IRCX residual 9xx error numerics (decision: adopt the draft taxonomy). Inert
+    // until a handler emits them; 926/927 back the clone/CREATE conformance path.
+    ERR_BADCOMMAND = 900,
+    ERR_BADLEVEL = 903,
+    ERR_BADPROPERTY = 905,
+    ERR_RESOURCE = 907,
+    ERR_SECURITY = 908,
+    ERR_UNKNOWNPACKAGE = 912,
+    ERR_DUPACCESS = 914,
+    ERR_MISACCESS = 915,
+    ERR_TOOMANYACCESSES = 916,
+    ERR_NOSUCHOBJECT = 924,
+    ERR_NOTSUPPORTED = 925,
+    ERR_CHANNELEXIST = 926,
+    ERR_ALREADYONCHANNEL = 927,
 };
 
 fn formatNumericCode(code: Numeric, buf: []u8) []const u8 {
@@ -2410,7 +2425,12 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_KNOCKONCHAN, &.{channel}, "You are already on that channel");
             return;
         }
-        if (!self.world.channelHasFlag(channel, .invite_only)) {
+        // IRCX KNOCK gating (additive, decision 6a): KNOCK is accepted when the
+        // channel is invite-only (+i) OR explicitly knock-enabled (+u). A channel
+        // with neither is "open" and refuses the knock (713).
+        const knock_invite = self.world.channelHasFlag(channel, .invite_only);
+        const knock_ext = self.world.channelHasExtFlag(channel, .knock);
+        if (!knock_invite and !knock_ext) {
             try queueNumeric(conn, .ERR_CHANOPEN, &.{channel}, "Channel is open");
             return;
         }
