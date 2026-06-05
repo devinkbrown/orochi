@@ -40,6 +40,7 @@ pub const range_coder = @import("range_coder.zig");
 pub const raptorq = @import("raptorq.zig");
 pub const rateless = @import("rateless.zig");
 pub const reactor = @import("reactor.zig");
+pub const resampler = @import("resampler.zig");
 pub const ringbuf = @import("ringbuf.zig");
 pub const ryusen = @import("ryusen.zig");
 pub const sazanami_props = @import("sazanami_props.zig");
@@ -106,6 +107,7 @@ test {
     _ = raptorq;
     _ = rateless;
     _ = reactor;
+    _ = resampler;
     _ = ringbuf;
     _ = ryusen;
     _ = sazanami_props;
