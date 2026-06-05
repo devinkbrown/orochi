@@ -30,6 +30,7 @@ pub const chghost = @import("chghost.zig");
 pub const cloak = @import("cloak.zig");
 pub const coilpack = @import("coilpack.zig");
 pub const coilpack_props = @import("coilpack_props.zig");
+pub const coilpack_value = @import("coilpack_value.zig");
 pub const connect_squit = @import("connect_squit.zig");
 pub const ctcp = @import("ctcp.zig");
 pub const ctcp_props = @import("ctcp_props.zig");
@@ -170,6 +171,7 @@ test {
     _ = cloak;
     _ = coilpack;
     _ = coilpack_props;
+    _ = coilpack_value;
     _ = connect_squit;
     _ = ctcp;
     _ = ctcp_props;

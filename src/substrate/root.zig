@@ -8,6 +8,7 @@ pub const geoip = @import("geoip.zig");
 pub const io = @import("io/root.zig");
 pub const ip_cidr = @import("ip_cidr.zig");
 pub const lotus = @import("lotus.zig");
+pub const opcodec_frame = @import("opcodec_frame.zig");
 pub const platform = @import("platform.zig");
 pub const queue = @import("queue.zig");
 pub const raptorq = @import("raptorq.zig");
@@ -39,6 +40,7 @@ test {
     _ = io;
     _ = ip_cidr;
     _ = lotus;
+    _ = opcodec_frame;
     _ = platform;
     _ = queue;
     _ = raptorq;
