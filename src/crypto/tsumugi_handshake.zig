@@ -509,6 +509,25 @@ fn writeBytes16(out: *std.ArrayList(u8), allocator: Allocator, bytes: []const u8
     try out.appendSlice(allocator, bytes);
 }
 
+/// Serialize a signed prekey to a standalone byte buffer (caller owns it). Used
+/// by the S2S TOFU preamble, where the responder announces its prekey before the
+/// IK handshake so the initiator need not know it in advance.
+pub fn encodeSignedPrekey(allocator: Allocator, p: *const SignedPrekey) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try encodePrekey(&out, allocator, p);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Parse a signed prekey from bytes produced by `encodeSignedPrekey`. The caller
+/// MUST then `verify` it (signature + validity window) before trusting it.
+pub fn decodeSignedPrekey(bytes: []const u8) Error!SignedPrekey {
+    var r = Reader{ .buf = bytes };
+    const p = try decodePrekey(&r);
+    if (r.pos != bytes.len) return error.InvalidMessage;
+    return p;
+}
+
 fn encodePrekey(out: *std.ArrayList(u8), allocator: Allocator, p: *const SignedPrekey) Error!void {
     try out.appendSlice(allocator, &p.realm);
     try out.appendSlice(allocator, &p.node_key);
@@ -713,6 +732,18 @@ test "two parties complete Tsumugi handshake and derive crossed keys" {
     try std.testing.expectEqualSlices(u8, &est_i.recv_key.declassify(), &est_r.send_key.declassify());
     try std.testing.expectEqualSlices(u8, &fx.r_pre.node_id, &est_i.peer_node_id);
     try std.testing.expectEqualSlices(u8, &fx.i_pre.node_id, &est_r.peer_node_id);
+}
+
+test "signed prekey encode/decode round-trips, verifies, and rejects truncation" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    const bytes = try encodeSignedPrekey(std.testing.allocator, &fx.i_pre);
+    defer std.testing.allocator.free(bytes);
+
+    const decoded = try decodeSignedPrekey(bytes);
+    try decoded.verify(500); // within the prekey's [10, 1010] validity window
+    try std.testing.expectEqualSlices(u8, &fx.i_pre.node_id, &decoded.node_id);
+    try std.testing.expectError(error.InvalidMessage, decodeSignedPrekey(bytes[0 .. bytes.len - 1]));
 }
 
 test "tampered transcript signature fails" {
