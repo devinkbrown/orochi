@@ -76,6 +76,7 @@ pub const sazanami_props = @import("sazanami_props.zig");
 pub const sazanami = @import("sazanami.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const segment_tree = @import("segment_tree.zig");
+pub const seq_crdt = @import("seq_crdt.zig");
 pub const sim_net = @import("sim_net.zig");
 pub const sim = @import("sim.zig");
 pub const sketch = @import("sketch.zig");
@@ -185,6 +186,7 @@ test {
     _ = sazanami;
     _ = scheduler;
     _ = segment_tree;
+    _ = seq_crdt;
     _ = sim_net;
     _ = sim;
     _ = sketch;
