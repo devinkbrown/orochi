@@ -185,6 +185,7 @@ class Bot:
         """Send immediately, bypassing the paced queue (PONG, registration, SASL)."""
         if not self.sock:
             return
+        log.debug(">> %s", line)
         try:
             self.sock.sendall((line + "\r\n").encode("utf-8", "replace"))
         except Exception as e:
@@ -254,6 +255,7 @@ class Bot:
                 while b"\r\n" in buf:
                     raw, buf = buf.split(b"\r\n", 1)
                     s = raw.decode("utf-8", "replace")
+                    log.debug("<< %s", s)
                     j = self.handle(s, joined)
                     joined = joined or j
 
@@ -311,10 +313,18 @@ class Bot:
             self.send_raw("PONG " + line.split(None, 1)[1])
             return joined
 
-        parts = line.split()
+        # Strip a leading IRCv3 message-tag block (@tag=val;... ) — once
+        # server-time/message-tags are enabled EVERY line carries one, which
+        # would otherwise shift parts[] and hide numerics like 001.
+        work = line
+        if work.startswith("@"):
+            sp = work.find(" ")
+            work = work[sp + 1:] if sp != -1 else ""
+
+        parts = work.split()
         # CAP negotiation (parts: :server CAP * SUB :caps)
         if len(parts) >= 3 and parts[1] == "CAP":
-            self.handle_cap(line, parts)
+            self.handle_cap(work, parts)
             return joined
         # SASL AUTHENTICATE challenge
         if parts and parts[0] == "AUTHENTICATE" and len(parts) >= 2:
@@ -348,13 +358,13 @@ class Bot:
                 return True
 
         # KICK us -> rejoin
-        m = re.match(r":\S+ KICK (\S+) " + re.escape(self.nick), line)
+        m = re.match(r":\S+ KICK (\S+) " + re.escape(self.nick), work)
         if m:
             self.enqueue(f"JOIN {m.group(1)}")
             return joined
 
         # PRIVMSG (commands + CTCP)
-        m = re.match(r"(?:@\S+ )?:(\S+?)!(\S+) PRIVMSG (\S+) :(.*)", line)
+        m = re.match(r":(\S+?)!(\S+) PRIVMSG (\S+) :(.*)", work)
         if not m:
             return joined
         nick, _userhost, target, text = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -478,7 +488,8 @@ class Bot:
 
 def main() -> None:
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+        level=logging.DEBUG if os.environ.get("MIZ_DEBUG") else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
     )
     Bot().run()
 
