@@ -6,6 +6,15 @@
 > (founder +Q, WALLOPS→Event-Spine, node_id identity, conformant numerics).
 > Status: ✅ done · 🟡 partial · ❌ missing. Goal: drive ❌/🟡 → ✅.
 
+## Progress (2026-06-05 conformance pass)
+Now ✅ live: IRCX/ISIRCX/MODE-ISIRCX gateway + RPL_IRCX 800 (pre- & post-reg);
+LISTX (811/812/817); DATA/REQUEST/REPLY tag messaging (904 + SYS/ADM/OWN/HST
+gating); AUTHONLY +a JOIN block (477); +z GAG (oper-set, silent drop);
+MEMBERKEY↔+k & MEMBERLIMIT↔+l PROP built-ins (+ NAME/MEMBERCOUNT computed);
+numerics fixed (PROP 913, MODEX 820/821). **Remaining**: CLONEABLE/CLONE
+auto-clone + takeover protection; OID; UTF8 IRCX prefixes; EVENT numeric/type
+alignment decision; fill residual 9xx error set.
+
 ## Discovery & session
 | Feature | Status | Notes |
 | --- | --- | --- |
