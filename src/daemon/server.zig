@@ -510,6 +510,7 @@ const Numeric = enum(u16) {
     ERR_NOACCESS = 913,
     ERR_NOWHISPER = 923,
     ERR_BADVALUE = 906,
+    ERR_BADTAG = 904,
     RPL_IRCX = 800,
     RPL_TESTLINE = 725,
     RPL_NOTESTLINE = 726,
@@ -1322,6 +1323,11 @@ pub const LinuxServer = struct {
             try self.handleIrcx(conn, true);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ISIRCX")) {
             try self.handleIrcx(conn, false);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "DATA") or
+            std.ascii.eqlIgnoreCase(parsed.command, "REQUEST") or
+            std.ascii.eqlIgnoreCase(parsed.command, "REPLY"))
+        {
+            try self.handleData(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHISPER")) {
             try self.handleWhisper(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PROP")) {
@@ -3276,6 +3282,72 @@ pub const LinuxServer = struct {
         const state: []const u8 = if (conn.ircx) "1" else "0";
         // version 0; package-list = advertised SASL mechs; maxmsg 512.
         try queueNumeric(conn, .RPL_IRCX, &.{ state, "0", "PLAIN,SCRAM-SHA-256,SCRAM-SHA-512,EXTERNAL", "512" }, "*");
+    }
+
+    /// Validate an IRCX DATA tag: first char [A-Za-z], rest [A-Za-z0-9.], ≤15.
+    fn validDataTag(tag: []const u8) bool {
+        if (tag.len == 0 or tag.len > 15) return false;
+        if (!std.ascii.isAlphabetic(tag[0])) return false;
+        for (tag) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '.') return false;
+        }
+        return true;
+    }
+
+    /// DATA / REQUEST / REPLY <target> <tag> :<message> — IRCX typed directed
+    /// messaging. Tag rules: [A-z][A-z0-9.]{0,14}; reserved prefixes SYS/ADM need
+    /// operator, OWN/HST need channel owner/host on a channel target. Relays
+    /// `:sender <CMD> <target> <tag> :<message>` to the target (a nick, or all
+    /// members of a channel).
+    fn handleData(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (conn.gagged) return;
+        if (parsed.param_count < 3) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, "Not enough parameters");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+        const tag = parsed.paramSlice()[1];
+        const message = parsed.paramSlice()[2];
+        if (!validDataTag(tag)) {
+            try queueNumeric(conn, .ERR_BADTAG, &.{tag}, "Invalid DATA tag");
+            return;
+        }
+        // Reserved-prefix authorization (case-insensitive 3-letter prefix).
+        const is_chan = world_model.isChannelName(target);
+        if (tag.len >= 3) {
+            const p = tag[0..3];
+            if (std.ascii.eqlIgnoreCase(p, "SYS") or std.ascii.eqlIgnoreCase(p, "ADM")) {
+                if (!conn.session.isOper()) {
+                    try queueNumeric(conn, .ERR_NOACCESS, &.{tag}, "Reserved DATA tag (operator only)");
+                    return;
+                }
+            } else if (std.ascii.eqlIgnoreCase(p, "OWN") or std.ascii.eqlIgnoreCase(p, "HST")) {
+                const ok = is_chan and blk: {
+                    const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse break :blk false;
+                    break :blk mm.isOperator();
+                };
+                if (!ok and !conn.session.isOper()) {
+                    try queueNumeric(conn, .ERR_NOACCESS, &.{tag}, "Reserved DATA tag (channel owner/host only)");
+                    return;
+                }
+            }
+        }
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const line = formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), parsed.command, &.{ target, tag }, message) catch return;
+        if (is_chan) {
+            if (!self.world.channelExists(target) or !self.world.isMember(target, worldIdFromClient(id))) {
+                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{target}, "You're not on that channel");
+                return;
+            }
+            try self.broadcastChannel(target, line, null);
+        } else {
+            const rwid = self.world.findNick(target) orelse {
+                try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+                return;
+            };
+            self.deliver(clientIdFromWorld(rwid), line) catch {};
+        }
     }
 
     /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
