@@ -48,6 +48,8 @@ const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
 const server_stats = @import("server_stats.zig");
+const activity = @import("../proto/activity.zig");
+const activity_subscriptions = @import("activity_subscriptions.zig");
 const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
@@ -741,6 +743,8 @@ pub const LinuxServer = struct {
     /// Observability: allocation-free runtime counters (totals + gauges), bumped
     /// inline on the hot path and rendered on demand (STATS z / Prometheus).
     stats: server_stats.Stats = .{},
+    /// #33 ACTIVITY: per-channel real-time activity-stream subscribers.
+    activity_subs: activity_subscriptions.SubscriptionStore,
     /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
     /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
     s2s_listener_fd: linux.fd_t = -1,
@@ -801,6 +805,7 @@ pub const LinuxServer = struct {
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
+            .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
         };
@@ -825,6 +830,7 @@ pub const LinuxServer = struct {
         self.access.deinit();
         self.accepts.deinit();
         self.silence.deinit();
+        self.activity_subs.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
@@ -1156,6 +1162,7 @@ pub const LinuxServer = struct {
             }
             self.stats.onClose(false);
             self.stats.onQuit();
+            self.activity_subs.removeClient(monitorIdFromClient(id));
             defer self.world.removeClient(worldIdFromClient(id));
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
@@ -1414,6 +1421,8 @@ pub const LinuxServer = struct {
             try self.handleStats(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TAGMSG")) {
             try self.handleTagmsg(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACTIVITY")) {
+            try self.handleActivity(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -4127,12 +4136,67 @@ pub const LinuxServer = struct {
                 if (!mconn.session.hasCap(.message_tags)) continue;
                 try self.deliver(mid, msg);
             }
+            // #33: a +typing tag also feeds the ACTIVITY stream subscribers.
+            if (findTagValue(tags, "+typing")) |tv| self.pushTypingActivity(id, conn, target, tv) catch {};
             return;
         }
         const recipient = self.world.findNick(target) orelse return;
         const rconn = self.clients.get(clientIdFromWorld(recipient)) orelse return;
         if (rconn.session.hasCap(.message_tags)) try self.deliver(clientIdFromWorld(recipient), msg);
         if (echo) try self.deliver(id, msg);
+    }
+
+    /// ACTIVITY SUBSCRIBE|UNSUBSCRIBE <#channel> — opt in/out of a channel's
+    /// real-time activity stream (#33). A subscriber must be a channel member.
+    fn handleActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACTIVITY"}, "Not enough parameters");
+            return;
+        }
+        const sub = parsed.paramSlice()[0];
+        const channel = parsed.paramSlice()[1];
+        if (!world_model.isChannelName(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const cid = monitorIdFromClient(id);
+        if (std.ascii.eqlIgnoreCase(sub, "SUBSCRIBE")) {
+            if (!self.world.isMember(channel, worldIdFromClient(id))) {
+                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+                return;
+            }
+            _ = self.activity_subs.subscribe(channel, cid) catch {
+                try self.noticeTo(conn, "ACTIVITY: subscription limit reached");
+                return;
+            };
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "Subscribed to activity on {s}", .{channel}) catch return;
+            try self.noticeTo(conn, line);
+        } else if (std.ascii.eqlIgnoreCase(sub, "UNSUBSCRIBE")) {
+            _ = self.activity_subs.unsubscribe(channel, cid);
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "Unsubscribed from activity on {s}", .{channel}) catch return;
+            try self.noticeTo(conn, line);
+        } else {
+            try self.noticeTo(conn, "ACTIVITY: expected SUBSCRIBE or UNSUBSCRIBE");
+        }
+    }
+
+    /// Push a typing ActivityEvent to a channel's activity-stream subscribers
+    /// (server-relayed as `:<typer> ACTIVITY <#chan> typing <state>`), skipping
+    /// the typer. Best-effort; an unknown typing value is dropped.
+    fn pushTypingActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, state_value: []const u8) !void {
+        const subs = self.activity_subs.subscribers(channel);
+        if (subs.len == 0) return;
+        const state = activity.TypingState.parse(state_value) catch return;
+        var prefix_buf: [256]u8 = undefined;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "ACTIVITY", &.{ channel, "typing", state.token() }, null);
+        for (subs) |sid| {
+            const cid = clientIdFromMonitor(sid);
+            if (cid.eql(id)) continue;
+            self.deliver(cid, line) catch continue;
+        }
     }
 
     fn handleMessage(
@@ -4519,6 +4583,20 @@ fn worldIdFromClient(id: client_model.ClientId) world_model.ClientId {
 fn usernameOf(self: *LinuxServer, world_id: world_model.ClientId) []const u8 {
     if (self.clients.get(clientIdFromWorld(world_id))) |c| return c.session.username();
     return "user";
+}
+
+/// Find a tag's value in a raw IRCv3 tag segment (`a=1;+typing=active;b`).
+/// Returns the value slice (may be empty), or null if the key is absent.
+fn findTagValue(tags_raw: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, tags_raw, ';');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+            if (std.mem.eql(u8, pair, key)) return pair[0..0]; // bare key, no value
+            continue;
+        };
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
 }
 
 /// True if `nick` (ASCII case-insensitive) is already among the listed members —
