@@ -174,6 +174,9 @@ class Bot:
         self.outq: deque[str] = deque()
         self.last_send = 0.0
         self.caps: set[str] = set()
+        self.cap_ls: set[str] = set()  # accumulates multiline CAP LS offers
+        self.cap_ended = False
+        self.connect_ts = 0.0
         self.sasl_active = False
         self.registered = False
 
@@ -222,6 +225,9 @@ class Bot:
     def connect(self) -> None:
         self.nick = NICK
         self.caps = set()
+        self.cap_ls = set()
+        self.cap_ended = False
+        self.connect_ts = time.time()
         self.sasl_active = False
         self.registered = False
         self.outq.clear()
@@ -253,6 +259,12 @@ class Bot:
 
             self.pump_out()
             now = time.time()
+
+            # CAP safety net: if registration hasn't completed shortly after
+            # connect, force CAP END so a stalled/odd negotiation can't wedge us.
+            if not self.registered and not self.cap_ended and now - self.connect_ts > 5:
+                log.warning("CAP negotiation timed out; forcing CAP END")
+                self.cap_end()
 
             if joined and now - self.last_beat > HEARTBEAT_SECS:
                 self.last_beat = now
@@ -317,11 +329,11 @@ class Bot:
             code = parts[1]
             if code in ("903",):  # SASL success
                 log.info("SASL authenticated")
-                self.send_raw("CAP END")
+                self.cap_end()
                 return joined
             if code in ("902", "904", "905", "906", "907"):  # SASL failed/aborted
                 log.warning("SASL failed (%s); continuing unauthenticated", code)
-                self.send_raw("CAP END")
+                self.cap_end()
                 return joined
             if code in ("433", "436"):  # nick in use -> recover
                 self.nick = self.nick + "_"
@@ -353,20 +365,31 @@ class Bot:
         self.command(nick, reply, text.strip())
         return joined
 
+    def cap_end(self) -> None:
+        if not self.cap_ended:
+            self.cap_ended = True
+            self.send_raw("CAP END")
+
     def handle_cap(self, line: str, parts: list[str]) -> None:
-        # :server CAP <target> <SUB> :cap list
+        # :server CAP <target> <SUB> [*] :cap list
         sub = parts[3] if len(parts) > 3 else ""
-        # The cap list is the trailing parameter after the last " :".
+        # The cap list is the trailing parameter after the first " :".
         offered = line.split(" :", 1)[1].split() if " :" in line else []
         if sub == "LS":
-            want = WANT_CAPS & set(c.split("=")[0] for c in offered)
-            use_sasl = bool(SASL_USER) and "sasl" in (c.split("=")[0] for c in offered)
+            # Multiline LS uses a "*" token right after LS on every line but the
+            # last; accumulate and only decide on the final line.
+            more = len(parts) > 4 and parts[4] == "*"
+            self.cap_ls |= set(c.split("=")[0] for c in offered)
+            if more:
+                return
+            want = WANT_CAPS & self.cap_ls
+            use_sasl = bool(SASL_USER) and "sasl" in self.cap_ls
             if use_sasl:
                 want.add("sasl")
             if want:
                 self.send_raw("CAP REQ :" + " ".join(sorted(want)))
             else:
-                self.send_raw("CAP END")
+                self.cap_end()
         elif sub == "ACK":
             acked = set(offered)
             self.caps |= acked
@@ -374,9 +397,9 @@ class Bot:
                 self.sasl_active = True
                 self.send_raw("AUTHENTICATE PLAIN")
             else:
-                self.send_raw("CAP END")
+                self.cap_end()
         elif sub == "NAK":
-            self.send_raw("CAP END")
+            self.cap_end()
 
     def ctcp(self, nick: str, body: str) -> None:
         cmd = body.split(" ", 1)[0].upper()
