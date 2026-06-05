@@ -7,6 +7,7 @@ pub const accept_list = @import("accept_list.zig");
 pub const account_notify = @import("account_notify.zig");
 pub const account_notify_emit = @import("account_notify_emit.zig");
 pub const account_register = @import("account_register.zig");
+pub const activity = @import("activity.zig");
 pub const auditorium = @import("auditorium.zig");
 pub const away = @import("away.zig");
 pub const away_props = @import("away_props.zig");
@@ -173,6 +174,7 @@ test {
     _ = account_notify;
     _ = account_notify_emit;
     _ = account_register;
+    _ = activity;
     _ = auditorium;
     _ = away;
     _ = away_props;
