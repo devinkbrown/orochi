@@ -92,6 +92,82 @@ pub fn encode(env: Envelope, out: []u8) EncodeError![]const u8 {
     return out[0..cursor];
 }
 
+pub const DecodeError = error{ Truncated, BadMagic, TrailingBytes, LengthOverflow };
+
+/// Decode a canonical unsigned envelope. Zero-copy: `scope` and `op_bytes` in
+/// the returned envelope borrow `bytes`, so the buffer must outlive the result.
+pub fn decode(bytes: []const u8) DecodeError!Envelope {
+    var r = Cursor{ .buf = bytes };
+    if (!std.mem.eql(u8, try r.take(canonical_magic.len), canonical_magic)) return error.BadMagic;
+    const origin = try r.take(@sizeOf(NodeId));
+    const hlc = try r.takeU64();
+    const family = (try r.take(1))[0];
+    const scope_len = try r.takeLen();
+    const scope = try r.take(scope_len);
+    const op_len = try r.takeLen();
+    const op_bytes = try r.take(op_len);
+    if (!r.done()) return error.TrailingBytes;
+
+    var env = Envelope{ .origin_node = undefined, .hlc = hlc, .family = family, .scope = scope, .op_bytes = op_bytes };
+    @memcpy(&env.origin_node, origin);
+    return env;
+}
+
+/// Wire size of a full signed delta: canonical envelope followed by the
+/// detached signature. The CID is recomputed on decode, never transmitted.
+pub fn signedWireLen(env: Envelope) usize {
+    return encodedLen(env) + signature_len;
+}
+
+/// Encode `signed` as `encode(env) || signature`.
+pub fn encodeSigned(signed: SignedDelta, out: []u8) EncodeError![]const u8 {
+    const total = signedWireLen(signed.env);
+    if (out.len < total) return error.OutputTooSmall;
+    const env_bytes = try encode(signed.env, out);
+    @memcpy(out[env_bytes.len..][0..signature_len], &signed.signature);
+    return out[0..total];
+}
+
+/// Decode a full signed delta from the wire, recomputing the CID from the
+/// envelope so a tampered payload yields a CID the signature cannot match.
+/// Zero-copy like `decode`; the result borrows `bytes`. Always pass the result
+/// through `verifyOne`/`verifyAuthorized` before trusting it.
+pub fn decodeSigned(bytes: []const u8) DecodeError!SignedDelta {
+    if (bytes.len < signature_len) return error.Truncated;
+    const split = bytes.len - signature_len;
+    const env = try decode(bytes[0..split]);
+    return .{
+        .env = env,
+        .cid = cid(env),
+        .signature = bytes[split..][0..signature_len].*,
+    };
+}
+
+const Cursor = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn done(self: *const Cursor) bool {
+        return self.pos == self.buf.len;
+    }
+
+    fn take(self: *Cursor, n: usize) DecodeError![]const u8 {
+        if (n > self.buf.len - self.pos) return error.Truncated;
+        defer self.pos += n;
+        return self.buf[self.pos..][0..n];
+    }
+
+    fn takeU64(self: *Cursor) DecodeError!u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .big);
+    }
+
+    fn takeLen(self: *Cursor) DecodeError!usize {
+        const v = try self.takeU64();
+        if (v > std.math.maxInt(usize)) return error.LengthOverflow;
+        return @intCast(v);
+    }
+};
+
 /// Compute BLAKE3(canonical unsigned envelope).
 pub fn cid(env: Envelope) Cid {
     var h = Blake3.init(.{});
@@ -327,6 +403,80 @@ test "authorizedFor predicate gates apply" {
     var wrong_scope = signed;
     wrong_scope.env.scope = "#denied";
     try std.testing.expect(!verifyAuthorized(wrong_scope, public_key, Pred.allow));
+}
+
+test "wire round-trip preserves a verifiable signed delta" {
+    const kp = try testKey(0x61);
+    const public_key = kp.public_key.toBytes();
+    const signed = try sign(testEnvelope(&kp, 7777, "#wire", "join:99:+v"), &kp);
+
+    var buf: [256]u8 = undefined;
+    const wire = try encodeSigned(signed, &buf);
+    try std.testing.expectEqual(signedWireLen(signed.env), wire.len);
+
+    const back = try decodeSigned(wire);
+    try std.testing.expect(verifyOne(back, public_key));
+    try std.testing.expectEqual(signed.env.hlc, back.env.hlc);
+    try std.testing.expectEqual(signed.env.family, back.env.family);
+    try std.testing.expectEqualSlices(u8, signed.env.scope, back.env.scope);
+    try std.testing.expectEqualSlices(u8, signed.env.op_bytes, back.env.op_bytes);
+    try std.testing.expectEqual(signed.cid, back.cid);
+}
+
+test "wire decode reverification rejects tampering and forgery" {
+    const kp = try testKey(0x62);
+    const public_key = kp.public_key.toBytes();
+    const signed = try sign(testEnvelope(&kp, 42, "#wire", "mode:+i"), &kp);
+
+    var buf: [256]u8 = undefined;
+    const wire = try encodeSigned(signed, &buf);
+
+    // A genuine copy verifies.
+    try std.testing.expect(verifyOne(try decodeSigned(wire), public_key));
+
+    // Flip a payload byte (last op byte, just before the detached signature):
+    // the recomputed CID no longer matches the signature.
+    var tampered_op = try std.testing.allocator.dupe(u8, wire);
+    defer std.testing.allocator.free(tampered_op);
+    tampered_op[tampered_op.len - signature_len - 1] ^= 0x01;
+    try std.testing.expect(!verifyOne(try decodeSigned(tampered_op), public_key));
+
+    // Flip a signature byte.
+    var tampered_sig = try std.testing.allocator.dupe(u8, wire);
+    defer std.testing.allocator.free(tampered_sig);
+    tampered_sig[tampered_sig.len - 1] ^= 0x01;
+    try std.testing.expect(!verifyOne(try decodeSigned(tampered_sig), public_key));
+
+    // A different key's view of the same bytes fails the pubkey->origin binding.
+    const other = try testKey(0x99);
+    try std.testing.expect(!verifyOne(try decodeSigned(wire), other.public_key.toBytes()));
+}
+
+test "wire decode rejects malformed buffers" {
+    const kp = try testKey(0x63);
+    const signed = try sign(testEnvelope(&kp, 1, "#x", "y"), &kp);
+    var buf: [256]u8 = undefined;
+    const wire = try encodeSigned(signed, &buf);
+
+    try std.testing.expectError(error.Truncated, decodeSigned(wire[0 .. signature_len - 1]));
+    try std.testing.expectError(error.Truncated, decodeSigned(wire[0 .. wire.len - 1]));
+
+    var bad_magic = try std.testing.allocator.dupe(u8, wire);
+    defer std.testing.allocator.free(bad_magic);
+    bad_magic[0] ^= 0xff;
+    try std.testing.expectError(error.BadMagic, decodeSigned(bad_magic));
+
+    var trailing: [300]u8 = undefined;
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0; // one extra byte inside the envelope region
+    try std.testing.expectError(error.TrailingBytes, decodeSigned(trailing[0 .. wire.len + 1]));
+}
+
+test "encodeSigned reports an undersized buffer" {
+    const kp = try testKey(0x64);
+    const signed = try sign(testEnvelope(&kp, 1, "#x", "yy"), &kp);
+    var small: [8]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, encodeSigned(signed, &small));
 }
 
 test {

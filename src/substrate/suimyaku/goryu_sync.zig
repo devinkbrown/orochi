@@ -747,3 +747,49 @@ test "invalid signed delta is rejected and not applied" {
     try std.testing.expect(!sync.channel.containsMember(42));
     try std.testing.expectEqual(@as(usize, 0), sync.store.count());
 }
+
+test "signed channel delta survives a wire crossing and applies on the peer" {
+    const allocator = std.testing.allocator;
+    const kp = try signed_delta.KeyPair.generateDeterministic([_]u8{0x71} ** signed_delta.seed_len);
+    test_pubkey = kp.public_key.toBytes();
+
+    // Origin builds a membership change locally and signs the canonical delta.
+    var src = channel_crdt.ChannelCrdt.init(allocator, 1);
+    defer src.deinit();
+    var join = try src.localJoin(55, .{ .op = true }, 100);
+    defer join.deinit();
+    var op_buf: [1024]u8 = undefined;
+    const op = try encodeMemberDelta(&op_buf, &join, 55);
+    const signed = try signChannelDelta(&kp, op, join.hlc.toU64());
+
+    // Serialize for the wire, then reconstruct and reverify on the far side.
+    var wire_buf: [2048]u8 = undefined;
+    const wire = try signed_delta.encodeSigned(signed, &wire_buf);
+    const received = try signed_delta.decodeSigned(wire);
+    try std.testing.expect(signed_delta.verifyOne(received, kp.public_key.toBytes()));
+
+    // Peer ingests the wire delta through verify-before-apply.
+    var peer = GoryuSync.init(allocator);
+    defer peer.deinit();
+    try peer.putPending(received);
+    try std.testing.expectEqual(@as(usize, 1), try peer.applyVerified(verifyTest));
+    try std.testing.expect(peer.channel.containsMember(55));
+    // The reconstructed state matches the origin's, end to end.
+    try std.testing.expect(channel_crdt.ChannelCrdt.eql(&peer.channel, &src));
+
+    // A delta carrying the same payload but signed by a different key fails the
+    // public-key->origin binding and is never applied.
+    const evil = try signed_delta.KeyPair.generateDeterministic([_]u8{0x7e} ** signed_delta.seed_len);
+    const forged = try signChannelDelta(&evil, op, join.hlc.toU64());
+    var forged_wire: [2048]u8 = undefined;
+    const forged_bytes = try signed_delta.encodeSigned(forged, &forged_wire);
+    const forged_recv = try signed_delta.decodeSigned(forged_bytes);
+    try std.testing.expect(!signed_delta.verifyOne(forged_recv, kp.public_key.toBytes()));
+
+    var victim = GoryuSync.init(allocator);
+    defer victim.deinit();
+    try victim.putPending(forged_recv);
+    try std.testing.expectError(error.VerificationFailed, victim.applyVerified(verifyTest));
+    try std.testing.expect(!victim.channel.containsMember(55));
+    try std.testing.expectEqual(@as(usize, 0), victim.store.count());
+}
