@@ -42,6 +42,7 @@ const chanmode_ext = @import("../proto/chanmode_ext.zig");
 const ircx_modex = @import("../proto/ircx_modex.zig");
 const auditorium = @import("../proto/auditorium.zig");
 const s2s_link = @import("s2s_link.zig");
+const tracelog = @import("../substrate/trace.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
@@ -709,6 +710,10 @@ pub const LinuxServer = struct {
     accepts: accept_list.AcceptList(.{}),
     msg_seq: u64 = 0,
     accept_armed: bool = false,
+    /// Observability: a lock-free flight recorder (last N structured events,
+    /// dumped on oper DEBUG / crash) + per-category level filter.
+    trace_recorder: tracelog.FlightRecorder(256) = .{},
+    trace_filter: tracelog.CategoryFilter = tracelog.CategoryFilter.init(.info),
     /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
     /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
     s2s_listener_fd: linux.fd_t = -1,
@@ -891,6 +896,7 @@ pub const LinuxServer = struct {
             // fails, so deinit can never observe a freed link.
             errdefer conn.s2s = null;
             try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.traceLog(.info, .s2s, "s2s peer accepted");
             return;
         }
 
@@ -898,6 +904,7 @@ pub const LinuxServer = struct {
         // AUTHENTICATE (during CAP negotiation, pre-registration).
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        self.traceLog(.info, .net, "client accepted");
     }
 
     /// Drive a server-to-server peer connection: feed inbound bytes to its
@@ -1342,6 +1349,8 @@ pub const LinuxServer = struct {
             try self.handleConnectCmd(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SQUIT")) {
             try self.handleSquit(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "DEBUG")) {
+            try self.handleDebug(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTLINE")) {
             try self.handleTestline(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TESTMASK")) {
@@ -2821,6 +2830,30 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// Record a structured event into the flight recorder (+ category filter).
+    /// Never faults the hot path.
+    fn traceLog(self: *LinuxServer, comptime level: tracelog.Level, category: tracelog.Category, msg: []const u8) void {
+        const now: u64 = @intCast(@max(0, platform.monotonicMillis()));
+        tracelog.emit(.debug, level, &self.trace_filter, self.trace_recorder.sink(), category, now, 0, msg, &.{}) catch {};
+    }
+
+    /// DEBUG — oper command: dump the flight recorder (last N structured events)
+    /// to the operator as notices. The "heavy debugging" entry point.
+    fn handleDebug(self: *LinuxServer, conn: *ConnState) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; DEBUG is for operators");
+            return;
+        }
+        var buf: [256]tracelog.RecordedEvent = undefined;
+        const events = self.trace_recorder.dump(&buf);
+        var line_buf: [320]u8 = undefined;
+        for (events) |ev| {
+            const l = std.fmt.bufPrint(&line_buf, "[{s}/{s}] {s}", .{ ev.level.token(), ev.category.token(), ev.message() }) catch continue;
+            try self.noticeTo(conn, l);
+        }
+        try self.noticeTo(conn, "End of DEBUG flight recorder");
+    }
+
     /// TESTLINE <mask> — oper tool: report the first K/D-line whose mask matches
     /// `mask` (RPL_TESTLINE 725) or RPL_NOTESTLINE 726 if none.
     fn handleTestline(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -3736,6 +3769,7 @@ pub const LinuxServer = struct {
             return;
         }
         conn.session.is_oper = true;
+        self.traceLog(.notice, .oper, "operator authenticated");
         // Subscribe the new oper to all Event Spine categories — wallops, oper
         // notices, kills, etc. arrive as typed events (IRCX EVENT model).
         conn.session.setEventMask(event_spine.CategoryMask.all());
@@ -5551,6 +5585,34 @@ test "threaded server: +x auditorium hides regular members in NAMES" {
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "C") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "~A") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "B") == null);
+}
+
+test "threaded server: oper DEBUG dumps the flight recorder" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "OPER admin mizuchi\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    // DEBUG dumps the structured flight recorder; OPER just recorded an event.
+    a.reset();
+    try writeAllFd(fd_a, "DEBUG\r\n");
+    try recvUntil(&a, "End of DEBUG flight recorder", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "operator authenticated") != null);
 }
 
 test "threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800" {
