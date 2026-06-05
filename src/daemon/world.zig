@@ -643,12 +643,36 @@ pub const World = struct {
     }
 };
 
+/// A valid channel name begins with a recognised channel sigil:
+///   `#`  — standard (network-wide) channel
+///   `&`  — local channel (RFC1459)
+///   `%#` / `%&` — IRCX UTF8 channel (the `%` marks a UTF8-named variant)
+/// The IRCX `^` UTF8→hex display form is intentionally NOT accepted yet (it needs
+/// a transliteration layer; tracked separately).
 pub fn isChannelName(name: []const u8) bool {
-    return name.len != 0 and name[0] == '#';
+    if (name.len == 0) return false;
+    return switch (name[0]) {
+        '#', '&' => true,
+        '%' => name.len >= 2 and (name[1] == '#' or name[1] == '&'),
+        else => false,
+    };
 }
 
 fn testClient(slot: u20) ClientId {
     return .{ .shard = 0, .slot = slot, .gen = 1 };
+}
+
+test "isChannelName accepts #, &, and %#/%& but not bare names or ^" {
+    try std.testing.expect(isChannelName("#chan"));
+    try std.testing.expect(isChannelName("&local"));
+    try std.testing.expect(isChannelName("%#utf8"));
+    try std.testing.expect(isChannelName("%&utf8local"));
+    // Rejections: empty, plain nick, bare %, and the deferred ^ form.
+    try std.testing.expect(!isChannelName(""));
+    try std.testing.expect(!isChannelName("nick"));
+    try std.testing.expect(!isChannelName("%"));
+    try std.testing.expect(!isChannelName("%nope"));
+    try std.testing.expect(!isChannelName("^hexchan"));
 }
 
 test "nick registry rejects collisions and supports lookup" {
