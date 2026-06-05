@@ -22,6 +22,7 @@ pub const registry = @import("registry.zig");
 pub const s2s_dst = @import("s2s_dst.zig");
 pub const s2s_link = @import("s2s_link.zig");
 pub const sasl_bridge = @import("sasl_bridge.zig");
+pub const secure_s2s_link = @import("secure_s2s_link.zig");
 pub const server = @import("server.zig");
 pub const server_stats = @import("server_stats.zig");
 pub const services = @import("services.zig");
@@ -52,6 +53,7 @@ test {
     _ = s2s_dst;
     _ = s2s_link;
     _ = sasl_bridge;
+    _ = secure_s2s_link;
     _ = server;
     _ = server_stats;
     _ = services;
