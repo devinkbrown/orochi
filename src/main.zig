@@ -71,6 +71,28 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // SASL account backend: when `[sasl] account_db` is configured, open the
+    // WAL-backed account store and verify SASL PLAIN credentials against it. The
+    // store/services/checker live for the server's lifetime (the checker fat
+    // pointer is copied into every connection).
+    var account_store: ?mizuchi.daemon.services.MizuStore = null;
+    defer if (account_store) |*s| s.deinit();
+    var account_services: mizuchi.daemon.services.Services = undefined;
+    var account_checker: mizuchi.daemon.sasl_bridge.ServicesPlainChecker = undefined;
+    if (held) |h| {
+        if (h.parsed.sasl.account_db) |db| {
+            if (mizuchi.daemon.services.MizuStore.open(allocator, init.io, std.Io.Dir.cwd(), db)) |store| {
+                account_store = store;
+                account_services = mizuchi.daemon.services.Services.init(&account_store.?, null);
+                account_checker = .{ .services = &account_services };
+                srv_cfg.sasl_checker = account_checker.checker();
+                std.debug.print("mizuchi: SASL account store opened ({s})\n", .{db});
+            } else |err| {
+                std.debug.print("mizuchi: account store error ({s}); SASL disabled\n", .{@errorName(err)});
+            }
+        }
+    }
+
     const Server = mizuchi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // io_uring unavailable (old kernel / sandbox): fall back to the DST boot banner.

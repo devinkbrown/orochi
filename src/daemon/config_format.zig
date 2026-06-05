@@ -40,6 +40,7 @@ pub const Schema = struct {
         .{ .section = "media", .key = "max_frame_bytes", .kind = .int, .default = "65536", .max = 16777216 },
         .{ .section = "sasl", .key = "enabled", .kind = .bool, .default = "false" },
         .{ .section = "sasl", .key = "realm", .kind = .string },
+        .{ .section = "sasl", .key = "account_db", .kind = .string },
     };
 
     pub fn find(section: []const u8, key: []const u8) ?Field {
@@ -116,6 +117,9 @@ pub const Config = struct {
     pub const Sasl = struct {
         enabled: bool = false,
         realm: ?[]const u8 = null,
+        /// Path (relative to the daemon cwd) of the WAL-backed account store. When
+        /// set, the daemon opens it and verifies SASL credentials against it.
+        account_db: ?[]const u8 = null,
     };
 
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
@@ -139,6 +143,7 @@ pub const Config = struct {
         allocator.free(self.mesh.trust_roots);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
+        if (self.sasl.account_db) |value| allocator.free(value);
         self.* = .{};
     }
 };
@@ -309,7 +314,13 @@ pub const Parser = struct {
     }
 
     fn setSasl(self: *Parser, line: usize, col: usize, key: []const u8, value: []const u8, sasl: *Config.Sasl) !void {
-        if (std.mem.eql(u8, key, "enabled")) sasl.enabled = try self.parseBool(value, line, col) else if (std.mem.eql(u8, key, "realm")) replaceOptional(self.allocator, &sasl.realm, try self.parseStringValue(value, line, col));
+        if (std.mem.eql(u8, key, "enabled")) {
+            sasl.enabled = try self.parseBool(value, line, col);
+        } else if (std.mem.eql(u8, key, "realm")) {
+            replaceOptional(self.allocator, &sasl.realm, try self.parseStringValue(value, line, col));
+        } else if (std.mem.eql(u8, key, "account_db")) {
+            replaceOptional(self.allocator, &sasl.account_db, try self.parseStringValue(value, line, col));
+        }
     }
 
     fn validate(self: *Parser, cfg: *const Config) !void {
