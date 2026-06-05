@@ -29,6 +29,7 @@ pub const secure_s2s_link = @import("secure_s2s_link.zig");
 pub const server = @import("server.zig");
 pub const server_stats = @import("server_stats.zig");
 pub const services = @import("services.zig");
+pub const sessions = @import("sessions.zig");
 pub const store = @import("store.zig");
 pub const whois = @import("whois.zig");
 pub const whowas = @import("whowas.zig");
@@ -63,6 +64,7 @@ test {
     _ = server;
     _ = server_stats;
     _ = services;
+    _ = sessions;
     _ = store;
     _ = whois;
     _ = whowas;
