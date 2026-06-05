@@ -179,6 +179,8 @@ class Bot:
         self.connect_ts = 0.0
         self.sasl_active = False
         self.registered = False
+        self.last_rx = 0.0
+        self.last_keepalive = 0.0
 
     # ---- io ----
     def send_raw(self, line: str) -> None:
@@ -244,6 +246,8 @@ class Bot:
     def loop(self) -> None:
         buf = b""
         joined = False
+        self.last_rx = time.time()
+        self.last_keepalive = time.time()
         assert self.sock is not None
         while True:
             r, _, _ = select.select([self.sock], [], [], 1)
@@ -251,6 +255,7 @@ class Bot:
                 data = self.sock.recv(4096)
                 if not data:
                     raise ConnectionError("eof")
+                self.last_rx = time.time()
                 buf += data
                 while b"\r\n" in buf:
                     raw, buf = buf.split(b"\r\n", 1)
@@ -261,6 +266,15 @@ class Bot:
 
             self.pump_out()
             now = time.time()
+
+            # Keepalive / dead-link detection (defense-in-depth beyond answering
+            # the server's PING): probe after 90s idle, force-reconnect after 240s
+            # of total silence so we never sit on a half-dead socket.
+            if now - self.last_rx > 240:
+                raise ConnectionError("read timeout")
+            if now - self.last_rx > 90 and now - self.last_keepalive > 60:
+                self.last_keepalive = now
+                self.send_raw(f"PING :ka{int(now)}")
 
             # CAP safety net: if registration hasn't completed shortly after
             # connect, force CAP END so a stalled/odd negotiation can't wedge us.
