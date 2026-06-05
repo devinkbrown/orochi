@@ -1,69 +1,107 @@
 #!/usr/bin/env python3
 """Mizuchi announce bot — lives in #root on IRCXNet (eshmaki.me) and announces build
 stats, changelog, progress, and planning, with the feature set of a normal IRC bot:
-nick recovery (433), CTCP, rich !commands (channel + PM), admin/announce/raw/topic,
-auto-rejoin on KICK, uptime, periodic heartbeat, git commit watcher, auto-reconnect.
+IRCv3 CAP negotiation + optional SASL PLAIN, nick recovery (433), CTCP, rich
+!commands (channel + PM), admin (say/announce/topic/raw), auto-rejoin on KICK,
+uptime, throttled git commit watcher, periodic heartbeat, non-blocking paced
+output, and auto-reconnect with exponential backoff.
 
-Config via env: MIZ_SERVER MIZ_PORT MIZ_NICK MIZ_CHANNEL MIZ_REPO MIZ_ADMIN
+Config via env:
+  MIZ_SERVER MIZ_PORT MIZ_NICK MIZ_CHANNEL MIZ_REPO MIZ_ADMIN
+  MIZ_PASS        — server password (PASS), optional
+  MIZ_SASL_USER   — SASL PLAIN account, optional (enables SASL when the server offers it)
+  MIZ_SASL_PASS   — SASL PLAIN password (defaults to MIZ_PASS)
 """
-import os, socket, time, subprocess, select, re
+from __future__ import annotations
 
-SERVER  = os.environ.get("MIZ_SERVER", "127.0.0.1")
-PORT    = int(os.environ.get("MIZ_PORT", "6667"))
-NICK    = os.environ.get("MIZ_NICK", "Mizuchi")
+import base64
+import logging
+import os
+import re
+import select
+import socket
+import subprocess
+import time
+from collections import deque
+
+SERVER = os.environ.get("MIZ_SERVER", "127.0.0.1")
+PORT = int(os.environ.get("MIZ_PORT", "6667"))
+NICK = os.environ.get("MIZ_NICK", "Mizuchi")
 CHANNEL = os.environ.get("MIZ_CHANNEL", "#root")
-REPO    = os.environ.get("MIZ_REPO", "/home/kain/mizuchi")
-ADMIN   = os.environ.get("MIZ_ADMIN", "")          # nick allowed to run admin cmds
-POLL_SECS = 15
+REPO = os.environ.get("MIZ_REPO", "/home/kain/mizuchi")
+ADMIN = os.environ.get("MIZ_ADMIN", "")  # nick allowed to run admin cmds
+PASSWORD = os.environ.get("MIZ_PASS", "")
+SASL_USER = os.environ.get("MIZ_SASL_USER", "")
+SASL_PASS = os.environ.get("MIZ_SASL_PASS", PASSWORD)
+
+POLL_SECS = 15  # how often to check git HEAD for new commits
 HEARTBEAT_SECS = 6 * 3600
-VERSION = "Mizuchi-announce 2.0 (Zig 0.16 IRC daemon build bot)"
+SEND_INTERVAL = 0.4  # min seconds between queued outbound lines (anti-flood)
+RECONNECT_MIN, RECONNECT_MAX = 6, 300
+# IRCv3 caps we use if the server offers them (graceful degrade otherwise).
+WANT_CAPS = {"server-time", "message-tags", "account-tag", "echo-message"}
+VERSION = "Mizuchi-announce 2.1 (Zig 0.16 IRC daemon build bot)"
 START = time.time()
 
 # mIRC colors
-C = "\x03"; B = "\x02"; RST = "\x0f"
-CYAN, GREEN, YEL, GREY, MAG, RED = C+"11", C+"03", C+"08", C+"14", C+"13", C+"04"
+C = "\x03"
+B = "\x02"
+RST = "\x0f"
+CYAN, GREEN, YEL, GREY, MAG, RED = C + "11", C + "03", C + "08", C + "14", C + "13", C + "04"
+
+log = logging.getLogger("announce")
 
 
-def git(*a):
+def git(*a: str) -> str:
     try:
-        return subprocess.check_output(["git", "-C", REPO, *a], text=True,
-                                       stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(
+            ["git", "-C", REPO, *a], text=True, stderr=subprocess.DEVNULL
+        ).strip()
     except Exception:
         return ""
 
 
-def module_count():
+def module_count() -> str:
     try:
         return subprocess.check_output(
             ["bash", "-lc", f"find {REPO}/src -name '*.zig' ! -name 'root.zig' | wc -l"],
-            text=True).strip()
+            text=True,
+        ).strip()
     except Exception:
         return "?"
 
 
-def test_count():
-    m = re.search(r"(\d+)\s+tests?\s+(?:pass|green)", git("log", "-1", "--format=%s") + " " +
-                  git("log", "-1", "--format=%b"))
+def test_count() -> str:
+    """Best-effort '<n> tests' pulled from recent commit messages."""
+    body = git("log", "-1", "--format=%s") + " " + git("log", "-1", "--format=%b")
+    m = re.search(r"(\d+)\s+tests?\s+(?:pass|green|passing)", body)
     if m:
         return m.group(1)
-    for s in git("log", "-15", "--format=%s").splitlines():
+    for s in git("log", "-15", "--format=%s%n%b").splitlines():
         m = re.search(r"(\d+)\s+tests", s)
         if m:
             return m.group(1)
     return "?"
 
 
-def head_line():
+def head_line() -> str:
     return git("log", "-1", "--format=%h %s")
 
 
-def uptime():
+def changed_files(rev: str = "HEAD") -> list[str]:
+    out = git("show", "--stat", "--format=", rev)
+    return [l.strip() for l in out.splitlines() if l.strip()][:8]
+
+
+def uptime() -> str:
     s = int(time.time() - START)
-    d, s = divmod(s, 86400); h, s = divmod(s, 3600); m, s = divmod(s, 60)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
     return (f"{d}d " if d else "") + f"{h}h {m}m {s}s"
 
 
-def stats_lines():
+def stats_lines() -> list[str]:
     return [
         f"{B}{CYAN}build{RST} :: modules={GREEN}{module_count()}{RST} "
         f"tests={GREEN}{test_count()}{RST} commits={GREEN}{git('rev-list','--count','HEAD')}{RST} zig 0.16",
@@ -71,7 +109,7 @@ def stats_lines():
     ]
 
 
-def project_lines():
+def project_lines() -> list[str]:
     return [
         f"{B}{MAG}\U0001f409 Mizuchi{RST} (水蛟) — Zig-native successor to the ophion IRC daemon. Running M2.",
         f"Full IRCv3/IRCX + services; S2S = {B}Suimyaku{RST} (水脈 CRDT mesh) over {B}Tsumugi{RST} "
@@ -88,56 +126,89 @@ ROADMAP = [
     "M12 Lotus history · M13 media · M15 Helix hot-upgrade · M17 RC soak",
 ]
 
-HELP = ("commands: !project !stats !tests !modules !commit !changelog !progress "
-        "!plan !uptime !version !ping !help" +
-        ("  | admin: !say !announce !topic !raw" if ADMIN else ""))
+HELP = (
+    "commands: !project !stats !tests !modules !commit !changelog !diff !progress "
+    "!plan !uptime !version !ping !help"
+    + ("  | admin: !say !announce !topic !raw" if ADMIN else "")
+)
 
 
 class Bot:
-    def __init__(self):
-        self.sock = None
+    def __init__(self) -> None:
+        self.sock: socket.socket | None = None
         self.nick = NICK
         self.last_commit = git("rev-parse", "HEAD")
         self.last_beat = time.time()
+        self.last_poll = 0.0
+        self.outq: deque[str] = deque()
+        self.last_send = 0.0
+        self.caps: set[str] = set()
+        self.sasl_active = False
+        self.registered = False
 
     # ---- io ----
-    def send(self, line):
+    def send_raw(self, line: str) -> None:
+        """Send immediately, bypassing the paced queue (PONG, registration, SASL)."""
+        if not self.sock:
+            return
         try:
             self.sock.sendall((line + "\r\n").encode("utf-8", "replace"))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("send failed: %s", e)
 
-    def msg(self, target, text):
-        self.send(f"PRIVMSG {target} :{text}")
-        time.sleep(0.4)  # anti-flood
+    def enqueue(self, line: str) -> None:
+        self.outq.append(line)
 
-    def notice(self, target, text):
-        self.send(f"NOTICE {target} :{text}")
-        time.sleep(0.4)
+    def msg(self, target: str, text: str) -> None:
+        self.enqueue(f"PRIVMSG {target} :{text}")
 
-    def announce(self, lines, target=None):
+    def notice(self, target: str, text: str) -> None:
+        self.enqueue(f"NOTICE {target} :{text}")
+
+    def announce(self, lines: list[str], target: str | None = None) -> None:
         for l in lines:
             self.msg(target or CHANNEL, l)
 
+    def pump_out(self) -> None:
+        """Drain at most one queued line per SEND_INTERVAL — never blocks recv."""
+        if self.outq and time.time() - self.last_send >= SEND_INTERVAL:
+            self.send_raw(self.outq.popleft())
+            self.last_send = time.time()
+
     # ---- lifecycle ----
-    def run(self):
+    def run(self) -> None:
+        backoff = RECONNECT_MIN
         while True:
             try:
-                self.connect(); self.loop()
+                self.connect()
+                backoff = RECONNECT_MIN  # successful connect resets backoff
+                self.loop()
             except Exception as e:
-                print("disconnect:", e, flush=True)
-            time.sleep(6)
+                log.warning("disconnect: %s", e)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
 
-    def connect(self):
+    def connect(self) -> None:
         self.nick = NICK
+        self.caps = set()
+        self.sasl_active = False
+        self.registered = False
+        self.outq.clear()
+        log.info("connecting to %s:%d as %s", SERVER, PORT, self.nick)
         self.sock = socket.create_connection((SERVER, PORT), timeout=30)
-        self.send(f"NICK {self.nick}")
-        self.send(f"USER {NICK} 0 * :Mizuchi build announcer")
+        # CAP LS first so registration waits for our negotiation; PASS before NICK/USER.
+        self.send_raw("CAP LS 302")
+        if PASSWORD:
+            self.send_raw(f"PASS {PASSWORD}")
+        self.send_raw(f"NICK {self.nick}")
+        self.send_raw(f"USER {NICK} 0 * :Mizuchi build announcer")
 
-    def loop(self):
-        buf = b""; joined = False
+    def loop(self) -> None:
+        buf = b""
+        joined = False
+        assert self.sock is not None
         while True:
-            r, _, _ = select.select([self.sock], [], [], 2)
+            r, _, _ = select.select([self.sock], [], [], 1)
             if r:
                 data = self.sock.recv(4096)
                 if not data:
@@ -148,61 +219,119 @@ class Bot:
                     s = raw.decode("utf-8", "replace")
                     j = self.handle(s, joined)
                     joined = joined or j
+
+            self.pump_out()
             now = time.time()
+
             if joined and now - self.last_beat > HEARTBEAT_SECS:
                 self.last_beat = now
                 self.announce(stats_lines())
-            if joined and now % 1 < 0.1:
-                pass
-            if joined:
+
+            # Throttled git HEAD watcher (was previously polled every loop tick).
+            if joined and now - self.last_poll >= POLL_SECS:
+                self.last_poll = now
                 cur = git("rev-parse", "HEAD")
                 if cur and cur != self.last_commit:
                     self.last_commit = cur
-                    self.msg(CHANNEL, f"{B}{GREEN}▶ commit{RST} {head_line()}  "
-                                      f"[tests={test_count()} modules={module_count()}]")
+                    self.msg(
+                        CHANNEL,
+                        f"{B}{GREEN}▶ commit{RST} {head_line()}  "
+                        f"[tests={test_count()} modules={module_count()}]",
+                    )
                     self.set_topic()
 
-    def set_topic(self):
-        self.send(f"TOPIC {CHANNEL} :Mizuchi M2 · {git('rev-parse','--short','HEAD')} · "
-                  f"{test_count()} tests · {module_count()} modules · !help")
+    def set_topic(self) -> None:
+        self.send_raw(
+            f"TOPIC {CHANNEL} :Mizuchi M2 · {git('rev-parse','--short','HEAD')} · "
+            f"{test_count()} tests · {module_count()} modules · !help"
+        )
 
     # ---- protocol ----
-    def handle(self, line, joined):
+    def handle(self, line: str, joined: bool) -> bool:
         if line.startswith("PING"):
-            self.send("PONG " + line.split(None, 1)[1]); return joined
+            self.send_raw("PONG " + line.split(None, 1)[1])
+            return joined
+
         parts = line.split()
+        # CAP negotiation (parts: :server CAP * SUB :caps)
+        if len(parts) >= 3 and parts[1] == "CAP":
+            self.handle_cap(line, parts)
+            return joined
+        # SASL AUTHENTICATE challenge
+        if parts and parts[0] == "AUTHENTICATE" and len(parts) >= 2:
+            if parts[1] == "+":
+                payload = base64.b64encode(
+                    f"{SASL_USER}\0{SASL_USER}\0{SASL_PASS}".encode("utf-8")
+                ).decode()
+                self.send_raw(f"AUTHENTICATE {payload}")
+            return joined
+
         if len(parts) >= 2:
             code = parts[1]
-            # nick in use -> recover
-            if code in ("433", "436"):
-                self.nick = self.nick + "_"
-                self.send(f"NICK {self.nick}")
+            if code in ("903",):  # SASL success
+                log.info("SASL authenticated")
+                self.send_raw("CAP END")
                 return joined
-            # welcome / end of motd -> join
-            if code in ("001", "376", "422") and not joined:
-                self.send(f"JOIN {CHANNEL}")
-                time.sleep(0.6)
-                self.announce(project_lines()); self.announce(stats_lines())
+            if code in ("902", "904", "905", "906", "907"):  # SASL failed/aborted
+                log.warning("SASL failed (%s); continuing unauthenticated", code)
+                self.send_raw("CAP END")
+                return joined
+            if code in ("433", "436"):  # nick in use -> recover
+                self.nick = self.nick + "_"
+                self.send_raw(f"NICK {self.nick}")
+                return joined
+            if code in ("001", "376", "422") and not joined:  # welcome / motd end -> join
+                self.registered = True
+                self.send_raw(f"JOIN {CHANNEL}")
+                self.announce(project_lines())
+                self.announce(stats_lines())
                 self.set_topic()
                 return True
+
         # KICK us -> rejoin
         m = re.match(r":\S+ KICK (\S+) " + re.escape(self.nick), line)
         if m:
-            time.sleep(1); self.send(f"JOIN {m.group(1)}")
+            self.enqueue(f"JOIN {m.group(1)}")
             return joined
+
         # PRIVMSG (commands + CTCP)
-        m = re.match(r":(\S+?)!(\S+) PRIVMSG (\S+) :(.*)", line)
+        m = re.match(r"(?:@\S+ )?:(\S+?)!(\S+) PRIVMSG (\S+) :(.*)", line)
         if not m:
             return joined
-        nick, userhost, target, text = m.group(1), m.group(2), m.group(3), m.group(4)
+        nick, _userhost, target, text = m.group(1), m.group(2), m.group(3), m.group(4)
         reply = CHANNEL if target == CHANNEL else nick
-        # CTCP
         if text.startswith("\x01") and text.endswith("\x01"):
-            self.ctcp(nick, text.strip("\x01")); return joined
+            self.ctcp(nick, text.strip("\x01"))
+            return joined
         self.command(nick, reply, text.strip())
         return joined
 
-    def ctcp(self, nick, body):
+    def handle_cap(self, line: str, parts: list[str]) -> None:
+        # :server CAP <target> <SUB> :cap list
+        sub = parts[3] if len(parts) > 3 else ""
+        # The cap list is the trailing parameter after the last " :".
+        offered = line.split(" :", 1)[1].split() if " :" in line else []
+        if sub == "LS":
+            want = WANT_CAPS & set(c.split("=")[0] for c in offered)
+            use_sasl = bool(SASL_USER) and "sasl" in (c.split("=")[0] for c in offered)
+            if use_sasl:
+                want.add("sasl")
+            if want:
+                self.send_raw("CAP REQ :" + " ".join(sorted(want)))
+            else:
+                self.send_raw("CAP END")
+        elif sub == "ACK":
+            acked = set(offered)
+            self.caps |= acked
+            if "sasl" in acked and SASL_USER:
+                self.sasl_active = True
+                self.send_raw("AUTHENTICATE PLAIN")
+            else:
+                self.send_raw("CAP END")
+        elif sub == "NAK":
+            self.send_raw("CAP END")
+
+    def ctcp(self, nick: str, body: str) -> None:
         cmd = body.split(" ", 1)[0].upper()
         arg = body[len(cmd):].strip()
         if cmd == "VERSION":
@@ -216,12 +345,14 @@ class Bot:
         elif cmd == "CLIENTINFO":
             self.notice(nick, "\x01CLIENTINFO VERSION PING TIME SOURCE CLIENTINFO\x01")
 
-    def command(self, nick, reply, text):
+    def command(self, nick: str, reply: str, text: str) -> None:
         if not text.startswith("!"):
             return
         cmd, _, arg = text[1:].partition(" ")
         cmd = cmd.lower()
-        if cmd in ("help",):
+        is_admin = bool(ADMIN) and nick == ADMIN
+
+        if cmd == "help":
             self.msg(reply, HELP)
         elif cmd in ("project", "about"):
             self.announce(project_lines(), reply)
@@ -234,10 +365,21 @@ class Bot:
         elif cmd in ("commit", "head"):
             self.msg(reply, f"HEAD {head_line()}")
         elif cmd == "changelog":
-            self.announce([f"{GREY}{l}{RST}" for l in git('log','-5','--format=%h %s').splitlines()] or ["(none)"], reply)
+            self.announce(
+                [f"{GREY}{l}{RST}" for l in git("log", "-5", "--format=%h %s").splitlines()]
+                or ["(none)"],
+                reply,
+            )
+        elif cmd in ("diff", "files"):
+            self.announce(
+                [f"{GREY}{l}{RST}" for l in changed_files()] or ["(no changes)"], reply
+            )
         elif cmd in ("progress", "status"):
-            self.msg(reply, f"{B}M2{RST} reached — multi-client chat works. tests={test_count()}, "
-                            f"modules={module_count()}. Next: IRCv3 caps, TLS/SASL, Suimyaku S2S.")
+            self.msg(
+                reply,
+                f"{B}M2{RST} reached — multi-client chat works. tests={test_count()}, "
+                f"modules={module_count()}. Next: IRCv3 caps, TLS/SASL, Suimyaku S2S.",
+            )
         elif cmd in ("plan", "roadmap"):
             self.announce([f"{YEL}{l}{RST}" for l in ROADMAP], reply)
         elif cmd == "uptime":
@@ -246,23 +388,30 @@ class Bot:
             self.msg(reply, VERSION)
         elif cmd == "ping":
             self.msg(reply, "pong")
-        elif cmd in ("source",):
+        elif cmd == "source":
             self.msg(reply, REPO)
         # ---- admin ----
-        elif ADMIN and nick == ADMIN and cmd == "say":
+        elif is_admin and cmd == "say":
             tgt, _, body = arg.partition(" ")
             if tgt and body:
                 self.msg(tgt, body)
-        elif ADMIN and nick == ADMIN and cmd in ("announce", "broadcast"):
+        elif is_admin and cmd in ("announce", "broadcast"):
             if arg:
                 self.msg(CHANNEL, f"{B}{MAG}announce{RST} {arg}")
-        elif ADMIN and nick == ADMIN and cmd == "topic":
+        elif is_admin and cmd == "topic":
             if arg:
-                self.send(f"TOPIC {CHANNEL} :{arg}")
-        elif ADMIN and nick == ADMIN and cmd == "raw":
+                self.send_raw(f"TOPIC {CHANNEL} :{arg}")
+        elif is_admin and cmd == "raw":
             if arg:
-                self.send(arg)
+                self.send_raw(arg)
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+    Bot().run()
 
 
 if __name__ == "__main__":
-    Bot().run()
+    main()
