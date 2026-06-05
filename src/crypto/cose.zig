@@ -408,18 +408,27 @@ pub const Cbor = struct {
         try out.appendSlice(allocator, &buf);
     }
 
+    const max_depth = 32;
+
     const Parser = struct {
         buf: []const u8,
         pos: usize = 0,
+        depth: u32 = 0,
 
         fn readValue(self: *Parser, allocator: std.mem.Allocator) Error!Value {
+            // Bound nesting so a crafted deeply-nested blob can't overflow the
+            // native stack (worker threads have small stacks).
+            if (self.depth >= max_depth) return error.BadCbor;
+            self.depth += 1;
+            defer self.depth -= 1;
             const first = try self.take();
             const major = first >> 5;
             const addl = first & 0x1f;
             const n = try self.readLen(addl);
             return switch (major) {
                 0 => .{ .unsigned = n },
-                1 => .{ .negative = -1 - @as(i64, @intCast(n)) },
+                // Guard the i64 cast: a major-1 value > maxInt(i64) would trap.
+                1 => if (n > std.math.maxInt(i64)) error.BadCbor else .{ .negative = -1 - @as(i64, @intCast(n)) },
                 2 => .{ .bytes = try self.takeSlice(n) },
                 3 => .{ .text = try self.takeSlice(n) },
                 4 => try self.readArray(allocator, n),
@@ -432,6 +441,9 @@ pub const Cbor = struct {
 
         fn readArray(self: *Parser, allocator: std.mem.Allocator, len: u64) Error!Value {
             if (len > std.math.maxInt(usize)) return error.BadCbor;
+            // Each element needs >= 1 byte on the wire; reject a declared count
+            // that can't fit the remaining input (allocation-bomb amplifier).
+            if (len > self.buf.len - self.pos) return error.BadCbor;
             const items = try allocator.alloc(Value, @intCast(len));
             errdefer allocator.free(items);
             var filled: usize = 0;
@@ -444,6 +456,9 @@ pub const Cbor = struct {
 
         fn readMap(self: *Parser, allocator: std.mem.Allocator, len: u64) Error!Value {
             if (len > std.math.maxInt(usize)) return error.BadCbor;
+            // Each pair needs >= 2 bytes; reject counts that can't fit remaining
+            // input (allocation-bomb amplifier).
+            if (len > (self.buf.len - self.pos)) return error.BadCbor;
             const items = try allocator.alloc(Pair, @intCast(len));
             errdefer allocator.free(items);
             var filled: usize = 0;

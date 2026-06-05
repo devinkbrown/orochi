@@ -199,7 +199,9 @@ fn parseServerFirst(raw: []const u8) ScramError!ServerFirst {
                 const value = std.fmt.parseUnsigned(u32, parsed.value, 10) catch {
                     return error.InvalidIterations;
                 };
-                if (value == 0) return error.InvalidIterations;
+                // Cap iterations: a malicious server could otherwise pin the
+                // client at ~4 billion PBKDF2 rounds (CPU-DoS).
+                if (value == 0 or value > 1_000_000) return error.InvalidIterations;
                 iterations = value;
             },
             'm' => return error.InvalidAttribute,

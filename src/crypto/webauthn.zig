@@ -120,6 +120,11 @@ const CborCursor = struct {
 
     /// Advance past the next CBOR item (used to skip values).
     fn skip(self: *CborCursor) CborError!void {
+        return self.skipDepth(0);
+    }
+
+    fn skipDepth(self: *CborCursor, depth: u32) CborError!void {
+        if (depth >= 32) return error.InvalidEncoding; // bound recursion
         const ib = try self.readByte();
         const major = ib >> 5;
         const add = ib & 0x1f;
@@ -127,18 +132,19 @@ const CborCursor = struct {
         switch (major) {
             0, 1 => {}, // uint / nint — no extra bytes
             2, 3 => { // bstr / tstr — arg bytes follow
-                if (self.pos + arg > self.data.len) return error.InvalidEncoding;
-                self.pos += @intCast(arg);
+                const len: usize = std.math.cast(usize, arg) orelse return error.Overflow;
+                if (len > self.data.len - self.pos) return error.InvalidEncoding;
+                self.pos += len;
             },
             4 => { // array — skip arg items
                 var i: u64 = 0;
-                while (i < arg) : (i += 1) try self.skip();
+                while (i < arg) : (i += 1) try self.skipDepth(depth + 1);
             },
             5 => { // map — skip 2*arg items
                 var i: u64 = 0;
-                while (i < 2 * arg) : (i += 1) try self.skip();
+                while (i < 2 * arg) : (i += 1) try self.skipDepth(depth + 1);
             },
-            6 => try self.skip(), // tag — skip the tagged item
+            6 => try self.skipDepth(depth + 1), // tag — skip the tagged item
             else => return error.InvalidEncoding,
         }
     }
@@ -159,7 +165,8 @@ const CborCursor = struct {
             },
             2 => {
                 const len: usize = std.math.cast(usize, arg) orelse return error.Overflow;
-                if (self.pos + len > self.data.len) return error.InvalidEncoding;
+                // Bounds-check without addition to avoid usize overflow.
+                if (len > self.data.len - self.pos) return error.InvalidEncoding;
                 const slice = self.data[self.pos .. self.pos + len];
                 self.pos += len;
                 return CborVal{ .bstr = slice };
