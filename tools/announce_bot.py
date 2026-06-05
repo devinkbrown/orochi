@@ -309,19 +309,23 @@ class Bot:
 
     # ---- protocol ----
     def handle(self, line: str, joined: bool) -> bool:
-        if line.startswith("PING"):
-            self.send_raw("PONG " + line.split(None, 1)[1])
-            return joined
-
         # Strip a leading IRCv3 message-tag block (@tag=val;... ) — once
         # server-time/message-tags are enabled EVERY line carries one, which
-        # would otherwise shift parts[] and hide numerics like 001.
+        # would otherwise shift parts[] and hide numerics like 001 AND the PING
+        # command (server tags PING too -> we must answer it or get ping-timed-out).
         work = line
         if work.startswith("@"):
             sp = work.find(" ")
             work = work[sp + 1:] if sp != -1 else ""
 
+        # PING may arrive as "PING :token" or ":server PING :token" (tagged or not).
         parts = work.split()
+        if parts and (parts[0] == "PING" or (len(parts) > 1 and parts[1] == "PING")):
+            token = work.split("PING", 1)[1].strip()
+            if token.startswith(":"):
+                token = token[1:]
+            self.send_raw("PONG :" + token)
+            return joined
         # CAP negotiation (parts: :server CAP * SUB :caps)
         if len(parts) >= 3 and parts[1] == "CAP":
             self.handle_cap(work, parts)
