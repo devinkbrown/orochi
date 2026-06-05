@@ -16,6 +16,11 @@ pub const InsertError = error{
 
 pub const DagError = InsertError || error{CorruptStore};
 
+/// `applyBackfill` extends InsertError with the case where, after a fixpoint,
+/// some streamed events still reference parents that never arrived — an
+/// incomplete (or forged) backfill batch.
+pub const BackfillError = error{ IncompleteStream, OutOfMemory };
+
 pub const Dag = struct {
     allocator: std.mem.Allocator,
     events: std.AutoHashMap(Cid, StoredEvent),
@@ -59,6 +64,45 @@ pub const Dag = struct {
 
     pub fn applyStreamed(self: *Dag, events: []const Event) InsertError!void {
         for (events) |ev| _ = try self.insert(ev);
+    }
+
+    /// Order-tolerant verified backfill: apply a batch of streamed events in any
+    /// order, deferring those whose parents have not arrived yet and retrying to a
+    /// fixpoint. Each event is content-addressed on insert (so a forged event
+    /// cannot masquerade as another), and an event whose parents never appear —
+    /// in the DAG or the batch — leaves the stream incomplete (`IncompleteStream`),
+    /// which is how a truncated or tampered backfill is rejected. Already-present
+    /// events are skipped. The DAG is only mutated by accepted inserts; a partial
+    /// batch still commits the events it could causally apply.
+    pub fn applyBackfill(self: *Dag, events: []const Event) BackfillError!void {
+        // Pending = indices not yet applied. Retry until a full pass makes no
+        // progress, then anything left is unresolved.
+        var pending: std.ArrayList(usize) = .empty;
+        defer pending.deinit(self.allocator);
+        try pending.ensureTotalCapacity(self.allocator, events.len);
+        for (events, 0..) |_, i| pending.appendAssumeCapacity(i);
+
+        while (pending.items.len != 0) {
+            var progressed = false;
+            var i: usize = 0;
+            while (i < pending.items.len) {
+                const idx = pending.items[i];
+                if (self.insert(events[idx])) |_| {
+                    _ = pending.swapRemove(i);
+                    progressed = true;
+                } else |err| switch (err) {
+                    error.DuplicateCid => {
+                        _ = pending.swapRemove(i); // already have it: drop, count as progress
+                        progressed = true;
+                    },
+                    error.MissingParents => i += 1, // defer; maybe a later pass resolves it
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Cycle => i += 1, // a self/forward-cycle event can never apply; treat as unresolved
+                }
+            }
+            if (!progressed) break;
+        }
+        if (pending.items.len != 0) return error.IncompleteStream;
     }
 
     pub fn getEvent(self: *const Dag, cid: Cid) ?Event {
@@ -486,6 +530,69 @@ test "out-of-causal-order stream is rejected" {
     try std.testing.expectEqual(@as(usize, 0), lagging.count());
     try std.testing.expectEqual(@as(usize, 1), lagging.missingParents().len);
     try std.testing.expect(cidEql(root, lagging.missingParents()[0]));
+}
+
+test "applyBackfill applies a reverse-causal-order stream to a fixpoint" {
+    const allocator = std.testing.allocator;
+
+    var source = Dag.init(allocator);
+    defer source.deinit();
+    const root = try source.insert(.{ .parents = &.{}, .payload = "root" });
+    const a = try source.insert(.{ .parents = &.{root}, .payload = "a" });
+    const b = try source.insert(.{ .parents = &.{root}, .payload = "b" });
+    const c = try source.insert(.{ .parents = &.{ a, b }, .payload = "c" });
+
+    // Deliberately reverse causal order — applyStreamed would reject this.
+    const stream = [_]Event{
+        source.getEvent(c).?,
+        source.getEvent(b).?,
+        source.getEvent(a).?,
+        source.getEvent(root).?,
+    };
+    var dag = Dag.init(allocator);
+    defer dag.deinit();
+    try dag.applyBackfill(&stream);
+    try std.testing.expectEqual(@as(usize, 4), dag.count());
+
+    const src_cids = try source.allCids();
+    defer allocator.free(src_cids);
+    const got_cids = try dag.allCids();
+    defer allocator.free(got_cids);
+    try expectCidSetsEqual(src_cids, got_cids);
+}
+
+test "applyBackfill rejects an incomplete stream and commits nothing unresolved" {
+    const allocator = std.testing.allocator;
+
+    var source = Dag.init(allocator);
+    defer source.deinit();
+    const root = try source.insert(.{ .parents = &.{}, .payload = "root" });
+    const a = try source.insert(.{ .parents = &.{root}, .payload = "a" });
+    const b = try source.insert(.{ .parents = &.{root}, .payload = "b" });
+    const c = try source.insert(.{ .parents = &.{ a, b }, .payload = "c" });
+
+    // Missing root and b: a (needs root) and c (needs a,b) can never apply.
+    const stream = [_]Event{ source.getEvent(c).?, source.getEvent(a).? };
+    var dag = Dag.init(allocator);
+    defer dag.deinit();
+    try std.testing.expectError(error.IncompleteStream, dag.applyBackfill(&stream));
+    try std.testing.expectEqual(@as(usize, 0), dag.count());
+}
+
+test "applyBackfill skips events already present" {
+    const allocator = std.testing.allocator;
+
+    var source = Dag.init(allocator);
+    defer source.deinit();
+    const root = try source.insert(.{ .parents = &.{}, .payload = "root" });
+    const a = try source.insert(.{ .parents = &.{root}, .payload = "a" });
+
+    var dag = Dag.init(allocator);
+    defer dag.deinit();
+    _ = try dag.insert(.{ .parents = &.{}, .payload = "root" }); // already have root
+    const stream = [_]Event{ source.getEvent(root).?, source.getEvent(a).? };
+    try dag.applyBackfill(&stream); // root is a duplicate (skipped), a applies
+    try std.testing.expectEqual(@as(usize, 2), dag.count());
 }
 
 test "duplicate cid and self-parent are rejected" {
