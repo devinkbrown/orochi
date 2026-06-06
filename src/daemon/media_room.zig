@@ -32,12 +32,23 @@ pub fn kindName(kind: MediaKind) []const u8 {
     };
 }
 
+pub const default_breakout = "main";
+pub const max_breakout_bytes: usize = 32;
+
 pub const MediaRooms = struct {
     allocator: std.mem.Allocator,
     rooms: std.StringHashMap(*Room),
+    /// Optional breakout (sub-room) label per participant, keyed by the composite
+    /// "channel\x00participant". Absent = the default "main" breakout. Kept in a
+    /// flat map so the substrate Session participant model stays untouched.
+    breakouts: std.StringHashMap([]u8),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
-        return .{ .allocator = allocator, .rooms = std.StringHashMap(*Room).init(allocator) };
+        return .{
+            .allocator = allocator,
+            .rooms = std.StringHashMap(*Room).init(allocator),
+            .breakouts = std.StringHashMap([]u8).init(allocator),
+        };
     }
 
     pub fn deinit(self: *MediaRooms) void {
@@ -47,7 +58,55 @@ pub const MediaRooms = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.rooms.deinit();
+        var bit = self.breakouts.iterator();
+        while (bit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.breakouts.deinit();
         self.* = undefined;
+    }
+
+    /// Build the "channel\x00participant" composite key into `buf`.
+    fn breakoutKey(buf: []u8, channel: []const u8, pid: []const u8) ?[]const u8 {
+        if (channel.len + 1 + pid.len > buf.len) return null;
+        @memcpy(buf[0..channel.len], channel);
+        buf[channel.len] = 0;
+        @memcpy(buf[channel.len + 1 ..][0..pid.len], pid);
+        return buf[0 .. channel.len + 1 + pid.len];
+    }
+
+    /// Assign `pid` in `channel` to breakout `name` (truncated to the cap).
+    pub fn setBreakout(self: *MediaRooms, channel: []const u8, pid: []const u8, name: []const u8) Error!void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        const trimmed = name[0..@min(name.len, max_breakout_bytes)];
+        const gop = try self.breakouts.getOrPut(k);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
+                _ = self.breakouts.remove(k);
+                return e;
+            };
+        } else {
+            self.allocator.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = try self.allocator.dupe(u8, trimmed);
+    }
+
+    /// The breakout `pid` is in within `channel` (default "main").
+    pub fn breakoutOf(self: *const MediaRooms, channel: []const u8, pid: []const u8) []const u8 {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return default_breakout;
+        return self.breakouts.get(k) orelse default_breakout;
+    }
+
+    fn clearBreakout(self: *MediaRooms, channel: []const u8, pid: []const u8) void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        if (self.breakouts.fetchRemove(k)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
+        }
     }
 
     /// The room for `channel`, or null when no call is active there.
@@ -69,6 +128,7 @@ pub const MediaRooms = struct {
         const entry = self.rooms.getEntry(channel) orelse return false;
         const id = media.ParticipantId.init(pid) catch return false;
         entry.value_ptr.*.leaveAll(id) catch return false;
+        self.clearBreakout(channel, pid);
         if (entry.value_ptr.*.count() == 0) self.dropRoom(entry);
         return true;
     }
@@ -91,6 +151,13 @@ pub const MediaRooms = struct {
     pub fn roster(self: *MediaRooms, channel: []const u8) []const Participant {
         const r = self.rooms.get(channel) orelse return &.{};
         return r.participants[0..r.len];
+    }
+
+    /// Whether `pid` is currently in `channel`'s call.
+    pub fn isParticipant(self: *MediaRooms, channel: []const u8, pid: []const u8) bool {
+        const r = self.rooms.get(channel) orelse return false;
+        const id = media.ParticipantId.init(pid) catch return false;
+        return r.participant(id) != null;
     }
 
     fn ensure(self: *MediaRooms, channel: []const u8) Error!*Room {
@@ -144,6 +211,19 @@ test "mute and speaking state track per kind" {
     const p2 = m.room("#c").?.participant(media.ParticipantId.init("alice") catch unreachable).?;
     try testing.expect(p2.muted.contains(.voice));
     try testing.expect(!p2.speaking.contains(.voice));
+}
+
+test "breakout assignment defaults to main and clears on leave" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try testing.expectEqualStrings("main", m.breakoutOf("#c", "alice"));
+    try m.setBreakout("#c", "alice", "design");
+    try testing.expectEqualStrings("design", m.breakoutOf("#c", "alice"));
+    try m.setBreakout("#c", "alice", "ops"); // reassign frees the old value
+    try testing.expectEqualStrings("ops", m.breakoutOf("#c", "alice"));
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expectEqualStrings("main", m.breakoutOf("#c", "alice")); // cleared
 }
 
 test "parseKind accepts aliases and rejects junk" {

@@ -4659,6 +4659,24 @@ pub const LinuxServer = struct {
             try self.mediaRoster(conn, channel);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "BREAKOUT")) {
+            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA BREAKOUT <#chan> <room>");
+                return;
+            }
+            // Must already be in the call to move between breakouts.
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before choosing a breakout");
+                return;
+            }
+            const bname = parsed.paramSlice()[2];
+            self.media_rooms.setBreakout(channel, nick, bname) catch {
+                try self.failReply(conn, "MEDIA", "BREAKOUT_FAILED", "Could not set breakout");
+                return;
+            };
+            try self.broadcastMediaEvent(channel, "BREAKOUT", nick, bname);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
             if (self.media_rooms.leaveAll(channel, nick))
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "")
@@ -4754,8 +4772,9 @@ pub const LinuxServer = struct {
                     }
                 }
             }
+            const breakout = self.media_rooms.breakoutOf(channel, p.id.slice());
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n] }) catch continue;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n], breakout }) catch continue;
             try appendToConn(conn, line);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
