@@ -36,6 +36,7 @@ const oper_motd_mod = @import("../proto/oper_motd.zig");
 const host_request_mod = @import("host_request.zig");
 const guise_mod = @import("guise.zig");
 const shun_mod = @import("shun.zig");
+const autojoin_mod = @import("autojoin.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -795,6 +796,8 @@ pub const LinuxServer = struct {
     guises: guise_mod.Registry,
     /// Network-wide silent mutes (SHUN): shunned senders' messages are dropped.
     shuns: shun_mod.ShunList,
+    /// Per-account auto-join channel lists, applied on login.
+    autojoins: autojoin_mod.AutoJoin,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -892,6 +895,7 @@ pub const LinuxServer = struct {
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
+            .autojoins = autojoin_mod.AutoJoin.init(allocator),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -940,6 +944,7 @@ pub const LinuxServer = struct {
         self.host_requests.deinit();
         self.guises.deinit();
         self.shuns.deinit();
+        self.autojoins.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1538,6 +1543,8 @@ pub const LinuxServer = struct {
                 self.notifyObservers(.connect, observeSubject(conn, ""));
                 // Apply any operator-approved vhost waiting for this account.
                 self.maybeApplyApprovedVhost(id, conn);
+                // Auto-join the account's configured channels.
+                self.applyAutojoin(id, conn);
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -1627,6 +1634,8 @@ pub const LinuxServer = struct {
             try self.handleShun(conn, parsed, false);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "GLOBAL")) {
             try self.handleGlobal(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "AUTOJOIN")) {
+            try self.handleAutojoin(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
             try self.handleRegister(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
@@ -3236,6 +3245,53 @@ pub const LinuxServer = struct {
         if (oper_motd_mod.buildOperMotdEnd(&buf, server_name, nick)) |line| try appendToConn(conn, line) else |_| {}
     }
 
+    /// `AUTOJOIN <ADD|DEL|LIST> [#channel]` — manage the caller's per-account
+    /// auto-join list (applied automatically on each login). Requires login.
+    fn handleAutojoin(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const account = conn.session.account() orelse {
+            try self.failReply(conn, "AUTOJOIN", "ACCOUNT_REQUIRED", "Log in to manage autojoin");
+            return;
+        };
+        const p = parsed.paramSlice();
+        if (p.len == 0 or std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            const chans = self.autojoins.list(account) catch &.{};
+            for (chans) |c| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :AUTOJOIN {s}\r\n", .{ server_name, conn.session.displayName(), c }) catch continue;
+                try appendToConn(conn, line);
+            }
+            try self.noticeTo(conn, "AUTOJOIN: end of list");
+            return;
+        }
+        if (p.len < 2 or p[1].len == 0) {
+            try self.noticeTo(conn, "Usage: AUTOJOIN <ADD|DEL|LIST> [#channel]");
+            return;
+        }
+        const channel = p[1];
+        if (std.ascii.eqlIgnoreCase(p[0], "ADD")) {
+            self.autojoins.add(account, channel) catch {
+                try self.noticeTo(conn, "AUTOJOIN: could not add (invalid channel, duplicate, or limit)");
+                return;
+            };
+            try self.noticeTo(conn, "AUTOJOIN added");
+        } else if (std.ascii.eqlIgnoreCase(p[0], "DEL")) {
+            self.autojoins.remove(account, channel) catch {
+                try self.noticeTo(conn, "AUTOJOIN: no such entry");
+                return;
+            };
+            try self.noticeTo(conn, "AUTOJOIN removed");
+        } else {
+            try self.noticeTo(conn, "Usage: AUTOJOIN <ADD|DEL|LIST> [#channel]");
+        }
+    }
+
+    /// On login, join the account's auto-join channels.
+    fn applyAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        const account = conn.session.account() orelse return;
+        const chans = self.autojoins.list(account) catch return;
+        for (chans) |c| self.joinOne(id, conn, c, null) catch {};
+    }
+
     /// `SHUN <mask> [secs] [:reason]` / `UNSHUN <mask>` — oper network mute.
     /// A shunned (non-oper) sender stays connected but their PRIVMSG/NOTICE are
     /// silently dropped. Bare `SHUN` lists active shuns.
@@ -4810,6 +4866,7 @@ pub const LinuxServer = struct {
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
+        self.applyAutojoin(idFromToken(conn.token), conn);
     }
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
@@ -4831,6 +4888,7 @@ pub const LinuxServer = struct {
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
+        self.applyAutojoin(idFromToken(conn.token), conn);
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).
