@@ -44,6 +44,7 @@ const auditorium = @import("../proto/auditorium.zig");
 const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
 const accept_list = @import("../proto/accept_list.zig");
+const cloak = @import("../proto/cloak.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
@@ -659,6 +660,11 @@ pub const Config = struct {
     /// Account services (REGISTER/IDENTIFY/DROP/…) backed by the WAL store. Null =
     /// account management disabled. Borrowed; outlives the server (owned by main).
     account_services: ?*services_mod.Services = null,
+    /// Hostname cloak key. When set, every client's real IP/host is HMAC-cloaked
+    /// on connect so other users never see the raw address. Null = no cloaking
+    /// (real host shown). main derives this from `[server] cloak_secret`, or a
+    /// random per-boot key when account/SASL features imply privacy is wanted.
+    cloak_key: ?cloak.SecretKey = null,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -994,12 +1000,59 @@ pub const LinuxServer = struct {
             return;
         }
 
+        // Capture the peer host (real + auto-cloak) before the client registers,
+        // so its first JOIN/PRIVMSG prefix already carries the cloaked host.
+        self.captureClientHost(conn);
+
         // Make the injected SASL verifier available before the client can send
         // AUTHENTICATE (during CAP negotiation, pre-registration).
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
         self.stats.onAccept();
         self.traceLog(.info, .net, "client accepted");
+    }
+
+    /// Capture the peer's IP at accept: record it as the real host and, when a
+    /// cloak key is configured, set the visible host to its HMAC cloak so other
+    /// users never see the raw address. Best-effort: any failure leaves the host
+    /// fields empty and the prefix path falls back to the default host.
+    fn captureClientHost(self: *LinuxServer, conn: *ConnState) void {
+        var storage: posix.sockaddr.storage = undefined;
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        const rc = linux.getpeername(conn.fd, @ptrCast(&storage), &len);
+        if (posix.errno(rc) != .SUCCESS) return;
+        const sa: *const posix.sockaddr = @ptrCast(@alignCast(&storage));
+        var ipbuf: [cloak.max_cloak_len]u8 = undefined;
+        const ip = switch (sa.family) {
+            posix.AF.INET => blk: {
+                const in: *const posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+                const b: [4]u8 = @bitCast(in.addr);
+                break :blk std.fmt.bufPrint(&ipbuf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch return;
+            },
+            posix.AF.INET6 => blk: {
+                const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+                break :blk formatIp6(&ipbuf, in6.addr) catch return;
+            },
+            else => return,
+        };
+        // Loopback connections display as the conventional "localhost" (cloaking
+        // a 127.x / ::1 address is pointless and noisy).
+        if (std.mem.startsWith(u8, ip, "127.") or std.mem.eql(u8, ip, "0:0:0:0:0:0:0:1")) {
+            conn.session.setRealHost(default_host);
+            conn.session.setVisibleHost(default_host);
+            return;
+        }
+        conn.session.setRealHost(ip);
+        if (self.config.cloak_key) |key| {
+            var cbuf: [cloak.max_cloak_len]u8 = undefined;
+            const cloaked = cloak.cloak(&cbuf, &key, ip, .{}) catch {
+                conn.session.setVisibleHost(ip);
+                return;
+            };
+            conn.session.setVisibleHost(cloaked);
+        } else {
+            conn.session.setVisibleHost(ip);
+        }
     }
 
     /// Drive a server-to-server peer connection: feed inbound bytes to its
@@ -2286,7 +2339,7 @@ pub const LinuxServer = struct {
             return;
         }
 
-        const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = default_host };
+        const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = hostOf(conn) };
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, args.reason) catch return;
         try self.broadcastChannel(args.channel, msg, null);
@@ -2585,7 +2638,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, inviting);
         try appendToConn(conn, "\r\n");
 
-        const prefix = invite.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = default_host };
+        const prefix = invite.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = hostOf(conn) };
         var line_buf: [default_reply_bytes]u8 = undefined;
         const target_line = invite.buildTargetInviteLine(&line_buf, prefix, args.nick, args.channel) catch return;
         // deliver() expects a CRLF-terminated line; the builder omits it.
@@ -3836,7 +3889,7 @@ pub const LinuxServer = struct {
         const sender = whisper.Prefix{
             .nick = conn.session.displayName(),
             .user = conn.session.username(),
-            .host = default_host,
+            .host = hostOf(conn),
         };
         for (args.recipients) |nick| {
             const rwid = self.world.findNick(nick) orelse {
@@ -5284,8 +5337,26 @@ fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
     return std.fmt.bufPrint(storage, "{s}!{s}@{s}", .{
         conn.session.displayName(),
         conn.session.username(),
-        default_host,
+        hostOf(conn),
     }) catch return error.OutputTooSmall;
+}
+
+/// The host to show for `conn`: its visible (cloaked/vhost) host, falling back
+/// to the placeholder when no peer address was captured (e.g. AF_UNIX tests).
+fn hostOf(conn: *const ConnState) []const u8 {
+    const h = conn.session.host();
+    return if (h.len == 0) default_host else h;
+}
+
+/// Format raw IPv6 bytes as eight colon-separated hex groups (matching the
+/// cloak module's IPv6 rendering style).
+fn formatIp6(out: []u8, address: [16]u8) ![]const u8 {
+    var groups: [8]u16 = undefined;
+    for (&groups, 0..) |*g, i| g.* = std.mem.readInt(u16, address[i * 2 ..][0..2], .big);
+    return std.fmt.bufPrint(out, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+        groups[0], groups[1], groups[2], groups[3],
+        groups[4], groups[5], groups[6], groups[7],
+    });
 }
 
 fn createListener(host: []const u8, port: u16, backlog: u31) ServerError!linux.fd_t {

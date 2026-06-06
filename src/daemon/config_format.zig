@@ -41,6 +41,7 @@ pub const Schema = struct {
         .{ .section = "sasl", .key = "enabled", .kind = .bool, .default = "false" },
         .{ .section = "sasl", .key = "realm", .kind = .string },
         .{ .section = "sasl", .key = "account_db", .kind = .string },
+        .{ .section = "cloak", .key = "secret", .kind = .string },
     };
 
     pub fn find(section: []const u8, key: []const u8) ?Field {
@@ -73,6 +74,7 @@ pub const Config = struct {
     limits: Limits = .{},
     media: Media = .{},
     sasl: Sasl = .{},
+    cloak: Cloak = .{},
 
     pub const Node = struct {
         id: u64 = 0,
@@ -122,6 +124,13 @@ pub const Config = struct {
         account_db: ?[]const u8 = null,
     };
 
+    pub const Cloak = struct {
+        /// Secret passphrase for hostname cloaking. Hashed to a 32-byte key at
+        /// boot; when set, every client's real IP is HMAC-cloaked. When absent,
+        /// the daemon generates a random per-boot key (privacy on by default).
+        secret: ?[]const u8 = null,
+    };
+
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
         return .{
             .listen = .{ .host = try allocator.dupe(u8, "127.0.0.1") },
@@ -144,11 +153,12 @@ pub const Config = struct {
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
+        if (self.cloak.secret) |value| allocator.free(value);
         self.* = .{};
     }
 };
 
-const Section = enum { none, node, listen, oper, mesh, limits, media, sasl };
+const Section = enum { none, node, listen, oper, mesh, limits, media, sasl, cloak };
 
 pub const Parser = struct {
     allocator: std.mem.Allocator,
@@ -219,6 +229,7 @@ pub const Parser = struct {
         if (std.mem.eql(u8, inner, "limits")) return .limits;
         if (std.mem.eql(u8, inner, "media")) return .media;
         if (std.mem.eql(u8, inner, "sasl")) return .sasl;
+        if (std.mem.eql(u8, inner, "cloak")) return .cloak;
         if (std.mem.eql(u8, inner, "oper")) {
             try opers.append(self.allocator, .{});
             return .oper;
@@ -267,6 +278,7 @@ pub const Parser = struct {
             .limits => try self.setLimits(line, col + eq + 2, key, value, &cfg.limits),
             .media => try self.setMedia(line, col + eq + 2, key, value, &cfg.media),
             .sasl => try self.setSasl(line, col + eq + 2, key, value, &cfg.sasl),
+            .cloak => try self.setCloak(line, col + eq + 2, key, value, &cfg.cloak),
             .none => unreachable,
         }
     }
@@ -320,6 +332,12 @@ pub const Parser = struct {
             replaceOptional(self.allocator, &sasl.realm, try self.parseStringValue(value, line, col));
         } else if (std.mem.eql(u8, key, "account_db")) {
             replaceOptional(self.allocator, &sasl.account_db, try self.parseStringValue(value, line, col));
+        }
+    }
+
+    fn setCloak(self: *Parser, line: usize, col: usize, key: []const u8, value: []const u8, c: *Config.Cloak) !void {
+        if (std.mem.eql(u8, key, "secret")) {
+            replaceOptional(self.allocator, &c.secret, try self.parseStringValue(value, line, col));
         }
     }
 
@@ -565,6 +583,7 @@ fn sectionName(section: Section) []const u8 {
         .limits => "limits",
         .media => "media",
         .sasl => "sasl",
+        .cloak => "cloak",
     };
 }
 

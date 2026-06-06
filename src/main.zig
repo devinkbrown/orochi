@@ -97,6 +97,22 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Hostname cloaking: derive the cloak key from `[cloak] secret` (hashed to
+    // 32 bytes), or generate a random per-boot key so a client's real IP is
+    // never shown to other users by default.
+    var cloak_key_bytes: [mizuchi.proto.cloak.key_len]u8 = undefined;
+    if (held) |h| {
+        if (h.parsed.cloak.secret) |secret| {
+            std.crypto.hash.sha2.Sha256.hash(secret, &cloak_key_bytes, .{});
+            srv_cfg.cloak_key = mizuchi.proto.cloak.SecretKey.init(cloak_key_bytes);
+        }
+    }
+    if (srv_cfg.cloak_key == null) {
+        init.io.random(&cloak_key_bytes);
+        srv_cfg.cloak_key = mizuchi.proto.cloak.SecretKey.init(cloak_key_bytes);
+        std.debug.print("mizuchi: cloak key generated (per-boot; set [cloak] secret to persist)\n", .{});
+    }
+
     const Server = mizuchi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // io_uring unavailable (old kernel / sandbox): fall back to the DST boot banner.

@@ -25,6 +25,7 @@ const MAX_UID_BYTES: usize = 16;
 const MAX_REALNAME_BYTES: usize = 256;
 const MAX_ACCOUNT_BYTES: usize = 64;
 const MAX_AWAY_BYTES: usize = 256;
+const MAX_HOST_BYTES: usize = 255;
 
 /// Parsed IRC line view. Slices borrow from the caller-owned input buffer.
 pub const LineView = struct {
@@ -411,6 +412,14 @@ pub const ClientSession = struct {
     account_store: FixedString(MAX_ACCOUNT_BYTES) = .{},
     logged_in: bool = false,
 
+    /// Real peer host/IP captured at accept (never shown to other users once a
+    /// cloak/vhost is set). `host_store` is the *visible* host: the auto-cloak of
+    /// the real host, or a VHOST/CHGHOST override. An empty visible host falls
+    /// back to the real host, and an empty real host falls back to the caller's
+    /// default at the prefix-building site.
+    real_host_store: FixedString(MAX_HOST_BYTES) = .{},
+    host_store: FixedString(MAX_HOST_BYTES) = .{},
+
     /// AWAY state (RFC 1459 / IRCv3 away-notify). `away_active` gates whether
     /// `away_store` holds a live message; cleared by a parameterless AWAY.
     away_store: FixedString(MAX_AWAY_BYTES) = .{},
@@ -561,6 +570,34 @@ pub const ClientSession = struct {
     pub fn realname(self: *const ClientSession) []const u8 {
         const r = self.client.identity.realname.slice();
         return if (r.len == 0) self.displayName() else r;
+    }
+
+    /// The client's *visible* host: the cloak/vhost if set, else the real host.
+    /// Returns "" when neither is known (caller substitutes a default).
+    pub fn host(self: *const ClientSession) []const u8 {
+        const v = self.host_store.slice();
+        if (v.len != 0) return v;
+        return self.real_host_store.slice();
+    }
+
+    /// The client's real (uncloaked) host/IP, or "" if not captured. Oper-only
+    /// surfaces (OPERSPY/WHOIS for opers) may show this.
+    pub fn realHost(self: *const ClientSession) []const u8 {
+        return self.real_host_store.slice();
+    }
+
+    /// Record the real peer host/IP (set once at accept). Truncates to capacity.
+    pub fn setRealHost(self: *ClientSession, value: []const u8) void {
+        self.real_host_store.set(value) catch {
+            self.real_host_store.set(value[0..@min(value.len, MAX_HOST_BYTES)]) catch return;
+        };
+    }
+
+    /// Set the visible host (auto-cloak result, or VHOST/CHGHOST override).
+    pub fn setVisibleHost(self: *ClientSession, value: []const u8) void {
+        self.host_store.set(value) catch {
+            self.host_store.set(value[0..@min(value.len, MAX_HOST_BYTES)]) catch return;
+        };
     }
 
     /// Whether this client negotiated `id` via CAP. Lets the message path apply
@@ -1154,4 +1191,14 @@ test "sasl PLAIN rejects bad credentials and stays logged out" {
     try dispatchText(&session, &replies, line);
     try std.testing.expect(session.account() == null);
     try expectContains(replies.written(), " 904 ");
+}
+
+test "host accessor prefers visible host, falls back to real then empty" {
+    var session = ClientSession.init();
+    try std.testing.expectEqualStrings("", session.host()); // nothing captured yet
+    session.setRealHost("203.0.113.7");
+    try std.testing.expectEqualStrings("203.0.113.7", session.host()); // real fallback
+    session.setVisibleHost("cloak-abcd.example");
+    try std.testing.expectEqualStrings("cloak-abcd.example", session.host()); // cloak wins
+    try std.testing.expectEqualStrings("203.0.113.7", session.realHost()); // real preserved
 }
