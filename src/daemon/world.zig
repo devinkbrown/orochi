@@ -591,7 +591,10 @@ pub const World = struct {
     pub fn part(self: *World, name: []const u8, client: ClientId) WorldError!void {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
         if (!channel.members.remove(client)) return error.NotOnChannel;
-        if (channel.members.count() == 0) {
+        // A registered (+r) channel persists across empty: its config, topic,
+        // and modes survive when the last member leaves. Unregistered channels
+        // are ephemeral and reclaimed here.
+        if (channel.members.count() == 0 and !channel.ext_modes.has(.registered)) {
             self.removeChannel(name);
         }
     }
@@ -692,7 +695,11 @@ pub const World = struct {
             var it = self.channels.iterator();
             while (it.next()) |entry| {
                 _ = entry.value_ptr.members.remove(client);
-                if (entry.value_ptr.members.count() == 0) {
+                // Registered (+r) channels persist across empty; only reclaim
+                // ephemeral channels on the last member's disconnect.
+                if (entry.value_ptr.members.count() == 0 and
+                    !entry.value_ptr.ext_modes.has(.registered))
+                {
                     empty_channel = entry.key_ptr.*;
                     break;
                 }
@@ -797,6 +804,34 @@ test "join part and membership cleanup" {
     try world.part("#x", b);
     try std.testing.expect(!world.channelExists("#x"));
     try std.testing.expectEqual(@as(usize, 0), world.channelCount());
+}
+
+test "registered (+r) channels persist across empty; part and disconnect keep them" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = testClient(1);
+    const b = testClient(2);
+
+    try std.testing.expect(try world.join("#reg", a));
+    try std.testing.expect(try world.join("#reg", b));
+    _ = try world.setChannelExtFlag("#reg", .registered, true);
+
+    // Last member parting must NOT reclaim a registered channel.
+    try world.part("#reg", a);
+    try world.part("#reg", b);
+    try std.testing.expect(world.channelExists("#reg"));
+    try std.testing.expect(world.channelHasExtFlag("#reg", .registered));
+
+    // Disconnect path likewise preserves it.
+    try std.testing.expect(try world.join("#reg", a));
+    world.removeClient(a);
+    try std.testing.expect(world.channelExists("#reg"));
+
+    // An unregistered channel beside it is still reclaimed on empty.
+    try std.testing.expect(try world.join("#eph", b));
+    world.removeClient(b);
+    try std.testing.expect(!world.channelExists("#eph"));
 }
 
 test "channels receive monotonic, stable, unique IRCX object ids" {
