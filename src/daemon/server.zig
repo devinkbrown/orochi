@@ -39,6 +39,7 @@ const shun_mod = @import("shun.zig");
 const autojoin_mod = @import("autojoin.zig");
 const memo_group_mod = @import("memo_group.zig");
 const welcome_pack_mod = @import("welcome_pack.zig");
+const mode_lock_mod = @import("../proto/mode_lock.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -804,6 +805,8 @@ pub const LinuxServer = struct {
     nick_groups: memo_group_mod.NickGroup,
     /// Network onboarding pack delivered once per account on first login.
     welcome: welcome_pack_mod.WelcomePack,
+    /// Per-channel services mode-lock specs (MLOCK), keyed by channel name.
+    mlocks: std.StringHashMapUnmanaged([]u8) = .empty,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -955,6 +958,14 @@ pub const LinuxServer = struct {
         self.autojoins.deinit();
         self.nick_groups.deinit();
         self.welcome.deinit();
+        {
+            var it = self.mlocks.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                self.allocator.free(e.value_ptr.*);
+            }
+            self.mlocks.deinit(self.allocator);
+        }
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -2213,6 +2224,32 @@ pub const LinuxServer = struct {
         }
 
         const mode_str = parsed.paramSlice()[1];
+
+        // MLOCK: a services mode-lock forbids non-founder, non-oper ops from
+        // changing locked flags. The founder (+Q) and server opers bypass it.
+        if (!conn.session.isOper() and !setter.contains(.founder)) {
+            if (self.mlocks.get(channel)) |spec_str| {
+                if (mode_lock_mod.LockSpec.parse(spec_str)) |spec| {
+                    var sign_on = true;
+                    for (mode_str) |ch| {
+                        switch (ch) {
+                            '+' => sign_on = true,
+                            '-' => sign_on = false,
+                            // Param/status modes are not lockable simple flags.
+                            'Q', 'q', 'o', 'v', 'b', 'e', 'I', 'k', 'l' => {},
+                            else => {
+                                if (mode_lock_mod.evaluate(spec, ch, sign_on) == .forbid) {
+                                    var nb: [default_reply_bytes]u8 = undefined;
+                                    const note = std.fmt.bufPrint(&nb, "Mode +{c} is locked by services (MLOCK {s})", .{ ch, spec_str }) catch return;
+                                    try self.noticeTo(conn, note);
+                                    return;
+                                }
+                            },
+                        }
+                    }
+                } else |_| {}
+            }
+        }
         // Sized generously; appends soft-fail (break) rather than erroring so a
         // pathological toggle string ("+i-i+i...") truncates instead of faulting.
         var applied_buf: [256]u8 = undefined;
@@ -5120,10 +5157,49 @@ pub const LinuxServer = struct {
                 const ci = result.channel_info;
                 try channelNotice(conn, "channel={s} founder={s} flags={d}", .{ ci.name.asSlice(), ci.founder.asSlice(), ci.flags });
             },
+            .set => |r| {
+                // Only the registered founder may SET channel properties.
+                const info = svc.channelInfo(r.channel) catch |err| {
+                    try self.failReply(conn, "CHANNEL", channelFailCode(err), "No such registered channel");
+                    return;
+                };
+                if (!std.ascii.eqlIgnoreCase(info.channel_info.founder.asSlice(), account)) {
+                    try self.failReply(conn, "CHANNEL", "ACCESS_DENIED", "Only the founder may SET channel properties");
+                    return;
+                }
+                if (r.field == .mlock) {
+                    _ = mode_lock_mod.LockSpec.parse(r.value) catch {
+                        try self.failReply(conn, "CHANNEL", "INVALID_PARAMS", "Bad MLOCK spec (e.g. +nt-k)");
+                        return;
+                    };
+                    self.setMlock(r.channel, r.value) catch {
+                        try self.failReply(conn, "CHANNEL", "TEMPORARILY_UNAVAILABLE", "Could not store MLOCK");
+                        return;
+                    };
+                    try channelNotice(conn, "Channel {s} MLOCK set to {s}", .{ r.channel, r.value });
+                } else {
+                    try channelNotice(conn, "CHANNEL SET {s} is not available yet", .{@tagName(r.field)});
+                }
+            },
             else => {
                 try channelNotice(conn, "{s} is not available yet", .{chanserv_cmd.fmtUsage(req.subcommand())});
             },
         }
+    }
+
+    /// Store (replace) a channel's services MLOCK spec, owning both strings.
+    fn setMlock(self: *LinuxServer, channel: []const u8, spec: []const u8) !void {
+        if (self.mlocks.getEntry(channel)) |e| {
+            const new_spec = try self.allocator.dupe(u8, spec);
+            self.allocator.free(e.value_ptr.*);
+            e.value_ptr.* = new_spec;
+            return;
+        }
+        const k = try self.allocator.dupe(u8, channel);
+        errdefer self.allocator.free(k);
+        const v = try self.allocator.dupe(u8, spec);
+        errdefer self.allocator.free(v);
+        try self.mlocks.put(self.allocator, k, v);
     }
 
     /// Map a services channel error to an IRCv3 standard-reply FAIL code.
