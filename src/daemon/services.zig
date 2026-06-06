@@ -59,9 +59,17 @@ comptime {
 pub const StateHook = struct {
     ptr: *anyopaque,
     create_channel: *const fn (ctx: *anyopaque, channel: []const u8) ServiceError!void,
+    /// Optional: invoked when a channel registration is dropped, so the live
+    /// world can clear the +r REGISTERED flag and let the channel become
+    /// ephemeral again. Null hooks simply skip this notification.
+    drop_channel: ?*const fn (ctx: *anyopaque, channel: []const u8) ServiceError!void = null,
 
     pub fn createChannel(self: StateHook, channel: []const u8) ServiceError!void {
         try self.create_channel(self.ptr, channel);
+    }
+
+    pub fn dropChannel(self: StateHook, channel: []const u8) ServiceError!void {
+        if (self.drop_channel) |cb| try cb(self.ptr, channel);
     }
 };
 
@@ -310,6 +318,7 @@ pub const Services = struct {
         const record = try self.loadChannel(channel);
         try self.requireAccess(record, actor, .founder);
         try self.store.family(.chanregs).delete(record.name.asSlice());
+        if (self.state) |hook| try hook.dropChannel(record.name.asSlice());
         return .{ .dropped_channel = .{ .name = record.name } };
     }
 
@@ -863,4 +872,47 @@ test "drop account and channel" {
 
     _ = try services.dropAccount("alice", "correct horse battery staple");
     try std.testing.expectError(error.NotFound, services.accountInfo("alice"));
+}
+
+test "state hook fires on channel register and drop" {
+    const Recorder = struct {
+        created: [64]u8 = undefined,
+        created_len: usize = 0,
+        dropped: [64]u8 = undefined,
+        dropped_len: usize = 0,
+
+        fn onCreate(ctx: *anyopaque, channel: []const u8) ServiceError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(self.created[0..channel.len], channel);
+            self.created_len = channel.len;
+        }
+        fn onDrop(ctx: *anyopaque, channel: []const u8) ServiceError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(self.dropped[0..channel.len], channel);
+            self.dropped_len = channel.len;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-hook.wal");
+    defer store.deinit();
+
+    var rec = Recorder{};
+    var services = Services.init(&store, .{
+        .ptr = &rec,
+        .create_channel = Recorder.onCreate,
+        .drop_channel = Recorder.onDrop,
+    });
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    _ = try services.registerChannel("#Mizuchi", "alice", &scratch);
+    // The canonical (lowercased) channel name is bridged to the live world.
+    try std.testing.expectEqualStrings("#mizuchi", rec.created[0..rec.created_len]);
+    try std.testing.expectEqual(@as(usize, 0), rec.dropped_len);
+
+    _ = try services.dropChannel("#mizuchi", "alice");
+    try std.testing.expectEqualStrings("#mizuchi", rec.dropped[0..rec.dropped_len]);
 }

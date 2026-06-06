@@ -246,6 +246,18 @@ pub const World = struct {
         return channel.ext_modes;
     }
 
+    /// Mark a channel REGISTERED (+r) on behalf of services, materializing an
+    /// empty persistent channel if it does not exist yet. A +r channel survives
+    /// when its last member leaves (see `part`/`removeClient`), so registering an
+    /// unoccupied channel keeps it reserved. Clearing +r leaves the (possibly
+    /// empty) channel in place; the next part/disconnect reclaims it normally.
+    pub fn markRegistered(self: *World, name: []const u8, on: bool) std.mem.Allocator.Error!bool {
+        const channel = try self.ensureChannel(name);
+        const before = channel.ext_modes.has(.registered);
+        if (on) channel.ext_modes.set(.registered) else channel.ext_modes.clear(.registered);
+        return before != on;
+    }
+
     /// Set or clear an IRCX extended channel flag. Returns true if it changed.
     pub fn setChannelExtFlag(self: *World, name: []const u8, flag: chanmode_ext.ExtChannelFlag, on: bool) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;

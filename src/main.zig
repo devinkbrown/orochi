@@ -11,6 +11,20 @@ fn envLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) a
     return allocator.dupe(u8, value);
 }
 
+/// Services → live-world bridge: a channel registration marks the live channel
+/// REGISTERED (+r), materializing it if empty so the reservation persists.
+fn svcCreateChannel(ctx: *anyopaque, channel: []const u8) mizuchi.daemon.services.ServiceError!void {
+    const srv: *mizuchi.daemon.server.Server = @ptrCast(@alignCast(ctx));
+    try srv.markChannelRegistered(channel, true);
+}
+
+/// Services → live-world bridge: dropping a registration clears +r so the
+/// channel reverts to ephemeral and is reclaimed once empty.
+fn svcDropChannel(ctx: *anyopaque, channel: []const u8) mizuchi.daemon.services.ServiceError!void {
+    const srv: *mizuchi.daemon.server.Server = @ptrCast(@alignCast(ctx));
+    try srv.markChannelRegistered(channel, false);
+}
+
 pub fn main(init: std.process.Init) !void {
     std.debug.print(
         \\
@@ -126,6 +140,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     defer srv.deinit();
+
+    // Now that the server (and its live world) exists, attach the services state
+    // hook so channel REGISTER/DROP reflects into the world's +r REGISTERED flag.
+    if (account_store != null) {
+        account_services.state = .{
+            .ptr = &srv,
+            .create_channel = svcCreateChannel,
+            .drop_channel = svcDropChannel,
+        };
+    }
 
     std.debug.print(
         "mizuchi: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",

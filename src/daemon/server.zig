@@ -2716,7 +2716,7 @@ pub const LinuxServer = struct {
             .channels = blk: {
                 const hide = tconn.session.umodes.contains(.hide_chans) and
                     !conn.session.isOper() and conn != tconn;
-                break :blk memberships[0 .. if (hide) 0 else nchan];
+                break :blk memberships[0..if (hide) 0 else nchan];
             },
         };
         whois.writeWhois(&sink, server_name, conn.session.displayName(), subject) catch return;
@@ -4455,6 +4455,14 @@ pub const LinuxServer = struct {
         };
     }
 
+    /// Services bridge: mark `channel` REGISTERED (+r) in the live world, or
+    /// clear it. Registering materializes an empty persistent channel so a
+    /// reserved channel survives with no members; dropping clears +r so the
+    /// channel becomes ephemeral and is reclaimed on the next empty.
+    pub fn markChannelRegistered(self: *LinuxServer, channel: []const u8, registered: bool) std.mem.Allocator.Error!void {
+        _ = try self.world.markRegistered(channel, registered);
+    }
+
     /// Mark `conn` logged in as the canonical (lowercased) `account`.
     fn loginSession(conn: *ConnState, account: []const u8) void {
         var buf: [account_register.MAX_ACCOUNT_BYTES]u8 = undefined;
@@ -5797,6 +5805,8 @@ const PortableServer = struct {
     /// non-Linux targets. Never reached: `init` returns Unsupported first, so the
     /// tests SkipZigTest before any thread is spawned.
     pub fn runThreaded(_: *PortableServer, _: *std.atomic.Value(bool)) void {}
+    /// Symbol parity for the services → world +r bridge (see LinuxServer).
+    pub fn markChannelRegistered(_: *PortableServer, _: []const u8, _: bool) std.mem.Allocator.Error!void {}
 };
 
 const CompletionHandler = struct {
