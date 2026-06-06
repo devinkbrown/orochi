@@ -46,6 +46,7 @@ const tracelog = @import("../substrate/trace.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const chghost = @import("../proto/chghost.zig");
+const content_filter_mod = @import("content_filter.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
@@ -781,6 +782,8 @@ pub const LinuxServer = struct {
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
     sessions: sessions_mod.SessionStore,
+    /// Koshi content filter: oper-curated patterns that block matching messages.
+    content_filter: content_filter_mod.ContentFilter,
     /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
     /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
     s2s_listener_fd: linux.fd_t = -1,
@@ -844,6 +847,7 @@ pub const LinuxServer = struct {
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
             .sessions = sessions_mod.SessionStore.init(allocator),
+            .content_filter = content_filter_mod.ContentFilter.init(allocator),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
             .reactor = config.reactor,
@@ -877,6 +881,7 @@ pub const LinuxServer = struct {
         self.silence.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
+        self.content_filter.deinit();
         self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
@@ -1554,6 +1559,8 @@ pub const LinuxServer = struct {
             try self.handleVhost(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVS")) {
             try self.handlePrivs(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "FILTER")) {
+            try self.handleFilter(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
@@ -4508,6 +4515,53 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// `FILTER ADD|DEL|LIST [pattern]` — oper-only Koshi content-filter control.
+    /// ADD/DEL manage case-insensitive substring patterns; LIST reports them.
+    /// Matching messages from non-opers are blocked in the message path.
+    fn handleFilter(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            var buf: [default_reply_bytes]u8 = undefined;
+            for (self.content_filter.list(), 0..) |p, i| {
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE FILTER LIST :#{d} {s}\r\n", .{ server_name, i + 1, p }) catch continue;
+                try appendToConn(conn, line);
+            }
+            var end_buf: [default_reply_bytes]u8 = undefined;
+            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE FILTER :End of filter list ({d})\r\n", .{ server_name, self.content_filter.list().len }) catch return;
+            try appendToConn(conn, end);
+            return;
+        }
+        if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"FILTER"}, "Usage: FILTER <ADD|DEL|LIST> [pattern]");
+            return;
+        }
+        const pattern = parsed.paramSlice()[1];
+        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            const ok = self.content_filter.add(pattern) catch {
+                try self.failReply(conn, "FILTER", "TEMPORARILY_UNAVAILABLE", "Filter store error");
+                return;
+            };
+            if (!ok) {
+                try self.failReply(conn, "FILTER", "INVALID_PATTERN", "Pattern empty, too long, full, or duplicate");
+                return;
+            }
+            try self.noticeTo(conn, "FILTER: pattern added");
+        } else if (std.ascii.eqlIgnoreCase(sub, "DEL")) {
+            const removed = self.content_filter.remove(pattern) catch false;
+            if (!removed) {
+                try self.failReply(conn, "FILTER", "NO_SUCH_PATTERN", "No such filter pattern");
+                return;
+            }
+            try self.noticeTo(conn, "FILTER: pattern removed");
+        } else {
+            try self.failReply(conn, "FILTER", "INVALID_SUBCOMMAND", "Use ADD, DEL, or LIST");
+        }
+    }
+
     /// `PRIVS` — report the caller's operator class and privilege set
     /// (RPL_PRIVS 270). Re-derived from the oper registry by account, so it
     /// always reflects the current config binding.
@@ -4894,6 +4948,13 @@ pub const LinuxServer = struct {
             }
             return;
         }
+        // Koshi content filter: block messages matching an oper-curated pattern.
+        // Opers are exempt; NOTICE drops silently (no auto-reply), PRIVMSG FAILs.
+        if (!conn.session.isOper() and self.content_filter.matches(text)) {
+            if (!is_notice) try self.failReply(conn, command, "MIZUCHI_FILTERED", "Message blocked by the content filter");
+            return;
+        }
+
         // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target.
         var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
         while (targets.next()) |target| {

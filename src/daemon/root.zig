@@ -14,6 +14,7 @@ pub const config_boot = @import("config_boot.zig");
 pub const config = @import("config.zig");
 pub const config_format = @import("config_format.zig");
 pub const config_schema = @import("config_schema.zig");
+pub const content_filter = @import("content_filter.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const event_spine = @import("event_spine.zig");
 pub const flood = @import("flood.zig");
@@ -49,6 +50,7 @@ test {
     _ = config;
     _ = config_format;
     _ = config_schema;
+    _ = content_filter;
     _ = dispatch;
     _ = event_spine;
     _ = flood;
