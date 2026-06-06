@@ -518,6 +518,8 @@ const Numeric = enum(u16) {
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
     RPL_ENDOFBANLIST = 368,
+    RPL_QUIETLIST = 728,
+    RPL_ENDOFQUIETLIST = 729,
     RPL_INVITELIST = 346,
     RPL_ENDOFINVITELIST = 347,
     RPL_EXCEPTLIST = 348,
@@ -2300,6 +2302,21 @@ pub const LinuxServer = struct {
                     else
                         (self.world.removeInvex(channel, mask) catch continue);
                     if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'I', mask);
+                },
+                'Z' => {
+                    // +Z quiet (MUTE) list — like +b but only suppresses speech.
+                    // No argument => list query (RPL_QUIETLIST 728 / 729).
+                    if (arg_index >= parsed.param_count) {
+                        try self.sendMaskList(conn, channel, self.world.mutesOf(channel), .RPL_QUIETLIST, .RPL_ENDOFQUIETLIST, "End of channel quiet list");
+                        continue;
+                    }
+                    const mask = parsed.paramSlice()[arg_index];
+                    arg_index += 1;
+                    const changed = if (adding)
+                        (self.world.addMute(channel, mask) catch continue)
+                    else
+                        (self.world.removeMute(channel, mask) catch continue);
+                    if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'Z', mask);
                 },
                 else => {
                     // IRCX extended channel flags (AUTHONLY a, AUDITORIUM x,
@@ -5483,6 +5500,19 @@ pub const LinuxServer = struct {
                 if (!mm.canSpeakModerated()) {
                     if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+M: identify to a registered account to speak)");
                     return;
+                }
+            }
+            // +Z quiet (MUTE): a member whose mask matches a quiet entry (and is
+            // not +e exempt) may not speak unless voiced-or-higher / oper.
+            {
+                const qm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+                if (!qm.canSpeakModerated() and !conn.session.isOper()) {
+                    var qmask_buf: [256]u8 = undefined;
+                    const qmask = clientPrefix(conn, &qmask_buf) catch "";
+                    if (qmask.len != 0 and self.world.isMuted(chan, qmask)) {
+                        if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+Z: you are quieted)");
+                        return;
+                    }
                 }
             }
             // Op-bypass gates (+C no-ctcp, +T no-notice). Ops/voiced-or-higher and

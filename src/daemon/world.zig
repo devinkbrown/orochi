@@ -64,6 +64,9 @@ const Channel = struct {
     exempts: std.ArrayListUnmanaged([]u8) = .empty,
     /// +I invite-exception masks: a match here lets a user bypass +i on JOIN.
     invex: std.ArrayListUnmanaged([]u8) = .empty,
+    /// +Z quiet (MUTE) masks: a match suppresses *speech* (not join), like a
+    /// ban that only mutes. Honors +e exempts.
+    mutes: std.ArrayListUnmanaged([]u8) = .empty,
     /// Pending invitations (INVITE) that satisfy +i, by client id.
     invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
     /// +p private (shown but flagged) and +h IRCX HIDDEN (omitted from LIST).
@@ -93,6 +96,8 @@ const Channel = struct {
         self.exempts.deinit(self.allocator);
         for (self.invex.items) |i| self.allocator.free(i);
         self.invex.deinit(self.allocator);
+        for (self.mutes.items) |m| self.allocator.free(m);
+        self.mutes.deinit(self.allocator);
         self.invites.deinit(self.allocator);
         self.members.deinit();
         self.* = undefined;
@@ -448,6 +453,26 @@ pub const World = struct {
     pub fn isInvexed(self: *World, name: []const u8, hostmask: []const u8) bool {
         const channel = self.channels.getPtr(name) orelse return false;
         return listMatches(channel.invex.items, hostmask);
+    }
+
+    /// +Z quiet (MUTE) list operations.
+    pub fn addMute(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        return self.listAddMask(&channel.mutes, mask);
+    }
+    pub fn removeMute(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        return self.listRemoveMask(&channel.mutes, mask);
+    }
+    pub fn mutesOf(self: *World, name: []const u8) ?[]const []const u8 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.mutes.items;
+    }
+    /// Whether `hostmask` is quieted (+Z) and not saved by a +e exempt.
+    pub fn isMuted(self: *World, name: []const u8, hostmask: []const u8) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        if (listMatches(channel.exempts.items, hostmask)) return false;
+        return listMatches(channel.mutes.items, hostmask);
     }
 
     /// Whether `hostmask` (nick!user@host) matches any +b entry (case-insensitive
