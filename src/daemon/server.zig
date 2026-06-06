@@ -34,6 +34,7 @@ const silence = @import("../proto/silence.zig");
 const chanserv_cmd = @import("../proto/chanserv_cmd.zig");
 const oper_motd_mod = @import("../proto/oper_motd.zig");
 const host_request_mod = @import("host_request.zig");
+const guise_mod = @import("guise.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
@@ -788,6 +789,8 @@ pub const LinuxServer = struct {
     oper_motd: oper_motd_mod.OperMotd,
     /// Pending/decided vhost requests (VHOST REQUEST → oper APPROVE/DENY).
     host_requests: host_request_mod.Queue,
+    /// Guise: per-account persona wardrobe + operator offer templates.
+    guises: guise_mod.Registry,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -883,6 +886,7 @@ pub const LinuxServer = struct {
             .observe = observe_mod.Registry.init(allocator, .{}),
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
+            .guises = guise_mod.Registry.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -929,6 +933,7 @@ pub const LinuxServer = struct {
         self.observe.deinit();
         self.oper_motd.deinit();
         self.host_requests.deinit();
+        self.guises.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -5347,20 +5352,32 @@ pub const LinuxServer = struct {
     /// negotiated the chghost cap (others see the new host on the next message).
     fn handleVhost(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"VHOST"}, "Usage: VHOST <host> | REQUEST <host> | LIST | APPROVE <account> | DENY <account> [:reason]");
-            return;
+            return self.vhostList(id, conn); // bare VHOST shows the wardrobe
         }
-        // Request/approval flow: REQUEST lets any logged-in user ask for a vhost;
-        // LIST/APPROVE/DENY are the oper review side. A bare host argument is the
-        // oper's immediate self-set (original behaviour).
         const p = parsed.paramSlice();
-        if (std.ascii.eqlIgnoreCase(p[0], "REQUEST")) {
+        // Guise wardrobe (self-service): LIST/USE/OFF/CLAIM, plus REQUEST to ask.
+        if (std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            return self.vhostList(id, conn);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "USE")) {
+            return self.handleVhostUse(id, conn, p);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "OFF")) {
+            return self.handleVhostOff(id, conn);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "CLAIM")) {
+            return self.handleVhostClaim(id, conn, p);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "REQUEST")) {
             return self.handleVhostRequest(conn, p);
-        } else if (std.ascii.eqlIgnoreCase(p[0], "LIST") or std.ascii.eqlIgnoreCase(p[0], "APPROVE") or std.ascii.eqlIgnoreCase(p[0], "DENY")) {
+        } else if (std.ascii.eqlIgnoreCase(p[0], "OFFERLIST")) {
+            return self.handleVhostOfferList(conn);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "APPROVE") or std.ascii.eqlIgnoreCase(p[0], "DENY")) {
             return self.handleVhostReview(id, conn, p);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "OFFER")) {
+            return self.handleVhostOffer(conn, p);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "SET")) {
+            return self.handleVhostSet(conn, p);
         }
+        // Bare `VHOST <host>` — oper immediate self-set (kept for convenience).
         if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            try self.noticeTo(conn, "Usage: VHOST LIST|USE <name>|OFF|CLAIM <host>|REQUEST <host>|OFFERLIST");
             return;
         }
         const new_host = parsed.paramSlice()[0];
@@ -5465,8 +5482,95 @@ pub const LinuxServer = struct {
         };
         var hbuf: [128]u8 = undefined;
         const host = std.fmt.bufPrint(&hbuf, "{s}", .{req.vhost}) catch return;
+        // Record the approved host as a switchable "granted" persona.
+        self.guises.grant(account, "granted", host, .granted, self.nowMs()) catch {};
         self.applyVhostToAccount(account, host);
         try self.noticeTo(conn, "VHOST approved and applied");
+    }
+
+    /// `VHOST LIST` (or bare VHOST) — show the caller's persona wardrobe and the
+    /// operator-published offer templates they can CLAIM.
+    fn vhostList(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+        _ = id;
+        if (conn.session.account()) |account| {
+            for (self.guises.personas(account)) |p| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST persona {s} = {s} ({s})\r\n", .{ server_name, conn.session.displayName(), p.name, p.host, p.source.token() }) catch continue;
+                try appendToConn(conn, line);
+            }
+        }
+        for (self.guises.offerList()) |o| {
+            var b: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST offer {s} :{s}\r\n", .{ server_name, conn.session.displayName(), o.template, o.label }) catch continue;
+            try appendToConn(conn, line);
+        }
+        try self.noticeTo(conn, "VHOST: USE <name> to wear a persona, CLAIM <host> for an offer, REQUEST <host> to ask");
+    }
+
+    /// `VHOST USE <name>` — instantly wear one of your granted personas.
+    fn handleVhostUse(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
+        const account = conn.session.account() orelse return self.failReply(conn, "VHOST", "ACCOUNT_REQUIRED", "Log in to use personas");
+        if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST USE <name>");
+        const persona = self.guises.find(account, p[1]) orelse return self.noticeTo(conn, "VHOST: no such persona (try VHOST LIST)");
+        try applyVhostLine(self, id, conn, persona.host);
+    }
+
+    /// `VHOST OFF` — drop the active vhost, restoring the connection's host.
+    fn handleVhostOff(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+        var hb: [128]u8 = undefined;
+        const real = conn.session.realHost();
+        const host = std.fmt.bufPrint(&hb, "{s}", .{real}) catch return;
+        try applyVhostLine(self, id, conn, host);
+    }
+
+    /// `VHOST CLAIM <host>` — self-service a host matching an operator offer
+    /// template; it becomes a `.claimed` persona and is worn immediately.
+    fn handleVhostClaim(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
+        const account = conn.session.account() orelse return self.failReply(conn, "VHOST", "ACCOUNT_REQUIRED", "Log in to claim a vhost");
+        if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST CLAIM <host>");
+        const host = p[1];
+        chghost.validateHost(host) catch return self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
+        _ = self.guises.claim(account, host, self.nowMs()) catch return self.noticeTo(conn, "VHOST: no operator offer matches that host");
+        try applyVhostLine(self, id, conn, host);
+    }
+
+    /// `VHOST OFFERLIST` — show offer templates (any user).
+    fn handleVhostOfferList(self: *LinuxServer, conn: *ConnState) !void {
+        for (self.guises.offerList()) |o| {
+            var b: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST offer {s} :{s}\r\n", .{ server_name, conn.session.displayName(), o.template, o.label }) catch continue;
+            try appendToConn(conn, line);
+        }
+        try self.noticeTo(conn, "VHOST: end of offer list");
+    }
+
+    /// `VHOST OFFER <template> [:label]` — oper publishes a claimable template.
+    fn handleVhostOffer(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
+        if (!conn.session.isOper()) return queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+        if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST OFFER <template> [:label]");
+        const label = if (p.len >= 3) p[2] else "vhost offer";
+        self.guises.addOffer(p[1], label) catch return self.noticeTo(conn, "VHOST: could not add offer (duplicate or limit)");
+        var b: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&b, "VHOST OFFER {s}", .{p[1]}) catch return;
+        try self.publishOperEvent(.oper_action, .notice, note);
+    }
+
+    /// `VHOST SET <account> <host> [name]` — oper assigns a fully custom vhost to
+    /// an account as a `.granted` persona, applied live. The robust escape hatch
+    /// for hosts no offer template covers.
+    fn handleVhostSet(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
+        if (!conn.session.isOper()) return queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+        if (p.len < 3 or p[1].len == 0 or p[2].len == 0) return self.noticeTo(conn, "Usage: VHOST SET <account> <host> [name]");
+        const account = p[1];
+        const host = p[2];
+        const name = if (p.len >= 4) p[3] else "oper";
+        chghost.validateHost(host) catch return self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
+        self.guises.grant(account, name, host, .granted, self.nowMs()) catch return self.noticeTo(conn, "VHOST: could not set (limit or invalid)");
+        self.applyVhostToAccount(account, host);
+        var b: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&b, "VHOST SET {s} -> {s}", .{ account, host }) catch return;
+        try self.publishOperEvent(.oper_action, .notice, note);
+        try self.noticeTo(conn, "VHOST set and applied");
     }
 
     /// On login, apply (and consume) an approved vhost request for the account.
@@ -5505,7 +5609,9 @@ pub const LinuxServer = struct {
         conn.session.setVisibleHost(new_host);
         try self.notifyCommonChannels(id, msg, .chghost, id);
         if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
-        try self.noticeTo(conn, "Your requested vhost was approved and applied");
+        var nb: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ server_name, conn.session.displayName(), new_host }) catch return;
+        try appendToConn(conn, note);
     }
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.

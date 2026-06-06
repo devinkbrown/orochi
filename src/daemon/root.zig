@@ -78,6 +78,7 @@ pub const focus_mode = @import("focus_mode.zig");
 pub const follow_graph = @import("follow_graph.zig");
 pub const font_pref = @import("font_pref.zig");
 pub const friend_list = @import("friend_list.zig");
+pub const guise = @import("guise.zig");
 pub const highlight_words = @import("highlight_words.zig");
 pub const history_optout = @import("history_optout.zig");
 pub const host_request = @import("host_request.zig");
@@ -263,6 +264,7 @@ test {
     _ = follow_graph;
     _ = font_pref;
     _ = friend_list;
+    _ = guise;
     _ = highlight_words;
     _ = history_optout;
     _ = host_request;
