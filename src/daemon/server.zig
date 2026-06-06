@@ -49,6 +49,7 @@ const chghost = @import("../proto/chghost.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
 const tegami_mod = @import("tegami.zig");
+const transcript_mod = @import("transcript.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
@@ -796,6 +797,8 @@ pub const LinuxServer = struct {
     media_rooms: media_room.MediaRooms,
     /// Tegami: per-account offline messages, delivered on next login.
     tegami: tegami_mod.TegamiBox,
+    /// Per-channel live media transcript (speaker-tagged caption ring).
+    transcript: transcript_mod.TranscriptLog,
     /// Server-owned config reloaded by the most recent REHASH. The live
     /// `oper_registry` borrows `reload_bindings`, which borrow `reload_parsed`;
     /// all three are freed (and the prior generation replaced) on each REHASH and
@@ -868,6 +871,7 @@ pub const LinuxServer = struct {
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
             .media_rooms = media_room.MediaRooms.init(allocator),
             .tegami = tegami_mod.TegamiBox.init(allocator),
+            .transcript = transcript_mod.TranscriptLog.init(allocator),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
             .reactor = config.reactor,
@@ -904,6 +908,7 @@ pub const LinuxServer = struct {
         self.content_filter.deinit();
         self.media_rooms.deinit();
         self.tegami.deinit();
+        self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
         self.read_markers.deinit();
@@ -4703,11 +4708,39 @@ pub const LinuxServer = struct {
             try self.broadcastMediaEvent(channel, "POS", nick, xy);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "CAPTION")) {
+            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA CAPTION <#chan> :<text>");
+                return;
+            }
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before captioning");
+                return;
+            }
+            const text = parsed.paramSlice()[2];
+            _ = self.transcript.push(channel, nick, text, platform.realtimeMillis()) catch {}; // retention is best-effort
+            // Live fan-out (text may contain spaces, so use a trailing `:` param).
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} CAPTION {s} :{s}\r\n", .{ server_name, channel, nick, text }) catch return;
+            try self.broadcastChannel(channel, line, null);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "TRANSCRIPT")) {
+            for (self.transcript.recent(channel)) |c| {
+                var buf: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} TRANSCRIPT {s} :{s}\r\n", .{ server_name, channel, c.speaker, c.text }) catch continue;
+                try appendToConn(conn, line);
+            }
+            var end_buf: [default_reply_bytes]u8 = undefined;
+            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of transcript ({d})\r\n", .{ server_name, channel, self.transcript.recent(channel).len }) catch return;
+            try appendToConn(conn, end);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
-            if (self.media_rooms.leaveAll(channel, nick))
-                try self.broadcastMediaEvent(channel, "LEAVE", nick, "")
-            else
-                try self.noticeTo(conn, "MEDIA: you are not in this call");
+            if (self.media_rooms.leaveAll(channel, nick)) {
+                try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
+                if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel); // call ended
+            } else try self.noticeTo(conn, "MEDIA: you are not in this call");
             return;
         }
 
@@ -4743,7 +4776,7 @@ pub const LinuxServer = struct {
             else
                 try self.failReply(conn, "MEDIA", "NOT_PUBLISHING", "You are not publishing that kind");
         } else {
-            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, or ROSTER");
+            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, CAPTION, TRANSCRIPT, or ROSTER");
         }
     }
 
@@ -4767,8 +4800,10 @@ pub const LinuxServer = struct {
         var it = self.world.channels.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
-            if (self.media_rooms.leaveAll(entry.key_ptr.*, nick))
+            if (self.media_rooms.leaveAll(entry.key_ptr.*, nick)) {
                 self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
+                if (self.media_rooms.room(entry.key_ptr.*) == null) _ = self.transcript.clearChannel(entry.key_ptr.*);
+            }
         }
     }
 

@@ -34,6 +34,7 @@ pub const services = @import("services.zig");
 pub const sessions = @import("sessions.zig");
 pub const store = @import("store.zig");
 pub const tegami = @import("tegami.zig");
+pub const transcript = @import("transcript.zig");
 pub const whois = @import("whois.zig");
 pub const whowas = @import("whowas.zig");
 pub const world_projection = @import("world_projection.zig");
@@ -72,6 +73,7 @@ test {
     _ = sessions;
     _ = store;
     _ = tegami;
+    _ = transcript;
     _ = whois;
     _ = whowas;
     _ = world_projection;
