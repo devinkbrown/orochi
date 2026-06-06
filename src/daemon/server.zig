@@ -62,6 +62,7 @@ const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
+const chan_forward = @import("../proto/chan_forward.zig");
 const clone_limit_mod = @import("clone_limit.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
@@ -2164,6 +2165,7 @@ pub const LinuxServer = struct {
         id: client_model.ClientId,
         channel: []const u8,
         supplied_key: ?[]const u8,
+        quiet: bool,
     ) !bool {
         const wid = worldIdFromClient(id);
         const invited = self.world.hasInvite(channel, wid);
@@ -2171,14 +2173,14 @@ pub const LinuxServer = struct {
         // +S TLS-only: join permitted only over a TLS session (implicit-TLS fact;
         // no STARTTLS). Server opers bypass.
         if (self.world.channelHasFlag(channel, .tls_only) and !conn.is_tls and !conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_SECUREONLYCHAN, &.{channel}, "Cannot join channel (+S) - TLS required");
+            if (!quiet) try queueNumeric(conn, .ERR_SECUREONLYCHAN, &.{channel}, "Cannot join channel (+S) - TLS required");
             return true;
         }
 
         // +a AUTHONLY (IRCX): only authenticated accounts may join, regardless of
         // invite. Enforced before all other gates.
         if (self.world.channelHasExtFlag(channel, .authonly) and conn.session.account() == null) {
-            try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{channel}, "Cannot join channel (+a) - you must be authenticated");
+            if (!quiet) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{channel}, "Cannot join channel (+a) - you must be authenticated");
             return true;
         }
 
@@ -2187,18 +2189,18 @@ pub const LinuxServer = struct {
         if (!invited) {
             // +b ban (isBanned already honors +e exceptions) blocks the join.
             if (self.world.isBanned(channel, mask)) {
-                try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
+                if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
                 return true;
             }
             // +i blocks unless the user holds an invite OR matches a +I invex mask.
             if (self.world.channelHasFlag(channel, .invite_only) and !self.world.isInvexed(channel, mask)) {
-                try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
+                if (!quiet) try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
                 return true;
             }
         }
         if (self.world.channelKey(channel)) |key| {
             if (supplied_key == null or !std.mem.eql(u8, supplied_key.?, key)) {
-                try queueNumeric(conn, .ERR_BADCHANNELKEY, &.{channel}, "Cannot join channel (+k)");
+                if (!quiet) try queueNumeric(conn, .ERR_BADCHANNELKEY, &.{channel}, "Cannot join channel (+k)");
                 return true;
             }
         }
@@ -2245,11 +2247,29 @@ pub const LinuxServer = struct {
             if (channel.len == 0) continue;
             const key_part = keys.next() orelse "";
             const key: ?[]const u8 = if (key_part.len != 0) key_part else null;
-            try self.joinOne(id, conn, channel, key);
+            try self.joinOne(id, conn, channel, key, 0);
         }
     }
 
-    fn joinOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, key: ?[]const u8) !void {
+    /// If `channel` has a usable +f forward target (one hop only, gated by
+    /// `depth`), emit RPL_LINKCHANNEL (470), copy the target into `out`, and
+    /// return it for the caller to JOIN. Returns null when no usable forward
+    /// exists. Does NOT call joinOne itself (keeps joinOne's error set clean).
+    fn forwardTarget(self: *LinuxServer, conn: *ConnState, channel: []const u8, depth: u8, out: []u8) !?[]const u8 {
+        if (depth != 0) return null;
+        const fwd = self.world.forwardOf(channel) orelse return null;
+        if (std.ascii.eqlIgnoreCase(fwd, channel)) return null;
+        if (!world_model.isChannelName(fwd)) return null;
+        if (fwd.len > out.len) return null;
+        @memcpy(out[0..fwd.len], fwd);
+        const ftarget = out[0..fwd.len];
+        var lb: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&lb, ":{s} 470 {s} {s} {s} :Forwarding to another channel\r\n", .{ server_name, conn.session.displayName(), channel, ftarget }) catch return null;
+        try appendToConn(conn, line);
+        return ftarget;
+    }
+
+    fn joinOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, key: ?[]const u8, depth: u8) !void {
         if (!world_model.isChannelName(channel)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
@@ -2259,9 +2279,22 @@ pub const LinuxServer = struct {
         // member. Creating a fresh channel (founder path) bypasses all gates.
         const wid = worldIdFromClient(id);
         var clone_buf: [160]u8 = undefined;
+        var fwd_buf: [80]u8 = undefined;
         var join_target = channel;
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
-            if (try self.joinDenied(conn, id, channel, key)) return;
+            // +f forward: when refused, redirect to the forward target (one hop).
+            // Suppress the deny numeric while a forward is a candidate, then either
+            // redirect quietly or, if the forward is unusable, emit the real deny.
+            const fwd_quiet = depth == 0 and self.world.forwardOf(channel) != null;
+            if (try self.joinDenied(conn, id, channel, key, fwd_quiet)) {
+                if (fwd_quiet) {
+                    if (try self.forwardTarget(conn, channel, depth, &fwd_buf)) |target| {
+                        return self.joinOne(id, conn, target, null, depth + 1);
+                    }
+                    _ = try self.joinDenied(conn, id, channel, key, false);
+                }
+                return;
+            }
             // +j join throttle: deny if the per-channel window is full. Opers and
             // invited users bypass. Checked after the hard gates so a denied join
             // does not consume a throttle slot.
@@ -2280,6 +2313,10 @@ pub const LinuxServer = struct {
                         return;
                     };
                 } else {
+                    // +l full: redirect to +f forward target if set, else hard 471.
+                    if (try self.forwardTarget(conn, channel, depth, &fwd_buf)) |target| {
+                        return self.joinOne(id, conn, target, null, depth + 1);
+                    }
                     try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
                     return;
                 }
@@ -2710,6 +2747,21 @@ pub const LinuxServer = struct {
                         if (self.world.throttleOf(channel) == null) continue;
                         self.world.clearThrottle(channel) catch continue;
                         appendModeLetter(&applied, &emitted_sign, '-', 'j');
+                    }
+                },
+                'f' => {
+                    // +f forward: param is the target channel on set, bare on unset.
+                    if (adding) {
+                        if (arg_index >= parsed.param_count) continue;
+                        const target = parsed.paramSlice()[arg_index];
+                        arg_index += 1;
+                        if (!chan_forward.validForwardTarget(target, channel)) continue;
+                        self.world.setForward(channel, target) catch continue;
+                        appendParamMode(&applied, &targets, &emitted_sign, '+', 'f', target);
+                    } else {
+                        if (self.world.forwardOf(channel) == null) continue;
+                        self.world.setForward(channel, null) catch continue;
+                        appendModeLetter(&applied, &emitted_sign, '-', 'f');
                     }
                 },
                 else => {
@@ -3802,7 +3854,7 @@ pub const LinuxServer = struct {
     fn applyAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
         const account = conn.session.account() orelse return;
         const chans = self.autojoins.list(account) catch return;
-        for (chans) |c| self.joinOne(id, conn, c, null) catch {};
+        for (chans) |c| self.joinOne(id, conn, c, null, 0) catch {};
     }
 
     /// `SHUN <mask> [secs] [:reason]` / `UNSHUN <mask>` — oper network mute.
@@ -4944,7 +4996,7 @@ pub const LinuxServer = struct {
             try self.operFounderTakeover(id, conn, req.channel);
             return;
         }
-        try self.joinOne(id, conn, req.channel, null);
+        try self.joinOne(id, conn, req.channel, null, 0);
     }
 
     /// Grant founder (+Q) to an operator on an existing channel, joining them

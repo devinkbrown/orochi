@@ -75,6 +75,9 @@ const Channel = struct {
     throttle_times: std.ArrayListUnmanaged(i64) = .empty,
     /// Pending invitations (INVITE) that satisfy +i, by client id.
     invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
+    /// +f forward target: when a join here is refused (+i/+k/+b/+l), the user is
+    /// redirected to JOIN this channel instead. Allocator-owned; null = no forward.
+    forward: ?[]u8 = null,
     /// +p private (shown but flagged) and +h IRCX HIDDEN (omitted from LIST).
     private: bool = false,
     hidden: bool = false,
@@ -96,6 +99,7 @@ const Channel = struct {
     fn deinit(self: *Channel) void {
         if (self.topic) |topic| self.allocator.free(topic);
         if (self.key) |k| self.allocator.free(k);
+        if (self.forward) |f| self.allocator.free(f);
         for (self.bans.items) |b| self.allocator.free(b);
         self.bans.deinit(self.allocator);
         for (self.exempts.items) |e| self.allocator.free(e);
@@ -492,6 +496,18 @@ pub const World = struct {
         const channel = self.channels.getPtr(name) orelse return false;
         if (listMatches(channel.exempts.items, hostmask)) return false;
         return listMatches(channel.mutes.items, hostmask);
+    }
+
+    /// +f forward target. `target == null` clears it. Owns a duped copy.
+    pub fn setForward(self: *World, name: []const u8, target: ?[]const u8) WorldError!void {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        if (channel.forward) |old| self.allocator.free(old);
+        channel.forward = if (target) |t| try self.allocator.dupe(u8, t) else null;
+    }
+    /// The +f forward target for `name`, or null when unset / no such channel.
+    pub fn forwardOf(self: *World, name: []const u8) ?[]const u8 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.forward;
     }
 
     /// +j join-throttle config.
