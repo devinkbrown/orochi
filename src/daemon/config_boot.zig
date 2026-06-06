@@ -26,6 +26,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.limits.ping_timeout_ms != 0) out.ping_timeout_ms = @intCast(cfg.limits.ping_timeout_ms);
     out.max_clones_per_ip = cfg.limits.max_clones_per_ip;
     out.max_clones_per_net = cfg.limits.max_clones_per_net;
+    out.reputation_refuse_threshold = cfg.limits.reputation_refuse_threshold;
+    if (cfg.limits.reputation_half_life_ms != 0) out.reputation_half_life_ms = @intCast(cfg.limits.reputation_half_life_ms);
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     return out;
 }
@@ -142,6 +144,24 @@ test "limits overlay clone caps" {
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u32, 4), loaded.config.max_clones_per_ip);
     try testing.expectEqual(@as(u32, 32), loaded.config.max_clones_per_net);
+}
+
+test "limits overlay reputation knobs" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\reputation_refuse_threshold = 120
+        \\reputation_half_life = 90s
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(u32, 120), loaded.config.reputation_refuse_threshold);
+    try testing.expectEqual(@as(i64, 90_000), loaded.config.reputation_half_life_ms);
 }
 
 test "minimal config: unspecified optional fields keep defaults" {

@@ -62,6 +62,7 @@ const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const dns = @import("../proto/dns.zig");
 const clone_limit_mod = @import("clone_limit.zig");
+const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
 const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
@@ -525,6 +526,11 @@ const s2s_listener_token: RingFdToken = .{ .slot = 1, .gen = 0 };
 const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
 /// How often the timeout sweep runs (ms).
 const timer_interval_ms: i64 = 2_000;
+/// Reputation penalty for a connection that never completed registration in the
+/// handshake window (scan/abuse signature).
+const reg_timeout_penalty: f64 = 50.0;
+/// Reputation penalty for an accept refused by the clone limiter.
+const clone_refuse_penalty: f64 = 25.0;
 const default_reply_bytes: usize = 8192;
 const default_recv_bytes: usize = 4096;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
@@ -698,6 +704,11 @@ pub const Config = struct {
     /// Max concurrent client connections aggregated across a /24 (IPv4) or /64
     /// (IPv6) prefix (0 = unlimited).
     max_clones_per_net: u32 = 0,
+    /// IP-reputation refuse threshold: a peer whose decaying penalty score
+    /// reaches this is refused at accept (0 = reputation disabled entirely).
+    reputation_refuse_threshold: u32 = 0,
+    /// Half-life (ms) of the IP-reputation penalty decay.
+    reputation_half_life_ms: i64 = 60_000,
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
     /// take on the account store's I/O lifecycle: a caller that has a store wires
@@ -882,6 +893,9 @@ pub const LinuxServer = struct {
     /// Concurrent-connection clone limiter (per exact IP and per /24|/64 prefix).
     /// Limits come from Config; a zero limit disables that dimension.
     clone_limit: clone_limit_mod.CloneLimiter,
+    /// Decaying per-IP penalty table. Only consulted/updated when Config's
+    /// reputation_refuse_threshold is non-zero (otherwise reputation is off).
+    reputation: ip_reputation_mod.IpReputation,
     /// Optional reactor seam (time/IO). Null = system monotonic clock.
     reactor: ?reactor_mod.Reactor = null,
     /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
@@ -992,6 +1006,10 @@ pub const LinuxServer = struct {
                 .max_per_ip = config.max_clones_per_ip,
                 .max_per_net = config.max_clones_per_net,
             }),
+            .reputation = ip_reputation_mod.IpReputation.init(allocator, .{
+                .half_life_ms = @intCast(@max(1, config.reputation_half_life_ms)),
+                .refuse_threshold = @floatFromInt(config.reputation_refuse_threshold),
+            }) catch unreachable,
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .snowflake = snowflake_id.Generator.init(.{ .node_id = @intCast(config.node_id & snowflake_id.NODE_MASK) }) catch unreachable,
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
@@ -1030,6 +1048,7 @@ pub const LinuxServer = struct {
         self.props.deinit();
         self.access.deinit();
         self.clone_limit.deinit();
+        self.reputation.deinit();
         self.accepts.deinit();
         self.silence.deinit();
         self.observe.deinit();
@@ -1114,6 +1133,7 @@ pub const LinuxServer = struct {
                 // Queue the ERROR and mark closing; the existing send-drain path
                 // (handleSend) calls closeConn for the proper io_uring-integrated
                 // teardown (shutdown in-flight recv, free slot). Never closeFd here.
+                self.penalizePeer(c, reg_timeout_penalty);
                 appendToConn(c, ":" ++ server_name ++ " ERROR :Registration timeout\r\n") catch {};
                 c.close_reason = "Registration timeout";
                 c.closing = true;
@@ -1249,6 +1269,21 @@ pub const LinuxServer = struct {
         // so its first JOIN/PRIVMSG prefix already carries the cloaked host.
         self.captureClientHost(conn);
 
+        // IP reputation: refuse a peer whose decaying penalty score has reached
+        // the configured threshold (drain-close, same as clone refusal).
+        if (self.reputationOn()) {
+            if (conn.peer_addr) |addr| {
+                if (self.reputation.shouldRefuse(addr, self.nowU64())) {
+                    appendToConn(conn, ":" ++ server_name ++ " ERROR :Connection refused (reputation)\r\n") catch {};
+                    conn.close_reason = "Reputation";
+                    conn.closing = true;
+                    self.armSendIfNeeded(conn) catch {};
+                    self.stats.onAccept();
+                    return;
+                }
+            }
+        }
+
         // Clone limiting: count this connection against its IP / prefix. Over the
         // cap, tell the client and drain-close WITHOUT arming recv — the queued
         // ERROR flushes via handleSend, which then closeConn's the slot. The
@@ -1258,6 +1293,7 @@ pub const LinuxServer = struct {
                 conn.clone_counted = true;
             } else |err| switch (err) {
                 error.TooManyPerIp, error.TooManyPerNet => {
+                    self.penalizePeer(conn, clone_refuse_penalty);
                     appendToConn(conn, ":" ++ server_name ++ " ERROR :Too many connections from your host\r\n") catch {};
                     conn.close_reason = "Too many connections";
                     conn.closing = true;
@@ -1328,6 +1364,25 @@ pub const LinuxServer = struct {
     /// (deterministic simulation), else the system monotonic clock.
     fn nowMs(self: *const LinuxServer) i64 {
         return if (self.reactor) |r| r.nowMillis() else platform.monotonicMillis();
+    }
+
+    /// Monotonic ms as a non-negative u64 (the reputation table's clock type).
+    fn nowU64(self: *const LinuxServer) u64 {
+        return @intCast(@max(0, self.nowMs()));
+    }
+
+    /// Whether IP reputation is active (a non-zero refuse threshold configured).
+    fn reputationOn(self: *const LinuxServer) bool {
+        return self.config.reputation_refuse_threshold != 0;
+    }
+
+    /// Add `points` of penalty to a peer's reputation (no-op when disabled or the
+    /// peer address is unknown). Best-effort: decay-math errors are swallowed.
+    fn penalizePeer(self: *LinuxServer, conn: *const ConnState, points: f64) void {
+        if (!self.reputationOn()) return;
+        if (conn.peer_addr) |addr| {
+            _ = self.reputation.penalize(addr, points, self.nowU64()) catch {};
+        }
     }
 
     /// Bands/features advertised by this node's S2S prekeys.
