@@ -85,6 +85,7 @@ const oper_mod = @import("oper.zig");
 const config_format = @import("config_format.zig");
 const services_mod = @import("services.zig");
 const account_register = @import("../proto/account_register.zig");
+const account_notify = @import("../proto/account_notify.zig");
 const sessions_mod = @import("sessions.zig");
 const tsumugi_hs = @import("../crypto/tsumugi_handshake.zig");
 const trace = @import("../proto/trace.zig");
@@ -6657,10 +6658,21 @@ pub const LinuxServer = struct {
     /// account-notify, after this client logs in (`label` = account name) or out
     /// (`label` = "*"). Best-effort; no-op if the client shares no channels.
     fn emitAccountChange(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, label: []const u8) void {
-        var prefix_buf: [256]u8 = undefined;
-        const pfx = clientPrefix(conn, &prefix_buf) catch return;
+        // Compose via the shared account_notify builder (single source of truth
+        // for the ACCOUNT line format + validation); "*" is the logout sentinel.
+        const change: account_notify.AccountChange = if (std.mem.eql(u8, label, account_notify.LOGOUT_SENTINEL))
+            .logout
+        else
+            .{ .login = label };
+        const prefix = account_notify.Prefix{
+            .nick = conn.session.displayName(),
+            .user = conn.session.username(),
+            .host = conn.session.host(),
+        };
+        var body_buf: [default_reply_bytes]u8 = undefined;
+        const body = account_notify.buildAccountNotifyLine(&body_buf, prefix, change) catch return;
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, ":{s} ACCOUNT {s}\r\n", .{ pfx, label }) catch return;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s}\r\n", .{body}) catch return;
         self.notifyCommonChannels(id, msg, .account_notify, id) catch {};
     }
 
