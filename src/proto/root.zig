@@ -52,6 +52,7 @@ pub const dtls_record = @import("dtls_record.zig");
 pub const ech = @import("ech.zig");
 pub const echo_message = @import("echo_message.zig");
 pub const elist = @import("elist.zig");
+pub const email_validate = @import("email_validate.zig");
 pub const extban_eval = @import("extban_eval.zig");
 pub const extban = @import("extban.zig");
 pub const extban_props = @import("extban_props.zig");
@@ -66,7 +67,9 @@ pub const help_db = @import("help_db.zig");
 pub const http1 = @import("http1.zig");
 pub const http2_hpack = @import("http2_hpack.zig");
 pub const http3_qpack = @import("http3_qpack.zig");
+pub const humanize = @import("humanize.zig");
 pub const ice = @import("ice.zig");
+pub const idna = @import("idna.zig");
 pub const invite = @import("invite.zig");
 pub const invite_notify = @import("invite_notify.zig");
 pub const irc_isupport = @import("irc_isupport.zig");
@@ -122,6 +125,7 @@ pub const names_reply = @import("names_reply.zig");
 pub const netsplit_batch = @import("netsplit_batch.zig");
 pub const nickdelay = @import("nickdelay.zig");
 pub const numeric = @import("numeric.zig");
+pub const numeric_range = @import("numeric_range.zig");
 pub const oper_motd = @import("oper_motd.zig");
 pub const oper_privs = @import("oper_privs.zig");
 pub const opus_packet = @import("opus_packet.zig");
@@ -163,10 +167,13 @@ pub const stun = @import("stun.zig");
 pub const trace = @import("trace.zig");
 pub const tsumugi_props = @import("tsumugi_props.zig");
 pub const tsumugi = @import("tsumugi.zig");
+pub const url_parse = @import("url_parse.zig");
 pub const userip = @import("userip.zig");
 pub const usermode = @import("usermode.zig");
 pub const utf8_guard = @import("utf8_guard.zig");
 pub const utf8_only = @import("utf8_only.zig");
+pub const utf8_width = @import("utf8_width.zig");
+pub const varint = @import("varint.zig");
 pub const vp8_payload = @import("vp8_payload.zig");
 pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
@@ -178,6 +185,8 @@ pub const who_props = @import("who_props.zig");
 pub const whowas_reply = @import("whowas_reply.zig");
 pub const who = @import("who.zig");
 pub const whox = @import("whox.zig");
+pub const wildcard_limit = @import("wildcard_limit.zig");
+pub const word_wrap = @import("word_wrap.zig");
 // gen:mods:end
 
 /// Native server-to-server mesh protocol (replaces TS6 entirely).
@@ -237,6 +246,7 @@ test {
     _ = ech;
     _ = echo_message;
     _ = elist;
+    _ = email_validate;
     _ = extban_eval;
     _ = extban;
     _ = extban_props;
@@ -251,7 +261,9 @@ test {
     _ = http1;
     _ = http2_hpack;
     _ = http3_qpack;
+    _ = humanize;
     _ = ice;
+    _ = idna;
     _ = invite;
     _ = invite_notify;
     _ = irc_isupport;
@@ -307,6 +319,7 @@ test {
     _ = netsplit_batch;
     _ = nickdelay;
     _ = numeric;
+    _ = numeric_range;
     _ = oper_motd;
     _ = oper_privs;
     _ = opus_packet;
@@ -348,10 +361,13 @@ test {
     _ = trace;
     _ = tsumugi_props;
     _ = tsumugi;
+    _ = url_parse;
     _ = userip;
     _ = usermode;
     _ = utf8_guard;
     _ = utf8_only;
+    _ = utf8_width;
+    _ = varint;
     _ = vp8_payload;
     _ = websocket_props;
     _ = websocket;
@@ -363,5 +379,7 @@ test {
     _ = whowas_reply;
     _ = who;
     _ = whox;
+    _ = wildcard_limit;
+    _ = word_wrap;
     // gen:tests:end
 }
