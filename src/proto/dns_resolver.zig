@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const dns = @import("dns.zig");
+const secure_fns = @import("secure_fns.zig");
 
 /// The question types this resolver can issue and parse (mirrors the subset the
 /// `dns.zig` codec supports). TXT/SRV are intentionally absent until the codec
@@ -112,8 +113,6 @@ pub const Resolver = struct {
     allocator: std.mem.Allocator,
     cache: dns.Cache,
     pending: std.AutoHashMapUnmanaged(u16, Pending) = .empty,
-    /// Rolling id cursor; `allocId` advances past any id still in flight.
-    next_id: u16 = 1,
     options: Options,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
@@ -288,14 +287,17 @@ pub const Resolver = struct {
         return std.math.clamp(ttl, self.options.min_ttl_seconds, self.options.max_ttl_seconds);
     }
 
-    /// Allocate a transaction id that no in-flight request is using.
+    /// Allocate an unpredictable transaction id that no in-flight request is
+    /// using. The id is drawn from a CSPRNG (not a counter) so an off-path
+    /// attacker cannot guess it — forged responses with the wrong id are
+    /// rejected. Collisions with an in-flight id are re-drawn; the bounded loop
+    /// surfaces a full table as `NoFreeTransactionId` rather than spinning.
     fn allocId(self: *Self) ResolverError!u16 {
+        const max_attempts: usize = 4 * (@as(usize, std.math.maxInt(u16)) + 1);
         var attempts: usize = 0;
-        while (attempts <= std.math.maxInt(u16)) : (attempts += 1) {
-            const candidate = self.next_id;
-            self.next_id +%= 1;
-            if (self.next_id == 0) self.next_id = 1; // keep ids non-zero
-            if (candidate == 0) continue;
+        while (attempts < max_attempts) : (attempts += 1) {
+            const candidate: u16 = @truncate(secure_fns.randomU64());
+            if (candidate == 0) continue; // keep ids non-zero
             if (!self.pending.contains(candidate)) return candidate;
         }
         return error.NoFreeTransactionId;
