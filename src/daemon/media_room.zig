@@ -35,6 +35,10 @@ pub fn kindName(kind: MediaKind) []const u8 {
 pub const default_breakout = "main";
 pub const max_breakout_bytes: usize = 32;
 
+/// 2D position in a call's spatial-audio plane (arbitrary integer units; clients
+/// scale/normalize). Default is the origin (centered / non-spatial).
+pub const Position = struct { x: i32 = 0, y: i32 = 0 };
+
 pub const MediaRooms = struct {
     allocator: std.mem.Allocator,
     rooms: std.StringHashMap(*Room),
@@ -42,12 +46,16 @@ pub const MediaRooms = struct {
     /// "channel\x00participant". Absent = the default "main" breakout. Kept in a
     /// flat map so the substrate Session participant model stays untouched.
     breakouts: std.StringHashMap([]u8),
+    /// Optional spatial-audio position per participant (same composite key).
+    /// Absent = origin. Value is inline (no per-entry allocation).
+    positions: std.StringHashMap(Position),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return .{
             .allocator = allocator,
             .rooms = std.StringHashMap(*Room).init(allocator),
             .breakouts = std.StringHashMap([]u8).init(allocator),
+            .positions = std.StringHashMap(Position).init(allocator),
         };
     }
 
@@ -64,6 +72,9 @@ pub const MediaRooms = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.breakouts.deinit();
+        var pit = self.positions.keyIterator();
+        while (pit.next()) |key| self.allocator.free(key.*);
+        self.positions.deinit();
         self.* = undefined;
     }
 
@@ -109,6 +120,33 @@ pub const MediaRooms = struct {
         }
     }
 
+    /// Set `pid`'s spatial-audio position within `channel`.
+    pub fn setPosition(self: *MediaRooms, channel: []const u8, pid: []const u8, pos: Position) Error!void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        const gop = try self.positions.getOrPut(k);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
+                _ = self.positions.remove(k);
+                return e;
+            };
+        }
+        gop.value_ptr.* = pos;
+    }
+
+    /// `pid`'s position within `channel` (origin if unset).
+    pub fn positionOf(self: *const MediaRooms, channel: []const u8, pid: []const u8) Position {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return .{};
+        return self.positions.get(k) orelse .{};
+    }
+
+    fn clearPosition(self: *MediaRooms, channel: []const u8, pid: []const u8) void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        if (self.positions.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+    }
+
     /// The room for `channel`, or null when no call is active there.
     pub fn room(self: *MediaRooms, channel: []const u8) ?*Room {
         return self.rooms.get(channel);
@@ -129,6 +167,7 @@ pub const MediaRooms = struct {
         const id = media.ParticipantId.init(pid) catch return false;
         entry.value_ptr.*.leaveAll(id) catch return false;
         self.clearBreakout(channel, pid);
+        self.clearPosition(channel, pid);
         if (entry.value_ptr.*.count() == 0) self.dropRoom(entry);
         return true;
     }
@@ -224,6 +263,19 @@ test "breakout assignment defaults to main and clears on leave" {
     try testing.expectEqualStrings("ops", m.breakoutOf("#c", "alice"));
     try testing.expect(m.leaveAll("#c", "alice"));
     try testing.expectEqualStrings("main", m.breakoutOf("#c", "alice")); // cleared
+}
+
+test "spatial position defaults to origin and clears on leave" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try testing.expectEqual(Position{ .x = 0, .y = 0 }, m.positionOf("#c", "alice"));
+    try m.setPosition("#c", "alice", .{ .x = -120, .y = 80 });
+    try testing.expectEqual(Position{ .x = -120, .y = 80 }, m.positionOf("#c", "alice"));
+    try m.setPosition("#c", "alice", .{ .x = 5, .y = 5 }); // overwrite in place
+    try testing.expectEqual(Position{ .x = 5, .y = 5 }, m.positionOf("#c", "alice"));
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expectEqual(Position{ .x = 0, .y = 0 }, m.positionOf("#c", "alice")); // cleared
 }
 
 test "parseKind accepts aliases and rejects junk" {

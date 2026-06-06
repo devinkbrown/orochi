@@ -4677,6 +4677,32 @@ pub const LinuxServer = struct {
             try self.broadcastMediaEvent(channel, "BREAKOUT", nick, bname);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "POS")) {
+            if (parsed.param_count < 4) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA POS <#chan> <x> <y>");
+                return;
+            }
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting a position");
+                return;
+            }
+            const x = std.fmt.parseInt(i32, parsed.paramSlice()[2], 10) catch {
+                try self.failReply(conn, "MEDIA", "INVALID_POSITION", "x and y must be integers");
+                return;
+            };
+            const y = std.fmt.parseInt(i32, parsed.paramSlice()[3], 10) catch {
+                try self.failReply(conn, "MEDIA", "INVALID_POSITION", "x and y must be integers");
+                return;
+            };
+            self.media_rooms.setPosition(channel, nick, .{ .x = x, .y = y }) catch {
+                try self.failReply(conn, "MEDIA", "POS_FAILED", "Could not set position");
+                return;
+            };
+            var xy_buf: [32]u8 = undefined;
+            const xy = std.fmt.bufPrint(&xy_buf, "{d} {d}", .{ x, y }) catch return;
+            try self.broadcastMediaEvent(channel, "POS", nick, xy);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
             if (self.media_rooms.leaveAll(channel, nick))
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "")
@@ -4773,8 +4799,9 @@ pub const LinuxServer = struct {
                 }
             }
             const breakout = self.media_rooms.breakoutOf(channel, p.id.slice());
+            const pos = self.media_rooms.positionOf(channel, p.id.slice());
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n], breakout }) catch continue;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s} {d} {d}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y }) catch continue;
             try appendToConn(conn, line);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
