@@ -67,6 +67,12 @@ const Channel = struct {
     /// +Z quiet (MUTE) masks: a match suppresses *speech* (not join), like a
     /// ban that only mutes. Honors +e exempts.
     mutes: std.ArrayListUnmanaged([]u8) = .empty,
+    /// +j join throttle: at most `throttle_joins` joins per `throttle_secs`
+    /// window (0 = disabled). `throttle_times` is a bounded ring of recent
+    /// successful join timestamps (ms) used to enforce the window.
+    throttle_joins: u16 = 0,
+    throttle_secs: u32 = 0,
+    throttle_times: std.ArrayListUnmanaged(i64) = .empty,
     /// Pending invitations (INVITE) that satisfy +i, by client id.
     invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
     /// +p private (shown but flagged) and +h IRCX HIDDEN (omitted from LIST).
@@ -98,6 +104,7 @@ const Channel = struct {
         self.invex.deinit(self.allocator);
         for (self.mutes.items) |m| self.allocator.free(m);
         self.mutes.deinit(self.allocator);
+        self.throttle_times.deinit(self.allocator);
         self.invites.deinit(self.allocator);
         self.members.deinit();
         self.* = undefined;
@@ -473,6 +480,46 @@ pub const World = struct {
         const channel = self.channels.getPtr(name) orelse return false;
         if (listMatches(channel.exempts.items, hostmask)) return false;
         return listMatches(channel.mutes.items, hostmask);
+    }
+
+    /// +j join-throttle config.
+    pub fn setThrottle(self: *World, name: []const u8, joins: u16, secs: u32) WorldError!void {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        channel.throttle_joins = joins;
+        channel.throttle_secs = secs;
+        channel.throttle_times.clearRetainingCapacity();
+    }
+    pub fn clearThrottle(self: *World, name: []const u8) WorldError!void {
+        const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        channel.throttle_joins = 0;
+        channel.throttle_secs = 0;
+        channel.throttle_times.clearRetainingCapacity();
+    }
+    /// Returns the active throttle as {joins, secs}, or null when disabled.
+    pub fn throttleOf(self: *World, name: []const u8) ?struct { joins: u16, secs: u32 } {
+        const channel = self.channels.getPtr(name) orelse return null;
+        if (channel.throttle_joins == 0) return null;
+        return .{ .joins = channel.throttle_joins, .secs = channel.throttle_secs };
+    }
+    /// Admit one join against the +j window: prune expired timestamps, then deny
+    /// (return false) without recording if the window is full, else record `now`
+    /// and allow. No-op allow when throttle is disabled.
+    pub fn throttleAdmit(self: *World, name: []const u8, now_ms: i64) bool {
+        const channel = self.channels.getPtr(name) orelse return true;
+        if (channel.throttle_joins == 0) return true;
+        const window_ms: i64 = @as(i64, channel.throttle_secs) * 1000;
+        // Prune timestamps outside the window (compact in place).
+        var kept: usize = 0;
+        for (channel.throttle_times.items) |ts| {
+            if (now_ms - ts < window_ms) {
+                channel.throttle_times.items[kept] = ts;
+                kept += 1;
+            }
+        }
+        channel.throttle_times.shrinkRetainingCapacity(kept);
+        if (channel.throttle_times.items.len >= channel.throttle_joins) return false;
+        channel.throttle_times.append(self.allocator, now_ms) catch return true; // alloc fail: fail-open
+        return true;
     }
 
     /// Whether `hostmask` (nick!user@host) matches any +b entry (case-insensitive

@@ -496,6 +496,7 @@ const Numeric = enum(u16) {
     RPL_MAPEND = 17,
     RPL_PRIVS = 270,
     ERR_SECUREONLYCHAN = 489,
+    ERR_THROTTLE = 480,
     RPL_LINKS = 364,
     RPL_ENDOFLINKS = 365,
     RPL_YOUREOPER = 381,
@@ -1923,6 +1924,15 @@ pub const LinuxServer = struct {
         var join_target = channel;
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
             if (try self.joinDenied(conn, id, channel, key)) return;
+            // +j join throttle: deny if the per-channel window is full. Opers and
+            // invited users bypass. Checked after the hard gates so a denied join
+            // does not consume a throttle slot.
+            if (!conn.session.isOper() and !self.world.hasInvite(channel, wid) and
+                !self.world.throttleAdmit(channel, self.nowMs()))
+            {
+                try queueNumeric(conn, .ERR_THROTTLE, &.{channel}, "Cannot join channel (+j) - join rate exceeded, try again shortly");
+                return;
+            }
             // +l full: IRCX +d cloneable channels redirect the join to a clone;
             // otherwise it is a hard 471.
             if (self.isChannelFull(channel)) {
@@ -2317,6 +2327,24 @@ pub const LinuxServer = struct {
                     else
                         (self.world.removeMute(channel, mask) catch continue);
                     if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'Z', mask);
+                },
+                'j' => {
+                    // +j join throttle: param "joins:seconds" on set, bare on unset.
+                    if (adding) {
+                        if (arg_index >= parsed.param_count) continue;
+                        const spec = parsed.paramSlice()[arg_index];
+                        arg_index += 1;
+                        const colon = std.mem.indexOfScalar(u8, spec, ':') orelse continue;
+                        const joins = std.fmt.parseInt(u16, spec[0..colon], 10) catch continue;
+                        const secs = std.fmt.parseInt(u32, spec[colon + 1 ..], 10) catch continue;
+                        if (joins == 0 or secs == 0) continue;
+                        self.world.setThrottle(channel, joins, secs) catch continue;
+                        appendParamMode(&applied, &targets, &emitted_sign, '+', 'j', spec);
+                    } else {
+                        if (self.world.throttleOf(channel) == null) continue;
+                        self.world.clearThrottle(channel) catch continue;
+                        appendModeLetter(&applied, &emitted_sign, '-', 'j');
+                    }
                 },
                 else => {
                     // IRCX extended channel flags (AUTHONLY a, AUDITORIUM x,
