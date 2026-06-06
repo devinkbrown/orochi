@@ -53,7 +53,6 @@ pub const counter_set = @import("counter_set.zig");
 pub const credit_ledger = @import("credit_ledger.zig");
 pub const custom_macro = @import("custom_macro.zig");
 pub const daily_streak = @import("daily_streak.zig");
-pub const dccallow = @import("dccallow.zig");
 pub const dedup_window = @import("dedup_window.zig");
 pub const delegation = @import("delegation.zig");
 pub const delivery_receipt = @import("delivery_receipt.zig");
@@ -234,7 +233,6 @@ test {
     _ = credit_ledger;
     _ = custom_macro;
     _ = daily_streak;
-    _ = dccallow;
     _ = dedup_window;
     _ = delegation;
     _ = delivery_receipt;

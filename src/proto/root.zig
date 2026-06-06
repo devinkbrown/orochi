@@ -143,7 +143,6 @@ pub const signed_object = @import("signed_object.zig");
 pub const silence = @import("silence.zig");
 pub const snomask = @import("snomask.zig");
 pub const socks5 = @import("socks5.zig");
-pub const spamfilter = @import("spamfilter.zig");
 pub const standard_replies_emit = @import("standard_replies_emit.zig");
 pub const standard_replies_props = @import("standard_replies_props.zig");
 pub const standard_replies = @import("standard_replies.zig");
@@ -319,7 +318,6 @@ test {
     _ = silence;
     _ = snomask;
     _ = socks5;
-    _ = spamfilter;
     _ = standard_replies_emit;
     _ = standard_replies_props;
     _ = standard_replies;
