@@ -21,6 +21,12 @@ pub const ChannelMode = enum(u4) {
     no_external,
     topic_ops,
     secret,
+    // Mizuchi Tier-1 boolean flags (see docs/mode_rearchitecture.md).
+    no_ctcp, // C: block channel CTCP (except ACTION) from non-ops
+    no_notice, // T: block channel NOTICE from non-ops
+    no_nick, // N: block nick changes by non-ops while joined
+    free_invite, // g: any member may INVITE while +i
+    tls_only, // S: join only permitted over a TLS session
 };
 
 /// Channel MODE operation direction.
@@ -93,6 +99,11 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .no_external, .letter = 'n', .name = "no-external", .kind = .flag_d },
     .{ .mode = .topic_ops, .letter = 't', .name = "topic-ops", .kind = .flag_d },
     .{ .mode = .secret, .letter = 's', .name = "secret", .kind = .flag_d },
+    .{ .mode = .no_ctcp, .letter = 'C', .name = "no-ctcp", .kind = .flag_d },
+    .{ .mode = .no_notice, .letter = 'T', .name = "no-notice", .kind = .flag_d },
+    .{ .mode = .no_nick, .letter = 'N', .name = "no-nick", .kind = .flag_d },
+    .{ .mode = .free_invite, .letter = 'g', .name = "free-invite", .kind = .flag_d },
+    .{ .mode = .tls_only, .letter = 'S', .name = "tls-only", .kind = .flag_d },
 };
 
 /// Caller-owned storage for one type-A channel mode list.
@@ -149,6 +160,11 @@ pub const ChannelModes = struct {
     no_external: bool = false,
     topic_ops: bool = false,
     secret: bool = false,
+    no_ctcp: bool = false,
+    no_notice: bool = false,
+    no_nick: bool = false,
+    free_invite: bool = false,
+    tls_only: bool = false,
 
     pub fn init(
         ban_storage: [][]const u8,
@@ -173,6 +189,11 @@ pub const ChannelModes = struct {
             .no_external => self.no_external,
             .topic_ops => self.topic_ops,
             .secret => self.secret,
+            .no_ctcp => self.no_ctcp,
+            .no_notice => self.no_notice,
+            .no_nick => self.no_nick,
+            .free_invite => self.free_invite,
+            .tls_only => self.tls_only,
             else => false,
         };
     }
@@ -202,6 +223,11 @@ pub const ChannelModes = struct {
             .no_external => &self.no_external,
             .topic_ops => &self.topic_ops,
             .secret => &self.secret,
+            .no_ctcp => &self.no_ctcp,
+            .no_notice => &self.no_notice,
+            .no_nick => &self.no_nick,
+            .free_invite => &self.free_invite,
+            .tls_only => &self.tls_only,
             else => return false,
         };
         if (slot.* == enabled) return false;
@@ -430,6 +456,11 @@ pub fn letterOf(mode: ChannelMode) u8 {
         .no_external => 'n',
         .topic_ops => 't',
         .secret => 's',
+        .no_ctcp => 'C',
+        .no_notice => 'T',
+        .no_nick => 'N',
+        .free_invite => 'g',
+        .tls_only => 'S',
     };
 }
 
@@ -530,7 +561,7 @@ fn applyOne(modes: *ChannelModes, change: AppliedChange) ChanModeError!bool {
                 return true;
             },
         },
-        .invite_only, .moderated, .no_external, .topic_ops, .secret => {
+        .invite_only, .moderated, .no_external, .topic_ops, .secret, .no_ctcp, .no_notice, .no_nick, .free_invite, .tls_only => {
             return modes.setFlag(change.mode, change.op == .add);
         },
     }

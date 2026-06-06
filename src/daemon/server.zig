@@ -494,6 +494,7 @@ const Numeric = enum(u16) {
     RPL_MAP = 15,
     RPL_MAPEND = 17,
     RPL_PRIVS = 270,
+    ERR_SECUREONLYCHAN = 489,
     RPL_LINKS = 364,
     RPL_ENDOFLINKS = 365,
     RPL_YOUREOPER = 381,
@@ -695,6 +696,9 @@ pub const ConnState = struct {
     send_offset: usize = 0,
     send_armed: bool = false,
     closing: bool = false,
+    /// Whether this session was accepted over TLS (implicit-TLS connection fact;
+    /// there is no STARTTLS). Gates +S channels. False until TLS lands.
+    is_tls: bool = false,
     /// IRCX opt-in: set true after the client sends `IRCX` (draft-pfenning §IRCX).
     /// Gates IRCX-only behaviors; base RFC1459/IRCv3 always works regardless.
     ircx: bool = false,
@@ -1822,6 +1826,13 @@ pub const LinuxServer = struct {
         const wid = worldIdFromClient(id);
         const invited = self.world.hasInvite(channel, wid);
 
+        // +S TLS-only: join permitted only over a TLS session (implicit-TLS fact;
+        // no STARTTLS). Server opers bypass.
+        if (self.world.channelHasFlag(channel, .tls_only) and !conn.is_tls and !conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_SECUREONLYCHAN, &.{channel}, "Cannot join channel (+S) - TLS required");
+            return true;
+        }
+
         // +a AUTHONLY (IRCX): only authenticated accounts may join, regardless of
         // invite. Enforced before all other gates.
         if (self.world.channelHasExtFlag(channel, .authonly) and conn.session.account() == null) {
@@ -2186,13 +2197,18 @@ pub const LinuxServer = struct {
                         targets.append(target_nick) catch break;
                     }
                 },
-                'i', 'm', 'n', 't', 's' => {
+                'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S' => {
                     const mode: world_model.ChannelMode = switch (ch) {
                         'i' => .invite_only,
                         'm' => .moderated,
                         'n' => .no_external,
                         't' => .topic_ops,
                         's' => .secret,
+                        'C' => .no_ctcp,
+                        'T' => .no_notice,
+                        'N' => .no_nick,
+                        'g' => .free_invite,
+                        'S' => .tls_only,
                         else => unreachable,
                     };
                     const changed = self.world.setChannelFlag(channel, mode, adding) catch continue;
@@ -2667,7 +2683,7 @@ pub const LinuxServer = struct {
             .on_channel = inviter_modes != null,
             .is_operator = if (inviter_modes) |m| m.isOperator() else false,
             .invite_only = self.world.channelHasFlag(args.channel, .invite_only),
-            .free_invite = false,
+            .free_invite = self.world.channelHasFlag(args.channel, .free_invite),
             .target_on_channel = if (target_wid) |t| self.world.isMember(args.channel, t) else false,
         });
         switch (result) {
@@ -4229,6 +4245,23 @@ pub const LinuxServer = struct {
         if (std.mem.eql(u8, old, newnick)) return; // no-op
         const wid = worldIdFromClient(id);
 
+        // +N no-nick: a non-op member of any +N channel may not change nick.
+        // Server opers bypass.
+        if (!conn.session.isOper()) {
+            var nit = self.world.channels.iterator();
+            while (nit.next()) |entry| {
+                if (!entry.value_ptr.members.contains(wid)) continue;
+                if (!self.world.channelHasFlag(entry.key_ptr.*, .no_nick)) continue;
+                const mm = self.world.memberModes(entry.key_ptr.*, wid) orelse world_model.MemberModes.empty();
+                if (!mm.isOperator()) {
+                    var nb: [default_reply_bytes]u8 = undefined;
+                    const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Cannot change nick while on {s} (+N)\r\n", .{ server_name, old, entry.key_ptr.* }) catch return;
+                    try appendToConn(conn, note);
+                    return;
+                }
+            }
+        }
+
         // Reserve the new nick (frees the old mapping for this client).
         self.world.registerNick(newnick, wid) catch |err| switch (err) {
             error.NickInUse => {
@@ -5431,6 +5464,16 @@ pub const LinuxServer = struct {
                     return;
                 }
             }
+            // Op-bypass gates (+C no-ctcp, +T no-notice). Ops/voiced-or-higher and
+            // server opers are exempt; ACTION is never treated as blockable CTCP.
+            const sender_op = (self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty()).isOperator() or conn.session.isOper();
+            if (!sender_op and self.world.channelHasFlag(chan, .no_ctcp) and isBlockableCtcp(text)) {
+                if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+C: no CTCP)");
+                return;
+            }
+            if (is_notice and !sender_op and self.world.channelHasFlag(chan, .no_notice)) {
+                return; // +T: drop channel NOTICE from non-ops (NOTICE never auto-replies)
+            }
             // STATUSMSG sender gate (chanop-or-voiced): only a
             // member who is voiced-or-higher may send to a status-prefixed target.
             if (min_rank > 0) {
@@ -5900,6 +5943,16 @@ fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
         conn.session.username(),
         hostOf(conn),
     }) catch return error.OutputTooSmall;
+}
+
+/// Whether `text` is a CTCP request that `+C` should block — i.e. wrapped in
+/// \x01 and NOT a CTCP ACTION (/me stays allowed).
+fn isBlockableCtcp(text: []const u8) bool {
+    if (text.len < 2 or text[0] != 0x01 or text[text.len - 1] != 0x01) return false;
+    const body = text[1 .. text.len - 1];
+    const action = "ACTION";
+    if (body.len >= action.len and std.ascii.eqlIgnoreCase(body[0..action.len], action)) return false;
+    return true;
 }
 
 /// The host to show for `conn`: its visible (cloaked/vhost) host, falling back
