@@ -906,6 +906,10 @@ pub const LinuxServer = struct {
     /// message ids for CHATHISTORY/REDACT (better than a per-node counter on a mesh).
     snowflake: snowflake_id.Generator,
     accept_armed: bool = false,
+    /// Oper-set drain mode: when true, new client connections are refused (S2S
+    /// links and existing clients are unaffected). Toggled by the DRAIN command
+    /// for graceful pre-shutdown / maintenance windows.
+    draining: bool = false,
     /// Whether the periodic timeout-sweep timer is currently in flight.
     timer_armed: bool = false,
     /// Observability: a lock-free flight recorder (last N structured events,
@@ -1268,6 +1272,16 @@ pub const LinuxServer = struct {
         // Capture the peer host (real + auto-cloak) before the client registers,
         // so its first JOIN/PRIVMSG prefix already carries the cloaked host.
         self.captureClientHost(conn);
+
+        // Drain mode: refuse new client connections (oper-initiated maintenance).
+        if (self.draining) {
+            appendToConn(conn, ":" ++ server_name ++ " ERROR :Server is draining; try again later\r\n") catch {};
+            conn.close_reason = "Server draining";
+            conn.closing = true;
+            self.armSendIfNeeded(conn) catch {};
+            self.stats.onAccept();
+            return;
+        }
 
         // IP reputation: refuse a peer whose decaying penalty score has reached
         // the configured threshold (drain-close, same as clone refusal).
@@ -1944,6 +1958,8 @@ pub const LinuxServer = struct {
             try self.handleKill(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLOSE")) {
             try self.handleClose(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "DRAIN")) {
+            try self.handleDrain(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WARD")) {
             try self.handleWard(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOWAS")) {
@@ -3137,6 +3153,22 @@ pub const LinuxServer = struct {
     /// anti-flood tool: clears half-open/handshake-stalled clients without
     /// touching registered users or server links. Each victim is torn down via
     /// the standard drain-close path (queue ERROR, mark closing, arm send).
+    /// `DRAIN [OFF]` (oper) — toggle drain mode. With no arg (or `ON`) the server
+    /// refuses new client connections; `DRAIN OFF` resumes accepting. Existing
+    /// clients and S2S links are never affected.
+    fn handleDrain(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        const off = parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "OFF");
+        self.draining = !off;
+        var buf: [default_reply_bytes]u8 = undefined;
+        const state = if (self.draining) "enabled (refusing new connections)" else "disabled (accepting connections)";
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :DRAIN {s}\r\n", .{ server_name, conn.session.displayName(), state }) catch return;
+        try appendToConn(conn, line);
+    }
+
     fn handleClose(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
