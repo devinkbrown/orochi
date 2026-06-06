@@ -116,4 +116,3 @@ test "message cap is enforced" {
     const long = "x" ** 401;
     try std.testing.expectError(error.MessageTooLong, welcome.set("#dev", long));
 }
-

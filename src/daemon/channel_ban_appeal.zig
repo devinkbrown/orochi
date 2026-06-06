@@ -155,4 +155,3 @@ test "text cap is enforced" {
     try std.testing.expectError(error.TextTooLong, appeals.file("#dev", "alice", long));
     try std.testing.expectError(error.EmptyText, appeals.file("#dev", "alice", ""));
 }
-

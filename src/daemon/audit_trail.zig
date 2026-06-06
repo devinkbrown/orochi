@@ -136,4 +136,3 @@ test "AuditTrail ring keeps newest records" {
     try std.testing.expectEqual(@as(u64, 3), out[0].seq);
     try std.testing.expectEqual(trail.latestSeq(), out[count - 1].seq);
 }
-

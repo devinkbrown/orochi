@@ -140,4 +140,3 @@ test "cancel reports whether an offer existed" {
     try std.testing.expect(!xfer.cancel("#team"));
     try std.testing.expect(xfer.pendingTo("#team") == null);
 }
-

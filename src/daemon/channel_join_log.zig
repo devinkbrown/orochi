@@ -162,4 +162,3 @@ test "record rejects empty names" {
     try std.testing.expectError(error.EmptyChannel, log.record("", "alice", 1));
     try std.testing.expectError(error.EmptyAccount, log.record("#dev", "", 1));
 }
-

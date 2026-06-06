@@ -114,4 +114,3 @@ test "empty names are rejected" {
     try std.testing.expectError(error.EmptyName, rules.ack("", "alice"));
     try std.testing.expectError(error.EmptyName, rules.ack("#dev", ""));
 }
-

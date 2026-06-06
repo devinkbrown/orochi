@@ -50,4 +50,3 @@ test "AbBucket includes experiment in hash input" {
     const b = buckets.bucket("stable-account", "exp-b", 4_294_967_291);
     try std.testing.expect(a != b);
 }
-
