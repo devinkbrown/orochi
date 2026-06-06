@@ -37,6 +37,7 @@ const host_request_mod = @import("host_request.zig");
 const guise_mod = @import("guise.zig");
 const shun_mod = @import("shun.zig");
 const autojoin_mod = @import("autojoin.zig");
+const memo_group_mod = @import("memo_group.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -798,6 +799,8 @@ pub const LinuxServer = struct {
     shuns: shun_mod.ShunList,
     /// Per-account auto-join channel lists, applied on login.
     autojoins: autojoin_mod.AutoJoin,
+    /// Per-account grouped-nick sets (GROUP), with a primary nick.
+    nick_groups: memo_group_mod.NickGroup,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -896,6 +899,7 @@ pub const LinuxServer = struct {
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
             .autojoins = autojoin_mod.AutoJoin.init(allocator),
+            .nick_groups = memo_group_mod.NickGroup.init(allocator),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -945,6 +949,7 @@ pub const LinuxServer = struct {
         self.guises.deinit();
         self.shuns.deinit();
         self.autojoins.deinit();
+        self.nick_groups.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1636,6 +1641,8 @@ pub const LinuxServer = struct {
             try self.handleGlobal(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "AUTOJOIN")) {
             try self.handleAutojoin(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "GROUP")) {
+            try self.handleGroup(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
             try self.handleRegister(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
@@ -3282,6 +3289,56 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "AUTOJOIN removed");
         } else {
             try self.noticeTo(conn, "Usage: AUTOJOIN <ADD|DEL|LIST> [#channel]");
+        }
+    }
+
+    /// `GROUP <ADD|DEL|LIST|PRIMARY> [nick]` — group multiple nicks under the
+    /// caller's account, with a primary. Backed by memo_group.NickGroup. Requires
+    /// login. (Distinct from single-nick reservation in reserved_nick.)
+    fn handleGroup(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const account = conn.session.account() orelse {
+            try self.failReply(conn, "GROUP", "ACCOUNT_REQUIRED", "Log in to manage your nick group");
+            return;
+        };
+        const p = parsed.paramSlice();
+        if (p.len == 0 or std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            var buf: [64][]const u8 = undefined;
+            const nicks = self.nick_groups.list(account, &buf) catch &.{};
+            const primary = (self.nick_groups.primary(account) catch null) orelse "";
+            for (nicks) |nk| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const star: []const u8 = if (std.ascii.eqlIgnoreCase(nk, primary)) " (primary)" else "";
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :GROUP {s}{s}\r\n", .{ server_name, conn.session.displayName(), nk, star }) catch continue;
+                try appendToConn(conn, line);
+            }
+            try self.noticeTo(conn, "GROUP: end of list");
+            return;
+        }
+        if (p.len < 2 or p[1].len == 0) {
+            try self.noticeTo(conn, "Usage: GROUP <ADD|DEL|LIST|PRIMARY> [nick]");
+            return;
+        }
+        const nick = p[1];
+        if (std.ascii.eqlIgnoreCase(p[0], "ADD")) {
+            _ = self.nick_groups.add(account, nick) catch {
+                try self.noticeTo(conn, "GROUP: could not add (invalid, duplicate, or limit)");
+                return;
+            };
+            try self.noticeTo(conn, "GROUP nick added");
+        } else if (std.ascii.eqlIgnoreCase(p[0], "DEL")) {
+            _ = self.nick_groups.remove(account, nick) catch {
+                try self.noticeTo(conn, "GROUP: no such grouped nick");
+                return;
+            };
+            try self.noticeTo(conn, "GROUP nick removed");
+        } else if (std.ascii.eqlIgnoreCase(p[0], "PRIMARY")) {
+            self.nick_groups.setPrimary(account, nick) catch {
+                try self.noticeTo(conn, "GROUP: nick must be in your group first");
+                return;
+            };
+            try self.noticeTo(conn, "GROUP primary set");
+        } else {
+            try self.noticeTo(conn, "Usage: GROUP <ADD|DEL|LIST|PRIMARY> [nick]");
         }
     }
 
