@@ -160,6 +160,20 @@ fn buildTagPrefix(session: *const dispatch.ClientSession, tags: LinuxServer.MsgT
             any = true;
         }
     }
+    // Relay the sender's CLIENT-ONLY (`+`) tags to message-tags recipients,
+    // merged into the single @-segment. Server-supplied tags in the sender's
+    // segment (no `+`) are NOT relayed, so a client can't spoof server-time etc.
+    if (tags.client_tags) |raw| {
+        if (session.hasCap(.message_tags)) {
+            var it = std.mem.splitScalar(u8, raw, ';');
+            while (it.next()) |t| {
+                if (t.len == 0 or t[0] != '+') continue;
+                b.append(if (any) ";" else "@") catch return "";
+                b.append(t) catch return "";
+                any = true;
+            }
+        }
+    }
     if (!any) return "";
     b.appendByte(' ') catch return "";
     return b.written();
@@ -1343,6 +1357,9 @@ pub const LinuxServer = struct {
     const MsgTags = struct {
         time_value: []const u8, // ISO-8601, e.g. "2026-06-04T..Z" (no key)
         account: ?[]const u8, // sender's account, or null when not logged in
+        /// Sender's raw IRCv3 tag segment (no leading '@'); only its client-only
+        /// (`+...`) tags are relayed, to recipients negotiating message-tags.
+        client_tags: ?[]const u8 = null,
     };
 
     /// Deliver `bytes` with an IRCv3 message-tag segment assembled for THIS
@@ -6349,7 +6366,7 @@ pub const LinuxServer = struct {
         var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
         while (targets.next()) |target| {
             if (target.len == 0) continue;
-            try self.messageOne(id, conn, command, target, text);
+            try self.messageOne(id, conn, command, target, text, parsed.tags_raw);
         }
     }
 
@@ -6360,6 +6377,7 @@ pub const LinuxServer = struct {
         command: []const u8,
         target: []const u8,
         text: []const u8,
+        client_tags: ?[]const u8,
     ) !void {
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
@@ -6450,7 +6468,7 @@ pub const LinuxServer = struct {
                 }
             }
             var time_buf: [40]u8 = undefined;
-            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
+            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags };
             if (min_rank == 0) {
                 try self.broadcastChannelTagged(chan, ctags, msg, id);
             } else {
@@ -6485,7 +6503,7 @@ pub const LinuxServer = struct {
             if (self.silence.isSilenced(target, sender_mask)) return;
         }
         var time_buf: [40]u8 = undefined;
-        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
+        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags };
         try self.deliverTagged(clientIdFromWorld(recipient), dtags, msg);
         if (echo) try self.deliverTagged(id, dtags, msg);
 
