@@ -178,6 +178,7 @@ pub const CapId = enum(u6) {
     invite_notify,
     account_tag,
     mizuchi_bouncer,
+    chghost,
 };
 
 const CapSet = struct {
@@ -221,6 +222,9 @@ const cap_specs = [_]CapSpec{
     // history on (re)join, bounded by the client's read marker). Multi-session
     // reclaim (SESSION RESUME) works without it; this only enables auto-replay.
     .{ .id = .mizuchi_bouncer, .name = "mizuchi/bouncer" },
+    // chghost: receive a native CHGHOST line when a common user's host changes
+    // (VHOST). Clients without it see the new host on the user's next message.
+    .{ .id = .chghost, .name = "chghost" },
     // account-notify is enumerated but not advertised: the only auth change is
     // SASL during pre-registration, before the client shares any channel, so
     // there is no post-join ACCOUNT event to deliver yet.

@@ -45,6 +45,7 @@ const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
+const chghost = @import("../proto/chghost.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
@@ -1548,6 +1549,8 @@ pub const LinuxServer = struct {
             try self.handleAccountInfo(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SESSION")) {
             try self.handleSession(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "VHOST")) {
+            try self.handleVhost(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
@@ -4500,6 +4503,53 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{server_name}) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// `VHOST <newhost>` — oper-only visible-host override. Updates the caller's
+    /// visible host and broadcasts a native CHGHOST to common-channel members who
+    /// negotiated the chghost cap (others see the new host on the next message).
+    fn handleVhost(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"VHOST"}, "Usage: VHOST <host>");
+            return;
+        }
+        const new_host = parsed.paramSlice()[0];
+        const user = conn.session.username();
+        chghost.validateHost(new_host) catch {
+            try self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
+            return;
+        };
+
+        // Build the CHGHOST line from the OLD prefix before mutating the host.
+        var prefix_buf: [256]u8 = undefined;
+        const old_prefix = clientPrefix(conn, &prefix_buf) catch return;
+        // old_prefix is nick!user@oldhost; split it back into a chghost.Prefix.
+        const bang = std.mem.indexOfScalar(u8, old_prefix, '!') orelse return;
+        const at = std.mem.indexOfScalarPos(u8, old_prefix, bang + 1, '@') orelse return;
+        const pfx = chghost.Prefix{
+            .nick = old_prefix[0..bang],
+            .user = old_prefix[bang + 1 .. at],
+            .host = old_prefix[at + 1 ..],
+        };
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const body = chghost.buildChghostLine(&line_buf, pfx, user, new_host) catch {
+            try self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
+            return;
+        };
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s}\r\n", .{body}) catch return;
+
+        // Apply the new visible host, then fan the CHGHOST out.
+        conn.session.setVisibleHost(new_host);
+        try self.notifyCommonChannels(id, msg, .chghost, id);
+        if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
+        var note_buf: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&note_buf, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ server_name, conn.session.displayName(), new_host }) catch return;
+        try appendToConn(conn, note);
     }
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.
