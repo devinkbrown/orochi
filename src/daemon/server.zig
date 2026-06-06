@@ -486,6 +486,7 @@ const default_host = "localhost";
 const Numeric = enum(u16) {
     RPL_MAP = 15,
     RPL_MAPEND = 17,
+    RPL_PRIVS = 270,
     RPL_LINKS = 364,
     RPL_ENDOFLINKS = 365,
     RPL_YOUREOPER = 381,
@@ -1551,6 +1552,8 @@ pub const LinuxServer = struct {
             try self.handleSession(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "VHOST")) {
             try self.handleVhost(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "PRIVS")) {
+            try self.handlePrivs(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
@@ -4503,6 +4506,40 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{server_name}) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// `PRIVS` — report the caller's operator class and privilege set
+    /// (RPL_PRIVS 270). Re-derived from the oper registry by account, so it
+    /// always reflects the current config binding.
+    fn handlePrivs(self: *LinuxServer, conn: *ConnState) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        const registry = self.oper_registry orelse {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "No operator registry configured");
+            return;
+        };
+        const account = conn.session.account() orelse return;
+        const grant = registry.elevate(.{ .name = account }) catch {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "No operator privileges for your account");
+            return;
+        };
+        var buf: [default_reply_bytes]u8 = undefined;
+        var n: usize = 0;
+        var it = grant.privileges.set.iterator();
+        while (it.next()) |p| {
+            const name = @tagName(p);
+            if (n != 0 and n < buf.len) {
+                buf[n] = ' ';
+                n += 1;
+            }
+            if (n + name.len <= buf.len) {
+                @memcpy(buf[n .. n + name.len], name);
+                n += name.len;
+            }
+        }
+        try queueNumeric(conn, .RPL_PRIVS, &.{ conn.session.displayName(), grant.class_name }, buf[0..n]);
     }
 
     /// `VHOST <newhost>` — oper-only visible-host override. Updates the caller's
