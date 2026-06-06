@@ -5155,7 +5155,8 @@ pub const LinuxServer = struct {
                     return;
                 };
                 const ci = result.channel_info;
-                try channelNotice(conn, "channel={s} founder={s} flags={d}", .{ ci.name.asSlice(), ci.founder.asSlice(), ci.flags });
+                const mlock = self.mlocks.get(r.channel) orelse "";
+                try channelNotice(conn, "channel={s} founder={s} flags={d} mlock={s}", .{ ci.name.asSlice(), ci.founder.asSlice(), ci.flags, mlock });
             },
             .set => |r| {
                 // Only the registered founder may SET channel properties.
