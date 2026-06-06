@@ -32,6 +32,7 @@ const whisper = @import("../proto/whisper.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
 const chanserv_cmd = @import("../proto/chanserv_cmd.zig");
+const oper_motd_mod = @import("../proto/oper_motd.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
@@ -782,6 +783,8 @@ pub const LinuxServer = struct {
     silence: silence.Store,
     /// Operator OBSERVE subscriptions (live Event-Spine surveillance feed).
     observe: observe_mod.Registry,
+    /// Operator MOTD (OPERMOTD), distinct from the user MOTD.
+    oper_motd: oper_motd_mod.OperMotd,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -875,6 +878,7 @@ pub const LinuxServer = struct {
             .read_markers = read_marker_store.DefaultStore.init(allocator),
             .silence = silence.Store.init(allocator),
             .observe = observe_mod.Registry.init(allocator, .{}),
+            .oper_motd = oper_motd_mod.OperMotd.init(allocator),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -919,6 +923,7 @@ pub const LinuxServer = struct {
         self.accepts.deinit();
         self.silence.deinit();
         self.observe.deinit();
+        self.oper_motd.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1596,6 +1601,8 @@ pub const LinuxServer = struct {
             try self.handleAway(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SETNAME")) {
             try self.handleSetname(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPERMOTD")) {
+            try self.handleOperMotd(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
             try self.handleRegister(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
@@ -3171,6 +3178,38 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes * 4]u8 = undefined;
         const batch = chathistory_cmd.writeBatch(&out_buf, "1", target, cmsgs[0..cn]) catch return;
         try appendToConn(conn, batch);
+    }
+
+    /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
+    /// ERR_NOOPERMOTD if unset). `OPERMOTD SET :<text>` (oper-only) replaces it.
+    fn handleOperMotd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        const p = parsed.paramSlice();
+        if (p.len >= 1 and std.ascii.eqlIgnoreCase(p[0], "SET")) {
+            const text = if (p.len >= 2) p[1] else "";
+            self.oper_motd.setFromText(text) catch {
+                try self.noticeTo(conn, "OPERMOTD: could not set (too long)");
+                return;
+            };
+            try self.noticeTo(conn, "OPERMOTD updated");
+            return;
+        }
+        const nick = conn.session.displayName();
+        var buf: [default_reply_bytes]u8 = undefined;
+        if (self.oper_motd.isEmpty()) {
+            const line = oper_motd_mod.buildNoOperMotd(&buf, server_name, nick) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+        if (oper_motd_mod.buildOperMotdStart(&buf, server_name, nick)) |line| try appendToConn(conn, line) else |_| {}
+        for (self.oper_motd.lines()) |l| {
+            var lb: [default_reply_bytes]u8 = undefined;
+            if (oper_motd_mod.buildOperMotdLine(&lb, server_name, nick, l)) |line| try appendToConn(conn, line) else |_| {}
+        }
+        if (oper_motd_mod.buildOperMotdEnd(&buf, server_name, nick)) |line| try appendToConn(conn, line) else |_| {}
     }
 
     /// `WARD <ADD|DEL|LIST|TEST> …` — the unified network-ban command for admins

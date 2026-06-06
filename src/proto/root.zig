@@ -159,7 +159,6 @@ pub const usermode = @import("usermode.zig");
 pub const utf8_guard = @import("utf8_guard.zig");
 pub const utf8_only = @import("utf8_only.zig");
 pub const vp8_payload = @import("vp8_payload.zig");
-pub const watch = @import("watch.zig");
 pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
 pub const webtransport = @import("webtransport.zig");
@@ -336,7 +335,6 @@ test {
     _ = utf8_guard;
     _ = utf8_only;
     _ = vp8_payload;
-    _ = watch;
     _ = websocket_props;
     _ = websocket;
     _ = webtransport;
