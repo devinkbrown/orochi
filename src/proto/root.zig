@@ -30,6 +30,7 @@ pub const chathistory = @import("chathistory.zig");
 pub const chathistory_cmd = @import("chathistory_cmd.zig");
 pub const chathistory_props = @import("chathistory_props.zig");
 pub const chathistory_query = @import("chathistory_query.zig");
+pub const chathistory_targets = @import("chathistory_targets.zig");
 pub const chghost_apply = @import("chghost_apply.zig");
 pub const chghost = @import("chghost.zig");
 pub const cidr_match = @import("cidr_match.zig");
@@ -207,6 +208,7 @@ test {
     _ = chathistory_cmd;
     _ = chathistory_props;
     _ = chathistory_query;
+    _ = chathistory_targets;
     _ = chghost_apply;
     _ = chghost;
     _ = cidr_match;
