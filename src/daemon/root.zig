@@ -19,6 +19,7 @@ pub const dispatch = @import("dispatch.zig");
 pub const event_spine = @import("event_spine.zig");
 pub const flood = @import("flood.zig");
 pub const flood_guard = @import("flood_guard.zig");
+pub const media_room = @import("media_room.zig");
 pub const node_identity = @import("node_identity.zig");
 pub const oper = @import("oper.zig");
 pub const registry = @import("registry.zig");
@@ -55,6 +56,7 @@ test {
     _ = event_spine;
     _ = flood;
     _ = flood_guard;
+    _ = media_room;
     _ = node_identity;
     _ = oper;
     _ = registry;

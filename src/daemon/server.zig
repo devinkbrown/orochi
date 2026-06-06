@@ -47,6 +47,7 @@ const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const chghost = @import("../proto/chghost.zig");
 const content_filter_mod = @import("content_filter.zig");
+const media_room = @import("media_room.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
@@ -790,6 +791,8 @@ pub const LinuxServer = struct {
     sessions: sessions_mod.SessionStore,
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
+    /// Per-channel media rooms (LADON SFU control plane): who is in each call.
+    media_rooms: media_room.MediaRooms,
     /// Server-owned config reloaded by the most recent REHASH. The live
     /// `oper_registry` borrows `reload_bindings`, which borrow `reload_parsed`;
     /// all three are freed (and the prior generation replaced) on each REHASH and
@@ -860,6 +863,7 @@ pub const LinuxServer = struct {
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
             .sessions = sessions_mod.SessionStore.init(allocator),
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
+            .media_rooms = media_room.MediaRooms.init(allocator),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
             .reactor = config.reactor,
@@ -894,6 +898,7 @@ pub const LinuxServer = struct {
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
+        self.media_rooms.deinit();
         self.allocator.free(self.reload_bindings);
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
         self.read_markers.deinit();
@@ -1389,6 +1394,8 @@ pub const LinuxServer = struct {
                 const nick = conn.session.displayName();
                 if (!std.mem.eql(u8, nick, "*")) self.monitorOffline(id, nick) catch {};
             }
+            // Media: drop the departing nick from any call, notifying members.
+            if (conn.session.registered()) self.leaveAllMediaRooms(id, conn);
             try self.broadcastQuit(id, conn, reason);
             closeFd(conn.fd);
             _ = self.clients.free(id);
@@ -1575,6 +1582,8 @@ pub const LinuxServer = struct {
             try self.handlePrivs(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "FILTER")) {
             try self.handleFilter(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MEDIA")) {
+            try self.handleMedia(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
@@ -4527,6 +4536,136 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{server_name}) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// `MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind] [arg]` —
+    /// LADON media control plane. Drives the per-channel SFU participant model and
+    /// broadcasts room presence to channel members as `NOTE MEDIA` events so
+    /// clients can render the call. The media bytes flow over the transport
+    /// substrate, not this control socket. Caller must be a channel member.
+    fn handleMedia(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind]");
+            return;
+        }
+        const sub = parsed.paramSlice()[0];
+        const channel = parsed.paramSlice()[1];
+        if (!world_model.isChannelName(channel) or !self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        if (!self.world.isMember(channel, worldIdFromClient(id))) {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+            return;
+        }
+        const nick = conn.session.displayName();
+
+        if (std.ascii.eqlIgnoreCase(sub, "ROSTER")) {
+            try self.mediaRoster(conn, channel);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
+            if (self.media_rooms.leaveAll(channel, nick))
+                try self.broadcastMediaEvent(channel, "LEAVE", nick, "")
+            else
+                try self.noticeTo(conn, "MEDIA: you are not in this call");
+            return;
+        }
+
+        // The remaining subcommands all take a kind (default voice).
+        const kind_tok = if (parsed.param_count >= 3) parsed.paramSlice()[2] else "voice";
+        const kind = media_room.parseKind(kind_tok) orelse {
+            try self.failReply(conn, "MEDIA", "INVALID_KIND", "Kind must be voice, video, or screen");
+            return;
+        };
+        const kname = media_room.kindName(kind);
+
+        if (std.ascii.eqlIgnoreCase(sub, "JOIN")) {
+            self.media_rooms.join(channel, nick, kind) catch {
+                try self.failReply(conn, "MEDIA", "JOIN_FAILED", "Could not join the call");
+                return;
+            };
+            try self.broadcastMediaEvent(channel, "JOIN", nick, kname);
+        } else if (std.ascii.eqlIgnoreCase(sub, "MUTE")) {
+            if (self.media_rooms.setMuted(channel, nick, kind, true))
+                try self.broadcastMediaEvent(channel, "MUTE", nick, kname)
+            else
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "You are not publishing that kind");
+        } else if (std.ascii.eqlIgnoreCase(sub, "UNMUTE")) {
+            if (self.media_rooms.setMuted(channel, nick, kind, false))
+                try self.broadcastMediaEvent(channel, "UNMUTE", nick, kname)
+            else
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "You are not publishing that kind");
+        } else if (std.ascii.eqlIgnoreCase(sub, "SPEAKING")) {
+            const on = parsed.param_count >= 4 and
+                (std.ascii.eqlIgnoreCase(parsed.paramSlice()[3], "on") or std.ascii.eqlIgnoreCase(parsed.paramSlice()[3], "1"));
+            if (self.media_rooms.setSpeaking(channel, nick, kind, on))
+                try self.broadcastMediaEvent(channel, if (on) "SPEAKING" else "SILENT", nick, kname)
+            else
+                try self.failReply(conn, "MEDIA", "NOT_PUBLISHING", "You are not publishing that kind");
+        } else {
+            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, or ROSTER");
+        }
+    }
+
+    /// Broadcast a `:server NOTE MEDIA <#chan> <verb> <nick> [kind]` presence
+    /// event to every member of `channel` (including the actor).
+    fn broadcastMediaEvent(self: *LinuxServer, channel: []const u8, verb: []const u8, nick: []const u8, kind: []const u8) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = if (kind.len != 0)
+            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s} {s}\r\n", .{ server_name, channel, verb, nick, kind }) catch return
+        else
+            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s}\r\n", .{ server_name, channel, verb, nick }) catch return;
+        try self.broadcastChannel(channel, line, null);
+    }
+
+    /// Remove a departing client from every media call it was in, broadcasting a
+    /// LEAVE to each affected channel. Called on disconnect (before the client is
+    /// removed from the world, so it is still a member for the broadcast).
+    fn leaveAllMediaRooms(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState) void {
+        const nick = conn.session.displayName();
+        if (std.mem.eql(u8, nick, "*")) return;
+        var it = self.world.channels.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
+            if (self.media_rooms.leaveAll(entry.key_ptr.*, nick))
+                self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
+        }
+    }
+
+    /// Emit the current call roster for `channel` to the caller: one
+    /// `NOTE MEDIA <#chan> ROSTER <nick> <kinds>` line per participant.
+    fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        for (self.media_rooms.roster(channel)) |p| {
+            var kinds_buf: [32]u8 = undefined;
+            var n: usize = 0;
+            inline for (.{ media_room.MediaKind.voice, .video, .screen }) |k| {
+                if (p.joined.contains(k)) {
+                    const name = media_room.kindName(k);
+                    const mark: []const u8 = if (p.muted.contains(k)) "-" else if (p.speaking.contains(k)) "*" else "";
+                    if (n != 0 and n < kinds_buf.len) {
+                        kinds_buf[n] = ',';
+                        n += 1;
+                    }
+                    for (mark) |c| {
+                        if (n < kinds_buf.len) {
+                            kinds_buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                    if (n + name.len <= kinds_buf.len) {
+                        @memcpy(kinds_buf[n .. n + name.len], name);
+                        n += name.len;
+                    }
+                }
+            }
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n] }) catch continue;
+            try appendToConn(conn, line);
+        }
+        var end_buf: [default_reply_bytes]u8 = undefined;
+        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of roster ({d})\r\n", .{ server_name, channel, self.media_rooms.roster(channel).len }) catch return;
+        try appendToConn(conn, end);
     }
 
     /// `FILTER ADD|DEL|LIST [pattern]` — oper-only Koshi content-filter control.
