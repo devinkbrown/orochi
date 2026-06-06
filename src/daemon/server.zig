@@ -2018,6 +2018,8 @@ pub const LinuxServer = struct {
             try self.handleCreate(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TRACE")) {
             try self.handleTrace(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ETRACE")) {
+            try self.handleEtrace(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "DIE") or std.ascii.eqlIgnoreCase(parsed.command, "RESTART")) {
             try self.handleDie(conn, parsed.command);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "USERIP")) {
@@ -4155,6 +4157,37 @@ pub const LinuxServer = struct {
             trace.emitTrace(ctx, &.{entry}, &scratch, &sink) catch {};
         }
         trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = server_name }}, &scratch, &sink) catch {};
+    }
+
+    /// `ETRACE` (oper) — extended TRACE: one RPL_ETRACE (709) line per local
+    /// registered user with class, nick, user, visible+real host, account, and
+    /// real name; terminated by RPL_TRACEEND (262). Read-only.
+    fn handleEtrace(self: *LinuxServer, conn: *ConnState) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        var it = self.clients.iterator();
+        while (it.next()) |e| {
+            const c = e.value;
+            if (!c.session.registered()) continue;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            const acct = c.session.account() orelse "0";
+            const line = std.fmt.bufPrint(&buf, ":{s} 709 {s} users User {s} {s} {s} {s} {s} :{s}\r\n", .{
+                server_name,
+                conn.session.displayName(),
+                c.session.displayName(),
+                c.session.username(),
+                c.session.host(),
+                c.session.realHost(),
+                acct,
+                c.session.realname(),
+            }) catch continue;
+            appendToConn(conn, line) catch {};
+        }
+        const endl = std.fmt.bufPrint(&buf, ":{s} 262 {s} {s} :End of ETRACE\r\n", .{ server_name, conn.session.displayName(), server_name }) catch return;
+        try appendToConn(conn, endl);
     }
 
     /// Map an EVENT category token (code or tag) to a daemon EventCategory.
