@@ -40,6 +40,7 @@ const autojoin_mod = @import("autojoin.zig");
 const memo_group_mod = @import("memo_group.zig");
 const welcome_pack_mod = @import("welcome_pack.zig");
 const mode_lock_mod = @import("../proto/mode_lock.zig");
+const account_verify_mod = @import("account_verify.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -821,6 +822,8 @@ pub const LinuxServer = struct {
     welcome: welcome_pack_mod.WelcomePack,
     /// Per-channel services mode-lock specs (MLOCK), keyed by channel name.
     mlocks: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Pending account email/token verifications (REGISTER -> VERIFY).
+    account_verifies: account_verify_mod.VerifyStore,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -921,6 +924,7 @@ pub const LinuxServer = struct {
             .autojoins = autojoin_mod.AutoJoin.init(allocator),
             .nick_groups = memo_group_mod.NickGroup.init(allocator),
             .welcome = welcome_pack_mod.WelcomePack.init(allocator),
+            .account_verifies = account_verify_mod.VerifyStore.init(allocator, .{ .token_bytes = 16 }),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -980,6 +984,7 @@ pub const LinuxServer = struct {
             }
             self.mlocks.deinit(self.allocator);
         }
+        self.account_verifies.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1679,6 +1684,8 @@ pub const LinuxServer = struct {
             try self.handleGroup(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WELCOME")) {
             try self.handleWelcome(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "VERIFY")) {
+            try self.handleVerify(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
             try self.handleRegister(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
@@ -3406,6 +3413,27 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// `VERIFY <code>` — confirm a pending account email verification issued at
+    /// REGISTER time. Backed by account_verify.
+    fn handleVerify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const account = conn.session.account() orelse {
+            try self.failReply(conn, "VERIFY", "ACCOUNT_REQUIRED", "Log in before verifying");
+            return;
+        };
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try self.noticeTo(conn, "Usage: VERIFY <code>");
+            return;
+        }
+        const now_u: u64 = @intCast(@max(0, self.nowMs()));
+        switch (self.account_verifies.confirm(account, parsed.paramSlice()[0], now_u)) {
+            .verified => try self.noticeTo(conn, "VERIFY: your account email is now verified"),
+            .expired => try self.failReply(conn, "VERIFY", "EXPIRED", "Verification code expired; re-register or request a new one"),
+            .no_pending => try self.noticeTo(conn, "VERIFY: nothing to verify for your account"),
+            .bad_token => try self.failReply(conn, "VERIFY", "INVALID_CODE", "Incorrect verification code"),
+            .locked => try self.failReply(conn, "VERIFY", "TOO_MANY_ATTEMPTS", "Too many attempts; verification locked"),
+        }
+    }
+
     /// `WELCOME <ADD :line | CLEAR | SHOW>` — oper-managed network onboarding
     /// pack delivered once per account on first login (backed by welcome_pack).
     fn handleWelcome(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -5037,6 +5065,20 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ server_name, account }) catch return;
         try appendToConn(conn, line);
+        // Optional email verification: when a real contact is supplied (not "*"),
+        // issue a token the user confirms with VERIFY. The account is usable
+        // immediately; verification status is tracked for features that gate on it.
+        const email = parsed.paramSlice()[1];
+        if (email.len != 0 and !std.mem.eql(u8, email, "*")) {
+            if (self.config.crypto_io) |io| {
+                var tok_bytes: [16]u8 = undefined;
+                io.random(&tok_bytes);
+                const now_u: u64 = @intCast(@max(0, self.nowMs()));
+                if (self.account_verifies.issue(account, email, &tok_bytes, now_u)) |token| {
+                    try channelNotice(conn, "VERIFY {s} to confirm your email {s}", .{ token, email });
+                } else |_| {}
+            }
+        }
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
