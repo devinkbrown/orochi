@@ -123,6 +123,12 @@ pub const IpReputation = struct {
         return self.adjust(addr, -points, now_ms);
     }
 
+    /// Forget all accumulated penalty for `addr` (oper UNREJECT). Returns true
+    /// if an entry was present and removed.
+    pub fn clear(self: *IpReputation, addr: Address) bool {
+        return self.entries.remove(Key.fromAddress(addr));
+    }
+
     /// Current time-decayed score for `addr`. Unknown addresses score 0.
     /// Read-only: does not allocate or mutate the table.
     pub fn score(self: *const IpReputation, addr: Address, now_ms: u64) f64 {

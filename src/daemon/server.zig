@@ -61,6 +61,7 @@ const tracelog = @import("../substrate/trace.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const dns = @import("../proto/dns.zig");
+const resolv_conf = @import("../proto/resolv_conf.zig");
 const clone_limit_mod = @import("clone_limit.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
@@ -1960,6 +1961,8 @@ pub const LinuxServer = struct {
             try self.handleClose(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "DRAIN")) {
             try self.handleDrain(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "UNREJECT")) {
+            try self.handleUnreject(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WARD")) {
             try self.handleWard(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOWAS")) {
@@ -3153,6 +3156,30 @@ pub const LinuxServer = struct {
     /// anti-flood tool: clears half-open/handshake-stalled clients without
     /// touching registered users or server links. Each victim is torn down via
     /// the standard drain-close path (queue ERROR, mark closing, arm send).
+    /// `UNREJECT <ip>` (oper) — forget an IP's accumulated reputation penalty so
+    /// a falsely-flagged host can reconnect immediately. No-op (but reported) if
+    /// reputation is disabled or the IP carries no penalty.
+    fn handleUnreject(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"UNREJECT"}, "Usage: UNREJECT <ip>");
+            return;
+        }
+        const ip_text = parsed.paramSlice()[0];
+        const addr = resolv_conf.parseIp(ip_text) orelse {
+            try self.failReply(conn, "UNREJECT", "INVALID_IP", "Not a valid IP address");
+            return;
+        };
+        const cleared = self.reputation.clear(addr);
+        var buf: [default_reply_bytes]u8 = undefined;
+        const state = if (cleared) "cleared" else "had no penalty";
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :UNREJECT {s}: {s}\r\n", .{ server_name, conn.session.displayName(), ip_text, state }) catch return;
+        try appendToConn(conn, line);
+    }
+
     /// `DRAIN [OFF]` (oper) — toggle drain mode. With no arg (or `ON`) the server
     /// refuses new client connections; `DRAIN OFF` resumes accepting. Existing
     /// clients and S2S links are never affected.
