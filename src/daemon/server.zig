@@ -30,6 +30,7 @@ const utf8_guard = @import("../proto/utf8_guard.zig");
 const whisper = @import("../proto/whisper.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
+const chanserv_cmd = @import("../proto/chanserv_cmd.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
@@ -1595,6 +1596,8 @@ pub const LinuxServer = struct {
             try self.handleDrop(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTINFO")) {
             try self.handleAccountInfo(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CHANNEL") or std.ascii.eqlIgnoreCase(parsed.command, "CS")) {
+            try self.handleChannel(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SESSION")) {
             try self.handleSession(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "VHOST")) {
@@ -4563,6 +4566,84 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ server_name, conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// Emit a `NOTICE` from the server to this connection (services replies use
+    /// real server NOTICEs — Mizuchi has NO pseudo-clients).
+    fn channelNotice(conn: *ConnState, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const head = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :", .{ server_name, conn.session.displayName() }) catch return;
+        try appendToConn(conn, head);
+        var body: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&body, fmt ++ "\r\n", args) catch return;
+        try appendToConn(conn, msg);
+    }
+
+    /// `CHANNEL <subcommand> …` (alias `CS`) — channel registration services as a
+    /// real server command (no pseudo-client). REGISTER/DROP/INFO are backed by
+    /// `services.zig`; REGISTER/DROP additionally reflect into the live `+r`
+    /// REGISTERED flag via the installed state hook. Founder/actor identity is the
+    /// caller's logged-in account.
+    fn handleChannel(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "CHANNEL", "TEMPORARILY_UNAVAILABLE", "Channel services are unavailable");
+        if (parsed.param_count < 1) {
+            try self.failReply(conn, "CHANNEL", "NEED_MORE_PARAMS", "Usage: CHANNEL <REGISTER|DROP|INFO|ACCESS|AKICK|SET|TRANSFER> <#channel> …");
+            return;
+        }
+        const account = conn.session.account() orelse {
+            try self.failReply(conn, "CHANNEL", "ACCOUNT_REQUIRED", "You must be logged in to use channel services");
+            return;
+        };
+        // The CHANNEL parser expects argv[0] to be the command verb; paramSlice()
+        // holds only the trailing params, so prepend the command token.
+        var argv: [16][]const u8 = undefined;
+        argv[0] = parsed.command;
+        const params = parsed.paramSlice();
+        const take = @min(params.len, argv.len - 1);
+        for (params[0..take], 0..) |p, i| argv[1 + i] = p;
+        const req = chanserv_cmd.parse(argv[0 .. 1 + take]) catch {
+            try self.failReply(conn, "CHANNEL", "INVALID_PARAMS", "Bad CHANNEL syntax");
+            return;
+        };
+        var scratch: [2048]u8 = undefined;
+        switch (req) {
+            .register => |r| {
+                _ = svc.registerChannel(r.channel, account, &scratch) catch |err| {
+                    try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel registration failed");
+                    return;
+                };
+                try channelNotice(conn, "Channel {s} registered to {s}", .{ r.channel, account });
+            },
+            .drop => |r| {
+                _ = svc.dropChannel(r.channel, account) catch |err| {
+                    try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel drop failed");
+                    return;
+                };
+                try channelNotice(conn, "Channel {s} dropped", .{r.channel});
+            },
+            .info => |r| {
+                const result = svc.channelInfo(r.channel) catch |err| {
+                    try self.failReply(conn, "CHANNEL", channelFailCode(err), "No such registered channel");
+                    return;
+                };
+                const ci = result.channel_info;
+                try channelNotice(conn, "channel={s} founder={s} flags={d}", .{ ci.name.asSlice(), ci.founder.asSlice(), ci.flags });
+            },
+            else => {
+                try channelNotice(conn, "{s} is not available yet", .{chanserv_cmd.fmtUsage(req.subcommand())});
+            },
+        }
+    }
+
+    /// Map a services channel error to an IRCv3 standard-reply FAIL code.
+    fn channelFailCode(err: anyerror) []const u8 {
+        return switch (err) {
+            error.AlreadyExists => "CHANNEL_EXISTS",
+            error.NotFound => "CHANNEL_UNKNOWN",
+            error.Forbidden => "ACCESS_DENIED",
+            error.InvalidChannel, error.InvalidName => "BAD_CHANNEL_NAME",
+            else => "TEMPORARILY_UNAVAILABLE",
+        };
     }
 
     /// Generate a 16-byte session reclaim token from the daemon CSPRNG (zeroed
