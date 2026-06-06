@@ -1299,7 +1299,13 @@ pub const LinuxServer = struct {
             self.stats.onClose(false);
             self.stats.onQuit();
             self.activity_subs.removeClient(monitorIdFromClient(id));
-            _ = self.sessions.removeClient(monitorIdFromClient(id));
+            // Multi-session: a logged-in client's session is *retained* as
+            // detached (for reclaim/bouncer); an anonymous client is dropped.
+            if (conn.session.account()) |acct| {
+                _ = self.sessions.markDetached(acct, monitorIdFromClient(id));
+            } else {
+                _ = self.sessions.removeClient(monitorIdFromClient(id));
+            }
             defer self.world.removeClient(worldIdFromClient(id));
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
@@ -1482,7 +1488,7 @@ pub const LinuxServer = struct {
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
             try self.handleIdentify(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "LOGOUT")) {
-            try self.handleLogout(conn);
+            try self.handleLogout(id, conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "DROP")) {
             try self.handleDrop(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTINFO")) {
@@ -4252,8 +4258,10 @@ pub const LinuxServer = struct {
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).
-    fn handleLogout(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
+    fn handleLogout(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+        // Drop this connection's live session before clearing the account binding
+        // (the session is keyed by account; logout fully ends it, no reclaim).
+        if (conn.session.account()) |acct| _ = self.sessions.remove(acct, monitorIdFromClient(id));
         conn.session.logout();
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ server_name, conn.session.displayName() }) catch return;
@@ -4327,6 +4335,10 @@ pub const LinuxServer = struct {
         const cid = monitorIdFromClient(id);
         const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
         var buf: [default_reply_bytes]u8 = undefined;
+        if (std.ascii.eqlIgnoreCase(sub, "RESUME")) {
+            try self.handleSessionResume(id, conn, account, parsed);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
             for (self.sessions.sessions(account)) |s| {
                 if (s.client != cid) continue;
@@ -4349,6 +4361,36 @@ pub const LinuxServer = struct {
         }
         const end = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION :End of session list\r\n", .{server_name}) catch return;
         try appendToConn(conn, end);
+    }
+
+    /// `SESSION RESUME <token>` — reclaim a previously-detached session of the
+    /// caller's own account by its reclaim token. The detached ghost is consumed
+    /// (removed) and the caller's live session continues in its place. Bouncer
+    /// replay of buffered traffic is layered on top in a later step.
+    fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
+        const cid = monitorIdFromClient(id);
+        const params = parsed.paramSlice();
+        if (params.len < 2 or params[1].len != 2 * @sizeOf(sessions_mod.Token)) {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
+            return;
+        }
+        var token: sessions_mod.Token = undefined;
+        _ = std.fmt.hexToBytes(&token, params[1]) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME token is not valid hex");
+            return;
+        };
+        const ghost = self.sessions.findTokenInAccount(account, token) orelse {
+            try self.failReply(conn, "SESSION", "NO_SESSION", "No session matches that token");
+            return;
+        };
+        if (ghost == cid) {
+            try self.noticeTo(conn, "SESSION: that token is this live session; nothing to resume");
+            return;
+        }
+        _ = self.sessions.remove(account, ghost); // reclaim consumes the ghost
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{server_name}) catch return;
+        try appendToConn(conn, line);
     }
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.

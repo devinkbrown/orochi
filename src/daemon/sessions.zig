@@ -75,10 +75,28 @@ pub const SessionStore = struct {
             list.items.items[idx] = .{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
             return list.items.items[idx];
         }
-        if (list.items.items.len >= self.cfg.max_sessions_per_account) return error.TooManySessions;
+        if (list.items.items.len >= self.cfg.max_sessions_per_account) {
+            // At cap: evict the oldest *detached* ghost to make room for the live
+            // session. Never evict an attached session (that would drop a peer).
+            if (oldestDetached(list)) |evict| {
+                _ = list.items.swapRemove(evict);
+            } else return error.TooManySessions;
+        }
         const session = Session{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
         try list.items.append(self.allocator, session);
         return session;
+    }
+
+    /// Index of the oldest (lowest signon) detached session in `list`, or null.
+    fn oldestDetached(list: *const SessionList) ?usize {
+        var best: ?usize = null;
+        for (list.items.items, 0..) |s, i| {
+            if (s.attached) continue;
+            if (best) |b| {
+                if (s.signon_ms < list.items.items[b].signon_ms) best = i;
+            } else best = i;
+        }
+        return best;
     }
 
     /// Mark a session detached (connection dropped) but retain it for reclaim/
@@ -131,6 +149,17 @@ pub const SessionStore = struct {
             for (entry.value_ptr.items.items) |s| {
                 if (std.mem.eql(u8, &s.token, &token)) return .{ .account = entry.key_ptr.*, .client = s.client };
             }
+        }
+        return null;
+    }
+
+    /// Look up a session by token *within* `account` (reclaim is scoped to the
+    /// caller's own account — a token never reaches across accounts). Returns the
+    /// matched client id, or null if no session in `account` bears the token.
+    pub fn findTokenInAccount(self: *const SessionStore, account: []const u8, token: Token) ?ClientId {
+        const list = self.accounts.getPtr(account) orelse return null;
+        for (list.items.items) |s| {
+            if (std.mem.eql(u8, &s.token, &token)) return s.client;
         }
         return null;
     }
@@ -205,10 +234,34 @@ test "removeClient drops a client without knowing its account" {
     try testing.expectEqual(@as(usize, 0), s.removeClient(999)); // unknown
 }
 
-test "per-account session cap is enforced" {
+test "per-account session cap is enforced for attached sessions" {
     var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 2 });
     defer s.deinit();
     _ = try s.attach("alice", 1, tok(1), 1);
     _ = try s.attach("alice", 2, tok(2), 1);
     try testing.expectError(error.TooManySessions, s.attach("alice", 3, tok(3), 1));
+}
+
+test "at cap, attach evicts the oldest detached ghost instead of failing" {
+    var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 2 });
+    defer s.deinit();
+    _ = try s.attach("alice", 1, tok(1), 10); // older
+    _ = try s.attach("alice", 2, tok(2), 20);
+    try testing.expect(s.markDetached("alice", 1)); // client 1 is the ghost
+    // New live session evicts the detached ghost (client 1), not client 2.
+    _ = try s.attach("alice", 3, tok(3), 30);
+    try testing.expectEqual(@as(usize, 2), s.sessions("alice").len);
+    try testing.expect(s.findTokenInAccount("alice", tok(1)) == null); // evicted
+    try testing.expectEqual(@as(ClientId, 2), s.findTokenInAccount("alice", tok(2)).?);
+    try testing.expectEqual(@as(ClientId, 3), s.findTokenInAccount("alice", tok(3)).?);
+}
+
+test "findTokenInAccount is scoped to the account" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("alice", 1, tok(0xAB), 1);
+    _ = try s.attach("bob", 2, tok(0xCD), 1);
+    try testing.expectEqual(@as(ClientId, 1), s.findTokenInAccount("alice", tok(0xAB)).?);
+    // bob's token must not resolve under alice.
+    try testing.expect(s.findTokenInAccount("alice", tok(0xCD)) == null);
 }
