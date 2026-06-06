@@ -1942,6 +1942,8 @@ pub const LinuxServer = struct {
             try self.handleMap(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KILL")) {
             try self.handleKill(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLOSE")) {
+            try self.handleClose(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WARD")) {
             try self.handleWard(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOWAS")) {
@@ -3131,6 +3133,33 @@ pub const LinuxServer = struct {
     /// KILL <nick> :<reason> — oper-only forced disconnect. Delivers a KILL line
     /// then routes the victim through the graceful close-on-drain path (its
     /// channels see a QUIT once the buffer flushes). Non-opers get 481.
+    /// `CLOSE` (oper) — drop every still-unregistered connection. A classic
+    /// anti-flood tool: clears half-open/handshake-stalled clients without
+    /// touching registered users or server links. Each victim is torn down via
+    /// the standard drain-close path (queue ERROR, mark closing, arm send).
+    fn handleClose(self: *LinuxServer, conn: *ConnState) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        var closed: usize = 0;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (c.closing) continue;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            if (c.session.registered()) continue;
+            appendToConn(c, ":" ++ server_name ++ " ERROR :Closing unregistered connection\r\n") catch {};
+            c.close_reason = "Closed by operator";
+            c.closing = true;
+            self.armSendIfNeeded(c) catch {};
+            closed += 1;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :CLOSE: {d} unregistered connection(s) closed\r\n", .{ server_name, conn.session.displayName(), closed }) catch return;
+        try appendToConn(conn, line);
+    }
+
     fn handleKill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
