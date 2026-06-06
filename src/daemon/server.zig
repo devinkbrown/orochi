@@ -4736,6 +4736,34 @@ pub const LinuxServer = struct {
             try appendToConn(conn, end);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "HAND")) {
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before raising your hand");
+                return;
+            }
+            const up = parsed.param_count < 3 or // bare HAND raises
+                std.ascii.eqlIgnoreCase(parsed.paramSlice()[2], "up") or
+                std.ascii.eqlIgnoreCase(parsed.paramSlice()[2], "1");
+            self.media_rooms.setHand(channel, nick, up) catch {
+                try self.failReply(conn, "MEDIA", "HAND_FAILED", "Could not update hand");
+                return;
+            };
+            try self.broadcastMediaEvent(channel, "HAND", nick, if (up) "up" else "down");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "REACT")) {
+            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0 or parsed.paramSlice()[2].len > 32) {
+                try self.failReply(conn, "MEDIA", "INVALID_REACTION", "Usage: MEDIA REACT <#chan> <reaction>");
+                return;
+            }
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before reacting");
+                return;
+            }
+            // Ephemeral: broadcast only, no retention.
+            try self.broadcastMediaEvent(channel, "REACT", nick, parsed.paramSlice()[2]);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
             if (self.media_rooms.leaveAll(channel, nick)) {
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
@@ -4776,7 +4804,7 @@ pub const LinuxServer = struct {
             else
                 try self.failReply(conn, "MEDIA", "NOT_PUBLISHING", "You are not publishing that kind");
         } else {
-            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, CAPTION, TRANSCRIPT, or ROSTER");
+            try self.failReply(conn, "MEDIA", "INVALID_SUBCOMMAND", "Use JOIN, LEAVE, MUTE, UNMUTE, SPEAKING, BREAKOUT, POS, HAND, REACT, CAPTION, TRANSCRIPT, or ROSTER");
         }
     }
 
@@ -4835,8 +4863,9 @@ pub const LinuxServer = struct {
             }
             const breakout = self.media_rooms.breakoutOf(channel, p.id.slice());
             const pos = self.media_rooms.positionOf(channel, p.id.slice());
+            const hand: []const u8 = if (self.media_rooms.handRaised(channel, p.id.slice())) "hand" else "-";
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s} {d} {d}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y }) catch continue;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s} {d} {d} {s}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
             try appendToConn(conn, line);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;

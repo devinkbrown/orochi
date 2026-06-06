@@ -49,6 +49,8 @@ pub const MediaRooms = struct {
     /// Optional spatial-audio position per participant (same composite key).
     /// Absent = origin. Value is inline (no per-entry allocation).
     positions: std.StringHashMap(Position),
+    /// Raised-hand set (same composite key). Presence of the key = hand raised.
+    hands: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return .{
@@ -56,6 +58,7 @@ pub const MediaRooms = struct {
             .rooms = std.StringHashMap(*Room).init(allocator),
             .breakouts = std.StringHashMap([]u8).init(allocator),
             .positions = std.StringHashMap(Position).init(allocator),
+            .hands = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -75,6 +78,9 @@ pub const MediaRooms = struct {
         var pit = self.positions.keyIterator();
         while (pit.next()) |key| self.allocator.free(key.*);
         self.positions.deinit();
+        var hit = self.hands.keyIterator();
+        while (hit.next()) |key| self.allocator.free(key.*);
+        self.hands.deinit();
         self.* = undefined;
     }
 
@@ -147,6 +153,34 @@ pub const MediaRooms = struct {
         if (self.positions.fetchRemove(k)) |kv| self.allocator.free(kv.key);
     }
 
+    /// Raise or lower `pid`'s hand in `channel`.
+    pub fn setHand(self: *MediaRooms, channel: []const u8, pid: []const u8, raised: bool) Error!void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        if (raised) {
+            const gop = try self.hands.getOrPut(k);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
+                    _ = self.hands.remove(k);
+                    return e;
+                };
+            }
+        } else self.clearHand(channel, pid);
+    }
+
+    /// Whether `pid`'s hand is raised in `channel`.
+    pub fn handRaised(self: *const MediaRooms, channel: []const u8, pid: []const u8) bool {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return false;
+        return self.hands.contains(k);
+    }
+
+    fn clearHand(self: *MediaRooms, channel: []const u8, pid: []const u8) void {
+        var kb: [256]u8 = undefined;
+        const k = breakoutKey(&kb, channel, pid) orelse return;
+        if (self.hands.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+    }
+
     /// The room for `channel`, or null when no call is active there.
     pub fn room(self: *MediaRooms, channel: []const u8) ?*Room {
         return self.rooms.get(channel);
@@ -168,6 +202,7 @@ pub const MediaRooms = struct {
         entry.value_ptr.*.leaveAll(id) catch return false;
         self.clearBreakout(channel, pid);
         self.clearPosition(channel, pid);
+        self.clearHand(channel, pid);
         if (entry.value_ptr.*.count() == 0) self.dropRoom(entry);
         return true;
     }
@@ -276,6 +311,22 @@ test "spatial position defaults to origin and clears on leave" {
     try testing.expectEqual(Position{ .x = 5, .y = 5 }, m.positionOf("#c", "alice"));
     try testing.expect(m.leaveAll("#c", "alice"));
     try testing.expectEqual(Position{ .x = 0, .y = 0 }, m.positionOf("#c", "alice")); // cleared
+}
+
+test "raise-hand toggles and clears on leave" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try testing.expect(!m.handRaised("#c", "alice"));
+    try m.setHand("#c", "alice", true);
+    try testing.expect(m.handRaised("#c", "alice"));
+    try m.setHand("#c", "alice", true); // idempotent
+    try testing.expect(m.handRaised("#c", "alice"));
+    try m.setHand("#c", "alice", false);
+    try testing.expect(!m.handRaised("#c", "alice"));
+    try m.setHand("#c", "alice", true);
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expect(!m.handRaised("#c", "alice")); // cleared on leave
 }
 
 test "parseKind accepts aliases and rejects junk" {
