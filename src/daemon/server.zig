@@ -42,6 +42,7 @@ const welcome_pack_mod = @import("welcome_pack.zig");
 const mode_lock_mod = @import("../proto/mode_lock.zig");
 const account_verify_mod = @import("account_verify.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
+const color_strip = @import("../proto/color_strip.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -6411,9 +6412,20 @@ pub const LinuxServer = struct {
         }
         // Koshi content filter: block messages matching an oper-curated pattern.
         // Opers are exempt; NOTICE drops silently (no auto-reply), PRIVMSG FAILs.
-        if (!conn.session.isOper() and self.content_filter.matches(text)) {
-            if (!is_notice) try self.failReply(conn, command, "MIZUCHI_FILTERED", "Message blocked by the content filter");
-            return;
+        // Match both the raw text AND a formatting-stripped copy so a filtered
+        // word can't be smuggled past Koshi via embedded mIRC color/format codes.
+        if (!conn.session.isOper()) {
+            var filtered = self.content_filter.matches(text);
+            if (!filtered and color_strip.hasFormatting(text)) {
+                var strip_buf: [1024]u8 = undefined;
+                if (color_strip.stripFormatting(text, &strip_buf)) |clean| {
+                    filtered = self.content_filter.matches(clean);
+                } else |_| {}
+            }
+            if (filtered) {
+                if (!is_notice) try self.failReply(conn, command, "MIZUCHI_FILTERED", "Message blocked by the content filter");
+                return;
+            }
         }
 
         // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target.
