@@ -60,6 +60,8 @@ const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
+const dns = @import("../proto/dns.zig");
+const clone_limit_mod = @import("clone_limit.zig");
 const chghost = @import("../proto/chghost.zig");
 const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
@@ -689,6 +691,13 @@ pub const Config = struct {
     ping_interval_ms: i64 = 120_000,
     /// Grace after a server PING before a silent client is dropped (Ping timeout).
     ping_timeout_ms: i64 = 60_000,
+    /// Max concurrent client connections from one exact IP (0 = unlimited). Over
+    /// the cap, the accept is refused with an ERROR. Loopback is counted too, so
+    /// raise this if local bots/services open many connections.
+    max_clones_per_ip: u32 = 0,
+    /// Max concurrent client connections aggregated across a /24 (IPv4) or /64
+    /// (IPv6) prefix (0 = unlimited).
+    max_clones_per_net: u32 = 0,
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
     /// take on the account store's I/O lifecycle: a caller that has a store wires
@@ -761,6 +770,12 @@ pub const ConnState = struct {
     awaiting_pong: bool = false,
     /// Wall-clock ms when the unsolicited server PING was sent (ping-timeout base).
     ping_sent_ms: i64 = 0,
+    /// The peer's parsed IP, captured at accept (null if getpeername failed or the
+    /// family is unsupported). Drives the clone limiter and is released on close.
+    peer_addr: ?dns.Address = null,
+    /// True once this connection was counted by the clone limiter, so `closeConn`
+    /// releases exactly the registrations it made (refused accepts never count).
+    clone_counted: bool = false,
     /// Whether this session was accepted over TLS (implicit-TLS connection fact;
     /// there is no STARTTLS). Gates +S channels. False until TLS lands.
     is_tls: bool = false,
@@ -864,6 +879,9 @@ pub const LinuxServer = struct {
     metadata: metadata_store.DefaultStore,
     props: ircx_prop_store.DefaultStore,
     access: ircx_access_store.AccessStore,
+    /// Concurrent-connection clone limiter (per exact IP and per /24|/64 prefix).
+    /// Limits come from Config; a zero limit disables that dimension.
+    clone_limit: clone_limit_mod.CloneLimiter,
     /// Optional reactor seam (time/IO). Null = system monotonic clock.
     reactor: ?reactor_mod.Reactor = null,
     /// Run flag from runThreaded, so DIE/RESTART can stop the reactor.
@@ -970,6 +988,10 @@ pub const LinuxServer = struct {
             .metadata = metadata_store.DefaultStore.init(allocator),
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
+            .clone_limit = clone_limit_mod.CloneLimiter.init(allocator, .{
+                .max_per_ip = config.max_clones_per_ip,
+                .max_per_net = config.max_clones_per_net,
+            }),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .snowflake = snowflake_id.Generator.init(.{ .node_id = @intCast(config.node_id & snowflake_id.NODE_MASK) }) catch unreachable,
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
@@ -1007,6 +1029,7 @@ pub const LinuxServer = struct {
         self.metadata.deinit();
         self.props.deinit();
         self.access.deinit();
+        self.clone_limit.deinit();
         self.accepts.deinit();
         self.silence.deinit();
         self.observe.deinit();
@@ -1226,6 +1249,26 @@ pub const LinuxServer = struct {
         // so its first JOIN/PRIVMSG prefix already carries the cloaked host.
         self.captureClientHost(conn);
 
+        // Clone limiting: count this connection against its IP / prefix. Over the
+        // cap, tell the client and drain-close WITHOUT arming recv — the queued
+        // ERROR flushes via handleSend, which then closeConn's the slot. The
+        // connection was never counted, so closeConn performs no release.
+        if (conn.peer_addr) |addr| {
+            if (self.clone_limit.register(addr)) {
+                conn.clone_counted = true;
+            } else |err| switch (err) {
+                error.TooManyPerIp, error.TooManyPerNet => {
+                    appendToConn(conn, ":" ++ server_name ++ " ERROR :Too many connections from your host\r\n") catch {};
+                    conn.close_reason = "Too many connections";
+                    conn.closing = true;
+                    self.armSendIfNeeded(conn) catch {};
+                    self.stats.onAccept();
+                    return;
+                },
+                error.NoSpaceLeft => {}, // tracking table OOM: fail open, allow the client
+            }
+        }
+
         // Make the injected SASL verifier available before the client can send
         // AUTHENTICATE (during CAP negotiation, pre-registration).
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
@@ -1249,10 +1292,12 @@ pub const LinuxServer = struct {
             posix.AF.INET => blk: {
                 const in: *const posix.sockaddr.in = @ptrCast(@alignCast(&storage));
                 const b: [4]u8 = @bitCast(in.addr);
+                conn.peer_addr = .{ .ipv4 = b };
                 break :blk std.fmt.bufPrint(&ipbuf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch return;
             },
             posix.AF.INET6 => blk: {
                 const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+                conn.peer_addr = .{ .ipv6 = in6.addr };
                 break :blk formatIp6(&ipbuf, in6.addr) catch return;
             },
             else => return,
@@ -1580,6 +1625,12 @@ pub const LinuxServer = struct {
             }
             self.stats.onClose(false);
             self.stats.onQuit();
+            // Release this connection's clone-limiter slot (only if it was counted;
+            // refused accepts and addr-less peers never registered).
+            if (conn.clone_counted) {
+                if (conn.peer_addr) |addr| self.clone_limit.release(addr);
+                conn.clone_counted = false;
+            }
             self.activity_subs.removeClient(monitorIdFromClient(id));
             // Multi-session: a logged-in client's session is *retained* as
             // detached (for reclaim/bouncer); an anonymous client is dropped.

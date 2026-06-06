@@ -24,6 +24,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.limits.handshake_timeout_ms != 0) out.registration_timeout_ms = @intCast(cfg.limits.handshake_timeout_ms);
     if (cfg.limits.ping_interval_ms != 0) out.ping_interval_ms = @intCast(cfg.limits.ping_interval_ms);
     if (cfg.limits.ping_timeout_ms != 0) out.ping_timeout_ms = @intCast(cfg.limits.ping_timeout_ms);
+    out.max_clones_per_ip = cfg.limits.max_clones_per_ip;
+    out.max_clones_per_net = cfg.limits.max_clones_per_net;
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     return out;
 }
@@ -122,6 +124,24 @@ test "limits durations overlay timeout knobs" {
     try testing.expectEqual(@as(i64, 15_000), loaded.config.registration_timeout_ms);
     try testing.expectEqual(@as(i64, 90_000), loaded.config.ping_interval_ms);
     try testing.expectEqual(@as(i64, 45_000), loaded.config.ping_timeout_ms);
+}
+
+test "limits overlay clone caps" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\max_clones_per_ip = 4
+        \\max_clones_per_net = 32
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(u32, 4), loaded.config.max_clones_per_ip);
+    try testing.expectEqual(@as(u32, 32), loaded.config.max_clones_per_net);
 }
 
 test "minimal config: unspecified optional fields keep defaults" {
