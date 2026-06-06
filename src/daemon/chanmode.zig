@@ -27,6 +27,7 @@ pub const ChannelMode = enum(u4) {
     no_nick, // N: block nick changes by non-ops while joined
     free_invite, // g: any member may INVITE while +i
     tls_only, // S: join only permitted over a TLS session
+    mod_reg, // M: mute unauthenticated members (speak needs an account or +v)
 };
 
 /// Channel MODE operation direction.
@@ -104,6 +105,7 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .no_nick, .letter = 'N', .name = "no-nick", .kind = .flag_d },
     .{ .mode = .free_invite, .letter = 'g', .name = "free-invite", .kind = .flag_d },
     .{ .mode = .tls_only, .letter = 'S', .name = "tls-only", .kind = .flag_d },
+    .{ .mode = .mod_reg, .letter = 'M', .name = "moderate-unregistered", .kind = .flag_d },
 };
 
 /// Caller-owned storage for one type-A channel mode list.
@@ -165,6 +167,7 @@ pub const ChannelModes = struct {
     no_nick: bool = false,
     free_invite: bool = false,
     tls_only: bool = false,
+    mod_reg: bool = false,
 
     pub fn init(
         ban_storage: [][]const u8,
@@ -194,6 +197,7 @@ pub const ChannelModes = struct {
             .no_nick => self.no_nick,
             .free_invite => self.free_invite,
             .tls_only => self.tls_only,
+            .mod_reg => self.mod_reg,
             else => false,
         };
     }
@@ -228,6 +232,7 @@ pub const ChannelModes = struct {
             .no_nick => &self.no_nick,
             .free_invite => &self.free_invite,
             .tls_only => &self.tls_only,
+            .mod_reg => &self.mod_reg,
             else => return false,
         };
         if (slot.* == enabled) return false;
@@ -461,6 +466,7 @@ pub fn letterOf(mode: ChannelMode) u8 {
         .no_nick => 'N',
         .free_invite => 'g',
         .tls_only => 'S',
+        .mod_reg => 'M',
     };
 }
 
@@ -561,7 +567,7 @@ fn applyOne(modes: *ChannelModes, change: AppliedChange) ChanModeError!bool {
                 return true;
             },
         },
-        .invite_only, .moderated, .no_external, .topic_ops, .secret, .no_ctcp, .no_notice, .no_nick, .free_invite, .tls_only => {
+        .invite_only, .moderated, .no_external, .topic_ops, .secret, .no_ctcp, .no_notice, .no_nick, .free_invite, .tls_only, .mod_reg => {
             return modes.setFlag(change.mode, change.op == .add);
         },
     }

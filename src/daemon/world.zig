@@ -257,6 +257,7 @@ pub const World = struct {
             .no_nick => channel.modes.no_nick = on,
             .free_invite => channel.modes.free_invite = on,
             .tls_only => channel.modes.tls_only = on,
+            .mod_reg => channel.modes.mod_reg = on,
             else => return error.UnsupportedMode, // not a flag mode (b/e/I/k/l)
         }
         return before != on;
@@ -495,6 +496,7 @@ pub const World = struct {
             .{ .m = .no_nick, .c = 'N' },
             .{ .m = .free_invite, .c = 'g' },
             .{ .m = .tls_only, .c = 'S' },
+            .{ .m = .mod_reg, .c = 'M' },
         };
         for (flags) |f| {
             if (channel.modes.containsFlag(f.m) and n < out.len) {

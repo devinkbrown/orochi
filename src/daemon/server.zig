@@ -2197,7 +2197,7 @@ pub const LinuxServer = struct {
                         targets.append(target_nick) catch break;
                     }
                 },
-                'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S' => {
+                'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M' => {
                     const mode: world_model.ChannelMode = switch (ch) {
                         'i' => .invite_only,
                         'm' => .moderated,
@@ -2209,6 +2209,7 @@ pub const LinuxServer = struct {
                         'N' => .no_nick,
                         'g' => .free_invite,
                         'S' => .tls_only,
+                        'M' => .mod_reg,
                         else => unreachable,
                     };
                     const changed = self.world.setChannelFlag(channel, mode, adding) catch continue;
@@ -5461,6 +5462,15 @@ pub const LinuxServer = struct {
                 const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
                 if (!mm.canSpeakModerated()) {
                     if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
+                    return;
+                }
+            }
+            // +M moderate-unregistered: an unauthenticated member may speak only
+            // if voiced-or-higher (like +m, scoped to non-account users).
+            if (self.world.channelHasFlag(chan, .mod_reg) and conn.session.account() == null) {
+                const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+                if (!mm.canSpeakModerated()) {
+                    if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+M: identify to a registered account to speak)");
                     return;
                 }
             }
