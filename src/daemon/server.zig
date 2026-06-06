@@ -35,6 +35,8 @@ const chanserv_cmd = @import("../proto/chanserv_cmd.zig");
 const oper_motd_mod = @import("../proto/oper_motd.zig");
 const host_request_mod = @import("host_request.zig");
 const guise_mod = @import("guise.zig");
+const shun_mod = @import("shun.zig");
+const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
@@ -791,6 +793,8 @@ pub const LinuxServer = struct {
     host_requests: host_request_mod.Queue,
     /// Guise: per-account persona wardrobe + operator offer templates.
     guises: guise_mod.Registry,
+    /// Network-wide silent mutes (SHUN): shunned senders' messages are dropped.
+    shuns: shun_mod.ShunList,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -887,6 +891,7 @@ pub const LinuxServer = struct {
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
+            .shuns = shun_mod.ShunList.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -934,6 +939,7 @@ pub const LinuxServer = struct {
         self.oper_motd.deinit();
         self.host_requests.deinit();
         self.guises.deinit();
+        self.shuns.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1615,6 +1621,12 @@ pub const LinuxServer = struct {
             try self.handleSetname(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPERMOTD")) {
             try self.handleOperMotd(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SHUN")) {
+            try self.handleShun(conn, parsed, true);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "UNSHUN")) {
+            try self.handleShun(conn, parsed, false);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "GLOBAL")) {
+            try self.handleGlobal(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
             try self.handleRegister(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
@@ -3222,6 +3234,95 @@ pub const LinuxServer = struct {
             if (oper_motd_mod.buildOperMotdLine(&lb, server_name, nick, l)) |line| try appendToConn(conn, line) else |_| {}
         }
         if (oper_motd_mod.buildOperMotdEnd(&buf, server_name, nick)) |line| try appendToConn(conn, line) else |_| {}
+    }
+
+    /// `SHUN <mask> [secs] [:reason]` / `UNSHUN <mask>` — oper network mute.
+    /// A shunned (non-oper) sender stays connected but their PRIVMSG/NOTICE are
+    /// silently dropped. Bare `SHUN` lists active shuns.
+    fn handleShun(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, adding: bool) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        const p = parsed.paramSlice();
+        if (adding and p.len == 0) {
+            var rows: [256]shun_mod.Shun = undefined;
+            for (self.shuns.list(&rows)) |s| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :SHUN {s} by {s} :{s}\r\n", .{ server_name, conn.session.displayName(), s.mask, s.set_by, s.reason }) catch continue;
+                try appendToConn(conn, line);
+            }
+            try self.noticeTo(conn, "SHUN: end of list");
+            return;
+        }
+        if (p.len == 0) {
+            try self.noticeTo(conn, "Usage: SHUN <mask> [secs] [:reason] | UNSHUN <mask>");
+            return;
+        }
+        const mask = p[0];
+        if (!adding) {
+            const removed = self.shuns.remove(mask);
+            var b: [default_reply_bytes]u8 = undefined;
+            const note = std.fmt.bufPrint(&b, "UNSHUN {s}: {s}", .{ mask, if (removed) "removed" else "not found" }) catch return;
+            try self.publishOperEvent(.oper_action, .notice, note);
+            return;
+        }
+        var secs: i64 = 0;
+        var reason: []const u8 = "No reason";
+        if (p.len >= 2) {
+            if (std.fmt.parseInt(i64, p[1], 10)) |n| secs = n else |_| reason = p[1];
+        }
+        if (p.len >= 3) reason = p[2];
+        const now = self.nowMs();
+        self.shuns.add(.{
+            .mask = mask,
+            .reason = reason,
+            .set_by = conn.session.displayName(),
+            .created_ms = now,
+            .expires_ms = if (secs > 0) now + secs * 1000 else 0,
+        }) catch {
+            try self.noticeTo(conn, "SHUN: could not add (limit or invalid mask)");
+            return;
+        };
+        var b: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&b, "SHUN {s}", .{mask}) catch return;
+        try self.publishOperEvent(.oper_action, .notice, note);
+    }
+
+    /// `GLOBAL [<mask>|#chan] :<text>` — oper broadcast to all users (or a
+    /// hostmask/channel audience). Delivered as a server NOTICE.
+    fn handleGlobal(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        _ = id;
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        const req = global_notice.Request.parse(parsed.paramSlice()) catch {
+            try self.noticeTo(conn, "Usage: GLOBAL [<mask>|#channel] :<text>");
+            return;
+        };
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = global_notice.formatLine(&line_buf, server_name, req.text) catch {
+            try self.noticeTo(conn, "GLOBAL: message too long");
+            return;
+        };
+        var sent: u32 = 0;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (!c.session.registered()) continue;
+            // Build this recipient's facets for audience matching.
+            var hm_buf: [320]u8 = undefined;
+            const hm = clientPrefix(c, &hm_buf) catch continue;
+            var chans: [64][]const u8 = undefined;
+            const nchans = self.world.channelsOf(worldIdFromClient(entry.id), &chans);
+            if (!req.inAudience(hm, chans[0..nchans])) continue;
+            self.deliver(entry.id, line) catch {};
+            sent += 1;
+        }
+        var nb: [96]u8 = undefined;
+        const note = std.fmt.bufPrint(&nb, "GLOBAL sent to {d} user(s)", .{sent}) catch return;
+        try self.noticeTo(conn, note);
     }
 
     /// `WARD <ADD|DEL|LIST|TEST> …` — the unified network-ban command for admins
@@ -5949,6 +6050,14 @@ pub const LinuxServer = struct {
     ) !void {
         // +z GAG (IRCX): the server silently discards a gagged user's messages.
         if (conn.gagged) return;
+        // SHUN: a network-shunned (non-oper) sender's messages are silently
+        // dropped before delivery.
+        if (self.shuns.count() > 0 and !conn.session.isOper()) {
+            var hm_buf: [320]u8 = undefined;
+            if (clientPrefix(conn, &hm_buf)) |hm| {
+                if (self.shuns.isShunned(hm, self.nowMs())) return;
+            } else |_| {}
+        }
         // NOTICE must never generate an automatic error reply (RFC 1459):
         // missing recipient/text is silently dropped to prevent bot reply loops.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
