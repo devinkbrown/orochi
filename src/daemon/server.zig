@@ -38,6 +38,7 @@ const guise_mod = @import("guise.zig");
 const shun_mod = @import("shun.zig");
 const autojoin_mod = @import("autojoin.zig");
 const memo_group_mod = @import("memo_group.zig");
+const welcome_pack_mod = @import("welcome_pack.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -801,6 +802,8 @@ pub const LinuxServer = struct {
     autojoins: autojoin_mod.AutoJoin,
     /// Per-account grouped-nick sets (GROUP), with a primary nick.
     nick_groups: memo_group_mod.NickGroup,
+    /// Network onboarding pack delivered once per account on first login.
+    welcome: welcome_pack_mod.WelcomePack,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -900,6 +903,7 @@ pub const LinuxServer = struct {
             .shuns = shun_mod.ShunList.init(allocator, .{}),
             .autojoins = autojoin_mod.AutoJoin.init(allocator),
             .nick_groups = memo_group_mod.NickGroup.init(allocator),
+            .welcome = welcome_pack_mod.WelcomePack.init(allocator),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -950,6 +954,7 @@ pub const LinuxServer = struct {
         self.shuns.deinit();
         self.autojoins.deinit();
         self.nick_groups.deinit();
+        self.welcome.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1550,6 +1555,7 @@ pub const LinuxServer = struct {
                 self.maybeApplyApprovedVhost(id, conn);
                 // Auto-join the account's configured channels.
                 self.applyAutojoin(id, conn);
+                self.deliverWelcome(conn);
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -1643,6 +1649,8 @@ pub const LinuxServer = struct {
             try self.handleAutojoin(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "GROUP")) {
             try self.handleGroup(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WELCOME")) {
+            try self.handleWelcome(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
             try self.handleRegister(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "IDENTIFY")) {
@@ -3342,6 +3350,59 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// `WELCOME <ADD :line | CLEAR | SHOW>` — oper-managed network onboarding
+    /// pack delivered once per account on first login (backed by welcome_pack).
+    fn handleWelcome(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        if (p.len == 0 or std.ascii.eqlIgnoreCase(p[0], "SHOW")) {
+            for (self.welcome.lines()) |l| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :WELCOME :{s}\r\n", .{ server_name, conn.session.displayName(), l }) catch continue;
+                try appendToConn(conn, line);
+            }
+            try self.noticeTo(conn, "WELCOME: end of pack");
+            return;
+        }
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "CLEAR")) {
+            self.welcome.setLines(&.{}) catch {};
+            try self.noticeTo(conn, "WELCOME pack cleared");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "ADD") and p.len >= 2 and p[1].len != 0) {
+            // Rebuild the pack = current lines + the new one, via independent
+            // dupes so setLines never aliases the pack's own storage.
+            var tmp: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer {
+                for (tmp.items) |it| self.allocator.free(it);
+                tmp.deinit(self.allocator);
+            }
+            for (self.welcome.lines()) |l| try tmp.append(self.allocator, try self.allocator.dupe(u8, l));
+            try tmp.append(self.allocator, try self.allocator.dupe(u8, p[1]));
+            self.welcome.setLines(tmp.items) catch {
+                try self.noticeTo(conn, "WELCOME: could not add (limit or invalid)");
+                return;
+            };
+            try self.noticeTo(conn, "WELCOME line added");
+            return;
+        }
+        try self.noticeTo(conn, "Usage: WELCOME <ADD :line | CLEAR | SHOW>");
+    }
+
+    /// On login, deliver the onboarding pack to a brand-new account exactly once.
+    fn deliverWelcome(self: *LinuxServer, conn: *ConnState) void {
+        const account = conn.session.account() orelse return;
+        const lines = (self.welcome.deliverOnce(account) catch return) orelse return;
+        for (lines) |l| {
+            var b: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :[Welcome] {s}\r\n", .{ server_name, conn.session.displayName(), l }) catch continue;
+            appendToConn(conn, line) catch {};
+        }
+    }
+
     /// On login, join the account's auto-join channels.
     fn applyAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
         const account = conn.session.account() orelse return;
@@ -4924,6 +4985,7 @@ pub const LinuxServer = struct {
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
         self.applyAutojoin(idFromToken(conn.token), conn);
+        self.deliverWelcome(conn);
     }
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
@@ -4946,6 +5008,7 @@ pub const LinuxServer = struct {
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
         self.applyAutojoin(idFromToken(conn.token), conn);
+        self.deliverWelcome(conn);
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).
