@@ -1910,6 +1910,10 @@ pub const LinuxServer = struct {
             try self.handleDrop(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTINFO")) {
             try self.handleAccountInfo(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTSET")) {
+            try self.handleAccountSet(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "GHOST")) {
+            try self.handleGhost(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CHANNEL") or std.ascii.eqlIgnoreCase(parsed.command, "CS")) {
             try self.handleChannel(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SESSION")) {
@@ -5382,6 +5386,68 @@ pub const LinuxServer = struct {
         const info = result.account_info;
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ server_name, conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// `ACCOUNTSET <account> <password> <field> <value>` — update an account
+    /// setting (field = `email` or `flags`). Backed by services.setAccount.
+    fn handleAccountSet(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "ACCOUNTSET", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count < 4) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCOUNTSET"}, "Usage: ACCOUNTSET <account> <password> <email|flags> <value>");
+            return;
+        }
+        const p = parsed.paramSlice();
+        const account = p[0];
+        const field: services_mod.AccountSetField = blk: {
+            if (std.ascii.eqlIgnoreCase(p[2], "email")) break :blk .{ .email = p[3] };
+            if (std.ascii.eqlIgnoreCase(p[2], "flags")) {
+                const flags = std.fmt.parseInt(u32, p[3], 10) catch {
+                    try self.failReply(conn, "ACCOUNTSET", "INVALID_VALUE", "flags must be a number");
+                    return;
+                };
+                break :blk .{ .flags = flags };
+            }
+            try self.failReply(conn, "ACCOUNTSET", "INVALID_FIELD", "Unknown field (use email or flags)");
+            return;
+        };
+        var scratch: [512]u8 = undefined;
+        _ = svc.setAccount(account, p[1], field, &scratch) catch {
+            try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
+            return;
+        };
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} updated ({s})\r\n", .{ server_name, conn.session.displayName(), account, p[2] }) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// `GHOST <nick> <password>` — disconnect a stale session occupying a nick
+    /// that belongs to the caller's account (password-verified). The victim is
+    /// torn down via the standard drain-close path.
+    fn handleGhost(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "GHOST", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"GHOST"}, "Usage: GHOST <nick> <password>");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+        _ = svc.ghostAccount(target, parsed.paramSlice()[1], target) catch {
+            try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
+            return;
+        };
+        var buf: [default_reply_bytes]u8 = undefined;
+        if (self.world.findNick(target)) |wid| {
+            if (self.clients.get(clientIdFromWorld(wid))) |victim| {
+                if (!victim.closing) {
+                    const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Ghosted by {s}\r\n", .{ server_name, conn.session.displayName() }) catch return;
+                    appendToConn(victim, ln) catch {};
+                    victim.close_reason = "Ghosted";
+                    victim.closing = true;
+                    self.armSendIfNeeded(victim) catch {};
+                }
+            }
+        }
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Ghost session for {s} removed\r\n", .{ server_name, conn.session.displayName(), target }) catch return;
         try appendToConn(conn, line);
     }
 
