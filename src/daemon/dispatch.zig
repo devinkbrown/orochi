@@ -254,9 +254,10 @@ const cap_specs = [_]CapSpec{
     .{ .id = .reply, .name = "draft/reply" },
     .{ .id = .batch, .name = "batch" },
     .{ .id = .bot, .name = "bot" },
-    // account-notify is enumerated but not advertised: the only auth change is
-    // SASL during pre-registration, before the client shares any channel, so
-    // there is no post-join ACCOUNT event to deliver yet.
+    // account-notify: receive an ACCOUNT line when a user in a common channel
+    // logs in (IDENTIFY) or out (LOGOUT). The server emits these at the live
+    // login/logout sites.
+    .{ .id = .account_notify, .name = "account-notify" },
 };
 
 const CapReplyKind = enum {

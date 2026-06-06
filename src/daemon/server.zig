@@ -5294,6 +5294,7 @@ pub const LinuxServer = struct {
             return;
         };
         loginSession(conn, account);
+        if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ server_name, account }) catch return;
         try appendToConn(conn, line);
@@ -5331,6 +5332,7 @@ pub const LinuxServer = struct {
             return;
         };
         loginSession(conn, account);
+        if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ server_name, conn.session.displayName(), account }) catch return;
         try appendToConn(conn, line);
@@ -5346,6 +5348,9 @@ pub const LinuxServer = struct {
         // Drop this connection's live session before clearing the account binding
         // (the session is keyed by account; logout fully ends it, no reclaim).
         if (conn.session.account()) |acct| _ = self.sessions.remove(acct, monitorIdFromClient(id));
+        // account-notify: tell common channels this user is no longer logged in
+        // (emit BEFORE clearing the account so the prefix/state is still valid).
+        self.emitAccountChange(id, conn, "*");
         conn.session.logout();
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ server_name, conn.session.displayName() }) catch return;
@@ -6491,6 +6496,17 @@ pub const LinuxServer = struct {
     /// Fan a pre-built message out to every member of every channel `id` shares,
     /// optionally gated on a negotiated capability, skipping `except`. Each
     /// recipient is delivered at most once even across multiple shared channels.
+    /// Fan an IRCv3 `ACCOUNT` line out to common-channel members that negotiated
+    /// account-notify, after this client logs in (`label` = account name) or out
+    /// (`label` = "*"). Best-effort; no-op if the client shares no channels.
+    fn emitAccountChange(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, label: []const u8) void {
+        var prefix_buf: [256]u8 = undefined;
+        const pfx = clientPrefix(conn, &prefix_buf) catch return;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, ":{s} ACCOUNT {s}\r\n", .{ pfx, label }) catch return;
+        self.notifyCommonChannels(id, msg, .account_notify, id) catch {};
+    }
+
     fn notifyCommonChannels(
         self: *LinuxServer,
         id: client_model.ClientId,
