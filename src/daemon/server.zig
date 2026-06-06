@@ -33,6 +33,7 @@ const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
 const chanserv_cmd = @import("../proto/chanserv_cmd.zig");
 const oper_motd_mod = @import("../proto/oper_motd.zig");
+const host_request_mod = @import("host_request.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
@@ -785,6 +786,8 @@ pub const LinuxServer = struct {
     observe: observe_mod.Registry,
     /// Operator MOTD (OPERMOTD), distinct from the user MOTD.
     oper_motd: oper_motd_mod.OperMotd,
+    /// Pending/decided vhost requests (VHOST REQUEST → oper APPROVE/DENY).
+    host_requests: host_request_mod.Queue,
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
@@ -879,6 +882,7 @@ pub const LinuxServer = struct {
             .silence = silence.Store.init(allocator),
             .observe = observe_mod.Registry.init(allocator, .{}),
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
+            .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -924,6 +928,7 @@ pub const LinuxServer = struct {
         self.silence.deinit();
         self.observe.deinit();
         self.oper_motd.deinit();
+        self.host_requests.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1520,6 +1525,8 @@ pub const LinuxServer = struct {
                 try self.deliverTegami(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
                 self.notifyObservers(.connect, observeSubject(conn, ""));
+                // Apply any operator-approved vhost waiting for this account.
+                self.maybeApplyApprovedVhost(id, conn);
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -5339,12 +5346,21 @@ pub const LinuxServer = struct {
     /// visible host and broadcasts a native CHGHOST to common-channel members who
     /// negotiated the chghost cap (others see the new host on the next message).
     fn handleVhost(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"VHOST"}, "Usage: VHOST <host> | REQUEST <host> | LIST | APPROVE <account> | DENY <account> [:reason]");
             return;
         }
-        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"VHOST"}, "Usage: VHOST <host>");
+        // Request/approval flow: REQUEST lets any logged-in user ask for a vhost;
+        // LIST/APPROVE/DENY are the oper review side. A bare host argument is the
+        // oper's immediate self-set (original behaviour).
+        const p = parsed.paramSlice();
+        if (std.ascii.eqlIgnoreCase(p[0], "REQUEST")) {
+            return self.handleVhostRequest(conn, p);
+        } else if (std.ascii.eqlIgnoreCase(p[0], "LIST") or std.ascii.eqlIgnoreCase(p[0], "APPROVE") or std.ascii.eqlIgnoreCase(p[0], "DENY")) {
+            return self.handleVhostReview(id, conn, p);
+        }
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
         }
         const new_host = parsed.paramSlice()[0];
@@ -5380,6 +5396,116 @@ pub const LinuxServer = struct {
         var note_buf: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&note_buf, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ server_name, conn.session.displayName(), new_host }) catch return;
         try appendToConn(conn, note);
+    }
+
+    /// `VHOST REQUEST <host>` — a logged-in user asks for a vhost; queued for oper
+    /// review. No effect until an oper APPROVEs.
+    fn handleVhostRequest(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
+        const account = conn.session.account() orelse {
+            try self.failReply(conn, "VHOST", "ACCOUNT_REQUIRED", "Log in before requesting a vhost");
+            return;
+        };
+        if (p.len < 2 or p[1].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"VHOST"}, "Usage: VHOST REQUEST <host>");
+            return;
+        }
+        const want = p[1];
+        chghost.validateHost(want) catch {
+            try self.failReply(conn, "VHOST", "INVALID_HOST", "Invalid host");
+            return;
+        };
+        self.host_requests.submit(account, want, self.nowMs()) catch {
+            try self.failReply(conn, "VHOST", "TEMPORARILY_UNAVAILABLE", "Could not queue request");
+            return;
+        };
+        try self.noticeTo(conn, "VHOST request submitted; pending operator approval");
+    }
+
+    /// `VHOST LIST|APPROVE <account>|DENY <account> [:reason]` — oper review side.
+    fn handleVhostReview(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
+        _ = id;
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            var buf: [128]host_request_mod.Request = undefined;
+            const pending = self.host_requests.pendingList(&buf) catch &.{};
+            for (pending) |r| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST pending {s} -> {s}\r\n", .{ server_name, conn.session.displayName(), r.account, r.vhost }) catch continue;
+                try appendToConn(conn, line);
+            }
+            try self.noticeTo(conn, "VHOST: end of pending list");
+            return;
+        }
+        if (p.len < 2 or p[1].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"VHOST"}, "Usage: VHOST APPROVE|DENY <account> [:reason]");
+            return;
+        }
+        const account = p[1];
+        if (std.ascii.eqlIgnoreCase(p[0], "DENY")) {
+            const reason = if (p.len >= 3) p[2] else "denied";
+            self.host_requests.deny(account, reason, self.nowMs()) catch {
+                try self.noticeTo(conn, "VHOST: no such pending request");
+                return;
+            };
+            try self.noticeTo(conn, "VHOST request denied");
+            return;
+        }
+        // APPROVE: record approval, then apply to any online sessions of the
+        // account immediately (offline accounts pick it up on next login).
+        const req = self.host_requests.get(account) orelse {
+            try self.noticeTo(conn, "VHOST: no such pending request");
+            return;
+        };
+        self.host_requests.approve(account, self.nowMs()) catch {
+            try self.noticeTo(conn, "VHOST: could not approve");
+            return;
+        };
+        var hbuf: [128]u8 = undefined;
+        const host = std.fmt.bufPrint(&hbuf, "{s}", .{req.vhost}) catch return;
+        self.applyVhostToAccount(account, host);
+        try self.noticeTo(conn, "VHOST approved and applied");
+    }
+
+    /// On login, apply (and consume) an approved vhost request for the account.
+    fn maybeApplyApprovedVhost(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        const account = conn.session.account() orelse return;
+        const req = self.host_requests.get(account) orelse return;
+        if (req.status != .approved) return;
+        var hbuf: [128]u8 = undefined;
+        const host = std.fmt.bufPrint(&hbuf, "{s}", .{req.vhost}) catch return;
+        applyVhostLine(self, id, conn, host) catch {};
+        _ = self.host_requests.take(account);
+    }
+
+    /// Apply `new_host` to every online session of `account` (CHGHOST fan-out).
+    fn applyVhostToAccount(self: *LinuxServer, account: []const u8, new_host: []const u8) void {
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            const acct = c.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
+            applyVhostLine(self, entry.id, c, new_host) catch {};
+        }
+    }
+
+    /// Set a client's visible host and fan a CHGHOST out to common channels.
+    fn applyVhostLine(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, new_host: []const u8) !void {
+        var prefix_buf: [256]u8 = undefined;
+        const old_prefix = clientPrefix(conn, &prefix_buf) catch return;
+        const bang = std.mem.indexOfScalar(u8, old_prefix, '!') orelse return;
+        const at = std.mem.indexOfScalarPos(u8, old_prefix, bang + 1, '@') orelse return;
+        const pfx = chghost.Prefix{ .nick = old_prefix[0..bang], .user = old_prefix[bang + 1 .. at], .host = old_prefix[at + 1 ..] };
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const body = chghost.buildChghostLine(&line_buf, pfx, conn.session.username(), new_host) catch return;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s}\r\n", .{body}) catch return;
+        conn.session.setVisibleHost(new_host);
+        try self.notifyCommonChannels(id, msg, .chghost, id);
+        if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
+        try self.noticeTo(conn, "Your requested vhost was approved and applied");
     }
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.
