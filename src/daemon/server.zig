@@ -56,6 +56,7 @@ const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
 const oper_mod = @import("oper.zig");
+const config_format = @import("config_format.zig");
 const services_mod = @import("services.zig");
 const account_register = @import("../proto/account_register.zig");
 const sessions_mod = @import("sessions.zig");
@@ -668,6 +669,11 @@ pub const Config = struct {
     /// (real host shown). main derives this from `[server] cloak_secret`, or a
     /// random per-boot key when account/SASL features imply privacy is wanted.
     cloak_key: ?cloak.SecretKey = null,
+    /// Config file path + resolver for live REHASH. When set (by main), REHASH
+    /// re-reads and re-parses this file and swaps in the new oper registry. Null
+    /// = REHASH acknowledges without reloading (e.g. defaults-only boot, tests).
+    config_path: ?[]const u8 = null,
+    config_resolver: config_format.Resolver = .{},
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -784,6 +790,12 @@ pub const LinuxServer = struct {
     sessions: sessions_mod.SessionStore,
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
+    /// Server-owned config reloaded by the most recent REHASH. The live
+    /// `oper_registry` borrows `reload_bindings`, which borrow `reload_parsed`;
+    /// all three are freed (and the prior generation replaced) on each REHASH and
+    /// on deinit. Null/empty until the first successful REHASH.
+    reload_parsed: ?config_format.Config = null,
+    reload_bindings: []oper_mod.OperBinding = &.{},
     /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
     /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
     s2s_listener_fd: linux.fd_t = -1,
@@ -882,6 +894,8 @@ pub const LinuxServer = struct {
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
+        self.allocator.free(self.reload_bindings);
+        if (self.reload_parsed) |*p| p.deinit(self.allocator);
         self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
@@ -4669,15 +4683,68 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// REHASH — oper-only configuration reload. The config store is static at
-    /// present, so this acknowledges with RPL_REHASHING (382) without I/O.
+    /// REHASH — oper-only configuration reload. Re-reads and re-parses the
+    /// configured file and swaps in a freshly-built oper registry (account→class
+    /// bindings). Existing sessions keep their current oper state; new SASL logins
+    /// observe the reloaded bindings. Without a config path it acknowledges only.
     fn handleRehash(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
         }
-        try queueNumeric(conn, .RPL_REHASHING, &.{"mizuchi.conf"}, "Rehashing");
+        const path = self.config.config_path orelse {
+            try queueNumeric(conn, .RPL_REHASHING, &.{"mizuchi.conf"}, "No config file; nothing to reload");
+            return;
+        };
+        const io = self.config.crypto_io orelse {
+            try queueNumeric(conn, .RPL_REHASHING, &.{path}, "No I/O available; cannot reload");
+            return;
+        };
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(1 << 20)) catch {
+            try self.noticeTo(conn, "REHASH: cannot read config file");
+            return;
+        };
+        defer self.allocator.free(text);
+
+        var parser = config_format.Parser.init(self.allocator, text, self.config.config_resolver);
+        var parsed = parser.parse() catch {
+            try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
+            return;
+        };
+        // Build the new oper bindings (strings borrow `parsed`, kept alive below).
+        const bindings = self.allocator.alloc(oper_mod.OperBinding, parsed.opers.len) catch {
+            parsed.deinit(self.allocator);
+            try self.noticeTo(conn, "REHASH: out of memory; keeping current config");
+            return;
+        };
+        for (parsed.opers, 0..) |o, i| {
+            bindings[i] = .{
+                .account_name = o.account,
+                .class_name = if (o.class.len != 0) o.class else "operator",
+                .privileges = oper_mod.OperPrivileges.full,
+            };
+        }
+        const new_registry: ?oper_mod.OperRegistry = if (bindings.len != 0)
+            (oper_mod.OperRegistry.init(bindings) catch {
+                self.allocator.free(bindings);
+                parsed.deinit(self.allocator);
+                try self.noticeTo(conn, "REHASH: invalid oper bindings; keeping current config");
+                return;
+            })
+        else
+            null;
+
+        // Commit: replace the previous reloaded generation, then point the live
+        // registry at the new bindings.
+        self.allocator.free(self.reload_bindings);
+        if (self.reload_parsed) |*p| p.deinit(self.allocator);
+        self.reload_parsed = parsed;
+        self.reload_bindings = bindings;
+        self.oper_registry = new_registry;
+
+        var note_buf: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&note_buf, "Configuration reloaded ({d} oper bindings)", .{bindings.len}) catch "Configuration reloaded";
+        try queueNumeric(conn, .RPL_REHASHING, &.{path}, note);
     }
 
     /// INFO — RPL_INFO (371) lines bracketed by RPL_INFOSTART/RPL_ENDOFINFO.

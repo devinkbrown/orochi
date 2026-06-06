@@ -42,6 +42,9 @@ pub fn main(init: std.process.Init) !void {
             if (mizuchi.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                 held = loaded;
                 srv_cfg = loaded.config;
+                // Enable live REHASH: the server re-reads this same file/resolver.
+                srv_cfg.config_path = path;
+                srv_cfg.config_resolver = resolver;
                 std.debug.print("mizuchi: loaded config from {s}\n", .{path});
             } else |err| {
                 std.debug.print("mizuchi: config error in {s} ({s}); using defaults\n", .{ path, @errorName(err) });
