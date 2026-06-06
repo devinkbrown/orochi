@@ -1,0 +1,431 @@
+//! Warden — the network ban registry. The network ban registry for admins and opers.
+//! checkpoints where travellers presented papers and were admitted or refused.
+//!
+//! Mizuchi replaces the legacy single-letter ban alphabet (K/D/G/Z/X/Q-line),
+//! whose semantics overlapped and confused "what is matched" with "what
+//! happens" and "where it applies", with one coherent entry — a `Ward` — built
+//! from three ORTHOGONAL axes:
+//!
+//!   * Match  — which identity facet the pattern tests
+//!              (address / host / mask / account / realname / certfp)
+//!   * Scope  — node (this server) or mesh (propagated network-wide)
+//!   * Action — what happens to a matching subject
+//!              (refuse / expel / quarantine / require_auth)
+//!
+//! A subject presents its `Facets` at the checkpoint; `check` returns the first
+//! active Ward that matches. Address matching understands IPv4 CIDR; every other
+//! facet uses case-insensitive globbing. Pure: owns all strings, performs no I/O.
+
+const std = @import("std");
+
+/// Which identity facet a Ward's pattern is tested against.
+pub const Match = enum {
+    address, // IP literal or CIDR (e.g. 192.0.2.0/24)
+    host, // resolved/cloaked hostname glob
+    mask, // nick!user@host glob
+    account, // services account name glob
+    realname, // GECOS / realname glob
+    certfp, // TLS client-certificate fingerprint glob
+
+    pub fn token(self: Match) []const u8 {
+        return switch (self) {
+            .address => "address",
+            .host => "host",
+            .mask => "mask",
+            .account => "account",
+            .realname => "realname",
+            .certfp => "certfp",
+        };
+    }
+
+    pub fn parse(raw: []const u8) ?Match {
+        inline for (@typeInfo(Match).@"enum".fields) |f| {
+            const m: Match = @enumFromInt(f.value);
+            if (std.ascii.eqlIgnoreCase(raw, m.token())) return m;
+        }
+        return null;
+    }
+};
+
+/// Where a Ward applies.
+pub const Scope = enum {
+    node,
+    mesh,
+
+    pub fn token(self: Scope) []const u8 {
+        return switch (self) {
+            .node => "node",
+            .mesh => "mesh",
+        };
+    }
+
+    pub fn parse(raw: []const u8) ?Scope {
+        if (std.ascii.eqlIgnoreCase(raw, "node")) return .node;
+        if (std.ascii.eqlIgnoreCase(raw, "mesh")) return .mesh;
+        return null;
+    }
+};
+
+/// What happens to a subject a Ward matches.
+pub const Action = enum {
+    refuse, // reject the connection before registration completes
+    expel, // disconnect the client with the Ward's reason
+    quarantine, // allow the connection but restrict it (no join/speak)
+    require_auth, // permit only if the subject is authenticated to an account
+
+    pub fn token(self: Action) []const u8 {
+        return switch (self) {
+            .refuse => "refuse",
+            .expel => "expel",
+            .quarantine => "quarantine",
+            .require_auth => "require_auth",
+        };
+    }
+
+    pub fn parse(raw: []const u8) ?Action {
+        inline for (@typeInfo(Action).@"enum".fields) |f| {
+            const a: Action = @enumFromInt(f.value);
+            if (std.ascii.eqlIgnoreCase(raw, a.token())) return a;
+        }
+        return null;
+    }
+};
+
+pub const Params = struct {
+    max_wards: usize = 1024,
+    max_pattern: usize = 256,
+    max_reason: usize = 512,
+    max_setter: usize = 64,
+};
+
+pub const WardError = error{
+    EmptyPattern,
+    PatternTooLong,
+    ReasonTooLong,
+    SetterTooLong,
+    TooManyWards,
+};
+
+/// A single ban entry. String fields are owned by the registry.
+pub const Ward = struct {
+    match: Match,
+    pattern: []const u8,
+    scope: Scope = .node,
+    action: Action = .expel,
+    reason: []const u8 = "",
+    set_by: []const u8 = "",
+    created_ms: i64 = 0,
+    /// Absolute expiry in epoch millis; 0 means permanent.
+    expires_ms: i64 = 0,
+
+    pub fn isExpired(self: Ward, now_ms: i64) bool {
+        return self.expires_ms != 0 and self.expires_ms <= now_ms;
+    }
+};
+
+/// The identity a subject presents at the checkpoint. Empty/null facets never
+/// match (a Ward on a facet the subject lacks simply does not apply).
+pub const Facets = struct {
+    address: []const u8 = "",
+    host: []const u8 = "",
+    mask: []const u8 = "",
+    account: ?[]const u8 = null,
+    realname: []const u8 = "",
+    certfp: []const u8 = "",
+
+    fn facet(self: Facets, m: Match) []const u8 {
+        return switch (m) {
+            .address => self.address,
+            .host => self.host,
+            .mask => self.mask,
+            .account => self.account orelse "",
+            .realname => self.realname,
+            .certfp => self.certfp,
+        };
+    }
+};
+
+pub const Registry = struct {
+    allocator: std.mem.Allocator,
+    params: Params,
+    wards: std.ArrayListUnmanaged(Ward) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, params: Params) Registry {
+        return .{ .allocator = allocator, .params = params };
+    }
+
+    pub fn deinit(self: *Registry) void {
+        for (self.wards.items) |*w| freeWard(self.allocator, w);
+        self.wards.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Add a Ward (its strings are duped). A Ward with the same (match, pattern)
+    /// is replaced in place.
+    pub fn add(self: *Registry, ward: Ward) (WardError || std.mem.Allocator.Error)!void {
+        try self.validate(ward);
+        var owned = try self.clone(ward);
+        errdefer freeWard(self.allocator, &owned);
+        if (self.indexOf(ward.match, ward.pattern)) |idx| {
+            freeWard(self.allocator, &self.wards.items[idx]);
+            self.wards.items[idx] = owned;
+            return;
+        }
+        if (self.wards.items.len >= self.params.max_wards) return error.TooManyWards;
+        try self.wards.append(self.allocator, owned);
+    }
+
+    /// Remove the Ward identified by (match, pattern). Returns true if present.
+    pub fn remove(self: *Registry, match: Match, pattern: []const u8) bool {
+        const idx = self.indexOf(match, pattern) orelse return false;
+        var w = self.wards.orderedRemove(idx);
+        freeWard(self.allocator, &w);
+        return true;
+    }
+
+    /// First active Ward whose facet pattern matches the subject, or null.
+    /// Expired Wards are pruned as a side effect.
+    pub fn check(self: *Registry, facets: Facets, now_ms: i64) ?*const Ward {
+        self.pruneExpired(now_ms);
+        for (self.wards.items) |*w| {
+            const value = facets.facet(w.match);
+            if (value.len == 0) continue;
+            if (matchValue(w.match, w.pattern, value)) return w;
+        }
+        return null;
+    }
+
+    /// Copy active Wards (optionally filtered by `only`) into `out`, newest stays
+    /// in insertion order. Returns the filled prefix.
+    pub fn list(self: *const Registry, only: ?Match, out: []Ward) []const Ward {
+        var n: usize = 0;
+        for (self.wards.items) |w| {
+            if (only) |m| {
+                if (w.match != m) continue;
+            }
+            if (n == out.len) break;
+            out[n] = w;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    pub fn count(self: *const Registry) usize {
+        return self.wards.items.len;
+    }
+
+    pub fn pruneExpired(self: *Registry, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.wards.items.len) {
+            if (self.wards.items[i].isExpired(now_ms)) {
+                var w = self.wards.orderedRemove(i);
+                freeWard(self.allocator, &w);
+            } else i += 1;
+        }
+    }
+
+    fn validate(self: *const Registry, w: Ward) WardError!void {
+        if (w.pattern.len == 0) return error.EmptyPattern;
+        if (w.pattern.len > self.params.max_pattern) return error.PatternTooLong;
+        if (w.reason.len > self.params.max_reason) return error.ReasonTooLong;
+        if (w.set_by.len > self.params.max_setter) return error.SetterTooLong;
+    }
+
+    fn clone(self: *Registry, w: Ward) std.mem.Allocator.Error!Ward {
+        const pattern = try self.allocator.dupe(u8, w.pattern);
+        errdefer self.allocator.free(pattern);
+        const reason = try self.allocator.dupe(u8, w.reason);
+        errdefer self.allocator.free(reason);
+        const set_by = try self.allocator.dupe(u8, w.set_by);
+        return .{
+            .match = w.match,
+            .pattern = pattern,
+            .scope = w.scope,
+            .action = w.action,
+            .reason = reason,
+            .set_by = set_by,
+            .created_ms = w.created_ms,
+            .expires_ms = w.expires_ms,
+        };
+    }
+
+    fn indexOf(self: *const Registry, match: Match, pattern: []const u8) ?usize {
+        for (self.wards.items, 0..) |w, i| {
+            if (w.match == match and std.mem.eql(u8, w.pattern, pattern)) return i;
+        }
+        return null;
+    }
+};
+
+fn freeWard(allocator: std.mem.Allocator, w: *Ward) void {
+    allocator.free(w.pattern);
+    allocator.free(w.reason);
+    allocator.free(w.set_by);
+    w.* = undefined;
+}
+
+/// Match a facet value against a Ward pattern. `.address` understands IPv4 CIDR
+/// (falling back to glob); all other facets use case-insensitive globbing.
+pub fn matchValue(match: Match, pattern: []const u8, value: []const u8) bool {
+    if (match == .address) {
+        if (parseCidr(pattern)) |cidr| {
+            if (parseIpv4(value)) |addr| return cidr.contains(addr);
+        }
+    }
+    return globMatch(pattern, value);
+}
+
+/// Iterative, case-insensitive `*`/`?` glob (no recursion, backtracking).
+pub fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: ?usize = null;
+    var mark: usize = 0;
+    while (t < text.len) {
+        if (p < pattern.len and (pattern[p] == '?' or std.ascii.toLower(pattern[p]) == std.ascii.toLower(text[t]))) {
+            p += 1;
+            t += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            mark = t;
+            p += 1;
+        } else if (star) |s| {
+            p = s + 1;
+            mark += 1;
+            t = mark;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
+const Ipv4Cidr = struct {
+    addr: u32,
+    prefix_bits: u6,
+    fn contains(self: Ipv4Cidr, addr: u32) bool {
+        if (self.prefix_bits == 0) return true;
+        const shift: u5 = @intCast(32 - self.prefix_bits);
+        const mask: u32 = @as(u32, std.math.maxInt(u32)) << shift;
+        return (self.addr & mask) == (addr & mask);
+    }
+};
+
+fn parseCidr(bytes: []const u8) ?Ipv4Cidr {
+    const slash = std.mem.indexOfScalar(u8, bytes, '/') orelse return null;
+    if (std.mem.indexOfScalar(u8, bytes[slash + 1 ..], '/') != null) return null;
+    const addr = parseIpv4(bytes[0..slash]) orelse return null;
+    const prefix_int = std.fmt.parseInt(u8, bytes[slash + 1 ..], 10) catch return null;
+    if (prefix_int > 32) return null;
+    return .{ .addr = addr, .prefix_bits = @intCast(prefix_int) };
+}
+
+fn parseIpv4(bytes: []const u8) ?u32 {
+    var parts: [4]u8 = undefined;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start <= bytes.len) {
+        if (count == parts.len) return null;
+        const end = std.mem.indexOfScalarPos(u8, bytes, start, '.') orelse bytes.len;
+        if (end == start) return null;
+        parts[count] = std.fmt.parseInt(u8, bytes[start..end], 10) catch return null;
+        count += 1;
+        if (end == bytes.len) break;
+        start = end + 1;
+    }
+    if (count != parts.len) return null;
+    return (@as(u32, parts[0]) << 24) | (@as(u32, parts[1]) << 16) | (@as(u32, parts[2]) << 8) | @as(u32, parts[3]);
+}
+
+// ── tests ────────────────────────────────────────────────────────────────
+
+fn mkWard(match: Match, pattern: []const u8, action: Action) Ward {
+    return .{ .match = match, .pattern = pattern, .action = action, .reason = "nope", .set_by = "oper", .created_ms = 100 };
+}
+
+test "axis tokens parse round-trip" {
+    inline for (@typeInfo(Match).@"enum".fields) |f| {
+        const m: Match = @enumFromInt(f.value);
+        try std.testing.expectEqual(m, Match.parse(m.token()).?);
+    }
+    try std.testing.expectEqual(Scope.mesh, Scope.parse("MESH").?);
+    try std.testing.expectEqual(Action.quarantine, Action.parse("Quarantine").?);
+    try std.testing.expect(Action.parse("kline") == null);
+}
+
+test "address ward matches ipv4 cidr; mask ward globs" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.add(mkWard(.address, "192.0.2.0/24", .refuse));
+    try reg.add(mkWard(.mask, "*!*@*.evil.example", .expel));
+
+    try std.testing.expect(reg.check(.{ .address = "192.0.2.50" }, 200) != null);
+    try std.testing.expect(reg.check(.{ .address = "192.0.3.50" }, 200) == null);
+    const hit = reg.check(.{ .mask = "bob!~b@host.evil.example" }, 200).?;
+    try std.testing.expectEqual(Action.expel, hit.action);
+}
+
+test "absent facet never matches; account ward needs account" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.add(mkWard(.account, "spammer*", .require_auth));
+    try std.testing.expect(reg.check(.{ .mask = "x!y@z" }, 0) == null); // no account facet
+    try std.testing.expect(reg.check(.{ .account = "spammer42" }, 0) != null);
+}
+
+test "expiry prunes and stops matching" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    var w = mkWard(.host, "*.bad", .expel);
+    w.expires_ms = 1000;
+    try reg.add(w);
+    try std.testing.expect(reg.check(.{ .host = "x.bad" }, 999) != null);
+    try std.testing.expect(reg.check(.{ .host = "x.bad" }, 1000) == null);
+    try std.testing.expectEqual(@as(usize, 0), reg.count());
+}
+
+test "add replaces on same match+pattern; remove + list" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    var a = mkWard(.mask, "*!*@dup", .expel);
+    a.reason = "first";
+    try reg.add(a);
+    var b = mkWard(.mask, "*!*@dup", .quarantine);
+    b.reason = "second";
+    try reg.add(b);
+    try std.testing.expectEqual(@as(usize, 1), reg.count());
+
+    try reg.add(mkWard(.host, "*.other", .expel));
+    var out: [8]Ward = undefined;
+    const masks = reg.list(.mask, &out);
+    try std.testing.expectEqual(@as(usize, 1), masks.len);
+    try std.testing.expectEqualStrings("second", masks[0].reason);
+
+    try std.testing.expect(reg.remove(.mask, "*!*@dup"));
+    try std.testing.expect(!reg.remove(.mask, "*!*@dup"));
+}
+
+test "limits and validation" {
+    var reg = Registry.init(std.testing.allocator, .{ .max_wards = 1, .max_pattern = 8, .max_reason = 4 });
+    defer reg.deinit();
+    try std.testing.expectError(error.EmptyPattern, reg.add(mkWard(.host, "", .expel)));
+    try std.testing.expectError(error.PatternTooLong, reg.add(mkWard(.host, "wayyytoolong", .expel)));
+    var longr = mkWard(.host, "a.b", .expel);
+    longr.reason = "toolong";
+    try std.testing.expectError(error.ReasonTooLong, reg.add(longr));
+    try reg.add(mkWard(.host, "a.b", .expel));
+    try std.testing.expectError(error.TooManyWards, reg.add(mkWard(.host, "c.d", .expel)));
+}
+
+test "no leak under churn" {
+    var reg = Registry.init(std.testing.allocator, .{ .max_wards = 64 });
+    defer reg.deinit();
+    for (0..40) |i| {
+        var buf: [32]u8 = undefined;
+        const pat = try std.fmt.bufPrint(&buf, "*!*@host{d}.x", .{i});
+        var w = mkWard(.mask, pat, .expel);
+        w.expires_ms = @intCast(i + 1);
+        try reg.add(w);
+    }
+    reg.pruneExpired(1000);
+    try std.testing.expectEqual(@as(usize, 0), reg.count());
+}

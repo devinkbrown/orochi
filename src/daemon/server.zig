@@ -35,7 +35,7 @@ const chanserv_cmd = @import("../proto/chanserv_cmd.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
-const ban_db = @import("ban_db.zig");
+const warden = @import("warden.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
@@ -783,7 +783,7 @@ pub const LinuxServer = struct {
     /// Operator OBSERVE subscriptions (live Event-Spine surveillance feed).
     observe: observe_mod.Registry,
     history: HistoryStore,
-    bans_db: ban_db.Store,
+    warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
     props: ircx_prop_store.DefaultStore,
     access: ircx_access_store.AccessStore,
@@ -876,7 +876,7 @@ pub const LinuxServer = struct {
             .silence = silence.Store.init(allocator),
             .observe = observe_mod.Registry.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
-            .bans_db = ban_db.Store.init(allocator, .{}),
+            .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
@@ -912,7 +912,7 @@ pub const LinuxServer = struct {
         }
         if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
         self.history.deinit();
-        self.bans_db.deinit();
+        self.warden.deinit();
         self.metadata.deinit();
         self.props.deinit();
         self.access.deinit();
@@ -1634,14 +1634,8 @@ pub const LinuxServer = struct {
             try self.handleMap(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KILL")) {
             try self.handleKill(conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "KLINE")) {
-            try self.handleAddLine(conn, parsed, .kline, "KLINE");
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "DLINE")) {
-            try self.handleAddLine(conn, parsed, .dline, "DLINE");
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "UNKLINE")) {
-            try self.handleRemoveLine(conn, parsed, .kline, "UNKLINE");
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "UNDLINE")) {
-            try self.handleRemoveLine(conn, parsed, .dline, "UNDLINE");
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "WARD")) {
+            try self.handleWard(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOWAS")) {
             try self.handleWhowas(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "KNOCK")) {
@@ -2988,8 +2982,8 @@ pub const LinuxServer = struct {
                     }
                 }
             },
-            'k', 'K' => try self.statsLines(conn, .kline, .RPL_STATSKLINE),
-            'd', 'D' => try self.statsLines(conn, .dline, .RPL_STATSDLINE),
+            'k', 'K' => try self.statsLines(conn, .mask, .RPL_STATSKLINE),
+            'd', 'D' => try self.statsLines(conn, .address, .RPL_STATSDLINE),
             'z', 'Z' => {
                 // Runtime counters (RPL_STATSDEBUG 249), oper-only.
                 if (!conn.session.isOper()) {
@@ -3179,49 +3173,116 @@ pub const LinuxServer = struct {
         try appendToConn(conn, batch);
     }
 
-    /// KLINE/DLINE <mask> [:reason] — oper-only ban-line add (stored in ban_db).
-    fn handleAddLine(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, kind: ban_db.Kind, cmd: []const u8) !void {
+    /// `WARD <ADD|DEL|LIST|TEST> …` — the unified network-ban command for admins
+    /// and opers, replacing the legacy K/D/G/Z/X/Q-line alphabet with one
+    /// orthogonal model (backed by the Warden registry: Match × Scope × Action).
+    /// Oper-only.
+    ///   ADD  <match> <pattern> [scope] [action] [duration_secs] [:reason]
+    ///   DEL  <match> <pattern>
+    ///   LIST [match]
+    ///   TEST <match> <value>
+    fn handleWard(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
         }
-        if (parsed.param_count < 1) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{cmd}, "Not enough parameters");
+        const p = parsed.paramSlice();
+        if (p.len < 1) {
+            try self.noticeTo(conn, "Usage: WARD <ADD|DEL|LIST|TEST> …");
             return;
         }
-        const mask = parsed.paramSlice()[0];
-        const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "No reason";
-        self.bans_db.add(.{
-            .kind = kind,
-            .mask = mask,
-            .reason = reason,
-            .set_by = conn.session.displayName(),
-            .set_at = platform.realtimeMillis(),
-            .duration_secs = 0,
-        }) catch {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Could not add ban line");
+        const sub = p[0];
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            const only: ?warden.Match = if (p.len >= 2) warden.Match.parse(p[1]) else null;
+            var rows: [256]warden.Ward = undefined;
+            const wards = self.warden.list(only, &rows);
+            for (wards) |w| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :WARD {s} {s} {s}/{s} by {s} :{s}\r\n", .{ server_name, conn.session.displayName(), w.match.token(), w.pattern, w.scope.token(), w.action.token(), w.set_by, w.reason }) catch continue;
+                try appendToConn(conn, line);
+            }
+            try self.noticeTo(conn, "WARD: end of list");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "TEST")) {
+            if (p.len < 3) {
+                try self.noticeTo(conn, "Usage: WARD TEST <match> <value>");
+                return;
+            }
+            const m = warden.Match.parse(p[1]) orelse {
+                try self.noticeTo(conn, "WARD: unknown match facet");
+                return;
+            };
+            var facets = warden.Facets{};
+            switch (m) {
+                .address => facets.address = p[2],
+                .host => facets.host = p[2],
+                .mask => facets.mask = p[2],
+                .account => facets.account = p[2],
+                .realname => facets.realname = p[2],
+                .certfp => facets.certfp = p[2],
+            }
+            if (self.warden.check(facets, platform.realtimeMillis())) |w| {
+                var b: [default_reply_bytes]u8 = undefined;
+                const line = std.fmt.bufPrint(&b, "WARD TEST: matched {s} {s} ({s}) :{s}", .{ w.match.token(), w.pattern, w.action.token(), w.reason }) catch return;
+                try self.noticeTo(conn, line);
+            } else {
+                try self.noticeTo(conn, "WARD TEST: no match");
+            }
+            return;
+        }
+        const adding = std.ascii.eqlIgnoreCase(sub, "ADD");
+        const deleting = std.ascii.eqlIgnoreCase(sub, "DEL");
+        if ((!adding and !deleting) or p.len < 3) {
+            try self.noticeTo(conn, "Usage: WARD ADD <match> <pattern> [scope] [action] [secs] [:reason] | DEL <match> <pattern>");
+            return;
+        }
+        const match = warden.Match.parse(p[1]) orelse {
+            try self.noticeTo(conn, "WARD: unknown match facet (address|host|mask|account|realname|certfp)");
             return;
         };
-        var nbuf: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&nbuf, "Added {s} for {s}", .{ cmd, mask }) catch return;
-        try self.publishOperEvent(.oper_action, .notice, note);
-        try queueNumeric(conn, .RPL_YOUREOPER, &.{}, note); // ack to setter (NOTICE-style)
-    }
-
-    /// UNKLINE/UNDLINE <mask> — oper-only ban-line removal.
-    fn handleRemoveLine(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, kind: ban_db.Kind, cmd: []const u8) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+        const pattern = p[2];
+        if (deleting) {
+            const removed = self.warden.remove(match, pattern);
+            var b: [default_reply_bytes]u8 = undefined;
+            const note = std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s}", .{ match.token(), pattern, if (removed) "removed" else "not found" }) catch return;
+            try self.publishOperEvent(.oper_action, .notice, note);
             return;
         }
-        if (parsed.param_count < 1) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{cmd}, "Not enough parameters");
-            return;
+        // ADD: optional positional scope, action, duration, then trailing reason.
+        var scope: warden.Scope = .node;
+        var action: warden.Action = .expel;
+        var secs: i64 = 0;
+        var reason: []const u8 = "No reason";
+        var i: usize = 3;
+        while (i < p.len) : (i += 1) {
+            if (warden.Scope.parse(p[i])) |s| {
+                scope = s;
+            } else if (warden.Action.parse(p[i])) |a| {
+                action = a;
+            } else if (std.fmt.parseInt(i64, p[i], 10)) |n| {
+                secs = n;
+            } else |_| {
+                reason = p[i]; // first non-axis, non-numeric token is the reason
+                break;
+            }
         }
-        const mask = parsed.paramSlice()[0];
-        const removed = self.bans_db.remove(kind, mask);
-        var nbuf: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&nbuf, "{s} {s}: {s}", .{ cmd, mask, if (removed) "removed" else "not found" }) catch return;
+        const now = platform.realtimeMillis();
+        self.warden.add(.{
+            .match = match,
+            .pattern = pattern,
+            .scope = scope,
+            .action = action,
+            .reason = reason,
+            .set_by = conn.session.displayName(),
+            .created_ms = now,
+            .expires_ms = if (secs > 0) now + secs * 1000 else 0,
+        }) catch {
+            try self.noticeTo(conn, "WARD: could not add ward (limit or invalid input)");
+            return;
+        };
+        var b: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s}", .{ match.token(), pattern, scope.token(), action.token() }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
     }
 
@@ -3463,16 +3524,12 @@ pub const LinuxServer = struct {
             return;
         }
         const target = parsed.paramSlice()[0];
-        var entries: [256]ban_db.Entry = undefined;
-        for ([_]ban_db.Kind{ .kline, .dline }) |kind| {
-            const rows = self.bans_db.list(kind, &entries);
-            for (rows) |e| {
-                if (ban_db.matches(kind, e.mask, target)) {
-                    const label: []const u8 = if (kind == .kline) "K" else "D";
-                    try queueNumeric(conn, .RPL_TESTLINE, &.{ label, e.mask }, e.reason);
-                    return;
-                }
-            }
+        // Probe the target against the most common facets (IP and nick!user@host
+        // / host) so a single token still reports any matching ward.
+        const facets = warden.Facets{ .address = target, .mask = target, .host = target };
+        if (self.warden.check(facets, platform.realtimeMillis())) |w| {
+            try queueNumeric(conn, .RPL_TESTLINE, &.{ w.match.token(), w.pattern }, w.reason);
+            return;
         }
         try queueNumeric(conn, .RPL_NOTESTLINE, &.{target}, "No matching ban found");
     }
@@ -3496,7 +3553,7 @@ pub const LinuxServer = struct {
             if (!c.session.registered()) continue;
             var hm_buf: [320]u8 = undefined;
             const hostmask = std.fmt.bufPrint(&hm_buf, "{s}!{s}@{s}", .{ c.session.displayName(), c.session.username(), default_host }) catch continue;
-            if (ban_db.matches(.kline, mask, hostmask)) matched += 1;
+            if (warden.globMatch(mask, hostmask)) matched += 1;
         }
         var cnt_buf: [24]u8 = undefined;
         const cnt = std.fmt.bufPrint(&cnt_buf, "{d}", .{matched}) catch "0";
@@ -4293,18 +4350,12 @@ pub const LinuxServer = struct {
         try appendToConn(conn, reply);
     }
 
-    /// STATS k/d — list ban-lines of a kind (RPL_STATSKLINE/DLINE).
-    fn statsLines(self: *LinuxServer, conn: *ConnState, kind: ban_db.Kind, code: Numeric) !void {
-        var entries: [256]ban_db.Entry = undefined;
-        const rows = self.bans_db.list(kind, &entries);
-        const label: []const u8 = switch (kind) {
-            .kline => "K",
-            .dline => "D",
-            .xline => "X",
-            .resv => "Q",
-        };
-        for (rows) |e| {
-            try queueNumeric(conn, code, &.{ label, e.mask, "*" }, e.reason);
+    /// STATS k/d — list Warden wards of a match facet (RPL_STATSKLINE/DLINE).
+    fn statsLines(self: *LinuxServer, conn: *ConnState, match: warden.Match, code: Numeric) !void {
+        var rows: [256]warden.Ward = undefined;
+        const wards = self.warden.list(match, &rows);
+        for (wards) |w| {
+            try queueNumeric(conn, code, &.{ w.match.token(), w.pattern, w.action.token() }, w.reason);
         }
     }
 
@@ -7646,7 +7697,7 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
 
     // KLINE emits an oper-action Event Spine notice (A is subscribed).
     a.reset();
-    try writeAllFd(fd_a, "KLINE bad!*@* :spam\r\n");
+    try writeAllFd(fd_a, "WARD ADD mask bad!*@* expel :spam\r\n");
     try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
     // TRACE -> 205 user line + 262 end.
     a.reset();
