@@ -1925,6 +1925,8 @@ pub const LinuxServer = struct {
             try self.handleDrop(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTINFO")) {
             try self.handleAccountInfo(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SASLINFO")) {
+            try self.handleSaslInfo(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "ACCOUNTSET")) {
             try self.handleAccountSet(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "GHOST")) {
@@ -5480,6 +5482,21 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ server_name, conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// `SASLINFO` — report the SASL mechanisms this server accepts and the
+    /// caller's current authentication state. Read-only; available to anyone.
+    fn handleSaslInfo(self: *LinuxServer, conn: *ConnState) !void {
+        const mechs = if (self.config.sasl_checker != null) "PLAIN" else "(none configured)";
+        var buf: [default_reply_bytes]u8 = undefined;
+        const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :SASL mechanisms: {s}\r\n", .{ server_name, conn.session.displayName(), mechs }) catch return;
+        try appendToConn(conn, m);
+        var buf2: [default_reply_bytes]u8 = undefined;
+        const status = if (conn.session.account()) |acct|
+            std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are logged in as {s}\r\n", .{ server_name, conn.session.displayName(), acct }) catch return
+        else
+            std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are not logged in\r\n", .{ server_name, conn.session.displayName() }) catch return;
+        try appendToConn(conn, status);
     }
 
     /// `ACCOUNTSET <account> <password> <field> <value>` — update an account
