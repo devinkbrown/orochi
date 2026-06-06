@@ -43,11 +43,22 @@ WANT_CAPS = {"server-time", "message-tags", "account-tag", "echo-message"}
 VERSION = "Mizuchi-announce 2.1 (Zig 0.16 IRC daemon build bot)"
 START = time.time()
 
-# mIRC colors
+# mIRC formatting + a fuller, deliberate palette.
 C = "\x03"
 B = "\x02"
+U = "\x1f"
 RST = "\x0f"
-CYAN, GREEN, YEL, GREY, MAG, RED = C + "11", C + "03", C + "08", C + "14", C + "13", C + "04"
+# Foreground codes (mIRC): a curated set we actually use.
+WHITE, BLACK, NAVY, GREEN, RED, MAROON = C + "00", C + "01", C + "02", C + "03", C + "04", C + "05"
+PURPLE, ORANGE, YEL, LGREEN, TEAL, CYAN = C + "06", C + "07", C + "08", C + "09", C + "10", C + "11"
+BLUE, PINK, GREY, SILVER = C + "12", C + "13", C + "14", C + "15"
+MAG = PINK  # back-compat alias
+# Per-conventional-commit-type accent color.
+TYPE_COLOR = {
+    "feat": LGREEN, "fix": RED, "docs": CYAN, "refactor": PINK, "test": GREEN,
+    "chore": SILVER, "perf": YEL, "build": BLUE, "ci": GREY, "style": PURPLE,
+    "revert": ORANGE,
+}
 
 log = logging.getLogger("announce")
 
@@ -101,12 +112,13 @@ def commit_stat(rev: str = "HEAD") -> str:
     dele = re.search(r"(\d+) deletions?", out)
     parts = []
     if files:
-        parts.append(f"{files.group(1)} files")
+        n = files.group(1)
+        parts.append(f"{SILVER}{n}{RST} file" + ("" if n == "1" else "s"))
     if ins:
-        parts.append(f"{GREEN}+{ins.group(1)}{RST}")
+        parts.append(f"{B}{GREEN}+{ins.group(1)}{RST}")
     if dele:
-        parts.append(f"{RED}-{dele.group(1)}{RST}")
-    return ", ".join(parts) if parts else "no file changes"
+        parts.append(f"{B}{RED}-{dele.group(1)}{RST}")
+    return " ".join(parts) if parts else "no file changes"
 
 
 def loc_count() -> str:
@@ -120,6 +132,23 @@ def loc_count() -> str:
         return f"{n/1000:.1f}k" if n >= 1000 else str(n)
     except Exception:
         return "?"
+
+
+# Conventional-commit type -> glyph for richer commit announcements.
+TYPE_GLYPH = {
+    "feat": "✨", "fix": "\U0001f41b", "docs": "\U0001f4dd", "refactor": "♻️",
+    "test": "✅", "chore": "\U0001f527", "perf": "⚡", "build": "\U0001f3d7️",
+    "ci": "\U0001f916", "style": "\U0001f3a8", "revert": "⏪",
+}
+
+
+def commit_field(fmt: str, rev: str = "HEAD") -> str:
+    return git("log", "-1", f"--format={fmt}", rev)
+
+
+def commit_type(subject: str) -> str:
+    m = re.match(r"([a-z]+)(?:\([^)]*\))?!?:", subject)
+    return m.group(1) if m else ""
 
 
 def uptime() -> str:
@@ -295,15 +324,19 @@ class Bot:
                 self.last_poll = now
                 cur = git("rev-parse", "HEAD")
                 if cur and cur != self.last_commit:
+                    # Announce EVERY new commit since the last poll (oldest-first),
+                    # not just the newest — a burst of commits is fully reported.
+                    revs = git("rev-list", "--reverse", f"{self.last_commit}..{cur}").split()
+                    if not revs:
+                        revs = [cur]  # history diverged (rebase/reset): show the tip
                     self.last_commit = cur
                     tc = test_count()
-                    self.msg(CHANNEL, f"{B}{GREEN}▶ commit{RST} {head_line()}")
-                    self.msg(
-                        CHANNEL,
-                        f"   {GREY}{commit_stat(cur)}{RST} · tests={GREEN}{tc}{RST}"
-                        f"{self.tests_delta(tc)} · modules={GREEN}{module_count()}{RST} "
-                        f"· loc={GREEN}{loc_count()}{RST}",
-                    )
+                    shown = revs[-5:]  # cap the burst; summarize the rest
+                    if len(revs) > len(shown):
+                        self.msg(CHANNEL, f"{GREY}… +{len(revs) - len(shown)} earlier commit(s){RST}")
+                    for i, rev in enumerate(shown):
+                        for l in self.commit_lines(rev, tc, with_delta=(i == len(shown) - 1)):
+                            self.msg(CHANNEL, l)
                     self.set_topic()
 
     def tests_delta(self, tc: str) -> str:
@@ -318,6 +351,32 @@ class Bot:
             out = f" {GREEN}(+{diff}){RST}" if diff > 0 else f" {RED}({diff}){RST}"
         self.last_tests = n
         return out
+
+    def commit_lines(self, rev: str, tc: str, with_delta: bool) -> list[str]:
+        """Rich, colorized multi-line announcement for one commit."""
+        subj = commit_field("%s", rev)
+        typ = commit_type(subj)
+        accent = TYPE_COLOR.get(typ, CYAN)
+        glyph = TYPE_GLYPH.get(typ, "▶")
+        # Show the type as a colored tag and drop its "type(scope): " prefix from
+        # the subject so it is not printed twice.
+        clean = re.sub(r"^[a-z]+(?:\([^)]*\))?!?:\s*", "", subj) if typ else subj
+        tag = f"{B}{accent}{typ}{RST} " if typ else ""
+        author = commit_field("%an", rev)
+        when = commit_field("%cr", rev)  # "3 minutes ago"
+        delta = self.tests_delta(tc) if with_delta else ""
+        total = git("rev-list", "--count", "HEAD")
+        lines = [
+            f"{accent}{B}▌{RST}{glyph} {B}{accent}{commit_field('%h', rev)}{RST} {tag}{WHITE}{clean}{RST}",
+            f"   {GREY}by {RST}{TEAL}{author}{RST} {GREY}· {when} ·{RST} {commit_stat(rev)}",
+            f"   {GREY}tests{RST} {B}{GREEN}{tc}{RST}{delta}  {GREY}modules{RST} {B}{CYAN}{module_count()}{RST}"
+            f"  {GREY}loc{RST} {B}{YEL}{loc_count()}{RST}  {GREY}#{total}{RST}",
+        ]
+        # Compact changed-files line for focused commits.
+        files = [l.split("|")[0].strip() for l in changed_files(rev) if "|" in l]
+        if files and len(files) <= 6:
+            lines.append(f"   {SILVER}└─ {' '.join(files)}{RST}")
+        return lines
 
     def set_topic(self) -> None:
         self.send_raw(
