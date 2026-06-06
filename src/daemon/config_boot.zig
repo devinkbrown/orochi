@@ -21,6 +21,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
     out.backlog = cfg.limits.backlog;
     out.max_clients = cfg.limits.max_clients;
+    if (cfg.limits.handshake_timeout_ms != 0) out.registration_timeout_ms = @intCast(cfg.limits.handshake_timeout_ms);
+    if (cfg.limits.ping_interval_ms != 0) out.ping_interval_ms = @intCast(cfg.limits.ping_interval_ms);
+    if (cfg.limits.ping_timeout_ms != 0) out.ping_timeout_ms = @intCast(cfg.limits.ping_timeout_ms);
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     return out;
 }
@@ -99,6 +102,26 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u16, 7700), loaded.config.s2s_port);
     try testing.expectEqual(@as(u64, 42), loaded.config.node_id);
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
+}
+
+test "limits durations overlay timeout knobs" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\handshake_timeout = 15s
+        \\ping_interval = 90s
+        \\ping_timeout = 45s
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(i64, 15_000), loaded.config.registration_timeout_ms);
+    try testing.expectEqual(@as(i64, 90_000), loaded.config.ping_interval_ms);
+    try testing.expectEqual(@as(i64, 45_000), loaded.config.ping_timeout_ms);
 }
 
 test "minimal config: unspecified optional fields keep defaults" {

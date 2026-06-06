@@ -35,6 +35,8 @@ pub const Schema = struct {
         .{ .section = "limits", .key = "backlog", .kind = .int, .default = "128", .min = 1, .max = 32767 },
         .{ .section = "limits", .key = "max_clients", .kind = .int, .default = "1024", .min = 1, .max = 32767 },
         .{ .section = "limits", .key = "handshake_timeout", .kind = .duration, .default = "30s", .min = 1000 },
+        .{ .section = "limits", .key = "ping_interval", .kind = .duration, .default = "120s", .min = 1000 },
+        .{ .section = "limits", .key = "ping_timeout", .kind = .duration, .default = "60s", .min = 1000 },
         .{ .section = "media", .key = "enabled", .kind = .bool, .default = "false" },
         .{ .section = "media", .key = "max_upload_bytes", .kind = .int, .default = "16777216", .max = 1073741824 },
         .{ .section = "media", .key = "max_frame_bytes", .kind = .int, .default = "65536", .max = 16777216 },
@@ -108,6 +110,8 @@ pub const Config = struct {
         backlog: u31 = 128,
         max_clients: u31 = 1024,
         handshake_timeout_ms: u64 = 30_000,
+        ping_interval_ms: u64 = 120_000,
+        ping_timeout_ms: u64 = 60_000,
     };
 
     pub const Media = struct {
@@ -318,7 +322,7 @@ pub const Parser = struct {
     }
 
     fn setLimits(self: *Parser, line: usize, col: usize, key: []const u8, value: []const u8, limits: *Config.Limits) !void {
-        if (std.mem.eql(u8, key, "backlog")) limits.backlog = @intCast(try self.parseIntRange(value, line, col, key, 1, 32767)) else if (std.mem.eql(u8, key, "max_clients")) limits.max_clients = @intCast(try self.parseIntRange(value, line, col, key, 1, 32767)) else if (std.mem.eql(u8, key, "handshake_timeout")) limits.handshake_timeout_ms = try self.parseDurationMs(value, line, col);
+        if (std.mem.eql(u8, key, "backlog")) limits.backlog = @intCast(try self.parseIntRange(value, line, col, key, 1, 32767)) else if (std.mem.eql(u8, key, "max_clients")) limits.max_clients = @intCast(try self.parseIntRange(value, line, col, key, 1, 32767)) else if (std.mem.eql(u8, key, "handshake_timeout")) limits.handshake_timeout_ms = try self.parseDurationMs(value, line, col) else if (std.mem.eql(u8, key, "ping_interval")) limits.ping_interval_ms = try self.parseDurationMs(value, line, col) else if (std.mem.eql(u8, key, "ping_timeout")) limits.ping_timeout_ms = try self.parseDurationMs(value, line, col);
     }
 
     fn setMedia(self: *Parser, line: usize, col: usize, key: []const u8, value: []const u8, media: *Config.Media) !void {

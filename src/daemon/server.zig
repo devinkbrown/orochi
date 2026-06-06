@@ -496,6 +496,11 @@ const ringlane = struct {
             _ = try self.inner.send(try encodeUserData(.send, token), fd, buffer, 0);
         }
 
+        /// Queue a relative single-shot timeout; fires as a `.timeout` completion.
+        pub fn submitTimeout(self: *Ring, token: FdToken, ts: *const linux.kernel_timespec) !void {
+            _ = try self.inner.timeout(try encodeUserData(.timeout, token), ts, 0, 0);
+        }
+
         pub fn reapCompletions(self: *Ring, out: []linux.io_uring_cqe, wait_nr: u32, handler: anytype) !void {
             const n = try self.inner.copy_cqes(out, wait_nr);
             for (out[0..n]) |cqe| {
@@ -514,6 +519,10 @@ const listener_token: RingFdToken = .{ .slot = 0, .gen = 0 };
 /// Distinct accept token for the S2S listener so handleAccept can tell the two
 /// listeners apart (same accept op; disambiguated by slot).
 const s2s_listener_token: RingFdToken = .{ .slot = 1, .gen = 0 };
+/// Reserved token for the periodic timeout sweep timer (single in-flight timer).
+const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
+/// How often the timeout sweep runs (ms).
+const timer_interval_ms: i64 = 2_000;
 const default_reply_bytes: usize = 8192;
 const default_recv_bytes: usize = 4096;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
@@ -671,6 +680,15 @@ pub const Config = struct {
     /// slots up front so ConnState buffers (targeted by in-flight io_uring I/O)
     /// never move; accepts past the cap are refused.
     max_clients: u31 = 1024,
+    /// Drop a connection that has not completed registration (NICK+USER) within
+    /// this many milliseconds (the io_uring timeout sweep enforces it).
+    registration_timeout_ms: i64 = 30_000,
+    /// A registered client idle (no inbound bytes) for this long is sent a
+    /// server PING; if it does not answer within `ping_timeout_ms` it is dropped
+    /// with "Ping timeout". The same periodic sweep enforces both.
+    ping_interval_ms: i64 = 120_000,
+    /// Grace after a server PING before a silent client is dropped (Ping timeout).
+    ping_timeout_ms: i64 = 60_000,
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
     /// take on the account store's I/O lifecycle: a caller that has a store wires
@@ -729,6 +747,20 @@ pub const ConnState = struct {
     send_offset: usize = 0,
     send_armed: bool = false,
     closing: bool = false,
+    /// QUIT reason broadcast to shared channels when this connection is torn down
+    /// via the send-drain path. Defaults to the generic socket-close reason; the
+    /// timeout sweep overrides it (e.g. "Ping timeout") before marking `closing`.
+    close_reason: []const u8 = "Client quit",
+    /// Wall-clock ms when the connection was accepted (registration-timeout base).
+    connected_at_ms: i64 = 0,
+    /// Wall-clock ms of the last inbound activity (recv with data). Updated on
+    /// every received chunk; the idle/ping sweep measures silence against it.
+    last_activity_ms: i64 = 0,
+    /// True after the sweep sent an unsolicited server PING and is awaiting any
+    /// inbound byte (PONG or otherwise) before the ping-timeout grace elapses.
+    awaiting_pong: bool = false,
+    /// Wall-clock ms when the unsolicited server PING was sent (ping-timeout base).
+    ping_sent_ms: i64 = 0,
     /// Whether this session was accepted over TLS (implicit-TLS connection fact;
     /// there is no STARTTLS). Gates +S channels. False until TLS lands.
     is_tls: bool = false,
@@ -842,6 +874,8 @@ pub const LinuxServer = struct {
     /// message ids for CHATHISTORY/REDACT (better than a per-node counter on a mesh).
     snowflake: snowflake_id.Generator,
     accept_armed: bool = false,
+    /// Whether the periodic timeout-sweep timer is currently in flight.
+    timer_armed: bool = false,
     /// Observability: a lock-free flight recorder (last N structured events,
     /// dumped on oper DEBUG / crash) + per-category level filter.
     trace_recorder: tracelog.FlightRecorder(256) = .{},
@@ -1022,6 +1056,66 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Keep exactly one periodic timeout-sweep timer in flight.
+    fn armTimer(self: *LinuxServer) !void {
+        if (self.timer_armed) return;
+        const ns = timer_interval_ms * std.time.ns_per_ms;
+        const ts: linux.kernel_timespec = .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) };
+        try self.ring.submitTimeout(timer_token, &ts);
+        self.timer_armed = true;
+    }
+
+    /// Fired when the periodic timer elapses: run the timeout sweep and re-arm.
+    fn onTimerTick(self: *LinuxServer) void {
+        self.timer_armed = false;
+        self.sweepTimeouts();
+    }
+
+    /// Drop connections that have not completed registration within the
+    /// configured window. (Idle/ping timeouts for registered clients build on
+    /// this same sweep.)
+    fn sweepTimeouts(self: *LinuxServer) void {
+        const now = self.nowMs();
+        const reg_deadline = self.config.registration_timeout_ms;
+        const ping_interval = self.config.ping_interval_ms;
+        const ping_grace = self.config.ping_timeout_ms;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (c.closing) continue; // already tearing down
+            if (c.s2s != null or c.s2s_secured != null) continue; // server links exempt
+
+            if (!c.session.registered()) {
+                // Unregistered: enforce the registration handshake window.
+                if (now - c.connected_at_ms <= reg_deadline) continue;
+                // Queue the ERROR and mark closing; the existing send-drain path
+                // (handleSend) calls closeConn for the proper io_uring-integrated
+                // teardown (shutdown in-flight recv, free slot). Never closeFd here.
+                appendToConn(c, ":" ++ server_name ++ " ERROR :Registration timeout\r\n") catch {};
+                c.close_reason = "Registration timeout";
+                c.closing = true;
+                self.armSendIfNeeded(c) catch {};
+                continue;
+            }
+
+            // Registered: idle clients get a server PING; if the grace elapses
+            // with no inbound traffic the connection is dropped (Ping timeout).
+            if (c.awaiting_pong) {
+                if (now - c.ping_sent_ms <= ping_grace) continue;
+                appendToConn(c, ":" ++ server_name ++ " ERROR :Ping timeout\r\n") catch {};
+                c.close_reason = "Ping timeout";
+                c.closing = true;
+                self.armSendIfNeeded(c) catch {};
+                continue;
+            }
+            if (now - c.last_activity_ms <= ping_interval) continue;
+            appendToConn(c, "PING :" ++ server_name ++ "\r\n") catch {};
+            c.awaiting_pong = true;
+            c.ping_sent_ms = now;
+            self.armSendIfNeeded(c) catch {};
+        }
+    }
+
     pub fn s2sBoundPort(self: *LinuxServer) !u16 {
         if (self.s2s_listener_fd < 0) return error.Unsupported;
         return socketPort(self.s2s_listener_fd);
@@ -1031,6 +1125,7 @@ pub const LinuxServer = struct {
     /// their own stop condition is satisfied.
     pub fn runOnce(self: *LinuxServer) !void {
         try self.armAccept();
+        self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
         _ = try self.ring.submitAndWait(1);
 
         var handler = CompletionHandler{ .server = self };
@@ -1079,6 +1174,8 @@ pub const LinuxServer = struct {
         errdefer _ = self.clients.free(id);
         const conn = self.clients.get(id).?;
         conn.token = try tokenFromId(id);
+        conn.connected_at_ms = self.nowMs();
+        conn.last_activity_ms = conn.connected_at_ms;
 
         if (is_s2s and self.s2sSecured()) {
             // PQ-secured peer: stand up a SecuredLink (responder). Its TOFU prekey
@@ -1304,6 +1401,10 @@ pub const LinuxServer = struct {
         if (event.res > 0) {
             const chunk = conn.recv_buf[0..@as(usize, @intCast(event.res))];
             self.stats.onBytesIn(chunk.len);
+            // Any inbound traffic proves liveness: refresh the idle clock and
+            // clear a pending ping-timeout (the client answered, PONG or not).
+            conn.last_activity_ms = self.nowMs();
+            conn.awaiting_pong = false;
             if (conn.s2s_secured) |link| {
                 self.driveS2sSecured(conn, link, chunk);
             } else if (conn.s2s) |link| {
@@ -1317,7 +1418,7 @@ pub const LinuxServer = struct {
             }
         }
         if (conn.closing and !conn.send_armed and conn.send_len == conn.send_offset) {
-            try self.closeConn(event.token, "Client quit");
+            try self.closeConn(event.token, conn.close_reason);
         }
     }
 
@@ -1325,7 +1426,7 @@ pub const LinuxServer = struct {
         const conn = try self.connForToken(event.token);
         conn.send_armed = false;
         if (event.res < 0) {
-            try self.closeConn(event.token, "Client quit");
+            try self.closeConn(event.token, conn.close_reason);
             return;
         }
 
@@ -1338,7 +1439,7 @@ pub const LinuxServer = struct {
 
         try self.armSendIfNeeded(conn);
         if (conn.closing and !conn.send_armed and conn.send_len == conn.send_offset) {
-            try self.closeConn(event.token, "Client quit");
+            try self.closeConn(event.token, conn.close_reason);
         }
     }
 
@@ -6791,16 +6892,27 @@ const CompletionHandler = struct {
                 self.err = err;
             },
             .recv => |event| self.server.handleRecv(event) catch |err| {
-                self.err = err;
+                self.recordOpErr(err);
             },
             .send => |event| self.server.handleSend(event) catch |err| {
-                self.err = err;
+                self.recordOpErr(err);
             },
             .connect => |event| self.server.handleConnect(event) catch |err| {
-                self.err = err;
+                self.recordOpErr(err);
             },
-            .timeout, .other => {},
+            .timeout => self.server.onTimerTick(),
+            .other => {},
         }
+    }
+
+    /// Record a per-connection op error, tolerating completions that arrive for a
+    /// connection whose slot was already freed (e.g. an in-flight recv reaping
+    /// after `closeConn` drained and freed the slot). The generational slab makes
+    /// such stale tokens impossible to alias a reused slot, so `ClientNotFound`
+    /// here is a benign lifecycle event, not a fatal loop error.
+    fn recordOpErr(self: *CompletionHandler, err: anyerror) void {
+        if (err == error.ClientNotFound) return;
+        self.err = err;
     }
 };
 
@@ -7186,6 +7298,13 @@ fn readFd(fd: linux.fd_t, buf: []u8) ServerError!usize {
 }
 
 fn closeFd(fd: linux.fd_t) void {
+    // Force FIN to the peer and complete any in-flight recv NOW. An io_uring
+    // recv SQE holds a reference to the socket's `struct file`, so a bare
+    // close(fd) only drops the fd-table entry — the socket lingers (no FIN)
+    // until that pending op is canceled. shutdown() releases it immediately:
+    // the peer sees EOF and the pending recv reaps with res=0 (its slot is
+    // already freed, so the completion is harmlessly ignored).
+    _ = linux.shutdown(fd, linux.SHUT.RDWR);
     _ = linux.close(fd);
 }
 
