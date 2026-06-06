@@ -1,7 +1,7 @@
 //! IRC LUSERS numeric reply builder.
 //!
 //! LUSERS reports network-visible population counters as the traditional
-//! RFC1459/RFC2812 numeric sequence, with Ophion-compatible reply text. The
+//! RFC1459/RFC2812 numeric sequence, with RFC-compatible reply text. The
 //! caller owns output storage: this module formats one line at a time into a
 //! scratch buffer and immediately hands it to `sink.send(line)`.
 const std = @import("std");
@@ -399,7 +399,7 @@ fn sampleCounts() Counts {
     };
 }
 
-test "full LUSERS sequence uses RFC2812 and Ophion text" {
+test "full LUSERS sequence uses RFC2812 reply text" {
     var scratch: [160]u8 = undefined;
     var slots: [7][]const u8 = undefined;
     var storage: [1024]u8 = undefined;

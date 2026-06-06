@@ -23,7 +23,7 @@ pub const DEFAULT_CHANNEL_PREFIXES: []const u8 = "#+&!";
 pub const RPL_KNOCK_CODE: u16 = 710;
 /// Local KNOCK delivery acknowledgement numeric not currently exported by `numeric.zig`.
 pub const RPL_KNOCKDLVR_CODE: u16 = 711;
-/// ophion KNOCK error numerics (not in numeric.zig): 712 throttle, 713 channel
+/// KNOCK error numerics (not in numeric.zig): 712 throttle, 713 channel
 /// is open (no need to knock), 714 already on channel, 715 KNOCK disabled.
 pub const ERR_TOOMANYKNOCK_CODE: u16 = 712;
 pub const ERR_CHANOPEN_CODE: u16 = 713;

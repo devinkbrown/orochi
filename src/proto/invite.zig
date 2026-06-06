@@ -3,7 +3,7 @@
 //! Channel lookup, target lookup, invite state mutation, and `invite-notify`
 //! broadcast fanout are owned by the caller. This module validates
 //! attacker-controlled IRC fields, parses `INVITE <nick> <channel>`, checks the
-//! Ophion-compatible channel privilege preconditions, and builds success/error
+//! RFC-compatible channel privilege preconditions, and builds success/error
 //! replies into caller-owned buffers without allocation.
 const std = @import("std");
 const numeric = @import("numeric.zig");
@@ -116,7 +116,7 @@ pub fn parseInviteArgsWith(comptime params_config: Params, params: []const []con
     };
 }
 
-/// Check the Ophion-compatible INVITE channel preconditions.
+/// Check the INVITE channel preconditions.
 ///
 /// `is_operator` means op-or-higher in Mizuchi's member tiers:
 /// founder `~`, owner `.`, and op `@` all satisfy it. Invite-only channels

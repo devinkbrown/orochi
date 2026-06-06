@@ -1,7 +1,7 @@
 //! IRC WHOWAS numeric reply builder.
 //!
 //! History storage and lookup policy live elsewhere. This module validates the
-//! caller-provided historical records and emits the RFC/Ophion WHOWAS wire
+//! caller-provided historical records and emits the RFC WHOWAS wire
 //! numerics into a caller-owned scratch buffer, one complete CRLF-terminated
 //! line at a time.
 const std = @import("std");

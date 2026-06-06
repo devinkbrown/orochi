@@ -1,7 +1,7 @@
 //! VERSION, TIME, and ADMIN numeric reply builders.
 //!
 //! These helpers write complete IRC reply lines into caller-owned buffers.
-//! They preserve the RFC numeric surface and Ophion's VERSION wire shape while
+//! They preserve the RFC numeric surface and a conventional VERSION wire shape while
 //! keeping all attacker-controlled bytes validated before emission.
 const std = @import("std");
 const numeric = @import("numeric.zig");
@@ -91,7 +91,7 @@ pub const ReplyLineSink = struct {
     }
 };
 
-/// Build one Ophion-shaped RPL_VERSION (351) line.
+/// Build one RPL_VERSION (351) line.
 ///
 /// Wire format:
 /// `:<server> 351 <requester> <version>(<build>[,<branding>]). <reply-server> :<description>\r\n`
@@ -175,7 +175,7 @@ pub fn writeTimeReplyWith(
 ///
 /// RPL_ADMINME (256) is always emitted. RPL_ADMINLOC1 (257),
 /// RPL_ADMINLOC2 (258), and RPL_ADMINEMAIL (259) are emitted when their
-/// corresponding `AdminInfo` field is non-null, matching Ophion's behavior.
+/// corresponding `AdminInfo` field is non-null.
 pub fn writeAdminReplies(
     out: []u8,
     ctx: ReplyContext,
@@ -548,7 +548,7 @@ fn sampleVersion() VersionInfo {
     };
 }
 
-test "VERSION builds Ophion-shaped RPL_VERSION 351" {
+test "VERSION builds RPL_VERSION 351" {
     var out: [160]u8 = undefined;
 
     const line = try writeVersionReply(&out, sampleContext(), sampleVersion());

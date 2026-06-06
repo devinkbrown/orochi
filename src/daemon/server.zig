@@ -1836,6 +1836,11 @@ pub const LinuxServer = struct {
         try self.sendTopicReply(conn, join_target);
         try self.sendNames(conn, join_target);
 
+        // Bouncer rewind: a reconnecting client with mizuchi/bouncer gets the
+        // channel messages it missed (everything after its stored read marker)
+        // replayed as a chathistory BATCH right after the NAMES burst.
+        try self.replayRewindOnJoin(conn, join_target);
+
         // Propagate this membership to mesh peers (status = the joiner's modes,
         // e.g. founder on a freshly created/cloned channel).
         const jmodes = self.world.memberModes(join_target, wid) orelse world_model.MemberModes.empty();
@@ -1966,7 +1971,7 @@ pub const LinuxServer = struct {
             return;
         }
 
-        // Query form: MODE #chan -> RPL_CHANNELMODEIS. Per ophion channel_modes:
+        // Query form: MODE #chan -> RPL_CHANNELMODEIS. Per the channel-mode rules:
         // the +l/+k LETTERS are shown to everyone, but their PARAM VALUES (limit,
         // key) only to members. Param order matches letter order (l before k).
         if (parsed.param_count == 1) {
@@ -2588,7 +2593,7 @@ pub const LinuxServer = struct {
         const full = std.fmt.bufPrint(&full_buf, "{s}\r\n", .{target_line}) catch return;
         try self.deliver(clientIdFromWorld(target), full);
 
-        // IRCv3 invite-notify (ophion m_invite.c): tell channel members who hold
+        // IRCv3 invite-notify: tell channel members who hold
         // the cap, except the inviter — `:inviter!u@h INVITE <target> :<channel>`.
         var notif_prefix: [256]u8 = undefined;
         var notif_buf: [default_reply_bytes]u8 = undefined;
@@ -2884,6 +2889,57 @@ pub const LinuxServer = struct {
         const sender = clientPrefix(conn, &prefix_buf) catch return;
         const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
         _ = self.history.append(target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts }) catch {};
+    }
+
+    /// Convert a fixed-width `YYYY-MM-DDThh:mm:ss.sssZ` read-marker timestamp to
+    /// epoch milliseconds (the unit the Lotus history ring is keyed on). Returns
+    /// null on any malformed field. Uses the civil-from-days algorithm so it is
+    /// allocation- and table-free.
+    fn markerToMillis(s: []const u8) ?u64 {
+        if (s.len < 24) return null;
+        const year = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
+        const month = std.fmt.parseInt(i64, s[5..7], 10) catch return null;
+        const day = std.fmt.parseInt(i64, s[8..10], 10) catch return null;
+        const hh = std.fmt.parseInt(i64, s[11..13], 10) catch return null;
+        const mm = std.fmt.parseInt(i64, s[14..16], 10) catch return null;
+        const ss = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
+        const ms = std.fmt.parseInt(i64, s[20..23], 10) catch return null;
+        const y = if (month <= 2) year - 1 else year;
+        const era = @divFloor(if (y >= 0) y else y - 399, 400);
+        const yoe = y - era * 400;
+        const mp: i64 = if (month > 2) month - 3 else month + 9;
+        const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+        const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+        const days = era * 146097 + doe - 719468;
+        const total_ms = (((days * 24 + hh) * 60 + mm) * 60 + ss) * 1000 + ms;
+        if (total_ms < 0) return null;
+        return @intCast(total_ms);
+    }
+
+    /// Bouncer rewind: when a `mizuchi/bouncer` client (re)joins a channel,
+    /// replay the messages it missed — everything after its stored read marker —
+    /// as a `chathistory` BATCH. No marker means there is nothing to rewind to
+    /// (a fresh client has read everything), so we stay silent rather than dump
+    /// the full ring. No-op for clients without the cap or without an account.
+    fn replayRewindOnJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        if (!conn.session.hasCap(.mizuchi_bouncer)) return;
+        const owner = conn.session.account() orelse return;
+        const marker = (self.read_markers.get(owner, channel) catch null) orelse return;
+        const marker_ms = markerToMillis(marker.slice()) orelse return;
+        var buf: [64]lotus.Message = undefined;
+        const found = self.history.after(channel, marker_ms, buf.len, buf[0..]) catch return;
+        if (found.len == 0) return;
+        var cmsgs: [64]chathistory_cmd.Message = undefined;
+        var cn: usize = 0;
+        for (found) |m| {
+            if (m.tombstone) continue;
+            cmsgs[cn] = .{ .timestamp_ms = m.timestamp, .msgid = m.msgid, .sender = m.sender, .text = m.text };
+            cn += 1;
+        }
+        if (cn == 0) return;
+        var out_buf: [default_reply_bytes * 4]u8 = undefined;
+        const batch = chathistory_cmd.writeBatch(&out_buf, "rewind", channel, cmsgs[0..cn]) catch return;
+        try appendToConn(conn, batch);
     }
 
     /// CHATHISTORY <sub> <target> <criteria...> <limit> — IRCv3 history replay.
@@ -3394,8 +3450,8 @@ pub const LinuxServer = struct {
     fn accessCanManage(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, level: ?ircx_access_store.Level) bool {
         if (conn.session.isOper()) return true;
         const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse return false;
-        // OWNER-level entries may only be managed by an owner/founder (ophion
-        // m_ircx_access can_write_to_access_list); op suffices for HOST/VOICE/etc.
+        // OWNER-level entries may only be managed by an owner/founder (IRCX
+        // ACCESS write rule); op suffices for HOST/VOICE/etc.
         if (level) |lv| {
             if (lv == .owner) return mm.contains(.owner) or mm.contains(.founder);
         }
@@ -4434,7 +4490,7 @@ pub const LinuxServer = struct {
     fn handleInfo(self: *LinuxServer, conn: *ConnState) !void {
         _ = self;
         const lines = [_][]const u8{
-            "Mizuchi IRC daemon — a clean-room Zig-native successor to ophion.",
+            "Mizuchi IRC daemon — a clean-room Zig-native mesh IRC server.",
             "100% Zig, no C interop. Substrate + crypto + daemon.",
             "Mesh protocol: Suimyaku (CRDT) + Sazanami (gossip) + Goryu (membership).",
         };
@@ -4675,7 +4731,7 @@ pub const LinuxServer = struct {
     ) !void {
         // +z GAG (IRCX): the server silently discards a gagged user's messages.
         if (conn.gagged) return;
-        // NOTICE must never generate an automatic error reply (ophion m_message.c):
+        // NOTICE must never generate an automatic error reply (RFC 1459):
         // missing recipient/text is silently dropped to prevent bot reply loops.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
         if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
@@ -4722,7 +4778,7 @@ pub const LinuxServer = struct {
         // own message back, byte-identical to what recipients see (`msg`).
         const echo = conn.session.hasCap(.echo_message);
 
-        // RFC 1459 / ophion m_message.c: NOTICE must NEVER generate an error
+        // RFC 1459: NOTICE must NEVER generate an error
         // reply (prevents NOTICE/error ping-pong between bots and servers). All
         // delivery-failure numerics below are suppressed for NOTICE.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
@@ -4761,7 +4817,7 @@ pub const LinuxServer = struct {
                     return;
                 }
             }
-            // STATUSMSG sender gate (ophion m_message.c: is_chanop_voiced): only a
+            // STATUSMSG sender gate (chanop-or-voiced): only a
             // member who is voiced-or-higher may send to a status-prefixed target.
             if (min_rank > 0) {
                 const sm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();

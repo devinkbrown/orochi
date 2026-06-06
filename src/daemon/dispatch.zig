@@ -176,6 +176,7 @@ pub const CapId = enum(u6) {
     account_notify,
     invite_notify,
     account_tag,
+    mizuchi_bouncer,
 };
 
 const CapSet = struct {
@@ -215,6 +216,10 @@ const cap_specs = [_]CapSpec{
     .{ .id = .extended_join, .name = "extended-join" },
     .{ .id = .invite_notify, .name = "invite-notify" },
     .{ .id = .account_tag, .name = "account-tag" },
+    // mizuchi/bouncer: opt-in to automatic rewind (replay of missed channel
+    // history on (re)join, bounded by the client's read marker). Multi-session
+    // reclaim (SESSION RESUME) works without it; this only enables auto-replay.
+    .{ .id = .mizuchi_bouncer, .name = "mizuchi/bouncer" },
     // account-notify is enumerated but not advertised: the only auth change is
     // SASL during pre-registration, before the client shares any channel, so
     // there is no post-join ACCOUNT event to deliver yet.

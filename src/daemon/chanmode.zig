@@ -210,7 +210,7 @@ pub const ChannelModes = struct {
     }
 };
 
-/// Stable member prefix mode identifiers. Builds on ophion + IRCX draft and
+/// Stable member prefix mode identifiers. Builds on the IRCX draft and
 /// adds a Mizuchi-native FOUNDER tier above owner:
 ///   founder +Q ('~') > owner +q ('.') > op +o ('@') > voice +v ('+')
 /// → ISUPPORT PREFIX=(Qqov)~.@+. The channel creator is the founder (a single
@@ -277,7 +277,7 @@ pub const MemberModes = struct {
     }
 
     /// ISUPPORT PREFIX token: (Qqov)~.@+ — Mizuchi founder (~) above the
-    /// ophion/IRCX owner (.) / op (@) / voice (+) tiers.
+    /// IRCX owner (.) / op (@) / voice (+) tiers.
     pub const isupport_prefix = "(Qqov)~.@+";
 
     /// Operator authority: op or any higher tier (owner/founder).

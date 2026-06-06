@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         \\
         \\  Mizuchi {s}  (水蛟)
-        \\  Zig-native successor to ophion — Suimyaku + Tsumugi mesh
+        \\  Zig-native mesh IRC daemon — Suimyaku + Tsumugi mesh
         \\
         \\
     , .{mizuchi.version});

@@ -41,9 +41,10 @@ pub const CapId = enum(u6) {
     message_editing,
     message_redaction,
     typing,
-    ophion_prop_notify,
-    ophion_session_sync,
-    ophion_suimyaku_media,
+    mizuchi_prop_notify,
+    mizuchi_session_sync,
+    mizuchi_bouncer,
+    mizuchi_suimyaku_media,
 };
 
 pub const CAP_COUNT: usize = @typeInfo(CapId).@"enum".fields.len;
@@ -401,9 +402,10 @@ const default_specs = [_]CapSpec{
     .{ .id = .message_editing, .name = "message-editing" },
     .{ .id = .message_redaction, .name = "message-redaction" },
     .{ .id = .typing, .name = "typing" },
-    .{ .id = .ophion_prop_notify, .name = "ophion/prop-notify" },
-    .{ .id = .ophion_session_sync, .name = "ophion/session-sync" },
-    .{ .id = .ophion_suimyaku_media, .name = "ophion/suimyaku-media" },
+    .{ .id = .mizuchi_prop_notify, .name = "mizuchi/prop-notify" },
+    .{ .id = .mizuchi_session_sync, .name = "mizuchi/session-sync" },
+    .{ .id = .mizuchi_bouncer, .name = "mizuchi/bouncer" },
+    .{ .id = .mizuchi_suimyaku_media, .name = "mizuchi/suimyaku-media" },
 };
 
 fn parseRequestedSet(registry: CapRegistry, raw_list: []const u8) ?RequestedSet {
