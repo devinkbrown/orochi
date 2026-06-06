@@ -43,6 +43,7 @@ const mode_lock_mod = @import("../proto/mode_lock.zig");
 const account_verify_mod = @import("account_verify.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const color_strip = @import("../proto/color_strip.zig");
+const snowflake_id = @import("../proto/snowflake_id.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -837,6 +838,9 @@ pub const LinuxServer = struct {
     shutdown: ?*std.atomic.Value(bool) = null,
     accepts: accept_list.AcceptList(.{}),
     msg_seq: u64 = 0,
+    /// Snowflake msgid generator: globally-unique, time-ordered, node-embedded
+    /// message ids for CHATHISTORY/REDACT (better than a per-node counter on a mesh).
+    snowflake: snowflake_id.Generator,
     accept_armed: bool = false,
     /// Observability: a lock-free flight recorder (last N structured events,
     /// dumped on oper DEBUG / crash) + per-category level filter.
@@ -933,6 +937,7 @@ pub const LinuxServer = struct {
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
             .accepts = accept_list.AcceptList(.{}).init(allocator),
+            .snowflake = snowflake_id.Generator.init(.{ .node_id = @intCast(config.node_id & snowflake_id.NODE_MASK) }) catch unreachable,
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
             .sessions = sessions_mod.SessionStore.init(allocator),
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
@@ -3187,11 +3192,14 @@ pub const LinuxServer = struct {
     /// monotonic server counter; sender is the full nick!user@host prefix.
     fn recordHistory(self: *LinuxServer, target: []const u8, conn: *ConnState, text: []const u8) void {
         self.msg_seq += 1;
+        const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+        // Unique, time-ordered, node-embedded msgid (falls back to the counter
+        // only if the snowflake clock overflows).
+        const sf = self.snowflake.next(ts) catch self.msg_seq;
         var id_buf: [24]u8 = undefined;
-        const msgid = std.fmt.bufPrint(&id_buf, "{d}", .{self.msg_seq}) catch return;
+        const msgid = std.fmt.bufPrint(&id_buf, "{d}", .{sf}) catch return;
         var prefix_buf: [256]u8 = undefined;
         const sender = clientPrefix(conn, &prefix_buf) catch return;
-        const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
         _ = self.history.append(target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts }) catch {};
     }
 
