@@ -46,6 +46,7 @@ const tracelog = @import("../substrate/trace.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const chghost = @import("../proto/chghost.zig");
+const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
 const tegami_mod = @import("tegami.zig");
@@ -2356,13 +2357,17 @@ pub const LinuxServer = struct {
             switch (ch) {
                 '+' => adding = true,
                 '-' => adding = false,
-                'i', 'B' => {
-                    const mode: dispatch.UserMode = if (ch == 'i') .invisible else .bot;
+                else => {
+                    // Catalog-driven: apply any client-writable user mode (i, B, D,
+                    // g, C, R, p, …). Server-managed modes (r/z/x) and unknown
+                    // letters are silently ignored.
+                    const mode = usermode.modeFromLetter(ch) orelse continue;
+                    const spec = usermode.specFor(mode) orelse continue;
+                    if (spec.policy != .client_writable) continue;
                     if (conn.session.setUmode(mode, adding)) {
                         appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
                     }
                 },
-                else => {}, // other umodes (r/Z/D/g/T/x) are server-managed
             }
         }
         if (applied.written().len == 0) return;
@@ -2661,7 +2666,13 @@ pub const LinuxServer = struct {
             .away = tconn.session.awayMessage(),
             .is_oper = tconn.session.isOper(),
             .is_bot = tconn.session.isBot(),
-            .channels = memberships[0..nchan],
+            // +p hide-chans: suppress the channel list unless the requester is the
+            // user themselves or an oper.
+            .channels = blk: {
+                const hide = tconn.session.umodes.contains(.hide_chans) and
+                    !conn.session.isOper() and conn != tconn;
+                break :blk memberships[0 .. if (hide) 0 else nchan];
+            },
         };
         whois.writeWhois(&sink, server_name, conn.session.displayName(), subject) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
@@ -5511,6 +5522,16 @@ pub const LinuxServer = struct {
             if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
             return;
         };
+        // +R regonly-pm: the recipient rejects PMs/notices from unauthenticated
+        // senders. Logged-in senders and opers always pass.
+        if (conn.session.account() == null and !conn.session.isOper()) {
+            if (self.clients.get(clientIdFromWorld(recipient))) |rconn| {
+                if (rconn.session.umodes.contains(.regonly_pm)) {
+                    if (!is_notice) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{target}, "Cannot message this user (+R: identify to a registered account)");
+                    return;
+                }
+            }
+        }
         // SILENCE: if the recipient has silenced a mask matching the sender, drop
         // the message silently (no error to the sender — ircu/charybdis behavior).
         {
@@ -6228,11 +6249,19 @@ test "processLine rejects malformed input without writing" {
 /// test instead of hanging). Accumulates into `client` and returns when `needle`
 /// is present, or errors after ~3s.
 fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
-    var polls: usize = 0;
-    while (polls < max_polls) : (polls += 1) {
+    // Use a WALL-CLOCK deadline rather than a fixed poll count: under heavy
+    // parallel-test CPU contention the reactor thread can be briefly starved, so
+    // a count-based budget (poll returns early on data, burning iterations)
+    // produced spurious TestTimeouts. `max_polls` now sets a lower bound on the
+    // budget; we wait at least that long but cap at a generous 20s so genuine
+    // bugs still fail in bounded time.
+    const budget_ms: i64 = @max(@as(i64, @intCast(max_polls)) * 25, 20_000);
+    const deadline = platform.monotonicMillis() + budget_ms;
+    while (true) {
         if (std.mem.indexOf(u8, client.written(), needle) != null) return;
+        if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
         var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+        const ready = posix.poll(&fds, 50) catch return error.Unexpected;
         if (ready == 0) continue;
         if ((fds[0].revents & linux.POLL.IN) == 0) continue;
         if (client.len == client.buf.len) return error.OutputTooSmall;
@@ -6240,7 +6269,6 @@ fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
         if (n == 0) return error.ConnectionReset;
         client.len += n;
     }
-    return error.TestTimeout;
 }
 
 test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {

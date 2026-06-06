@@ -17,6 +17,8 @@ pub const UserMode = enum(u4) {
     callerid,
     no_ctcp,
     cloaked,
+    regonly_pm, // R: reject PMs/notices from unauthenticated senders
+    hide_chans, // p: suppress own channel list in WHOIS (opers still see it)
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
@@ -141,6 +143,8 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .callerid, .letter = 'g', .name = "callerid" },
     .{ .mode = .no_ctcp, .letter = 'C', .name = "no-ctcp" },
     .{ .mode = .cloaked, .letter = 'x', .name = "cloaked", .policy = .server_managed },
+    .{ .mode = .regonly_pm, .letter = 'R', .name = "regonly-pm" },
+    .{ .mode = .hide_chans, .letter = 'p', .name = "hide-chans" },
 };
 
 pub const DefaultCatalog = Catalog(&default_specs);
