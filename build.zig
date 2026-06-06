@@ -17,6 +17,26 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    // Mizuchi targets 64-bit only (native x86_64/aarch64; the wasm32 browser
+    // codec below is the lone, deliberate exception). Reject a 32-bit daemon
+    // target at configure time with a clear message instead of a confusing later
+    // failure.
+    if (target.result.ptrBitWidth() != 64) {
+        std.debug.panic(
+            "Mizuchi is 64-bit only; target '{s}' is {d}-bit. Use a 64-bit target (e.g. x86_64-linux, aarch64-linux).",
+            .{ @tagName(target.result.cpu.arch), target.result.ptrBitWidth() },
+        );
+    }
+
+    // Strip debug info from optimized builds (smaller, faster-to-load binaries).
+    // Debug builds keep symbols for backtraces; test binaries (below) always keep
+    // them so failing-test traces stay readable.
+    const strip_release = optimize != .Debug;
+
+    // Focused testing: `zig build test -Dtest-filter=<substr>` runs only matching
+    // tests — a big win on the full suite's compile+run time during iteration.
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains the given substring") orelse &.{};
+
     // macOS/BSD reach the OS via libc (getentropy, clock_gettime, getpid) in
     // src/substrate/platform.zig. Linux uses raw syscalls (no libc) and Windows
     // uses ntdll/advapi32, so libc is linked only on the libc-mandatory targets.
@@ -78,6 +98,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
+            .strip = strip_release,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
@@ -128,6 +149,7 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = test_filters,
     });
 
     // A run step that will run the test executable.
@@ -138,6 +160,7 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
 
     // A run step that will run the second test executable.
@@ -158,12 +181,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/wasm/opcodec_wasm.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
+        .strip = true,
     });
     // The codecs depend only on std, so expose them as standalone wasm-targeted
     // modules (the full mizuchi root pulls in io_uring/sockets and won't build
     // freestanding).
-    const wasm_adpcm = b.createModule(.{ .root_source_file = b.path("src/substrate/opvox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall });
-    const wasm_opvis = b.createModule(.{ .root_source_file = b.path("src/substrate/opvis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall });
+    const wasm_adpcm = b.createModule(.{ .root_source_file = b.path("src/substrate/opvox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
+    const wasm_opvis = b.createModule(.{ .root_source_file = b.path("src/substrate/opvis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
     wasm_mod.addImport("opvox_adpcm", wasm_adpcm);
     wasm_mod.addImport("opvis_delta", wasm_opvis);
     const wasm = b.addExecutable(.{ .name = "opcodec", .root_module = wasm_mod });
@@ -171,6 +195,39 @@ pub fn build(b: *std.Build) void {
     wasm.rdynamic = true; // keep the `export fn`s in the final module
     const wasm_step = b.step("wasm", "Build the OPVOX/OPVIS codec WASM module");
     wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
+
+    // `zig build check` — semantic analysis without producing a binary. This is
+    // the fast inner-loop / editor (ZLS) target: it surfaces type errors quickly
+    // and skips the (slow) machine-code emit + link the default install does.
+    const check_step = b.step("check", "Type-check the daemon without emitting a binary");
+    const check_exe = b.addExecutable(.{
+        .name = "mizuchi-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "mizuchi", .module = mod }},
+        }),
+    });
+    check_exe.generated_bin = null; // analyze only; do not codegen/link an artifact
+    check_step.dependOn(&check_exe.step);
+
+    // `zig build release` — one-shot optimized, stripped daemon (ReleaseFast)
+    // installed to zig-out/bin, independent of the default step's optimize mode.
+    const release_step = b.step("release", "Build an optimized, stripped daemon (ReleaseFast)");
+    const release_exe = b.addExecutable(.{
+        .name = "mizuchi",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = needs_libc,
+            .strip = true,
+            .imports = &.{.{ .name = "mizuchi", .module = mod }},
+        }),
+    });
+    release_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
