@@ -111,6 +111,7 @@ pub const mention_mute = @import("mention_mute.zig");
 pub const message_flag = @import("message_flag.zig");
 pub const mod_log = @import("mod_log.zig");
 pub const nick_alias = @import("nick_alias.zig");
+pub const nick_enforcement = @import("nick_enforcement.zig");
 pub const nick_history = @import("nick_history.zig");
 pub const nickname_color = @import("nickname_color.zig");
 pub const node_identity = @import("node_identity.zig");
@@ -317,6 +318,7 @@ test {
     _ = message_flag;
     _ = mod_log;
     _ = nick_alias;
+    _ = nick_enforcement;
     _ = nick_history;
     _ = nickname_color;
     _ = node_identity;
