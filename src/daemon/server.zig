@@ -48,6 +48,7 @@ const cloak = @import("../proto/cloak.zig");
 const chghost = @import("../proto/chghost.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
+const tegami_mod = @import("tegami.zig");
 const ircx_create_cmd = @import("../proto/ircx_create_cmd.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
@@ -791,8 +792,10 @@ pub const LinuxServer = struct {
     sessions: sessions_mod.SessionStore,
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
-    /// Per-channel media rooms (LADON SFU control plane): who is in each call.
+    /// Per-channel media rooms (Mizuchi media SFU control plane): who is in each call.
     media_rooms: media_room.MediaRooms,
+    /// Tegami: per-account offline messages, delivered on next login.
+    tegami: tegami_mod.TegamiBox,
     /// Server-owned config reloaded by the most recent REHASH. The live
     /// `oper_registry` borrows `reload_bindings`, which borrow `reload_parsed`;
     /// all three are freed (and the prior generation replaced) on each REHASH and
@@ -864,6 +867,7 @@ pub const LinuxServer = struct {
             .sessions = sessions_mod.SessionStore.init(allocator),
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
             .media_rooms = media_room.MediaRooms.init(allocator),
+            .tegami = tegami_mod.TegamiBox.init(allocator),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
             .reactor = config.reactor,
@@ -899,6 +903,7 @@ pub const LinuxServer = struct {
         self.sessions.deinit();
         self.content_filter.deinit();
         self.media_rooms.deinit();
+        self.tegami.deinit();
         self.allocator.free(self.reload_bindings);
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
         self.read_markers.deinit();
@@ -1483,6 +1488,7 @@ pub const LinuxServer = struct {
                 // an operator class. Emits 381 + MODE +o after the welcome burst.
                 try self.elevateOperFromAccount(conn);
                 self.trackSession(id, conn); // multi-session registry (SASL login)
+                try self.deliverTegami(conn); // hand over any offline messages
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -1584,6 +1590,8 @@ pub const LinuxServer = struct {
             try self.handleFilter(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "MEDIA")) {
             try self.handleMedia(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TEGAMI")) {
+            try self.handleTegami(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "OPER")) {
             try self.handleOper(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "REHASH")) {
@@ -4380,6 +4388,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        try self.deliverTegami(conn);
     }
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
@@ -4400,6 +4409,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
+        try self.deliverTegami(conn);
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).
@@ -4538,8 +4548,93 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR>` — Mizuchi offline mail.
+    /// SEND stores a message for an account (delivered when it next logs in);
+    /// LIST shows the caller's own pending mail; CLEAR discards it. SEND requires
+    /// the sender to be logged in (so recipients can see who wrote).
+    fn handleTegami(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
+        const me = conn.session.account();
+
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            const acct = me orelse {
+                try self.failReply(conn, "TEGAMI", "ACCOUNT_REQUIRED", "Log in to read your tegami");
+                return;
+            };
+            try self.tegamiList(conn, acct);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "CLEAR")) {
+            const acct = me orelse {
+                try self.failReply(conn, "TEGAMI", "ACCOUNT_REQUIRED", "Log in to clear your tegami");
+                return;
+            };
+            const n = self.tegami.clear(acct);
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Cleared {d} message(s)\r\n", .{ server_name, n }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "SEND")) {
+            const from = me orelse {
+                try self.failReply(conn, "TEGAMI", "ACCOUNT_REQUIRED", "Log in to send tegami");
+                return;
+            };
+            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TEGAMI"}, "Usage: TEGAMI SEND <account> :<message>");
+                return;
+            }
+            const to = parsed.paramSlice()[1];
+            const text = parsed.paramSlice()[2];
+            // The recipient must be a known account (delivery is account-scoped).
+            if (self.account_services) |svc| {
+                _ = svc.accountInfo(to) catch {
+                    try self.failReply(conn, "TEGAMI", "ACCOUNT_UNKNOWN", "No such account");
+                    return;
+                };
+            }
+            _ = self.tegami.send(to, from, text, platform.realtimeMillis()) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.MailboxFull => "MAILBOX_FULL",
+                    error.MessageInvalid => "INVALID_MESSAGE",
+                    else => "TEMPORARILY_UNAVAILABLE",
+                };
+                try self.failReply(conn, "TEGAMI", code, "Could not deliver tegami");
+                return;
+            };
+            try self.noticeTo(conn, "TEGAMI: message stored for delivery");
+            return;
+        }
+        try self.failReply(conn, "TEGAMI", "INVALID_SUBCOMMAND", "Use SEND, LIST, or CLEAR");
+    }
+
+    /// Emit the caller's pending tegami as NOTE lines (without clearing).
+    fn tegamiList(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
+        for (self.tegami.pending(account)) |m| {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ server_name, m.from, m.text }) catch continue;
+            try appendToConn(conn, line);
+        }
+        var end_buf: [default_reply_bytes]u8 = undefined;
+        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE TEGAMI :End of tegami ({d})\r\n", .{ server_name, self.tegami.count(account) }) catch return;
+        try appendToConn(conn, end);
+    }
+
+    /// Deliver and clear any pending tegami for the freshly-logged-in account.
+    fn deliverTegami(self: *LinuxServer, conn: *ConnState) !void {
+        const account = conn.session.account() orelse return;
+        const msgs = self.tegami.pending(account);
+        if (msgs.len == 0) return;
+        for (msgs) |m| {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ server_name, m.from, m.text }) catch continue;
+            try appendToConn(conn, line);
+        }
+        _ = self.tegami.clear(account);
+    }
+
     /// `MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind] [arg]` —
-    /// LADON media control plane. Drives the per-channel SFU participant model and
+    /// Mizuchi media control plane. Drives the per-channel SFU participant model and
     /// broadcasts room presence to channel members as `NOTE MEDIA` events so
     /// clients can render the call. The media bytes flow over the transport
     /// substrate, not this control socket. Caller must be a channel member.
