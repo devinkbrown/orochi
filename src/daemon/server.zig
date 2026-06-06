@@ -41,6 +41,7 @@ const memo_group_mod = @import("memo_group.zig");
 const welcome_pack_mod = @import("welcome_pack.zig");
 const mode_lock_mod = @import("../proto/mode_lock.zig");
 const account_verify_mod = @import("account_verify.zig");
+const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -3525,6 +3526,11 @@ pub const LinuxServer = struct {
             try self.publishOperEvent(.oper_action, .notice, note);
             return;
         }
+        // Reject over-broad shun masks (e.g. *!*@*) so a shun can't mute everyone.
+        if (wildcard_limit.isTooBroad(mask, wildcard_limit.Policy.channel_ban)) {
+            try self.noticeTo(conn, "SHUN: mask too broad (needs more literal characters)");
+            return;
+        }
         var secs: i64 = 0;
         var reason: []const u8 = "No reason";
         if (p.len >= 2) {
@@ -3657,6 +3663,12 @@ pub const LinuxServer = struct {
             var b: [default_reply_bytes]u8 = undefined;
             const note = std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s}", .{ match.token(), pattern, if (removed) "removed" else "not found" }) catch return;
             try self.publishOperEvent(.oper_action, .notice, note);
+            return;
+        }
+        // Reject over-broad glob patterns (e.g. *!*@*) for non-address facets so
+        // a single ward can't sweep the whole network. Address (CIDR) is exempt.
+        if (match != .address and wildcard_limit.isTooBroad(pattern, wildcard_limit.Policy.channel_ban)) {
+            try self.noticeTo(conn, "WARD: pattern too broad (needs more literal characters)");
             return;
         }
         // ADD: optional positional scope, action, duration, then trailing reason.
