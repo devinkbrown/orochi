@@ -2035,7 +2035,9 @@ pub const LinuxServer = struct {
 
         try self.broadcastJoin(join_target, conn);
         try self.sendTopicReply(conn, join_target);
-        try self.sendNames(conn, join_target);
+        // draft/no-implicit-names: a capable client suppresses the automatic
+        // NAMES burst on JOIN (it can still request NAMES explicitly).
+        if (!conn.session.hasCap(.no_implicit_names)) try self.sendNames(conn, join_target);
 
         // Bouncer rewind: a reconnecting client with mizuchi/bouncer gets the
         // channel messages it missed (everything after its stored read marker)

@@ -179,6 +179,7 @@ pub const CapId = enum(u6) {
     account_tag,
     mizuchi_bouncer,
     chghost,
+    no_implicit_names,
 };
 
 const CapSet = struct {
@@ -225,6 +226,9 @@ const cap_specs = [_]CapSpec{
     // chghost: receive a native CHGHOST line when a common user's host changes
     // (VHOST). Clients without it see the new host on the user's next message.
     .{ .id = .chghost, .name = "chghost" },
+    // no-implicit-names: a capable client suppresses the automatic NAMES burst
+    // sent on JOIN (it can still issue NAMES explicitly).
+    .{ .id = .no_implicit_names, .name = "no-implicit-names" },
     // account-notify is enumerated but not advertised: the only auth change is
     // SASL during pre-registration, before the client shares any channel, so
     // there is no post-join ACCOUNT event to deliver yet.
