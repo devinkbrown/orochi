@@ -141,19 +141,20 @@ def stats_lines() -> list[str]:
 
 def project_lines() -> list[str]:
     return [
-        f"{B}{MAG}\U0001f409 Mizuchi{RST} (水蛟) — Zig-native successor to the ophion IRC daemon. Running M2.",
-        f"Full IRCv3/IRCX + services; S2S = {B}Suimyaku{RST} (水脈 CRDT mesh) over {B}Tsumugi{RST} "
-        f"(紬 PQ-hybrid ratchet), gossip = {B}Sazanami{RST}. No TS6. Clean-room.",
-        f"Built max-parallel (Claude+Codex); every wave audited by a zig-code-reviewer agent.",
-        f"repo: {REPO}",
+        f"{B}{MAG}\U0001f409 Mizuchi{RST} (水蛟) — a clean-room, from-scratch Zig 0.16 IRC + realtime daemon. A totally new architecture.",
+        f"IRCv3/IRCX + accounts/SASL, multi-session bouncer, and a full media conferencing surface "
+        f"(rooms, breakout, spatial audio, live captions/transcripts, raise-hand/reactions).",
+        f"Mesh = {B}Suimyaku{RST} (水脈 CRDT) over {B}Tsumugi{RST} (紬 PQ-hybrid ratchet), gossip = "
+        f"{B}Sazanami{RST}, content filter = {B}Koshi{RST}, offline mail = {B}Tegami{RST}. 64-bit, modern-only.",
+        f"Built max-parallel (Claude + Codex). repo: {REPO}",
     ]
 
 
 ROADMAP = [
-    "M0 boot ✔ · M1 server ✔ · M2 multi-client chat ✔  ← here",
-    "M3 IRCv3 caps · M4 TLS(1.3+hardened 1.2)+SASL · M5/6 IRCX parity · M7 services+MizuStore",
-    "M8-11 Suimyaku mesh (HELLO/AUTH→CRDT→Sazanami+Merkle→Tsumugi ratchet)",
-    "M12 Lotus history · M13 media · M15 Helix hot-upgrade · M17 RC soak",
+    "core ✔ · IRCv3/IRCX ✔ · accounts/SASL ✔ · multi-session bouncer ✔ · host-cloak/VHOST/CHGHOST ✔",
+    "moderation (Koshi filter · PRIVS · live REHASH) ✔ · media conferencing surface ✔ · Tegami offline mail ✔",
+    "mesh: Suimyaku CRDT + Tsumugi PQ ratchet + Sazanami gossip (secured S2S live)",
+    "next: implicit-TLS · hot UPGRADE · deeper services · Ocean client",
 ]
 
 HELP = (
@@ -181,6 +182,9 @@ class Bot:
         self.registered = False
         self.last_rx = 0.0
         self.last_keepalive = 0.0
+        # Post the project/stats intro only ONCE per process — reconnects rejoin
+        # quietly so a flaky link can't spam #root with repeated intros.
+        self.intro_done = False
 
     # ---- io ----
     def send_raw(self, line: str) -> None:
@@ -370,8 +374,10 @@ class Bot:
             if code in ("001", "376", "422") and not joined:  # welcome / motd end -> join
                 self.registered = True
                 self.send_raw(f"JOIN {CHANNEL}")
-                self.announce(project_lines())
-                self.announce(stats_lines())
+                if not self.intro_done:
+                    self.intro_done = True
+                    self.announce(project_lines())
+                    self.announce(stats_lines())
                 self.set_topic()
                 return True
 
@@ -475,8 +481,9 @@ class Bot:
         elif cmd in ("progress", "status"):
             self.msg(
                 reply,
-                f"{B}M2{RST} reached — multi-client chat works. tests={test_count()}, "
-                f"modules={module_count()}. Next: IRCv3 caps, TLS/SASL, Suimyaku S2S.",
+                f"{B}live{RST}: accounts/SASL · multi-session bouncer · media conferencing · "
+                f"moderation + live REHASH. tests={test_count()}, modules={module_count()}. "
+                f"Next: implicit-TLS, hot UPGRADE, Ocean client.",
             )
         elif cmd in ("plan", "roadmap"):
             self.announce([f"{YEL}{l}{RST}" for l in ROADMAP], reply)
