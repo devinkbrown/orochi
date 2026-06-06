@@ -11,6 +11,7 @@ const linux = std.os.linux;
 
 const dispatch = @import("dispatch.zig");
 const event_spine = @import("event_spine.zig");
+const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
 const sasl = @import("../proto/sasl.zig");
@@ -779,6 +780,8 @@ pub const LinuxServer = struct {
     monitor: monitor.MonitorStore,
     read_markers: read_marker_store.DefaultStore,
     silence: silence.Store,
+    /// Operator OBSERVE subscriptions (live Event-Spine surveillance feed).
+    observe: observe_mod.Registry,
     history: HistoryStore,
     bans_db: ban_db.Store,
     metadata: metadata_store.DefaultStore,
@@ -871,6 +874,7 @@ pub const LinuxServer = struct {
             .monitor = monitor.MonitorStore.init(allocator, 128),
             .read_markers = read_marker_store.DefaultStore.init(allocator),
             .silence = silence.Store.init(allocator),
+            .observe = observe_mod.Registry.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .bans_db = ban_db.Store.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -914,6 +918,7 @@ pub const LinuxServer = struct {
         self.access.deinit();
         self.accepts.deinit();
         self.silence.deinit();
+        self.observe.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         self.content_filter.deinit();
@@ -1417,6 +1422,9 @@ pub const LinuxServer = struct {
             }
             // Media: drop the departing nick from any call, notifying members.
             if (conn.session.registered()) self.leaveAllMediaRooms(id, conn);
+            // OBSERVE: push a quit record, then drop this client's own subscription.
+            if (conn.session.registered()) self.notifyObservers(.quit, observeSubject(conn, reason));
+            _ = self.observe.clear(monitorIdFromClient(id));
             try self.broadcastQuit(id, conn, reason);
             closeFd(conn.fd);
             _ = self.clients.free(id);
@@ -1505,6 +1513,8 @@ pub const LinuxServer = struct {
                 try self.elevateOperFromAccount(conn);
                 self.trackSession(id, conn); // multi-session registry (SASL login)
                 try self.deliverTegami(conn); // hand over any offline messages
+                // OBSERVE: push a connect record to watching operators.
+                self.notifyObservers(.connect, observeSubject(conn, ""));
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -3596,6 +3606,15 @@ pub const LinuxServer = struct {
             try self.publishOperEvent(.announce, .notice, message);
             return;
         }
+        // EVENT OBSERVE <mask> [actions…] | OFF | LIST — a standing operator
+        // observation subscription. Unlike a one-shot spy dump, this records the
+        // operator's interest mask and pushes a live NOTE EVENT OBSERVE feed of
+        // matching client lifecycle events (with real hosts); subscribing also
+        // emits an immediate snapshot of the currently-matching population.
+        if (std.ascii.eqlIgnoreCase(params[0], "OBSERVE")) {
+            try self.handleObserve(conn, params);
+            return;
+        }
         const is_add = std.ascii.eqlIgnoreCase(params[0], "ADD");
         const is_del = std.ascii.eqlIgnoreCase(params[0], "DEL");
         const is_list = std.ascii.eqlIgnoreCase(params[0], "LIST");
@@ -3623,6 +3642,91 @@ pub const LinuxServer = struct {
             }
         }
         try appendToConn(conn, "EVENT LIST :End of event list\r\n");
+    }
+
+    /// Stable observer key for a connection (bitcast ClientId, matching the
+    /// monitor/session keying convention).
+    fn observeKey(conn: *const ConnState) u64 {
+        return monitorIdFromClient(idFromToken(conn.token));
+    }
+
+    /// Build an OBSERVE subject from a live connection. `host` is the REAL host —
+    /// observation is an operator-trust surface, so it deliberately bypasses the
+    /// cloak applied to ordinary visibility.
+    fn observeSubject(conn: *const ConnState, detail: []const u8) observe_mod.Subject {
+        return .{
+            .nick = conn.session.displayName(),
+            .user = conn.session.username(),
+            .host = conn.session.realHost(),
+            .account = conn.session.account(),
+            .detail = detail,
+        };
+    }
+
+    /// Push a live OBSERVE record to every operator whose standing filter matches
+    /// the subject for this action. Best-effort; delivery failures are ignored.
+    fn notifyObservers(self: *LinuxServer, action: observe_mod.Action, subject: observe_mod.Subject) void {
+        if (self.observe.count() == 0) return;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value.session.isOper()) continue;
+            const filter = self.observe.get(observeKey(entry.value)) orelse continue;
+            if (!observe_mod.Registry.matches(filter, subject, action)) continue;
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = observe_mod.Registry.formatNote(&buf, server_name, action, subject) orelse continue;
+            self.deliver(entry.id, line) catch {};
+        }
+    }
+
+    /// `EVENT OBSERVE <mask> [actions…] | OFF | LIST` — manage the caller's
+    /// observation subscription. Oper-gated by the EVENT command itself.
+    fn handleObserve(self: *LinuxServer, conn: *ConnState, params: []const []const u8) !void {
+        const key = observeKey(conn);
+        if (params.len < 2 or params[1].len == 0 or std.ascii.eqlIgnoreCase(params[1], "LIST")) {
+            if (self.observe.get(key)) |f| {
+                try self.noticeTo(conn, "OBSERVE: active");
+                var lbuf: [default_reply_bytes]u8 = undefined;
+                if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :filter {s}\r\n", .{ server_name, f.mask })) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+            } else {
+                try self.noticeTo(conn, "OBSERVE: no active subscription (EVENT OBSERVE <mask>)");
+            }
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(params[1], "OFF")) {
+            _ = self.observe.clear(key);
+            try self.noticeTo(conn, "OBSERVE: subscription cleared");
+            return;
+        }
+        // Optional trailing action tokens narrow the subscription; default = all.
+        var actions: u16 = 0;
+        for (params[2..]) |tok| {
+            if (observe_mod.Action.parse(tok)) |a| actions |= a.bit();
+        }
+        self.observe.set(key, params[1], actions, self.nowMs()) catch {
+            try self.noticeTo(conn, "OBSERVE: could not set subscription (mask too long or too many observers)");
+            return;
+        };
+        var hbuf: [default_reply_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&hbuf, ":{s} NOTE EVENT OBSERVE :watching {s}\r\n", .{ server_name, params[1] })) |line| {
+            try appendToConn(conn, line);
+        } else |_| {}
+        // Immediate snapshot: enumerate the currently-matching population so the
+        // operator gets present state, not only future transitions.
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value.session.registered()) continue;
+            const subj = observeSubject(entry.value, "present");
+            var hm: [512]u8 = undefined;
+            const mask_str = std.fmt.bufPrint(&hm, "{s}!{s}@{s}", .{ subj.nick, subj.user, subj.host }) catch continue;
+            if (!observe_mod.globMatch(params[1], mask_str)) continue;
+            var lbuf: [default_reply_bytes]u8 = undefined;
+            if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :present {s}!{s}@{s} acct={s}\r\n", .{ server_name, subj.nick, subj.user, subj.host, subj.account orelse "*" })) |line| {
+                try appendToConn(conn, line);
+            } else |_| {}
+        }
+        try self.noticeTo(conn, "OBSERVE: end of snapshot");
     }
 
     /// Whether `conn` may view/manage the IRCX ACCESS list of `channel`: opers or
@@ -4350,6 +4454,12 @@ pub const LinuxServer = struct {
 
         // MONITOR: old nick went away, new nick appeared.
         self.monitorTransition(old, newnick) catch {};
+
+        // OBSERVE: push a nick-change record (detail = "-> <new>"); the subject's
+        // session now carries the new nick, so report the new identity + change.
+        var dbuf: [80]u8 = undefined;
+        const detail = std.fmt.bufPrint(&dbuf, "<- {s}", .{old}) catch "";
+        self.notifyObservers(.nick, observeSubject(conn, detail));
     }
 
     /// MONITOR notify for a nick change: old offline, new online, WITHOUT

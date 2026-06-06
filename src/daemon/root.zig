@@ -101,6 +101,7 @@ pub const nickname_color = @import("nickname_color.zig");
 pub const node_identity = @import("node_identity.zig");
 pub const notification_pref = @import("notification_pref.zig");
 pub const notification_queue = @import("notification_queue.zig");
+pub const observe = @import("observe.zig");
 pub const online_counter = @import("online_counter.zig");
 pub const oper = @import("oper.zig");
 pub const oper_query = @import("oper_query.zig");
@@ -281,6 +282,7 @@ test {
     _ = node_identity;
     _ = notification_pref;
     _ = notification_queue;
+    _ = observe;
     _ = online_counter;
     _ = oper;
     _ = oper_query;
