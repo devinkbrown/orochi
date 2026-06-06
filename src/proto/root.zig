@@ -96,7 +96,6 @@ pub const lusers = @import("lusers.zig");
 pub const membership_event = @import("membership_event.zig");
 pub const meshpass = @import("meshpass.zig");
 pub const meshpass_props = @import("meshpass_props.zig");
-pub const message_redaction = @import("message_redaction.zig");
 pub const message_tags_relay = @import("message_tags_relay.zig");
 pub const metadata = @import("metadata.zig");
 pub const metadata_props = @import("metadata_props.zig");
@@ -274,7 +273,6 @@ test {
     _ = membership_event;
     _ = meshpass;
     _ = meshpass_props;
-    _ = message_redaction;
     _ = message_tags_relay;
     _ = metadata;
     _ = metadata_props;
