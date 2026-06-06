@@ -180,6 +180,14 @@ pub const CapId = enum(u6) {
     mizuchi_bouncer,
     chghost,
     no_implicit_names,
+    chathistory,
+    message_redaction,
+    read_marker,
+    typing,
+    react,
+    reply,
+    batch,
+    bot,
 };
 
 const CapSet = struct {
@@ -229,6 +237,23 @@ const cap_specs = [_]CapSpec{
     // no-implicit-names: a capable client suppresses the automatic NAMES burst
     // sent on JOIN (it can still issue NAMES explicitly).
     .{ .id = .no_implicit_names, .name = "no-implicit-names" },
+    // The following expose already-live command/relay paths to clients that
+    // negotiate them. Each is backed by a verified handler or the client-only
+    // message-tag relay, so advertising them cannot strand a client:
+    //   draft/chathistory     -> CHATHISTORY command (emits a `chathistory` BATCH)
+    //   draft/message-redaction -> REDACT command
+    //   draft/read-marker     -> MARKREAD command
+    //   draft/typing/react/reply -> relayed as client-only tags on TAGMSG
+    //   batch                 -> server emits BATCH (chathistory, netsplit)
+    //   bot                   -> +B bot flag surfaced in WHOIS (335)
+    .{ .id = .chathistory, .name = "draft/chathistory" },
+    .{ .id = .message_redaction, .name = "draft/message-redaction" },
+    .{ .id = .read_marker, .name = "draft/read-marker" },
+    .{ .id = .typing, .name = "draft/typing" },
+    .{ .id = .react, .name = "draft/react" },
+    .{ .id = .reply, .name = "draft/reply" },
+    .{ .id = .batch, .name = "batch" },
+    .{ .id = .bot, .name = "bot" },
     // account-notify is enumerated but not advertised: the only auth change is
     // SASL during pre-registration, before the client shares any channel, so
     // there is no post-join ACCOUNT event to deliver yet.
