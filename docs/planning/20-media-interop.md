@@ -1,21 +1,33 @@
-# 20 — Dual-Stack Media Interop (native ↔ WebRTC), pure-SFU
+# 20 — Media: our codec everywhere, WebRTC as transport + opt-in fallback (pure-SFU)
 
 Status: **architecture decided + building blocks landed; live daemon wiring pending.**
-This supersedes the framing in [18-media-transport.md](18-media-transport.md): Mizuchi's
-media is a **dual-stack pure SFU**, not standard WebRTC. This note records the corrected
-direction (so it doesn't drift again), why, and the module inventory.
+This supersedes the framing in [18-media-transport.md](18-media-transport.md). The earlier
+draft of this note framed WebRTC as a *forced mobile gateway with standard codecs*; that
+was wrong. The corrected model below is recorded so it doesn't drift again.
 
 ## Decision
 
-Two media stacks, bridged, **with the server never touching codec bytes**:
+**One codec for everyone — ours (OPVOX/OPVIS).** Mobile and desktop have *identical*
+functionality; WebRTC is a **transport**, not a codec choice. There is exactly one optional
+escape hatch (the opt-in standard-codec fallback). The server never touches codec bytes in
+any mode.
 
-1. **Native (primary) — Suimyaku plane.** Capable / desktop clients. `opcodec`
-   (OPVOX/OPVIS) frames in `opcodec_frame` containers over `ryusen`/`transport_stack`
-   (custom adaptive transport) + CoilPack, with `secure_channel` (TreeKEM/HPKE) for E2E.
-2. **WebRTC (fallback) — gateway.** Mobile / constrained clients. Standard RTP/SRTP with
-   the device's **hardware** codecs (Opus/H.264/VP8). Rationale: OPVIS (video) in WASM on a
-   phone is too slow / may not load — phones need hardware decode, which only exists for
-   standard codecs. (Audio/OPVOX in WASM is plausible; video is the wall.)
+1. **Primary — our codec, all platforms.** `opcodec` (OPVOX audio / OPVIS video) frames in
+   `opcodec_frame` containers, with `secure_channel` (TreeKEM/HPKE) for E2E. Desktop runs
+   it natively; **browser and mobile run the same codec in WASM** (SIMD+threads). The SFU
+   forwards the *identical opaque opcodec frame* to every participant — so a phone and a
+   desktop in the same call see the same media path. No per-platform media divergence.
+
+2. **Transport is decoupled from codec.** The preferred transport is WebTransport / QUIC
+   datagrams over `ryusen`/`transport_stack` + CoilPack. On devices where that isn't
+   available (notably older iOS Safari), a **WebRTC DataChannel is used purely as a carrier**
+   for our opaque opcodec frames — same bytes, same codec, different pipe. WebRTC here is
+   *transport only*; its media-track codecs are not used on this path.
+
+3. **Opt-in standard-codec fallback.** A user **having trouble with our custom codec** (e.g.
+   a low-end phone that can't WASM-decode OPVIS at framerate, or battery constraints) can
+   **choose** to use standard WebRTC with the device's hardware codecs (Opus/H.264/VP8).
+   This is a deliberate per-user choice, not the default and not forced by platform.
 
 ### The hard rule: the server never encodes/decodes/transcodes
 
@@ -23,13 +35,14 @@ Mizuchi is a **selective-forwarding unit**, not an MCU. The SFU only ever **forw
 codec payloads** and **rewraps transport headers**. No media encode/decode/transcode runs
 on the server — ever. Consequences:
 
-- A mixed native/WebRTC call must **converge on one codec every participant supports**
-  (`kakehashi.selectCommon`). The forwarded stream is then understood by all receivers with
-  zero server codec work. If no common codec exists, the call is **not transcode-free as
-  composed** — a participant renegotiates (e.g. a native client also offering the mobile
-  hardware codec), or that media kind is disabled for the mismatched peer. The server does
-  **not** bridge it by transcoding.
-- Producing a common codec is a **client** responsibility; the SFU only verifies one exists.
+- An **all-default call** uses OPVOX/OPVIS for everyone (incl. mobile via WASM); the SFU
+  forwards one opaque stream — zero codec work, perfect parity.
+- If a participant **opts into** the standard-codec fallback, the call **converges on one
+  codec every participant supports** (`kakehashi.selectCommon`). Every Mizuchi client can
+  also speak the standard stack, so a shared codec always exists; the forwarded stream is
+  understood by all with zero server codec work. The server does **not** bridge by
+  transcoding — convergence (or per-kind disable) is a **client** responsibility; the SFU
+  only verifies a shared codec exists.
 
 ## Kakehashi — the bridge (`src/substrate/kakehashi.zig`)
 
@@ -51,19 +64,22 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
   `opcodec_fec` (XOR FEC), `opcodec_reassembly` (reorder/jitter), `simulcast_select` +
   `opcodec_layer` + `frame_marking` (layer forwarding without decode), `bwe_estimate`
   (delay-based target bitrate), `media_pacer` (egress pacing), `native_feedback`.
-- **WebRTC gateway (mobile/standard interop):** `srtp`/`srtcp`, `dtls_srtp`/`dtls_handshake`/
-  `dtls_keyexchange`/`dtls_fingerprint`, `rtp_ext`/`rtp_red`/`audio_level`/`mid_rid`/
-  `playout_delay`, `rtcp_compound`/`rtcp_xr`/`remb`/`pli_fir`/`twcc_feedback`/`rtx`,
-  `sdp_session`/`ice_candidate`/`stun_ice_attrs`, `dcep`/`sctp_chunk`, `sframe`, `flexfec`.
+- **WebRTC stack (transport carrier + opt-in standard-codec fallback):** `srtp`/`srtcp`,
+  `dtls_srtp`/`dtls_handshake`/`dtls_keyexchange`/`dtls_fingerprint`, `rtp_ext`/`rtp_red`/
+  `audio_level`/`mid_rid`/`playout_delay`, `rtcp_compound`/`rtcp_xr`/`remb`/`pli_fir`/
+  `twcc_feedback`/`rtx`, `sdp_session`/`ice_candidate`/`stun_ice_attrs`, `dcep`/`sctp_chunk`,
+  `sframe`, `flexfec`. `dcep`/`sctp_chunk` are what let a WebRTC DataChannel carry our opaque
+  opcodec frames (transport role); the RTP/codec pieces serve the opt-in standard fallback.
 - **Live WebRTC transport (already wired):** `media_transport`/`media_socket`/`media_plane`
-  (UDP + ICE/STUN/SRTP-SDES relay + NACK) — this is the gateway leg.
+  (UDP + ICE/STUN/SRTP-SDES relay + NACK).
 
 ## Remaining live wiring (serial; not yet done)
 
 1. **Native media transport in the daemon.** Today `media_plane` is only the WebRTC/UDP
-   gateway. The native leg (`opcodec_frame` over `ryusen`/CoilPack + `secure_channel`) is
-   library-only — it must be brought into the daemon as a live transport before Kakehashi
-   can bridge real native↔WebRTC calls. **This is the gating arc.**
+   leg. The native leg (`opcodec_frame` over `ryusen`/CoilPack + `secure_channel`) is
+   library-only — it must be brought into the daemon as a live transport so our codec runs
+   end-to-end on the default path. `native_media_link` is the forward-decision glue for it.
+   **This is the gating arc.**
 2. **Hook Kakehashi into the SFU forward path:** per-channel `kakehashi_session`; on each
    relayed frame, serialize to each target's leg (`toNative`/`toRtp`) via `ssrc_map`; drive
    `simulcast_select` from `bwe_estimate`; answer `rtcp_translate`/`native_feedback`.
@@ -74,4 +90,7 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 ## Non-goals
 
 - Server-side transcoding / MCU mixing. Never.
-- Replacing the native stack with WebRTC. WebRTC is the **mobile fallback gateway** only.
+- Replacing our codec with WebRTC's. Our codec (OPVOX/OPVIS) is the default on **every**
+  platform incl. mobile (via WASM). WebRTC is a **transport carrier** for our codec, plus an
+  **opt-in standard-codec fallback** for users who choose it — never the forced default.
+- Per-platform feature divergence. Mobile and desktop have the same functionality.
