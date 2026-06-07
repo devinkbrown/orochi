@@ -189,6 +189,7 @@ pub const CapId = enum(u6) {
     batch,
     bot,
     channel_rename,
+    extended_monitor,
 };
 
 const CapSet = struct {
@@ -258,6 +259,9 @@ const cap_specs = [_]CapSpec{
     // channel-rename: receive a native RENAME line when a common channel is
     // renamed; clients without it get a PART(old)+JOIN(new) fallback.
     .{ .id = .channel_rename, .name = "draft/channel-rename" },
+    // extended-monitor: receive AWAY/SETNAME/CHGHOST/ACCOUNT changes for
+    // MONITOR'd nicks even without a shared channel.
+    .{ .id = .extended_monitor, .name = "extended-monitor" },
     // account-notify: receive an ACCOUNT line when a user in a common channel
     // logs in (IDENTIFY) or out (LOGOUT). The server emits these at the live
     // login/logout sites.

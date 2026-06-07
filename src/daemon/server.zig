@@ -5593,7 +5593,7 @@ pub const LinuxServer = struct {
         self.recordWhowas(conn);
         conn.session.setNick(newnick) catch return;
         self.deliver(id, msg) catch {};
-        self.notifyCommonChannels(id, msg, null, id) catch {};
+        self.notifyCommonChannels(id, msg, null, id, null) catch {};
         self.monitorTransition(old, newnick) catch {};
     }
 
@@ -5678,7 +5678,7 @@ pub const LinuxServer = struct {
 
         // Deliver to self + every common-channel member (dedup, except self once).
         try self.deliver(id, msg);
-        try self.notifyCommonChannels(id, msg, null, id);
+        try self.notifyCommonChannels(id, msg, null, id, null);
 
         // MONITOR: old nick went away, new nick appeared.
         self.monitorTransition(old, newnick) catch {};
@@ -5728,7 +5728,7 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
         const msg = try formatMessage(&msg_buf, prefix, "AWAY", &.{}, reason);
-        try self.notifyCommonChannels(id, msg, .away_notify, id);
+        try self.notifyCommonChannels(id, msg, .away_notify, id, conn.session.displayName());
 
         // #33: feed the ACTIVITY stream a presence transition.
         self.pushPresenceActivity(id, conn, if (reason != null) .away else .active);
@@ -5752,7 +5752,7 @@ pub const LinuxServer = struct {
         const prefix = try clientPrefix(conn, &prefix_buf);
         const msg = try formatMessage(&msg_buf, prefix, "SETNAME", &.{}, newname);
         try self.deliver(id, msg); // echo to self
-        try self.notifyCommonChannels(id, msg, .setname, id);
+        try self.notifyCommonChannels(id, msg, .setname, id, conn.session.displayName());
     }
 
     /// OPER <name> <password> — elevate to IRC operator. Matches against the
@@ -6826,7 +6826,7 @@ pub const LinuxServer = struct {
 
         // Apply the new visible host, then fan the CHGHOST out.
         conn.session.setVisibleHost(new_host);
-        try self.notifyCommonChannels(id, msg, .chghost, id);
+        try self.notifyCommonChannels(id, msg, .chghost, id, conn.session.displayName());
         if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
         var note_buf: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&note_buf, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ server_name, conn.session.displayName(), new_host }) catch return;
@@ -7025,7 +7025,7 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "{s}\r\n", .{body}) catch return;
         conn.session.setVisibleHost(new_host);
-        try self.notifyCommonChannels(id, msg, .chghost, id);
+        try self.notifyCommonChannels(id, msg, .chghost, id, conn.session.displayName());
         if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
         var nb: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ server_name, conn.session.displayName(), new_host }) catch return;
@@ -7216,7 +7216,7 @@ pub const LinuxServer = struct {
         const body = account_notify.buildAccountNotifyLine(&body_buf, prefix, change) catch return;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "{s}\r\n", .{body}) catch return;
-        self.notifyCommonChannels(id, msg, .account_notify, id) catch {};
+        self.notifyCommonChannels(id, msg, .account_notify, id, conn.session.displayName()) catch {};
     }
 
     fn notifyCommonChannels(
@@ -7225,6 +7225,7 @@ pub const LinuxServer = struct {
         msg: []const u8,
         cap: ?dispatch.CapId,
         except: client_model.ClientId,
+        monitor_nick: ?[]const u8,
     ) !void {
         var seen = std.AutoHashMap(u64, void).init(self.allocator);
         defer seen.deinit();
@@ -7243,6 +7244,21 @@ pub const LinuxServer = struct {
                     if (!mconn.session.hasCap(c)) continue;
                 }
                 try self.deliver(mid, msg);
+            }
+        }
+        // extended-monitor: also deliver to clients MONITORing this nick who do
+        // NOT already share a channel (those are in `seen`) and negotiated the
+        // cap. Keeps the no-duplicate guarantee against the channel fan-out.
+        if (monitor_nick) |nick| {
+            var watchers: [128]monitor.ClientId = undefined;
+            const n = self.monitor.watchersOf(nick, &watchers);
+            for (watchers[0..n]) |w| {
+                const wid = clientIdFromMonitor(w);
+                if (wid.eql(except)) continue;
+                if (seen.contains(@as(u64, @bitCast(wid)))) continue;
+                const wconn = self.clients.get(wid) orelse continue;
+                if (!wconn.session.hasCap(.extended_monitor)) continue;
+                try self.deliver(wid, msg);
             }
         }
     }

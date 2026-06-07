@@ -255,6 +255,22 @@ pub const MonitorStore = struct {
         try self.notifyWatchers(.RPL_MONOFFLINE, normalized, removed.value.slice(), sink);
     }
 
+    /// Fill `out` with the clients currently monitoring `nick` (case-insensitive),
+    /// returning how many were written (truncated to `out.len`). Used by the
+    /// extended-monitor cap to fan a target's state changes to its watchers.
+    pub fn watchersOf(self: *MonitorStore, nick: []const u8, out: []ClientId) usize {
+        const key = NickKey.init(nick, true) catch return 0;
+        const watchers = self.reverse.getPtr(key) orelse return 0;
+        var n: usize = 0;
+        var it = watchers.keyIterator();
+        while (it.next()) |client| {
+            if (n >= out.len) break;
+            out[n] = client.*;
+            n += 1;
+        }
+        return n;
+    }
+
     pub fn isMonitoring(self: *MonitorStore, client: ClientId, target: []const u8) MonitorError!bool {
         const normalized = try NickKey.init(target, true);
         const state = self.clients.getPtr(client) orelse return false;
@@ -503,6 +519,30 @@ test "online transition notifies only watching clients" {
         try std.testing.expect(reply.client == 1 or reply.client == 3);
         try expectReply(reply, .RPL_MONONLINE, reply.client, "ALICE");
     }
+}
+
+test "watchersOf lists the clients monitoring a nick (case-insensitive)" {
+    var store = MonitorStore.init(std.testing.allocator, 8);
+    defer store.deinit();
+    var replies: [16]MonitorReply = undefined;
+    var storage: [1024]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+
+    try store.addTargets(1, "Alice", &sink);
+    try store.addTargets(3, "alice", &sink);
+    try store.addTargets(2, "Bob", &sink);
+
+    var out: [8]ClientId = undefined;
+    const n = store.watchersOf("ALICE", &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    var saw1 = false;
+    var saw3 = false;
+    for (out[0..n]) |c| {
+        if (c == 1) saw1 = true;
+        if (c == 3) saw3 = true;
+    }
+    try std.testing.expect(saw1 and saw3);
+    try std.testing.expectEqual(@as(usize, 0), store.watchersOf("nobody", &out));
 }
 
 test "offline transition notifies watchers" {
