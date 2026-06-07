@@ -113,6 +113,7 @@ pub const mention_index = @import("mention_index.zig");
 pub const mention_mute = @import("mention_mute.zig");
 pub const message_flag = @import("message_flag.zig");
 pub const mod_log = @import("mod_log.zig");
+pub const module_core = @import("module_core.zig");
 pub const nick_alias = @import("nick_alias.zig");
 pub const nick_enforcement = @import("nick_enforcement.zig");
 pub const nick_history = @import("nick_history.zig");
@@ -323,6 +324,7 @@ test {
     _ = mention_mute;
     _ = message_flag;
     _ = mod_log;
+    _ = module_core;
     _ = nick_alias;
     _ = nick_enforcement;
     _ = nick_history;

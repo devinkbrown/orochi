@@ -10,6 +10,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 const dispatch = @import("dispatch.zig");
+const module_core = @import("module_core.zig");
+const module_manifest = @import("modules/manifest.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
@@ -324,6 +326,10 @@ const irc_line = struct {
         return null;
     }
 };
+
+/// Public alias of the daemon's parsed-line view so module files (module_core.zig)
+/// can name the type the live dispatch path uses.
+pub const ParsedLine = irc_line.LineView;
 
 const ringlane = struct {
     const IoUring = linux.IoUring;
@@ -1861,6 +1867,28 @@ pub const LinuxServer = struct {
         parsed: *const irc_line.LineView,
         line: []const u8,
     ) !void {
+        // SerpentRegistry module spine (strangler-fig): consult the comptime
+        // module registry first. A migrated command is handled here and returns;
+        // anything not yet migrated falls through to the legacy chain below.
+        {
+            var core = module_core.Core{
+                .services = .{ .allocator = self.allocator, .config = &self.config },
+                .server = self,
+                .id = id,
+                .conn = conn,
+                .parsed = parsed,
+                .line = line,
+            };
+            switch (try module_manifest.Live.dispatch(&core, parsed.command, parsed.paramSlice())) {
+                .handled => return,
+                .too_few_params => {
+                    try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, "Not enough parameters");
+                    return;
+                },
+                .not_found => {},
+            }
+        }
+
         if (std.ascii.eqlIgnoreCase(parsed.command, "JOIN")) {
             try self.handleJoin(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PART")) {
@@ -1875,16 +1903,6 @@ pub const LinuxServer = struct {
             try self.handleIson(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "USERHOST")) {
             try self.handleUserhost(conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "LUSERS")) {
-            try self.handleLusers(conn);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "MOTD")) {
-            try self.handleMotd(conn);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "VERSION")) {
-            try self.handleVersion(conn);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TIME")) {
-            try self.handleTime(conn);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "ADMIN")) {
-            try self.handleAdmin(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "INVITE")) {
             try self.handleInvite(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "WHOIS")) {
@@ -5186,7 +5204,7 @@ pub const LinuxServer = struct {
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
-    fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         const clients: u64 = @intCast(self.clients.len());
         var opers: u64 = 0;
         var oit = self.clients.iterator();
@@ -5211,7 +5229,7 @@ pub const LinuxServer = struct {
     }
 
     /// MOTD (375/372/376).
-    fn handleMotd(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleMotd(self: *LinuxServer, conn: *ConnState) !void {
         _ = self;
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [8]motd.MotdLine = undefined;
@@ -5224,7 +5242,7 @@ pub const LinuxServer = struct {
     }
 
     /// TIME (391) — current wall-clock server time.
-    fn handleTime(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleTime(self: *LinuxServer, conn: *ConnState) !void {
         _ = self;
         var tbuf: [64]u8 = undefined;
         const tstr = formatServerTime(&tbuf);
@@ -5234,7 +5252,7 @@ pub const LinuxServer = struct {
     }
 
     /// ADMIN (256/257/258/259).
-    fn handleAdmin(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleAdmin(self: *LinuxServer, conn: *ConnState) !void {
         _ = self;
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [4]serverinfo.ReplyLine = undefined;
@@ -5248,7 +5266,7 @@ pub const LinuxServer = struct {
     }
 
     /// VERSION (351).
-    fn handleVersion(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleVersion(self: *LinuxServer, conn: *ConnState) !void {
         _ = self;
         var out_buf: [default_reply_bytes]u8 = undefined;
         const info = serverinfo.VersionInfo{
@@ -6619,7 +6637,7 @@ pub const LinuxServer = struct {
     }
 
     /// INFO — RPL_INFO (371) lines bracketed by RPL_INFOSTART/RPL_ENDOFINFO.
-    fn handleInfo(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleInfo(self: *LinuxServer, conn: *ConnState) !void {
         _ = self;
         const lines = [_][]const u8{
             "Mizuchi IRC daemon — a clean-room Zig-native mesh IRC server.",
@@ -6632,7 +6650,7 @@ pub const LinuxServer = struct {
     }
 
     /// USERS — local user listing (RPL_USERSSTART/RPL_USERS/RPL_ENDOFUSERS).
-    fn handleUsers(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleUsers(self: *LinuxServer, conn: *ConnState) !void {
         try queueNumeric(conn, .RPL_USERSSTART, &.{}, "UserID   Terminal  Host");
         var any = false;
         var it = self.clients.iterator();
@@ -6653,7 +6671,7 @@ pub const LinuxServer = struct {
 
     /// LINKS — single-node mesh view: just this server (RPL_LINKS 364 /
     /// RPL_ENDOFLINKS 365). Reimagined for Suimyaku once S2S lands.
-    fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Mizuchi IRC daemon"}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ server_name, server_name }, detail);
@@ -6672,7 +6690,7 @@ pub const LinuxServer = struct {
     }
 
     /// MAP — network topology. Single node today (RPL_MAP 015 / RPL_MAPEND 017).
-    fn handleMap(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleMap(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [160]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "{s} [Users: {d}]", .{
             server_name,
