@@ -18,6 +18,10 @@
 const std = @import("std");
 
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
+
+/// Cross-node relay message types (re-exported at module scope for the daemon).
+pub const RelayMessage = s2s_peer.RelayMessage;
+pub const RelayVerb = s2s_peer.RelayVerb;
 const channel_crdt = @import("../substrate/suimyaku/channel_crdt.zig");
 const peer_link = @import("../substrate/suimyaku/peer_link.zig");
 
@@ -177,6 +181,9 @@ pub const S2sLink = struct {
     pub fn channelMembers(self: *const S2sLink, channel: []const u8) []const s2s_peer.MemberInfo {
         return self.peer.channelMembers(channel);
     }
+
+    pub const RelayMessage = s2s_peer.RelayMessage;
+    pub const RelayVerb = s2s_peer.RelayVerb;
 
     /// Forward a cross-node user message (PRIVMSG/NOTICE/TAGMSG) to the peer.
     pub fn sendMessage(self: *S2sLink, msg: s2s_peer.RelayMessage) !void {

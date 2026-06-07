@@ -1512,6 +1512,14 @@ pub const LinuxServer = struct {
             };
             link.clearOutbound();
         }
+        // Drain inbound cross-node user messages and deliver to local clients.
+        if (link.takeInbound()) |inbound| {
+            for (inbound) |*owned| {
+                self.deliverRelay(owned.msg, link);
+                owned.deinit(self.allocator);
+            }
+            self.allocator.free(inbound);
+        } else |_| {}
     }
 
     /// Completion for an outbound S2S connect: on success open the handshake from
@@ -1695,6 +1703,60 @@ pub const LinuxServer = struct {
             }
             try self.deliverTagged(id, tags, bytes);
         }
+    }
+
+    /// Forward a cross-node user message to every established S2S peer except
+    /// `skip`. Loop-guarded per-peer by (origin_node, hlc). Best-effort: a full
+    /// link buffer never faults the local delivery that triggered it.
+    fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage, skip: ?*s2s_link.S2sLink) void {
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            const link = c.s2s orelse continue;
+            if (skip) |s| if (link == s) continue;
+            if (!link.established()) continue;
+            link.sendMessage(msg) catch continue;
+            const out = link.outbound();
+            if (out.len != 0) {
+                appendToConn(c, out) catch continue;
+                link.clearOutbound();
+                self.armSendIfNeeded(c) catch {};
+            }
+        }
+    }
+
+    /// Deliver an inbound relayed user message to LOCAL recipients (channel
+    /// members or a local nick), then re-forward to other peers for multi-hop
+    /// (loop-guarded by the per-peer seen-set + origin id).
+    fn deliverRelay(self: *LinuxServer, msg: s2s_link.RelayMessage, source_link: *s2s_link.S2sLink) void {
+        const verb = switch (msg.verb) {
+            .privmsg => "PRIVMSG",
+            .notice => "NOTICE",
+            .tagmsg => "TAGMSG",
+        };
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = if (msg.verb == .tagmsg)
+            (if (msg.tags.len > 0)
+                std.fmt.bufPrint(&line_buf, "@{s} :{s} TAGMSG {s}\r\n", .{ msg.tags, msg.source_prefix, msg.target }) catch return
+            else
+                std.fmt.bufPrint(&line_buf, ":{s} TAGMSG {s}\r\n", .{ msg.source_prefix, msg.target }) catch return)
+        else if (msg.tags.len > 0)
+            std.fmt.bufPrint(&line_buf, "@{s} :{s} {s} {s} :{s}\r\n", .{ msg.tags, msg.source_prefix, verb, msg.target, msg.text }) catch return
+        else
+            std.fmt.bufPrint(&line_buf, ":{s} {s} {s} :{s}\r\n", .{ msg.source_prefix, verb, msg.target, msg.text }) catch return;
+
+        if (world_model.isChannelName(msg.target)) {
+            var members = self.world.memberIterator(msg.target) orelse {
+                self.relayToPeers(msg, source_link);
+                return;
+            };
+            while (members.next()) |member| {
+                self.deliver(clientIdFromWorld(member.*), line) catch {};
+            }
+        } else if (self.world.findNick(msg.target)) |wid| {
+            self.deliver(clientIdFromWorld(wid), line) catch {};
+        }
+        self.relayToPeers(msg, source_link);
     }
 
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
@@ -7011,6 +7073,25 @@ pub const LinuxServer = struct {
                 try self.broadcastChannelMinRank(chan, ctags, msg, id, min_rank);
             }
             if (echo) try self.deliverTagged(id, ctags, msg);
+            // Cross-node relay: forward this channel message to mesh peers so
+            // remote members of `chan` receive it. Loop-guarded; the far side
+            // delivers only to its own local members. Best-effort.
+            {
+                var pbuf: [320]u8 = undefined;
+                if (clientPrefix(conn, &pbuf)) |prefix| {
+                    self.relayToPeers(.{
+                        .verb = if (is_notice) .notice else .privmsg,
+                        .target = chan,
+                        .source_nick = conn.session.displayName(),
+                        .source_prefix = prefix,
+                        .account = conn.session.account() orelse "",
+                        .tags = client_tags orelse "",
+                        .text = text,
+                        .origin_node = self.config.node_id,
+                        .hlc = @intCast(@max(0, self.nowMs())),
+                    }, null);
+                } else |_| {}
+            }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare
             // chan). Only the message body + sender prefix are stored.
             if (min_rank == 0) self.recordHistory(chan, conn, text);
