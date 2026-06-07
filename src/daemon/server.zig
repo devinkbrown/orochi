@@ -16,6 +16,7 @@ const mod_registry = @import("registry.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
+const tiered_keys = @import("tiered_keys.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
@@ -2465,6 +2466,26 @@ pub const LinuxServer = struct {
         }
 
         _ = try self.world.join(join_target, wid);
+
+        // IRCX tiered keys: a presented key matching the channel's HOSTKEY/OWNERKEY
+        // property grants graduated status (op / owner) on join — additive, so a
+        // founder keeps founder. Member-tier (+k) is already enforced as the gate.
+        if (key) |presented| {
+            var tkeys = tiered_keys.ChannelKeys{};
+            defer tkeys.deinit(self.allocator);
+            const chan_entity = ircx_prop_store.Entity{ .kind = .channel, .id = join_target };
+            if (self.props.getProp(chan_entity, "HOSTKEY")) |ev| {
+                tkeys.setKey(self.allocator, .host, ev.value) catch {};
+            } else |_| {}
+            if (self.props.getProp(chan_entity, "OWNERKEY")) |ev| {
+                tkeys.setKey(self.allocator, .owner, ev.value) catch {};
+            } else |_| {}
+            switch (tkeys.grantFor(presented)) {
+                .owner => _ = self.world.setMemberMode(join_target, wid, .owner, true) catch {},
+                .host => _ = self.world.setMemberMode(join_target, wid, .op, true) catch {},
+                .member, .none => {},
+            }
+        }
 
         try self.broadcastJoin(join_target, conn);
         try self.sendTopicReply(conn, join_target);
