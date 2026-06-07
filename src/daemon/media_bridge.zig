@@ -28,6 +28,22 @@ pub const PtMap = kakehashi.PtMap;
 pub const Error = kakehashi.Error || opcodec_frame.DecodeError || opcodec_frame.EncodeError;
 
 const max_id_bytes = 64;
+const max_rewrap = 1600; // >= one MTU datagram after header rewrap
+
+/// Sends `bytes` to `dest` on some leg's socket. `ctx` is the caller's context.
+pub const SendFn = *const fn (ctx: *anyopaque, dest: TransportAddress, bytes: []const u8) void;
+
+/// Hook the native pump invokes (after its in-leg forward) to also deliver a
+/// frame to the channel's WebRTC members. The implementation looks up the
+/// channel's `ChannelBridge` and calls `fanoutNativeToWebrtc`.
+pub const CrossLegSink = struct {
+    ctx: *anyopaque,
+    on_native_frame: *const fn (ctx: *anyopaque, channel: []const u8, datagram: []const u8) void,
+
+    pub fn onNativeFrame(self: CrossLegSink, channel: []const u8, datagram: []const u8) void {
+        self.on_native_frame(self.ctx, channel, datagram);
+    }
+};
 
 /// The default per-call RTP payload-type map (dynamic PTs for our codecs). Used
 /// when a call hasn't negotiated a custom mapping.
@@ -106,6 +122,33 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
 
         pub fn count(self: *const Self) usize {
             return self.len;
+        }
+
+        /// Rewrap a native opcodec `datagram` to RTP and send it to each WebRTC
+        /// member of the call (header-only; opaque payload shared verbatim). Used
+        /// by the native pump to bridge a native frame to WebRTC peers.
+        pub fn fanoutNativeToWebrtc(self: *Self, datagram: []const u8, send_ctx: *anyopaque, send: SendFn) void {
+            var targets: [max_participants]Member = undefined;
+            const n = self.crossTargets(.native, "", &targets);
+            if (n == 0) return;
+            var scratch: [max_rewrap]u8 = undefined;
+            for (targets[0..n]) |m| {
+                const rtp = nativeDatagramToRtp(datagram, &self.ptmap, m.ssrc, &scratch) catch continue;
+                send(send_ctx, m.addr, rtp);
+            }
+        }
+
+        /// Rewrap an `rtp` packet to native opcodec datagrams and send to each
+        /// native member. Used by the WebRTC relay to bridge to native peers.
+        pub fn fanoutWebrtcToNative(self: *Self, rtp: []const u8, keyframe_hint: bool, send_ctx: *anyopaque, send: SendFn) void {
+            var targets: [max_participants]Member = undefined;
+            const n = self.crossTargets(.webrtc, "", &targets);
+            if (n == 0) return;
+            var scratch: [max_rewrap]u8 = undefined;
+            for (targets[0..n]) |m| {
+                const len = rtpToNativeDatagram(rtp, &self.ptmap, m.band_id, m.stream_id, keyframe_hint, &scratch) catch continue;
+                send(send_ctx, m.addr, scratch[0..len]);
+            }
         }
 
         /// Copy into `out` every member on the leg OPPOSITE to `from_leg`,

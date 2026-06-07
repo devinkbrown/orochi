@@ -238,6 +238,13 @@ pub const MediaPlane = struct {
         return self.transport.statsForChannel(channel, out);
     }
 
+    /// Send `bytes` to `dest` on the media socket. Used by the native pump's
+    /// cross-leg sink to deliver RTP-rewrapped frames to WebRTC peers. UDP
+    /// sendto on a shared fd is safe to call from another thread.
+    pub fn sendTo(self: *MediaPlane, dest: TransportAddress, bytes: []const u8) void {
+        if (self.socket) |*s| s.sendTo(dest, bytes);
+    }
+
     /// Whether a participant's ICE check has bound a peer address (test/introspection).
     pub fn isConnected(self: *MediaPlane, channel: []const u8, participant: []const u8) bool {
         lockSpin(&self.mutex);

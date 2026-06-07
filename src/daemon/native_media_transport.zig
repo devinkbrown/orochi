@@ -16,6 +16,7 @@
 //! are forwarded verbatim.
 const std = @import("std");
 const native_media_link = @import("native_media_link.zig");
+const media_bridge = @import("media_bridge.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const opcodec_frame = @import("../substrate/opcodec_frame.zig");
 
@@ -50,9 +51,18 @@ pub const NativeMediaTransport = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started); advertised to native clients.
     port: u16 = 0,
+    /// Optional cross-leg sink: after forwarding a native frame to native peers,
+    /// the pump hands it here to also reach the channel's WebRTC members
+    /// (rewrapped to RTP). Null = native-only call (no bridging).
+    cross: ?media_bridge.CrossLegSink = null,
 
     pub fn init(allocator: std.mem.Allocator) NativeMediaTransport {
         return .{ .allocator = allocator };
+    }
+
+    /// Install the cross-leg sink (call before `start`, or while stopped).
+    pub fn setCrossLegSink(self: *NativeMediaTransport, sink: media_bridge.CrossLegSink) void {
+        self.cross = sink;
     }
 
     pub fn deinit(self: *NativeMediaTransport) void {
@@ -107,14 +117,28 @@ pub const NativeMediaTransport = struct {
 
             lockSpin(&self.mutex);
             var n: usize = 0;
+            var chanbuf: [256]u8 = undefined;
+            var chanlen: usize = 0;
             if (self.stream_index.get(view.stream_id)) |chan| {
                 if (self.channels.getPtr(chan)) |link| {
                     n = link.inboundFrom(got.data, got.from, &targets);
+                    // Copy the channel name out under the lock so the cross-leg
+                    // sink can use it after we unlock (the key may be freed if the
+                    // channel is torn down concurrently).
+                    if (chan.len <= chanbuf.len) {
+                        @memcpy(chanbuf[0..chan.len], chan);
+                        chanlen = chan.len;
+                    }
                 }
             }
             self.mutex.unlock();
 
             for (targets[0..n]) |dst| sock.sendTo(dst, got.data);
+
+            // Bridge the same frame to any WebRTC members of this channel.
+            if (chanlen != 0) {
+                if (self.cross) |sink| sink.onNativeFrame(chanbuf[0..chanlen], got.data);
+            }
         }
     }
 
@@ -324,6 +348,59 @@ test "NativeMediaTransport: unregister drops the channel and frees its index" {
     // channel torn down; re-registering works cleanly (no stale key/index)
     try nmt.register("#call", "carol", .voice, 300, .{});
     try testing.expectEqual(@as(usize, 1), nmt.countChannel("#call"));
+}
+
+const rtp_profile = @import("../proto/rtp_profile.zig");
+const TestBridge = media_bridge.ChannelBridge(8);
+
+const TestXCtx = struct {
+    bridge: *TestBridge,
+    sock: *MediaSocket, // stands in for the media_plane (WebRTC) socket
+
+    fn onNative(ctx: *anyopaque, channel: []const u8, datagram: []const u8) void {
+        _ = channel;
+        const self: *TestXCtx = @ptrCast(@alignCast(ctx));
+        self.bridge.fanoutNativeToWebrtc(datagram, ctx, sendVia);
+    }
+    fn sendVia(ctx: *anyopaque, dest: TransportAddress, bytes: []const u8) void {
+        const self: *TestXCtx = @ptrCast(@alignCast(ctx));
+        self.sock.sendTo(dest, bytes);
+    }
+};
+
+test "NativeMediaTransport: pump bridges a native frame to a WebRTC member as RTP" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+
+    // WebRTC receiver (mob) + the socket the sink sends RTP from (WebRTC plane).
+    var mob = try MediaSocket.bind(loopback_be, 0);
+    defer mob.deinit();
+    mob.setRecvTimeoutMs(2000);
+    const mob_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try mob.localPort());
+    var wsock = try MediaSocket.bind(loopback_be, 0);
+    defer wsock.deinit();
+
+    var bridge = TestBridge.init();
+    try bridge.register("mob", .{ .leg = .webrtc, .addr = mob_addr, .ssrc = 0x1234 });
+
+    var xctx = TestXCtx{ .bridge = &bridge, .sock = &wsock };
+    nmt.setCrossLegSink(.{ .ctx = &xctx, .on_native_frame = TestXCtx.onNative });
+    try nmt.start(loopback_be, 0);
+
+    try nmt.register("#call", "alice", .voice, 100, .{}); // native publisher
+
+    var alice = try MediaSocket.bind(loopback_be, 0);
+    defer alice.deinit();
+    var fbuf: [64]u8 = undefined;
+    const frame = opframe(100, &fbuf);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, nmt.port);
+    alice.sendTo(server_addr, frame);
+
+    // mob receives the same opaque payload, now wrapped as RTP for its ssrc.
+    var rbuf: [media_socket.max_datagram]u8 = undefined;
+    const got = mob.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, rtp_profile.header_len + 4), got.data.len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, got.data[rtp_profile.header_len..]);
 }
 
 test "NativeMediaTransport: start/shutdown is clean and re-startable" {
