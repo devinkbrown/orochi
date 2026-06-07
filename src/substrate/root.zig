@@ -15,6 +15,7 @@ pub const cc_cubic = @import("cc_cubic.zig");
 pub const circuit_breaker = @import("circuit_breaker.zig");
 pub const consistent_hash = @import("consistent_hash.zig");
 pub const count_min_sketch = @import("count_min_sketch.zig");
+pub const crc32c = @import("crc32c.zig");
 pub const crdt_counter = @import("crdt_counter.zig");
 pub const crdt_lww = @import("crdt_lww.zig");
 pub const crdt_orset = @import("crdt_orset.zig");
@@ -129,6 +130,7 @@ test {
     _ = circuit_breaker;
     _ = consistent_hash;
     _ = count_min_sketch;
+    _ = crc32c;
     _ = crdt_counter;
     _ = crdt_lww;
     _ = crdt_orset;
