@@ -59,6 +59,7 @@ pub const metrics = @import("metrics.zig");
 pub const minhash = @import("minhash.zig");
 pub const multipath = @import("multipath.zig");
 pub const native_feedback = @import("native_feedback.zig");
+pub const native_media_plane = @import("native_media_plane.zig");
 pub const object_pool = @import("object_pool.zig");
 pub const opcodec_fec = @import("opcodec_fec.zig");
 pub const opcodec_frame = @import("opcodec_frame.zig");
@@ -191,6 +192,7 @@ test {
     _ = minhash;
     _ = multipath;
     _ = native_feedback;
+    _ = native_media_plane;
     _ = object_pool;
     _ = opcodec_fec;
     _ = opcodec_frame;
