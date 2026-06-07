@@ -24,6 +24,9 @@ pub const chathistory_cursor_capsule = @import("chathistory_cursor_capsule.zig")
 pub const away_capsule = @import("away_capsule.zig");
 pub const ban_capsule = @import("ban_capsule.zig");
 pub const silence_capsule = @import("silence_capsule.zig");
+pub const ratelimit_capsule = @import("ratelimit_capsule.zig");
+pub const whowas_capsule = @import("whowas_capsule.zig");
+pub const tegami_capsule = @import("tegami_capsule.zig");
 pub const upgrade_manifest = @import("upgrade_manifest.zig");
 
 // Successor-side planners + deterministic self-tests.
@@ -31,6 +34,7 @@ pub const resume_plan = @import("resume_plan.zig");
 pub const session_resume_plan = @import("session_resume_plan.zig");
 pub const upgrade_dst = @import("upgrade_dst.zig");
 pub const session_migration_dst = @import("session_migration_dst.zig");
+pub const world_migration_dst = @import("world_migration_dst.zig");
 
 test {
     std.testing.refAllDecls(@This());

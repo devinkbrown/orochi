@@ -96,6 +96,7 @@ pub const extended_monitor_store = @import("extended_monitor_store.zig");
 pub const fcrdns = @import("fcrdns.zig");
 pub const flexfec = @import("flexfec.zig");
 pub const frame = @import("frame.zig");
+pub const frame_marking = @import("frame_marking.zig");
 pub const frame_props = @import("frame_props.zig");
 pub const gcounter = @import("gcounter.zig");
 pub const global_notice = @import("global_notice.zig");
@@ -398,6 +399,7 @@ test {
     _ = fcrdns;
     _ = flexfec;
     _ = frame;
+    _ = frame_marking;
     _ = frame_props;
     _ = gcounter;
     _ = global_notice;
