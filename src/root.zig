@@ -11,6 +11,10 @@ pub const proto = @import("proto/root.zig");
 pub const substrate = @import("substrate/root.zig");
 // gen:mods:end
 
+/// MizuWasm — pure-Zig sandboxed control-plane plugin host (subdir, not scanned
+/// by genroots). See docs/planning/17-module-system.md §8.
+pub const wasm_host = @import("wasm/host/root.zig");
+
 test {
     // 0.16 dropped refAllDeclsRecursive; reference each package so its tests run.
     std.testing.refAllDecls(@This());
@@ -20,4 +24,5 @@ test {
     _ = proto;
     _ = substrate;
     // gen:tests:end
+    _ = wasm_host;
 }
