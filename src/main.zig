@@ -63,6 +63,18 @@ pub fn main(init: std.process.Init) !void {
                     } else {
                         std.debug.print("mizuchi: Helix resume (no listen fd; binding fresh)\n", .{});
                     }
+                    // Recover any serialized state capsules from the inherited arena.
+                    if (r.arena_fd) |afd| {
+                        if (mizuchi.daemon.helix.live.readArena(allocator, afd)) |caps| {
+                            defer {
+                                for (caps) |*cap| cap.deinit(allocator);
+                                allocator.free(caps);
+                            }
+                            std.debug.print("mizuchi: Helix resume — {d} state capsule(s) recovered\n", .{caps.len});
+                        } else |e| {
+                            std.debug.print("mizuchi: Helix arena read failed ({s})\n", .{@errorName(e)});
+                        }
+                    }
                 } else {
                     std.debug.print("mizuchi: --supervisor with no Helix handoff env; normal boot\n", .{});
                 }

@@ -169,6 +169,18 @@ pub fn encode(allocator: Allocator, capsule: Capsule) Error![]u8 {
 
 pub fn decode(allocator: Allocator, bytes: []const u8) Error!Capsule {
     var r = coilpack.Cbs.init(bytes);
+    const capsule = try decodeReader(allocator, &r);
+    if (!r.done()) {
+        var c = capsule;
+        c.deinit(allocator);
+        return error.TrailingBytes;
+    }
+    return capsule;
+}
+
+/// Decode one capsule from a shared reader, advancing it past this capsule (no
+/// end-of-buffer check). Used by `decodeStream` to walk a concatenated sequence.
+pub fn decodeReader(allocator: Allocator, r: *coilpack.Cbs) Error!Capsule {
     for (magic) |want| {
         const got = try r.readU8();
         if (got != want) return error.BadMagic;
@@ -202,12 +214,28 @@ pub fn decode(allocator: Allocator, bytes: []const u8) Error!Capsule {
         errdefer allocator.free(payload);
         try fields.append(allocator, .{ .ordinal = ordinal, .bytes = payload });
     }
-    if (!r.done()) return error.TrailingBytes;
 
     var capsule = Capsule{ .header = header, .fields = try fields.toOwnedSlice(allocator) };
     errdefer capsule.deinit(allocator);
     try validate(capsule);
     return capsule;
+}
+
+/// Decode every capsule in a concatenated `bytes` stream (the on-arena format).
+/// The caller owns the returned slice and must `deinit` each capsule and free
+/// the slice.
+pub fn decodeStream(allocator: Allocator, bytes: []const u8) Error![]Capsule {
+    var list: std.ArrayList(Capsule) = .empty;
+    errdefer {
+        for (list.items) |*c| c.deinit(allocator);
+        list.deinit(allocator);
+    }
+    var r = coilpack.Cbs.init(bytes);
+    while (!r.done()) {
+        const cap = try decodeReader(allocator, &r);
+        try list.append(allocator, cap);
+    }
+    return try list.toOwnedSlice(allocator);
 }
 
 fn validateHeader(header: Header) Error!void {
@@ -279,6 +307,33 @@ test "capsule encodes, decodes, and validates ordinal order" {
     try std.testing.expectEqual(@as(usize, 2), decoded.fields.len);
     try std.testing.expectEqual(@as(u32, 2), decoded.fields[1].ordinal);
     try std.testing.expect(std.mem.eql(u8, "session", decoded.fields[1].bytes));
+}
+
+test "decodeStream walks a concatenated capsule sequence" {
+    const allocator = std.testing.allocator;
+    var f1 = [_]Field{.{ .ordinal = 1, .bytes = "alice" }};
+    var f2 = [_]Field{.{ .ordinal = 1, .bytes = "#chan" }};
+
+    const e1 = try encode(allocator, make(.clients, f1[0..]));
+    defer allocator.free(e1);
+    const e2 = try encode(allocator, make(.channels, f2[0..]));
+    defer allocator.free(e2);
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    try stream.appendSlice(allocator, e1);
+    try stream.appendSlice(allocator, e2);
+
+    const caps = try decodeStream(allocator, stream.items);
+    defer {
+        for (caps) |*c| c.deinit(allocator);
+        allocator.free(caps);
+    }
+    try std.testing.expectEqual(@as(usize, 2), caps.len);
+    try std.testing.expectEqual(CapsuleKind.clients, caps[0].header.kind);
+    try std.testing.expectEqual(CapsuleKind.channels, caps[1].header.kind);
+    try std.testing.expect(std.mem.eql(u8, "alice", caps[0].fields[0].bytes));
+    try std.testing.expect(std.mem.eql(u8, "#chan", caps[1].fields[0].bytes));
 }
 
 test "negotiation is per capsule schema range" {

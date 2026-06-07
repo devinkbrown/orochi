@@ -274,6 +274,34 @@ pub fn resumeFromEnv() ?Resume {
     return .{ .arena_fd = arena_fd, .control_fd = control_fd, .listen_fd = listen_fd };
 }
 
+/// Successor side: read the sealed capsule arena (inherited memfd) and decode the
+/// concatenated capsule stream. The caller owns the returned slice and must
+/// `deinit` each capsule and free the slice. The fds for client re-attach are a
+/// separate (later) step; this surfaces the serialized state pieces.
+pub fn readArena(allocator: std.mem.Allocator, arena_fd: handoff.Fd) anyerror![]capsule.Capsule {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+
+    // Read the whole sealed memfd via positional reads (no size syscall needed).
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var tmp: [4096]u8 = undefined;
+    var off: u64 = 0;
+    while (true) {
+        const rc = linux.pread(arena_fd, &tmp, tmp.len, @intCast(off));
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) break; // EOF
+                try buf.appendSlice(allocator, tmp[0..n]);
+                off += n;
+            },
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+    }
+    return capsule.decodeStream(allocator, buf.items);
+}
+
 fn fdEnvEntry(allocator: std.mem.Allocator, name: []const u8, fd: handoff.Fd) ![:0]u8 {
     var buf: [128]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{s}={d}", .{ name, fd });
@@ -335,6 +363,37 @@ test "live prepare seals capsules and handoff passes fds" {
 
 test "resumeFromEnv returns null when fd variables are absent" {
     try std.testing.expectEqual(@as(?Resume, null), resumeFromEnv());
+}
+
+test "readArena round-trips the sealed capsule stream" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Prepare seals two capsules into a memfd arena.
+    const pieces = [_]StatePiece{
+        .{ .kind = .clients, .bytes = "client-state" },
+        .{ .kind = .channels, .bytes = "channel-state" },
+    };
+    var prepared = try prepare(allocator, .{
+        .epoch = 7,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "helix-readarena",
+        .pieces = pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+
+    const caps = try readArena(allocator, prepared.runtime.arena.?.fd);
+    defer {
+        for (caps) |*c| c.deinit(allocator);
+        allocator.free(caps);
+    }
+    try std.testing.expectEqual(@as(usize, 2), caps.len);
+    try std.testing.expectEqual(capsule.CapsuleKind.clients, caps[0].header.kind);
+    try std.testing.expect(std.mem.eql(u8, "client-state", caps[0].fields[0].bytes));
+    try std.testing.expectEqual(capsule.CapsuleKind.channels, caps[1].header.kind);
+    try std.testing.expect(std.mem.eql(u8, "channel-state", caps[1].fields[0].bytes));
 }
 
 test "exec plan with listener carries the listen fd env entry" {
