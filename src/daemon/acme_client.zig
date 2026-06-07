@@ -43,7 +43,8 @@ const max_nonce_retries: u8 = 3;
 /// The http-01 challenge type token used to select a challenge from an authz.
 const http01_type = "http-01";
 
-/// JOSE `alg` value for Ed25519 account keys (RFC 8037).
+/// JOSE `alg` for the account key. ES256 (ECDSA P-256 + SHA-256) is the
+/// algorithm Let's Encrypt accepts; it rejects EdDSA on accounts.
 const jose_alg = "ES256";
 
 // ---------------------------------------------------------------------------

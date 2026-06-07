@@ -7,7 +7,7 @@
 //! simple synchronous driver is the right tool; it never blocks the event loop.
 //!
 //! It is clean-room and self-contained: TLS via `crypto/tls_client`, HTTP via
-//! `proto/http1_client`, ACME via `daemon/acme_client`, signatures via Ed25519
+//! `proto/http1_client`, ACME via `daemon/acme_client`, signatures via ES256
 //! (`crypto/sign`). No OpenSSL, no certbot, no external processes.
 //!
 //! Trust anchors (the CA root DER(s) that validate the ACME API endpoint's own
@@ -232,8 +232,10 @@ pub const HttpsTransport = struct {
         if (self.last_response) |r| self.allocator.free(r);
         self.last_response = raw;
         const resp = try http1.parseResponse(raw, &self.header_scratch);
+        // Trace every exchange under --debug; always surface error bodies (the
+        // RFC 7807 problem document) so failures are diagnosable without --debug.
         if (self.debug or resp.status >= 300) {
-            const preview = resp.body[0..@min(resp.body.len, 8000)];
+            const preview = resp.body[0..@min(resp.body.len, 512)];
             std.debug.print("acme<- {s} {s} -> {d} (body {d}B)\n  {s}\n", .{ method, url_str, resp.status, resp.body.len, preview });
         }
         return .{

@@ -1,7 +1,8 @@
 //! `mizuchi acme-issue` entry: assemble the clean-room ACME stack into a single
-//! out-of-band issuance run. Generates an Ed25519 account key, loads trust
-//! anchors from a CA bundle, starts the loopback HTTP-01 listener (which nginx
-//! proxies `/.well-known/acme-challenge/` to), and drives `acme_runner.issue`.
+//! out-of-band issuance run. Generates distinct ES256 (ECDSA P-256) account and
+//! certificate keys, loads trust anchors from a CA bundle, starts the loopback
+//! HTTP-01 listener (which nginx proxies `/.well-known/acme-challenge/` to), and
+//! drives `acme_runner.issue`.
 //!
 //! Defaults target Let's Encrypt STAGING (the chosen dry-run posture). It never
 //! touches certbot or /etc/letsencrypt; the chain is written to a kain-owned path.

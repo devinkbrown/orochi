@@ -425,10 +425,8 @@ pub const Client = struct {
             }
             if (rec.content_type != .handshake) return error.BadRecord;
 
-            dbg("first record ct={d} len={d}", .{ @intFromEnum(rec.content_type), rec.fragment.len });
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
-            dbg("  handshake msg typ={d} off={d}/{d}", .{ @intFromEnum(msg.typ), off, rec.fragment.len });
             if (off != rec.fragment.len or msg.typ != .server_hello) return error.BadHandshake;
             var selected = try self.parseServerHello(msg.body);
             try self.appendTranscript(msg.raw);
@@ -985,23 +983,22 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
 
     const last = chain[chain.len - 1];
     const last_parts = try extractCertParts(last);
-    dbg("chain.len={d} last.issuer_der.len={d}", .{ chain.len, last_parts.issuer_der.len });
-    var matched: usize = 0;
     for (anchors) |anchor_der| {
         const anchor_parts = extractCertParts(anchor_der) catch continue;
+        // Match the chain tip to a trust anchor by DN: either the tip is issued by
+        // the anchor (tip.issuer == anchor.subject), or the tip *is* the anchor
+        // (self-included root). Then verify the tip's signature with the anchor.
         if (!std.mem.eql(u8, last_parts.issuer_der, anchor_parts.subject_der) and
             !std.mem.eql(u8, last_parts.subject_der, anchor_parts.subject_der))
         {
             continue;
         }
-        matched += 1;
         verifyCertSignature(last_parts, anchor_der) catch |err| {
-            dbg("anchor DN matched but verify failed: {s}", .{@errorName(err)});
+            dbg("trust-anchor DN matched but signature check failed: {s}", .{@errorName(err)});
             continue;
         };
         return;
     }
-    dbg("no anchor accepted (DN matches={d})", .{matched});
     return error.UnknownCa;
 }
 
