@@ -13,6 +13,7 @@ const posix = std.posix;
 const media_transport = @import("../substrate/media_transport.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
+const rtp_nack = @import("../substrate/rtp_nack.zig");
 
 pub const MediaTransport = media_transport.MediaTransport;
 pub const MediaSocket = media_socket.MediaSocket;
@@ -135,20 +136,52 @@ pub const MediaPlane = struct {
                 }
             } else {
                 // Media: require RTP/RTCP framing (version 2 in the top two bits,
-                // min header) so the port is not an open UDP reflector for
-                // arbitrary payloads. Learn the SSRC from RTP (not RTCP) packets.
+                // min header) so the port is not an open UDP reflector.
                 if (got.data.len < rtp_profile.header_len or (got.data[0] & 0xC0) != 0x80) continue;
-                var ssrc: u32 = 0;
-                if (!isRtcp(got.data[1])) {
-                    if (rtp_profile.decodeHeader(got.data)) |dh| ssrc = dh.header.ssrc else |_| {}
+                const b1 = got.data[1];
+                if (isRtcp(b1)) {
+                    // Terminate Generic NACK (RTPFB PT=205, FMT=1) locally from the
+                    // retransmit cache; other RTCP is relayed like media.
+                    if (b1 == 205 and (got.data[0] & 0x1f) == 1 and got.data.len >= 12) {
+                        const media_ssrc = std.mem.readInt(u32, got.data[8..12], .big);
+                        self.handleNack(sock, got.from, media_ssrc, got.data[12..]);
+                        continue;
+                    }
+                    self.relay(sock, got.from, got.data, 0, null);
+                } else {
+                    var ssrc: u32 = 0;
+                    var seq: ?u16 = null;
+                    if (rtp_profile.decodeHeader(got.data)) |dh| {
+                        ssrc = dh.header.ssrc;
+                        seq = dh.header.sequence;
+                    } else |_| {}
+                    self.relay(&sock.*, got.from, got.data, ssrc, seq);
                 }
-                // Selectively forward to the other call participants.
-                var targets: [media_transport.max_forward]TransportAddress = undefined;
-                lockSpin(&self.mutex);
-                const n = self.transport.forwardFromSource(got.from, got.data.len, ssrc, &targets);
-                self.mutex.unlock();
-                for (targets[0..n]) |dst| sock.sendTo(dst, got.data);
             }
+        }
+    }
+
+    /// Selectively forward `packet` (from `source`) to the other call
+    /// participants; meter + (for RTP, `seq` non-null) cache it for NACK.
+    fn relay(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16) void {
+        var targets: [media_transport.max_forward]TransportAddress = undefined;
+        lockSpin(&self.mutex);
+        const n = self.transport.forwardFromSource(source, packet, ssrc, seq, &targets);
+        self.mutex.unlock();
+        for (targets[0..n]) |dst| sock.sendTo(dst, packet);
+    }
+
+    /// Answer a Generic NACK from `requester` for `media_ssrc`: resend each
+    /// requested-and-still-cached packet from the publisher's retransmit buffer.
+    fn handleNack(self: *MediaPlane, sock: *MediaSocket, requester: TransportAddress, media_ssrc: u32, fci: []const u8) void {
+        const missing = rtp_nack.parseNackFci(self.allocator, fci) catch return;
+        defer self.allocator.free(missing);
+        var scratch: [media_socket.max_datagram]u8 = undefined;
+        for (missing) |seq| {
+            lockSpin(&self.mutex);
+            const got = self.transport.copyRetransmit(media_ssrc, seq, &scratch);
+            self.mutex.unlock();
+            if (got) |len| sock.sendTo(requester, scratch[0..len]);
         }
     }
 

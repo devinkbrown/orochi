@@ -16,6 +16,10 @@ const std = @import("std");
 const ice = @import("../proto/ice.zig");
 const stun = @import("../proto/stun.zig");
 const srtp = @import("../proto/srtp.zig");
+const rtp_nack = @import("rtp_nack.zig");
+
+/// Packets retained per sender for NACK retransmission (RFC 4585).
+pub const rtx_capacity: usize = 512;
 
 /// SRTP master key (16) + master salt (14): the per-call SDES keying material
 /// the server distributes to every participant over the signaling channel.
@@ -41,6 +45,8 @@ pub const Endpoint = struct {
     /// Media packets/bytes received from this participant and relayed onward.
     rx_packets: u64 = 0,
     rx_bytes: u64 = 0,
+    /// Recently-relayed RTP for this sender, for NACK retransmission.
+    rtx: rtp_nack.RetransmitBuffer,
 
     pub fn ufragSlice(self: *const Endpoint) []const u8 {
         return self.ufrag[0..];
@@ -75,6 +81,8 @@ pub const MediaTransport = struct {
     by_ufrag: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Bound peer address -> composite key, for routing inbound RTP by source.
     by_addr: std.AutoHashMapUnmanaged(AddrKey, []const u8) = .empty,
+    /// Learned RTP SSRC -> composite key, for resolving NACK media sources.
+    by_ssrc: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     /// Channel -> per-call SRTP group key (SDES). One key per active call,
     /// distributed to every participant; dropped when the call empties.
     group_keys: std.StringHashMapUnmanaged([group_key_len]u8) = .empty,
@@ -84,11 +92,15 @@ pub const MediaTransport = struct {
     }
 
     pub fn deinit(self: *MediaTransport) void {
-        var it = self.endpoints.keyIterator();
-        while (it.next()) |k| self.allocator.free(k.*);
+        var it = self.endpoints.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.rtx.deinit();
+        }
         self.endpoints.deinit(self.allocator);
         self.by_ufrag.deinit(self.allocator);
         self.by_addr.deinit(self.allocator);
+        self.by_ssrc.deinit(self.allocator);
         var gk = self.group_keys.keyIterator();
         while (gk.next()) |k| self.allocator.free(k.*);
         self.group_keys.deinit(self.allocator);
@@ -121,18 +133,22 @@ pub const MediaTransport = struct {
         var kb: [256]u8 = undefined;
         const k = compositeKey(&kb, channel, participant) orelse return error.NameTooLong;
 
-        var ep = Endpoint{ .ufrag = undefined, .pwd = undefined };
+        var ep = Endpoint{ .ufrag = undefined, .pwd = undefined, .rtx = rtp_nack.RetransmitBuffer.init(self.allocator, rtx_capacity) };
         fillCreds(rng, &ep.ufrag, &ep.pwd);
 
         const gop = try self.endpoints.getOrPut(self.allocator, k);
         if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
                 _ = self.endpoints.remove(k);
+                ep.rtx.deinit();
                 return e;
             };
         } else {
-            // Rotating creds: drop the stale ufrag index entry.
+            // Rotating creds: tear down the prior incarnation's indexes + buffer.
             _ = self.by_ufrag.remove(gop.value_ptr.ufragSlice());
+            if (gop.value_ptr.remote) |a| _ = self.by_addr.remove(addrKey(a));
+            if (gop.value_ptr.ssrc != 0) _ = self.by_ssrc.remove(gop.value_ptr.ssrc);
+            gop.value_ptr.rtx.deinit();
         }
         gop.value_ptr.* = ep;
         // Index the (stable) stored ufrag slice back to the owned key.
@@ -262,17 +278,34 @@ pub const MediaTransport = struct {
     /// fill `out` with the bound remotes of every *other* connected participant
     /// in the same call (the SFU relay set). Returns 0 if the source is not a
     /// known bound endpoint.
+    /// `packet` is the full inbound datagram (metered + RTP-cached for NACK).
     /// `ssrc` (0 = unknown/RTCP) is learned onto the sending endpoint the first
-    /// time it is seen.
-    pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, bytes_len: usize, ssrc: u32, out: []TransportAddress) usize {
+    /// time it is seen, and indexed for NACK source resolution. `seq` non-null
+    /// (RTP only) caches the packet for retransmission.
+    pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16, out: []TransportAddress) usize {
         const key = self.by_addr.get(addrKey(source)) orelse return 0;
         if (self.endpoints.getPtr(key)) |ep| {
             ep.rx_packets += 1;
-            ep.rx_bytes += bytes_len;
-            if (ssrc != 0 and ep.ssrc == 0) ep.ssrc = ssrc;
+            ep.rx_bytes += packet.len;
+            if (ssrc != 0 and ep.ssrc == 0) {
+                ep.ssrc = ssrc;
+                self.by_ssrc.put(self.allocator, ssrc, key) catch {};
+            }
+            if (seq) |s| ep.rtx.onSent(s, packet) catch {};
         }
         const sep = std.mem.indexOfScalar(u8, key, 0) orelse return 0;
         return self.forwardTargets(key[0..sep], key[sep + 1 ..], out);
+    }
+
+    /// Copy a cached RTP packet (by media SSRC + sequence) into `out` for NACK
+    /// retransmission, returning its length, or null if not retained.
+    pub fn copyRetransmit(self: *MediaTransport, media_ssrc: u32, seq: u16, out: []u8) ?usize {
+        const key = self.by_ssrc.get(media_ssrc) orelse return null;
+        const ep = self.endpoints.getPtr(key) orelse return null;
+        const bytes = ep.rtx.lookup(seq) orelse return null;
+        if (bytes.len > out.len) return null;
+        @memcpy(out[0..bytes.len], bytes);
+        return bytes.len;
     }
 
     /// Per-participant transport stats snapshot (copied out so callers need not
@@ -355,8 +388,11 @@ pub const MediaTransport = struct {
         var kb: [256]u8 = undefined;
         const k = compositeKey(&kb, channel, participant) orelse return;
         if (self.endpoints.fetchRemove(k)) |kv| {
-            _ = self.by_ufrag.remove(kv.value.ufragSlice());
-            if (kv.value.remote) |addr| _ = self.by_addr.remove(addrKey(addr));
+            var ep = kv.value;
+            _ = self.by_ufrag.remove(ep.ufragSlice());
+            if (ep.remote) |addr| _ = self.by_addr.remove(addrKey(addr));
+            if (ep.ssrc != 0) _ = self.by_ssrc.remove(ep.ssrc);
+            ep.rtx.deinit();
             self.allocator.free(kv.key);
         }
         self.dropGroupKeyIfEmpty(channel);
@@ -492,18 +528,27 @@ test "forwardFromSource routes an RTP packet to the other peers" {
     try testing.expect(mt.bindRemote("#c", "bob", testAddr(2, 5002)));
     try testing.expect(mt.bindRemote("#c", "carol", testAddr(3, 5003)));
 
-    // A packet from alice's bound address forwards to bob+carol, not alice.
+    // An RTP packet from alice (ssrc 0xAA, seq 7) forwards to bob+carol, not
+    // alice; it is also SSRC-indexed and cached for NACK.
+    const pkt = [_]u8{ 0x80, 0x60, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0xAA, 1, 2, 3 };
     var out: [8]TransportAddress = undefined;
-    const n = mt.forwardFromSource(alice_addr, 100, 0, &out);
+    const n = mt.forwardFromSource(alice_addr, &pkt, 0xAA, 7, &out);
     try testing.expectEqual(@as(usize, 2), n);
     for (out[0..n]) |a| try testing.expect(a.port == 5002 or a.port == 5003);
 
-    // An unknown source routes nowhere.
-    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(testAddr(9, 9999), 100, 0, &out));
+    // NACK for alice's ssrc + seq 7 retrieves the cached packet.
+    var rtx: [64]u8 = undefined;
+    const got = mt.copyRetransmit(0xAA, 7, &rtx) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &pkt, rtx[0..got]);
+    try testing.expect(mt.copyRetransmit(0xAA, 99, &rtx) == null); // seq not cached
 
-    // After alice leaves, her address no longer resolves.
+    // An unknown source routes nowhere.
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(testAddr(9, 9999), &pkt, 0, null, &out));
+
+    // After alice leaves, her address and ssrc no longer resolve.
     mt.remove("#c", "alice");
-    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, 100, 0, &out));
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, &pkt, 0, null, &out));
+    try testing.expect(mt.copyRetransmit(0xAA, 7, &rtx) == null);
 }
 
 test "group key is stable per call and released when it empties" {
