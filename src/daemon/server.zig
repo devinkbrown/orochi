@@ -1984,6 +1984,11 @@ pub const LinuxServer = struct {
         parsed: *const irc_line.LineView,
         line: []const u8,
     ) !void {
+        // Refresh the world's wall-clock so a channel created by this command
+        // (JOIN/CREATE) gets a correct IRCX CREATION timestamp without the pure
+        // world taking a clock dependency.
+        self.world.clock_unix = @divFloor(self.nowMs(), 1000);
+
         // SerpentRegistry module spine (strangler-fig): consult the comptime
         // module registry first. A migrated command is handled here and returns;
         // anything not yet migrated falls through to the legacy chain below.
@@ -4856,6 +4861,11 @@ pub const LinuxServer = struct {
             if (oid == 0) return null;
             // IRCX object id: '0' type prefix + 8 hex digits.
             return std.fmt.bufPrint(buf, "0{x:0>8}", .{oid}) catch null;
+        }
+        if (std.ascii.eqlIgnoreCase(key, "CREATION")) {
+            const created = self.world.channelCreatedUnix(entity.id) orelse return null;
+            if (created == 0) return null;
+            return std.fmt.bufPrint(buf, "{d}", .{created}) catch null;
         }
         if (std.ascii.eqlIgnoreCase(key, "MEMBERCOUNT")) {
             return std.fmt.bufPrint(buf, "{d}", .{self.world.memberCount(entity.id)}) catch null;

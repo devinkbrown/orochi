@@ -87,6 +87,9 @@ const Channel = struct {
     /// IRCX object id, assigned once at creation (0 = unset). Surfaced as the
     /// channel OID built-in property.
     oid: u32 = 0,
+    /// Unix seconds when the channel was created (0 = unset). Surfaced as the
+    /// IRCX CREATION built-in property. Sourced from World.clock_unix.
+    created_unix: i64 = 0,
 
     fn init(allocator: std.mem.Allocator) Channel {
         return .{
@@ -130,6 +133,10 @@ pub const World = struct {
     /// Monotonic IRCX object-id source. Each newly-created channel gets the next
     /// value; starts at 1 so 0 means "unset" (never a real OID).
     next_oid: u32 = 1,
+    /// Current wall-clock time in unix seconds, refreshed by the server before
+    /// dispatch so `ensureChannel` can stamp a channel's CREATION time without the
+    /// pure world taking a clock dependency. 0 until first set.
+    clock_unix: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) World {
         return .{
@@ -316,6 +323,13 @@ pub const World = struct {
     }
 
     /// The IRCX object id assigned to `name` at creation (null if no such channel).
+    /// Unix-seconds creation time assigned to `name` at creation (null if no such
+    /// channel; 0 if created before the server set a clock). IRCX CREATION prop.
+    pub fn channelCreatedUnix(self: *World, name: []const u8) ?i64 {
+        const channel = self.channels.getPtr(name) orelse return null;
+        return channel.created_unix;
+    }
+
     pub fn channelOid(self: *World, name: []const u8) ?u32 {
         const channel = self.channels.getPtr(name) orelse return null;
         return channel.oid;
@@ -748,6 +762,7 @@ pub const World = struct {
         entry.key_ptr.* = owned_name;
         entry.value_ptr.* = Channel.init(self.allocator);
         entry.value_ptr.oid = self.next_oid;
+        entry.value_ptr.created_unix = self.clock_unix;
         self.next_oid +%= 1;
         return entry.value_ptr;
     }
