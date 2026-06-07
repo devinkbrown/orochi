@@ -117,6 +117,25 @@ fn bridgeOnNativeFrame(ctx: *anyopaque, channel: []const u8, datagram: []const u
     var sctx = BridgeSendCtx{ .server = self, .channel = channel };
     br.fanoutNativeToWebrtc(datagram, &sctx, bridgeSendToWebrtc);
 }
+
+/// Resolve a native target's learned address from the native transport and send
+/// the rewrapped opcodec datagram there.
+fn bridgeSendToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
+    const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
+    if (s.server.native_media.remoteFor(s.channel, target.id())) |addr|
+        s.server.native_media.sendTo(addr, bytes);
+}
+
+/// Cross-leg sink invoked by the WebRTC relay: rewrap the RTP frame to opcodec
+/// and fan it out to the channel's native members (live addresses per peer).
+fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void {
+    const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+    lockSpin(&self.media_bridges_mu);
+    defer self.media_bridges_mu.unlock();
+    const br = self.media_bridges.getPtr(channel) orelse return;
+    var sctx = BridgeSendCtx{ .server = self, .channel = channel };
+    br.fanoutWebrtcToNative(rtp, keyframe_hint, &sctx, bridgeSendToNative);
+}
 const tegami_mod = @import("tegami.zig");
 const transcript_mod = @import("transcript.zig");
 const announce_board_mod = @import("announce_board.zig");
@@ -1173,6 +1192,8 @@ pub const LinuxServer = struct {
         var host_buf: [16]u8 = undefined;
         const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
         std.debug.print("mizuchi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
+        // Bridge WebRTC RTP frames to any native members of each channel.
+        self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
     }
 
     pub fn deinit(self: *LinuxServer) void {

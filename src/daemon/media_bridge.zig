@@ -49,6 +49,18 @@ pub const CrossLegSink = struct {
     }
 };
 
+/// Hook the WebRTC relay invokes (after its in-leg forward) to also deliver an
+/// RTP frame to the channel's native members. The implementation looks up the
+/// channel's `ChannelBridge` and calls `fanoutWebrtcToNative`.
+pub const RtpCrossSink = struct {
+    ctx: *anyopaque,
+    on_rtp_frame: *const fn (ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void,
+
+    pub fn onRtpFrame(self: RtpCrossSink, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void {
+        self.on_rtp_frame(self.ctx, channel, rtp, keyframe_hint);
+    }
+};
+
 /// The default per-call RTP payload-type map (dynamic PTs for our codecs). Used
 /// when a call hasn't negotiated a custom mapping.
 pub fn defaultPtMap() PtMap {

@@ -162,6 +162,16 @@ pub const MediaTransport = struct {
         return self.endpoints.getPtr(k);
     }
 
+    /// The channel that owns the participant bound to `source`, or null if the
+    /// address is unknown. Lets the WebRTC relay learn an inbound RTP packet's
+    /// channel (for cross-leg bridging). The returned slice borrows the composite
+    /// endpoint key (valid while that endpoint exists).
+    pub fn channelForSource(self: *MediaTransport, source: TransportAddress) ?[]const u8 {
+        const composite = self.by_addr.get(addrKey(source)) orelse return null;
+        const nul = std.mem.indexOfScalar(u8, composite, 0) orelse return composite;
+        return composite[0..nul];
+    }
+
     /// Resolve a participant endpoint from the server ufrag carried in a STUN
     /// binding's USERNAME (`<server-ufrag>:<peer-ufrag>`).
     pub fn byServerUfrag(self: *MediaTransport, server_ufrag: []const u8) ?*Endpoint {
@@ -448,6 +458,19 @@ test "forwardTargets returns other connected peers only" {
     const n = mt.forwardTargets("#c", "alice", &out);
     try testing.expectEqual(@as(usize, 2), n);
     for (out[0..n]) |addr| try testing.expect(addr.port == 5002 or addr.port == 5003);
+}
+
+test "channelForSource resolves the channel of a bound peer address" {
+    var prng = std.Random.DefaultPrng.init(11);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    _ = try mt.allocate("#call", "alice", prng.random());
+    try testing.expect(mt.bindRemote("#call", "alice", testAddr(7, 6001)));
+
+    const chan = mt.channelForSource(testAddr(7, 6001)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("#call", chan);
+    // an unbound address resolves to null
+    try testing.expect(mt.channelForSource(testAddr(8, 9999)) == null);
 }
 
 test "handleStunBinding authenticates, binds the peer, and answers" {

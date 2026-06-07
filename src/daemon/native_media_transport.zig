@@ -212,6 +212,21 @@ pub const NativeMediaTransport = struct {
         link.setSelection(id, sel);
     }
 
+    /// Send `bytes` to `dest` on the native socket. Used by the WebRTC relay's
+    /// cross-leg sink to deliver opcodec-rewrapped frames to native peers.
+    pub fn sendTo(self: *NativeMediaTransport, dest: TransportAddress, bytes: []const u8) void {
+        if (self.socket) |*s| s.sendTo(dest, bytes);
+    }
+
+    /// The learned transport address of a native participant in `channel`, or
+    /// null if unknown / not yet learned (the peer hasn't published a datagram).
+    pub fn remoteFor(self: *NativeMediaTransport, channel: []const u8, id: []const u8) ?TransportAddress {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const link = self.channels.getPtr(channel) orelse return null;
+        return link.addrFor(id);
+    }
+
     /// Participant count in `channel` (0 if the channel has no native call).
     pub fn countChannel(self: *NativeMediaTransport, channel: []const u8) usize {
         lockSpin(&self.mutex);

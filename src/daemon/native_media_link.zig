@@ -132,6 +132,14 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             return null;
         }
 
+        /// The learned transport address of a participant by string id, or null
+        /// if unknown / not yet learned. Used to deliver cross-leg (WebRTC→native)
+        /// frames to a native peer.
+        pub fn addrFor(self: *Self, id_bytes: []const u8) ?TransportAddress {
+            const id = ParticipantId.init(id_bytes) catch return null;
+            return self.addrForId(id);
+        }
+
         /// Decode one inbound native datagram and compute the forward set as
         /// transport addresses. The SAME `datagram` bytes are then sent verbatim
         /// to each address in `out[0..n]`. Returns 0 (and forwards nothing) when

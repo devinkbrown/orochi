@@ -14,6 +14,7 @@ const media_transport = @import("../substrate/media_transport.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const rtp_nack = @import("../substrate/rtp_nack.zig");
+const media_bridge = @import("media_bridge.zig");
 
 pub const MediaTransport = media_transport.MediaTransport;
 pub const MediaSocket = media_socket.MediaSocket;
@@ -78,6 +79,10 @@ pub const MediaPlane = struct {
     /// CSPRNG for ICE credential generation, seeded from the OS at init.
     /// Accessed only under `mutex` (in allocate).
     csprng: std.Random.DefaultCsprng,
+    /// Optional cross-leg sink: after relaying an RTP frame to WebRTC peers, the
+    /// pump hands it here to also reach the channel's native members (rewrapped to
+    /// opcodec). Null = no native members / no bridging.
+    cross: ?media_bridge.RtpCrossSink = null,
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
@@ -93,6 +98,11 @@ pub const MediaPlane = struct {
         self.shutdown();
         self.transport.deinit();
         self.* = undefined;
+    }
+
+    /// Install the cross-leg sink (call before `start`, or while stopped).
+    pub fn setCrossLegSink(self: *MediaPlane, sink: media_bridge.RtpCrossSink) void {
+        self.cross = sink;
     }
 
     /// Bind the media socket on `bind_be`:`port` (port 0 = ephemeral) and spawn
@@ -161,7 +171,7 @@ pub const MediaPlane = struct {
                         self.handleNack(sock, got.from, media_ssrc, got.data[12..]);
                         continue;
                     }
-                    self.relay(sock, got.from, got.data, 0, null);
+                    self.relay(sock, got.from, got.data, 0, null, false);
                 } else {
                     var ssrc: u32 = 0;
                     var seq: ?u16 = null;
@@ -169,7 +179,7 @@ pub const MediaPlane = struct {
                         ssrc = dh.header.ssrc;
                         seq = dh.header.sequence;
                     } else |_| {}
-                    self.relay(&sock.*, got.from, got.data, ssrc, seq);
+                    self.relay(&sock.*, got.from, got.data, ssrc, seq, true);
                 }
             }
         }
@@ -177,12 +187,29 @@ pub const MediaPlane = struct {
 
     /// Selectively forward `packet` (from `source`) to the other call
     /// participants; meter + (for RTP, `seq` non-null) cache it for NACK.
-    fn relay(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16) void {
+    fn relay(self: *MediaPlane, sock: *MediaSocket, source: TransportAddress, packet: []const u8, ssrc: u32, seq: ?u16, bridge_media: bool) void {
         var targets: [media_transport.max_forward]TransportAddress = undefined;
+        var chanbuf: [256]u8 = undefined;
+        var chanlen: usize = 0;
         lockSpin(&self.mutex);
         const n = self.transport.forwardFromSource(source, packet, ssrc, seq, &targets);
+        if (bridge_media) {
+            // Copy the source's channel out under the lock so the cross-leg sink
+            // can use it after we unlock (the composite key may be freed).
+            if (self.transport.channelForSource(source)) |chan| {
+                if (chan.len <= chanbuf.len) {
+                    @memcpy(chanbuf[0..chan.len], chan);
+                    chanlen = chan.len;
+                }
+            }
+        }
         self.mutex.unlock();
         for (targets[0..n]) |dst| sock.sendTo(dst, packet);
+
+        // Bridge the same RTP frame to any native members of this channel.
+        if (bridge_media and chanlen != 0) {
+            if (self.cross) |sink| sink.onRtpFrame(chanbuf[0..chanlen], packet, false);
+        }
     }
 
     /// Answer a Generic NACK from `requester` for `media_ssrc`: resend each
