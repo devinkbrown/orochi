@@ -55,8 +55,7 @@ pub fn loadFromText(
     base: server.Config,
     resolver: config_format.Resolver,
 ) !Loaded {
-    var parser = config_format.Parser.init(allocator, text, resolver);
-    var parsed = try parser.parse();
+    var parsed = try config_format.parseToml(allocator, text, resolver);
     errdefer parsed.deinit(allocator);
 
     // Build the SASL-only operator registry from `[oper]` blocks (full privileges
@@ -116,9 +115,9 @@ test "limits durations overlay timeout knobs" {
         \\[listen]
         \\irc = 6680
         \\[limits]
-        \\handshake_timeout = 15s
-        \\ping_interval = 90s
-        \\ping_timeout = 45s
+        \\handshake_timeout = "15s"
+        \\ping_interval = "90s"
+        \\ping_timeout = "45s"
         \\
     ;
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
@@ -155,7 +154,7 @@ test "limits overlay reputation knobs" {
         \\irc = 6680
         \\[limits]
         \\reputation_refuse_threshold = 120
-        \\reputation_half_life = 90s
+        \\reputation_half_life = "90s"
         \\
     ;
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});

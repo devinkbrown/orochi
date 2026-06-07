@@ -231,6 +231,7 @@ pub const tls_session_ticket = @import("tls_session_ticket.zig");
 pub const tls_signature_scheme = @import("tls_signature_scheme.zig");
 pub const tls_supported_versions = @import("tls_supported_versions.zig");
 pub const tls_transcript = @import("tls_transcript.zig");
+pub const toml = @import("toml.zig");
 pub const trace = @import("trace.zig");
 pub const tsumugi_props = @import("tsumugi_props.zig");
 pub const tsumugi = @import("tsumugi.zig");
@@ -496,6 +497,7 @@ test {
     _ = tls_signature_scheme;
     _ = tls_supported_versions;
     _ = tls_transcript;
+    _ = toml;
     _ = trace;
     _ = tsumugi_props;
     _ = tsumugi;

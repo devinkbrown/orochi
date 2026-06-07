@@ -6570,8 +6570,7 @@ pub const LinuxServer = struct {
         };
         defer self.allocator.free(text);
 
-        var parser = config_format.Parser.init(self.allocator, text, self.config.config_resolver);
-        var parsed = parser.parse() catch {
+        var parsed = config_format.parseToml(self.allocator, text, self.config.config_resolver) catch {
             try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
             return;
         };
