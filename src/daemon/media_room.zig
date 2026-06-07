@@ -8,11 +8,31 @@
 //! allocated (the Session value is large) and keyed by an owned channel name.
 const std = @import("std");
 const media = @import("../substrate/suimyaku/media.zig");
+const toml = @import("../proto/toml.zig");
 
 pub const max_participants: usize = 64;
 pub const Room = media.Session(max_participants);
 pub const MediaKind = media.MediaKind;
 pub const Participant = media.Participant;
+
+/// Runtime-tunable media-room bounds.
+///
+/// `max_participants` is intentionally NOT here: it parameterizes the comptime
+/// `Session(N)` roster type (`[N]Participant` inline storage) and cannot be made
+/// runtime without reworking the substrate Session into heap storage. It stays a
+/// comptime constant; `[media.sfu] max_participants_per_room` is DEFERRED.
+///
+/// Only the runtime breakout-label cap is config-driven here. Defaults equal the
+/// bare constants; `applyToml` overlays the `[media.sfu]` section.
+pub const Config = struct {
+    max_breakout_bytes: usize = max_breakout_bytes,
+};
+
+/// Overlay `[media.sfu]` keys from a parsed TOML document onto `cfg`.
+/// `max_participants_per_room` is deferred (comptime) and ignored here.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.sfu.max_breakout_label_bytes")) |v| cfg.max_breakout_bytes = @intCast(v);
+}
 
 pub const Error = std.mem.Allocator.Error || media.SessionError;
 
@@ -41,6 +61,7 @@ pub const Position = struct { x: i32 = 0, y: i32 = 0 };
 
 pub const MediaRooms = struct {
     allocator: std.mem.Allocator,
+    config: Config,
     rooms: std.StringHashMap(*Room),
     /// Optional breakout (sub-room) label per participant, keyed by the composite
     /// "channel\x00participant". Absent = the default "main" breakout. Kept in a
@@ -53,8 +74,13 @@ pub const MediaRooms = struct {
     hands: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
+        return initConfig(allocator, .{});
+    }
+
+    pub fn initConfig(allocator: std.mem.Allocator, config: Config) MediaRooms {
         return .{
             .allocator = allocator,
+            .config = config,
             .rooms = std.StringHashMap(*Room).init(allocator),
             .breakouts = std.StringHashMap([]u8).init(allocator),
             .positions = std.StringHashMap(Position).init(allocator),
@@ -97,7 +123,7 @@ pub const MediaRooms = struct {
     pub fn setBreakout(self: *MediaRooms, channel: []const u8, pid: []const u8, name: []const u8) Error!void {
         var kb: [256]u8 = undefined;
         const k = breakoutKey(&kb, channel, pid) orelse return;
-        const trimmed = name[0..@min(name.len, max_breakout_bytes)];
+        const trimmed = name[0..@min(name.len, self.config.max_breakout_bytes)];
         const gop = try self.breakouts.getOrPut(k);
         if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
@@ -335,4 +361,31 @@ test "parseKind accepts aliases and rejects junk" {
     try testing.expectEqual(MediaKind.video, parseKind("Video").?);
     try testing.expectEqual(MediaKind.screen, parseKind("screen").?);
     try testing.expect(parseKind("hologram") == null);
+}
+
+test "applyToml defaults match historical constants" {
+    var doc = try toml.parse(testing.allocator, "");
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(max_breakout_bytes, cfg.max_breakout_bytes);
+}
+
+test "applyToml overlays media.sfu breakout label cap" {
+    const src =
+        \\[media.sfu]
+        \\max_breakout_label_bytes = 4
+        \\max_participants_per_room = 8
+    ;
+    var doc = try toml.parse(testing.allocator, src);
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(@as(usize, 4), cfg.max_breakout_bytes);
+
+    var m = MediaRooms.initConfig(testing.allocator, cfg);
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try m.setBreakout("#c", "alice", "engineering"); // truncated to 4 bytes
+    try testing.expectEqualStrings("engi", m.breakoutOf("#c", "alice"));
 }

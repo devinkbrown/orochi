@@ -3,13 +3,43 @@
 //! Bounded roster state, SFU forwarding decisions, simulcast layer choice, ABR
 //! hints, and codec offer/answer negotiation. Hot paths use inline storage.
 const std = @import("std");
+const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 
+// NOTE: the four size constants below are used as COMPTIME array bounds
+// (`[max_participant_id_bytes]u8`, `[max_codecs]Codec`, ...). They parameterize
+// inline storage and CANNOT be made runtime without reworking those types onto
+// the heap, so the corresponding `[media.sfu]` byte/count keys are DEFERRED.
 pub const max_participant_id_bytes = 64;
 pub const max_rid_bytes = 16;
 pub const max_codecs = 8;
 pub const max_crypto_suites = 4;
+
+// -- Video / simulcast geometry defaults -------------------------------------
+
+pub const default_max_layer_width: u16 = 3840;
+pub const default_max_layer_height: u16 = 2160;
+pub const default_max_layer_fps: u8 = 60;
+pub const default_receiver_max_fps: u8 = 60;
+
+/// Runtime-tunable simulcast geometry guards (the `SimulcastLayer.init` accept
+/// bounds and the default receiver fps ceiling). Defaults equal the historical
+/// 4K@60 bounds; `applyToml` overlays the `[media.video]` section.
+pub const VideoConfig = struct {
+    max_layer_width: u16 = default_max_layer_width,
+    max_layer_height: u16 = default_max_layer_height,
+    max_layer_fps: u8 = default_max_layer_fps,
+    default_receiver_max_fps: u8 = default_receiver_max_fps,
+};
+
+/// Overlay `[media.video]` keys from a parsed TOML document onto `cfg`.
+pub fn applyTomlVideo(cfg: *VideoConfig, doc: *const toml.Document) void {
+    if (doc.getUint("media.video.max_layer_width")) |v| cfg.max_layer_width = @intCast(v);
+    if (doc.getUint("media.video.max_layer_height")) |v| cfg.max_layer_height = @intCast(v);
+    if (doc.getUint("media.video.max_layer_fps")) |v| cfg.max_layer_fps = @intCast(v);
+    if (doc.getUint("media.video.default_receiver_max_fps")) |v| cfg.default_receiver_max_fps = @intCast(v);
+}
 
 pub const MediaKind = enum(u2) {
     voice,
@@ -287,11 +317,17 @@ pub const SimulcastLayer = struct {
     pub const Error = Rid.Error || error{ InvalidLayerBitrate, InvalidLayerGeometry, InvalidLayerFps };
 
     pub fn init(rid: []const u8, bitrate_kbps: u32, width: u16, height: u16, fps: u8) Error!SimulcastLayer {
+        return initWithConfig(.{}, rid, bitrate_kbps, width, height, fps);
+    }
+
+    /// Config-driven variant: accept-bounds come from `cfg` instead of the
+    /// historical hardcoded 4K@60 guards.
+    pub fn initWithConfig(cfg: VideoConfig, rid: []const u8, bitrate_kbps: u32, width: u16, height: u16, fps: u8) Error!SimulcastLayer {
         if (bitrate_kbps == 0) return error.InvalidLayerBitrate;
-        if (width == 0 or height == 0 or width > 3840 or height > 2160) {
+        if (width == 0 or height == 0 or width > cfg.max_layer_width or height > cfg.max_layer_height) {
             return error.InvalidLayerGeometry;
         }
-        if (fps == 0 or fps > 60) return error.InvalidLayerFps;
+        if (fps == 0 or fps > cfg.max_layer_fps) return error.InvalidLayerFps;
         return .{
             .rid = try Rid.init(rid),
             .bitrate_kbps = bitrate_kbps,
@@ -310,7 +346,7 @@ pub const ReceiverConstraints = struct {
     max_bitrate_kbps: u32,
     max_width: u16,
     max_height: u16,
-    max_fps: u8 = 60,
+    max_fps: u8 = default_receiver_max_fps,
 };
 
 pub fn LayerDeclaration(comptime capacity: usize) type {
@@ -585,7 +621,39 @@ pub const AbrConfig = struct {
     max_bitrate_kbps: u32 = 6000,
     high_loss_percent: u8 = 8,
     high_rtt_ms: u16 = 350,
+    /// NACKs/sec at/above which the link is treated as congested.
+    high_nack_per_second: u16 = 20,
+    /// Bitrate retained on congestion (loss-driven scale), as a percent.
+    congestion_decrease_percent: u32 = 60,
+    /// Fraction of available bandwidth targeted on congestion, as a percent.
+    congestion_utilization_percent: u32 = 80,
+    /// Loss % at/above which FEC level jumps to max while decreasing.
+    fec_escalate_loss_percent: u8 = 15,
+    /// Spare-bandwidth margin (percent of current) required before increasing.
+    increase_headroom_percent: u32 = 25,
+    /// Bitrate ramp-up multiplier per increase step, as a percent (>100).
+    increase_step_percent: u32 = 115,
+    /// Loss % at/below which steady-state holds with no FEC.
+    hold_no_fec_loss_percent: u8 = 1,
+    /// Maximum FEC redundancy level the ladder may emit.
+    max_fec_level: u8 = 3,
 };
+
+/// Overlay `[media.abr]` keys from a parsed TOML document onto `cfg`.
+pub fn applyTomlAbr(cfg: *AbrConfig, doc: *const toml.Document) void {
+    if (doc.getUint("media.abr.min_bitrate_kbps")) |v| cfg.min_bitrate_kbps = @intCast(v);
+    if (doc.getUint("media.abr.max_bitrate_kbps")) |v| cfg.max_bitrate_kbps = @intCast(v);
+    if (doc.getUint("media.abr.high_loss_percent")) |v| cfg.high_loss_percent = @intCast(v);
+    if (doc.getUint("media.abr.high_rtt_ms")) |v| cfg.high_rtt_ms = @intCast(v);
+    if (doc.getUint("media.abr.high_nack_per_second")) |v| cfg.high_nack_per_second = @intCast(v);
+    if (doc.getUint("media.abr.congestion_decrease_percent")) |v| cfg.congestion_decrease_percent = @intCast(v);
+    if (doc.getUint("media.abr.congestion_utilization_percent")) |v| cfg.congestion_utilization_percent = @intCast(v);
+    if (doc.getUint("media.abr.fec_escalate_loss_percent")) |v| cfg.fec_escalate_loss_percent = @intCast(v);
+    if (doc.getUint("media.abr.increase_headroom_percent")) |v| cfg.increase_headroom_percent = @intCast(v);
+    if (doc.getUint("media.abr.increase_step_percent")) |v| cfg.increase_step_percent = @intCast(v);
+    if (doc.getUint("media.abr.hold_no_fec_loss_percent")) |v| cfg.hold_no_fec_loss_percent = @intCast(v);
+    if (doc.getUint("media.abr.max_fec_level")) |v| cfg.max_fec_level = @intCast(v);
+}
 
 pub const AbrHint = struct {
     action: AbrAction,
@@ -607,29 +675,31 @@ pub fn abrHint(config: AbrConfig, stats: AbrStats) error{InvalidAbrInput}!AbrHin
         return .{
             .action = .pause,
             .target_bitrate_kbps = 0,
-            .fec_level = 3,
+            .fec_level = config.max_fec_level,
             .request_keyframe = false,
         };
     }
 
     const congested = stats.packet_loss_percent >= config.high_loss_percent or
-        stats.rtt_ms >= config.high_rtt_ms or stats.nack_per_second >= 20;
+        stats.rtt_ms >= config.high_rtt_ms or stats.nack_per_second >= config.high_nack_per_second;
 
     if (congested) {
-        const loss_scaled = mulDiv(stats.current_bitrate_kbps, 60, 100);
-        const network_scaled = mulDiv(available, 80, 100);
+        const loss_scaled = mulDiv(stats.current_bitrate_kbps, config.congestion_decrease_percent, 100);
+        const network_scaled = mulDiv(available, config.congestion_utilization_percent, 100);
+        // One notch below max for moderate loss; full FEC once loss escalates.
+        const decrease_fec: u8 = if (config.max_fec_level > 0) config.max_fec_level - 1 else 0;
         return .{
             .action = .decrease,
             .target_bitrate_kbps = clampBitrate(@min(loss_scaled, network_scaled), config.min_bitrate_kbps, config.max_bitrate_kbps),
-            .fec_level = if (stats.packet_loss_percent >= 15) 3 else 2,
+            .fec_level = if (stats.packet_loss_percent >= config.fec_escalate_loss_percent) config.max_fec_level else decrease_fec,
             .request_keyframe = true,
         };
     }
 
-    if (available > stats.current_bitrate_kbps + stats.current_bitrate_kbps / 4) {
+    if (available > stats.current_bitrate_kbps + mulDiv(stats.current_bitrate_kbps, config.increase_headroom_percent, 100)) {
         return .{
             .action = .increase,
-            .target_bitrate_kbps = clampBitrate(mulDiv(stats.current_bitrate_kbps, 115, 100), config.min_bitrate_kbps, available),
+            .target_bitrate_kbps = clampBitrate(mulDiv(stats.current_bitrate_kbps, config.increase_step_percent, 100), config.min_bitrate_kbps, available),
             .fec_level = if (stats.packet_loss_percent == 0) 0 else 1,
             .request_keyframe = false,
         };
@@ -638,7 +708,7 @@ pub fn abrHint(config: AbrConfig, stats: AbrStats) error{InvalidAbrInput}!AbrHin
     return .{
         .action = .hold,
         .target_bitrate_kbps = clampBitrate(stats.current_bitrate_kbps, config.min_bitrate_kbps, available),
-        .fec_level = if (stats.packet_loss_percent <= 1) 0 else 1,
+        .fec_level = if (stats.packet_loss_percent <= config.hold_no_fec_loss_percent) 0 else 1,
         .request_keyframe = false,
     };
 }
@@ -796,4 +866,118 @@ test "allocator-backed forward clone has no leaks" {
 
     try std.testing.expectEqual(@as(usize, 1), owned.len);
     try std.testing.expect(owned[0].eql(&bob));
+}
+
+test "applyTomlVideo defaults match historical 4K@60 guards" {
+    var doc = try toml.parse(std.testing.allocator, "");
+    defer doc.deinit(std.testing.allocator);
+    var cfg: VideoConfig = .{};
+    applyTomlVideo(&cfg, &doc);
+    try std.testing.expectEqual(default_max_layer_width, cfg.max_layer_width);
+    try std.testing.expectEqual(default_max_layer_height, cfg.max_layer_height);
+    try std.testing.expectEqual(default_max_layer_fps, cfg.max_layer_fps);
+    try std.testing.expectEqual(default_receiver_max_fps, cfg.default_receiver_max_fps);
+    try std.testing.expectEqual(default_receiver_max_fps, (ReceiverConstraints{ .max_bitrate_kbps = 1, .max_width = 1, .max_height = 1 }).max_fps);
+}
+
+test "applyTomlVideo overlays media.video and drives SimulcastLayer guards" {
+    const src =
+        \\[media.video]
+        \\max_layer_width = 1280
+        \\max_layer_height = 720
+        \\max_layer_fps = 30
+        \\default_receiver_max_fps = 30
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+    var cfg: VideoConfig = .{};
+    applyTomlVideo(&cfg, &doc);
+    try std.testing.expectEqual(@as(u16, 1280), cfg.max_layer_width);
+
+    // Within the tightened bounds: accepted.
+    _ = try SimulcastLayer.initWithConfig(cfg, "h", 900, 1280, 720, 30);
+    // Above the tightened geometry / fps: rejected.
+    try std.testing.expectError(error.InvalidLayerGeometry, SimulcastLayer.initWithConfig(cfg, "f", 2500, 1920, 1080, 30));
+    try std.testing.expectError(error.InvalidLayerFps, SimulcastLayer.initWithConfig(cfg, "x", 900, 1280, 720, 60));
+    // The default-config init still accepts 4K@60 (defaults unchanged).
+    _ = try SimulcastLayer.init("f", 2500, 3840, 2160, 60);
+}
+
+test "applyTomlAbr defaults match historical AbrConfig" {
+    var doc = try toml.parse(std.testing.allocator, "");
+    defer doc.deinit(std.testing.allocator);
+    var cfg: AbrConfig = .{};
+    applyTomlAbr(&cfg, &doc);
+    const def: AbrConfig = .{};
+    try std.testing.expectEqual(def.min_bitrate_kbps, cfg.min_bitrate_kbps);
+    try std.testing.expectEqual(def.max_bitrate_kbps, cfg.max_bitrate_kbps);
+    try std.testing.expectEqual(def.high_loss_percent, cfg.high_loss_percent);
+    try std.testing.expectEqual(def.high_rtt_ms, cfg.high_rtt_ms);
+    try std.testing.expectEqual(@as(u16, 20), cfg.high_nack_per_second);
+    try std.testing.expectEqual(@as(u32, 60), cfg.congestion_decrease_percent);
+    try std.testing.expectEqual(@as(u32, 80), cfg.congestion_utilization_percent);
+    try std.testing.expectEqual(@as(u8, 15), cfg.fec_escalate_loss_percent);
+    try std.testing.expectEqual(@as(u32, 25), cfg.increase_headroom_percent);
+    try std.testing.expectEqual(@as(u32, 115), cfg.increase_step_percent);
+    try std.testing.expectEqual(@as(u8, 1), cfg.hold_no_fec_loss_percent);
+    try std.testing.expectEqual(@as(u8, 3), cfg.max_fec_level);
+}
+
+test "abrHint behavior with defaults is unchanged after lifting" {
+    // Congested by NACK rate (>= 20) drives a decrease with FEC level 2.
+    const decrease = try abrHint(.{}, .{
+        .current_bitrate_kbps = 1000,
+        .available_bitrate_kbps = 2000,
+        .packet_loss_percent = 0,
+        .rtt_ms = 10,
+        .nack_per_second = 25,
+    });
+    try std.testing.expectEqual(AbrAction.decrease, decrease.action);
+    try std.testing.expectEqual(@as(u8, 2), decrease.fec_level);
+    try std.testing.expectEqual(@as(u32, 600), decrease.target_bitrate_kbps); // 60% of 1000
+
+    // High loss escalates FEC to the max level on decrease.
+    const escalate = try abrHint(.{}, .{
+        .current_bitrate_kbps = 1000,
+        .available_bitrate_kbps = 2000,
+        .packet_loss_percent = 20,
+        .rtt_ms = 10,
+    });
+    try std.testing.expectEqual(@as(u8, 3), escalate.fec_level);
+
+    // Ample headroom (> 25%) drives an increase to 115% of current.
+    const increase = try abrHint(.{}, .{
+        .current_bitrate_kbps = 1000,
+        .available_bitrate_kbps = 5000,
+        .packet_loss_percent = 0,
+        .rtt_ms = 10,
+    });
+    try std.testing.expectEqual(AbrAction.increase, increase.action);
+    try std.testing.expectEqual(@as(u32, 1150), increase.target_bitrate_kbps);
+}
+
+test "applyTomlAbr overlays media.abr and changes abrHint thresholds" {
+    const src =
+        \\[media.abr]
+        \\high_nack_per_second = 100
+        \\congestion_decrease_percent = 50
+        \\increase_step_percent = 200
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+    var cfg: AbrConfig = .{};
+    applyTomlAbr(&cfg, &doc);
+    try std.testing.expectEqual(@as(u16, 100), cfg.high_nack_per_second);
+
+    // 25 NACKs/sec no longer congests at the raised threshold, and with ample
+    // headroom the stream now increases by the configured 200% step.
+    const hint = try abrHint(cfg, .{
+        .current_bitrate_kbps = 1000,
+        .available_bitrate_kbps = 5000,
+        .packet_loss_percent = 0,
+        .rtt_ms = 10,
+        .nack_per_second = 25,
+    });
+    try std.testing.expectEqual(AbrAction.increase, hint.action);
+    try std.testing.expectEqual(@as(u32, 2000), hint.target_bitrate_kbps);
 }

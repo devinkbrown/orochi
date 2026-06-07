@@ -1,4 +1,5 @@
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 pub const max_messages: usize = 4096;
 pub const max_msgid_len: usize = 128;
@@ -6,6 +7,27 @@ pub const max_emoji_len: usize = 64;
 pub const max_reactor_len: usize = 128;
 pub const max_emojis_per_message: usize = 64;
 pub const max_reactors_per_emoji: usize = 1024;
+
+/// Runtime-tunable reaction-tally bounds. Defaults equal the bare constants
+/// above; `applyToml` overlays the `[media.reactions]` section.
+pub const Config = struct {
+    max_messages: usize = max_messages,
+    max_msgid_len: usize = max_msgid_len,
+    max_emoji_len: usize = max_emoji_len,
+    max_reactor_len: usize = max_reactor_len,
+    max_emojis_per_message: usize = max_emojis_per_message,
+    max_reactors_per_emoji: usize = max_reactors_per_emoji,
+};
+
+/// Overlay `[media.reactions]` keys from a parsed TOML document onto `cfg`.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.reactions.max_messages")) |v| cfg.max_messages = @intCast(v);
+    if (doc.getUint("media.reactions.max_msgid_bytes")) |v| cfg.max_msgid_len = @intCast(v);
+    if (doc.getUint("media.reactions.max_emoji_bytes")) |v| cfg.max_emoji_len = @intCast(v);
+    if (doc.getUint("media.reactions.max_reactor_bytes")) |v| cfg.max_reactor_len = @intCast(v);
+    if (doc.getUint("media.reactions.max_emojis_per_message")) |v| cfg.max_emojis_per_message = @intCast(v);
+    if (doc.getUint("media.reactions.max_reactors_per_emoji")) |v| cfg.max_reactors_per_emoji = @intCast(v);
+}
 
 pub const Error = std.mem.Allocator.Error || error{
     MessageIdTooLong,
@@ -56,9 +78,14 @@ const MessageReactions = struct {
 pub const ReactionTally = struct {
     allocator: std.mem.Allocator,
     messages: std.StringHashMap(MessageReactions),
+    config: Config,
 
     pub fn init(allocator: std.mem.Allocator) ReactionTally {
-        return .{ .allocator = allocator, .messages = std.StringHashMap(MessageReactions).init(allocator) };
+        return initConfig(allocator, .{});
+    }
+
+    pub fn initConfig(allocator: std.mem.Allocator, config: Config) ReactionTally {
+        return .{ .allocator = allocator, .messages = std.StringHashMap(MessageReactions).init(allocator), .config = config };
     }
 
     pub fn deinit(self: *ReactionTally) void {
@@ -72,11 +99,11 @@ pub const ReactionTally = struct {
     }
 
     pub fn react(self: *ReactionTally, msgid: []const u8, emoji: []const u8, reactor: []const u8) Error!u32 {
-        try validateInput(msgid, emoji, reactor);
+        try validateInput(self, msgid, emoji, reactor);
         const message = try self.ensureMessage(msgid);
         const bucket = try self.ensureEmoji(message, emoji);
         if (bucket.findReactor(reactor) != null) return bucket.count;
-        if (bucket.reactors.items.len >= max_reactors_per_emoji) return error.TooManyReactors;
+        if (bucket.reactors.items.len >= self.config.max_reactors_per_emoji) return error.TooManyReactors;
 
         const owned_reactor = try self.allocator.dupe(u8, reactor);
         errdefer self.allocator.free(owned_reactor);
@@ -110,7 +137,7 @@ pub const ReactionTally = struct {
 
     fn ensureMessage(self: *ReactionTally, msgid: []const u8) Error!*MessageReactions {
         if (self.messages.getPtr(msgid)) |message| return message;
-        if (self.messages.count() >= max_messages) return error.TooManyMessages;
+        if (self.messages.count() >= self.config.max_messages) return error.TooManyMessages;
 
         const owned_key = try self.allocator.dupe(u8, msgid);
         errdefer self.allocator.free(owned_key);
@@ -120,7 +147,7 @@ pub const ReactionTally = struct {
 
     fn ensureEmoji(self: *ReactionTally, message: *MessageReactions, emoji: []const u8) Error!*EmojiCount {
         if (message.findEmoji(emoji)) |idx| return &message.counts.items[idx];
-        if (message.counts.items.len >= max_emojis_per_message) return error.TooManyEmojis;
+        if (message.counts.items.len >= self.config.max_emojis_per_message) return error.TooManyEmojis;
 
         const owned_emoji = try self.allocator.dupe(u8, emoji);
         errdefer self.allocator.free(owned_emoji);
@@ -136,12 +163,12 @@ pub const ReactionTally = struct {
     }
 };
 
-fn validateInput(msgid: []const u8, emoji: []const u8, reactor: []const u8) Error!void {
-    if (msgid.len > max_msgid_len) return error.MessageIdTooLong;
+fn validateInput(self: *const ReactionTally, msgid: []const u8, emoji: []const u8, reactor: []const u8) Error!void {
+    if (msgid.len > self.config.max_msgid_len) return error.MessageIdTooLong;
     if (emoji.len == 0) return error.EmptyEmoji;
-    if (emoji.len > max_emoji_len) return error.EmojiTooLong;
+    if (emoji.len > self.config.max_emoji_len) return error.EmojiTooLong;
     if (reactor.len == 0) return error.EmptyReactor;
-    if (reactor.len > max_reactor_len) return error.ReactorTooLong;
+    if (reactor.len > self.config.max_reactor_len) return error.ReactorTooLong;
 }
 
 const testing = std.testing;
@@ -197,4 +224,42 @@ test "input caps are enforced" {
     try testing.expectError(error.MessageIdTooLong, tally.react("m" ** (max_msgid_len + 1), "ok", "a"));
     try testing.expectError(error.EmojiTooLong, tally.react("m", "e" ** (max_emoji_len + 1), "a"));
     try testing.expectError(error.ReactorTooLong, tally.react("m", "ok", "r" ** (max_reactor_len + 1)));
+}
+
+test "applyToml defaults match historical constants" {
+    var doc = try toml.parse(testing.allocator, "");
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(max_messages, cfg.max_messages);
+    try testing.expectEqual(max_msgid_len, cfg.max_msgid_len);
+    try testing.expectEqual(max_emoji_len, cfg.max_emoji_len);
+    try testing.expectEqual(max_reactor_len, cfg.max_reactor_len);
+    try testing.expectEqual(max_emojis_per_message, cfg.max_emojis_per_message);
+    try testing.expectEqual(max_reactors_per_emoji, cfg.max_reactors_per_emoji);
+}
+
+test "applyToml overlays media.reactions keys and drives caps" {
+    const src =
+        \\[media.reactions]
+        \\max_messages = 5
+        \\max_msgid_bytes = 4
+        \\max_emoji_bytes = 8
+        \\max_reactor_bytes = 8
+        \\max_emojis_per_message = 2
+        \\max_reactors_per_emoji = 2
+    ;
+    var doc = try toml.parse(testing.allocator, src);
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(@as(usize, 5), cfg.max_messages);
+    try testing.expectEqual(@as(usize, 2), cfg.max_reactors_per_emoji);
+
+    var tally = ReactionTally.initConfig(testing.allocator, cfg);
+    defer tally.deinit();
+    _ = try tally.react("m", "+", "a");
+    _ = try tally.react("m", "+", "b");
+    try testing.expectError(error.TooManyReactors, tally.react("m", "+", "c"));
+    try testing.expectError(error.MessageIdTooLong, tally.react("toolong", "+", "a"));
 }

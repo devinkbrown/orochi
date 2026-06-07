@@ -23,8 +23,33 @@
 //! Bounded sliding-window: accepts out-of-order frames, emits in-order,
 //! drops duplicates, surfaces gap ranges for FEC/retransmit.
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Default out-of-order reorder/jitter window depth (frames). Frames outside the
+/// window are late-dropped. Mirrors `ReassemblyConfig.window`'s default.
+pub const default_reorder_window_frames: u32 = 64;
+
+/// Runtime-tunable reassembly defaults. The actual ring storage of
+/// `ReassemblyBuffer(max_payload, window_cap)` is comptime-bound (DEFERRED); only
+/// the runtime `ReassemblyConfig.window` default is lifted here. Defaults equal
+/// the historical values; `applyToml` overlays the `[media]` section.
+pub const Config = struct {
+    reorder_window_frames: u32 = default_reorder_window_frames,
+};
+
+/// Overlay `[media]` keys from a parsed TOML document onto `cfg`.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.reorder_window_frames")) |v| cfg.reorder_window_frames = @intCast(v);
+}
+
+/// Build a `ReassemblyConfig` whose runtime window comes from `cfg`. The caller
+/// must still ensure the value is <= the comptime `window_cap` of the buffer it
+/// initializes.
+pub fn reassemblyConfig(cfg: Config) ReassemblyConfig {
+    return .{ .window = cfg.reorder_window_frames };
+}
 
 // -- Constants ---------------------------------------------------------------
 
@@ -187,7 +212,7 @@ pub const GapRange = struct {
 
 pub const ReassemblyConfig = struct {
     /// Out-of-order window size.  Frames outside this window are late-dropped.
-    window: u32 = 64,
+    window: u32 = default_reorder_window_frames,
     /// Optional anchor sequence.  When null, the first push sets the anchor.
     initial_seq: ?u32 = null,
 };
@@ -473,6 +498,29 @@ fn testFrame(band_id: u8, stream_id: u32, seq: u32, ts: u64, kf: bool, codec: Co
         .codec = codec,
         .payload = payload,
     };
+}
+
+test "applyToml default matches the historical reorder window" {
+    var doc = try toml.parse(testing.allocator, "");
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(default_reorder_window_frames, cfg.reorder_window_frames);
+    try testing.expectEqual(default_reorder_window_frames, (ReassemblyConfig{}).window);
+    try testing.expectEqual(default_reorder_window_frames, reassemblyConfig(cfg).window);
+}
+
+test "applyToml overlays media.reorder_window_frames" {
+    const src =
+        \\[media]
+        \\reorder_window_frames = 32
+    ;
+    var doc = try toml.parse(testing.allocator, src);
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(@as(u32, 32), cfg.reorder_window_frames);
+    try testing.expectEqual(@as(u32, 32), reassemblyConfig(cfg).window);
 }
 
 test "encode/decode round-trip: opvox_audio" {

@@ -1,11 +1,31 @@
 //! Bounded per-channel pinned media references.
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 pub const max_channels: usize = 4096;
 pub const max_pins_per_channel: usize = 50;
 pub const max_channel_len: usize = 128;
 pub const max_url_len: usize = 2048;
 pub const max_actor_len: usize = 128;
+
+/// Runtime-tunable pinned-media bounds. Defaults equal the bare constants above;
+/// `applyToml` overlays the `[media.pins]` section.
+pub const Config = struct {
+    max_channels: usize = max_channels,
+    max_pins_per_channel: usize = max_pins_per_channel,
+    max_channel_len: usize = max_channel_len,
+    max_url_len: usize = max_url_len,
+    max_actor_len: usize = max_actor_len,
+};
+
+/// Overlay `[media.pins]` keys from a parsed TOML document onto `cfg`.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.pins.max_channels")) |v| cfg.max_channels = @intCast(v);
+    if (doc.getUint("media.pins.max_per_channel")) |v| cfg.max_pins_per_channel = @intCast(v);
+    if (doc.getUint("media.pins.max_channel_bytes")) |v| cfg.max_channel_len = @intCast(v);
+    if (doc.getUint("media.pins.max_url_bytes")) |v| cfg.max_url_len = @intCast(v);
+    if (doc.getUint("media.pins.max_actor_bytes")) |v| cfg.max_actor_len = @intCast(v);
+}
 
 pub const Error = std.mem.Allocator.Error || error{
     InvalidChannel,
@@ -41,17 +61,22 @@ const PinList = struct {
 pub const MediaPin = struct {
     allocator: std.mem.Allocator,
     channels: std.StringHashMap(PinList),
-    channel_limit: usize,
+    config: Config,
 
     pub fn init(allocator: std.mem.Allocator) MediaPin {
-        return initWithLimit(allocator, max_channels);
+        return initConfig(allocator, .{});
     }
 
+    /// Back-compat constructor: override only the channel cap.
     pub fn initWithLimit(allocator: std.mem.Allocator, channel_limit: usize) MediaPin {
+        return initConfig(allocator, .{ .max_channels = channel_limit });
+    }
+
+    pub fn initConfig(allocator: std.mem.Allocator, config: Config) MediaPin {
         return .{
             .allocator = allocator,
             .channels = std.StringHashMap(PinList).init(allocator),
-            .channel_limit = channel_limit,
+            .config = config,
         };
     }
 
@@ -66,7 +91,7 @@ pub const MediaPin = struct {
     }
 
     pub fn pin(self: *MediaPin, channel: []const u8, url: []const u8, by: []const u8) Error!usize {
-        try validate(channel, url, by);
+        try self.validate(channel, url, by);
         const pin_list = try self.ensureChannel(channel);
 
         if (pin_list.findUrl(url)) |idx| {
@@ -77,7 +102,7 @@ pub const MediaPin = struct {
             return idx;
         }
 
-        if (pin_list.pins.items.len >= max_pins_per_channel) return error.TooManyPins;
+        if (pin_list.pins.items.len >= self.config.max_pins_per_channel) return error.TooManyPins;
         const owned_url = try self.allocator.dupe(u8, url);
         errdefer self.allocator.free(owned_url);
         const owned_by = try self.allocator.dupe(u8, by);
@@ -107,7 +132,7 @@ pub const MediaPin = struct {
 
     fn ensureChannel(self: *MediaPin, channel: []const u8) Error!*PinList {
         if (self.channels.getPtr(channel)) |pins| return pins;
-        if (self.channels.count() >= self.channel_limit) return error.TooManyChannels;
+        if (self.channels.count() >= self.config.max_channels) return error.TooManyChannels;
         const owned = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(owned);
         try self.channels.putNoClobber(owned, .{});
@@ -121,9 +146,11 @@ pub const MediaPin = struct {
         self.allocator.free(owned_key);
     }
 
-    fn validate(channel: []const u8, url: []const u8, by: []const u8) Error!void {
+    fn validate(self: *const MediaPin, channel: []const u8, url: []const u8, by: []const u8) Error!void {
         if (channel.len == 0) return error.InvalidChannel;
-        if (channel.len > max_channel_len or url.len == 0 or url.len > max_url_len or by.len > max_actor_len) {
+        if (channel.len > self.config.max_channel_len or url.len == 0 or
+            url.len > self.config.max_url_len or by.len > self.config.max_actor_len)
+        {
             return error.FieldTooLong;
         }
     }
@@ -176,4 +203,40 @@ test "pin cap is enforced per channel" {
         _ = try pins.pin("#room", url, "alice");
     }
     try testing.expectError(error.TooManyPins, pins.pin("#room", "https://m.example/full", "alice"));
+}
+
+test "applyToml defaults match historical constants" {
+    var doc = try toml.parse(testing.allocator, "");
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(max_channels, cfg.max_channels);
+    try testing.expectEqual(max_pins_per_channel, cfg.max_pins_per_channel);
+    try testing.expectEqual(max_channel_len, cfg.max_channel_len);
+    try testing.expectEqual(max_url_len, cfg.max_url_len);
+    try testing.expectEqual(max_actor_len, cfg.max_actor_len);
+}
+
+test "applyToml overlays media.pins keys and drives the per-channel cap" {
+    const src =
+        \\[media.pins]
+        \\max_channels = 9
+        \\max_per_channel = 2
+        \\max_channel_bytes = 64
+        \\max_url_bytes = 256
+        \\max_actor_bytes = 64
+    ;
+    var doc = try toml.parse(testing.allocator, src);
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(@as(usize, 9), cfg.max_channels);
+    try testing.expectEqual(@as(usize, 2), cfg.max_pins_per_channel);
+    try testing.expectEqual(@as(usize, 256), cfg.max_url_len);
+
+    var pins = MediaPin.initConfig(testing.allocator, cfg);
+    defer pins.deinit();
+    _ = try pins.pin("#room", "https://m.example/a", "alice");
+    _ = try pins.pin("#room", "https://m.example/b", "bob");
+    try testing.expectError(error.TooManyPins, pins.pin("#room", "https://m.example/c", "carol"));
 }

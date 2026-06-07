@@ -4,11 +4,30 @@
 //! the recent context (`MEDIA TRANSCRIPT`). The ring is cleared when the call
 //! ends. Owned strings; FIFO eviction past the per-channel cap.
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 pub const max_text_bytes: usize = 400;
 pub const max_speaker_bytes: usize = 64;
 pub const max_per_channel: usize = 128;
 pub const max_channels: usize = 4096;
+
+/// Runtime-tunable caption-ring limits. Defaults equal the historical bare
+/// constants above; `applyToml` overlays the `[media.captions]` section.
+pub const Config = struct {
+    max_text_bytes: usize = max_text_bytes,
+    max_speaker_bytes: usize = max_speaker_bytes,
+    max_per_channel: usize = max_per_channel,
+    max_channels: usize = max_channels,
+};
+
+/// Overlay `[media.captions]` keys from a parsed TOML document onto `cfg`.
+/// Absent keys leave the existing (default) value untouched.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.captions.max_text_bytes")) |v| cfg.max_text_bytes = @intCast(v);
+    if (doc.getUint("media.captions.max_speaker_bytes")) |v| cfg.max_speaker_bytes = @intCast(v);
+    if (doc.getUint("media.captions.ring_depth_per_channel")) |v| cfg.max_per_channel = @intCast(v);
+    if (doc.getUint("media.captions.max_channels")) |v| cfg.max_channels = @intCast(v);
+}
 
 pub const Error = std.mem.Allocator.Error || error{ TooManyChannels, CaptionInvalid };
 
@@ -35,9 +54,14 @@ const Ring = struct {
 pub const TranscriptLog = struct {
     allocator: std.mem.Allocator,
     channels: std.StringHashMap(Ring),
+    config: Config,
 
     pub fn init(allocator: std.mem.Allocator) TranscriptLog {
-        return .{ .allocator = allocator, .channels = std.StringHashMap(Ring).init(allocator) };
+        return initConfig(allocator, .{});
+    }
+
+    pub fn initConfig(allocator: std.mem.Allocator, config: Config) TranscriptLog {
+        return .{ .allocator = allocator, .channels = std.StringHashMap(Ring).init(allocator), .config = config };
     }
 
     pub fn deinit(self: *TranscriptLog) void {
@@ -53,8 +77,8 @@ pub const TranscriptLog = struct {
     /// Append a caption to `channel`'s transcript (FIFO-evicting the oldest past
     /// the cap). `speaker`/`text` are copied. Returns the new depth.
     pub fn push(self: *TranscriptLog, channel: []const u8, speaker: []const u8, text: []const u8, at_ms: i64) Error!usize {
-        if (speaker.len == 0 or speaker.len > max_speaker_bytes) return error.CaptionInvalid;
-        if (text.len == 0 or text.len > max_text_bytes) return error.CaptionInvalid;
+        if (speaker.len == 0 or speaker.len > self.config.max_speaker_bytes) return error.CaptionInvalid;
+        if (text.len == 0 or text.len > self.config.max_text_bytes) return error.CaptionInvalid;
         const ring = try self.ensure(channel);
 
         const speaker_owned = try self.allocator.dupe(u8, speaker);
@@ -62,7 +86,7 @@ pub const TranscriptLog = struct {
         const text_owned = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(text_owned);
         try ring.items.append(self.allocator, .{ .speaker = speaker_owned, .text = text_owned, .at_ms = at_ms });
-        if (ring.items.items.len > max_per_channel) {
+        if (ring.items.items.len > self.config.max_per_channel) {
             var evicted = ring.items.orderedRemove(0);
             evicted.deinit(self.allocator);
         }
@@ -88,7 +112,7 @@ pub const TranscriptLog = struct {
 
     fn ensure(self: *TranscriptLog, channel: []const u8) Error!*Ring {
         if (self.channels.getPtr(channel)) |ring| return ring;
-        if (self.channels.count() >= max_channels) return error.TooManyChannels;
+        if (self.channels.count() >= self.config.max_channels) return error.TooManyChannels;
         const owned = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(owned);
         try self.channels.putNoClobber(owned, .{});
@@ -130,4 +154,42 @@ test "rejects empty/oversize captions" {
     defer t.deinit();
     try testing.expectError(error.CaptionInvalid, t.push("#c", "alice", "", 0));
     try testing.expectError(error.CaptionInvalid, t.push("#c", "", "hi", 0));
+}
+
+test "applyToml defaults match historical constants" {
+    var doc = try toml.parse(testing.allocator, "");
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(max_text_bytes, cfg.max_text_bytes);
+    try testing.expectEqual(max_speaker_bytes, cfg.max_speaker_bytes);
+    try testing.expectEqual(max_per_channel, cfg.max_per_channel);
+    try testing.expectEqual(max_channels, cfg.max_channels);
+}
+
+test "applyToml overlays media.captions keys" {
+    const src =
+        \\[media.captions]
+        \\max_text_bytes = 1000
+        \\max_speaker_bytes = 80
+        \\ring_depth_per_channel = 8
+        \\max_channels = 99
+    ;
+    var doc = try toml.parse(testing.allocator, src);
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(@as(usize, 1000), cfg.max_text_bytes);
+    try testing.expectEqual(@as(usize, 80), cfg.max_speaker_bytes);
+    try testing.expectEqual(@as(usize, 8), cfg.max_per_channel);
+    try testing.expectEqual(@as(usize, 99), cfg.max_channels);
+}
+
+test "config-driven ring depth evicts at the overlaid cap" {
+    var t = TranscriptLog.initConfig(testing.allocator, .{ .max_per_channel = 3 });
+    defer t.deinit();
+    var i: usize = 0;
+    while (i < 10) : (i += 1) _ = try t.push("#c", "s", "m", @intCast(i));
+    try testing.expectEqual(@as(usize, 3), t.recent("#c").len);
+    try testing.expectEqual(@as(i64, 7), t.recent("#c")[0].at_ms);
 }

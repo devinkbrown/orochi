@@ -1,12 +1,29 @@
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
+
+pub const max_channels = 4096;
+pub const max_sessions_per_channel = 1024;
+pub const max_key_bytes = 128;
+
+/// Runtime-tunable recording-index bounds. Defaults equal the bare constants
+/// above; `applyToml` overlays the `[media.recording]` section.
+pub const Config = struct {
+    max_channels: usize = max_channels,
+    max_sessions_per_channel: usize = max_sessions_per_channel,
+    max_key_bytes: usize = max_key_bytes,
+};
+
+/// Overlay `[media.recording]` keys from a parsed TOML document onto `cfg`.
+/// Shares the section with `recording_consent`; only index-owned keys are read.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.recording.max_channels")) |v| cfg.max_channels = @intCast(v);
+    if (doc.getUint("media.recording.max_sessions_per_channel")) |v| cfg.max_sessions_per_channel = @intCast(v);
+    if (doc.getUint("media.recording.max_key_bytes")) |v| cfg.max_key_bytes = @intCast(v);
+}
 
 pub const RecordingIndex = struct {
     const Self = @This();
     const SessionList = std.ArrayList(Session);
-
-    const max_channels = 4096;
-    const max_sessions_per_channel = 1024;
-    const max_key_bytes = 128;
 
     pub const Session = struct {
         id: []const u8,
@@ -17,11 +34,17 @@ pub const RecordingIndex = struct {
 
     allocator: std.mem.Allocator,
     by_channel: std.StringHashMap(SessionList),
+    config: Config,
 
     pub fn init(allocator: std.mem.Allocator) Self {
+        return initConfig(allocator, .{});
+    }
+
+    pub fn initConfig(allocator: std.mem.Allocator, config: Config) Self {
         return .{
             .allocator = allocator,
             .by_channel = std.StringHashMap(SessionList).init(allocator),
+            .config = config,
         };
     }
 
@@ -36,19 +59,18 @@ pub const RecordingIndex = struct {
     }
 
     pub fn start(self: *Self, channel: []const u8, id: []const u8, by: []const u8, now: i64) !void {
-        try checkKey(channel);
-        try checkKey(id);
-        try checkKey(by);
+        try self.checkKey(channel);
+        try self.checkKey(id);
+        try self.checkKey(by);
 
+        // `owned_id`/`owned_by` are freed by these errdefers on every error path
+        // until ownership transfers into the SessionList (which then owns them and
+        // frees them in `freeSessions`). Do NOT add a second guard for these — a
+        // redundant guard double-frees on the capacity-exceeded paths below.
         const owned_id = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(owned_id);
         const owned_by = try self.allocator.dupe(u8, by);
         errdefer self.allocator.free(owned_by);
-        var session_owned = false;
-        errdefer if (!session_owned) {
-            self.allocator.free(owned_id);
-            self.allocator.free(owned_by);
-        };
 
         const session: Session = .{
             .id = owned_id,
@@ -57,13 +79,12 @@ pub const RecordingIndex = struct {
         };
 
         if (self.by_channel.getPtr(channel)) |sessions| {
-            if (sessions.items.len >= max_sessions_per_channel) return error.TooManySessions;
+            if (sessions.items.len >= self.config.max_sessions_per_channel) return error.TooManySessions;
             try sessions.append(self.allocator, session);
-            session_owned = true;
             return;
         }
 
-        if (self.by_channel.count() >= max_channels) return error.TooManyChannels;
+        if (self.by_channel.count() >= self.config.max_channels) return error.TooManyChannels;
 
         const owned_channel = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(owned_channel);
@@ -74,7 +95,6 @@ pub const RecordingIndex = struct {
         try sessions.append(self.allocator, session);
         try self.by_channel.put(owned_channel, sessions);
         list_owned = true;
-        session_owned = true;
     }
 
     pub fn stop(self: *Self, channel: []const u8, id: []const u8, now: i64) bool {
@@ -101,9 +121,9 @@ pub const RecordingIndex = struct {
         sessions.deinit(allocator);
     }
 
-    fn checkKey(value: []const u8) !void {
+    fn checkKey(self: *const Self, value: []const u8) !void {
         if (value.len == 0) return error.EmptyKey;
-        if (value.len > max_key_bytes) return error.KeyTooLong;
+        if (value.len > self.config.max_key_bytes) return error.KeyTooLong;
     }
 };
 
@@ -156,4 +176,35 @@ test "empty and oversized keys are rejected" {
     var long: [129]u8 = undefined;
     @memset(&long, 'x');
     try std.testing.expectError(error.KeyTooLong, index.start("#alpha", &long, "maki", 100));
+}
+
+test "applyToml defaults match historical constants" {
+    var doc = try toml.parse(std.testing.allocator, "");
+    defer doc.deinit(std.testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try std.testing.expectEqual(@as(usize, max_channels), cfg.max_channels);
+    try std.testing.expectEqual(@as(usize, max_sessions_per_channel), cfg.max_sessions_per_channel);
+    try std.testing.expectEqual(@as(usize, max_key_bytes), cfg.max_key_bytes);
+}
+
+test "applyToml overlays media.recording keys and drives the per-channel cap" {
+    const src =
+        \\[media.recording]
+        \\max_channels = 3
+        \\max_sessions_per_channel = 2
+        \\max_key_bytes = 8
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try std.testing.expectEqual(@as(usize, 2), cfg.max_sessions_per_channel);
+
+    var index = RecordingIndex.initConfig(std.testing.allocator, cfg);
+    defer index.deinit();
+    try index.start("#a", "r1", "m", 1);
+    try index.start("#a", "r2", "m", 2);
+    try std.testing.expectError(error.TooManySessions, index.start("#a", "r3", "m", 3));
+    try std.testing.expectError(error.KeyTooLong, index.start("#a", "012345678", "m", 4));
 }

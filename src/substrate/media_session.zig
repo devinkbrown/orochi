@@ -15,11 +15,41 @@ const std = @import("std");
 const opcodec = @import("opcodec_frame.zig");
 const red_fec = @import("red_fec.zig");
 const sdp = @import("../proto/sdp_lite.zig");
+const toml = @import("../proto/toml.zig");
 
 pub const MediaFrame = opcodec.MediaFrame;
 pub const CodecTag = opcodec.CodecTag;
 pub const PushResult = opcodec.PushResult;
 pub const MediaDescription = sdp.MediaDescription;
+
+/// Canonical Receiver wiring defaults.
+///
+/// `Receiver(max_payload, window)` is a COMPTIME-parameterized type — the inline
+/// `[window]Slot(max_payload)` ring cannot be made runtime without reworking the
+/// substrate buffer onto the heap, so the *type parameters* are DEFERRED. This
+/// Config carries the documented runtime defaults so a caller can build the
+/// `ReassemblyConfig` window from `[media]` and pick comptime bounds that cover
+/// it. Defaults equal the historical wiring (`Receiver(256, 64)` with a runtime
+/// `.window = 16`).
+pub const default_max_payload_bytes: usize = 256;
+pub const default_reorder_window_frames: u32 = 16;
+
+pub const Config = struct {
+    max_payload_bytes: usize = default_max_payload_bytes,
+    reorder_window_frames: u32 = default_reorder_window_frames,
+};
+
+/// Overlay `[media]` keys from a parsed TOML document onto `cfg`.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.max_payload_bytes")) |v| cfg.max_payload_bytes = @intCast(v);
+    if (doc.getUint("media.reorder_window_frames")) |v| cfg.reorder_window_frames = @intCast(v);
+}
+
+/// Build the runtime `ReassemblyConfig` (reorder window) for a Receiver from
+/// `cfg`. The window must be <= the comptime `window` bound of the Receiver type.
+pub fn reassemblyConfig(cfg: Config) opcodec.ReassemblyConfig {
+    return .{ .window = cfg.reorder_window_frames };
+}
 
 /// Run the sdp_lite offer/answer to produce the negotiated media description.
 /// Caller owns the returned description (call `deinit`).
@@ -228,4 +258,36 @@ test "FEC recovers a single dropped frame and delivery completes in order" {
     const n = rx.drain(&out);
     try testing.expectEqual(@as(usize, 4), n);
     for (0..4) |i| try testing.expectEqual(@as(u32, @intCast(i)), out[i].sequence);
+}
+
+test "applyToml defaults match the canonical Receiver wiring" {
+    var doc = try toml.parse(testing.allocator, "");
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(default_max_payload_bytes, cfg.max_payload_bytes);
+    try testing.expectEqual(default_reorder_window_frames, cfg.reorder_window_frames);
+    try testing.expectEqual(default_reorder_window_frames, reassemblyConfig(cfg).window);
+}
+
+test "applyToml overlays media keys and drives a Receiver window" {
+    const src =
+        \\[media]
+        \\max_payload_bytes = 512
+        \\reorder_window_frames = 8
+    ;
+    var doc = try toml.parse(testing.allocator, src);
+    defer doc.deinit(testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try testing.expectEqual(@as(usize, 512), cfg.max_payload_bytes);
+    try testing.expectEqual(@as(u32, 8), cfg.reorder_window_frames);
+
+    // Comptime bounds must cover the configured runtime window; the runtime
+    // window is taken from config.
+    var rx = Receiver(256, 64).init(reassemblyConfig(cfg));
+    var pk = Packetizer.init(MEDIA_BAND, 1, .opvox_audio);
+    var wire: [64]u8 = undefined;
+    const len = try pk.packetize("hi", true, 0, &wire);
+    try testing.expectEqual(PushResult.buffered, try rx.ingest(wire[0..len]));
 }

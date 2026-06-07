@@ -12,9 +12,30 @@
 //! length (frame_size set at Mixer init time).
 
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
 const AutoHashMap = std.AutoHashMap;
+
+/// Documented mixer defaults (historically caller-supplied / hardcoded).
+pub const default_energy_threshold: f32 = 1e-6;
+pub const default_frame_size_samples: usize = 960;
+pub const default_gain: f32 = 1.0;
+
+/// Runtime-tunable mixer configuration. Defaults equal the historical values;
+/// `applyToml` overlays the `[media.audio]` section.
+pub const Config = struct {
+    energy_threshold: f32 = default_energy_threshold,
+    frame_size_samples: usize = default_frame_size_samples,
+    default_gain: f32 = default_gain,
+};
+
+/// Overlay `[media.audio]` keys from a parsed TOML document onto `cfg`.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getFloat("media.audio.energy_threshold")) |v| cfg.energy_threshold = @floatCast(v);
+    if (doc.getUint("media.audio.frame_size_samples")) |v| cfg.frame_size_samples = @intCast(v);
+    if (doc.getFloat("media.audio.default_gain")) |v| cfg.default_gain = @floatCast(v);
+}
 
 /// Soft limiter: maps any finite real input to the open interval (-1, 1).
 /// Uses the algebraic sigmoid x / (1 + |x|), which:
@@ -52,17 +73,32 @@ pub const Mixer = struct {
     frame_size: usize,
     /// Energy threshold below which a participant is considered silent.
     energy_threshold: f32,
+    /// Initial per-participant gain applied on join.
+    default_gain: f32,
     /// Ordered list of participants (order stable for determinism).
     participants: ArrayList(Participant),
 
     /// Initialise a mixer.
     /// `frame_size`        — number of f32 samples per frame.
     /// `energy_threshold`  — RMS² gate; 1e-6 is a reasonable default.
+    /// New participants join at `default_gain` (1.0).
     pub fn init(allocator: Allocator, frame_size: usize, energy_threshold: f32) Mixer {
         return .{
             .allocator = allocator,
             .frame_size = frame_size,
             .energy_threshold = energy_threshold,
+            .default_gain = default_gain,
+            .participants = .{ .items = &.{}, .capacity = 0 },
+        };
+    }
+
+    /// Initialise a mixer from a `Config` (frame size, energy gate, join gain).
+    pub fn initConfig(allocator: Allocator, config: Config) Mixer {
+        return .{
+            .allocator = allocator,
+            .frame_size = config.frame_size_samples,
+            .energy_threshold = config.energy_threshold,
+            .default_gain = config.default_gain,
             .participants = .{ .items = &.{}, .capacity = 0 },
         };
     }
@@ -84,7 +120,7 @@ pub const Mixer = struct {
         @memset(frame, 0.0);
         try self.participants.append(self.allocator, .{
             .id = id,
-            .gain = 1.0,
+            .gain = self.default_gain,
             .frame = frame,
             .active = false,
         });
@@ -486,4 +522,44 @@ test "deterministic: same input always produces same output" {
     for (o1, 0..) |s, i| {
         try std.testing.expectApproxEqAbs(s, o2[i], 1e-7);
     }
+}
+
+test "applyToml defaults match historical mixer values" {
+    var doc = try toml.parse(std.testing.allocator, "");
+    defer doc.deinit(std.testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try std.testing.expectEqual(default_energy_threshold, cfg.energy_threshold);
+    try std.testing.expectEqual(default_frame_size_samples, cfg.frame_size_samples);
+    try std.testing.expectEqual(default_gain, cfg.default_gain);
+}
+
+test "applyToml overlays media.audio keys and drives mixer init" {
+    const src =
+        \\[media.audio]
+        \\energy_threshold = 0.01
+        \\frame_size_samples = 4
+        \\default_gain = 0.5
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+    var cfg: Config = .{};
+    applyToml(&cfg, &doc);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), cfg.energy_threshold, 1e-9);
+    try std.testing.expectEqual(@as(usize, 4), cfg.frame_size_samples);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cfg.default_gain, 1e-9);
+
+    var mx = Mixer.initConfig(std.testing.allocator, cfg);
+    defer mx.deinit();
+    try std.testing.expectEqual(@as(usize, 4), mx.frame_size);
+    try mx.addParticipant(1);
+    // New participant joins at the configured default gain (0.5): a 0.8 frame
+    // mixes down to 0.4 before the soft limiter.
+    const f: [4]f32 = .{ 0.8, 0.8, 0.8, 0.8 };
+    try mx.addParticipant(2);
+    try mx.submitFrame(2, &f);
+    var out: [4]f32 = undefined;
+    try mx.mixFor(1, &out);
+    const expected = softLimit(0.4);
+    for (out) |s| try std.testing.expectApproxEqAbs(expected, s, 1e-6);
 }
