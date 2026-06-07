@@ -1,20 +1,20 @@
 //! Media session: composes the shipped media primitives into a send/receive
 //! pipeline over the mesh's media bands (>=64).
 //!
-//!   negotiate()            -> agree codecs/FEC/direction via sdp_lite offer/answer
+//!   negotiate()            -> agree codecs/FEC/direction via sdp offer/answer
 //!   Packetizer.packetize() -> opcodec MediaFrame (seq/ts) -> wire bytes
 //!   Receiver.ingest()      -> decode -> reassembly reorder buffer
 //!   protectGeneration()    -> red_fec (ULPFEC) parity over a generation of frames
 //!   recoverFrame()         -> rebuild a single dropped frame from the FEC packet
 //!
 //! This is the media analog of `transport_stack.zig`: a thin coordinator wiring
-//! independently-tested modules (sdp_lite, opcodec_frame, red_fec) so a stream of
+//! independently-tested modules (sdp, opcodec_frame, red_fec) so a stream of
 //! media frames survives reordering and single-packet loss end to end.
 const std = @import("std");
 
 const opcodec = @import("opcodec_frame.zig");
 const red_fec = @import("red_fec.zig");
-const sdp = @import("../proto/sdp_lite.zig");
+const sdp = @import("../proto/sdp.zig");
 const toml = @import("../proto/toml.zig");
 
 pub const MediaFrame = opcodec.MediaFrame;
@@ -51,7 +51,7 @@ pub fn reassemblyConfig(cfg: Config) opcodec.ReassemblyConfig {
     return .{ .window = cfg.reorder_window_frames };
 }
 
-/// Run the sdp_lite offer/answer to produce the negotiated media description.
+/// Run the sdp offer/answer to produce the negotiated media description.
 /// Caller owns the returned description (call `deinit`).
 pub fn negotiate(
     allocator: std.mem.Allocator,
@@ -180,7 +180,7 @@ pub fn recoverFrame(
 const testing = std.testing;
 const MEDIA_BAND: u8 = 64;
 
-test "negotiate intersects codecs and FEC via sdp_lite" {
+test "negotiate intersects codecs and FEC via sdp" {
     const allocator = testing.allocator;
     const local_codecs = [_]sdp.Codec{
         .{ .tag = .opvox, .clock_rate = 48000, .params = 0 },

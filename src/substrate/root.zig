@@ -37,6 +37,7 @@ pub const geoip = @import("geoip.zig");
 pub const gf256 = @import("gf256.zig");
 pub const hdr_histogram = @import("hdr_histogram.zig");
 pub const hyperloglog = @import("hyperloglog.zig");
+pub const ice_agent = @import("ice_agent.zig");
 pub const interval_tree = @import("interval_tree.zig");
 pub const io = @import("io/root.zig");
 pub const ip_cidr = @import("ip_cidr.zig");
@@ -155,6 +156,7 @@ test {
     _ = gf256;
     _ = hdr_histogram;
     _ = hyperloglog;
+    _ = ice_agent;
     _ = interval_tree;
     _ = io;
     _ = ip_cidr;

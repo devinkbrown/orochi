@@ -200,7 +200,7 @@ pub const sasl = @import("sasl.zig");
 pub const sasl_scram512_server = @import("sasl_scram512_server.zig");
 pub const sasl_scram = @import("sasl_scram.zig");
 pub const sasl_scram_server = @import("sasl_scram_server.zig");
-pub const sdp_lite = @import("sdp_lite.zig");
+pub const sdp = @import("sdp.zig");
 pub const secure_fns = @import("secure_fns.zig");
 pub const semver = @import("semver.zig");
 pub const serverinfo = @import("serverinfo.zig");
@@ -266,9 +266,9 @@ pub const who = @import("who.zig");
 pub const whox = @import("whox.zig");
 pub const wildcard_limit = @import("wildcard_limit.zig");
 pub const word_wrap = @import("word_wrap.zig");
-pub const x509_lite = @import("x509_lite.zig");
 pub const x509_name = @import("x509_name.zig");
 pub const x509_selfsign = @import("x509_selfsign.zig");
+pub const x509 = @import("x509.zig");
 // gen:mods:end
 
 /// Native server-to-server mesh protocol (replaces TS6 entirely).
@@ -476,7 +476,7 @@ test {
     _ = sasl_scram512_server;
     _ = sasl_scram;
     _ = sasl_scram_server;
-    _ = sdp_lite;
+    _ = sdp;
     _ = secure_fns;
     _ = semver;
     _ = serverinfo;
@@ -542,8 +542,8 @@ test {
     _ = whox;
     _ = wildcard_limit;
     _ = word_wrap;
-    _ = x509_lite;
     _ = x509_name;
     _ = x509_selfsign;
+    _ = x509;
     // gen:tests:end
 }
