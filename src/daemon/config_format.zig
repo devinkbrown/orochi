@@ -51,6 +51,10 @@ pub const Config = struct {
         ws: u16 = 0,
         webtransport: u16 = 0,
         s2s: u16 = 0,
+        /// UDP port for the media (SFU) transport plane; 0 = ephemeral.
+        media: u16 = 0,
+        /// IP advertised to clients as the server media (ICE) candidate.
+        media_host: []const u8 = "",
     };
 
     /// An operator binding. Mizuchi grants oper SASL-only: `account` is the SASL
@@ -129,8 +133,12 @@ pub const Config = struct {
     };
 
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
+        const host = try allocator.dupe(u8, "127.0.0.1");
+        errdefer allocator.free(host);
+        const media_host = try allocator.dupe(u8, "127.0.0.1");
+        errdefer allocator.free(media_host);
         return .{
-            .listen = .{ .host = try allocator.dupe(u8, "127.0.0.1") },
+            .listen = .{ .host = host, .media_host = media_host },
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
         };
     }
@@ -139,6 +147,7 @@ pub const Config = struct {
         if (self.node.public_key) |value| allocator.free(value);
         if (self.node.secret_key) |value| allocator.free(value);
         allocator.free(self.listen.host);
+        allocator.free(self.listen.media_host);
         for (self.opers) |oper| {
             allocator.free(oper.account);
             allocator.free(oper.class);
@@ -184,6 +193,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.listen.ws = try portField(doc, "listen.ws", cfg.listen.ws);
     cfg.listen.webtransport = try portField(doc, "listen.webtransport", cfg.listen.webtransport);
     cfg.listen.s2s = try portField(doc, "listen.s2s", cfg.listen.s2s);
+    cfg.listen.media = try portField(doc, "listen.media", cfg.listen.media);
+    try setStr(allocator, resolver, doc.getString("listen.media_host"), &cfg.listen.media_host);
 
     // [mesh]
     try setStr(allocator, resolver, doc.getString("mesh.realm"), &cfg.mesh.realm);

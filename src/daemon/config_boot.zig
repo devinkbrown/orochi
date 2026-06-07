@@ -20,6 +20,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
+    if (cfg.listen.media != 0) out.media_port = cfg.listen.media;
+    if (cfg.listen.media_host.len != 0) out.media_host = cfg.listen.media_host;
     out.backlog = cfg.limits.backlog;
     out.max_clients = cfg.limits.max_clients;
     if (cfg.limits.handshake_timeout_ms != 0) out.registration_timeout_ms = @intCast(cfg.limits.handshake_timeout_ms);
@@ -138,6 +140,23 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u16, 7700), loaded.config.s2s_port);
     try testing.expectEqual(@as(u64, 42), loaded.config.node_id);
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
+}
+
+test "media listen overlays media port and candidate host" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\media = 7820
+        \\media_host = "203.0.113.5"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(u16, 7820), loaded.config.media_port);
+    try testing.expectEqualStrings("203.0.113.5", loaded.config.media_host);
 }
 
 test "limits durations overlay timeout knobs" {
