@@ -42,6 +42,7 @@ pub const interval_tree = @import("interval_tree.zig");
 pub const io = @import("io/root.zig");
 pub const ip_cidr = @import("ip_cidr.zig");
 pub const jitter_buffer = @import("jitter_buffer.zig");
+pub const kakehashi = @import("kakehashi.zig");
 pub const l4s = @import("l4s.zig");
 pub const levenshtein = @import("levenshtein.zig");
 pub const loadbalance = @import("loadbalance.zig");
@@ -164,6 +165,7 @@ test {
     _ = io;
     _ = ip_cidr;
     _ = jitter_buffer;
+    _ = kakehashi;
     _ = l4s;
     _ = levenshtein;
     _ = loadbalance;

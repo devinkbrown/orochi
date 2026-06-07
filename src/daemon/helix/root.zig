@@ -22,6 +22,8 @@ pub const bouncer_buffer_capsule = @import("bouncer_buffer_capsule.zig");
 pub const read_marker_capsule = @import("read_marker_capsule.zig");
 pub const chathistory_cursor_capsule = @import("chathistory_cursor_capsule.zig");
 pub const away_capsule = @import("away_capsule.zig");
+pub const ban_capsule = @import("ban_capsule.zig");
+pub const silence_capsule = @import("silence_capsule.zig");
 pub const upgrade_manifest = @import("upgrade_manifest.zig");
 
 // Successor-side planners + deterministic self-tests.
