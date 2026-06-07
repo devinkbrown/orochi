@@ -8,6 +8,7 @@ const std = @import("std");
 const sasl = @import("../proto/sasl.zig");
 const usermode = @import("../proto/usermode.zig");
 const event_spine = @import("event_spine.zig");
+const session_snapshot = @import("helix/session_snapshot.zig");
 
 pub const UserMode = usermode.UserMode;
 
@@ -597,6 +598,45 @@ pub const ClientSession = struct {
         return self.registration.registered;
     }
 
+    /// Capture this session's carry-over state for a Helix UPGRADE. The returned
+    /// snapshot borrows the session's inline buffers (valid until the session is
+    /// next mutated); callers serialize it immediately via session_snapshot.encode.
+    pub fn snapshot(self: *const ClientSession) session_snapshot.Snapshot {
+        return .{
+            .nick = self.client.identity.nick.slice(),
+            .realname = self.client.identity.realname.slice(),
+            .account = self.account_store.slice(),
+            .real_host = self.real_host_store.slice(),
+            .host = self.host_store.slice(),
+            .away = self.away_store.slice(),
+            .logged_in = self.logged_in,
+            .away_active = self.away_active,
+            .is_oper = self.is_oper,
+        };
+    }
+
+    /// Reconstruct a carried-over session from its snapshot (successor side). A
+    /// restored session is registered by definition — only registered clients are
+    /// snapshotted. Best-effort: a field that fails validation is left empty.
+    pub fn restore(self: *ClientSession, snap: session_snapshot.Snapshot) void {
+        self.client.identity.nick.set(snap.nick) catch {
+            self.client.identity.nick.len = 0;
+        };
+        self.client.identity.realname.set(snap.realname) catch {
+            self.client.identity.realname.len = 0;
+        };
+        self.real_host_store.set(snap.real_host) catch {
+            self.real_host_store.len = 0;
+        };
+        self.host_store.set(snap.host) catch {
+            self.host_store.len = 0;
+        };
+        if (snap.logged_in and snap.account.len > 0) self.loginAs(snap.account) else self.logout();
+        if (snap.away_active) self.setAway(snap.away) else self.clearAway();
+        self.is_oper = snap.is_oper;
+        self.registration.registered = true;
+    }
+
     pub fn displayName(self: *const ClientSession) []const u8 {
         const nick = self.client.identity.nick.slice();
         return if (nick.len == 0) "*" else nick;
@@ -1098,6 +1138,34 @@ fn expectCodesInOrder(haystack: []const u8, codes: []const []const u8) !void {
         const found = std.mem.indexOfPos(u8, haystack, pos, code) orelse return error.TestExpectedEqual;
         pos = found + code.len;
     }
+}
+
+test "session snapshot -> encode -> decode -> restore round-trips" {
+    var s = ClientSession.init();
+    try s.setNick("alice");
+    try s.setRealname("Alice Example");
+    s.loginAs("alice");
+    s.setRealHost("10.0.0.7");
+    s.setVisibleHost("cloak-ab12.mizuchi");
+    s.setAway("brb");
+    s.is_oper = true;
+
+    const allocator = std.testing.allocator;
+    const bytes = try session_snapshot.encode(allocator, s.snapshot());
+    defer allocator.free(bytes);
+    const decoded = try session_snapshot.decode(bytes);
+
+    var s2 = ClientSession.init();
+    s2.restore(decoded);
+    try std.testing.expectEqualStrings("alice", s2.displayName());
+    try std.testing.expectEqualStrings("Alice Example", s2.client.identity.realname.slice());
+    try std.testing.expect(s2.logged_in);
+    try std.testing.expectEqualStrings("alice", s2.account().?);
+    try std.testing.expectEqualStrings("10.0.0.7", s2.real_host_store.slice());
+    try std.testing.expectEqualStrings("cloak-ab12.mizuchi", s2.host_store.slice());
+    try std.testing.expectEqualStrings("brb", s2.awayMessage().?);
+    try std.testing.expect(s2.isOper());
+    try std.testing.expect(s2.registered());
 }
 
 test "full registration handshake emits welcome numerics" {
