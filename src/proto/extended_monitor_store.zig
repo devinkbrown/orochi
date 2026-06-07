@@ -7,6 +7,7 @@ const std = @import("std");
 const monitor = @import("monitor.zig");
 const extended_monitor = @import("extended_monitor.zig");
 const metadata = @import("metadata.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const ClientId = monitor.ClientId;
 pub const Watcher = extended_monitor.Watcher;
@@ -32,6 +33,17 @@ pub const Params = struct {
     max_metadata_key_bytes: usize = DEFAULT_MAX_METADATA_KEY_BYTES,
     max_metadata_value_bytes: usize = DEFAULT_MAX_METADATA_VALUE_BYTES,
     max_line_bytes: usize = DEFAULT_MAX_LINE_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_line_bytes` is a wire budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .extended = extended_monitor.Params.fromLimits(limits),
+            .max_account_bytes = limits.ext_monitor_account_len,
+            .max_metadata_key_bytes = limits.ext_monitor_meta_key_len,
+            .max_metadata_value_bytes = limits.ext_monitor_meta_value_len,
+        };
+    }
 };
 
 pub const AccountChange = union(enum) {

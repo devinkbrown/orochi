@@ -4,6 +4,7 @@
 //! concerns. It owns retained target, key, and value bytes; callers own list
 //! output storage and protocol rendering.
 const std = @import("std");
+const limits_config = @import("limits_config.zig");
 
 pub const default_max_targets: usize = 1024;
 pub const default_max_keys_per_target: usize = 64;
@@ -15,6 +16,16 @@ pub const Params = struct {
     max_keys_per_target: usize = default_max_keys_per_target,
     max_key: usize = default_max_key,
     max_value: usize = default_max_value,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_targets = limits.metadata_max_targets,
+            .max_keys_per_target = limits.metadata_max_keys,
+            .max_key = limits.metadata_key_len,
+            .max_value = limits.metadata_value_len,
+        };
+    }
 };
 
 pub const MetadataStoreError = error{

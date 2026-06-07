@@ -4,6 +4,7 @@
 //! ANONYMOUS may continue as a guest login. The server assigns the actual guest
 //! account name outside this module; no persistent identity is created here.
 const std = @import("std");
+const limits_config = @import("limits_config.zig");
 
 /// SASL mechanism name advertised for ANONYMOUS.
 pub const mechanism = "ANONYMOUS";
@@ -17,6 +18,14 @@ pub const Params = struct {
     enabled: bool = true,
     /// Maximum trace token length in bytes.
     max_trace_bytes: usize = default_max_trace_bytes,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `enabled` keeps its default; mechanism availability is wired elsewhere.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_trace_bytes = limits.sasl_anonymous_trace_len,
+        };
+    }
 };
 
 /// Parsing failures for ANONYMOUS client responses.

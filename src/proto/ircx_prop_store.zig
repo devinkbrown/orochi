@@ -2,6 +2,7 @@
 const std = @import("std");
 const irc_line = @import("irc_line.zig");
 const ircx = @import("ircx.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const default_max_entities: usize = 1024;
 pub const default_max_props_per_entity: usize = 64;
@@ -19,6 +20,19 @@ pub const Params = struct {
     max_value: usize = default_max_value,
     max_owner_bytes: usize = default_max_owner_bytes,
     max_request_keys: usize = default_max_request_keys,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_entities = limits.ircx_max_entities,
+            .max_props_per_entity = limits.ircx_props_per_entity,
+            .max_entity_id = limits.ircx_entity_id_len,
+            .max_key = limits.ircx_prop_name_len,
+            .max_value = limits.ircx_prop_value_len,
+            .max_owner_bytes = limits.ircx_prop_owner_len,
+            .max_request_keys = limits.ircx_prop_request_keys,
+        };
+    }
 };
 
 pub const PropError = irc_line.ParseError || error{

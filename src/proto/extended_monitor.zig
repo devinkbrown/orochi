@@ -6,6 +6,7 @@
 //! style broadcast because they monitor the target and negotiated the required
 //! capabilities.
 const std = @import("std");
+const limits_config = @import("limits_config.zig");
 
 pub const ClientId = u64;
 pub const DEFAULT_MAX_NICK_BYTES: usize = 64;
@@ -36,6 +37,17 @@ pub const Params = struct {
     max_host_bytes: usize = DEFAULT_MAX_HOST_BYTES,
     max_verb_bytes: usize = DEFAULT_MAX_VERB_BYTES,
     max_param_bytes: usize = DEFAULT_MAX_PARAM_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_nick_bytes = limits.nick_len,
+            .max_user_bytes = limits.user_len,
+            .max_host_bytes = limits.host_len,
+            .max_verb_bytes = limits.ext_monitor_verb_len,
+            .max_param_bytes = limits.ext_monitor_param_len,
+        };
+    }
 };
 
 /// Identity used as the IRC message prefix: `:nick!user@host`.

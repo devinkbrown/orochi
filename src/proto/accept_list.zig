@@ -1,5 +1,6 @@
 const std = @import("std");
 const numeric = @import("numeric.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const AcceptNumeric = enum(u16) {
     RPL_ACCEPTLIST = 281,
@@ -27,6 +28,17 @@ pub const Params = struct {
     max_ops: usize = 32,
     max_server_name_bytes: usize = 255,
     max_line_bytes: usize = 512,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_line_bytes` is a wire-framing budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_owners = limits.accept_max_owners,
+            .max_entries_per_owner = limits.accept_entries_per_owner,
+            .max_nick_bytes = limits.nick_len,
+            .max_server_name_bytes = limits.server_name_len,
+        };
+    }
 };
 
 pub const AcceptError = std.mem.Allocator.Error || error{

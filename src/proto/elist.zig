@@ -4,6 +4,7 @@
 //! filter set owns only its filter array and must be deinitialized by caller.
 const std = @import("std");
 const listx = @import("listx.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const DEFAULT_MAX_FILTER_BYTES: usize = 512;
 pub const DEFAULT_MAX_MASK_BYTES: usize = 128;
@@ -58,6 +59,14 @@ pub const Channel = struct {
 pub const Params = struct {
     max_filter_bytes: usize = DEFAULT_MAX_FILTER_BYTES,
     max_mask_bytes: usize = DEFAULT_MAX_MASK_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_filter_bytes` is a wire budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_mask_bytes = limits.list_mask_len,
+        };
+    }
 };
 
 pub const FilterSet = struct {

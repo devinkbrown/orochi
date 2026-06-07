@@ -6,6 +6,7 @@
 //! configured IRC line limit.
 const std = @import("std");
 const numeric = @import("numeric.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const DEFAULT_MAX_LINE_BYTES: usize = 512;
 pub const DEFAULT_MAX_SERVER_BYTES: usize = 255;
@@ -39,6 +40,17 @@ pub const Params = struct {
     max_nick_bytes: usize = DEFAULT_MAX_NICK_BYTES,
     max_user_bytes: usize = DEFAULT_MAX_USER_BYTES,
     max_host_bytes: usize = DEFAULT_MAX_HOST_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_line_bytes` is a wire budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_server_bytes = limits.server_name_len,
+            .max_nick_bytes = limits.nick_len,
+            .max_user_bytes = limits.user_len,
+            .max_host_bytes = limits.host_len,
+        };
+    }
 };
 
 /// One complete IRC numeric line stored in caller-owned output bytes.

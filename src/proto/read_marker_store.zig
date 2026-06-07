@@ -1,6 +1,7 @@
 //! Allocator-backed IRCv3 draft/read-marker storage and MARKREAD parsing.
 const std = @import("std");
 const wire = @import("read_marker.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const Timestamp = wire.ReadTimestamp;
 pub const Marker = wire.Marker;
@@ -13,6 +14,15 @@ pub const Params = struct {
     max_entries: usize = default_max_entries,
     max_owner_bytes: usize = default_max_owner_bytes,
     max_target_bytes: usize = default_max_target_bytes,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_entries = limits.read_marker_max_entries,
+            .max_owner_bytes = limits.read_marker_owner_len,
+            .max_target_bytes = limits.read_marker_target_len,
+        };
+    }
 };
 
 pub const ReadMarkerStoreError = wire.ReadMarkerError || error{

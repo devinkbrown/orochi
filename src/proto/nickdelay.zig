@@ -13,6 +13,7 @@
 //! lowercase form of the nick.
 
 const std = @import("std");
+const limits_config = @import("limits_config.zig");
 
 /// IRC numerics emitted when a reclaim attempt is rejected by a live hold.
 pub const NickDelayNumeric = enum(u16) {
@@ -63,6 +64,18 @@ pub const Params = struct {
     max_nick_bytes: usize = 64,
     /// Maximum byte length of an accepted note.
     max_note_bytes: usize = 256,
+
+    /// Derive `Params` from the central policy limits (config-driven). Fields
+    /// with no shared counterpart keep their default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .quit_delay_secs = @intCast(limits.nick_quit_delay_secs),
+            .change_delay_secs = @intCast(limits.nick_change_delay_secs),
+            .max_holds = limits.nick_max_holds,
+            .max_nick_bytes = limits.nick_len,
+            .max_note_bytes = limits.nick_note_len,
+        };
+    }
 };
 
 /// Errors surfaced by `NickDelay` operations.

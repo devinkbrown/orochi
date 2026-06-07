@@ -6,6 +6,7 @@
 //! emitted into caller-owned line buffers.
 const std = @import("std");
 const numeric = @import("numeric.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const RPL_LISTXSTART: u16 = 811;
 pub const RPL_LISTXENTRY: u16 = 812;
@@ -47,6 +48,20 @@ pub const Params = struct {
     max_requester_bytes: usize = DEFAULT_MAX_REQUESTER_BYTES,
     max_channel_bytes: usize = DEFAULT_MAX_CHANNEL_BYTES,
     max_topic_bytes: usize = DEFAULT_MAX_TOPIC_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_line_bytes` and `max_filter_bytes` are wire budgets and keep their
+    /// defaults.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_filters = limits.list_max_filters,
+            .max_mask_bytes = limits.list_mask_len,
+            .max_server_bytes = limits.server_name_len,
+            .max_requester_bytes = limits.nick_len,
+            .max_channel_bytes = limits.target_len_128,
+            .max_topic_bytes = limits.topic_len,
+        };
+    }
 };
 
 /// Strict threshold comparison used by LISTX numeric filters.

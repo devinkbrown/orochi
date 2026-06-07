@@ -5,6 +5,7 @@
 //! caller-owned buffers; storage and permission checks live above it.
 const std = @import("std");
 const numeric = @import("numeric.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const RPL_ACCESSADD: u16 = 801;
 pub const RPL_ACCESSDELETE: u16 = 802;
@@ -48,6 +49,18 @@ pub const Params = struct {
     max_server_bytes: usize = DEFAULT_MAX_SERVER_BYTES,
     max_requester_bytes: usize = DEFAULT_MAX_REQUESTER_BYTES,
     max_duration_digits: usize = DEFAULT_MAX_DURATION_DIGITS,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_line_bytes` is a wire budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_mask_bytes = limits.ircx_access_mask_len,
+            .max_reason_bytes = limits.ircx_saccess_reason_len,
+            .max_server_bytes = limits.server_name_len,
+            .max_requester_bytes = limits.nick_len,
+            .max_duration_digits = limits.ircx_duration_digits,
+        };
+    }
 };
 
 /// Server-level IRCX ACCESS entry kinds.

@@ -5,6 +5,7 @@
 //! drop the message when any stored mask matches.
 const std = @import("std");
 const listx = @import("listx.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const RPL_SILELIST: u16 = 271;
 pub const RPL_ENDOFSILELIST: u16 = 272;
@@ -40,6 +41,17 @@ pub const Params = struct {
     max_line_bytes: usize = DEFAULT_MAX_LINE_BYTES,
     max_server_bytes: usize = DEFAULT_MAX_SERVER_BYTES,
     max_requester_bytes: usize = DEFAULT_MAX_REQUESTER_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_line_bytes` is a wire-framing budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_masks_per_owner = limits.silence_masks_per_owner,
+            .max_mask_bytes = limits.list_mask_len,
+            .max_operations = limits.silence_ops_per_command,
+            .max_server_bytes = limits.server_name_len,
+        };
+    }
 };
 
 pub const OperationKind = enum {

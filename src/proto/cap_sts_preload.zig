@@ -3,6 +3,7 @@
 //! This module owns only the in-memory preload model. It does not perform
 //! network I/O, command dispatch, certificate checks, or persistence.
 const std = @import("std");
+const limits_config = @import("limits_config.zig");
 
 /// Maximum canonical DNS hostname length accepted by the preload list.
 pub const MAX_HOST_LEN: usize = 255;
@@ -19,6 +20,14 @@ pub const Params = struct {
     max_entries: usize = DEFAULT_MAX_ENTRIES,
     /// Maximum canonical hostname bytes accepted per entry.
     max_host_bytes: usize = MAX_HOST_LEN,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_entries = limits.sts_preload_max_entries,
+            .max_host_bytes = limits.sts_preload_host_len,
+        };
+    }
 };
 
 /// Errors returned by preload-list validation and storage operations.

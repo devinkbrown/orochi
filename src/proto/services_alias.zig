@@ -5,6 +5,7 @@
 //! configured service nick, while direct targets such as `NickServ` resolve to
 //! that same service nick without being treated as pseudo-commands.
 const std = @import("std");
+const limits_config = @import("limits_config.zig");
 
 pub const DEFAULT_MAX_SERVICE_NICK_BYTES: usize = 32;
 pub const DEFAULT_MAX_TARGET_NICK_BYTES: usize = 32;
@@ -24,6 +25,15 @@ pub const Params = struct {
     max_service_nick_bytes: usize = DEFAULT_MAX_SERVICE_NICK_BYTES,
     max_target_nick_bytes: usize = DEFAULT_MAX_TARGET_NICK_BYTES,
     max_text_bytes: usize = DEFAULT_MAX_TEXT_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_text_bytes` is a multiline-wire budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_service_nick_bytes = limits.service_nick_len,
+            .max_target_nick_bytes = limits.service_target_nick_len,
+        };
+    }
 };
 
 pub const Alias = struct {

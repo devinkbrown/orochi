@@ -6,6 +6,7 @@
 //! input into mode letters and optional mode parameters for the command layer.
 const std = @import("std");
 const numeric = @import("numeric.zig");
+const limits_config = @import("limits_config.zig");
 
 // MODEX is a Mizuchi extension, not in draft-pfenning IRCX. Use numerics past the
 // draft-reserved IRCX block (800-819) to avoid colliding with IRCRPL_EVENTADD/DEL
@@ -50,6 +51,20 @@ pub const Params = struct {
     max_target_bytes: usize = DEFAULT_MAX_TARGET_BYTES,
     max_channel_bytes: usize = DEFAULT_MAX_CHANNEL_BYTES,
     max_member_bytes: usize = DEFAULT_MAX_MEMBER_BYTES,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_line_bytes` is a wire budget and keeps its default.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_changes = limits.ircx_modex_max_changes,
+            .max_name_bytes = limits.ircx_modex_name_len,
+            .max_server_bytes = limits.server_name_len,
+            .max_requester_bytes = limits.nick_len,
+            .max_target_bytes = limits.ircx_modex_target_len,
+            .max_channel_bytes = limits.target_len_128,
+            .max_member_bytes = limits.nick_len,
+        };
+    }
 };
 
 /// The kind of state controlled by a MODEX name.

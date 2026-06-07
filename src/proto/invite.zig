@@ -7,6 +7,7 @@
 //! replies into caller-owned buffers without allocation.
 const std = @import("std");
 const numeric = @import("numeric.zig");
+const limits_config = @import("limits_config.zig");
 
 pub const DEFAULT_MAX_NICK_BYTES: usize = 64;
 pub const DEFAULT_MAX_USER_BYTES: usize = 64;
@@ -45,6 +46,21 @@ pub const Params = struct {
     max_description_bytes: usize = DEFAULT_MAX_DESCRIPTION_BYTES,
     channel_prefixes: []const u8 = DEFAULT_CHANNEL_PREFIXES,
     require_utf8: bool = true,
+
+    /// Derive `Params` from the central policy limits (config-driven).
+    /// `max_channel_bytes` keeps its builder default (does not share the 64-byte
+    /// CHANNELLEN policy). `channel_prefixes` aliases the config value, which
+    /// must outlive any use of the returned `Params`.
+    pub fn fromLimits(limits: *const limits_config.Limits) Params {
+        return .{
+            .max_nick_bytes = limits.nick_len,
+            .max_user_bytes = limits.user_len,
+            .max_host_bytes = limits.host_len,
+            .max_server_name_bytes = limits.server_name_len,
+            .max_description_bytes = limits.realname_len,
+            .channel_prefixes = limits.channel_prefixes.slice(),
+        };
+    }
 };
 
 /// Identity used as the IRC message prefix: `nick!user@host`.
