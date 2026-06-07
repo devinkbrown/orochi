@@ -6901,13 +6901,23 @@ pub const LinuxServer = struct {
         const n = self.media_plane.statsForChannel(channel, &buf_stats);
         for (buf_stats[0..n]) |s| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} ice={s} ssrc={x} rx_pkts={d} rx_bytes={d}\r\n", .{
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} leg=webrtc ice={s} ssrc={x} rx_pkts={d} rx_bytes={d}\r\n", .{
                 server_name, channel, s.name(), if (s.connected) "connected" else "pending", s.ssrc, s.rx_packets, s.rx_bytes,
             }) catch continue;
             try appendToConn(conn, line);
         }
+        // Native leg (our own OPVOX/OPVIS codec) stats.
+        var native_stats: [native_media_mod.max_call_participants]native_media_mod.NativeMediaTransport.Stat = undefined;
+        const nn = self.native_media.statsForChannel(channel, &native_stats);
+        for (native_stats[0..nn]) |s| {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} leg=native stream={d} rx_pkts={d} rx_bytes={d}\r\n", .{
+                server_name, channel, s.name(), s.stream_id, s.rx_packets, s.rx_bytes,
+            }) catch continue;
+            try appendToConn(conn, line);
+        }
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of media stats ({d})\r\n", .{ server_name, channel, n }) catch return;
+        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of media stats ({d})\r\n", .{ server_name, channel, n + nn }) catch return;
         try appendToConn(conn, end);
     }
 

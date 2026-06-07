@@ -45,6 +45,21 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             stream_id: u32,
             addr: TransportAddress,
             live: bool = false,
+            /// Media frames/bytes received from this publisher and forwarded.
+            rx_packets: u64 = 0,
+            rx_bytes: u64 = 0,
+        };
+
+        /// Per-participant transport stats snapshot.
+        pub const Stat = struct {
+            id: ParticipantId,
+            stream_id: u32,
+            rx_packets: u64,
+            rx_bytes: u64,
+
+            pub fn name(self: *const Stat) []const u8 {
+                return self.id.slice();
+            }
         };
 
         plane: native_plane.NativeMediaPlane(max_participants),
@@ -140,6 +155,17 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             return self.addrForId(id);
         }
 
+        /// Snapshot per-participant stats into `out`; returns the count.
+        pub fn stats(self: *Self, out: []Stat) usize {
+            var n: usize = 0;
+            for (self.entries[0..self.len]) |e| {
+                if (!e.live or n >= out.len) continue;
+                out[n] = .{ .id = e.id, .stream_id = e.stream_id, .rx_packets = e.rx_packets, .rx_bytes = e.rx_bytes };
+                n += 1;
+            }
+            return n;
+        }
+
         /// Decode one inbound native datagram and compute the forward set as
         /// transport addresses. The SAME `datagram` bytes are then sent verbatim
         /// to each address in `out[0..n]`. Returns 0 (and forwards nothing) when
@@ -150,7 +176,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             out: []TransportAddress,
         ) usize {
             const view = opcodec_frame.decode(datagram) catch return 0;
-            return self.forwardView(view, out);
+            return self.forwardView(view, datagram.len, out);
         }
 
         /// Like `inbound`, but first learns the source participant's transport
@@ -169,17 +195,20 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
                     break;
                 }
             }
-            return self.forwardView(view, out);
+            return self.forwardView(view, datagram.len, out);
         }
 
-        fn forwardView(self: *Self, view: opcodec_frame.FrameView, out: []TransportAddress) usize {
-            // Identify the publishing participant by the frame's stream_id.
+        fn forwardView(self: *Self, view: opcodec_frame.FrameView, datagram_len: usize, out: []TransportAddress) usize {
+            // Identify the publishing participant by the frame's stream_id, and
+            // meter the frame against that publisher.
             var src_id: ?ParticipantId = null;
             var src_kind: MediaKind = .voice;
-            for (self.entries[0..self.len]) |e| {
+            for (self.entries[0..self.len]) |*e| {
                 if (e.live and e.stream_id == view.stream_id) {
                     src_id = e.id;
                     src_kind = e.kind;
+                    e.rx_packets += 1;
+                    e.rx_bytes += datagram_len;
                     break;
                 }
             }
@@ -309,6 +338,32 @@ test "inboundFrom learns the publisher's address and still forwards to others" {
     const n2 = link.inboundFrom(frame(200, floor, 1, false, &fbuf), mkAddr(2, 9000), &out);
     try testing.expectEqual(@as(usize, 1), n2);
     try testing.expect(out[0].eql(learned));
+}
+
+test "stats meter received frames against the publisher" {
+    var link = NativeMediaLink(8).init();
+    const floor = opcodec_frame.MEDIA_BAND_FLOOR;
+    try link.register("alice", .voice, 100, mkAddr(1, 5000));
+    try link.register("bob", .voice, 200, mkAddr(2, 5000));
+
+    var fbuf: [64]u8 = undefined;
+    var out: [8]TransportAddress = undefined;
+    const d1 = frame(100, floor, 1, false, &fbuf);
+    const dlen = d1.len;
+    _ = link.inbound(d1, &out);
+    _ = link.inbound(frame(100, floor, 2, false, &fbuf), &out);
+
+    var stats: [8]NativeMediaLink(8).Stat = undefined;
+    const n = link.stats(&stats);
+    try testing.expectEqual(@as(usize, 2), n);
+    for (stats[0..n]) |s| {
+        if (std.mem.eql(u8, s.name(), "alice")) {
+            try testing.expectEqual(@as(u64, 2), s.rx_packets);
+            try testing.expectEqual(@as(u64, 2 * dlen), s.rx_bytes);
+        } else {
+            try testing.expectEqual(@as(u64, 0), s.rx_packets); // bob published nothing
+        }
+    }
 }
 
 test "updateAddress redirects a receiver's copies" {

@@ -227,6 +227,16 @@ pub const NativeMediaTransport = struct {
         return link.addrFor(id);
     }
 
+    pub const Stat = Link.Stat;
+
+    /// Snapshot per-participant native transport stats for `channel` into `out`.
+    pub fn statsForChannel(self: *NativeMediaTransport, channel: []const u8, out: []Stat) usize {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const link = self.channels.getPtr(channel) orelse return 0;
+        return link.stats(out);
+    }
+
     /// Participant count in `channel` (0 if the channel has no native call).
     pub fn countChannel(self: *NativeMediaTransport, channel: []const u8) usize {
         lockSpin(&self.mutex);
