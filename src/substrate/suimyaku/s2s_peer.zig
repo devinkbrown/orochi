@@ -14,6 +14,7 @@ const gossip_round = @import("gossip_round.zig");
 const anti_entropy_repair = @import("anti_entropy_repair.zig");
 const membership_view = @import("membership_view.zig");
 const peer_link = @import("peer_link.zig");
+const message_relay = @import("message_relay.zig");
 const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
@@ -261,6 +262,13 @@ pub const S2sPeer = struct {
             .PONG => self.pong_rx_count += 1,
             .QUIT => self.closeRemote(),
             .MEMBERSHIP => try self.recvMembership(frame.payload),
+            // Cross-node user message: full deliver/forward wiring lands in the
+            // task-#63 routing commit; recognized here so the frame stream stays
+            // in sync (decode-validate then drop until the inbound queue lands).
+            .MESSAGE => {
+                var owned = message_relay.decode(self.allocator, frame.payload) catch return;
+                owned.deinit(self.allocator);
+            },
         }
     }
 
