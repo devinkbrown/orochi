@@ -16,6 +16,7 @@ const oper_security = @import("oper_security.zig");
 const user_query = @import("user_query.zig");
 const feature_misc = @import("feature_misc.zig");
 const introspect = @import("introspect.zig");
+const upgrade = @import("upgrade.zig");
 
 /// The enabled module set. Order is load/dispatch order for ties.
 pub const enabled = [_]registry.Module{
@@ -28,6 +29,7 @@ pub const enabled = [_]registry.Module{
     user_query.module,
     feature_misc.module,
     introspect.module,
+    upgrade.module,
 };
 
 /// Comptime-assembled + comptime-validated live registry. Referencing `Live`

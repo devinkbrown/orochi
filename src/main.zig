@@ -48,6 +48,22 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit(); // no-op on POSIX, frees the arg buffer on Windows/WASI
     _ = args.skip(); // argv[0]
     if (args.next()) |first| {
+        // `mizuchi --supervisor` is the Helix in-process-upgrade successor mode:
+        // a fresh image execve'd by an UPGRADE handoff. If the handoff env fds are
+        // present we resume from them; otherwise it boots normally. (Full client-fd
+        // re-attach is the remaining hardening step — see docs/planning/17.)
+        if (std.mem.eql(u8, first, "--supervisor")) {
+            if (comptime builtin.os.tag == .linux) {
+                if (mizuchi.daemon.helix.live.resumeFromEnv()) |r| {
+                    std.debug.print("mizuchi: Helix resume (arena_fd={d}, control_fd={d})\n", .{ r.arena_fd, r.control_fd });
+                } else {
+                    std.debug.print("mizuchi: --supervisor with no Helix handoff env; normal boot\n", .{});
+                }
+            } else {
+                std.debug.print("mizuchi: --supervisor is Linux-only\n", .{});
+            }
+            // Fall through to a normal boot (config defaults; no config path arg).
+        } else
         // `mizuchi acme-issue ...` runs an out-of-band ACME issuance and exits.
         // Linux-only (raw socket syscalls); comptime-gated so non-linux targets
         // never analyze the linux-specific ACME path.
@@ -69,10 +85,9 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("acme-issue is only supported on Linux\n", .{});
                 return;
             }
-        }
-
-        const path = first;
-        const resolver = mizuchi.daemon.config_format.Resolver{
+        } else {
+            const path = first;
+            const resolver = mizuchi.daemon.config_format.Resolver{
             .ctx = init.environ_map,
             .env = envLookup,
         };
@@ -88,8 +103,9 @@ pub fn main(init: std.process.Init) !void {
             } else |err| {
                 std.debug.print("mizuchi: config error in {s} ({s}); using defaults\n", .{ path, @errorName(err) });
             }
-        } else |err| {
-            std.debug.print("mizuchi: cannot read config {s} ({s}); using defaults\n", .{ path, @errorName(err) });
+            } else |err| {
+                std.debug.print("mizuchi: cannot read config {s} ({s}); using defaults\n", .{ path, @errorName(err) });
+            }
         }
     }
 
