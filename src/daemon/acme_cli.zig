@@ -29,6 +29,8 @@ pub const Options = struct {
     ca_bundle_path: []const u8 = default_ca_bundle,
     contact: ?[]const u8 = null,
     challenge_port: u16 = default_challenge_port,
+    /// Cert private-key output path. Null => derive from `cert_out_path`.
+    key_out_path: ?[]const u8 = null,
     debug: bool = false,
 };
 
@@ -38,6 +40,7 @@ pub fn usage() void {
         \\usage: mizuchi acme-issue --domain <fqdn> --out <path> [options]
         \\  --domain <fqdn>        domain to issue for (required)
         \\  --out <path>           cert chain output path (required; kain-owned dir)
+        \\  --key-out <path>       cert key output path (default: <out>.key.pem)
         \\  --prod                 use Let's Encrypt PRODUCTION (default: staging)
         \\  --ca-bundle <path>     trust anchors PEM (default: {s})
         \\  --contact <mailto:..>  ACME account contact (optional)
@@ -54,6 +57,7 @@ pub fn parseArgs(args: []const []const u8) ?Options {
     var directory: []const u8 = staging_directory;
     var ca_bundle: []const u8 = default_ca_bundle;
     var contact: ?[]const u8 = null;
+    var key_out: ?[]const u8 = null;
     var port: u16 = default_challenge_port;
     var debug = false;
 
@@ -70,6 +74,9 @@ pub fn parseArgs(args: []const []const u8) ?Options {
         } else if (std.mem.eql(u8, a, "--out") and i + 1 < args.len) {
             i += 1;
             out = args[i];
+        } else if (std.mem.eql(u8, a, "--key-out") and i + 1 < args.len) {
+            i += 1;
+            key_out = args[i];
         } else if (std.mem.eql(u8, a, "--ca-bundle") and i + 1 < args.len) {
             i += 1;
             ca_bundle = args[i];
@@ -92,6 +99,7 @@ pub fn parseArgs(args: []const []const u8) ?Options {
         .ca_bundle_path = ca_bundle,
         .contact = contact,
         .challenge_port = port,
+        .key_out_path = key_out,
         .debug = debug,
     };
 }
@@ -129,21 +137,37 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
         break :blk contacts_storage[0..1];
     } else &.{};
 
+    // Key path: explicit --key-out, else derive (<cert without .pem>.key.pem).
+    const derived_key = try deriveKeyPath(allocator, opts.cert_out_path);
+    defer allocator.free(derived_key);
+    const key_out = opts.key_out_path orelse derived_key;
+
     const result = try acme_runner.issue(allocator, io, .{
         .directory_url = opts.directory_url,
         .domains = &domains,
         .contacts = contacts,
         .trust_anchors = anchors.items,
         .cert_out_path = opts.cert_out_path,
+        .key_out_path = key_out,
         .debug = opts.debug,
     }, account_key, cert_key, &store, null);
 
     if (result.cert_written) {
-        std.debug.print("acme: SUCCESS — wrote {s}\n", .{opts.cert_out_path});
+        std.debug.print("acme: SUCCESS — wrote chain {s}\n              and key {s}\n", .{ opts.cert_out_path, key_out });
     } else {
         std.debug.print("acme: finished in state {s} without a cert\n", .{@tagName(result.state)});
     }
     return result.cert_written;
+}
+
+/// Derive the key output path from the cert path: strip a trailing ".pem" and
+/// append ".key.pem", else append ".key". Caller owns the result.
+fn deriveKeyPath(allocator: Allocator, cert_path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, cert_path, ".pem")) {
+        const stem = cert_path[0 .. cert_path.len - ".pem".len];
+        return std.fmt.allocPrint(allocator, "{s}.key.pem", .{stem});
+    }
+    return std.fmt.allocPrint(allocator, "{s}.key", .{cert_path});
 }
 
 /// Decode every `CERTIFICATE` PEM block in `text` into owned DER, in order.
@@ -191,6 +215,16 @@ test "parseArgs requires domain and out, toggles prod" {
 
     const prod = parseArgs(&.{ "--domain", "eshmaki.me", "--out", "/p/c.pem", "--prod" }).?;
     try std.testing.expectEqualStrings(prod_directory, prod.directory_url);
+}
+
+test "deriveKeyPath swaps .pem for .key.pem, else appends .key" {
+    const allocator = std.testing.allocator;
+    const a = try deriveKeyPath(allocator, "/p/eshmaki.me.fullchain.pem");
+    defer allocator.free(a);
+    try std.testing.expectEqualStrings("/p/eshmaki.me.fullchain.key.pem", a);
+    const b = try deriveKeyPath(allocator, "/p/cert");
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("/p/cert.key", b);
 }
 
 test "loadTrustAnchors decodes multiple CERTIFICATE blocks" {

@@ -20,6 +20,7 @@ const http1 = @import("../proto/http1_client.zig");
 const acme = @import("acme_client.zig");
 const http01 = @import("acme_http01_server.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
+const pem = @import("../proto/pem.zig");
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 
@@ -301,6 +302,9 @@ pub const IssueConfig = struct {
     trust_anchors: []const []const u8,
     /// Absolute path the issued PEM chain is written to (kain-owned dir).
     cert_out_path: []const u8,
+    /// Absolute path the cert PRIVATE KEY (SEC1 EC PEM) is written to, for the
+    /// TLS server (nginx) to consume. Null skips writing the key.
+    key_out_path: ?[]const u8 = null,
     /// Max state-machine steps before giving up (defends against loops/hangs).
     max_steps: usize = 64,
     /// Log every HTTP exchange (errors are always logged regardless).
@@ -356,6 +360,11 @@ pub fn issue(
             .serve_http01 => |c| try token_store.put(c.token, c.key_authorization),
             .write_cert => |c| {
                 try writeCertAtomic(io, cfg.cert_out_path, c.pem);
+                if (cfg.key_out_path) |kp| {
+                    var pem_buf: [512]u8 = undefined;
+                    const key_pem = try ecPrivateKeyPem(cert_key, &pem_buf);
+                    try writeCertAtomic(io, kp, key_pem);
+                }
                 cert_written = true;
             },
         };
@@ -532,6 +541,24 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
     const remain = list.items.len - n;
     std.mem.copyForwards(u8, list.items[0..remain], list.items[n..]);
     list.shrinkRetainingCapacity(remain);
+}
+
+/// Encode a P-256 key pair as a SEC1 `EC PRIVATE KEY` PEM (RFC 5915), the form
+/// nginx's ssl_certificate_key accepts. Returns a slice of `out`.
+fn ecPrivateKeyPem(kp: ecdsa_p256.KeyPair, out: []u8) ![]const u8 {
+    const priv = kp.secret_key.toBytes(); // 32-byte scalar
+    const sec1 = kp.public_key.toUncompressedSec1(); // 0x04 ‖ x ‖ y (65 bytes)
+    // ECPrivateKey ::= SEQUENCE { INTEGER 1, OCTET STRING priv,
+    //   [0] namedCurve(prime256v1), [1] BIT STRING uncompressed-point }
+    var der: [121]u8 = .{
+        0x30, 0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
+    } ++ [_]u8{0} ** 32 // private scalar
+    ++ [_]u8{ 0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 } // [0] prime256v1
+    ++ [_]u8{ 0xa1, 0x44, 0x03, 0x42, 0x00 } // [1] BIT STRING header (0 unused bits)
+    ++ [_]u8{0} ** 65; // uncompressed point
+    @memcpy(der[7..39], &priv);
+    @memcpy(der[56..121], &sec1);
+    return pem.encode(out, "EC PRIVATE KEY", &der) catch return error.NoSpaceLeft;
 }
 
 /// Write the issued PEM chain to `path` atomically (temp file + rename via the
