@@ -5,6 +5,7 @@ pub const aead = @import("aead.zig");
 pub const aead_kat = @import("aead_kat.zig");
 pub const aead_stream = @import("aead_stream.zig");
 pub const age = @import("age.zig");
+pub const argon2_kdf = @import("argon2_kdf.zig");
 pub const cose = @import("cose.zig");
 pub const ecdh_p256 = @import("ecdh_p256.zig");
 pub const ecdsa_p256 = @import("ecdsa_p256.zig");
@@ -55,6 +56,7 @@ test {
     _ = aead_kat;
     _ = aead_stream;
     _ = age;
+    _ = argon2_kdf;
     _ = cose;
     _ = ecdh_p256;
     _ = ecdsa_p256;
