@@ -1,5 +1,6 @@
 //! Mizuchi entry point (M1: Ringlane TCP server).
 const std = @import("std");
+const builtin = @import("builtin");
 const mizuchi = @import("mizuchi");
 
 /// ${VAR} resolver for the config parser — reads the process environment map
@@ -46,7 +47,31 @@ pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.iterateAllocator(init.minimal.args, allocator);
     defer args.deinit(); // no-op on POSIX, frees the arg buffer on Windows/WASI
     _ = args.skip(); // argv[0]
-    if (args.next()) |path| {
+    if (args.next()) |first| {
+        // `mizuchi acme-issue ...` runs an out-of-band ACME issuance and exits.
+        // Linux-only (raw socket syscalls); comptime-gated so non-linux targets
+        // never analyze the linux-specific ACME path.
+        if (std.mem.eql(u8, first, "acme-issue")) {
+            if (comptime builtin.os.tag == .linux) {
+                var rest: std.ArrayList([]const u8) = .empty;
+                defer rest.deinit(allocator);
+                while (args.next()) |a| try rest.append(allocator, a);
+                const opts = mizuchi.daemon.acme_cli.parseArgs(rest.items) orelse {
+                    mizuchi.daemon.acme_cli.usage();
+                    return;
+                };
+                _ = mizuchi.daemon.acme_cli.runIssue(allocator, init.io, opts) catch |err| {
+                    std.debug.print("acme-issue failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                return;
+            } else {
+                std.debug.print("acme-issue is only supported on Linux\n", .{});
+                return;
+            }
+        }
+
+        const path = first;
         const resolver = mizuchi.daemon.config_format.Resolver{
             .ctx = init.environ_map,
             .env = envLookup,

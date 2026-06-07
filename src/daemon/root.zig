@@ -9,6 +9,7 @@ pub const accessibility_pref = @import("accessibility_pref.zig");
 pub const account_rename = @import("account_rename.zig");
 pub const account_verify = @import("account_verify.zig");
 pub const achievement = @import("achievement.zig");
+pub const acme_cli = @import("acme_cli.zig");
 pub const acme_client = @import("acme_client.zig");
 pub const acme_http01_listener = @import("acme_http01_listener.zig");
 pub const acme_http01_server = @import("acme_http01_server.zig");
@@ -220,6 +221,7 @@ test {
     _ = account_rename;
     _ = account_verify;
     _ = achievement;
+    _ = acme_cli;
     _ = acme_client;
     _ = acme_http01_listener;
     _ = acme_http01_server;
