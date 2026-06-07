@@ -37,8 +37,11 @@ pub const HashAlg = enum {
     }
 };
 
-/// Supports moduli up to 4096 bits (64 × 64-bit limbs).
-pub const max_limbs: usize = 64;
+/// Capacity must hold not only a modulus but the *product* of two reduced
+/// operands during modexp: an n-limb modulus yields up to 2n-limb products. To
+/// verify RSA-4096 chains (64-limb modulus → 128-limb products) with headroom,
+/// the cap is 132 limbs. Accepted moduli are still bounded to ~4096 bits.
+pub const max_limbs: usize = 132;
 pub const max_bytes: usize = max_limbs * 8;
 
 // ---------------------------------------------------------------------------

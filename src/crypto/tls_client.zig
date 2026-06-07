@@ -29,8 +29,15 @@ const tls_alpn = @import("../proto/tls_alpn.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = hkdf_tls13.Sha256;
+
+/// Opt-in handshake tracing (set by out-of-band tools like acme_runner).
+pub var debug_log: bool = false;
+fn dbg(comptime fmt: []const u8, args: anytype) void {
+    if (debug_log) std.debug.print("tls: " ++ fmt ++ "\n", args);
+}
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("tls_client requires a 64-bit target");
@@ -149,6 +156,7 @@ const HandshakeMsg = struct {
 const LeafPublicKey = union(enum) {
     rsa: rsa_verify.PublicKey,
     ecdsa_p256: ecdsa_p256.PublicKey,
+    ecdsa_p384: EcdsaP384.PublicKey,
     ed25519: sign.PublicKey,
 };
 
@@ -378,6 +386,7 @@ pub const Client = struct {
         const sigs = try tls_signature_scheme.build(&sigs_buf, &[_]tls_signature_scheme.SignatureScheme{
             .rsa_pss_rsae_sha256,
             .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
             .ed25519,
             .rsa_pkcs1_sha256,
         });
@@ -416,8 +425,10 @@ pub const Client = struct {
             }
             if (rec.content_type != .handshake) return error.BadRecord;
 
+            dbg("first record ct={d} len={d}", .{ @intFromEnum(rec.content_type), rec.fragment.len });
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
+            dbg("  handshake msg typ={d} off={d}/{d}", .{ @intFromEnum(msg.typ), off, rec.fragment.len });
             if (off != rec.fragment.len or msg.typ != .server_hello) return error.BadHandshake;
             var selected = try self.parseServerHello(msg.body);
             try self.appendTranscript(msg.raw);
@@ -446,6 +457,7 @@ pub const Client = struct {
             defer self.allocator.free(opened.content);
             consumePrefix(&self.recv_buf, rec.wire_len);
 
+            dbg("decrypted flight record ct={d} len={d}", .{ @intFromEnum(opened.content_type), opened.content.len });
             if (opened.content_type == .alert) {
                 self.last_alert = try tls_alert.parse(opened.content);
                 return error.TlsAlert;
@@ -459,6 +471,7 @@ pub const Client = struct {
     fn tryProcessPlainHandshake(self: *Client) Error!bool {
         var off: usize = 0;
         const msg = parseHandshakeMaybe(self.hs_plain.items, &off) orelse return false;
+        dbg("plain handshake state={s} msg typ={d} len={d}", .{ @tagName(self.state), @intFromEnum(msg.typ), msg.body.len });
         switch (self.state) {
             .wait_encrypted_extensions => {
                 if (msg.typ != .encrypted_extensions) return error.BadHandshake;
@@ -555,7 +568,11 @@ pub const Client = struct {
                     if (!ok) return error.BadHandshake;
                     self.selected_alpn = selected;
                 },
-                .supported_versions, .key_share, .signature_algorithms, .supported_groups, .server_name => {
+                // key_share / supported_versions / signature_algorithms belong to
+                // ServerHello/CertificateRequest and are illegal here. server_name
+                // (empty SNI ack) and supported_groups ARE permitted in EE
+                // (RFC 8446 §4.3.1), so only reject the genuinely-illegal ones.
+                .supported_versions, .key_share, .signature_algorithms => {
                     return error.BadHandshake;
                 },
                 else => {},
@@ -913,6 +930,14 @@ fn verifySignatureScheme(key: LeafPublicKey, scheme: tls_signature_scheme.Signat
             const decoded = try ecdsa_p256.signatureFromDer(sig);
             if (!ecdsa_p256.verify(decoded, msg, pk)) return error.BadSignature;
         },
+        .ecdsa_secp384r1_sha384 => {
+            const pk = switch (key) {
+                .ecdsa_p384 => |pk| pk,
+                else => return error.UnsupportedPublicKey,
+            };
+            const decoded = EcdsaP384.Signature.fromDer(sig) catch return error.BadSignature;
+            decoded.verify(msg, pk) catch return error.BadSignature;
+        },
         .rsa_pss_rsae_sha256 => {
             const pk = switch (key) {
                 .rsa => |pk| pk,
@@ -960,6 +985,8 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
 
     const last = chain[chain.len - 1];
     const last_parts = try extractCertParts(last);
+    dbg("chain.len={d} last.issuer_der.len={d}", .{ chain.len, last_parts.issuer_der.len });
+    var matched: usize = 0;
     for (anchors) |anchor_der| {
         const anchor_parts = extractCertParts(anchor_der) catch continue;
         if (!std.mem.eql(u8, last_parts.issuer_der, anchor_parts.subject_der) and
@@ -967,9 +994,14 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
         {
             continue;
         }
-        verifyCertSignature(last_parts, anchor_der) catch continue;
+        matched += 1;
+        verifyCertSignature(last_parts, anchor_der) catch |err| {
+            dbg("anchor DN matched but verify failed: {s}", .{@errorName(err)});
+            continue;
+        };
         return;
     }
+    dbg("no anchor accepted (DN matches={d})", .{matched});
     return error.UnknownCa;
 }
 
@@ -985,6 +1017,8 @@ fn verifyCertSignature(cert: CertParts, issuer_der: []const u8) Error!void {
     const key = try parsePublicKeyFromSpki(issuer.spki_der);
     if (oidEq(cert.signature_algorithm_oid, &oid_ecdsa_sha256)) {
         try verifySignatureScheme(key, .ecdsa_secp256r1_sha256, cert.tbs_der, cert.signature);
+    } else if (oidEq(cert.signature_algorithm_oid, &oid_ecdsa_sha384)) {
+        try verifySignatureScheme(key, .ecdsa_secp384r1_sha384, cert.tbs_der, cert.signature);
     } else if (oidEq(cert.signature_algorithm_oid, &oid_sha256_rsa)) {
         const pk = switch (key) {
             .rsa => |pk| pk,
@@ -1091,8 +1125,14 @@ fn parsePublicKeyFromSpki(spki_der: []const u8) Error!LeafPublicKey {
         return .{ .rsa = .{ .n = n, .e = e } };
     }
     if (oidEq(alg.oid, &oid_ec_public_key)) {
-        if (alg.params == null or !oidEq(alg.params.?, &oid_prime256v1)) return error.UnsupportedPublicKey;
-        return .{ .ecdsa_p256 = try ecdsa_p256.parsePublicKeySec1(key_bytes) };
+        const params = alg.params orelse return error.UnsupportedPublicKey;
+        if (oidEq(params, &oid_prime256v1)) {
+            return .{ .ecdsa_p256 = try ecdsa_p256.parsePublicKeySec1(key_bytes) };
+        }
+        if (oidEq(params, &oid_secp384r1)) {
+            return .{ .ecdsa_p384 = EcdsaP384.PublicKey.fromSec1(key_bytes) catch return error.UnsupportedPublicKey };
+        }
+        return error.UnsupportedPublicKey;
     }
     if (oidEq(alg.oid, &oid_ed25519)) {
         if (key_bytes.len != sign.public_key_len) return error.UnsupportedPublicKey;
@@ -1135,9 +1175,15 @@ fn bitStringBytes(tlv: x509.Tlv) Error![]const u8 {
 
 fn positiveIntegerBytes(tlv: x509.Tlv) Error![]const u8 {
     if (tlv.tag != x509.Tag.integer or tlv.value.len == 0) return error.BadCertificate;
+    // A DER INTEGER is two's-complement: a set high bit on the *first* byte means
+    // negative. Positive values whose magnitude MSB is set carry a leading 0x00
+    // sign byte, which we strip to get the unsigned magnitude. (The previous
+    // check tested the high bit *after* stripping, wrongly rejecting every
+    // RSA modulus, whose magnitude MSB is always set.)
+    if (tlv.value[0] & 0x80 != 0) return error.BadCertificate; // negative
     var v = tlv.value;
-    if (v.len > 1 and v[0] == 0) v = v[1..];
-    if (v.len == 0 or v[0] & 0x80 != 0) return error.BadCertificate;
+    if (v.len > 1 and v[0] == 0) v = v[1..]; // drop the sign byte
+    if (v.len == 0) return error.BadCertificate;
     return v;
 }
 
@@ -1150,7 +1196,9 @@ const oid_sha256_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x
 const oid_rsassa_pss = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A };
 const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
 const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
+const oid_secp384r1 = [_]u8{ 0x2B, 0x81, 0x04, 0x00, 0x22 };
 const oid_ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
+const oid_ecdsa_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
 const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
 
 fn secureZero(buf: []u8) void {

@@ -32,6 +32,8 @@ pub const SignatureScheme = enum(u16) {
     ed25519 = 0x0807,
     /// ECDSA over NIST P-256 with SHA-256.
     ecdsa_secp256r1_sha256 = 0x0403,
+    /// ECDSA over NIST P-384 with SHA-384 (common in CA intermediates).
+    ecdsa_secp384r1_sha384 = 0x0503,
     /// RSASSA-PSS with public-key OID rsaEncryption, SHA-256.
     rsa_pss_rsae_sha256 = 0x0804,
     /// RSASSA-PKCS1-v1_5 with SHA-256.

@@ -19,7 +19,7 @@ const tls_client = @import("../crypto/tls_client.zig");
 const http1 = @import("../proto/http1_client.zig");
 const acme = @import("acme_client.zig");
 const http01 = @import("acme_http01_server.zig");
-const sign = @import("../crypto/sign.zig");
+const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 
@@ -150,11 +150,16 @@ fn httpsRequest(
     var plaintext: std.ArrayList(u8) = .empty;
     defer plaintext.deinit(allocator);
 
-    while (true) {
+    read_loop: while (true) {
         // Frame and decrypt every complete TLS record we currently hold.
         while (frameRecordLen(pending.items)) |rec_len| {
             const rec = pending.items[0..rec_len];
-            const read = try tc.decryptApp(rec);
+            const read = tc.decryptApp(rec) catch |err| switch (err) {
+                // A trailing alert (close_notify, sent with Connection: close)
+                // ends the stream; the HTTP response we already have is final.
+                error.TlsAlert => break :read_loop,
+                else => return err,
+            };
             switch (read) {
                 .application_data => |pt| {
                     defer allocator.free(pt);
@@ -164,6 +169,9 @@ fn httpsRequest(
                 .control => {}, // post-handshake record (e.g. NewSessionTicket): ignore
             }
             consumePrefix(&pending, rec_len);
+            // Stop as soon as the HTTP message is complete, so we never decrypt a
+            // trailing close_notify/record bundled in the same segment.
+            if (http1.isComplete(plaintext.items)) break :read_loop;
         }
         if (http1.isComplete(plaintext.items)) break;
 
@@ -192,6 +200,8 @@ pub const HttpsTransport = struct {
     trust_anchors: []const []const u8,
     last_response: ?[]u8 = null,
     header_scratch: [64]http1.Header = undefined,
+    /// When true, log every exchange; errors (status >= 300) are always logged.
+    debug: bool = false,
 
     pub fn init(allocator: Allocator, resolver: Resolver, trust_anchors: []const []const u8) HttpsTransport {
         return .{ .allocator = allocator, .resolver = resolver, .trust_anchors = trust_anchors };
@@ -214,10 +224,17 @@ pub const HttpsTransport = struct {
         body: []const u8,
     ) anyerror!acme.HttpResponse {
         const url = try Url.parse(url_str);
-        const raw = try httpsRequest(self.allocator, self.resolver, self.trust_anchors, method, url, extra, body);
+        const raw = httpsRequest(self.allocator, self.resolver, self.trust_anchors, method, url, extra, body) catch |err| {
+            if (self.debug) std.debug.print("acme!! {s} {s} transport error: {s}\n", .{ method, url_str, @errorName(err) });
+            return err;
+        };
         if (self.last_response) |r| self.allocator.free(r);
         self.last_response = raw;
         const resp = try http1.parseResponse(raw, &self.header_scratch);
+        if (self.debug or resp.status >= 300) {
+            const preview = resp.body[0..@min(resp.body.len, 8000)];
+            std.debug.print("acme<- {s} {s} -> {d} (body {d}B)\n  {s}\n", .{ method, url_str, resp.status, resp.body.len, preview });
+        }
         return .{
             .status = resp.status,
             .body = resp.body,
@@ -242,30 +259,33 @@ pub const HttpsTransport = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Ed25519 signer adapter (account key == issued-cert key, per acme_client)
+// ES256 signer adapter (ECDSA P-256; account key == issued-cert key, per
+// acme_client). Let's Encrypt accepts ES256/ES384/ES512/RS256, not EdDSA.
 // ---------------------------------------------------------------------------
 
-pub const Ed25519Signer = struct {
-    key_pair: sign.KeyPair,
+pub const Es256Signer = struct {
+    key_pair: ecdsa_p256.KeyPair,
 
-    pub fn init(key_pair: sign.KeyPair) Ed25519Signer {
+    pub fn init(key_pair: ecdsa_p256.KeyPair) Es256Signer {
         return .{ .key_pair = key_pair };
     }
 
-    pub fn signer(self: *Ed25519Signer) acme.Signer {
-        return .{
-            .ctx = self,
-            .public_key = self.key_pair.public_key,
-            .signFn = signThunk,
-        };
+    pub fn signer(self: *Es256Signer) acme.Signer {
+        const sec1 = self.key_pair.public_key.toUncompressedSec1(); // 0x04 ‖ x ‖ y
+        var x: [32]u8 = undefined;
+        var y: [32]u8 = undefined;
+        @memcpy(&x, sec1[1..33]);
+        @memcpy(&y, sec1[33..65]);
+        return .{ .ctx = self, .public_key_x = x, .public_key_y = y, .signFn = signThunk };
     }
 
     fn signThunk(ctx: *anyopaque, signing_input: []const u8, out: []u8) anyerror![]const u8 {
-        const self: *Ed25519Signer = @ptrCast(@alignCast(ctx));
-        if (out.len < sign.signature_len) return error.NoSpaceLeft;
-        const sig = try self.key_pair.sign(signing_input);
-        @memcpy(out[0..sign.signature_len], &sig);
-        return out[0..sign.signature_len];
+        const self: *Es256Signer = @ptrCast(@alignCast(ctx));
+        if (out.len < 64) return error.NoSpaceLeft;
+        const sig = try ecdsa_p256.sign(signing_input, self.key_pair);
+        const raw = sig.toBytes(); // fixed-width r‖s (64 bytes), the ES256 form
+        @memcpy(out[0..64], &raw);
+        return out[0..64];
     }
 };
 
@@ -283,6 +303,8 @@ pub const IssueConfig = struct {
     cert_out_path: []const u8,
     /// Max state-machine steps before giving up (defends against loops/hangs).
     max_steps: usize = 64,
+    /// Log every HTTP exchange (errors are always logged regardless).
+    debug: bool = false,
 };
 
 pub const IssueResult = struct {
@@ -302,22 +324,27 @@ pub fn issue(
     allocator: Allocator,
     io: std.Io,
     cfg: IssueConfig,
-    key_pair: sign.KeyPair,
+    account_key: ecdsa_p256.KeyPair,
+    cert_key: ecdsa_p256.KeyPair,
     token_store: *http01.TokenStore,
     resolver: ?Resolver,
 ) !IssueResult {
     var sys = SystemResolver{ .allocator = allocator, .io = io };
     const active_resolver = resolver orelse sys.resolver();
 
-    var ed = Ed25519Signer.init(key_pair);
+    var account_es = Es256Signer.init(account_key);
+    var cert_es = Es256Signer.init(cert_key);
     var http_transport = HttpsTransport.init(allocator, active_resolver, cfg.trust_anchors);
+    http_transport.debug = cfg.debug;
+    tls_client.debug_log = cfg.debug;
     defer http_transport.deinit();
 
     var client = acme.Acme.init(allocator, .{
         .directory_url = cfg.directory_url,
         .domains = cfg.domains,
         .contacts = cfg.contacts,
-        .signer = ed.signer(),
+        .signer = account_es.signer(),
+        .cert_signer = cert_es.signer(),
     });
     defer client.deinit();
 

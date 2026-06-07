@@ -217,7 +217,10 @@ fn parseChallengeValue(allocator: Allocator, value: std.json.Value) ParseError!C
     errdefer allocator.free(typ);
     const url = try dupStringField(allocator, obj, "url");
     errdefer allocator.free(url);
-    const token = try dupStringField(allocator, obj, "token");
+    // Not every challenge type carries a token (e.g. dns-persist-01 uses
+    // issuer-domain-names). Only http-01/dns-01 — which we select — need one, so
+    // tolerate its absence with an empty string rather than rejecting the authz.
+    const token = (try optionalDupStringField(allocator, obj, "token")) orelse try allocator.dupe(u8, "");
     errdefer allocator.free(token);
     const status = try parseStatusField(obj, "status");
     return .{ .allocator = allocator, .type = typ, .url = url, .token = token, .status = status };

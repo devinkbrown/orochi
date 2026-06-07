@@ -260,9 +260,11 @@ pub fn parseMessage(
         .nscount = readU16(packet, 8),
         .arcount = readU16(packet, 10),
     };
-    if (header.nscount != 0 or header.arcount != 0) return error.UnsupportedSection;
+    // Authority/additional sections are tolerated: we parse the answer section
+    // and ignore the rest. This lets us extract A/AAAA records from CNAME-chained
+    // or EDNS responses (recursive resolvers return the resolved address records
+    // alongside CNAME records the answer section).
     if (header.qdcount > max_questions) return error.TooManyQuestions;
-    if (header.ancount > max_answers) return error.TooManyAnswers;
 
     var msg = Message(max_questions, max_answers){
         .header = header,
@@ -285,52 +287,58 @@ pub fn parseMessage(
         }
     }
 
-    if (max_answers > 0) {
-        var ai: usize = 0;
-        while (ai < msg.answer_count) : (ai += 1) {
-            var name = Name{};
-            pos = try decodeName(packet, pos, &name);
-            if (pos + 10 > packet.len) return error.TruncatedMessage;
+    // Walk every answer record to keep `pos` correct, but only STORE the record
+    // types we model (A/AAAA/PTR). Unknown types (e.g. CNAME) are skipped, so a
+    // CNAME chain still yields its terminal address records.
+    var stored: usize = 0;
+    var ai: usize = 0;
+    while (ai < header.ancount) : (ai += 1) {
+        var name = Name{};
+        pos = try decodeName(packet, pos, &name);
+        if (pos + 10 > packet.len) return error.TruncatedMessage;
 
-            const rr_type = try RecordType.fromInt(readU16(packet, pos));
-            const class = readU16(packet, pos + 2);
-            if (class != class_in) return error.UnsupportedClass;
-            const ttl = readU32(packet, pos + 4);
-            const rdlen = readU16(packet, pos + 8);
-            pos += 10;
-            if (pos + rdlen > packet.len) return error.TruncatedMessage;
-            const rdata_start = pos;
-            const rdata_end = pos + rdlen;
+        const raw_type = readU16(packet, pos);
+        const class = readU16(packet, pos + 2);
+        const ttl = readU32(packet, pos + 4);
+        const rdlen = readU16(packet, pos + 8);
+        pos += 10;
+        if (pos + rdlen > packet.len) return error.TruncatedMessage;
+        const rdata_start = pos;
+        const rdata_end = pos + rdlen;
+        pos = rdata_end;
 
-            const data = switch (rr_type) {
-                .a => blk: {
-                    if (rdlen != 4) return error.MalformedRData;
-                    break :blk RData{ .a = packet[pos..][0..4].* };
-                },
-                .aaaa => blk: {
-                    if (rdlen != 16) return error.MalformedRData;
-                    break :blk RData{ .aaaa = packet[pos..][0..16].* };
-                },
-                .ptr => blk: {
-                    var ptr_name = Name{};
-                    const ptr_next = try decodeName(packet, rdata_start, &ptr_name);
-                    if (ptr_next != rdata_end) return error.MalformedRData;
-                    break :blk RData{ .ptr = ptr_name };
-                },
-            };
+        const rr_type = RecordType.fromInt(raw_type) catch continue; // skip unknown (CNAME, ...)
+        if (class != class_in) continue;
+        if (max_answers == 0 or stored >= max_answers) continue;
 
-            msg.answers[ai] = .{
-                .name = name,
-                .rr_type = rr_type,
-                .class = class,
-                .ttl = ttl,
-                .data = data,
-            };
-            pos = rdata_end;
-        }
+        const data = switch (rr_type) {
+            .a => blk: {
+                if (rdlen != 4) return error.MalformedRData;
+                break :blk RData{ .a = packet[rdata_start..][0..4].* };
+            },
+            .aaaa => blk: {
+                if (rdlen != 16) return error.MalformedRData;
+                break :blk RData{ .aaaa = packet[rdata_start..][0..16].* };
+            },
+            .ptr => blk: {
+                var ptr_name = Name{};
+                const ptr_next = try decodeName(packet, rdata_start, &ptr_name);
+                if (ptr_next != rdata_end) return error.MalformedRData;
+                break :blk RData{ .ptr = ptr_name };
+            },
+        };
+
+        msg.answers[stored] = .{
+            .name = name,
+            .rr_type = rr_type,
+            .class = class,
+            .ttl = ttl,
+            .data = data,
+        };
+        stored += 1;
     }
+    msg.answer_count = stored;
 
-    if (pos != packet.len) return error.TrailingBytes;
     return msg;
 }
 
@@ -749,6 +757,45 @@ test "parses compressed answer name and rejects compression loops" {
         0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01,
     };
     try std.testing.expectError(error.CompressionLoop, parseMessage(1, 0, &loop));
+}
+
+test "skips CNAME records and returns the terminal A record" {
+    // Header: id=0x1234, response, qd=1, an=2 (CNAME + A), ns=0, ar=0.
+    const packet = [_]u8{
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        // question: example.com A IN
+        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x03, 'c',  'o',  'm',
+        0x00, 0x00, 0x01, 0x00, 0x01,
+        // answer 1: name=ptr(0x0c), type CNAME(5), IN, ttl, rdlen=2, rdata=ptr(0x0c)
+        0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x2a, 0x00, 0x02, 0xc0, 0x0c,
+        // answer 2: name=ptr(0x0c), type A(1), IN, ttl, rdlen=4, rdata=192.0.2.1
+        0xc0, 0x0c, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x04, 192,  0,    2,    1,
+    };
+    const parsed = try parseMessage(1, max_cache_addrs, &packet);
+    try std.testing.expectEqual(@as(usize, 1), parsed.answer_count);
+    try std.testing.expectEqual(RecordType.a, parsed.answers[0].rr_type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2, 1 }, &parsed.answers[0].data.a);
+}
+
+test "tolerates additional/authority records after the answer section" {
+    // an=1 (A) followed by ar=1 (an A-shaped record we should ignore safely).
+    const packet = [_]u8{
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x03, 'c',  'o',  'm',
+        0x00, 0x00, 0x01, 0x00, 0x01,
+        // answer: A 192.0.2.1
+        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x2a, 0x00, 0x04, 192,  0,    2,    1,
+        // additional: (ignored) A 203.0.113.9
+           0xc0, 0x0c, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x04, 203,  0,    113,
+        9,
+    };
+    const parsed = try parseMessage(1, max_cache_addrs, &packet);
+    try std.testing.expectEqual(@as(usize, 1), parsed.answer_count);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2, 1 }, &parsed.answers[0].data.a);
 }
 
 test "rejects truncated and oversize messages" {

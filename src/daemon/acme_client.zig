@@ -29,6 +29,7 @@ const jwk = @import("../proto/acme_jwk.zig");
 const challenge = @import("../proto/acme_challenge.zig");
 const csr = @import("../proto/csr.zig");
 const problem = @import("../proto/acme_problem.zig");
+const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("acme_client requires a 64-bit target");
@@ -43,7 +44,7 @@ const max_nonce_retries: u8 = 3;
 const http01_type = "http-01";
 
 /// JOSE `alg` value for Ed25519 account keys (RFC 8037).
-const jose_alg = "EdDSA";
+const jose_alg = "ES256";
 
 // ---------------------------------------------------------------------------
 // Injected I/O surfaces
@@ -76,12 +77,15 @@ pub const Transport = struct {
     }
 };
 
-/// Injected signer. `sign` receives the JWS signing input and writes the raw
-/// signature (Ed25519: 64 bytes) into `out`, returning the populated slice.
+/// Injected signer for ES256 (ECDSA P-256 + SHA-256), the JWS algorithm Let's
+/// Encrypt accepts for accounts. `sign` receives the JWS signing input and writes
+/// the raw fixed-width signature (r‖s, 64 bytes) into `out`. The same key is
+/// reused for the certificate CSR (acme_client converts r‖s to DER there).
 pub const Signer = struct {
     ctx: *anyopaque,
-    /// Raw Ed25519 public key (the `x` JWK coordinate).
-    public_key: [32]u8,
+    /// Affine P-256 public-key coordinates (the `x`/`y` JWK members).
+    public_key_x: [32]u8,
+    public_key_y: [32]u8,
     signFn: *const fn (ctx: *anyopaque, signing_input: []const u8, out: []u8) anyerror![]const u8,
 
     fn sign(self: Signer, signing_input: []const u8, out: []u8) anyerror![]const u8 {
@@ -104,7 +108,12 @@ pub const Config = struct {
     contacts: []const []const u8 = &.{},
     /// Whether to set `termsOfServiceAgreed`.
     tos_agreed: bool = true,
+    /// Account key — signs the JWS of every ACME request.
     signer: Signer,
+    /// Certificate key — signs the CSR and becomes the issued cert's key. MUST be
+    /// a distinct key from `signer`; Let's Encrypt rejects a CSR whose public key
+    /// equals the account key.
+    cert_signer: Signer,
 };
 
 /// Effects the caller MUST act on when returned from `step`.
@@ -253,8 +262,8 @@ pub const Acme = struct {
 
             var hdr_buf: [1024]u8 = undefined;
             const protected = if (jwk_header) blk: {
-                var jwk_buf: [jwk.okp_json_max_len]u8 = undefined;
-                const jwk_json = jwk.jwkOkp(self.config.signer.public_key, &jwk_buf) catch
+                var jwk_buf: [jwk.ec_json_max_len]u8 = undefined;
+                const jwk_json = jwk.jwkEc(self.config.signer.public_key_x, self.config.signer.public_key_y, &jwk_buf) catch
                     return self.fail(error.OutOfMemory);
                 break :blk jws.protectedHeaderJwk(jose_alg, nonce, url, jwk_json, &hdr_buf) catch
                     return self.fail(error.OutOfMemory);
@@ -394,7 +403,7 @@ pub const Acme = struct {
 
         var thumb_buf: [jwk.thumbprint_b64_len]u8 = undefined;
         var thumb_digest: [32]u8 = undefined;
-        jwk.thumbprintOkp(self.config.signer.public_key, &thumb_digest);
+        jwk.thumbprintEc(self.config.signer.public_key_x, self.config.signer.public_key_y, &thumb_digest);
         const thumb = std.base64.url_safe_no_pad.Encoder.encode(&thumb_buf, &thumb_digest);
 
         const key_auth = challenge.keyAuthorization(chal.token, thumb, &self.keyauth_buf) catch
@@ -446,15 +455,24 @@ pub const Acme = struct {
         const cri = csr.certificationRequestInfo(&cri_buf, .{
             .common_name = self.config.domains[0],
             .dns_names = self.config.domains,
-            .spki_der = &ed25519Spki(self.config.signer.public_key),
+            .spki_der = &ecP256Spki(self.config.cert_signer.public_key_x, self.config.cert_signer.public_key_y),
         }) catch return self.fail(error.OutOfMemory);
 
+        // The cert key (distinct from the account key) signs the CRI. It yields a
+        // fixed-width ES256 (r‖s) signature; a PKCS#10 CSR carries the DER-encoded
+        // ECDSA signature, so transcode r‖s -> DER.
         var sig_buf: [64]u8 = undefined;
-        const signature = self.config.signer.sign(cri, &sig_buf) catch
+        const raw_sig = self.config.cert_signer.sign(cri, &sig_buf) catch
+            return self.fail(error.OutOfMemory);
+        if (raw_sig.len != 64) return self.fail(error.UnexpectedStatus);
+        var fixed: [64]u8 = undefined;
+        @memcpy(&fixed, raw_sig[0..64]);
+        var der_sig_buf: [80]u8 = undefined;
+        const der_sig = ecdsa_p256.signatureToDer(ecdsa_p256.Signature.fromBytes(fixed), &der_sig_buf) catch
             return self.fail(error.OutOfMemory);
 
         var csr_buf: [4096]u8 = undefined;
-        const csr_der = csr.assemble(&csr_buf, cri, &ed25519_sig_alg, signature) catch
+        const csr_der = csr.assemble(&csr_buf, cri, &ecdsa_sha256_sig_alg, der_sig) catch
             return self.fail(error.OutOfMemory);
 
         var payload_buf: [8192]u8 = undefined;
@@ -516,18 +534,21 @@ fn isProblemStatus(status: u16) bool {
     return status >= 400;
 }
 
-/// DER SubjectPublicKeyInfo for an Ed25519 public key (48 bytes, RFC 8410).
-fn ed25519Spki(public_key: [32]u8) [44]u8 {
-    var out: [44]u8 = .{
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    } ++ [_]u8{0} ** 32;
-    @memcpy(out[12..44], &public_key);
+/// DER SubjectPublicKeyInfo for an uncompressed P-256 public key (91 bytes):
+/// SEQUENCE { SEQUENCE { ecPublicKey, prime256v1 }, BIT STRING (0x04‖x‖y) }.
+fn ecP256Spki(x: [32]u8, y: [32]u8) [91]u8 {
+    var out: [91]u8 = .{
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+        0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+        0x42, 0x00, 0x04,
+    } ++ [_]u8{0} ** 64;
+    @memcpy(out[27..59], &x);
+    @memcpy(out[59..91], &y);
     return out;
 }
 
-/// DER AlgorithmIdentifier for Ed25519 signatures (id-Ed25519, RFC 8410): the
-/// SEQUENCE { OID 1.3.101.112 } with no parameters.
-const ed25519_sig_alg = [_]u8{ 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70 };
+/// DER AlgorithmIdentifier for ecdsa-with-SHA256 (1.2.840.10045.4.3.2), no params.
+const ecdsa_sha256_sig_alg = [_]u8{ 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
 
 // ===========================================================================
 // Tests (AAA) — driven by an in-memory mock transport replaying a full flow.
@@ -586,12 +607,17 @@ fn testSign(ctx: *anyopaque, signing_input: []const u8, out: []u8) anyerror![]co
     _ = signing_input;
     const calls: *usize = @ptrCast(@alignCast(ctx));
     calls.* += 1;
-    @memset(out[0..64], 0);
+    @memset(out[0..64], 0x42); // non-zero r‖s so DER transcoding is well-formed
     return out[0..64];
 }
 
 fn makeSigner(calls: *usize) Signer {
-    return .{ .ctx = calls, .public_key = [_]u8{7} ** 32, .signFn = testSign };
+    return .{
+        .ctx = calls,
+        .public_key_x = [_]u8{7} ** 32,
+        .public_key_y = [_]u8{9} ** 32,
+        .signFn = testSign,
+    };
 }
 
 /// Run the machine to a terminal state, collecting emitted effect tags.
@@ -664,6 +690,7 @@ test "full http-01 issuance flow drives machine to done and emits effects" {
         .domains = &.{"example.com"},
         .contacts = &.{"mailto:admin@example.com"},
         .signer = makeSigner(&sign_calls),
+        .cert_signer = makeSigner(&sign_calls),
     });
     defer acme.deinit();
 
@@ -707,6 +734,7 @@ test "badNonce on newAccount is retried with the fresh nonce then succeeds" {
         .directory_url = "https://ca/directory",
         .domains = &.{"example.com"},
         .signer = makeSigner(&sign_calls),
+        .cert_signer = makeSigner(&sign_calls),
     });
     defer acme.deinit();
 
@@ -731,6 +759,7 @@ test "stepping a terminal machine returns error.Terminal" {
         .directory_url = "x",
         .domains = &.{"example.com"},
         .signer = makeSigner(&sign_calls),
+        .cert_signer = makeSigner(&sign_calls),
     });
     defer acme.deinit();
     acme.state = .done;

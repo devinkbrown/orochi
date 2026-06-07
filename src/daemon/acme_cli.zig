@@ -11,7 +11,7 @@ const std = @import("std");
 const acme_runner = @import("acme_runner.zig");
 const http01 = @import("acme_http01_server.zig");
 const listener = @import("acme_http01_listener.zig");
-const sign = @import("../crypto/sign.zig");
+const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const pem = @import("../proto/pem.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,6 +29,7 @@ pub const Options = struct {
     ca_bundle_path: []const u8 = default_ca_bundle,
     contact: ?[]const u8 = null,
     challenge_port: u16 = default_challenge_port,
+    debug: bool = false,
 };
 
 /// Print a one-line usage summary for the acme-issue subcommand.
@@ -54,12 +55,15 @@ pub fn parseArgs(args: []const []const u8) ?Options {
     var ca_bundle: []const u8 = default_ca_bundle;
     var contact: ?[]const u8 = null;
     var port: u16 = default_challenge_port;
+    var debug = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--prod")) {
             directory = prod_directory;
+        } else if (std.mem.eql(u8, a, "--debug")) {
+            debug = true;
         } else if (std.mem.eql(u8, a, "--domain") and i + 1 < args.len) {
             i += 1;
             domain = args[i];
@@ -88,6 +92,7 @@ pub fn parseArgs(args: []const []const u8) ?Options {
         .ca_bundle_path = ca_bundle,
         .contact = contact,
         .challenge_port = port,
+        .debug = debug,
     };
 }
 
@@ -102,9 +107,11 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
     if (anchors.items.len == 0) return error.NoTrustAnchors;
     std.debug.print("acme: loaded {d} trust anchors from {s}\n", .{ anchors.items.len, opts.ca_bundle_path });
 
-    // --- Account key (fresh per run; staging accounts are disposable) ---
-    var key_pair = sign.KeyPair.generate(io);
-    defer key_pair.deinit();
+    // --- Keys: ES256 / ECDSA P-256 (the alg Let's Encrypt accepts). The account
+    // and certificate keys MUST differ (LE rejects a CSR keyed to the account).
+    // Fresh per run; staging accounts are disposable. ---
+    const account_key = ecdsa_p256.KeyPair.generate(io);
+    const cert_key = ecdsa_p256.KeyPair.generate(io);
 
     // --- Loopback HTTP-01 listener (nginx proxies the challenge path here) ---
     var store = http01.TokenStore.init(allocator);
@@ -128,7 +135,8 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
         .contacts = contacts,
         .trust_anchors = anchors.items,
         .cert_out_path = opts.cert_out_path,
-    }, key_pair, &store, null);
+        .debug = opts.debug,
+    }, account_key, cert_key, &store, null);
 
     if (result.cert_written) {
         std.debug.print("acme: SUCCESS — wrote {s}\n", .{opts.cert_out_path});

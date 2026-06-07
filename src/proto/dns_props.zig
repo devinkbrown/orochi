@@ -35,7 +35,9 @@ fn parseOkOrTypedError(input: []const u8) !void {
 
 fn expectMessageInvariants(msg: anytype) !void {
     try std.testing.expectEqual(@as(usize, msg.header.qdcount), msg.question_count);
-    try std.testing.expectEqual(@as(usize, msg.header.ancount), msg.answer_count);
+    // parseMessage stores only the answer record types it models (A/AAAA/PTR),
+    // skipping others (e.g. CNAME), so stored answers are a subset of ancount.
+    try std.testing.expect(msg.answer_count <= msg.header.ancount);
     try std.testing.expect(msg.question_count <= msg.questions.len);
     try std.testing.expect(msg.answer_count <= msg.answers.len);
 
