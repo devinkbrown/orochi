@@ -80,6 +80,7 @@ const channel_rename = @import("../proto/channel_rename.zig");
 const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
+const media_plane_mod = @import("media_plane.zig");
 const tegami_mod = @import("tegami.zig");
 const transcript_mod = @import("transcript.zig");
 const announce_board_mod = @import("announce_board.zig");
@@ -699,6 +700,10 @@ pub const ServerError = error{
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16,
+    /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
+    media_port: u16 = 0,
+    /// Host/IP advertised to clients as the server's media (ICE) candidate.
+    media_host: []const u8 = "127.0.0.1",
     backlog: u31 = 128,
     ring_entries: u16 = 32,
     /// Hard cap on concurrent connections. The client table reserves this many
@@ -972,6 +977,9 @@ pub const LinuxServer = struct {
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Mizuchi media SFU control plane): who is in each call.
     media_rooms: media_room.MediaRooms,
+    /// Media transport plane: UDP socket + ICE/STUN endpoint registry + pump
+    /// thread. Started on boot (`start`), torn down on `deinit`.
+    media_plane: media_plane_mod.MediaPlane,
     /// Tegami: per-account offline messages, delivered on next login.
     tegami: tegami_mod.TegamiBox,
     /// Per-channel live media transcript (speaker-tagged caption ring).
@@ -1070,6 +1078,7 @@ pub const LinuxServer = struct {
             }),
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
             .media_rooms = media_room.MediaRooms.init(allocator),
+            .media_plane = media_plane_mod.MediaPlane.init(allocator),
             .tegami = tegami_mod.TegamiBox.init(allocator),
             .transcript = transcript_mod.TranscriptLog.init(allocator),
             .oper_registry = config.oper_registry,
@@ -1085,6 +1094,13 @@ pub const LinuxServer = struct {
     pub fn start(self: *LinuxServer) void {
         self.driveLifecycle(.init);
         self.driveLifecycle(.ready);
+        // Bring the media transport plane online (bind UDP + pump thread). Media
+        // is optional: a bind failure logs and the daemon keeps serving IRC.
+        self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
+            std.debug.print("mizuchi: media plane disabled ({s})\n", .{@errorName(e)});
+            return;
+        };
+        std.debug.print("mizuchi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, self.config.media_host });
     }
 
     pub fn deinit(self: *LinuxServer) void {
@@ -1137,6 +1153,7 @@ pub const LinuxServer = struct {
         self.sessions.deinit();
         self.content_filter.deinit();
         self.media_rooms.deinit();
+        self.media_plane.deinit();
         self.tegami.deinit();
         self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
@@ -6448,6 +6465,7 @@ pub const LinuxServer = struct {
         }
         if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
             if (self.media_rooms.leaveAll(channel, nick)) {
+                self.media_plane.remove(channel, nick);
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
                 if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel); // call ended
             } else try self.noticeTo(conn, "MEDIA: you are not in this call");
@@ -6511,6 +6529,7 @@ pub const LinuxServer = struct {
         while (it.next()) |entry| {
             if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
             if (self.media_rooms.leaveAll(entry.key_ptr.*, nick)) {
+                self.media_plane.remove(entry.key_ptr.*, nick);
                 self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
                 if (self.media_rooms.room(entry.key_ptr.*) == null) _ = self.transcript.clearChannel(entry.key_ptr.*);
             }
@@ -6618,6 +6637,16 @@ pub const LinuxServer = struct {
         var pbuf: [320]u8 = undefined;
         if (formatMediaCodecLine(&pbuf, channel, "PROFILE", negotiated.codecs, negotiated.fec)) |line|
             self.broadcastChannel(channel, line, id) catch {};
+        // Allocate this caller's ICE endpoint and advertise the server transport
+        // (ufrag/pwd + media candidate) so the client can run STUN to the SFU.
+        const nick = conn.session.displayName();
+        if (self.media_plane.allocate(channel, nick)) |creds| {
+            var tbuf: [320]u8 = undefined;
+            const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d}\r\n", .{
+                server_name, channel, creds.ufragSlice(), creds.pwdSlice(), self.config.media_host, self.media_plane.port,
+            }) catch return;
+            try appendToConn(conn, tline);
+        }
     }
 
     /// `MEDIA ANSWER <#chan> <codec[,codec...]>` — a later participant reconciles
