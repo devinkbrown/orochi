@@ -19,6 +19,7 @@
 const std = @import("std");
 const kakehashi = @import("../substrate/kakehashi.zig");
 const opcodec_frame = @import("../substrate/opcodec_frame.zig");
+const rtp_profile = @import("../proto/rtp_profile.zig");
 const ice = @import("../proto/ice.zig");
 
 pub const Leg = kakehashi.Leg; // .native | .webrtc
@@ -30,8 +31,11 @@ pub const Error = kakehashi.Error || opcodec_frame.DecodeError || opcodec_frame.
 const max_id_bytes = 64;
 const max_rewrap = 1600; // >= one MTU datagram after header rewrap
 
-/// Sends `bytes` to `dest` on some leg's socket. `ctx` is the caller's context.
-pub const SendFn = *const fn (ctx: *anyopaque, dest: TransportAddress, bytes: []const u8) void;
+/// Sends `bytes` to `target` on some leg's socket. The callback resolves the
+/// target's *live* transport address (learned post-OFFER via STUN / first
+/// datagram) from the owning plane, rather than trusting a possibly-stale
+/// `target.addr`. `ctx` is the caller's context.
+pub const SendFn = *const fn (ctx: *anyopaque, target: *const Member, bytes: []const u8) void;
 
 /// Hook the native pump invokes (after its in-leg forward) to also deliver a
 /// frame to the channel's WebRTC members. The implementation looks up the
@@ -124,31 +128,35 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             return self.len;
         }
 
-        /// Rewrap a native opcodec `datagram` to RTP and send it to each WebRTC
-        /// member of the call (header-only; opaque payload shared verbatim). Used
-        /// by the native pump to bridge a native frame to WebRTC peers.
+        /// Rewrap a native opcodec `datagram` ONCE (keeping the source publisher's
+        /// stream_id as the RTP ssrc, so receivers can demux) and send the same
+        /// RTP packet to each WebRTC member of the call. Header-only; opaque
+        /// payload shared verbatim. The `send` callback resolves each target's
+        /// live address.
         pub fn fanoutNativeToWebrtc(self: *Self, datagram: []const u8, send_ctx: *anyopaque, send: SendFn) void {
             var targets: [max_participants]Member = undefined;
             const n = self.crossTargets(.native, "", &targets);
             if (n == 0) return;
+            const view = opcodec_frame.decode(datagram) catch return;
+            const bf = kakehashi.fromNative(view);
             var scratch: [max_rewrap]u8 = undefined;
-            for (targets[0..n]) |m| {
-                const rtp = nativeDatagramToRtp(datagram, &self.ptmap, m.ssrc, &scratch) catch continue;
-                send(send_ctx, m.addr, rtp);
-            }
+            const rtp = kakehashi.toRtp(bf, &self.ptmap, view.stream_id, &scratch) catch return;
+            for (targets[0..n]) |*m| send(send_ctx, m, rtp);
         }
 
-        /// Rewrap an `rtp` packet to native opcodec datagrams and send to each
-        /// native member. Used by the WebRTC relay to bridge to native peers.
+        /// Rewrap an `rtp` packet ONCE to a native opcodec datagram (keeping the
+        /// source ssrc as the native stream_id) and send to each native member.
+        /// Used by the WebRTC relay to bridge to native peers.
         pub fn fanoutWebrtcToNative(self: *Self, rtp: []const u8, keyframe_hint: bool, send_ctx: *anyopaque, send: SendFn) void {
             var targets: [max_participants]Member = undefined;
             const n = self.crossTargets(.webrtc, "", &targets);
             if (n == 0) return;
+            const dh = rtp_profile.decodeHeader(rtp) catch return;
+            const bf = kakehashi.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
+            const nf = kakehashi.toNative(bf, opcodec_frame.MEDIA_BAND_FLOOR, dh.header.ssrc);
             var scratch: [max_rewrap]u8 = undefined;
-            for (targets[0..n]) |m| {
-                const len = rtpToNativeDatagram(rtp, &self.ptmap, m.band_id, m.stream_id, keyframe_hint, &scratch) catch continue;
-                send(send_ctx, m.addr, scratch[0..len]);
-            }
+            const len = opcodec_frame.encode(nf, &scratch) catch return;
+            for (targets[0..n]) |*m| send(send_ctx, m, scratch[0..len]);
         }
 
         /// Copy into `out` every member on the leg OPPOSITE to `from_leg`,

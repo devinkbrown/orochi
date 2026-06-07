@@ -245,6 +245,17 @@ pub const MediaPlane = struct {
         if (self.socket) |*s| s.sendTo(dest, bytes);
     }
 
+    /// The bound remote address of a WebRTC participant (learned via STUN), or
+    /// null if unknown/unbound. Lets the cross-leg sink resolve a live target
+    /// address rather than a stale one.
+    pub fn remoteFor(self: *MediaPlane, channel: []const u8, participant: []const u8) ?TransportAddress {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const ep = self.transport.get(channel, participant) orelse return null;
+        if (!ep.connected()) return null;
+        return ep.remote;
+    }
+
     /// Whether a participant's ICE check has bound a peer address (test/introspection).
     pub fn isConnected(self: *MediaPlane, channel: []const u8, participant: []const u8) bool {
         lockSpin(&self.mutex);

@@ -82,6 +82,41 @@ const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
 const media_plane_mod = @import("media_plane.zig");
 const native_media_mod = @import("native_media_transport.zig");
+const media_bridge_mod = @import("media_bridge.zig");
+
+/// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
+const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
+
+/// Blocking acquire on the tryLock-only `std.atomic.Mutex` guarding the media
+/// bridge registry (rare register/leave vs. the native pump thread).
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.Thread.yield() catch {};
+}
+
+/// Context for the native→WebRTC cross-leg send callback.
+const BridgeSendCtx = struct {
+    server: *LinuxServer,
+    channel: []const u8,
+};
+
+/// Resolve a WebRTC target's live address from the media plane and send the
+/// rewrapped RTP packet there.
+fn bridgeSendToWebrtc(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
+    const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
+    if (s.server.media_plane.remoteFor(s.channel, target.id())) |addr|
+        s.server.media_plane.sendTo(addr, bytes);
+}
+
+/// Cross-leg sink invoked by the native pump: rewrap the native frame to RTP and
+/// fan it out to the channel's WebRTC members (live addresses resolved per peer).
+fn bridgeOnNativeFrame(ctx: *anyopaque, channel: []const u8, datagram: []const u8) void {
+    const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+    lockSpin(&self.media_bridges_mu);
+    defer self.media_bridges_mu.unlock();
+    const br = self.media_bridges.getPtr(channel) orelse return;
+    var sctx = BridgeSendCtx{ .server = self, .channel = channel };
+    br.fanoutNativeToWebrtc(datagram, &sctx, bridgeSendToWebrtc);
+}
 const tegami_mod = @import("tegami.zig");
 const transcript_mod = @import("transcript.zig");
 const announce_board_mod = @import("announce_board.zig");
@@ -991,6 +1026,10 @@ pub const LinuxServer = struct {
     /// Native media transport: UDP leg for our own OPVOX/OPVIS codec
     /// (opcodec_frame datagrams). Started on boot, torn down on `deinit`.
     native_media: native_media_mod.NativeMediaTransport,
+    /// Per-channel cross-leg bridge roster (native ↔ opt-in WebRTC). Consulted by
+    /// the native pump's cross-leg sink; guarded by `media_bridges_mu`.
+    media_bridges: std.StringHashMapUnmanaged(Bridge) = .empty,
+    media_bridges_mu: std.atomic.Mutex = .unlocked,
     /// Tegami: per-account offline messages, delivered on next login.
     tegami: tegami_mod.TegamiBox,
     /// Per-channel live media transcript (speaker-tagged caption ring).
@@ -1121,6 +1160,8 @@ pub const LinuxServer = struct {
         };
         if (self.native_media.port != 0) {
             std.debug.print("mizuchi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
+            // Bridge native frames to any opt-in WebRTC members of each channel.
+            self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
         }
 
         // Bring the media transport plane online (bind UDP + pump thread). Media
@@ -1186,6 +1227,11 @@ pub const LinuxServer = struct {
         self.media_rooms.deinit();
         self.media_plane.deinit();
         self.native_media.deinit();
+        {
+            var bit = self.media_bridges.keyIterator();
+            while (bit.next()) |k| self.allocator.free(k.*);
+            self.media_bridges.deinit(self.allocator);
+        }
         self.tegami.deinit();
         self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
@@ -6381,7 +6427,13 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "OFFER")) {
-            try self.mediaOffer(id, conn, channel, if (parsed.param_count >= 3) parsed.paramSlice()[2] else "");
+            try self.mediaOffer(
+                id,
+                conn,
+                channel,
+                if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
+                if (parsed.param_count >= 4) parsed.paramSlice()[3] else "",
+            );
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "ANSWER")) {
@@ -6533,6 +6585,7 @@ pub const LinuxServer = struct {
             if (self.media_rooms.leaveAll(channel, nick)) {
                 self.media_plane.remove(channel, nick);
                 self.native_media.unregister(channel, nick);
+                self.bridgeUnregister(channel, nick);
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
                 if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel); // call ended
             } else try self.noticeTo(conn, "MEDIA: you are not in this call");
@@ -6598,6 +6651,7 @@ pub const LinuxServer = struct {
             if (self.media_rooms.leaveAll(entry.key_ptr.*, nick)) {
                 self.media_plane.remove(entry.key_ptr.*, nick);
                 self.native_media.unregister(entry.key_ptr.*, nick);
+                self.bridgeUnregister(entry.key_ptr.*, nick);
                 self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
                 if (self.media_rooms.room(entry.key_ptr.*) == null) _ = self.transcript.clearChannel(entry.key_ptr.*);
             }
@@ -6676,7 +6730,7 @@ pub const LinuxServer = struct {
     /// persist it as the channel's active call profile, and reply with the agreed
     /// set. The UDP transport plane (ICE/STUN/TURN/jitter) is a separate layer;
     /// this is the live signaling/negotiation half.
-    fn mediaOffer(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, codec_csv: []const u8) !void {
+    fn mediaOffer(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, codec_csv: []const u8, transport_arg: []const u8) !void {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
@@ -6726,8 +6780,8 @@ pub const LinuxServer = struct {
         // for the channel's native call and advertise the candidate + the
         // stream_id the client must stamp into its opcodec frames. Independent of
         // the WebRTC plane above; best-effort (media is optional).
+        const stream_id = nativeStreamId(channel, nick);
         if (self.native_media.port != 0) {
-            const stream_id = nativeStreamId(channel, nick);
             self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
             var nbuf: [256]u8 = undefined;
             const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=OPVOX/OPVIS\r\n", .{
@@ -6735,6 +6789,48 @@ pub const LinuxServer = struct {
             }) catch return;
             try appendToConn(conn, nline);
         }
+        // Record this participant's leg in the per-channel cross-leg bridge. The
+        // client opts into the WebRTC leg with `transport=webrtc` (default native).
+        // The bridge lets a native participant and an opt-in-WebRTC participant in
+        // the same call hear each other (rewrap only, never transcode).
+        const want_webrtc = isWebrtcTransport(transport_arg);
+        const leg: media_bridge_mod.Leg = if (want_webrtc) .webrtc else .native;
+        self.bridgeRegister(channel, nick, leg, stream_id);
+    }
+
+    /// True when the OFFER's transport token opts into the WebRTC leg
+    /// (`transport=webrtc` or bare `webrtc`); anything else means native.
+    fn isWebrtcTransport(arg: []const u8) bool {
+        const v = if (std.mem.startsWith(u8, arg, "transport=")) arg["transport=".len..] else arg;
+        return std.ascii.eqlIgnoreCase(v, "webrtc");
+    }
+
+    /// Register (or update) a participant's leg in the channel's bridge roster.
+    fn bridgeRegister(self: *LinuxServer, channel: []const u8, id: []const u8, leg: media_bridge_mod.Leg, stream_id: u32) void {
+        lockSpin(&self.media_bridges_mu);
+        defer self.media_bridges_mu.unlock();
+        const gop = self.media_bridges.getOrPut(self.allocator, channel) catch return;
+        if (!gop.found_existing) {
+            const key = self.allocator.dupe(u8, channel) catch {
+                _ = self.media_bridges.remove(channel);
+                return;
+            };
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = Bridge.init();
+        }
+        gop.value_ptr.register(id, .{ .leg = leg, .stream_id = stream_id, .ssrc = stream_id }) catch {};
+    }
+
+    /// Remove a participant from the channel's bridge; drop the channel once empty.
+    fn bridgeUnregister(self: *LinuxServer, channel: []const u8, id: []const u8) void {
+        lockSpin(&self.media_bridges_mu);
+        defer self.media_bridges_mu.unlock();
+        const br = self.media_bridges.getPtr(channel) orelse return;
+        _ = br.unregister(id);
+        if (br.count() != 0) return;
+        const key = self.media_bridges.getKey(channel).?;
+        _ = self.media_bridges.remove(channel);
+        self.allocator.free(key);
     }
 
     /// Deterministic per-(channel,participant) opcodec stream id advertised to the

@@ -362,9 +362,9 @@ const TestXCtx = struct {
         const self: *TestXCtx = @ptrCast(@alignCast(ctx));
         self.bridge.fanoutNativeToWebrtc(datagram, ctx, sendVia);
     }
-    fn sendVia(ctx: *anyopaque, dest: TransportAddress, bytes: []const u8) void {
+    fn sendVia(ctx: *anyopaque, target: *const media_bridge.Member, bytes: []const u8) void {
         const self: *TestXCtx = @ptrCast(@alignCast(ctx));
-        self.sock.sendTo(dest, bytes);
+        self.sock.sendTo(target.addr, bytes);
     }
 };
 
