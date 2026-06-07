@@ -714,6 +714,9 @@ pub const Config = struct {
     reg_timeout_penalty: f64 = 50.0,
     /// IP-reputation penalty added when accept is refused by the clone limiter.
     clone_refuse_penalty: f64 = 25.0,
+    /// Multi-session/bouncer registry sizing.
+    session_max_accounts: u64 = 65536,
+    session_max_per_account: u32 = 64,
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
     /// take on the account store's I/O lifecycle: a caller that has a store wires
@@ -1022,7 +1025,10 @@ pub const LinuxServer = struct {
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .snowflake = snowflake_id.Generator.init(.{ .node_id = @intCast(config.node_id & snowflake_id.NODE_MASK) }) catch unreachable,
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
-            .sessions = sessions_mod.SessionStore.init(allocator),
+            .sessions = sessions_mod.SessionStore.initWithConfig(allocator, .{
+                .max_accounts = @intCast(config.session_max_accounts),
+                .max_sessions_per_account = config.session_max_per_account,
+            }),
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
             .media_rooms = media_room.MediaRooms.init(allocator),
             .tegami = tegami_mod.TegamiBox.init(allocator),

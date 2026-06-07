@@ -33,6 +33,7 @@ pub const Config = struct {
     limits: Limits = .{},
     io: Io = .{},
     reputation: Reputation = .{},
+    sessions: Sessions = .{},
     media: Media = .{},
     sasl: Sasl = .{},
     cloak: Cloak = .{},
@@ -89,6 +90,12 @@ pub const Config = struct {
     pub const Reputation = struct {
         registration_timeout_penalty: f64 = 50.0,
         clone_refuse_penalty: f64 = 25.0,
+    };
+
+    /// Multi-session / bouncer registry sizing.
+    pub const Sessions = struct {
+        max_accounts: u64 = 65536,
+        max_per_account: u32 = 64,
     };
 
     pub const Media = struct {
@@ -189,6 +196,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [reputation]
     cfg.reputation.registration_timeout_penalty = try floatField(doc, "reputation.registration_timeout_penalty", cfg.reputation.registration_timeout_penalty, 0, 1000);
     cfg.reputation.clone_refuse_penalty = try floatField(doc, "reputation.clone_refuse_penalty", cfg.reputation.clone_refuse_penalty, 0, 1000);
+
+    // [sessions]
+    cfg.sessions.max_accounts = try uintField(doc, "sessions.max_accounts", cfg.sessions.max_accounts, 1, std.math.maxInt(u32));
+    cfg.sessions.max_per_account = @intCast(try uintField(doc, "sessions.max_per_account", cfg.sessions.max_per_account, 1, 1_000_000));
 
     // [media]
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;

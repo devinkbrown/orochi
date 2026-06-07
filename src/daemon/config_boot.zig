@@ -32,6 +32,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.ring_entries = @intCast(cfg.io.ring_entries);
     out.reg_timeout_penalty = cfg.reputation.registration_timeout_penalty;
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
+    out.session_max_accounts = cfg.sessions.max_accounts;
+    out.session_max_per_account = cfg.sessions.max_per_account;
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     return out;
 }
