@@ -14,6 +14,7 @@
 //! so a binding is demultiplexed back to a participant by its server ufrag.
 const std = @import("std");
 const ice = @import("../proto/ice.zig");
+const stun = @import("../proto/stun.zig");
 
 pub const ufrag_len: usize = 8;
 pub const pwd_len: usize = 24;
@@ -158,6 +159,60 @@ pub const MediaTransport = struct {
         return n;
     }
 
+    /// Convert an ICE transport address into a STUN address (null if the IP
+    /// length is neither 4 nor 16 octets).
+    fn toStunAddress(a: TransportAddress) ?stun.Address {
+        return switch (a.ip_len) {
+            4 => .{ .ipv4 = .{ .ip = a.ip[0..4].*, .port = a.port } },
+            16 => .{ .ipv6 = .{ .ip = a.ip[0..16].*, .port = a.port } },
+            else => null,
+        };
+    }
+
+    /// Process an inbound STUN binding request that arrived from `source` on the
+    /// media socket. The request is demultiplexed to a participant via the
+    /// server ufrag in its USERNAME (`<server-ufrag>:<peer-ufrag>`), its
+    /// MESSAGE-INTEGRITY is verified against that endpoint's password, and on
+    /// success the source is bound as the peer's media address and a binding
+    /// success response (XOR-MAPPED-ADDRESS = source, MESSAGE-INTEGRITY,
+    /// FINGERPRINT) is returned for the caller to send back. Returns null when
+    /// the datagram is not an authenticated binding for a known endpoint (the
+    /// caller drops it). The returned slice is owned by `allocator`.
+    pub fn handleStunBinding(
+        self: *MediaTransport,
+        allocator: std.mem.Allocator,
+        datagram: []const u8,
+        source: TransportAddress,
+    ) !?[]u8 {
+        var msg = stun.decode(allocator, datagram) catch return null;
+        defer msg.deinit(allocator);
+        if (msg.typ != .binding_request) return null;
+
+        // Pull the USERNAME and isolate the server ufrag (before the ':').
+        var username: ?[]const u8 = null;
+        for (msg.attributes) |attr| {
+            if (attr == .username) username = attr.username;
+        }
+        const user = username orelse return null;
+        const colon = std.mem.indexOfScalar(u8, user, ':') orelse user.len;
+        const server_ufrag = user[0..colon];
+
+        const ep = self.byServerUfrag(server_ufrag) orelse return null;
+        // Short-term credential check (RFC 8445 §7.3): the peer keys its request
+        // with the server's advertised password.
+        const ok = stun.verifyMessageIntegrity(datagram, ep.pwdSlice()) catch return null;
+        if (!ok) return null;
+
+        ep.remote = source; // connectivity confirmed → bind the peer address
+
+        const mapped = toStunAddress(source) orelse return null;
+        return try stun.buildBindingSuccessResponse(allocator, msg.transaction_id, .{
+            .xor_mapped_address = mapped,
+            .integrity_key = ep.pwdSlice(),
+            .fingerprint = true,
+        });
+    }
+
     /// Drop a participant's endpoint (on MEDIA LEAVE / disconnect).
     pub fn remove(self: *MediaTransport, channel: []const u8, participant: []const u8) void {
         var kb: [256]u8 = undefined;
@@ -218,6 +273,71 @@ test "forwardTargets returns other connected peers only" {
     const n = mt.forwardTargets("#c", "alice", &out);
     try testing.expectEqual(@as(usize, 2), n);
     for (out[0..n]) |addr| try testing.expect(addr.port == 5002 or addr.port == 5003);
+}
+
+test "handleStunBinding authenticates, binds the peer, and answers" {
+    var prng = std.Random.DefaultPrng.init(0xfeed);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    const ep = try mt.allocate("#c", "alice", prng.random());
+    const ufrag = ep.ufrag;
+    const pwd = ep.pwd;
+
+    // Client builds a binding request: USERNAME=<server>:<peer>, keyed by pwd.
+    var user_buf: [ufrag_len + 6]u8 = undefined;
+    const user = std.fmt.bufPrint(&user_buf, "{s}:peer", .{ufrag[0..]}) catch unreachable;
+    const tx: stun.TransactionId = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const req = try stun.buildBindingRequest(testing.allocator, tx, .{
+        .username = user,
+        .integrity_key = pwd[0..],
+        .fingerprint = true,
+    });
+    defer testing.allocator.free(req);
+
+    const src = testAddr(7, 50007);
+    const resp = (try mt.handleStunBinding(testing.allocator, req, src)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(resp);
+
+    // Peer address is now bound, and it is the SFU forward target for others.
+    try testing.expect(mt.get("#c", "alice").?.connected());
+    try testing.expectEqual(@as(u16, 50007), mt.get("#c", "alice").?.remote.?.port);
+
+    // The response is a success with a verifiable MESSAGE-INTEGRITY.
+    var decoded = try stun.decode(testing.allocator, resp);
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(stun.MessageType.binding_success_response, decoded.typ);
+    try testing.expect(try stun.verifyMessageIntegrity(resp, pwd[0..]));
+}
+
+test "handleStunBinding rejects bad integrity and unknown ufrag" {
+    var prng = std.Random.DefaultPrng.init(0xabcd);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    const ep = try mt.allocate("#c", "alice", prng.random());
+    const ufrag = ep.ufrag;
+
+    const tx: stun.TransactionId = .{ 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    var user_buf: [ufrag_len + 6]u8 = undefined;
+    const user = std.fmt.bufPrint(&user_buf, "{s}:peer", .{ufrag[0..]}) catch unreachable;
+
+    // Wrong password -> integrity fails -> dropped (null), no binding.
+    const bad = try stun.buildBindingRequest(testing.allocator, tx, .{
+        .username = user,
+        .integrity_key = "wrong-password",
+        .fingerprint = true,
+    });
+    defer testing.allocator.free(bad);
+    try testing.expect((try mt.handleStunBinding(testing.allocator, bad, testAddr(1, 1))) == null);
+    try testing.expect(!mt.get("#c", "alice").?.connected());
+
+    // Unknown ufrag -> dropped.
+    const unknown = try stun.buildBindingRequest(testing.allocator, tx, .{
+        .username = "ZZZZZZZZ:peer",
+        .integrity_key = "whatever",
+        .fingerprint = true,
+    });
+    defer testing.allocator.free(unknown);
+    try testing.expect((try mt.handleStunBinding(testing.allocator, unknown, testAddr(1, 1))) == null);
 }
 
 test "remove drops the endpoint and its ufrag index" {
