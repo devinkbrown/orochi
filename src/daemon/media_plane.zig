@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const media_transport = @import("../substrate/media_transport.zig");
 const media_socket = @import("../substrate/media_socket.zig");
+const rtp_profile = @import("../proto/rtp_profile.zig");
 
 pub const MediaTransport = media_transport.MediaTransport;
 pub const MediaSocket = media_socket.MediaSocket;
@@ -23,6 +24,13 @@ pub const any_be = media_socket.any_be;
 /// near-zero (rare allocate/remove vs. low-rate STUN handshakes), so yielding.
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.Thread.yield() catch {};
+}
+
+/// Whether byte 1 of a version-2 packet marks it as RTCP rather than RTP.
+/// RFC 5761 reserves RTP payload types 64–95 so RTCP packet types (200–204,
+/// i.e. byte 1 in 192–223) are unambiguous on a muxed RTP/RTCP socket.
+fn isRtcp(b1: u8) bool {
+    return b1 >= 192 and b1 <= 223;
 }
 
 /// Fill `buf` with OS entropy (getrandom), falling back to a constant only if
@@ -126,10 +134,18 @@ pub const MediaPlane = struct {
                     sock.sendTo(got.from, r);
                 }
             } else {
-                // RTP/RTCP: selectively forward to the other call participants.
+                // Media: require RTP/RTCP framing (version 2 in the top two bits,
+                // min header) so the port is not an open UDP reflector for
+                // arbitrary payloads. Learn the SSRC from RTP (not RTCP) packets.
+                if (got.data.len < rtp_profile.header_len or (got.data[0] & 0xC0) != 0x80) continue;
+                var ssrc: u32 = 0;
+                if (!isRtcp(got.data[1])) {
+                    if (rtp_profile.decodeHeader(got.data)) |dh| ssrc = dh.header.ssrc else |_| {}
+                }
+                // Selectively forward to the other call participants.
                 var targets: [media_transport.max_forward]TransportAddress = undefined;
                 lockSpin(&self.mutex);
-                const n = self.transport.forwardFromSource(got.from, got.data.len, &targets);
+                const n = self.transport.forwardFromSource(got.from, got.data.len, ssrc, &targets);
                 self.mutex.unlock();
                 for (targets[0..n]) |dst| sock.sendTo(dst, got.data);
             }

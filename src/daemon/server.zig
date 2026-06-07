@@ -6688,8 +6688,8 @@ pub const LinuxServer = struct {
         const n = self.media_plane.statsForChannel(channel, &buf_stats);
         for (buf_stats[0..n]) |s| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} ice={s} rx_pkts={d} rx_bytes={d}\r\n", .{
-                server_name, channel, s.name(), if (s.connected) "connected" else "pending", s.rx_packets, s.rx_bytes,
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} ice={s} ssrc={x} rx_pkts={d} rx_bytes={d}\r\n", .{
+                server_name, channel, s.name(), if (s.connected) "connected" else "pending", s.ssrc, s.rx_packets, s.rx_bytes,
             }) catch continue;
             try appendToConn(conn, line);
         }

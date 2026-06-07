@@ -251,11 +251,14 @@ pub const MediaTransport = struct {
     /// fill `out` with the bound remotes of every *other* connected participant
     /// in the same call (the SFU relay set). Returns 0 if the source is not a
     /// known bound endpoint.
-    pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, bytes_len: usize, out: []TransportAddress) usize {
+    /// `ssrc` (0 = unknown/RTCP) is learned onto the sending endpoint the first
+    /// time it is seen.
+    pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, bytes_len: usize, ssrc: u32, out: []TransportAddress) usize {
         const key = self.by_addr.get(addrKey(source)) orelse return 0;
         if (self.endpoints.getPtr(key)) |ep| {
             ep.rx_packets += 1;
             ep.rx_bytes += bytes_len;
+            if (ssrc != 0 and ep.ssrc == 0) ep.ssrc = ssrc;
         }
         const sep = std.mem.indexOfScalar(u8, key, 0) orelse return 0;
         return self.forwardTargets(key[0..sep], key[sep + 1 ..], out);
@@ -267,6 +270,7 @@ pub const MediaTransport = struct {
         name_buf: [64]u8 = undefined,
         name_len: usize = 0,
         connected: bool = false,
+        ssrc: u32 = 0,
         rx_packets: u64 = 0,
         rx_bytes: u64 = 0,
 
@@ -287,6 +291,7 @@ pub const MediaTransport = struct {
             const who = key[sep + 1 ..];
             var s = ParticipantStat{
                 .connected = entry.value_ptr.connected(),
+                .ssrc = entry.value_ptr.ssrc,
                 .rx_packets = entry.value_ptr.rx_packets,
                 .rx_bytes = entry.value_ptr.rx_bytes,
             };
@@ -442,16 +447,16 @@ test "forwardFromSource routes an RTP packet to the other peers" {
 
     // A packet from alice's bound address forwards to bob+carol, not alice.
     var out: [8]TransportAddress = undefined;
-    const n = mt.forwardFromSource(alice_addr, 100, &out);
+    const n = mt.forwardFromSource(alice_addr, 100, 0, &out);
     try testing.expectEqual(@as(usize, 2), n);
     for (out[0..n]) |a| try testing.expect(a.port == 5002 or a.port == 5003);
 
     // An unknown source routes nowhere.
-    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(testAddr(9, 9999), 100, &out));
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(testAddr(9, 9999), 100, 0, &out));
 
     // After alice leaves, her address no longer resolves.
     mt.remove("#c", "alice");
-    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, 100, &out));
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, 100, 0, &out));
 }
 
 test "remove drops the endpoint and its ufrag index" {
