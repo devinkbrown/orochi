@@ -39,7 +39,16 @@ pub fn Secret(comptime spec: anytype) type {
         }
 
         pub fn expose(self: *const Self) []const u8 {
-            return bytesView(Value, self.value);
+            // Slice self.value IN PLACE — never via a by-value helper, which would
+            // return a slice into a temporary copy (dangling after return).
+            return switch (@typeInfo(Value)) {
+                .array => self.value[0..],
+                .pointer => |ptr| if (ptr.size == .slice and ptr.child == u8)
+                    self.value
+                else
+                    @compileError("Secret pointer type must be a u8 slice"),
+                else => @compileError("Secret value must be a byte array or byte slice"),
+            };
         }
 
         pub fn declassify(self: *const Self) Value {
@@ -111,7 +120,9 @@ fn bytesView(comptime T: type, value: T) []const u8 {
 
 fn constantTimeBytesEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
-    return std.crypto.timing_safe.compare(u8, a, b, .big) == .eq;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= (x ^ y);
+    return diff == 0;
 }
 
 test "Secret constantTimeEql reports true and false" {
@@ -127,7 +138,7 @@ test "Secret constantTimeEql reports true and false" {
 test "Secret format redacts bytes" {
     const key = Secret(4).init(.{ 9, 8, 7, 6 });
     var buf: [32]u8 = undefined;
-    const out = try std.fmt.bufPrint(&buf, "{}", .{key});
+    const out = try std.fmt.bufPrint(&buf, "{f}", .{key});
 
     try std.testing.expectEqualStrings(redacted, out);
 }
@@ -169,7 +180,7 @@ test "SecretSlice format redacts bytes" {
     defer secret.deinit(allocator);
 
     var buf: [32]u8 = undefined;
-    const out = try std.fmt.bufPrint(&buf, "{}", .{secret});
+    const out = try std.fmt.bufPrint(&buf, "{f}", .{secret});
 
     try std.testing.expectEqualStrings(redacted, out);
 }
