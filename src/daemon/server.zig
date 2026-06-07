@@ -83,6 +83,7 @@ const media_room = @import("media_room.zig");
 const media_plane_mod = @import("media_plane.zig");
 const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
+const helix_live = @import("helix/live.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -766,6 +767,10 @@ pub const Config = struct {
     /// UDP port for the native media transport (our own OPVOX/OPVIS codec leg);
     /// 0 = ephemeral. Bound on boot alongside the WebRTC/UDP media plane.
     native_media_port: u16 = 0,
+    /// An already-bound+listening socket fd to ADOPT instead of binding fresh
+    /// (Helix hot-UPGRADE listener handoff: the port stays bound across execve).
+    /// null = bind a new listener normally. Linux only.
+    inherited_listener_fd: ?linux.fd_t = null,
     backlog: u31 = 128,
     ring_entries: u16 = 32,
     /// Hard cap on concurrent connections. The client table reserves this many
@@ -1078,7 +1083,12 @@ pub const LinuxServer = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !LinuxServer {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
-        const listener_fd = try createListener(config.host, config.port, config.backlog);
+        // Adopt an inherited listening socket from a Helix UPGRADE handoff if one
+        // was passed (port stays bound across execve); otherwise bind fresh.
+        const listener_fd = if (config.inherited_listener_fd) |fd| blk: {
+            std.debug.print("mizuchi: adopting inherited listener fd {d}\n", .{fd});
+            break :blk fd;
+        } else try createListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
 
         const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0)
@@ -4565,6 +4575,43 @@ pub const LinuxServer = struct {
         const note = std.fmt.bufPrint(&nbuf, "{s} requested by {s}", .{ cmd, conn.session.displayName() }) catch cmd;
         try self.publishOperEvent(.oper_action, .critical, note);
         if (self.shutdown) |flag| flag.store(false, .release);
+    }
+
+    /// `UPGRADE` — oper-only hot in-place binary upgrade (Helix). Re-execs
+    /// `/proc/self/exe --supervisor` preserving the listening socket, so the port
+    /// stays bound across the swap (no connection-refused window). Existing client
+    /// connections drop (their fds are CLOEXEC) and reconnect to the new image.
+    /// Full client/session state carry-over is a later increment.
+    pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
+        if (comptime builtin.os.tag != .linux) {
+            try self.noticeTo(conn, "UPGRADE is Linux-only");
+            return;
+        }
+        var nbuf: [128]u8 = undefined;
+        const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{conn.session.displayName()}) catch "UPGRADE";
+        try self.publishOperEvent(.oper_action, .critical, note);
+        try self.noticeTo(conn, "UPGRADE: re-exec preserving the listener; clients will reconnect");
+
+        // Preserve the listening socket across execve (clear FD_CLOEXEC).
+        _ = linux.fcntl(self.listener_fd, posix.F.SETFD, 0);
+        var plan = helix_live.buildListenerExecPlan(self.allocator, "/proc/self/exe", self.listener_fd) catch |e| {
+            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            var eb: [96]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            return;
+        };
+        defer plan.deinit(self.allocator);
+        // commit execve's the new image; on success it never returns.
+        plan.commit(self.allocator) catch |e| {
+            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            var eb: [96]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            return;
+        };
     }
 
     /// TRACE — oper-only: RPL_TRACEUSER (205) per connected client + RPL_ENDOFTRACE (262).

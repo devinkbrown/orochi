@@ -55,7 +55,14 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, first, "--supervisor")) {
             if (comptime builtin.os.tag == .linux) {
                 if (mizuchi.daemon.helix.live.resumeFromEnv()) |r| {
-                    std.debug.print("mizuchi: Helix resume (arena_fd={d}, control_fd={d})\n", .{ r.arena_fd, r.control_fd });
+                    if (r.listen_fd) |lfd| {
+                        // Adopt the inherited listening socket so the port stays
+                        // bound across the upgrade (no connection-refused window).
+                        srv_cfg.inherited_listener_fd = lfd;
+                        std.debug.print("mizuchi: Helix resume — adopting listen fd {d}\n", .{lfd});
+                    } else {
+                        std.debug.print("mizuchi: Helix resume (no listen fd; binding fresh)\n", .{});
+                    }
                 } else {
                     std.debug.print("mizuchi: --supervisor with no Helix handoff env; normal boot\n", .{});
                 }

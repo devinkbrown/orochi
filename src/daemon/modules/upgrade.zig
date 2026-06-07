@@ -53,12 +53,18 @@ fn upgrade(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
     defer prepared.deinit();
 
     var ok: [128]u8 = undefined;
-    const summary = std.fmt.bufPrint(&ok, "UPGRADE prepared: {d} capsule(s) sealed, model={s}; exec handoff staged", .{
+    const summary = std.fmt.bufPrint(&ok, "UPGRADE prepared: {d} capsule(s) sealed, model={s}; re-exec preserving listener", .{
         prepared.capsule_count,
         @tagName(prepared.model.state),
     }) catch "UPGRADE prepared";
     try core.reply(.RPL_INFO, &.{}, summary);
     try core.reply(.RPL_ENDOFINFO, &.{}, "End of UPGRADE");
+
+    // Perform the listener-preserving execve handoff: the port stays bound across
+    // the swap; clients reconnect to the new image. (Full client/session-fd
+    // carry-over via the prepared capsules is the next increment.) On success this
+    // never returns; on failure the server keeps running and reported the error.
+    try core.server.handleUpgrade(core.conn);
 }
 
 pub const module = registry.Module{

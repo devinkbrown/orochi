@@ -140,15 +140,14 @@ pub const ExecPlan = struct {
     pub fn commit(self: ExecPlan, allocator: std.mem.Allocator) anyerror!noreturn {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
-        var argv_ptrs = try allocator.alloc(?[*:0]const u8, self.argv.len + 1);
+        // execve wants null-sentinel-terminated arrays of [*:0] pointers.
+        const argv_ptrs = try allocator.allocSentinel(?[*:0]const u8, self.argv.len, null);
         defer allocator.free(argv_ptrs);
         for (self.argv, 0..) |arg, i| argv_ptrs[i] = arg.ptr;
-        argv_ptrs[self.argv.len] = null;
 
-        var envp_ptrs = try allocator.alloc(?[*:0]const u8, self.envp.len + 1);
+        const envp_ptrs = try allocator.allocSentinel(?[*:0]const u8, self.envp.len, null);
         defer allocator.free(envp_ptrs);
         for (self.envp, 0..) |entry, i| envp_ptrs[i] = entry.ptr;
-        envp_ptrs[self.envp.len] = null;
 
         const rc = linux.execve(self.argv[0].ptr, argv_ptrs.ptr, envp_ptrs.ptr);
         switch (linux.errno(rc)) {
@@ -217,11 +216,35 @@ pub fn buildExecPlanWithListener(
     return .{ .argv = argv, .envp = envp, .arena_fd = arena_fd, .control_fd = control_fd };
 }
 
+/// Build a minimal listener-only exec plan: re-exec the binary preserving just
+/// the listening socket fd (state capsules are not carried). The caller must
+/// clear `FD_CLOEXEC` on `listen_fd` before `commit` so it survives execve.
+pub fn buildListenerExecPlan(
+    allocator: std.mem.Allocator,
+    binary_path: []const u8,
+    listen_fd: handoff.Fd,
+) anyerror!ExecPlan {
+    var argv = try allocator.alloc([:0]const u8, 2);
+    errdefer allocator.free(argv);
+    argv[0] = try allocator.dupeZ(u8, binary_path);
+    errdefer allocator.free(argv[0]);
+    argv[1] = try allocator.dupeZ(u8, "--supervisor");
+    errdefer allocator.free(argv[1]);
+
+    var envp = try allocator.alloc([:0]const u8, 1);
+    errdefer allocator.free(envp);
+    envp[0] = try fdEnvEntry(allocator, env_listen_fd, listen_fd);
+    errdefer allocator.free(envp[0]);
+
+    return .{ .argv = argv, .envp = envp, .arena_fd = -1, .control_fd = -1 };
+}
+
 /// Supervisor/resume side: read inherited fds from the environment, or return
-/// null for a normal boot.
+/// null for a normal boot. Each fd is optional — a listener-only handoff carries
+/// just `listen_fd`, while a full state handoff also carries arena + control.
 pub const Resume = struct {
-    arena_fd: handoff.Fd,
-    control_fd: handoff.Fd,
+    arena_fd: ?handoff.Fd = null,
+    control_fd: ?handoff.Fd = null,
     /// The inherited listening socket, or null if the predecessor did not pass
     /// one (older handoff / listener not preserved).
     listen_fd: ?handoff.Fd = null,
@@ -244,13 +267,11 @@ pub fn resumeFromEnv() ?Resume {
         else => return null,
     }
     const env = buf[0..@as(usize, @intCast(read_len))];
-    const arena_fd = readFdFromEnvBlock(env, env_arena_fd) orelse return null;
-    const control_fd = readFdFromEnvBlock(env, env_control_fd) orelse return null;
-    return .{
-        .arena_fd = arena_fd,
-        .control_fd = control_fd,
-        .listen_fd = readFdFromEnvBlock(env, env_listen_fd), // optional
-    };
+    const arena_fd = readFdFromEnvBlock(env, env_arena_fd);
+    const control_fd = readFdFromEnvBlock(env, env_control_fd);
+    const listen_fd = readFdFromEnvBlock(env, env_listen_fd);
+    if (arena_fd == null and control_fd == null and listen_fd == null) return null;
+    return .{ .arena_fd = arena_fd, .control_fd = control_fd, .listen_fd = listen_fd };
 }
 
 fn fdEnvEntry(allocator: std.mem.Allocator, name: []const u8, fd: handoff.Fd) ![:0]u8 {
@@ -327,6 +348,39 @@ test "exec plan with listener carries the listen fd env entry" {
     try std.testing.expectEqualStrings("MIZUCHI_HELIX_ARENA_FD=10", plan.envp[0]);
     try std.testing.expectEqualStrings("MIZUCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
     try std.testing.expectEqualStrings("MIZUCHI_HELIX_LISTEN_FD=12", plan.envp[2]);
+}
+
+test "ExecPlan.commit execve's the target (fork + /bin/true)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Build a plan pointing at /bin/true so the child execs and exits 0.
+    var plan = try buildListenerExecPlan(allocator, "/bin/true", 0);
+    defer plan.deinit(allocator);
+
+    const pid_rc = linux.fork();
+    const pid: i32 = @intCast(@as(isize, @bitCast(pid_rc)));
+    if (pid == 0) {
+        // Child: commit replaces the image; if it returns, exec failed.
+        plan.commit(allocator) catch {};
+        linux.exit(127);
+    }
+    var status: u32 = 0;
+    _ = linux.wait4(pid, &status, 0, null);
+    // Exited cleanly via the execve'd /bin/true (low 7 bits 0, exit code 0),
+    // not the 127 exec-failed fallback.
+    try std.testing.expectEqual(@as(u32, 0), status & 0x7f); // WIFEXITED
+    try std.testing.expectEqual(@as(u32, 0), (status >> 8) & 0xff); // exit code
+}
+
+test "listener-only exec plan carries just the listen fd" {
+    const allocator = std.testing.allocator;
+    var plan = try buildListenerExecPlan(allocator, "/proc/self/exe", 7);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqualStrings("/proc/self/exe", plan.argv[0]);
+    try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
+    try std.testing.expectEqual(@as(usize, 1), plan.envp.len);
+    try std.testing.expectEqualStrings("MIZUCHI_HELIX_LISTEN_FD=7", plan.envp[0]);
 }
 
 test "readFdFromEnvBlock parses the listen fd, absent -> null" {
