@@ -1215,7 +1215,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
+    pub fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
         const is_s2s = event.token.slot == s2s_listener_token.slot;
         if (!event.more) {
             if (is_s2s) self.s2s_accept_armed = false else self.accept_armed = false;
@@ -1495,7 +1495,7 @@ pub const LinuxServer = struct {
 
     /// Completion for an outbound S2S connect: on success open the handshake from
     /// our side and start receiving; on failure tear the peer down.
-    fn handleConnect(self: *LinuxServer, event: ringlane.ConnectEvent) !void {
+    pub fn handleConnect(self: *LinuxServer, event: ringlane.ConnectEvent) !void {
         const conn = self.connForToken(event.token) catch return;
         if (event.res < 0) {
             try self.closeConn(event.token, "S2S connect failed");
@@ -1525,7 +1525,7 @@ pub const LinuxServer = struct {
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
     }
 
-    fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
+    pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
         conn.closing = event.res <= 0;
@@ -1553,7 +1553,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn handleSend(self: *LinuxServer, event: ringlane.SendEvent) !void {
+    pub fn handleSend(self: *LinuxServer, event: ringlane.SendEvent) !void {
         const conn = try self.connForToken(event.token);
         conn.send_armed = false;
         if (event.res < 0) {
@@ -2264,7 +2264,7 @@ pub const LinuxServer = struct {
         return null;
     }
 
-    fn handleJoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleJoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"JOIN"}, "Not enough parameters");
             return;
@@ -2381,7 +2381,7 @@ pub const LinuxServer = struct {
         self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true);
     }
 
-    fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PART"}, "Not enough parameters");
             return;
@@ -2432,7 +2432,7 @@ pub const LinuxServer = struct {
         self.announceMembership(channel, parted_nick, 0, false);
     }
 
-    fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"NAMES"}, "Not enough parameters");
             return;
@@ -2472,7 +2472,7 @@ pub const LinuxServer = struct {
     /// only) gated by tier rank, flag modes (i/m/n/t/s), and parameterised modes
     /// (+k key, +l limit, +b ban; `MODE #c b` lists bans). User-target MODE is not
     /// handled on this path.
-    fn handleMode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleMode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MODE"}, "Not enough parameters");
             return;
@@ -2827,7 +2827,7 @@ pub const LinuxServer = struct {
     /// MODE <nick> [modes] — user modes. A client may only view/change its own
     /// (ERR_USERSDONTMATCH 502 otherwise). Query form returns RPL_UMODEIS (221).
     /// Supports +i invisible and +B bot today (IRCv3 bot-mode).
-    fn handleUserMode(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
+    pub fn handleUserMode(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
         _ = self;
         if (!std.mem.eql(u8, target, conn.session.displayName())) {
             try queueNumeric(conn, .ERR_USERSDONTMATCH, &.{}, "Cannot change mode for other users");
@@ -2874,7 +2874,7 @@ pub const LinuxServer = struct {
     /// KICK <channel> <user> [:reason]. Kicker must be op-or-higher and may not
     /// kick a member who outranks them (tier rank). The target sees their own
     /// kick (broadcast before removal).
-    fn handleKick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleKick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const args = kick.parseKickArgs(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KICK"}, "Not enough parameters");
             return;
@@ -2912,7 +2912,7 @@ pub const LinuxServer = struct {
     }
 
     /// ISON <nick>... — reply RPL_ISON (303) with the subset that is online.
-    fn handleIson(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleIson(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var online_buf: [32][]const u8 = undefined;
         var count: usize = 0;
         for (parsed.paramSlice()) |nick| {
@@ -2930,7 +2930,7 @@ pub const LinuxServer = struct {
     }
 
     /// USERHOST <nick>... (up to 5) — reply RPL_USERHOST (302).
-    fn handleUserhost(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleUserhost(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var targets: [ison_userhost.USERHOST_MAX_TARGETS]ison_userhost.UserhostTarget = undefined;
         var count: usize = 0;
         for (parsed.paramSlice()) |nick| {
@@ -2949,7 +2949,7 @@ pub const LinuxServer = struct {
     /// WHO <channel|nick> — RPL_WHOREPLY (352) per match + RPL_ENDOFWHO (315).
     /// WHOX channel reply: RPL_WHOSPCRPL (354) per member with only the requested
     /// fields, then RPL_ENDOFWHO (315).
-    fn handleWhox(self: *LinuxServer, conn: *ConnState, target: []const u8, req: whox.Request) !void {
+    pub fn handleWhox(self: *LinuxServer, conn: *ConnState, target: []const u8, req: whox.Request) !void {
         const requester = conn.session.displayName();
         if (world_model.isChannelName(target) and self.world.channelExists(target)) {
             var it = self.world.memberIterator(target) orelse return;
@@ -2991,7 +2991,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, "\r\n");
     }
 
-    fn handleWho(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleWho(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHO"}, "Not enough parameters");
             return;
@@ -3060,7 +3060,7 @@ pub const LinuxServer = struct {
 
     /// LIST [<filters>] — RPL_LISTSTART/RPL_LIST/RPL_LISTEND. Secret (+s)
     /// channels are hidden. Filters that fail to parse fall back to listing all.
-    fn handleList(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleList(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const request = list.parseList(parsed.paramSlice()) catch list.Request{};
         // ELIST extended filters (>N/<N/C/T/mask); empty set matches everything.
         var filters = elist.parseParams(self.allocator, parsed.paramSlice()) catch elist.FilterSet{};
@@ -3086,7 +3086,7 @@ pub const LinuxServer = struct {
     /// LISTX [<filter>] — IRCX extended channel list (811/812/817). Filter terms
     /// (member-count, name/topic/subject mask, registered) per draft; time-based
     /// terms degrade gracefully (no creation/topic timestamps tracked yet).
-    fn handleListx(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleListx(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const request = listx.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LISTX"}, "Invalid LISTX filter");
             return;
@@ -3113,7 +3113,7 @@ pub const LinuxServer = struct {
     }
 
     /// WHOIS [server] <nick> — full WHOIS sequence for a local user.
-    fn handleWhois(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleWhois(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHOIS"}, "Not enough parameters");
             return;
@@ -3172,7 +3172,7 @@ pub const LinuxServer = struct {
 
     /// INVITE <nick> <channel> — invite a user; +i channels require op (no +g
     /// free-invite mode yet). RPL_INVITING to inviter + INVITE line to target.
-    fn handleInvite(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleInvite(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const args = invite.parseInviteArgs(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"INVITE"}, "Not enough parameters");
             return;
@@ -3242,7 +3242,7 @@ pub const LinuxServer = struct {
     /// `UNREJECT <ip>` (oper) — forget an IP's accumulated reputation penalty so
     /// a falsely-flagged host can reconnect immediately. No-op (but reported) if
     /// reputation is disabled or the IP carries no penalty.
-    fn handleUnreject(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleUnreject(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -3266,7 +3266,7 @@ pub const LinuxServer = struct {
     /// `DRAIN [OFF]` (oper) — toggle drain mode. With no arg (or `ON`) the server
     /// refuses new client connections; `DRAIN OFF` resumes accepting. Existing
     /// clients and S2S links are never affected.
-    fn handleDrain(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleDrain(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -3279,7 +3279,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
-    fn handleClose(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleClose(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -3302,7 +3302,7 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
-    fn handleKill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleKill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -3345,7 +3345,7 @@ pub const LinuxServer = struct {
 
     /// WHOWAS <nick> [count] — historical identities from the ring, most-recent
     /// first (314 + 312 signoff, 406 if none, 369 end).
-    fn handleWhowas(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleWhowas(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHOWAS"}, "Not enough parameters");
             return;
@@ -3376,7 +3376,7 @@ pub const LinuxServer = struct {
     /// KNOCK <channel> [:reason] — ask for an invite to a +i channel. Channel
     /// ops get RPL_KNOCK (710); the knocker gets RPL_KNOCKDLVR (711). Refused if
     /// the channel is open (713) or the knocker is already a member (714).
-    fn handleKnock(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleKnock(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KNOCK"}, "Not enough parameters");
             return;
@@ -3419,7 +3419,7 @@ pub const LinuxServer = struct {
 
     /// MONITOR +/-/C/L/S — IRCv3 contact notification. Targets' online/offline
     /// transitions are reported (730/731); L lists (732/733), S reports status.
-    fn handleMonitor(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleMonitor(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var replies_buf: [64]monitor.MonitorReply = undefined;
         var storage: [default_reply_bytes]u8 = undefined;
         var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
@@ -3464,7 +3464,7 @@ pub const LinuxServer = struct {
 
     /// STATS <letter> — server statistics. Supports u (uptime, 242) and o (oper
     /// blocks, 243). All queries terminate with RPL_ENDOFSTATS (219).
-    fn handleStats(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleStats(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"STATS"}, "Not enough parameters");
             return;
@@ -3512,7 +3512,7 @@ pub const LinuxServer = struct {
     /// MARKREAD <target> [timestamp=…] — IRCv3 read-marker. GET returns the
     /// stored marker (or `*`); SET advances it (monotonic) and echoes it back.
     /// Keyed by the client's account when logged in, else its nick.
-    fn handleMarkread(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleMarkread(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const owner = conn.session.account() orelse conn.session.displayName();
         const req = read_marker_store.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MARKREAD"}, "Invalid MARKREAD parameters");
@@ -3542,7 +3542,7 @@ pub const LinuxServer = struct {
     /// SILENCE [+mask|-mask ...] — server-side ignore list. With no args (or a
     /// query) it lists the caller's masks (RPL_SILELIST 271 / 272). Add/remove
     /// ops are applied and echoed. Keyed by the caller's nick.
-    fn handleSilence(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleSilence(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const owner = conn.session.displayName();
         if (parsed.param_count == 0) {
             var lbuf: [default_reply_bytes]u8 = undefined;
@@ -3639,7 +3639,7 @@ pub const LinuxServer = struct {
     /// CHATHISTORY <sub> <target> <criteria...> <limit> — IRCv3 history replay.
     /// Supports LATEST and BEFORE/AFTER with timestamp selectors over the Lotus
     /// ring; emits a `chathistory` BATCH of PRIVMSG lines (msgid+server-time).
-    fn handleChathistory(self: *LinuxServer, conn: *ConnState, line: []const u8) !void {
+    pub fn handleChathistory(self: *LinuxServer, conn: *ConnState, line: []const u8) !void {
         const trimmed = std.mem.trimEnd(u8, line, "\r\n");
         const req = chathistory_cmd.parse(trimmed) catch return; // malformed: silent (FAIL TODO)
         var buf: [64]lotus.Message = undefined;
@@ -3685,7 +3685,7 @@ pub const LinuxServer = struct {
 
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
     /// ERR_NOOPERMOTD if unset). `OPERMOTD SET :<text>` (oper-only) replaces it.
-    fn handleOperMotd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleOperMotd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -3717,7 +3717,7 @@ pub const LinuxServer = struct {
 
     /// `AUTOJOIN <ADD|DEL|LIST> [#channel]` — manage the caller's per-account
     /// auto-join list (applied automatically on each login). Requires login.
-    fn handleAutojoin(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleAutojoin(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse {
             try self.failReply(conn, "AUTOJOIN", "ACCOUNT_REQUIRED", "Log in to manage autojoin");
             return;
@@ -3758,7 +3758,7 @@ pub const LinuxServer = struct {
     /// `GROUP <ADD|DEL|LIST|PRIMARY> [nick]` — group multiple nicks under the
     /// caller's account, with a primary. Backed by memo_group.NickGroup. Requires
     /// login. (Distinct from single-nick reservation in reserved_nick.)
-    fn handleGroup(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleGroup(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse {
             try self.failReply(conn, "GROUP", "ACCOUNT_REQUIRED", "Log in to manage your nick group");
             return;
@@ -3807,7 +3807,7 @@ pub const LinuxServer = struct {
 
     /// `VERIFY <code>` — confirm a pending account email verification issued at
     /// REGISTER time. Backed by account_verify.
-    fn handleVerify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleVerify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse {
             try self.failReply(conn, "VERIFY", "ACCOUNT_REQUIRED", "Log in before verifying");
             return;
@@ -3828,7 +3828,7 @@ pub const LinuxServer = struct {
 
     /// `WELCOME <ADD :line | CLEAR | SHOW>` — oper-managed network onboarding
     /// pack delivered once per account on first login (backed by welcome_pack).
-    fn handleWelcome(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleWelcome(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const p = parsed.paramSlice();
         if (p.len == 0 or std.ascii.eqlIgnoreCase(p[0], "SHOW")) {
             for (self.welcome.lines()) |l| {
@@ -3889,7 +3889,7 @@ pub const LinuxServer = struct {
     /// `SHUN <mask> [secs] [:reason]` / `UNSHUN <mask>` — oper network mute.
     /// A shunned (non-oper) sender stays connected but their PRIVMSG/NOTICE are
     /// silently dropped. Bare `SHUN` lists active shuns.
-    fn handleShun(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, adding: bool) !void {
+    pub fn handleShun(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, adding: bool) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -3946,7 +3946,7 @@ pub const LinuxServer = struct {
 
     /// `GLOBAL [<mask>|#chan] :<text>` — oper broadcast to all users (or a
     /// hostmask/channel audience). Delivered as a server NOTICE.
-    fn handleGlobal(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleGlobal(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         _ = id;
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
@@ -3988,7 +3988,7 @@ pub const LinuxServer = struct {
     ///   DEL  <match> <pattern>
     ///   LIST [match]
     ///   TEST <match> <value>
-    fn handleWard(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleWard(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -4101,7 +4101,7 @@ pub const LinuxServer = struct {
 
     /// ACCEPT [+nick|-nick|*|...] — caller-id (+g) allow list. Bare/`*` lists
     /// (RPL_ACCEPTLIST 281 / RPL_ENDOFACCEPT 282); +/- add/remove. Keyed by nick.
-    fn handleAcceptCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleAcceptCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const owner = conn.session.displayName();
         if (parsed.param_count == 0) {
             try self.sendAcceptList(conn, owner);
@@ -4128,7 +4128,7 @@ pub const LinuxServer = struct {
     }
 
     /// USERIP <nick>... — like USERHOST but shows IP (340).
-    fn handleUserip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleUserip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"USERIP"}, "Not enough parameters");
             return;
@@ -4156,7 +4156,7 @@ pub const LinuxServer = struct {
 
     /// DIE / RESTART — oper-only server shutdown. Clears the reactor run flag so
     /// runThreaded exits after the current iteration.
-    fn handleDie(self: *LinuxServer, conn: *ConnState, cmd: []const u8) !void {
+    pub fn handleDie(self: *LinuxServer, conn: *ConnState, cmd: []const u8) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -4168,7 +4168,7 @@ pub const LinuxServer = struct {
     }
 
     /// TRACE — oper-only: RPL_TRACEUSER (205) per connected client + RPL_ENDOFTRACE (262).
-    fn handleTrace(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleTrace(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -4188,7 +4188,7 @@ pub const LinuxServer = struct {
     /// `ETRACE` (oper) — extended TRACE: one RPL_ETRACE (709) line per local
     /// registered user with class, nick, user, visible+real host, account, and
     /// real name; terminated by RPL_TRACEEND (262). Read-only.
-    fn handleEtrace(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleEtrace(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -4228,7 +4228,7 @@ pub const LinuxServer = struct {
     /// CONNECT <host> <port> — oper command: open an outbound server-to-server
     /// link to a peer. Creates a socket, stands up the outbound-side S2sLink, and
     /// submits an async io_uring connect; the handshake opens on connect completion.
-    fn handleConnectCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleConnectCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; CONNECT is for operators");
             return;
@@ -4296,7 +4296,7 @@ pub const LinuxServer = struct {
 
     /// SQUIT <server> [:reason] — oper command: tear down the S2S link to a peer
     /// identified by its (handshake-learned) server name.
-    fn handleSquit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleSquit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; SQUIT is for operators");
             return;
@@ -4341,7 +4341,7 @@ pub const LinuxServer = struct {
 
     /// DEBUG — oper command: dump the flight recorder (last N structured events)
     /// to the operator as notices. The "heavy debugging" entry point.
-    fn handleDebug(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleDebug(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; DEBUG is for operators");
             return;
@@ -4358,7 +4358,7 @@ pub const LinuxServer = struct {
 
     /// TESTLINE <mask> — oper tool: report the first K/D-line whose mask matches
     /// `mask` (RPL_TESTLINE 725) or RPL_NOTESTLINE 726 if none.
-    fn handleTestline(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleTestline(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
             return;
@@ -4380,7 +4380,7 @@ pub const LinuxServer = struct {
 
     /// TESTMASK <mask> — oper tool: count connected clients whose nick!user@host
     /// matches `mask` (RPL_TESTMASK 727).
-    fn handleTestmask(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleTestmask(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
             return;
@@ -4408,7 +4408,7 @@ pub const LinuxServer = struct {
     /// named modes (AUTHONLY/OWNER/…) to mode letters and delegates to the regular
     /// MODE engine (which gates + broadcasts). A bare MODEX queries active modes
     /// (RPL_MODEXLIST 820 + RPL_MODEXEND 821).
-    fn handleModex(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleModex(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var changes_buf: [ircx_modex.DEFAULT_MAX_CHANGES]ircx_modex.ModeChange = undefined;
         const req = ircx_modex.parseParams(parsed.paramSlice(), &changes_buf) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MODEX"}, "Invalid MODEX");
@@ -4482,7 +4482,7 @@ pub const LinuxServer = struct {
     /// CategoryMask that WALLOPS/KILL/oper-action publish through). Parsed
     /// daemon-native against the real event_spine (the ircx_event_cmd builder
     /// carries its own proto-local mask facade that can't see daemon types).
-    fn handleEvent(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleEvent(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT is for operators");
             return;
@@ -4581,7 +4581,7 @@ pub const LinuxServer = struct {
 
     /// `EVENT OBSERVE <mask> [actions…] | OFF | LIST` — manage the caller's
     /// observation subscription. Oper-gated by the EVENT command itself.
-    fn handleObserve(self: *LinuxServer, conn: *ConnState, params: []const []const u8) !void {
+    pub fn handleObserve(self: *LinuxServer, conn: *ConnState, params: []const []const u8) !void {
         const key = observeKey(conn);
         if (params.len < 2 or params[1].len == 0 or std.ascii.eqlIgnoreCase(params[1], "LIST")) {
             if (self.observe.get(key)) |f| {
@@ -4647,7 +4647,7 @@ pub const LinuxServer = struct {
     /// IRCX per-channel access list (OWNER/HOST/VOICE/GRANT/DENY). Replies are
     /// RPL_ACCESS{ADD 801,DELETE 802,START 803,ENTRY 804,END 805}. All operations
     /// require channel-operator (or oper).
-    fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const req = ircx_access_store.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCESS"}, "Invalid ACCESS");
             return;
@@ -4837,7 +4837,7 @@ pub const LinuxServer = struct {
     /// One param lists all; two gets keys; three sets (empty trailing deletes).
     /// Replies are RPL_PROPLIST 818 + RPL_PROPEND 819. Writes are gated by
     /// channel-operator (channel/member entities) or self (user entities).
-    fn handleProp(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleProp(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         // This parser folds the trailing param in without a flag; treating a 3rd
         // param as "trailing present" lets parseParamsBounded map an empty value
         // (`PROP e k :`) to delete and a non-empty value to set — both correct.
@@ -4921,7 +4921,7 @@ pub const LinuxServer = struct {
     /// enables IRCX mode for the session; `ISIRCX` only queries. Both reply with
     /// RPL_IRCX (800): `<state> <version> <package-list> <maxmsg> <option-list>`.
     /// Mizuchi advertises its SASL mechanisms as the package list.
-    fn handleIrcx(self: *LinuxServer, conn: *ConnState, enable: bool) !void {
+    pub fn handleIrcx(self: *LinuxServer, conn: *ConnState, enable: bool) !void {
         _ = self;
         if (enable) conn.ircx = true;
         const state: []const u8 = if (conn.ircx) "1" else "0";
@@ -4944,7 +4944,7 @@ pub const LinuxServer = struct {
     /// operator, OWN/HST need channel owner/host on a channel target. Relays
     /// `:sender <CMD> <target> <tag> :<message>` to the target (a nick, or all
     /// members of a channel).
-    fn handleData(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleData(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (conn.gagged) return;
         if (parsed.param_count < 3) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, "Not enough parameters");
@@ -4999,7 +4999,7 @@ pub const LinuxServer = struct {
     /// message. The sender must be on the channel; each recipient is delivered a
     /// `:sender WHISPER <channel> <nick> :<text>` line only if also on the channel
     /// (ERR_NOSUCHNICK 401 / ERR_NOTONCHANNEL 442 per failing recipient).
-    fn handleWhisper(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleWhisper(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var recipient_storage: [whisper.DEFAULT_MAX_RECIPIENTS][]const u8 = undefined;
         const args = whisper.parseWhisperArgs(parsed.paramSlice(), &recipient_storage) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHISPER"}, "Not enough parameters");
@@ -5043,7 +5043,7 @@ pub const LinuxServer = struct {
 
     /// CREATE <channel> [modes] — IRCX channel creation (create-or-join as
     /// founder). Delegates to the JOIN path after parsing the IRCX form.
-    fn handleCreate(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleCreate(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const req = ircx_create_cmd.parseParams(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CREATE"}, "Invalid CREATE");
             return;
@@ -5098,7 +5098,7 @@ pub const LinuxServer = struct {
 
     /// METADATA <target> <GET|LIST|SET|CLEAR> [key [:value]] — IRCv3 metadata-2.
     /// Per-target key/value store; RPL_KEYVALUE (761) + RPL_METADATAEND (762).
-    fn handleMetadata(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleMetadata(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"METADATA"}, "Not enough parameters");
             return;
@@ -5155,7 +5155,7 @@ pub const LinuxServer = struct {
     /// REDACT <channel> <msgid> [:reason] — IRCv3 message-redaction. Tombstones
     /// the message in the CHATHISTORY ring (filtered from future replay) and
     /// broadcasts the redaction to the channel. Requires channel-operator.
-    fn handleRedact(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleRedact(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"REDACT"}, "Not enough parameters");
             return;
@@ -5184,7 +5184,7 @@ pub const LinuxServer = struct {
 
     /// HELP / HELPOP [topic] — static help topics (704/705/706, 524 if unknown).
     /// Defaults to the HELP index topic when no argument is given.
-    fn handleHelp(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleHelp(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const topic = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
             parsed.paramSlice()[0]
         else
@@ -5284,7 +5284,7 @@ pub const LinuxServer = struct {
     /// `:old!u@h NICK :new` to the client and every common-channel member.
     /// MONITOR watchers see old offline / new online; the old identity is
     /// recorded in WHOWAS.
-    fn handleNickChange(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleNickChange(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NONICKNAMEGIVEN, &.{}, "No nickname given");
             return;
@@ -5372,7 +5372,7 @@ pub const LinuxServer = struct {
     /// message (RPL_NOWAWAY 306); a bare AWAY clears it (RPL_UNAWAY 305). When
     /// the away-notify cap is negotiated by peers, an `AWAY` state change is
     /// announced to all common-channel members.
-    fn handleAway(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleAway(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const reason: ?[]const u8 = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
             parsed.paramSlice()[0]
         else
@@ -5399,7 +5399,7 @@ pub const LinuxServer = struct {
 
     /// SETNAME :<realname> — IRCv3 setname. Updates the GECOS and echoes the
     /// change to the client and to setname-capable common-channel members.
-    fn handleSetname(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleSetname(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SETNAME"}, "Not enough parameters");
             return;
@@ -5421,7 +5421,7 @@ pub const LinuxServer = struct {
     /// OPER <name> <password> — elevate to IRC operator. Matches against the
     /// single configured oper block; success sets the session oper flag, emits
     /// RPL_YOUREOPER (381) and the +o umode reflection.
-    fn handleOper(self: *LinuxServer, conn: *ConnState, _: *const irc_line.LineView) !void {
+    pub fn handleOper(self: *LinuxServer, conn: *ConnState, _: *const irc_line.LineView) !void {
         // OPER is disabled: Mizuchi grants operator status SASL-only. A client is
         // elevated automatically on SASL login when its account has an `[oper]`
         // binding (see elevateOperFromAccount). There is no password credential.
@@ -5482,7 +5482,7 @@ pub const LinuxServer = struct {
     /// `REGISTER <account> <email|*> <password>` (IRCv3 draft/account-registration).
     /// Immediate registration (no email verification step yet); logs the client in
     /// and applies oper elevation if the account is bound in the registry.
-    fn handleRegister(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleRegister(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Account registration is unavailable");
         if (parsed.param_count < 3) {
             try self.failReply(conn, "REGISTER", "NEED_MORE_PARAMS", "Usage: REGISTER <account> <email|*> <password>");
@@ -5522,7 +5522,7 @@ pub const LinuxServer = struct {
     }
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
-    fn handleIdentify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleIdentify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"IDENTIFY"}, "Usage: IDENTIFY <account> <password>");
@@ -5546,7 +5546,7 @@ pub const LinuxServer = struct {
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).
-    fn handleLogout(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+    pub fn handleLogout(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
         // Drop this connection's live session before clearing the account binding
         // (the session is keyed by account; logout fully ends it, no reclaim).
         if (conn.session.account()) |acct| _ = self.sessions.remove(acct, monitorIdFromClient(id));
@@ -5560,7 +5560,7 @@ pub const LinuxServer = struct {
     }
 
     /// `DROP <account> <password>` — delete an account (requires its password).
-    fn handleDrop(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleDrop(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "DROP", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"DROP"}, "Usage: DROP <account> <password>");
@@ -5577,7 +5577,7 @@ pub const LinuxServer = struct {
     }
 
     /// `ACCOUNTINFO [account]` — report account name + flags (self if omitted).
-    fn handleAccountInfo(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleAccountInfo(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "ACCOUNTINFO", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const target = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
             parsed.paramSlice()[0]
@@ -5598,7 +5598,7 @@ pub const LinuxServer = struct {
 
     /// `SASLINFO` — report the SASL mechanisms this server accepts and the
     /// caller's current authentication state. Read-only; available to anyone.
-    fn handleSaslInfo(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleSaslInfo(self: *LinuxServer, conn: *ConnState) !void {
         const mechs = if (self.config.sasl_checker != null) "PLAIN" else "(none configured)";
         var buf: [default_reply_bytes]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :SASL mechanisms: {s}\r\n", .{ server_name, conn.session.displayName(), mechs }) catch return;
@@ -5613,7 +5613,7 @@ pub const LinuxServer = struct {
 
     /// `ACCOUNTSET <account> <password> <field> <value>` — update an account
     /// setting (field = `email` or `flags`). Backed by services.setAccount.
-    fn handleAccountSet(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleAccountSet(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "ACCOUNTSET", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count < 4) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCOUNTSET"}, "Usage: ACCOUNTSET <account> <password> <email|flags> <value>");
@@ -5646,7 +5646,7 @@ pub const LinuxServer = struct {
     /// `GHOST <nick> <password>` — disconnect a stale session occupying a nick
     /// that belongs to the caller's account (password-verified). The victim is
     /// torn down via the standard drain-close path.
-    fn handleGhost(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleGhost(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "GHOST", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"GHOST"}, "Usage: GHOST <nick> <password>");
@@ -5689,7 +5689,7 @@ pub const LinuxServer = struct {
     /// `services.zig`; REGISTER/DROP additionally reflect into the live `+r`
     /// REGISTERED flag via the installed state hook. Founder/actor identity is the
     /// caller's logged-in account.
-    fn handleChannel(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleChannel(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "CHANNEL", "TEMPORARILY_UNAVAILABLE", "Channel services are unavailable");
         if (parsed.param_count < 1) {
             try self.failReply(conn, "CHANNEL", "NEED_MORE_PARAMS", "Usage: CHANNEL <REGISTER|DROP|INFO|ACCESS|AKICK|SET|TRANSFER> <#channel> …");
@@ -5813,7 +5813,7 @@ pub const LinuxServer = struct {
 
     /// `SESSION [LIST|TOKEN]` — list the account's live sessions, or reveal this
     /// session's reclaim token (to the owning session only).
-    fn handleSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse {
             try self.noticeTo(conn, "SESSION: you are not logged in to an account");
             return;
@@ -5853,7 +5853,7 @@ pub const LinuxServer = struct {
     /// caller's own account by its reclaim token. The detached ghost is consumed
     /// (removed) and the caller's live session continues in its place. Bouncer
     /// replay of buffered traffic is layered on top in a later step.
-    fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
+    pub fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
         const cid = monitorIdFromClient(id);
         const params = parsed.paramSlice();
         if (params.len < 2 or params[1].len != 2 * @sizeOf(sessions_mod.Token)) {
@@ -5883,7 +5883,7 @@ pub const LinuxServer = struct {
     /// SEND stores a message for an account (delivered when it next logs in);
     /// LIST shows the caller's own pending mail; CLEAR discards it. SEND requires
     /// the sender to be logged in (so recipients can see who wrote).
-    fn handleTegami(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleTegami(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
         const me = conn.session.account();
 
@@ -5969,7 +5969,7 @@ pub const LinuxServer = struct {
     /// broadcasts room presence to channel members as `NOTE MEDIA` events so
     /// clients can render the call. The media bytes flow over the transport
     /// substrate, not this control socket. Caller must be a channel member.
-    fn handleMedia(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleMedia(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind]");
             return;
@@ -6202,7 +6202,7 @@ pub const LinuxServer = struct {
     /// `FILTER ADD|DEL|LIST [pattern]` — oper-only Koshi content-filter control.
     /// ADD/DEL manage case-insensitive substring patterns; LIST reports them.
     /// Matching messages from non-opers are blocked in the message path.
-    fn handleFilter(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleFilter(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -6249,7 +6249,7 @@ pub const LinuxServer = struct {
     /// `PRIVS` — report the caller's operator class and privilege set
     /// (RPL_PRIVS 270). Re-derived from the oper registry by account, so it
     /// always reflects the current config binding.
-    fn handlePrivs(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handlePrivs(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -6283,7 +6283,7 @@ pub const LinuxServer = struct {
     /// `VHOST <newhost>` — oper-only visible-host override. Updates the caller's
     /// visible host and broadcasts a native CHGHOST to common-channel members who
     /// negotiated the chghost cap (others see the new host on the next message).
-    fn handleVhost(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleVhost(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             return self.vhostList(id, conn); // bare VHOST shows the wardrobe
         }
@@ -6350,7 +6350,7 @@ pub const LinuxServer = struct {
 
     /// `VHOST REQUEST <host>` — a logged-in user asks for a vhost; queued for oper
     /// review. No effect until an oper APPROVEs.
-    fn handleVhostRequest(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
+    pub fn handleVhostRequest(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
         const account = conn.session.account() orelse {
             try self.failReply(conn, "VHOST", "ACCOUNT_REQUIRED", "Log in before requesting a vhost");
             return;
@@ -6372,7 +6372,7 @@ pub const LinuxServer = struct {
     }
 
     /// `VHOST LIST|APPROVE <account>|DENY <account> [:reason]` — oper review side.
-    fn handleVhostReview(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
+    pub fn handleVhostReview(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
         _ = id;
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
@@ -6441,7 +6441,7 @@ pub const LinuxServer = struct {
     }
 
     /// `VHOST USE <name>` — instantly wear one of your granted personas.
-    fn handleVhostUse(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
+    pub fn handleVhostUse(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
         const account = conn.session.account() orelse return self.failReply(conn, "VHOST", "ACCOUNT_REQUIRED", "Log in to use personas");
         if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST USE <name>");
         const persona = self.guises.find(account, p[1]) orelse return self.noticeTo(conn, "VHOST: no such persona (try VHOST LIST)");
@@ -6449,7 +6449,7 @@ pub const LinuxServer = struct {
     }
 
     /// `VHOST OFF` — drop the active vhost, restoring the connection's host.
-    fn handleVhostOff(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+    pub fn handleVhostOff(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
         var hb: [128]u8 = undefined;
         const real = conn.session.realHost();
         const host = std.fmt.bufPrint(&hb, "{s}", .{real}) catch return;
@@ -6458,7 +6458,7 @@ pub const LinuxServer = struct {
 
     /// `VHOST CLAIM <host>` — self-service a host matching an operator offer
     /// template; it becomes a `.claimed` persona and is worn immediately.
-    fn handleVhostClaim(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
+    pub fn handleVhostClaim(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, p: []const []const u8) !void {
         const account = conn.session.account() orelse return self.failReply(conn, "VHOST", "ACCOUNT_REQUIRED", "Log in to claim a vhost");
         if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST CLAIM <host>");
         const host = p[1];
@@ -6468,7 +6468,7 @@ pub const LinuxServer = struct {
     }
 
     /// `VHOST OFFERLIST` — show offer templates (any user).
-    fn handleVhostOfferList(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleVhostOfferList(self: *LinuxServer, conn: *ConnState) !void {
         for (self.guises.offerList()) |o| {
             var b: [default_reply_bytes]u8 = undefined;
             const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST offer {s} :{s}\r\n", .{ server_name, conn.session.displayName(), o.template, o.label }) catch continue;
@@ -6478,7 +6478,7 @@ pub const LinuxServer = struct {
     }
 
     /// `VHOST OFFER <template> [:label]` — oper publishes a claimable template.
-    fn handleVhostOffer(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
+    pub fn handleVhostOffer(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
         if (!conn.session.isOper()) return queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
         if (p.len < 2 or p[1].len == 0) return self.noticeTo(conn, "Usage: VHOST OFFER <template> [:label]");
         const label = if (p.len >= 3) p[2] else "vhost offer";
@@ -6491,7 +6491,7 @@ pub const LinuxServer = struct {
     /// `VHOST SET <account> <host> [name]` — oper assigns a fully custom vhost to
     /// an account as a `.granted` persona, applied live. The robust escape hatch
     /// for hosts no offer template covers.
-    fn handleVhostSet(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
+    pub fn handleVhostSet(self: *LinuxServer, conn: *ConnState, p: []const []const u8) !void {
         if (!conn.session.isOper()) return queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
         if (p.len < 3 or p[1].len == 0 or p[2].len == 0) return self.noticeTo(conn, "Usage: VHOST SET <account> <host> [name]");
         const account = p[1];
@@ -6577,7 +6577,7 @@ pub const LinuxServer = struct {
     /// configured file and swaps in a freshly-built oper registry (account→class
     /// bindings). Existing sessions keep their current oper state; new SASL logins
     /// observe the reloaded bindings. Without a config path it acknowledges only.
-    fn handleRehash(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleRehash(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
@@ -6766,7 +6766,7 @@ pub const LinuxServer = struct {
     /// text body) to recipients that negotiated message-tags. A TAGMSG carrying
     /// no tags is a no-op. Delivered untagged-by-server (the client `@tags`
     /// segment is the whole tag set) — server-time-in-tags is a future merge.
-    fn handleTagmsg(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleTagmsg(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) return;
         const tags = parsed.tags_raw orelse return; // nothing to relay
         const target = parsed.paramSlice()[0];
@@ -6804,7 +6804,7 @@ pub const LinuxServer = struct {
 
     /// ACTIVITY SUBSCRIBE|UNSUBSCRIBE <#channel> — opt in/out of a channel's
     /// real-time activity stream (#33). A subscriber must be a channel member.
-    fn handleActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACTIVITY"}, "Not enough parameters");
             return;
@@ -6894,7 +6894,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn handleMessage(
+    pub fn handleMessage(
         self: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
@@ -7108,7 +7108,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn handleTopic(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleTopic(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TOPIC"}, "Not enough parameters");
             return;
@@ -7144,7 +7144,7 @@ pub const LinuxServer = struct {
         try self.broadcastChannel(channel, msg, null);
     }
 
-    fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const reason = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "Client quit";
         self.recordWhowas(conn); // before removeClient: snapshot the live identity
         try self.broadcastQuit(id, conn, reason);

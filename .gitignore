@@ -1,3 +1,4 @@
 .zig-cache/
 zig-out/
 announce_bot.log
+.claude/worktrees/
