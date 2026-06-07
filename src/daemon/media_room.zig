@@ -9,6 +9,7 @@
 const std = @import("std");
 const media = @import("../substrate/suimyaku/media.zig");
 const toml = @import("../proto/toml.zig");
+const sdp = @import("../proto/sdp.zig");
 
 pub const max_participants: usize = 64;
 pub const Room = media.Session(max_participants);
@@ -59,6 +60,23 @@ pub const max_breakout_bytes: usize = 32;
 /// scale/normalize). Default is the origin (centered / non-spatial).
 pub const Position = struct { x: i32 = 0, y: i32 = 0 };
 
+/// Max distinct codecs a negotiated call profile retains.
+pub const max_profile_codecs: usize = 4;
+
+/// The codec/FEC set agreed for a channel's call, established by `MEDIA OFFER`
+/// and used as the baseline a later `MEDIA ANSWER` negotiates against. Stored
+/// fully inline (all scalar fields) so no per-call heap allocation is needed.
+pub const CallProfile = struct {
+    codecs: [max_profile_codecs]sdp.Codec = undefined,
+    codec_count: u8 = 0,
+    fec: sdp.Fec = .{ .scheme = .none, .redundancy = 0 },
+
+    /// Borrowed view of the negotiated codecs.
+    pub fn slice(self: *const CallProfile) []const sdp.Codec {
+        return self.codecs[0..self.codec_count];
+    }
+};
+
 pub const MediaRooms = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -72,6 +90,10 @@ pub const MediaRooms = struct {
     positions: std.StringHashMap(Position),
     /// Raised-hand set (same composite key). Presence of the key = hand raised.
     hands: std.StringHashMap(void),
+    /// Negotiated codec/FEC profile per channel (the call's agreed media set),
+    /// keyed by an owned channel name. Established by `MEDIA OFFER`; consulted by
+    /// `MEDIA ANSWER`. Cleared when the call ends.
+    profiles: std.StringHashMap(CallProfile),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return initConfig(allocator, .{});
@@ -85,6 +107,7 @@ pub const MediaRooms = struct {
             .breakouts = std.StringHashMap([]u8).init(allocator),
             .positions = std.StringHashMap(Position).init(allocator),
             .hands = std.StringHashMap(void).init(allocator),
+            .profiles = std.StringHashMap(CallProfile).init(allocator),
         };
     }
 
@@ -107,6 +130,9 @@ pub const MediaRooms = struct {
         var hit = self.hands.keyIterator();
         while (hit.next()) |key| self.allocator.free(key.*);
         self.hands.deinit();
+        var fit = self.profiles.keyIterator();
+        while (fit.next()) |key| self.allocator.free(key.*);
+        self.profiles.deinit();
         self.* = undefined;
     }
 
@@ -212,6 +238,32 @@ pub const MediaRooms = struct {
         return self.rooms.get(channel);
     }
 
+    /// Record the call's negotiated codec/FEC set for `channel` (overwrites any
+    /// prior profile). `codecs` is copied inline (truncated to the cap).
+    pub fn setProfile(self: *MediaRooms, channel: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) Error!void {
+        var prof = CallProfile{ .fec = fec };
+        const n = @min(codecs.len, max_profile_codecs);
+        @memcpy(prof.codecs[0..n], codecs[0..n]);
+        prof.codec_count = @intCast(n);
+        const gop = try self.profiles.getOrPut(channel);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, channel) catch |e| {
+                _ = self.profiles.remove(channel);
+                return e;
+            };
+        }
+        gop.value_ptr.* = prof;
+    }
+
+    /// The negotiated profile for `channel`, or null when none has been set.
+    pub fn profileOf(self: *const MediaRooms, channel: []const u8) ?CallProfile {
+        return self.profiles.get(channel);
+    }
+
+    fn clearProfile(self: *MediaRooms, channel: []const u8) void {
+        if (self.profiles.fetchRemove(channel)) |kv| self.allocator.free(kv.key);
+    }
+
     /// Participant `pid` joins `channel`'s call publishing `kind` (creating the
     /// room on first join).
     pub fn join(self: *MediaRooms, channel: []const u8, pid: []const u8, kind: MediaKind) Error!void {
@@ -274,6 +326,7 @@ pub const MediaRooms = struct {
     fn dropRoom(self: *MediaRooms, entry: std.StringHashMap(*Room).Entry) void {
         const key = entry.key_ptr.*;
         const r = entry.value_ptr.*;
+        self.clearProfile(key);
         self.rooms.removeByPtr(entry.key_ptr);
         self.allocator.free(key);
         self.allocator.destroy(r);
@@ -297,6 +350,25 @@ test "join/roster/leave lifecycle prunes empty rooms" {
     try testing.expectEqual(@as(usize, 1), m.roster("#c").len);
     try testing.expect(m.leaveAll("#c", "bob"));
     try testing.expect(m.room("#c") == null); // pruned
+}
+
+test "call profile persists then clears when the call ends" {
+    var m = MediaRooms.init(testing.allocator);
+    defer m.deinit();
+    try testing.expect(m.profileOf("#c") == null);
+    try m.join("#c", "alice", .voice);
+    const codecs = [_]sdp.Codec{.{ .tag = .opvox, .clock_rate = 48000, .params = 0 }};
+    try m.setProfile("#c", &codecs, .{ .scheme = .rs_block, .redundancy = 1 });
+    const prof = m.profileOf("#c").?;
+    try testing.expectEqual(@as(usize, 1), prof.slice().len);
+    try testing.expectEqual(sdp.CodecTag.opvox, prof.slice()[0].tag);
+    try testing.expectEqual(sdp.FecScheme.rs_block, prof.fec.scheme);
+    // reassigning overwrites in place (no leak)
+    const codecs2 = [_]sdp.Codec{ .{ .tag = .opvox, .clock_rate = 48000, .params = 0 }, .{ .tag = .opvis, .clock_rate = 90000, .params = 0 } };
+    try m.setProfile("#c", &codecs2, .{ .scheme = .none, .redundancy = 0 });
+    try testing.expectEqual(@as(usize, 2), m.profileOf("#c").?.slice().len);
+    try testing.expect(m.leaveAll("#c", "alice"));
+    try testing.expect(m.profileOf("#c") == null); // cleared with the room
 }
 
 test "mute and speaking state track per kind" {

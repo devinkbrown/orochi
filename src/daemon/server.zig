@@ -6261,6 +6261,10 @@ pub const LinuxServer = struct {
             try self.mediaOffer(conn, channel, if (parsed.param_count >= 3) parsed.paramSlice()[2] else "");
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "ANSWER")) {
+            try self.mediaAnswer(conn, channel, if (parsed.param_count >= 3) parsed.paramSlice()[2] else "");
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "BREAKOUT")) {
             if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA BREAKOUT <#chan> <room>");
@@ -6434,16 +6438,29 @@ pub const LinuxServer = struct {
 
     /// Emit the current call roster for `channel` to the caller: one
     /// `NOTE MEDIA <#chan> ROSTER <nick> <kinds>` line per participant.
-    /// `MEDIA OFFER <#chan> <codec[,codec...]>` — negotiate the call's codec + FEC
-    /// set against the SFU's supported codecs (real sdp/media_session offer/answer)
-    /// and reply with the agreed set. The UDP transport plane (ICE/STUN/TURN/jitter)
-    /// is a separate layer; this is the live signaling/negotiation half.
-    fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8) !void {
-        var cbuf: [4]sdp.Codec = undefined;
-        var cn: usize = 0;
+    fn codecTagName(tag: sdp.CodecTag) []const u8 {
+        return switch (tag) {
+            .opvox => "opvox",
+            .opvis => "opvis",
+            .raw => "raw",
+        };
+    }
+
+    fn fecSchemeName(scheme: sdp.FecScheme) []const u8 {
+        return switch (scheme) {
+            .none => "none",
+            .rateless_lt => "rateless_lt",
+            .rs_block => "rs_block",
+        };
+    }
+
+    /// Parse a "codec[,codec...]" list into `out`, returning how many were
+    /// recognized. Unknown names are skipped; the clock rate is codec-derived.
+    fn parseCodecCsv(out: []sdp.Codec, codec_csv: []const u8) usize {
+        var n: usize = 0;
         var it = std.mem.splitScalar(u8, codec_csv, ',');
         while (it.next()) |name| {
-            if (name.len == 0) continue;
+            if (name.len == 0 or n >= out.len) continue;
             const tag: sdp.CodecTag = if (std.ascii.eqlIgnoreCase(name, "opvox"))
                 .opvox
             else if (std.ascii.eqlIgnoreCase(name, "opvis"))
@@ -6452,11 +6469,41 @@ pub const LinuxServer = struct {
                 .raw
             else
                 continue;
-            if (cn < cbuf.len) {
-                cbuf[cn] = .{ .tag = tag, .clock_rate = 48000, .params = 0 };
-                cn += 1;
-            }
+            out[n] = .{ .tag = tag, .clock_rate = if (tag == .opvis) 90000 else 48000, .params = 0 };
+            n += 1;
         }
+        return n;
+    }
+
+    /// Emit `:server NOTE MEDIA <#chan> <label> codecs=<list> fec=<scheme>`.
+    fn mediaNegotiatedReply(conn: *ConnState, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) !void {
+        var buf: [320]u8 = undefined;
+        var w = Buf{ .storage = &buf };
+        w.append(":") catch return;
+        w.append(server_name) catch return;
+        w.append(" NOTE MEDIA ") catch return;
+        w.append(channel) catch return;
+        w.appendByte(' ') catch return;
+        w.append(label) catch return;
+        w.append(" codecs=") catch return;
+        for (codecs, 0..) |c, i| {
+            if (i != 0) w.appendByte(',') catch return;
+            w.append(codecTagName(c.tag)) catch return;
+        }
+        w.append(" fec=") catch return;
+        w.append(fecSchemeName(fec.scheme)) catch return;
+        w.append("\r\n") catch return;
+        try appendToConn(conn, w.written());
+    }
+
+    /// `MEDIA OFFER <#chan> <codec[,codec...]>` — negotiate the call's codec + FEC
+    /// set against the SFU's supported codecs (real sdp/media_session offer/answer),
+    /// persist it as the channel's active call profile, and reply with the agreed
+    /// set. The UDP transport plane (ICE/STUN/TURN/jitter) is a separate layer;
+    /// this is the live signaling/negotiation half.
+    fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8) !void {
+        var cbuf: [4]sdp.Codec = undefined;
+        const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
             try self.failReply(conn, "MEDIA", "NO_CODECS", "Offer at least one codec: opvox,opvis,raw");
             return;
@@ -6476,29 +6523,37 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the SFU");
             return;
         }
-        var buf: [320]u8 = undefined;
-        var w = Buf{ .storage = &buf };
-        w.append(":") catch return;
-        w.append(server_name) catch return;
-        w.append(" NOTE MEDIA ") catch return;
-        w.append(channel) catch return;
-        w.append(" OFFER-ACK codecs=") catch return;
-        for (negotiated.codecs, 0..) |c, i| {
-            if (i != 0) w.appendByte(',') catch return;
-            w.append(switch (c.tag) {
-                .opvox => "opvox",
-                .opvis => "opvis",
-                .raw => "raw",
-            }) catch return;
+        // Persist the agreed set as the call profile a later ANSWER negotiates against.
+        self.media_rooms.setProfile(channel, negotiated.codecs, negotiated.fec) catch {};
+        try mediaNegotiatedReply(conn, channel, "OFFER-ACK", negotiated.codecs, negotiated.fec);
+    }
+
+    /// `MEDIA ANSWER <#chan> <codec[,codec...]>` — a later participant reconciles
+    /// their codec capabilities against the call's active profile (set by OFFER).
+    /// Replies with the intersection so everyone converges on a shared media set.
+    fn mediaAnswer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8) !void {
+        const prof = self.media_rooms.profileOf(channel) orelse {
+            try self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile; send MEDIA OFFER first");
+            return;
+        };
+        var cbuf: [4]sdp.Codec = undefined;
+        const cn = parseCodecCsv(&cbuf, codec_csv);
+        if (cn == 0) {
+            try self.failReply(conn, "MEDIA", "NO_CODECS", "Answer at least one codec: opvox,opvis,raw");
+            return;
         }
-        w.append(" fec=") catch return;
-        w.append(switch (negotiated.fec.scheme) {
-            .none => "none",
-            .rateless_lt => "rateless_lt",
-            .rs_block => "rs_block",
-        }) catch return;
-        w.append("\r\n") catch return;
-        try appendToConn(conn, w.written());
+        const answerer = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
+        const offered = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = prof.slice(), .fec = prof.fec, .direction = .sendrecv };
+        var negotiated = media_session.negotiate(self.allocator, offered, answerer) catch {
+            try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
+            return;
+        };
+        defer negotiated.deinit(self.allocator);
+        if (negotiated.codecs.len == 0) {
+            try self.failReply(conn, "MEDIA", "NO_COMMON_CODEC", "No codec in common with the call profile");
+            return;
+        }
+        try mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
     }
 
     fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
