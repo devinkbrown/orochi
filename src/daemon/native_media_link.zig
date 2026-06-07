@@ -142,7 +142,29 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             out: []TransportAddress,
         ) usize {
             const view = opcodec_frame.decode(datagram) catch return 0;
+            return self.forwardView(view, out);
+        }
 
+        /// Like `inbound`, but first learns the source participant's transport
+        /// address from `from` (the datagram's origin) — how the live SFU
+        /// discovers each publisher's return path on a connectionless socket.
+        pub fn inboundFrom(
+            self: *Self,
+            datagram: []const u8,
+            from: TransportAddress,
+            out: []TransportAddress,
+        ) usize {
+            const view = opcodec_frame.decode(datagram) catch return 0;
+            for (self.entries[0..self.len]) |*e| {
+                if (e.live and e.stream_id == view.stream_id) {
+                    e.addr = from;
+                    break;
+                }
+            }
+            return self.forwardView(view, out);
+        }
+
+        fn forwardView(self: *Self, view: opcodec_frame.FrameView, out: []TransportAddress) usize {
             // Identify the publishing participant by the frame's stream_id.
             var src_id: ?ParticipantId = null;
             var src_kind: MediaKind = .voice;
@@ -256,6 +278,29 @@ test "unregister removes a participant from the forward set" {
     link.unregister("b");
     try testing.expectEqual(@as(usize, 0), link.inbound(frame(1, floor, 2, false, &fbuf), &out));
     try testing.expectEqual(@as(usize, 1), link.count());
+}
+
+test "inboundFrom learns the publisher's address and still forwards to others" {
+    var link = NativeMediaLink(8).init();
+    const floor = opcodec_frame.MEDIA_BAND_FLOOR;
+    // alice registered with a placeholder address (unknown until she sends).
+    try link.register("alice", .voice, 100, mkAddr(0, 0));
+    try link.register("bob", .voice, 200, mkAddr(2, 9000));
+
+    var fbuf: [64]u8 = undefined;
+    var out: [8]TransportAddress = undefined;
+    const learned = mkAddr(7, 1234);
+    const n = link.inboundFrom(frame(100, floor, 1, false, &fbuf), learned, &out);
+
+    // forwarded to bob only (source excluded)
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(out[0].eql(mkAddr(2, 9000)));
+
+    // alice's address was learned from the datagram origin: a frame from bob
+    // now forwards back to alice's learned address.
+    const n2 = link.inboundFrom(frame(200, floor, 1, false, &fbuf), mkAddr(2, 9000), &out);
+    try testing.expectEqual(@as(usize, 1), n2);
+    try testing.expect(out[0].eql(learned));
 }
 
 test "updateAddress redirects a receiver's copies" {
