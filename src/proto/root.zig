@@ -215,6 +215,7 @@ pub const sni = @import("sni.zig");
 pub const snomask = @import("snomask.zig");
 pub const snowflake_id = @import("snowflake_id.zig");
 pub const socks5 = @import("socks5.zig");
+pub const srtp = @import("srtp.zig");
 pub const standard_replies_emit = @import("standard_replies_emit.zig");
 pub const standard_replies_props = @import("standard_replies_props.zig");
 pub const standard_replies = @import("standard_replies.zig");
@@ -491,6 +492,7 @@ test {
     _ = snomask;
     _ = snowflake_id;
     _ = socks5;
+    _ = srtp;
     _ = standard_replies_emit;
     _ = standard_replies_props;
     _ = standard_replies;
