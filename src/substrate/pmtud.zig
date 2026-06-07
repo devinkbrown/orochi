@@ -6,6 +6,7 @@
 //! `onPtbReceived`.
 
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 /// DPLPMTUD search state.
 pub const State = enum {
@@ -31,6 +32,16 @@ pub const Config = struct {
     /// controller treats the path as blackholed and falls back.
     blackhole_loss_threshold: u8 = 3,
 };
+
+/// Overlay `[transport.pmtud]` keys onto `cfg`. Absent keys are left at their
+/// current values, so the default config is behavior-preserving.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    const p = "transport.pmtud.";
+    if (doc.getUint(p ++ "base_mtu")) |v| cfg.base_mtu = @intCast(v);
+    if (doc.getUint(p ++ "max_mtu")) |v| cfg.max_mtu = @intCast(v);
+    if (doc.getUint(p ++ "min_probe_delta")) |v| cfg.min_probe_delta = @intCast(v);
+    if (doc.getUint(p ++ "blackhole_loss_threshold")) |v| cfg.blackhole_loss_threshold = @intCast(v);
+}
 
 pub const InitError = error{
     InvalidBaseMtu,
@@ -412,6 +423,34 @@ test "invalid configurations are rejected" {
         .max_mtu = 1500,
         .blackhole_loss_threshold = 0,
     }));
+}
+
+test "applyToml overlays pmtud keys and preserves defaults when absent" {
+    const src =
+        \\[transport.pmtud]
+        \\base_mtu = 1280
+        \\max_mtu = 9000
+        \\min_probe_delta = 4
+        \\blackhole_loss_threshold = 5
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    applyToml(&cfg, &doc);
+
+    try std.testing.expectEqual(@as(usize, 1280), cfg.base_mtu);
+    try std.testing.expectEqual(@as(usize, 9000), cfg.max_mtu);
+    try std.testing.expectEqual(@as(usize, 4), cfg.min_probe_delta);
+    try std.testing.expectEqual(@as(u8, 5), cfg.blackhole_loss_threshold);
+
+    var def_doc = try toml.parse(std.testing.allocator, "x = 1\n");
+    defer def_doc.deinit(std.testing.allocator);
+    var def_cfg = Config{};
+    applyToml(&def_cfg, &def_doc);
+    try std.testing.expectEqual((Config{}).base_mtu, def_cfg.base_mtu);
+    try std.testing.expectEqual((Config{}).max_mtu, def_cfg.max_mtu);
+    try std.testing.expectEqual((Config{}).blackhole_loss_threshold, def_cfg.blackhole_loss_threshold);
 }
 
 fn driveSearch(p: *Pmtud, path_mtu: usize, out: []usize) usize {

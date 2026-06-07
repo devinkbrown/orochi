@@ -21,6 +21,7 @@
 //!   _ = bbr.phase();
 
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -29,28 +30,34 @@ const std = @import("std");
 /// BBR phases.
 pub const Phase = enum { Startup, Drain, ProbeBW, ProbeRTT };
 
-/// Pacing-gain cycle used during ProbeBW (8 slots, wraps).
+/// Default pacing-gain cycle used during ProbeBW (8 slots, wraps).
 /// Slot 0 probes upward; slot 1 drains; slots 2-7 cruise.
-const PACING_GAIN_CYCLE: [8]f64 = .{
+const PACING_GAIN_CYCLE_DEFAULT: [8]f64 = .{
     1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
 };
 
 /// High pacing gain for Startup (2 * ln2 ≈ 1.386; BBR spec uses 2 / ln2 ≈ 2.885).
-const STARTUP_PACING_GAIN: f64 = 2.885;
-const STARTUP_CWND_GAIN: f64 = 2.0;
-const DRAIN_PACING_GAIN: f64 = 1.0 / STARTUP_PACING_GAIN;
-const DRAIN_CWND_GAIN: f64 = STARTUP_CWND_GAIN;
-const PROBE_BW_CWND_GAIN: f64 = 2.0;
-const PROBE_RTT_CWND_FRACTION: f64 = 0.75;
+const STARTUP_PACING_GAIN_DEFAULT: f64 = 2.885;
+const STARTUP_CWND_GAIN_DEFAULT: f64 = 2.0;
+const PROBE_BW_CWND_GAIN_DEFAULT: f64 = 2.0;
+const PROBE_RTT_CWND_FRACTION_DEFAULT: f64 = 0.75;
 
 /// Window length for the max-bandwidth filter (RTT rounds).
-const BW_WINDOW_LEN: usize = 10;
+const BW_WINDOW_LEN_DEFAULT: usize = 10;
 /// Window length for the min-RTT filter (microseconds; 10 s default).
 const MIN_RTT_WINDOW_US_DEFAULT: u64 = 10_000_000;
 /// ProbeRTT duration: hold cwnd at a reduced level for 200 ms.
-const PROBE_RTT_DURATION_US: u64 = 200_000;
+const PROBE_RTT_DURATION_US_DEFAULT: u64 = 200_000;
 /// Minimum cwnd (bytes) to avoid degenerate congestion windows.
-const MIN_CWND_BYTES: u64 = 4 * 1500;
+const MIN_CWND_BYTES_DEFAULT: u64 = 4 * 1500;
+/// Round/cycle duration fallback before the first RTT sample (100 ms).
+const PRE_RTT_ROUND_US_DEFAULT: u64 = 100_000;
+/// Minimum bandwidth growth per round to stay in Startup (1.25 = 25%).
+const STARTUP_GROWTH_THRESHOLD_DEFAULT: f64 = 1.25;
+/// Consecutive flat rounds before exiting Startup.
+const STARTUP_FULL_BW_ROUNDS_DEFAULT: u32 = 3;
+/// Rounds spent in Drain before ProbeBW.
+const DRAIN_ROUNDS_DEFAULT: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Windowed max/min filters (sliding window via three-register algorithm)
@@ -119,7 +126,72 @@ pub const Config = struct {
     min_rtt_window_us: u64 = MIN_RTT_WINDOW_US_DEFAULT,
     /// Initial bytes-in-flight estimate (used to seed cwnd before first ACK).
     initial_cwnd_bytes: u64 = 10 * 1460,
+    /// ProbeBW pacing-gain cycle (8 slots, wraps).
+    pacing_gain_cycle: [8]f64 = PACING_GAIN_CYCLE_DEFAULT,
+    /// Startup pacing gain (2 / ln2 ≈ 2.885).
+    startup_pacing_gain: f64 = STARTUP_PACING_GAIN_DEFAULT,
+    /// Startup cwnd gain (also reused as the Drain cwnd gain).
+    startup_cwnd_gain: f64 = STARTUP_CWND_GAIN_DEFAULT,
+    /// ProbeBW cwnd gain.
+    probe_bw_cwnd_gain: f64 = PROBE_BW_CWND_GAIN_DEFAULT,
+    /// cwnd fraction held during ProbeRTT.
+    probe_rtt_cwnd_fraction: f64 = PROBE_RTT_CWND_FRACTION_DEFAULT,
+    /// Max-bandwidth filter window length (RTT rounds).
+    bw_window_rounds: usize = BW_WINDOW_LEN_DEFAULT,
+    /// ProbeRTT hold duration in microseconds.
+    probe_rtt_duration_us: u64 = PROBE_RTT_DURATION_US_DEFAULT,
+    /// Floor cwnd to avoid degenerate windows (bytes).
+    min_cwnd_bytes: u64 = MIN_CWND_BYTES_DEFAULT,
+    /// Round/cycle duration fallback before the first RTT sample (microseconds).
+    pre_rtt_round_us: u64 = PRE_RTT_ROUND_US_DEFAULT,
+    /// Min bandwidth growth/round to stay in Startup (1.25 = 25%).
+    startup_growth_threshold: f64 = STARTUP_GROWTH_THRESHOLD_DEFAULT,
+    /// Consecutive flat rounds before exiting Startup.
+    startup_full_bw_rounds: u32 = STARTUP_FULL_BW_ROUNDS_DEFAULT,
+    /// Rounds spent in Drain before transitioning to ProbeBW.
+    drain_rounds: u32 = DRAIN_ROUNDS_DEFAULT,
+
+    /// Derived Drain pacing gain (1 / startup_pacing_gain).
+    pub fn drainPacingGain(self: Config) f64 {
+        return 1.0 / self.startup_pacing_gain;
+    }
+    /// Derived Drain cwnd gain (== startup_cwnd_gain).
+    pub fn drainCwndGain(self: Config) f64 {
+        return self.startup_cwnd_gain;
+    }
 };
+
+/// Overlay `[transport.congestion.bbr]` keys onto `cfg`. Absent keys are left at
+/// their current values, so the default config is behavior-preserving.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    const p = "transport.congestion.bbr.";
+    if (doc.getUint(p ++ "mss_bytes")) |v| cfg.mss = v;
+    if (doc.getUint(p ++ "min_rtt_window_us")) |v| cfg.min_rtt_window_us = v;
+    if (doc.getUint(p ++ "initial_cwnd_bytes")) |v| cfg.initial_cwnd_bytes = v;
+    if (doc.getArray(p ++ "pacing_gain_cycle")) |arr| {
+        if (arr.len == cfg.pacing_gain_cycle.len) {
+            var i: usize = 0;
+            while (i < arr.len) : (i += 1) {
+                cfg.pacing_gain_cycle[i] = switch (arr[i]) {
+                    .float => arr[i].float,
+                    .integer => @floatFromInt(arr[i].integer),
+                    else => cfg.pacing_gain_cycle[i],
+                };
+            }
+        }
+    }
+    if (doc.getFloat(p ++ "startup_pacing_gain")) |v| cfg.startup_pacing_gain = v;
+    if (doc.getFloat(p ++ "startup_cwnd_gain")) |v| cfg.startup_cwnd_gain = v;
+    if (doc.getFloat(p ++ "probe_bw_cwnd_gain")) |v| cfg.probe_bw_cwnd_gain = v;
+    if (doc.getFloat(p ++ "probe_rtt_cwnd_fraction")) |v| cfg.probe_rtt_cwnd_fraction = v;
+    if (doc.getUint(p ++ "bw_window_rounds")) |v| cfg.bw_window_rounds = @intCast(v);
+    if (doc.getUint(p ++ "probe_rtt_duration_us")) |v| cfg.probe_rtt_duration_us = v;
+    if (doc.getUint(p ++ "min_cwnd_bytes")) |v| cfg.min_cwnd_bytes = v;
+    if (doc.getUint(p ++ "pre_rtt_round_us")) |v| cfg.pre_rtt_round_us = v;
+    if (doc.getFloat(p ++ "startup_growth_threshold")) |v| cfg.startup_growth_threshold = v;
+    if (doc.getUint(p ++ "startup_full_bw_rounds")) |v| cfg.startup_full_bw_rounds = @intCast(v);
+    if (doc.getUint(p ++ "drain_rounds")) |v| cfg.drain_rounds = @intCast(v);
+}
 
 // ---------------------------------------------------------------------------
 // Bandwidth sample
@@ -204,8 +276,8 @@ pub const Bbr = struct {
             .current_phase = .Startup,
             .bw_filter = WindowedFilter(u64, true).init(0),
             .min_rtt_filter = WindowedFilter(u64, false).init(std.math.maxInt(u64)),
-            .pacing_gain = STARTUP_PACING_GAIN,
-            .cwnd_gain = STARTUP_CWND_GAIN,
+            .pacing_gain = cfg.startup_pacing_gain,
+            .cwnd_gain = cfg.startup_cwnd_gain,
             .cycle_index = 0,
             .bw_bps = 0,
             .min_rtt_us = std.math.maxInt(u64),
@@ -255,7 +327,7 @@ pub const Bbr = struct {
 
         // 4. Update bandwidth filter (skip app-limited samples that would lower bw).
         if (!sample.app_limited or sample.rate_bps > self.bw_bps) {
-            self.bw_filter.update(sample.rate_bps, self.round_count, BW_WINDOW_LEN);
+            self.bw_filter.update(sample.rate_bps, self.round_count, self.cfg.bw_window_rounds);
             self.bw_bps = self.bw_filter.get();
         }
 
@@ -322,7 +394,7 @@ pub const Bbr = struct {
         const round_duration = if (self.min_rtt_us != std.math.maxInt(u64))
             self.min_rtt_us
         else
-            100_000; // 100ms fallback before first RTT sample
+            self.cfg.pre_rtt_round_us; // fallback before first RTT sample
 
         self.round_advanced = false;
         if (now_us >= self.round_start_us + round_duration) {
@@ -347,11 +419,11 @@ pub const Bbr = struct {
 
         self.cwnd_bytes = switch (self.current_phase) {
             .ProbeRTT => @max(
-                MIN_CWND_BYTES,
-                @as(u64, @intFromFloat(@as(f64, @floatFromInt(bdp)) * PROBE_RTT_CWND_FRACTION)),
+                self.cfg.min_cwnd_bytes,
+                @as(u64, @intFromFloat(@as(f64, @floatFromInt(bdp)) * self.cfg.probe_rtt_cwnd_fraction)),
             ),
             else => @max(
-                MIN_CWND_BYTES,
+                self.cfg.min_cwnd_bytes,
                 @as(u64, @intFromFloat(@as(f64, @floatFromInt(bdp)) * self.cwnd_gain)),
             ),
         };
@@ -378,7 +450,7 @@ pub const Bbr = struct {
         // 3 consecutive rounds (queue is saturated).
         // prev_round_bw_bps was captured at the start of this round.
         if (self.prev_round_bw_bps > 0 and self.bw_bps > 0) {
-            const threshold: u64 = (self.prev_round_bw_bps * 125) / 100;
+            const threshold: u64 = @intFromFloat(@as(f64, @floatFromInt(self.prev_round_bw_bps)) * self.cfg.startup_growth_threshold);
             if (self.bw_bps < threshold) {
                 self.startup_rounds_without_gain += 1;
             } else {
@@ -386,15 +458,15 @@ pub const Bbr = struct {
             }
         }
 
-        if (self.startup_rounds_without_gain >= 3) {
+        if (self.startup_rounds_without_gain >= self.cfg.startup_full_bw_rounds) {
             self.enterDrain();
         }
     }
 
     fn enterDrain(self: *Bbr) void {
         self.current_phase = .Drain;
-        self.pacing_gain = DRAIN_PACING_GAIN;
-        self.cwnd_gain = DRAIN_CWND_GAIN;
+        self.pacing_gain = self.cfg.drainPacingGain();
+        self.cwnd_gain = self.cfg.drainCwndGain();
         self.drain_rounds = 0;
         self.drain_enter_round = self.round_count;
     }
@@ -409,7 +481,7 @@ pub const Bbr = struct {
         if (self.round_advanced) {
             self.drain_rounds += 1;
         }
-        if (self.drain_rounds >= 1) {
+        if (self.drain_rounds >= self.cfg.drain_rounds) {
             self.enterProbeBW(now_us);
         }
     }
@@ -422,8 +494,8 @@ pub const Bbr = struct {
         self.current_phase = .ProbeBW;
         self.cycle_index = 0;
         self.cycle_start_us = now_us;
-        self.pacing_gain = PACING_GAIN_CYCLE[0];
-        self.cwnd_gain = PROBE_BW_CWND_GAIN;
+        self.pacing_gain = self.cfg.pacing_gain_cycle[0];
+        self.cwnd_gain = self.cfg.probe_bw_cwnd_gain;
     }
 
     fn onAckProbeBW(self: *Bbr, now_us: u64) void {
@@ -431,11 +503,11 @@ pub const Bbr = struct {
         const cycle_duration = if (self.min_rtt_us != std.math.maxInt(u64))
             self.min_rtt_us
         else
-            100_000; // fallback: 100 ms
+            self.cfg.pre_rtt_round_us; // fallback before first RTT sample
 
         if (now_us >= self.cycle_start_us + cycle_duration) {
-            self.cycle_index = (self.cycle_index + 1) % PACING_GAIN_CYCLE.len;
-            self.pacing_gain = PACING_GAIN_CYCLE[self.cycle_index];
+            self.cycle_index = (self.cycle_index + 1) % self.cfg.pacing_gain_cycle.len;
+            self.pacing_gain = self.cfg.pacing_gain_cycle[self.cycle_index];
             self.cycle_start_us = now_us;
         }
     }
@@ -454,21 +526,21 @@ pub const Bbr = struct {
     }
 
     fn onAckProbeRTT(self: *Bbr, now_us: u64) void {
-        // Stay in ProbeRTT for PROBE_RTT_DURATION_US.
-        if (now_us >= self.probe_rtt_enter_us + PROBE_RTT_DURATION_US) {
+        // Stay in ProbeRTT for the configured hold duration.
+        if (now_us >= self.probe_rtt_enter_us + self.cfg.probe_rtt_duration_us) {
             // Refresh the min-rtt stamp and return to the previous phase.
             self.min_rtt_stamp_us = now_us;
             switch (self.probe_rtt_return_phase) {
                 .ProbeBW => self.enterProbeBW(now_us),
                 .Startup => {
                     self.current_phase = .Startup;
-                    self.pacing_gain = STARTUP_PACING_GAIN;
-                    self.cwnd_gain = STARTUP_CWND_GAIN;
+                    self.pacing_gain = self.cfg.startup_pacing_gain;
+                    self.cwnd_gain = self.cfg.startup_cwnd_gain;
                 },
                 .Drain => {
                     self.current_phase = .Drain;
-                    self.pacing_gain = DRAIN_PACING_GAIN;
-                    self.cwnd_gain = DRAIN_CWND_GAIN;
+                    self.pacing_gain = self.cfg.drainPacingGain();
+                    self.cwnd_gain = self.cfg.drainCwndGain();
                 },
                 .ProbeRTT => self.enterProbeBW(now_us),
             }
@@ -676,7 +748,7 @@ test "ProbeRTT engages after min-rtt window expires" {
     try std.testing.expectEqual(Phase.ProbeRTT, bbr.phase());
 
     // After PROBE_RTT_DURATION_US, should return to ProbeBW.
-    now_us += PROBE_RTT_DURATION_US + 1;
+    now_us += PROBE_RTT_DURATION_US_DEFAULT + 1;
     bbr.onAck(now_us, 4096, 10_000, false);
     try std.testing.expectEqual(Phase.ProbeBW, bbr.phase());
 }
@@ -701,7 +773,7 @@ test "cwnd tracks BDP (bw * min_rtt)" {
         const expected_min = bdp; // at minimum 1x BDP
         try std.testing.expect(bbr.cwnd() >= expected_min);
         // cwnd should not exceed cwnd_gain * bdp * some tolerance.
-        const ceiling = bdp * 4 + MIN_CWND_BYTES;
+        const ceiling = bdp * 4 + MIN_CWND_BYTES_DEFAULT;
         try std.testing.expect(bbr.cwnd() <= ceiling);
     }
 }
@@ -767,4 +839,62 @@ test "pacing_rate equals pacing_gain times bw" {
         const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(bbr.bw_bps)) * bbr.pacing_gain);
         try std.testing.expectEqual(expected, bbr.pacingRate());
     }
+}
+
+test "applyToml overlays bbr keys and leaves absent keys at defaults" {
+    const src =
+        \\[transport.congestion.bbr]
+        \\mss_bytes = 1200
+        \\min_rtt_window_us = 8000000
+        \\initial_cwnd_bytes = 30000
+        \\pacing_gain_cycle = [1.5, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        \\startup_pacing_gain = 2.0
+        \\startup_cwnd_gain = 3.0
+        \\probe_bw_cwnd_gain = 2.5
+        \\probe_rtt_cwnd_fraction = 0.5
+        \\bw_window_rounds = 16
+        \\probe_rtt_duration_us = 150000
+        \\min_cwnd_bytes = 8000
+        \\pre_rtt_round_us = 50000
+        \\startup_growth_threshold = 1.5
+        \\startup_full_bw_rounds = 5
+        \\drain_rounds = 2
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    applyToml(&cfg, &doc);
+
+    try std.testing.expectEqual(@as(u64, 1200), cfg.mss);
+    try std.testing.expectEqual(@as(u64, 8_000_000), cfg.min_rtt_window_us);
+    try std.testing.expectEqual(@as(u64, 30_000), cfg.initial_cwnd_bytes);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), cfg.pacing_gain_cycle[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), cfg.pacing_gain_cycle[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), cfg.startup_pacing_gain, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), cfg.startup_cwnd_gain, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), cfg.probe_bw_cwnd_gain, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), cfg.probe_rtt_cwnd_fraction, 1e-9);
+    try std.testing.expectEqual(@as(usize, 16), cfg.bw_window_rounds);
+    try std.testing.expectEqual(@as(u64, 150_000), cfg.probe_rtt_duration_us);
+    try std.testing.expectEqual(@as(u64, 8_000), cfg.min_cwnd_bytes);
+    try std.testing.expectEqual(@as(u64, 50_000), cfg.pre_rtt_round_us);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), cfg.startup_growth_threshold, 1e-9);
+    try std.testing.expectEqual(@as(u32, 5), cfg.startup_full_bw_rounds);
+    try std.testing.expectEqual(@as(u32, 2), cfg.drain_rounds);
+}
+
+test "applyToml leaves config untouched when section is absent" {
+    var doc = try toml.parse(std.testing.allocator, "title = \"x\"\n");
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    applyToml(&cfg, &doc);
+
+    const def = Config{};
+    try std.testing.expectEqual(def.mss, cfg.mss);
+    try std.testing.expectEqual(def.min_rtt_window_us, cfg.min_rtt_window_us);
+    try std.testing.expectApproxEqAbs(def.startup_pacing_gain, cfg.startup_pacing_gain, 1e-9);
+    try std.testing.expectEqual(def.startup_full_bw_rounds, cfg.startup_full_bw_rounds);
+    try std.testing.expectApproxEqAbs(def.pacing_gain_cycle[0], cfg.pacing_gain_cycle[0], 1e-9);
 }

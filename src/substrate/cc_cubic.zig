@@ -1,8 +1,26 @@
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 const DEFAULT_C: f64 = 0.4;
 const DEFAULT_BETA: f64 = 0.7;
 const USEC_PER_SEC: f64 = 1_000_000.0;
+
+/// Overlay `[transport.congestion.cubic]` keys onto `cfg`. Absent keys are left
+/// at their current values. `max_cwnd_packets` / `initial_ssthresh_packets` of
+/// `0` mean "unbounded" (maxInt(u64)), matching the struct defaults.
+pub fn applyToml(cfg: *Cubic.Config, doc: *const toml.Document) void {
+    const p = "transport.congestion.cubic.";
+    if (doc.getFloat(p ++ "c")) |v| cfg.c = v;
+    if (doc.getFloat(p ++ "beta")) |v| cfg.beta = v;
+    if (doc.getUint(p ++ "initial_cwnd_packets")) |v| cfg.initial_cwnd = v;
+    if (doc.getUint(p ++ "min_cwnd_packets")) |v| cfg.min_cwnd = v;
+    if (doc.getUint(p ++ "max_cwnd_packets")) |v| {
+        cfg.max_cwnd = if (v == 0) std.math.maxInt(u64) else v;
+    }
+    if (doc.getUint(p ++ "initial_ssthresh_packets")) |v| {
+        cfg.initial_ssthresh = if (v == 0) std.math.maxInt(u64) else v;
+    }
+}
 
 pub const Cubic = struct {
     const Self = @This();
@@ -315,4 +333,36 @@ test "deterministic" {
     try expectApprox(a.w_max_packets, b.w_max_packets, 0.0);
     try std.testing.expectEqual(a.cwnd(), b.cwnd());
     try std.testing.expectEqual(a.ssthresh(), b.ssthresh());
+}
+
+test "applyToml overlays cubic keys; 0 means unbounded for max/ssthresh" {
+    const src =
+        \\[transport.congestion.cubic]
+        \\c = 0.5
+        \\beta = 0.8
+        \\initial_cwnd_packets = 20
+        \\min_cwnd_packets = 4
+        \\max_cwnd_packets = 0
+        \\initial_ssthresh_packets = 64
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Cubic.Config{};
+    applyToml(&cfg, &doc);
+
+    try expectApprox(cfg.c, 0.5, 1e-9);
+    try expectApprox(cfg.beta, 0.8, 1e-9);
+    try std.testing.expectEqual(@as(u64, 20), cfg.initial_cwnd);
+    try std.testing.expectEqual(@as(u64, 4), cfg.min_cwnd);
+    try std.testing.expectEqual(std.math.maxInt(u64), cfg.max_cwnd); // 0 -> unbounded
+    try std.testing.expectEqual(@as(u64, 64), cfg.initial_ssthresh);
+
+    var def_doc = try toml.parse(std.testing.allocator, "x = 1\n");
+    defer def_doc.deinit(std.testing.allocator);
+    var def_cfg = Cubic.Config{};
+    applyToml(&def_cfg, &def_doc);
+    try expectApprox(def_cfg.c, DEFAULT_C, 1e-9);
+    try expectApprox(def_cfg.beta, DEFAULT_BETA, 1e-9);
+    try std.testing.expectEqual(std.math.maxInt(u64), def_cfg.max_cwnd);
 }

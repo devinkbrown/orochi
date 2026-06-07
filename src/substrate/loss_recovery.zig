@@ -1,4 +1,5 @@
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 pub const PacketNumber = u64;
 
@@ -22,16 +23,69 @@ const Packet = struct {
     lost: bool = false,
 };
 
-const initial_rto_us: u64 = 1_000_000;
-const min_rto_us: u64 = 1_000_000;
-const clock_granularity_us: u64 = 1_000;
-const rack_min_reorder_window_us: u64 = 1_000;
-const initial_tlp_delay_us: u64 = 200_000;
-const min_tlp_delay_us: u64 = 10_000;
+const initial_rto_us_default: u64 = 1_000_000;
+const min_rto_us_default: u64 = 1_000_000;
+const clock_granularity_us_default: u64 = 1_000;
+const rack_min_reorder_window_us_default: u64 = 1_000;
+const initial_tlp_delay_us_default: u64 = 200_000;
+const min_tlp_delay_us_default: u64 = 10_000;
 const default_packet_threshold: u64 = 3;
+const rack_reorder_rtt_fraction_div_default: u64 = 4;
+const srtt_alpha_shift_default: u6 = 3;
+const rttvar_beta_shift_default: u6 = 2;
+const tlp_srtt_multiplier_default: u64 = 2;
+const rto_rttvar_multiplier_default: u64 = 4;
+
+/// Loss-detection / RTO / RACK / TLP tuning. Defaults match the historical
+/// hardcoded values, so `Config{}` is behavior-preserving.
+pub const Config = struct {
+    /// RTO used before any SRTT sample (microseconds).
+    initial_rto_us: u64 = initial_rto_us_default,
+    /// Lower clamp on computed RTO (microseconds).
+    min_rto_us: u64 = min_rto_us_default,
+    /// Granularity floor added to RTT variation (microseconds).
+    clock_granularity_us: u64 = clock_granularity_us_default,
+    /// Floor of the RACK reorder window (microseconds).
+    rack_min_reorder_window_us: u64 = rack_min_reorder_window_us_default,
+    /// TLP probe delay before SRTT exists (microseconds).
+    initial_tlp_delay_us: u64 = initial_tlp_delay_us_default,
+    /// Lower clamp on TLP delay (microseconds).
+    min_tlp_delay_us: u64 = min_tlp_delay_us_default,
+    /// RACK/packet-threshold reorder gap before declaring loss.
+    packet_threshold: u64 = default_packet_threshold,
+    /// Divisor of min-RTT used as the RACK reorder window (min_rtt / div).
+    rack_reorder_rtt_fraction_div: u64 = rack_reorder_rtt_fraction_div_default,
+    /// SRTT EWMA shift (gain 1/(1<<shift); RFC6298 default 1/8).
+    srtt_alpha_shift: u6 = srtt_alpha_shift_default,
+    /// RTTVAR EWMA shift (gain 1/(1<<shift); RFC6298 default 1/4).
+    rttvar_beta_shift: u6 = rttvar_beta_shift_default,
+    /// TLP delay multiplier on SRTT.
+    tlp_srtt_multiplier: u64 = tlp_srtt_multiplier_default,
+    /// RTTVAR multiplier in the RTO formula (RFC6298 K).
+    rto_rttvar_multiplier: u64 = rto_rttvar_multiplier_default,
+};
+
+/// Overlay `[transport.recovery]` keys onto `cfg`. Absent keys are left at their
+/// current values, so the default config is behavior-preserving.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    const p = "transport.recovery.";
+    if (doc.getUint(p ++ "initial_rto_us")) |v| cfg.initial_rto_us = v;
+    if (doc.getUint(p ++ "min_rto_us")) |v| cfg.min_rto_us = v;
+    if (doc.getUint(p ++ "clock_granularity_us")) |v| cfg.clock_granularity_us = v;
+    if (doc.getUint(p ++ "rack_min_reorder_window_us")) |v| cfg.rack_min_reorder_window_us = v;
+    if (doc.getUint(p ++ "initial_tlp_delay_us")) |v| cfg.initial_tlp_delay_us = v;
+    if (doc.getUint(p ++ "min_tlp_delay_us")) |v| cfg.min_tlp_delay_us = v;
+    if (doc.getUint(p ++ "packet_threshold")) |v| cfg.packet_threshold = v;
+    if (doc.getUint(p ++ "rack_reorder_rtt_fraction_div")) |v| cfg.rack_reorder_rtt_fraction_div = v;
+    if (doc.getUint(p ++ "srtt_alpha_shift")) |v| cfg.srtt_alpha_shift = @intCast(v);
+    if (doc.getUint(p ++ "rttvar_beta_shift")) |v| cfg.rttvar_beta_shift = @intCast(v);
+    if (doc.getUint(p ++ "tlp_srtt_multiplier")) |v| cfg.tlp_srtt_multiplier = v;
+    if (doc.getUint(p ++ "rto_rttvar_multiplier")) |v| cfg.rto_rttvar_multiplier = v;
+}
 
 pub const LossRecovery = struct {
     allocator: std.mem.Allocator,
+    cfg: Config = .{},
     sent: std.ArrayList(Packet) = .empty,
     lost_scratch: std.ArrayList(PacketNumber) = .empty,
     bytes_in_flight: u64 = 0,
@@ -45,6 +99,14 @@ pub const LossRecovery = struct {
 
     pub fn init(allocator: std.mem.Allocator) LossRecovery {
         return .{ .allocator = allocator };
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) LossRecovery {
+        return .{
+            .allocator = allocator,
+            .cfg = cfg,
+            .packet_threshold = cfg.packet_threshold,
+        };
     }
 
     pub fn deinit(self: *LossRecovery) void {
@@ -124,9 +186,9 @@ pub const LossRecovery = struct {
 
     pub fn rto(self: LossRecovery) u64 {
         const base = if (self.srtt_us) |srtt| blk: {
-            const variation = @max(clock_granularity_us, saturatingMul(self.rttvar_us orelse 0, 4));
-            break :blk @max(min_rto_us, saturatingAdd(srtt, variation));
-        } else initial_rto_us;
+            const variation = @max(self.cfg.clock_granularity_us, saturatingMul(self.rttvar_us orelse 0, self.cfg.rto_rttvar_multiplier));
+            break :blk @max(self.cfg.min_rto_us, saturatingAdd(srtt, variation));
+        } else self.cfg.initial_rto_us;
 
         return saturatingShiftLeft(base, self.consecutive_rto_timeouts);
     }
@@ -140,9 +202,9 @@ pub const LossRecovery = struct {
     pub fn tlpTimeout(self: LossRecovery) ?u64 {
         const tail_sent = self.latestInflightSentTime() orelse return null;
         const probe_delay = if (self.srtt_us) |srtt|
-            @max(min_tlp_delay_us, saturatingMul(srtt, 2))
+            @max(self.cfg.min_tlp_delay_us, saturatingMul(srtt, self.cfg.tlp_srtt_multiplier))
         else
-            initial_tlp_delay_us;
+            self.cfg.initial_tlp_delay_us;
         return saturatingAdd(tail_sent, @min(probe_delay, self.rto()));
     }
 
@@ -183,8 +245,10 @@ pub const LossRecovery = struct {
         const rttvar = self.rttvar_us orelse 1;
         const deviation = if (srtt > sample) srtt - sample else sample - srtt;
 
-        self.rttvar_us = @intCast((@as(u128, rttvar) * 3 + deviation) / 4);
-        self.srtt_us = @intCast((@as(u128, srtt) * 7 + sample) / 8);
+        const rttvar_div: u128 = @as(u128, 1) << self.cfg.rttvar_beta_shift;
+        const srtt_div: u128 = @as(u128, 1) << self.cfg.srtt_alpha_shift;
+        self.rttvar_us = @intCast((@as(u128, rttvar) * (rttvar_div - 1) + deviation) / rttvar_div);
+        self.srtt_us = @intCast((@as(u128, srtt) * (srtt_div - 1) + sample) / srtt_div);
     }
 
     fn packetThresholdLost(self: LossRecovery, packet: Packet) bool {
@@ -202,8 +266,9 @@ pub const LossRecovery = struct {
     }
 
     fn rackReorderWindow(self: LossRecovery) u64 {
-        const min_rtt = self.min_rtt_us orelse return rack_min_reorder_window_us;
-        return @max(rack_min_reorder_window_us, min_rtt / 4);
+        const min_rtt = self.min_rtt_us orelse return self.cfg.rack_min_reorder_window_us;
+        const div = @max(self.cfg.rack_reorder_rtt_fraction_div, 1);
+        return @max(self.cfg.rack_min_reorder_window_us, min_rtt / div);
     }
 
     fn latestInflightSentTime(self: LossRecovery) ?u64 {
@@ -279,7 +344,7 @@ test "in-order acks clear in-flight and update srtt and rttvar" {
     try std.testing.expectEqual(@as(usize, 0), recovery.inFlightCount());
     try std.testing.expectEqual(@as(?u64, 99_000), recovery.smoothedRtt());
     try std.testing.expectEqual(@as(?u64, 49_500), recovery.rttVar());
-    try std.testing.expect(recovery.rto() >= min_rto_us);
+    try std.testing.expect(recovery.rto() >= min_rto_us_default);
 }
 
 test "sack ranges clear in-flight packets inclusively" {
@@ -389,4 +454,60 @@ test "deterministic for identical supplied timestamps" {
     try std.testing.expectEqual(a.rto(), b.rto());
     try std.testing.expectEqual(a.tlpTimeout(), b.tlpTimeout());
     try std.testing.expectEqual(a.inFlightBytes(), b.inFlightBytes());
+}
+
+test "applyToml overlays recovery keys and preserves defaults when absent" {
+    const src =
+        \\[transport.recovery]
+        \\initial_rto_us = 500000
+        \\min_rto_us = 200000
+        \\clock_granularity_us = 2000
+        \\rack_min_reorder_window_us = 1500
+        \\initial_tlp_delay_us = 150000
+        \\min_tlp_delay_us = 5000
+        \\packet_threshold = 5
+        \\rack_reorder_rtt_fraction_div = 8
+        \\srtt_alpha_shift = 4
+        \\rttvar_beta_shift = 3
+        \\tlp_srtt_multiplier = 3
+        \\rto_rttvar_multiplier = 2
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    applyToml(&cfg, &doc);
+
+    try std.testing.expectEqual(@as(u64, 500_000), cfg.initial_rto_us);
+    try std.testing.expectEqual(@as(u64, 200_000), cfg.min_rto_us);
+    try std.testing.expectEqual(@as(u64, 2_000), cfg.clock_granularity_us);
+    try std.testing.expectEqual(@as(u64, 1_500), cfg.rack_min_reorder_window_us);
+    try std.testing.expectEqual(@as(u64, 150_000), cfg.initial_tlp_delay_us);
+    try std.testing.expectEqual(@as(u64, 5_000), cfg.min_tlp_delay_us);
+    try std.testing.expectEqual(@as(u64, 5), cfg.packet_threshold);
+    try std.testing.expectEqual(@as(u64, 8), cfg.rack_reorder_rtt_fraction_div);
+    try std.testing.expectEqual(@as(u6, 4), cfg.srtt_alpha_shift);
+    try std.testing.expectEqual(@as(u6, 3), cfg.rttvar_beta_shift);
+    try std.testing.expectEqual(@as(u64, 3), cfg.tlp_srtt_multiplier);
+    try std.testing.expectEqual(@as(u64, 2), cfg.rto_rttvar_multiplier);
+
+    var def_doc = try toml.parse(std.testing.allocator, "x = 1\n");
+    defer def_doc.deinit(std.testing.allocator);
+    var def_cfg = Config{};
+    applyToml(&def_cfg, &def_doc);
+    try std.testing.expectEqual((Config{}).initial_rto_us, def_cfg.initial_rto_us);
+    try std.testing.expectEqual((Config{}).packet_threshold, def_cfg.packet_threshold);
+    try std.testing.expectEqual((Config{}).srtt_alpha_shift, def_cfg.srtt_alpha_shift);
+}
+
+test "initWithConfig applies a custom packet threshold and initial RTO" {
+    var recovery = LossRecovery.initWithConfig(std.testing.allocator, .{
+        .packet_threshold = 5,
+        .initial_rto_us = 250_000,
+    });
+    defer recovery.deinit();
+
+    try std.testing.expectEqual(@as(u64, 5), recovery.packet_threshold);
+    // No SRTT yet: rto() returns the configured initial RTO.
+    try std.testing.expectEqual(@as(u64, 250_000), recovery.rto());
 }

@@ -5,6 +5,7 @@
 //! default; actual loss uses the configured classic multiplicative backoff.
 
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 /// Q16 fixed-point scale used for ECN marking fractions.
 pub const fraction_one: u32 = 1 << 16;
@@ -32,6 +33,22 @@ pub const Config = struct {
     /// Loss backoff denominator. Default is classic halving.
     loss_backoff_den: u32 = 2,
 };
+
+/// Overlay `[transport.congestion.l4s]` keys onto `cfg`. Absent keys are left at
+/// their current values, so the default config is behavior-preserving.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    const p = "transport.congestion.l4s.";
+    if (doc.getUint(p ++ "initial_cwnd_bytes")) |v| cfg.initial_cwnd = v;
+    if (doc.getUint(p ++ "min_cwnd_bytes")) |v| cfg.min_cwnd = v;
+    if (doc.getUint(p ++ "max_cwnd_bytes")) |v| cfg.max_cwnd = v;
+    if (doc.getUint(p ++ "additive_increase_bytes")) |v| cfg.additive_increase_bytes = v;
+    if (doc.getUint(p ++ "alpha_gain_num")) |v| cfg.alpha_gain_num = @intCast(v);
+    if (doc.getUint(p ++ "alpha_gain_den")) |v| cfg.alpha_gain_den = @intCast(v);
+    if (doc.getUint(p ++ "marking_reduction_num")) |v| cfg.marking_reduction_num = @intCast(v);
+    if (doc.getUint(p ++ "marking_reduction_den")) |v| cfg.marking_reduction_den = @intCast(v);
+    if (doc.getUint(p ++ "loss_backoff_num")) |v| cfg.loss_backoff_num = @intCast(v);
+    if (doc.getUint(p ++ "loss_backoff_den")) |v| cfg.loss_backoff_den = @intCast(v);
+}
 
 /// A deterministic scalable congestion controller.
 pub const Controller = struct {
@@ -370,4 +387,43 @@ test "deterministic given identical inputs" {
 
 fn absDiff(a: u64, b: u64) u64 {
     return if (a > b) a - b else b - a;
+}
+
+test "applyToml overlays l4s keys and preserves defaults when absent" {
+    const src =
+        \\[transport.congestion.l4s]
+        \\initial_cwnd_bytes = 24000
+        \\min_cwnd_bytes = 3600
+        \\max_cwnd_bytes = 8388608
+        \\additive_increase_bytes = 1460
+        \\alpha_gain_num = 1
+        \\alpha_gain_den = 8
+        \\marking_reduction_num = 1
+        \\marking_reduction_den = 4
+        \\loss_backoff_num = 2
+        \\loss_backoff_den = 3
+    ;
+    var doc = try toml.parse(std.testing.allocator, src);
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    applyToml(&cfg, &doc);
+
+    try std.testing.expectEqual(@as(u64, 24_000), cfg.initial_cwnd);
+    try std.testing.expectEqual(@as(u64, 3_600), cfg.min_cwnd);
+    try std.testing.expectEqual(@as(u64, 8_388_608), cfg.max_cwnd);
+    try std.testing.expectEqual(@as(u64, 1_460), cfg.additive_increase_bytes);
+    try std.testing.expectEqual(@as(u32, 1), cfg.alpha_gain_num);
+    try std.testing.expectEqual(@as(u32, 8), cfg.alpha_gain_den);
+    try std.testing.expectEqual(@as(u32, 1), cfg.marking_reduction_num);
+    try std.testing.expectEqual(@as(u32, 4), cfg.marking_reduction_den);
+    try std.testing.expectEqual(@as(u32, 2), cfg.loss_backoff_num);
+    try std.testing.expectEqual(@as(u32, 3), cfg.loss_backoff_den);
+
+    var def_doc = try toml.parse(std.testing.allocator, "x = 1\n");
+    defer def_doc.deinit(std.testing.allocator);
+    var def_cfg = Config{};
+    applyToml(&def_cfg, &def_doc);
+    try std.testing.expectEqual((Config{}).initial_cwnd, def_cfg.initial_cwnd);
+    try std.testing.expectEqual((Config{}).max_cwnd, def_cfg.max_cwnd);
 }

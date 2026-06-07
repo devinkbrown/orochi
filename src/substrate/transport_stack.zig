@@ -22,6 +22,7 @@ const pacing = @import("pacing.zig");
 const flow = @import("flow.zig");
 const loss_recovery = @import("loss_recovery.zig");
 const qlog = @import("qlog.zig");
+const toml = @import("../proto/toml.zig");
 
 pub const PacketNumber = loss_recovery.PacketNumber;
 pub const SackRange = loss_recovery.SackRange;
@@ -116,7 +117,29 @@ pub const Config = struct {
     rate_cap_bps: u64 = 0,
     rate_cap_burst: u64 = 0,
     start_us: u64 = 0,
+    /// RTT (microseconds) assumed when seeding the initial pacer rate before the
+    /// first ACK arrives.
+    seed_rtt_us: u64 = 10_000,
+    /// RTT (microseconds) used for cc/pacing when no SRTT sample exists yet.
+    fallback_rtt_us: u64 = 10_000,
+    /// Pacer burst budget expressed as a multiple of MSS.
+    pacer_burst_mss_multiple: u64 = 2,
 };
+
+/// Overlay `[transport]` (stack-level) keys onto `cfg`. Absent keys are left at
+/// their current values, so the default config is behavior-preserving.
+///
+/// NOTE: `transport.qlog_capacity` is intentionally NOT applied here — the qlog
+/// ring capacity is a comptime type parameter (`qlog.Recorder(N)`), so it is
+/// resolved at the orchestrator's `Recorder` type alias, not at runtime.
+pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("transport.mss_bytes")) |v| cfg.mss = v;
+    if (doc.getUint("transport.rate_cap_bps")) |v| cfg.rate_cap_bps = v;
+    if (doc.getUint("transport.rate_cap_burst_bytes")) |v| cfg.rate_cap_burst = v;
+    if (doc.getUint("transport.seed_rtt_us")) |v| cfg.seed_rtt_us = v;
+    if (doc.getUint("transport.fallback_rtt_us")) |v| cfg.fallback_rtt_us = v;
+    if (doc.getUint("transport.pacer_burst_mss_multiple")) |v| cfg.pacer_burst_mss_multiple = v;
+}
 
 pub const SendResult = union(enum) {
     sent: struct { pn: PacketNumber, bytes: usize },
@@ -147,12 +170,12 @@ pub const TransportStack = struct {
         recorder: *Recorder,
         cfg: Config,
     ) TransportStack {
-        const seed_rate = @max(cc.pacingRate(10_000), 1);
+        const seed_rate = @max(cc.pacingRate(cfg.seed_rtt_us), 1);
         return .{
             .allocator = allocator,
             .transport = transport,
             .cc = cc,
-            .pacer = pacing.Pacer.init(seed_rate, @max(2 * cfg.mss, 1), cfg.start_us),
+            .pacer = pacing.Pacer.init(seed_rate, @max(cfg.pacer_burst_mss_multiple * cfg.mss, 1), cfg.start_us),
             .rate_cap = if (cfg.rate_cap_bps > 0) flow.TokenBucket.init(cfg.rate_cap_burst, cfg.rate_cap_bps, cfg.start_us) else null,
             .loss = loss_recovery.LossRecovery.init(allocator),
             .recorder = recorder,
@@ -223,7 +246,7 @@ pub const TransportStack = struct {
         const before = self.loss.inFlightBytes();
         try self.loss.onAck(acked_pns, sack_ranges, self.now_us, ack_delay_us);
         const acked_bytes = before - self.loss.inFlightBytes();
-        const rtt = self.loss.smoothedRtt() orelse 10_000;
+        const rtt = self.loss.smoothedRtt() orelse self.cfg.fallback_rtt_us;
 
         self.cc.onAck(self.now_us, acked_bytes, acked_bytes, rtt, ce_marked, app_limited);
         self.pacer.pacing_rate = @max(self.cc.pacingRate(rtt), 1);
@@ -362,4 +385,36 @@ test "a gap (later pns acked) is detected as loss and drives cc.onLoss" {
         }
     }
     try testing.expect(fired); // pns[0] reported lost; cc.onLoss invoked
+}
+
+test "applyToml overlays stack-level keys and preserves defaults when absent" {
+    const src =
+        \\[transport]
+        \\mss_bytes = 1500
+        \\rate_cap_bps = 1000000
+        \\rate_cap_burst_bytes = 65536
+        \\seed_rtt_us = 20000
+        \\fallback_rtt_us = 30000
+        \\pacer_burst_mss_multiple = 4
+    ;
+    var doc = try toml.parse(testing.allocator, src);
+    defer doc.deinit(testing.allocator);
+
+    var cfg = Config{};
+    applyToml(&cfg, &doc);
+
+    try testing.expectEqual(@as(u64, 1500), cfg.mss);
+    try testing.expectEqual(@as(u64, 1_000_000), cfg.rate_cap_bps);
+    try testing.expectEqual(@as(u64, 65_536), cfg.rate_cap_burst);
+    try testing.expectEqual(@as(u64, 20_000), cfg.seed_rtt_us);
+    try testing.expectEqual(@as(u64, 30_000), cfg.fallback_rtt_us);
+    try testing.expectEqual(@as(u64, 4), cfg.pacer_burst_mss_multiple);
+
+    var def_doc = try toml.parse(testing.allocator, "x = 1\n");
+    defer def_doc.deinit(testing.allocator);
+    var def_cfg = Config{};
+    applyToml(&def_cfg, &def_doc);
+    try testing.expectEqual((Config{}).mss, def_cfg.mss);
+    try testing.expectEqual((Config{}).seed_rtt_us, def_cfg.seed_rtt_us);
+    try testing.expectEqual((Config{}).pacer_burst_mss_multiple, def_cfg.pacer_burst_mss_multiple);
 }
