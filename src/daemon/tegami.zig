@@ -6,11 +6,43 @@
 //! account next logs in (REGISTER / IDENTIFY / SASL). In-memory + bounded; a
 //! WAL/snapshot backing can be layered later (mirroring the account store).
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
-pub const max_text_bytes: usize = 400;
-pub const max_from_bytes: usize = 64;
-pub const max_per_account: usize = 64;
-pub const max_accounts: usize = 65536;
+pub const default_max_text_bytes: usize = 400;
+pub const default_max_from_bytes: usize = 64;
+pub const default_max_per_account: usize = 64;
+pub const default_max_accounts: usize = 65536;
+
+/// Runtime-tunable offline-mailbox limits. Defaults preserve the historical
+/// hardcoded behaviour; the orchestrator overlays the `[bouncer]` TOML section
+/// via `Config.applyToml` before constructing a `TegamiBox`.
+pub const Config = struct {
+    /// Max offline DM body length (bytes).
+    max_text_bytes: usize = default_max_text_bytes,
+    /// Max sender-name length on an offline DM (bytes).
+    max_from_bytes: usize = default_max_from_bytes,
+    /// Offline mailbox depth cap per account (entries).
+    max_per_account: usize = default_max_per_account,
+    /// Max distinct offline mailboxes.
+    max_accounts: usize = default_max_accounts,
+
+    /// Overlay `[bouncer]` keys from a parsed TOML document onto `cfg`. Missing
+    /// keys leave the current value untouched. Pure: no I/O, never fails.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("bouncer.tegami_text_max_len")) |v| {
+            if (v >= 1) cfg.max_text_bytes = @intCast(v);
+        }
+        if (doc.getUint("bouncer.tegami_from_max_len")) |v| {
+            if (v >= 1) cfg.max_from_bytes = @intCast(v);
+        }
+        if (doc.getUint("bouncer.tegami_mailbox_depth")) |v| {
+            if (v >= 1) cfg.max_per_account = @intCast(v);
+        }
+        if (doc.getUint("bouncer.tegami_max_accounts")) |v| {
+            if (v >= 1) cfg.max_accounts = @intCast(v);
+        }
+    }
+};
 
 pub const Error = std.mem.Allocator.Error || error{ TooManyAccounts, MailboxFull, MessageInvalid };
 
@@ -37,9 +69,14 @@ const Mailbox = struct {
 pub const TegamiBox = struct {
     allocator: std.mem.Allocator,
     boxes: std.StringHashMap(Mailbox),
+    cfg: Config = .{},
 
     pub fn init(allocator: std.mem.Allocator) TegamiBox {
-        return .{ .allocator = allocator, .boxes = std.StringHashMap(Mailbox).init(allocator) };
+        return initWithConfig(allocator, .{});
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) TegamiBox {
+        return .{ .allocator = allocator, .boxes = std.StringHashMap(Mailbox).init(allocator), .cfg = cfg };
     }
 
     pub fn deinit(self: *TegamiBox) void {
@@ -56,10 +93,10 @@ pub const TegamiBox = struct {
     /// depth. Errors on empty/oversize fields, a full mailbox, or too many
     /// accounts. `from`/`text` are copied.
     pub fn send(self: *TegamiBox, to_account: []const u8, from: []const u8, text: []const u8, now_ms: i64) Error!usize {
-        if (to_account.len == 0 or from.len == 0 or from.len > max_from_bytes) return error.MessageInvalid;
-        if (text.len == 0 or text.len > max_text_bytes) return error.MessageInvalid;
+        if (to_account.len == 0 or from.len == 0 or from.len > self.cfg.max_from_bytes) return error.MessageInvalid;
+        if (text.len == 0 or text.len > self.cfg.max_text_bytes) return error.MessageInvalid;
         const box = try self.ensure(to_account);
-        if (box.items.items.len >= max_per_account) return error.MailboxFull;
+        if (box.items.items.len >= self.cfg.max_per_account) return error.MailboxFull;
 
         const from_owned = try self.allocator.dupe(u8, from);
         errdefer self.allocator.free(from_owned);
@@ -94,7 +131,7 @@ pub const TegamiBox = struct {
 
     fn ensure(self: *TegamiBox, account: []const u8) Error!*Mailbox {
         if (self.boxes.getPtr(account)) |box| return box;
-        if (self.boxes.count() >= max_accounts) return error.TooManyAccounts;
+        if (self.boxes.count() >= self.cfg.max_accounts) return error.TooManyAccounts;
         const owned = try self.allocator.dupe(u8, account);
         errdefer self.allocator.free(owned);
         try self.boxes.putNoClobber(owned, .{});
@@ -128,7 +165,7 @@ test "rejects invalid fields and enforces mailbox cap" {
     try testing.expectError(error.MessageInvalid, t.send("alice", "bob", "", 0));
     try testing.expectError(error.MessageInvalid, t.send("alice", "", "hi", 0));
     var i: usize = 0;
-    while (i < max_per_account) : (i += 1) _ = try t.send("bob", "x", "m", 0);
+    while (i < default_max_per_account) : (i += 1) _ = try t.send("bob", "x", "m", 0);
     try testing.expectError(error.MailboxFull, t.send("bob", "x", "m", 0));
 }
 
@@ -142,4 +179,35 @@ test "mailboxes are independent per account" {
     _ = t.clear("alice");
     try testing.expectEqual(@as(usize, 0), t.count("alice"));
     try testing.expectEqual(@as(usize, 1), t.count("carol"));
+}
+
+test "Config defaults preserve historical limits" {
+    const cfg = Config{};
+    try testing.expectEqual(default_max_text_bytes, cfg.max_text_bytes);
+    try testing.expectEqual(default_max_from_bytes, cfg.max_from_bytes);
+    try testing.expectEqual(default_max_per_account, cfg.max_per_account);
+    try testing.expectEqual(default_max_accounts, cfg.max_accounts);
+}
+
+test "Config.applyToml overlays [bouncer] tegami keys" {
+    var doc = try toml.parse(
+        testing.allocator,
+        "[bouncer]\ntegami_text_max_len = 800\ntegami_from_max_len = 32\ntegami_mailbox_depth = 8\ntegami_max_accounts = 1024\n",
+    );
+    defer doc.deinit(testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try testing.expectEqual(@as(usize, 800), cfg.max_text_bytes);
+    try testing.expectEqual(@as(usize, 32), cfg.max_from_bytes);
+    try testing.expectEqual(@as(usize, 8), cfg.max_per_account);
+    try testing.expectEqual(@as(usize, 1024), cfg.max_accounts);
+}
+
+test "initWithConfig enforces a smaller mailbox depth" {
+    var t = TegamiBox.initWithConfig(testing.allocator, .{ .max_per_account = 2 });
+    defer t.deinit();
+    _ = try t.send("alice", "bob", "one", 0);
+    _ = try t.send("alice", "bob", "two", 0);
+    try testing.expectError(error.MailboxFull, t.send("alice", "bob", "three", 0));
 }

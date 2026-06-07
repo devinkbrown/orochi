@@ -8,19 +8,46 @@
 //! matching O(text) regardless of pattern count. Matching is case-insensitive.
 const std = @import("std");
 const aho = @import("../substrate/aho_corasick.zig");
+const toml = @import("../proto/toml.zig");
 
 pub const Error = std.mem.Allocator.Error;
 
-pub const max_patterns: usize = 256;
-pub const max_pattern_len: usize = 256;
+pub const default_max_patterns: usize = 256;
+pub const default_max_pattern_len: usize = 256;
+
+/// Runtime-tunable Koshi filter limits. Defaults preserve the historical
+/// hardcoded behaviour; the orchestrator overlays the `[filter]` TOML section
+/// via `Config.applyToml` before constructing a `ContentFilter`.
+pub const Config = struct {
+    /// Max oper-curated filter patterns (Aho-Corasick set size).
+    max_patterns: usize = default_max_patterns,
+    /// Max length of a single filter pattern (bytes).
+    max_pattern_len: usize = default_max_pattern_len,
+
+    /// Overlay `[filter]` keys from a parsed TOML document onto `cfg`. Missing
+    /// keys leave the current value untouched. Pure: no I/O, never fails.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("filter.koshi_max_patterns")) |v| {
+            if (v >= 1) cfg.max_patterns = @intCast(v);
+        }
+        if (doc.getUint("filter.koshi_pattern_max_len")) |v| {
+            if (v >= 1) cfg.max_pattern_len = @intCast(v);
+        }
+    }
+};
 
 pub const ContentFilter = struct {
     allocator: std.mem.Allocator,
     patterns: std.ArrayListUnmanaged([]u8) = .empty,
     automaton: ?aho.AhoCorasick = null,
+    cfg: Config = .{},
 
     pub fn init(allocator: std.mem.Allocator) ContentFilter {
         return .{ .allocator = allocator };
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) ContentFilter {
+        return .{ .allocator = allocator, .cfg = cfg };
     }
 
     pub fn deinit(self: *ContentFilter) void {
@@ -33,8 +60,8 @@ pub const ContentFilter = struct {
     /// Add a pattern (deduplicated, case-insensitive). Returns false if the
     /// pattern is empty, too long, the table is full, or it already exists.
     pub fn add(self: *ContentFilter, pattern: []const u8) Error!bool {
-        if (pattern.len == 0 or pattern.len > max_pattern_len) return false;
-        if (self.patterns.items.len >= max_patterns) return false;
+        if (pattern.len == 0 or pattern.len > self.cfg.max_pattern_len) return false;
+        if (self.patterns.items.len >= self.cfg.max_patterns) return false;
         if (self.indexOf(pattern) != null) return false;
         const owned = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(owned);
@@ -115,4 +142,31 @@ test "multiple patterns match independently" {
     try testing.expect(try f.remove("buy now"));
     try testing.expect(!f.matches("please buy now!"));
     try testing.expect(f.matches("free money still here"));
+}
+
+test "Config defaults preserve historical limits" {
+    const cfg = Config{};
+    try testing.expectEqual(default_max_patterns, cfg.max_patterns);
+    try testing.expectEqual(default_max_pattern_len, cfg.max_pattern_len);
+}
+
+test "Config.applyToml overlays [filter] koshi keys" {
+    var doc = try toml.parse(
+        testing.allocator,
+        "[filter]\nkoshi_max_patterns = 16\nkoshi_pattern_max_len = 32\n",
+    );
+    defer doc.deinit(testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try testing.expectEqual(@as(usize, 16), cfg.max_patterns);
+    try testing.expectEqual(@as(usize, 32), cfg.max_pattern_len);
+}
+
+test "initWithConfig enforces a smaller pattern cap" {
+    var f = ContentFilter.initWithConfig(testing.allocator, .{ .max_patterns = 1 });
+    defer f.deinit();
+    try testing.expect(try f.add("first"));
+    try testing.expect(!try f.add("second")); // table full
+    try testing.expectEqual(@as(usize, 1), f.list().len);
 }

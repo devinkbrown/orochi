@@ -4,11 +4,13 @@
 //! key/value store backed by a checksummed append-only log, with snapshot
 //! compaction and a bounded recent-mutation feed for service sync.
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
 const record_header_len = 8;
 const payload_header_len = 10;
-const max_record_len = 16 * 1024 * 1024;
-const max_wal_len = 256 * 1024 * 1024;
+const default_max_record_len = 16 * 1024 * 1024;
+const default_max_wal_len = 256 * 1024 * 1024;
+const default_changefeed_capacity = 64;
 const tombstone_len = std.math.maxInt(u32);
 const meta_kind_next_seq: u8 = 0xFE;
 const meta_next_seq_payload_len = 9;
@@ -19,6 +21,32 @@ pub const StoreError = error{
     UnknownFamily,
     UnknownRecordKind,
     RecordTooLarge,
+};
+
+/// Runtime-tunable storage limits. Defaults preserve the historical hardcoded
+/// behaviour; the orchestrator overlays the `[storage]` TOML section via
+/// `Config.applyToml` before opening the store.
+pub const Config = struct {
+    /// Max single WAL/snapshot record payload size (bytes).
+    max_record_bytes: usize = default_max_record_len,
+    /// Max WAL file size accepted on replay (bytes); oversize logs are rejected.
+    max_wal_bytes: usize = default_max_wal_len,
+    /// Bounded recent-mutation changefeed ring size (entries).
+    changefeed_capacity: usize = default_changefeed_capacity,
+
+    /// Overlay `[storage]` keys from a parsed TOML document onto `cfg`. Missing
+    /// keys leave the current value untouched. Pure: no I/O, never fails.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("storage.max_record_bytes")) |v| {
+            if (v >= 1 and v <= std.math.maxInt(u32)) cfg.max_record_bytes = @intCast(v);
+        }
+        if (doc.getUint("storage.max_wal_bytes")) |v| {
+            if (v >= 1) cfg.max_wal_bytes = @intCast(v);
+        }
+        if (doc.getUint("storage.changefeed_capacity")) |v| {
+            if (v >= 1) cfg.changefeed_capacity = @intCast(v);
+        }
+    }
 };
 
 pub const Family = enum(u8) {
@@ -74,6 +102,7 @@ pub const MizuStore = struct {
     maps: [family_count]KvMap,
     changefeed: ChangeFeed,
     next_seq: u64 = 1,
+    cfg: Config = .{},
 
     /// Opens `wal_path` under `dir`, replays `<wal_path>.snap` first, then WAL.
     pub fn open(
@@ -81,6 +110,17 @@ pub const MizuStore = struct {
         io: std.Io,
         dir: std.Io.Dir,
         wal_path: []const u8,
+    ) !MizuStore {
+        return openWithConfig(allocator, io, dir, wal_path, .{});
+    }
+
+    /// Like `open`, but with explicit storage limits (see `Config`).
+    pub fn openWithConfig(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        wal_path: []const u8,
+        cfg: Config,
     ) !MizuStore {
         const owned_wal = try allocator.dupe(u8, wal_path);
         const owned_snapshot = std.mem.concat(allocator, u8, &.{ wal_path, ".snap" }) catch |err| {
@@ -95,7 +135,8 @@ pub const MizuStore = struct {
             .wal_path = owned_wal,
             .snapshot_path = owned_snapshot,
             .maps = initMaps(allocator),
-            .changefeed = try ChangeFeed.init(allocator, 64),
+            .changefeed = try ChangeFeed.init(allocator, cfg.changefeed_capacity),
+            .cfg = cfg,
         };
         errdefer store.deinit();
 
@@ -154,6 +195,7 @@ pub const MizuStore = struct {
                     store_family,
                     entry.key_ptr.*,
                     entry.value_ptr.*,
+                    self.cfg.max_record_bytes,
                 );
             }
         }
@@ -199,7 +241,7 @@ pub const MizuStore = struct {
 
         const stat = try file.stat(self.io);
         if (stat.size == 0) return;
-        if (replay_kind == .wal and stat.size > max_wal_len) return StoreError.RecordTooLarge;
+        if (replay_kind == .wal and stat.size > self.cfg.max_wal_bytes) return StoreError.RecordTooLarge;
 
         var offset: u64 = 0;
         var header: [record_header_len]u8 = undefined;
@@ -216,7 +258,7 @@ pub const MizuStore = struct {
             const expected_sum = readU32(header[4..8]);
             const record_end = offset + payload_len;
 
-            if (payload_len > max_record_len) return StoreError.RecordTooLarge;
+            if (payload_len > self.cfg.max_record_bytes) return StoreError.RecordTooLarge;
             if (stat.size - offset < payload_len) {
                 if (replay_kind == .wal) return;
                 return StoreError.BadRecord;
@@ -255,7 +297,7 @@ pub const MizuStore = struct {
     ) !void {
         try self.ensureWal();
         const file = self.wal_file.?;
-        const next_offset = try writeRecordAt(self.io, file, self.wal_offset, self.allocator, kind, store_family, key, value);
+        const next_offset = try writeRecordAt(self.io, file, self.wal_offset, self.allocator, kind, store_family, key, value, self.cfg.max_record_bytes);
         try file.sync(self.io);
         self.wal_offset = next_offset;
     }
@@ -485,12 +527,13 @@ fn writeRecordAt(
     store_family: Family,
     key: []const u8,
     value: []const u8,
+    max_record_bytes: usize,
 ) !u64 {
     if (key.len > std.math.maxInt(u32) or value.len > std.math.maxInt(u32))
         return StoreError.RecordTooLarge;
 
     const payload_len = payload_header_len + key.len + if (kind == .delete) 0 else value.len;
-    if (payload_len > max_record_len) return StoreError.RecordTooLarge;
+    if (payload_len > max_record_bytes) return StoreError.RecordTooLarge;
 
     const record = try allocator.alloc(u8, record_header_len + payload_len);
     defer allocator.free(record);
@@ -657,7 +700,7 @@ test "checksum-bad final WAL record is ignored after replaying valid prefix" {
     var file = try tmp.dir.openFile(std.testing.io, "final-checksum.wal", .{ .mode = .read_write, .allow_directory = false });
     defer file.close(std.testing.io);
     const stat = try file.stat(std.testing.io);
-    _ = try writeRecordAt(std.testing.io, file, stat.size, std.testing.allocator, .put, .accounts, "bob", "bad");
+    _ = try writeRecordAt(std.testing.io, file, stat.size, std.testing.allocator, .put, .accounts, "bob", "bad", default_max_record_len);
     try file.writePositionalAll(std.testing.io, &.{0xAA}, stat.size + 6);
     try file.sync(std.testing.io);
 
@@ -733,4 +776,55 @@ test "changefeed records mutations" {
     try std.testing.expectEqualStrings("alice", last.key);
     try std.testing.expect(last.value == null);
     try std.testing.expect(store.family(.accounts).get("alice") == null);
+}
+
+test "storage Config defaults preserve historical limits" {
+    const cfg = Config{};
+    try std.testing.expectEqual(@as(usize, default_max_record_len), cfg.max_record_bytes);
+    try std.testing.expectEqual(@as(usize, default_max_wal_len), cfg.max_wal_bytes);
+    try std.testing.expectEqual(@as(usize, default_changefeed_capacity), cfg.changefeed_capacity);
+}
+
+test "storage Config.applyToml overlays [storage] keys" {
+    var doc = try toml.parse(
+        std.testing.allocator,
+        "[storage]\nmax_record_bytes = 65536\nmax_wal_bytes = 1048576\nchangefeed_capacity = 128\n",
+    );
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 65536), cfg.max_record_bytes);
+    try std.testing.expectEqual(@as(usize, 1048576), cfg.max_wal_bytes);
+    try std.testing.expectEqual(@as(usize, 128), cfg.changefeed_capacity);
+}
+
+test "storage Config.applyToml leaves defaults when section absent" {
+    var doc = try toml.parse(std.testing.allocator, "[other]\nx = 1\n");
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, default_max_record_len), cfg.max_record_bytes);
+    try std.testing.expectEqual(@as(usize, default_max_wal_len), cfg.max_wal_bytes);
+    try std.testing.expectEqual(@as(usize, default_changefeed_capacity), cfg.changefeed_capacity);
+}
+
+test "openWithConfig honours a smaller record limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try MizuStore.openWithConfig(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "cfg-limit.wal",
+        .{ .max_record_bytes = 16 },
+    );
+    defer store.deinit();
+
+    try std.testing.expectError(
+        StoreError.RecordTooLarge,
+        store.family(.accounts).put("alice", "this value is definitely longer than sixteen bytes"),
+    );
 }

@@ -8,12 +8,44 @@
 //! Clean-room Mizuchi-native implementation. Imports only `std`.
 
 const std = @import("std");
+const toml = @import("../proto/toml.zig");
 
-/// Hard limits enforced by the board.
-pub const max_announcements: usize = 512;
-pub const max_category_len: usize = 32;
-pub const max_title_len: usize = 120;
-pub const max_body_len: usize = 1000;
+/// Historical default limits (kept as named constants for tests / call sites).
+pub const default_max_announcements: usize = 512;
+pub const default_max_category_len: usize = 32;
+pub const default_max_title_len: usize = 120;
+pub const default_max_body_len: usize = 1000;
+
+/// Runtime-tunable announcement-board limits. Defaults preserve the historical
+/// hardcoded behaviour; the orchestrator overlays the `[bouncer]` TOML section
+/// via `Config.applyToml` before constructing an `AnnounceBoard`.
+pub const Config = struct {
+    /// Retained announcement-board cap (FIFO eviction).
+    max_announcements: usize = default_max_announcements,
+    /// Max announcement category tag length (bytes).
+    max_category_len: usize = default_max_category_len,
+    /// Max announcement headline length (bytes).
+    max_title_len: usize = default_max_title_len,
+    /// Max announcement body length (bytes).
+    max_body_len: usize = default_max_body_len,
+
+    /// Overlay `[bouncer]` keys from a parsed TOML document onto `cfg`. Missing
+    /// keys leave the current value untouched. Pure: no I/O, never fails.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("bouncer.announce_max_entries")) |v| {
+            if (v >= 1) cfg.max_announcements = @intCast(v);
+        }
+        if (doc.getUint("bouncer.announce_category_max_len")) |v| {
+            if (v >= 1) cfg.max_category_len = @intCast(v);
+        }
+        if (doc.getUint("bouncer.announce_title_max_len")) |v| {
+            if (v >= 1) cfg.max_title_len = @intCast(v);
+        }
+        if (doc.getUint("bouncer.announce_body_max_len")) |v| {
+            if (v >= 1) cfg.max_body_len = @intCast(v);
+        }
+    }
+};
 
 pub const Error = error{
     AnnouncementInvalid,
@@ -33,11 +65,11 @@ pub const Announcement = struct {
     id: u64,
     /// "*" for a global announcement, otherwise a channel name.
     scope: []u8,
-    /// Short classification tag (<= max_category_len).
+    /// Short classification tag (<= default_max_category_len).
     category: []u8,
-    /// Headline (<= max_title_len).
+    /// Headline (<= default_max_title_len).
     title: []u8,
-    /// Full text (<= max_body_len).
+    /// Full text (<= default_max_body_len).
     body: []u8,
     /// Publishing account/identity.
     by: []u8,
@@ -59,15 +91,21 @@ pub const AnnounceBoard = struct {
     /// Key: owned account string. Value: set of dismissed ids.
     dismissals: std.StringHashMapUnmanaged(IdSet),
     next_id: u64,
+    cfg: Config = .{},
 
     const IdSet = std.AutoHashMapUnmanaged(u64, void);
 
     pub fn init(allocator: std.mem.Allocator) AnnounceBoard {
+        return initWithConfig(allocator, .{});
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) AnnounceBoard {
         return .{
             .allocator = allocator,
             .items = .empty,
             .dismissals = .empty,
             .next_id = 1,
+            .cfg = cfg,
         };
     }
 
@@ -97,7 +135,7 @@ pub const AnnounceBoard = struct {
     ///
     /// Validation: every text field must be non-empty and within its length
     /// bound, otherwise `error.AnnouncementInvalid` is returned and nothing is
-    /// stored. When the board is at `max_announcements`, the oldest entry
+    /// stored. When the board is at `default_max_announcements`, the oldest entry
     /// (FIFO) is evicted to make room.
     pub fn publish(
         self: *AnnounceBoard,
@@ -111,13 +149,13 @@ pub const AnnounceBoard = struct {
         expires_ms: i64,
     ) Error!u64 {
         if (!validField(scope, scope.len)) return error.AnnouncementInvalid;
-        if (!validField(category, max_category_len)) return error.AnnouncementInvalid;
-        if (!validField(title, max_title_len)) return error.AnnouncementInvalid;
-        if (!validField(body, max_body_len)) return error.AnnouncementInvalid;
+        if (!validField(category, self.cfg.max_category_len)) return error.AnnouncementInvalid;
+        if (!validField(title, self.cfg.max_title_len)) return error.AnnouncementInvalid;
+        if (!validField(body, self.cfg.max_body_len)) return error.AnnouncementInvalid;
         if (!validField(by, by.len)) return error.AnnouncementInvalid;
 
         // FIFO eviction when at capacity. Index 0 is the oldest insertion.
-        if (self.items.items.len >= max_announcements) {
+        if (self.items.items.len >= self.cfg.max_announcements) {
             var oldest = self.items.orderedRemove(0);
             self.freeAnnouncement(&oldest);
         }
@@ -350,15 +388,15 @@ test "cap eviction drops oldest FIFO when full" {
     // Fill to capacity.
     var first_id: u64 = 0;
     var i: usize = 0;
-    while (i < max_announcements) : (i += 1) {
+    while (i < default_max_announcements) : (i += 1) {
         const id = try board.publish("*", "c", "t", "b", "bot", .normal, now, 0);
         if (i == 0) first_id = id;
     }
-    try std.testing.expectEqual(max_announcements, board.len());
+    try std.testing.expectEqual(default_max_announcements, board.len());
 
     // One more publish evicts the oldest (first_id) but stays at the cap.
     const overflow_id = try board.publish("*", "c", "newest", "b", "bot", .urgent, now, 0);
-    try std.testing.expectEqual(max_announcements, board.len());
+    try std.testing.expectEqual(default_max_announcements, board.len());
 
     // The evicted oldest is gone; the new one is present.
     try std.testing.expect(!board.revoke(first_id));
@@ -376,9 +414,9 @@ test "publish rejects invalid fields" {
     defer board.deinit();
 
     const now: i64 = 1_000;
-    const big_category = "x" ** (max_category_len + 1);
-    const big_title = "y" ** (max_title_len + 1);
-    const big_body = "z" ** (max_body_len + 1);
+    const big_category = "x" ** (default_max_category_len + 1);
+    const big_title = "y" ** (default_max_title_len + 1);
+    const big_body = "z" ** (default_max_body_len + 1);
 
     try std.testing.expectError(error.AnnouncementInvalid, board.publish("", "c", "t", "b", "bot", .normal, now, 0));
     try std.testing.expectError(error.AnnouncementInvalid, board.publish("*", "", "t", "b", "bot", .normal, now, 0));
@@ -389,4 +427,38 @@ test "publish rejects invalid fields" {
 
     // Nothing was stored.
     try std.testing.expectEqual(@as(usize, 0), board.len());
+}
+
+test "Config defaults preserve historical limits" {
+    const cfg = Config{};
+    try std.testing.expectEqual(default_max_announcements, cfg.max_announcements);
+    try std.testing.expectEqual(default_max_category_len, cfg.max_category_len);
+    try std.testing.expectEqual(default_max_title_len, cfg.max_title_len);
+    try std.testing.expectEqual(default_max_body_len, cfg.max_body_len);
+}
+
+test "Config.applyToml overlays [bouncer] announce keys" {
+    var doc = try toml.parse(
+        std.testing.allocator,
+        "[bouncer]\nannounce_max_entries = 32\nannounce_category_max_len = 8\nannounce_title_max_len = 16\nannounce_body_max_len = 128\n",
+    );
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 32), cfg.max_announcements);
+    try std.testing.expectEqual(@as(usize, 8), cfg.max_category_len);
+    try std.testing.expectEqual(@as(usize, 16), cfg.max_title_len);
+    try std.testing.expectEqual(@as(usize, 128), cfg.max_body_len);
+}
+
+test "initWithConfig enforces a smaller board cap" {
+    var board = AnnounceBoard.initWithConfig(std.testing.allocator, .{ .max_announcements = 2 });
+    defer board.deinit();
+
+    const now: i64 = 1_000;
+    _ = try board.publish("*", "c", "t", "b", "bot", .normal, now, 0);
+    _ = try board.publish("*", "c", "t", "b", "bot", .normal, now, 0);
+    _ = try board.publish("*", "c", "newest", "b", "bot", .normal, now, 0); // evicts oldest
+    try std.testing.expectEqual(@as(usize, 2), board.len());
 }

@@ -2,6 +2,7 @@
 const std = @import("std");
 
 const store_mod = @import("store.zig");
+const toml = @import("../proto/toml.zig");
 
 pub const MizuStore = store_mod.MizuStore;
 
@@ -19,7 +20,23 @@ const salt_hex_len = salt_len * 2;
 const hash_hex_len = hash_len * 2;
 const generation_len = 16;
 const generation_hex_len = generation_len * 2;
-const pbkdf2_rounds: u32 = 100_000;
+const default_pbkdf2_rounds: u32 = 100_000;
+
+/// Runtime-tunable account/credential policy. Defaults preserve the historical
+/// hardcoded behaviour; the orchestrator overlays the `[accounts]` TOML section
+/// via `Config.applyToml` before constructing `Services`.
+pub const Config = struct {
+    /// PBKDF2-HMAC-SHA256 iteration count for account password hashing.
+    pbkdf2_rounds: u32 = default_pbkdf2_rounds,
+
+    /// Overlay `[accounts]` keys from a parsed TOML document onto `cfg`. Missing
+    /// keys leave the current value untouched. Pure: no I/O, never fails.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("accounts.pbkdf2_rounds")) |v| {
+            if (v >= 1 and v <= std.math.maxInt(u32)) cfg.pbkdf2_rounds = @intCast(v);
+        }
+    }
+};
 
 const account_version = "A1";
 const channel_version = "C1";
@@ -217,9 +234,14 @@ const AkickRecord = struct {
 pub const Services = struct {
     store: *MizuStore,
     state: ?StateHook = null,
+    cfg: Config = .{},
 
     pub fn init(store: *MizuStore, state: ?StateHook) Services {
         return .{ .store = store, .state = state };
+    }
+
+    pub fn initWithConfig(store: *MizuStore, state: ?StateHook, cfg: Config) Services {
+        return .{ .store = store, .state = state, .cfg = cfg };
     }
 
     pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
@@ -231,7 +253,7 @@ pub const Services = struct {
         self.store.io.randomSecure(&salt) catch self.store.io.random(&salt);
 
         var hash: [hash_len]u8 = undefined;
-        try hashPassword(&hash, password, &salt);
+        try hashPassword(&hash, password, &salt, self.cfg.pbkdf2_rounds);
 
         const record = AccountRecord{
             .name = AccountName.init(key.asSlice()) catch return error.InvalidName,
@@ -246,24 +268,24 @@ pub const Services = struct {
     pub fn identifyAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
         const key = try accountKey(name);
         const value = self.store.family(.accounts).get(key.asSlice()) orelse {
-            try rejectMissingAccount(password);
+            try rejectMissingAccount(password, self.cfg.pbkdf2_rounds);
             return error.AuthFailed;
         };
         const record = try decodeAccount(value);
-        try verifyPassword(record, password);
+        try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         return .{ .identified = .{ .name = record.name } };
     }
 
     pub fn dropAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
         const record = try self.loadAccount(name);
-        try verifyPassword(record, password);
+        try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         try self.store.family(.accounts).delete(record.name.asSlice());
         return .{ .dropped_account = .{ .name = record.name } };
     }
 
     pub fn ghostAccount(self: *Services, name: []const u8, password: []const u8, nick: []const u8) ServiceError!CommandResult {
         const record = try self.loadAccount(name);
-        try verifyPassword(record, password);
+        try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         const clean_nick = try validateNick(nick);
         return .{ .ghosted = .{ .account = record.name, .nick = clean_nick } };
     }
@@ -276,7 +298,7 @@ pub const Services = struct {
         scratch: []u8,
     ) ServiceError!CommandResult {
         var record = try self.loadAccount(name);
-        try verifyPassword(record, password);
+        try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         switch (field) {
             .email => |email| record.email = try validateEmail(email),
             .flags => |flags| record.flags = flags,
@@ -550,21 +572,21 @@ fn hasCtlOrSep(input: []const u8) bool {
     return false;
 }
 
-fn hashPassword(out: *[hash_len]u8, password: []const u8, salt: *const [salt_len]u8) ServiceError!void {
-    try std.crypto.pwhash.pbkdf2(out, password, salt, pbkdf2_rounds, std.crypto.auth.hmac.sha2.HmacSha256);
+fn hashPassword(out: *[hash_len]u8, password: []const u8, salt: *const [salt_len]u8, rounds: u32) ServiceError!void {
+    try std.crypto.pwhash.pbkdf2(out, password, salt, rounds, std.crypto.auth.hmac.sha2.HmacSha256);
 }
 
-fn verifyPassword(record: AccountRecord, password: []const u8) ServiceError!void {
+fn verifyPassword(record: AccountRecord, password: []const u8, rounds: u32) ServiceError!void {
     try validatePassword(password);
     var candidate: [hash_len]u8 = undefined;
-    try hashPassword(&candidate, password, &record.salt);
+    try hashPassword(&candidate, password, &record.salt, rounds);
     if (!std.crypto.timing_safe.eql([hash_len]u8, candidate, record.hash)) return error.AuthFailed;
 }
 
-fn rejectMissingAccount(password: []const u8) ServiceError!void {
+fn rejectMissingAccount(password: []const u8, rounds: u32) ServiceError!void {
     try validatePassword(password);
     var candidate: [hash_len]u8 = undefined;
-    try hashPassword(&candidate, password, &missing_account_salt);
+    try hashPassword(&candidate, password, &missing_account_salt, rounds);
 }
 
 fn encodeAccount(record: AccountRecord, scratch: []u8) ServiceError![]const u8 {
@@ -915,4 +937,51 @@ test "state hook fires on channel register and drop" {
 
     _ = try services.dropChannel("#mizuchi", "alice");
     try std.testing.expectEqualStrings("#mizuchi", rec.dropped[0..rec.dropped_len]);
+}
+
+test "Config default preserves historical pbkdf2 rounds" {
+    const cfg = Config{};
+    try std.testing.expectEqual(default_pbkdf2_rounds, cfg.pbkdf2_rounds);
+    try std.testing.expectEqual(@as(u32, 100_000), cfg.pbkdf2_rounds);
+}
+
+test "Config.applyToml overlays accounts.pbkdf2_rounds" {
+    var doc = try toml.parse(std.testing.allocator, "[accounts]\npbkdf2_rounds = 250000\n");
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(u32, 250_000), cfg.pbkdf2_rounds);
+}
+
+test "Config.applyToml leaves defaults when keys absent" {
+    var doc = try toml.parse(std.testing.allocator, "[server]\nname = \"x\"\n");
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(default_pbkdf2_rounds, cfg.pbkdf2_rounds);
+}
+
+test "Config.applyToml ignores out-of-range rounds" {
+    var doc = try toml.parse(std.testing.allocator, "[accounts]\npbkdf2_rounds = 0\n");
+    defer doc.deinit(std.testing.allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(default_pbkdf2_rounds, cfg.pbkdf2_rounds);
+}
+
+test "initWithConfig threads custom rounds into hashing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-cfg-rounds.wal");
+    defer store.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 4096 });
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("Bob", "correct horse battery staple", &scratch);
+    const identified = try services.identifyAccount("bob", "correct horse battery staple");
+    try std.testing.expectEqualStrings("bob", identified.identified.name.asSlice());
 }
