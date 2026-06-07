@@ -15,6 +15,7 @@ const module_manifest = @import("modules/manifest.zig");
 const mod_registry = @import("registry.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
+const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
@@ -886,6 +887,10 @@ pub const LinuxServer = struct {
     /// declared commands are dispatched after the comptime registry misses.
     /// Empty by default (no plugins) => the consult is a fast miss.
     wasm: wasm_bridge.Bridge,
+    /// Server-wide loop-guard for cross-node relayed messages, keyed by
+    /// (origin_node, hlc). Per-peer seen-sets miss cross-path duplicates in a
+    /// cyclic mesh; this global set dedups deliver + re-forward across all paths.
+    relay_seen: message_relay.SeenSet,
     listener_fd: linux.fd_t,
     ring: RingCore,
     clients: ClientTable,
@@ -1013,6 +1018,7 @@ pub const LinuxServer = struct {
             .allocator = allocator,
             .config = config,
             .wasm = wasm_bridge.Bridge.init(allocator),
+            .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .listener_fd = listener_fd,
             .s2s_listener_fd = s2s_listener_fd,
             .ring = ring,
@@ -1073,6 +1079,7 @@ pub const LinuxServer = struct {
     pub fn deinit(self: *LinuxServer) void {
         self.driveDeinit();
         self.wasm.deinit();
+        self.relay_seen.deinit();
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) {
                 if (slot.value.s2s) |link| {
@@ -1500,6 +1507,14 @@ pub const LinuxServer = struct {
             link.clearOutbound();
         }
         if (!was and link.established()) self.traceLog(.info, .s2s, "s2s secured link established");
+        // Drain inbound cross-node user messages over the secured link.
+        if (link.takeInbound()) |inbound| {
+            for (inbound) |*owned| {
+                self.deliverRelay(owned.msg);
+                owned.deinit(self.allocator);
+            }
+            self.allocator.free(inbound);
+        } else |_| {}
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
@@ -1524,7 +1539,7 @@ pub const LinuxServer = struct {
         // Drain inbound cross-node user messages and deliver to local clients.
         if (link.takeInbound()) |inbound| {
             for (inbound) |*owned| {
-                self.deliverRelay(owned.msg, link);
+                self.deliverRelay(owned.msg);
                 owned.deinit(self.allocator);
             }
             self.allocator.free(inbound);
@@ -1721,19 +1736,20 @@ pub const LinuxServer = struct {
     /// Forward a cross-node user message to every established S2S peer except
     /// `skip`. Loop-guarded per-peer by (origin_node, hlc). Best-effort: a full
     /// link buffer never faults the local delivery that triggered it.
-    fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage, skip: ?*s2s_link.S2sLink) void {
-        var it = self.clients.iterator();
-        while (it.next()) |entry| {
-            const c = entry.value;
-            const link = c.s2s orelse continue;
-            if (skip) |s| if (link == s) continue;
-            if (!link.established()) continue;
-            link.sendMessage(msg) catch continue;
-            const out = link.outbound();
-            if (out.len != 0) {
-                appendToConn(c, out) catch continue;
+    fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
+        for (self.clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const c = &slot.value;
+            if (c.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.sendMessage(msg) catch continue;
+                self.flushS2sOutbound(c, link.outbound()) catch continue;
                 link.clearOutbound();
-                self.armSendIfNeeded(c) catch {};
+            } else if (c.s2s) |link| {
+                if (!link.established()) continue;
+                link.sendMessage(msg) catch continue;
+                self.flushS2sOutbound(c, link.outbound()) catch continue;
+                link.clearOutbound();
             }
         }
     }
@@ -1741,7 +1757,9 @@ pub const LinuxServer = struct {
     /// Deliver an inbound relayed user message to LOCAL recipients (channel
     /// members or a local nick), then re-forward to other peers for multi-hop
     /// (loop-guarded by the per-peer seen-set + origin id).
-    fn deliverRelay(self: *LinuxServer, msg: s2s_link.RelayMessage, source_link: *s2s_link.S2sLink) void {
+    fn deliverRelay(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
+        // Global mesh-wide dedup (handles cross-path duplicates in a cyclic mesh).
+        if (self.relay_seen.observe(msg.origin_node, msg.hlc)) return;
         const verb = switch (msg.verb) {
             .privmsg => "PRIVMSG",
             .notice => "NOTICE",
@@ -1759,17 +1777,17 @@ pub const LinuxServer = struct {
             std.fmt.bufPrint(&line_buf, ":{s} {s} {s} :{s}\r\n", .{ msg.source_prefix, verb, msg.target, msg.text }) catch return;
 
         if (world_model.isChannelName(msg.target)) {
-            var members = self.world.memberIterator(msg.target) orelse {
-                self.relayToPeers(msg, source_link);
-                return;
-            };
-            while (members.next()) |member| {
-                self.deliver(clientIdFromWorld(member.*), line) catch {};
+            if (self.world.memberIterator(msg.target)) |*it| {
+                var members = it.*;
+                while (members.next()) |member| {
+                    self.deliver(clientIdFromWorld(member.*), line) catch {};
+                }
             }
         } else if (self.world.findNick(msg.target)) |wid| {
             self.deliver(clientIdFromWorld(wid), line) catch {};
         }
-        self.relayToPeers(msg, source_link);
+        // Multi-hop re-forward to all peers (global seen-set already deduped).
+        self.relayToPeers(msg);
     }
 
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
@@ -7165,6 +7183,8 @@ pub const LinuxServer = struct {
             {
                 var pbuf: [320]u8 = undefined;
                 if (clientPrefix(conn, &pbuf)) |prefix| {
+                    const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+                    _ = self.relay_seen.observe(self.config.node_id, hlc); // drop an echo back
                     self.relayToPeers(.{
                         .verb = if (is_notice) .notice else .privmsg,
                         .target = chan,
@@ -7174,8 +7194,8 @@ pub const LinuxServer = struct {
                         .tags = client_tags orelse "",
                         .text = text,
                         .origin_node = self.config.node_id,
-                        .hlc = @intCast(@max(0, self.nowMs())),
-                    }, null);
+                        .hlc = hlc,
+                    });
                 } else |_| {}
             }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare

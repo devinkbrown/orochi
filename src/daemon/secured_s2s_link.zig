@@ -138,6 +138,20 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
+    /// Forward a cross-node user message over the secured CRDT link.
+    pub fn sendMessage(self: *SecuredLink, msg: s2s_link.RelayMessage) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendMessage(msg);
+        try self.drainInner();
+    }
+
+    /// Drain inbound cross-node messages decoded by the inner link. Caller owns
+    /// the slice + each Owned (deinit each, free the slice).
+    pub fn takeInbound(self: *SecuredLink) anyerror![]s2s_peer.InboundMessage {
+        const link = self.inner orelse return &.{};
+        return link.takeInbound();
+    }
+
     fn writeFramed(self: *SecuredLink, payload: []const u8) anyerror!void {
         var hdr: [4]u8 = undefined;
         std.mem.writeInt(u32, &hdr, @intCast(payload.len), .little);
