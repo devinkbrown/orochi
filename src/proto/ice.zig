@@ -38,16 +38,23 @@ pub const TransportAddress = struct {
         return out;
     }
 
-    pub fn bytes(self: TransportAddress) []const u8 {
+    /// Returns the active IP bytes. Takes `self` by reference: a by-value
+    /// receiver would return a slice into the destroyed parameter temporary
+    /// (dangling), which made `eql`/`less` compare reused stack garbage.
+    pub fn bytes(self: *const TransportAddress) []const u8 {
         return self.ip[0..self.ip_len];
     }
 
     pub fn eql(a: TransportAddress, b: TransportAddress) bool {
-        return a.port == b.port and std.mem.eql(u8, a.bytes(), b.bytes());
+        // Slice directly from the by-value params (live for this call) rather
+        // than via a by-value `bytes()` whose result would dangle.
+        return a.port == b.port and
+            a.ip_len == b.ip_len and
+            std.mem.eql(u8, a.ip[0..a.ip_len], b.ip[0..b.ip_len]);
     }
 
     fn less(a: TransportAddress, b: TransportAddress) bool {
-        const ip_order = std.mem.order(u8, a.bytes(), b.bytes());
+        const ip_order = std.mem.order(u8, a.ip[0..a.ip_len], b.ip[0..b.ip_len]);
         if (ip_order != .eq) return ip_order == .lt;
         return a.port < b.port;
     }

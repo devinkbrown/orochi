@@ -113,6 +113,7 @@ pub const login_throttle = @import("login_throttle.zig");
 pub const mask_style = @import("mask_style.zig");
 pub const media_pin = @import("media_pin.zig");
 pub const media_plane = @import("media_plane.zig");
+pub const native_media_link = @import("native_media_link.zig");
 pub const media_room = @import("media_room.zig");
 pub const memo_group = @import("memo_group.zig");
 pub const mention_graph = @import("mention_graph.zig");
@@ -345,6 +346,7 @@ test {
     _ = mask_style;
     _ = media_pin;
     _ = media_plane;
+    _ = native_media_link;
     _ = media_room;
     _ = memo_group;
     _ = mention_graph;
