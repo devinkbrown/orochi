@@ -41,4 +41,14 @@ pub const Core = struct {
     pub fn params(self: *const Core) []const []const u8 {
         return self.parsed.paramSlice();
     }
+
+    /// Emit a numeric reply to the current client.
+    pub fn reply(self: *Core, code: server.ReplyCode, p: []const []const u8, trailing: []const u8) !void {
+        try self.server.moduleNumeric(self.conn, code, p, trailing);
+    }
+
+    /// Emit an already-formatted, CRLF-terminated raw line to the current client.
+    pub fn raw(self: *Core, bytes: []const u8) !void {
+        try self.server.moduleRaw(self.conn, bytes);
+    }
 };

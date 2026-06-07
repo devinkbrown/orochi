@@ -331,6 +331,10 @@ const irc_line = struct {
 /// can name the type the live dispatch path uses.
 pub const ParsedLine = irc_line.LineView;
 
+/// Public alias of the daemon's numeric-reply code enum so modules can emit
+/// numerics through `Core.reply` without reaching into server internals.
+pub const ReplyCode = Numeric;
+
 const ringlane = struct {
     const IoUring = linux.IoUring;
 
@@ -1900,6 +1904,19 @@ pub const LinuxServer = struct {
             var sink = QueueSink{ .conn = conn };
             try processLine(conn, line, &sink);
         }
+    }
+
+    /// Module-facing numeric reply: lets a SerpentRegistry module emit a numeric
+    /// to a client through `Core.reply` without touching server internals.
+    pub fn moduleNumeric(self: *LinuxServer, conn: *ConnState, code: Numeric, params: []const []const u8, trailing: []const u8) ServerError!void {
+        _ = self;
+        try queueNumeric(conn, code, params, trailing);
+    }
+
+    /// Module-facing raw line emit (already CRLF-terminated by the caller).
+    pub fn moduleRaw(self: *LinuxServer, conn: *ConnState, bytes: []const u8) ServerError!void {
+        _ = self;
+        try appendToConn(conn, bytes);
     }
 
     fn registerConnNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
