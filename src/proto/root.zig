@@ -208,6 +208,7 @@ pub const rtcp_xr = @import("rtcp_xr.zig");
 pub const rtp_ext = @import("rtp_ext.zig");
 pub const rtp_profile = @import("rtp_profile.zig");
 pub const rtp_red = @import("rtp_red.zig");
+pub const rtt_estimator = @import("rtt_estimator.zig");
 pub const rtx = @import("rtx.zig");
 pub const s2s_frame = @import("s2s_frame.zig");
 pub const sasl_anonymous = @import("sasl_anonymous.zig");
@@ -511,6 +512,7 @@ test {
     _ = rtp_ext;
     _ = rtp_profile;
     _ = rtp_red;
+    _ = rtt_estimator;
     _ = rtx;
     _ = s2s_frame;
     _ = sasl_anonymous;
