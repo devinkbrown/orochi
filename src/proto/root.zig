@@ -139,6 +139,7 @@ pub const list_props = @import("list_props.zig");
 pub const listx = @import("listx.zig");
 pub const lotus = @import("lotus.zig");
 pub const lusers = @import("lusers.zig");
+pub const markdown = @import("markdown.zig");
 pub const membership_event = @import("membership_event.zig");
 pub const merkle_tree = @import("merkle_tree.zig");
 pub const meshpass = @import("meshpass.zig");
@@ -414,6 +415,7 @@ test {
     _ = listx;
     _ = lotus;
     _ = lusers;
+    _ = markdown;
     _ = membership_event;
     _ = merkle_tree;
     _ = meshpass;
