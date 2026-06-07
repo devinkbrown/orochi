@@ -17,6 +17,7 @@ const wasm_bridge = @import("../wasm/host/bridge.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const tiered_keys = @import("tiered_keys.zig");
+const nick_enforcement = @import("nick_enforcement.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
@@ -704,6 +705,9 @@ pub const Config = struct {
     /// Drop a connection that has not completed registration (NICK+USER) within
     /// this many milliseconds (the io_uring timeout sweep enforces it).
     registration_timeout_ms: i64 = 30_000,
+    /// Grace window (ms) an unauthenticated user may hold a REGISTERED nick before
+    /// being force-renamed to a Guest nick. 0 disables nick protection.
+    nick_grace_ms: i64 = 60_000,
     /// A registered client idle (no inbound bytes) for this long is sent a
     /// server PING; if it does not answer within `ping_timeout_ms` it is dropped
     /// with "Ping timeout". The same periodic sweep enforces both.
@@ -790,6 +794,9 @@ pub const ConnState = struct {
     send_offset: usize = 0,
     send_armed: bool = false,
     closing: bool = false,
+    /// When this connection took a REGISTERED nick while unauthenticated (UNIX ms;
+    /// 0 = nick is free / owned by this account). The sweep enforces the grace.
+    nick_claimed_at_ms: i64 = 0,
     /// QUIT reason broadcast to shared channels when this connection is torn down
     /// via the send-drain path. Defaults to the generic socket-close reason; the
     /// timeout sweep overrides it (e.g. "Ping timeout") before marking `closing`.
@@ -1194,6 +1201,35 @@ pub const LinuxServer = struct {
                 c.closing = true;
                 self.armSendIfNeeded(c) catch {};
                 continue;
+            }
+
+            // Nick protection: a registered nick held by an unauthenticated user
+            // is force-renamed to a Guest nick once the grace window elapses. The
+            // check self-clears once the user identifies (authenticated_to_owner).
+            if (c.nick_claimed_at_ms != 0) {
+                const authed_owner = if (c.session.account()) |a|
+                    std.ascii.eqlIgnoreCase(a, c.session.displayName())
+                else
+                    false;
+                switch (nick_enforcement.evaluate(.{
+                    .nick_is_registered = true,
+                    .authenticated_to_owner = authed_owner,
+                    .claimed_at_ms = c.nick_claimed_at_ms,
+                    .now_ms = now,
+                    .grace_ms = self.config.nick_grace_ms,
+                })) {
+                    .allow => c.nick_claimed_at_ms = 0,
+                    .warn => {},
+                    .enforce => {
+                        var gbuf: [32]u8 = undefined;
+                        const seed: u64 = @as(u64, @bitCast(entry.id)) & 0xFFFFFF;
+                        if (nick_enforcement.guestNick(&gbuf, seed)) |guest| {
+                            self.forceRenameTo(entry.id, c, guest);
+                            self.armSendIfNeeded(c) catch {};
+                        } else |_| {}
+                        c.nick_claimed_at_ms = 0;
+                    },
+                }
             }
 
             // Registered: idle clients get a server PING; if the grace elapses
@@ -2000,6 +2036,7 @@ pub const LinuxServer = struct {
                 self.applyAutojoin(id, conn);
                 self.deliverWelcome(conn);
                 self.emitClientRegistered(id, conn);
+                self.evaluateNickProtection(conn);
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -5460,6 +5497,50 @@ pub const LinuxServer = struct {
     /// `:old!u@h NICK :new` to the client and every common-channel member.
     /// MONITOR watchers see old offline / new online; the old identity is
     /// recorded in WHOWAS.
+    /// Server-initiated forced nick change (nick-protection enforcement). Mirrors
+    /// the broadcast path of handleNickChange. Best-effort: returns silently if the
+    /// target nick is already taken (retried on a later sweep).
+    fn forceRenameTo(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, newnick: []const u8) void {
+        const wid = worldIdFromClient(id);
+        var old_buf: [64]u8 = undefined;
+        const old_slice = conn.session.displayName();
+        if (old_slice.len == 0 or old_slice.len > old_buf.len) return;
+        @memcpy(old_buf[0..old_slice.len], old_slice);
+        const old = old_buf[0..old_slice.len];
+        if (std.mem.eql(u8, old, newnick)) return;
+
+        self.world.registerNick(newnick, wid) catch return; // taken → try next sweep
+        var prefix_buf: [256]u8 = undefined;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const old_prefix = clientPrefix(conn, &prefix_buf) catch return;
+        const msg = formatMessage(&msg_buf, old_prefix, "NICK", &.{}, newnick) catch return;
+        self.recordWhowas(conn);
+        conn.session.setNick(newnick) catch return;
+        self.deliver(id, msg) catch {};
+        self.notifyCommonChannels(id, msg, null, id) catch {};
+        self.monitorTransition(old, newnick) catch {};
+    }
+
+    /// Re-evaluate nick protection after a connection (re)sets its nick: if the
+    /// nick maps to a registered account this connection is NOT authenticated to,
+    /// start the grace timer and warn; otherwise clear it. The sweep enforces.
+    fn evaluateNickProtection(self: *LinuxServer, conn: *ConnState) void {
+        conn.nick_claimed_at_ms = 0;
+        if (self.config.nick_grace_ms <= 0) return;
+        const svc = self.account_services orelse return;
+        const nick = conn.session.displayName();
+        if (nick.len == 0 or std.mem.eql(u8, nick, "*")) return;
+        if (conn.session.account()) |acct| {
+            if (std.ascii.eqlIgnoreCase(acct, nick)) return; // already owns it
+        }
+        _ = svc.accountInfo(nick) catch return; // not registered → nothing to protect
+        conn.nick_claimed_at_ms = self.nowMs();
+        var b: [default_reply_bytes]u8 = undefined;
+        const secs: u64 = @intCast(@divFloor(self.config.nick_grace_ms, 1000));
+        const note = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :Nick {s} is registered — IDENTIFY within {d}s or you'll be renamed to a Guest nick.\r\n", .{ server_name, nick, nick, secs }) catch return;
+        appendToConn(conn, note) catch {};
+    }
+
     pub fn handleNickChange(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NONICKNAMEGIVEN, &.{}, "No nickname given");
@@ -5531,6 +5612,10 @@ pub const LinuxServer = struct {
         var dbuf: [80]u8 = undefined;
         const detail = std.fmt.bufPrint(&dbuf, "<- {s}", .{old}) catch "";
         self.notifyObservers(.nick, observeSubject(conn, detail));
+
+        // Nick protection: a newly-taken registered nick (while unauthenticated)
+        // starts the grace timer; the sweep enforces a Guest rename on expiry.
+        self.evaluateNickProtection(conn);
     }
 
     /// MONITOR notify for a nick change: old offline, new online, WITHOUT
@@ -5696,6 +5781,7 @@ pub const LinuxServer = struct {
         self.applyAutojoin(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
         self.emitClientRegistered(idFromToken(conn.token), conn);
+        self.evaluateNickProtection(conn);
     }
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
@@ -5721,6 +5807,7 @@ pub const LinuxServer = struct {
         self.applyAutojoin(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
         self.emitClientRegistered(idFromToken(conn.token), conn);
+        self.evaluateNickProtection(conn);
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).

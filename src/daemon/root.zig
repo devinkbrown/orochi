@@ -126,7 +126,6 @@ pub const nick_alias = @import("nick_alias.zig");
 pub const nick_enforcement = @import("nick_enforcement.zig");
 pub const nick_history = @import("nick_history.zig");
 pub const nickname_color = @import("nickname_color.zig");
-pub const nick_protection = @import("nick_protection.zig");
 pub const node_identity = @import("node_identity.zig");
 pub const notification_pref = @import("notification_pref.zig");
 pub const notification_queue = @import("notification_queue.zig");
@@ -358,7 +357,6 @@ test {
     _ = nick_enforcement;
     _ = nick_history;
     _ = nickname_color;
-    _ = nick_protection;
     _ = node_identity;
     _ = notification_pref;
     _ = notification_queue;
