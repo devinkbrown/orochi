@@ -14,6 +14,7 @@ const module_core = @import("module_core.zig");
 const module_manifest = @import("modules/manifest.zig");
 const mod_registry = @import("registry.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
+const netsplit_batch = @import("netsplit_batch.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
@@ -824,6 +825,10 @@ pub const ConnState = struct {
     /// bytes instead of `s2s`. Exactly one of `s2s`/`s2s_secured` is set per peer.
     /// Heap-owned; freed in closeConn/deinit.
     s2s_secured: ?*secured_s2s_link.SecuredLink = null,
+    /// One-shot guard: membership-roster burst sent to this peer once its link
+    /// first reaches established (so the peer's NAMES/WHO is correct immediately,
+    /// not only after future joins). See sendMembershipBurstTo / docs/planning/16.
+    s2s_burst_done: bool = false,
     /// Target address for an outbound S2S connect, kept here (the slot is stable)
     /// so it outlives the in-flight IORING_OP_CONNECT submission.
     s2s_connect_addr: posix.sockaddr.in = undefined,
@@ -1495,6 +1500,10 @@ pub const LinuxServer = struct {
             link.clearOutbound();
         }
         if (!was and link.established()) self.traceLog(.info, .s2s, "s2s secured link established");
+        if (!conn.s2s_burst_done and link.established()) {
+            conn.s2s_burst_done = true;
+            self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
+        }
     }
 
     fn driveS2s(self: *LinuxServer, conn: *ConnState, link: *s2s_link.S2sLink, bytes: []const u8) void {
@@ -1520,6 +1529,10 @@ pub const LinuxServer = struct {
             }
             self.allocator.free(inbound);
         } else |_| {}
+        if (!conn.s2s_burst_done and link.established()) {
+            conn.s2s_burst_done = true;
+            self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
+        }
     }
 
     /// Completion for an outbound S2S connect: on success open the handshake from
@@ -1775,6 +1788,7 @@ pub const LinuxServer = struct {
         if (self.clients.get(id)) |conn| {
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
+                self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
@@ -1784,6 +1798,7 @@ pub const LinuxServer = struct {
                 return;
             }
             if (conn.s2s) |link| {
+                self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s = null;
@@ -2084,6 +2099,77 @@ pub const LinuxServer = struct {
     /// World projection (#6) producer: announce a local member's presence (or
     /// departure) in `channel` to every established S2S peer. Best-effort — a full
     /// link buffer or send-arm failure never faults the local membership change.
+    /// On peer-link drop, notify local members with an IRCv3 netsplit BATCH of
+    /// QUITs for the remote members that link had announced (instead of letting
+    /// them silently vanish from NAMES). Must run BEFORE the link is deinit'd
+    /// (it reads the link's remote roster). Best-effort. (#64)
+    fn netsplitOnPeerDrop(self: *LinuxServer, conn: *ConnState) void {
+        const remote_name = if (conn.s2s_secured) |l| l.remoteName() else if (conn.s2s) |l| l.remoteName() else return;
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            const remote_members = if (conn.s2s_secured) |l|
+                l.channelMembers(cv.name)
+            else if (conn.s2s) |l|
+                l.channelMembers(cv.name)
+            else
+                &.{};
+            if (remote_members.len == 0) continue;
+
+            var ghosts: [32]netsplit_batch.Ghost = undefined;
+            var prefixes: [32][160]u8 = undefined;
+            var n: usize = 0;
+            for (remote_members) |m| {
+                if (n >= ghosts.len) break;
+                const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!*@{s}", .{ m.nick, remote_name }) catch continue;
+                ghosts[n] = .{ .prefix = prefix, .nick = m.nick };
+                n += 1;
+            }
+            if (n == 0) continue;
+
+            var ref_buf: [16]u8 = undefined;
+            const ref = netsplit_batch.makeBatchRef(&ref_buf, @intCast(@max(@as(i64, 0), self.nowMs())));
+            var batch_buf: [8192]u8 = undefined;
+            const batch = netsplit_batch.writeNetsplit(&batch_buf, ref, server_name, remote_name, ghosts[0..n]) catch continue;
+
+            var members = self.world.memberIterator(cv.name) orelse continue;
+            while (members.next()) |member| {
+                const mc = self.clients.get(clientIdFromWorld(member.*)) orelse continue;
+                if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
+                appendToConn(mc, batch) catch continue;
+                self.armSendIfNeeded(mc) catch {};
+            }
+        }
+    }
+
+    /// Burst the full local channel-member roster to ONE freshly-established peer
+    /// link (the conn's s2s/s2s_secured), so the peer's NAMES/WHO is correct
+    /// immediately rather than only after subsequent joins. Best-effort. (#65)
+    fn sendMembershipBurstTo(self: *LinuxServer, conn: *ConnState) void {
+        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            var members = self.world.memberIterator(cv.name) orelse continue;
+            while (members.next()) |member| {
+                const mconn = self.clients.get(clientIdFromWorld(member.*)) orelse continue;
+                if (mconn.s2s != null or mconn.s2s_secured != null) continue; // skip peer links
+                const nick = mconn.session.displayName();
+                const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
+                if (conn.s2s_secured) |link| {
+                    link.sendMembership(cv.name, nick, status, hlc, true) catch continue;
+                } else if (conn.s2s) |link| {
+                    link.sendMembership(cv.name, nick, status, hlc, true) catch continue;
+                }
+            }
+        }
+        if (conn.s2s_secured) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        } else if (conn.s2s) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        }
+    }
+
     fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         for (self.clients.slots.items) |*slot| {
