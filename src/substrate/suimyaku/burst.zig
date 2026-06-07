@@ -3,6 +3,7 @@ const std = @import("std");
 const channel_crdt = @import("channel_crdt.zig");
 const clock = @import("clock.zig");
 const delta_codec = @import("delta_codec.zig");
+const toml = @import("../../proto/toml.zig");
 
 pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const Hlc = channel_crdt.Hlc;
@@ -18,7 +19,16 @@ pub const codec_limits = delta_codec.Limits{
     .max_dots_per_add = 1,
 };
 
-pub const Limits = struct { max_burst_bytes: usize = 64 * 1024, max_records: usize = 512 };
+pub const Limits = struct {
+    max_burst_bytes: usize = 64 * 1024,
+    max_records: usize = 512,
+
+    /// Overlay `[mesh.link]` state-burst keys onto these limits.
+    pub fn applyToml(cfg: *Limits, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.link.burst_max_bytes")) |v| cfg.max_burst_bytes = @intCast(v);
+        if (doc.getUint("mesh.link.burst_max_records")) |v| cfg.max_records = @intCast(v);
+    }
+};
 
 pub const default_limits = Limits{};
 
@@ -596,4 +606,18 @@ test "two nodes bursting to each other converge" {
     try apply(allocator, &a, burst_b, default_limits);
     try apply(allocator, &b, burst_a, default_limits);
     try std.testing.expect(ChannelCrdt.eql(&a, &b));
+}
+
+test "Limits.applyToml overlays mesh.link burst keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.link]
+        \\burst_max_bytes = 262144
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Limits{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 262144), cfg.max_burst_bytes);
+    try std.testing.expectEqual(@as(usize, 512), cfg.max_records); // default
 }

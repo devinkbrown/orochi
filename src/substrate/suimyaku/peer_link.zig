@@ -4,6 +4,7 @@
 //! (the `s2s_peer` driver) feed complete frame bytes in and provide output
 //! buffers for any emitted bytes.
 const std = @import("std");
+const toml = @import("../../proto/toml.zig");
 
 pub const State = enum {
     idle,
@@ -105,6 +106,28 @@ pub const default_heartbeat_interval_ms: u64 = 15_000;
 pub const default_idle_timeout_ms: u64 = 45_000;
 pub const default_drain_timeout_ms: u64 = 5_000;
 pub const max_payload_len: usize = std.math.maxInt(u16);
+
+/// Tunable peer-link transport parameters. Defaults mirror the `default_*`
+/// constants above, so a `Config{}` is behaviorally identical to the prior
+/// hardcoded values.
+pub const Config = struct {
+    send_credit: u32 = default_send_credit,
+    replay_window: u64 = default_replay_window,
+    handshake_timeout_ms: u64 = default_handshake_timeout_ms,
+    heartbeat_interval_ms: u64 = default_heartbeat_interval_ms,
+    idle_timeout_ms: u64 = default_idle_timeout_ms,
+    drain_timeout_ms: u64 = default_drain_timeout_ms,
+
+    /// Overlay `[mesh.link]` peer-link transport keys onto this config.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.link.send_credit_bytes")) |v| cfg.send_credit = @intCast(v);
+        if (doc.getUint("mesh.link.replay_window")) |v| cfg.replay_window = v;
+        if (doc.getUint("mesh.link.handshake_timeout_ms")) |v| cfg.handshake_timeout_ms = v;
+        if (doc.getUint("mesh.link.heartbeat_interval_ms")) |v| cfg.heartbeat_interval_ms = v;
+        if (doc.getUint("mesh.link.idle_timeout_ms")) |v| cfg.idle_timeout_ms = v;
+        if (doc.getUint("mesh.link.drain_timeout_ms")) |v| cfg.drain_timeout_ms = v;
+    }
+};
 
 const magic = [_]u8{ 'S', 'P', 'L', 'K' };
 // Peer-link wire protocol major version.
@@ -593,4 +616,20 @@ test "heartbeat and timeout are deterministic with caller supplied clock" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "Config.applyToml overlays mesh.link transport keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.link]
+        \\send_credit_bytes = 131072
+        \\idle_timeout_ms = 90000
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(u32, 131072), cfg.send_credit);
+    try std.testing.expectEqual(@as(u64, 90000), cfg.idle_timeout_ms);
+    try std.testing.expectEqual(default_heartbeat_interval_ms, cfg.heartbeat_interval_ms); // default
 }

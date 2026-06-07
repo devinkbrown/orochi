@@ -4,6 +4,7 @@
 //! sends full payloads eagerly and digest/GRAFT repair lazily.
 const std = @import("std");
 const membership_view = @import("membership_view.zig");
+const toml = @import("../../proto/toml.zig");
 
 pub const NodeId = membership_view.NodeId;
 pub const Rng = membership_view.Rng;
@@ -29,6 +30,16 @@ pub const Config = struct {
         if (self.active_max == 0) return error.InvalidConfig;
         if (self.passive_max <= self.active_max) return error.InvalidConfig;
         if (self.prwl > self.arwl) return error.InvalidConfig;
+    }
+
+    /// Overlay `[mesh.gossip]` HyParView keys onto this config.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.gossip.active_view_max")) |v| cfg.active_max = @intCast(v);
+        if (doc.getUint("mesh.gossip.passive_view_max")) |v| cfg.passive_max = @intCast(v);
+        if (doc.getUint("mesh.gossip.active_walk_len")) |v| cfg.arwl = @intCast(v);
+        if (doc.getUint("mesh.gossip.passive_walk_len")) |v| cfg.prwl = @intCast(v);
+        if (doc.getUint("mesh.gossip.shuffle_active_count")) |v| cfg.shuffle_active = @intCast(v);
+        if (doc.getUint("mesh.gossip.shuffle_passive_count")) |v| cfg.shuffle_passive = @intCast(v);
     }
 };
 
@@ -352,6 +363,11 @@ pub const Views = struct {
 
 pub const PlumtreeConfig = struct {
     graft_retry_ms: i64 = 1000,
+
+    /// Overlay `[mesh.gossip]` Plumtree keys onto this config.
+    pub fn applyToml(cfg: *PlumtreeConfig, doc: *const toml.Document) void {
+        if (doc.getInt("mesh.gossip.graft_retry_ms")) |v| cfg.graft_retry_ms = v;
+    }
 };
 
 const StoredMessage = struct {
@@ -745,4 +761,28 @@ test "plumtree eager builds tree lazy graft recovers and prune sheds duplicate" 
         else => {},
     };
     try std.testing.expect(pc.hasMessage(101));
+}
+
+test "Config/PlumtreeConfig applyToml overlay mesh.gossip keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.gossip]
+        \\active_view_max = 16
+        \\passive_view_max = 128
+        \\active_walk_len = 9
+        \\graft_retry_ms = 750
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 16), cfg.active_max);
+    try std.testing.expectEqual(@as(usize, 128), cfg.passive_max);
+    try std.testing.expectEqual(@as(u8, 9), cfg.arwl);
+    // Untouched.
+    try std.testing.expectEqual(@as(u8, 3), cfg.prwl);
+
+    var pc = PlumtreeConfig{};
+    pc.applyToml(&doc);
+    try std.testing.expectEqual(@as(i64, 750), pc.graft_retry_ms);
 }

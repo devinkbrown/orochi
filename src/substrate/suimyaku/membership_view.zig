@@ -6,6 +6,7 @@
 //! by the caller, so simulation, replay, and production actors share the same
 //! deterministic state machine.
 const std = @import("std");
+const toml = @import("../../proto/toml.zig");
 
 /// Stable identifier for a mesh node (planning/04: low 64 bits of NodeId).
 pub const NodeId = u64;
@@ -54,6 +55,14 @@ pub const Config = struct {
         if (self.shuffle_active_count + self.shuffle_passive_count == 0) {
             return error.InvalidConfig;
         }
+    }
+
+    /// Overlay `[mesh.gossip]` bounded-view keys onto this config.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.gossip.view_active_capacity")) |v| cfg.active_capacity = @intCast(v);
+        if (doc.getUint("mesh.gossip.view_passive_capacity")) |v| cfg.passive_capacity = @intCast(v);
+        if (doc.getUint("mesh.gossip.view_shuffle_active")) |v| cfg.shuffle_active_count = @intCast(v);
+        if (doc.getUint("mesh.gossip.view_shuffle_passive")) |v| cfg.shuffle_passive_count = @intCast(v);
     }
 };
 
@@ -549,4 +558,22 @@ test "invalid input is rejected without changing the view" {
     try std.testing.expectError(error.InvalidNode, view.join(1, 100, &rng));
     try std.testing.expectEqual(@as(usize, 0), view.activeCount());
     try std.testing.expectEqual(@as(usize, 0), view.passiveCount());
+}
+
+test "Config.applyToml overlays mesh.gossip bounded-view keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.gossip]
+        \\view_active_capacity = 10
+        \\view_passive_capacity = 80
+        \\view_shuffle_active = 3
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 10), cfg.active_capacity);
+    try std.testing.expectEqual(@as(usize, 80), cfg.passive_capacity);
+    try std.testing.expectEqual(@as(usize, 3), cfg.shuffle_active_count);
+    try std.testing.expectEqual(@as(usize, 4), cfg.shuffle_passive_count); // default
 }

@@ -4,6 +4,7 @@
 //! ownership in at init. String keys are copied into managed StringHashMaps and
 //! released on removal/deinit.
 const std = @import("std");
+const toml = @import("../../proto/toml.zig");
 
 pub const NodeId = u64;
 
@@ -28,6 +29,14 @@ pub const Config = struct {
         if (self.max_channels == 0) return error.InvalidConfig;
         if (self.max_nodes_per_channel == 0) return error.InvalidConfig;
         if (self.max_name_len == 0) return error.InvalidConfig;
+    }
+
+    /// Overlay `[mesh.routing]` route-table keys onto this config.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.routing.max_nicks")) |v| cfg.max_nicks = @intCast(v);
+        if (doc.getUint("mesh.routing.max_channels")) |v| cfg.max_channels = @intCast(v);
+        if (doc.getUint("mesh.routing.max_nodes_per_channel")) |v| cfg.max_nodes_per_channel = @intCast(v);
+        if (doc.getUint("mesh.routing.max_name_len")) |v| cfg.max_name_len = @intCast(v);
     }
 };
 
@@ -542,4 +551,20 @@ test "removeNode evicts that node's remote members (netsplit hygiene)" {
 
     table.removeNode(20); // last member gone -> channel pruned
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#chat").len);
+}
+
+test "Config.applyToml overlays mesh.routing route-table keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.routing]
+        \\max_nicks = 8192
+        \\max_nodes_per_channel = 128
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 8192), cfg.max_nicks);
+    try std.testing.expectEqual(@as(usize, 128), cfg.max_nodes_per_channel);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.max_channels); // default
 }

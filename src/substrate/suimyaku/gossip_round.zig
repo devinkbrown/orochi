@@ -3,6 +3,7 @@ const std = @import("std");
 
 const membership_view = @import("membership_view.zig");
 const goryu = @import("goryu.zig");
+const toml = @import("../../proto/toml.zig");
 
 pub const NodeId = membership_view.NodeId;
 pub const MemberState = enum { alive, suspect, dead, left };
@@ -19,6 +20,12 @@ pub const SazanamiConfig = struct {
         if (c.suspicion_timeout_ms < 0) c.suspicion_timeout_ms = 0;
         if (c.witness_quorum < 1) c.witness_quorum = 1;
         return c;
+    }
+
+    /// Overlay `[mesh.swim]` Sazanami keys onto this config.
+    pub fn applyToml(cfg: *SazanamiConfig, doc: *const toml.Document) void {
+        if (doc.getInt("mesh.swim.sazanami_suspicion_timeout_ms")) |v| cfg.suspicion_timeout_ms = v;
+        if (doc.getUint("mesh.swim.sazanami_witness_quorum")) |v| cfg.witness_quorum = @intCast(v);
     }
 };
 
@@ -215,6 +222,13 @@ pub const Config = struct {
         if (c.fanout == 0) c.fanout = 1;
         if (c.max_member_deltas == 0) c.max_member_deltas = 1;
         return c;
+    }
+
+    /// Overlay `[mesh.gossip]` gossip-round keys onto this config.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.gossip.round_fanout")) |v| cfg.fanout = @intCast(v);
+        if (doc.getUint("mesh.gossip.max_member_deltas")) |v| cfg.max_member_deltas = @intCast(v);
+        if (doc.getUint("mesh.gossip.max_suspicions")) |v| cfg.max_suspicions = @intCast(v);
     }
 };
 
@@ -695,4 +709,28 @@ test "rounds are deterministic with the same seed" {
     try testing.expectEqualSlices(NodeId, ra.peers.items, rb.peers.items);
     try testing.expectEqualSlices(MemberDelta, ra.payload.member_deltas.items, rb.payload.member_deltas.items);
     try testing.expectEqualSlices(Suspicion, ra.payload.suspicions.items, rb.payload.suspicions.items);
+}
+
+test "Config/SazanamiConfig applyToml overlay mesh.gossip + mesh.swim keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.gossip]
+        \\round_fanout = 7
+        \\max_suspicions = 99
+        \\[mesh.swim]
+        \\sazanami_suspicion_timeout_ms = 4000
+        \\sazanami_witness_quorum = 5
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try testing.expectEqual(@as(usize, 7), cfg.fanout);
+    try testing.expectEqual(@as(usize, 99), cfg.max_suspicions);
+    try testing.expectEqual(@as(usize, 64), cfg.max_member_deltas); // default kept
+
+    var sz = SazanamiConfig{};
+    sz.applyToml(&doc);
+    try testing.expectEqual(@as(i64, 4000), sz.suspicion_timeout_ms);
+    try testing.expectEqual(@as(u8, 5), sz.witness_quorum);
 }

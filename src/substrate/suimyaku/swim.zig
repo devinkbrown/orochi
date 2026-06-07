@@ -5,6 +5,7 @@
 const std = @import("std");
 
 const membership_view = @import("membership_view.zig");
+const toml = @import("../../proto/toml.zig");
 
 pub const NodeId = membership_view.NodeId;
 pub const Rng = membership_view.Rng;
@@ -32,6 +33,15 @@ pub const Config = struct {
         if (c.quorum < 2) c.quorum = 2;
         if (c.quorum > max_witnesses) c.quorum = max_witnesses;
         return c;
+    }
+
+    /// Overlay `[mesh.swim]` TOML keys onto this config. Missing keys leave the
+    /// field at its current (default) value, preserving behavior.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getInt("mesh.swim.probe_period_ms")) |v| cfg.period_ms = v;
+        if (doc.getUint("mesh.swim.indirect_probes")) |v| cfg.k = @intCast(v);
+        if (doc.getUint("mesh.swim.witness_quorum")) |v| cfg.quorum = @intCast(v);
+        if (doc.getInt("mesh.swim.suspect_timeout_ms")) |v| cfg.suspect_timeout_ms = v;
     }
 };
 
@@ -546,4 +556,24 @@ test "newer incarnation refutes stale suspicion" {
 
     try swim.onMembershipDelta(.{ .node = 6, .state = .suspect, .incarnation = 0, .witnesses = &.{3} }, 20);
     try testing.expectEqual(State.alive, swim.status(6));
+}
+
+test "Config.applyToml overlays mesh.swim keys and leaves missing at defaults" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.swim]
+        \\probe_period_ms = 2500
+        \\indirect_probes = 5
+        \\witness_quorum = 4
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+
+    try std.testing.expectEqual(@as(i64, 2500), cfg.period_ms);
+    try std.testing.expectEqual(@as(usize, 5), cfg.k);
+    try std.testing.expectEqual(@as(usize, 4), cfg.quorum);
+    // Untouched key keeps its default.
+    try std.testing.expectEqual(@as(i64, 3_000), cfg.suspect_timeout_ms);
 }

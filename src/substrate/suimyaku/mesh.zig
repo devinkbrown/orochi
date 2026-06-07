@@ -28,6 +28,7 @@ const std = @import("std");
 const gossip = @import("gossip_views.zig");
 const swim = @import("swim.zig");
 const membership_view = @import("membership_view.zig");
+const toml = @import("../../proto/toml.zig");
 
 pub const NodeId = membership_view.NodeId;
 pub const Rng = membership_view.Rng;
@@ -41,6 +42,16 @@ pub const Config = struct {
     swim: swim.Config = .{},
     /// Deterministic seed for this node's overlay/probe randomness.
     rng_seed: u64 = 0,
+
+    /// Overlay the composite `[mesh.*]` config by delegating to each embedded
+    /// sub-config's `applyToml`. Missing keys leave every field at its default,
+    /// so the mesh behaves identically until the orchestrator wires real values.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        cfg.views.applyToml(doc);
+        cfg.plumtree.applyToml(doc);
+        cfg.swim.applyToml(doc);
+        if (doc.getUint("mesh.rng_seed")) |v| cfg.rng_seed = v;
+    }
 };
 
 /// One cross-node control/data message. The only heap-owning variant is
@@ -585,4 +596,26 @@ test "GRAFT repair delivers a lazily-announced broadcast" {
     }
     try testing.expect(delivered);
     try testing.expect(b.hasMessage(msg_id));
+}
+
+test "Config.applyToml composite delegates to views/plumtree/swim and rng_seed" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\rng_seed = 12345
+        \\[mesh]
+        \\rng_seed = 12345
+        \\[mesh.gossip]
+        \\active_view_max = 12
+        \\graft_retry_ms = 500
+        \\[mesh.swim]
+        \\indirect_probes = 7
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 12), cfg.views.active_max);
+    try std.testing.expectEqual(@as(i64, 500), cfg.plumtree.graft_retry_ms);
+    try std.testing.expectEqual(@as(usize, 7), cfg.swim.k);
+    try std.testing.expectEqual(@as(u64, 12345), cfg.rng_seed);
 }

@@ -13,6 +13,7 @@ const std = @import("std");
 const clock = @import("clock.zig");
 const goryu = @import("goryu.zig");
 const merkle = @import("merkle.zig");
+const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -91,6 +92,12 @@ pub const StrategyConfig = struct {
             .delta_replay_limit = delta_replay_limit,
             .full_resync_threshold = full_resync_threshold,
         };
+    }
+
+    /// Overlay `[mesh.antientropy]` strategy keys onto this config.
+    pub fn applyToml(cfg: *StrategyConfig, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.antientropy.delta_replay_limit")) |v| cfg.delta_replay_limit = @intCast(v);
+        if (doc.getUint("mesh.antientropy.full_resync_threshold")) |v| cfg.full_resync_threshold = @intCast(v);
     }
 };
 
@@ -411,4 +418,18 @@ test "causal stability watermark is the min across peer frontiers" {
     try std.testing.expect(!watermark.containsDot(.{ .replica = 1, .counter = 4 }));
     try std.testing.expectEqual(@as(u48, 700), watermark.hlc.wall_ms);
     try std.testing.expectEqual(@as(u16, 4), watermark.hlc.logical);
+}
+
+test "StrategyConfig.applyToml overlays mesh.antientropy keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.antientropy]
+        \\delta_replay_limit = 16
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = StrategyConfig{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 16), cfg.delta_replay_limit);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.full_resync_threshold); // default
 }

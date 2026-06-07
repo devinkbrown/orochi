@@ -13,6 +13,7 @@ const gossip_round = @import("gossip_round.zig");
 const membership_view = @import("membership_view.zig");
 const merkle = @import("merkle.zig");
 const peer_link = @import("peer_link.zig");
+const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,6 +38,21 @@ pub const Config = struct {
     repair_interval_ms: u64 = 2_000,
     view_config: membership_view.Config = .{ .active_capacity = 4, .passive_capacity = 8 },
     swim_config: gossip_round.SazanamiConfig = .{},
+    peer_link_config: peer_link.Config = .{},
+
+    /// Overlay `[mesh.link]` keys (session cadence + per-session view/gossip
+    /// overrides) and delegate to the embedded sub-configs (peer-link transport,
+    /// burst limits). Sub-configs that draw from other `[mesh.*]` sections
+    /// (gossip_config, swim_config) are applied by the orchestrator separately.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.link.gossip_interval_ms")) |v| cfg.gossip_interval_ms = v;
+        if (doc.getUint("mesh.link.repair_interval_ms")) |v| cfg.repair_interval_ms = v;
+        if (doc.getUint("mesh.link.gossip_fanout")) |v| cfg.gossip_config.fanout = @intCast(v);
+        if (doc.getUint("mesh.link.view_active_capacity")) |v| cfg.view_config.active_capacity = @intCast(v);
+        if (doc.getUint("mesh.link.view_passive_capacity")) |v| cfg.view_config.passive_capacity = @intCast(v);
+        cfg.peer_link_config.applyToml(doc);
+        cfg.burst_limits.applyToml(doc);
+    }
 };
 
 pub const Options = struct {
@@ -85,6 +101,11 @@ pub const LinkSession = struct {
                 .clock = options.clock,
                 .local_epoch_ms = options.local_epoch_ms,
                 .initial_send_credit = options.initial_send_credit,
+                .replay_window = options.config.peer_link_config.replay_window,
+                .handshake_timeout_ms = options.config.peer_link_config.handshake_timeout_ms,
+                .heartbeat_interval_ms = options.config.peer_link_config.heartbeat_interval_ms,
+                .idle_timeout_ms = options.config.peer_link_config.idle_timeout_ms,
+                .drain_timeout_ms = options.config.peer_link_config.drain_timeout_ms,
             }),
             .gossip = gossip,
             .local_node_id = options.local_node_id,
@@ -724,4 +745,28 @@ test "link session convergence is deterministic with seed" {
     try std.testing.expect(ChannelCrdt.eql(&a1, &b1));
     try std.testing.expect(ChannelCrdt.eql(&a2, &b2));
     try std.testing.expect(ChannelCrdt.eql(&a1, &a2));
+}
+
+test "Config.applyToml overlays mesh.link session + delegates to sub-configs" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.link]
+        \\gossip_interval_ms = 1500
+        \\repair_interval_ms = 3000
+        \\gossip_fanout = 4
+        \\view_active_capacity = 6
+        \\send_credit_bytes = 131072
+        \\burst_max_records = 1024
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(u64, 1500), cfg.gossip_interval_ms);
+    try std.testing.expectEqual(@as(u64, 3000), cfg.repair_interval_ms);
+    try std.testing.expectEqual(@as(usize, 4), cfg.gossip_config.fanout);
+    try std.testing.expectEqual(@as(usize, 6), cfg.view_config.active_capacity);
+    // Delegated sub-configs.
+    try std.testing.expectEqual(@as(u32, 131072), cfg.peer_link_config.send_credit);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.burst_limits.max_records);
 }

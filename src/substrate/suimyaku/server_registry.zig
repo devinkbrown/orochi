@@ -7,6 +7,7 @@
 //! server-id (SID) concept; a node is known solely by its node id.
 const std = @import("std");
 const membership_view = @import("membership_view.zig");
+const toml = @import("../../proto/toml.zig");
 
 pub const NodeId = membership_view.NodeId;
 
@@ -18,6 +19,13 @@ pub const Config = struct {
     pub fn validate(self: Config) Error!void {
         if (self.max_nodes == 0) return error.InvalidConfig;
         if (self.max_name_len == 0) return error.InvalidConfig;
+    }
+
+    /// Overlay `[mesh.routing]` server-registry keys onto this config.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.routing.max_servers")) |v| cfg.max_nodes = @intCast(v);
+        if (doc.getUint("mesh.routing.max_server_name_len")) |v| cfg.max_name_len = @intCast(v);
+        if (doc.getUint("mesh.routing.max_server_desc_len")) |v| cfg.max_description_len = @intCast(v);
     }
 };
 
@@ -505,4 +513,20 @@ test "bounds and validation reject bad input" {
 
     try registry.add(.{ .node_id = 1, .name = "ok.net", .description = "ok", .last_seen_ms = 1 });
     try std.testing.expectError(error.RegistryFull, registry.add(.{ .node_id = 2, .name = "no.net", .last_seen_ms = 2 }));
+}
+
+test "Config.applyToml overlays mesh.routing server-registry keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.routing]
+        \\max_servers = 1024
+        \\max_server_desc_len = 512
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.max_nodes);
+    try std.testing.expectEqual(@as(usize, 512), cfg.max_description_len);
+    try std.testing.expectEqual(@as(usize, 63), cfg.max_name_len); // default
 }

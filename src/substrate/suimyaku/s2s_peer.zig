@@ -14,6 +14,7 @@ const gossip_round = @import("gossip_round.zig");
 const anti_entropy_repair = @import("anti_entropy_repair.zig");
 const membership_view = @import("membership_view.zig");
 const peer_link = @import("peer_link.zig");
+const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,6 +46,25 @@ pub const Config = struct {
     },
     registry: server_registry.Config = .{},
     routes: route_table.Config = .{},
+
+    /// Consolidated applier for the EFFECTIVE production path
+    /// (`s2s_peer` → `link_session` → peer-link/gossip/swim/burst). Overlays
+    /// every `[mesh.*]` section this driver owns. Missing keys leave fields at
+    /// their defaults, so behavior is unchanged until the orchestrator supplies
+    /// a parsed config. The aggregate `[mesh.gossip]`/`[mesh.swim]` sections are
+    /// applied to the embedded session sub-configs here (link.applyToml only
+    /// handles the `[mesh.link]` per-session overrides + transport + burst).
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        // Apply the broad `[mesh.gossip]`/`[mesh.swim]` sections to the embedded
+        // session sub-configs first, then the narrower `[mesh.link]` per-session
+        // overrides last so an explicit per-session override always wins.
+        cfg.link.gossip_config.applyToml(doc);
+        cfg.link.swim_config.applyToml(doc);
+        cfg.link.view_config.applyToml(doc);
+        cfg.link.applyToml(doc);
+        cfg.registry.applyToml(doc);
+        cfg.routes.applyToml(doc);
+    }
 };
 
 pub const Options = struct {
@@ -745,4 +765,33 @@ test "partial inbound bytes are buffered until complete frame" {
     try std.testing.expectEqual(@as(usize, 1), b.ping_rx_count);
     try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 1);
     try std.testing.expectEqual(@as(usize, 1), a.pong_rx_count);
+}
+
+test "Config.applyToml consolidated EFFECTIVE prod path overlay" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.gossip]
+        \\round_fanout = 5
+        \\[mesh.swim]
+        \\sazanami_witness_quorum = 3
+        \\[mesh.link]
+        \\gossip_interval_ms = 1750
+        \\idle_timeout_ms = 90000
+        \\[mesh.routing]
+        \\max_servers = 256
+        \\max_nicks = 2048
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    // [mesh.gossip]/[mesh.swim] flow into the session sub-configs.
+    try std.testing.expectEqual(@as(usize, 5), cfg.link.gossip_config.fanout);
+    try std.testing.expectEqual(@as(u8, 3), cfg.link.swim_config.witness_quorum);
+    // [mesh.link] session cadence + transport.
+    try std.testing.expectEqual(@as(u64, 1750), cfg.link.gossip_interval_ms);
+    try std.testing.expectEqual(@as(u64, 90000), cfg.link.peer_link_config.idle_timeout_ms);
+    // [mesh.routing] registry + routes.
+    try std.testing.expectEqual(@as(usize, 256), cfg.registry.max_nodes);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.routes.max_nicks);
 }

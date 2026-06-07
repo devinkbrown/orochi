@@ -7,6 +7,7 @@ const delta_codec = @import("delta_codec.zig");
 const prolly = @import("prolly.zig");
 const riblt = @import("riblt.zig");
 const signed_delta = @import("../../proto/signed_delta.zig");
+const toml = @import("../../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 const Cid = signed_delta.Cid;
@@ -15,12 +16,35 @@ const SignedDelta = signed_delta.SignedDelta;
 const DeltaView = delta_codec.DeltaView(delta_codec.default_limits);
 
 const magic = [_]u8{ 'G', 'Y', 'S', '1' };
-const symbols_per_pump = 24;
-const max_symbols = 512;
-const max_requests = 512;
-const max_fills = 512;
-const max_scope_len = 4096;
 const max_op_len = delta_codec.default_limits.max_wire_bytes;
+
+/// Default values for the anti-entropy sync pump/message limits. These mirror
+/// the previously-hardcoded module constants, so `Config{}` is behaviorally
+/// identical to the prior values.
+const default_symbols_per_pump = 24;
+const default_max_symbols = 512;
+const default_max_requests = 512;
+const default_max_fills = 512;
+const default_max_scope_len = 4096;
+
+/// Runtime tuning for the RIBLT anti-entropy sync. Carried by `GoryuSync` and
+/// copied into each `Session`.
+pub const Config = struct {
+    symbols_per_pump: usize = default_symbols_per_pump,
+    max_symbols: usize = default_max_symbols,
+    max_requests: usize = default_max_requests,
+    max_fills: usize = default_max_fills,
+    max_scope_len: usize = default_max_scope_len,
+
+    /// Overlay `[mesh.antientropy]` sync keys onto this config.
+    pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("mesh.antientropy.symbols_per_pump")) |v| cfg.symbols_per_pump = @intCast(v);
+        if (doc.getUint("mesh.antientropy.max_symbols")) |v| cfg.max_symbols = @intCast(v);
+        if (doc.getUint("mesh.antientropy.max_requests")) |v| cfg.max_requests = @intCast(v);
+        if (doc.getUint("mesh.antientropy.max_fills")) |v| cfg.max_fills = @intCast(v);
+        if (doc.getUint("mesh.antientropy.max_scope_len")) |v| cfg.max_scope_len = @intCast(v);
+    }
+};
 
 pub const Error = Allocator.Error || error{
     BadCid,
@@ -74,14 +98,20 @@ pub const GoryuSync = struct {
     store: std.AutoHashMap(Cid, OwnedDelta),
     pending: std.AutoHashMap(Cid, OwnedDelta),
     channel: channel_crdt.ChannelCrdt,
+    cfg: Config = .{},
 
     pub fn init(allocator: Allocator) GoryuSync {
+        return initWithConfig(allocator, .{});
+    }
+
+    pub fn initWithConfig(allocator: Allocator, cfg: Config) GoryuSync {
         return .{
             .allocator = allocator,
             .index = prolly.Tree.init(allocator),
             .store = std.AutoHashMap(Cid, OwnedDelta).init(allocator),
             .pending = std.AutoHashMap(Cid, OwnedDelta).init(allocator),
             .channel = channel_crdt.ChannelCrdt.init(allocator, 0),
+            .cfg = cfg,
         };
     }
 
@@ -198,6 +228,7 @@ pub const GoryuSync = struct {
 pub const Session = struct {
     owner: *GoryuSync,
     peer_root: Hash,
+    cfg: Config,
     encoder: riblt.Encoder,
     decoder: riblt.Decoder,
     decoded: bool = false,
@@ -219,6 +250,7 @@ pub const Session = struct {
         return .{
             .owner = owner,
             .peer_root = peer_root,
+            .cfg = owner.cfg,
             .encoder = encoder,
             .decoder = decoder,
             .wanted = std.AutoHashMap(Cid, void).init(owner.allocator),
@@ -259,13 +291,13 @@ pub const Session = struct {
     }
 
     fn consume(self: *Session, bytes: []const u8) Error!void {
-        var r = Reader{ .buf = bytes };
+        var r = Reader{ .buf = bytes, .max_scope_len = self.cfg.max_scope_len };
         try r.expectMagic();
 
         const symbol_count = try r.readU16();
         const request_count = try r.readU16();
         const fill_count = try r.readU16();
-        if (symbol_count > max_symbols or request_count > max_requests or fill_count > max_fills) {
+        if (symbol_count > self.cfg.max_symbols or request_count > self.cfg.max_requests or fill_count > self.cfg.max_fills) {
             return error.MessageTooLarge;
         }
 
@@ -327,7 +359,7 @@ fn writeFrame(session: *Session, out: *std.ArrayList(u8)) Error!void {
 
     var symbol_count: u16 = 0;
     if (!session.decoded) {
-        while (symbol_count < symbols_per_pump) : (symbol_count += 1) {
+        while (symbol_count < session.cfg.symbols_per_pump) : (symbol_count += 1) {
             const sym = session.encoder.nextSymbol();
             try writeSymbol(out, session.owner.allocator, sym);
         }
@@ -343,7 +375,7 @@ fn writeFrame(session: *Session, out: *std.ArrayList(u8)) Error!void {
     var fill_count: u16 = 0;
     for (session.fills.items) |cid| {
         if (session.owner.store.get(cid)) |stored| {
-            try writeSignedDelta(out, session.owner.allocator, stored.signed);
+            try writeSignedDelta(out, session.owner.allocator, stored.signed, session.cfg.max_scope_len);
             fill_count += 1;
         }
     }
@@ -362,7 +394,7 @@ fn writeSymbol(out: *std.ArrayList(u8), allocator: Allocator, sym: riblt.CodedSy
     try appendU64(out, allocator, sym.check_xor);
 }
 
-fn writeSignedDelta(out: *std.ArrayList(u8), allocator: Allocator, signed: SignedDelta) Error!void {
+fn writeSignedDelta(out: *std.ArrayList(u8), allocator: Allocator, signed: SignedDelta, max_scope_len: usize) Error!void {
     if (signed.env.scope.len > max_scope_len or signed.env.op_bytes.len > max_op_len) {
         return error.MessageTooLarge;
     }
@@ -380,6 +412,7 @@ fn writeSignedDelta(out: *std.ArrayList(u8), allocator: Allocator, signed: Signe
 const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
+    max_scope_len: usize = default_max_scope_len,
 
     fn done(self: *const Reader) bool {
         return self.pos == self.buf.len;
@@ -430,7 +463,7 @@ const Reader = struct {
         const family = (try self.readArray(1))[0];
         const scope_len = try self.readU16();
         const op_len = try self.readU32();
-        if (scope_len > max_scope_len or op_len > max_op_len) return error.MessageTooLarge;
+        if (scope_len > self.max_scope_len or op_len > max_op_len) return error.MessageTooLarge;
         const scope = try self.readBytes(scope_len);
         const op_bytes = try self.readBytes(op_len);
         const signature = try self.readArray(signed_delta.signature_len);
@@ -792,4 +825,20 @@ test "signed channel delta survives a wire crossing and applies on the peer" {
     try std.testing.expectError(error.VerificationFailed, victim.applyVerified(verifyTest));
     try std.testing.expect(!victim.channel.containsMember(55));
     try std.testing.expectEqual(@as(usize, 0), victim.store.count());
+}
+
+test "Config.applyToml overlays mesh.antientropy sync keys" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator,
+        \\[mesh.antientropy]
+        \\symbols_per_pump = 48
+        \\max_symbols = 256
+    );
+    defer doc.deinit(allocator);
+
+    var cfg = Config{};
+    cfg.applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 48), cfg.symbols_per_pump);
+    try std.testing.expectEqual(@as(usize, 256), cfg.max_symbols);
+    try std.testing.expectEqual(@as(usize, 512), cfg.max_requests); // default
 }
