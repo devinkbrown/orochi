@@ -1,8 +1,7 @@
-//! IRCv3 labeled-response framing helpers.
+//! Allocation-free IRCv3 labeled-response builders.
 //!
-//! Callers pass already-rendered IRC response lines and a caller-owned sink.
-//! This module performs no allocation in the framing path and keeps all scratch
-//! storage bounded.
+//! The daemon decides when replies exist; this module only renders caller-owned
+//! buffers so clients can correlate replies with an inbound `label` tag.
 const std = @import("std");
 
 pub const MAX_LABEL_LEN: usize = 64;
@@ -11,7 +10,7 @@ pub const MAX_LINE_BODY: usize = 8191;
 pub const MAX_ESCAPED_LABEL_LEN: usize = MAX_LABEL_LEN * 2;
 pub const MAX_WIRE_LINE: usize = 1 + "label=".len + MAX_ESCAPED_LABEL_LEN + 1 + MAX_LINE_BODY + 2;
 
-pub const LabeledError = error{
+pub const Error = error{
     DuplicateTag,
     InvalidBatchRef,
     InvalidLabel,
@@ -19,189 +18,122 @@ pub const LabeledError = error{
     OutputTooSmall,
 };
 
-/// Prefix `@label=<id>` onto one response line.
-///
-/// When `label` is null, this is a byte-for-byte passthrough into `out`.
-/// Tagged output is normalized to a CRLF-terminated wire line.
-pub fn tagLine(label: ?[]const u8, line: []const u8, out: []u8) LabeledError![]const u8 {
+pub const LabeledError = Error;
+
+/// Wrap one outbound reply with `@label=<label>`.
+pub fn wrapSingle(out: []u8, label: []const u8, line: []const u8) Error![]const u8 {
+    return prependTag(out, "label", label, try checkedLine(line, "label"), .escaped_value);
+}
+
+/// Build the opening `labeled-response` BATCH line.
+pub fn beginBatch(out: []u8, label: []const u8, ref: []const u8) Error![]const u8 {
+    try validateBatchRef(ref);
+    var w = Writer{ .buf = out };
+    try w.bytes("@label=");
+    try w.escapedLabel(label);
+    try w.bytes(" BATCH +");
+    try w.bytes(ref);
+    try w.bytes(" labeled-response\r\n");
+    return w.slice();
+}
+
+/// Tag one line as a member of an already-open labeled-response batch.
+pub fn wrapBatchLine(out: []u8, ref: []const u8, line: []const u8) Error![]const u8 {
+    try validateBatchRef(ref);
+    return prependTag(out, "batch", ref, try checkedLine(line, "batch"), .plain_value);
+}
+
+pub const batchLine = wrapBatchLine;
+
+/// Build the closing BATCH line.
+pub fn endBatch(out: []u8, ref: []const u8) Error![]const u8 {
+    try validateBatchRef(ref);
+    var w = Writer{ .buf = out };
+    try w.bytes("BATCH -");
+    try w.bytes(ref);
+    try w.bytes("\r\n");
+    return w.slice();
+}
+
+/// Build the labeled ACK used when a command has no outbound replies.
+pub fn ack(out: []u8, label: []const u8) Error![]const u8 {
+    var w = Writer{ .buf = out };
+    try w.bytes("@label=");
+    try w.escapedLabel(label);
+    try w.bytes(" ACK\r\n");
+    return w.slice();
+}
+
+pub fn tagLine(label: ?[]const u8, line: []const u8, out: []u8) Error![]const u8 {
     const id = label orelse {
         if (line.len > out.len) return error.OutputTooSmall;
         @memcpy(out[0..line.len], line);
         return out[0..line.len];
     };
-
-    const body = try validateOutboundLine(line, "label");
-    var writer = SliceWriter{ .buf = out };
-    try writer.append("@label=");
-    try writer.appendEscapedLabel(id);
-    try appendTaggedBody(&writer, body);
-    return writer.finishCrlf();
+    return wrapSingle(out, id, line);
 }
 
-/// Build the labeled ACK used for commands that otherwise emit no response.
-pub fn buildAck(label: []const u8, out: []u8) LabeledError![]const u8 {
-    var writer = SliceWriter{ .buf = out };
-    try writer.append("@label=");
-    try writer.appendEscapedLabel(label);
-    try writer.append(" ACK\r\n");
-    return out[0..writer.len];
+pub fn buildAck(label: []const u8, out: []u8) Error![]const u8 {
+    return ack(out, label);
 }
 
-/// Emit labeled-response framing for a slice of complete response lines.
-pub fn emitSlice(
-    sink: anytype,
-    label: ?[]const u8,
-    batch_ref: []const u8,
-    lines: []const []const u8,
-) anyerror!void {
-    var iterator = SliceIterator{ .lines = lines };
-    try emitIterator(sink, label, batch_ref, &iterator);
-}
+const TagValueMode = enum { plain_value, escaped_value };
 
-/// Emit labeled-response framing from an iterator with `next() ?[]const u8`.
-///
-/// The implementation buffers at most two line slices to choose between ACK,
-/// single-line, and batch framing.
-pub fn emitIterator(
-    sink: anytype,
-    label: ?[]const u8,
-    batch_ref: []const u8,
-    iterator: anytype,
-) anyerror!void {
-    var it = iterator;
-    const first = it.next() orelse {
-        if (label) |id| {
-            var out: [MAX_WIRE_LINE]u8 = undefined;
-            try sink.appendLine(try buildAck(id, &out));
-        }
-        return;
-    };
-
-    const second = it.next() orelse {
-        var out: [MAX_WIRE_LINE]u8 = undefined;
-        try sink.appendLine(try tagLine(label, first, &out));
-        return;
-    };
-
-    const id = label orelse {
-        try sink.appendLine(first);
-        try sink.appendLine(second);
-        while (it.next()) |line| try sink.appendLine(line);
-        return;
-    };
-
-    try validateBatchRef(batch_ref);
-
-    var out: [MAX_WIRE_LINE]u8 = undefined;
-    try sink.appendLine(try writeBatchOpen(id, batch_ref, &out));
-    try sink.appendLine(try batchTagLine(batch_ref, first, &out));
-    try sink.appendLine(try batchTagLine(batch_ref, second, &out));
-    while (it.next()) |line| {
-        try sink.appendLine(try batchTagLine(batch_ref, line, &out));
+fn prependTag(
+    out: []u8,
+    key: []const u8,
+    value: []const u8,
+    body: []const u8,
+    mode: TagValueMode,
+) Error![]const u8 {
+    var w = Writer{ .buf = out };
+    try w.byte('@');
+    try w.bytes(key);
+    try w.byte('=');
+    switch (mode) {
+        .plain_value => try w.bytes(value),
+        .escaped_value => try w.escapedLabel(value),
     }
-    try sink.appendLine(try writeBatchClose(batch_ref, &out));
-}
-
-const SliceIterator = struct {
-    lines: []const []const u8,
-    index: usize = 0,
-
-    fn next(self: *SliceIterator) ?[]const u8 {
-        if (self.index >= self.lines.len) return null;
-        defer self.index += 1;
-        return self.lines[self.index];
-    }
-};
-
-fn writeBatchOpen(label: []const u8, batch_ref: []const u8, out: []u8) LabeledError![]const u8 {
-    var writer = SliceWriter{ .buf = out };
-    try writer.append("@label=");
-    try writer.appendEscapedLabel(label);
-    try writer.append(" BATCH +");
-    try writer.append(batch_ref);
-    try writer.append(" labeled-response\r\n");
-    return out[0..writer.len];
-}
-
-fn writeBatchClose(batch_ref: []const u8, out: []u8) LabeledError![]const u8 {
-    var writer = SliceWriter{ .buf = out };
-    try writer.append("BATCH -");
-    try writer.append(batch_ref);
-    try writer.append("\r\n");
-    return out[0..writer.len];
-}
-
-fn batchTagLine(batch_ref: []const u8, line: []const u8, out: []u8) LabeledError![]const u8 {
-    const body = try validateOutboundLine(line, "batch");
-    var writer = SliceWriter{ .buf = out };
-    try writer.append("@batch=");
-    try writer.append(batch_ref);
-    try appendTaggedBody(&writer, body);
-    return writer.finishCrlf();
-}
-
-fn appendTaggedBody(writer: *SliceWriter, body: []const u8) LabeledError!void {
     if (body[0] == '@') {
-        try writer.appendByte(';');
-        try writer.append(body[1..]);
+        try w.byte(';');
+        try w.bytes(body[1..]);
     } else {
-        try writer.appendByte(' ');
-        try writer.append(body);
+        try w.byte(' ');
+        try w.bytes(body);
     }
+    try w.bytes("\r\n");
+    return w.slice();
 }
 
-fn validateOutboundLine(line: []const u8, duplicate_key: []const u8) LabeledError![]const u8 {
-    const body = stripLineEnding(line);
+fn checkedLine(line: []const u8, duplicate_key: []const u8) Error![]const u8 {
+    const body = stripEnding(line);
     if (body.len == 0 or body.len > MAX_LINE_BODY) return error.InvalidLine;
-
     for (body) |ch| {
         switch (ch) {
             0, '\r', '\n' => return error.InvalidLine,
             else => {},
         }
     }
-
     if (body[0] == '@') {
         const tag_end = std.mem.indexOfScalar(u8, body, ' ') orelse return error.InvalidLine;
-        if (tag_end == 1) return error.InvalidLine;
-        if (skipSpaces(body, tag_end) >= body.len) return error.InvalidLine;
-        try validateTagsNoDuplicate(body[1..tag_end], duplicate_key);
+        if (tag_end == 1 or tag_end + 1 >= body.len) return error.InvalidLine;
+        try checkedTags(body[1..tag_end], duplicate_key);
     }
-
     return body;
 }
 
-fn validateTagsNoDuplicate(tags: []const u8, duplicate_key: []const u8) LabeledError!void {
+fn checkedTags(tags: []const u8, duplicate_key: []const u8) Error!void {
     var cursor: usize = 0;
     while (cursor < tags.len) {
-        const next = std.mem.indexOfScalar(u8, tags[cursor..], ';') orelse tags.len - cursor;
-        const item = tags[cursor .. cursor + next];
+        const len = std.mem.indexOfScalar(u8, tags[cursor..], ';') orelse tags.len - cursor;
+        const item = tags[cursor .. cursor + len];
         if (item.len == 0) return error.InvalidLine;
-
         const eq = std.mem.indexOfScalar(u8, item, '=') orelse item.len;
         const key = item[0..eq];
         if (!validTagKey(key)) return error.InvalidLine;
         if (std.mem.eql(u8, key, duplicate_key)) return error.DuplicateTag;
-
-        cursor += next;
+        cursor += len;
         if (cursor < tags.len) cursor += 1;
-    }
-}
-
-fn validateBatchRef(batch_ref: []const u8) LabeledError!void {
-    if (batch_ref.len == 0 or batch_ref.len > MAX_BATCH_REF_LEN) return error.InvalidBatchRef;
-    for (batch_ref) |ch| {
-        switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '/', '_' => {},
-            else => return error.InvalidBatchRef,
-        }
-    }
-}
-
-fn validateLabel(label: []const u8) LabeledError!void {
-    if (label.len == 0 or label.len > MAX_LABEL_LEN) return error.InvalidLabel;
-    for (label) |ch| {
-        if (ch == 0) return error.InvalidLabel;
     }
 }
 
@@ -216,142 +148,102 @@ fn validTagKey(key: []const u8) bool {
     return true;
 }
 
-fn stripLineEnding(input: []const u8) []const u8 {
-    if (input.len >= 2 and input[input.len - 2] == '\r' and input[input.len - 1] == '\n') {
-        return input[0 .. input.len - 2];
+fn validateBatchRef(ref: []const u8) Error!void {
+    if (ref.len == 0 or ref.len > MAX_BATCH_REF_LEN) return error.InvalidBatchRef;
+    for (ref) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '/', '_' => {},
+            else => return error.InvalidBatchRef,
+        }
     }
-    if (input.len >= 1 and (input[input.len - 1] == '\r' or input[input.len - 1] == '\n')) {
-        return input[0 .. input.len - 1];
-    }
-    return input;
 }
 
-fn skipSpaces(bytes: []const u8, start: usize) usize {
-    var cursor = start;
-    while (cursor < bytes.len and bytes[cursor] == ' ') {
-        cursor += 1;
-    }
-    return cursor;
+fn validateLabel(label: []const u8) Error!void {
+    if (label.len == 0 or label.len > MAX_LABEL_LEN) return error.InvalidLabel;
+    for (label) |ch| if (ch == 0) return error.InvalidLabel;
 }
 
-const SliceWriter = struct {
+fn stripEnding(line: []const u8) []const u8 {
+    if (line.len >= 2 and line[line.len - 2] == '\r' and line[line.len - 1] == '\n') {
+        return line[0 .. line.len - 2];
+    }
+    if (line.len >= 1 and (line[line.len - 1] == '\r' or line[line.len - 1] == '\n')) {
+        return line[0 .. line.len - 1];
+    }
+    return line;
+}
+
+const Writer = struct {
     buf: []u8,
     len: usize = 0,
 
-    fn append(self: *SliceWriter, bytes: []const u8) LabeledError!void {
-        if (bytes.len > self.buf.len - self.len) return error.OutputTooSmall;
-        @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
-        self.len += bytes.len;
+    fn bytes(self: *Writer, src: []const u8) Error!void {
+        if (src.len > self.buf.len - self.len) return error.OutputTooSmall;
+        @memcpy(self.buf[self.len .. self.len + src.len], src);
+        self.len += src.len;
     }
 
-    fn appendByte(self: *SliceWriter, byte: u8) LabeledError!void {
+    fn byte(self: *Writer, ch: u8) Error!void {
         if (self.len >= self.buf.len) return error.OutputTooSmall;
-        self.buf[self.len] = byte;
+        self.buf[self.len] = ch;
         self.len += 1;
     }
 
-    fn appendEscapedLabel(self: *SliceWriter, label: []const u8) LabeledError!void {
+    fn escapedLabel(self: *Writer, label: []const u8) Error!void {
         try validateLabel(label);
         for (label) |ch| {
             switch (ch) {
-                ';' => try self.append("\\:"),
-                ' ' => try self.append("\\s"),
-                '\r' => try self.append("\\r"),
-                '\n' => try self.append("\\n"),
-                '\\' => try self.append("\\\\"),
-                else => try self.appendByte(ch),
+                ';' => try self.bytes("\\:"),
+                ' ' => try self.bytes("\\s"),
+                '\r' => try self.bytes("\\r"),
+                '\n' => try self.bytes("\\n"),
+                '\\' => try self.bytes("\\\\"),
+                else => try self.byte(ch),
             }
         }
     }
 
-    fn finishCrlf(self: *SliceWriter) LabeledError![]const u8 {
-        try self.append("\r\n");
+    fn slice(self: *const Writer) []const u8 {
         return self.buf[0..self.len];
     }
 };
 
-const AllocSink = struct {
-    allocator: std.mem.Allocator,
-    bytes: std.ArrayList(u8) = .empty,
+const TestSink = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn appendLine(self: *AllocSink, line: []const u8) !void {
-        try self.bytes.appendSlice(self.allocator, line);
-    }
-
-    fn deinit(self: *AllocSink) void {
-        self.bytes.deinit(self.allocator);
+    fn append(self: *TestSink, allocator: std.mem.Allocator, line: []const u8) !void {
+        try self.bytes.appendSlice(allocator, line);
     }
 };
 
-test "single tagged line exact bytes" {
+test "single tag prepend" {
     var out: [128]u8 = undefined;
-    const line = try tagLine("abc123", ":irc.example 401 me nick :No such nick\r\n", &out);
-    try std.testing.expectEqualStrings(
-        "@label=abc123 :irc.example 401 me nick :No such nick\r\n",
-        line,
-    );
+    const line = try wrapSingle(&out, "abc123", ":srv 401 me nick :No such nick\r\n");
+    try std.testing.expectEqualStrings("@label=abc123 :srv 401 me nick :No such nick\r\n", line);
 }
 
-test "multi-line response is wrapped in labeled-response batch" {
-    const allocator = std.testing.allocator;
-    var sink = AllocSink{ .allocator = allocator };
-    defer sink.deinit();
-
-    const lines = [_][]const u8{
-        ":irc.example 311 me nick ~ident host * :Name\r\n",
-        ":irc.example 318 me nick :End of /WHOIS list.\r\n",
-    };
-    try emitSlice(&sink, "whois-1", "ref42", &lines);
-
-    try std.testing.expectEqualStrings(
-        "@label=whois-1 BATCH +ref42 labeled-response\r\n" ++
-            "@batch=ref42 :irc.example 311 me nick ~ident host * :Name\r\n" ++
-            "@batch=ref42 :irc.example 318 me nick :End of /WHOIS list.\r\n" ++
-            "BATCH -ref42\r\n",
-        sink.bytes.items,
-    );
-}
-
-test "empty labeled response emits ACK" {
-    const allocator = std.testing.allocator;
-    var sink = AllocSink{ .allocator = allocator };
-    defer sink.deinit();
-
-    try emitSlice(&sink, "pong", "unused", &.{});
-    try std.testing.expectEqualStrings("@label=pong ACK\r\n", sink.bytes.items);
-
+test "ACK on empty" {
     var out: [64]u8 = undefined;
-    const ack = try buildAck("pong", &out);
-    try std.testing.expectEqualStrings("@label=pong ACK\r\n", ack);
+    const line = try ack(&out, "empty-1");
+    try std.testing.expectEqualStrings("@label=empty-1 ACK\r\n", line);
 }
 
-test "no-label passthrough is exact" {
+test "batch framing for multiple" {
     const allocator = std.testing.allocator;
-    var sink = AllocSink{ .allocator = allocator };
-    defer sink.deinit();
+    var sink = TestSink{};
+    defer sink.bytes.deinit(allocator);
 
-    const lines = [_][]const u8{
-        ":irc.example NOTICE me :one\r\n",
-        "@time=2026-06-04T00:00:00.000Z :irc.example NOTICE me :two\r\n",
-    };
-    try emitSlice(&sink, null, "unused", &lines);
+    var out: [MAX_WIRE_LINE]u8 = undefined;
+    try sink.append(allocator, try beginBatch(&out, "whois-1", "b42"));
+    try sink.append(allocator, try wrapBatchLine(&out, "b42", ":srv 311 me nick ~u h * :Name"));
+    try sink.append(allocator, try wrapBatchLine(&out, "b42", "@time=2026-06-07T00:00:00.000Z :srv 318 me nick :End"));
+    try sink.append(allocator, try endBatch(&out, "b42"));
 
     try std.testing.expectEqualStrings(
-        ":irc.example NOTICE me :one\r\n" ++
-            "@time=2026-06-04T00:00:00.000Z :irc.example NOTICE me :two\r\n",
+        "@label=whois-1 BATCH +b42 labeled-response\r\n" ++
+            "@batch=b42 :srv 311 me nick ~u h * :Name\r\n" ++
+            "@batch=b42;time=2026-06-07T00:00:00.000Z :srv 318 me nick :End\r\n" ++
+            "BATCH -b42\r\n",
         sink.bytes.items,
-    );
-
-    var out: [64]u8 = undefined;
-    const passthrough = try tagLine(null, "RAW\nBYTES", &out);
-    try std.testing.expectEqualStrings("RAW\nBYTES", passthrough);
-}
-
-test "existing message tags are preserved after the label or batch tag" {
-    var out: [160]u8 = undefined;
-    const line = try tagLine("needs escaping; \\r\n", "@time=2026-06-04T00:00:00.000Z NOTICE me :ok", &out);
-    try std.testing.expectEqualStrings(
-        "@label=needs\\sescaping\\:\\s\\\\r\\n;time=2026-06-04T00:00:00.000Z NOTICE me :ok\r\n",
-        line,
     );
 }
