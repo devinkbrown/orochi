@@ -115,6 +115,10 @@ pub const Config = struct {
         enabled: bool = false,
         max_upload_bytes: u64 = 16 * 1024 * 1024,
         max_frame_bytes: u64 = 64 * 1024,
+        /// STUN server (IPv4 literal) queried at boot for the reflexive media
+        /// candidate; with stun_port set, overrides listen.media_host on success.
+        stun_host: ?[]const u8 = null,
+        stun_port: u16 = 0,
     };
 
     pub const Sasl = struct {
@@ -164,6 +168,7 @@ pub const Config = struct {
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
+        if (self.media.stun_host) |value| allocator.free(value);
         if (self.cloak.secret) |value| allocator.free(value);
         self.* = .{};
     }
@@ -231,6 +236,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;
     cfg.media.max_upload_bytes = try uintField(doc, "media.max_upload_bytes", cfg.media.max_upload_bytes, 0, 1024 * 1024 * 1024);
     cfg.media.max_frame_bytes = try uintField(doc, "media.max_frame_bytes", cfg.media.max_frame_bytes, 0, 16 * 1024 * 1024);
+    try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
+    cfg.media.stun_port = try portField(doc, "media.stun_port", cfg.media.stun_port);
 
     // [sasl]
     if (doc.getBool("sasl.enabled")) |b| cfg.sasl.enabled = b;

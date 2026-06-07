@@ -704,6 +704,10 @@ pub const Config = struct {
     media_port: u16 = 0,
     /// Host/IP advertised to clients as the server's media (ICE) candidate.
     media_host: []const u8 = "127.0.0.1",
+    /// Optional STUN server (IPv4 literal) queried at boot to discover the
+    /// reflexive media candidate behind NAT; overrides media_host when it works.
+    media_stun_host: []const u8 = "",
+    media_stun_port: u16 = 0,
     backlog: u31 = 128,
     ring_entries: u16 = 32,
     /// Hard cap on concurrent connections. The client table reserves this many
@@ -1094,13 +1098,22 @@ pub const LinuxServer = struct {
     pub fn start(self: *LinuxServer) void {
         self.driveLifecycle(.init);
         self.driveLifecycle(.ready);
+        // Optional STUN-based reflexive-candidate discovery at boot (before the
+        // pump thread starts). Configured as an IPv4 literal + port.
+        if (self.config.media_stun_port != 0) {
+            if (parseIp4(self.config.media_stun_host)) |ip4| {
+                self.media_plane.stun_server = media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port) catch null;
+            }
+        }
         // Bring the media transport plane online (bind UDP + pump thread). Media
         // is optional: a bind failure logs and the daemon keeps serving IRC.
         self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
             std.debug.print("mizuchi: media plane disabled ({s})\n", .{@errorName(e)});
             return;
         };
-        std.debug.print("mizuchi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, self.config.media_host });
+        var host_buf: [16]u8 = undefined;
+        const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
+        std.debug.print("mizuchi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
     }
 
     pub fn deinit(self: *LinuxServer) void {
@@ -6649,9 +6662,12 @@ pub const LinuxServer = struct {
             const gk = self.media_plane.groupKey(channel);
             var gk_b64: [std.base64.standard.Encoder.calcSize(gk.len)]u8 = undefined;
             const srtp_b64 = std.base64.standard.Encoder.encode(&gk_b64, &gk);
+            // Prefer the STUN-discovered reflexive candidate over the static host.
+            var host_buf: [16]u8 = undefined;
+            const cand_host = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
             var tbuf: [400]u8 = undefined;
             const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} srtp={s}\r\n", .{
-                server_name, channel, creds.ufragSlice(), creds.pwdSlice(), self.config.media_host, self.media_plane.port, srtp_b64,
+                server_name, channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
             }) catch return;
             try appendToConn(conn, tline);
         }
@@ -8179,6 +8195,19 @@ fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
         conn.session.username(),
         hostOf(conn),
     }) catch return error.OutputTooSmall;
+}
+
+/// Parse a dotted-quad IPv4 literal ("a.b.c.d") into 4 octets, or null if it is
+/// not a well-formed IPv4 address.
+fn parseIp4(s: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) {
+        if (i >= 4) return null;
+        out[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+    }
+    return if (i == 4) out else null;
 }
 
 /// Build the extended-ban evaluation context for `conn`. `host_mask` is the full

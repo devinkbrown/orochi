@@ -22,6 +22,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
     if (cfg.listen.media != 0) out.media_port = cfg.listen.media;
     if (cfg.listen.media_host.len != 0) out.media_host = cfg.listen.media_host;
+    if (cfg.media.stun_host) |h| out.media_stun_host = h;
+    if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     out.backlog = cfg.limits.backlog;
     out.max_clients = cfg.limits.max_clients;
     if (cfg.limits.handshake_timeout_ms != 0) out.registration_timeout_ms = @intCast(cfg.limits.handshake_timeout_ms);
@@ -157,6 +159,24 @@ test "media listen overlays media port and candidate host" {
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u16, 7820), loaded.config.media_port);
     try testing.expectEqualStrings("203.0.113.5", loaded.config.media_host);
+}
+
+test "media stun server overlays discovery config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[media]
+        \\stun_host = "198.51.100.9"
+        \\stun_port = 3478
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqualStrings("198.51.100.9", loaded.config.media_stun_host);
+    try testing.expectEqual(@as(u16, 3478), loaded.config.media_stun_port);
 }
 
 test "limits durations overlay timeout knobs" {

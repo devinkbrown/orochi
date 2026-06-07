@@ -70,6 +70,11 @@ pub const MediaPlane = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The bound local UDP port (0 until started); advertised to clients.
     port: u16 = 0,
+    /// Optional STUN server to query at boot for the reflexive candidate. Set
+    /// before `start`.
+    stun_server: ?TransportAddress = null,
+    /// The discovered server-reflexive address (null if discovery is off/failed).
+    discovered: ?TransportAddress = null,
     /// CSPRNG for ICE credential generation, seeded from the OS at init.
     /// Accessed only under `mutex` (in allocate).
     csprng: std.Random.DefaultCsprng,
@@ -96,9 +101,18 @@ pub const MediaPlane = struct {
         if (self.socket != null) return;
         var sock = try MediaSocket.bind(bind_be, port);
         errdefer sock.deinit();
-        sock.setRecvTimeoutMs(250); // wake periodically to observe the stop flag
         self.port = try sock.localPort();
         self.socket = sock;
+
+        // Discover the server-reflexive candidate before the pump owns the socket.
+        if (self.stun_server) |srv| {
+            self.socket.?.setRecvTimeoutMs(1500); // allow for STUN RTT
+            var txid: [12]u8 = undefined;
+            self.csprng.random().bytes(&txid);
+            self.discovered = self.socket.?.queryReflexive(srv, txid, self.allocator);
+        }
+        self.socket.?.setRecvTimeoutMs(250); // pump: wake to observe the stop flag
+
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, pumpLoop, .{self}) catch |e| {
             self.socket.?.deinit();
@@ -192,6 +206,15 @@ pub const MediaPlane = struct {
         defer self.mutex.unlock();
         const ep = self.transport.allocate(channel, participant, self.csprng.random()) catch return null;
         return .{ .ufrag = ep.ufrag, .pwd = ep.pwd };
+    }
+
+    /// Format the discovered server-reflexive IPv4 into `buf` for advertising as
+    /// the media candidate, or null when discovery is off/failed (caller uses
+    /// its configured fallback host).
+    pub fn candidateIp(self: *const MediaPlane, buf: []u8) ?[]const u8 {
+        const a = self.discovered orelse return null;
+        if (a.ip_len != 4) return null;
+        return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a.ip[0], a.ip[1], a.ip[2], a.ip[3] }) catch null;
     }
 
     /// The per-call SRTP group key (SDES) for `channel`, generated on first use.
