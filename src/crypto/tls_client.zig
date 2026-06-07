@@ -76,6 +76,13 @@ pub const FeedResult = union(enum) {
     bytes_to_send: []u8,
 };
 
+/// Result of `decryptApp`: decrypted application bytes (caller owns) or a
+/// benign post-handshake control record that was consumed and ignored.
+pub const AppRead = union(enum) {
+    application_data: []u8,
+    control,
+};
+
 const State = enum {
     idle,
     wait_server_hello,
@@ -267,6 +274,14 @@ pub const Client = struct {
         return self.state == .connected;
     }
 
+    /// Raw (still-encrypted) record bytes received but not consumed by the
+    /// handshake driver. After `handshakeDone()`, a one-shot caller should frame
+    /// and `decryptApp` these *before* reading further from the socket, since a
+    /// server may flush post-handshake records in the same segment as Finished.
+    pub fn pendingBytes(self: *const Client) []const u8 {
+        return self.recv_buf.items;
+    }
+
     pub fn encrypt(self: *Client, appdata: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
@@ -294,6 +309,34 @@ pub const Client = struct {
         }
         if (opened.content_type != .application_data) return error.BadRecord;
         return opened.content;
+    }
+
+    /// Post-handshake-aware read of one decrypted record. Returns the decrypted
+    /// application bytes, or `.control` for benign post-handshake handshake
+    /// records the one-shot client ignores (e.g. NewSessionTicket). Alerts raise
+    /// `error.TlsAlert`. Note: a post-handshake KeyUpdate is *not* honored here
+    /// (treated as control); a one-shot request never triggers a server rekey.
+    pub fn decryptApp(self: *Client, record: []const u8) Error!AppRead {
+        if (self.state != .connected) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const opened = try openRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_read_seq, record);
+        self.app_read_seq += 1;
+        switch (opened.content_type) {
+            .application_data => return .{ .application_data = opened.content },
+            .alert => {
+                defer self.allocator.free(opened.content);
+                self.last_alert = try tls_alert.parse(opened.content);
+                return error.TlsAlert;
+            },
+            .handshake => {
+                self.allocator.free(opened.content);
+                return .control;
+            },
+            else => {
+                self.allocator.free(opened.content);
+                return error.BadRecord;
+            },
+        }
     }
 
     fn writeClientHello(self: *Client, out: *std.ArrayList(u8)) Error!void {
@@ -376,10 +419,10 @@ pub const Client = struct {
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
             if (off != rec.fragment.len or msg.typ != .server_hello) return error.BadHandshake;
-            const selected = try self.parseServerHello(msg.body);
+            var selected = try self.parseServerHello(msg.body);
             try self.appendTranscript(msg.raw);
             try self.deriveHandshakeKeys(selected.shared_secret);
-            secureZero(selected.shared_secret);
+            secureZero(&selected.shared_secret);
             consumePrefix(&self.recv_buf, rec.wire_len);
             self.state = .wait_encrypted_extensions;
             return true;
@@ -1188,6 +1231,29 @@ test "application record seals and opens with AES-128-GCM" {
     // Assert
     try std.testing.expectEqual(tls_record.ContentType.application_data, opened.content_type);
     try std.testing.expectEqualSlices(u8, msg, opened.content);
+}
+
+test "decryptApp skips post-handshake handshake records (NewSessionTicket)" {
+    // Arrange: a connected client with known server app keys.
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+    client.state = .connected;
+    client.selected_suite = .tls_aes_128_gcm_sha256;
+    client.server_app_keys.key[0..Aes128Gcm.key_length].* = [_]u8{0x5A} ** Aes128Gcm.key_length;
+    client.server_app_keys.iv = [_]u8{0xA5} ** 12;
+
+    // A NewSessionTicket arrives first (seq 0), then real application data (seq 1).
+    const ticket = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, "\x04\x00\x00\x00");
+    defer allocator.free(ticket);
+    const app = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 1, .application_data, "HTTP/1.1 200 OK");
+    defer allocator.free(app);
+
+    // Act / Assert
+    try std.testing.expectEqual(AppRead.control, try client.decryptApp(ticket));
+    const got = try client.decryptApp(app);
+    defer allocator.free(got.application_data);
+    try std.testing.expectEqualSlices(u8, "HTTP/1.1 200 OK", got.application_data);
 }
 
 fn clientHelloExtensions(body: []const u8) ?[]const u8 {

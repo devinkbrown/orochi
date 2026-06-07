@@ -1,0 +1,566 @@
+//! Live ACME issuance orchestration: drives the `acme_client` state machine over
+//! real TLS 1.3 + HTTP/1.1 to a CA (e.g. Let's Encrypt), serving HTTP-01
+//! challenges from a `TokenStore` and writing the issued chain to disk.
+//!
+//! This runs OUT OF BAND (blocking sockets, a dedicated call — not the io_uring
+//! hot loop). Certificate issuance/renewal happens roughly every ~60 days, so a
+//! simple synchronous driver is the right tool; it never blocks the event loop.
+//!
+//! It is clean-room and self-contained: TLS via `crypto/tls_client`, HTTP via
+//! `proto/http1_client`, ACME via `daemon/acme_client`, signatures via Ed25519
+//! (`crypto/sign`). No OpenSSL, no certbot, no external processes.
+//!
+//! Trust anchors (the CA root DER(s) that validate the ACME API endpoint's own
+//! certificate) are supplied by the caller — this module pins nothing implicitly.
+
+const std = @import("std");
+
+const tls_client = @import("../crypto/tls_client.zig");
+const http1 = @import("../proto/http1_client.zig");
+const acme = @import("acme_client.zig");
+const http01 = @import("acme_http01_server.zig");
+const sign = @import("../crypto/sign.zig");
+const dns = @import("../proto/dns.zig");
+const resolv_conf = @import("../proto/resolv_conf.zig");
+
+const Allocator = std.mem.Allocator;
+const linux = std.os.linux;
+const posix = std.posix;
+const net = std.Io.net;
+
+pub const Error = error{
+    InvalidUrl,
+    NotHttps,
+    ConnectionClosed,
+    ConnectFailed,
+    SocketUnavailable,
+    UnsupportedAddressFamily,
+    ResponseTooLarge,
+} || Allocator.Error || tls_client.Error || http1.Error;
+
+/// Resolves an ACME endpoint hostname to an IP address. Injected because this
+/// std build has no DNS resolver and the daemon's S2S path uses configured IPs;
+/// a future DNS module (or a static config map) provides the implementation.
+pub const Resolver = struct {
+    ctx: *anyopaque,
+    resolveFn: *const fn (ctx: *anyopaque, host: []const u8, port: u16) anyerror!net.IpAddress,
+
+    fn resolve(self: Resolver, host: []const u8, port: u16) anyerror!net.IpAddress {
+        return self.resolveFn(self.ctx, host, port);
+    }
+};
+
+/// Maximum bytes accepted for a single HTTP response (ACME payloads are small).
+const max_response_bytes: usize = 256 * 1024;
+const max_tls_record: usize = 5 + (1 << 14) + 256;
+
+// ---------------------------------------------------------------------------
+// URL parsing (absolute https URLs only)
+// ---------------------------------------------------------------------------
+
+pub const Url = struct {
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+
+    /// Parse `https://host[:port]/path`. Slices borrow `url`.
+    pub fn parse(url: []const u8) Error!Url {
+        const scheme = "https://";
+        if (!std.mem.startsWith(u8, url, scheme)) return error.NotHttps;
+        const rest = url[scheme.len..];
+        const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+        const authority = rest[0..path_start];
+        const path = if (path_start == rest.len) "/" else rest[path_start..];
+        if (authority.len == 0) return error.InvalidUrl;
+
+        var host = authority;
+        var port: u16 = 443;
+        if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
+            // Guard against IPv6 literals (not needed for ACME hostnames).
+            if (std.mem.indexOfScalar(u8, authority, ']') == null) {
+                host = authority[0..colon];
+                port = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch
+                    return error.InvalidUrl;
+            }
+        }
+        if (host.len == 0) return error.InvalidUrl;
+        return .{ .host = host, .port = port, .path = path };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Blocking one-shot HTTPS request over the clean-room TLS 1.3 client
+// ---------------------------------------------------------------------------
+
+/// Perform a single request/response over a fresh TLS 1.3 connection and return
+/// the decrypted HTTP response bytes (caller owns). `Connection: close` is sent;
+/// one connection serves exactly one exchange (simple and correct for ACME).
+fn httpsRequest(
+    allocator: Allocator,
+    resolver: Resolver,
+    trust_anchors: []const []const u8,
+    method: []const u8,
+    url: Url,
+    extra_headers: []const http1.Header,
+    body: []const u8,
+) Error![]u8 {
+    const addr = resolver.resolve(url.host, url.port) catch return error.ConnectFailed;
+    const fd = try connectAddr(addr);
+    defer closeFd(fd);
+
+    var tc = try tls_client.Client.init(allocator, .{
+        .server_name = url.host,
+        .trust_anchors = trust_anchors,
+        .alpn_protocols = &.{"http/1.1"},
+    });
+    defer tc.deinit();
+
+    // --- TLS handshake ---
+    {
+        const hello = try tc.start();
+        defer allocator.free(hello);
+        try writeAll(fd, hello);
+    }
+    var read_buf: [max_tls_record]u8 = undefined;
+    while (!tc.handshakeDone()) {
+        const n = try readSome(fd, &read_buf);
+        switch (try tc.feed(read_buf[0..n])) {
+            .need_more => {},
+            .bytes_to_send => |out| {
+                defer allocator.free(out);
+                try writeAll(fd, out);
+            },
+        }
+    }
+
+    // --- Build + send the (encrypted) request ---
+    {
+        var req_buf: [16 * 1024]u8 = undefined;
+        const req = try http1.buildRequest(&req_buf, method, url.host, url.path, extra_headers, body);
+        const record = try tc.encrypt(req);
+        defer allocator.free(record);
+        try writeAll(fd, record);
+    }
+
+    // --- Read + decrypt the response until it is a complete HTTP message ---
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
+    try pending.appendSlice(allocator, tc.pendingBytes()); // drain post-Finished flush
+
+    var plaintext: std.ArrayList(u8) = .empty;
+    defer plaintext.deinit(allocator);
+
+    while (true) {
+        // Frame and decrypt every complete TLS record we currently hold.
+        while (frameRecordLen(pending.items)) |rec_len| {
+            const rec = pending.items[0..rec_len];
+            const read = try tc.decryptApp(rec);
+            switch (read) {
+                .application_data => |pt| {
+                    defer allocator.free(pt);
+                    if (plaintext.items.len + pt.len > max_response_bytes) return error.ResponseTooLarge;
+                    try plaintext.appendSlice(allocator, pt);
+                },
+                .control => {}, // post-handshake record (e.g. NewSessionTicket): ignore
+            }
+            consumePrefix(&pending, rec_len);
+        }
+        if (http1.isComplete(plaintext.items)) break;
+
+        const n = readSome(fd, &read_buf) catch |err| switch (err) {
+            error.ConnectionClosed => break, // server closed; use what we have
+            else => return err,
+        };
+        if (n == 0) break;
+        try pending.appendSlice(allocator, read_buf[0..n]);
+    }
+
+    return plaintext.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------------------
+// acme_client.Transport adapter
+// ---------------------------------------------------------------------------
+
+/// Bridges `acme_client.Transport` to live HTTPS. Owns the most recent response
+/// buffer + header scratch; each call frees the prior one, so returned slices
+/// stay valid until the next `get`/`postJws` (which is exactly the contract the
+/// state machine relies on).
+pub const HttpsTransport = struct {
+    allocator: Allocator,
+    resolver: Resolver,
+    trust_anchors: []const []const u8,
+    last_response: ?[]u8 = null,
+    header_scratch: [64]http1.Header = undefined,
+
+    pub fn init(allocator: Allocator, resolver: Resolver, trust_anchors: []const []const u8) HttpsTransport {
+        return .{ .allocator = allocator, .resolver = resolver, .trust_anchors = trust_anchors };
+    }
+
+    pub fn deinit(self: *HttpsTransport) void {
+        if (self.last_response) |r| self.allocator.free(r);
+        self.last_response = null;
+    }
+
+    pub fn transport(self: *HttpsTransport) acme.Transport {
+        return .{ .ctx = self, .getFn = getThunk, .postJwsFn = postThunk };
+    }
+
+    fn exchange(
+        self: *HttpsTransport,
+        method: []const u8,
+        url_str: []const u8,
+        extra: []const http1.Header,
+        body: []const u8,
+    ) anyerror!acme.HttpResponse {
+        const url = try Url.parse(url_str);
+        const raw = try httpsRequest(self.allocator, self.resolver, self.trust_anchors, method, url, extra, body);
+        if (self.last_response) |r| self.allocator.free(r);
+        self.last_response = raw;
+        const resp = try http1.parseResponse(raw, &self.header_scratch);
+        return .{
+            .status = resp.status,
+            .body = resp.body,
+            .nonce = http1.header(resp, "replay-nonce"),
+            .location = http1.header(resp, "location"),
+        };
+    }
+
+    fn getThunk(ctx: *anyopaque, url: []const u8) anyerror!acme.HttpResponse {
+        const self: *HttpsTransport = @ptrCast(@alignCast(ctx));
+        return self.exchange("GET", url, &.{}, "");
+    }
+
+    fn postThunk(ctx: *anyopaque, url: []const u8, jws_body: []const u8) anyerror!acme.HttpResponse {
+        const self: *HttpsTransport = @ptrCast(@alignCast(ctx));
+        const headers = [_]http1.Header{
+            .{ .name = "Content-Type", .value = "application/jose+json" },
+            .{ .name = "Connection", .value = "close" },
+        };
+        return self.exchange("POST", url, &headers, jws_body);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Ed25519 signer adapter (account key == issued-cert key, per acme_client)
+// ---------------------------------------------------------------------------
+
+pub const Ed25519Signer = struct {
+    key_pair: sign.KeyPair,
+
+    pub fn init(key_pair: sign.KeyPair) Ed25519Signer {
+        return .{ .key_pair = key_pair };
+    }
+
+    pub fn signer(self: *Ed25519Signer) acme.Signer {
+        return .{
+            .ctx = self,
+            .public_key = self.key_pair.public_key,
+            .signFn = signThunk,
+        };
+    }
+
+    fn signThunk(ctx: *anyopaque, signing_input: []const u8, out: []u8) anyerror![]const u8 {
+        const self: *Ed25519Signer = @ptrCast(@alignCast(ctx));
+        if (out.len < sign.signature_len) return error.NoSpaceLeft;
+        const sig = try self.key_pair.sign(signing_input);
+        @memcpy(out[0..sign.signature_len], &sig);
+        return out[0..sign.signature_len];
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Top-level issuance driver
+// ---------------------------------------------------------------------------
+
+pub const IssueConfig = struct {
+    directory_url: []const u8,
+    domains: []const []const u8,
+    contacts: []const []const u8 = &.{},
+    /// CA-API trust anchors (root CA DER) validating the ACME endpoint cert.
+    trust_anchors: []const []const u8,
+    /// Absolute path the issued PEM chain is written to (kain-owned dir).
+    cert_out_path: []const u8,
+    /// Max state-machine steps before giving up (defends against loops/hangs).
+    max_steps: usize = 64,
+};
+
+pub const IssueResult = struct {
+    state: acme.State,
+    cert_written: bool,
+};
+
+/// Run a full issuance. `token_store` MUST already be wired to a live HTTP-01
+/// responder reachable at `http://<domain>/.well-known/acme-challenge/<token>`
+/// (see [acme_http01_server]); this driver only populates/clears it.
+///
+/// `resolver` turns ACME endpoint hostnames into IPs. Pass `null` to use the
+/// built-in blocking resolver (reads /etc/resolv.conf, queries via our own
+/// `dns.zig` over UDP). `io` is used for the resolver's resolv.conf read and the
+/// atomic cert write.
+pub fn issue(
+    allocator: Allocator,
+    io: std.Io,
+    cfg: IssueConfig,
+    key_pair: sign.KeyPair,
+    token_store: *http01.TokenStore,
+    resolver: ?Resolver,
+) !IssueResult {
+    var sys = SystemResolver{ .allocator = allocator, .io = io };
+    const active_resolver = resolver orelse sys.resolver();
+
+    var ed = Ed25519Signer.init(key_pair);
+    var http_transport = HttpsTransport.init(allocator, active_resolver, cfg.trust_anchors);
+    defer http_transport.deinit();
+
+    var client = acme.Acme.init(allocator, .{
+        .directory_url = cfg.directory_url,
+        .domains = cfg.domains,
+        .contacts = cfg.contacts,
+        .signer = ed.signer(),
+    });
+    defer client.deinit();
+
+    var cert_written = false;
+    var steps: usize = 0;
+    while (steps < cfg.max_steps) : (steps += 1) {
+        const progress = try client.step(http_transport.transport());
+        for (progress.effects) |effect| switch (effect) {
+            .serve_http01 => |c| try token_store.put(c.token, c.key_authorization),
+            .write_cert => |c| {
+                try writeCertAtomic(io, cfg.cert_out_path, c.pem);
+                cert_written = true;
+            },
+        };
+        if (progress.done) {
+            return .{ .state = progress.state, .cert_written = cert_written };
+        }
+    }
+    return error.TooManySteps;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in blocking DNS resolver (reuses our own dns.zig + resolv_conf)
+// ---------------------------------------------------------------------------
+
+/// Default `Resolver`: parses /etc/resolv.conf and performs a blocking A-record
+/// lookup over UDP using the clean-room `dns.zig` codec. Out-of-band only.
+///
+/// Handles IP literals and direct A records. Our minimal codec does not decode
+/// CNAME chains or EDNS additional records, so CDN-fronted endpoints may not
+/// resolve here — inject a custom `Resolver` (or a static host→IP) for those.
+pub const SystemResolver = struct {
+    allocator: Allocator,
+    io: std.Io,
+
+    pub fn resolver(self: *SystemResolver) Resolver {
+        return .{ .ctx = self, .resolveFn = resolveThunk };
+    }
+
+    fn resolveThunk(ctx: *anyopaque, host: []const u8, port: u16) anyerror!net.IpAddress {
+        const self: *SystemResolver = @ptrCast(@alignCast(ctx));
+        // IP-literal fast path (no query needed).
+        if (net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
+        return systemResolveA(self.allocator, self.io, host, port);
+    }
+};
+
+fn systemResolveA(allocator: Allocator, io: std.Io, host: []const u8, port: u16) !net.IpAddress {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, "/etc/resolv.conf", allocator, .limited(64 * 1024)) catch
+        return error.NoNameservers;
+    defer allocator.free(text);
+    const conf = resolv_conf.parse(text);
+    const servers = conf.nameserverSlice();
+    if (servers.len == 0) return error.NoNameservers;
+
+    var id_seed: [2]u8 = undefined;
+    osEntropy(&id_seed);
+    const query_id = std.mem.readInt(u16, &id_seed, .big);
+
+    var query_buf: [dns.max_message_len]u8 = undefined;
+    const query = try dns.encodeQuery(&query_buf, query_id, host, .a);
+
+    for (servers) |srv| {
+        const ns_v4 = switch (srv) {
+            .ipv4 => |b| b,
+            .ipv6 => continue, // UDP-over-IPv6 nameserver not wired; try next
+        };
+        const answer = queryOneServer(ns_v4, query) catch continue;
+        if (answer) |ipv4| return .{ .ip4 = .{ .bytes = ipv4, .port = port } };
+    }
+    return error.HostNotFound;
+}
+
+/// Send `query` to a v4 nameserver:53 and return the first A record, or null.
+fn queryOneServer(ns_v4: [4]u8, query: []const u8) !?[4]u8 {
+    const fd = try udpSocket();
+    defer closeFd(fd);
+    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, 53), .addr = @bitCast(ns_v4) };
+    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.ConnectFailed;
+
+    if (posix.errno(linux.write(fd, query.ptr, query.len)) != .SUCCESS) return error.ConnectFailed;
+
+    var resp_buf: [dns.max_message_len]u8 = undefined;
+    const rc = linux.read(fd, &resp_buf, resp_buf.len);
+    if (posix.errno(rc) != .SUCCESS) return error.ConnectFailed;
+    const n: usize = @intCast(rc);
+
+    const msg = dns.parseMessage(1, dns.max_cache_addrs, resp_buf[0..n]) catch return null;
+    for (msg.answerSlice()) |rr| switch (rr.data) {
+        .a => |ipv4| return ipv4,
+        else => {},
+    };
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Low-level socket helpers (raw linux syscalls, matching server.zig idiom)
+// ---------------------------------------------------------------------------
+
+fn connectAddr(addr: net.IpAddress) Error!linux.fd_t {
+    const a4 = switch (addr) {
+        .ip4 => |x| x,
+        .ip6 => return error.UnsupportedAddressFamily,
+    };
+    const fd = try socketTcp();
+    errdefer closeFd(fd);
+    var sa = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, a4.port),
+        .addr = @bitCast(a4.bytes),
+    };
+    switch (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in)))) {
+        .SUCCESS => return fd,
+        else => return error.ConnectFailed,
+    }
+}
+
+fn socketTcp() Error!linux.fd_t {
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => error.SocketUnavailable,
+    };
+}
+
+fn udpSocket() Error!linux.fd_t {
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => error.SocketUnavailable,
+    };
+}
+
+fn closeFd(fd: linux.fd_t) void {
+    _ = linux.close(fd);
+}
+
+fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        switch (posix.errno(rc)) {
+            .SUCCESS => off += @intCast(rc),
+            else => return error.ConnectionClosed,
+        }
+    }
+}
+
+fn readSome(fd: linux.fd_t, buf: []u8) Error!usize {
+    const rc = linux.read(fd, buf.ptr, buf.len);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {
+            const n: usize = @intCast(rc);
+            if (n == 0) return error.ConnectionClosed;
+            return n;
+        },
+        else => return error.ConnectionClosed,
+    }
+}
+
+fn osEntropy(buf: []u8) void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const rc = linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
+        if (posix.errno(rc) != .SUCCESS) {
+            // Fallback: monotonic-ish fill; query IDs are not security-critical.
+            for (buf[filled..]) |*b| b.* = 0x55;
+            return;
+        }
+        filled += @intCast(rc);
+    }
+}
+
+/// Return the total wire length of the leading TLS record in `buf`, or null if a
+/// full record is not yet present.
+fn frameRecordLen(buf: []const u8) ?usize {
+    if (buf.len < 5) return null;
+    const len = std.mem.readInt(u16, buf[3..5], .big);
+    const total = 5 + @as(usize, len);
+    if (buf.len < total) return null;
+    return total;
+}
+
+fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
+    const remain = list.items.len - n;
+    std.mem.copyForwards(u8, list.items[0..remain], list.items[n..]);
+    list.shrinkRetainingCapacity(remain);
+}
+
+/// Write the issued PEM chain to `path` atomically (temp file + rename via the
+/// Io layer), so an nginx reload never reads a partial cert. The chain is public;
+/// default permissions are fine. The containing dir should be kain-owned.
+fn writeCertAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, data);
+    try atomic.file.sync(io);
+    try atomic.replace(io);
+}
+
+// ---------------------------------------------------------------------------
+// Tests (network paths are exercised live, not here; these cover pure logic)
+// ---------------------------------------------------------------------------
+
+test "Url.parse extracts host, default port, and path" {
+    const u = try Url.parse("https://acme-v02.api.letsencrypt.org/directory");
+    try std.testing.expectEqualStrings("acme-v02.api.letsencrypt.org", u.host);
+    try std.testing.expectEqual(@as(u16, 443), u.port);
+    try std.testing.expectEqualStrings("/directory", u.path);
+}
+
+test "Url.parse honors explicit port and bare authority" {
+    const a = try Url.parse("https://example.com:8443/acme/new-order");
+    try std.testing.expectEqual(@as(u16, 8443), a.port);
+    try std.testing.expectEqualStrings("/acme/new-order", a.path);
+
+    const b = try Url.parse("https://example.com");
+    try std.testing.expectEqualStrings("example.com", b.host);
+    try std.testing.expectEqualStrings("/", b.path);
+}
+
+test "Url.parse rejects non-https and empty authority" {
+    try std.testing.expectError(error.NotHttps, Url.parse("http://example.com/"));
+    try std.testing.expectError(error.InvalidUrl, Url.parse("https:///path"));
+}
+
+test "frameRecordLen needs a full record" {
+    try std.testing.expectEqual(@as(?usize, null), frameRecordLen(&[_]u8{ 0x17, 0x03, 0x03 }));
+    // header says 4 bytes of payload; only 2 present -> incomplete
+    try std.testing.expectEqual(@as(?usize, null), frameRecordLen(&[_]u8{ 0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb }));
+    // full 4-byte payload present -> total 9
+    try std.testing.expectEqual(@as(?usize, 9), frameRecordLen(&[_]u8{ 0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd }));
+}
+
+test "consumePrefix shifts remaining bytes down" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(allocator);
+    try list.appendSlice(allocator, "ABCDEFG");
+    consumePrefix(&list, 3);
+    try std.testing.expectEqualStrings("DEFG", list.items);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
