@@ -22,6 +22,7 @@ pub const crdt_orset = @import("crdt_orset.zig");
 pub const crdt_text = @import("crdt_text.zig");
 pub const cron = @import("cron.zig");
 pub const cuckoo = @import("cuckoo.zig");
+pub const cuckoo_filter = @import("cuckoo_filter.zig");
 pub const ddsketch = @import("ddsketch.zig");
 pub const dtx = @import("dtx.zig");
 pub const egwalker = @import("egwalker.zig");
@@ -137,6 +138,7 @@ test {
     _ = crdt_text;
     _ = cron;
     _ = cuckoo;
+    _ = cuckoo_filter;
     _ = ddsketch;
     _ = dtx;
     _ = egwalker;
