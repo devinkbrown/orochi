@@ -14,6 +14,7 @@ const http01 = @import("acme_http01_server.zig");
 const listener = @import("acme_http01_listener.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const pem = @import("../proto/pem.zig");
+const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -22,6 +23,8 @@ pub const prod_directory = "https://acme-v02.api.letsencrypt.org/directory";
 pub const default_ca_bundle = "/etc/ssl/certs/ca-certificates.crt";
 /// Fixed loopback port nginx proxies the ACME challenge path to.
 pub const default_challenge_port: u16 = 14402;
+/// Max bytes read from the CA-bundle file (defense against a runaway/huge file).
+pub const default_ca_bundle_max_bytes: usize = 4 << 20;
 
 pub const Options = struct {
     domain: []const u8,
@@ -33,7 +36,36 @@ pub const Options = struct {
     /// Cert private-key output path. Null => derive from `cert_out_path`.
     key_out_path: ?[]const u8 = null,
     debug: bool = false,
+    /// Max bytes read from the CA-bundle file.
+    ca_bundle_max_bytes: usize = default_ca_bundle_max_bytes,
 };
+
+/// Overlay `[acme]` config onto `opts`, leaving any key absent from the document
+/// at its current (default / CLI-supplied) value. Behavior is unchanged when the
+/// document carries none of these keys. String values borrow `doc` — the caller
+/// must keep the parsed document alive for the lifetime of `opts`.
+///
+/// Note: `prod_directory_url` is overlaid only when the active directory is still
+/// the staging default, so an explicit `--prod` (already pointing at production)
+/// or a `staging_directory_url` override is never clobbered by it.
+pub fn applyToml(opts: *Options, doc: *const toml.Document) void {
+    // Honor a configured staging endpoint whenever the run is still on staging.
+    if (std.mem.eql(u8, opts.directory_url, staging_directory)) {
+        if (doc.getString("acme.staging_directory_url")) |v| opts.directory_url = v;
+    }
+    // Honor a configured production endpoint only for prod runs (the default
+    // directory_url at this point is staging unless --prod was passed).
+    if (std.mem.eql(u8, opts.directory_url, prod_directory)) {
+        if (doc.getString("acme.prod_directory_url")) |v| opts.directory_url = v;
+    }
+    if (doc.getString("acme.ca_bundle_path")) |v| opts.ca_bundle_path = v;
+    if (doc.getUint("acme.challenge_port")) |v| {
+        if (v >= 1 and v <= std.math.maxInt(u16)) opts.challenge_port = @intCast(v);
+    }
+    if (doc.getUint("acme.ca_bundle_max_bytes")) |v| {
+        if (v != 0) opts.ca_bundle_max_bytes = @intCast(v);
+    }
+}
 
 /// Print a one-line usage summary for the acme-issue subcommand.
 pub fn usage() void {
@@ -108,7 +140,7 @@ pub fn parseArgs(args: []const []const u8) ?Options {
 /// Run a full issuance. Returns true iff a certificate was written.
 pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
     // --- Trust anchors from the CA bundle ---
-    const bundle_text = try std.Io.Dir.cwd().readFileAlloc(io, opts.ca_bundle_path, allocator, .limited(4 << 20));
+    const bundle_text = try std.Io.Dir.cwd().readFileAlloc(io, opts.ca_bundle_path, allocator, .limited(opts.ca_bundle_max_bytes));
     defer allocator.free(bundle_text);
 
     var anchors = try loadTrustAnchors(allocator, bundle_text);
@@ -243,6 +275,77 @@ test "loadTrustAnchors decodes multiple CERTIFICATE blocks" {
 
     try std.testing.expectEqual(@as(usize, 2), anchors.items.len);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00 }, anchors.items[0]);
+}
+
+test "applyToml overlays acme keys and leaves absent keys at defaults" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\[acme]
+        \\staging_directory_url = "https://staging.example/dir"
+        \\ca_bundle_path = "/custom/ca.pem"
+        \\challenge_port = 8888
+        \\ca_bundle_max_bytes = 1048576
+    ;
+    var doc = try toml.parse(allocator, src);
+    defer doc.deinit(allocator);
+
+    var opts: Options = .{ .domain = "x.test", .cert_out_path = "/p/c.pem" };
+    applyToml(&opts, &doc);
+
+    try std.testing.expectEqualStrings("https://staging.example/dir", opts.directory_url);
+    try std.testing.expectEqualStrings("/custom/ca.pem", opts.ca_bundle_path);
+    try std.testing.expectEqual(@as(u16, 8888), opts.challenge_port);
+    try std.testing.expectEqual(@as(usize, 1048576), opts.ca_bundle_max_bytes);
+}
+
+test "applyToml is a no-op when the acme table is absent" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator, "[server]\nname = \"mz\"\n");
+    defer doc.deinit(allocator);
+
+    var opts: Options = .{ .domain = "x.test", .cert_out_path = "/p/c.pem" };
+    applyToml(&opts, &doc);
+
+    try std.testing.expectEqualStrings(staging_directory, opts.directory_url);
+    try std.testing.expectEqualStrings(default_ca_bundle, opts.ca_bundle_path);
+    try std.testing.expectEqual(default_challenge_port, opts.challenge_port);
+    try std.testing.expectEqual(default_ca_bundle_max_bytes, opts.ca_bundle_max_bytes);
+}
+
+test "applyToml overlays prod_directory_url only on prod runs" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\[acme]
+        \\prod_directory_url = "https://prod.example/dir"
+    ;
+    var doc = try toml.parse(allocator, src);
+    defer doc.deinit(allocator);
+
+    // Staging run: prod override must NOT apply.
+    var staging_opts: Options = .{ .domain = "x.test", .cert_out_path = "/p/c.pem" };
+    applyToml(&staging_opts, &doc);
+    try std.testing.expectEqualStrings(staging_directory, staging_opts.directory_url);
+
+    // Prod run (e.g. --prod): the override applies.
+    var prod_opts: Options = .{ .domain = "x.test", .cert_out_path = "/p/c.pem", .directory_url = prod_directory };
+    applyToml(&prod_opts, &doc);
+    try std.testing.expectEqualStrings("https://prod.example/dir", prod_opts.directory_url);
+}
+
+test "applyToml rejects out-of-range challenge_port and zero max bytes" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\[acme]
+        \\challenge_port = 70000
+        \\ca_bundle_max_bytes = 0
+    ;
+    var doc = try toml.parse(allocator, src);
+    defer doc.deinit(allocator);
+
+    var opts: Options = .{ .domain = "x.test", .cert_out_path = "/p/c.pem" };
+    applyToml(&opts, &doc);
+    try std.testing.expectEqual(default_challenge_port, opts.challenge_port);
+    try std.testing.expectEqual(default_ca_bundle_max_bytes, opts.ca_bundle_max_bytes);
 }
 
 test {

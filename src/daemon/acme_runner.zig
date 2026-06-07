@@ -23,6 +23,7 @@ const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const pem = @import("../proto/pem.zig");
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
+const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
@@ -51,8 +52,15 @@ pub const Resolver = struct {
     }
 };
 
-/// Maximum bytes accepted for a single HTTP response (ACME payloads are small).
-const max_response_bytes: usize = 256 * 1024;
+/// Default maximum bytes accepted for a single HTTP response (ACME payloads are
+/// small). Operationally tunable via `[acme].max_response_bytes`.
+pub const default_max_response_bytes: usize = 256 * 1024;
+/// Default max bytes of an RFC 7807 problem body logged on error/debug.
+pub const default_error_body_preview_bytes: usize = 512;
+/// Default max bytes read from /etc/resolv.conf by the built-in resolver.
+pub const default_resolv_conf_max_bytes: usize = 64 * 1024;
+/// Default UDP port used for the built-in resolver's DNS A-record lookups.
+pub const default_dns_port: u16 = 53;
 const max_tls_record: usize = 5 + (1 << 14) + 256;
 
 // ---------------------------------------------------------------------------
@@ -104,6 +112,7 @@ fn httpsRequest(
     url: Url,
     extra_headers: []const http1.Header,
     body: []const u8,
+    max_response_bytes: usize,
 ) Error![]u8 {
     const addr = resolver.resolve(url.host, url.port) catch return error.ConnectFailed;
     const fd = try connectAddr(addr);
@@ -203,6 +212,10 @@ pub const HttpsTransport = struct {
     header_scratch: [64]http1.Header = undefined,
     /// When true, log every exchange; errors (status >= 300) are always logged.
     debug: bool = false,
+    /// Max bytes accepted for a single HTTP response.
+    max_response_bytes: usize = default_max_response_bytes,
+    /// Max bytes of an RFC 7807 problem body logged on error/debug.
+    error_body_preview_bytes: usize = default_error_body_preview_bytes,
 
     pub fn init(allocator: Allocator, resolver: Resolver, trust_anchors: []const []const u8) HttpsTransport {
         return .{ .allocator = allocator, .resolver = resolver, .trust_anchors = trust_anchors };
@@ -225,7 +238,7 @@ pub const HttpsTransport = struct {
         body: []const u8,
     ) anyerror!acme.HttpResponse {
         const url = try Url.parse(url_str);
-        const raw = httpsRequest(self.allocator, self.resolver, self.trust_anchors, method, url, extra, body) catch |err| {
+        const raw = httpsRequest(self.allocator, self.resolver, self.trust_anchors, method, url, extra, body, self.max_response_bytes) catch |err| {
             if (self.debug) std.debug.print("acme!! {s} {s} transport error: {s}\n", .{ method, url_str, @errorName(err) });
             return err;
         };
@@ -235,7 +248,7 @@ pub const HttpsTransport = struct {
         // Trace every exchange under --debug; always surface error bodies (the
         // RFC 7807 problem document) so failures are diagnosable without --debug.
         if (self.debug or resp.status >= 300) {
-            const preview = resp.body[0..@min(resp.body.len, 512)];
+            const preview = resp.body[0..@min(resp.body.len, self.error_body_preview_bytes)];
             std.debug.print("acme<- {s} {s} -> {d} (body {d}B)\n  {s}\n", .{ method, url_str, resp.status, resp.body.len, preview });
         }
         return .{
@@ -311,7 +324,38 @@ pub const IssueConfig = struct {
     max_steps: usize = 64,
     /// Log every HTTP exchange (errors are always logged regardless).
     debug: bool = false,
+    /// Max bytes accepted for a single ACME HTTP response.
+    max_response_bytes: usize = default_max_response_bytes,
+    /// Max bytes of an RFC 7807 problem body logged on error/debug.
+    error_body_preview_bytes: usize = default_error_body_preview_bytes,
+    /// Max bytes read from /etc/resolv.conf by the built-in resolver.
+    resolv_conf_max_bytes: usize = default_resolv_conf_max_bytes,
+    /// UDP port the built-in resolver uses for DNS A-record lookups.
+    dns_port: u16 = default_dns_port,
 };
+
+/// Overlay `[acme]` config onto `cfg`, leaving any absent key at its current
+/// (default) value. Behavior is unchanged when the document carries none of
+/// these keys. Only operational tunables are read here; cryptographic/protocol
+/// domain constants stay in code.
+pub fn applyToml(cfg: *IssueConfig, doc: *const toml.Document) void {
+    if (doc.getUint("acme.max_steps")) |v| {
+        if (v != 0) cfg.max_steps = @intCast(v);
+    }
+    if (doc.getBool("acme.debug")) |v| cfg.debug = v;
+    if (doc.getUint("acme.max_response_bytes")) |v| {
+        if (v != 0) cfg.max_response_bytes = @intCast(v);
+    }
+    if (doc.getUint("acme.error_body_preview_bytes")) |v| {
+        cfg.error_body_preview_bytes = @intCast(v);
+    }
+    if (doc.getUint("acme.resolv_conf_max_bytes")) |v| {
+        if (v != 0) cfg.resolv_conf_max_bytes = @intCast(v);
+    }
+    if (doc.getUint("acme.dns_port")) |v| {
+        if (v >= 1 and v <= std.math.maxInt(u16)) cfg.dns_port = @intCast(v);
+    }
+}
 
 pub const IssueResult = struct {
     state: acme.State,
@@ -335,13 +379,20 @@ pub fn issue(
     token_store: *http01.TokenStore,
     resolver: ?Resolver,
 ) !IssueResult {
-    var sys = SystemResolver{ .allocator = allocator, .io = io };
+    var sys = SystemResolver{
+        .allocator = allocator,
+        .io = io,
+        .resolv_conf_max_bytes = cfg.resolv_conf_max_bytes,
+        .dns_port = cfg.dns_port,
+    };
     const active_resolver = resolver orelse sys.resolver();
 
     var account_es = Es256Signer.init(account_key);
     var cert_es = Es256Signer.init(cert_key);
     var http_transport = HttpsTransport.init(allocator, active_resolver, cfg.trust_anchors);
     http_transport.debug = cfg.debug;
+    http_transport.max_response_bytes = cfg.max_response_bytes;
+    http_transport.error_body_preview_bytes = cfg.error_body_preview_bytes;
     tls_client.debug_log = cfg.debug;
     defer http_transport.deinit();
 
@@ -390,6 +441,10 @@ pub fn issue(
 pub const SystemResolver = struct {
     allocator: Allocator,
     io: std.Io,
+    /// Max bytes read from /etc/resolv.conf.
+    resolv_conf_max_bytes: usize = default_resolv_conf_max_bytes,
+    /// UDP port used for DNS A-record lookups.
+    dns_port: u16 = default_dns_port,
 
     pub fn resolver(self: *SystemResolver) Resolver {
         return .{ .ctx = self, .resolveFn = resolveThunk };
@@ -399,12 +454,19 @@ pub const SystemResolver = struct {
         const self: *SystemResolver = @ptrCast(@alignCast(ctx));
         // IP-literal fast path (no query needed).
         if (net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
-        return systemResolveA(self.allocator, self.io, host, port);
+        return systemResolveA(self.allocator, self.io, host, port, self.resolv_conf_max_bytes, self.dns_port);
     }
 };
 
-fn systemResolveA(allocator: Allocator, io: std.Io, host: []const u8, port: u16) !net.IpAddress {
-    const text = std.Io.Dir.cwd().readFileAlloc(io, "/etc/resolv.conf", allocator, .limited(64 * 1024)) catch
+fn systemResolveA(
+    allocator: Allocator,
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    resolv_conf_max_bytes: usize,
+    dns_port: u16,
+) !net.IpAddress {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, "/etc/resolv.conf", allocator, .limited(resolv_conf_max_bytes)) catch
         return error.NoNameservers;
     defer allocator.free(text);
     const conf = resolv_conf.parse(text);
@@ -423,17 +485,17 @@ fn systemResolveA(allocator: Allocator, io: std.Io, host: []const u8, port: u16)
             .ipv4 => |b| b,
             .ipv6 => continue, // UDP-over-IPv6 nameserver not wired; try next
         };
-        const answer = queryOneServer(ns_v4, query) catch continue;
+        const answer = queryOneServer(ns_v4, query, dns_port) catch continue;
         if (answer) |ipv4| return .{ .ip4 = .{ .bytes = ipv4, .port = port } };
     }
     return error.HostNotFound;
 }
 
-/// Send `query` to a v4 nameserver:53 and return the first A record, or null.
-fn queryOneServer(ns_v4: [4]u8, query: []const u8) !?[4]u8 {
+/// Send `query` to a v4 nameserver:<dns_port> and return the first A record, or null.
+fn queryOneServer(ns_v4: [4]u8, query: []const u8, dns_port: u16) !?[4]u8 {
     const fd = try udpSocket();
     defer closeFd(fd);
-    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, 53), .addr = @bitCast(ns_v4) };
+    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, dns_port), .addr = @bitCast(ns_v4) };
     if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
         return error.ConnectFailed;
 
@@ -615,6 +677,57 @@ test "consumePrefix shifts remaining bytes down" {
     try list.appendSlice(allocator, "ABCDEFG");
     consumePrefix(&list, 3);
     try std.testing.expectEqualStrings("DEFG", list.items);
+}
+
+test "applyToml overlays runner acme tunables" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\[acme]
+        \\max_steps = 128
+        \\debug = true
+        \\max_response_bytes = 1048576
+        \\error_body_preview_bytes = 1024
+        \\resolv_conf_max_bytes = 131072
+        \\dns_port = 5353
+    ;
+    var doc = try toml.parse(allocator, src);
+    defer doc.deinit(allocator);
+
+    var cfg: IssueConfig = .{
+        .directory_url = "https://x/dir",
+        .domains = &.{"x.test"},
+        .trust_anchors = &.{},
+        .cert_out_path = "/p/c.pem",
+    };
+    applyToml(&cfg, &doc);
+
+    try std.testing.expectEqual(@as(usize, 128), cfg.max_steps);
+    try std.testing.expectEqual(true, cfg.debug);
+    try std.testing.expectEqual(@as(usize, 1048576), cfg.max_response_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.error_body_preview_bytes);
+    try std.testing.expectEqual(@as(usize, 131072), cfg.resolv_conf_max_bytes);
+    try std.testing.expectEqual(@as(u16, 5353), cfg.dns_port);
+}
+
+test "applyToml leaves runner defaults when acme table absent" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator, "[tls]\ndebug_log = true\n");
+    defer doc.deinit(allocator);
+
+    var cfg: IssueConfig = .{
+        .directory_url = "https://x/dir",
+        .domains = &.{"x.test"},
+        .trust_anchors = &.{},
+        .cert_out_path = "/p/c.pem",
+    };
+    applyToml(&cfg, &doc);
+
+    try std.testing.expectEqual(@as(usize, 64), cfg.max_steps);
+    try std.testing.expectEqual(false, cfg.debug);
+    try std.testing.expectEqual(default_max_response_bytes, cfg.max_response_bytes);
+    try std.testing.expectEqual(default_error_body_preview_bytes, cfg.error_body_preview_bytes);
+    try std.testing.expectEqual(default_resolv_conf_max_bytes, cfg.resolv_conf_max_bytes);
+    try std.testing.expectEqual(default_dns_port, cfg.dns_port);
 }
 
 test {

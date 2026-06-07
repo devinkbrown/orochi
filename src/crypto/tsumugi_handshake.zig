@@ -10,6 +10,7 @@ const hash = @import("hash.zig");
 const Secret = @import("secret.zig").Secret;
 const sign = @import("sign.zig");
 const xwing = @import("xwing.zig");
+const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 const Blake3 = std.crypto.hash.Blake3;
@@ -23,7 +24,22 @@ pub const ChainKey = Secret([ChaCha.key_length]u8);
 pub const Nonce96 = [ChaCha.nonce_length]u8;
 
 pub const protocol_version: u16 = 1;
-pub const max_meshpass_len = 4096;
+
+/// Historic default for the maximum accepted mesh-password length.
+pub const default_max_meshpass_len: usize = 4096;
+
+/// Operationally tunable max Tsumugi mesh-password length accepted in the
+/// handshake. Overridable via `[tls].tsumugi_max_meshpass_len`; defaults
+/// preserve prior behavior.
+pub var max_meshpass_len: usize = default_max_meshpass_len;
+
+/// Overlay `[tls].tsumugi_max_meshpass_len` onto the module-level meshpass cap.
+/// Absent or zero values leave the current cap unchanged (behavior preserved).
+pub fn applyToml(doc: *const toml.Document) void {
+    if (doc.getUint("tls.tsumugi_max_meshpass_len")) |v| {
+        if (v != 0) max_meshpass_len = @intCast(v);
+    }
+}
 
 const magic = "MZTH";
 const msg_m1: u8 = 1;
@@ -787,4 +803,22 @@ test "initiator identity and MeshPass are not cleartext in M1" {
     try std.testing.expect(!contains(m1, &fx.i_pre.node_id));
     try std.testing.expect(!contains(m1, &fx.i_node.public_key));
     try std.testing.expect(!contains(m1, fx.cfg_i.mesh_pass));
+}
+
+test "applyToml overrides tsumugi_max_meshpass_len and restores cleanly" {
+    const saved = max_meshpass_len;
+    defer max_meshpass_len = saved; // never leak the override into other tests
+    const allocator = std.testing.allocator;
+
+    var doc = try toml.parse(allocator, "[tls]\ntsumugi_max_meshpass_len = 512\n");
+    defer doc.deinit(allocator);
+    applyToml(&doc);
+    try std.testing.expectEqual(@as(usize, 512), max_meshpass_len);
+
+    // Absent / zero leaves the current value unchanged.
+    max_meshpass_len = default_max_meshpass_len;
+    var zero = try toml.parse(allocator, "[tls]\ntsumugi_max_meshpass_len = 0\n");
+    defer zero.deinit(allocator);
+    applyToml(&zero);
+    try std.testing.expectEqual(default_max_meshpass_len, max_meshpass_len);
 }

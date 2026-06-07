@@ -26,12 +26,19 @@ const sni = @import("../proto/sni.zig");
 const tls_alert = @import("../proto/tls_alert.zig");
 const tls_finished = @import("../proto/tls_finished.zig");
 const tls_alpn = @import("../proto/tls_alpn.zig");
+const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = hkdf_tls13.Sha256;
 
 /// Opt-in handshake tracing (set by out-of-band tools like acme_runner).
 pub var debug_log: bool = false;
+
+/// Overlay `[tls].debug_log` onto the module-level tracing flag. Absent key
+/// leaves the current value unchanged (behavior preserved).
+pub fn applyToml(doc: *const toml.Document) void {
+    if (doc.getBool("tls.debug_log")) |v| debug_log = v;
+}
 fn dbg(comptime fmt: []const u8, args: anytype) void {
     if (debug_log) std.debug.print("tls: " ++ fmt ++ "\n", args);
 }
@@ -1309,6 +1316,29 @@ fn clientHelloExtensions(body: []const u8) ?[]const u8 {
     _ = c.take(c.readU16() catch return null) catch return null;
     _ = c.take(c.readU8() catch return null) catch return null;
     return c.take(c.readU16() catch return null) catch return null;
+}
+
+test "applyToml toggles the tls debug_log flag and restores cleanly" {
+    const saved = debug_log;
+    defer debug_log = saved; // never leak the override into other tests
+    const allocator = std.testing.allocator;
+
+    var on = try toml.parse(allocator, "[tls]\ndebug_log = true\n");
+    defer on.deinit(allocator);
+    applyToml(&on);
+    try std.testing.expectEqual(true, debug_log);
+
+    var off = try toml.parse(allocator, "[tls]\ndebug_log = false\n");
+    defer off.deinit(allocator);
+    applyToml(&off);
+    try std.testing.expectEqual(false, debug_log);
+
+    // Absent key leaves the current value unchanged.
+    debug_log = true;
+    var none = try toml.parse(allocator, "[server]\nname = \"mz\"\n");
+    defer none.deinit(allocator);
+    applyToml(&none);
+    try std.testing.expectEqual(true, debug_log);
 }
 
 test {

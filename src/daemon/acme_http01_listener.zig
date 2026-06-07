@@ -12,6 +12,7 @@
 const std = @import("std");
 
 const http01 = @import("acme_http01_server.zig");
+const toml = @import("../proto/toml.zig");
 
 const linux = std.os.linux;
 const posix = std.posix;
@@ -32,17 +33,59 @@ const max_request: usize = 8 * 1024;
 /// Max response bytes (status line + headers + key authorization).
 const max_response: usize = 4 * 1024;
 
+/// Default TCP accept backlog for the challenge listener.
+pub const default_listen_backlog: u31 = 16;
+/// Default accept-poll wake interval (ms) so the loop re-checks the stop flag.
+pub const default_accept_poll_ms: u32 = 250;
+/// Default per-connection read timeout (seconds) guarding against slow clients.
+pub const default_conn_read_timeout_sec: u32 = 5;
+
+/// Operational tunables for the loopback HTTP-01 listener. The bind address is
+/// NOT configurable: it is a security invariant that this listener only ever
+/// binds 127.0.0.1 (nginx proxies the public challenge path to it).
+pub const Config = struct {
+    /// TCP accept backlog.
+    listen_backlog: u31 = default_listen_backlog,
+    /// Accept-poll wake interval in milliseconds.
+    accept_poll_ms: u32 = default_accept_poll_ms,
+    /// Per-connection read timeout in seconds.
+    conn_read_timeout_sec: u32 = default_conn_read_timeout_sec,
+
+    /// Overlay `[acme]` config keys onto a Config, leaving absent keys at their
+    /// current value. `http01_bind_address` is intentionally NOT honored: the
+    /// loopback bind is a security invariant.
+    pub fn applyToml(self: *Config, doc: *const toml.Document) void {
+        if (doc.getUint("acme.http01_listen_backlog")) |v| {
+            if (v >= 1 and v <= std.math.maxInt(u31)) self.listen_backlog = @intCast(v);
+        }
+        if (doc.getUint("acme.http01_accept_poll_ms")) |v| {
+            if (v != 0 and v <= std.math.maxInt(u32)) self.accept_poll_ms = @intCast(v);
+        }
+        if (doc.getUint("acme.http01_conn_read_timeout_sec")) |v| {
+            if (v != 0 and v <= std.math.maxInt(u32)) self.conn_read_timeout_sec = @intCast(v);
+        }
+    }
+};
+
 pub const ChallengeServer = struct {
     store: *http01.TokenStore,
     listen_fd: linux.fd_t,
     port: u16,
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
+    /// Per-connection read timeout (seconds); read by the accept loop.
+    conn_read_timeout_sec: u32 = default_conn_read_timeout_sec,
 
     /// Bind `127.0.0.1:port` (use port 0 for an ephemeral port) and start
-    /// listening. No thread is running yet; call `spawn`. The returned value must
-    /// live at a stable address for the thread's lifetime.
+    /// listening with default tunables. No thread is running yet; call `spawn`.
     pub fn init(store: *http01.TokenStore, port: u16) ListenerError!ChallengeServer {
+        return initWithConfig(store, port, .{});
+    }
+
+    /// Like `init`, but with explicit operational tunables. The bind address is
+    /// always 127.0.0.1 (security invariant); only timeouts/backlog are tunable.
+    /// The returned value must live at a stable address for the thread's lifetime.
+    pub fn initWithConfig(store: *http01.TokenStore, port: u16, config: Config) ListenerError!ChallengeServer {
         const fd = try socketTcp();
         errdefer closeFd(fd);
 
@@ -51,20 +94,28 @@ pub const ChallengeServer = struct {
 
         var addr = linux.sockaddr.in{
             .port = std.mem.nativeToBig(u16, port),
-            .addr = std.mem.nativeToBig(u32, 0x7f00_0001), // 127.0.0.1
+            .addr = std.mem.nativeToBig(u32, 0x7f00_0001), // 127.0.0.1 (invariant)
         };
         if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
             return error.BindFailed;
-        if (posix.errno(linux.listen(fd, 16)) != .SUCCESS)
+        if (posix.errno(linux.listen(fd, config.listen_backlog)) != .SUCCESS)
             return error.ListenFailed;
 
         // Receive timeout so a blocked accept4 wakes periodically to re-check the
         // stop flag. Closing the listener from another thread does NOT reliably
         // wake accept4, so this poll is how shutdown actually terminates.
-        const tv = linux.timeval{ .sec = 0, .usec = 250 * 1000 };
+        const tv = linux.timeval{
+            .sec = @intCast(config.accept_poll_ms / 1000),
+            .usec = @intCast((config.accept_poll_ms % 1000) * 1000),
+        };
         _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
 
-        return .{ .store = store, .listen_fd = fd, .port = try boundPort(fd) };
+        return .{
+            .store = store,
+            .listen_fd = fd,
+            .port = try boundPort(fd),
+            .conn_read_timeout_sec = config.conn_read_timeout_sec,
+        };
     }
 
     /// Spawn the background accept loop.
@@ -97,7 +148,7 @@ pub const ChallengeServer = struct {
         defer closeFd(fd);
         // Accepted sockets do not inherit the listener's timeout; cap the read so a
         // silent/slow client cannot stall the single-threaded accept loop.
-        const tv = linux.timeval{ .sec = 5, .usec = 0 };
+        const tv = linux.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
         _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
         var req_buf: [max_request]u8 = undefined;
         const rc = linux.read(fd, &req_buf, req_buf.len);
@@ -201,6 +252,56 @@ test "ChallengeServer returns 404 for unknown token" {
     const rc = linux.read(cfd, &buf, buf.len);
     try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
     try std.testing.expect(std.mem.startsWith(u8, buf[0..@intCast(rc)], "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "Config.applyToml overlays listener tunables and skips bind address" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\[acme]
+        \\http01_listen_backlog = 64
+        \\http01_accept_poll_ms = 500
+        \\http01_conn_read_timeout_sec = 10
+        \\http01_bind_address = "0.0.0.0"
+    ;
+    var doc = try toml.parse(allocator, src);
+    defer doc.deinit(allocator);
+
+    var cfg: Config = .{};
+    cfg.applyToml(&doc);
+
+    try std.testing.expectEqual(@as(u31, 64), cfg.listen_backlog);
+    try std.testing.expectEqual(@as(u32, 500), cfg.accept_poll_ms);
+    try std.testing.expectEqual(@as(u32, 10), cfg.conn_read_timeout_sec);
+    // bind address is a security invariant: never read from config.
+}
+
+test "Config.applyToml leaves defaults when keys absent" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator, "[server]\nname = \"mz\"\n");
+    defer doc.deinit(allocator);
+
+    var cfg: Config = .{};
+    cfg.applyToml(&doc);
+
+    try std.testing.expectEqual(default_listen_backlog, cfg.listen_backlog);
+    try std.testing.expectEqual(default_accept_poll_ms, cfg.accept_poll_ms);
+    try std.testing.expectEqual(default_conn_read_timeout_sec, cfg.conn_read_timeout_sec);
+}
+
+test "initWithConfig honors a custom backlog and read timeout" {
+    const allocator = std.testing.allocator;
+    var store = http01.TokenStore.init(allocator);
+    defer store.deinit();
+
+    var server = try ChallengeServer.initWithConfig(&store, 0, .{
+        .listen_backlog = 32,
+        .accept_poll_ms = 100,
+        .conn_read_timeout_sec = 3,
+    });
+    defer server.shutdown();
+    try server.spawn();
+
+    try std.testing.expectEqual(@as(u32, 3), server.conn_read_timeout_sec);
 }
 
 test {

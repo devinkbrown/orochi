@@ -17,6 +17,7 @@ const std = @import("std");
 const ratchet = @import("ratchet.zig");
 const hpke = @import("hpke.zig");
 const treekem = @import("treekem.zig");
+const toml = @import("../proto/toml.zig");
 
 const X25519 = std.crypto.dh.X25519;
 
@@ -24,7 +25,26 @@ pub const Header = ratchet.Header;
 pub const SealedMessage = ratchet.SealedMessage;
 pub const PublicKey = [X25519.public_length]u8;
 
-pub const default_max_skip = 256;
+/// Historic default for the double-ratchet's max cached skipped message keys.
+pub const default_max_skip_default: usize = 256;
+
+/// Operationally tunable max skipped message keys cached by the double ratchet.
+/// Overridable via `[tls].ratchet_max_skip`; defaults preserve prior behavior.
+pub var default_max_skip: usize = default_max_skip_default;
+
+/// Overlay `[tls].ratchet_max_skip` onto the module-level ratchet skip cap.
+/// Absent or zero values leave the current cap unchanged (behavior preserved).
+pub fn applyToml(doc: *const toml.Document) void {
+    if (doc.getUint("tls.ratchet_max_skip")) |v| {
+        if (v != 0) default_max_skip = @intCast(v);
+    }
+}
+
+/// The ratchet `max_skip` (a `u32` in the ratchet API), clamped from the
+/// module-level `usize` default so an over-large config never overflows.
+fn ratchetMaxSkip() u32 {
+    return std.math.cast(u32, default_max_skip) orelse std.math.maxInt(u32);
+}
 
 /// Derive the ratchet's first "next" DH key pair deterministically from the
 /// shared root + a role label, so each side has a pre-staged pair for its first
@@ -55,7 +75,7 @@ pub const Channel = struct {
     ) !struct { channel: Channel, enc: hpke.Enc } {
         const encapsulation = try hpke.encapDeterministic(responder_pub, eph_seed);
         const root = ratchet.RootKey.init(encapsulation.shared_secret);
-        var r = try ratchet.Ratchet.initAlice(allocator, root, own_pair, responder_pub, default_max_skip);
+        var r = try ratchet.Ratchet.initAlice(allocator, root, own_pair, responder_pub, ratchetMaxSkip());
         r.setNextDhKeyPair(try deriveNextPair(encapsulation.shared_secret, "mz-next-initiator"));
         return .{ .channel = .{ .rx = r }, .enc = encapsulation.enc };
     }
@@ -70,7 +90,7 @@ pub const Channel = struct {
     ) !Channel {
         const shared = try hpke.decap(enc, own_pair.secret_key);
         const root = ratchet.RootKey.init(shared);
-        var b = ratchet.Ratchet.initBob(allocator, root, own_pair, default_max_skip);
+        var b = ratchet.Ratchet.initBob(allocator, root, own_pair, ratchetMaxSkip());
         b.setNextDhKeyPair(try deriveNextPair(shared, "mz-next-responder"));
         return .{ .rx = b };
     }
@@ -221,4 +241,23 @@ test "group: all members share a key; rekey on remove evicts the removed member"
     defer rm.deinit();
     const k2 = g.groupKey();
     try testing.expect(!std.mem.eql(u8, &k1, &k2));
+}
+
+test "applyToml overrides ratchet_max_skip and restores cleanly" {
+    const saved = default_max_skip;
+    defer default_max_skip = saved; // never leak the override into other tests
+    const allocator = testing.allocator;
+
+    var doc = try toml.parse(allocator, "[tls]\nratchet_max_skip = 64\n");
+    defer doc.deinit(allocator);
+    applyToml(&doc);
+    try testing.expectEqual(@as(usize, 64), default_max_skip);
+    try testing.expectEqual(@as(u32, 64), ratchetMaxSkip());
+
+    // Absent / zero leaves the current value unchanged.
+    default_max_skip = default_max_skip_default;
+    var zero = try toml.parse(allocator, "[tls]\nratchet_max_skip = 0\n");
+    defer zero.deinit(allocator);
+    applyToml(&zero);
+    try testing.expectEqual(default_max_skip_default, default_max_skip);
 }

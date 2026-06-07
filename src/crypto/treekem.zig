@@ -11,6 +11,7 @@ const std = @import("std");
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const testing = std.testing;
+const toml = @import("../proto/toml.zig");
 
 pub const member_seed_len = X25519.seed_length;
 pub const public_key_len = X25519.public_length;
@@ -24,7 +25,21 @@ pub const SecretKey = [secret_key_len]u8;
 pub const Secret = [secret_len]u8;
 
 const suite_label = "mizuchi-treekem-v1";
-const max_members = 1024;
+
+/// Historic default for the maximum TreeKEM group size.
+pub const default_max_members: usize = 1024;
+
+/// Operationally tunable maximum TreeKEM group members. Overridable via
+/// `[tls].treekem_max_members`; defaults preserve prior behavior.
+pub var max_members: usize = default_max_members;
+
+/// Overlay `[tls].treekem_max_members` onto the module-level member cap. Absent
+/// or zero values leave the current cap unchanged (behavior preserved).
+pub fn applyToml(doc: *const toml.Document) void {
+    if (doc.getUint("tls.treekem_max_members")) |v| {
+        if (v != 0) max_members = @intCast(v);
+    }
+}
 
 pub const Error = error{
     EmptyGroup,
@@ -650,4 +665,26 @@ test "deterministic fixed seeds reproduce roots and commits" {
         try testing.expectEqualSlices(u8, &a.ephemeral_public, &b.ephemeral_public);
         try testing.expectEqualSlices(u8, &a.ciphertext, &b.ciphertext);
     }
+}
+
+test "applyToml overrides treekem_max_members and enforces the new cap" {
+    const saved = max_members;
+    defer max_members = saved; // never leak the override into other tests
+    const allocator = testing.allocator;
+
+    var doc = try toml.parse(allocator, "[tls]\ntreekem_max_members = 2\n");
+    defer doc.deinit(allocator);
+    applyToml(&doc);
+    try testing.expectEqual(@as(usize, 2), max_members);
+
+    // A 3-member init now exceeds the cap.
+    const seeds = [_]MemberSeed{ fixedSeed(0xd1), fixedSeed(0xd2), fixedSeed(0xd3) };
+    try testing.expectError(error.TooManyMembers, Group.init(allocator, &seeds));
+
+    // Absent / zero leaves the current value unchanged.
+    max_members = default_max_members;
+    var zero = try toml.parse(allocator, "[tls]\ntreekem_max_members = 0\n");
+    defer zero.deinit(allocator);
+    applyToml(&zero);
+    try testing.expectEqual(default_max_members, max_members);
 }

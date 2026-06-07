@@ -21,6 +21,7 @@
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const base64url = @import("base64url.zig");
+const toml = @import("toml.zig");
 
 /// The fixed URL path prefix every HTTP-01 challenge is served under (§8.3).
 pub const well_known_prefix = "/.well-known/acme-challenge/";
@@ -31,7 +32,20 @@ const join_byte: u8 = '.';
 /// Defensive upper bound on ACME token length. Tokens are server-chosen opaque
 /// base64url strings; RFC 8555 §8.1 requires "at least 128 bits of entropy"
 /// but sets no maximum. We accept a generous range and reject absurd inputs.
-const max_token_len: usize = 256;
+pub const default_max_token_len: usize = 256;
+
+/// Operationally tunable wire-parse cap on challenge token length. Overridable
+/// via `[acme].wire_max_token_len`; defaults to the historic 256-byte bound so
+/// behavior is unchanged when unset.
+pub var max_token_len: usize = default_max_token_len;
+
+/// Overlay `[acme].wire_max_token_len` onto the module-level token cap. Absent
+/// or zero values leave the current cap unchanged (behavior preserved).
+pub fn applyToml(doc: *const toml.Document) void {
+    if (doc.getUint("acme.wire_max_token_len")) |v| {
+        if (v != 0) max_token_len = @intCast(v);
+    }
+}
 
 /// Errors surfaced by this module.
 ///
@@ -255,7 +269,7 @@ test "validateToken rejects illegal characters" {
 
 test "validateToken rejects an over-long token" {
     // Arrange
-    const token = "a" ** (max_token_len + 1);
+    const token = "a" ** (default_max_token_len + 1);
 
     // Act / Assert
     try testing.expect(!validateToken(token));
@@ -267,4 +281,32 @@ test "validateToken accepts all alphabet boundary characters" {
 
     // Act / Assert
     try testing.expect(validateToken(token));
+}
+
+test "applyToml overrides the wire token cap and restores cleanly" {
+    // Arrange
+    const saved = max_token_len;
+    defer max_token_len = saved; // never leak the override into other tests
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator, "[acme]\nwire_max_token_len = 8\n");
+    defer doc.deinit(allocator);
+
+    // Act
+    applyToml(&doc);
+
+    // Assert — a 9-char token now fails, an 8-char token passes.
+    try testing.expectEqual(@as(usize, 8), max_token_len);
+    try testing.expect(!validateToken("AAAAAAAAA"));
+    try testing.expect(validateToken("AAAAAAAA"));
+}
+
+test "applyToml leaves the cap unchanged when key absent or zero" {
+    const saved = max_token_len;
+    defer max_token_len = saved;
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator, "[acme]\nwire_max_token_len = 0\n");
+    defer doc.deinit(allocator);
+
+    applyToml(&doc);
+    try testing.expectEqual(default_max_token_len, max_token_len);
 }
