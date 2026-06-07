@@ -10,6 +10,7 @@ const std = @import("std");
 const config_format = @import("config_format.zig");
 const server = @import("server.zig");
 const oper_mod = @import("oper.zig");
+const og_mod = @import("operator_groups.zig");
 
 /// Overlay non-empty/non-zero config values onto `base` (which carries defaults).
 /// `cfg`'s string fields (e.g. host) are borrowed — keep `cfg` alive as long as
@@ -64,15 +65,41 @@ pub fn loadFromText(
     var parsed = try config_format.parseToml(allocator, text, resolver);
     errdefer parsed.deinit(allocator);
 
-    // Build the SASL-only operator registry from `[oper]` blocks (full privileges
-    // per class for now; fine-grained privileges are a future config addition).
+    // Role-based operator groups: build a transient registry from `[[oper_groups]]`
+    // (each a named privilege set, optionally inheriting another). An oper's
+    // privileges are then resolved from its `class` group; an oper whose class
+    // names no group falls back to full privileges (back-compatible default).
+    var groups = og_mod.Registry.init();
+    defer groups.deinit(allocator);
+    for (parsed.oper_groups) |g| {
+        var pbuf: [32]oper_mod.Privilege = undefined;
+        var pn: usize = 0;
+        for (g.privileges) |ps| {
+            if (std.meta.stringToEnum(oper_mod.Privilege, ps)) |p| {
+                if (pn < pbuf.len) {
+                    pbuf[pn] = p;
+                    pn += 1;
+                }
+            }
+        }
+        groups.add(allocator, g.name, oper_mod.OperPrivileges.initMany(pbuf[0..pn]), if (g.inherits.len > 0) g.inherits else null) catch {};
+    }
+
+    // Build the SASL-only operator registry from `[[opers]]` blocks.
     const bindings = try allocator.alloc(oper_mod.OperBinding, parsed.opers.len);
     errdefer allocator.free(bindings);
     for (parsed.opers, 0..) |o, i| {
+        const privileges = blk: {
+            if (o.class.len != 0 and groups.get(o.class) != null) {
+                const ep = groups.effectivePrivileges(o.class);
+                if (ep.count() > 0) break :blk ep; // empty group => fall back to full
+            }
+            break :blk oper_mod.OperPrivileges.full;
+        };
         bindings[i] = .{
             .account_name = o.account,
             .class_name = if (o.class.len != 0) o.class else "operator",
-            .privileges = oper_mod.OperPrivileges.full,
+            .privileges = privileges,
         };
     }
 

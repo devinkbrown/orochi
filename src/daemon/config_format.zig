@@ -29,6 +29,7 @@ pub const Config = struct {
     node: Node = .{},
     listen: Listen = .{},
     opers: []Oper = &.{},
+    oper_groups: []OperGroup = &.{},
     mesh: Mesh = .{},
     limits: Limits = .{},
     io: Io = .{},
@@ -55,6 +56,14 @@ pub const Config = struct {
     /// An operator binding. Mizuchi grants oper SASL-only: `account` is the SASL
     /// account elevated on login (no password — SASL is the auth), and `class`
     /// names its privilege class. There is no OPER-password credential.
+    /// A role-based operator group: a named privilege set (optionally inheriting
+    /// another group's privileges). An `[[opers]]` block's `class` names its group.
+    pub const OperGroup = struct {
+        name: []const u8 = "",
+        privileges: []const []const u8 = &.{},
+        inherits: []const u8 = "",
+    };
+
     pub const Oper = struct {
         account: []const u8 = "",
         class: []const u8 = "",
@@ -135,6 +144,12 @@ pub const Config = struct {
             allocator.free(oper.class);
         }
         allocator.free(self.opers);
+        for (self.oper_groups) |g| {
+            allocator.free(g.name);
+            freeStringList(allocator, g.privileges);
+            allocator.free(g.inherits);
+        }
+        allocator.free(self.oper_groups);
         allocator.free(self.mesh.realm);
         freeStringList(allocator, self.mesh.trust_roots);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
@@ -235,6 +250,34 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
             try list.append(allocator, .{ .account = account, .class = class });
         }
         cfg.opers = try list.toOwnedSlice(allocator);
+    }
+
+    // [[oper_groups]] role-based privilege sets
+    if (doc.getArray("oper_groups")) |arr| {
+        var list: std.ArrayList(Config.OperGroup) = .empty;
+        errdefer {
+            for (list.items) |g| {
+                allocator.free(g.name);
+                freeStringList(allocator, g.privileges);
+                allocator.free(g.inherits);
+            }
+            list.deinit(allocator);
+        }
+        for (arr) |*item| {
+            const name = try resolveStr(allocator, resolver, item.getString("name") orelse return error.ParseError);
+            errdefer allocator.free(name);
+            const privileges: []const []const u8 = if (item.getArray("privileges")) |parr|
+                try ownStringArray(allocator, resolver, parr)
+            else
+                &.{};
+            errdefer freeStringList(allocator, privileges);
+            const inherits = if (item.getString("inherits")) |s|
+                try resolveStr(allocator, resolver, s)
+            else
+                try allocator.dupe(u8, "");
+            try list.append(allocator, .{ .name = name, .privileges = privileges, .inherits = inherits });
+        }
+        cfg.oper_groups = try list.toOwnedSlice(allocator);
     }
 
     // Required-field validation.
