@@ -166,6 +166,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer srv.deinit();
 
+    // Drive the SerpentRegistry module init→ready lifecycle now that the server
+    // is at its final address (init() returns by value, so `self` is not stable
+    // inside it). No-op until a module declares lifecycle fns.
+    srv.start();
+
     // Now that the server (and its live world) exists, attach the services state
     // hook so channel REGISTER/DROP reflects into the world's +r REGISTERED flag.
     if (account_store != null) {

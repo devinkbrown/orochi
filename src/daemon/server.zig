@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const dispatch = @import("dispatch.zig");
 const module_core = @import("module_core.zig");
 const module_manifest = @import("modules/manifest.zig");
+const mod_registry = @import("registry.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
@@ -1050,7 +1051,16 @@ pub const LinuxServer = struct {
         };
     }
 
+    /// Run module init→ready lifecycle once the server is at its final address
+    /// (called by main after construction; init() returns by value so `self`
+    /// is not stable inside it).
+    pub fn start(self: *LinuxServer) void {
+        self.driveLifecycle(.init);
+        self.driveLifecycle(.ready);
+    }
+
     pub fn deinit(self: *LinuxServer) void {
+        self.driveDeinit();
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) {
                 if (slot.value.s2s) |link| {
@@ -1838,6 +1848,7 @@ pub const LinuxServer = struct {
                 // Auto-join the account's configured channels.
                 self.applyAutojoin(id, conn);
                 self.deliverWelcome(conn);
+                self.emitClientRegistered(id, conn);
             }
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
                 conn.closing = true;
@@ -1917,6 +1928,39 @@ pub const LinuxServer = struct {
     pub fn moduleRaw(self: *LinuxServer, conn: *ConnState, bytes: []const u8) ServerError!void {
         _ = self;
         try appendToConn(conn, bytes);
+    }
+
+    /// Drive a module-lifecycle phase across every enabled module. Hook handlers
+    /// (and lifecycle fns) receive `*LinuxServer` as their erased ctx. No module
+    /// declares lifecycle fns yet, so this is a no-op walk today — but the spine
+    /// is live so a module/plugin can opt in without further server changes.
+    fn driveLifecycle(self: *LinuxServer, comptime phase: enum { init, ready }) void {
+        inline for (module_manifest.enabled) |m| {
+            const fn_opt = switch (phase) {
+                .init => m.on_init,
+                .ready => m.on_ready,
+            };
+            if (fn_opt) |f| f(self) catch |err| {
+                std.debug.print("mizuchi: module {s} on_{s} failed: {s}\n", .{ m.id, @tagName(phase), @errorName(err) });
+            };
+        }
+    }
+
+    fn driveDeinit(self: *LinuxServer) void {
+        inline for (module_manifest.enabled) |m| {
+            if (m.on_deinit) |f| f(self);
+        }
+    }
+
+    /// Fire the informational `client_registered` typed hook for a freshly
+    /// welcomed client. Veto is N/A (informational). Errors are swallowed: a
+    /// subscriber fault must never break registration.
+    fn emitClientRegistered(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        var payload = mod_registry.ClientRegisteredPayload{
+            .client_id = @as(u64, @bitCast(id)),
+            .nick = conn.session.displayName(),
+        };
+        _ = module_manifest.Live.callHook(.client_registered, self, &payload) catch {};
     }
 
     fn registerConnNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
@@ -5368,6 +5412,7 @@ pub const LinuxServer = struct {
         try self.deliverTegami(conn);
         self.applyAutojoin(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
+        self.emitClientRegistered(idFromToken(conn.token), conn);
     }
 
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
@@ -5392,6 +5437,7 @@ pub const LinuxServer = struct {
         try self.deliverTegami(conn);
         self.applyAutojoin(idFromToken(conn.token), conn);
         self.deliverWelcome(conn);
+        self.emitClientRegistered(idFromToken(conn.token), conn);
     }
 
     /// `LOGOUT` — drop the session's account login (does not affect oper for now).
@@ -6770,6 +6816,19 @@ pub const LinuxServer = struct {
             return;
         }
         const text = parsed.paramSlice()[1];
+        // message_pre_deliver typed hook (veto-capable): a subscribed module/plugin
+        // may drop the message by clearing `approved`. No subscriber today =>
+        // approved stays true => identical behavior. Errors never break delivery.
+        {
+            var mpd = mod_registry.MessagePreDeliverPayload{
+                .source_id = @as(u64, @bitCast(id)),
+                .target = parsed.paramSlice()[0],
+                .text = text,
+            };
+            const verdict = module_manifest.Live.callHook(.message_pre_deliver, self, &mpd) catch mod_registry.HookResult.continue_;
+            _ = verdict;
+            if (!mpd.approved) return;
+        }
         // utf8only: reject malformed UTF-8 bodies with a standard-replies FAIL and
         // drop the message (ISUPPORT advertises UTF8ONLY). NOTICE stays silent.
         if (!utf8_guard.isValidMessageBody(text)) {
@@ -7128,6 +7187,7 @@ const PortableServer = struct {
         return error.Unsupported;
     }
     pub fn deinit(_: *PortableServer) void {}
+    pub fn start(_: *PortableServer) void {}
     pub fn boundPort(_: *PortableServer) ServerError!u16 {
         return error.Unsupported;
     }
