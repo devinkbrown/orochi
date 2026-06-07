@@ -39,6 +39,7 @@ pub const MessageTarget = union(enum) {
 const chanmode = @import("chanmode.zig");
 const chanmode_ext = @import("../proto/chanmode_ext.zig");
 const listx = @import("../proto/listx.zig");
+const extban = @import("../proto/extban.zig");
 
 /// Per-member channel status modes (op @, voice + — no halfop) keyed by client.
 const MemberMap = std.AutoHashMap(ClientId, chanmode.MemberModes);
@@ -456,6 +457,26 @@ pub const World = struct {
         return false;
     }
 
+    /// Client view used for extended-ban (`$a:`/`$r:`/`$g:`/`$c:`/`$~...`)
+    /// evaluation. Re-exported from the extban parser so callers build one place.
+    pub const BanContext = extban.ClientContext;
+
+    /// Like `listMatches`, but each entry may be an extended ban. Plain masks
+    /// fall through to a host glob against `ctx.host` (the full nick!user@host
+    /// prefix), preserving classic +b/+e/+I/+Z behavior; `$`-prefixed entries
+    /// match account/realname/country/channel/negation. Malformed `$` entries
+    /// degrade to a literal host glob so a bad mask never silently disables a ban.
+    fn listMatchesCtx(list: []const []const u8, ctx: extban.ClientContext) bool {
+        for (list) |m| {
+            if (extban.parse(m)) |matcher| {
+                if (matcher.matches(ctx)) return true;
+            } else |_| {
+                if (listx.globMatch(m, ctx.host)) return true;
+            }
+        }
+        return false;
+    }
+
     /// +e ban-exception list operations.
     pub fn addExempt(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
@@ -571,6 +592,29 @@ pub const World = struct {
         // A +e ban-exception match overrides any +b ban.
         if (listMatches(channel.exempts.items, hostmask)) return false;
         return listMatches(channel.bans.items, hostmask);
+    }
+
+    /// Extended-ban-aware +b check: `ctx.host` carries the full nick!user@host
+    /// prefix (so plain masks behave exactly as `isBanned`), while `$`-typed
+    /// bans match the richer context. A matching +e exception (also extban-aware)
+    /// overrides the ban.
+    pub fn isBannedCtx(self: *World, name: []const u8, ctx: extban.ClientContext) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        if (listMatchesCtx(channel.exempts.items, ctx)) return false;
+        return listMatchesCtx(channel.bans.items, ctx);
+    }
+
+    /// Extended-ban-aware +Z quiet check (mirrors `isMuted`).
+    pub fn isMutedCtx(self: *World, name: []const u8, ctx: extban.ClientContext) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        if (listMatchesCtx(channel.exempts.items, ctx)) return false;
+        return listMatchesCtx(channel.mutes.items, ctx);
+    }
+
+    /// Extended-ban-aware +I invite-exception check (mirrors `isInvexed`).
+    pub fn isInvexedCtx(self: *World, name: []const u8, ctx: extban.ClientContext) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        return listMatchesCtx(channel.invex.items, ctx);
     }
 
     /// Record an INVITE so the target may bypass +i.
@@ -1065,6 +1109,41 @@ test "channel key, limit, bans, and invites with ownership" {
     // memberCount tracks membership.
     try std.testing.expectEqual(@as(usize, 1), world.memberCount("#x"));
     try std.testing.expectError(error.NoSuchChannel, world.setChannelKey("#nope", "k"));
+}
+
+test "extended bans match account, realname, channel, and negation" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try world.join("#x", a);
+
+    // Plain mask via the ctx path still globs the host prefix (back-compat).
+    try std.testing.expect(try world.addBan("#x", "bad!*@*"));
+    try std.testing.expect(world.isBannedCtx("#x", .{ .host = "bad!u@h" }));
+    try std.testing.expect(!world.isBannedCtx("#x", .{ .host = "ok!u@h" }));
+    try std.testing.expect(try world.removeBan("#x", "bad!*@*"));
+
+    // $a: account ban.
+    try std.testing.expect(try world.addBan("#x", "$a:spammer"));
+    try std.testing.expect(world.isBannedCtx("#x", .{ .account = "spammer", .host = "x!y@z" }));
+    try std.testing.expect(!world.isBannedCtx("#x", .{ .account = "good", .host = "x!y@z" }));
+    // Unauthenticated client never matches an account ban.
+    try std.testing.expect(!world.isBannedCtx("#x", .{ .host = "x!y@z" }));
+
+    // $r: realname glob; $e exemption (also extban-aware) overrides.
+    try std.testing.expect(try world.addBan("#x", "$r:*bot*"));
+    try std.testing.expect(world.isBannedCtx("#x", .{ .realname = "evil bot 9000", .host = "x!y@z" }));
+    try std.testing.expect(try world.addExempt("#x", "$a:trusted"));
+    try std.testing.expect(!world.isBannedCtx("#x", .{ .account = "trusted", .realname = "evil bot", .host = "x!y@z" }));
+
+    // $c: channel ban — banned when present in #secret.
+    try std.testing.expect(try world.addBan("#x", "$c:#secret"));
+    const chans = [_][]const u8{"#secret"};
+    try std.testing.expect(world.isBannedCtx("#x", .{ .host = "n!u@h", .channels = &chans }));
+    // $~a: negated account ban (matches everyone NOT logged in as alice).
+    try std.testing.expect(try world.addMute("#x", "$~a:alice"));
+    try std.testing.expect(!world.isMutedCtx("#x", .{ .account = "alice", .host = "x!y@z" }));
+    try std.testing.expect(world.isMutedCtx("#x", .{ .account = "bob", .host = "x!y@z" }));
 }
 
 test "channel flag modes set, query, and render" {

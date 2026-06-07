@@ -2405,14 +2405,17 @@ pub const LinuxServer = struct {
 
         var mask_buf: [256]u8 = undefined;
         const mask = try clientPrefix(conn, &mask_buf);
+        // Extended-ban context (account/realname/channels + host glob fallthrough).
+        var chan_buf: [64][]const u8 = undefined;
+        const ban_ctx = banContextFor(self, conn, wid, mask, &chan_buf);
         if (!invited) {
-            // +b ban (isBanned already honors +e exceptions) blocks the join.
-            if (self.world.isBanned(channel, mask)) {
+            // +b ban (isBannedCtx honors +e exceptions and extended bans) blocks the join.
+            if (self.world.isBannedCtx(channel, ban_ctx)) {
                 if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
                 return true;
             }
             // +i blocks unless the user holds an invite OR matches a +I invex mask.
-            if (self.world.channelHasFlag(channel, .invite_only) and !self.world.isInvexed(channel, mask)) {
+            if (self.world.channelHasFlag(channel, .invite_only) and !self.world.isInvexedCtx(channel, ban_ctx)) {
                 if (!quiet) try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
                 return true;
             }
@@ -7456,7 +7459,9 @@ pub const LinuxServer = struct {
                 if (!qm.canSpeakModerated() and !conn.session.isOper()) {
                     var qmask_buf: [256]u8 = undefined;
                     const qmask = clientPrefix(conn, &qmask_buf) catch "";
-                    if (qmask.len != 0 and self.world.isMuted(chan, qmask)) {
+                    var qchan_buf: [64][]const u8 = undefined;
+                    const quiet_ctx = banContextFor(self, conn, worldIdFromClient(id), qmask, &qchan_buf);
+                    if (qmask.len != 0 and self.world.isMutedCtx(chan, quiet_ctx)) {
                         if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+Z: you are quieted)");
                         return;
                     }
@@ -8033,6 +8038,27 @@ fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
         conn.session.username(),
         hostOf(conn),
     }) catch return error.OutputTooSmall;
+}
+
+/// Build the extended-ban evaluation context for `conn`. `host_mask` is the full
+/// nick!user@host prefix (so plain +b masks still glob against it); `chan_buf`
+/// backs the client's current channel list (for `$c:` bans). The returned
+/// context borrows `host_mask` and `chan_buf`, so both must outlive its use.
+fn banContextFor(
+    self: *LinuxServer,
+    conn: *const ConnState,
+    wid: world_model.ClientId,
+    host_mask: []const u8,
+    chan_buf: [][]const u8,
+) world_model.World.BanContext {
+    const nchan = self.world.channelsOf(wid, chan_buf);
+    return .{
+        .account = conn.session.account(),
+        .realname = conn.session.realname(),
+        .host = host_mask,
+        .country = null, // no GeoIP source yet; $g: bans never match
+        .channels = chan_buf[0..nchan],
+    };
 }
 
 /// Whether `text` is a CTCP request that `+C` should block — i.e. wrapped in
