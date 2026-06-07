@@ -210,6 +210,7 @@ pub const topk_tally = @import("topk_tally.zig");
 pub const totp = @import("totp.zig");
 pub const transcript = @import("transcript.zig");
 pub const trending_topics = @import("trending_topics.zig");
+pub const turn_relay = @import("turn_relay.zig");
 pub const typing_state = @import("typing_state.zig");
 pub const upload_quota = @import("upload_quota.zig");
 pub const vote_kick = @import("vote_kick.zig");
@@ -441,6 +442,7 @@ test {
     _ = totp;
     _ = transcript;
     _ = trending_topics;
+    _ = turn_relay;
     _ = typing_state;
     _ = upload_quota;
     _ = vote_kick;

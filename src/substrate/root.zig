@@ -72,6 +72,7 @@ pub const rateless = @import("rateless.zig");
 pub const ratelimit = @import("ratelimit.zig");
 pub const reactor = @import("reactor.zig");
 pub const red_fec = @import("red_fec.zig");
+pub const reed_solomon = @import("reed_solomon.zig");
 pub const rendezvous_hash = @import("rendezvous_hash.zig");
 pub const resampler = @import("resampler.zig");
 pub const ringbuf = @import("ringbuf.zig");
@@ -191,6 +192,7 @@ test {
     _ = ratelimit;
     _ = reactor;
     _ = red_fec;
+    _ = reed_solomon;
     _ = rendezvous_hash;
     _ = resampler;
     _ = ringbuf;
