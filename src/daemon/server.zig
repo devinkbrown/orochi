@@ -84,6 +84,7 @@ const media_plane_mod = @import("media_plane.zig");
 const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
 const helix_live = @import("helix/live.zig");
+const session_snapshot = @import("helix/session_snapshot.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -4577,11 +4578,12 @@ pub const LinuxServer = struct {
         if (self.shutdown) |flag| flag.store(false, .release);
     }
 
-    /// `UPGRADE` — oper-only hot in-place binary upgrade (Helix). Re-execs
-    /// `/proc/self/exe --supervisor` preserving the listening socket, so the port
-    /// stays bound across the swap (no connection-refused window). Existing client
-    /// connections drop (their fds are CLOEXEC) and reconnect to the new image.
-    /// Full client/session state carry-over is a later increment.
+    /// `UPGRADE` — oper-only hot in-place binary upgrade (Helix). Serializes every
+    /// registered session into a sealed memfd arena, then re-execs
+    /// `/proc/self/exe --supervisor` preserving both the listening socket and the
+    /// arena, so the port stays bound and the successor recovers session state.
+    /// Client socket-fd re-attach (so connections survive, not just state) is the
+    /// next increment; for now clients reconnect to the new image.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
@@ -4594,9 +4596,68 @@ pub const LinuxServer = struct {
         var nbuf: [128]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{conn.session.displayName()}) catch "UPGRADE";
         try self.publishOperEvent(.oper_action, .critical, note);
-        try self.noticeTo(conn, "UPGRADE: re-exec preserving the listener; clients will reconnect");
 
-        // Preserve the listening socket across execve (clear FD_CLOEXEC).
+        // Serialize every registered session into encoded snapshot pieces.
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |b| self.allocator.free(b);
+            blobs.deinit(self.allocator);
+        }
+        var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer pieces.deinit(self.allocator);
+        var it = self.clients.iterator();
+        while (it.next()) |e| {
+            if (!e.value.session.registered()) continue;
+            const blob = session_snapshot.encode(self.allocator, e.value.session.snapshot()) catch continue;
+            blobs.append(self.allocator, blob) catch {
+                self.allocator.free(blob);
+                continue;
+            };
+            pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch {};
+        }
+
+        // Seal the state arena. On failure, fall back to a listener-only upgrade
+        // so UPGRADE still works (just without state carry-over).
+        const now = self.nowMs();
+        var prepared = helix_live.prepare(self.allocator, .{
+            .epoch = @intCast(@max(0, now)),
+            .now_ms = now,
+            .timeout_ms = 5000,
+            .arena_name = "mizuchi-helix",
+            .pieces = pieces.items,
+            .fds = &.{},
+        }) catch |e| {
+            var eb: [96]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE: state seal failed ({s}); listener-only", .{@errorName(e)}) catch "UPGRADE: listener-only");
+            return self.upgradeListenerOnly(conn);
+        };
+        defer prepared.deinit();
+
+        const arena = prepared.runtime.arena orelse return self.upgradeListenerOnly(conn);
+        var sbuf: [96]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} session(s) sealed; re-exec preserving listener", .{prepared.capsule_count}) catch "UPGRADE: re-exec");
+
+        // Preserve the listener + arena across execve (clear FD_CLOEXEC).
+        _ = linux.fcntl(self.listener_fd, posix.F.SETFD, 0);
+        _ = linux.fcntl(arena.fd, posix.F.SETFD, 0);
+        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, "/proc/self/exe", arena.fd, self.listener_fd) catch |e| {
+            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            var eb: [96]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            return;
+        };
+        defer plan.deinit(self.allocator);
+        plan.commit(self.allocator) catch |e| {
+            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            var eb: [96]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            return;
+        };
+    }
+
+    /// Listener-only upgrade fallback: re-exec preserving just the listening
+    /// socket (no state arena). Caller has already done the oper/linux checks.
+    fn upgradeListenerOnly(self: *LinuxServer, conn: *ConnState) !void {
         _ = linux.fcntl(self.listener_fd, posix.F.SETFD, 0);
         var plan = helix_live.buildListenerExecPlan(self.allocator, "/proc/self/exe", self.listener_fd) catch |e| {
             _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
@@ -4605,7 +4666,6 @@ pub const LinuxServer = struct {
             return;
         };
         defer plan.deinit(self.allocator);
-        // commit execve's the new image; on success it never returns.
         plan.commit(self.allocator) catch |e| {
             _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;

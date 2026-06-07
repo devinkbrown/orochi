@@ -239,6 +239,32 @@ pub fn buildListenerExecPlan(
     return .{ .argv = argv, .envp = envp, .arena_fd = -1, .control_fd = -1 };
 }
 
+/// Build an exec plan carrying the sealed state arena AND the listening socket
+/// (no control socket). The successor reads the arena's capsules and adopts the
+/// listener. The caller must clear `FD_CLOEXEC` on both fds before `commit`.
+pub fn buildArenaListenerExecPlan(
+    allocator: std.mem.Allocator,
+    binary_path: []const u8,
+    arena_fd: handoff.Fd,
+    listen_fd: handoff.Fd,
+) anyerror!ExecPlan {
+    var argv = try allocator.alloc([:0]const u8, 2);
+    errdefer allocator.free(argv);
+    argv[0] = try allocator.dupeZ(u8, binary_path);
+    errdefer allocator.free(argv[0]);
+    argv[1] = try allocator.dupeZ(u8, "--supervisor");
+    errdefer allocator.free(argv[1]);
+
+    var envp = try allocator.alloc([:0]const u8, 2);
+    errdefer allocator.free(envp);
+    envp[0] = try fdEnvEntry(allocator, env_arena_fd, arena_fd);
+    errdefer allocator.free(envp[0]);
+    envp[1] = try fdEnvEntry(allocator, env_listen_fd, listen_fd);
+    errdefer allocator.free(envp[1]);
+
+    return .{ .argv = argv, .envp = envp, .arena_fd = arena_fd, .control_fd = -1 };
+}
+
 /// Supervisor/resume side: read inherited fds from the environment, or return
 /// null for a normal boot. Each fd is optional — a listener-only handoff carries
 /// just `listen_fd`, while a full state handoff also carries arena + control.
@@ -430,6 +456,16 @@ test "ExecPlan.commit execve's the target (fork + /bin/true)" {
     // not the 127 exec-failed fallback.
     try std.testing.expectEqual(@as(u32, 0), status & 0x7f); // WIFEXITED
     try std.testing.expectEqual(@as(u32, 0), (status >> 8) & 0xff); // exit code
+}
+
+test "arena+listener exec plan carries both fds, no control" {
+    const allocator = std.testing.allocator;
+    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, 6);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), plan.envp.len);
+    try std.testing.expectEqualStrings("MIZUCHI_HELIX_ARENA_FD=5", plan.envp[0]);
+    try std.testing.expectEqualStrings("MIZUCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
+    try std.testing.expectEqual(@as(handoff.Fd, -1), plan.control_fd);
 }
 
 test "listener-only exec plan carries just the listen fd" {
