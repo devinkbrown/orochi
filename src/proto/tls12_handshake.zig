@@ -490,12 +490,14 @@ test "encoders report NoSpaceLeft and oversize inputs" {
     const cert = [_]u8{0xaa};
     const chain = [_][]const u8{&cert};
     var short_out: [2]u8 = undefined;
-    var max_cert: [max_u24 + 1]u8 = undefined;
+    // 16 MB — heap-allocated so it cannot overflow the test thread's stack.
+    const max_cert = try testing.allocator.alloc(u8, max_u24 + 1);
+    defer testing.allocator.free(max_cert);
 
     try testing.expectError(error.NoSpaceLeft, encodeServerHello(&short_out, 0x0303, &random, "", 0x1301, 0, ""));
     try testing.expectError(error.SessionIdTooLong, encodeServerHello(&short_out, 0x0303, &random, &long_session, 0x1301, 0, ""));
     try testing.expectError(error.NoSpaceLeft, encodeCertificate(&short_out, &chain));
-    try testing.expectError(error.CertificateTooLarge, encodeCertificate(&short_out, &.{&max_cert}));
+    try testing.expectError(error.CertificateTooLarge, encodeCertificate(&short_out, &.{max_cert}));
     try testing.expectError(error.NoSpaceLeft, encodeFinished(&short_out, &([_]u8{0} ** finished_verify_data_len)));
     try testing.expectError(error.NoSpaceLeft, wrapHandshake(&short_out, client_hello_msg_type, &cert));
 }
