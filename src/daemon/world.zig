@@ -369,6 +369,27 @@ pub const World = struct {
         return true;
     }
 
+    /// Rename a channel in place (draft/channel-rename): rekey the existing
+    /// Channel value from `old` to `new`, preserving membership, modes, bans,
+    /// topic, OID, and creation time. Returns false if `new` already exists;
+    /// `error.NoSuchChannel` if `old` does not. The Channel carries no internal
+    /// name, so a map rekey is a complete rename.
+    pub fn renameChannel(self: *World, old: []const u8, new: []const u8) WorldError!bool {
+        if (!self.channels.contains(old)) return error.NoSuchChannel;
+        if (self.channels.contains(new)) return false;
+
+        const new_key = try self.allocator.dupe(u8, new);
+        errdefer self.allocator.free(new_key);
+        const kv = self.channels.fetchRemove(old).?; // {key, value}
+        self.channels.put(new_key, kv.value) catch |e| {
+            // Re-insert under the original key so the channel is never lost.
+            self.channels.put(kv.key, kv.value) catch {};
+            return e;
+        };
+        self.allocator.free(kv.key);
+        return true;
+    }
+
     /// +p private channel flag.
     pub fn setPrivate(self: *World, name: []const u8, on: bool) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
@@ -1109,6 +1130,28 @@ test "channel key, limit, bans, and invites with ownership" {
     // memberCount tracks membership.
     try std.testing.expectEqual(@as(usize, 1), world.memberCount("#x"));
     try std.testing.expectError(error.NoSuchChannel, world.setChannelKey("#nope", "k"));
+}
+
+test "renameChannel rekeys in place, preserving membership and bans" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try world.join("#old", a);
+    try world.setTopic("#old", "hello");
+    try std.testing.expect(try world.addBan("#old", "bad!*@*"));
+
+    // Rename moves everything to the new key.
+    try std.testing.expect(try world.renameChannel("#old", "#new"));
+    try std.testing.expect(!world.channelExists("#old"));
+    try std.testing.expect(world.channelExists("#new"));
+    try std.testing.expect(world.isMember("#new", a));
+    try std.testing.expect(world.isBanned("#new", "bad!u@h"));
+
+    // Renaming onto an existing channel fails (false); missing source errors.
+    const b = ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    _ = try world.join("#taken", b);
+    try std.testing.expect(!(try world.renameChannel("#new", "#taken")));
+    try std.testing.expectError(error.NoSuchChannel, world.renameChannel("#ghost", "#x"));
 }
 
 test "extended bans match account, realname, channel, and negation" {

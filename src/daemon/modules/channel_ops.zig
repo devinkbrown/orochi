@@ -41,6 +41,10 @@ fn create(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleCreate(x.id, x.conn, x.parsed);
 }
+fn rename(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleRename(x.id, x.conn, x.parsed);
+}
 
 pub const module = registry.Module{
     .id = "channel.ops",
@@ -54,5 +58,6 @@ pub const module = registry.Module{
         .{ .name = "TOPIC", .handler = topic },
         .{ .name = "KNOCK", .handler = knock },
         .{ .name = "CREATE", .handler = create },
+        .{ .name = "RENAME", .handler = rename },
     },
 };

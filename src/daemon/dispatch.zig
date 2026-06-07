@@ -188,6 +188,7 @@ pub const CapId = enum(u6) {
     reply,
     batch,
     bot,
+    channel_rename,
 };
 
 const CapSet = struct {
@@ -254,6 +255,9 @@ const cap_specs = [_]CapSpec{
     .{ .id = .reply, .name = "draft/reply" },
     .{ .id = .batch, .name = "batch" },
     .{ .id = .bot, .name = "bot" },
+    // channel-rename: receive a native RENAME line when a common channel is
+    // renamed; clients without it get a PART(old)+JOIN(new) fallback.
+    .{ .id = .channel_rename, .name = "draft/channel-rename" },
     // account-notify: receive an ACCOUNT line when a user in a common channel
     // logs in (IDENTIFY) or out (LOGOUT). The server emits these at the live
     // login/logout sites.

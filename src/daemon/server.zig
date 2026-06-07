@@ -76,6 +76,7 @@ const chan_forward = @import("../proto/chan_forward.zig");
 const clone_limit_mod = @import("clone_limit.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
+const channel_rename = @import("../proto/channel_rename.zig");
 const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
@@ -3628,6 +3629,76 @@ pub const LinuxServer = struct {
             try self.armSendIfNeeded(opconn);
         }
         try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
+    }
+
+    /// RENAME <#old> <#new> [:reason] — IRCv3 draft/channel-rename. A channel
+    /// operator (or server oper) renames a channel in place; membership/modes/
+    /// bans/topic carry over. Members negotiating draft/channel-rename receive a
+    /// native `:renamer RENAME #old #new [:reason]`; others get a PART(old)+
+    /// JOIN(new) fallback so their client tracks the move.
+    pub fn handleRename(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const args = channel_rename.parseRenameArgs(parsed.paramSlice()) catch |e| {
+            const code: []const u8 = switch (e) {
+                error.MissingOldChannel, error.MissingNewChannel => "NEED_MORE_PARAMS",
+                error.NeedSameType => "NEED_SAME_TYPE",
+                else => "INVALID_PARAMS",
+            };
+            try self.failReply(conn, "RENAME", code, "Invalid RENAME parameters");
+            return;
+        };
+        const old = args.old_channel;
+        const new = args.new_channel;
+        if (!self.world.channelExists(old)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{old}, "No such channel");
+            return;
+        }
+        const wid = worldIdFromClient(id);
+        if (!self.world.isMember(old, wid)) {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{old}, "You're not on that channel");
+            return;
+        }
+        const mm = self.world.memberModes(old, wid) orelse world_model.MemberModes.empty();
+        if (!mm.isOperator() and !conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{old}, "You're not channel operator");
+            return;
+        }
+        const ok = self.world.renameChannel(old, new) catch {
+            try self.failReply(conn, "RENAME", "CANNOT_RENAME", "Could not rename channel");
+            return;
+        };
+        if (!ok) {
+            try self.failReply(conn, "RENAME", "CHANNEL_NAME_IN_USE", "Target channel name is already in use");
+            return;
+        }
+
+        // Native RENAME line, sourced from the renamer's prefix.
+        var pfx_buf: [256]u8 = undefined;
+        const pfx = clientPrefix(conn, &pfx_buf) catch return;
+        var rline_buf: [default_reply_bytes]u8 = undefined;
+        const rline = if (args.reason.len != 0)
+            std.fmt.bufPrint(&rline_buf, ":{s} RENAME {s} {s} :{s}\r\n", .{ pfx, old, new, args.reason }) catch return
+        else
+            std.fmt.bufPrint(&rline_buf, ":{s} RENAME {s} {s}\r\n", .{ pfx, old, new }) catch return;
+
+        // Fan out to every member (channel now lives under the new key).
+        var members = self.world.memberIterator(new) orelse return;
+        while (members.next()) |member| {
+            const mid = clientIdFromWorld(member.*);
+            const mconn = self.clients.get(mid) orelse continue;
+            if (mconn.session.hasCap(.channel_rename)) {
+                self.deliver(mid, rline) catch {};
+            } else {
+                // PART(old)+JOIN(new) fallback, sourced as the member themself.
+                var mpfx_buf: [256]u8 = undefined;
+                const mpfx = clientPrefix(mconn, &mpfx_buf) catch continue;
+                var part_buf: [default_reply_bytes]u8 = undefined;
+                const part = std.fmt.bufPrint(&part_buf, ":{s} PART {s} :Channel renamed to {s}\r\n", .{ mpfx, old, new }) catch continue;
+                self.deliver(mid, part) catch {};
+                var join_buf: [default_reply_bytes]u8 = undefined;
+                const join = std.fmt.bufPrint(&join_buf, ":{s} JOIN {s}\r\n", .{ mpfx, new }) catch continue;
+                self.deliver(mid, join) catch {};
+            }
+        }
     }
 
     /// MONITOR +/-/C/L/S — IRCv3 contact notification. Targets' online/offline
