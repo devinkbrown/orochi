@@ -15,6 +15,7 @@ const media_socket = @import("../substrate/media_socket.zig");
 
 pub const MediaTransport = media_transport.MediaTransport;
 pub const MediaSocket = media_socket.MediaSocket;
+pub const TransportAddress = media_transport.TransportAddress;
 pub const loopback_be = media_socket.loopback_be;
 pub const any_be = media_socket.any_be;
 
@@ -124,8 +125,14 @@ pub const MediaPlane = struct {
                     defer self.allocator.free(r);
                     sock.sendTo(got.from, r);
                 }
+            } else {
+                // RTP/RTCP: selectively forward to the other call participants.
+                var targets: [media_transport.max_forward]TransportAddress = undefined;
+                lockSpin(&self.mutex);
+                const n = self.transport.forwardFromSource(got.from, &targets);
+                self.mutex.unlock();
+                for (targets[0..n]) |dst| sock.sendTo(dst, got.data);
             }
-            // RTP relay over forwardTargets lands in the next step.
         }
     }
 
@@ -160,7 +167,6 @@ pub const MediaPlane = struct {
 
 const testing = std.testing;
 const stun = @import("../proto/stun.zig");
-const TransportAddress = media_transport.TransportAddress;
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
     var plane = MediaPlane.init(testing.allocator);

@@ -18,6 +18,8 @@ const stun = @import("../proto/stun.zig");
 
 pub const ufrag_len: usize = 8;
 pub const pwd_len: usize = 24;
+/// Max SFU forward fan-out considered per inbound packet (call size cap).
+pub const max_forward: usize = 64;
 
 pub const TransportAddress = ice.TransportAddress;
 
@@ -45,12 +47,26 @@ pub const Endpoint = struct {
 
 const ufrag_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// Canonical 18-byte key for an address index: ip(16) ++ port(2, big-endian).
+/// The IP is always 16 fully-initialized bytes (IPv4 lives in the first 4),
+/// so byte-array hashing is well-defined.
+const AddrKey = [18]u8;
+
+fn addrKey(a: TransportAddress) AddrKey {
+    var k: AddrKey = undefined;
+    @memcpy(k[0..16], &a.ip);
+    std.mem.writeInt(u16, k[16..18], a.port, .big);
+    return k;
+}
+
 pub const MediaTransport = struct {
     allocator: std.mem.Allocator,
     /// Composite "channel\x00participant" -> Endpoint.
     endpoints: std.StringHashMapUnmanaged(Endpoint) = .empty,
     /// Server ufrag -> composite key, for STUN binding demultiplexing.
     by_ufrag: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Bound peer address -> composite key, for routing inbound RTP by source.
+    by_addr: std.AutoHashMapUnmanaged(AddrKey, []const u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) MediaTransport {
         return .{ .allocator = allocator };
@@ -61,6 +77,7 @@ pub const MediaTransport = struct {
         while (it.next()) |k| self.allocator.free(k.*);
         self.endpoints.deinit(self.allocator);
         self.by_ufrag.deinit(self.allocator);
+        self.by_addr.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -122,11 +139,23 @@ pub const MediaTransport = struct {
         return self.endpoints.getPtr(key);
     }
 
-    /// Bind the peer's media address after a successful connectivity check.
+    /// Bind the peer's media address after a successful connectivity check, and
+    /// (re)index it for RTP source routing.
     pub fn bindRemote(self: *MediaTransport, channel: []const u8, participant: []const u8, addr: TransportAddress) bool {
-        const ep = self.get(channel, participant) orelse return false;
-        ep.remote = addr;
+        var kb: [256]u8 = undefined;
+        const k = compositeKey(&kb, channel, participant) orelse return false;
+        const owned = self.endpoints.getKey(k) orelse return false;
+        const ep = self.endpoints.getPtr(k).?;
+        self.rebindAddr(ep, owned, addr);
         return true;
+    }
+
+    /// Point `ep.remote` at `addr`, refreshing the by_addr index from any prior
+    /// binding to the (stable, owned) `owned_key`.
+    fn rebindAddr(self: *MediaTransport, ep: *Endpoint, owned_key: []const u8, addr: TransportAddress) void {
+        if (ep.remote) |old| _ = self.by_addr.remove(addrKey(old));
+        ep.remote = addr;
+        self.by_addr.put(self.allocator, addrKey(addr), owned_key) catch {};
     }
 
     /// Record the SSRC a participant publishes (best-effort; first packet wins
@@ -197,13 +226,14 @@ pub const MediaTransport = struct {
         const colon = std.mem.indexOfScalar(u8, user, ':') orelse user.len;
         const server_ufrag = user[0..colon];
 
-        const ep = self.byServerUfrag(server_ufrag) orelse return null;
+        const owned_key = self.by_ufrag.get(server_ufrag) orelse return null;
+        const ep = self.endpoints.getPtr(owned_key) orelse return null;
         // Short-term credential check (RFC 8445 §7.3): the peer keys its request
         // with the server's advertised password.
         const ok = stun.verifyMessageIntegrity(datagram, ep.pwdSlice()) catch return null;
         if (!ok) return null;
 
-        ep.remote = source; // connectivity confirmed → bind the peer address
+        self.rebindAddr(ep, owned_key, source); // connectivity confirmed → bind + index
 
         const mapped = toStunAddress(source) orelse return null;
         return try stun.buildBindingSuccessResponse(allocator, msg.transaction_id, .{
@@ -213,12 +243,23 @@ pub const MediaTransport = struct {
         });
     }
 
+    /// Route an inbound RTP/RTCP datagram by its UDP `source`: resolve the
+    /// sending participant via the address index, then fill `out` with the bound
+    /// remotes of every *other* connected participant in the same call (the SFU
+    /// relay set). Returns 0 if the source is not a known bound endpoint.
+    pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, out: []TransportAddress) usize {
+        const key = self.by_addr.get(addrKey(source)) orelse return 0;
+        const sep = std.mem.indexOfScalar(u8, key, 0) orelse return 0;
+        return self.forwardTargets(key[0..sep], key[sep + 1 ..], out);
+    }
+
     /// Drop a participant's endpoint (on MEDIA LEAVE / disconnect).
     pub fn remove(self: *MediaTransport, channel: []const u8, participant: []const u8) void {
         var kb: [256]u8 = undefined;
         const k = compositeKey(&kb, channel, participant) orelse return;
         if (self.endpoints.fetchRemove(k)) |kv| {
             _ = self.by_ufrag.remove(kv.value.ufragSlice());
+            if (kv.value.remote) |addr| _ = self.by_addr.remove(addrKey(addr));
             self.allocator.free(kv.key);
         }
     }
@@ -338,6 +379,33 @@ test "handleStunBinding rejects bad integrity and unknown ufrag" {
     });
     defer testing.allocator.free(unknown);
     try testing.expect((try mt.handleStunBinding(testing.allocator, unknown, testAddr(1, 1))) == null);
+}
+
+test "forwardFromSource routes an RTP packet to the other peers" {
+    var prng = std.Random.DefaultPrng.init(0x5151);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    _ = try mt.allocate("#c", "alice", prng.random());
+    _ = try mt.allocate("#c", "bob", prng.random());
+    _ = try mt.allocate("#c", "carol", prng.random());
+
+    const alice_addr = testAddr(1, 5001);
+    try testing.expect(mt.bindRemote("#c", "alice", alice_addr));
+    try testing.expect(mt.bindRemote("#c", "bob", testAddr(2, 5002)));
+    try testing.expect(mt.bindRemote("#c", "carol", testAddr(3, 5003)));
+
+    // A packet from alice's bound address forwards to bob+carol, not alice.
+    var out: [8]TransportAddress = undefined;
+    const n = mt.forwardFromSource(alice_addr, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    for (out[0..n]) |a| try testing.expect(a.port == 5002 or a.port == 5003);
+
+    // An unknown source routes nowhere.
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(testAddr(9, 9999), &out));
+
+    // After alice leaves, her address no longer resolves.
+    mt.remove("#c", "alice");
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, &out));
 }
 
 test "remove drops the endpoint and its ufrag index" {
