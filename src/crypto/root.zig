@@ -21,6 +21,7 @@ pub const node_short_id = @import("node_short_id.zig");
 pub const pake = @import("pake.zig");
 pub const random = @import("random.zig");
 pub const ratchet = @import("ratchet.zig");
+pub const rsa_verify = @import("rsa_verify.zig");
 pub const sasl_scram_client = @import("sasl_scram_client.zig");
 pub const secret = @import("secret.zig");
 pub const secure_channel = @import("secure_channel.zig");
@@ -69,6 +70,7 @@ test {
     _ = pake;
     _ = random;
     _ = ratchet;
+    _ = rsa_verify;
     _ = sasl_scram_client;
     _ = secret;
     _ = secure_channel;
