@@ -106,6 +106,7 @@ pub const upgrade_capsule = @import("upgrade_capsule.zig");
 pub const utf8 = @import("utf8.zig");
 pub const uuid = @import("uuid.zig");
 pub const vad = @import("vad.zig");
+pub const vlq = @import("vlq.zig");
 pub const wal = @import("wal.zig");
 pub const wildcard = @import("wildcard.zig");
 pub const xor_filter = @import("xor_filter.zig");
@@ -222,6 +223,7 @@ test {
     _ = utf8;
     _ = uuid;
     _ = vad;
+    _ = vlq;
     _ = wal;
     _ = wildcard;
     _ = xor_filter;

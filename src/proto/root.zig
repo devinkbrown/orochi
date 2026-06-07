@@ -21,6 +21,7 @@ pub const auditorium = @import("auditorium.zig");
 pub const away = @import("away.zig");
 pub const away_props = @import("away_props.zig");
 pub const base32 = @import("base32.zig");
+pub const base58 = @import("base58.zig");
 pub const base64url = @import("base64url.zig");
 pub const batch = @import("batch.zig");
 pub const batch_props = @import("batch_props.zig");
@@ -295,6 +296,7 @@ test {
     _ = away;
     _ = away_props;
     _ = base32;
+    _ = base58;
     _ = base64url;
     _ = batch;
     _ = batch_props;
