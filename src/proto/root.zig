@@ -75,6 +75,7 @@ pub const draft_channel_context = @import("draft_channel_context.zig");
 pub const draft_no_implicit_names = @import("draft_no_implicit_names.zig");
 pub const draft_reply_relay = @import("draft_reply_relay.zig");
 pub const dtls_record = @import("dtls_record.zig");
+pub const dtls_srtp = @import("dtls_srtp.zig");
 pub const ech = @import("ech.zig");
 pub const echo_message = @import("echo_message.zig");
 pub const ed25519_pkcs8 = @import("ed25519_pkcs8.zig");
@@ -352,6 +353,7 @@ test {
     _ = draft_no_implicit_names;
     _ = draft_reply_relay;
     _ = dtls_record;
+    _ = dtls_srtp;
     _ = ech;
     _ = echo_message;
     _ = ed25519_pkcs8;
