@@ -20,10 +20,16 @@ pub const Error = error{
     MemoryLimitExceeded,
     MemoryOutOfBounds,
     FuelExhausted,
+    UnknownImport,
+    HostCallDenied,
 } || std.mem.Allocator.Error;
 
 pub const Value = union(enum) { i32: u32 };
 pub const Config = struct { max_memory_bytes: usize = 64 * 1024 };
+pub const HostCall = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, instance: *Instance, module: []const u8, name: []const u8, args: []const Value) Error!?Value,
+};
 
 const page_size = 64 * 1024;
 const ValType = enum { i32 };
@@ -45,6 +51,17 @@ const Function = struct {
         allocator.free(self.body);
     }
 };
+const Import = struct {
+    module: []u8,
+    name: []u8,
+    kind: u8,
+    type_index: u32,
+
+    fn deinit(self: Import, allocator: std.mem.Allocator) void {
+        allocator.free(self.module);
+        allocator.free(self.name);
+    }
+};
 const Export = struct {
     name: []u8,
     kind: u8,
@@ -54,10 +71,19 @@ const Export = struct {
         allocator.free(self.name);
     }
 };
+const DataSegment = struct {
+    offset: usize,
+    bytes: []u8,
+
+    fn deinit(self: DataSegment, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+    }
+};
 
 pub const Instance = struct {
     allocator: std.mem.Allocator,
     types: []FuncType,
+    imports: []Import,
     functions: []Function,
     exports: []Export,
     memory: []u8,
@@ -69,9 +95,11 @@ pub const Instance = struct {
 
     pub fn deinit(self: *Instance) void {
         for (self.types) |ty| ty.deinit(self.allocator);
+        for (self.imports) |im| im.deinit(self.allocator);
         for (self.functions) |func| func.deinit(self.allocator);
         for (self.exports) |ex| ex.deinit(self.allocator);
         self.allocator.free(self.types);
+        self.allocator.free(self.imports);
         self.allocator.free(self.functions);
         self.allocator.free(self.exports);
         self.allocator.free(self.memory);
@@ -79,20 +107,37 @@ pub const Instance = struct {
     }
 
     pub fn call(self: *Instance, export_name: []const u8, args: []const Value, fuel: u64) Error!?Value {
-        const func_index = self.exportedFunction(export_name) orelse return error.UnknownExport;
-        if (func_index >= self.functions.len) return error.MalformedModule;
-        return self.execute(func_index, args, fuel);
+        return self.callWithHostcalls(export_name, args, fuel, null);
     }
 
-    fn exportedFunction(self: *const Instance, name: []const u8) ?usize {
+    pub fn callWithHostcalls(self: *Instance, export_name: []const u8, args: []const Value, fuel: u64, host: ?HostCall) Error!?Value {
+        const func_index = self.exportedFunction(export_name) orelse return error.UnknownExport;
+        var remaining_fuel = fuel;
+        return self.executeCombined(func_index, args, &remaining_fuel, host);
+    }
+
+    pub fn memorySlice(self: *const Instance, ptr: u32, len: u32) Error![]const u8 {
+        const start: usize = @intCast(ptr);
+        const n: usize = @intCast(len);
+        if (start > self.memory.len or n > self.memory.len - start) return error.MemoryOutOfBounds;
+        return self.memory[start..][0..n];
+    }
+
+    fn exportedFunction(self: *const Instance, name: []const u8) ?u32 {
         for (self.exports) |ex| {
-            if (ex.kind == 0 and std.mem.eql(u8, ex.name, name)) return @intCast(ex.index);
+            if (ex.kind == 0 and std.mem.eql(u8, ex.name, name)) return ex.index;
         }
         return null;
     }
 
-    fn execute(self: *Instance, func_index: usize, args: []const Value, initial_fuel: u64) Error!?Value {
-        var fuel = initial_fuel;
+    fn executeCombined(self: *Instance, func_index: u32, args: []const Value, fuel: *u64, host: ?HostCall) Error!?Value {
+        if (func_index < self.imports.len) return self.callImport(@intCast(func_index), args, host);
+        const defined_index: usize = @intCast(func_index - @as(u32, @intCast(self.imports.len)));
+        if (defined_index >= self.functions.len) return error.MalformedModule;
+        return self.executeDefined(defined_index, args, fuel, host);
+    }
+
+    fn executeDefined(self: *Instance, func_index: usize, args: []const Value, fuel: *u64, host: ?HostCall) Error!?Value {
         const func = self.functions[func_index];
         const ty = self.types[@intCast(func.type_index)];
         if (args.len != ty.params.len) return error.TypeMismatch;
@@ -107,13 +152,14 @@ pub const Instance = struct {
         defer stack.deinit(self.allocator);
         var reader = Parser{ .data = func.body };
         while (reader.pos < reader.data.len) {
-            if (fuel == 0) return error.FuelExhausted;
-            fuel -= 1;
+            if (fuel.* == 0) return error.FuelExhausted;
+            fuel.* -= 1;
             switch (try reader.byte()) {
                 0x00 => return error.UnsupportedOpcode, // unreachable
                 0x01 => {}, // nop
                 0x0b => return finish(ty, &stack),
                 0x0f => return finish(ty, &stack),
+                0x10 => try self.executeCall(&stack, try reader.readU32(), fuel, host),
                 0x1a => _ = try pop(&stack),
                 0x20 => try stack.append(self.allocator, try getLocal(locals, try reader.readU32())),
                 0x21 => try setLocal(locals, try reader.readU32(), try pop(&stack)),
@@ -144,6 +190,42 @@ pub const Instance = struct {
             }
         }
         return error.MalformedModule;
+    }
+
+    fn executeCall(self: *Instance, stack: *std.ArrayList(Value), func_index: u32, fuel: *u64, host: ?HostCall) Error!void {
+        const ty = try self.functionType(func_index);
+        const call_args = try self.allocator.alloc(Value, ty.params.len);
+        defer self.allocator.free(call_args);
+        var i = ty.params.len;
+        while (i > 0) {
+            i -= 1;
+            call_args[i] = try pop(stack);
+        }
+        const result = try self.executeCombined(func_index, call_args, fuel, host);
+        if (ty.results.len == 0) {
+            if (result != null) return error.TypeMismatch;
+        } else {
+            try stack.append(self.allocator, result orelse return error.TypeMismatch);
+        }
+    }
+
+    fn callImport(self: *Instance, import_index: usize, args: []const Value, host: ?HostCall) Error!?Value {
+        const im = self.imports[import_index];
+        const ty = self.types[@intCast(im.type_index)];
+        if (args.len != ty.params.len) return error.TypeMismatch;
+        const callback = host orelse return error.UnknownImport;
+        const result = try callback.call(callback.ctx, self, im.module, im.name, args);
+        if (ty.results.len == 0 and result != null) return error.TypeMismatch;
+        if (ty.results.len == 1 and result == null) return error.TypeMismatch;
+        if (ty.results.len > 1) return error.TypeMismatch;
+        return result;
+    }
+
+    fn functionType(self: *const Instance, func_index: u32) Error!FuncType {
+        if (func_index < self.imports.len) return self.types[@intCast(self.imports[@intCast(func_index)].type_index)];
+        const defined_index: usize = @intCast(func_index - @as(u32, @intCast(self.imports.len)));
+        if (defined_index >= self.functions.len) return error.MalformedModule;
+        return self.types[@intCast(self.functions[defined_index].type_index)];
     }
 
     fn loadI32(self: *const Instance, addr: u32, offset: u32) Error!u32 {
@@ -228,18 +310,24 @@ const Parser = struct {
         if (!std.mem.eql(u8, try self.bytes(4), "\x01\x00\x00\x00")) return error.InvalidVersion;
 
         var types: std.ArrayList(FuncType) = .empty;
+        var imports: std.ArrayList(Import) = .empty;
         var func_type_indexes: std.ArrayList(u32) = .empty;
         defer func_type_indexes.deinit(allocator);
         var functions: std.ArrayList(Function) = .empty;
         var exports: std.ArrayList(Export) = .empty;
+        var data_segments: std.ArrayList(DataSegment) = .empty;
         var memory_pages: usize = 0;
         errdefer {
             for (types.items) |ty| ty.deinit(allocator);
+            for (imports.items) |im| im.deinit(allocator);
             for (functions.items) |func| func.deinit(allocator);
             for (exports.items) |ex| ex.deinit(allocator);
+            for (data_segments.items) |seg| seg.deinit(allocator);
             types.deinit(allocator);
+            imports.deinit(allocator);
             functions.deinit(allocator);
             exports.deinit(allocator);
+            data_segments.deinit(allocator);
         }
 
         while (self.pos < self.data.len) {
@@ -249,11 +337,14 @@ const Parser = struct {
             if (end > self.data.len) return error.MalformedModule;
             var sec = Parser{ .data = self.data[self.pos..end] };
             switch (id) {
+                0 => {},
                 1 => try parseTypes(&sec, allocator, &types),
+                2 => try parseImports(&sec, allocator, &imports),
                 3 => try parseFunctions(&sec, allocator, &func_type_indexes),
                 5 => memory_pages = try parseMemory(&sec, config),
                 7 => try parseExports(&sec, allocator, &exports),
                 10 => try parseCode(&sec, allocator, func_type_indexes.items, &functions),
+                11 => try parseData(&sec, allocator, &data_segments),
                 else => return error.UnsupportedSection,
             }
             if (sec.pos != sec.data.len) return error.MalformedModule;
@@ -262,12 +353,26 @@ const Parser = struct {
 
         const memory_bytes = memory_pages * page_size;
         if (memory_bytes > config.max_memory_bytes) return error.MemoryLimitExceeded;
+        const memory = try allocator.alloc(u8, memory_bytes);
+        errdefer allocator.free(memory);
+        @memset(memory, 0);
+        for (data_segments.items) |seg| {
+            if (seg.offset > memory.len or seg.bytes.len > memory.len - seg.offset) return error.MemoryOutOfBounds;
+            @memcpy(memory[seg.offset..][0..seg.bytes.len], seg.bytes);
+        }
+        const owned_types = try types.toOwnedSlice(allocator);
+        const owned_imports = try imports.toOwnedSlice(allocator);
+        const owned_functions = try functions.toOwnedSlice(allocator);
+        const owned_exports = try exports.toOwnedSlice(allocator);
+        for (data_segments.items) |seg| seg.deinit(allocator);
+        data_segments.deinit(allocator);
         return .{
             .allocator = allocator,
-            .types = try types.toOwnedSlice(allocator),
-            .functions = try functions.toOwnedSlice(allocator),
-            .exports = try exports.toOwnedSlice(allocator),
-            .memory = try allocator.alloc(u8, memory_bytes),
+            .types = owned_types,
+            .imports = owned_imports,
+            .functions = owned_functions,
+            .exports = owned_exports,
+            .memory = memory,
         };
     }
 
@@ -340,6 +445,26 @@ fn parseFunctions(p: *Parser, allocator: std.mem.Allocator, out: *std.ArrayList(
     for (0..count) |_| try out.append(allocator, try p.readU32());
 }
 
+fn parseImports(p: *Parser, allocator: std.mem.Allocator, out: *std.ArrayList(Import)) Error!void {
+    const count = try p.readU32();
+    for (0..count) |_| {
+        const module_len = try p.readU32();
+        const module = try allocator.dupe(u8, try p.bytes(module_len));
+        errdefer allocator.free(module);
+        const name_len = try p.readU32();
+        const name = try allocator.dupe(u8, try p.bytes(name_len));
+        errdefer allocator.free(name);
+        const kind = try p.byte();
+        if (kind != 0) return error.UnsupportedSection;
+        try out.append(allocator, .{
+            .module = module,
+            .name = name,
+            .kind = kind,
+            .type_index = try p.readU32(),
+        });
+    }
+}
+
 fn parseMemory(p: *Parser, config: Config) Error!usize {
     if (try p.readU32() != 1) return error.MalformedModule;
     const flags = try p.readU32();
@@ -378,6 +503,21 @@ fn parseCode(p: *Parser, allocator: std.mem.Allocator, types: []const u32, out: 
         errdefer allocator.free(body);
         try out.append(allocator, .{ .type_index = types[i], .local_count = local_count, .body = body });
         p.pos = body_end;
+    }
+}
+
+fn parseData(p: *Parser, allocator: std.mem.Allocator, out: *std.ArrayList(DataSegment)) Error!void {
+    const count = try p.readU32();
+    for (0..count) |_| {
+        if (try p.readU32() != 0) return error.UnsupportedSection;
+        if (try p.byte() != 0x41) return error.UnsupportedOpcode;
+        const offset_i32 = try p.readI32();
+        if (offset_i32 < 0) return error.MemoryOutOfBounds;
+        if (try p.byte() != 0x0b) return error.MalformedModule;
+        const len = try p.readU32();
+        const bytes = try allocator.dupe(u8, try p.bytes(len));
+        errdefer allocator.free(bytes);
+        try out.append(allocator, .{ .offset = @intCast(offset_i32), .bytes = bytes });
     }
 }
 

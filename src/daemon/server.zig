@@ -13,6 +13,7 @@ const dispatch = @import("dispatch.zig");
 const module_core = @import("module_core.zig");
 const module_manifest = @import("modules/manifest.zig");
 const mod_registry = @import("registry.zig");
+const wasm_bridge = @import("../wasm/host/bridge.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
@@ -876,6 +877,10 @@ const QueueSink = struct {
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    /// MizuWasm control-plane plugin bridge: loaded third-party plugins whose
+    /// declared commands are dispatched after the comptime registry misses.
+    /// Empty by default (no plugins) => the consult is a fast miss.
+    wasm: wasm_bridge.Bridge,
     listener_fd: linux.fd_t,
     ring: RingCore,
     clients: ClientTable,
@@ -1002,6 +1007,7 @@ pub const LinuxServer = struct {
         return .{
             .allocator = allocator,
             .config = config,
+            .wasm = wasm_bridge.Bridge.init(allocator),
             .listener_fd = listener_fd,
             .s2s_listener_fd = s2s_listener_fd,
             .ring = ring,
@@ -1061,6 +1067,7 @@ pub const LinuxServer = struct {
 
     pub fn deinit(self: *LinuxServer) void {
         self.driveDeinit();
+        self.wasm.deinit();
         for (self.clients.slots.items) |*slot| {
             if (slot.occupied) {
                 if (slot.value.s2s) |link| {
@@ -1898,6 +1905,37 @@ pub const LinuxServer = struct {
                 .handled => return,
                 .too_few_params => {
                     try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, "Not enough parameters");
+                    return;
+                },
+                .not_found => {},
+            }
+        }
+
+        // MizuWasm control-plane plugins: a loaded third-party plugin may own this
+        // command. Consulted after the comptime registry misses; empty by default.
+        if (self.wasm.count() > 0 and self.wasm.hasCommand(parsed.command)) {
+            var wcore = module_core.Core{
+                .services = .{ .allocator = self.allocator, .config = &self.config },
+                .server = self,
+                .id = id,
+                .conn = conn,
+                .parsed = parsed,
+                .line = line,
+            };
+            const host = wasm_bridge.HostBindings{
+                .ctx = &wcore,
+                .reply = wasmReplyCb,
+                .log = wasmLogCb,
+                .now_ms = wasmNowCb,
+            };
+            switch (self.wasm.dispatch(parsed.command, parsed.paramSlice(), host)) {
+                .handled => return,
+                .denied => {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{parsed.command}, "Plugin lacks the required capability");
+                    return;
+                },
+                .trap => {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{parsed.command}, "Plugin execution trapped");
                     return;
                 },
                 .not_found => {},
@@ -7304,6 +7342,22 @@ fn monitorNumeric(n: monitor.MonitorNumeric) Numeric {
         .RPL_ENDOFMONLIST => .RPL_ENDOFMONLIST,
         .ERR_MONLISTFULL => .ERR_MONLISTFULL,
     };
+}
+
+/// MizuWasm host callbacks: route a plugin's granted hostcalls to the live
+/// connection. `ctx` is the per-invocation `*module_core.Core`. A plugin reply is
+/// framed as a server NOTICE to the requesting client.
+fn wasmReplyCb(ctx: *anyopaque, text: []const u8) void {
+    const core: *module_core.Core = @ptrCast(@alignCast(ctx));
+    var buf: [600]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ server_name, core.conn.session.displayName(), text }) catch return;
+    appendToConn(core.conn, line) catch {};
+}
+fn wasmLogCb(_: *anyopaque, text: []const u8) void {
+    std.debug.print("mizuchi: wasm-plugin: {s}\n", .{text});
+}
+fn wasmNowCb(_: *anyopaque) i64 {
+    return platform.monotonicMillis();
 }
 
 const Buf = struct {

@@ -127,6 +127,16 @@ pub const PluginStore = struct {
         return plugin.instance.call(name, args, fuel);
     }
 
+    pub fn callExportWithHostcalls(self: *PluginStore, handle: PluginHandle, name: []const u8, args: []const interp.Value, fuel: u64, host: interp.HostCall) Error!?interp.Value {
+        const plugin = self.findPlugin(handle) orelse return error.UnknownPlugin;
+        return plugin.instance.callWithHostcalls(name, args, fuel, host);
+    }
+
+    pub fn hasCapability(self: *const PluginStore, handle: PluginHandle, cap: abi.Capability) Error!bool {
+        const plugin = self.findPluginConst(handle) orelse return error.UnknownPlugin;
+        return plugin.grants.has(cap);
+    }
+
     pub fn dispatchHostcall(self: *PluginStore, handle: PluginHandle, name: []const u8, args: []const u64) Error!HostcallResult {
         const plugin = self.findPlugin(handle) orelse return error.UnknownPlugin;
         const func = abi.findHostFunction(name) orelse return error.UnknownHostFunction;
@@ -201,6 +211,11 @@ pub const PluginStore = struct {
     }
 
     fn findPlugin(self: *PluginStore, handle: PluginHandle) ?*LoadedPlugin {
+        if (self.findPluginIndex(handle)) |index| return &self.plugins.items[index];
+        return null;
+    }
+
+    fn findPluginConst(self: *const PluginStore, handle: PluginHandle) ?*const LoadedPlugin {
         if (self.findPluginIndex(handle)) |index| return &self.plugins.items[index];
         return null;
     }
