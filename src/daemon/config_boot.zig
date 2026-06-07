@@ -28,6 +28,10 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.max_clones_per_net = cfg.limits.max_clones_per_net;
     out.reputation_refuse_threshold = cfg.limits.reputation_refuse_threshold;
     if (cfg.limits.reputation_half_life_ms != 0) out.reputation_half_life_ms = @intCast(cfg.limits.reputation_half_life_ms);
+    if (cfg.limits.sweep_interval_ms != 0) out.sweep_interval_ms = @intCast(cfg.limits.sweep_interval_ms);
+    out.ring_entries = @intCast(cfg.io.ring_entries);
+    out.reg_timeout_penalty = cfg.reputation.registration_timeout_penalty;
+    out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     return out;
 }

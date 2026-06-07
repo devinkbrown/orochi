@@ -31,6 +31,8 @@ pub const Config = struct {
     opers: []Oper = &.{},
     mesh: Mesh = .{},
     limits: Limits = .{},
+    io: Io = .{},
+    reputation: Reputation = .{},
     media: Media = .{},
     sasl: Sasl = .{},
     cloak: Cloak = .{},
@@ -73,6 +75,20 @@ pub const Config = struct {
         max_clones_per_net: u32 = 0,
         reputation_refuse_threshold: u32 = 0,
         reputation_half_life_ms: u64 = 60_000,
+        /// Period of the io_uring timeout-sweep timer; sets the enforcement
+        /// granularity of registration/ping/idle timeouts.
+        sweep_interval_ms: u64 = 2_000,
+    };
+
+    /// io_uring / per-connection transport tuning.
+    pub const Io = struct {
+        ring_entries: u32 = 32,
+    };
+
+    /// Decaying IP-reputation penalty weights.
+    pub const Reputation = struct {
+        registration_timeout_penalty: f64 = 50.0,
+        clone_refuse_penalty: f64 = 25.0,
     };
 
     pub const Media = struct {
@@ -165,6 +181,14 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);
     if (doc.getString("limits.ping_timeout")) |s| cfg.limits.ping_timeout_ms = try durationMs(s);
     if (doc.getString("limits.reputation_half_life")) |s| cfg.limits.reputation_half_life_ms = try durationMs(s);
+    if (doc.getString("limits.sweep_interval")) |s| cfg.limits.sweep_interval_ms = try durationMs(s);
+
+    // [io]
+    cfg.io.ring_entries = @intCast(try uintField(doc, "io.ring_entries", cfg.io.ring_entries, 8, 4096));
+
+    // [reputation]
+    cfg.reputation.registration_timeout_penalty = try floatField(doc, "reputation.registration_timeout_penalty", cfg.reputation.registration_timeout_penalty, 0, 1000);
+    cfg.reputation.clone_refuse_penalty = try floatField(doc, "reputation.clone_refuse_penalty", cfg.reputation.clone_refuse_penalty, 0, 1000);
 
     // [media]
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;
@@ -272,6 +296,12 @@ fn uintField(doc: toml.Document, path: []const u8, current: u64, min: u64, max: 
     const u: u64 = @intCast(v);
     if (u < min or u > max) return error.ParseError;
     return u;
+}
+
+fn floatField(doc: toml.Document, path: []const u8, current: f64, min: f64, max: f64) TomlError!f64 {
+    const v = doc.getFloat(path) orelse return current;
+    if (v < min or v > max) return error.ParseError;
+    return v;
 }
 
 /// Parse a duration string ("500ms" | "30s" | "5m" | "2h") into milliseconds.
@@ -398,6 +428,32 @@ test "parseToml: required fields and ranges are enforced" {
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[limits]\nping_interval=\"5x\"\n", .{}));
     // Malformed TOML.
     try testing.expectError(error.ParseError, parseToml(allocator, "[node\nid=1\n", .{}));
+}
+
+test "parseToml: [io] / [reputation] / sweep_interval lift" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\sweep_interval = "500ms"
+        \\[io]
+        \\ring_entries = 256
+        \\[reputation]
+        \\registration_timeout_penalty = 80.0
+        \\clone_refuse_penalty = 10
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u64, 500), cfg.limits.sweep_interval_ms);
+    try testing.expectEqual(@as(u32, 256), cfg.io.ring_entries);
+    try testing.expectEqual(@as(f64, 80.0), cfg.reputation.registration_timeout_penalty);
+    try testing.expectEqual(@as(f64, 10.0), cfg.reputation.clone_refuse_penalty);
+    // out-of-range ring_entries rejected
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\nring_entries=4\n", .{}));
 }
 
 test "parseToml: minimal config keeps defaults" {

@@ -527,13 +527,8 @@ const listener_token: RingFdToken = .{ .slot = 0, .gen = 0 };
 const s2s_listener_token: RingFdToken = .{ .slot = 1, .gen = 0 };
 /// Reserved token for the periodic timeout sweep timer (single in-flight timer).
 const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
-/// How often the timeout sweep runs (ms).
-const timer_interval_ms: i64 = 2_000;
-/// Reputation penalty for a connection that never completed registration in the
-/// handshake window (scan/abuse signature).
-const reg_timeout_penalty: f64 = 50.0;
-/// Reputation penalty for an accept refused by the clone limiter.
-const clone_refuse_penalty: f64 = 25.0;
+// Timeout-sweep period and IP-reputation penalty weights are operator-tunable
+// via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
 const default_recv_bytes: usize = 4096;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
@@ -712,6 +707,13 @@ pub const Config = struct {
     reputation_refuse_threshold: u32 = 0,
     /// Half-life (ms) of the IP-reputation penalty decay.
     reputation_half_life_ms: i64 = 60_000,
+    /// Period (ms) of the io_uring timeout-sweep timer; enforcement granularity
+    /// of registration/ping/idle timeouts.
+    sweep_interval_ms: i64 = 2_000,
+    /// IP-reputation penalty added when a connection never finishes registration.
+    reg_timeout_penalty: f64 = 50.0,
+    /// IP-reputation penalty added when accept is refused by the clone limiter.
+    clone_refuse_penalty: f64 = 25.0,
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
     /// take on the account store's I/O lifecycle: a caller that has a store wires
@@ -1108,7 +1110,7 @@ pub const LinuxServer = struct {
     /// Keep exactly one periodic timeout-sweep timer in flight.
     fn armTimer(self: *LinuxServer) !void {
         if (self.timer_armed) return;
-        const ns = timer_interval_ms * std.time.ns_per_ms;
+        const ns = self.config.sweep_interval_ms * std.time.ns_per_ms;
         const ts: linux.kernel_timespec = .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) };
         try self.ring.submitTimeout(timer_token, &ts);
         self.timer_armed = true;
@@ -1140,7 +1142,7 @@ pub const LinuxServer = struct {
                 // Queue the ERROR and mark closing; the existing send-drain path
                 // (handleSend) calls closeConn for the proper io_uring-integrated
                 // teardown (shutdown in-flight recv, free slot). Never closeFd here.
-                self.penalizePeer(c, reg_timeout_penalty);
+                self.penalizePeer(c, self.config.reg_timeout_penalty);
                 appendToConn(c, ":" ++ server_name ++ " ERROR :Registration timeout\r\n") catch {};
                 c.close_reason = "Registration timeout";
                 c.closing = true;
@@ -1310,7 +1312,7 @@ pub const LinuxServer = struct {
                 conn.clone_counted = true;
             } else |err| switch (err) {
                 error.TooManyPerIp, error.TooManyPerNet => {
-                    self.penalizePeer(conn, clone_refuse_penalty);
+                    self.penalizePeer(conn, self.config.clone_refuse_penalty);
                     appendToConn(conn, ":" ++ server_name ++ " ERROR :Too many connections from your host\r\n") catch {};
                     conn.close_reason = "Too many connections";
                     conn.closing = true;
