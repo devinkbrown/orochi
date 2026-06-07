@@ -268,6 +268,47 @@ test "NativeMediaTransport: media never crosses channels" {
     try testing.expect(other.recvFrom(&rbuf) == null); // eve hears nothing
 }
 
+test "NativeMediaTransport: setSelection drops higher layers over the wire" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    try nmt.start(loopback_be, 0);
+
+    var lowbw = try MediaSocket.bind(loopback_be, 0);
+    defer lowbw.deinit();
+    lowbw.setRecvTimeoutMs(400);
+    const lowbw_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try lowbw.localPort());
+
+    var src = try MediaSocket.bind(loopback_be, 0);
+    defer src.deinit();
+
+    try nmt.register("#v", "src", .video, 10, .{});
+    try nmt.register("#v", "lowbw", .video, 11, lowbw_addr);
+    nmt.setSelection("#v", "lowbw", .{ .max_spatial = 0, .max_temporal = 0 });
+
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, nmt.port);
+    var fbuf: [64]u8 = undefined;
+    var rbuf: [media_socket.max_datagram]u8 = undefined;
+
+    // A spatial layer-1 (band floor+1) non-keyframe must be dropped for lowbw.
+    const hi = opcodec_frame.encode(.{
+        .band_id = opcodec_frame.MEDIA_BAND_FLOOR + 1,
+        .stream_id = 10,
+        .sequence = 1,
+        .timestamp = 0,
+        .keyframe = false,
+        .codec = .opvis_video,
+        .payload = &[_]u8{ 1, 2, 3 },
+    }, &fbuf) catch unreachable;
+    src.sendTo(server_addr, fbuf[0..hi]);
+    try testing.expect(lowbw.recvFrom(&rbuf) == null);
+
+    // The base layer (band floor) is delivered.
+    const base = opframe(10, &fbuf);
+    src.sendTo(server_addr, base);
+    const got = lowbw.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, base, got.data);
+}
+
 test "NativeMediaTransport: unregister drops the channel and frees its index" {
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();

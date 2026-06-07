@@ -6399,6 +6399,36 @@ pub const LinuxServer = struct {
             try self.mediaStats(conn, channel);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "LAYER")) {
+            // `MEDIA LAYER <#chan> <max_spatial> <max_temporal>` — receiver-driven
+            // simulcast: ask the native SFU to forward this receiver only up to
+            // the given spatial/temporal layer (e.g. a small screen / slow link
+            // requests the base layer). The SFU drops higher layers without ever
+            // decoding; keyframes at/below the ceiling always pass.
+            if (parsed.param_count < 4) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA LAYER <#chan> <max_spatial> <max_temporal>");
+                return;
+            }
+            if (!self.media_rooms.isParticipant(channel, nick)) {
+                try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "Join the call before setting a layer ceiling");
+                return;
+            }
+            const max_spatial = std.fmt.parseInt(u8, parsed.paramSlice()[2], 10) catch {
+                try self.failReply(conn, "MEDIA", "BAD_LAYER", "max_spatial must be 0-255");
+                return;
+            };
+            const max_temporal = std.fmt.parseInt(u3, parsed.paramSlice()[3], 10) catch {
+                try self.failReply(conn, "MEDIA", "BAD_LAYER", "max_temporal must be 0-7");
+                return;
+            };
+            self.native_media.setSelection(channel, nick, .{ .max_spatial = max_spatial, .max_temporal = max_temporal });
+            var lbuf: [160]u8 = undefined;
+            const lline = std.fmt.bufPrint(&lbuf, ":{s} NOTE MEDIA {s} LAYER spatial<={d} temporal<={d}\r\n", .{
+                server_name, channel, max_spatial, max_temporal,
+            }) catch return;
+            try appendToConn(conn, lline);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "BREAKOUT")) {
             if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA BREAKOUT <#chan> <room>");
