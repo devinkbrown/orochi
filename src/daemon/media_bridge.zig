@@ -1,0 +1,242 @@
+//! Media bridge spine — per-channel cross-leg roster + datagram rewrap.
+//!
+//! A media call can mix participants on two transports: the native leg
+//! (opcodec_frame over UDP, our OPVOX/OPVIS codec) and the WebRTC leg (RTP/SRTP).
+//! Within a leg the respective plane already forwards. This module is the spine
+//! that lets a frame ingressing on ONE leg reach participants on the OTHER leg —
+//! by header-rewrap only, never transcoding. The codec payload is opaque and
+//! shared verbatim; only the transport header (opcodec container ↔ RTP) changes.
+//!
+//! `ChannelBridge` holds the call's roster (who is on which leg + their transport
+//! identity) and answers `crossTargets(leg)` — the opposite-leg recipients for a
+//! frame that arrived on `leg`. The free `*Datagram` helpers do the actual
+//! rewrap, reusing `kakehashi`. The two live pumps (native + WebRTC) will call
+//! these to deliver across legs.
+//!
+//! Pure SFU: this never encodes/decodes/transcodes media. A mixed call still
+//! requires a shared codec (`kakehashi.selectCommon`); rewrap just moves the
+//! agreed opaque payload between the two wire framings.
+const std = @import("std");
+const kakehashi = @import("../substrate/kakehashi.zig");
+const opcodec_frame = @import("../substrate/opcodec_frame.zig");
+const ice = @import("../proto/ice.zig");
+
+pub const Leg = kakehashi.Leg; // .native | .webrtc
+pub const TransportAddress = ice.TransportAddress;
+pub const PtMap = kakehashi.PtMap;
+
+pub const Error = kakehashi.Error || opcodec_frame.DecodeError || opcodec_frame.EncodeError;
+
+const max_id_bytes = 64;
+
+/// The default per-call RTP payload-type map (dynamic PTs for our codecs). Used
+/// when a call hasn't negotiated a custom mapping.
+pub fn defaultPtMap() PtMap {
+    var m = PtMap{};
+    m.add(111, .opvox); // audio
+    m.add(96, .opvis); // video
+    return m;
+}
+
+/// One call participant and the transport identity needed to deliver to it.
+pub const Member = struct {
+    id_buf: [max_id_bytes]u8 = undefined,
+    id_len: u8 = 0,
+    leg: Leg,
+    addr: TransportAddress = .{},
+    /// Native identity (opcodec stream + band the egress frame carries).
+    stream_id: u32 = 0,
+    band_id: u8 = opcodec_frame.MEDIA_BAND_FLOOR,
+    /// WebRTC identity (RTP SSRC stamped on the egress packet).
+    ssrc: u32 = 0,
+
+    pub fn id(self: *const Member) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+};
+
+pub fn ChannelBridge(comptime max_participants: usize) type {
+    return struct {
+        const Self = @This();
+        pub const RegisterError = error{ Full, BadId };
+
+        members: [max_participants]Member = undefined,
+        len: usize = 0,
+        ptmap: PtMap = .{},
+
+        pub fn init() Self {
+            return .{ .ptmap = defaultPtMap() };
+        }
+
+        fn find(self: *Self, id: []const u8) ?*Member {
+            for (self.members[0..self.len]) |*m| {
+                if (std.mem.eql(u8, m.id(), id)) return m;
+            }
+            return null;
+        }
+
+        /// Register/update a participant's leg + transport identity.
+        pub fn register(self: *Self, id: []const u8, m: Member) RegisterError!void {
+            if (id.len == 0 or id.len > max_id_bytes) return error.BadId;
+            if (self.find(id)) |existing| {
+                var updated = m;
+                @memcpy(updated.id_buf[0..id.len], id);
+                updated.id_len = @intCast(id.len);
+                existing.* = updated;
+                return;
+            }
+            if (self.len >= max_participants) return error.Full;
+            var nm = m;
+            @memcpy(nm.id_buf[0..id.len], id);
+            nm.id_len = @intCast(id.len);
+            self.members[self.len] = nm;
+            self.len += 1;
+        }
+
+        pub fn unregister(self: *Self, id: []const u8) bool {
+            for (self.members[0..self.len], 0..) |*mem, i| {
+                if (std.mem.eql(u8, mem.id(), id)) {
+                    self.members[i] = self.members[self.len - 1];
+                    self.len -= 1;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        pub fn count(self: *const Self) usize {
+            return self.len;
+        }
+
+        /// Copy into `out` every member on the leg OPPOSITE to `from_leg`,
+        /// excluding `from_id` (the publisher). These are the participants the
+        /// caller must reach by rewrapping the frame onto the other transport.
+        pub fn crossTargets(self: *Self, from_leg: Leg, from_id: []const u8, out: []Member) usize {
+            const other: Leg = if (from_leg == .native) .webrtc else .native;
+            var n: usize = 0;
+            for (self.members[0..self.len]) |m| {
+                if (m.leg != other) continue;
+                if (std.mem.eql(u8, m.id(), from_id)) continue;
+                if (n >= out.len) break;
+                out[n] = m;
+                n += 1;
+            }
+            return n;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Datagram-level rewrap (reuses kakehashi; payload is borrowed/opaque).
+// ---------------------------------------------------------------------------
+
+/// Rewrap a native opcodec datagram as an RTP packet for a WebRTC target
+/// (`ssrc`). Header-only: the codec payload is copied verbatim. Returns the RTP
+/// bytes in `out`.
+pub fn nativeDatagramToRtp(datagram: []const u8, map: *const PtMap, ssrc: u32, out: []u8) Error![]const u8 {
+    const view = try opcodec_frame.decode(datagram);
+    const bf = kakehashi.fromNative(view);
+    return kakehashi.toRtp(bf, map, ssrc, out);
+}
+
+/// Rewrap an RTP packet as a native opcodec datagram for a native target
+/// (`band_id`/`stream_id`). Header-only. Returns the encoded length in `out`.
+pub fn rtpToNativeDatagram(
+    rtp: []const u8,
+    map: *const PtMap,
+    band_id: u8,
+    stream_id: u32,
+    keyframe_hint: bool,
+    out: []u8,
+) Error!usize {
+    const bf = try kakehashi.fromRtp(rtp, map, keyframe_hint);
+    const nf = kakehashi.toNative(bf, band_id, stream_id);
+    return opcodec_frame.encode(nf, out);
+}
+
+// ---------------------------------------------------------------------------
+// Tests (run under the unified build; transitively imports opcodec/rtp_profile,
+// so not standalone `zig test`-able — expected).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn addr(last: u8, port: u16) TransportAddress {
+    return TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, last }, port) catch unreachable;
+}
+
+test "crossTargets returns only opposite-leg members, excluding the sender" {
+    var br = ChannelBridge(8).init();
+    try br.register("alice", .{ .leg = .native, .addr = addr(1, 5000), .stream_id = 100 });
+    try br.register("bob", .{ .leg = .native, .addr = addr(2, 5000), .stream_id = 200 });
+    try br.register("mob", .{ .leg = .webrtc, .addr = addr(3, 6000), .ssrc = 0xAAAA });
+    try br.register("pho", .{ .leg = .webrtc, .addr = addr(4, 6000), .ssrc = 0xBBBB });
+
+    var out: [8]Member = undefined;
+    // a native sender reaches the WebRTC members only
+    const n = br.crossTargets(.native, "alice", &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    for (out[0..n]) |m| try testing.expectEqual(Leg.webrtc, m.leg);
+
+    // a WebRTC sender reaches the native members, excluding itself
+    const n2 = br.crossTargets(.webrtc, "mob", &out);
+    try testing.expectEqual(@as(usize, 2), n2);
+    for (out[0..n2]) |m| try testing.expectEqual(Leg.native, m.leg);
+}
+
+test "unregister drops a member; register updates in place" {
+    var br = ChannelBridge(4).init();
+    try br.register("a", .{ .leg = .native, .stream_id = 1 });
+    try br.register("a", .{ .leg = .webrtc, .ssrc = 9 }); // update -> same slot
+    try testing.expectEqual(@as(usize, 1), br.count());
+    try testing.expect(br.find("a").?.leg == .webrtc);
+    try testing.expect(br.unregister("a"));
+    try testing.expectEqual(@as(usize, 0), br.count());
+    try testing.expect(!br.unregister("a"));
+}
+
+test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {
+    var map = defaultPtMap();
+
+    // Encode an opvis (video) native frame.
+    var src: [128]u8 = undefined;
+    const slen = try opcodec_frame.encode(.{
+        .band_id = opcodec_frame.MEDIA_BAND_FLOOR + 2,
+        .stream_id = 7,
+        .sequence = 1234,
+        .timestamp = 90000,
+        .keyframe = true,
+        .codec = .opvis_video,
+        .payload = "video-payload",
+    }, &src);
+
+    // Native -> RTP (for a WebRTC peer's ssrc).
+    var rtp_buf: [256]u8 = undefined;
+    const rtp = try nativeDatagramToRtp(src[0..slen], &map, 0xCAFEBABE, &rtp_buf);
+
+    // RTP -> native (for a native peer's band/stream).
+    var back: [256]u8 = undefined;
+    const blen = try rtpToNativeDatagram(rtp, &map, opcodec_frame.MEDIA_BAND_FLOOR + 2, 7, true, &back);
+    const view = try opcodec_frame.decode(back[0..blen]);
+
+    try testing.expectEqual(opcodec_frame.CodecTag.opvis_video, view.codec);
+    try testing.expectEqualStrings("video-payload", view.payload);
+    try testing.expect(view.keyframe);
+    try testing.expectEqual(@as(u32, 1234 & 0xFFFF), view.sequence); // RTP seq is 16-bit
+}
+
+test "rewrap rejects an unknown payload type" {
+    var empty = PtMap{};
+    var src: [64]u8 = undefined;
+    const slen = try opcodec_frame.encode(.{
+        .band_id = opcodec_frame.MEDIA_BAND_FLOOR,
+        .stream_id = 1,
+        .sequence = 1,
+        .timestamp = 1,
+        .keyframe = false,
+        .codec = .opvox_audio,
+        .payload = "x",
+    }, &src);
+    var out: [128]u8 = undefined;
+    try testing.expectError(error.UnknownPayloadType, nativeDatagramToRtp(src[0..slen], &empty, 1, &out));
+}

@@ -115,6 +115,7 @@ pub const media_pin = @import("media_pin.zig");
 pub const media_plane = @import("media_plane.zig");
 pub const native_media_link = @import("native_media_link.zig");
 pub const native_media_transport = @import("native_media_transport.zig");
+pub const media_bridge = @import("media_bridge.zig");
 pub const media_room = @import("media_room.zig");
 pub const memo_group = @import("memo_group.zig");
 pub const mention_graph = @import("mention_graph.zig");
@@ -349,6 +350,7 @@ test {
     _ = media_plane;
     _ = native_media_link;
     _ = native_media_transport;
+    _ = media_bridge;
     _ = media_room;
     _ = memo_group;
     _ = mention_graph;
