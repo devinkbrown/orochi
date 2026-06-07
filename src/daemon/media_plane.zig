@@ -129,7 +129,7 @@ pub const MediaPlane = struct {
                 // RTP/RTCP: selectively forward to the other call participants.
                 var targets: [media_transport.max_forward]TransportAddress = undefined;
                 lockSpin(&self.mutex);
-                const n = self.transport.forwardFromSource(got.from, &targets);
+                const n = self.transport.forwardFromSource(got.from, got.data.len, &targets);
                 self.mutex.unlock();
                 for (targets[0..n]) |dst| sock.sendTo(dst, got.data);
             }
@@ -150,6 +150,13 @@ pub const MediaPlane = struct {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         self.transport.remove(channel, participant);
+    }
+
+    /// Snapshot per-participant transport stats for `channel` into `out`.
+    pub fn statsForChannel(self: *MediaPlane, channel: []const u8, out: []MediaTransport.ParticipantStat) usize {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.transport.statsForChannel(channel, out);
     }
 
     /// Whether a participant's ICE check has bound a peer address (test/introspection).

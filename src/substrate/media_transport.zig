@@ -33,6 +33,9 @@ pub const Endpoint = struct {
     remote: ?TransportAddress = null,
     /// The RTP SSRC the participant publishes (learned from its first packet).
     ssrc: u32 = 0,
+    /// Media packets/bytes received from this participant and relayed onward.
+    rx_packets: u64 = 0,
+    rx_bytes: u64 = 0,
 
     pub fn ufragSlice(self: *const Endpoint) []const u8 {
         return self.ufrag[0..];
@@ -244,13 +247,56 @@ pub const MediaTransport = struct {
     }
 
     /// Route an inbound RTP/RTCP datagram by its UDP `source`: resolve the
-    /// sending participant via the address index, then fill `out` with the bound
-    /// remotes of every *other* connected participant in the same call (the SFU
-    /// relay set). Returns 0 if the source is not a known bound endpoint.
-    pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, out: []TransportAddress) usize {
+    /// sending participant via the address index, meter it (`bytes_len`), then
+    /// fill `out` with the bound remotes of every *other* connected participant
+    /// in the same call (the SFU relay set). Returns 0 if the source is not a
+    /// known bound endpoint.
+    pub fn forwardFromSource(self: *MediaTransport, source: TransportAddress, bytes_len: usize, out: []TransportAddress) usize {
         const key = self.by_addr.get(addrKey(source)) orelse return 0;
+        if (self.endpoints.getPtr(key)) |ep| {
+            ep.rx_packets += 1;
+            ep.rx_bytes += bytes_len;
+        }
         const sep = std.mem.indexOfScalar(u8, key, 0) orelse return 0;
         return self.forwardTargets(key[0..sep], key[sep + 1 ..], out);
+    }
+
+    /// Per-participant transport stats snapshot (copied out so callers need not
+    /// hold a lock while formatting).
+    pub const ParticipantStat = struct {
+        name_buf: [64]u8 = undefined,
+        name_len: usize = 0,
+        connected: bool = false,
+        rx_packets: u64 = 0,
+        rx_bytes: u64 = 0,
+
+        pub fn name(self: *const ParticipantStat) []const u8 {
+            return self.name_buf[0..self.name_len];
+        }
+    };
+
+    /// Fill `out` with a stats snapshot for each participant in `channel`.
+    pub fn statsForChannel(self: *MediaTransport, channel: []const u8, out: []ParticipantStat) usize {
+        var n: usize = 0;
+        var it = self.endpoints.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+            if (!std.mem.eql(u8, key[0..sep], channel)) continue;
+            if (n >= out.len) break;
+            const who = key[sep + 1 ..];
+            var s = ParticipantStat{
+                .connected = entry.value_ptr.connected(),
+                .rx_packets = entry.value_ptr.rx_packets,
+                .rx_bytes = entry.value_ptr.rx_bytes,
+            };
+            const len = @min(who.len, s.name_buf.len);
+            @memcpy(s.name_buf[0..len], who[0..len]);
+            s.name_len = len;
+            out[n] = s;
+            n += 1;
+        }
+        return n;
     }
 
     /// Drop a participant's endpoint (on MEDIA LEAVE / disconnect).
@@ -396,16 +442,16 @@ test "forwardFromSource routes an RTP packet to the other peers" {
 
     // A packet from alice's bound address forwards to bob+carol, not alice.
     var out: [8]TransportAddress = undefined;
-    const n = mt.forwardFromSource(alice_addr, &out);
+    const n = mt.forwardFromSource(alice_addr, 100, &out);
     try testing.expectEqual(@as(usize, 2), n);
     for (out[0..n]) |a| try testing.expect(a.port == 5002 or a.port == 5003);
 
     // An unknown source routes nowhere.
-    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(testAddr(9, 9999), &out));
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(testAddr(9, 9999), 100, &out));
 
     // After alice leaves, her address no longer resolves.
     mt.remove("#c", "alice");
-    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, &out));
+    try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, 100, &out));
 }
 
 test "remove drops the endpoint and its ufrag index" {

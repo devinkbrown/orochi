@@ -6363,6 +6363,10 @@ pub const LinuxServer = struct {
                 try self.failReply(conn, "MEDIA", "NO_OFFER", "No active call profile for this channel");
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "STATS")) {
+            try self.mediaStats(conn, channel);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "BREAKOUT")) {
             if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MEDIA"}, "Usage: MEDIA BREAKOUT <#chan> <room>");
@@ -6675,6 +6679,23 @@ pub const LinuxServer = struct {
             return;
         }
         try mediaNegotiatedReply(conn, channel, "ANSWER-ACK", negotiated.codecs, negotiated.fec);
+    }
+
+    /// `MEDIA STATS <#chan>` — per-participant transport state: ICE status and
+    /// relayed packet/byte counts, terminated by an end line.
+    fn mediaStats(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
+        var buf_stats: [64]media_plane_mod.MediaTransport.ParticipantStat = undefined;
+        const n = self.media_plane.statsForChannel(channel, &buf_stats);
+        for (buf_stats[0..n]) |s| {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} ice={s} rx_pkts={d} rx_bytes={d}\r\n", .{
+                server_name, channel, s.name(), if (s.connected) "connected" else "pending", s.rx_packets, s.rx_bytes,
+            }) catch continue;
+            try appendToConn(conn, line);
+        }
+        var end_buf: [default_reply_bytes]u8 = undefined;
+        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of media stats ({d})\r\n", .{ server_name, channel, n }) catch return;
+        try appendToConn(conn, end);
     }
 
     fn mediaRoster(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
