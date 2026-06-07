@@ -35,12 +35,15 @@ pub const AeadAlg = enum {
     chacha20_poly1305,
     /// AES-256-GCM (allowed when both peers advertise hardware support).
     aes256_gcm,
+    /// AES-128-GCM (the default GCM suite for TLS 1.2/1.3; 16-byte key).
+    aes128_gcm,
 
     /// The backing std.crypto type for this algorithm.
     fn Impl(comptime alg: AeadAlg) type {
         return switch (alg) {
             .chacha20_poly1305 => std.crypto.aead.chacha_poly.ChaCha20Poly1305,
             .aes256_gcm => std.crypto.aead.aes_gcm.Aes256Gcm,
+            .aes128_gcm => std.crypto.aead.aes_gcm.Aes128Gcm,
         };
     }
 };

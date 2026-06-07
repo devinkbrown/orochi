@@ -6,6 +6,8 @@ pub const aead_kat = @import("aead_kat.zig");
 pub const aead_stream = @import("aead_stream.zig");
 pub const age = @import("age.zig");
 pub const cose = @import("cose.zig");
+pub const ecdh_p256 = @import("ecdh_p256.zig");
+pub const ecdsa_p256 = @import("ecdsa_p256.zig");
 pub const ed25519_batch = @import("ed25519_batch.zig");
 pub const hash = @import("hash.zig");
 pub const hash_kat = @import("hash_kat.zig");
@@ -52,6 +54,8 @@ test {
     _ = aead_stream;
     _ = age;
     _ = cose;
+    _ = ecdh_p256;
+    _ = ecdsa_p256;
     _ = ed25519_batch;
     _ = hash;
     _ = hash_kat;
