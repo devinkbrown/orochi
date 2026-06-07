@@ -22,6 +22,9 @@ const Allocator = std.mem.Allocator;
 pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const NodeId = gossip_round.NodeId;
 pub const MemberInfo = route_table.Member;
+pub const RelayMessage = message_relay.RelayMessage;
+pub const InboundMessage = message_relay.Owned;
+pub const RelayVerb = message_relay.Verb;
 
 const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 const handshake_version: u8 = 1;
@@ -110,6 +113,11 @@ pub const S2sPeer = struct {
     ping_rx_count: usize = 0,
     pong_rx_count: usize = 0,
     config: Config,
+    /// Inbound cross-node user messages decoded from MESSAGE frames, awaiting the
+    /// daemon to drain + deliver to local clients (the daemon owns delivery; the
+    /// peer driver stays substrate-pure). Loop-guarded by `seen`.
+    inbound: std.ArrayListUnmanaged(message_relay.Owned) = .empty,
+    seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
         const server_name = try options.allocator.dupe(u8, options.server_name);
@@ -156,10 +164,14 @@ pub const S2sPeer = struct {
             .description = description,
             .channel_name = channel_name,
             .config = options.config,
+            .seen = message_relay.SeenSet.init(options.allocator, 1024),
         };
     }
 
     pub fn deinit(self: *S2sPeer) void {
+        for (self.inbound.items) |*owned| owned.deinit(self.allocator);
+        self.inbound.deinit(self.allocator);
+        self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
         self.allocator.free(self.description);
@@ -262,14 +274,38 @@ pub const S2sPeer = struct {
             .PONG => self.pong_rx_count += 1,
             .QUIT => self.closeRemote(),
             .MEMBERSHIP => try self.recvMembership(frame.payload),
-            // Cross-node user message: full deliver/forward wiring lands in the
-            // task-#63 routing commit; recognized here so the frame stream stays
-            // in sync (decode-validate then drop until the inbound queue lands).
-            .MESSAGE => {
-                var owned = message_relay.decode(self.allocator, frame.payload) catch return;
-                owned.deinit(self.allocator);
-            },
+            .MESSAGE => try self.recvMessage(frame.payload),
         }
+    }
+
+    /// Decode an inbound cross-node MESSAGE and queue it for the daemon to
+    /// deliver locally. Loop-guarded by (origin_node, hlc): a duplicate that has
+    /// already traversed this node is dropped (never re-queued/re-forwarded). A
+    /// malformed payload is dropped, never fatal to the link.
+    fn recvMessage(self: *S2sPeer, payload: []const u8) !void {
+        var owned = message_relay.decode(self.allocator, payload) catch return;
+        if (self.seen.observe(owned.msg.origin_node, owned.msg.hlc)) {
+            owned.deinit(self.allocator); // duplicate — already seen
+            return;
+        }
+        self.inbound.append(self.allocator, owned) catch {
+            owned.deinit(self.allocator);
+        };
+    }
+
+    /// Emit a cross-node user message to this peer. Records it in the loop-guard
+    /// so an echo back is dropped. Best-effort; only meaningful once established.
+    pub fn sendMessage(self: *S2sPeer, sink: ByteSink, msg: message_relay.RelayMessage) !void {
+        _ = self.seen.observe(msg.origin_node, msg.hlc);
+        const wire = try message_relay.encode(self.allocator, msg);
+        defer self.allocator.free(wire);
+        try emitFrame(self.allocator, sink, .MESSAGE, wire);
+    }
+
+    /// Transfer ownership of all queued inbound messages to the caller, which
+    /// must `deinit` each `Owned` and free the returned slice. Resets the queue.
+    pub fn takeInbound(self: *S2sPeer) ![]message_relay.Owned {
+        return self.inbound.toOwnedSlice(self.allocator);
     }
 
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A

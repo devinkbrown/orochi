@@ -177,6 +177,17 @@ pub const S2sLink = struct {
     pub fn channelMembers(self: *const S2sLink, channel: []const u8) []const s2s_peer.MemberInfo {
         return self.peer.channelMembers(channel);
     }
+
+    /// Forward a cross-node user message (PRIVMSG/NOTICE/TAGMSG) to the peer.
+    pub fn sendMessage(self: *S2sLink, msg: s2s_peer.RelayMessage) !void {
+        try self.peer.sendMessage(self.sink(), msg);
+    }
+
+    /// Drain inbound cross-node messages decoded from this peer. Caller owns the
+    /// returned slice + each Owned (deinit each, free the slice).
+    pub fn takeInbound(self: *S2sLink) ![]s2s_peer.InboundMessage {
+        return self.peer.takeInbound();
+    }
 };
 
 test "two links handshake and converge over a byte loopback" {
