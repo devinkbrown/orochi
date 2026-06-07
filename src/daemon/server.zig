@@ -1755,6 +1755,20 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// True if any S2S peer link (secured or plaintext) is established — used to
+    /// decide whether an unknown-local nick might be reachable across the mesh.
+    fn hasEstablishedPeer(self: *LinuxServer) bool {
+        for (self.clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |l| {
+                if (l.established()) return true;
+            } else if (slot.value.s2s) |l| {
+                if (l.established()) return true;
+            }
+        }
+        return false;
+    }
+
     /// Deliver an inbound relayed user message to LOCAL recipients (channel
     /// members or a local nick), then re-forward to other peers for multi-hop
     /// (loop-guarded by the per-peer seen-set + origin id).
@@ -7236,6 +7250,32 @@ pub const LinuxServer = struct {
         }
 
         const recipient = self.world.findNick(target) orelse {
+            // Not local: relay to mesh peers so the node that owns this nick can
+            // deliver (loop-guarded; a truly-nonexistent nick is dropped far-side).
+            if (self.hasEstablishedPeer()) {
+                var pbuf2: [320]u8 = undefined;
+                if (clientPrefix(conn, &pbuf2)) |prefix| {
+                    const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+                    _ = self.relay_seen.observe(self.config.node_id, hlc);
+                    self.relayToPeers(.{
+                        .verb = if (is_notice) .notice else .privmsg,
+                        .target = target,
+                        .source_nick = conn.session.displayName(),
+                        .source_prefix = prefix,
+                        .account = conn.session.account() orelse "",
+                        .tags = client_tags orelse "",
+                        .text = text,
+                        .origin_node = self.config.node_id,
+                        .hlc = hlc,
+                    });
+                    if (echo) {
+                        var et_buf: [40]u8 = undefined;
+                        const etags = MsgTags{ .time_value = serverTimeValue(&et_buf), .account = conn.session.account(), .client_tags = client_tags };
+                        self.deliverTagged(id, etags, msg) catch {};
+                    }
+                    return;
+                } else |_| {}
+            }
             if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
             return;
         };
