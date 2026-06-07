@@ -5,13 +5,28 @@
 //! daemon work: module metadata is validated at comptime, command and hook
 //! tables are generated once, and dispatch is a small table scan over immutable
 //! declarations.
+//!
+//! Hooks are typed: each `HookId` maps to a concrete payload struct via
+//! `HookPayload`, and `callHook` is parameterized by the comptime id. Veto-
+//! capable phases carry a mutable `approved: bool` an early hook can flip to
+//! `false`, while still honoring stop-on-veto ordering semantics.
 const std = @import("std");
 
 /// Command handler used by registry dispatch.
 pub const CommandHandler = *const fn (ctx: *anyopaque, invocation: CommandInvocation) anyerror!void;
 
-/// Hook handler used by registry hook dispatch.
+/// Hook handler used by registry hook dispatch. The handler is type-erased at
+/// the registry boundary (matching command handlers); `callHook` reconstitutes
+/// the concrete `*HookPayload(id)` for the caller.
 pub const HookHandler = *const fn (ctx: *anyopaque, payload: *anyopaque) anyerror!HookResult;
+
+/// Lifecycle callback for fallible module phases (register/init/ready/reload).
+/// The ctx is `*anyopaque` so the registry stays decoupled from `module_core`;
+/// the daemon passes a `*Core` and casts inside the module's handler.
+pub const LifecycleFn = *const fn (ctx: *anyopaque) anyerror!void;
+
+/// Lifecycle callback for teardown, which must not fail.
+pub const DeinitFn = *const fn (ctx: *anyopaque) void;
 
 /// A parsed command invocation passed to command handlers.
 pub const CommandInvocation = struct {
@@ -53,6 +68,136 @@ pub const ModeClass = enum {
     user,
 };
 
+/// Typed hook identifiers. Each id has a payload type via `HookPayload`.
+pub const HookId = enum {
+    client_pre_register,
+    client_registered,
+    client_quit,
+    channel_pre_join,
+    channel_joined,
+    channel_part,
+    message_pre_deliver,
+    nick_pre_change,
+    nick_changed,
+    oper_elevated,
+    config_reloaded,
+    upgrade_capsule_export,
+    upgrade_capsule_import,
+};
+
+// --- Hook payload structs -------------------------------------------------
+//
+// Veto-capable phases carry `approved: bool = true`; an early hook flips it to
+// `false` and typically returns `.stop` to halt the chain. Payloads stay small
+// and explicit so dispatch can hand back a concrete `*Payload` to handlers.
+
+/// `client_pre_register` payload. Veto-capable: deny registration.
+pub const ClientPreRegisterPayload = struct {
+    client_id: u64,
+    nick: []const u8 = "",
+    user: []const u8 = "",
+    host: []const u8 = "",
+    approved: bool = true,
+};
+
+/// `client_registered` payload. Informational.
+pub const ClientRegisteredPayload = struct {
+    client_id: u64,
+    nick: []const u8 = "",
+};
+
+/// `client_quit` payload. Informational.
+pub const ClientQuitPayload = struct {
+    client_id: u64,
+    reason: []const u8 = "",
+};
+
+/// `channel_pre_join` payload. Veto-capable: deny the join.
+pub const ChannelPreJoinPayload = struct {
+    client_id: u64,
+    channel: []const u8,
+    key: ?[]const u8 = null,
+    approved: bool = true,
+};
+
+/// `channel_joined` payload. Informational.
+pub const ChannelJoinedPayload = struct {
+    client_id: u64,
+    channel: []const u8,
+};
+
+/// `channel_part` payload. Informational.
+pub const ChannelPartPayload = struct {
+    client_id: u64,
+    channel: []const u8,
+    reason: []const u8 = "",
+};
+
+/// `message_pre_deliver` payload. Veto-capable: drop the message.
+pub const MessagePreDeliverPayload = struct {
+    source_id: u64,
+    target: []const u8,
+    text: []const u8,
+    approved: bool = true,
+};
+
+/// `nick_pre_change` payload. Veto-capable: deny the rename.
+pub const NickPreChangePayload = struct {
+    client_id: u64,
+    old_nick: []const u8,
+    new_nick: []const u8,
+    approved: bool = true,
+};
+
+/// `nick_changed` payload. Informational.
+pub const NickChangedPayload = struct {
+    client_id: u64,
+    old_nick: []const u8,
+    new_nick: []const u8,
+};
+
+/// `oper_elevated` payload. Informational.
+pub const OperElevatedPayload = struct {
+    client_id: u64,
+    oper_name: []const u8 = "",
+};
+
+/// `config_reloaded` payload. Informational.
+pub const ConfigReloadedPayload = struct {
+    generation: u64 = 0,
+};
+
+/// `upgrade_capsule_export` payload. Lets modules serialize state on drain.
+pub const UpgradeCapsuleExportPayload = struct {
+    capsule_version: u32 = 0,
+    bytes_written: usize = 0,
+};
+
+/// `upgrade_capsule_import` payload. Lets modules restore state on launch.
+pub const UpgradeCapsuleImportPayload = struct {
+    capsule_version: u32 = 0,
+    bytes_read: usize = 0,
+};
+
+/// Map a `HookId` to a mutable pointer to its concrete payload type.
+pub fn HookPayload(comptime id: HookId) type {
+    return switch (id) {
+        .client_pre_register => *ClientPreRegisterPayload,
+        .client_registered => *ClientRegisteredPayload,
+        .client_quit => *ClientQuitPayload,
+        .channel_pre_join => *ChannelPreJoinPayload,
+        .channel_joined => *ChannelJoinedPayload,
+        .channel_part => *ChannelPartPayload,
+        .message_pre_deliver => *MessagePreDeliverPayload,
+        .nick_pre_change => *NickPreChangePayload,
+        .nick_changed => *NickChangedPayload,
+        .oper_elevated => *OperElevatedPayload,
+        .config_reloaded => *ConfigReloadedPayload,
+        .upgrade_capsule_export => *UpgradeCapsuleExportPayload,
+        .upgrade_capsule_import => *UpgradeCapsuleImportPayload,
+    };
+}
+
 /// Command declaration exported by a module.
 pub const CommandSpec = struct {
     name: []const u8,
@@ -60,9 +205,10 @@ pub const CommandSpec = struct {
     handler: CommandHandler,
 };
 
-/// Hook binding exported by a module.
+/// Hook binding exported by a module. `hook` is a typed `HookId`; the handler
+/// stays type-erased at the registry boundary.
 pub const HookBinding = struct {
-    hook: []const u8,
+    hook: HookId,
     priority: HookPriority = .normal,
     handler: HookHandler,
 };
@@ -97,11 +243,45 @@ pub const ISupportSpec = struct {
     value: ?[]const u8 = null,
 };
 
-/// Complete comptime module declaration.
+/// Semantic version exported by a module.
+pub const Version = struct {
+    major: u16 = 0,
+    minor: u16 = 0,
+    patch: u16 = 0,
+};
+
+/// Functional category for inventory and ordering documentation.
+pub const Category = enum {
+    core,
+    protocol,
+    service,
+    security,
+    feature,
+    media,
+    diagnostic,
+};
+
+/// Module init/dispatch ordering preference. Lower values are earlier.
+pub const Priority = enum(u8) {
+    first = 0,
+    early = 1,
+    normal = 2,
+    late = 3,
+    last = 4,
+};
+
+/// Complete comptime module declaration. Every field beyond `id` has a default
+/// so existing module literals keep compiling as the schema grows.
 pub const Module = struct {
     id: []const u8,
+    version: Version = .{},
+    category: Category = .feature,
+    priority: Priority = .normal,
+
     requires: []const []const u8 = &.{},
+    optional_requires: []const []const u8 = &.{},
     conflicts: []const []const u8 = &.{},
+    config_blocks: []const []const u8 = &.{},
 
     commands: []const CommandSpec = &.{},
     hooks: []const HookBinding = &.{},
@@ -110,6 +290,13 @@ pub const Module = struct {
     usermodes: []const UserModeSpec = &.{},
     numerics: []const NumericSpec = &.{},
     isupport: []const ISupportSpec = &.{},
+
+    // Lifecycle hooks. The daemon passes a `*Core` as the `*anyopaque` ctx.
+    on_register: ?LifecycleFn = null,
+    on_init: ?LifecycleFn = null,
+    on_ready: ?LifecycleFn = null,
+    on_reload: ?LifecycleFn = null,
+    on_deinit: ?DeinitFn = null,
 };
 
 /// Validation failure kind used by tests and by Registry compile errors.
@@ -117,6 +304,7 @@ pub const ValidationKind = enum {
     duplicate_module,
     missing_dependency,
     module_conflict,
+    dependency_cycle,
     duplicate_command,
     duplicate_cap,
     duplicate_channel_mode,
@@ -180,6 +368,10 @@ pub fn validate(comptime mods: []const Module) ?ValidationError {
                 };
             }
         }
+    }
+
+    if (findDependencyCycle(mods)) |cycle| {
+        return cycle;
     }
 
     for (mods, 0..) |module, module_index| {
@@ -294,14 +486,19 @@ pub fn Registry(comptime mods: []const Module) type {
             return .handled;
         }
 
+        /// Fire all bindings for `id` in priority order (ties by module order),
+        /// stopping early when a handler returns `.stop`. The caller passes a
+        /// `HookPayload(id)` (a typed pointer); it is type-erased only across
+        /// the registry boundary and handled back to each handler.
         pub fn callHook(
-            comptime hook: []const u8,
+            comptime id: HookId,
             ctx: *anyopaque,
-            payload: *anyopaque,
+            payload: HookPayload(id),
         ) anyerror!HookResult {
+            const erased: *anyopaque = @ptrCast(payload);
             inline for (hooks) |entry| {
-                if (std.mem.eql(u8, entry.binding.hook, hook)) {
-                    const result = try entry.binding.handler(ctx, payload);
+                if (entry.binding.hook == id) {
+                    const result = try entry.binding.handler(ctx, erased);
                     if (result == .stop) return .stop;
                 }
             }
@@ -315,6 +512,7 @@ fn validationMessage(comptime err: ValidationError) []const u8 {
         .duplicate_module => "SerpentRegistry: duplicate module id",
         .missing_dependency => "SerpentRegistry: missing required module",
         .module_conflict => "SerpentRegistry: conflicting modules selected",
+        .dependency_cycle => "SerpentRegistry: dependency cycle in module requires",
         .duplicate_command => "SerpentRegistry: duplicate command name",
         .duplicate_cap => "SerpentRegistry: duplicate capability name",
         .duplicate_channel_mode => "SerpentRegistry: duplicate channel mode letter",
@@ -328,6 +526,55 @@ fn hasModule(comptime mods: []const Module, id: []const u8) bool {
         if (std.mem.eql(u8, module.id, id)) return true;
     }
     return false;
+}
+
+fn moduleIndex(comptime mods: []const Module, id: []const u8) ?usize {
+    for (mods, 0..) |module, index| {
+        if (std.mem.eql(u8, module.id, id)) return index;
+    }
+    return null;
+}
+
+/// Detect a cycle in the `requires` graph via DFS with three-color marking.
+/// Returns a `dependency_cycle` ValidationError naming a module on the cycle.
+/// Assumes all `requires` resolve (missing deps are caught earlier).
+fn findDependencyCycle(comptime mods: []const Module) ?ValidationError {
+    const n = mods.len;
+    // 0 = unvisited (white), 1 = on stack (gray), 2 = done (black).
+    var color = [_]u8{0} ** n;
+
+    for (mods, 0..) |_, start| {
+        if (color[start] != 0) continue;
+        if (visitForCycle(mods, start, &color)) |found| {
+            return .{
+                .kind = .dependency_cycle,
+                .module_id = mods[found].id,
+                .name = mods[found].id,
+            };
+        }
+    }
+    return null;
+}
+
+/// DFS helper: returns the index of a module that closes a back-edge (cycle),
+/// or null if the subtree rooted at `node` is acyclic.
+fn visitForCycle(
+    comptime mods: []const Module,
+    node: usize,
+    color: []u8,
+) ?usize {
+    color[node] = 1; // gray
+    for (mods[node].requires) |required| {
+        const dep = moduleIndex(mods, required) orelse continue;
+        if (color[dep] == 1) {
+            return dep; // back-edge: dep is an ancestor on the stack
+        }
+        if (color[dep] == 0) {
+            if (visitForCycle(mods, dep, color)) |found| return found;
+        }
+    }
+    color[node] = 2; // black
+    return null;
 }
 
 fn findPriorCommand(
@@ -474,6 +721,7 @@ fn buildHookTable(comptime mods: []const Module) [countHooks(mods)]HookEntry {
         }
     }
 
+    // Stable insertion sort by priority; equal priorities keep module order.
     var sorted = 1;
     while (sorted < table.len) : (sorted += 1) {
         const item = table[sorted];
@@ -551,6 +799,8 @@ fn hookPrecedes(left: HookEntry, right: HookEntry) bool {
     return @intFromEnum(left.binding.priority) < @intFromEnum(right.binding.priority);
 }
 
+// --- Tests ----------------------------------------------------------------
+
 const TestCtx = struct {
     command_count: usize = 0,
     order: [8]u8 = undefined,
@@ -599,11 +849,13 @@ fn hookFour(ctx: *anyopaque, _: *anyopaque) anyerror!HookResult {
 
 const coreModule = Module{
     .id = "core",
+    .category = .core,
+    .version = .{ .major = 1 },
     .commands = &.{
         .{ .name = "PING", .min_params = 1, .handler = pingHandler },
     },
     .hooks = &.{
-        .{ .hook = "client.register", .priority = .normal, .handler = hookOne },
+        .{ .hook = .client_registered, .priority = .normal, .handler = hookOne },
     },
     .caps = &.{
         .{ .name = "server-time" },
@@ -624,13 +876,14 @@ const coreModule = Module{
 
 const capModule = Module{
     .id = "cap",
+    .category = .protocol,
     .requires = &.{"core"},
     .commands = &.{
         .{ .name = "PONG", .handler = pongHandler },
     },
     .hooks = &.{
-        .{ .hook = "client.register", .priority = .first, .handler = hookTwo },
-        .{ .hook = "client.register", .priority = .normal, .handler = hookThree },
+        .{ .hook = .client_registered, .priority = .first, .handler = hookTwo },
+        .{ .hook = .client_registered, .priority = .normal, .handler = hookThree },
     },
     .caps = &.{
         .{ .name = "message-tags" },
@@ -640,7 +893,7 @@ const capModule = Module{
 const lateModule = Module{
     .id = "late",
     .hooks = &.{
-        .{ .hook = "client.register", .priority = .late, .handler = hookFour },
+        .{ .hook = .client_registered, .priority = .late, .handler = hookFour },
     },
 };
 
@@ -680,9 +933,9 @@ test "registry checks command minimum parameters before calling handlers" {
 test "hooks fire in priority order with stable module-order ties" {
     const R = Registry(&.{ coreModule, capModule, lateModule });
     var ctx = TestCtx{};
-    var payload: u8 = 0;
+    var payload = ClientRegisteredPayload{ .client_id = 7 };
 
-    const result = try R.callHook("client.register", &ctx, &payload);
+    const result = try R.callHook(.client_registered, &ctx, &payload);
     try std.testing.expectEqual(HookResult.continue_, result);
     try std.testing.expectEqualSlices(u8, &.{ 2, 1, 3, 4 }, ctx.order[0..ctx.order_len]);
 }
@@ -695,4 +948,59 @@ test "validator recognizes duplicate command names without failing this file" {
     try std.testing.expect(std.ascii.eqlIgnoreCase("PING", err.name));
     try std.testing.expectEqualStrings("dupe", err.module_id);
     try std.testing.expectEqualStrings("core", err.other_module_id);
+}
+
+// Veto handlers for the typed-payload test. An early hook denies the join and
+// stops the chain; a later hook would have approved it but must not run.
+fn vetoJoinHandler(_: *anyopaque, payload: *anyopaque) anyerror!HookResult {
+    const join: *ChannelPreJoinPayload = @ptrCast(@alignCast(payload));
+    join.approved = false;
+    return .stop;
+}
+
+fn approveJoinHandler(_: *anyopaque, payload: *anyopaque) anyerror!HookResult {
+    const join: *ChannelPreJoinPayload = @ptrCast(@alignCast(payload));
+    join.approved = true;
+    return .continue_;
+}
+
+const vetoModule = Module{
+    .id = "veto",
+    .category = .security,
+    .hooks = &.{
+        .{ .hook = .channel_pre_join, .priority = .early, .handler = vetoJoinHandler },
+        .{ .hook = .channel_pre_join, .priority = .late, .handler = approveJoinHandler },
+    },
+};
+
+test "typed hook payload supports early veto with stop semantics" {
+    const R = Registry(&.{vetoModule});
+    var ctx = TestCtx{};
+    var payload = ChannelPreJoinPayload{ .client_id = 1, .channel = "#zig" };
+
+    const result = try R.callHook(.channel_pre_join, &ctx, &payload);
+    try std.testing.expectEqual(HookResult.stop, result);
+    // Early hook flipped approved=false; the late approver never ran.
+    try std.testing.expect(!payload.approved);
+}
+
+const cycleAlpha = Module{
+    .id = "alpha",
+    .requires = &.{"beta"},
+};
+
+const cycleBeta = Module{
+    .id = "beta",
+    .requires = &.{"alpha"},
+};
+
+test "validator detects a dependency cycle between two modules" {
+    const err = validate(&.{ cycleAlpha, cycleBeta }) orelse
+        return error.ExpectedDependencyCycle;
+
+    try std.testing.expectEqual(ValidationKind.dependency_cycle, err.kind);
+    // The named module sits on the cycle.
+    try std.testing.expect(
+        std.mem.eql(u8, "alpha", err.module_id) or std.mem.eql(u8, "beta", err.module_id),
+    );
 }

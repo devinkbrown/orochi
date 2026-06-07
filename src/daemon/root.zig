@@ -213,7 +213,13 @@ pub const world = @import("world.zig");
 pub const xp_levels = @import("xp_levels.zig");
 // gen:mods:end
 
+// Subsystem packages living in subdirectories (not scanned by genroots).
+pub const helix = @import("helix/root.zig");
+pub const module_manifest = @import("modules/manifest.zig");
+
 test {
+    _ = helix;
+    _ = module_manifest;
     // gen:tests:begin
     _ = ab_bucket;
     _ = accessibility_pref;
