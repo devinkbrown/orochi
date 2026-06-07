@@ -31,6 +31,7 @@ pub const bot_registry = @import("bot_registry.zig");
 pub const causal_trace = @import("causal_trace.zig");
 pub const cert_store = @import("cert_store.zig");
 pub const challenge_gate = @import("challenge_gate.zig");
+pub const chanfix = @import("chanfix.zig");
 pub const chanmode = @import("chanmode.zig");
 pub const channel_alias = @import("channel_alias.zig");
 pub const channel_ban_appeal = @import("channel_ban_appeal.zig");
@@ -261,6 +262,7 @@ test {
     _ = causal_trace;
     _ = cert_store;
     _ = challenge_gate;
+    _ = chanfix;
     _ = chanmode;
     _ = channel_alias;
     _ = channel_ban_appeal;

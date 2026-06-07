@@ -128,6 +128,7 @@ pub const kick = @import("kick.zig");
 pub const knock = @import("knock.zig");
 pub const labeled_batch = @import("labeled_batch.zig");
 pub const labeled_response = @import("labeled_response.zig");
+pub const leet_normalize = @import("leet_normalize.zig");
 pub const levenshtein = @import("levenshtein.zig");
 pub const limits_config = @import("limits_config.zig");
 pub const links_map = @import("links_map.zig");
@@ -400,6 +401,7 @@ test {
     _ = knock;
     _ = labeled_batch;
     _ = labeled_response;
+    _ = leet_normalize;
     _ = levenshtein;
     _ = limits_config;
     _ = links_map;
