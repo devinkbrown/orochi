@@ -81,6 +81,7 @@ const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
 const media_plane_mod = @import("media_plane.zig");
+const native_media_mod = @import("native_media_transport.zig");
 const tegami_mod = @import("tegami.zig");
 const transcript_mod = @import("transcript.zig");
 const announce_board_mod = @import("announce_board.zig");
@@ -708,6 +709,9 @@ pub const Config = struct {
     /// reflexive media candidate behind NAT; overrides media_host when it works.
     media_stun_host: []const u8 = "",
     media_stun_port: u16 = 0,
+    /// UDP port for the native media transport (our own OPVOX/OPVIS codec leg);
+    /// 0 = ephemeral. Bound on boot alongside the WebRTC/UDP media plane.
+    native_media_port: u16 = 0,
     backlog: u31 = 128,
     ring_entries: u16 = 32,
     /// Hard cap on concurrent connections. The client table reserves this many
@@ -984,6 +988,9 @@ pub const LinuxServer = struct {
     /// Media transport plane: UDP socket + ICE/STUN endpoint registry + pump
     /// thread. Started on boot (`start`), torn down on `deinit`.
     media_plane: media_plane_mod.MediaPlane,
+    /// Native media transport: UDP leg for our own OPVOX/OPVIS codec
+    /// (opcodec_frame datagrams). Started on boot, torn down on `deinit`.
+    native_media: native_media_mod.NativeMediaTransport,
     /// Tegami: per-account offline messages, delivered on next login.
     tegami: tegami_mod.TegamiBox,
     /// Per-channel live media transcript (speaker-tagged caption ring).
@@ -1083,6 +1090,7 @@ pub const LinuxServer = struct {
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
             .media_rooms = media_room.MediaRooms.init(allocator),
             .media_plane = media_plane_mod.MediaPlane.init(allocator),
+            .native_media = native_media_mod.NativeMediaTransport.init(allocator),
             .tegami = tegami_mod.TegamiBox.init(allocator),
             .transcript = transcript_mod.TranscriptLog.init(allocator),
             .oper_registry = config.oper_registry,
@@ -1105,6 +1113,16 @@ pub const LinuxServer = struct {
                 self.media_plane.stun_server = media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port) catch null;
             }
         }
+        // Bring the native media transport online (our own OPVOX/OPVIS codec
+        // leg). Independent of the WebRTC plane below; a bind failure logs and
+        // the daemon keeps serving IRC.
+        self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
+            std.debug.print("mizuchi: native media transport disabled ({s})\n", .{@errorName(e)});
+        };
+        if (self.native_media.port != 0) {
+            std.debug.print("mizuchi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
+        }
+
         // Bring the media transport plane online (bind UDP + pump thread). Media
         // is optional: a bind failure logs and the daemon keeps serving IRC.
         self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
@@ -1167,6 +1185,7 @@ pub const LinuxServer = struct {
         self.content_filter.deinit();
         self.media_rooms.deinit();
         self.media_plane.deinit();
+        self.native_media.deinit();
         self.tegami.deinit();
         self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
@@ -6483,6 +6502,7 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
             if (self.media_rooms.leaveAll(channel, nick)) {
                 self.media_plane.remove(channel, nick);
+                self.native_media.unregister(channel, nick);
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
                 if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel); // call ended
             } else try self.noticeTo(conn, "MEDIA: you are not in this call");
@@ -6547,6 +6567,7 @@ pub const LinuxServer = struct {
             if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
             if (self.media_rooms.leaveAll(entry.key_ptr.*, nick)) {
                 self.media_plane.remove(entry.key_ptr.*, nick);
+                self.native_media.unregister(entry.key_ptr.*, nick);
                 self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
                 if (self.media_rooms.room(entry.key_ptr.*) == null) _ = self.transcript.clearChannel(entry.key_ptr.*);
             }
@@ -6671,6 +6692,31 @@ pub const LinuxServer = struct {
             }) catch return;
             try appendToConn(conn, tline);
         }
+        // Native transport (our own OPVOX/OPVIS codec leg): register this caller
+        // for the channel's native call and advertise the candidate + the
+        // stream_id the client must stamp into its opcodec frames. Independent of
+        // the WebRTC plane above; best-effort (media is optional).
+        if (self.native_media.port != 0) {
+            const stream_id = nativeStreamId(channel, nick);
+            self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
+            var nbuf: [256]u8 = undefined;
+            const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=OPVOX/OPVIS\r\n", .{
+                server_name, channel, self.config.media_host, self.native_media.port, stream_id,
+            }) catch return;
+            try appendToConn(conn, nline);
+        }
+    }
+
+    /// Deterministic per-(channel,participant) opcodec stream id advertised to the
+    /// native client; it stamps this into every opcodec frame it publishes so the
+    /// SFU can map a frame back to its publisher. Never 0 (0 reads as "unset").
+    fn nativeStreamId(channel: []const u8, nick: []const u8) u32 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(channel);
+        hasher.update(":");
+        hasher.update(nick);
+        const v: u32 = @truncate(hasher.final());
+        return if (v == 0) 1 else v;
     }
 
     /// `MEDIA ANSWER <#chan> <codec[,codec...]>` — a later participant reconciles

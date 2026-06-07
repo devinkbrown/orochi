@@ -53,6 +53,9 @@ pub const Config = struct {
         s2s: u16 = 0,
         /// UDP port for the media (SFU) transport plane; 0 = ephemeral.
         media: u16 = 0,
+        /// UDP port for the native media transport (our OPVOX/OPVIS codec leg);
+        /// 0 = ephemeral.
+        native_media: u16 = 0,
         /// IP advertised to clients as the server media (ICE) candidate.
         media_host: []const u8 = "",
     };
@@ -199,6 +202,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.listen.webtransport = try portField(doc, "listen.webtransport", cfg.listen.webtransport);
     cfg.listen.s2s = try portField(doc, "listen.s2s", cfg.listen.s2s);
     cfg.listen.media = try portField(doc, "listen.media", cfg.listen.media);
+    cfg.listen.native_media = try portField(doc, "listen.native_media", cfg.listen.native_media);
     try setStr(allocator, resolver, doc.getString("listen.media_host"), &cfg.listen.media_host);
 
     // [mesh]

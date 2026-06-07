@@ -1,15 +1,19 @@
 //! Daemon-owned native media transport: the live UDP leg for Mizuchi's own
 //! codec (OPVOX/OPVIS). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
-//! carries `opcodec_frame` datagrams instead of RTP, and forwards them through
-//! `NativeMediaLink` (stream_id → publisher → recipients).
+//! carries `opcodec_frame` datagrams instead of RTP, and forwards them through a
+//! per-channel `NativeMediaLink` (stream_id → publisher → recipients).
+//!
+//! Per-channel isolation: each media call (channel) has its own `NativeMediaLink`
+//! so media never crosses between channels. A global `stream_id → channel` index
+//! lets the pump route an inbound datagram (which carries only a stream_id) to
+//! the right channel's link.
 //!
 //! The pump thread blocks on the socket (short recv timeout to observe the stop
-//! flag), and for each datagram that parses as an opcodec frame: learns the
-//! publisher's return address from the datagram origin, computes the SFU forward
-//! set, and resends the SAME opaque bytes to each recipient. The daemon's main
-//! thread registers/removes participants (on MEDIA OFFER / LEAVE) through the
-//! same mutex. The server NEVER encodes/decodes/transcodes — frames are forwarded
-//! verbatim.
+//! flag), and for each datagram that parses as an opcodec frame: routes by
+//! stream_id to the owning channel, learns the publisher's return address from
+//! the datagram origin, computes the SFU forward set, and resends the SAME opaque
+//! bytes to each recipient. The server NEVER encodes/decodes/transcodes — frames
+//! are forwarded verbatim.
 const std = @import("std");
 const native_media_link = @import("native_media_link.zig");
 const media_socket = @import("../substrate/media_socket.zig");
@@ -34,7 +38,12 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 pub const NativeMediaTransport = struct {
-    link: Link,
+    allocator: std.mem.Allocator,
+    /// channel name (owned key) -> that call's forward link.
+    channels: std.StringHashMapUnmanaged(Link) = .empty,
+    /// stream_id -> the channel key that owns the publisher (borrows a key from
+    /// `channels`, so it is only valid while that channel entry exists).
+    stream_index: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     socket: ?MediaSocket = null,
     mutex: std.atomic.Mutex = .unlocked,
     thread: ?std.Thread = null,
@@ -42,12 +51,16 @@ pub const NativeMediaTransport = struct {
     /// Bound local UDP port (0 until started); advertised to native clients.
     port: u16 = 0,
 
-    pub fn init() NativeMediaTransport {
-        return .{ .link = Link.init() };
+    pub fn init(allocator: std.mem.Allocator) NativeMediaTransport {
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *NativeMediaTransport) void {
         self.shutdown();
+        var it = self.channels.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.channels.deinit(self.allocator);
+        self.stream_index.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -90,9 +103,15 @@ pub const NativeMediaTransport = struct {
             const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
             // Require opcodec framing so the port is not an open UDP reflector.
             if (got.data.len < opcodec_frame.MIN_FRAME_WIRE_BYTES) continue;
+            const view = opcodec_frame.decode(got.data) catch continue;
 
             lockSpin(&self.mutex);
-            const n = self.link.inboundFrom(got.data, got.from, &targets);
+            var n: usize = 0;
+            if (self.stream_index.get(view.stream_id)) |chan| {
+                if (self.channels.getPtr(chan)) |link| {
+                    n = link.inboundFrom(got.data, got.from, &targets);
+                }
+            }
             self.mutex.unlock();
 
             for (targets[0..n]) |dst| sock.sendTo(dst, got.data);
@@ -101,39 +120,80 @@ pub const NativeMediaTransport = struct {
 
     // -- Main-thread registry operations (all under the mutex) --------------
 
-    /// Register/update a native participant for the call (MEDIA OFFER). `addr`
+    fn linkForChannel(self: *NativeMediaTransport, channel: []const u8) !*Link {
+        const gop = try self.channels.getOrPut(self.allocator, channel);
+        if (!gop.found_existing) {
+            const key = self.allocator.dupe(u8, channel) catch |e| {
+                _ = self.channels.remove(channel);
+                return e;
+            };
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = Link.init();
+        }
+        return gop.value_ptr;
+    }
+
+    /// Register/update a native participant in `channel` (MEDIA OFFER). `addr`
     /// may be a placeholder; the pump learns the real return path from the
-    /// participant's first datagram.
+    /// participant's first datagram. `stream_id` is what the publisher stamps
+    /// into its opcodec frames (advertised back to the client).
     pub fn register(
         self: *NativeMediaTransport,
+        channel: []const u8,
         id: []const u8,
         kind: MediaKind,
         stream_id: u32,
         addr: TransportAddress,
-    ) native_media_link.RegisterError!void {
+    ) !void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        return self.link.register(id, kind, stream_id, addr);
+        const link = try self.linkForChannel(channel);
+        try link.register(id, kind, stream_id, addr);
+        // Index stream_id -> channel key (borrow the map's stable key pointer).
+        const key = self.channels.getKey(channel).?;
+        try self.stream_index.put(self.allocator, stream_id, key);
     }
 
-    /// Remove a participant (MEDIA LEAVE / disconnect).
-    pub fn unregister(self: *NativeMediaTransport, id: []const u8) void {
+    /// Remove a participant from `channel` (MEDIA LEAVE / disconnect). Drops the
+    /// channel (and its stream-index entries) once the last participant leaves.
+    pub fn unregister(self: *NativeMediaTransport, channel: []const u8, id: []const u8) void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        self.link.unregister(id);
+        const link = self.channels.getPtr(channel) orelse return;
+        link.unregister(id);
+        if (link.count() != 0) return;
+
+        // Last participant gone: tear the channel down. Clear stream-index
+        // entries that borrow this channel's key BEFORE freeing the key.
+        const key = self.channels.getKey(channel).?;
+        var it = self.stream_index.iterator();
+        var doomed: [max_call_participants]u32 = undefined;
+        var dn: usize = 0;
+        while (it.next()) |e| {
+            if (e.value_ptr.*.ptr == key.ptr and dn < doomed.len) {
+                doomed[dn] = e.key_ptr.*;
+                dn += 1;
+            }
+        }
+        for (doomed[0..dn]) |sid| _ = self.stream_index.remove(sid);
+        _ = self.channels.remove(channel);
+        self.allocator.free(key);
     }
 
-    /// Set a receiver's simulcast spatial/temporal ceiling.
-    pub fn setSelection(self: *NativeMediaTransport, id: []const u8, sel: Selection) void {
+    /// Set a receiver's simulcast spatial/temporal ceiling within `channel`.
+    pub fn setSelection(self: *NativeMediaTransport, channel: []const u8, id: []const u8, sel: Selection) void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        self.link.setSelection(id, sel);
+        const link = self.channels.getPtr(channel) orelse return;
+        link.setSelection(id, sel);
     }
 
-    pub fn count(self: *NativeMediaTransport) usize {
+    /// Participant count in `channel` (0 if the channel has no native call).
+    pub fn countChannel(self: *NativeMediaTransport, channel: []const u8) usize {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        return self.link.count();
+        const link = self.channels.getPtr(channel) orelse return 0;
+        return link.count();
     }
 };
 
@@ -143,47 +203,90 @@ pub const NativeMediaTransport = struct {
 
 const testing = std.testing;
 
-test "NativeMediaTransport: pump learns sender + forwards an opcodec frame to the receiver" {
-    var nmt = NativeMediaTransport.init();
-    defer nmt.deinit();
-    try nmt.start(loopback_be, 0);
-
-    // Receiver socket (bob): the transport forwards to its bound address.
-    var bob = try MediaSocket.bind(loopback_be, 0);
-    defer bob.deinit();
-    bob.setRecvTimeoutMs(2000);
-    const bob_port = try bob.localPort();
-    const bob_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, bob_port);
-
-    // Sender socket (alice): registered with a placeholder addr; learned on send.
-    var alice = try MediaSocket.bind(loopback_be, 0);
-    defer alice.deinit();
-
-    try nmt.register("alice", .voice, 100, try TransportAddress.fromBytes(&[_]u8{ 0, 0, 0, 0 }, 0));
-    try nmt.register("bob", .voice, 200, bob_addr);
-
-    // Alice publishes one opcodec frame (stream_id 100) to the transport.
-    var fbuf: [64]u8 = undefined;
-    const flen = try opcodec_frame.encode(.{
+fn opframe(stream_id: u32, buf: []u8) []const u8 {
+    const n = opcodec_frame.encode(.{
         .band_id = opcodec_frame.MEDIA_BAND_FLOOR,
-        .stream_id = 100,
+        .stream_id = stream_id,
         .sequence = 1,
         .timestamp = 0,
         .keyframe = true,
         .codec = .opvox_audio,
         .payload = &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF },
-    }, &fbuf);
-    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, nmt.port);
-    alice.sendTo(server_addr, fbuf[0..flen]);
+    }, buf) catch unreachable;
+    return buf[0..n];
+}
 
-    // Bob receives the forwarded, verbatim frame.
+test "NativeMediaTransport: pump learns sender + forwards an opcodec frame to the receiver" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    try nmt.start(loopback_be, 0);
+
+    var bob = try MediaSocket.bind(loopback_be, 0);
+    defer bob.deinit();
+    bob.setRecvTimeoutMs(2000);
+    const bob_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try bob.localPort());
+
+    var alice = try MediaSocket.bind(loopback_be, 0);
+    defer alice.deinit();
+
+    try nmt.register("#call", "alice", .voice, 100, .{});
+    try nmt.register("#call", "bob", .voice, 200, bob_addr);
+
+    var fbuf: [64]u8 = undefined;
+    const frame = opframe(100, &fbuf);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, nmt.port);
+    alice.sendTo(server_addr, frame);
+
     var rbuf: [media_socket.max_datagram]u8 = undefined;
     const got = bob.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualSlices(u8, fbuf[0..flen], got.data);
+    try testing.expectEqualSlices(u8, frame, got.data);
+}
+
+test "NativeMediaTransport: media never crosses channels" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    try nmt.start(loopback_be, 0);
+
+    // A listener registered in a DIFFERENT channel must never receive the frame.
+    var other = try MediaSocket.bind(loopback_be, 0);
+    defer other.deinit();
+    other.setRecvTimeoutMs(400);
+    const other_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try other.localPort());
+
+    var alice = try MediaSocket.bind(loopback_be, 0);
+    defer alice.deinit();
+
+    try nmt.register("#a", "alice", .voice, 100, .{});
+    try nmt.register("#b", "eve", .voice, 999, other_addr); // different channel
+
+    var fbuf: [64]u8 = undefined;
+    const frame = opframe(100, &fbuf);
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, nmt.port);
+    alice.sendTo(server_addr, frame);
+
+    var rbuf: [media_socket.max_datagram]u8 = undefined;
+    try testing.expect(other.recvFrom(&rbuf) == null); // eve hears nothing
+}
+
+test "NativeMediaTransport: unregister drops the channel and frees its index" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+
+    try nmt.register("#call", "alice", .voice, 100, .{});
+    try nmt.register("#call", "bob", .voice, 200, .{});
+    try testing.expectEqual(@as(usize, 2), nmt.countChannel("#call"));
+
+    nmt.unregister("#call", "alice");
+    try testing.expectEqual(@as(usize, 1), nmt.countChannel("#call"));
+    nmt.unregister("#call", "bob");
+    try testing.expectEqual(@as(usize, 0), nmt.countChannel("#call"));
+    // channel torn down; re-registering works cleanly (no stale key/index)
+    try nmt.register("#call", "carol", .voice, 300, .{});
+    try testing.expectEqual(@as(usize, 1), nmt.countChannel("#call"));
 }
 
 test "NativeMediaTransport: start/shutdown is clean and re-startable" {
-    var nmt = NativeMediaTransport.init();
+    var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
     try testing.expect(nmt.port != 0);

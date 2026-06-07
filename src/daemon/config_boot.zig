@@ -21,6 +21,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
     if (cfg.listen.media != 0) out.media_port = cfg.listen.media;
+    if (cfg.listen.native_media != 0) out.native_media_port = cfg.listen.native_media;
     if (cfg.listen.media_host.len != 0) out.media_host = cfg.listen.media_host;
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
