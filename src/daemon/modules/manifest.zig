@@ -8,12 +8,30 @@
 const registry = @import("../registry.zig");
 
 const query_info = @import("query_info.zig");
+const channel_ops = @import("channel_ops.zig");
+const messaging = @import("messaging.zig");
+const accounts = @import("accounts.zig");
+const ircx = @import("ircx.zig");
+const oper_security = @import("oper_security.zig");
+const user_query = @import("user_query.zig");
+const feature_misc = @import("feature_misc.zig");
 
 /// The enabled module set. Order is load/dispatch order for ties.
 pub const enabled = [_]registry.Module{
     query_info.module,
+    channel_ops.module,
+    messaging.module,
+    accounts.module,
+    ircx.module,
+    oper_security.module,
+    user_query.module,
+    feature_misc.module,
 };
 
 /// Comptime-assembled + comptime-validated live registry. Referencing `Live`
-/// from the server forces the validation to run at build time.
-pub const Live = registry.Registry(&enabled);
+/// from the server forces the validation to run at build time. The branch quota
+/// is raised because validation is O(commands^2) over the full command set.
+pub const Live = blk: {
+    @setEvalBranchQuota(200_000);
+    break :blk registry.Registry(&enabled);
+};
