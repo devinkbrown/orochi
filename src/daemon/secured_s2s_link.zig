@@ -130,6 +130,11 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.remoteName() else "";
     }
 
+    /// Which node (if known) owns `nick`, per this peer's route table.
+    pub fn routeNickNode(self: *const SecuredLink, nick: []const u8) ?u64 {
+        return if (self.inner) |l| l.routeNickNode(nick) else null;
+    }
+
     /// Announce a local member to the peer over the secured CRDT link (no-op until
     /// established). Outbound bytes accumulate in `out`.
     pub fn sendMembership(self: *SecuredLink, channel: []const u8, nick: []const u8, status: u4, hlc: u64, present: bool) anyerror!void {

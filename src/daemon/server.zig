@@ -1737,22 +1737,49 @@ pub const LinuxServer = struct {
     /// Forward a cross-node user message to every established S2S peer except
     /// `skip`. Loop-guarded per-peer by (origin_node, hlc). Best-effort: a full
     /// link buffer never faults the local delivery that triggered it.
-    fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
+    /// Which peers a relayed message should go to, narrowed via route_table so we
+    /// don't broadcast every message to the whole mesh.
+    const RelayScope = union(enum) {
+        all,
+        channel: []const u8, // only peers that announced members of this channel
+        nick: []const u8, // only the peer whose route_table owns this nick
+    };
+
+    /// Forward a relayed message to the peers selected by `scope`. Returns the
+    /// number of peer links it was sent to (so callers can fall back to a wider
+    /// scope when a targeted route is not yet known).
+    fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage, scope: RelayScope) usize {
+        var sent: usize = 0;
         for (self.clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             const c = &slot.value;
             if (c.s2s_secured) |link| {
                 if (!link.established()) continue;
+                if (!relayWanted(link, scope)) continue;
                 link.sendMessage(msg) catch continue;
                 self.flushS2sOutbound(c, link.outbound()) catch continue;
                 link.clearOutbound();
+                sent += 1;
             } else if (c.s2s) |link| {
                 if (!link.established()) continue;
+                if (!relayWanted(link, scope)) continue;
                 link.sendMessage(msg) catch continue;
                 self.flushS2sOutbound(c, link.outbound()) catch continue;
                 link.clearOutbound();
+                sent += 1;
             }
         }
+        return sent;
+    }
+
+    /// Per-link scope test (duck-typed over S2sLink / SecuredLink — both expose
+    /// channelMembers + routeNickNode).
+    fn relayWanted(link: anytype, scope: RelayScope) bool {
+        return switch (scope) {
+            .all => true,
+            .channel => |ch| link.channelMembers(ch).len > 0,
+            .nick => |nk| link.routeNickNode(nk) != null,
+        };
     }
 
     /// True if any S2S peer link (secured or plaintext) is established — used to
@@ -1801,8 +1828,15 @@ pub const LinuxServer = struct {
         } else if (self.world.findNick(msg.target)) |wid| {
             self.deliver(clientIdFromWorld(wid), line) catch {};
         }
-        // Multi-hop re-forward to all peers (global seen-set already deduped).
-        self.relayToPeers(msg);
+        // Multi-hop re-forward, scoped via route_table (global seen-set already
+        // deduped, so re-forwarding the source link is harmless).
+        const scope: RelayScope = if (world_model.isChannelName(msg.target))
+            .{ .channel = msg.target }
+        else
+            .{ .nick = msg.target };
+        if (self.relayToPeers(msg, scope) == 0 and !world_model.isChannelName(msg.target)) {
+            _ = self.relayToPeers(msg, .all); // unknown nick route → widen for multi-hop
+        }
     }
 
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
@@ -7230,7 +7264,7 @@ pub const LinuxServer = struct {
                 if (clientPrefix(conn, &pbuf)) |prefix| {
                     const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
                     _ = self.relay_seen.observe(self.config.node_id, hlc); // drop an echo back
-                    self.relayToPeers(.{
+                    _ = self.relayToPeers(.{
                         .verb = if (is_notice) .notice else .privmsg,
                         .target = chan,
                         .source_nick = conn.session.displayName(),
@@ -7240,7 +7274,7 @@ pub const LinuxServer = struct {
                         .text = text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
-                    });
+                    }, .{ .channel = chan }); // route_table: only peers with members
                 } else |_| {}
             }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare
@@ -7257,7 +7291,7 @@ pub const LinuxServer = struct {
                 if (clientPrefix(conn, &pbuf2)) |prefix| {
                     const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
                     _ = self.relay_seen.observe(self.config.node_id, hlc);
-                    self.relayToPeers(.{
+                    const relay_msg = s2s_link.RelayMessage{
                         .verb = if (is_notice) .notice else .privmsg,
                         .target = target,
                         .source_nick = conn.session.displayName(),
@@ -7267,7 +7301,12 @@ pub const LinuxServer = struct {
                         .text = text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
-                    });
+                    };
+                    // route_table: send only to the peer that owns this nick; if the
+                    // route isn't known yet, fall back to flooding all peers.
+                    if (self.relayToPeers(relay_msg, .{ .nick = target }) == 0) {
+                        _ = self.relayToPeers(relay_msg, .all);
+                    }
                     if (echo) {
                         var et_buf: [40]u8 = undefined;
                         const etags = MsgTags{ .time_value = serverTimeValue(&et_buf), .account = conn.session.account(), .client_tags = client_tags };
