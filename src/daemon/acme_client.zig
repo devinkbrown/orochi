@@ -1,0 +1,740 @@
+//! ACME (RFC 8555) certificate-issuance orchestration state machine.
+//!
+//! Conductor for a Let's Encrypt http-01 issuance flow. Owns no sockets, clock,
+//! or RNG: every interaction is injected. The caller calls `step` repeatedly;
+//! each call advances the machine by one round-trip (or one local decision) and
+//! returns a `Progress` plus zero-or-more `Effect`s the caller must act on (serve
+//! an http-01 token, write the issued certificate).
+//!
+//! Flow (RFC 8555 §7): directory -> newNonce -> newAccount -> newOrder(domains)
+//! -> per authorization: GET authz, pick http-01, provision key-auth, POST
+//! challenge, poll until valid -> finalize with CSR -> poll order -> download.
+//!
+//! Injection: `Transport` (ctx + `get`/`postJws` fn pointers returning
+//! `HttpResponse`); `Signer` (ctx + `sign(signing_input) -> signature`). The
+//! machine builds the JWS header/signing-input and frames the flattened JWS; it
+//! never touches a private key. The Replay-Nonce on each response is threaded
+//! into the next signed request, with `badNonce` recovery.
+//!
+//! Pure, 64-bit, allocator-clean (no leaks under std.testing.allocator).
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const directory = @import("../proto/acme_directory.zig");
+const order_mod = @import("../proto/acme_order.zig");
+const account_mod = @import("../proto/acme_account.zig");
+const jws = @import("../proto/acme_jws.zig");
+const jwk = @import("../proto/acme_jwk.zig");
+const challenge = @import("../proto/acme_challenge.zig");
+const csr = @import("../proto/csr.zig");
+const problem = @import("../proto/acme_problem.zig");
+
+comptime {
+    if (@bitSizeOf(usize) != 64) @compileError("acme_client requires a 64-bit target");
+}
+
+/// Upper bound on how many times a single signed request is retried after a
+/// `badNonce` rejection before the machine gives up. RFC 8555 only ever expects
+/// one retry, but we allow a small margin.
+const max_nonce_retries: u8 = 3;
+
+/// The http-01 challenge type token used to select a challenge from an authz.
+const http01_type = "http-01";
+
+/// JOSE `alg` value for Ed25519 account keys (RFC 8037).
+const jose_alg = "EdDSA";
+
+// ---------------------------------------------------------------------------
+// Injected I/O surfaces
+// ---------------------------------------------------------------------------
+
+/// A single HTTP response from the transport. Slices are borrowed for the
+/// duration of one `step`; the machine copies anything it must retain. `nonce`
+/// is the `Replay-Nonce` header, `location` the `Location` header (account kid /
+/// order URL), each null when absent.
+pub const HttpResponse = struct {
+    status: u16,
+    body: []const u8,
+    nonce: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+};
+
+/// Injected HTTP transport. `get` does a plain GET; `postJws` POSTs a flattened
+/// JWS body. Implementations populate `nonce`/`location` from headers.
+pub const Transport = struct {
+    ctx: *anyopaque,
+    getFn: *const fn (ctx: *anyopaque, url: []const u8) anyerror!HttpResponse,
+    postJwsFn: *const fn (ctx: *anyopaque, url: []const u8, jws_body: []const u8) anyerror!HttpResponse,
+
+    fn get(self: Transport, url: []const u8) anyerror!HttpResponse {
+        return self.getFn(self.ctx, url);
+    }
+
+    fn postJws(self: Transport, url: []const u8, body: []const u8) anyerror!HttpResponse {
+        return self.postJwsFn(self.ctx, url, body);
+    }
+};
+
+/// Injected signer. `sign` receives the JWS signing input and writes the raw
+/// signature (Ed25519: 64 bytes) into `out`, returning the populated slice.
+pub const Signer = struct {
+    ctx: *anyopaque,
+    /// Raw Ed25519 public key (the `x` JWK coordinate).
+    public_key: [32]u8,
+    signFn: *const fn (ctx: *anyopaque, signing_input: []const u8, out: []u8) anyerror![]const u8,
+
+    fn sign(self: Signer, signing_input: []const u8, out: []u8) anyerror![]const u8 {
+        return self.signFn(self.ctx, signing_input, out);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Configuration & effects
+// ---------------------------------------------------------------------------
+
+/// Static inputs for an issuance run. All slices are borrowed and must outlive
+/// the `Acme` instance.
+pub const Config = struct {
+    /// Absolute URL of the ACME directory resource.
+    directory_url: []const u8,
+    /// Domains to include in the order (first is the CSR common name).
+    domains: []const []const u8,
+    /// Contact URIs (e.g. "mailto:admin@example.com").
+    contacts: []const []const u8 = &.{},
+    /// Whether to set `termsOfServiceAgreed`.
+    tos_agreed: bool = true,
+    signer: Signer,
+};
+
+/// Effects the caller MUST act on when returned from `step`.
+pub const Effect = union(enum) {
+    /// Provision the http-01 challenge: serve `key_authorization` (as the body)
+    /// at `/.well-known/acme-challenge/<token>` until issuance completes.
+    serve_http01: struct { token: []const u8, key_authorization: []const u8 },
+    /// The issued certificate chain (PEM). Persist it.
+    write_cert: struct { pem: []const u8 },
+};
+
+/// Result of one `step` call. `effects` borrows storage owned by the `Acme`
+/// instance; it is valid until the next `step` call.
+pub const Progress = struct {
+    state: State,
+    done: bool,
+    effects: []const Effect,
+};
+
+/// Issuance lifecycle. Exhaustively switched everywhere.
+pub const State = enum {
+    start, // fetch directory
+    account, // ensure nonce, create account
+    order, // create order
+    authorizing, // fetch the next authorization
+    polling_authz, // challenge POSTed; poll authz until valid
+    finalizing, // finalize order with CSR
+    polling_order, // poll order until it carries a certificate URL
+    downloading, // download the certificate
+    done, // terminal success
+    failed, // terminal failure
+};
+
+pub const Error = error{
+    Terminal, // stepped after a terminal state
+    MissingNonce, // signed request needs a nonce we do not have
+    UnexpectedStatus, // unexpected HTTP status / problem document
+    MissingAccountUrl, // newAccount lacked a Location header
+    MissingOrderUrl, // newOrder lacked a Location header
+    NoHttp01Challenge, // authz offered no http-01 challenge
+    OrderFailed, // order reached a terminal non-valid state
+    AuthzFailed, // authz reached a terminal non-valid state
+    TooManyNonceRetries, // badNonce retried past the limit
+} || Allocator.Error;
+
+// ---------------------------------------------------------------------------
+// The state machine
+// ---------------------------------------------------------------------------
+
+pub const Acme = struct {
+    allocator: Allocator,
+    config: Config,
+    state: State = .start,
+
+    /// Owned copies threaded between steps.
+    dir: ?directory.Directory = null,
+    nonce: ?[]u8 = null,
+    account_url: ?[]u8 = null,
+    order_url: ?[]u8 = null,
+    finalize_url: ?[]u8 = null,
+    cert_url: ?[]u8 = null,
+
+    /// Authorization URLs remaining to process (owned).
+    authz_urls: [][]u8 = &.{},
+    authz_index: usize = 0,
+    /// URL of the challenge we POSTed (owned), used to poll the authz.
+    current_authz_url: ?[]u8 = null,
+
+    /// Effect scratch storage, valid until the next step.
+    effect_buf: [2]Effect = undefined,
+    /// Backing storage for effect string fields.
+    token_buf: [256]u8 = undefined,
+    keyauth_buf: [512]u8 = undefined,
+    pem_buf: ?[]u8 = null,
+
+    /// badNonce retry counter for the in-flight signed request.
+    nonce_retries: u8 = 0,
+
+    pub fn init(allocator: Allocator, config: Config) Acme {
+        return .{ .allocator = allocator, .config = config };
+    }
+
+    pub fn deinit(self: *Acme) void {
+        if (self.dir) |*d| d.deinit(self.allocator);
+        if (self.nonce) |n| self.allocator.free(n);
+        if (self.account_url) |u| self.allocator.free(u);
+        if (self.order_url) |u| self.allocator.free(u);
+        if (self.finalize_url) |u| self.allocator.free(u);
+        if (self.cert_url) |u| self.allocator.free(u);
+        if (self.current_authz_url) |u| self.allocator.free(u);
+        for (self.authz_urls) |u| self.allocator.free(u);
+        self.allocator.free(self.authz_urls);
+        if (self.pem_buf) |p| self.allocator.free(p);
+        self.* = undefined;
+    }
+
+    /// Advance the machine by one round-trip. Returns the new `Progress`.
+    pub fn step(self: *Acme, transport: Transport) Error!Progress {
+        return switch (self.state) {
+            .start => self.stepStart(transport),
+            .account => self.stepAccount(transport),
+            .order => self.stepOrder(transport),
+            .authorizing => self.stepAuthorizing(transport),
+            .polling_authz => self.stepPollAuthz(transport),
+            .finalizing => self.stepFinalize(transport),
+            .polling_order => self.stepPollOrder(transport),
+            .downloading => self.stepDownload(transport),
+            .done, .failed => error.Terminal,
+        };
+    }
+
+    // --- helpers -----------------------------------------------------------
+
+    fn noEffects(self: *Acme) Progress {
+        return .{ .state = self.state, .done = self.state == .done, .effects = self.effect_buf[0..0] };
+    }
+
+    fn fail(self: *Acme, err: Error) Error {
+        self.state = .failed;
+        return err;
+    }
+
+    /// Replace the stored nonce with a copy of `new`, freeing the old one.
+    fn setNonce(self: *Acme, new: ?[]const u8) Allocator.Error!void {
+        const incoming = new orelse return;
+        const copy = try self.allocator.dupe(u8, incoming);
+        if (self.nonce) |old| self.allocator.free(old);
+        self.nonce = copy;
+    }
+
+    fn takeNonce(self: *Acme) Error![]const u8 {
+        return self.nonce orelse self.fail(error.MissingNonce);
+    }
+
+    /// Build and POST a signed JWS, retrying on `badNonce`. `jwk_header` picks
+    /// the JWK protected header (newAccount) vs. the KID header.
+    fn postSigned(
+        self: *Acme,
+        transport: Transport,
+        url: []const u8,
+        payload: []const u8,
+        jwk_header: bool,
+    ) Error!HttpResponse {
+        while (true) {
+            const nonce = try self.takeNonce();
+
+            var hdr_buf: [1024]u8 = undefined;
+            const protected = if (jwk_header) blk: {
+                var jwk_buf: [jwk.okp_json_max_len]u8 = undefined;
+                const jwk_json = jwk.jwkOkp(self.config.signer.public_key, &jwk_buf) catch
+                    return self.fail(error.OutOfMemory);
+                break :blk jws.protectedHeaderJwk(jose_alg, nonce, url, jwk_json, &hdr_buf) catch
+                    return self.fail(error.OutOfMemory);
+            } else blk: {
+                const kid = self.account_url orelse return self.fail(error.MissingAccountUrl);
+                break :blk jws.protectedHeaderKid(jose_alg, nonce, url, kid, &hdr_buf) catch
+                    return self.fail(error.OutOfMemory);
+            };
+
+            var si_buf: [2048]u8 = undefined;
+            const signing_input = jws.signingInput(protected, payload, &si_buf) catch
+                return self.fail(error.OutOfMemory);
+
+            var sig_buf: [64]u8 = undefined;
+            const signature = self.config.signer.sign(signing_input, &sig_buf) catch
+                return self.fail(error.OutOfMemory);
+
+            var body_buf: [4096]u8 = undefined;
+            const body = jws.flattened(protected, payload, signature, &body_buf) catch
+                return self.fail(error.OutOfMemory);
+
+            const resp = transport.postJws(url, body) catch return self.fail(error.UnexpectedStatus);
+            try self.setNonce(resp.nonce);
+
+            if (isProblemStatus(resp.status)) {
+                const prob = problem.parse(self.allocator, resp.body) catch
+                    return self.fail(error.UnexpectedStatus);
+                if (prob.kind == .bad_nonce and self.nonce_retries < max_nonce_retries) {
+                    self.nonce_retries += 1;
+                    continue;
+                }
+                return self.fail(error.UnexpectedStatus);
+            }
+
+            self.nonce_retries = 0;
+            return resp;
+        }
+    }
+
+    // --- per-state handlers ------------------------------------------------
+
+    fn stepStart(self: *Acme, transport: Transport) Error!Progress {
+        const resp = transport.get(self.config.directory_url) catch return self.fail(error.UnexpectedStatus);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+        try self.setNonce(resp.nonce);
+
+        const dir = directory.parse(self.allocator, resp.body) catch
+            return self.fail(error.UnexpectedStatus);
+        self.dir = dir;
+
+        if (self.nonce == null) {
+            const nresp = transport.get(dir.new_nonce) catch return self.fail(error.UnexpectedStatus);
+            try self.setNonce(nresp.nonce);
+        }
+
+        self.state = .account;
+        return self.noEffects();
+    }
+
+    fn stepAccount(self: *Acme, transport: Transport) Error!Progress {
+        const dir = self.dir.?;
+
+        var payload_buf: [1024]u8 = undefined;
+        const payload = account_mod.buildNewAccount(&payload_buf, self.config.contacts, self.config.tos_agreed) catch
+            return self.fail(error.OutOfMemory);
+
+        const resp = try self.postSigned(transport, dir.new_account, payload, true);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+
+        const loc = resp.location orelse return self.fail(error.MissingAccountUrl);
+        self.account_url = try self.allocator.dupe(u8, loc);
+
+        self.state = .order;
+        return self.noEffects();
+    }
+
+    fn stepOrder(self: *Acme, transport: Transport) Error!Progress {
+        const dir = self.dir.?;
+
+        var payload_buf: [2048]u8 = undefined;
+        const payload = order_mod.buildNewOrder(&payload_buf, self.config.domains) catch
+            return self.fail(error.OutOfMemory);
+
+        const resp = try self.postSigned(transport, dir.new_order, payload, false);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+
+        const loc = resp.location orelse return self.fail(error.MissingOrderUrl);
+        self.order_url = try self.allocator.dupe(u8, loc);
+
+        var parsed = order_mod.parseOrder(self.allocator, resp.body) catch
+            return self.fail(error.UnexpectedStatus);
+        defer parsed.deinit();
+
+        self.finalize_url = try self.allocator.dupe(u8, parsed.finalize);
+
+        var urls = try self.allocator.alloc([]u8, parsed.authorizations.len);
+        errdefer self.allocator.free(urls);
+        var filled: usize = 0;
+        errdefer for (urls[0..filled]) |u| self.allocator.free(u);
+        for (parsed.authorizations, 0..) |a, i| {
+            urls[i] = try self.allocator.dupe(u8, a);
+            filled += 1;
+        }
+        self.authz_urls = urls;
+        self.authz_index = 0;
+
+        self.state = .authorizing;
+        return self.noEffects();
+    }
+
+    fn stepAuthorizing(self: *Acme, transport: Transport) Error!Progress {
+        if (self.authz_index >= self.authz_urls.len) {
+            self.state = .finalizing;
+            return self.noEffects();
+        }
+
+        const authz_url = self.authz_urls[self.authz_index];
+        const resp = try self.postSigned(transport, authz_url, "", false);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+
+        var authz = order_mod.parseAuthorization(self.allocator, resp.body) catch
+            return self.fail(error.UnexpectedStatus);
+        defer authz.deinit();
+
+        if (authz.status == .valid) {
+            self.authz_index += 1;
+            return self.noEffects();
+        }
+        if (authz.status == .invalid or authz.status == .deactivated or
+            authz.status == .expired or authz.status == .revoked)
+        {
+            return self.fail(error.AuthzFailed);
+        }
+
+        const chal = order_mod.findChallenge(authz, http01_type) orelse
+            return self.fail(error.NoHttp01Challenge);
+
+        var thumb_buf: [jwk.thumbprint_b64_len]u8 = undefined;
+        var thumb_digest: [32]u8 = undefined;
+        jwk.thumbprintOkp(self.config.signer.public_key, &thumb_digest);
+        const thumb = std.base64.url_safe_no_pad.Encoder.encode(&thumb_buf, &thumb_digest);
+
+        const key_auth = challenge.keyAuthorization(chal.token, thumb, &self.keyauth_buf) catch
+            return self.fail(error.OutOfMemory);
+        if (chal.token.len > self.token_buf.len) return self.fail(error.OutOfMemory);
+        @memcpy(self.token_buf[0..chal.token.len], chal.token);
+        const token = self.token_buf[0..chal.token.len];
+
+        self.effect_buf[0] = .{ .serve_http01 = .{ .token = token, .key_authorization = key_auth } };
+
+        if (self.current_authz_url) |old| self.allocator.free(old);
+        self.current_authz_url = try self.allocator.dupe(u8, authz_url);
+
+        const chal_url = try self.allocator.dupe(u8, chal.url);
+        defer self.allocator.free(chal_url);
+        const trig = try self.postSigned(transport, chal_url, "{}", false);
+        if (!isOk(trig.status)) return self.fail(error.UnexpectedStatus);
+
+        self.state = .polling_authz;
+        return .{ .state = self.state, .done = false, .effects = self.effect_buf[0..1] };
+    }
+
+    fn stepPollAuthz(self: *Acme, transport: Transport) Error!Progress {
+        const authz_url = self.current_authz_url orelse return self.fail(error.AuthzFailed);
+        const resp = try self.postSigned(transport, authz_url, "", false);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+
+        var authz = order_mod.parseAuthorization(self.allocator, resp.body) catch
+            return self.fail(error.UnexpectedStatus);
+        defer authz.deinit();
+
+        switch (authz.status) {
+            .valid => {
+                self.authz_index += 1;
+                self.state = .authorizing;
+                return self.noEffects();
+            },
+            .pending, .processing => {
+                return self.noEffects();
+            },
+            .invalid, .deactivated, .expired, .revoked, .ready => return self.fail(error.AuthzFailed),
+        }
+    }
+
+    fn stepFinalize(self: *Acme, transport: Transport) Error!Progress {
+        const finalize_url = self.finalize_url orelse return self.fail(error.OrderFailed);
+
+        var cri_buf: [4096]u8 = undefined;
+        const cri = csr.certificationRequestInfo(&cri_buf, .{
+            .common_name = self.config.domains[0],
+            .dns_names = self.config.domains,
+            .spki_der = &ed25519Spki(self.config.signer.public_key),
+        }) catch return self.fail(error.OutOfMemory);
+
+        var sig_buf: [64]u8 = undefined;
+        const signature = self.config.signer.sign(cri, &sig_buf) catch
+            return self.fail(error.OutOfMemory);
+
+        var csr_buf: [4096]u8 = undefined;
+        const csr_der = csr.assemble(&csr_buf, cri, &ed25519_sig_alg, signature) catch
+            return self.fail(error.OutOfMemory);
+
+        var payload_buf: [8192]u8 = undefined;
+        const payload = order_mod.buildFinalize(&payload_buf, csr_der) catch
+            return self.fail(error.OutOfMemory);
+
+        const resp = try self.postSigned(transport, finalize_url, payload, false);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+
+        self.state = .polling_order;
+        return self.noEffects();
+    }
+
+    fn stepPollOrder(self: *Acme, transport: Transport) Error!Progress {
+        const order_url = self.order_url orelse return self.fail(error.OrderFailed);
+        const resp = try self.postSigned(transport, order_url, "", false);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+
+        var parsed = order_mod.parseOrder(self.allocator, resp.body) catch
+            return self.fail(error.UnexpectedStatus);
+        defer parsed.deinit();
+
+        switch (parsed.status) {
+            .valid => {
+                const cert = parsed.certificate orelse return self.fail(error.OrderFailed);
+                self.cert_url = try self.allocator.dupe(u8, cert);
+                self.state = .downloading;
+                return self.noEffects();
+            },
+            .processing, .ready, .pending => return self.noEffects(),
+            .invalid, .deactivated, .expired, .revoked => return self.fail(error.OrderFailed),
+        }
+    }
+
+    fn stepDownload(self: *Acme, transport: Transport) Error!Progress {
+        const cert_url = self.cert_url orelse return self.fail(error.OrderFailed);
+        const resp = try self.postSigned(transport, cert_url, "", false);
+        if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
+
+        const pem = try self.allocator.dupe(u8, resp.body);
+        if (self.pem_buf) |old| self.allocator.free(old);
+        self.pem_buf = pem;
+
+        self.effect_buf[0] = .{ .write_cert = .{ .pem = pem } };
+        self.state = .done;
+        return .{ .state = .done, .done = true, .effects = self.effect_buf[0..1] };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Small pure helpers
+// ---------------------------------------------------------------------------
+
+fn isOk(status: u16) bool {
+    return status >= 200 and status < 300;
+}
+
+fn isProblemStatus(status: u16) bool {
+    return status >= 400;
+}
+
+/// DER SubjectPublicKeyInfo for an Ed25519 public key (48 bytes, RFC 8410).
+fn ed25519Spki(public_key: [32]u8) [44]u8 {
+    var out: [44]u8 = .{
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    } ++ [_]u8{0} ** 32;
+    @memcpy(out[12..44], &public_key);
+    return out;
+}
+
+/// DER AlgorithmIdentifier for Ed25519 signatures (id-Ed25519, RFC 8410): the
+/// SEQUENCE { OID 1.3.101.112 } with no parameters.
+const ed25519_sig_alg = [_]u8{ 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70 };
+
+// ===========================================================================
+// Tests (AAA) — driven by an in-memory mock transport replaying a full flow.
+// ===========================================================================
+
+const testing = std.testing;
+
+/// Canned response keyed by url. The mock returns the next unconsumed entry for
+/// a url, so a repeated url (e.g. an authz poll) yields different bodies in turn.
+const Canned = struct {
+    url: []const u8,
+    status: u16 = 200,
+    body: []const u8,
+    nonce: ?[]const u8 = "nonce-default",
+    location: ?[]const u8 = null,
+    used: bool = false,
+};
+
+const MockTransport = struct {
+    entries: []Canned,
+    sign_calls: *usize,
+
+    fn next(self: *MockTransport, url: []const u8) HttpResponse {
+        for (self.entries) |*e| {
+            if (!e.used and std.mem.eql(u8, e.url, url)) {
+                e.used = true;
+                return .{ .status = e.status, .body = e.body, .nonce = e.nonce, .location = e.location };
+            }
+        }
+        // Fall back to the last matching (re-poll) entry if all consumed.
+        var last: ?*Canned = null;
+        for (self.entries) |*e| {
+            if (std.mem.eql(u8, e.url, url)) last = e;
+        }
+        if (last) |e| return .{ .status = e.status, .body = e.body, .nonce = e.nonce, .location = e.location };
+        return .{ .status = 404, .body = "{}", .nonce = "nonce-default" };
+    }
+
+    fn getThunk(ctx: *anyopaque, url: []const u8) anyerror!HttpResponse {
+        const self: *MockTransport = @ptrCast(@alignCast(ctx));
+        return self.next(url);
+    }
+
+    fn postThunk(ctx: *anyopaque, url: []const u8, _: []const u8) anyerror!HttpResponse {
+        const self: *MockTransport = @ptrCast(@alignCast(ctx));
+        return self.next(url);
+    }
+
+    fn transport(self: *MockTransport) Transport {
+        return .{ .ctx = self, .getFn = getThunk, .postJwsFn = postThunk };
+    }
+};
+
+/// Deterministic test signer: 64 zero bytes (signatures are not verified here).
+fn testSign(ctx: *anyopaque, signing_input: []const u8, out: []u8) anyerror![]const u8 {
+    _ = signing_input;
+    const calls: *usize = @ptrCast(@alignCast(ctx));
+    calls.* += 1;
+    @memset(out[0..64], 0);
+    return out[0..64];
+}
+
+fn makeSigner(calls: *usize) Signer {
+    return .{ .ctx = calls, .public_key = [_]u8{7} ** 32, .signFn = testSign };
+}
+
+/// Run the machine to a terminal state, collecting emitted effect tags.
+fn driveToEnd(acme: *Acme, t: Transport, saw_serve: *bool, saw_cert: *bool) !State {
+    var guard: usize = 0;
+    while (acme.state != .done and acme.state != .failed) : (guard += 1) {
+        if (guard > 64) return error.TestExpectedEqual;
+        const prog = try acme.step(t);
+        for (prog.effects) |eff| switch (eff) {
+            .serve_http01 => saw_serve.* = true,
+            .write_cert => saw_cert.* = true,
+        };
+    }
+    return acme.state;
+}
+
+test "full http-01 issuance flow drives machine to done and emits effects" {
+    // Arrange — canned Let's Encrypt-style responses.
+    const dir_json =
+        \\{"newNonce":"https://ca/nonce","newAccount":"https://ca/acct",
+        \\"newOrder":"https://ca/order","revokeCert":"https://ca/revoke",
+        \\"keyChange":"https://ca/keychange"}
+    ;
+    const order_json =
+        \\{"status":"pending","identifiers":[{"type":"dns","value":"example.com"}],
+        \\"authorizations":["https://ca/authz/1"],"finalize":"https://ca/finalize/1"}
+    ;
+    const authz_pending =
+        \\{"status":"pending","identifier":{"type":"dns","value":"example.com"},
+        \\"challenges":[{"type":"http-01","url":"https://ca/chal/1","token":"tok123","status":"pending"}]}
+    ;
+    const authz_valid =
+        \\{"status":"valid","identifier":{"type":"dns","value":"example.com"},
+        \\"challenges":[{"type":"http-01","url":"https://ca/chal/1","token":"tok123","status":"valid"}]}
+    ;
+    const order_processing =
+        \\{"status":"processing","identifiers":[{"type":"dns","value":"example.com"}],
+        \\"authorizations":["https://ca/authz/1"],"finalize":"https://ca/finalize/1"}
+    ;
+    const order_valid =
+        \\{"status":"valid","identifiers":[{"type":"dns","value":"example.com"}],
+        \\"authorizations":["https://ca/authz/1"],"finalize":"https://ca/finalize/1",
+        \\"certificate":"https://ca/cert/1"}
+    ;
+    const cert_pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    var entries = [_]Canned{
+        .{ .url = "https://ca/directory", .body = dir_json, .nonce = "n0" },
+        .{ .url = "https://ca/acct", .status = 201, .body = "{\"status\":\"valid\"}", .nonce = "n1", .location = "https://ca/acct/9" },
+        .{ .url = "https://ca/order", .status = 201, .body = order_json, .nonce = "n2", .location = "https://ca/order/1" },
+        // GET (POST-as-GET) authz before triggering.
+        .{ .url = "https://ca/authz/1", .body = authz_pending, .nonce = "n3" },
+        // trigger challenge POST.
+        .{ .url = "https://ca/chal/1", .body = authz_pending, .nonce = "n4" },
+        // poll authz -> valid.
+        .{ .url = "https://ca/authz/1", .body = authz_valid, .nonce = "n5" },
+        // finalize.
+        .{ .url = "https://ca/finalize/1", .body = order_processing, .nonce = "n6" },
+        // poll order -> processing then valid.
+        .{ .url = "https://ca/order/1", .body = order_processing, .nonce = "n7" },
+        .{ .url = "https://ca/order/1", .body = order_valid, .nonce = "n8" },
+        // download cert.
+        .{ .url = "https://ca/cert/1", .body = cert_pem, .nonce = "n9" },
+    };
+    var sign_calls: usize = 0;
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "https://ca/directory",
+        .domains = &.{"example.com"},
+        .contacts = &.{"mailto:admin@example.com"},
+        .signer = makeSigner(&sign_calls),
+    });
+    defer acme.deinit();
+
+    // Act
+    var saw_serve = false;
+    var saw_cert = false;
+    const final = try driveToEnd(&acme, mock.transport(), &saw_serve, &saw_cert);
+
+    // Assert
+    try testing.expectEqual(State.done, final);
+    try testing.expect(saw_serve);
+    try testing.expect(saw_cert);
+    try testing.expect(acme.pem_buf != null);
+    try testing.expectEqualStrings(cert_pem, acme.pem_buf.?);
+    try testing.expect(sign_calls > 0);
+}
+
+test "badNonce on newAccount is retried with the fresh nonce then succeeds" {
+    // Arrange — first newAccount POST returns badNonce (carrying a new nonce);
+    // the retry succeeds. We only drive far enough to observe recovery.
+    const dir_json =
+        \\{"newNonce":"https://ca/nonce","newAccount":"https://ca/acct",
+        \\"newOrder":"https://ca/order","revokeCert":"https://ca/revoke",
+        \\"keyChange":"https://ca/keychange"}
+    ;
+    const bad_nonce_problem =
+        \\{"type":"urn:ietf:params:acme:error:badNonce","detail":"bad nonce"}
+    ;
+
+    var entries = [_]Canned{
+        .{ .url = "https://ca/directory", .body = dir_json, .nonce = "n0" },
+        // First acct POST -> 400 badNonce, hands back a fresh nonce.
+        .{ .url = "https://ca/acct", .status = 400, .body = bad_nonce_problem, .nonce = "fresh-nonce" },
+        // Retry acct POST -> 201 created.
+        .{ .url = "https://ca/acct", .status = 201, .body = "{\"status\":\"valid\"}", .nonce = "n2", .location = "https://ca/acct/9" },
+    };
+    var sign_calls: usize = 0;
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "https://ca/directory",
+        .domains = &.{"example.com"},
+        .signer = makeSigner(&sign_calls),
+    });
+    defer acme.deinit();
+
+    // Act — step through start then account.
+    _ = try acme.step(mock.transport()); // start -> account
+    const prog = try acme.step(mock.transport()); // account (retries internally) -> order
+
+    // Assert — recovered past the badNonce and advanced to order.
+    try testing.expectEqual(State.order, prog.state);
+    try testing.expect(acme.account_url != null);
+    try testing.expectEqualStrings("https://ca/acct/9", acme.account_url.?);
+    // signer was called twice for the account request (original + retry).
+    try testing.expect(sign_calls >= 2);
+}
+
+test "stepping a terminal machine returns error.Terminal" {
+    // Arrange
+    var sign_calls: usize = 0;
+    var entries = [_]Canned{.{ .url = "x", .body = "{}" }};
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "x",
+        .domains = &.{"example.com"},
+        .signer = makeSigner(&sign_calls),
+    });
+    defer acme.deinit();
+    acme.state = .done;
+
+    // Act / Assert
+    try testing.expectError(error.Terminal, acme.step(mock.transport()));
+}

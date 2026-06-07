@@ -93,6 +93,7 @@ pub const happy_eyeballs = @import("happy_eyeballs.zig");
 pub const help_db = @import("help_db.zig");
 pub const hostmask_compile = @import("hostmask_compile.zig");
 pub const hosts_file = @import("hosts_file.zig");
+pub const http1_client = @import("http1_client.zig");
 pub const http1 = @import("http1.zig");
 pub const http2_hpack = @import("http2_hpack.zig");
 pub const http3_qpack = @import("http3_qpack.zig");
@@ -357,6 +358,7 @@ test {
     _ = help_db;
     _ = hostmask_compile;
     _ = hosts_file;
+    _ = http1_client;
     _ = http1;
     _ = http2_hpack;
     _ = http3_qpack;
