@@ -161,6 +161,13 @@ pub const MediaPlane = struct {
         return .{ .ufrag = ep.ufrag, .pwd = ep.pwd };
     }
 
+    /// The per-call SRTP group key (SDES) for `channel`, generated on first use.
+    pub fn groupKey(self: *MediaPlane, channel: []const u8) [media_transport.group_key_len]u8 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.transport.ensureGroupKey(channel, self.csprng.random());
+    }
+
     /// Drop a participant's endpoint (MEDIA LEAVE / disconnect).
     pub fn remove(self: *MediaPlane, channel: []const u8, participant: []const u8) void {
         lockSpin(&self.mutex);

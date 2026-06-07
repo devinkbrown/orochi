@@ -6645,9 +6645,13 @@ pub const LinuxServer = struct {
         // (ufrag/pwd + media candidate) so the client can run STUN to the SFU.
         const nick = conn.session.displayName();
         if (self.media_plane.allocate(channel, nick)) |creds| {
-            var tbuf: [320]u8 = undefined;
-            const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d}\r\n", .{
-                server_name, channel, creds.ufragSlice(), creds.pwdSlice(), self.config.media_host, self.media_plane.port,
+            // Per-call SRTP group key (SDES), base64'd; safe over the TLS IRC link.
+            const gk = self.media_plane.groupKey(channel);
+            var gk_b64: [std.base64.standard.Encoder.calcSize(gk.len)]u8 = undefined;
+            const srtp_b64 = std.base64.standard.Encoder.encode(&gk_b64, &gk);
+            var tbuf: [400]u8 = undefined;
+            const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} srtp={s}\r\n", .{
+                server_name, channel, creds.ufragSlice(), creds.pwdSlice(), self.config.media_host, self.media_plane.port, srtp_b64,
             }) catch return;
             try appendToConn(conn, tline);
         }

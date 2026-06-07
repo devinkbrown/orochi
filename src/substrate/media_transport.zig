@@ -15,6 +15,11 @@
 const std = @import("std");
 const ice = @import("../proto/ice.zig");
 const stun = @import("../proto/stun.zig");
+const srtp = @import("../proto/srtp.zig");
+
+/// SRTP master key (16) + master salt (14): the per-call SDES keying material
+/// the server distributes to every participant over the signaling channel.
+pub const group_key_len: usize = srtp.master_key_len + srtp.master_salt_len;
 
 pub const ufrag_len: usize = 8;
 pub const pwd_len: usize = 24;
@@ -70,6 +75,9 @@ pub const MediaTransport = struct {
     by_ufrag: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Bound peer address -> composite key, for routing inbound RTP by source.
     by_addr: std.AutoHashMapUnmanaged(AddrKey, []const u8) = .empty,
+    /// Channel -> per-call SRTP group key (SDES). One key per active call,
+    /// distributed to every participant; dropped when the call empties.
+    group_keys: std.StringHashMapUnmanaged([group_key_len]u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) MediaTransport {
         return .{ .allocator = allocator };
@@ -81,6 +89,9 @@ pub const MediaTransport = struct {
         self.endpoints.deinit(self.allocator);
         self.by_ufrag.deinit(self.allocator);
         self.by_addr.deinit(self.allocator);
+        var gk = self.group_keys.keyIterator();
+        while (gk.next()) |k| self.allocator.free(k.*);
+        self.group_keys.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -304,7 +315,42 @@ pub const MediaTransport = struct {
         return n;
     }
 
-    /// Drop a participant's endpoint (on MEDIA LEAVE / disconnect).
+    /// The per-call SRTP group key for `channel`, generating and storing a fresh
+    /// one (from `rng`) on first use. The same key is returned for every
+    /// participant in the call until it empties.
+    pub fn ensureGroupKey(self: *MediaTransport, channel: []const u8, rng: std.Random) [group_key_len]u8 {
+        if (self.group_keys.getPtr(channel)) |k| return k.*;
+        var key: [group_key_len]u8 = undefined;
+        rng.bytes(&key);
+        const gop = self.group_keys.getOrPut(self.allocator, channel) catch return key;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, channel) catch {
+                _ = self.group_keys.remove(channel);
+                return key;
+            };
+            gop.value_ptr.* = key;
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// Whether any participant endpoint remains in `channel`.
+    fn channelHasEndpoints(self: *MediaTransport, channel: []const u8) bool {
+        var it = self.endpoints.keyIterator();
+        while (it.next()) |k| {
+            const key = k.*;
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+            if (std.mem.eql(u8, key[0..sep], channel)) return true;
+        }
+        return false;
+    }
+
+    fn dropGroupKeyIfEmpty(self: *MediaTransport, channel: []const u8) void {
+        if (self.channelHasEndpoints(channel)) return;
+        if (self.group_keys.fetchRemove(channel)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// Drop a participant's endpoint (on MEDIA LEAVE / disconnect). The call's
+    /// SRTP group key is released once the last participant leaves.
     pub fn remove(self: *MediaTransport, channel: []const u8, participant: []const u8) void {
         var kb: [256]u8 = undefined;
         const k = compositeKey(&kb, channel, participant) orelse return;
@@ -313,6 +359,7 @@ pub const MediaTransport = struct {
             if (kv.value.remote) |addr| _ = self.by_addr.remove(addrKey(addr));
             self.allocator.free(kv.key);
         }
+        self.dropGroupKeyIfEmpty(channel);
     }
 };
 
@@ -457,6 +504,29 @@ test "forwardFromSource routes an RTP packet to the other peers" {
     // After alice leaves, her address no longer resolves.
     mt.remove("#c", "alice");
     try testing.expectEqual(@as(usize, 0), mt.forwardFromSource(alice_addr, 100, 0, &out));
+}
+
+test "group key is stable per call and released when it empties" {
+    var prng = std.Random.DefaultPrng.init(0x6abe);
+    var mt = MediaTransport.init(testing.allocator);
+    defer mt.deinit();
+    _ = try mt.allocate("#c", "alice", prng.random());
+    _ = try mt.allocate("#c", "bob", prng.random());
+
+    // Every participant in the same call gets the identical key...
+    const k1 = mt.ensureGroupKey("#c", prng.random());
+    const k2 = mt.ensureGroupKey("#c", prng.random());
+    try testing.expectEqualSlices(u8, &k1, &k2);
+    // ...but a different call gets a different key.
+    _ = try mt.allocate("#d", "dave", prng.random());
+    const kd = mt.ensureGroupKey("#d", prng.random());
+    try testing.expect(!std.mem.eql(u8, &k1, &kd));
+
+    // Key persists while participants remain, released when the last leaves.
+    mt.remove("#c", "alice");
+    try testing.expect(mt.group_keys.contains("#c"));
+    mt.remove("#c", "bob");
+    try testing.expect(!mt.group_keys.contains("#c"));
 }
 
 test "remove drops the endpoint and its ufrag index" {
