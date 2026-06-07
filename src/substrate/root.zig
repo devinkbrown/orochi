@@ -49,6 +49,7 @@ pub const loss_recovery = @import("loss_recovery.zig");
 pub const lotus = @import("lotus.zig");
 pub const lru = @import("lru.zig");
 pub const media_session = @import("media_session.zig");
+pub const media_transport = @import("media_transport.zig");
 pub const merkle_mountain_range = @import("merkle_mountain_range.zig");
 pub const metrics = @import("metrics.zig");
 pub const minhash = @import("minhash.zig");
@@ -169,6 +170,7 @@ test {
     _ = lotus;
     _ = lru;
     _ = media_session;
+    _ = media_transport;
     _ = merkle_mountain_range;
     _ = metrics;
     _ = minhash;
