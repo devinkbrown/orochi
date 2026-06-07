@@ -24,6 +24,9 @@ pub const ResponseError = error{
 pub const TokenStore = struct {
     allocator: std.mem.Allocator,
     tokens: std.StringHashMap([]u8),
+    /// Guards `tokens` so a challenge-serving listener thread can `get` while the
+    /// issuance thread `put`s. Uncontended in single-threaded use.
+    mutex: std.atomic.Mutex = .unlocked,
 
     const Self = @This();
 
@@ -48,6 +51,9 @@ pub const TokenStore = struct {
         try validateToken(token);
         try validateKeyAuthorization(key_auth);
 
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+
         const owned_value = try self.allocator.dupe(u8, key_auth);
         errdefer self.allocator.free(owned_value);
 
@@ -64,6 +70,8 @@ pub const TokenStore = struct {
     }
 
     pub fn remove(self: *Self, token: []const u8) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
         if (self.tokens.fetchRemove(token)) |removed| {
             self.allocator.free(removed.key);
             self.allocator.free(removed.value);
@@ -72,13 +80,15 @@ pub const TokenStore = struct {
         return false;
     }
 
-    pub fn get(self: *const Self, token: []const u8) ?[]const u8 {
+    pub fn get(self: *Self, token: []const u8) ?[]const u8 {
         validateToken(token) catch return null;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
         return self.tokens.get(token);
     }
 };
 
-pub fn handleRequest(store: *const TokenStore, request_bytes: []const u8, out: []u8) ResponseError![]const u8 {
+pub fn handleRequest(store: *TokenStore, request_bytes: []const u8, out: []u8) ResponseError![]const u8 {
     const body = if (parseChallengeToken(request_bytes)) |token|
         store.get(token) orelse not_found_body
     else
@@ -90,6 +100,12 @@ pub fn handleRequest(store: *const TokenStore, request_bytes: []const u8, out: [
         "200 OK";
 
     return writeResponse(out, status, body);
+}
+
+/// Blocking acquire on the tryLock-only `std.atomic.Mutex`. Contention is
+/// near-zero (rare puts vs. validation-window gets), so a yielding spin is fine.
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.Thread.yield() catch {};
 }
 
 fn parseChallengeToken(request_bytes: []const u8) ?[]const u8 {

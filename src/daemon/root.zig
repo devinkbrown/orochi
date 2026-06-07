@@ -10,6 +10,7 @@ pub const account_rename = @import("account_rename.zig");
 pub const account_verify = @import("account_verify.zig");
 pub const achievement = @import("achievement.zig");
 pub const acme_client = @import("acme_client.zig");
+pub const acme_http01_listener = @import("acme_http01_listener.zig");
 pub const acme_http01_server = @import("acme_http01_server.zig");
 pub const acme_runner = @import("acme_runner.zig");
 pub const activity_subscriptions = @import("activity_subscriptions.zig");
@@ -220,6 +221,7 @@ test {
     _ = account_verify;
     _ = achievement;
     _ = acme_client;
+    _ = acme_http01_listener;
     _ = acme_http01_server;
     _ = acme_runner;
     _ = activity_subscriptions;
