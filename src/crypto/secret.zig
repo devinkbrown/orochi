@@ -1,46 +1,175 @@
-//! Secret(T) — the constant-time discipline seam (planning/02, "CT-Zone").
+//! VeilSafe secret wrappers for byte material that should not leak through logs.
 //!
-//! Secret-bearing values are wrapped so that, as this type and the `ctcheck`
-//! build pass mature, a data-dependent branch or index on a secret becomes a
-//! compile error. For M0 it establishes the boundary: safe construction, an
-//! explicit/auditable `declassify`, and a verified `wipe`.
+//! `Secret(N)` keeps fixed-size sensitive bytes behind an explicit `expose`
+//! method, compares them without data-dependent early exits, and always formats
+//! as redacted text. `SecretSlice` provides the same discipline for
+//! allocator-owned runtime-length bytes and wipes its allocation on `deinit`.
+
 const std = @import("std");
 
-pub fn Secret(comptime T: type) type {
+const redacted = "[redacted]";
+
+pub fn Secret(comptime spec: anytype) type {
+    const Value = secretValueType(spec);
+
     return struct {
         const Self = @This();
-        value: T,
 
-        pub fn init(v: T) Self {
-            return .{ .value = v };
+        value: Value,
+
+        pub fn init(value: Value) Self {
+            return .{ .value = value };
         }
 
-        /// Explicit escape hatch. Every call site is a deliberate review point;
-        /// future `ctcheck` will require a comptime declassification reason.
-        pub fn declassify(self: *const Self) T {
+        pub fn constantTimeEql(self: *const Self, other: *const Self) bool {
+            return constantTimeBytesEql(self.expose(), other.expose());
+        }
+
+        pub fn wipe(self: *Self) void {
+            switch (@typeInfo(Value)) {
+                .array => std.crypto.secureZero(u8, self.value[0..]),
+                .pointer => |ptr| {
+                    if (ptr.size != .slice or ptr.is_const) {
+                        @compileError("Secret(" ++ @typeName(Value) ++ ").wipe requires mutable byte storage");
+                    }
+                    std.crypto.secureZero(u8, self.value);
+                },
+                else => @compileError("Secret(" ++ @typeName(Value) ++ ") must wrap bytes"),
+            }
+        }
+
+        pub fn expose(self: *const Self) []const u8 {
+            return bytesView(Value, self.value);
+        }
+
+        pub fn declassify(self: *const Self) Value {
             return self.value;
         }
 
-        /// Best-effort secure zeroization the optimizer must not elide.
-        ///
-        /// Rejected at comptime for pointer/slice `T`: `asBytes` would only zero
-        /// the slice header (ptr+len), never the pointed-to key bytes — a silent
-        /// no-op footgun. Wrap an inline array (`Secret([N]u8)`) or wipe the
-        /// backing buffer explicitly.
-        pub fn wipe(self: *Self) void {
-            comptime if (@typeInfo(T) == .pointer)
-                @compileError("Secret(" ++ @typeName(T) ++ ").wipe cannot zero pointed-to bytes; wrap an array like Secret([N]u8)");
-            const bytes = std.mem.asBytes(&self.value);
-            for (bytes) |*b| {
-                const vp: *volatile u8 = @ptrCast(b);
-                vp.* = 0;
-            }
+        pub fn format(_: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll(redacted);
         }
     };
 }
 
-test "secret wipe zeroes the backing bytes" {
-    var s = Secret([4]u8).init(.{ 1, 2, 3, 4 });
-    s.wipe();
-    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, s.declassify());
+pub const SecretSlice = struct {
+    const Self = @This();
+
+    bytes: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) !Self {
+        const owned = try allocator.dupe(u8, bytes);
+        return .{ .bytes = owned };
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        self.wipe();
+        allocator.free(self.bytes);
+        self.bytes = &.{};
+    }
+
+    pub fn constantTimeEql(self: *const Self, other: *const Self) bool {
+        return constantTimeBytesEql(self.bytes, other.bytes);
+    }
+
+    pub fn wipe(self: *Self) void {
+        std.crypto.secureZero(u8, self.bytes);
+    }
+
+    pub fn expose(self: *const Self) []const u8 {
+        return self.bytes;
+    }
+
+    pub fn format(_: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll(redacted);
+    }
+};
+
+fn secretValueType(comptime spec: anytype) type {
+    return switch (@TypeOf(spec)) {
+        comptime_int => [spec]u8,
+        type => spec,
+        else => @compileError("Secret expects a byte count or byte container type"),
+    };
+}
+
+fn bytesView(comptime T: type, value: T) []const u8 {
+    return switch (@typeInfo(T)) {
+        .array => |array| blk: {
+            if (array.child != u8) @compileError("Secret array child type must be u8");
+            break :blk value[0..];
+        },
+        .pointer => |ptr| blk: {
+            if (ptr.size != .slice or ptr.child != u8) {
+                @compileError("Secret pointer type must be a u8 slice");
+            }
+            break :blk value;
+        },
+        else => @compileError("Secret value must be a byte array or byte slice"),
+    };
+}
+
+fn constantTimeBytesEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    return std.crypto.timing_safe.compare(u8, a, b, .big) == .eq;
+}
+
+test "Secret constantTimeEql reports true and false" {
+    const Key = Secret(4);
+    const a = Key.init(.{ 1, 2, 3, 4 });
+    const b = Key.init(.{ 1, 2, 3, 4 });
+    const c = Key.init(.{ 1, 2, 3, 5 });
+
+    try std.testing.expect(a.constantTimeEql(&b));
+    try std.testing.expect(!a.constantTimeEql(&c));
+}
+
+test "Secret format redacts bytes" {
+    const key = Secret(4).init(.{ 9, 8, 7, 6 });
+    var buf: [32]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{}", .{key});
+
+    try std.testing.expectEqualStrings(redacted, out);
+}
+
+test "Secret wipe zeroes bytes" {
+    var key = Secret(4).init(.{ 1, 2, 3, 4 });
+
+    key.wipe();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, key.expose());
+}
+
+test "Secret expose returns bytes" {
+    const key = Secret(4).init(.{ 4, 3, 2, 1 });
+
+    try std.testing.expectEqualSlices(u8, &.{ 4, 3, 2, 1 }, key.expose());
+}
+
+test "SecretSlice owns compares exposes and wipes" {
+    const allocator = std.testing.allocator;
+    var a = try SecretSlice.init(allocator, &.{ 1, 2, 3 });
+    defer a.deinit(allocator);
+    var b = try SecretSlice.init(allocator, &.{ 1, 2, 3 });
+    defer b.deinit(allocator);
+    var c = try SecretSlice.init(allocator, &.{ 1, 2, 4 });
+    defer c.deinit(allocator);
+
+    try std.testing.expect(a.constantTimeEql(&b));
+    try std.testing.expect(!a.constantTimeEql(&c));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, a.expose());
+
+    a.wipe();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, a.expose());
+}
+
+test "SecretSlice format redacts bytes" {
+    const allocator = std.testing.allocator;
+    var secret = try SecretSlice.init(allocator, &.{ 8, 6, 7, 5, 3, 0, 9 });
+    defer secret.deinit(allocator);
+
+    var buf: [32]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{}", .{secret});
+
+    try std.testing.expectEqualStrings(redacted, out);
 }

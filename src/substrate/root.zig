@@ -25,6 +25,7 @@ pub const ddsketch = @import("ddsketch.zig");
 pub const dtx = @import("dtx.zig");
 pub const egwalker = @import("egwalker.zig");
 pub const ewma = @import("ewma.zig");
+pub const fault_loom = @import("fault_loom.zig");
 pub const fec_window = @import("fec_window.zig");
 pub const fenwick = @import("fenwick.zig");
 pub const flow = @import("flow.zig");
@@ -136,6 +137,7 @@ test {
     _ = dtx;
     _ = egwalker;
     _ = ewma;
+    _ = fault_loom;
     _ = fec_window;
     _ = fenwick;
     _ = flow;
