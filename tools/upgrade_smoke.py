@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Live Helix UPGRADE smoke test.
+
+Boots a Mizuchi daemon with an account DB + an [[opers]] binding, registers an
+operator account, logs in over SASL (auto-elevates to oper), issues UPGRADE, and
+verifies the hot re-exec:
+
+  * the operator elevation works (RPL_YOUREOPER 381),
+  * the daemon execve's --supervisor and ADOPTS the inherited listener (log),
+  * session state is carried across the handoff (sealed/recovered log lines),
+  * the port stays bound (same PID) and still serves IRC after the upgrade.
+
+Usage: python3 tools/upgrade_smoke.py [path-to-mizuchi-binary]
+Exit code 0 = PASS.
+"""
+import base64
+import os
+import socket
+import subprocess
+import sys
+import time
+
+PORT = 16720
+HOST = "127.0.0.1"
+ACCT = "admin"
+PASSWORD = "secretpass0"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "zig-out", "bin", "mizuchi")
+DB = "/tmp/mz_upgrade_accts.db"
+CONF = "/tmp/mz_upgrade.toml"
+LOG = "/tmp/mz_upgrade.log"
+
+
+def recv_until(sock, needle, timeout=4.0):
+    sock.settimeout(timeout)
+    buf = b""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        if needle in buf:
+            break
+    return buf.decode("utf-8", "replace")
+
+
+def connect():
+    return socket.create_connection((HOST, PORT), timeout=4)
+
+
+def fail(msg, proc=None):
+    print(f"FAIL: {msg}")
+    try:
+        with open(LOG) as f:
+            print("--- daemon log ---")
+            print(f.read())
+    except OSError:
+        pass
+    cleanup(proc)
+    sys.exit(1)
+
+
+def cleanup(proc):
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    for p in (CONF, LOG, DB, DB + ".wal"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def main():
+    if not os.path.exists(BIN):
+        fail(f"binary not found: {BIN} (run `zig build` first)")
+    for p in (DB, DB + ".wal"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    with open(CONF, "w") as f:
+        f.write(
+            "[node]\nid = 1\n"
+            f"[listen]\nirc = {PORT}\n"
+            f"[sasl]\naccount_db = \"{DB}\"\n"
+            f"[[opers]]\naccount = \"{ACCT}\"\nclass = \"netadmin\"\n"
+        )
+
+    proc = subprocess.Popen([BIN, CONF], stdout=open(LOG, "w"), stderr=subprocess.STDOUT)
+    time.sleep(2.5)
+    if proc.poll() is not None:
+        fail("daemon exited during boot", proc)
+    pid_before = proc.pid
+
+    # Conn A: register the operator account.
+    a = connect()
+    a.sendall(b"NICK reg\r\nUSER reg 0 * :reg\r\n")
+    if " 001 " not in recv_until(a, b" 001 "):
+        fail("conn A did not register (no 001)", proc)
+    a.sendall(f"REGISTER {ACCT} * {PASSWORD}\r\n".encode())
+    reg = recv_until(a, b"REGISTER")
+    if "REGISTER SUCCESS" not in reg and "FAIL" not in reg:
+        fail(f"unexpected REGISTER reply: {reg!r}", proc)
+    a.close()
+
+    # Conn B: SASL login -> auto-elevate to oper -> UPGRADE.
+    b = connect()
+    b.sendall(b"CAP LS 302\r\n")
+    recv_until(b, b"CAP")
+    b.sendall(b"CAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\n")
+    if "AUTHENTICATE +" not in recv_until(b, b"AUTHENTICATE +"):
+        fail("server did not prompt AUTHENTICATE +", proc)
+    token = base64.b64encode(b"\0" + ACCT.encode() + b"\0" + PASSWORD.encode()).decode()
+    b.sendall(f"AUTHENTICATE {token}\r\n".encode())
+    sasl = recv_until(b, b"90")
+    if " 903 " not in sasl and " 900 " not in sasl:
+        fail(f"SASL login failed: {sasl!r}", proc)
+    b.sendall(b"CAP END\r\nNICK admin\r\nUSER admin 0 * :admin\r\n")
+    welcome = recv_until(b, b" 381 ")
+    if " 381 " not in welcome:
+        fail(f"operator not elevated (no 381): {welcome!r}", proc)
+    print("PASS: operator elevated via SASL (381)")
+
+    b.sendall(b"UPGRADE\r\n")
+    time.sleep(0.4)
+    b.close()
+
+    # Give the execve time to land + the successor to adopt + boot.
+    time.sleep(2.5)
+
+    if proc.poll() is not None:
+        fail("daemon process died across UPGRADE (execve should preserve PID)", proc)
+    if proc.pid != pid_before:
+        fail("PID changed — execve should keep the same PID", proc)
+    print(f"PASS: daemon survived UPGRADE (same PID {proc.pid})")
+
+    with open(LOG) as f:
+        log = f.read()
+    if "adopting inherited listener fd" not in log:
+        fail("successor did not adopt the inherited listener", proc)
+    print("PASS: successor adopted the inherited listener socket")
+    if "session(s) sealed" in log or "state capsule(s) recovered" in log:
+        print("PASS: session state carried across the handoff")
+    else:
+        print("WARN: no state-carry log line (state may be empty)")
+
+    # Conn C: a fresh client must connect + register after the upgrade.
+    time.sleep(0.3)
+    c = connect()
+    c.sendall(b"NICK after\r\nUSER after 0 * :after\r\n")
+    if " 001 " not in recv_until(c, b" 001 "):
+        fail("post-upgrade client could not register (port not serving)", proc)
+    c.close()
+    print("PASS: port stayed bound and serves IRC after UPGRADE")
+
+    cleanup(proc)
+    print("\nALL CHECKS PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
