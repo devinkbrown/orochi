@@ -97,6 +97,35 @@ pub const MediaSocket = struct {
         return (first & 0xC0) == 0;
     }
 
+    /// Send a plain STUN binding request to `server` and return the reflexive
+    /// (public) address it reports in XOR-MAPPED-ADDRESS — the server's own
+    /// server-reflexive candidate. `txid` is the caller-supplied transaction id
+    /// (use random bytes). Returns null on timeout / malformed / no address.
+    /// Must be called before the pump thread owns the socket (e.g. at boot).
+    pub fn queryReflexive(self: *MediaSocket, server: TransportAddress, txid: [12]u8, allocator: std.mem.Allocator) ?TransportAddress {
+        const req = stun.buildBindingRequest(allocator, txid, .{ .fingerprint = true }) catch return null;
+        defer allocator.free(req);
+        self.sendTo(server, req);
+
+        var buf: [max_datagram]u8 = undefined;
+        const got = self.recvFrom(&buf) orelse return null;
+        var msg = stun.decode(allocator, got.data) catch return null;
+        defer msg.deinit(allocator);
+        if (msg.typ != .binding_success_response) return null;
+        for (msg.attributes) |a| {
+            const addr: ?stun.Address = switch (a) {
+                .xor_mapped_address => |v| v,
+                .mapped_address => |v| v,
+                else => null,
+            };
+            if (addr) |sa| return switch (sa) {
+                .ipv4 => |v| TransportAddress.fromBytes(&v.ip, v.port) catch null,
+                .ipv6 => |v| TransportAddress.fromBytes(&v.ip, v.port) catch null,
+            };
+        }
+        return null;
+    }
+
     /// Read and process one datagram: STUN binding requests are answered (binding
     /// the peer address); RTP is left for the SFU relay step. Returns true if a
     /// datagram was read, false on timeout/idle. `buf` is scratch for the read.
@@ -168,6 +197,45 @@ test "loopback STUN binding round-trip binds the peer and answers" {
     defer decoded.deinit(testing.allocator);
     try testing.expectEqual(stun.MessageType.binding_success_response, decoded.typ);
     try testing.expect(try stun.verifyMessageIntegrity(got.data, pwd[0..]));
+}
+
+fn reflectorThread(sock: *MediaSocket) void {
+    var fba_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const a = fba.allocator();
+    var buf: [max_datagram]u8 = undefined;
+    const got = sock.recvFrom(&buf) orelse return;
+    var msg = stun.decode(a, got.data) catch return;
+    defer msg.deinit(a);
+    if (msg.typ != .binding_request) return;
+    const mapped = stun.Address{ .ipv4 = .{ .ip = got.from.ip[0..4].*, .port = got.from.port } };
+    const resp = stun.buildBindingSuccessResponse(a, msg.transaction_id, .{
+        .xor_mapped_address = mapped,
+        .fingerprint = true,
+    }) catch return;
+    sock.sendTo(got.from, resp);
+}
+
+test "queryReflexive learns the reflexive address from a STUN server" {
+    var server = try MediaSocket.bind(loopback_be, 0);
+    defer server.deinit();
+    server.setRecvTimeoutMs(2000);
+    const sport = try server.localPort();
+
+    var client = try MediaSocket.bind(loopback_be, 0);
+    defer client.deinit();
+    client.setRecvTimeoutMs(2000);
+    const cport = try client.localPort();
+
+    const t = try std.Thread.spawn(.{}, reflectorThread, .{&server});
+    defer t.join();
+
+    const server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, sport);
+    const refl = client.queryReflexive(server_addr, .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, testing.allocator) orelse
+        return error.TestUnexpectedResult;
+    // The reflector reports back what it saw: the client's own loopback ip:port.
+    try testing.expectEqual(cport, refl.port);
+    try testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, refl.bytes());
 }
 
 test "isStun demultiplexes STUN from RTP" {
