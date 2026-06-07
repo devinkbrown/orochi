@@ -119,6 +119,9 @@ pub fn handOff(prepared: *Prepared, fds: []const handoff.Fd, arena_fd: handoff.F
 /// Environment-variable names used to pass inherited fds across execve to the successor.
 pub const env_arena_fd = "MIZUCHI_HELIX_ARENA_FD";
 pub const env_control_fd = "MIZUCHI_HELIX_CONTROL_FD";
+/// The inherited listening-socket fd, preserved across execve so the successor
+/// keeps the port bound (no connection-refused window during an UPGRADE).
+pub const env_listen_fd = "MIZUCHI_HELIX_LISTEN_FD";
 
 pub const ExecPlan = struct {
     argv: []const [:0]const u8,
@@ -185,11 +188,43 @@ pub fn buildExecPlan(
     };
 }
 
+/// Build an exec plan that ALSO preserves the listening-socket fd across the
+/// handoff, so the successor can adopt it and keep the port bound. The caller
+/// must clear `FD_CLOEXEC` on `listen_fd` before `commit` so it survives execve.
+pub fn buildExecPlanWithListener(
+    allocator: std.mem.Allocator,
+    binary_path: []const u8,
+    arena_fd: handoff.Fd,
+    control_fd: handoff.Fd,
+    listen_fd: handoff.Fd,
+) anyerror!ExecPlan {
+    var argv = try allocator.alloc([:0]const u8, 2);
+    errdefer allocator.free(argv);
+    argv[0] = try allocator.dupeZ(u8, binary_path);
+    errdefer allocator.free(argv[0]);
+    argv[1] = try allocator.dupeZ(u8, "--supervisor");
+    errdefer allocator.free(argv[1]);
+
+    var envp = try allocator.alloc([:0]const u8, 3);
+    errdefer allocator.free(envp);
+    envp[0] = try fdEnvEntry(allocator, env_arena_fd, arena_fd);
+    errdefer allocator.free(envp[0]);
+    envp[1] = try fdEnvEntry(allocator, env_control_fd, control_fd);
+    errdefer allocator.free(envp[1]);
+    envp[2] = try fdEnvEntry(allocator, env_listen_fd, listen_fd);
+    errdefer allocator.free(envp[2]);
+
+    return .{ .argv = argv, .envp = envp, .arena_fd = arena_fd, .control_fd = control_fd };
+}
+
 /// Supervisor/resume side: read inherited fds from the environment, or return
 /// null for a normal boot.
 pub const Resume = struct {
     arena_fd: handoff.Fd,
     control_fd: handoff.Fd,
+    /// The inherited listening socket, or null if the predecessor did not pass
+    /// one (older handoff / listener not preserved).
+    listen_fd: ?handoff.Fd = null,
 };
 
 pub fn resumeFromEnv() ?Resume {
@@ -211,7 +246,11 @@ pub fn resumeFromEnv() ?Resume {
     const env = buf[0..@as(usize, @intCast(read_len))];
     const arena_fd = readFdFromEnvBlock(env, env_arena_fd) orelse return null;
     const control_fd = readFdFromEnvBlock(env, env_control_fd) orelse return null;
-    return .{ .arena_fd = arena_fd, .control_fd = control_fd };
+    return .{
+        .arena_fd = arena_fd,
+        .control_fd = control_fd,
+        .listen_fd = readFdFromEnvBlock(env, env_listen_fd), // optional
+    };
 }
 
 fn fdEnvEntry(allocator: std.mem.Allocator, name: []const u8, fd: handoff.Fd) ![:0]u8 {
@@ -275,6 +314,26 @@ test "live prepare seals capsules and handoff passes fds" {
 
 test "resumeFromEnv returns null when fd variables are absent" {
     try std.testing.expectEqual(@as(?Resume, null), resumeFromEnv());
+}
+
+test "exec plan with listener carries the listen fd env entry" {
+    const allocator = std.testing.allocator;
+    var plan = try buildExecPlanWithListener(allocator, "/tmp/mizuchi", 10, 11, 12);
+    defer plan.deinit(allocator);
+
+    try std.testing.expectEqualStrings("/tmp/mizuchi", plan.argv[0]);
+    try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
+    try std.testing.expectEqual(@as(usize, 3), plan.envp.len);
+    try std.testing.expectEqualStrings("MIZUCHI_HELIX_ARENA_FD=10", plan.envp[0]);
+    try std.testing.expectEqualStrings("MIZUCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
+    try std.testing.expectEqualStrings("MIZUCHI_HELIX_LISTEN_FD=12", plan.envp[2]);
+}
+
+test "readFdFromEnvBlock parses the listen fd, absent -> null" {
+    const block = "FOO=bar\x00MIZUCHI_HELIX_LISTEN_FD=37\x00BAZ=qux\x00";
+    try std.testing.expectEqual(@as(?handoff.Fd, 37), readFdFromEnvBlock(block, env_listen_fd));
+    const none = "FOO=bar\x00BAZ=qux\x00";
+    try std.testing.expectEqual(@as(?handoff.Fd, null), readFdFromEnvBlock(none, env_listen_fd));
 }
 
 test "exec plan owns argv and envp without committing" {
