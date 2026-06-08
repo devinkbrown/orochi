@@ -282,13 +282,15 @@ const cap_specs = [_]CapSpec{
     .{ .id = .server_time, .name = "server-time" },
     .{ .id = .message_tags, .name = "message-tags" },
     .{ .id = .echo_message, .name = "echo-message" },
-    // handleAuthenticate routes PLAIN, EXTERNAL, and SCRAM-SHA-256 through the
-    // sasl_mechrouter, but the live server only injects the PLAIN checker today —
-    // EXTERNAL needs a TLS certfp source and SCRAM needs a SCRAM-credential store
-    // (the account DB stores PBKDF2, not SCRAM keys). Advertising only PLAIN keeps
-    // the cap honest; flip this to "PLAIN,EXTERNAL,SCRAM-SHA-256" once main.zig
-    // injects those checkers (the routing + tests are already in place).
-    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN" },
+    // handleAuthenticate routes PLAIN and SCRAM-SHA-256 through the mechrouter;
+    // the live server injects both checkers from the account store (PLAIN via the
+    // PBKDF2 path, SCRAM-SHA-256 via the mirrored SCRAM credential store) plus a
+    // per-connection server nonce. Each fails closed when unconfigured, exactly
+    // like PLAIN always has. EXTERNAL is intentionally NOT advertised: it needs a
+    // client-certificate fingerprint, which requires mutual-TLS (a client-cert
+    // request the TLS server does not issue yet) — advertising it would strand
+    // clients. Add it here once mTLS lands.
+    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN,SCRAM-SHA-256" },
     .{ .id = .multi_prefix, .name = "multi-prefix" },
     .{ .id = .userhost_in_names, .name = "userhost-in-names" },
     .{ .id = .away_notify, .name = "away-notify" },
@@ -664,8 +666,10 @@ pub const ClientSession = struct {
     /// connection presents a client cert. Drives SASL EXTERNAL; null = no cert.
     tls_certfp: ?[]const u8 = null,
     /// Server nonce for SCRAM challenges. Borrowed for the router's lifetime; the
-    /// live server points this at a per-connection CSPRNG-filled buffer.
+    /// live server points this at `sasl_server_nonce_buf` via setSaslServerNonce.
     sasl_server_nonce: []const u8 = "",
+    /// Stable per-connection backing for `sasl_server_nonce` (hex CSPRNG output).
+    sasl_server_nonce_buf: [32]u8 = undefined,
     account_store: FixedString(MAX_ACCOUNT_BYTES) = .{},
     logged_in: bool = false,
 
@@ -906,6 +910,14 @@ pub const ClientSession = struct {
     /// and by tests; normal clients arrive here via CAP REQ).
     pub fn addCap(self: *ClientSession, id: CapId) void {
         self.cap.negotiated.add(id);
+    }
+
+    /// Point `sasl_server_nonce` at a stable per-connection copy of `nonce`
+    /// (the server supplies fresh CSPRNG hex at accept). Truncated to the buffer.
+    pub fn setSaslServerNonce(self: *ClientSession, nonce: []const u8) void {
+        const n = @min(nonce.len, self.sasl_server_nonce_buf.len);
+        @memcpy(self.sasl_server_nonce_buf[0..n], nonce[0..n]);
+        self.sasl_server_nonce = self.sasl_server_nonce_buf[0..n];
     }
 
     /// Operator-facing STS enable: store the formatted wire value so the `sts`

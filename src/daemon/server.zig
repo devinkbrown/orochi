@@ -25,6 +25,7 @@ const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
 const sasl = @import("../proto/sasl.zig");
+const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const names_reply = @import("../proto/names_reply.zig");
 const chanmode = @import("chanmode.zig");
 const kick = @import("../proto/kick.zig");
@@ -856,6 +857,10 @@ pub const Config = struct {
     /// take on the account store's I/O lifecycle: a caller that has a store wires
     /// `sasl_bridge.ServicesPlainChecker.checker()` here. Null = SASL fails closed.
     sasl_checker: ?sasl.PlainChecker = null,
+    /// Optional SASL SCRAM-SHA-256 credential lookup (account -> SCRAM record).
+    /// Injected from the SCRAM credential store; null = SCRAM fails closed. When
+    /// set, each accepted connection also gets a fresh CSPRNG server nonce.
+    sasl_scram256: ?sasl_mechrouter.Scram256Lookup = null,
     /// Optional server-to-server listener port (0 = disabled). Accepts on this
     /// socket are driven as Suimyaku mesh peers via S2sLink, not IRC clients.
     s2s_port: u16 = 0,
@@ -1654,7 +1659,7 @@ pub const LinuxServer = struct {
             }
             conn.tls = tls;
             conn.is_tls = true;
-            if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+            self.injectSaslState(conn);
             try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             self.stats.onAccept();
             self.traceLog(.info, .net, "tls client accepted");
@@ -1711,9 +1716,9 @@ pub const LinuxServer = struct {
             }
         }
 
-        // Make the injected SASL verifier available before the client can send
+        // Make the injected SASL verifiers available before the client can send
         // AUTHENTICATE (during CAP negotiation, pre-registration).
-        if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+        self.injectSaslState(conn);
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
         self.stats.onAccept();
         self.traceLog(.info, .net, "client accepted");
@@ -2196,6 +2201,28 @@ pub const LinuxServer = struct {
 
     fn connForToken(self: *LinuxServer, token: RingFdToken) ServerError!*ConnState {
         return self.clients.get(idFromToken(token)) orelse error.ClientNotFound;
+    }
+
+    /// Make the injected SASL verifiers available on a freshly accepted session
+    /// before the client can AUTHENTICATE. PLAIN is a fat-pointer checker; SCRAM
+    /// additionally needs a per-connection server nonce, minted here from the
+    /// CSPRNG as hex (printable, comma-free — required by the SCRAM message grammar).
+    fn injectSaslState(self: *LinuxServer, conn: *ConnState) void {
+        if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+        if (self.config.sasl_scram256) |scram| {
+            if (self.config.crypto_io) |io| {
+                var raw: [16]u8 = undefined;
+                io.random(&raw);
+                var hex: [32]u8 = undefined;
+                const charset = "0123456789abcdef";
+                for (raw, 0..) |b, i| {
+                    hex[i * 2] = charset[b >> 4];
+                    hex[i * 2 + 1] = charset[b & 0x0f];
+                }
+                conn.session.setSaslServerNonce(&hex);
+                conn.session.sasl_scram256 = scram;
+            }
+        }
     }
 
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
@@ -4975,7 +5002,7 @@ pub const LinuxServer = struct {
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
         conn.session.restore(snap);
-        if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+        self.injectSaslState(conn);
         // Re-populate the world nick registry so the carried client stays
         // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
         // collisions; ignore NickInUse defensively. Channel membership carry-over
@@ -6505,7 +6532,10 @@ pub const LinuxServer = struct {
     /// `SASLINFO` — report the SASL mechanisms this server accepts and the
     /// caller's current authentication state. Read-only; available to anyone.
     pub fn handleSaslInfo(self: *LinuxServer, conn: *ConnState) !void {
-        const mechs = if (self.config.sasl_checker != null) "PLAIN" else "(none configured)";
+        const mechs = if (self.config.sasl_checker != null)
+            (if (self.config.sasl_scram256 != null) "PLAIN,SCRAM-SHA-256" else "PLAIN")
+        else
+            "(none configured)";
         var buf: [default_reply_bytes]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :SASL mechanisms: {s}\r\n", .{ server_name, conn.session.displayName(), mechs }) catch return;
         try appendToConn(conn, m);

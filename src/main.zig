@@ -150,15 +150,22 @@ pub fn main(init: std.process.Init) !void {
     defer if (account_store) |*s| s.deinit();
     var account_services: mizuchi.daemon.services.Services = undefined;
     var account_checker: mizuchi.daemon.sasl_bridge.ServicesPlainChecker = undefined;
+    // SCRAM-SHA-256 credential mirror: provisioned alongside each account so a
+    // client can authenticate without sending its password. Must outlive the
+    // server (the lookup fat-pointer captures &scram_store).
+    var scram_store = mizuchi.daemon.scram_store.ScramStore.init(allocator);
+    defer scram_store.deinit();
     if (held) |h| {
         if (h.parsed.sasl.account_db) |db| {
             if (mizuchi.daemon.services.MizuStore.open(allocator, init.io, std.Io.Dir.cwd(), db)) |store| {
                 account_store = store;
                 account_services = mizuchi.daemon.services.Services.init(&account_store.?, null);
+                account_services.attachScramStore(&scram_store);
                 account_checker = .{ .services = &account_services };
                 srv_cfg.sasl_checker = account_checker.checker();
+                srv_cfg.sasl_scram256 = scram_store.scram256Lookup();
                 srv_cfg.account_services = &account_services;
-                std.debug.print("mizuchi: SASL account store opened ({s})\n", .{db});
+                std.debug.print("mizuchi: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 live\n", .{db});
             } else |err| {
                 std.debug.print("mizuchi: account store error ({s}); SASL disabled\n", .{@errorName(err)});
             }
