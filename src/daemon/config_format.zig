@@ -38,6 +38,7 @@ pub const Config = struct {
     media: Media = .{},
     sasl: Sasl = .{},
     cloak: Cloak = .{},
+    tls: Tls = .{},
 
     pub const Node = struct {
         id: u64 = 0,
@@ -139,6 +140,24 @@ pub const Config = struct {
         secret: ?[]const u8 = null,
     };
 
+    /// TLS listener settings. The live listener is wired elsewhere; this section
+    /// only describes intent. When `enabled` and no `cert_path`/`key_path` are
+    /// given, the daemon bootstraps a self-signed Ed25519 leaf (see
+    /// `tls_certs.loadOrBootstrap`) using `dns_name` as the CN/SAN.
+    pub const Tls = struct {
+        /// Whether to stand up a TLS listener at all.
+        enabled: bool = false,
+        /// TLS listener port (the conventional IRCS port is 6697).
+        port: u16 = 6697,
+        /// PEM/DER leaf certificate path. When set together with `key_path`,
+        /// the on-disk material is loaded instead of bootstrapping.
+        cert_path: ?[]const u8 = null,
+        /// PEM/DER private key path; paired with `cert_path`.
+        key_path: ?[]const u8 = null,
+        /// CN/SAN used for the self-signed bootstrap leaf when no files are set.
+        dns_name: []const u8 = "localhost",
+    };
+
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
         const host = try allocator.dupe(u8, "127.0.0.1");
         errdefer allocator.free(host);
@@ -147,6 +166,7 @@ pub const Config = struct {
         return .{
             .listen = .{ .host = host, .media_host = media_host },
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
+            .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
         };
     }
 
@@ -173,6 +193,9 @@ pub const Config = struct {
         if (self.sasl.account_db) |value| allocator.free(value);
         if (self.media.stun_host) |value| allocator.free(value);
         if (self.cloak.secret) |value| allocator.free(value);
+        allocator.free(self.tls.dns_name);
+        if (self.tls.cert_path) |value| allocator.free(value);
+        if (self.tls.key_path) |value| allocator.free(value);
         self.* = .{};
     }
 };
@@ -250,6 +273,13 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [cloak]
     try setOpt(allocator, resolver, doc.getString("cloak.secret"), &cfg.cloak.secret);
+
+    // [tls]
+    if (doc.getBool("tls.enabled")) |b| cfg.tls.enabled = b;
+    cfg.tls.port = try portField(doc, "tls.port", cfg.tls.port);
+    try setOpt(allocator, resolver, doc.getString("tls.cert_path"), &cfg.tls.cert_path);
+    try setOpt(allocator, resolver, doc.getString("tls.key_path"), &cfg.tls.key_path);
+    try setStr(allocator, resolver, doc.getString("tls.dns_name"), &cfg.tls.dns_name);
 
     // [[opers]] arrays-of-tables
     if (doc.getArray("opers")) |arr| {
@@ -540,6 +570,52 @@ test "parseToml: minimal config keeps defaults" {
     try testing.expectEqual(@as(u16, 6680), cfg.listen.irc);
     try testing.expectEqual(@as(u16, 0), cfg.listen.s2s);
     try testing.expectEqualStrings("127.0.0.1", cfg.listen.host);
+}
+
+test "parseToml: [tls] section projects onto Config" {
+    // Arrange
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\port = 7000
+        \\cert_path = "/etc/mizuchi/leaf.pem"
+        \\key_path = "/etc/mizuchi/leaf.key"
+        \\dns_name = "irc.example.test"
+        \\
+    ;
+
+    // Act
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+
+    // Assert
+    try testing.expect(cfg.tls.enabled);
+    try testing.expectEqual(@as(u16, 7000), cfg.tls.port);
+    try testing.expectEqualStrings("/etc/mizuchi/leaf.pem", cfg.tls.cert_path.?);
+    try testing.expectEqualStrings("/etc/mizuchi/leaf.key", cfg.tls.key_path.?);
+    try testing.expectEqualStrings("irc.example.test", cfg.tls.dns_name);
+}
+
+test "parseToml: [tls] omitted keeps secure defaults" {
+    // Arrange
+    const allocator = testing.allocator;
+    const text = "[node]\nid = 1\n[listen]\nirc = 6680\n";
+
+    // Act
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+
+    // Assert
+    try testing.expect(!cfg.tls.enabled);
+    try testing.expectEqual(@as(u16, 6697), cfg.tls.port);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.tls.cert_path);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.tls.key_path);
+    try testing.expectEqualStrings("localhost", cfg.tls.dns_name);
 }
 
 test {

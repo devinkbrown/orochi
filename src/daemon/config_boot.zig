@@ -48,11 +48,39 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
 /// owned parsed config (caller must `deinit` it AFTER it is done using the
 /// returned Config, since string fields are borrowed). On parse failure returns
 /// the error and, when available, fills `diag_out`.
+/// Neutral projection of the `[tls]` section for the boot layer. `server.Config`
+/// has no TLS fields (and is owned by another module), so the parsed TLS intent
+/// rides alongside the mapped server config here; `main.zig` consumes it to drive
+/// `tls_certs.loadOrBootstrap` and the (separately wired) TLS listener. String
+/// fields borrow `parsed` — keep the owning `Loaded` alive while they are used.
+pub const TlsBootConfig = struct {
+    enabled: bool = false,
+    port: u16 = 6697,
+    cert_path: ?[]const u8 = null,
+    key_path: ?[]const u8 = null,
+    dns_name: []const u8 = "localhost",
+};
+
+/// Project the parsed `[tls]` section onto the neutral boot struct. Borrows
+/// `cfg`'s string fields; keep `cfg` alive as long as the result is used.
+pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
+    return .{
+        .enabled = cfg.tls.enabled,
+        .port = cfg.tls.port,
+        .cert_path = cfg.tls.cert_path,
+        .key_path = cfg.tls.key_path,
+        .dns_name = cfg.tls.dns_name,
+    };
+}
+
 pub const Loaded = struct {
     config: server.Config,
     parsed: config_format.Config,
     /// Owned oper bindings backing `config.oper_registry` (strings borrow `parsed`).
     oper_bindings: []oper_mod.OperBinding = &.{},
+    /// Parsed `[tls]` intent (strings borrow `parsed`); the live listener and
+    /// certificate loading are wired by `main.zig`, not here.
+    tls: TlsBootConfig = .{},
 
     pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
         allocator.free(self.oper_bindings);
@@ -112,7 +140,12 @@ pub fn loadFromText(
     if (bindings.len != 0) {
         config.oper_registry = try oper_mod.OperRegistry.init(bindings);
     }
-    return .{ .config = config, .parsed = parsed, .oper_bindings = bindings };
+    return .{
+        .config = config,
+        .parsed = parsed,
+        .oper_bindings = bindings,
+        .tls = mapTlsBootConfig(parsed),
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +284,41 @@ test "minimal config: unspecified optional fields keep defaults" {
     try testing.expectEqual(@as(u16, 6680), loaded.config.port);
     try testing.expectEqual(@as(u64, 9), loaded.config.node_id);
     try testing.expectEqual(@as(u16, 0), loaded.config.s2s_port); // unspecified -> default
+}
+
+test "tls section projects onto the boot tls config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\port = 7001
+        \\cert_path = "leaf.pem"
+        \\key_path = "leaf.key"
+        \\dns_name = "irc.example.test"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(loaded.tls.enabled);
+    try testing.expectEqual(@as(u16, 7001), loaded.tls.port);
+    try testing.expectEqualStrings("leaf.pem", loaded.tls.cert_path.?);
+    try testing.expectEqualStrings("leaf.key", loaded.tls.key_path.?);
+    try testing.expectEqualStrings("irc.example.test", loaded.tls.dns_name);
+}
+
+test "tls omitted keeps boot defaults" {
+    const allocator = testing.allocator;
+    const text = "[node]\nid = 1\n[listen]\nirc = 6680\n";
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(!loaded.tls.enabled);
+    try testing.expectEqual(@as(u16, 6697), loaded.tls.port);
+    try testing.expectEqual(@as(?[]const u8, null), loaded.tls.cert_path);
+    try testing.expectEqualStrings("localhost", loaded.tls.dns_name);
 }
 
 test "missing required [node].id is rejected" {

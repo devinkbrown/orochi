@@ -209,6 +209,7 @@ pub const tiered_keys = @import("tiered_keys.zig");
 pub const timeout_policy = @import("timeout_policy.zig");
 pub const timer_set = @import("timer_set.zig");
 pub const timezone_pref = @import("timezone_pref.zig");
+pub const tls_certs = @import("tls_certs.zig");
 pub const tls_conn = @import("tls_conn.zig");
 pub const topic_history = @import("topic_history.zig");
 pub const topk_tally = @import("topk_tally.zig");
@@ -446,6 +447,7 @@ test {
     _ = timeout_policy;
     _ = timer_set;
     _ = timezone_pref;
+    _ = tls_certs;
     _ = tls_conn;
     _ = topic_history;
     _ = topk_tally;
