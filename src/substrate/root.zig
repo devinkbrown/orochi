@@ -76,6 +76,7 @@ pub const opvox_adpcm = @import("opvox_adpcm.zig");
 pub const pacing = @import("pacing.zig");
 pub const pairing_heap = @import("pairing_heap.zig");
 pub const pcm = @import("pcm.zig");
+pub const persistent_map = @import("persistent_map.zig");
 pub const platform = @import("platform.zig");
 pub const playout_clock = @import("playout_clock.zig");
 pub const plc = @import("plc.zig");
@@ -216,6 +217,7 @@ test {
     _ = pacing;
     _ = pairing_heap;
     _ = pcm;
+    _ = persistent_map;
     _ = platform;
     _ = playout_clock;
     _ = plc;
