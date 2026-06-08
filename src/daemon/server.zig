@@ -861,6 +861,10 @@ pub const Config = struct {
     /// Injected from the SCRAM credential store; null = SCRAM fails closed. When
     /// set, each accepted connection also gets a fresh CSPRNG server nonce.
     sasl_scram256: ?sasl_mechrouter.Scram256Lookup = null,
+    /// Optional IRCv3 STS wire value ("duration=..,port=..[,preload]"), built by
+    /// main.zig from `[sts]` config when a TLS listener is live. Null = STS not
+    /// advertised (the default-off honesty guard). Borrowed for the server's life.
+    sts_value: ?[]const u8 = null,
     /// Optional server-to-server listener port (0 = disabled). Accepts on this
     /// socket are driven as Suimyaku mesh peers via S2sLink, not IRC clients.
     s2s_port: u16 = 0,
@@ -1659,7 +1663,7 @@ pub const LinuxServer = struct {
             }
             conn.tls = tls;
             conn.is_tls = true;
-            self.injectSaslState(conn);
+            self.injectSessionState(conn);
             try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             self.stats.onAccept();
             self.traceLog(.info, .net, "tls client accepted");
@@ -1718,7 +1722,7 @@ pub const LinuxServer = struct {
 
         // Make the injected SASL verifiers available before the client can send
         // AUTHENTICATE (during CAP negotiation, pre-registration).
-        self.injectSaslState(conn);
+        self.injectSessionState(conn);
         try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
         self.stats.onAccept();
         self.traceLog(.info, .net, "client accepted");
@@ -2203,11 +2207,12 @@ pub const LinuxServer = struct {
         return self.clients.get(idFromToken(token)) orelse error.ClientNotFound;
     }
 
-    /// Make the injected SASL verifiers available on a freshly accepted session
-    /// before the client can AUTHENTICATE. PLAIN is a fat-pointer checker; SCRAM
-    /// additionally needs a per-connection server nonce, minted here from the
-    /// CSPRNG as hex (printable, comma-free — required by the SCRAM message grammar).
-    fn injectSaslState(self: *LinuxServer, conn: *ConnState) void {
+    /// Apply server-injected per-session state on a freshly accepted client
+    /// before it can negotiate: the SASL verifiers (PLAIN fat-pointer checker;
+    /// SCRAM additionally needs a per-connection CSPRNG hex server nonce —
+    /// printable + comma-free per the SCRAM grammar) and the STS policy (so the
+    /// `sts` cap is advertised on CAP LS when an operator enabled it).
+    fn injectSessionState(self: *LinuxServer, conn: *ConnState) void {
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
         if (self.config.sasl_scram256) |scram| {
             if (self.config.crypto_io) |io| {
@@ -2223,6 +2228,7 @@ pub const LinuxServer = struct {
                 conn.session.sasl_scram256 = scram;
             }
         }
+        if (self.config.sts_value) |v| conn.session.enableSts(v) catch {};
     }
 
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
@@ -5002,7 +5008,7 @@ pub const LinuxServer = struct {
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
         conn.session.restore(snap);
-        self.injectSaslState(conn);
+        self.injectSessionState(conn);
         // Re-populate the world nick registry so the carried client stays
         // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
         // collisions; ignore NickInUse defensively. Channel membership carry-over

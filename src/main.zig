@@ -213,6 +213,30 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // IRCv3 STS: when an operator enables `[sts]` AND a TLS listener is live,
+    // build the advertised wire value so each session's `sts` cap is offered.
+    // STS without a live TLS port would strand clients, so require both.
+    var sts_value_buf: [mizuchi.proto.sts.MAX_VALUE_LEN]u8 = undefined;
+    if (held) |h| {
+        if (h.sts.enabled) {
+            if (srv_cfg.tls_cert_chain.len != 0) {
+                const policy = mizuchi.proto.sts_policy.Policy{
+                    .duration_seconds = h.sts.duration,
+                    .port = h.sts.port,
+                    .preload = h.sts.preload,
+                };
+                if (mizuchi.proto.sts_policy.writeCapValue(policy, .combined, &sts_value_buf)) |value| {
+                    srv_cfg.sts_value = value;
+                    std.debug.print("mizuchi: STS advertised ({s})\n", .{value});
+                } else |err| {
+                    std.debug.print("mizuchi: STS value error ({s}); STS disabled\n", .{@errorName(err)});
+                }
+            } else {
+                std.debug.print("mizuchi: [sts] enabled but no TLS listener; STS NOT advertised\n", .{});
+            }
+        }
+    }
+
     const Server = mizuchi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // io_uring unavailable (old kernel / sandbox): fall back to the DST boot banner.
