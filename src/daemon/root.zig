@@ -50,6 +50,7 @@ pub const client = @import("client.zig");
 pub const clone_detect = @import("clone_detect.zig");
 pub const clone_limit = @import("clone_limit.zig");
 pub const color_pref = @import("color_pref.zig");
+pub const command_class = @import("command_class.zig");
 pub const commands = @import("commands.zig");
 pub const command_stats = @import("command_stats.zig");
 pub const compose_draft = @import("compose_draft.zig");
@@ -294,6 +295,7 @@ test {
     _ = clone_detect;
     _ = clone_limit;
     _ = color_pref;
+    _ = command_class;
     _ = commands;
     _ = command_stats;
     _ = compose_draft;
