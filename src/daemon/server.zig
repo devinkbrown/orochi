@@ -1126,6 +1126,14 @@ const Reactor = struct {
     }
 };
 
+/// The reactor whose loop is running on THIS thread. Each reactor thread sets it
+/// once at loop entry (`runOnce`); handlers reach their own ring/connection table
+/// through `LinuxServer.rx()` with no parameter threading. Null off any reactor
+/// thread (e.g. a test calling a handler directly, or the main thread querying
+/// `boundPort`), where `rx()` falls back to the single embedded reactor — which is
+/// the same pointer in the single-reactor configuration, so the fallback is exact.
+threadlocal var current_reactor: ?*Reactor = null;
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -1248,7 +1256,7 @@ pub const LinuxServer = struct {
     /// entry). Centralizing the lookup keeps every handler's `self.rx().ring` /
     /// `self.rx().clients` access shard-correct with no signature changes.
     inline fn rx(self: *LinuxServer) *Reactor {
-        return &self.io;
+        return current_reactor orelse &self.io;
     }
 
     /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
@@ -1620,6 +1628,10 @@ pub const LinuxServer = struct {
     /// Process at least one io_uring completion. Callers may loop this until
     /// their own stop condition is satisfied.
     pub fn runOnce(self: *LinuxServer) !void {
+        // Bind this thread to its reactor so every handler's rx() resolves to the
+        // reactor whose ring produced the completions (single embedded reactor
+        // today; one per shard once threads are spawned).
+        current_reactor = &self.io;
         try self.armAccept();
         self.armWake() catch {}; // cross-reactor wake poll; non-fatal if it can't arm
         self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
