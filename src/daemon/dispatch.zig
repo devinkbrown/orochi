@@ -282,15 +282,13 @@ const cap_specs = [_]CapSpec{
     .{ .id = .server_time, .name = "server-time" },
     .{ .id = .message_tags, .name = "message-tags" },
     .{ .id = .echo_message, .name = "echo-message" },
-    // handleAuthenticate routes PLAIN and SCRAM-SHA-256 through the mechrouter;
-    // the live server injects both checkers from the account store (PLAIN via the
-    // PBKDF2 path, SCRAM-SHA-256 via the mirrored SCRAM credential store) plus a
-    // per-connection server nonce. Each fails closed when unconfigured, exactly
-    // like PLAIN always has. EXTERNAL is intentionally NOT advertised: it needs a
-    // client-certificate fingerprint, which requires mutual-TLS (a client-cert
-    // request the TLS server does not issue yet) — advertising it would strand
-    // clients. Add it here once mTLS lands.
-    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN,SCRAM-SHA-256" },
+    // handleAuthenticate routes PLAIN, SCRAM-SHA-256, and EXTERNAL through the
+    // mechrouter. The live server injects each checker from the account store
+    // (PLAIN via PBKDF2, SCRAM-SHA-256 via the mirrored credential store + a
+    // per-connection nonce, EXTERNAL via the account ⇄ certfp bindings over the
+    // mutual-TLS client cert). Each fails closed when unconfigured, exactly like
+    // PLAIN always has, so advertising all three never strands a client.
+    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN,EXTERNAL,SCRAM-SHA-256" },
     .{ .id = .multi_prefix, .name = "multi-prefix" },
     .{ .id = .userhost_in_names, .name = "userhost-in-names" },
     .{ .id = .away_notify, .name = "away-notify" },

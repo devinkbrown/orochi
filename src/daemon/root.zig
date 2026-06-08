@@ -29,6 +29,7 @@ pub const birthday = @import("birthday.zig");
 pub const block_list = @import("block_list.zig");
 pub const bot_registry = @import("bot_registry.zig");
 pub const causal_trace = @import("causal_trace.zig");
+pub const certfp_bind = @import("certfp_bind.zig");
 pub const cert_store = @import("cert_store.zig");
 pub const challenge_gate = @import("challenge_gate.zig");
 pub const chanfix = @import("chanfix.zig");
@@ -267,6 +268,7 @@ test {
     _ = block_list;
     _ = bot_registry;
     _ = causal_trace;
+    _ = certfp_bind;
     _ = cert_store;
     _ = challenge_gate;
     _ = chanfix;

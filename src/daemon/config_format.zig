@@ -157,6 +157,9 @@ pub const Config = struct {
         key_path: ?[]const u8 = null,
         /// CN/SAN used for the self-signed bootstrap leaf when no files are set.
         dns_name: []const u8 = "localhost",
+        /// Request a client certificate (mutual TLS) so SASL EXTERNAL can match
+        /// the presented fingerprint to an account. Off by default.
+        request_client_cert: bool = false,
     };
 
     /// IRCv3 STS (Strict Transport Security) advertisement policy. When enabled,
@@ -300,6 +303,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("tls.cert_path"), &cfg.tls.cert_path);
     try setOpt(allocator, resolver, doc.getString("tls.key_path"), &cfg.tls.key_path);
     try setStr(allocator, resolver, doc.getString("tls.dns_name"), &cfg.tls.dns_name);
+    if (doc.getBool("tls.request_client_cert")) |b| cfg.tls.request_client_cert = b;
 
     // [sts]
     if (doc.getBool("sts.enabled")) |b| cfg.sts.enabled = b;

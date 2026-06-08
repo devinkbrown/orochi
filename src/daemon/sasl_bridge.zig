@@ -67,6 +67,31 @@ pub const ServicesScramLookup = struct {
     }
 };
 
+/// Adapter exposing a `*Services` as the mechrouter's SASL EXTERNAL verifier:
+/// the presented client-cert fingerprint is matched to a bound account
+/// (CERTADD). Hand `lookup()` to `mechrouter.Callbacks.external`. No secret is
+/// exchanged — possession of the cert's private key was already proven by the
+/// TLS CertificateVerify; this only maps the fingerprint to an account.
+///
+/// LIFETIME: the returned fat pointer borrows `*Services`, which must outlive
+/// every connection (own it alongside the `Server`).
+pub const ServicesExternalLookup = struct {
+    services: *Services,
+
+    pub fn lookup(self: *ServicesExternalLookup) mechrouter.ExternalLookup {
+        return .{ .ptr = self, .verifyFn = verify };
+    }
+
+    fn verify(ptr: *anyopaque, certfp: []const u8, authzid: []const u8) ?[]const u8 {
+        const self: *ServicesExternalLookup = @ptrCast(@alignCast(ptr));
+        const account = self.services.accountForCertfp(certfp) orelse return null;
+        // Identity assumption is unsupported: a non-empty authzid must name the
+        // same account the certificate is bound to (case-insensitive).
+        if (authzid.len != 0 and !std.ascii.eqlIgnoreCase(authzid, account)) return null;
+        return account;
+    }
+};
+
 test "services-backed PLAIN checker verifies registered accounts" {
     const MizuStore = services_mod.MizuStore;
     var tmp = std.testing.tmpDir(.{});
@@ -89,6 +114,34 @@ test "services-backed PLAIN checker verifies registered accounts" {
     try std.testing.expect(!chk.verify(.{ .authzid = "", .authcid = "nobody", .password = "whatever" }));
     // Identity assumption (authzid != authcid) is refused.
     try std.testing.expect(!chk.verify(.{ .authzid = "bob", .authcid = "alice", .password = "correct horse battery staple" }));
+}
+
+test "services-backed EXTERNAL verifier maps a bound certfp to its account" {
+    const MizuStore = services_mod.MizuStore;
+    const certfp_bind_mod = @import("certfp_bind.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try MizuStore.open(std.testing.allocator, std.testing.io, tmp.dir, "extbridge.wal");
+    defer store.deinit();
+
+    var services = Services.init(&store, null);
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    services.attachCertfpBinds(&binds);
+
+    const fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try services.bindCertfp("alice", fp);
+
+    var bridge = ServicesExternalLookup{ .services = &services };
+    const ext = bridge.lookup();
+
+    // The bound fingerprint resolves to its account.
+    try std.testing.expectEqualStrings("alice", ext.verify(fp, "").?);
+    // A matching authzid is allowed (case-insensitive).
+    try std.testing.expectEqualStrings("alice", ext.verify(fp, "ALICE").?);
+    // An unbound fingerprint and a mismatched authzid both fail.
+    try std.testing.expect(ext.verify("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "") == null);
+    try std.testing.expect(ext.verify(fp, "bob") == null);
 }
 
 const scram256 = @import("../proto/sasl_scram_server.zig");

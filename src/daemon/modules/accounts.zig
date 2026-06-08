@@ -49,6 +49,10 @@ fn session(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleSession(x.id, x.conn, x.parsed);
 }
+fn certAdd(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleCertAdd(x.conn);
+}
 
 pub const module = registry.Module{
     .id = "accounts",
@@ -65,5 +69,6 @@ pub const module = registry.Module{
         .{ .name = "CHANNEL", .handler = channel },
         .{ .name = "CS", .handler = channel },
         .{ .name = "SESSION", .handler = session },
+        .{ .name = "CERTADD", .handler = certAdd },
     },
 };

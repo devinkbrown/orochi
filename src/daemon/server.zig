@@ -26,6 +26,7 @@ const client_model = @import("client.zig");
 const world_model = @import("world.zig");
 const sasl = @import("../proto/sasl.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
+const certfp = @import("../proto/certfp.zig");
 const names_reply = @import("../proto/names_reply.zig");
 const chanmode = @import("chanmode.zig");
 const kick = @import("../proto/kick.zig");
@@ -861,6 +862,12 @@ pub const Config = struct {
     /// Injected from the SCRAM credential store; null = SCRAM fails closed. When
     /// set, each accepted connection also gets a fresh CSPRNG server nonce.
     sasl_scram256: ?sasl_mechrouter.Scram256Lookup = null,
+    /// Optional SASL EXTERNAL verifier (TLS certfp -> account). Injected from the
+    /// account ⇄ certfp binding bridge; null = EXTERNAL fails closed.
+    sasl_external: ?sasl_mechrouter.ExternalLookup = null,
+    /// Mutual TLS: request a client certificate on the TLS listener so SASL
+    /// EXTERNAL has a fingerprint to match. Off by default.
+    tls_request_client_cert: bool = false,
     /// Optional IRCv3 STS wire value ("duration=..,port=..[,preload]"), built by
     /// main.zig from `[sts]` config when a TLS listener is live. Null = STS not
     /// advertised (the default-off honesty guard). Borrowed for the server's life.
@@ -1000,6 +1007,9 @@ pub const ConnState = struct {
     /// decrypted through this adapter and outbound bytes encrypted, transparently
     /// to the IRC layer. Heap-owned; freed in closeConn/deinit.
     tls: ?*tls_conn.TlsConn = null,
+    /// Stable backing for `session.tls_certfp` (the presented client cert's
+    /// lowercase-hex SHA-256), populated once the mTLS handshake completes.
+    certfp_buf: [certfp.fingerprint_len]u8 = undefined,
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -1650,6 +1660,7 @@ pub const LinuxServer = struct {
             tls.* = tls_conn.TlsConn.init(self.allocator, .{
                 .cert_chain = self.config.tls_cert_chain,
                 .signing_key = self.config.tls_signing_key.?,
+                .request_client_cert = self.config.tls_request_client_cert,
             }) catch {
                 self.allocator.destroy(tls);
                 closeFd(conn.fd);
@@ -2229,6 +2240,7 @@ pub const LinuxServer = struct {
             }
         }
         if (self.config.sts_value) |v| conn.session.enableSts(v) catch {};
+        if (self.config.sasl_external) |ext| conn.session.sasl_external = ext;
     }
 
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
@@ -2341,6 +2353,14 @@ pub const LinuxServer = struct {
             conn.closing = true;
             return;
         };
+        // Once the mTLS handshake completes, bind the presented client cert's
+        // fingerprint to the session so SASL EXTERNAL can match it to an account.
+        if (conn.session.tls_certfp == null and conn.tls.?.handshakeDone()) {
+            if (conn.tls.?.clientCertDer()) |der| {
+                certfp.computeHex(der, &conn.certfp_buf);
+                conn.session.tls_certfp = conn.certfp_buf[0..];
+            }
+        }
         if (outcome.handshake_bytes.len != 0) {
             appendToConn(conn, outcome.handshake_bytes) catch {
                 conn.closing = true;
@@ -6551,6 +6571,19 @@ pub const LinuxServer = struct {
         else
             std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are not logged in\r\n", .{ server_name, conn.session.displayName() }) catch return;
         try appendToConn(conn, status);
+    }
+
+    /// `CERTADD` — bind the TLS client-certificate fingerprint presented on this
+    /// connection to the caller's logged-in account, enabling future password-less
+    /// SASL EXTERNAL logins. Requires both an account login and a presented cert.
+    pub fn handleCertAdd(self: *LinuxServer, conn: *ConnState) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "CERTADD", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const account = conn.session.account() orelse return self.failReply(conn, "CERTADD", "NOT_LOGGED_IN", "Log in before binding a certificate");
+        const fp = conn.session.tls_certfp orelse return self.failReply(conn, "CERTADD", "NO_CLIENT_CERT", "No TLS client certificate presented on this connection");
+        svc.bindCertfp(account, fp) catch return self.failReply(conn, "CERTADD", "CERT_ADD_FAILED", "Could not bind certificate");
+        var buf: [default_reply_bytes]u8 = undefined;
+        const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Certificate fingerprint {s} bound to {s}\r\n", .{ server_name, conn.session.displayName(), fp, account }) catch return;
+        try appendToConn(conn, m);
     }
 
     /// `ACCOUNTSET <account> <password> <field> <value>` — update an account

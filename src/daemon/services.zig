@@ -4,6 +4,7 @@ const std = @import("std");
 const store_mod = @import("store.zig");
 const toml = @import("../proto/toml.zig");
 const scram_store_mod = @import("scram_store.zig");
+const certfp_bind_mod = @import("certfp_bind.zig");
 
 pub const MizuStore = store_mod.MizuStore;
 pub const ScramStore = scram_store_mod.ScramStore;
@@ -244,6 +245,10 @@ pub const Services = struct {
     /// companion (see scram_store.zig). Null leaves SCRAM unprovisioned, exactly
     /// matching the historical PLAIN-only behaviour.
     scram: ?*ScramStore = null,
+    /// Optional account ⇄ TLS certfp bindings, backing SASL EXTERNAL (CERTADD).
+    /// In-memory companion (see certfp_bind.zig); null = EXTERNAL has nothing to
+    /// match and fails closed.
+    certfp_binds: ?*certfp_bind_mod.CertfpBindStore = null,
 
     pub fn init(store: *MizuStore, state: ?StateHook) Services {
         return .{ .store = store, .state = state };
@@ -257,6 +262,25 @@ pub const Services = struct {
     /// gain SCRAM-SHA-256 material; the store must outlive `self`.
     pub fn attachScramStore(self: *Services, scram: *ScramStore) void {
         self.scram = scram;
+    }
+
+    /// Attach the account ⇄ certfp binding store (for SASL EXTERNAL / CERTADD).
+    /// The store must outlive `self`.
+    pub fn attachCertfpBinds(self: *Services, binds: *certfp_bind_mod.CertfpBindStore) void {
+        self.certfp_binds = binds;
+    }
+
+    /// Bind a TLS certfp to an account (the CERTADD command). Caller has verified
+    /// the account is the caller's own logged-in account.
+    pub fn bindCertfp(self: *Services, account: []const u8, fingerprint: []const u8) certfp_bind_mod.CertfpBindError!void {
+        const binds = self.certfp_binds orelse return error.InvalidFingerprint;
+        try binds.bind(account, fingerprint);
+    }
+
+    /// The account a certfp is bound to, if any (SASL EXTERNAL verification).
+    pub fn accountForCertfp(self: *const Services, fingerprint: []const u8) ?[]const u8 {
+        const binds = self.certfp_binds orelse return null;
+        return binds.accountForFingerprint(fingerprint);
     }
 
     pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
