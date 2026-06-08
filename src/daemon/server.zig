@@ -156,6 +156,7 @@ const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
 const tls_conn = @import("tls_conn.zig");
+const reactor_wake = @import("reactor_wake.zig");
 const oper_mod = @import("oper.zig");
 const config_format = @import("config_format.zig");
 const services_mod = @import("services.zig");
@@ -660,6 +661,10 @@ const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
 /// Distinct accept token for the implicit-TLS client listener (:6697), so
 /// handleAccept can tell it apart from the plaintext + S2S listeners.
 const tls_listener_token: RingFdToken = .{ .slot = 3, .gen = 0 };
+/// Reserved token for this reactor's cross-reactor wake eventfd poll. When the
+/// multi-reactor model lands, another reactor `wake()`s this fd to make the loop
+/// run and drain its cross-shard mailbox.
+const wake_token: RingFdToken = .{ .slot = 4, .gen = 0 };
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
@@ -1188,6 +1193,14 @@ pub const LinuxServer = struct {
     tls_listener_fd: linux.fd_t = -1,
     tls_accept_armed: bool = false,
 
+    /// This reactor's cross-reactor wake eventfd (null if eventfd is unavailable),
+    /// its in-flight poll-arm flag, and a monotonic count of observed wakes. Lets
+    /// another thread `wakeReactor()` to make this loop run and (once the
+    /// multi-reactor model lands) drain its cross-shard mailbox.
+    wake: ?reactor_wake.ReactorWake = null,
+    wake_armed: bool = false,
+    wake_count: std.atomic.Value(u32) = .init(0),
+
     /// Operator registry (account -> oper class), from config. Borrowed; outlives
     /// the server via the loaded config.
     oper_registry: ?oper_mod.OperRegistry = null,
@@ -1247,6 +1260,9 @@ pub const LinuxServer = struct {
             .listener_fd = listener_fd,
             .s2s_listener_fd = s2s_listener_fd,
             .tls_listener_fd = tls_listener_fd,
+            // Best-effort: a daemon without eventfd simply runs un-wakeable (the
+            // single reactor never needs an external nudge today).
+            .wake = reactor_wake.ReactorWake.init() catch null,
             .ring = ring,
             .clients = clients,
             .world = world_model.World.init(allocator),
@@ -1413,6 +1429,7 @@ pub const LinuxServer = struct {
         self.world.deinit();
         self.clients.deinit();
         self.ring.deinit();
+        if (self.wake) |*w| w.deinit();
         closeFd(self.listener_fd);
         if (self.tls_listener_fd >= 0) closeFd(self.tls_listener_fd);
         self.* = undefined;
@@ -1432,6 +1449,32 @@ pub const LinuxServer = struct {
             try self.ring.submitAccept(tls_listener_token, self.tls_listener_fd);
             self.tls_accept_armed = true;
         }
+    }
+
+    /// Keep exactly one poll on the cross-reactor wake eventfd in flight, so a
+    /// foreign reactor's `wakeReactor()` makes this loop run.
+    fn armWake(self: *LinuxServer) !void {
+        if (self.wake) |w| {
+            if (!self.wake_armed) {
+                try self.ring.submitPollAdd(wake_token, w.fd(), linux.POLL.IN);
+                self.wake_armed = true;
+            }
+        }
+    }
+
+    /// Wake this reactor from any thread: the in-flight wake poll completes, the
+    /// loop runs, and (once the multi-reactor model lands) drains its mailbox.
+    pub fn wakeReactor(self: *LinuxServer) void {
+        if (self.wake) |*w| w.wake();
+    }
+
+    /// Handle the wake-fd poll completion: drain the eventfd, mark the poll
+    /// consumed (re-armed next `runOnce`), and record the wake.
+    fn onWakePoll(self: *LinuxServer) void {
+        self.wake_armed = false;
+        if (self.wake) |*w| w.drain();
+        _ = self.wake_count.fetchAdd(1, .monotonic);
+        // (multi-reactor: drain this shard's cross-shard mailbox here.)
     }
 
     /// Keep exactly one periodic timeout-sweep timer in flight.
@@ -1538,6 +1581,7 @@ pub const LinuxServer = struct {
     /// their own stop condition is satisfied.
     pub fn runOnce(self: *LinuxServer) !void {
         try self.armAccept();
+        self.armWake() catch {}; // cross-reactor wake poll; non-fatal if it can't arm
         self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
         _ = try self.ring.submitAndWait(1);
 
@@ -8814,10 +8858,11 @@ const CompletionHandler = struct {
                 self.recordOpErr(err);
             },
             .timeout => self.server.onTimerTick(),
-            // poll: a reactor's cross-reactor wake fd became readable. The live
-            // multi-reactor loop drains the eventfd + its mailbox here; today the
-            // single reactor submits no poll ops, so this is an inert branch.
-            .poll => {},
+            // poll: the cross-reactor wake eventfd became readable — drain it so
+            // the loop ran (and, once sharded, drain this reactor's mailbox).
+            .poll => |event| {
+                if (event.token.slot == wake_token.slot) self.server.onWakePoll();
+            },
             .other => {},
         }
     }
@@ -10184,6 +10229,34 @@ test "threaded server: draft/multiline batch reassembles + splits to recipient" 
         "BATCH -z\r\n");
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line1more\r\n", 200);
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line2\r\n", 200);
+}
+
+test "threaded server: external wakeReactor drives the running reactor loop" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.wake == null) return error.SkipZigTest; // eventfd unavailable
+    const plain_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // From this (foreign) thread, wake the reactor; the in-flight wake poll
+    // completes, the loop runs, and onWakePoll bumps the counter.
+    server.wakeReactor();
+    var spins: usize = 0;
+    while (server.wake_count.load(.monotonic) == 0) : (spins += 1) {
+        if (spins > 5_000_000) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(server.wake_count.load(.monotonic) >= 1);
 }
 
 test "ring: poll op fires a completion when a watched eventfd becomes readable" {
