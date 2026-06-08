@@ -64,6 +64,7 @@ pub const cooldown = @import("cooldown.zig");
 pub const countdown = @import("countdown.zig");
 pub const counter_set = @import("counter_set.zig");
 pub const credit_ledger = @import("credit_ledger.zig");
+pub const cross_shard_smoke = @import("cross_shard_smoke.zig");
 pub const custom_macro = @import("custom_macro.zig");
 pub const daily_streak = @import("daily_streak.zig");
 pub const dedup_window = @import("dedup_window.zig");
@@ -307,6 +308,7 @@ test {
     _ = countdown;
     _ = counter_set;
     _ = credit_ledger;
+    _ = cross_shard_smoke;
     _ = custom_macro;
     _ = daily_streak;
     _ = dedup_window;

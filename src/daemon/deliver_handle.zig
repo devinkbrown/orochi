@@ -21,7 +21,10 @@ pub const DeliverBuf = struct {
     next_free: std.atomic.Value(u32) = .init(invalid_index),
 };
 
-pub const DeliverMsg = packed struct {
+/// A POD handoff record carried over a shard mailbox: the target client and the
+/// pooled buffer holding its bytes. Plain (not `packed`) — it crosses threads by
+/// value through `BoundedMpmc`, which cannot store a bit-packed raw pointer.
+pub const DeliverMsg = struct {
     to: ClientId,
     buf: *DeliverBuf,
 };
