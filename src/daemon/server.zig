@@ -4714,7 +4714,15 @@ pub const LinuxServer = struct {
         conn.last_activity_ms = conn.connected_at_ms;
         conn.session.restore(snap);
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+        // Re-populate the world nick registry so the carried client stays
+        // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
+        // collisions; ignore NickInUse defensively. Channel membership carry-over
+        // is a further refinement.
+        if (snap.nick.len != 0 and !std.mem.eql(u8, snap.nick, "*")) {
+            self.world.registerNick(snap.nick, worldIdFromClient(id)) catch {};
+        }
         self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
+            self.world.removeClient(worldIdFromClient(id));
             _ = self.clients.free(id);
             closeFd(snap.fd);
             return false;

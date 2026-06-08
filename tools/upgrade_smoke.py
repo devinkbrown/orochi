@@ -170,8 +170,20 @@ def main():
         fail(f"survivor connection broke across UPGRADE: {e}", proc)
     if "PONG" not in pong:
         fail(f"survivor connection did not answer PING after UPGRADE: {pong!r}", proc)
-    d.close()
     print("PASS: pre-upgrade connection SURVIVED the swap (PING/PONG)")
+
+    # The survivor's nick must be re-registered in the new image's world: a fresh
+    # client can WHOIS it and get RPL_WHOISUSER (311).
+    c2 = connect()
+    c2.sendall(b"NICK whoiser\r\nUSER whoiser 0 * :whoiser\r\n")
+    recv_until(c2, b" 001 ")
+    c2.sendall(b"WHOIS survivor\r\n")
+    whois = recv_until(c2, b" 318 ")
+    c2.close()
+    d.close()
+    if " 311 " not in whois:
+        fail(f"carried nick not re-registered in world (no WHOIS 311): {whois!r}", proc)
+    print("PASS: carried nick re-registered in the new image's world (WHOIS 311)")
 
     # Conn C: a fresh client must connect + register after the upgrade.
     time.sleep(0.3)
