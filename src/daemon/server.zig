@@ -55,6 +55,7 @@ const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const color_strip = @import("../proto/color_strip.zig");
 const snowflake_id = @import("../proto/snowflake_id.zig");
 const msgid_mod = @import("../proto/msgid.zig");
+const multiline = @import("../proto/multiline.zig");
 const secure_fns = @import("../proto/secure_fns.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
@@ -273,6 +274,25 @@ fn buildTagPrefix(session: *const dispatch.ClientSession, tags: LinuxServer.MsgT
 /// ISON predicate: nicks are pre-filtered to online before the builder runs.
 fn alwaysOnline(_: []const u8) bool {
     return true;
+}
+
+/// The value of the IRCv3 `batch` tag on a line, or null if absent. Parses the
+/// raw tag segment (the daemon's line parser keeps tags as `tags_raw`).
+fn batchTagValue(parsed: *const irc_line.LineView) ?[]const u8 {
+    const raw = parsed.tags_raw orelse return null;
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |tag| {
+        if (std.mem.startsWith(u8, tag, "batch=")) return tag["batch=".len..];
+    }
+    return null;
+}
+
+/// Whether a BATCH line opens a `draft/multiline` batch
+/// (`BATCH +<ref> draft/multiline <target>`).
+fn isMultilineOpen(parsed: *const irc_line.LineView) bool {
+    return parsed.param_count == 3 and
+        parsed.params[0].len >= 1 and parsed.params[0][0] == '+' and
+        std.mem.eql(u8, parsed.params[1], multiline.draft_multiline_batch);
 }
 
 const server_version = "mizuchi-0.1";
@@ -873,6 +893,25 @@ pub const Config = struct {
 
 /// Per-connection daemon state used by both the pure command core and the
 /// socket loop. No slices in this struct borrow from transient recv buffers.
+/// draft/multiline reassembly limits. Advertised verbatim in the cap value
+/// (`max-bytes`/`max-lines`) and enforced by the per-conn assembler. Sized
+/// modestly so a single open batch costs ~4 KiB of heap, allocated lazily.
+pub const multiline_cfg = multiline.Config{
+    .max_bytes = 4096,
+    .max_lines = 24,
+    .max_ref_len = 64,
+    .max_target_len = 128,
+};
+const MultilineAssembler = multiline.Assembler(multiline_cfg);
+
+/// Per-connection state for one in-flight inbound draft/multiline batch.
+/// Heap-owned (so the `out` accumulator has a stable address) and allocated
+/// only while a batch is open; freed on close/abort and connection teardown.
+const MultilineState = struct {
+    assembler: MultilineAssembler = MultilineAssembler.init(),
+    out: [multiline_cfg.max_bytes]u8 = undefined,
+};
+
 pub const ConnState = struct {
     fd: linux.fd_t = -1,
     token: RingFdToken = .{ .slot = 0, .gen = 0 },
@@ -932,6 +971,9 @@ pub const ConnState = struct {
     /// Target address for an outbound S2S connect, kept here (the slot is stable)
     /// so it outlives the in-flight IORING_OP_CONNECT submission.
     s2s_connect_addr: posix.sockaddr.in = undefined,
+    /// Non-null while this client has an open inbound draft/multiline batch.
+    /// Heap-owned; freed when the batch closes/aborts or the connection ends.
+    multiline: ?*MultilineState = null,
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -1244,6 +1286,10 @@ pub const LinuxServer = struct {
                     link.deinit();
                     self.allocator.destroy(link);
                     slot.value.s2s_secured = null;
+                }
+                if (slot.value.multiline) |ms| {
+                    self.allocator.destroy(ms);
+                    slot.value.multiline = null;
                 }
                 closeFd(slot.value.fd);
             }
@@ -2069,6 +2115,8 @@ pub const LinuxServer = struct {
             }
             self.stats.onClose(false);
             self.stats.onQuit();
+            // Free any in-flight inbound multiline batch buffer.
+            self.abortMultiline(conn);
             // Release this connection's clone-limiter slot (only if it was counted;
             // refused accepts and addr-less peers never registered).
             if (conn.clone_counted) {
@@ -2239,6 +2287,14 @@ pub const LinuxServer = struct {
         // (JOIN/CREATE) gets a correct IRCX CREATION timestamp without the pure
         // world taking a clock dependency.
         self.world.clock_unix = @divFloor(self.nowMs(), 1000);
+
+        // draft/multiline: a negotiating client's `BATCH +ref draft/multiline`
+        // and its @batch-tagged PRIVMSG/NOTICE chunks are routed into the
+        // per-conn reassembler instead of normal dispatch. Returns true when the
+        // line was consumed by the multiline path.
+        if (conn.session.hasCap(.multiline)) {
+            if (try self.routeMultiline(id, conn, parsed, line)) return;
+        }
 
         // SerpentRegistry module spine (strangler-fig): consult the comptime
         // module registry first. A migrated command is handled here and returns;
@@ -7957,18 +8013,42 @@ pub const LinuxServer = struct {
             return;
         }
         const text = parsed.paramSlice()[1];
+        if (!try self.messageContentGates(id, conn, command, parsed.paramSlice()[0], text, is_notice)) return;
+
+        // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target.
+        var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
+        while (targets.next()) |target| {
+            if (target.len == 0) continue;
+            try self.messageOne(id, conn, command, target, text, parsed.tags_raw);
+        }
+    }
+
+    /// Body-dependent veto gates shared by PRIVMSG/NOTICE and reassembled
+    /// draft/multiline: the message_pre_deliver hook, utf8only, and the Koshi
+    /// content filter. Returns true if delivery may proceed; on a drop it emits
+    /// the appropriate FAIL (PRIVMSG) or stays silent (NOTICE) and returns
+    /// false. Callers apply gag/shun and parameter checks beforehand.
+    fn messageContentGates(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        command: []const u8,
+        target: []const u8,
+        text: []const u8,
+        is_notice: bool,
+    ) !bool {
         // message_pre_deliver typed hook (veto-capable): a subscribed module/plugin
         // may drop the message by clearing `approved`. No subscriber today =>
         // approved stays true => identical behavior. Errors never break delivery.
         {
             var mpd = mod_registry.MessagePreDeliverPayload{
                 .source_id = @as(u64, @bitCast(id)),
-                .target = parsed.paramSlice()[0],
+                .target = target,
                 .text = text,
             };
             const verdict = module_manifest.Live.callHook(.message_pre_deliver, self, &mpd) catch mod_registry.HookResult.continue_;
             _ = verdict;
-            if (!mpd.approved) return;
+            if (!mpd.approved) return false;
         }
         // utf8only: reject malformed UTF-8 bodies with a standard-replies FAIL and
         // drop the message (ISUPPORT advertises UTF8ONLY). NOTICE stays silent.
@@ -7977,11 +8057,11 @@ pub const LinuxServer = struct {
                 var fail_buf: [128]u8 = undefined;
                 if (utf8_guard.buildInvalidUtf8Fail(&fail_buf, command)) |line| {
                     var crlf: [160]u8 = undefined;
-                    const out = std.fmt.bufPrint(&crlf, "{s}\r\n", .{line}) catch return;
+                    const out = std.fmt.bufPrint(&crlf, "{s}\r\n", .{line}) catch return false;
                     try appendToConn(conn, out);
                 } else |_| {}
             }
-            return;
+            return false;
         }
         // Koshi content filter: block messages matching an oper-curated pattern.
         // Opers are exempt; NOTICE drops silently (no auto-reply), PRIVMSG FAILs.
@@ -7997,15 +8077,98 @@ pub const LinuxServer = struct {
             }
             if (filtered) {
                 if (!is_notice) try self.failReply(conn, command, "MIZUCHI_FILTERED", "Message blocked by the content filter");
-                return;
+                return false;
             }
         }
+        return true;
+    }
 
-        // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target.
-        var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
-        while (targets.next()) |target| {
-            if (target.len == 0) continue;
-            try self.messageOne(id, conn, command, target, text, parsed.tags_raw);
+    /// Route one line from a draft/multiline-capable client into the per-conn
+    /// reassembler. Returns true when the line was consumed (a multiline BATCH
+    /// open/close or a tagged chunk); false to let normal dispatch handle it.
+    fn routeMultiline(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        parsed: *const irc_line.LineView,
+        line: []const u8,
+    ) !bool {
+        const is_batch = std.ascii.eqlIgnoreCase(parsed.command, "BATCH");
+
+        if (conn.multiline) |ms| {
+            // A batch is open: a BATCH line is its close, anything tagged with
+            // our reference is a chunk. Any assembler error aborts + FAILs.
+            if (is_batch) {
+                const msg = ms.assembler.finish(line, &ms.out) catch {
+                    self.abortMultiline(conn);
+                    try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
+                    return true;
+                };
+                try self.deliverMultiline(id, conn, msg.command, msg.target, msg.value);
+                self.abortMultiline(conn); // batch closed; release the buffer
+                return true;
+            }
+            if (batchTagValue(parsed)) |ref| {
+                if (std.mem.eql(u8, ref, ms.assembler.reference())) {
+                    ms.assembler.append(line, &ms.out) catch {
+                        self.abortMultiline(conn);
+                        try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
+                        return true;
+                    };
+                    return true;
+                }
+            }
+            return false; // unrelated line; leave the open batch untouched
+        }
+
+        // No open batch: only consume a `BATCH +ref draft/multiline target` open.
+        if (is_batch and isMultilineOpen(parsed)) {
+            const ms = self.allocator.create(MultilineState) catch return false;
+            ms.* = .{};
+            ms.assembler.begin(line) catch {
+                self.allocator.destroy(ms);
+                try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Invalid multiline batch");
+                return true;
+            };
+            conn.multiline = ms;
+            return true;
+        }
+        return false;
+    }
+
+    /// Deliver a reassembled multiline message: split the joined value on the
+    /// inter-chunk newline and emit each segment as an individual PRIVMSG/NOTICE
+    /// (server-side splitting is spec-permitted for any recipient).
+    fn deliverMultiline(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        command: multiline.PayloadCommand,
+        target: []const u8,
+        value: []const u8,
+    ) !void {
+        if (conn.gagged) return;
+        if (self.shuns.count() > 0 and !conn.session.isOper()) {
+            var hm_buf: [320]u8 = undefined;
+            if (clientPrefix(conn, &hm_buf)) |hm| {
+                if (self.shuns.isShunned(hm, self.nowMs())) return;
+            } else |_| {}
+        }
+        const cmd = command.token();
+        const is_notice = command == .notice;
+        if (!try self.messageContentGates(id, conn, cmd, target, value, is_notice)) return;
+
+        var it = std.mem.splitScalar(u8, value, '\n');
+        while (it.next()) |segment| {
+            try self.messageOne(id, conn, cmd, target, segment, null);
+        }
+    }
+
+    /// Free and clear a connection's open multiline batch state, if any.
+    fn abortMultiline(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.multiline) |ms| {
+            self.allocator.destroy(ms);
+            conn.multiline = null;
         }
     }
 
@@ -9731,6 +9894,53 @@ test "threaded server: PRIVMSG multi-target delivery" {
     try writeAllFd(fd_a, "PRIVMSG B,C :hi both\r\n");
     try recvUntil(b, ":A!alice@localhost PRIVMSG B :hi both\r\n", 200);
     try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
+}
+
+test "threaded server: draft/multiline batch reassembles + splits to recipient" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A negotiates draft/multiline; B is an ordinary member.
+    try writeAllFd(fd_a, "CAP REQ :draft/multiline\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #m\r\n");
+    try recvUntil(&a, " 366 A #m ", 200);
+    try writeAllFd(fd_b, "JOIN #m\r\n");
+    try recvUntil(&b, " 366 B #m ", 200);
+
+    // chunk2 carries the concat tag so it joins chunk1 into one line; chunk3 is a
+    // fresh line. The reassembled value is "Line1more\nLine2" and is delivered to
+    // B as two separate PRIVMSGs.
+    b.reset();
+    try writeAllFd(fd_a,
+        "BATCH +z draft/multiline #m\r\n" ++
+        "@batch=z PRIVMSG #m :Line1\r\n" ++
+        "@batch=z;draft/multiline-concat PRIVMSG #m :more\r\n" ++
+        "@batch=z PRIVMSG #m :Line2\r\n" ++
+        "BATCH -z\r\n");
+    try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line1more\r\n", 200);
+    try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line2\r\n", 200);
 }
 
 test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {

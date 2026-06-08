@@ -247,6 +247,7 @@ pub const CapId = enum(u6) {
     labeled_response,
     pre_away,
     channel_context,
+    multiline,
 };
 
 const CapSet = struct {
@@ -350,6 +351,10 @@ const cap_specs = [_]CapSpec{
     // direct message marks it as part of a channel's context. Carried by the
     // generic client-tag relay (mergeTags), so advertising is all that's needed.
     .{ .id = .channel_context, .name = "draft/channel-context" },
+    // multiline: the server accepts an inbound `BATCH +ref draft/multiline`
+    // (PRIVMSG/NOTICE chunks), reassembles it, and delivers the result. Limits
+    // are advertised as the cap value and enforced by the per-conn assembler.
+    .{ .id = .multiline, .name = "draft/multiline", .value_302 = "max-bytes=4096,max-lines=24" },
 };
 
 const CapReplyKind = enum {
