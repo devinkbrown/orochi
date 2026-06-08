@@ -167,6 +167,7 @@ pub const monitor_props = @import("monitor_props.zig");
 pub const motd = @import("motd.zig");
 pub const msgedit = @import("msgedit.zig");
 pub const msgedit_store = @import("msgedit_store.zig");
+pub const msgid = @import("msgid.zig");
 pub const msgtags = @import("msgtags.zig");
 pub const msgtags_props = @import("msgtags_props.zig");
 pub const multiline_assembler = @import("multiline_assembler.zig");
@@ -471,6 +472,7 @@ test {
     _ = motd;
     _ = msgedit;
     _ = msgedit_store;
+    _ = msgid;
     _ = msgtags;
     _ = msgtags_props;
     _ = multiline_assembler;
