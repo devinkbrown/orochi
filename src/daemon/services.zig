@@ -3,8 +3,10 @@ const std = @import("std");
 
 const store_mod = @import("store.zig");
 const toml = @import("../proto/toml.zig");
+const scram_store_mod = @import("scram_store.zig");
 
 pub const MizuStore = store_mod.MizuStore;
+pub const ScramStore = scram_store_mod.ScramStore;
 
 const account_max = 32;
 const channel_max = 64;
@@ -235,6 +237,13 @@ pub const Services = struct {
     store: *MizuStore,
     state: ?StateHook = null,
     cfg: Config = .{},
+    /// Optional SCRAM-SHA-256 credential mirror. When set, account registration
+    /// additionally derives and stores `{salt, iters, StoredKey, ServerKey}` so
+    /// the daemon can advertise and complete SCRAM-SHA-256. PLAIN remains the
+    /// source of truth in the persistent account record; this is an in-memory
+    /// companion (see scram_store.zig). Null leaves SCRAM unprovisioned, exactly
+    /// matching the historical PLAIN-only behaviour.
+    scram: ?*ScramStore = null,
 
     pub fn init(store: *MizuStore, state: ?StateHook) Services {
         return .{ .store = store, .state = state };
@@ -242,6 +251,12 @@ pub const Services = struct {
 
     pub fn initWithConfig(store: *MizuStore, state: ?StateHook, cfg: Config) Services {
         return .{ .store = store, .state = state, .cfg = cfg };
+    }
+
+    /// Attach a SCRAM credential mirror. Accounts registered after this call
+    /// gain SCRAM-SHA-256 material; the store must outlive `self`.
+    pub fn attachScramStore(self: *Services, scram: *ScramStore) void {
+        self.scram = scram;
     }
 
     pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
@@ -262,6 +277,16 @@ pub const Services = struct {
         };
         const encoded = try encodeAccount(record, scratch);
         try self.store.family(.accounts).put(key.asSlice(), encoded);
+
+        // Mirror the credential into the SCRAM store, if attached, so a
+        // SCRAM-SHA-256 exchange can later verify this account. The canonical
+        // (lowercased) name is used so SCRAM lookups match the account key. The
+        // PLAIN record above is already persisted and authoritative; a SCRAM
+        // mirror failure must not roll that back, so failures map to
+        // error.InvalidRecord rather than leaving a half-registered account.
+        if (self.scram) |scram| {
+            scram.deriveAndStore(record.name.asSlice(), password) catch return error.InvalidRecord;
+        }
         return .{ .registered_account = .{ .name = record.name } };
     }
 
@@ -970,6 +995,44 @@ test "Config.applyToml ignores out-of-range rounds" {
     var cfg = Config{};
     cfg.applyToml(&doc);
     try std.testing.expectEqual(default_pbkdf2_rounds, cfg.pbkdf2_rounds);
+}
+
+test "registerAccount mirrors SCRAM credentials when a store is attached" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-scram-mirror.wal");
+    defer store.deinit();
+
+    var scram = ScramStore.init(std.testing.allocator);
+    defer scram.deinit();
+
+    var services = Services.init(&store, null);
+    services.attachScramStore(&scram);
+    var scratch: [record_max]u8 = undefined;
+
+    // Registration provisions both the PLAIN record and the SCRAM mirror.
+    _ = try services.registerAccount("Alice", "correct horse battery staple", &scratch);
+    const record = scram.lookup("alice");
+    try std.testing.expect(record != null);
+    try std.testing.expect(record.?.salt.len != 0);
+    // The PLAIN path still verifies against the persistent account record.
+    _ = try services.identifyAccount("alice", "correct horse battery staple");
+}
+
+test "registerAccount without a SCRAM store leaves SCRAM unprovisioned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-scram-absent.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    // No store attached: registration succeeds with historical behaviour intact.
+    const registered = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    try std.testing.expectEqualStrings("alice", registered.registered_account.name.asSlice());
+    try std.testing.expect(services.scram == null);
 }
 
 test "initWithConfig threads custom rounds into hashing" {

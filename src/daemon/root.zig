@@ -178,6 +178,7 @@ pub const sasl_bridge = @import("sasl_bridge.zig");
 pub const saved_messages = @import("saved_messages.zig");
 pub const scheduled_message = @import("scheduled_message.zig");
 pub const scoped_access = @import("scoped_access.zig");
+pub const scram_store = @import("scram_store.zig");
 pub const screen_annotation = @import("screen_annotation.zig");
 pub const search_index = @import("search_index.zig");
 pub const secured_s2s_link = @import("secured_s2s_link.zig");
@@ -414,6 +415,7 @@ test {
     _ = saved_messages;
     _ = scheduled_message;
     _ = scoped_access;
+    _ = scram_store;
     _ = screen_annotation;
     _ = search_index;
     _ = secured_s2s_link;
