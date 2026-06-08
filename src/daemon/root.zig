@@ -190,6 +190,7 @@ pub const server_stats = @import("server_stats.zig");
 pub const services = @import("services.zig");
 pub const session_pin = @import("session_pin.zig");
 pub const sessions = @import("sessions.zig");
+pub const shard = @import("shard.zig");
 pub const shop_inventory = @import("shop_inventory.zig");
 pub const shun = @import("shun.zig");
 pub const slowmode = @import("slowmode.zig");
@@ -429,6 +430,7 @@ test {
     _ = services;
     _ = session_pin;
     _ = sessions;
+    _ = shard;
     _ = shop_inventory;
     _ = shun;
     _ = slowmode;
