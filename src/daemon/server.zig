@@ -2176,6 +2176,14 @@ pub const LinuxServer = struct {
                 try self.handleIrcx(conn, false);
                 return;
             }
+            // draft/pre-away: a negotiating client may set its AWAY state during
+            // the registration handshake. Apply it now so the user is already
+            // marked away when registration completes. away-notify fan-out is a
+            // no-op here (no channels joined yet).
+            if (std.ascii.eqlIgnoreCase(parsed.command, "AWAY") and conn.session.hasCap(.pre_away)) {
+                try self.handleAway(id, conn, &parsed);
+                return;
+            }
             var sink = QueueSink{ .conn = conn };
             try processLine(conn, line, &sink);
             if (conn.session.registered()) {

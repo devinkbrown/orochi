@@ -245,6 +245,7 @@ pub const CapId = enum(u6) {
     standard_replies,
     cap_notify,
     labeled_response,
+    pre_away,
 };
 
 const CapSet = struct {
@@ -339,6 +340,11 @@ const cap_specs = [_]CapSpec{
     // labeled-response BATCH for multi-line replies, or a bare labeled ACK for
     // commands that emit nothing). Framing lives in proto/labeled_response.zig.
     .{ .id = .labeled_response, .name = "labeled-response" },
+    // pre-away: a negotiating client may send AWAY during the registration
+    // handshake (before the welcome burst). The away state is applied
+    // immediately so the user is already marked away when registration
+    // completes. Handled in processLiveLine's pre-registration branch.
+    .{ .id = .pre_away, .name = "draft/pre-away" },
 };
 
 const CapReplyKind = enum {
