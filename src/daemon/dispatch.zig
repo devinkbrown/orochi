@@ -9,6 +9,7 @@ const sasl = @import("../proto/sasl.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const scram_server = @import("../proto/sasl_scram_server.zig");
 const usermode = @import("../proto/usermode.zig");
+const sts_policy = @import("../proto/sts_policy.zig");
 const event_spine = @import("event_spine.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const labeled_response = @import("../proto/labeled_response.zig");
@@ -248,6 +249,7 @@ pub const CapId = enum(u6) {
     pre_away,
     channel_context,
     multiline,
+    sts,
 };
 
 const CapSet = struct {
@@ -270,6 +272,10 @@ const CapSpec = struct {
     id: CapId,
     name: []const u8,
     value_302: ?[]const u8 = null,
+    /// When set, the cap is omitted from CAP LS unless the session supplies a
+    /// runtime policy value (see `StsPolicy`). This keeps honesty-gated caps
+    /// like `sts` absent from the default build, where no policy is configured.
+    requires_policy: bool = false,
 };
 
 const cap_specs = [_]CapSpec{
@@ -355,6 +361,40 @@ const cap_specs = [_]CapSpec{
     // (PRIVMSG/NOTICE chunks), reassembles it, and delivers the result. Limits
     // are advertised as the cap value and enforced by the per-conn assembler.
     .{ .id = .multiline, .name = "draft/multiline", .value_302 = "max-bytes=4096,max-lines=24" },
+    // sts (Strict Transport Security): the modern, config-gated replacement for
+    // STARTTLS (which this daemon deliberately never implements). The value is
+    // NOT static: it is the wire policy ("duration=<s>,port=<p>[,preload]")
+    // produced from operator config and supplied per-session at LS time. With
+    // `requires_policy`, the cap is OMITTED entirely until a policy is present,
+    // so a default build that has not enabled STS advertises nothing -- never
+    // stranding a client by promising TLS that no listener serves.
+    .{ .id = .sts, .name = "sts", .requires_policy = true },
+};
+
+/// Per-session STS advertisement policy.
+///
+/// DEFAULT OFF: a freshly initialized session has `enabled == false`, so the
+/// `sts` cap is never advertised. An operator enables STS exactly once, after a
+/// TLS listener is live, by building this from config and storing it on the
+/// session's CAP layer before LS is answered.
+///
+/// Config wiring point (owned by config_*.zig / server.zig, not this file):
+///   1. Parse the `[sts]` config fragment with `sts_policy.parseConfig`.
+///   2. Build the wire value with `sts_policy.writeCapValue(policy, .combined, ..)`.
+///   3. Call `ClientSession.enableSts(value)` so LS emits `sts=<value>`.
+/// Until step 3 runs the default-off invariant holds.
+pub const StsPolicy = struct {
+    /// Whether STS is advertised at all. Stays false on the default path.
+    enabled: bool = false,
+    /// Backing storage for the formatted wire value (no protocol-path alloc).
+    value_buf: [sts_policy.MAX_CAP_VALUE_LEN]u8 = undefined,
+    value_len: usize = 0,
+
+    /// The wire value (without the `sts=` name), or null when disabled.
+    pub fn value(self: *const StsPolicy) ?[]const u8 {
+        if (!self.enabled) return null;
+        return self.value_buf[0..self.value_len];
+    }
 };
 
 const CapReplyKind = enum {
@@ -397,6 +437,8 @@ const CapSession = struct {
     state: CapState = .idle,
     negotiated: CapSet = .{},
     cap_302: bool = false,
+    /// STS advertisement policy. Default-constructed = disabled (see StsPolicy).
+    sts: StsPolicy = .{},
 
     fn registrationHeld(self: CapSession) bool {
         return self.state == .negotiating;
@@ -411,9 +453,7 @@ const CapSession = struct {
         if (std.ascii.eqlIgnoreCase(subcommand, "LS")) {
             self.state = .negotiating;
             self.cap_302 = self.cap_302 or (params.len != 0 and std.mem.eql(u8, params[0], "302"));
-            var body: [512]u8 = undefined;
-            const caps = try writeCapList(self.cap_302, &body);
-            try sink.append(.ls, false, caps);
+            try emitCapLs(self.cap_302, self.sts.value(), sink);
             return .ok;
         }
         if (std.ascii.eqlIgnoreCase(subcommand, "REQ")) {
@@ -444,27 +484,50 @@ fn capBit(id: CapId) u64 {
     return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(id)));
 }
 
-fn writeCapList(cap_302: bool, out: []u8) DispatchError![]const u8 {
+/// Emit CAP LS, chunked across multiple `CAP * LS *` continuation lines when the
+/// advertised set no longer fits one IRC message. Every chunk but the last is
+/// flagged as a continuation (gets the trailing `*` parameter); the final chunk
+/// closes the list. A space is left for the `:<server> CAP <nick> LS * :` framing
+/// so each emitted line stays under the 512-byte wire limit.
+fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sink: *CapReplySink) DispatchError!void {
+    const seg_max: usize = 400;
+    var seg: [seg_max]u8 = undefined;
     var len: usize = 0;
     for (cap_specs) |spec| {
-        const value = if (cap_302) spec.value_302 else null;
+        // Policy-gated caps (sts) are omitted entirely until the session
+        // supplies a runtime value. This is the default-off honesty guard:
+        // no policy -> the cap never reaches CAP LS.
+        const policy_value: ?[]const u8 = if (spec.requires_policy) sts_value else null;
+        if (spec.requires_policy and policy_value == null) continue;
+
+        // 302 clients see values; bare LS suppresses them. A policy-gated cap's
+        // value is the policy itself, surfaced regardless of 302 since its
+        // presence is already the operator's explicit, actionable signal.
+        const static_value = if (cap_302) spec.value_302 else null;
+        const value = policy_value orelse static_value;
         const value_len: usize = if (value) |v| 1 + v.len else 0;
         const space_len: usize = if (len == 0) 0 else 1;
-        if (len + space_len + spec.name.len + value_len > out.len) return error.OutputTooSmall;
+        if (len + space_len + spec.name.len + value_len > seg.len) {
+            // The current chunk is full and at least one more cap follows, so it
+            // is a continuation. Flush it and start a fresh chunk.
+            try sink.append(.ls, true, seg[0..len]);
+            len = 0;
+        }
         if (len != 0) {
-            out[len] = ' ';
+            seg[len] = ' ';
             len += 1;
         }
-        @memcpy(out[len .. len + spec.name.len], spec.name);
+        @memcpy(seg[len .. len + spec.name.len], spec.name);
         len += spec.name.len;
         if (value) |v| {
-            out[len] = '=';
+            seg[len] = '=';
             len += 1;
-            @memcpy(out[len .. len + v.len], v);
+            @memcpy(seg[len .. len + v.len], v);
             len += v.len;
         }
     }
-    return out[0..len];
+    // Final chunk closes the list (also covers the empty-set case).
+    try sink.append(.ls, false, seg[0..len]);
 }
 
 fn applyCapRequest(negotiated: *CapSet, raw_list: []const u8) bool {
@@ -843,6 +906,25 @@ pub const ClientSession = struct {
     /// and by tests; normal clients arrive here via CAP REQ).
     pub fn addCap(self: *ClientSession, id: CapId) void {
         self.cap.negotiated.add(id);
+    }
+
+    /// Operator-facing STS enable: store the formatted wire value so the `sts`
+    /// cap is advertised on the next CAP LS. This is the single flip that breaks
+    /// the default-off invariant, and the server/config layer calls it only
+    /// after a TLS listener is live. `wire_value` is the `sts=` value WITHOUT the
+    /// name (e.g. "duration=2592000,port=6697"); build it with
+    /// `sts_policy.writeCapValue(policy, .combined, ..)`.
+    pub fn enableSts(self: *ClientSession, wire_value: []const u8) error{OutputTooSmall}!void {
+        if (wire_value.len > self.cap.sts.value_buf.len) return error.OutputTooSmall;
+        @memcpy(self.cap.sts.value_buf[0..wire_value.len], wire_value);
+        self.cap.sts.value_len = wire_value.len;
+        self.cap.sts.enabled = true;
+    }
+
+    /// Disable STS advertisement (policy removal / TLS listener taken down).
+    pub fn disableSts(self: *ClientSession) void {
+        self.cap.sts.enabled = false;
+        self.cap.sts.value_len = 0;
     }
 };
 
@@ -1498,6 +1580,53 @@ test "CAP negotiation holds registration until CAP END" {
     try dispatchText(&session, &replies, "CAP END");
     try std.testing.expect(session.registered());
     try expectCodesInOrder(replies.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
+}
+
+test "default config never advertises the sts cap" {
+    var session = ClientSession.init();
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    // Honesty guard: a fresh session has STS disabled, so CAP LS (302 or bare)
+    // must not promise TLS the default build does not serve.
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), " CAP * LS :");
+    try expectNotContains(replies.written(), "sts=");
+    try expectNotContains(replies.written(), " sts ");
+    try expectNotContains(replies.written(), ":sts ");
+    replies.clear();
+
+    var bare = ClientSession.init();
+    var bare_storage: [4096]u8 = undefined;
+    var bare_replies = ReplyCtx.init(&bare_storage);
+    try dispatchText(&bare, &bare_replies, "CAP LS");
+    try expectNotContains(bare_replies.written(), "sts");
+}
+
+test "enabled sts policy advertises a well-formed value" {
+    var session = ClientSession.init();
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    // Operator wiring point: build the wire value from config, then flip it on.
+    var value_buf: [sts_policy.MAX_CAP_VALUE_LEN]u8 = undefined;
+    const policy = sts_policy.Policy{ .duration_seconds = 2_592_000, .port = 6697 };
+    const wire = try sts_policy.writeCapValue(policy, .combined, &value_buf);
+    try session.enableSts(wire);
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), "sts=duration=2592000,port=6697");
+
+    // And the value parses back to the same policy (round-trip sanity).
+    const parsed = try @import("../proto/sts.zig").parseValue(wire);
+    try std.testing.expectEqual(@as(?u64, 2_592_000), parsed.duration_seconds);
+    try std.testing.expectEqual(@as(?u16, 6697), parsed.port);
+
+    // Disabling restores the default-off invariant.
+    session.disableSts();
+    replies.clear();
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectNotContains(replies.written(), "sts=");
 }
 
 test "short parameters emit ERR_NEEDMOREPARAMS" {
