@@ -90,6 +90,12 @@ pub const TlsConn = struct {
         return self.server.selectedAlpn();
     }
 
+    /// The verified client leaf DER (mTLS), or null. SHA-256 of this is the
+    /// SASL EXTERNAL CertFP.
+    pub fn clientCertDer(self: *const TlsConn) ?[]const u8 {
+        return self.server.clientCertDer();
+    }
+
     /// Drive the connection with a chunk of bytes read from the socket.
     ///
     /// Appends `socket_bytes` to the receive buffer, then drains every complete

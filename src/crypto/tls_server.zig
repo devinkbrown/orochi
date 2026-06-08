@@ -24,6 +24,7 @@ const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
 const tls_finished = @import("../proto/tls_finished.zig");
 const tls_alpn = @import("../proto/tls_alpn.zig");
+const x509 = @import("x509.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
@@ -40,7 +41,8 @@ pub const Error = error{
     FinishedMismatch,
     NoCertificate,
 } || Allocator.Error || tls_record.Error || hkdf.Error ||
-    tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error;
+    tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error ||
+    tls_signature_scheme.Error;
 
 pub const Config = struct {
     /// DER certificates, leaf first. The leaf SPKI must be the Ed25519 public
@@ -52,6 +54,13 @@ pub const Config = struct {
     /// ALPN protocols the server is willing to select, in preference order.
     /// Empty disables ALPN negotiation.
     alpn_protocols: []const []const u8 = &.{},
+    /// Mutual TLS: when true the server sends a CertificateRequest and verifies
+    /// the client's Certificate + CertificateVerify (Ed25519). CertFP pins by
+    /// fingerprint, so any presented leaf is accepted once its possession proof
+    /// verifies — there is no CA-chain requirement. A client that declines (empty
+    /// Certificate) still completes; `clientCertDer()` stays null. Default false
+    /// is fully backward-compatible (no CertificateRequest).
+    request_client_cert: bool = false,
 };
 
 pub const FeedResult = union(enum) {
@@ -78,7 +87,16 @@ const CipherSuite = enum(u16) {
     }
 };
 
-const State = enum { idle, wait_client_hello, wait_client_finished, connected };
+const State = enum {
+    idle,
+    wait_client_hello,
+    // mTLS: the client's final flight is Certificate -> CertificateVerify ->
+    // Finished. Without mTLS the server jumps straight to wait_client_finished.
+    wait_client_cert,
+    wait_client_cert_verify,
+    wait_client_finished,
+    connected,
+};
 
 const TrafficKeys = struct {
     key: [ChaCha20Poly1305.key_length]u8 = [_]u8{0} ** ChaCha20Poly1305.key_length,
@@ -103,6 +121,17 @@ pub const Server = struct {
 
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
+
+    /// mTLS: whether a CertificateRequest is sent + the client flight verified.
+    request_client_cert: bool = false,
+    /// Decrypted client-flight handshake bytes accumulated across records, so a
+    /// Certificate/CertificateVerify/Finished split over records reassembles.
+    client_flight: std.ArrayList(u8) = .empty,
+    /// Verified client leaf DER (owned), or null when no cert was presented /
+    /// the possession proof failed. SHA-256 of this is the SASL EXTERNAL CertFP.
+    client_cert_der: ?[]u8 = null,
+    /// Ed25519 public key parsed from the presented leaf (for CertificateVerify).
+    client_leaf_key: ?Ed25519.PublicKey = null,
 
     early_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
     handshake_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
@@ -130,6 +159,7 @@ pub const Server = struct {
             .allocator = allocator,
             .config = config,
             .state = .wait_client_hello,
+            .request_client_cert = config.request_client_cert,
             .x25519_pair = kx.X25519Kx.generateDeterministic(seed) catch return error.BadState,
         };
     }
@@ -149,11 +179,19 @@ pub const Server = struct {
         self.server_app_keys.wipe();
         self.transcript.deinit(self.allocator);
         self.recv_buf.deinit(self.allocator);
+        self.client_flight.deinit(self.allocator);
+        if (self.client_cert_der) |der| self.allocator.free(der);
         self.* = undefined;
     }
 
     pub fn handshakeDone(self: *const Server) bool {
         return self.state == .connected;
+    }
+
+    /// The verified client leaf DER (mTLS), or null. SHA-256 of this is the
+    /// SASL EXTERNAL CertFP.
+    pub fn clientCertDer(self: *const Server) ?[]const u8 {
+        return self.client_cert_der;
     }
 
     pub fn selectedAlpn(self: *const Server) ?[]const u8 {
@@ -177,30 +215,111 @@ pub const Server = struct {
             try self.appendTranscript(msg.raw);
             const reply = try self.buildServerFlight(msg.body);
             consumePrefix(&self.recv_buf, rec.wire_len);
-            self.state = .wait_client_finished;
+            // mTLS expects Certificate -> CertificateVerify -> Finished; otherwise
+            // just the client Finished.
+            self.state = if (self.request_client_cert) .wait_client_cert else .wait_client_finished;
             return .{ .bytes_to_send = reply };
         }
 
-        // wait_client_finished: an encrypted handshake record carrying Finished.
-        const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
-        if (rec.content_type == .change_cipher_spec) {
-            consumePrefix(&self.recv_buf, rec.wire_len);
-            return self.feed(&.{});
-        }
-        if (rec.content_type != .application_data) return error.BadRecord;
+        // Post-flight: drain every complete record currently buffered — the
+        // client's closing flight (Certificate/CertificateVerify/Finished under
+        // mTLS, or just Finished) may arrive across one or several records.
+        // Decrypt each, accumulate the inner handshake bytes, and drive the
+        // message sub-state machine until Finished completes the handshake.
         const suite = self.selected_suite orelse return error.BadState;
-        const opened = try openRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
-        self.hs_read_seq += 1;
-        defer self.allocator.free(opened.content);
-        consumePrefix(&self.recv_buf, rec.wire_len);
-        if (opened.content_type != .handshake) return error.BadRecord;
-        var off: usize = 0;
-        const fin = try parseHandshake(opened.content, &off);
-        if (fin.typ != .finished) return error.BadHandshake;
-        const th = Sha256.transcriptHash(self.transcript.items);
-        if (!tls_finished.verify(self.client_hs_secret, th, fin.body)) return error.FinishedMismatch;
-        self.state = .connected;
+        while (self.state != .connected) {
+            const rec = completePlainRecord(self.recv_buf.items) orelse break;
+            if (rec.content_type == .change_cipher_spec) {
+                consumePrefix(&self.recv_buf, rec.wire_len);
+                continue;
+            }
+            if (rec.content_type != .application_data) return error.BadRecord;
+            const opened = try openRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
+            self.hs_read_seq += 1;
+            defer self.allocator.free(opened.content);
+            consumePrefix(&self.recv_buf, rec.wire_len);
+            if (opened.content_type != .handshake) return error.BadRecord;
+            try self.client_flight.appendSlice(self.allocator, opened.content);
+            while (try self.processClientFlightMessage()) {}
+        }
         return .need_more;
+    }
+
+    /// Parse and consume one complete handshake message from the accumulated
+    /// client flight, advancing the sub-state. Returns false when no complete
+    /// message remains (await more bytes).
+    fn processClientFlightMessage(self: *Server) Error!bool {
+        var off: usize = 0;
+        const msg = parseHandshakeMaybe(self.client_flight.items, &off) orelse return false;
+        switch (self.state) {
+            .wait_client_cert => {
+                if (msg.typ != .certificate) return error.BadHandshake;
+                try self.parseClientCertificate(msg.body);
+                try self.appendTranscript(msg.raw);
+                // A presented leaf must prove possession via CertificateVerify; an
+                // empty Certificate (declined) goes straight to Finished.
+                self.state = if (self.client_leaf_key != null) .wait_client_cert_verify else .wait_client_finished;
+            },
+            .wait_client_cert_verify => {
+                if (msg.typ != .certificate_verify) return error.BadHandshake;
+                try self.verifyClientCertificateVerify(msg.body);
+                try self.appendTranscript(msg.raw);
+                self.state = .wait_client_finished;
+            },
+            .wait_client_finished => {
+                if (msg.typ != .finished) return error.BadHandshake;
+                const th = Sha256.transcriptHash(self.transcript.items);
+                if (!tls_finished.verify(self.client_hs_secret, th, msg.body)) return error.FinishedMismatch;
+                try self.appendTranscript(msg.raw);
+                self.state = .connected;
+            },
+            else => return error.BadState,
+        }
+        consumePrefix(&self.client_flight, off);
+        return self.state != .connected;
+    }
+
+    /// Capture the presented client leaf DER (CertFP pins by fingerprint, so only
+    /// the leaf matters; an empty list = a client that declined).
+    fn parseClientCertificate(self: *Server, body: []const u8) Error!void {
+        var c = Cursor.init(body);
+        const request_context = try c.take(try c.readU8());
+        if (request_context.len != 0) return error.BadHandshake;
+        const list = try c.take(try c.readU24());
+        var certs = Cursor.init(list);
+        if (certs.remaining() == 0) return; // declined
+        const der = try certs.take(try certs.readU24());
+        _ = try certs.take(try certs.readU16()); // per-cert extensions (ignored)
+        const leaf = try self.allocator.dupe(u8, der);
+        errdefer self.allocator.free(leaf);
+        self.client_leaf_key = try ed25519KeyFromCert(leaf);
+        self.client_cert_der = leaf;
+    }
+
+    /// Verify the client's CertificateVerify (Ed25519) over the transcript with
+    /// the client context. A failed possession proof clears the captured cert so
+    /// no untrusted fingerprint is exposed.
+    fn verifyClientCertificateVerify(self: *Server, body: []const u8) Error!void {
+        if (body.len < 4) return error.BadHandshake;
+        const scheme = std.mem.readInt(u16, body[0..2], .big);
+        const sig_len = std.mem.readInt(u16, body[2..4], .big);
+        if (body.len != 4 + @as(usize, sig_len)) return error.BadHandshake;
+        if (scheme != @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519)) return self.failClientCert();
+        if (sig_len != Ed25519.Signature.encoded_length) return self.failClientCert();
+        const key = self.client_leaf_key orelse return error.BadHandshake;
+        const th = Sha256.transcriptHash(self.transcript.items);
+        const input = clientCertificateVerifyInput(th);
+        var sig_bytes: [Ed25519.Signature.encoded_length]u8 = undefined;
+        @memcpy(&sig_bytes, body[4..][0..Ed25519.Signature.encoded_length]);
+        const sig = Ed25519.Signature.fromBytes(sig_bytes);
+        sig.verify(&input, key) catch return self.failClientCert();
+    }
+
+    fn failClientCert(self: *Server) Error {
+        if (self.client_cert_der) |der| self.allocator.free(der);
+        self.client_cert_der = null;
+        self.client_leaf_key = null;
+        return error.BadHandshake;
     }
 
     pub fn encrypt(self: *Server, appdata: []const u8) Error![]u8 {
@@ -238,6 +357,7 @@ pub const Server = struct {
         var flight: std.ArrayList(u8) = .empty;
         defer flight.deinit(self.allocator);
         try self.writeEncryptedExtensions(&flight);
+        if (self.request_client_cert) try self.writeCertificateRequest(&flight);
         try self.writeCertificate(&flight);
         try self.writeCertificateVerify(&flight);
         try self.writeServerFinished(&flight);
@@ -365,6 +485,25 @@ pub const Server = struct {
         try self.emit(out, .encrypted_extensions, try ext_builder.finish());
     }
 
+    /// CertificateRequest (mTLS): empty request context + a signature_algorithms
+    /// extension (the only mandatory one in TLS 1.3). We accept Ed25519 client
+    /// certs, so that is what we advertise.
+    fn writeCertificateRequest(self: *Server, out: *std.ArrayList(u8)) Error!void {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try body.append(self.allocator, 0); // certificate_request_context: empty
+
+        var sigs_buf: [8]u8 = undefined;
+        const sigs = try tls_signature_scheme.build(&sigs_buf, &[_]tls_signature_scheme.SignatureScheme{.ed25519});
+        var ext_storage: [32]u8 = undefined;
+        var ext_builder = try tls_extension.Builder.begin(&ext_storage);
+        try ext_builder.addTyped(.signature_algorithms, sigs);
+        const extensions = try ext_builder.finish();
+        try appendU16(self.allocator, &body, @intCast(extensions.len));
+        try body.appendSlice(self.allocator, extensions);
+        try self.emit(out, .certificate_request, body.items);
+    }
+
     /// Append a handshake message to the encrypted flight AND to the running
     /// transcript (every message after ServerHello must be folded in before the
     /// CertificateVerify signature and Finished MAC are computed).
@@ -463,6 +602,7 @@ const HandshakeType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
     encrypted_extensions = 8,
+    certificate_request = 13,
     certificate = 11,
     certificate_verify = 15,
     finished = 20,
@@ -475,6 +615,7 @@ const PlainRecord = struct { content_type: tls_record.ContentType, fragment: []c
 const OpenedRecord = struct { content_type: tls_record.ContentType, content: []u8 };
 
 const certificate_verify_context = "TLS 1.3, server CertificateVerify";
+const client_certificate_verify_context = "TLS 1.3, client CertificateVerify";
 
 fn certificateVerifyInput(transcript_hash: [Sha256.hash_len]u8) [64 + certificate_verify_context.len + 1 + Sha256.hash_len]u8 {
     var out: [64 + certificate_verify_context.len + 1 + Sha256.hash_len]u8 = undefined;
@@ -483,6 +624,32 @@ fn certificateVerifyInput(transcript_hash: [Sha256.hash_len]u8) [64 + certificat
     out[64 + certificate_verify_context.len] = 0;
     @memcpy(out[64 + certificate_verify_context.len + 1 ..], &transcript_hash);
     return out;
+}
+
+// The client CertificateVerify binds the same transcript with a distinct
+// context string (RFC 8446 §4.4.3). Both context strings are 33 bytes so the
+// signed-input layout is identical.
+fn clientCertificateVerifyInput(transcript_hash: [Sha256.hash_len]u8) [64 + client_certificate_verify_context.len + 1 + Sha256.hash_len]u8 {
+    var out: [64 + client_certificate_verify_context.len + 1 + Sha256.hash_len]u8 = undefined;
+    @memset(out[0..64], 0x20);
+    @memcpy(out[64..][0..client_certificate_verify_context.len], client_certificate_verify_context);
+    out[64 + client_certificate_verify_context.len] = 0;
+    @memcpy(out[64 + client_certificate_verify_context.len + 1 ..], &transcript_hash);
+    return out;
+}
+
+/// Extract the Ed25519 public key from a leaf certificate's DER. CertFP/EXTERNAL
+/// only target Ed25519 client certs; a non-Ed25519 SPKI yields an error so the
+/// caller fails the possession proof rather than trusting an unverifiable cert.
+fn ed25519KeyFromCert(der: []const u8) Error!Ed25519.PublicKey {
+    const cert = x509.parse(der) catch return error.BadHandshake;
+    // SPKI value = SEQUENCE { AlgorithmIdentifier, BIT STRING { 0x00 ++ key } }.
+    // For Ed25519 the trailing BIT STRING carries the 32-byte raw key.
+    const spki = cert.spki_value;
+    if (spki.len < Ed25519.PublicKey.encoded_length) return error.BadHandshake;
+    var key_bytes: [Ed25519.PublicKey.encoded_length]u8 = undefined;
+    @memcpy(&key_bytes, spki[spki.len - Ed25519.PublicKey.encoded_length ..]);
+    return Ed25519.PublicKey.fromBytes(key_bytes) catch return error.BadHandshake;
 }
 
 fn pickSuite(block: []const u8) ?CipherSuite {
@@ -661,7 +828,21 @@ const Cursor = struct {
     fn readU16(self: *Cursor) Error!u16 {
         return std.mem.readInt(u16, (try self.take(2))[0..2], .big);
     }
+
+    fn readU24(self: *Cursor) Error!usize {
+        const b = try self.take(3);
+        return (@as(usize, b[0]) << 16) | (@as(usize, b[1]) << 8) | b[2];
+    }
 };
+
+/// Like parseHandshake but returns null (instead of erroring) when fewer than a
+/// full handshake message is buffered yet — used to drain the client flight.
+fn parseHandshakeMaybe(input: []const u8, offset: *usize) ?HandshakeMsg {
+    if (input.len < 4) return null;
+    const len = (@as(usize, input[1]) << 16) | (@as(usize, input[2]) << 8) | input[3];
+    if (input.len < 4 + len) return null;
+    return parseHandshake(input, offset) catch null;
+}
 
 test "loopback: tls_client completes a handshake against tls_server + app data both ways" {
     const tls_client = @import("tls_client.zig");
@@ -716,6 +897,108 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("hello server", got_s);
+}
+
+test "mTLS: server requests + verifies a client cert and exposes its leaf DER" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const sign = @import("sign.zig");
+    const alloc = std.testing.allocator;
+
+    // One seed yields both the std-Ed25519 cert key and the sign.KeyPair the
+    // client signs CertificateVerify with — same public key, so the server's
+    // SPKI-extracted key verifies the possession proof.
+    const s_seed = [_]u8{0x33} ** Ed25519.KeyPair.seed_length;
+    const c_seed = [_]u8{0x44} ** Ed25519.KeyPair.seed_length;
+    const server_kp = try Ed25519.KeyPair.generateDeterministic(s_seed);
+    const client_kp = try Ed25519.KeyPair.generateDeterministic(c_seed);
+    const client_sign = try sign.KeyPair.fromSeed(c_seed);
+
+    var server_cert_buf: [1024]u8 = undefined;
+    const server_der = try x509_selfsign.buildSelfSigned(&server_cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x33, 0x01 },
+        .key_pair = server_kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var client_cert_buf: [1024]u8 = undefined;
+    const client_der = try x509_selfsign.buildSelfSigned(&client_cert_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x44, 0x01 },
+        .key_pair = client_kp,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{server_der}, .signing_key = server_kp, .request_client_cert = true });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{server_der} });
+    defer client.deinit();
+    client.setClientCertForTest(client_der, client_sign);
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cflight = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cflight);
+    try std.testing.expect(client.handshakeDone());
+
+    _ = try server.feed(cflight);
+    try std.testing.expect(server.handshakeDone());
+
+    // The verified client leaf is exactly what was presented (CertFP source).
+    const presented = server.clientCertDer() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, client_der, presented);
+}
+
+test "mTLS: a declining client still completes with no client cert" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x55} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x55, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .request_client_cert = true });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    client.declineClientCertForTest(); // responds to CertificateRequest with an empty Certificate
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cflight = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cflight);
+    _ = try server.feed(cflight);
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(server.clientCertDer() == null);
 }
 
 test {

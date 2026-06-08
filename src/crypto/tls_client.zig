@@ -112,6 +112,7 @@ const HandshakeType = enum(u8) {
     server_hello = 2,
     encrypted_extensions = 8,
     certificate = 11,
+    certificate_request = 13,
     certificate_verify = 15,
     finished = 20,
     _,
@@ -190,6 +191,25 @@ pub const Client = struct {
     selected_alpn: ?[]const u8 = null,
     leaf_key: ?LeafPublicKey = null,
     last_alert: ?tls_alert.Alert = null,
+
+    // --- Test-only client-certificate support (mutual TLS) ---
+    // Existing behavior is fully preserved when no client cert is configured:
+    // an incoming CertificateRequest is otherwise ignored and no client
+    // Certificate/CertificateVerify is ever sent. These are exercised only by
+    // the tls_server mTLS loopback tests, never by the production HTTPS path.
+    /// Set true once the server's CertificateRequest is seen.
+    cert_requested: bool = false,
+    /// Borrowed client leaf DER to present, or null to present an empty
+    /// Certificate (decline). Only meaningful when the server requested a cert.
+    client_cert_der: ?[]const u8 = null,
+    /// Ed25519 key pair matching `client_cert_der`'s SPKI, used to sign the
+    /// client CertificateVerify.
+    client_key_pair: ?sign.KeyPair = null,
+    /// When true, the server certificate's chain-to-trust-anchor and DNS-name
+    /// checks are skipped (the leaf key is still parsed so the server
+    /// CertificateVerify signature is verified). Used only by the tls_server
+    /// mTLS loopback tests, whose x509_selfsign leaves carry a CN but no SAN.
+    skip_cert_verify_for_test: bool = false,
 
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
@@ -287,6 +307,31 @@ pub const Client = struct {
 
     pub fn handshakeDone(self: *const Client) bool {
         return self.state == .connected;
+    }
+
+    /// Test-only: configure a client certificate to present in response to a
+    /// server CertificateRequest. `der` and `key_pair` are borrowed. Without
+    /// this call (or `declineClientCertForTest`) the client never sends a
+    /// client Certificate, preserving the production server-only-auth path.
+    pub fn setClientCertForTest(self: *Client, der: []const u8, key_pair: sign.KeyPair) void {
+        self.client_cert_der = der;
+        self.client_key_pair = key_pair;
+    }
+
+    /// Test-only: respond to a server CertificateRequest with an empty
+    /// Certificate (decline client auth). The client still completes the
+    /// handshake; no CertificateVerify is sent. This is the default behavior
+    /// when no client cert is configured; the explicit call documents intent.
+    pub fn declineClientCertForTest(self: *Client) void {
+        self.client_cert_der = null;
+        self.client_key_pair = null;
+    }
+
+    /// Test-only: skip the server-certificate chain and DNS-name checks. The
+    /// leaf public key is still parsed and the server CertificateVerify is
+    /// still verified. Lets the mTLS loopback use CN-only self-signed leaves.
+    pub fn skipServerCertVerifyForTest(self: *Client) void {
+        self.skip_cert_verify_for_test = true;
     }
 
     /// Raw (still-encrypted) record bytes received but not consumed by the
@@ -485,10 +530,19 @@ pub const Client = struct {
                 self.state = .wait_certificate;
             },
             .wait_certificate => {
-                if (msg.typ != .certificate) return error.BadHandshake;
-                try self.parseAndVerifyCertificate(msg.body);
-                try self.appendTranscript(msg.raw);
-                self.state = .wait_certificate_verify;
+                // An optional CertificateRequest precedes the server
+                // Certificate (RFC 8446 §4.3.2). Record it and keep waiting for
+                // the server Certificate; the request itself stays in the
+                // transcript. Only the test-only mTLS path acts on it later.
+                if (msg.typ == .certificate_request) {
+                    self.cert_requested = true;
+                    try self.appendTranscript(msg.raw);
+                } else {
+                    if (msg.typ != .certificate) return error.BadHandshake;
+                    try self.parseAndVerifyCertificate(msg.body);
+                    try self.appendTranscript(msg.raw);
+                    self.state = .wait_certificate_verify;
+                }
             },
             .wait_certificate_verify => {
                 if (msg.typ != .certificate_verify) return error.BadHandshake;
@@ -608,7 +662,9 @@ pub const Client = struct {
         }
         if (count == 0) return error.EmptyCertificateChain;
         const chain = chain_buf[0..count];
-        try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name);
+        if (!self.skip_cert_verify_for_test) {
+            try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name);
+        }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
     }
 
@@ -630,16 +686,84 @@ pub const Client = struct {
     }
 
     fn writeClientFinishedRecord(self: *Client) Error![]u8 {
+        const suite = self.selected_suite orelse return error.BadState;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+
+        // mTLS (test-only): if the server requested a client certificate, send
+        // a client Certificate first (empty when declining), then a
+        // CertificateVerify when a key pair is configured. Each goes out as its
+        // own encrypted handshake record and is folded into the transcript
+        // before the client Finished MAC is computed.
+        if (self.cert_requested) {
+            try self.appendClientCertificate(&out, suite);
+            if (self.client_cert_der != null and self.client_key_pair != null) {
+                try self.appendClientCertificateVerify(&out, suite);
+            }
+        }
+
         const th = Sha256.transcriptHash(self.transcript.items);
         const verify_data = tls_finished.verifyData(self.client_hs_secret, th);
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
         try writeHandshake(self.allocator, &hs, .finished, &verify_data);
         try self.appendTranscript(hs.items);
-        const suite = self.selected_suite orelse return error.BadState;
         const record = try sealRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_write_seq, .handshake, hs.items);
+        defer self.allocator.free(record);
         self.hs_write_seq += 1;
-        return record;
+        try out.appendSlice(self.allocator, record);
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    /// Test-only: append an encrypted client Certificate handshake record. When
+    /// no client cert is configured the CertificateEntry list is empty (a
+    /// well-formed decline per RFC 8446 §4.4.2).
+    fn appendClientCertificate(self: *Client, out: *std.ArrayList(u8), suite: CipherSuite) Error!void {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try body.append(self.allocator, 0); // certificate_request_context: empty
+        if (self.client_cert_der) |der| {
+            const entry_len = 3 + der.len + 2;
+            try appendU24(self.allocator, &body, entry_len);
+            try appendU24(self.allocator, &body, der.len);
+            try body.appendSlice(self.allocator, der);
+            try appendU16(self.allocator, &body, 0); // no certificate extensions
+        } else {
+            try appendU24(self.allocator, &body, 0); // empty entry list
+        }
+        try self.appendClientHandshakeRecord(out, suite, .certificate, body.items);
+    }
+
+    /// Test-only: append an encrypted client CertificateVerify signed with the
+    /// configured Ed25519 key over the "client CertificateVerify" context.
+    fn appendClientCertificateVerify(self: *Client, out: *std.ArrayList(u8), suite: CipherSuite) Error!void {
+        const key_pair = self.client_key_pair orelse return error.BadState;
+        const th = Sha256.transcriptHash(self.transcript.items);
+        const input = clientCertificateVerifyInput(&th);
+        const sig = key_pair.sign(&input) catch return error.BadSignature;
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
+        try appendU16(self.allocator, &body, @intCast(sig.len));
+        try body.appendSlice(self.allocator, &sig);
+        try self.appendClientHandshakeRecord(out, suite, .certificate_verify, body.items);
+    }
+
+    fn appendClientHandshakeRecord(
+        self: *Client,
+        out: *std.ArrayList(u8),
+        suite: CipherSuite,
+        typ: HandshakeType,
+        body: []const u8,
+    ) Error!void {
+        var hs: std.ArrayList(u8) = .empty;
+        defer hs.deinit(self.allocator);
+        try writeHandshake(self.allocator, &hs, typ, body);
+        try self.appendTranscript(hs.items);
+        const record = try sealRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_write_seq, .handshake, hs.items);
+        defer self.allocator.free(record);
+        self.hs_write_seq += 1;
+        try out.appendSlice(self.allocator, record);
     }
 
     fn deriveHandshakeKeys(self: *Client, shared_secret: [32]u8) Error!void {
@@ -924,6 +1048,20 @@ fn certificateVerifyInput(transcript_hash: *const [Sha256.hash_len]u8) [64 + cer
 }
 
 const certificate_verify_context = "TLS 1.3, server CertificateVerify";
+
+/// CertificateVerify signed input for the *client*'s CertificateVerify. The
+/// context string differs from the server's (RFC 8446 §4.4.3); the framing of
+/// 64 spaces + context + 0x00 separator + transcript hash is identical.
+fn clientCertificateVerifyInput(transcript_hash: *const [Sha256.hash_len]u8) [64 + client_certificate_verify_context.len + 1 + Sha256.hash_len]u8 {
+    var out: [64 + client_certificate_verify_context.len + 1 + Sha256.hash_len]u8 = undefined;
+    @memset(out[0..64], 0x20);
+    @memcpy(out[64..][0..client_certificate_verify_context.len], client_certificate_verify_context);
+    out[64 + client_certificate_verify_context.len] = 0;
+    @memcpy(out[64 + client_certificate_verify_context.len + 1 ..], transcript_hash);
+    return out;
+}
+
+const client_certificate_verify_context = "TLS 1.3, client CertificateVerify";
 
 fn verifySignatureScheme(key: LeafPublicKey, scheme: tls_signature_scheme.SignatureScheme, msg: []const u8, sig: []const u8) Error!void {
     switch (scheme) {
