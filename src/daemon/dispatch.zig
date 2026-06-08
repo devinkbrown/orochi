@@ -246,6 +246,7 @@ pub const CapId = enum(u6) {
     cap_notify,
     labeled_response,
     pre_away,
+    channel_context,
 };
 
 const CapSet = struct {
@@ -345,6 +346,10 @@ const cap_specs = [_]CapSpec{
     // immediately so the user is already marked away when registration
     // completes. Handled in processLiveLine's pre-registration branch.
     .{ .id = .pre_away, .name = "draft/pre-away" },
+    // channel-context: a client-only `+draft/channel-context=<chan>` tag on a
+    // direct message marks it as part of a channel's context. Carried by the
+    // generic client-tag relay (mergeTags), so advertising is all that's needed.
+    .{ .id = .channel_context, .name = "draft/channel-context" },
 };
 
 const CapReplyKind = enum {
