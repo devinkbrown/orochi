@@ -95,6 +95,7 @@ pub const ringbuf = @import("ringbuf.zig");
 pub const roaring = @import("roaring.zig");
 pub const robin_hood = @import("robin_hood.zig");
 pub const rtp_nack = @import("rtp_nack.zig");
+pub const rwlock = @import("rwlock.zig");
 pub const ryusen = @import("ryusen.zig");
 pub const sazanami_props = @import("sazanami_props.zig");
 pub const sazanami = @import("sazanami.zig");
@@ -233,6 +234,7 @@ test {
     _ = roaring;
     _ = robin_hood;
     _ = rtp_nack;
+    _ = rwlock;
     _ = ryusen;
     _ = sazanami_props;
     _ = sazanami;
