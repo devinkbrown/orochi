@@ -11,6 +11,7 @@ pub const Error = error{
     SerialTooLarge,
     InvalidValidity,
     InvalidTime,
+    InvalidDnsName,
 };
 
 pub const Params = struct {
@@ -19,6 +20,13 @@ pub const Params = struct {
     not_after: i64,
     serial: []const u8,
     key_pair: Ed25519.KeyPair,
+    /// SubjectAltName dNSName entries. Standards TLS clients (RFC 6125) ignore
+    /// the CN and match the hostname against the SAN, so a server cert MUST
+    /// carry at least one. Empty keeps the legacy (extension-less) output.
+    dns_names: []const []const u8 = &.{},
+    /// Emit a critical BasicConstraints `cA:TRUE` so the cert can serve as its
+    /// own trust anchor (self-signed root). Off by default.
+    is_ca: bool = false,
 };
 
 const tag_integer: u8 = 0x02;
@@ -33,19 +41,26 @@ const tag_context_0_constructed: u8 = 0xa0;
 
 const max_common_name_len = 64;
 const max_serial_len = 20;
+const max_dns_name_len = 253;
 const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 };
 const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 };
+const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 }; // 2.5.29.17
+const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 }; // 2.5.29.19
+const tag_boolean: u8 = 0x01;
+const tag_octet_string: u8 = 0x04;
+const tag_context_3_constructed: u8 = 0xa3;
+const tag_san_dns_name: u8 = 0x82; // GeneralName [2] dNSName (context, primitive)
 
 pub fn buildSelfSigned(out: []u8, params: Params) ![]const u8 {
     if (@bitSizeOf(usize) != 64) return error.UnsupportedArchitecture;
     try validateParams(params);
 
-    var tbs_buf: [512]u8 = undefined;
+    var tbs_buf: [1024]u8 = undefined;
     const tbs = try buildTbs(&tbs_buf, params);
     const sig = try Ed25519.KeyPair.sign(params.key_pair, tbs, null);
     const sig_bytes = sig.toBytes();
 
-    var cert_body_buf: [768]u8 = undefined;
+    var cert_body_buf: [1280]u8 = undefined;
     var cert_body = DerWriter.init(&cert_body_buf);
     try cert_body.write(tbs);
     try writeAlgorithmIdentifier(&cert_body);
@@ -64,10 +79,14 @@ fn validateParams(params: Params) Error!void {
     }
     if (params.serial.len == 0) return error.InvalidSerial;
     if (params.not_after < params.not_before) return error.InvalidValidity;
+    for (params.dns_names) |name| {
+        if (name.len == 0 or name.len > max_dns_name_len) return error.InvalidDnsName;
+        for (name) |b| if (b <= 0x20 or b >= 0x7f) return error.InvalidDnsName;
+    }
 }
 
 fn buildTbs(out: []u8, params: Params) ![]const u8 {
-    var body_buf: [480]u8 = undefined;
+    var body_buf: [960]u8 = undefined;
     var body = DerWriter.init(&body_buf);
     try writeVersion(&body);
     try writeSerial(&body, params.serial);
@@ -76,10 +95,55 @@ fn buildTbs(out: []u8, params: Params) ![]const u8 {
     try writeValidity(&body, params.not_before, params.not_after);
     try writeName(&body, params.common_name);
     try writeSubjectPublicKeyInfo(&body, params.key_pair.public_key.toBytes());
+    if (params.dns_names.len != 0 or params.is_ca) try writeExtensions(&body, params);
 
     var tbs = DerWriter.init(out);
     try tbs.tlv(tag_sequence, body.bytes());
     return tbs.bytes();
+}
+
+/// `[3] EXPLICIT SEQUENCE OF Extension` carrying SubjectAltName (dNSNames) and,
+/// optionally, a critical BasicConstraints cA:TRUE.
+fn writeExtensions(w: *DerWriter, params: Params) !void {
+    var seq_buf: [768]u8 = undefined;
+    var seq = DerWriter.init(&seq_buf);
+
+    if (params.is_ca) {
+        // BasicConstraints ::= SEQUENCE { cA BOOLEAN } -> octet-string -> ext.
+        var bc_buf: [8]u8 = undefined;
+        var bc = DerWriter.init(&bc_buf);
+        try bc.tlv(tag_boolean, &.{0xff});
+        var bc_seq_buf: [12]u8 = undefined;
+        var bc_seq = DerWriter.init(&bc_seq_buf);
+        try bc_seq.tlv(tag_sequence, bc.bytes());
+        try writeExtension(&seq, &oid_basic_constraints, true, bc_seq.bytes());
+    }
+
+    if (params.dns_names.len != 0) {
+        var names_buf: [600]u8 = undefined;
+        var names = DerWriter.init(&names_buf);
+        for (params.dns_names) |name| try names.tlv(tag_san_dns_name, name);
+        var san_buf: [620]u8 = undefined;
+        var san = DerWriter.init(&san_buf);
+        try san.tlv(tag_sequence, names.bytes());
+        try writeExtension(&seq, &oid_subject_alt_name, false, san.bytes());
+    }
+
+    var explicit_buf: [768]u8 = undefined;
+    var explicit = DerWriter.init(&explicit_buf);
+    try explicit.tlv(tag_sequence, seq.bytes());
+    try w.tlv(tag_context_3_constructed, explicit.bytes());
+}
+
+/// One `Extension ::= SEQUENCE { extnID OID, critical BOOLEAN OPTIONAL,
+/// extnValue OCTET STRING }`. `der` is the already-encoded extension value.
+fn writeExtension(w: *DerWriter, oid: []const u8, critical: bool, der: []const u8) !void {
+    var ext_buf: [700]u8 = undefined;
+    var ext = DerWriter.init(&ext_buf);
+    try ext.tlv(tag_oid, oid);
+    if (critical) try ext.tlv(tag_boolean, &.{0xff});
+    try ext.tlv(tag_octet_string, der);
+    try w.tlv(tag_sequence, ext.bytes());
 }
 
 fn writeVersion(w: *DerWriter) !void {
@@ -411,6 +475,38 @@ test "buildSelfSigned reports truncation and oversized inputs with typed errors"
     params.serial = &.{1};
     params.common_name = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklm";
     try testing.expectError(error.CommonNameTooLong, buildSelfSigned(&out, params));
+}
+
+test "buildSelfSigned emits SAN dnsNames + CA basic-constraints parseable by x509" {
+    const x509 = @import("../crypto/x509.zig");
+    var params = try testParams();
+    params.dns_names = &.{ "irc.example.test", "example.test" };
+    params.is_ca = true;
+    var out: [1024]u8 = undefined;
+    const der = try buildSelfSigned(&out, params);
+
+    const cert = try x509.parse(der);
+    try testing.expect(cert.basic_constraints_ca);
+    try testing.expectEqual(@as(usize, 2), cert.san_dns_count);
+    try testing.expectEqualStrings("irc.example.test", cert.san_dns[0]);
+    try testing.expectEqualStrings("example.test", cert.san_dns[1]);
+
+    // The TBS signature must still verify after adding the v3 extensions block.
+    var cursor: usize = 0;
+    const outer = try readTlv(der, &cursor);
+    var body_cursor: usize = 0;
+    const tbs = try readTlv(outer.value, &body_cursor);
+    _ = try readTlv(outer.value, &body_cursor);
+    const sig_bits = try readTlv(outer.value, &body_cursor);
+    const signature = Ed25519.Signature.fromBytes(sig_bits.value[1..][0..Ed25519.Signature.encoded_length].*);
+    try signature.verify(tbs.full, params.key_pair.public_key);
+}
+
+test "buildSelfSigned rejects malformed SAN dnsNames" {
+    var params = try testParams();
+    params.dns_names = &.{"bad host"}; // space is not a legal dNSName byte
+    var out: [1024]u8 = undefined;
+    try testing.expectError(error.InvalidDnsName, buildSelfSigned(&out, params));
 }
 
 test "buildSelfSigned has stable DER known-answer prefix for deterministic inputs" {
