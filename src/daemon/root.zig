@@ -177,6 +177,7 @@ pub const registry = @import("registry.zig");
 pub const reminder = @import("reminder.zig");
 pub const report_queue = @import("report_queue.zig");
 pub const reserved_nick = @import("reserved_nick.zig");
+pub const reuseport = @import("reuseport.zig");
 pub const rolling_average = @import("rolling_average.zig");
 pub const s2s_dst = @import("s2s_dst.zig");
 pub const s2s_link = @import("s2s_link.zig");
@@ -423,6 +424,7 @@ test {
     _ = reminder;
     _ = report_queue;
     _ = reserved_nick;
+    _ = reuseport;
     _ = rolling_average;
     _ = s2s_dst;
     _ = s2s_link;
