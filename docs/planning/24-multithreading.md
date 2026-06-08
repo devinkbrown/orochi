@@ -227,3 +227,37 @@ route off-shard deliveries through the fabric.
   grace period and starve reclamation).
 - Writers never block on readers (publication is a single atomic store; freeing is
   deferred to the grace period), so a slow reader can never deadlock a writer.
+
+---
+
+## world.zig RCU adoption map (the serial integration)
+
+`world.zig` is the coupled heart: ~80 methods, already RwLock-guarded, holding the
+full channel record (modes, key, limit, bans/exempts/invex/mutes, forward,
+throttle, topic, OID, per-member modes, invites) plus the nick registry and
+memberships. A wholesale rewrite of all of it is neither necessary nor wise. The
+RCU win is on the **delivery hot path**, so adoption is surgical:
+
+**Goes lock-free (read-class, RCU registries — `world_rcu.zig`):**
+- `findNick` (nick → ClientId), `nickOf` (id → nick) — nick registry.
+- `channelExists`, channel lookup, `resolveMessageTarget` — channel registry.
+- `isMember`, `memberIterator`/member fan-out, `memberCount`, `channelsOf` —
+  membership sets.
+These are what PRIVMSG/NOTICE/TAGMSG/WHO/NAMES/WHOIS hit; they become loads of the
+published snapshot under an EBR guard — no lock.
+
+**Stays write-serialized (write-class, infrequent), publishing into the RCU index:**
+- `registerNick`/`unregisterNick`, `join`/`part`/`removeClient` — mutate the
+  registries via copy-on-write + publish + retire (so the reads above stay lock-free).
+- Channel-state mutators (`setChannelFlag`/`setChannelKey`/`setChannelLimit`,
+  ban/exempt/invex/mute add/remove, `setTopic`, `setMemberMode`, `addInvite`,
+  throttle, `renameChannel`/`cloneChannel`) — the channel *record* itself stays a
+  heap object reached via the channel registry; its fields are mutated under the
+  writer path. (Rich per-channel state can migrate to per-field RCU later if a
+  single hot channel's mode churn ever shows contention — it does not today.)
+
+**Net:** delivery — the only path that runs on every message on every reactor —
+reads with no lock; structural changes (join/part/nick/mode) serialize among the
+few writers and publish atomically. This is the surgical adoption that lands the
+RCU benefit without rewriting 80 methods, and it is the serial step gated on
+`rcu_map.zig` + `world_rcu.zig` landing verified.
