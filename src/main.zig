@@ -63,18 +63,9 @@ pub fn main(init: std.process.Init) !void {
                     } else {
                         std.debug.print("mizuchi: Helix resume (no listen fd; binding fresh)\n", .{});
                     }
-                    // Recover any serialized state capsules from the inherited arena.
-                    if (r.arena_fd) |afd| {
-                        if (mizuchi.daemon.helix.live.readArena(allocator, afd)) |caps| {
-                            defer {
-                                for (caps) |*cap| cap.deinit(allocator);
-                                allocator.free(caps);
-                            }
-                            std.debug.print("mizuchi: Helix resume — {d} state capsule(s) recovered\n", .{caps.len});
-                        } else |e| {
-                            std.debug.print("mizuchi: Helix arena read failed ({s})\n", .{@errorName(e)});
-                        }
-                    }
+                    // Hand the inherited state arena to the server, which reads it
+                    // after boot and re-attaches the carried-over client connections.
+                    if (r.arena_fd) |afd| srv_cfg.resume_arena_fd = afd;
                 } else {
                     std.debug.print("mizuchi: --supervisor with no Helix handoff env; normal boot\n", .{});
                 }
@@ -215,6 +206,10 @@ pub fn main(init: std.process.Init) !void {
             .drop_channel = svcDropChannel,
         };
     }
+
+    // Helix UPGRADE successor: re-attach the carried-over client connections
+    // (inherited socket fds + restored sessions) now that the ring exists.
+    if (comptime builtin.os.tag == .linux) srv.adoptInheritedSessions();
 
     std.debug.print(
         "mizuchi: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",

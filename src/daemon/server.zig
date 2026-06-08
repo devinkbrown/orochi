@@ -772,6 +772,9 @@ pub const Config = struct {
     /// (Helix hot-UPGRADE listener handoff: the port stays bound across execve).
     /// null = bind a new listener normally. Linux only.
     inherited_listener_fd: ?linux.fd_t = null,
+    /// Inherited Helix state-arena memfd (UPGRADE handoff); `adoptInheritedSessions`
+    /// reads it after boot to re-attach carried-over client connections. null = none.
+    resume_arena_fd: ?linux.fd_t = null,
     backlog: u31 = 128,
     ring_entries: u16 = 32,
     /// Hard cap on concurrent connections. The client table reserves this many
@@ -4608,12 +4611,19 @@ pub const LinuxServer = struct {
         var it = self.clients.iterator();
         while (it.next()) |e| {
             if (!e.value.session.registered()) continue;
-            const blob = session_snapshot.encode(self.allocator, e.value.session.snapshot()) catch continue;
+            // Don't carry the requesting oper's own connection: it issued UPGRADE
+            // and its buffered reply would be lost across the swap; let it reconnect.
+            if (e.value.fd == conn.fd) continue;
+            var snap = e.value.session.snapshot();
+            snap.fd = e.value.fd; // re-attached by the successor
+            const blob = session_snapshot.encode(self.allocator, snap) catch continue;
             blobs.append(self.allocator, blob) catch {
                 self.allocator.free(blob);
                 continue;
             };
             pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch {};
+            // Preserve the client socket across execve so the successor re-attaches it.
+            _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
         }
 
         // Seal the state arena. On failure, fall back to a listener-only upgrade
@@ -4653,6 +4663,63 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
+    }
+
+    /// Successor side of UPGRADE: read the inherited state arena and re-attach
+    /// every carried-over client connection (inherited socket fd + restored
+    /// session) into the client table + io_uring recv. Called once after boot.
+    /// Best-effort: a client that can't be re-attached is dropped, not fatal.
+    pub fn adoptInheritedSessions(self: *LinuxServer) void {
+        if (comptime builtin.os.tag != .linux) return;
+        const arena_fd = self.config.resume_arena_fd orelse return;
+        const caps = helix_live.readArena(self.allocator, arena_fd) catch |e| {
+            std.debug.print("mizuchi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
+            return;
+        };
+        defer {
+            for (caps) |*c| c.deinit(self.allocator);
+            self.allocator.free(caps);
+        }
+        var adopted: usize = 0;
+        for (caps) |c| {
+            if (c.fields.len == 0) continue;
+            const snap = session_snapshot.decode(c.fields[0].bytes) catch continue;
+            if (snap.fd < 0) continue;
+            if (self.adoptInheritedClient(snap)) adopted += 1;
+        }
+        // The arena is fully consumed; close the inherited memfd.
+        closeFd(arena_fd);
+        self.config.resume_arena_fd = null;
+        std.debug.print("mizuchi: UPGRADE resume — re-attached {d} client connection(s)\n", .{adopted});
+    }
+
+    /// Re-attach one carried-over client: take ownership of its inherited socket
+    /// fd, restore its session, and arm recv. Returns true on success.
+    fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot) bool {
+        if (self.clients.len() >= self.config.max_clients) {
+            closeFd(snap.fd);
+            return false;
+        }
+        const id = self.clients.alloc(ConnState.init(snap.fd)) catch {
+            closeFd(snap.fd);
+            return false;
+        };
+        const conn = self.clients.get(id).?;
+        conn.token = tokenFromId(id) catch {
+            _ = self.clients.free(id);
+            closeFd(snap.fd);
+            return false;
+        };
+        conn.connected_at_ms = self.nowMs();
+        conn.last_activity_ms = conn.connected_at_ms;
+        conn.session.restore(snap);
+        if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+        self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
+            _ = self.clients.free(id);
+            closeFd(snap.fd);
+            return false;
+        };
+        return true;
     }
 
     /// Listener-only upgrade fallback: re-exec preserving just the listening

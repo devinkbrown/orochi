@@ -11,6 +11,7 @@
 //!   [u16 len][nick][u16 len][realname][u16 len][account]
 //!   [u16 len][real_host][u16 len][host][u16 len][away]
 //!   [u8 flags]   bit0=logged_in  bit1=away_active  bit2=is_oper
+//!   [i32 fd]     the client's socket fd (inherited across execve), -1 if none
 const std = @import("std");
 
 pub const Error = error{ Truncated, TooLong };
@@ -26,6 +27,9 @@ pub const Snapshot = struct {
     logged_in: bool = false,
     away_active: bool = false,
     is_oper: bool = false,
+    /// The client's socket fd, preserved across execve (CLOEXEC cleared by the
+    /// predecessor) so the successor re-attaches the live connection. -1 = none.
+    fd: i32 = -1,
 };
 
 const flag_logged_in: u8 = 1 << 0;
@@ -48,6 +52,9 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     if (snap.away_active) flags |= flag_away_active;
     if (snap.is_oper) flags |= flag_is_oper;
     try out.append(allocator, flags);
+    var fd_le: [4]u8 = undefined;
+    std.mem.writeInt(i32, &fd_le, snap.fd, .little);
+    try out.appendSlice(allocator, &fd_le);
     return out.toOwnedSlice(allocator);
 }
 
@@ -61,6 +68,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     const host = try r.lenPrefixed();
     const away = try r.lenPrefixed();
     const flags = try r.byte();
+    const fd = try r.i32le();
     return .{
         .nick = nick,
         .realname = realname,
@@ -71,6 +79,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .logged_in = flags & flag_logged_in != 0,
         .away_active = flags & flag_away_active != 0,
         .is_oper = flags & flag_is_oper != 0,
+        .fd = fd,
     };
 }
 
@@ -83,6 +92,12 @@ const Reader = struct {
         const b = self.buf[self.pos];
         self.pos += 1;
         return b;
+    }
+    fn i32le(self: *Reader) Error!i32 {
+        if (self.pos + 4 > self.buf.len) return error.Truncated;
+        const v = std.mem.readInt(i32, self.buf[self.pos..][0..4], .little);
+        self.pos += 4;
+        return v;
     }
     fn lenPrefixed(self: *Reader) Error![]const u8 {
         if (self.pos + 2 > self.buf.len) return error.Truncated;
@@ -113,11 +128,13 @@ test "snapshot encode/decode round-trips identity + flags" {
         .logged_in = true,
         .away_active = true,
         .is_oper = false,
+        .fd = 42,
     };
     const bytes = try encode(allocator, snap);
     defer allocator.free(bytes);
 
     const got = try decode(bytes);
+    try testing.expectEqual(@as(i32, 42), got.fd);
     try testing.expectEqualStrings("alice", got.nick);
     try testing.expectEqualStrings("Alice Example", got.realname);
     try testing.expectEqualStrings("alice", got.account);

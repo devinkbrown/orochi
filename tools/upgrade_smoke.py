@@ -129,6 +129,13 @@ def main():
         fail(f"operator not elevated (no 381): {welcome!r}", proc)
     print("PASS: operator elevated via SASL (381)")
 
+    # Conn D: a plain registered client we keep OPEN across the UPGRADE to prove
+    # its TCP connection (fd) is re-attached, not dropped.
+    d = connect()
+    d.sendall(b"NICK survivor\r\nUSER survivor 0 * :survivor\r\n")
+    if " 001 " not in recv_until(d, b" 001 "):
+        fail("conn D did not register before UPGRADE", proc)
+
     b.sendall(b"UPGRADE\r\n")
     time.sleep(0.4)
     b.close()
@@ -147,10 +154,24 @@ def main():
     if "adopting inherited listener fd" not in log:
         fail("successor did not adopt the inherited listener", proc)
     print("PASS: successor adopted the inherited listener socket")
-    if "session(s) sealed" in log or "state capsule(s) recovered" in log:
-        print("PASS: session state carried across the handoff")
+    # The successor logs how many carried-over connections it re-attached; >=1
+    # proves session state + the client fd both crossed the handoff.
+    if "re-attached" in log and "re-attached 0 client" not in log:
+        print("PASS: successor re-attached carried-over connection(s) (state + fd)")
     else:
-        print("WARN: no state-carry log line (state may be empty)")
+        fail("successor did not re-attach any client connection", proc)
+
+    # Conn D was kept open across the upgrade: its TCP connection must survive,
+    # with recv re-armed — a PING gets a PONG from the new image.
+    try:
+        d.sendall(b"PING :survive\r\n")
+        pong = recv_until(d, b"PONG")
+    except OSError as e:
+        fail(f"survivor connection broke across UPGRADE: {e}", proc)
+    if "PONG" not in pong:
+        fail(f"survivor connection did not answer PING after UPGRADE: {pong!r}", proc)
+    d.close()
+    print("PASS: pre-upgrade connection SURVIVED the swap (PING/PONG)")
 
     # Conn C: a fresh client must connect + register after the upgrade.
     time.sleep(0.3)
