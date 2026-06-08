@@ -1,0 +1,376 @@
+//! Runtime-sized cross-shard delivery fabric for the multi-reactor daemon.
+//!
+//! This is the live, allocator-backed counterpart of the `cross_shard_smoke.zig`
+//! capstone test. That test wires three lock-free primitives together by hand at
+//! comptime-fixed sizes (`Mailboxes(...)`, `WakeSet(...)`, `DeliverPool(...)`);
+//! the real daemon decides its shard count at boot from the host's core count,
+//! so the *number* of mailboxes and wake fds must be a runtime value. This struct
+//! bundles, per shard:
+//!
+//!   * one lock-free MPMC inbox (`BoundedMpmc(DeliverMsg, capacity)`), and
+//!   * one cross-reactor wake eventfd (`ReactorWake`),
+//!
+//! plus ONE shared pooled-buffer allocator (`DeliverPool(pool_slots)`) used by
+//! every reactor to copy bytes into pooled `DeliverBuf`s before handoff.
+//!
+//! The element types are comptime-fixed in size, but the *count* of inboxes and
+//! wakes is runtime: both live as heap slices of length `num_shards`. The pool is
+//! large (~1MB at `pool_slots`), so it is heap-allocated once and shared by
+//! pointer. Everything inside is lock-free; the only allocation happens at `init`
+//! and the only deallocation at `deinit`.
+//!
+//! Usage mirrors the smoke test, just behind a reusable runtime-sized struct:
+//!   * a sender copies bytes via `acquire`, addresses a `DeliverMsg`, hands it off
+//!     with `sendTo(target_shard, msg)`, then pokes `wake(target_shard)`;
+//!   * the owning reactor registers `wakeFd(shard)` for a read in its io_uring,
+//!     and on readiness calls `drainWake(shard)` then `drain(shard, out)`,
+//!     consuming each `DeliverMsg` and `release`-ing its buffer back to the pool.
+//!
+//! Linux-only: the wake fds are kernel eventfds and `ReactorWake.init()` may fail
+//! with `error.ReactorWakeUnsupported`, which `init` propagates.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const linux = std.os.linux;
+
+const queue = @import("../substrate/queue.zig");
+const shard = @import("shard.zig");
+const reactor_wake = @import("reactor_wake.zig");
+const deliver_handle = @import("deliver_handle.zig");
+const client = @import("client.zig");
+
+pub const ClientId = client.ClientId;
+pub const DeliverBuf = deliver_handle.DeliverBuf;
+pub const DeliverMsg = deliver_handle.DeliverMsg;
+
+const ReactorWake = reactor_wake.ReactorWake;
+
+/// Shared, runtime-sized cross-shard delivery fabric. Owns one inbox + one wake
+/// eventfd per shard and one shared pooled-buffer allocator. Thread-safe for the
+/// documented access pattern: any thread may `acquire`/`release`/`sendTo`/`wake`;
+/// only the owning reactor calls `drain`/`drainWake` for its own shard.
+pub const ReactorFabric = struct {
+    /// Per-shard mailbox depth (messages). Comptime: the MPMC ring needs a fixed,
+    /// power-of-two capacity. Only the shard *count* is runtime.
+    pub const capacity: usize = 256;
+    /// Shared pool size (buffers). Comptime for the same reason (~1MB total).
+    pub const pool_slots: usize = 256;
+
+    const Mailbox = queue.BoundedMpmc(DeliverMsg, capacity);
+    const Pool = deliver_handle.DeliverPool(pool_slots);
+
+    allocator: std.mem.Allocator,
+    /// One MPMC inbox per shard; index `i` is shard `i`'s inbox. Heap slice sized
+    /// to the runtime shard count.
+    inboxes: []Mailbox,
+    /// One wake eventfd per shard; index `i` is shard `i`'s wake handle.
+    wakes: []ReactorWake,
+    /// The single shared pooled-buffer allocator, heap-allocated once (~1MB).
+    pool: *Pool,
+
+    /// Build a fabric for `num_shards` shards (>= 1, <= `shard.max_shards`).
+    ///
+    /// Allocates the inbox slice, the wake slice, and the shared pool, then stands
+    /// up one eventfd per shard. On any partial failure every resource already
+    /// created — including every eventfd opened so far — is released, so neither
+    /// memory nor file descriptors leak on the error path.
+    pub fn init(allocator: std.mem.Allocator, num_shards: usize) !ReactorFabric {
+        std.debug.assert(num_shards >= 1);
+        std.debug.assert(num_shards <= shard.max_shards);
+
+        const inboxes = try allocator.alloc(Mailbox, num_shards);
+        errdefer allocator.free(inboxes);
+        for (inboxes) |*ib| ib.* = Mailbox.init();
+
+        const wakes = try allocator.alloc(ReactorWake, num_shards);
+        errdefer allocator.free(wakes);
+
+        // Stand up one eventfd per shard. Track how many succeeded so the errdefer
+        // closes exactly those (and no uninitialized handles) if a later one fails.
+        var made: usize = 0;
+        errdefer for (wakes[0..made]) |*w| w.deinit();
+        while (made < num_shards) : (made += 1) {
+            wakes[made] = try ReactorWake.init();
+        }
+
+        const pool = try allocator.create(Pool);
+        errdefer allocator.destroy(pool);
+        pool.* = Pool.init();
+
+        return .{
+            .allocator = allocator,
+            .inboxes = inboxes,
+            .wakes = wakes,
+            .pool = pool,
+        };
+    }
+
+    /// Release every resource: destroy the shared pool, close every wake eventfd,
+    /// then free the two heap slices. After this the fabric is unusable.
+    pub fn deinit(self: *ReactorFabric) void {
+        self.allocator.destroy(self.pool);
+        for (self.wakes) |*w| w.deinit();
+        self.allocator.free(self.wakes);
+        self.allocator.free(self.inboxes);
+        self.* = undefined;
+    }
+
+    /// The number of shards this fabric was sized for.
+    pub fn numShards(self: *const ReactorFabric) usize {
+        return self.inboxes.len;
+    }
+
+    /// Copy `bytes_in` into a pooled `DeliverBuf`, returning null if the pool is
+    /// momentarily exhausted or `bytes_in` exceeds the pool's per-buffer maximum.
+    /// Callable from any thread.
+    pub fn acquire(self: *ReactorFabric, bytes_in: []const u8) ?*DeliverBuf {
+        return self.pool.acquire(bytes_in);
+    }
+
+    /// Drop one reference to `buf`, returning it to the pool when the last
+    /// reference is released. Callable from any thread.
+    pub fn release(self: *ReactorFabric, buf: *DeliverBuf) void {
+        self.pool.release(buf);
+    }
+
+    /// The bytes a `DeliverBuf` currently holds.
+    pub fn bytes(self: *ReactorFabric, buf: *const DeliverBuf) []const u8 {
+        return self.pool.bytes(buf);
+    }
+
+    /// Enqueue `msg` for the reactor owning `target`. Returns false if that inbox
+    /// is full (caller decides: drop, retry, or back-pressure). Callable from any
+    /// thread (MPMC). Does NOT wake the target — call `wake` after a successful
+    /// handoff so a sleeping reactor notices.
+    pub fn sendTo(self: *ReactorFabric, target: u12, msg: DeliverMsg) bool {
+        return self.inboxes[target].push(msg);
+    }
+
+    /// Drain up to `out.len` messages from `target`'s inbox into `out`, returning
+    /// the count written. Called only by that shard's owning reactor.
+    pub fn drain(self: *ReactorFabric, target: u12, out: []DeliverMsg) usize {
+        return self.inboxes[target].popBatch(out);
+    }
+
+    /// Poke the wake eventfd of the reactor owning `target` so its io_uring loop
+    /// runs and rescans its inbox. Callable from any thread; best-effort.
+    pub fn wake(self: *ReactorFabric, target: u12) void {
+        self.wakes[target].wake();
+    }
+
+    /// Clear `target`'s wake eventfd readiness; called by that shard's reactor
+    /// before it rescans its inbox.
+    pub fn drainWake(self: *ReactorFabric, target: u12) void {
+        self.wakes[target].drain();
+    }
+
+    /// The eventfd shard `target` registers for a read in its own io_uring.
+    pub fn wakeFd(self: *const ReactorFabric, target: u12) linux.fd_t {
+        return self.wakes[target].fd();
+    }
+};
+
+const testing = std.testing;
+
+test "single-shard fabric round-trips one delivery and reclaims its buffer" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var fabric = ReactorFabric.init(testing.allocator, 1) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fabric.numShards());
+
+    // Acquire → bytes → hand off → drainWake → drain → bytes → release, shard 0.
+    const buf = fabric.acquire("PRIVMSG #zig :hello\r\n") orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("PRIVMSG #zig :hello\r\n", fabric.bytes(buf));
+
+    const msg = DeliverMsg{ .to = .{ .shard = 0, .slot = 3, .gen = 1 }, .buf = buf };
+    try testing.expect(fabric.sendTo(0, msg));
+    fabric.wake(0);
+
+    var out: [4]DeliverMsg = undefined;
+    fabric.drainWake(0);
+    const n = fabric.drain(0, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(out[0].to.eql(.{ .shard = 0, .slot = 3, .gen = 1 }));
+    try testing.expectEqualStrings("PRIVMSG #zig :hello\r\n", fabric.bytes(out[0].buf));
+    fabric.release(out[0].buf);
+}
+
+test "fabric routes deliveries only to the addressed shard" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var fabric = ReactorFabric.init(testing.allocator, 4) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    const buf1 = fabric.acquire("one") orelse return error.TestExpectedEqual;
+    const buf3 = fabric.acquire("three") orelse return error.TestExpectedEqual;
+
+    try testing.expect(fabric.sendTo(1, .{ .to = .{ .shard = 1, .slot = 5, .gen = 1 }, .buf = buf1 }));
+    try testing.expect(fabric.sendTo(3, .{ .to = .{ .shard = 3, .slot = 6, .gen = 1 }, .buf = buf3 }));
+
+    var out: [8]DeliverMsg = undefined;
+    // Shards 0 and 2 are empty; 1 and 3 hold exactly one each.
+    try testing.expectEqual(@as(usize, 0), fabric.drain(0, &out));
+    try testing.expectEqual(@as(usize, 0), fabric.drain(2, &out));
+
+    const n1 = fabric.drain(1, &out);
+    try testing.expectEqual(@as(usize, 1), n1);
+    try testing.expectEqualStrings("one", fabric.bytes(out[0].buf));
+    fabric.release(out[0].buf);
+
+    const n3 = fabric.drain(3, &out);
+    try testing.expectEqual(@as(usize, 1), n3);
+    try testing.expectEqualStrings("three", fabric.bytes(out[0].buf));
+    fabric.release(out[0].buf);
+}
+
+/// One consumer reactor stand-in: sleeps in poll() on its wake fd, drains the
+/// eventfd then its inbox, copies + releases each buffer, and records per-seq
+/// arrival so the test can detect drops, duplicates, or misrouting.
+const TestReactor = struct {
+    fabric: *ReactorFabric,
+    shard_id: u12,
+    expected: usize,
+    received: usize = 0,
+    /// seen[seq] guards against duplicate delivery of a sequence number.
+    seen: [per_shard]bool = [_]bool{false} ** per_shard,
+    /// Set on misrouting, a malformed payload, an out-of-range seq, or a dup.
+    corrupt: bool = false,
+
+    const per_shard = 1500;
+
+    fn run(self: *TestReactor) void {
+        var pfd = [_]std.posix.pollfd{.{
+            .fd = self.fabric.wakeFd(self.shard_id),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        var out: [64]DeliverMsg = undefined;
+        // Bounded so a wiring bug fails the test instead of hanging forever.
+        var idle_polls: usize = 0;
+        while (self.received < self.expected) {
+            _ = std.posix.poll(&pfd, 100) catch break;
+            // Drain the eventfd before the inbox: a wake that lands after this
+            // drain but before a later push re-arms readiness, so none is lost.
+            self.fabric.drainWake(self.shard_id);
+
+            const n = self.fabric.drain(self.shard_id, &out);
+            if (n == 0) {
+                idle_polls += 1;
+                if (idle_polls > 200) break; // ~20s without progress: give up.
+                continue;
+            }
+            idle_polls = 0;
+            for (out[0..n]) |msg| self.consume(msg);
+        }
+    }
+
+    fn consume(self: *TestReactor, msg: DeliverMsg) void {
+        defer self.fabric.release(msg.buf);
+        if (msg.to.shard != self.shard_id) {
+            self.corrupt = true;
+            return;
+        }
+        const payload = self.fabric.bytes(msg.buf);
+        // Payload is "<shard>:<seq>" — re-derive and check it round-tripped.
+        var it = std.mem.splitScalar(u8, payload, ':');
+        const sh = std.fmt.parseInt(u12, it.first(), 10) catch {
+            self.corrupt = true;
+            return;
+        };
+        const seq = std.fmt.parseInt(usize, it.rest(), 10) catch {
+            self.corrupt = true;
+            return;
+        };
+        if (sh != self.shard_id or seq >= per_shard or self.seen[seq]) {
+            self.corrupt = true;
+            return;
+        }
+        self.seen[seq] = true;
+        self.received += 1;
+    }
+};
+
+/// Cross-shard sender: produces `total` deliveries split evenly between the two
+/// shards, retrying on pool exhaustion and inbox back-pressure exactly as the
+/// live fan-out path will.
+fn produce(fabric: *ReactorFabric, num_shards: u12, per_shard: usize) void {
+    const total = per_shard * num_shards;
+    var line: [32]u8 = undefined;
+    var seqs = [_]usize{ 0, 0 };
+    var produced: usize = 0;
+    while (produced < total) : (produced += 1) {
+        const target: u12 = @intCast(produced % num_shards);
+        const seq = seqs[target];
+        seqs[target] += 1;
+        const payload = std.fmt.bufPrint(&line, "{d}:{d}", .{ target, seq }) catch unreachable;
+
+        // Acquire a pooled buffer (copies the bytes), retrying if in-flight
+        // deliveries momentarily drained the pool.
+        const buf = while (true) {
+            if (fabric.acquire(payload)) |b| break b;
+            std.Thread.yield() catch {};
+        };
+        const msg = DeliverMsg{ .to = .{ .shard = target, .slot = @intCast(seq), .gen = 1 }, .buf = buf };
+        // Hand off + wake, retrying on a full inbox.
+        while (!fabric.sendTo(target, msg)) std.Thread.yield() catch {};
+        fabric.wake(target);
+    }
+}
+
+test "two reactors deliver cross-shard through the fabric exactly once with no buffer leak" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const num_shards: u12 = 2;
+    const per_shard = TestReactor.per_shard;
+
+    var fabric = ReactorFabric.init(testing.allocator, num_shards) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    var reactors: [num_shards]TestReactor = undefined;
+    for (0..num_shards) |i| {
+        reactors[i] = .{ .fabric = &fabric, .shard_id = @intCast(i), .expected = per_shard };
+    }
+
+    var threads: [num_shards]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |t| t.join();
+    for (0..num_shards) |i| {
+        threads[i] = std.Thread.spawn(.{}, TestReactor.run, .{&reactors[i]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+
+    // Drive the producer on this thread once both reactors are armed.
+    produce(&fabric, num_shards, per_shard);
+
+    for (threads[0..spawned]) |t| t.join();
+
+    for (&reactors) |*r| {
+        try testing.expect(!r.corrupt);
+        try testing.expectEqual(@as(usize, per_shard), r.received);
+    }
+
+    // Every handed-off buffer must be back in the pool: drain to exhaustion and
+    // confirm exactly the full slot count is reclaimable (no handoff leak).
+    var reclaimed: usize = 0;
+    var pinned: ?*DeliverBuf = null;
+    while (fabric.acquire("x")) |b| {
+        reclaimed += 1;
+        if (reclaimed > ReactorFabric.pool_slots) {
+            pinned = b;
+            break;
+        }
+    }
+    if (pinned) |b| fabric.release(b);
+    try testing.expectEqual(@as(usize, ReactorFabric.pool_slots), reclaimed);
+}
