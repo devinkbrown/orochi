@@ -103,6 +103,8 @@ pub const ChannelPropKey = enum {
     oid,
     name,
     creation,
+    membercount,
+    memberlimit,
     language,
     ownerkey,
     hostkey,
@@ -123,6 +125,8 @@ pub const ChannelPropKey = enum {
             .oid => "OID",
             .name => "NAME",
             .creation => "CREATION",
+            .membercount => "MEMBERCOUNT",
+            .memberlimit => "MEMBERLIMIT",
             .language => "LANGUAGE",
             .ownerkey => "OWNERKEY",
             .hostkey => "HOSTKEY",
@@ -161,6 +165,11 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
     const key = channelPropKey(raw) orelse return null;
     return switch (key) {
         .oid, .name, .creation => .{ .key = key, .max_value = 63, .min_setter = .server, .read_only = true },
+        // MEMBERCOUNT is a live computed value; never client-writable.
+        .membercount => .{ .key = key, .max_value = 20, .min_setter = .server, .read_only = true },
+        // MEMBERLIMIT mirrors channel mode +l; host may set it (the daemon links
+        // the write to the MODE change before the generic store is consulted).
+        .memberlimit => .{ .key = key, .max_value = 20, .min_setter = .host },
         .language => .{ .key = key, .max_value = 31, .min_setter = .host },
         .ownerkey => .{ .key = key, .max_value = 31, .min_setter = .owner, .secret = true },
         .hostkey, .memberkey => .{ .key = key, .max_value = 31, .min_setter = .owner, .secret = true },
@@ -723,6 +732,19 @@ test "limits and built-in channel property metadata are enforced" {
     try std.testing.expect((channelPropInfo("OWNERKEY").?).secret);
     try std.testing.expectError(error.ReadOnlyProperty, store.setProp(entity, "OID", "1", .{ .id = "server", .access = .server }));
     try std.testing.expectError(error.AccessDenied, store.setProp(entity, "PICS", "safe", .{ .id = "owner", .access = .owner }));
+
+    // MEMBERCOUNT is a computed read-only builtin; MEMBERLIMIT is host-settable.
+    // (Checked via metadata + a default-limit store; the Tiny store's 8-byte key
+    // cap would reject these long key names before the read-only rule applies.)
+    try std.testing.expect(channelPropKey("MEMBERCOUNT").? == .membercount);
+    try std.testing.expect(channelPropInfo("MEMBERCOUNT").?.read_only);
+    try std.testing.expect(!channelPropInfo("MEMBERLIMIT").?.read_only);
+
+    var full = DefaultStore.init(std.testing.allocator);
+    defer full.deinit();
+    const chan = try Entity.fromId("#mc");
+    try std.testing.expectError(error.ReadOnlyProperty, full.setProp(chan, "MEMBERCOUNT", "1", .{ .id = "server", .access = .server }));
+    _ = try full.setProp(chan, "MEMBERLIMIT", "50", .{ .id = "host", .access = .host });
 }
 
 test "reply builders and no-leak clear path" {

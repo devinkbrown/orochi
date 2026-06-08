@@ -47,6 +47,24 @@ pub const Snapshot = struct {
     creation_time: ?i64 = null,
     /// Nick or account name that last set the channel topic.
     topic_setter: ?[]const u8 = null,
+    /// Channel display name (the canonical channel id, e.g. `#zig`).
+    channel_name: ?[]const u8 = null,
+    /// Current channel topic text.
+    topic: ?[]const u8 = null,
+    /// Channel subject (short descriptor distinct from TOPIC).
+    subject: ?[]const u8 = null,
+    /// Channel language tag (e.g. `en`, `de`).
+    language: ?[]const u8 = null,
+    /// Host key attached to a channel object (write-only secret, never read out).
+    host_key: ?[]const u8 = null,
+    /// Member key attached to a channel object (mirrors +k; secret).
+    member_key: ?[]const u8 = null,
+    /// Live channel member count.
+    member_count: ?u64 = null,
+    /// Channel member limit (mirrors +l); null when unset.
+    member_limit: ?u64 = null,
+    /// Channel registration state used by the `registered` provider.
+    registered: ?bool = null,
     /// Display name used by the user profile provider.
     profile_display_name: ?[]const u8 = null,
     /// Real name used by the user profile provider.
@@ -70,6 +88,9 @@ pub const Provider = struct {
     scope: PropScope,
     /// Pure provider implementation.
     read: ProviderFn,
+    /// True for write-only secret keys (OWNERKEY/HOSTKEY/MEMBERKEY/OPKEY) that the
+    /// IRCX draft marks "never readable"; callers must not emit these to clients.
+    secret: bool = false,
 };
 
 /// Registry of known computed property providers.
@@ -124,11 +145,20 @@ const builtin_providers = [_]Provider{
     .{ .name = "member_of", .scope = .user, .read = readMemberOf },
     .{ .name = "onjoin", .scope = .channel, .read = readOnJoin },
     .{ .name = "onpart", .scope = .channel, .read = readOnPart },
-    .{ .name = "opkey", .scope = .channel, .read = readOpKey },
-    .{ .name = "ownerkey", .scope = .channel, .read = readOwnerKey },
+    .{ .name = "opkey", .scope = .channel, .read = readOpKey, .secret = true },
+    .{ .name = "ownerkey", .scope = .channel, .read = readOwnerKey, .secret = true },
     .{ .name = "user_profile", .scope = .user, .read = readUserProfile },
     .{ .name = "creation_time", .scope = .channel, .read = readCreationTime },
     .{ .name = "topic_setter", .scope = .channel, .read = readTopicSetter },
+    .{ .name = "name", .scope = .channel, .read = readChannelName },
+    .{ .name = "topic", .scope = .channel, .read = readTopic },
+    .{ .name = "subject", .scope = .channel, .read = readSubject },
+    .{ .name = "language", .scope = .channel, .read = readLanguage },
+    .{ .name = "hostkey", .scope = .channel, .read = readHostKey, .secret = true },
+    .{ .name = "memberkey", .scope = .channel, .read = readMemberKey, .secret = true },
+    .{ .name = "membercount", .scope = .channel, .read = readMemberCount },
+    .{ .name = "memberlimit", .scope = .channel, .read = readMemberLimit },
+    .{ .name = "registered", .scope = .channel, .read = readRegistered },
 };
 
 fn readAccount(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
@@ -169,6 +199,51 @@ fn readCreationTime(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue
 fn readTopicSetter(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
     _ = out_buf;
     return .{ .text = ctx.topic_setter orelse "" };
+}
+
+fn readChannelName(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.channel_name orelse "" };
+}
+
+fn readTopic(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.topic orelse "" };
+}
+
+fn readSubject(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.subject orelse "" };
+}
+
+fn readLanguage(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.language orelse "" };
+}
+
+fn readHostKey(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.host_key orelse "" };
+}
+
+fn readMemberKey(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.member_key orelse "" };
+}
+
+fn readMemberCount(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .number = @intCast(ctx.member_count orelse 0) };
+}
+
+fn readMemberLimit(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .number = @intCast(ctx.member_limit orelse 0) };
+}
+
+fn readRegistered(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .boolean = ctx.registered orelse false };
 }
 
 fn readUserProfile(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
@@ -229,6 +304,13 @@ fn expectNumber(value: PropValue, expected: i64) !void {
     switch (value) {
         .number => |actual| try std.testing.expectEqual(expected, actual),
         .text, .boolean, .list => return error.UnexpectedValueKind,
+    }
+}
+
+fn expectBoolean(value: PropValue, expected: bool) !void {
+    switch (value) {
+        .boolean => |actual| try std.testing.expectEqual(expected, actual),
+        .text, .number, .list => return error.UnexpectedValueKind,
     }
 }
 
@@ -448,6 +530,70 @@ test "topic_setter provider returns the borrowed setter name" {
     try expectText(value, "carol");
 }
 
+test "channel string providers return snapshot text or empty" {
+    const allocator = std.testing.allocator;
+    const out = try allocator.alloc(u8, 1);
+    defer allocator.free(out);
+    var registry = ProviderRegistry.init();
+    defer registry.deinit();
+
+    const snapshot = Snapshot{
+        .channel_name = "#zig",
+        .topic = "Zig IRCX",
+        .subject = "dev",
+        .language = "en",
+        .host_key = "host-secret",
+        .member_key = "member-secret",
+    };
+
+    try expectText(try registry.query("name", &snapshot, out), "#zig");
+    try expectText(try registry.query("topic", &snapshot, out), "Zig IRCX");
+    try expectText(try registry.query("subject", &snapshot, out), "dev");
+    try expectText(try registry.query("language", &snapshot, out), "en");
+    try expectText(try registry.query("hostkey", &snapshot, out), "host-secret");
+    try expectText(try registry.query("memberkey", &snapshot, out), "member-secret");
+
+    const empty = Snapshot{};
+    try expectText(try registry.query("topic", &empty, out), "");
+}
+
+test "channel numeric and boolean providers" {
+    const allocator = std.testing.allocator;
+    const out = try allocator.alloc(u8, 1);
+    defer allocator.free(out);
+    var registry = ProviderRegistry.init();
+    defer registry.deinit();
+
+    const snapshot = Snapshot{
+        .member_count = 42,
+        .member_limit = 100,
+        .registered = true,
+    };
+
+    try expectNumber(try registry.query("membercount", &snapshot, out), 42);
+    try expectNumber(try registry.query("memberlimit", &snapshot, out), 100);
+    try expectBoolean(try registry.query("registered", &snapshot, out), true);
+
+    const unset = Snapshot{};
+    try expectNumber(try registry.query("membercount", &unset, out), 0);
+    try expectNumber(try registry.query("memberlimit", &unset, out), 0);
+    try expectBoolean(try registry.query("registered", &unset, out), false);
+}
+
+test "secret key providers are flagged so callers never emit them" {
+    var registry = ProviderRegistry.init();
+    defer registry.deinit();
+
+    try std.testing.expect(registry.lookup("ownerkey").?.secret);
+    try std.testing.expect(registry.lookup("opkey").?.secret);
+    try std.testing.expect(registry.lookup("hostkey").?.secret);
+    try std.testing.expect(registry.lookup("memberkey").?.secret);
+
+    try std.testing.expect(!registry.lookup("topic").?.secret);
+    try std.testing.expect(!registry.lookup("name").?.secret);
+    try std.testing.expect(!registry.lookup("account").?.secret);
+}
+
 test "lookup is case-insensitive and returns provider descriptors" {
     // Arrange
     var registry = ProviderRegistry.init();
@@ -482,9 +628,9 @@ test "listForScope filters user and channel providers" {
     const allocator = std.testing.allocator;
 
     // Arrange
-    const user_buf = try allocator.alloc(Provider, 9);
+    const user_buf = try allocator.alloc(Provider, builtin_providers.len);
     defer allocator.free(user_buf);
-    const channel_buf = try allocator.alloc(Provider, 9);
+    const channel_buf = try allocator.alloc(Provider, builtin_providers.len);
     defer allocator.free(channel_buf);
     var registry = ProviderRegistry.init();
     defer registry.deinit();
@@ -495,12 +641,13 @@ test "listForScope filters user and channel providers" {
 
     // Assert
     try std.testing.expectEqual(@as(usize, 3), users.len);
-    try std.testing.expectEqual(@as(usize, 6), channels.len);
+    try std.testing.expectEqual(@as(usize, 15), channels.len);
     try std.testing.expectEqualStrings("account", users[0].name);
     try std.testing.expectEqualStrings("member_of", users[1].name);
     try std.testing.expectEqualStrings("user_profile", users[2].name);
     try std.testing.expectEqualStrings("onjoin", channels[0].name);
     try std.testing.expectEqualStrings("topic_setter", channels[5].name);
+    try std.testing.expectEqualStrings("name", channels[6].name);
 }
 
 test "listForScope truncates to caller capacity without allocating" {

@@ -100,6 +100,16 @@ pub const Filter = struct {
         topic_age_ms: Threshold,
         topic_only,
         channel_mask: []const u8,
+        /// `N=<mask>` — channel-name mask (synonym surface to a bare `#mask`).
+        name_mask: []const u8,
+        /// `T=<mask>` — topic-text mask.
+        topic_mask: []const u8,
+        /// `S=<mask>` — subject-text mask.
+        subject_mask: []const u8,
+        /// `L=<mask>` — language-tag mask.
+        language_mask: []const u8,
+        /// `R=0` / `R=1` — unregistered / registered channel filter.
+        registered: bool,
     };
 };
 
@@ -138,6 +148,12 @@ pub const ChannelInfo = struct {
     topic: []const u8 = "",
     created_ms: u64,
     topic_ms: ?u64 = null,
+    /// Channel subject text used by the `S=` filter.
+    subject: []const u8 = "",
+    /// Channel language tag used by the `L=` filter.
+    language: []const u8 = "",
+    /// Channel registration state used by the `R=` filter.
+    registered: bool = false,
 };
 
 /// Reply-level data shared by LISTX numerics.
@@ -232,12 +248,35 @@ pub fn parseFilterWith(comptime params: Params, token: []const u8) ListxError!Fi
         return .{ .criterion = .topic_only };
     }
 
-    if (token.len >= 3 and asciiEqual(token[0], 'T')) {
+    if (token.len >= 3 and asciiEqual(token[0], 'T') and (token[1] == '<' or token[1] == '>')) {
         const comparison = Comparison.fromByte(token[1]) orelse return error.InvalidFilter;
         return .{ .criterion = .{ .topic_age_ms = .{
             .comparison = comparison,
             .value = try parseDecimal(token[2..]),
         } } };
+    }
+
+    // `R=0` / `R=1` registered filter.
+    if (token.len == 3 and asciiEqual(token[0], 'R') and token[1] == '=') {
+        return switch (token[2]) {
+            '0' => .{ .criterion = .{ .registered = false } },
+            '1' => .{ .criterion = .{ .registered = true } },
+            else => error.InvalidValue,
+        };
+    }
+
+    // `N=` / `T=` / `S=` / `L=` text-mask filters.
+    if (token.len >= 2 and token[1] == '=') {
+        const mask = token[2..];
+        if (mask.len == 0) return error.InvalidMask;
+        try validateTextMaskWith(params, mask);
+        return switch (asciiLower(token[0])) {
+            'n' => .{ .criterion = .{ .name_mask = mask } },
+            't' => .{ .criterion = .{ .topic_mask = mask } },
+            's' => .{ .criterion = .{ .subject_mask = mask } },
+            'l' => .{ .criterion = .{ .language_mask = mask } },
+            else => error.InvalidFilter,
+        };
     }
 
     if (token[0] == '#') {
@@ -274,6 +313,22 @@ pub fn matchesFilters(filters: []const Filter, channel: ChannelInfo, now_ms: u64
             .channel_mask => |mask| {
                 has_mask = true;
                 matched_mask = matched_mask or globMatch(mask, channel.name);
+            },
+            .name_mask => |mask| {
+                has_mask = true;
+                matched_mask = matched_mask or globMatch(mask, channel.name);
+            },
+            .topic_mask => |mask| {
+                if (!globMatch(mask, channel.topic)) return false;
+            },
+            .subject_mask => |mask| {
+                if (!globMatch(mask, channel.subject)) return false;
+            },
+            .language_mask => |mask| {
+                if (!globMatch(mask, channel.language)) return false;
+            },
+            .registered => |want| {
+                if (channel.registered != want) return false;
             },
         }
     }
@@ -443,6 +498,12 @@ fn validateMaskWith(comptime params: Params, mask: []const u8) ListxError!void {
             else => {},
         }
     }
+}
+
+fn validateTextMaskWith(comptime params: Params, mask: []const u8) ListxError!void {
+    if (mask.len > params.max_mask_bytes) return error.MaskTooLong;
+    // `validateFilterBytes` already rejected control bytes, commas, and spaces in
+    // the whole token; nothing further is required for a text-mask payload.
 }
 
 fn parseDecimal(bytes: []const u8) ListxError!u64 {
@@ -646,6 +707,80 @@ test "combined filters match with mask disjunction" {
     try std.testing.expect(request.matches(matching, 100_000));
     try std.testing.expect(!request.matches(too_small, 100_000));
     try std.testing.expect(!request.matches(wrong_mask, 100_000));
+}
+
+test "parse text mask and registered filters" {
+    const request = try parse(&.{"N=#zig*,T=*release*,S=dev,L=en,R=1"});
+
+    try std.testing.expectEqualStrings("#zig*", request.filters[0].criterion.name_mask);
+    try std.testing.expectEqualStrings("*release*", request.filters[1].criterion.topic_mask);
+    try std.testing.expectEqualStrings("dev", request.filters[2].criterion.subject_mask);
+    try std.testing.expectEqualStrings("en", request.filters[3].criterion.language_mask);
+    try std.testing.expectEqual(true, request.filters[4].criterion.registered);
+
+    const unreg = try parse(&.{"R=0"});
+    try std.testing.expectEqual(false, unreg.filters[0].criterion.registered);
+}
+
+test "text mask and registered filters match channel metadata" {
+    const request = try parse(&.{"N=#zig*,T=*ship*,S=dev,L=en,R=1"});
+
+    const matching = ChannelInfo{
+        .name = "#zig-core",
+        .members = 5,
+        .topic = "now shipping",
+        .created_ms = 0,
+        .subject = "dev",
+        .language = "en",
+        .registered = true,
+    };
+    const wrong_topic = ChannelInfo{
+        .name = "#zig-core",
+        .members = 5,
+        .topic = "quiet day",
+        .created_ms = 0,
+        .subject = "dev",
+        .language = "en",
+        .registered = true,
+    };
+    const unregistered = ChannelInfo{
+        .name = "#zig-core",
+        .members = 5,
+        .topic = "now shipping",
+        .created_ms = 0,
+        .subject = "dev",
+        .language = "en",
+        .registered = false,
+    };
+    const wrong_name = ChannelInfo{
+        .name = "#ops",
+        .members = 5,
+        .topic = "now shipping",
+        .created_ms = 0,
+        .subject = "dev",
+        .language = "en",
+        .registered = true,
+    };
+
+    try std.testing.expect(request.matches(matching, 1_000));
+    try std.testing.expect(!request.matches(wrong_topic, 1_000));
+    try std.testing.expect(!request.matches(unregistered, 1_000));
+    try std.testing.expect(!request.matches(wrong_name, 1_000));
+}
+
+test "registered=0 selects only unregistered channels" {
+    const request = try parse(&.{"R=0"});
+    const reg = ChannelInfo{ .name = "#a", .members = 1, .created_ms = 0, .registered = true };
+    const unreg = ChannelInfo{ .name = "#b", .members = 1, .created_ms = 0, .registered = false };
+
+    try std.testing.expect(!request.matches(reg, 0));
+    try std.testing.expect(request.matches(unreg, 0));
+}
+
+test "malformed text mask filters are rejected" {
+    try std.testing.expectError(error.InvalidMask, parse(&.{"N="}));
+    try std.testing.expectError(error.InvalidValue, parse(&.{"R=2"}));
+    try std.testing.expectError(error.InvalidFilter, parse(&.{"Q=foo"}));
 }
 
 test "topic filters reject channels without topic metadata" {

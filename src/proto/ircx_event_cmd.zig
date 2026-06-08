@@ -74,7 +74,8 @@ pub fn parseOperation(token: []const u8) ParseError!Operation {
     return error.InvalidSubcommand;
 }
 
-/// Resolve category tokens using both `EventCategory.code()` and `.token()`.
+/// Resolve category tokens using `EventCategory.code()`, `.token()`, and the
+/// IRCX draft compatibility aliases.
 pub fn lookupCategory(token: []const u8) ParseError!EventCategory {
     inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
         const category: EventCategory = @field(EventCategory, field.name);
@@ -84,7 +85,21 @@ pub fn lookupCategory(token: []const u8) ParseError!EventCategory {
             return category;
         }
     }
-    return error.UnknownCategory;
+    return draftAlias(token) orelse error.UnknownCategory;
+}
+
+/// Map the six IRCX draft EVENT types (CHANNEL, MEMBER, SERVER, CONNECTION,
+/// SOCKET, USER) onto Mizuchi's richer Event-Spine taxonomy so draft clients keep
+/// working. Mizuchi intentionally diverges from the flat draft set (Event-Spine
+/// path B in docs/planning/14-ircx-remainder.md); these aliases are the bridge.
+pub fn draftAlias(token: []const u8) ?EventCategory {
+    if (std.ascii.eqlIgnoreCase(token, "CHANNEL")) return .announce;
+    if (std.ascii.eqlIgnoreCase(token, "MEMBER")) return .oper_action;
+    if (std.ascii.eqlIgnoreCase(token, "SERVER")) return .server_link;
+    if (std.ascii.eqlIgnoreCase(token, "CONNECTION")) return .connect;
+    if (std.ascii.eqlIgnoreCase(token, "SOCKET")) return .disconnect;
+    if (std.ascii.eqlIgnoreCase(token, "USER")) return .service;
+    return null;
 }
 
 /// Apply an ADD/DEL request to an existing mask. LIST leaves the mask unchanged.
@@ -275,6 +290,21 @@ test "parse LIST accepts optional category filter" {
     try std.testing.expectEqual(Operation.list, filtered.operation);
     try std.testing.expect(filtered.mask.contains(.security));
     try std.testing.expect(filtered.mask.contains(.oper_action));
+}
+
+test "draft EVENT category aliases map onto the Event-Spine taxonomy" {
+    const channel = try parse("EVENT ADD CHANNEL MEMBER SERVER");
+    try std.testing.expect(channel.mask.contains(.announce));
+    try std.testing.expect(channel.mask.contains(.oper_action));
+    try std.testing.expect(channel.mask.contains(.server_link));
+
+    const transport = try parseParams(&.{ "ADD", "CONNECTION", "SOCKET", "USER" });
+    try std.testing.expect(transport.mask.contains(.connect));
+    try std.testing.expect(transport.mask.contains(.disconnect));
+    try std.testing.expect(transport.mask.contains(.service));
+
+    // Aliases are case-insensitive like the native tokens.
+    try std.testing.expectEqual(EventCategory.connect, try lookupCategory("connection"));
 }
 
 test "unknown category handling" {
