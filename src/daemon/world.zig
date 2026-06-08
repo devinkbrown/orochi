@@ -3,6 +3,7 @@
 //! This module intentionally models only local daemon state: nick ownership,
 //! channel membership, and channel topics. It has no S2S/CRDT responsibilities.
 const std = @import("std");
+const rwlock = @import("../substrate/rwlock.zig");
 
 /// Opaque client handle value used by the local server world.
 pub const ClientId = packed struct {
@@ -138,6 +139,29 @@ pub const World = struct {
     /// dispatch so `ensureChannel` can stamp a channel's CREATION time without the
     /// pure world taking a clock dependency. 0 until first set.
     clock_unix: i64 = 0,
+    /// Guards all of the maps above for the multi-reactor model: lookups take the
+    /// read lock, mutations (join/part/nick/mode/rename/remove) the write lock.
+    /// Every mutation — and its allocation — happens under the exclusive lock, so
+    /// the allocator is never touched concurrently; reads are concurrent and
+    /// allocation-free. Uncontended with a single reactor (the current default),
+    /// so the live single-thread path pays only a couple of atomics. The World
+    /// owns the lock so it travels with the data it guards; callers (the reactor
+    /// loop) bracket world access with lockRead/lockWrite — see
+    /// docs/planning/24-multithreading.md (Phase B).
+    lock: rwlock.RwLock = .{},
+
+    pub fn lockRead(self: *World) void {
+        self.lock.lockShared();
+    }
+    pub fn unlockRead(self: *World) void {
+        self.lock.unlockShared();
+    }
+    pub fn lockWrite(self: *World) void {
+        self.lock.lockExclusive();
+    }
+    pub fn unlockWrite(self: *World) void {
+        self.lock.unlockExclusive();
+    }
 
     pub fn init(allocator: std.mem.Allocator) World {
         return .{
@@ -1318,4 +1342,76 @@ test "channelsOf lists a client's channels" {
     }
     try std.testing.expect(seen_x and seen_y);
     try std.testing.expectEqual(@as(usize, 1), world.channelsOf(b, &buf));
+}
+
+const MtCtx = struct {
+    world: *World,
+    client: ClientId,
+    nick: []const u8,
+    iters: u64,
+
+    fn writer(ctx: *MtCtx) void {
+        // Register once, then hammer join/part on a shared channel — every
+        // mutation (and its allocation) under the exclusive write lock.
+        ctx.world.lockWrite();
+        ctx.world.registerNick(ctx.nick, ctx.client) catch {};
+        ctx.world.unlockWrite();
+        var i: u64 = 0;
+        while (i < ctx.iters) : (i += 1) {
+            ctx.world.lockWrite();
+            _ = ctx.world.join("#mt", ctx.client) catch {};
+            ctx.world.part("#mt", ctx.client) catch {};
+            ctx.world.unlockWrite();
+        }
+    }
+
+    fn reader(ctx: *MtCtx) void {
+        var i: u64 = 0;
+        while (i < ctx.iters) : (i += 1) {
+            ctx.world.lockRead();
+            std.mem.doNotOptimizeAway(ctx.world.nickOf(ctx.client));
+            ctx.world.unlockRead();
+        }
+    }
+};
+
+test "World mutations + reads are race-free under its RwLock" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const writers = 4;
+    const iters: u64 = 3000;
+    var nick_bufs: [writers][8]u8 = undefined;
+    var ctxs: [writers]MtCtx = undefined;
+    for (0..writers) |i| {
+        const nick = std.fmt.bufPrint(&nick_bufs[i], "n{d}", .{i}) catch unreachable;
+        ctxs[i] = .{
+            .world = &world,
+            .client = ClientId{ .shard = 0, .slot = @intCast(i + 1), .gen = 1 },
+            .nick = nick,
+            .iters = iters,
+        };
+    }
+
+    var threads: [writers * 2]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |t| t.join();
+    for (0..writers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, MtCtx.writer, .{&ctxs[i]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (0..writers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, MtCtx.reader, .{&ctxs[i]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+
+    // Each writer registered exactly one (distinct) nick; all joins were paired
+    // with parts, so the shared channel ends empty. Consistency proves the lock
+    // serialised every mutation without corruption.
+    try std.testing.expectEqual(@as(usize, writers), world.nicks.count());
+    try std.testing.expectEqual(@as(usize, 0), world.memberCount("#mt"));
+    for (0..writers) |i| {
+        try std.testing.expectEqualStrings(ctxs[i].nick, world.nickOf(ctxs[i].client).?);
+    }
 }
