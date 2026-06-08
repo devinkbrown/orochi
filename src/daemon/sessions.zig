@@ -9,6 +9,7 @@
 //! supplies the reclaim token (generated from the daemon CSPRNG). A flat per-
 //! account list keeps ownership trivial (one owned account-name key per account).
 const std = @import("std");
+const rwlock = @import("../substrate/rwlock.zig");
 
 pub const ClientId = u64;
 pub const Token = [16]u8;
@@ -48,6 +49,7 @@ pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     accounts: std.StringHashMap(SessionList),
+    lock: rwlock.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) SessionStore {
         return initWithConfig(allocator, .{});
@@ -58,18 +60,26 @@ pub const SessionStore = struct {
     }
 
     pub fn deinit(self: *SessionStore) void {
-        var it = self.accounts.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
+        {
+            self.lock.lockExclusive();
+            defer self.lock.unlockExclusive();
+
+            var it = self.accounts.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.accounts.deinit();
         }
-        self.accounts.deinit();
         self.* = undefined;
     }
 
     /// Register a live session for `account`. Idempotent on `client` (re-attach
     /// refreshes its token/signon and marks it attached). Returns the session.
     pub fn attach(self: *SessionStore, account: []const u8, client: ClientId, token: Token, signon_ms: i64) Error!Session {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const list = try self.ensureAccount(account);
         if (list.indexOfClient(client)) |idx| {
             list.items.items[idx] = .{ .client = client, .token = token, .signon_ms = signon_ms, .attached = true };
@@ -102,6 +112,9 @@ pub const SessionStore = struct {
     /// Mark a session detached (connection dropped) but retain it for reclaim/
     /// bouncer. Returns true if it was present. The session is NOT removed.
     pub fn markDetached(self: *SessionStore, account: []const u8, client: ClientId) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const list = self.accounts.getPtr(account) orelse return false;
         const idx = list.indexOfClient(client) orelse return false;
         list.items.items[idx].attached = false;
@@ -111,6 +124,9 @@ pub const SessionStore = struct {
     /// Fully remove a session (e.g. explicit logout / reclaim consumed). Prunes
     /// the account when its last session goes. Returns true if removed.
     pub fn remove(self: *SessionStore, account: []const u8, client: ClientId) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const entry = self.accounts.getEntry(account) orelse return false;
         const idx = entry.value_ptr.indexOfClient(client) orelse return false;
         _ = entry.value_ptr.items.swapRemove(idx);
@@ -121,6 +137,9 @@ pub const SessionStore = struct {
     /// Drop a client from whatever account holds it (disconnect path, when the
     /// caller may not know the account). Returns the account name match count (0/1).
     pub fn removeClient(self: *SessionStore, client: ClientId) usize {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.indexOfClient(client)) |idx| {
@@ -135,6 +154,9 @@ pub const SessionStore = struct {
     /// Borrowed session list for `account` (empty if none). Valid until the next
     /// mutation touching this account.
     pub fn sessions(self: *const SessionStore, account: []const u8) []const Session {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
         const list = self.accounts.getPtr(account) orelse return &.{};
         return list.items.items;
     }
@@ -144,6 +166,9 @@ pub const SessionStore = struct {
     /// Find the session bearing `token` (for reclaim). The returned `account`
     /// borrows the store's key storage.
     pub fn findByToken(self: *const SessionStore, token: Token) ?Match {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
         var it = self.accounts.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items.items) |s| {
@@ -157,6 +182,9 @@ pub const SessionStore = struct {
     /// caller's own account — a token never reaches across accounts). Returns the
     /// matched client id, or null if no session in `account` bears the token.
     pub fn findTokenInAccount(self: *const SessionStore, account: []const u8, token: Token) ?ClientId {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
         const list = self.accounts.getPtr(account) orelse return null;
         for (list.items.items) |s| {
             if (std.mem.eql(u8, &s.token, &token)) return s.client;
@@ -264,4 +292,127 @@ test "findTokenInAccount is scoped to the account" {
     try testing.expectEqual(@as(ClientId, 1), s.findTokenInAccount("alice", tok(0xAB)).?);
     // bob's token must not resolve under alice.
     try testing.expect(s.findTokenInAccount("alice", tok(0xCD)) == null);
+}
+
+const SessionMtCtx = struct {
+    store: *SessionStore,
+    writer_id: usize,
+    iters: usize,
+    failures: *std.atomic.Value(u32),
+
+    fn account(out: *[16]u8, writer_id: usize) []const u8 {
+        return std.fmt.bufPrint(out, "acct{d}", .{writer_id}) catch unreachable;
+    }
+
+    fn tempAccount(out: *[24]u8, writer_id: usize, i: usize) []const u8 {
+        return std.fmt.bufPrint(out, "tmp{d}_{d}", .{ writer_id, i }) catch unreachable;
+    }
+
+    fn client(writer_id: usize, i: usize) ClientId {
+        return @intCast(1000 + writer_id * 100 + i);
+    }
+
+    fn tempClient(writer_id: usize, i: usize) ClientId {
+        return @intCast(10000 + writer_id * 100 + i);
+    }
+
+    fn writer(ctx: *SessionMtCtx) void {
+        var acct_buf: [16]u8 = undefined;
+        var tmp_buf: [24]u8 = undefined;
+        const acct = account(&acct_buf, ctx.writer_id);
+        var i: usize = 0;
+        while (i < ctx.iters) : (i += 1) {
+            const cid = client(ctx.writer_id, i);
+            _ = ctx.store.attach(acct, cid, tok(@intCast(i + 2)), @intCast(i)) catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if ((i & 1) == 0) {
+                if (!ctx.store.markDetached(acct, cid)) {
+                    _ = ctx.failures.fetchAdd(1, .monotonic);
+                    return;
+                }
+                _ = ctx.store.attach(acct, cid, tok(@intCast(i + 3)), @intCast(i + 1000)) catch {
+                    _ = ctx.failures.fetchAdd(1, .monotonic);
+                    return;
+                };
+            }
+
+            const tmp = tempAccount(&tmp_buf, ctx.writer_id, i);
+            const tmp_cid = tempClient(ctx.writer_id, i);
+            _ = ctx.store.attach(tmp, tmp_cid, tok(@intCast(i + 4)), @intCast(i)) catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            const removed = if ((i & 1) == 0)
+                ctx.store.remove(tmp, tmp_cid)
+            else
+                ctx.store.removeClient(tmp_cid) == 1;
+            if (!removed) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+    }
+
+    fn reader(ctx: *SessionMtCtx) void {
+        var i: usize = 0;
+        while (i < ctx.iters * 4) : (i += 1) {
+            const seed_sessions = ctx.store.sessions("seed");
+            if (seed_sessions.len != 1 or seed_sessions[0].client != 1) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+            const found = ctx.store.findByToken(tok(1)) orelse {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (!std.mem.eql(u8, found.account, "seed") or found.client != 1) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+            if (ctx.store.findTokenInAccount("seed", tok(1)) != 1) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+    }
+};
+
+test "SessionStore concurrent writers and readers preserve sessions" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("seed", 1, tok(1), 1);
+
+    const writers = 4;
+    const readers = 4;
+    const iters = 64;
+    var failures = std.atomic.Value(u32).init(0);
+    var ctxs: [writers]SessionMtCtx = undefined;
+    for (0..writers) |i| {
+        ctxs[i] = .{ .store = &s, .writer_id = i, .iters = iters, .failures = &failures };
+    }
+
+    var threads: [writers + readers]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |t| t.join();
+    for (0..writers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, SessionMtCtx.writer, .{&ctxs[i]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (0..readers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, SessionMtCtx.reader, .{&ctxs[i % writers]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), s.sessions("seed").len);
+    var acct_buf: [16]u8 = undefined;
+    for (0..writers) |w| {
+        const acct = SessionMtCtx.account(&acct_buf, w);
+        const list = s.sessions(acct);
+        try testing.expectEqual(@as(usize, iters), list.len);
+        for (list) |session| try testing.expect(session.attached);
+    }
 }

@@ -68,6 +68,7 @@ pub const custom_macro = @import("custom_macro.zig");
 pub const daily_streak = @import("daily_streak.zig");
 pub const dedup_window = @import("dedup_window.zig");
 pub const delegation = @import("delegation.zig");
+pub const deliver_handle = @import("deliver_handle.zig");
 pub const delivery_receipt = @import("delivery_receipt.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const dm_request = @import("dm_request.zig");
@@ -310,6 +311,7 @@ test {
     _ = daily_streak;
     _ = dedup_window;
     _ = delegation;
+    _ = deliver_handle;
     _ = delivery_receipt;
     _ = dispatch;
     _ = dm_request;

@@ -5,6 +5,7 @@ const store_mod = @import("store.zig");
 const toml = @import("../proto/toml.zig");
 const scram_store_mod = @import("scram_store.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
+const rwlock = @import("../substrate/rwlock.zig");
 
 pub const MizuStore = store_mod.MizuStore;
 pub const ScramStore = scram_store_mod.ScramStore;
@@ -249,6 +250,7 @@ pub const Services = struct {
     /// In-memory companion (see certfp_bind.zig); null = EXTERNAL has nothing to
     /// match and fails closed.
     certfp_binds: ?*certfp_bind_mod.CertfpBindStore = null,
+    lock: rwlock.RwLock = .{},
 
     pub fn init(store: *MizuStore, state: ?StateHook) Services {
         return .{ .store = store, .state = state };
@@ -261,29 +263,44 @@ pub const Services = struct {
     /// Attach a SCRAM credential mirror. Accounts registered after this call
     /// gain SCRAM-SHA-256 material; the store must outlive `self`.
     pub fn attachScramStore(self: *Services, scram: *ScramStore) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         self.scram = scram;
     }
 
     /// Attach the account ⇄ certfp binding store (for SASL EXTERNAL / CERTADD).
     /// The store must outlive `self`.
     pub fn attachCertfpBinds(self: *Services, binds: *certfp_bind_mod.CertfpBindStore) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         self.certfp_binds = binds;
     }
 
     /// Bind a TLS certfp to an account (the CERTADD command). Caller has verified
     /// the account is the caller's own logged-in account.
     pub fn bindCertfp(self: *Services, account: []const u8, fingerprint: []const u8) certfp_bind_mod.CertfpBindError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const binds = self.certfp_binds orelse return error.InvalidFingerprint;
         try binds.bind(account, fingerprint);
     }
 
     /// The account a certfp is bound to, if any (SASL EXTERNAL verification).
     pub fn accountForCertfp(self: *const Services, fingerprint: []const u8) ?[]const u8 {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
         const binds = self.certfp_binds orelse return null;
         return binds.accountForFingerprint(fingerprint);
     }
 
     pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const key = try accountKey(name);
         if (self.store.family(.accounts).get(key.asSlice()) != null) return error.AlreadyExists;
         try validatePassword(password);
@@ -315,6 +332,9 @@ pub const Services = struct {
     }
 
     pub fn identifyAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
         const key = try accountKey(name);
         const value = self.store.family(.accounts).get(key.asSlice()) orelse {
             try rejectMissingAccount(password, self.cfg.pbkdf2_rounds);
@@ -326,6 +346,9 @@ pub const Services = struct {
     }
 
     pub fn dropAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const record = try self.loadAccount(name);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         try self.store.family(.accounts).delete(record.name.asSlice());
@@ -333,6 +356,9 @@ pub const Services = struct {
     }
 
     pub fn ghostAccount(self: *Services, name: []const u8, password: []const u8, nick: []const u8) ServiceError!CommandResult {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
         const record = try self.loadAccount(name);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         const clean_nick = try validateNick(nick);
@@ -346,6 +372,9 @@ pub const Services = struct {
         field: AccountSetField,
         scratch: []u8,
     ) ServiceError!CommandResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         var record = try self.loadAccount(name);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         switch (field) {
@@ -358,11 +387,17 @@ pub const Services = struct {
     }
 
     pub fn accountInfo(self: *Services, name: []const u8) ServiceError!CommandResult {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
         const record = try self.loadAccount(name);
         return .{ .account_info = record.info() };
     }
 
     pub fn registerChannel(self: *Services, channel: []const u8, founder: []const u8, scratch: []u8) ServiceError!CommandResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const channel_key = try channelKey(channel);
         if (self.store.family(.chanregs).get(channel_key.asSlice()) != null) return error.AlreadyExists;
         const founder_key = try accountKey(founder);
@@ -386,6 +421,9 @@ pub const Services = struct {
     }
 
     pub fn dropChannel(self: *Services, channel: []const u8, actor: []const u8) ServiceError!CommandResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         const record = try self.loadChannel(channel);
         try self.requireAccess(record, actor, .founder);
         try self.store.family(.chanregs).delete(record.name.asSlice());
@@ -394,6 +432,29 @@ pub const Services = struct {
     }
 
     pub fn channelAccess(
+        self: *Services,
+        channel: []const u8,
+        actor: []const u8,
+        target: []const u8,
+        action: AccessAction,
+        level: AccessLevel,
+        scratch: []u8,
+    ) ServiceError!CommandResult {
+        switch (action) {
+            .query => {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                return self.channelAccessUnlocked(channel, actor, target, action, level, scratch);
+            },
+            .grant, .revoke => {
+                self.lock.lockExclusive();
+                defer self.lock.unlockExclusive();
+                return self.channelAccessUnlocked(channel, actor, target, action, level, scratch);
+            },
+        }
+    }
+
+    fn channelAccessUnlocked(
         self: *Services,
         channel: []const u8,
         actor: []const u8,
@@ -430,6 +491,29 @@ pub const Services = struct {
     }
 
     pub fn channelAkick(
+        self: *Services,
+        channel: []const u8,
+        actor: []const u8,
+        mask: []const u8,
+        action: AkickAction,
+        reason: []const u8,
+        scratch: []u8,
+    ) ServiceError!CommandResult {
+        switch (action) {
+            .query => {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                return self.channelAkickUnlocked(channel, actor, mask, action, reason, scratch);
+            },
+            .add, .remove => {
+                self.lock.lockExclusive();
+                defer self.lock.unlockExclusive();
+                return self.channelAkickUnlocked(channel, actor, mask, action, reason, scratch);
+            },
+        }
+    }
+
+    fn channelAkickUnlocked(
         self: *Services,
         channel: []const u8,
         actor: []const u8,
@@ -479,6 +563,9 @@ pub const Services = struct {
         field: ChannelSetField,
         scratch: []u8,
     ) ServiceError!CommandResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         var record = try self.loadChannel(channel);
         try self.requireAccess(record, actor, .admin);
         switch (field) {
@@ -490,6 +577,9 @@ pub const Services = struct {
     }
 
     pub fn channelInfo(self: *Services, channel: []const u8) ServiceError!CommandResult {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
         const record = try self.loadChannel(channel);
         return .{ .channel_info = record.info() };
     }
@@ -1071,4 +1161,97 @@ test "initWithConfig threads custom rounds into hashing" {
     _ = try services.registerAccount("Bob", "correct horse battery staple", &scratch);
     const identified = try services.identifyAccount("bob", "correct horse battery staple");
     try std.testing.expectEqualStrings("bob", identified.identified.name.asSlice());
+}
+
+const ServicesMtCtx = struct {
+    services: *Services,
+    writer_id: usize,
+    iters: usize,
+    failures: *std.atomic.Value(u32),
+
+    fn accountName(out: *[account_max]u8, writer_id: usize, i: usize) []const u8 {
+        return std.fmt.bufPrint(out, "svc{d}_{d}", .{ writer_id, i }) catch unreachable;
+    }
+
+    fn writer(ctx: *ServicesMtCtx) void {
+        var scratch: [record_max]u8 = undefined;
+        var name_buf: [account_max]u8 = undefined;
+        var i: usize = 0;
+        while (i < ctx.iters) : (i += 1) {
+            const name = accountName(&name_buf, ctx.writer_id, i);
+            _ = ctx.services.registerAccount(name, "correct horse battery staple", &scratch) catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            _ = ctx.services.setAccount(name, "correct horse battery staple", .{ .email = "thread@example.test" }, &scratch) catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+        }
+    }
+
+    fn reader(ctx: *ServicesMtCtx) void {
+        var i: usize = 0;
+        while (i < ctx.iters * 4) : (i += 1) {
+            _ = ctx.services.identifyAccount("seed", "correct horse battery staple") catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            const info = ctx.services.accountInfo("seed") catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (!std.mem.eql(u8, info.account_info.name.asSlice(), "seed")) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+            _ = ctx.services.ghostAccount("seed", "correct horse battery staple", "SeedNick") catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+        }
+    }
+};
+
+test "Services concurrent account writers and readers preserve account records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-concurrent.wal");
+    defer store.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 16 });
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("seed", "correct horse battery staple", &scratch);
+
+    const writers = 4;
+    const readers = 4;
+    const iters = 16;
+    var failures = std.atomic.Value(u32).init(0);
+    var ctxs: [writers]ServicesMtCtx = undefined;
+    for (0..writers) |i| {
+        ctxs[i] = .{ .services = &services, .writer_id = i, .iters = iters, .failures = &failures };
+    }
+
+    var threads: [writers + readers]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |t| t.join();
+    for (0..writers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, ServicesMtCtx.writer, .{&ctxs[i]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (0..readers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, ServicesMtCtx.reader, .{&ctxs[i % writers]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+
+    try std.testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    var name_buf: [account_max]u8 = undefined;
+    for (0..writers) |w| {
+        for (0..iters) |i| {
+            const name = ServicesMtCtx.accountName(&name_buf, w, i);
+            const info = try services.accountInfo(name);
+            try std.testing.expectEqualStrings("thread@example.test", info.account_info.email.asSlice());
+        }
+    }
 }

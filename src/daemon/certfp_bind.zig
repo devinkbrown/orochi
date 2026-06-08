@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const certfp = @import("../proto/certfp.zig");
+const rwlock = @import("../substrate/rwlock.zig");
 
 pub const CertfpBindError = error{
     InvalidFingerprint,
@@ -27,24 +28,33 @@ pub const CertfpBindStore = struct {
     allocator: std.mem.Allocator,
     /// fingerprint (lowercase hex) -> owned account name.
     entries: std.StringHashMapUnmanaged([]u8),
+    lock: rwlock.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) CertfpBindStore {
         return .{ .allocator = allocator, .entries = .empty };
     }
 
     pub fn deinit(self: *CertfpBindStore) void {
-        var it = self.entries.iterator();
-        while (it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.*);
+        {
+            self.lock.lockExclusive();
+            defer self.lock.unlockExclusive();
+
+            var it = self.entries.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                self.allocator.free(e.value_ptr.*);
+            }
+            self.entries.deinit(self.allocator);
         }
-        self.entries.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Bind `fingerprint` to `account`. Re-binding the same fingerprint replaces
     /// the owner (the most recent CERTADD wins). One account may own many certs.
     pub fn bind(self: *CertfpBindStore, account: []const u8, fingerprint: []const u8) CertfpBindError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         certfp.validateFingerprint(fingerprint) catch return error.InvalidFingerprint;
         if (account.len == 0 or account.len > max_account_len) return error.AccountTooLong;
 
@@ -63,12 +73,18 @@ pub const CertfpBindStore = struct {
 
     /// The account owning `fingerprint`, or null. Borrowed (store-owned).
     pub fn accountForFingerprint(self: *const CertfpBindStore, fingerprint: []const u8) ?[]const u8 {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
         if (fingerprint.len != certfp.fingerprint_len) return null;
         return self.entries.get(fingerprint);
     }
 
     /// Remove a binding; returns whether one was present.
     pub fn unbind(self: *CertfpBindStore, fingerprint: []const u8) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         if (self.entries.fetchRemove(fingerprint)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
@@ -121,4 +137,96 @@ test "unbind removes a present binding" {
     try std.testing.expect(store.unbind(fp));
     try std.testing.expect(!store.unbind(fp));
     try std.testing.expect(store.accountForFingerprint(fp) == null);
+}
+
+const CertfpMtCtx = struct {
+    store: *CertfpBindStore,
+    writer_id: usize,
+    iters: usize,
+    failures: *std.atomic.Value(u32),
+
+    fn fpFor(out: *[certfp.fingerprint_len]u8, writer_id: usize, i: usize, suffix: usize) []const u8 {
+        return std.fmt.bufPrint(out, "{x:0>64}", .{writer_id * 10000 + i * 2 + suffix + 1}) catch unreachable;
+    }
+
+    fn writer(ctx: *CertfpMtCtx) void {
+        var fp_buf: [certfp.fingerprint_len]u8 = undefined;
+        var tmp_buf: [certfp.fingerprint_len]u8 = undefined;
+        var acct_buf: [max_account_len]u8 = undefined;
+        var i: usize = 0;
+        while (i < ctx.iters) : (i += 1) {
+            const acct = std.fmt.bufPrint(&acct_buf, "acct{d}_{d}", .{ ctx.writer_id, i }) catch unreachable;
+            const fp = fpFor(&fp_buf, ctx.writer_id, i, 0);
+            ctx.store.bind(acct, fp) catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+
+            const tmp = fpFor(&tmp_buf, ctx.writer_id, i, 1);
+            ctx.store.bind(acct, tmp) catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (!ctx.store.unbind(tmp)) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+    }
+
+    fn reader(ctx: *CertfpMtCtx) void {
+        const seed = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        var i: usize = 0;
+        while (i < ctx.iters * 4) : (i += 1) {
+            const acct = ctx.store.accountForFingerprint(seed) orelse {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (!std.mem.eql(u8, acct, "seed")) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+    }
+};
+
+test "CertfpBindStore concurrent writers and readers preserve bindings" {
+    const alloc = std.testing.allocator;
+    var store = CertfpBindStore.init(alloc);
+    defer store.deinit();
+
+    const seed = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try store.bind("seed", seed);
+
+    const writers = 4;
+    const readers = 4;
+    const iters = 64;
+    var failures = std.atomic.Value(u32).init(0);
+    var ctxs: [writers]CertfpMtCtx = undefined;
+    for (0..writers) |i| {
+        ctxs[i] = .{ .store = &store, .writer_id = i, .iters = iters, .failures = &failures };
+    }
+
+    var threads: [writers + readers]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |t| t.join();
+    for (0..writers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, CertfpMtCtx.writer, .{&ctxs[i]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (0..readers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, CertfpMtCtx.reader, .{&ctxs[i % writers]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+
+    try std.testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1 + writers * iters), store.entries.count());
+    var fp_buf: [certfp.fingerprint_len]u8 = undefined;
+    for (0..writers) |w| {
+        for (0..iters) |i| {
+            const fp = CertfpMtCtx.fpFor(&fp_buf, w, i, 0);
+            try std.testing.expect(store.accountForFingerprint(fp) != null);
+        }
+    }
 }

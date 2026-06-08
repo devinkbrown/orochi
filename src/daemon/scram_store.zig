@@ -23,6 +23,7 @@ const std = @import("std");
 const sasl = @import("../proto/sasl.zig");
 const mechrouter = @import("../proto/sasl_mechrouter.zig");
 const crypto_random = @import("../crypto/random.zig");
+const rwlock = @import("../substrate/rwlock.zig");
 
 /// SCRAM-SHA-256 digest length (StoredKey / ServerKey size), in bytes.
 /// Derived from `ScramRecord` so it tracks the canonical record definition.
@@ -67,6 +68,7 @@ pub const ScramStore = struct {
     allocator: std.mem.Allocator,
     /// Maps canonical account name -> SCRAM material. Keys and salt bytes owned.
     entries: std.StringHashMapUnmanaged(Entry),
+    lock: rwlock.RwLock = .{},
 
     /// Create an empty store backed by `allocator`.
     pub fn init(allocator: std.mem.Allocator) ScramStore {
@@ -76,17 +78,22 @@ pub const ScramStore = struct {
     /// Free every owned key and salt, then the backing table. The store must
     /// not be used after this call.
     pub fn deinit(self: *ScramStore) void {
-        var it = self.entries.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            // Scrub the salt before release: it is not secret on its own, but
-            // co-locating zeroization with key material keeps the policy local.
-            secureZero(entry.value_ptr.salt);
-            self.allocator.free(entry.value_ptr.salt);
-            secureZero(&entry.value_ptr.stored_key);
-            secureZero(&entry.value_ptr.server_key);
+        {
+            self.lock.lockExclusive();
+            defer self.lock.unlockExclusive();
+
+            var it = self.entries.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                // Scrub the salt before release: it is not secret on its own, but
+                // co-locating zeroization with key material keeps the policy local.
+                secureZero(entry.value_ptr.salt);
+                self.allocator.free(entry.value_ptr.salt);
+                secureZero(&entry.value_ptr.stored_key);
+                secureZero(&entry.value_ptr.server_key);
+            }
+            self.entries.deinit(self.allocator);
         }
-        self.entries.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -103,13 +110,16 @@ pub const ScramStore = struct {
         account: []const u8,
         password: []const u8,
     ) ScramStoreError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
         if (account.len == 0 or account.len > MAX_ACCOUNT_LEN) return error.InvalidAccount;
 
         var salt: [salt_len]u8 = undefined;
         crypto_random.fillOsEntropy(&salt) catch return error.EntropyFailed;
+        defer secureZero(&salt);
 
-        try self.storeWithSalt(account, password, &salt, default_iterations);
-        secureZero(&salt);
+        try self.storeWithSaltUnlocked(account, password, &salt, default_iterations);
     }
 
     /// Derive and store SCRAM credentials using a caller-supplied salt and
@@ -117,6 +127,19 @@ pub const ScramStore = struct {
     /// callers that must reuse a salt; production registration should prefer
     /// `deriveAndStore`, which generates a fresh salt.
     pub fn storeWithSalt(
+        self: *ScramStore,
+        account: []const u8,
+        password: []const u8,
+        salt: []const u8,
+        iterations: u32,
+    ) ScramStoreError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        try self.storeWithSaltUnlocked(account, password, salt, iterations);
+    }
+
+    fn storeWithSaltUnlocked(
         self: *ScramStore,
         account: []const u8,
         password: []const u8,
@@ -163,6 +186,9 @@ pub const ScramStore = struct {
     /// entry is overwritten or the store is torn down. Returns null for an
     /// unknown account.
     pub fn lookup(self: *const ScramStore, account: []const u8) ?sasl.ScramRecord {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+
         const entry = self.entries.get(account) orelse return null;
         return .{
             .salt = entry.salt,
@@ -176,6 +202,9 @@ pub const ScramStore = struct {
     /// source. The returned fat pointer borrows `self`, so the `ScramStore` must
     /// outlive every connection that copies it (own it alongside the `Server`).
     pub fn scram256Lookup(self: *ScramStore) mechrouter.Scram256Lookup {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
         return .{ .ptr = self, .lookupFn = lookupThunk };
     }
 
@@ -253,6 +282,81 @@ test "empty or oversize account names are rejected" {
     // Act / Assert
     try std.testing.expectError(error.InvalidAccount, store.deriveAndStore("", "password value here"));
     try std.testing.expectError(error.InvalidAccount, store.deriveAndStore(too_long, "password value here"));
+}
+
+const ScramMtCtx = struct {
+    store: *ScramStore,
+    writer_id: usize,
+    iters: usize,
+    failures: *std.atomic.Value(u32),
+
+    fn writer(ctx: *ScramMtCtx) void {
+        var name_buf: [MAX_ACCOUNT_LEN]u8 = undefined;
+        var i: usize = 0;
+        while (i < ctx.iters) : (i += 1) {
+            const name = std.fmt.bufPrint(&name_buf, "scram{d}_{d}", .{ ctx.writer_id, i }) catch unreachable;
+            var salt = [_]u8{@intCast(ctx.writer_id * ctx.iters + i + 1)} ** salt_len;
+            ctx.store.storeWithSalt(name, "thread password value", &salt, 4096) catch {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+        }
+    }
+
+    fn reader(ctx: *ScramMtCtx) void {
+        var i: usize = 0;
+        while (i < ctx.iters * 4) : (i += 1) {
+            const record = ctx.store.lookup("seed") orelse {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (record.salt.len != salt_len or record.iterations != 4096) {
+                _ = ctx.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+            std.mem.doNotOptimizeAway(record.stored_key);
+        }
+    }
+};
+
+test "ScramStore concurrent writers and readers preserve entries" {
+    var store = ScramStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const seed_salt = [_]u8{0xA5} ** salt_len;
+    try store.storeWithSalt("seed", "thread password value", &seed_salt, 4096);
+
+    const writers = 4;
+    const readers = 4;
+    const iters = 24;
+    var failures = std.atomic.Value(u32).init(0);
+    var ctxs: [writers]ScramMtCtx = undefined;
+    for (0..writers) |i| {
+        ctxs[i] = .{ .store = &store, .writer_id = i, .iters = iters, .failures = &failures };
+    }
+
+    var threads: [writers + readers]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |t| t.join();
+    for (0..writers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, ScramMtCtx.writer, .{&ctxs[i]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (0..readers) |i| {
+        threads[spawned] = std.Thread.spawn(.{}, ScramMtCtx.reader, .{&ctxs[i % writers]}) catch return error.SkipZigTest;
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+
+    try std.testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1 + writers * iters), store.entries.count());
+    for (0..writers) |w| {
+        var name_buf: [MAX_ACCOUNT_LEN]u8 = undefined;
+        for (0..iters) |i| {
+            const name = std.fmt.bufPrint(&name_buf, "scram{d}_{d}", .{ w, i }) catch unreachable;
+            try std.testing.expect(store.lookup(name) != null);
+        }
+    }
 }
 
 test {
