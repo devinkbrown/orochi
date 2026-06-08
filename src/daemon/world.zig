@@ -1219,6 +1219,84 @@ test "channel flag modes set, query, and render" {
     try std.testing.expectError(error.NoSuchChannel, world.setChannelFlag("#nope", .secret, true));
 }
 
+test "+Z quiet (MUTE) list: add, match, exempt override, remove" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try world.join("#z", a);
+
+    // Empty list mutes nobody.
+    try std.testing.expect(!world.isMuted("#z", "loud!u@h"));
+
+    // Add (dedup), glob + case-insensitive match.
+    try std.testing.expect(try world.addMute("#z", "loud!*@*"));
+    try std.testing.expect(!(try world.addMute("#z", "loud!*@*"))); // dup
+    try std.testing.expect(world.isMuted("#z", "LOUD!user@host"));
+    try std.testing.expect(!world.isMuted("#z", "quiet!user@host"));
+    try std.testing.expectEqual(@as(usize, 1), world.mutesOf("#z").?.len);
+
+    // A +e exempt overrides a +Z quiet, mirroring +b/+e semantics.
+    try std.testing.expect(try world.addExempt("#z", "loud!vip@*"));
+    try std.testing.expect(!world.isMuted("#z", "loud!vip@host")); // exempt wins
+    try std.testing.expect(world.isMuted("#z", "loud!other@host")); // still muted
+
+    // Remove returns to un-muted.
+    try std.testing.expect(try world.removeMute("#z", "loud!*@*"));
+    try std.testing.expect(!world.isMuted("#z", "loud!other@host"));
+    try std.testing.expectError(error.NoSuchChannel, world.addMute("#nope", "x!*@*"));
+}
+
+test "+j join throttle: token bucket admits up to N per window, then denies" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try world.join("#j", a);
+
+    // Disabled by default: every join admitted, throttleOf is null.
+    try std.testing.expect(world.throttleOf("#j") == null);
+    try std.testing.expect(world.throttleAdmit("#j", 0));
+
+    // Configure 2 joins per 10 seconds.
+    try world.setThrottle("#j", 2, 10);
+    const cfg = world.throttleOf("#j").?;
+    try std.testing.expectEqual(@as(u16, 2), cfg.joins);
+    try std.testing.expectEqual(@as(u32, 10), cfg.secs);
+
+    // First two joins in the window are admitted; the third is denied.
+    try std.testing.expect(world.throttleAdmit("#j", 1000));
+    try std.testing.expect(world.throttleAdmit("#j", 2000));
+    try std.testing.expect(!world.throttleAdmit("#j", 3000));
+
+    // After the window elapses, old timestamps prune and joins admit again.
+    try std.testing.expect(world.throttleAdmit("#j", 13000)); // 1000ms entry expired
+    try std.testing.expect(world.throttleAdmit("#j", 13500)); // 2000ms entry expired
+    try std.testing.expect(!world.throttleAdmit("#j", 14000)); // window full again
+
+    // Clearing disables the throttle entirely.
+    try world.clearThrottle("#j");
+    try std.testing.expect(world.throttleOf("#j") == null);
+    try std.testing.expect(world.throttleAdmit("#j", 99999));
+    try std.testing.expectError(error.NoSuchChannel, world.setThrottle("#nope", 1, 1));
+}
+
+test "+f forward target: set (owned dupe), read, replace, clear" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try world.join("#f", a);
+
+    try std.testing.expect(world.forwardOf("#f") == null);
+    try world.setForward("#f", "#overflow");
+    try std.testing.expectEqualStrings("#overflow", world.forwardOf("#f").?);
+    // Replace frees the old dupe and stores the new one.
+    try world.setForward("#f", "#lobby");
+    try std.testing.expectEqualStrings("#lobby", world.forwardOf("#f").?);
+    // Clear frees the dupe.
+    try world.setForward("#f", null);
+    try std.testing.expect(world.forwardOf("#f") == null);
+    try std.testing.expectError(error.NoSuchChannel, world.setForward("#nope", "#x"));
+}
+
 test "channelsOf lists a client's channels" {
     var world = World.init(std.testing.allocator);
     defer world.deinit();

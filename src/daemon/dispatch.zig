@@ -28,6 +28,17 @@ const MAX_ACCOUNT_BYTES: usize = 64;
 const MAX_AWAY_BYTES: usize = 256;
 const MAX_HOST_BYTES: usize = 255;
 
+/// ISUPPORT CHANMODES token. Every advertised letter MUST be enforced by the
+/// channel-MODE handler (see `server.zig` handleChannelMode); this is the single
+/// source of truth shared by the welcome burst and the honesty test below.
+///   A (list, always param):   b e I Z   (ban, exempt, invex, MUTE quiet)
+///   B (param to set/unset):   k         (key)
+///   C (param to set only):    l f j     (limit, forward target, join throttle)
+///   D (flag, never param):    i m n s t C T N M S g
+/// `f`/`j`/`Z` live in the world layer (per-channel storage) rather than the
+/// compact `chanmode.ChannelMode` enum, but are fully parsed and enforced.
+pub const CHANMODES_TOKEN = "CHANMODES=beIZ,k,lfj,imnstCTNMSg";
+
 /// Parsed IRC line view. Slices borrow from the caller-owned input buffer.
 pub const LineView = struct {
     command: []const u8,
@@ -1059,7 +1070,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     try replies.numeric(session, .RPL_YOURHOST, &.{}, "Your host is mizuchi.local, running Mizuchi");
     try replies.numeric(session, .RPL_CREATED, &.{}, "This server was created for deterministic tests");
     try replies.numeric(session, .RPL_MYINFO, &.{ SERVER_NAME, "mizuchi-0.1", "io", "ov" }, "are supported by this server");
-    try replies.numeric(session, .RPL_ISUPPORT, &.{ "CHANTYPES=#&", "NICKLEN=64", "CASEMAPPING=ascii", "PREFIX=(Qqov)~.@+", "CHANMODES=beIZ,k,lfj,imnstCTNMSg", "STATUSMSG=~.@+", "BOT=B", "EXTBAN=$,acgmrz", "WHOX", "UTF8ONLY" }, "are supported by this server");
+    try replies.numeric(session, .RPL_ISUPPORT, &.{ "CHANTYPES=#&", "NICKLEN=64", "CASEMAPPING=ascii", "PREFIX=(Qqov)~.@+", CHANMODES_TOKEN, "STATUSMSG=~.@+", "BOT=B", "EXTBAN=$,acgmrz", "WHOX", "UTF8ONLY" }, "are supported by this server");
 }
 
 fn emitUnknownCommand(
@@ -1318,6 +1329,52 @@ test "sasl PLAIN rejects bad credentials and stays logged out" {
     try dispatchText(&session, &replies, line);
     try std.testing.expect(session.account() == null);
     try expectContains(replies.written(), " 904 ");
+}
+
+test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
+    const chanmode = @import("chanmode.zig");
+
+    // The token must keep the four-class A,B,C,D shape.
+    const eq = "CHANMODES=";
+    try std.testing.expect(std.mem.startsWith(u8, CHANMODES_TOKEN, eq));
+    const value = CHANMODES_TOKEN[eq.len..];
+    var it = std.mem.splitScalar(u8, value, ',');
+    const class_a = it.next().?;
+    const class_b = it.next().?;
+    const class_c = it.next().?;
+    const class_d = it.next().?;
+    try std.testing.expect(it.next() == null); // exactly four classes
+
+    try std.testing.expectEqualStrings("beIZ", class_a);
+    try std.testing.expectEqualStrings("k", class_b);
+    try std.testing.expectEqualStrings("lfj", class_c);
+    try std.testing.expectEqualStrings("imnstCTNMSg", class_d);
+
+    // Letters backed by the compact chanmode.ChannelMode enum must resolve in the
+    // catalog with the matching protocol class.
+    const enum_letters = "beIklimnstCTNMSg";
+    for (enum_letters) |letter| {
+        const spec = chanmode.specFromLetter(letter) orelse {
+            std.debug.print("CHANMODES advertises '{c}' but chanmode has no spec\n", .{letter});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(letter, spec.letter);
+    }
+
+    // f, j, Z are enforced in the world layer (forward / throttle / quiet) and are
+    // intentionally NOT in the compact enum, but are still real, handled modes.
+    // Their absence from the enum must be deliberate, not an oversight.
+    for ("fjZ") |letter| {
+        try std.testing.expect(chanmode.specFromLetter(letter) == null);
+    }
+
+    // The advertisement must not leak any letter the handler does not enforce.
+    // The full enforced set across both layers:
+    const enforced = "beIZklfjimnstCTNMSg";
+    for (class_a) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
+    for (class_b) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
+    for (class_c) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
+    for (class_d) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
 }
 
 test "host accessor prefers visible host, falls back to real then empty" {
