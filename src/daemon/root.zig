@@ -240,6 +240,7 @@ pub const whois = @import("whois.zig");
 pub const whowas = @import("whowas.zig");
 pub const world_clock = @import("world_clock.zig");
 pub const world_projection = @import("world_projection.zig");
+pub const world_rcu = @import("world_rcu.zig");
 pub const world = @import("world.zig");
 pub const xp_levels = @import("xp_levels.zig");
 // gen:mods:end
@@ -487,6 +488,7 @@ test {
     _ = whowas;
     _ = world_clock;
     _ = world_projection;
+    _ = world_rcu;
     _ = world;
     _ = xp_levels;
     // gen:tests:end
