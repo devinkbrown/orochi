@@ -135,6 +135,8 @@ def main():
     d.sendall(b"NICK survivor\r\nUSER survivor 0 * :survivor\r\n")
     if " 001 " not in recv_until(d, b" 001 "):
         fail("conn D did not register before UPGRADE", proc)
+    d.sendall(b"JOIN #durable\r\n")
+    recv_until(d, b" 366 ")  # end of NAMES — join complete
 
     b.sendall(b"UPGRADE\r\n")
     time.sleep(0.4)
@@ -180,10 +182,24 @@ def main():
     c2.sendall(b"WHOIS survivor\r\n")
     whois = recv_until(c2, b" 318 ")
     c2.close()
-    d.close()
+    # NB: keep `d` (survivor) OPEN — closing it would drop it from #durable before
+    # the channel-membership check below.
     if " 311 " not in whois:
         fail(f"carried nick not re-registered in world (no WHOIS 311): {whois!r}", proc)
     print("PASS: carried nick re-registered in the new image's world (WHOIS 311)")
+
+    # Channel membership must survive: a fresh client joining #durable sees the
+    # carried-over survivor in the NAMES list (RPL_NAMREPLY 353).
+    e = connect()
+    e.sendall(b"NICK joiner\r\nUSER joiner 0 * :joiner\r\n")
+    recv_until(e, b" 001 ")
+    e.sendall(b"JOIN #durable\r\n")
+    names = recv_until(e, b" 366 ")
+    e.close()
+    d.close()
+    if "survivor" not in names:
+        fail(f"carried channel membership lost (survivor not in #durable NAMES): {names!r}", proc)
+    print("PASS: carried channel membership survived (NAMES shows survivor in #durable)")
 
     # Conn C: a fresh client must connect + register after the upgrade.
     time.sleep(0.3)

@@ -219,6 +219,15 @@ pub const World = struct {
         return !member.found_existing;
     }
 
+    /// Re-attach `client` to `name` with EXACT `modes` (Helix UPGRADE carry-over).
+    /// Ensures the channel exists and sets the member's status modes verbatim,
+    /// bypassing the founder-on-first-join rule so restored state is faithful.
+    pub fn restoreMember(self: *World, name: []const u8, client: ClientId, modes: MemberModes) WorldError!void {
+        const channel = try self.ensureChannel(name);
+        const member = try channel.members.getOrPut(client);
+        member.value_ptr.* = modes;
+    }
+
     /// Status modes for `client` in `name`, or null if not a member / no channel.
     pub fn memberModes(self: *World, name: []const u8, client: ClientId) ?MemberModes {
         const channel = self.channels.getPtr(name) orelse return null;

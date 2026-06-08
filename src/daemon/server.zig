@@ -4616,6 +4616,15 @@ pub const LinuxServer = struct {
             if (e.value.fd == conn.fd) continue;
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
+            // Capture channel memberships + member modes so the successor re-joins.
+            var chan_names: [64][]const u8 = undefined;
+            const nch = self.world.channelsOf(worldIdFromClient(e.id), &chan_names);
+            var chans: [64]session_snapshot.ChannelMembership = undefined;
+            for (chan_names[0..nch], 0..) |cname, ci| {
+                const m = self.world.memberModes(cname, worldIdFromClient(e.id)) orelse continue;
+                chans[ci] = .{ .name = cname, .modes = m.bits };
+            }
+            snap.channels = chans[0..nch];
             const blob = session_snapshot.encode(self.allocator, snap) catch continue;
             blobs.append(self.allocator, blob) catch {
                 self.allocator.free(blob);
@@ -4720,6 +4729,11 @@ pub const LinuxServer = struct {
         // is a further refinement.
         if (snap.nick.len != 0 and !std.mem.eql(u8, snap.nick, "*")) {
             self.world.registerNick(snap.nick, worldIdFromClient(id)) catch {};
+        }
+        // Re-join the carried channel memberships with their exact member modes.
+        var cit = session_snapshot.channelIter(snap.channels_blob);
+        while (cit.next()) |ch| {
+            self.world.restoreMember(ch.name, worldIdFromClient(id), .{ .bits = ch.modes }) catch {};
         }
         self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
             self.world.removeClient(worldIdFromClient(id));
