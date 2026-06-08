@@ -17,6 +17,7 @@ pub const account_capsule = @import("account_capsule.zig");
 pub const listener_capsule = @import("listener_capsule.zig");
 pub const session_capsule = @import("session_capsule.zig");
 pub const session_snapshot = @import("session_snapshot.zig");
+pub const session_migrate = @import("session_migrate.zig");
 pub const monitor_capsule = @import("monitor_capsule.zig");
 pub const metadata_capsule = @import("metadata_capsule.zig");
 pub const bouncer_buffer_capsule = @import("bouncer_buffer_capsule.zig");
