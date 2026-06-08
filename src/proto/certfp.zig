@@ -108,6 +108,20 @@ pub fn whoisCertfpBodyLen(nick: []const u8) usize {
     return nick.len + whois_certfp_trailing_prefix.len + fingerprint_len;
 }
 
+/// Derive the CertFP of a DER-encoded leaf certificate: the lowercase hex
+/// SHA-256 of the raw certificate bytes (the charybdis/Atheme convention). The
+/// live TLS listener calls this on the negotiated peer cert to populate
+/// `session.tls_certfp`, which SASL EXTERNAL then matches against an account.
+pub fn computeHex(cert_der: []const u8, out: *Fingerprint) void {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(cert_der, &digest, .{});
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 0x0f];
+    }
+}
+
 /// Validate one caller-supplied lowercase SHA-256 hex fingerprint.
 pub fn validateFingerprint(fp: []const u8) CertFpError!void {
     if (fp.len != fingerprint_len) return error.InvalidFingerprint;
@@ -208,6 +222,23 @@ test "timing_safe match true/false" {
     try std.testing.expect(fingerprintEqual(a, b));
     try std.testing.expect(!fingerprintEqual(a, c));
     try std.testing.expect(!fingerprintEqual(a, "short"));
+}
+
+test "computeHex derives a valid lowercase-hex SHA-256 CertFP" {
+    var fp: Fingerprint = undefined;
+    computeHex("", &fp);
+    // SHA-256("") known answer.
+    try std.testing.expectEqualStrings(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        &fp,
+    );
+    // The output always satisfies the store's validator and is stable.
+    var again: Fingerprint = undefined;
+    const der = [_]u8{ 0x30, 0x82, 0x01, 0x0a, 0xde, 0xad, 0xbe, 0xef };
+    computeHex(&der, &fp);
+    computeHex(&der, &again);
+    try validateFingerprint(&fp);
+    try std.testing.expect(fingerprintEqual(&fp, &again));
 }
 
 test {
