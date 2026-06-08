@@ -82,7 +82,7 @@ pub const Limits = struct {
     modes_per_line: u32 = 4,
 
     // String-valued ISUPPORT policy tokens.
-    chantypes: Str = Str.fromLiteral("#"),
+    chantypes: Str = Str.fromLiteral("#&"),
     prefix: Str = Str.fromLiteral("(qaohv)~&@%+"),
     chanmodes: Str = Str.fromLiteral("b,k,l,imnpst"),
     casemapping: Str = Str.fromLiteral("ascii"),
@@ -92,7 +92,7 @@ pub const Limits = struct {
     targmax: Str = Str.fromLiteral("JOIN:,WHOIS:1,PRIVMSG:,NOTICE:,MONITOR:"),
     excepts_mode: Str = Str.fromLiteral("e"),
     invex_mode: Str = Str.fromLiteral("I"),
-    extban: Str = Str.fromLiteral("$,acgr"),
+    extban: Str = Str.fromLiteral("$,acgmrz"),
     account_extban: Str = Str.fromLiteral("a"),
     isupport_trailing: Str = Str.fromLiteral("are supported by this server"),
     channel_prefixes: Str = Str.fromLiteral("#+&!"),
@@ -418,7 +418,7 @@ test "defaults reproduce historical values" {
     try std.testing.expectEqual(@as(u32, 5), l.dns_timeout_secs);
     try std.testing.expectEqual(@as(u32, 60), l.nick_quit_delay_secs);
     try std.testing.expectEqualStrings("Mizuchi", l.network.slice());
-    try std.testing.expectEqualStrings("#", l.chantypes.slice());
+    try std.testing.expectEqualStrings("#&", l.chantypes.slice());
 }
 
 test "applyToml overlays known keys and clamps out of range" {

@@ -276,7 +276,7 @@ fn hexValue(byte: u8) ?u8 {
 const common_tokens = [_]Token{
     .{ .key = "CHANMODES", .value = "b,k,l,imnpst" },
     .{ .key = "PREFIX", .value = "(ov)@+" },
-    .{ .key = "CHANTYPES", .value = "#" },
+    .{ .key = "CHANTYPES", .value = "#&" },
     .{ .key = "NETWORK", .value = "Mizuchi Net" },
     .{ .key = "CASEMAPPING", .value = "rfc1459" },
     .{ .key = "TARGMAX", .value = "NAMES:1,LIST:1,KICK:1,PRIVMSG:4" },
@@ -319,7 +319,7 @@ test "round-trip parse of common ISUPPORT tokens" {
 
     try std.testing.expectEqualStrings("b,k,l,imnpst", map.getStr("CHANMODES").?);
     try std.testing.expectEqualStrings("(ov)@+", map.getStr("PREFIX").?);
-    try std.testing.expectEqualStrings("#", map.getStr("CHANTYPES").?);
+    try std.testing.expectEqualStrings("#&", map.getStr("CHANTYPES").?);
     try std.testing.expectEqualStrings("Mizuchi Net", map.getStr("NETWORK").?);
     try std.testing.expectEqualStrings("rfc1459", map.getStr("CASEMAPPING").?);
     try std.testing.expectEqualStrings("NAMES:1,LIST:1,KICK:1,PRIVMSG:4", map.getStr("TARGMAX").?);

@@ -24,6 +24,9 @@ pub const Candidate = struct {
     realname: []const u8 = "",
     country: ?[]const u8 = null,
     channels: []const []const u8 = &.{},
+    /// True when the client is connected over a secure (TLS) transport; matched
+    /// by the `$z` secure-connection extban.
+    secure: bool = false,
 };
 
 /// Parse through extban.zig and immediately evaluate the parsed mask.
@@ -56,6 +59,8 @@ fn evaluateNode(parsed: anytype, index: usize, candidate: Candidate) bool {
         .realname => |pattern| glob(pattern, candidate.realname),
         .country => |pattern| if (candidate.country) |country| glob(pattern, country) else false,
         .channel => |pattern| matchAnyChannel(pattern, candidate.channels),
+        .secure => candidate.secure,
+        .mute => |pattern| matchMask(pattern, candidate),
         .negation => |child| !evaluateNode(parsed, child, candidate),
     };
 }
@@ -140,6 +145,21 @@ test "evaluates country extban match and no match" {
     try std.testing.expect(!evaluate(parsed, .{}));
 }
 
+test "evaluates secure-connection extban" {
+    const parsed = try extban.parse("$z");
+
+    try std.testing.expect(evaluate(parsed, .{ .secure = true }));
+    try std.testing.expect(!evaluate(parsed, .{ .secure = false }));
+    try std.testing.expect(!evaluate(parsed, .{}));
+}
+
+test "evaluates mute extban over hostmask" {
+    const parsed = try extban.parse("$m:*!*@*.spam.example");
+
+    try std.testing.expect(evaluate(parsed, .{ .hostmask = "nick!user@a.spam.example" }));
+    try std.testing.expect(!evaluate(parsed, .{ .hostmask = "nick!user@a.good.example" }));
+}
+
 test "evaluates negated extbans" {
     const parsed = try extban.parse("$~a:alice");
 
@@ -160,7 +180,7 @@ test "malformed parse errors are surfaced before evaluation" {
     try std.testing.expectError(error.MissingType, parseAndEvaluate("$", .{}));
     try std.testing.expectError(error.EmptyPattern, parseAndEvaluate("$a:", .{}));
     try std.testing.expectError(error.MissingDelimiter, parseAndEvaluate("$aalice", .{}));
-    try std.testing.expectError(error.UnknownType, parseAndEvaluate("$m:*!*@host", .{}));
+    try std.testing.expectError(error.UnknownType, parseAndEvaluate("$x:*!*@host", .{}));
     try std.testing.expectError(error.InvalidByte, parseAndEvaluate("$r:bad\nname", .{}));
 }
 

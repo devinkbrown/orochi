@@ -251,7 +251,7 @@ pub fn emitDefault(server_name: []const u8, requester: []const u8, sink: *ReplyS
 /// Modern default token set. Modules may copy these into a `TokenMap` and
 /// replace entries as policy/config changes.
 pub const default_tokens = [_]Token{
-    .{ .name = "CHANTYPES", .value = "#" },
+    .{ .name = "CHANTYPES", .value = "#&" },
     .{ .name = "PREFIX", .value = "(qaohv)~&@%+" },
     .{ .name = "CHANMODES", .value = "b,k,l,imnpst" },
     .{ .name = "NICKLEN", .value = "64" },
@@ -273,7 +273,7 @@ pub const default_tokens = [_]Token{
     .{ .name = "MODES", .value = "4" },
     .{ .name = "EXCEPTS", .value = "e" },
     .{ .name = "INVEX", .value = "I" },
-    .{ .name = "EXTBAN", .value = "$,acgr" },
+    .{ .name = "EXTBAN", .value = "$,acgmrz" },
     .{ .name = "ACCOUNTEXTBAN", .value = "a" },
     .{ .name = "WHOX" },
     .{ .name = "IRCX" },

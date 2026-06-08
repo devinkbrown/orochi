@@ -870,7 +870,7 @@ const coreModule = Module{
         .{ .code = 1, .name = "RPL_WELCOME" },
     },
     .isupport = &.{
-        .{ .token = "CHANTYPES", .value = "#" },
+        .{ .token = "CHANTYPES", .value = "#&" },
     },
 };
 

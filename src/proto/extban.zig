@@ -29,6 +29,8 @@ pub const NodeKind = enum {
     realname,
     country,
     channel,
+    secure,
+    mute,
     negation,
 };
 
@@ -42,6 +44,9 @@ pub const ClientContext = struct {
     host: []const u8 = "",
     country: ?[]const u8 = null,
     channels: []const []const u8 = &.{},
+    /// True when the client is connected over a secure (TLS) transport. Used by
+    /// the `$z` secure-connection extban.
+    secure: bool = false,
 };
 
 pub const Node = union(NodeKind) {
@@ -50,6 +55,13 @@ pub const Node = union(NodeKind) {
     realname: []const u8,
     country: []const u8,
     channel: []const u8,
+    /// `$z` secure-connection: the pattern is ignored; matches when the client
+    /// is on a TLS transport.
+    secure: []const u8,
+    /// `$m` mute (quiet): a hostmask-style pattern, but classified separately so
+    /// the ban-check path can apply it as speech suppression rather than a join
+    /// denial. Matching semantics are identical to a plain hostmask.
+    mute: []const u8,
     negation: usize,
 };
 
@@ -94,6 +106,8 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 .realname => |pattern| pattern,
                 .country => |pattern| pattern,
                 .channel => |pattern| pattern,
+                .secure => |pattern| pattern,
+                .mute => |pattern| pattern,
                 .negation => null,
             };
         }
@@ -128,6 +142,16 @@ pub fn Matcher(comptime max_nodes: usize) type {
 
         fn parseTyped(self: *Self, typed: []const u8) ParseError!usize {
             if (typed.len == 0) return error.MissingType;
+
+            // `$z` (secure connection) takes no pattern: bare `$z` is valid, and a
+            // trailing `:pattern` is accepted but ignored (the pattern carries no
+            // matching meaning for this type).
+            if (typed[0] == 'z') {
+                if (typed.len == 1) return self.appendNode(.{ .secure = "" });
+                if (typed[1] != ':') return error.MissingDelimiter;
+                return self.appendNode(.{ .secure = typed[2..] });
+            }
+
             if (typed.len < 2 or typed[1] != ':') return error.MissingDelimiter;
             if (typed.len == 2) return error.EmptyPattern;
 
@@ -137,6 +161,7 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 'r' => self.appendNode(.{ .realname = pattern }),
                 'g' => self.appendNode(.{ .country = pattern }),
                 'c' => self.appendNode(.{ .channel = pattern }),
+                'm' => self.appendNode(.{ .mute = pattern }),
                 else => error.UnknownType,
             };
         }
@@ -158,6 +183,8 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 .realname => |pattern| patternMatch(pattern, ctx.realname),
                 .country => |pattern| if (ctx.country) |country| patternMatch(pattern, country) else false,
                 .channel => |pattern| matchAnyChannel(pattern, ctx.channels),
+                .secure => ctx.secure,
+                .mute => |pattern| patternMatch(pattern, ctx.host),
                 .negation => |child| !self.matchNode(child, ctx),
             };
         }
@@ -179,6 +206,8 @@ fn nodeKind(node: Node) NodeKind {
         .realname => .realname,
         .country => .country,
         .channel => .channel,
+        .secure => .secure,
+        .mute => .mute,
         .negation => .negation,
     };
 }
@@ -280,6 +309,33 @@ test "parses each extended ban type" {
     const channel = try parse("$c:#ops");
     try std.testing.expectEqual(NodeKind.channel, channel.rootKind());
     try std.testing.expectEqualStrings("#ops", channel.rootPattern().?);
+
+    const secure = try parse("$z");
+    try std.testing.expectEqual(NodeKind.secure, secure.rootKind());
+
+    const secure_with_pattern = try parse("$z:ignored");
+    try std.testing.expectEqual(NodeKind.secure, secure_with_pattern.rootKind());
+
+    const mute = try parse("$m:*!*@spam.example");
+    try std.testing.expectEqual(NodeKind.mute, mute.rootKind());
+    try std.testing.expectEqualStrings("*!*@spam.example", mute.rootPattern().?);
+}
+
+test "matches secure-connection extban" {
+    const secure_ban = try parse("$z");
+    try std.testing.expect(secure_ban.matches(.{ .secure = true }));
+    try std.testing.expect(!secure_ban.matches(.{ .secure = false }));
+
+    // Negation: ban everyone NOT on a secure connection.
+    const insecure_ban = try parse("$~z");
+    try std.testing.expect(!insecure_ban.matches(.{ .secure = true }));
+    try std.testing.expect(insecure_ban.matches(.{ .secure = false }));
+}
+
+test "matches mute extban against host like a plain hostmask" {
+    const mute = try parse("$m:*.spam.example");
+    try std.testing.expect(mute.matches(.{ .host = "node.spam.example" }));
+    try std.testing.expect(!mute.matches(.{ .host = "node.good.example" }));
 }
 
 test "matches positive and negative account extbans" {
