@@ -471,6 +471,9 @@ const ringlane = struct {
         send = 3,
         timeout = 4,
         connect = 5,
+        // poll: readiness watch on a bare fd (e.g. a reactor's cross-reactor
+        // wake eventfd). Fires a `.poll` completion when the fd is readable.
+        poll = 6,
     };
 
     pub const FdToken = struct {
@@ -502,6 +505,7 @@ const ringlane = struct {
             3 => .send,
             4 => .timeout,
             5 => .connect,
+            6 => .poll,
             else => return error.UnknownOpKind,
         };
         return .{
@@ -537,6 +541,11 @@ const ringlane = struct {
         res: i32,
     };
 
+    pub const PollEvent = struct {
+        token: FdToken,
+        res: i32,
+    };
+
     pub const Completion = union(OpKind) {
         other: void,
         accept: AcceptEvent,
@@ -544,6 +553,7 @@ const ringlane = struct {
         send: SendEvent,
         timeout: void,
         connect: ConnectEvent,
+        poll: PollEvent,
     };
 
     fn decodeCompletion(cqe: linux.io_uring_cqe) error{UnknownOpKind}!Completion {
@@ -561,6 +571,7 @@ const ringlane = struct {
             } },
             .timeout => .{ .timeout = {} },
             .connect => .{ .connect = .{ .token = ud.token, .res = cqe.res } },
+            .poll => .{ .poll = .{ .token = ud.token, .res = cqe.res } },
         };
     }
 
@@ -617,6 +628,13 @@ const ringlane = struct {
         /// Queue a relative single-shot timeout; fires as a `.timeout` completion.
         pub fn submitTimeout(self: *Ring, token: FdToken, ts: *const linux.kernel_timespec) !void {
             _ = try self.inner.timeout(try encodeUserData(.timeout, token), ts, 0, 0);
+        }
+
+        /// Watch `fd` for readability (single-shot); fires a `.poll` completion.
+        /// Used by a reactor to wake on its cross-reactor eventfd (see
+        /// reactor_wake.zig) — re-arm after each completion.
+        pub fn submitPollAdd(self: *Ring, token: FdToken, fd: linux.fd_t, poll_mask: u32) !void {
+            _ = try self.inner.poll_add(try encodeUserData(.poll, token), fd, poll_mask);
         }
 
         pub fn reapCompletions(self: *Ring, out: []linux.io_uring_cqe, wait_nr: u32, handler: anytype) !void {
@@ -8796,6 +8814,10 @@ const CompletionHandler = struct {
                 self.recordOpErr(err);
             },
             .timeout => self.server.onTimerTick(),
+            // poll: a reactor's cross-reactor wake fd became readable. The live
+            // multi-reactor loop drains the eventfd + its mailbox here; today the
+            // single reactor submits no poll ops, so this is an inert branch.
+            .poll => {},
             .other => {},
         }
     }
@@ -10162,6 +10184,50 @@ test "threaded server: draft/multiline batch reassembles + splits to recipient" 
         "BATCH -z\r\n");
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line1more\r\n", 200);
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line2\r\n", 200);
+}
+
+test "ring: poll op fires a completion when a watched eventfd becomes readable" {
+    var ring = RingCore.init(8, .{}) catch |err| {
+        if (ringlane.isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    defer ring.deinit();
+
+    const efd_rc = linux.eventfd(0, 0);
+    if (posix.errno(efd_rc) != .SUCCESS) return error.SkipZigTest;
+    const efd: linux.fd_t = @intCast(efd_rc);
+    defer closeFd(efd);
+
+    const tok = RingFdToken{ .slot = 7, .gen = 3 };
+    try ring.submitPollAdd(tok, efd, linux.POLL.IN);
+
+    // Make the eventfd readable, then reap: the poll completion must fire.
+    var one: u64 = 1;
+    _ = linux.write(efd, std.mem.asBytes(&one), @sizeOf(u64));
+
+    const Sink = struct {
+        got: bool = false,
+        slot: u32 = 0,
+        res: i32 = 0,
+        fn onCompletion(self: *@This(), c: ringlane.Completion) void {
+            switch (c) {
+                .poll => |e| {
+                    self.got = true;
+                    self.slot = e.token.slot;
+                    self.res = e.res;
+                },
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{};
+    _ = try ring.submitAndWait(1);
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    try ring.reapCompletions(&cqes, 0, &sink);
+
+    try std.testing.expect(sink.got);
+    try std.testing.expectEqual(@as(u32, 7), sink.slot);
+    try std.testing.expect(sink.res >= 0); // poll res carries the ready mask
 }
 
 test "threaded server: implicit-TLS client handshakes + registers over the wire" {
