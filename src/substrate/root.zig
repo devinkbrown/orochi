@@ -26,6 +26,7 @@ pub const cuckoo = @import("cuckoo.zig");
 pub const cuckoo_filter = @import("cuckoo_filter.zig");
 pub const ddsketch = @import("ddsketch.zig");
 pub const dtx = @import("dtx.zig");
+pub const ebr = @import("ebr.zig");
 pub const egwalker = @import("egwalker.zig");
 pub const ewma = @import("ewma.zig");
 pub const fault_loom = @import("fault_loom.zig");
@@ -165,6 +166,7 @@ test {
     _ = cuckoo_filter;
     _ = ddsketch;
     _ = dtx;
+    _ = ebr;
     _ = egwalker;
     _ = ewma;
     _ = fault_loom;
