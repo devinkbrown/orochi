@@ -25,6 +25,7 @@ const whois_channels_code = numeric.Numeric.RPL_WHOISCHANNELS;
 const whois_logged_in_code = numeric.Numeric.RPL_WHOISLOGGEDIN;
 const whois_bot_code = numeric.Numeric.RPL_WHOISBOT;
 const whois_operator_code = numeric.Numeric.RPL_WHOISOPERATOR;
+const whois_certfp_code = numeric.Numeric.RPL_WHOISCERTFP;
 const away_code = numeric.Numeric.RPL_AWAY;
 const endofwhois_code = numeric.Numeric.RPL_ENDOFWHOIS;
 const nosuchnick_code = numeric.Numeric.ERR_NOSUCHNICK;
@@ -89,6 +90,9 @@ pub const WhoisSubject = struct {
     is_bot: bool = false,
     is_oper: bool = false,
     away: ?[]const u8 = null,
+    /// TLS client-certificate fingerprint (lowercase hex), surfaced as
+    /// RPL_WHOISCERTFP (276) when the target authenticated over a client cert.
+    certfp: ?[]const u8 = null,
     channels: []const ChannelMembership = &.{},
 };
 
@@ -169,6 +173,9 @@ pub fn writeWhoisWith(
     }
     if (subject.is_oper) {
         try writeWhoisOperatorLine(params, sink, server_name, requester_nick, subject.nick);
+    }
+    if (subject.certfp) |fp| {
+        try writeWhoisCertfpLine(params, sink, server_name, requester_nick, subject.nick, fp);
     }
     if (subject.away) |away_message| {
         try writeAwayLine(params, sink, server_name, requester_nick, subject.nick, away_message);
@@ -498,6 +505,24 @@ fn writeWhoisOperatorLine(
     try b.numericPrefix(whois_operator_code, server_name, requester_nick);
     try b.spaceParam(subject_nick);
     try b.spaceTrailing("is an IRC operator");
+    try b.crlf();
+    try sink.commitLine(&b);
+}
+
+fn writeWhoisCertfpLine(
+    comptime params: Params,
+    sink: *WhoisLineSink,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    subject_nick: []const u8,
+    fingerprint: []const u8,
+) WhoisError!void {
+    var b = try sink.beginLine();
+    b.max_line_bytes = params.max_line_bytes;
+    try b.numericPrefix(whois_certfp_code, server_name, requester_nick);
+    try b.spaceParam(subject_nick);
+    try b.spaceTrailing("has client certificate fingerprint ");
+    try b.appendBytes(fingerprint);
     try b.crlf();
     try sink.commitLine(&b);
 }

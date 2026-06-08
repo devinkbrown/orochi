@@ -3808,6 +3808,9 @@ pub const LinuxServer = struct {
             .away = tconn.session.awayMessage(),
             .is_oper = tconn.session.isOper(),
             .is_bot = tconn.session.isBot(),
+            // RPL_WHOISCERTFP (276): surface the TLS client-cert fingerprint of a
+            // mutual-TLS user (the same value SASL EXTERNAL matches to an account).
+            .certfp = tconn.session.tls_certfp,
             // +p hide-chans: suppress the channel list unless the requester is the
             // user themselves or an oper.
             .channels = blk: {
