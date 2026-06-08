@@ -9,6 +9,8 @@ const sasl = @import("../proto/sasl.zig");
 const usermode = @import("../proto/usermode.zig");
 const event_spine = @import("event_spine.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
+const labeled_response = @import("../proto/labeled_response.zig");
+const msgid = @import("../proto/msgid.zig");
 
 pub const UserMode = usermode.UserMode;
 
@@ -39,14 +41,32 @@ const MAX_HOST_BYTES: usize = 255;
 /// compact `chanmode.ChannelMode` enum, but are fully parsed and enforced.
 pub const CHANMODES_TOKEN = "CHANMODES=beIZ,k,lfj,imnstCTNMSg";
 
-/// Parsed IRC line view. Slices borrow from the caller-owned input buffer.
+/// Max bytes retained for a captured `@label` value (post-unescape). Matches
+/// the framing helper's `labeled_response.MAX_LABEL_LEN`; longer labels are
+/// dropped (treated as no label) rather than truncated.
+const MAX_LABEL_BYTES: usize = labeled_response.MAX_LABEL_LEN;
+
+/// Parsed IRC line view. Slices borrow from the caller-owned input buffer,
+/// except `label_store` which owns the unescaped inbound `@label` value.
 pub const LineView = struct {
     command: []const u8,
     params: [MAX_PARAMS][]const u8 = [_][]const u8{""} ** MAX_PARAMS,
     param_count: usize = 0,
+    /// Unescaped `@label=<x>` tag value captured from the client, or null.
+    /// Backed by `label_store`; never borrows from the input buffer because the
+    /// wire form may be escaped (e.g. `\s`, `\:`).
+    label_store: [MAX_LABEL_BYTES]u8 = undefined,
+    label_len: usize = 0,
+    has_label: bool = false,
 
     pub fn paramSlice(self: *const LineView) []const []const u8 {
         return self.params[0..self.param_count];
+    }
+
+    /// The captured inbound label, or null when the client sent none.
+    pub fn label(self: *const LineView) ?[]const u8 {
+        if (!self.has_label) return null;
+        return self.label_store[0..self.label_len];
     }
 };
 
@@ -69,6 +89,17 @@ pub fn parseLine(input: []const u8) error{ EmptyLine, EmbeddedNul, EmbeddedLineB
 
     var cursor = skipSpaces(body, 0);
     if (cursor >= body.len) return error.MissingCommand;
+
+    // IRCv3 message tags: a leading `@tags` segment terminated by a space.
+    var captured_label: ?[]const u8 = null;
+    var label_buf: [MAX_LABEL_BYTES]u8 = undefined;
+    if (body[cursor] == '@') {
+        const tags_end = findSpace(body, cursor) orelse return error.MissingCommand;
+        captured_label = captureLabel(body[cursor + 1 .. tags_end], &label_buf);
+        cursor = skipSpaces(body, tags_end);
+        if (cursor >= body.len) return error.MissingCommand;
+    }
+
     if (body[cursor] == ':') {
         cursor = skipSpaces(body, findSpace(body, cursor) orelse return error.MissingCommand);
     }
@@ -76,6 +107,11 @@ pub fn parseLine(input: []const u8) error{ EmptyLine, EmbeddedNul, EmbeddedLineB
     const command_end = findSpace(body, cursor) orelse body.len;
     if (command_end == cursor) return error.MissingCommand;
     var line = LineView{ .command = body[cursor..command_end] };
+    if (captured_label) |value| {
+        @memcpy(line.label_store[0..value.len], value);
+        line.label_len = value.len;
+        line.has_label = true;
+    }
     cursor = skipSpaces(body, command_end);
 
     while (cursor < body.len) {
@@ -206,6 +242,7 @@ pub const CapId = enum(u6) {
     metadata_2,
     standard_replies,
     cap_notify,
+    labeled_response,
 };
 
 const CapSet = struct {
@@ -292,6 +329,11 @@ const cap_specs = [_]CapSpec{
     // cap-notify: the cap set is static, so CAP NEW/DEL never fire, but advertising
     // signals support and is required before some clients enable other caps.
     .{ .id = .cap_notify, .name = "cap-notify" },
+    // labeled-response: when a client tags a command with @label=<x>, the
+    // server echoes @label=<x> on the response (a single tagged line, a
+    // labeled-response BATCH for multi-line replies, or a bare labeled ACK for
+    // commands that emit nothing). Framing lives in proto/labeled_response.zig.
+    .{ .id = .labeled_response, .name = "labeled-response" },
 };
 
 const CapReplyKind = enum {
@@ -455,6 +497,54 @@ fn findSpace(bytes: []const u8, start: usize) ?usize {
         if (bytes[cursor] == ' ') return cursor;
     }
     return null;
+}
+
+/// Scan a `key=value;key2=value2` tag segment for `label`, unescaping its value
+/// into `out` per the IRCv3 message-tags value escape rules. Returns the
+/// unescaped label slice, or null when absent, empty, or too long to retain.
+fn captureLabel(tags: []const u8, out: []u8) ?[]const u8 {
+    var cursor: usize = 0;
+    while (cursor < tags.len) {
+        const seg_end = std.mem.indexOfScalarPos(u8, tags, cursor, ';') orelse tags.len;
+        const item = tags[cursor..seg_end];
+        const eq = std.mem.indexOfScalar(u8, item, '=');
+        const key = if (eq) |i| item[0..i] else item;
+        if (std.mem.eql(u8, key, "label")) {
+            const raw = if (eq) |i| item[i + 1 ..] else "";
+            return unescapeTagValue(raw, out);
+        }
+        cursor = if (seg_end < tags.len) seg_end + 1 else tags.len;
+    }
+    return null;
+}
+
+/// Unescape an IRCv3 tag value (`\:`->`;`, `\s`->space, `\\`->`\`, `\r`, `\n`)
+/// into `out`. Returns null if the result is empty or would exceed `out`.
+fn unescapeTagValue(raw: []const u8, out: []u8) ?[]const u8 {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        var ch = raw[i];
+        if (ch == '\\' and i + 1 < raw.len) {
+            i += 1;
+            ch = switch (raw[i]) {
+                ':' => ';',
+                's' => ' ',
+                'r' => '\r',
+                'n' => '\n',
+                '\\' => '\\',
+                else => raw[i],
+            };
+        } else if (ch == '\\') {
+            // Trailing lone backslash: dropped per the spec.
+            break;
+        }
+        if (len >= out.len) return null;
+        out[len] = ch;
+        len += 1;
+    }
+    if (len == 0) return null;
+    return out[0..len];
 }
 
 /// Authoritative registration flags for local dispatch; `Client.registration`
@@ -824,7 +914,36 @@ pub const ReplyCtx = struct {
 };
 
 /// Dispatch one parsed client line.
+///
+/// When the client tagged the command with `@label=<x>` and negotiated the
+/// `labeled-response` cap, every reply line this dispatch produces is reframed
+/// under the label: a single tagged line, a `labeled-response` BATCH for
+/// multi-line output, or a bare labeled ACK when the command emits nothing.
 pub fn dispatchLine(
+    session: *ClientSession,
+    replies: *ReplyCtx,
+    line: *const LineView,
+) DispatchError!void {
+    const active_label: ?[]const u8 = if (session.hasCap(.labeled_response)) line.label() else null;
+    if (active_label) |label_value| {
+        // Buffer the command's raw replies, then reframe under the label into
+        // the caller's storage. The scratch must hold the un-framed lines.
+        var scratch_buf: [LABELED_SCRATCH_BYTES]u8 = undefined;
+        var scratch = ReplyCtx.init(&scratch_buf);
+        scratch.server_name = replies.server_name;
+        scratch.network_name = replies.network_name;
+        try dispatchInner(session, &scratch, line);
+        try emitLabeled(replies, label_value, scratch.written());
+        return;
+    }
+    try dispatchInner(session, replies, line);
+}
+
+/// Scratch capacity for a single command's pre-framing reply bytes. Sized to
+/// hold a full registration burst (the largest reply set produced here).
+const LABELED_SCRATCH_BYTES: usize = 4096;
+
+fn dispatchInner(
     session: *ClientSession,
     replies: *ReplyCtx,
     line: *const LineView,
@@ -858,6 +977,49 @@ pub fn dispatchLine(
         try maybeCompleteRegistration(session, replies);
     }
 }
+
+/// Reframe `raw` (zero or more CRLF-terminated reply lines) under `label` into
+/// `out` using the labeled-response framing helper.
+fn emitLabeled(out: *ReplyCtx, label: []const u8, raw: []const u8) DispatchError!void {
+    var sink = ReplyCtxSink{ .ctx = out };
+    var it = CrlfLineIterator{ .bytes = raw };
+    labeled_response.emitIterator(&sink, label, LABELED_BATCH_REF, &it) catch
+        return error.OutputTooSmall;
+}
+
+/// Batch reference used for labeled-response BATCH framing. Per-dispatch
+/// uniqueness is not required by the spec since the open/close bracket the
+/// label's own lines on a single connection.
+const LABELED_BATCH_REF = "mizu-label";
+
+/// Adapter exposing `ReplyCtx` as a labeled_response sink (`appendLine`).
+const ReplyCtxSink = struct {
+    ctx: *ReplyCtx,
+
+    pub fn appendLine(self: *ReplyCtxSink, line: []const u8) DispatchError!void {
+        try self.ctx.append(line);
+    }
+};
+
+/// Iterates CRLF-terminated lines, yielding each line *including* its CRLF so
+/// the framing helper sees complete wire lines.
+const CrlfLineIterator = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    pub fn next(self: *CrlfLineIterator) ?[]const u8 {
+        if (self.index >= self.bytes.len) return null;
+        const rest = self.bytes[self.index..];
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse {
+            // No terminator: yield the remainder as a final line.
+            self.index = self.bytes.len;
+            return rest;
+        };
+        const line = rest[0 .. nl + 1];
+        self.index += nl + 1;
+        return line;
+    }
+};
 
 const Handler = *const fn (ctx: DispatchCtx) DispatchError!void;
 
@@ -1375,6 +1537,74 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     for (class_b) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_c) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_d) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
+}
+
+test "parseLine captures and unescapes the @label tag value" {
+    const line = try parseLine("@label=abc\\s123 PING :tok");
+    try std.testing.expectEqualStrings("PING", line.command);
+    try std.testing.expectEqualStrings("abc 123", line.label().?);
+    try std.testing.expectEqualStrings("tok", line.paramSlice()[0]);
+}
+
+test "parseLine ignores other tags and reports no label when absent" {
+    const line = try parseLine("@time=2026-06-08T00:00:00.000Z PING :tok");
+    try std.testing.expectEqualStrings("PING", line.command);
+    try std.testing.expect(line.label() == null);
+}
+
+test "labeled single-line reply echoes @label on the one line" {
+    var session = ClientSession.init();
+    session.addCap(.labeled_response);
+    var storage: [512]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "@label=ping-1 PING :tok");
+    // Single line: tagged directly (no BATCH wrapper).
+    try expectContains(replies.written(), "@label=ping-1 ");
+    try expectContains(replies.written(), "PONG mizuchi.local :tok\r\n");
+    try expectNotContains(replies.written(), "BATCH");
+}
+
+test "labeled multi-line reply is wrapped in a labeled-response BATCH" {
+    var session = ClientSession.init();
+    session.addCap(.labeled_response);
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    // Drive registration so the final command emits the multi-numeric welcome
+    // burst under one label -> BATCH framing.
+    try dispatchText(&session, &replies, "NICK kain");
+    replies.clear();
+    try dispatchText(&session, &replies, "@label=reg-1 USER kain 0 * :Kain Mizuchi");
+    try std.testing.expect(session.registered());
+
+    const out = replies.written();
+    try expectContains(out, "@label=reg-1 BATCH +");
+    try expectContains(out, " labeled-response\r\n");
+    try expectContains(out, "BATCH -");
+    // Inner lines carry @batch=, not @label=.
+    try expectContains(out, "@batch=");
+}
+
+test "labeled no-output command emits a bare labeled ACK" {
+    var session = ClientSession.init();
+    session.addCap(.labeled_response);
+    var storage: [256]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    // PONG produces no reply; with a label this becomes an ACK.
+    try dispatchText(&session, &replies, "@label=k1 PONG :tok");
+    try std.testing.expectEqualStrings("@label=k1 ACK\r\n", replies.written());
+}
+
+test "label is ignored when the labeled-response cap is not negotiated" {
+    var session = ClientSession.init();
+    var storage: [256]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "@label=ping-1 PING :tok");
+    try expectNotContains(replies.written(), "@label=");
+    try expectContains(replies.written(), "PONG mizuchi.local :tok\r\n");
 }
 
 test "host accessor prefers visible host, falls back to real then empty" {

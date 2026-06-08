@@ -54,6 +54,8 @@ const account_verify_mod = @import("account_verify.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const color_strip = @import("../proto/color_strip.zig");
 const snowflake_id = @import("../proto/snowflake_id.zig");
+const msgid_mod = @import("../proto/msgid.zig");
+const secure_fns = @import("../proto/secure_fns.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
@@ -236,6 +238,16 @@ fn buildTagPrefix(session: *const dispatch.ClientSession, tags: LinuxServer.MsgT
         if (tags.account) |acct| {
             b.append(if (any) ";account=" else "@account=") catch return "";
             b.append(acct) catch return "";
+            any = true;
+        }
+    }
+    // msgid: the server-minted per-message id, delivered to recipients that
+    // negotiated message-tags (the prerequisite for receiving server tags).
+    // This is what message-redaction later references.
+    if (tags.msgid) |id| {
+        if (session.hasCap(.message_tags)) {
+            b.append(if (any) ";msgid=" else "@msgid=") catch return "";
+            b.append(id) catch return "";
             any = true;
         }
     }
@@ -1026,6 +1038,10 @@ pub const LinuxServer = struct {
     /// Snowflake msgid generator: globally-unique, time-ordered, node-embedded
     /// message ids for CHATHISTORY/REDACT (better than a per-node counter on a mesh).
     snowflake: snowflake_id.Generator,
+    /// IRCv3 `msgid` minter for relayed PRIVMSG/NOTICE/TAGMSG (`@msgid=<id>`).
+    /// Seeded once from boot entropy so ids are opaque and disjoint across boots;
+    /// the value message-redaction later references. See proto/msgid.zig.
+    msgid_gen: msgid_mod.Generator,
     accept_armed: bool = false,
     /// Oper-set drain mode: when true, new client connections are refused (S2S
     /// links and existing clients are unaffected). Toggled by the DRAIN command
@@ -1154,6 +1170,9 @@ pub const LinuxServer = struct {
             }) catch unreachable,
             .accepts = accept_list.AcceptList(.{}).init(allocator),
             .snowflake = snowflake_id.Generator.init(.{ .node_id = @intCast(config.node_id & snowflake_id.NODE_MASK) }) catch unreachable,
+            // Seed the msgid minter once from boot entropy (OS CSPRNG via
+            // secure_fns/getrandom) so ids are opaque and disjoint across boots.
+            .msgid_gen = msgid_mod.Generator.init(secure_fns.randomU64()),
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
             .sessions = sessions_mod.SessionStore.initWithConfig(allocator, .{
                 .max_accounts = @intCast(config.session_max_accounts),
@@ -1831,6 +1850,9 @@ pub const LinuxServer = struct {
         /// Sender's raw IRCv3 tag segment (no leading '@'); only its client-only
         /// (`+...`) tags are relayed, to recipients negotiating message-tags.
         client_tags: ?[]const u8 = null,
+        /// Server-minted `msgid` value (no `msgid=` key), shared by every
+        /// recipient of this message. Null for events that carry no msgid.
+        msgid: ?[]const u8 = null,
     };
 
     /// Deliver `bytes` with an IRCv3 message-tag segment assembled for THIS
@@ -1839,7 +1861,9 @@ pub const LinuxServer = struct {
     fn deliverTagged(self: *LinuxServer, id: client_model.ClientId, tags: MsgTags, bytes: []const u8) !void {
         const conn = self.clients.get(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
-        var tagbuf: [128]u8 = undefined;
+        // Sized for the full @-segment: server-time + account + msgid + relayed
+        // client-only tags.
+        var tagbuf: [256]u8 = undefined;
         const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
         if (prefix.len != 0) try appendToConn(conn, prefix);
         try appendToConn(conn, bytes);
@@ -7770,10 +7794,15 @@ pub const LinuxServer = struct {
         const tags = parsed.tags_raw orelse return; // nothing to relay
         const target = parsed.paramSlice()[0];
 
+        // Stamp a server-minted msgid into the relayed tag segment (so a relayed
+        // TAGMSG, like PRIVMSG/NOTICE, carries `@msgid=…` for message-redaction).
+        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+        const message_id = self.msgid_gen.next(&msgid_buf);
+
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "@{s} :{s} TAGMSG {s}\r\n", .{
-            tags, try clientPrefix(conn, &prefix_buf), target,
+        const msg = std.fmt.bufPrint(&msg_buf, "@msgid={s};{s} :{s} TAGMSG {s}\r\n", .{
+            message_id, tags, try clientPrefix(conn, &prefix_buf), target,
         }) catch return error.OutputTooSmall;
         const echo = conn.session.hasCap(.echo_message);
 
@@ -7985,6 +8014,11 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
 
+        // Mint one IRCv3 msgid for this message; all recipients (and the echoing
+        // sender) share it so message-redaction can reference a single id.
+        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+        const message_id = self.msgid_gen.next(&msgid_buf);
+
         // IRCv3 echo-message: a sender that negotiated the cap also receives its
         // own message back, byte-identical to what recipients see (`msg`).
         const echo = conn.session.hasCap(.echo_message);
@@ -8072,7 +8106,7 @@ pub const LinuxServer = struct {
                 }
             }
             var time_buf: [40]u8 = undefined;
-            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags };
+            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
             if (min_rank == 0) {
                 try self.broadcastChannelTagged(chan, ctags, msg, id);
             } else {
@@ -8159,7 +8193,7 @@ pub const LinuxServer = struct {
             if (self.silence.isSilenced(target, sender_mask)) return;
         }
         var time_buf: [40]u8 = undefined;
-        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags };
+        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
         try self.deliverTagged(clientIdFromWorld(recipient), dtags, msg);
         if (echo) try self.deliverTagged(id, dtags, msg);
 
@@ -9339,6 +9373,48 @@ test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #t :hello\r\n", 200);
 }
 
+test "threaded server: server stamps @msgid on relayed PRIVMSG for message-tags holders" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A negotiates message-tags; B does not.
+    try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #m\r\n");
+    try recvUntil(&a, " 366 A #m ", 200);
+    try writeAllFd(fd_b, "JOIN #m\r\n");
+    try recvUntil(&b, " 366 B #m ", 200);
+
+    // B messages the channel; A (message-tags holder) sees an @msgid= tag on the
+    // relayed line. The id is opaque, so assert presence + the unchanged body.
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #m :hello\r\n");
+    try recvUntil(&a, "PRIVMSG #m :hello\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "@msgid=") != null);
+}
+
 test "buildTagPrefix assembles server-time + account into one tag segment" {
     var session = dispatch.ClientSession.init();
     const tags = LinuxServer.MsgTags{ .time_value = "2026-06-04T12:00:00.000Z", .account = "alice" };
@@ -9360,6 +9436,28 @@ test "buildTagPrefix assembles server-time + account into one tag segment" {
     s2.addCap(.account_tag);
     const no_acct = LinuxServer.MsgTags{ .time_value = "", .account = null };
     try std.testing.expectEqualStrings("", buildTagPrefix(&s2, no_acct, &buf));
+}
+
+test "buildTagPrefix stamps msgid only for message-tags recipients" {
+    var buf: [256]u8 = undefined;
+    const tags = LinuxServer.MsgTags{ .time_value = "", .account = null, .msgid = "0123456789ABCDEFGHJKMNPQRS" };
+
+    // No message-tags cap -> msgid is withheld.
+    var none = dispatch.ClientSession.init();
+    try std.testing.expectEqualStrings("", buildTagPrefix(&none, tags, &buf));
+
+    // message-tags negotiated -> msgid present as its own @-segment.
+    var mt = dispatch.ClientSession.init();
+    mt.addCap(.message_tags);
+    try std.testing.expectEqualStrings("@msgid=0123456789ABCDEFGHJKMNPQRS ", buildTagPrefix(&mt, tags, &buf));
+
+    // Coexists with server-time in one segment, semicolon-joined.
+    mt.addCap(.server_time);
+    const timed = LinuxServer.MsgTags{ .time_value = "2026-06-08T00:00:00.000Z", .account = null, .msgid = "0123456789ABCDEFGHJKMNPQRS" };
+    try std.testing.expectEqualStrings(
+        "@time=2026-06-08T00:00:00.000Z;msgid=0123456789ABCDEFGHJKMNPQRS ",
+        buildTagPrefix(&mt, timed, &buf),
+    );
 }
 
 test "threaded server: TAGMSG relays client tags to message-tags peers" {
@@ -9395,10 +9493,13 @@ test "threaded server: TAGMSG relays client tags to message-tags peers" {
     try writeAllFd(fd_b, "JOIN #t\r\n");
     try recvUntil(&b, " 366 B #t ", 200);
 
-    // A's tagged TAGMSG is relayed verbatim to B (message-tags peer).
+    // A's tagged TAGMSG is relayed to B (message-tags peer) with a server-minted
+    // @msgid stamped ahead of the relayed client tags.
     b.reset();
     try writeAllFd(fd_a, "@+typing=active TAGMSG #t\r\n");
-    try recvUntil(&b, "@+typing=active :A!alice@localhost TAGMSG #t\r\n", 200);
+    try recvUntil(&b, "+typing=active :A!alice@localhost TAGMSG #t\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "@msgid=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), ";+typing=active") != null);
 }
 
 test "threaded server: +e/+I list queries + +I join bypass" {
