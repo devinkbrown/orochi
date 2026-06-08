@@ -6,6 +6,8 @@
 //! tests and reactor integration.
 const std = @import("std");
 const sasl = @import("../proto/sasl.zig");
+const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
+const scram_server = @import("../proto/sasl_scram_server.zig");
 const usermode = @import("../proto/usermode.zig");
 const event_spine = @import("event_spine.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
@@ -271,9 +273,12 @@ const cap_specs = [_]CapSpec{
     .{ .id = .server_time, .name = "server-time" },
     .{ .id = .message_tags, .name = "message-tags" },
     .{ .id = .echo_message, .name = "echo-message" },
-    // Advertise only what handleAuthenticate actually accepts (PLAIN today).
-    // EXTERNAL/SCRAM are implemented in proto/sasl.zig but not yet wired here;
-    // advertising them would let a client pick a dead mechanism.
+    // handleAuthenticate routes PLAIN, EXTERNAL, and SCRAM-SHA-256 through the
+    // sasl_mechrouter, but the live server only injects the PLAIN checker today —
+    // EXTERNAL needs a TLS certfp source and SCRAM needs a SCRAM-credential store
+    // (the account DB stores PBKDF2, not SCRAM keys). Advertising only PLAIN keeps
+    // the cap honest; flip this to "PLAIN,EXTERNAL,SCRAM-SHA-256" once main.zig
+    // injects those checkers (the routing + tests are already in place).
     .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN" },
     .{ .id = .multi_prefix, .name = "multi-prefix" },
     .{ .id = .userhost_in_names, .name = "userhost-in-names" },
@@ -567,6 +572,21 @@ pub const ClientSession = struct {
     /// Injected PLAIN verifier. The live server sets this to a services-backed
     /// checker; left null (e.g. no account store yet) SASL PLAIN fails closed.
     sasl_plain: ?sasl.PlainChecker = null,
+    /// Injected EXTERNAL verifier (account ←→ TLS certfp). Null fails closed.
+    sasl_external: ?sasl_mechrouter.ExternalLookup = null,
+    /// Injected SCRAM-SHA-256 credential lookup. Null fails closed.
+    sasl_scram256: ?sasl_mechrouter.Scram256Lookup = null,
+    /// Per-session SASL mechanism router. Lazily initialized on the first
+    /// AUTHENTICATE <mech> line so the heavy fixed buffers cost nothing for
+    /// connections that never authenticate. Reset to null on abort/failure so a
+    /// re-auth always starts from a clean exchange.
+    sasl_router: ?sasl_mechrouter.Router = null,
+    /// Hex-encoded TLS client-certificate fingerprint, set at accept when the
+    /// connection presents a client cert. Drives SASL EXTERNAL; null = no cert.
+    tls_certfp: ?[]const u8 = null,
+    /// Server nonce for SCRAM challenges. Borrowed for the router's lifetime; the
+    /// live server points this at a per-connection CSPRNG-filled buffer.
+    sasl_server_nonce: []const u8 = "",
     account_store: FixedString(MAX_ACCOUNT_BYTES) = .{},
     logged_in: bool = false,
 
@@ -1139,72 +1159,139 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
     }
 
     const payload = ctx.params()[0];
-    if (std.mem.eql(u8, payload, "*")) {
-        ctx.session.sasl_pending = null;
-        ctx.session.client.registration.sasl = .failed;
-        try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
-        return;
+
+    // Phase 1 — mechanism selection. No exchange is in progress, so this line
+    // names the mechanism. Route the choice through the mechanism router; PLAIN,
+    // EXTERNAL, and SCRAM-SHA-256 are all live (each fails closed if its checker
+    // is not injected on this session).
+    if (ctx.session.sasl_router == null) {
+        if (std.mem.eql(u8, payload, "*")) {
+            // Abort with no exchange in progress: nothing to tear down.
+            ctx.session.client.registration.sasl = .failed;
+            try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
+            return;
+        }
+
+        var router = sasl_mechrouter.Router.init(.{
+            .plain = saslPlainAdapter(ctx.session),
+            .external = ctx.session.sasl_external,
+            .scram256 = ctx.session.sasl_scram256,
+        }, ctx.session.sasl_server_nonce);
+        router.tls_certfp = ctx.session.tls_certfp;
+
+        switch (router.start(payload)) {
+            .continue_ => |challenge| {
+                // Starting a fresh exchange clears any prior login so a re-auth
+                // can never leave logged_in set with a stale/failed account.
+                ctx.session.logged_in = false;
+                ctx.session.account_store.len = 0;
+                ctx.session.sasl_pending = sasl.Mechanism.parse(payload);
+                ctx.session.sasl_router = router;
+                ctx.session.client.registration.sasl = .authenticating;
+                try ctx.replies.message(null, "AUTHENTICATE", &.{challenge}, null);
+                return;
+            },
+            .fail => return saslFail(ctx, "Unsupported SASL mechanism"),
+            // start() only ever yields continue_/fail.
+            .success => return saslFail(ctx, "SASL authentication failed"),
+        }
     }
 
-    // Phase 1 — mechanism selection. Only PLAIN is wired today; EXTERNAL/SCRAM
-    // arrive when the certfp/SCRAM checkers are plumbed in.
-    if (ctx.session.sasl_pending == null) {
-        const mech = sasl.Mechanism.parse(payload) orelse return saslFail(ctx, "Unsupported SASL mechanism");
-        if (mech != .plain) return saslFail(ctx, "Unsupported SASL mechanism");
-        // Starting a fresh exchange clears any prior login so a re-auth can
-        // never leave logged_in set with a stale/failed account.
-        ctx.session.logged_in = false;
-        ctx.session.account_store.len = 0;
-        ctx.session.sasl_pending = mech;
-        ctx.session.client.registration.sasl = .authenticating;
-        try ctx.replies.message(null, "AUTHENTICATE", &.{"+"}, null);
-        return;
+    // Phase 2+ — feed the response chunk into the in-progress exchange. The
+    // router owns "*" abort, base64 decoding, and multi-step SCRAM challenges.
+    var out_buf: [sasl_mechrouter.MAX_B64_MESSAGE]u8 = undefined;
+    const outcome = ctx.session.sasl_router.?.receive(payload, &out_buf);
+    switch (outcome) {
+        .continue_ => |challenge| {
+            // SCRAM emits a server-first challenge; await the client-final line.
+            // A literal "+" / empty slice means "send empty and keep waiting".
+            const reply = if (challenge.len == 0) "+" else challenge;
+            try ctx.replies.message(null, "AUTHENTICATE", &.{reply}, null);
+            return;
+        },
+        .fail => |failure| {
+            ctx.session.sasl_router = null;
+            ctx.session.sasl_pending = null;
+            return switch (failure) {
+                .aborted => saslAbort(ctx),
+                else => saslFail(ctx, "SASL authentication failed"),
+            };
+        },
+        .success => |result| {
+            // `result.account` and `result.final_data` borrow from the router's
+            // internal buffers, so copy everything out BEFORE clearing the router
+            // (clearing the optional invalidates those slices).
+            //
+            // Store the CANONICAL (ASCII-lowercased) account name, matching how
+            // the account store keys accounts (services.accountKey). Otherwise
+            // account() would report the client's claimed casing ("Alice") while
+            // authz uses the canonical form ("alice") — an identity mismatch.
+            if (result.account.len > MAX_ACCOUNT_BYTES) return saslFail(ctx, "SASL authentication failed");
+            var account_buf: [MAX_ACCOUNT_BYTES]u8 = undefined;
+            const account = std.ascii.lowerString(account_buf[0..result.account.len], result.account);
+
+            // SCRAM carries a server-final verifier the client checks before it
+            // trusts the success; emit it as a final AUTHENTICATE before 900/903.
+            // Copy it out of the router buffer before the router is cleared.
+            var final_buf: [sasl_mechrouter.MAX_B64_MESSAGE]u8 = undefined;
+            const final_copy: ?[]const u8 = if (result.final_data) |final| blk: {
+                if (final.len > final_buf.len) break :blk null;
+                @memcpy(final_buf[0..final.len], final);
+                break :blk final_buf[0..final.len];
+            } else null;
+
+            ctx.session.sasl_router = null;
+            ctx.session.sasl_pending = null;
+
+            ctx.session.account_store.set(account) catch return saslFail(ctx, "SASL authentication failed");
+
+            if (final_copy) |final| {
+                const reply = if (final.len == 0) "+" else final;
+                try ctx.replies.message(null, "AUTHENTICATE", &.{reply}, null);
+            }
+
+            ctx.session.logged_in = true;
+            ctx.session.client.registration.sasl = .succeeded;
+            try ctx.replies.numeric(ctx.session, .RPL_LOGGEDIN, &.{ ctx.session.displayName(), account }, "You are now logged in");
+            try ctx.replies.numeric(ctx.session, .RPL_SASLSUCCESS, &.{}, "SASL authentication successful");
+        },
     }
-
-    // Phase 2 — credentials for the pending PLAIN mechanism.
-    ctx.session.sasl_pending = null;
-    const checker = ctx.session.sasl_plain orelse return saslFail(ctx, "SASL authentication failed");
-
-    // Sized for a full line's worth of base64 (lines are capped upstream); a
-    // payload that still overflows fails closed via decodeAuthPayload.
-    var decode_buf: [sasl_decode_cap]u8 = undefined;
-    const raw = decodeAuthPayload(payload, &decode_buf) catch return saslFail(ctx, "SASL authentication failed");
-    const creds = sasl.parsePlain(raw) catch return saslFail(ctx, "SASL authentication failed");
-    if (!checker.verify(creds)) return saslFail(ctx, "SASL authentication failed");
-
-    // Store the CANONICAL (ASCII-lowercased) account name, matching how the
-    // account store keys accounts (services.accountKey). Otherwise account()
-    // would report the client's claimed casing ("Alice") while authz uses the
-    // canonical form ("alice") — an identity mismatch.
-    if (creds.authcid.len > MAX_ACCOUNT_BYTES) return saslFail(ctx, "SASL authentication failed");
-    var account_buf: [MAX_ACCOUNT_BYTES]u8 = undefined;
-    const account = std.ascii.lowerString(account_buf[0..creds.authcid.len], creds.authcid);
-    ctx.session.account_store.set(account) catch return saslFail(ctx, "SASL authentication failed");
-    ctx.session.logged_in = true;
-    ctx.session.client.registration.sasl = .succeeded;
-    try ctx.replies.numeric(ctx.session, .RPL_LOGGEDIN, &.{ ctx.session.displayName(), account }, "You are now logged in");
-    try ctx.replies.numeric(ctx.session, .RPL_SASLSUCCESS, &.{}, "SASL authentication successful");
 }
 
-/// Decoded-credential buffer cap: covers a full IRC line of base64 so legit
-/// PLAIN credentials never silently fail; oversize still fails closed.
-const sasl_decode_cap: usize = 8192;
+/// Adapt the session's bool-returning PLAIN checker to the router's
+/// account-returning `PlainLookup`. Returns null when no PLAIN checker is
+/// injected so PLAIN fails closed exactly as before.
+fn saslPlainAdapter(session: *ClientSession) ?sasl_mechrouter.PlainLookup {
+    if (session.sasl_plain == null) return null;
+    return .{ .ptr = session, .verifyFn = saslPlainVerify };
+}
+
+/// `PlainLookup` shim: verify via the injected bool checker, then return the
+/// authcid as the account name on success (the router copies it into its own
+/// buffer, so borrowing from the decoded creds for the call is safe).
+fn saslPlainVerify(ptr: *anyopaque, creds: sasl.PlainCredentials) ?[]const u8 {
+    const session: *ClientSession = @ptrCast(@alignCast(ptr));
+    const checker = session.sasl_plain orelse return null;
+    if (!checker.verify(creds)) return null;
+    return creds.authcid;
+}
 
 fn saslFail(ctx: DispatchCtx, message: []const u8) DispatchError!void {
     ctx.session.sasl_pending = null;
+    ctx.session.sasl_router = null;
     ctx.session.logged_in = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
     try ctx.replies.numeric(ctx.session, .ERR_SASLFAIL, &.{}, message);
 }
 
-/// Decode a base64 AUTHENTICATE payload into `out`, rejecting oversize input.
-fn decodeAuthPayload(payload_b64: []const u8, out: []u8) ![]const u8 {
-    const decoder = std.base64.standard.Decoder;
-    const len = try decoder.calcSizeForSlice(payload_b64);
-    if (len > out.len) return error.OutputTooSmall;
-    try decoder.decode(out[0..len], payload_b64);
-    return out[0..len];
+fn saslAbort(ctx: DispatchCtx) DispatchError!void {
+    ctx.session.sasl_pending = null;
+    ctx.session.sasl_router = null;
+    ctx.session.logged_in = false;
+    ctx.session.account_store.len = 0;
+    ctx.session.client.registration.sasl = .failed;
+    try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
 }
 
 fn handlePing(ctx: DispatchCtx) DispatchError!void {
@@ -1605,6 +1692,147 @@ test "label is ignored when the labeled-response cap is not negotiated" {
     try dispatchText(&session, &replies, "@label=ping-1 PING :tok");
     try expectNotContains(replies.written(), "@label=");
     try expectContains(replies.written(), "PONG mizuchi.local :tok\r\n");
+}
+
+const TestExternalChecker = struct {
+    fn verify(_: *anyopaque, certfp: []const u8, authzid: []const u8) ?[]const u8 {
+        if (!std.mem.eql(u8, certfp, "DEADBEEF")) return null;
+        if (authzid.len != 0 and !std.mem.eql(u8, authzid, "alice")) return null;
+        return "alice";
+    }
+};
+
+test "sasl EXTERNAL logs in via matching certfp through the router" {
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    var anchor: u8 = 0;
+    session.sasl_external = .{ .ptr = &anchor, .verifyFn = TestExternalChecker.verify };
+    session.tls_certfp = "DEADBEEF";
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE EXTERNAL");
+    try expectContains(replies.written(), "AUTHENTICATE +\r\n");
+
+    // Empty authzid ("+") => use the certificate identity.
+    replies.clear();
+    try dispatchText(&session, &replies, "AUTHENTICATE +");
+    try std.testing.expectEqualStrings("alice", session.account().?);
+    try expectContains(replies.written(), " 900 ");
+    try expectContains(replies.written(), " 903 ");
+}
+
+test "sasl EXTERNAL fails closed when no client certificate is present" {
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    var anchor: u8 = 0;
+    session.sasl_external = .{ .ptr = &anchor, .verifyFn = TestExternalChecker.verify };
+    // No tls_certfp set: the mechanism must be unavailable per spec.
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE EXTERNAL");
+    try std.testing.expect(session.account() == null);
+    try std.testing.expect(session.sasl_router == null);
+    try expectContains(replies.written(), " 904 ");
+}
+
+const TestScramDb = struct {
+    record: scram_server.Credential,
+
+    fn lookup(ptr: *anyopaque, name: []const u8) ?scram_server.Credential {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, name, "user")) return null;
+        return self.record;
+    }
+};
+
+test "sasl SCRAM-SHA-256 full handshake through the router logs in" {
+    const HmacSha256 = std.crypto.auth.hmac.Hmac(std.crypto.hash.sha2.Sha256);
+    const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+
+    const salt = "saltSALTsalt";
+    const iterations: u32 = 4096;
+    const password = "pencil";
+
+    var keys = try sasl.deriveScramKeys(password, salt, iterations);
+    defer keys.wipe();
+    var db = TestScramDb{ .record = .{
+        .salt = salt,
+        .iterations = iterations,
+        .stored_key = keys.stored_key,
+        .server_key = keys.server_key,
+    } };
+
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    session.sasl_scram256 = .{ .ptr = &db, .lookupFn = TestScramDb.lookup };
+    session.sasl_server_nonce = "SERVERNONCE";
+
+    var storage: [2048]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    // Mechanism selection.
+    try dispatchText(&session, &replies, "AUTHENTICATE SCRAM-SHA-256");
+    try expectContains(replies.written(), "AUTHENTICATE +\r\n");
+
+    // client-first.
+    var cf_b64: [128]u8 = undefined;
+    const cf = std.base64.standard.Encoder.encode(&cf_b64, "n,,n=user,r=CLIENTNONCE");
+    var line1: [256]u8 = undefined;
+    replies.clear();
+    try dispatchText(&session, &replies, try std.fmt.bufPrint(&line1, "AUTHENTICATE {s}", .{cf}));
+
+    // Extract the server-first challenge the router emitted.
+    const written1 = replies.written();
+    const marker = "AUTHENTICATE ";
+    const start = std.mem.indexOf(u8, written1, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, written1, start, '\r').?;
+    const server_first_b64 = written1[start..end];
+    var server_first_raw: [sasl.MAX_SCRAM_MESSAGE]u8 = undefined;
+    const sf_decoder = std.base64.standard.Decoder;
+    const sf_len = try sf_decoder.calcSizeForSlice(server_first_b64);
+    try sf_decoder.decode(server_first_raw[0..sf_len], server_first_b64);
+    const server_first = server_first_raw[0..sf_len];
+    const parsed_first = try scram_server.parseServerFirst(server_first);
+
+    // Build the client-final with a correct proof.
+    var without_proof_buf: [256]u8 = undefined;
+    const without_proof = try std.fmt.bufPrint(&without_proof_buf, "c=biws,r={s}", .{parsed_first.nonce});
+    var auth_message_buf: [768]u8 = undefined;
+    const auth_message = try std.fmt.bufPrint(&auth_message_buf, "n=user,r=CLIENTNONCE,{s},{s}", .{ server_first, without_proof });
+    var client_sig: [digest_len]u8 = undefined;
+    HmacSha256.create(&client_sig, auth_message, &keys.stored_key);
+    var proof: [digest_len]u8 = undefined;
+    for (&proof, keys.client_key, client_sig) |*dst, ck, cs| dst.* = ck ^ cs;
+    var proof_b64_buf: [std.base64.standard.Encoder.calcSize(digest_len)]u8 = undefined;
+    const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &proof);
+    var final_buf: [320]u8 = undefined;
+    const client_final = try std.fmt.bufPrint(&final_buf, "{s},p={s}", .{ without_proof, proof_b64 });
+    var final_b64_buf: [512]u8 = undefined;
+    const final_b64 = std.base64.standard.Encoder.encode(&final_b64_buf, client_final);
+
+    var line2: [640]u8 = undefined;
+    replies.clear();
+    try dispatchText(&session, &replies, try std.fmt.bufPrint(&line2, "AUTHENTICATE {s}", .{final_b64}));
+
+    try std.testing.expectEqualStrings("user", session.account().?);
+    try expectContains(replies.written(), " 900 ");
+    try expectContains(replies.written(), " 903 ");
+
+    // The router emits a base64 server-final (v=<verifier>) as an AUTHENTICATE
+    // line before the 900/903; decode it and confirm it parses as a verifier.
+    const written2 = replies.written();
+    const m2 = "AUTHENTICATE ";
+    const s2 = std.mem.indexOf(u8, written2, m2).? + m2.len;
+    const e2 = std.mem.indexOfScalarPos(u8, written2, s2, '\r').?;
+    var final_raw: [sasl.MAX_SCRAM_MESSAGE]u8 = undefined;
+    const fd = std.base64.standard.Decoder;
+    const fl = try fd.calcSizeForSlice(written2[s2..e2]);
+    try fd.decode(final_raw[0..fl], written2[s2..e2]);
+    _ = try scram_server.parseServerFinal(final_raw[0..fl]);
 }
 
 test "host accessor prefers visible host, falls back to real then empty" {
