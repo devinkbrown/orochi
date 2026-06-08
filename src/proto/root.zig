@@ -28,6 +28,7 @@ pub const batch = @import("batch.zig");
 pub const batch_props = @import("batch_props.zig");
 pub const bech32 = @import("bech32.zig");
 pub const bot_mode = @import("bot_mode.zig");
+pub const bounce = @import("bounce.zig");
 pub const bwe_estimate = @import("bwe_estimate.zig");
 pub const cap = @import("cap.zig");
 pub const cap_dynamic = @import("cap_dynamic.zig");
@@ -333,6 +334,7 @@ test {
     _ = batch_props;
     _ = bech32;
     _ = bot_mode;
+    _ = bounce;
     _ = bwe_estimate;
     _ = cap;
     _ = cap_dynamic;
