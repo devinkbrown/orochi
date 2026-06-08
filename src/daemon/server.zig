@@ -153,6 +153,7 @@ const activity = @import("../proto/activity.zig");
 const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
+const tls_conn = @import("tls_conn.zig");
 const oper_mod = @import("oper.zig");
 const config_format = @import("config_format.zig");
 const services_mod = @import("services.zig");
@@ -636,6 +637,9 @@ const listener_token: RingFdToken = .{ .slot = 0, .gen = 0 };
 const s2s_listener_token: RingFdToken = .{ .slot = 1, .gen = 0 };
 /// Reserved token for the periodic timeout sweep timer (single in-flight timer).
 const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
+/// Distinct accept token for the implicit-TLS client listener (:6697), so
+/// handleAccept can tell it apart from the plaintext + S2S listeners.
+const tls_listener_token: RingFdToken = .{ .slot = 3, .gen = 0 };
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
@@ -855,6 +859,15 @@ pub const Config = struct {
     /// Optional server-to-server listener port (0 = disabled). Accepts on this
     /// socket are driven as Suimyaku mesh peers via S2sLink, not IRC clients.
     s2s_port: u16 = 0,
+    /// Optional implicit-TLS client listener port (0 = disabled). Accepts here
+    /// are ordinary IRC clients whose bytes are wrapped in TLS 1.3 (no STARTTLS).
+    /// Requires both `tls_cert_chain` and `tls_signing_key`.
+    tls_port: u16 = 0,
+    /// Leaf-first DER certificate chain presented on the TLS listener. Borrowed
+    /// for the server's lifetime (loaded by main.zig via tls_certs.loadOrBootstrap).
+    tls_cert_chain: []const []const u8 = &.{},
+    /// Ed25519 key matching the leaf cert's SPKI; signs each TLS CertificateVerify.
+    tls_signing_key: ?std.crypto.sign.Ed25519.KeyPair = null,
     /// This node's sovereign mesh identity — the single id that keys the server
     /// registry, the CRDT replica lane, and gossip/routing. No legacy server-id
     /// (SID): one identity. MUST be unique per node and non-zero. The default is a
@@ -974,6 +987,10 @@ pub const ConnState = struct {
     /// Non-null while this client has an open inbound draft/multiline batch.
     /// Heap-owned; freed when the batch closes/aborts or the connection ends.
     multiline: ?*MultilineState = null,
+    /// Non-null for an implicit-TLS client: inbound socket bytes are framed +
+    /// decrypted through this adapter and outbound bytes encrypted, transparently
+    /// to the IRC layer. Heap-owned; freed in closeConn/deinit.
+    tls: ?*tls_conn.TlsConn = null,
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
@@ -1013,11 +1030,9 @@ const QueueSink = struct {
     conn: *ConnState,
 
     fn write(self: *QueueSink, bytes: []const u8) ServerError!void {
-        if (self.conn.send_len + bytes.len > self.conn.send_buf.len) {
-            return error.OutputTooSmall;
-        }
-        @memcpy(self.conn.send_buf[self.conn.send_len .. self.conn.send_len + bytes.len], bytes);
-        self.conn.send_len += bytes.len;
+        // Route through appendToConn so a TLS connection's pre-registration /
+        // PING replies are encrypted on the same seam as everything else.
+        return appendToConn(self.conn, bytes);
     }
 };
 
@@ -1132,6 +1147,10 @@ pub const LinuxServer = struct {
     s2s_accept_armed: bool = false,
     s2s_feed_seq: u64 = 0,
 
+    /// Implicit-TLS client listener (-1 = disabled) + its accept-armed flag.
+    tls_listener_fd: linux.fd_t = -1,
+    tls_accept_armed: bool = false,
+
     /// Operator registry (account -> oper class), from config. Borrowed; outlives
     /// the server via the loaded config.
     oper_registry: ?oper_mod.OperRegistry = null,
@@ -1159,6 +1178,15 @@ pub const LinuxServer = struct {
             -1;
         errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
 
+        // Cert presence is the "TLS configured" signal (main.zig only supplies a
+        // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
+        // same convention the plaintext listener uses.
+        const tls_listener_fd: linux.fd_t = if (config.tls_cert_chain.len != 0 and config.tls_signing_key != null)
+            try createListener(config.host, config.tls_port, config.backlog)
+        else
+            -1;
+        errdefer if (tls_listener_fd >= 0) closeFd(tls_listener_fd);
+
         var ring = RingCore.init(config.ring_entries, config.features) catch |err| {
             if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
             return err;
@@ -1181,6 +1209,7 @@ pub const LinuxServer = struct {
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .listener_fd = listener_fd,
             .s2s_listener_fd = s2s_listener_fd,
+            .tls_listener_fd = tls_listener_fd,
             .ring = ring,
             .clients = clients,
             .world = world_model.World.init(allocator),
@@ -1291,6 +1320,11 @@ pub const LinuxServer = struct {
                     self.allocator.destroy(ms);
                     slot.value.multiline = null;
                 }
+                if (slot.value.tls) |t| {
+                    t.deinit();
+                    self.allocator.destroy(t);
+                    slot.value.tls = null;
+                }
                 closeFd(slot.value.fd);
             }
         }
@@ -1343,6 +1377,7 @@ pub const LinuxServer = struct {
         self.clients.deinit();
         self.ring.deinit();
         closeFd(self.listener_fd);
+        if (self.tls_listener_fd >= 0) closeFd(self.tls_listener_fd);
         self.* = undefined;
     }
 
@@ -1355,6 +1390,10 @@ pub const LinuxServer = struct {
         if (self.s2s_listener_fd >= 0 and !self.s2s_accept_armed) {
             try self.ring.submitAccept(s2s_listener_token, self.s2s_listener_fd);
             self.s2s_accept_armed = true;
+        }
+        if (self.tls_listener_fd >= 0 and !self.tls_accept_armed) {
+            try self.ring.submitAccept(tls_listener_token, self.tls_listener_fd);
+            self.tls_accept_armed = true;
         }
     }
 
@@ -1453,6 +1492,11 @@ pub const LinuxServer = struct {
         return socketPort(self.s2s_listener_fd);
     }
 
+    pub fn tlsBoundPort(self: *LinuxServer) !u16 {
+        if (self.tls_listener_fd < 0) return error.Unsupported;
+        return socketPort(self.tls_listener_fd);
+    }
+
     /// Process at least one io_uring completion. Callers may loop this until
     /// their own stop condition is satisfied.
     pub fn runOnce(self: *LinuxServer) !void {
@@ -1485,8 +1529,15 @@ pub const LinuxServer = struct {
 
     pub fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
         const is_s2s = event.token.slot == s2s_listener_token.slot;
+        const is_tls = event.token.slot == tls_listener_token.slot;
         if (!event.more) {
-            if (is_s2s) self.s2s_accept_armed = false else self.accept_armed = false;
+            if (is_s2s) {
+                self.s2s_accept_armed = false;
+            } else if (is_tls) {
+                self.tls_accept_armed = false;
+            } else {
+                self.accept_armed = false;
+            }
         }
         if (event.res < 0) return error.BadCompletion;
 
@@ -1551,6 +1602,62 @@ pub const LinuxServer = struct {
             try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             self.stats.onS2sAccept();
             self.traceLog(.info, .s2s, "s2s peer accepted");
+            return;
+        }
+
+        if (is_tls) {
+            // Implicit-TLS client. Refusals MUST be silent here: a plaintext IRC
+            // ERROR sent to a peer mid-TLS-handshake is protocol garbage, so we
+            // gate then close the fd directly rather than queueing a message.
+            self.captureClientHost(conn);
+            var refuse = self.draining;
+            if (!refuse and self.reputationOn()) {
+                if (conn.peer_addr) |addr| {
+                    if (self.reputation.shouldRefuse(addr, self.nowU64())) refuse = true;
+                }
+            }
+            if (!refuse) {
+                if (conn.peer_addr) |addr| {
+                    if (self.clone_limit.register(addr)) {
+                        conn.clone_counted = true;
+                    } else |err| switch (err) {
+                        error.TooManyPerIp, error.TooManyPerNet => {
+                            self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                            refuse = true;
+                        },
+                        error.NoSpaceLeft => {},
+                    }
+                }
+            }
+            if (refuse) {
+                closeFd(conn.fd);
+                _ = self.clients.free(id);
+                self.stats.onAccept();
+                return;
+            }
+            // Stand up the per-connection TLS engine; the IRC layer above sees
+            // only decrypted plaintext once the handshake completes.
+            const tls = try self.allocator.create(tls_conn.TlsConn);
+            tls.* = tls_conn.TlsConn.init(self.allocator, .{
+                .cert_chain = self.config.tls_cert_chain,
+                .signing_key = self.config.tls_signing_key.?,
+            }) catch {
+                self.allocator.destroy(tls);
+                closeFd(conn.fd);
+                _ = self.clients.free(id);
+                self.stats.onAccept();
+                return;
+            };
+            errdefer {
+                tls.deinit();
+                self.allocator.destroy(tls);
+            }
+            conn.tls = tls;
+            conn.is_tls = true;
+            if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.stats.onAccept();
+            self.traceLog(.info, .net, "tls client accepted");
             return;
         }
 
@@ -1832,6 +1939,8 @@ pub const LinuxServer = struct {
                 self.driveS2sSecured(conn, link, chunk);
             } else if (conn.s2s) |link| {
                 self.driveS2s(conn, link, chunk);
+            } else if (conn.tls != null) {
+                try self.driveTls(id, conn, chunk);
             } else {
                 try self.feedBytes(id, conn, chunk);
             }
@@ -2117,6 +2226,12 @@ pub const LinuxServer = struct {
             self.stats.onQuit();
             // Free any in-flight inbound multiline batch buffer.
             self.abortMultiline(conn);
+            // Tear down the per-connection TLS engine, if any.
+            if (conn.tls) |t| {
+                t.deinit();
+                self.allocator.destroy(t);
+                conn.tls = null;
+            }
             // Release this connection's clone-limiter slot (only if it was counted;
             // refused accepts and addr-less peers never registered).
             if (conn.clone_counted) {
@@ -2180,6 +2295,27 @@ pub const LinuxServer = struct {
             if (entry.value_ptr.members.contains(worldIdFromClient(id))) {
                 try self.broadcastChannel(entry.key_ptr.*, msg, id);
             }
+        }
+    }
+
+    /// Drive an implicit-TLS client's recv chunk: frame + decrypt through the
+    /// per-conn adapter, write any handshake flight back (raw — appendToConn
+    /// leaves it unencrypted while the handshake is incomplete), and feed any
+    /// decrypted plaintext into the normal line parser. A handshake/record fault
+    /// closes only this connection.
+    fn driveTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chunk: []const u8) !void {
+        const outcome = conn.tls.?.onInbound(chunk) catch {
+            conn.closing = true;
+            return;
+        };
+        if (outcome.handshake_bytes.len != 0) {
+            appendToConn(conn, outcome.handshake_bytes) catch {
+                conn.closing = true;
+                return;
+            };
+        }
+        if (outcome.plaintext.len != 0) {
+            try self.feedBytes(id, conn, outcome.plaintext);
         }
     }
 
@@ -8707,6 +8843,19 @@ const Buf = struct {
 };
 
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
+    // Implicit-TLS: once the handshake is live, every app-layer write is encrypted
+    // into TLS records before it reaches the wire buffer. Pre-handshake writes (the
+    // server's own handshake flight, queued by driveTls) pass through untouched.
+    if (conn.tls) |t| {
+        if (t.handshakeDone()) {
+            const ciphertext = t.write(bytes) catch return error.OutputTooSmall;
+            return rawAppendToConn(conn, ciphertext);
+        }
+    }
+    return rawAppendToConn(conn, bytes);
+}
+
+fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     if (conn.send_len + bytes.len > conn.send_buf.len) {
         // Reclaim the already-sent prefix [0, send_offset) for a slow consumer by
         // sliding the unsent tail to the front. NEVER do this while a send SQE is
@@ -9941,6 +10090,110 @@ test "threaded server: draft/multiline batch reassembles + splits to recipient" 
         "BATCH -z\r\n");
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line1more\r\n", 200);
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line2\r\n", 200);
+}
+
+test "threaded server: implicit-TLS client handshakes + registers over the wire" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    // Bootstrap a self-signed Ed25519 leaf with a SAN the client will accept.
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x51, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{der};
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = kp,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const tls_port = try server.tlsBoundPort();
+    const plain_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(tls_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+    defer client.deinit();
+
+    // TLS 1.3 handshake driven over the live socket.
+    const ch = try client.start();
+    defer alloc.free(ch);
+    try writeAllFd(fd, ch);
+    var rbuf: [4096]u8 = undefined;
+    var guard: usize = 0;
+    while (!client.handshakeDone()) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        switch (try client.feed(rbuf[0..n])) {
+            .bytes_to_send => |b| {
+                defer alloc.free(b);
+                try writeAllFd(fd, b);
+            },
+            .need_more => {},
+        }
+    }
+
+    try std.testing.expect(client.handshakeDone());
+
+    // Registration over the encrypted channel: send NICK/USER, then read the
+    // welcome burst back, framing + decrypting TLS records until RPL_WELCOME.
+    const reg = try client.encrypt("NICK T\r\nUSER t 0 * :Tester\r\n");
+    defer alloc.free(reg);
+    try writeAllFd(fd, reg);
+
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(alloc);
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(alloc);
+    guard = 0;
+    while (std.mem.indexOf(u8, plain.items, " 001 T ") == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try cipher.appendSlice(alloc, rbuf[0..n]);
+        // Drain every complete TLS record (5-byte header + big-endian length).
+        while (cipher.items.len >= 5) {
+            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+            const wire_len = 5 + @as(usize, body_len);
+            if (cipher.items.len < wire_len) break;
+            switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                .application_data => |pt| {
+                    defer alloc.free(pt);
+                    try plain.appendSlice(alloc, pt);
+                },
+                .control => {},
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+        }
+    }
+    try expectContains(plain.items, " 001 T ");
 }
 
 test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
