@@ -109,6 +109,10 @@ pub const Loaded = struct {
     tls: TlsBootConfig = .{},
     /// Neutral IRCv3 STS boot projection; `main.zig` consumes this to enable STS.
     sts: StsBootConfig = .{},
+    /// Number of worker reactor shards to spin up (`ReactorPool` size). 1 = the
+    /// single-reactor model. `server.Config` carries no thread-topology field,
+    /// so the parsed `[limits].num_shards` rides here for `main.zig` to consume.
+    num_shards: u16 = 1,
 
     pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
         allocator.free(self.oper_bindings);
@@ -174,6 +178,7 @@ pub fn loadFromText(
         .oper_bindings = bindings,
         .tls = mapTlsBootConfig(parsed),
         .sts = mapStsBootConfig(parsed),
+        .num_shards = parsed.limits.num_shards,
     };
 }
 
@@ -296,6 +301,27 @@ test "limits overlay reputation knobs" {
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u32, 120), loaded.config.reputation_refuse_threshold);
     try testing.expectEqual(@as(i64, 90_000), loaded.config.reputation_half_life_ms);
+}
+
+test "num_shards lifts onto the boot config and defaults to 1" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\num_shards = 4
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(u16, 4), loaded.num_shards);
+
+    // Omitted -> single reactor.
+    var dflt = try loadFromText(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{ .port = 6680 }, .{});
+    defer dflt.deinit(allocator);
+    try testing.expectEqual(@as(u16, 1), dflt.num_shards);
 }
 
 test "minimal config: unspecified optional fields keep defaults" {

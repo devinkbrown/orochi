@@ -168,6 +168,7 @@ pub const rate_quota = @import("rate_quota.zig");
 pub const reaction_leaderboard = @import("reaction_leaderboard.zig");
 pub const reaction_tally = @import("reaction_tally.zig");
 pub const reactor_fabric = @import("reactor_fabric.zig");
+pub const reactor_pool = @import("reactor_pool.zig");
 pub const reactor_wake = @import("reactor_wake.zig");
 pub const read_later = @import("read_later.zig");
 pub const recording_consent = @import("recording_consent.zig");
@@ -416,6 +417,7 @@ test {
     _ = reaction_leaderboard;
     _ = reaction_tally;
     _ = reactor_fabric;
+    _ = reactor_pool;
     _ = reactor_wake;
     _ = read_later;
     _ = recording_consent;

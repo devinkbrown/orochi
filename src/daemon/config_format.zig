@@ -10,6 +10,7 @@
 //! defaults stand. Required: `[node].id` and `[listen].irc`.
 const std = @import("std");
 const toml = @import("../proto/toml.zig");
+const shard = @import("shard.zig");
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("config_format requires a 64-bit target");
@@ -87,6 +88,9 @@ pub const Config = struct {
     pub const Limits = struct {
         backlog: u31 = 128,
         max_clients: u31 = 1024,
+        /// Number of worker reactor shards (`ReactorPool` threads). 1 = the
+        /// single-reactor model; bounded by `shard.max_shards`.
+        num_shards: u16 = 1,
         handshake_timeout_ms: u64 = 30_000,
         ping_interval_ms: u64 = 120_000,
         ping_timeout_ms: u64 = 60_000,
@@ -262,6 +266,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [limits]
     cfg.limits.backlog = @intCast(try uintField(doc, "limits.backlog", cfg.limits.backlog, 1, 32767));
     cfg.limits.max_clients = @intCast(try uintField(doc, "limits.max_clients", cfg.limits.max_clients, 1, 32767));
+    cfg.limits.num_shards = @intCast(try uintField(doc, "limits.num_shards", cfg.limits.num_shards, 1, shard.max_shards));
     cfg.limits.max_clones_per_ip = @intCast(try uintField(doc, "limits.max_clones_per_ip", cfg.limits.max_clones_per_ip, 0, 65535));
     cfg.limits.max_clones_per_net = @intCast(try uintField(doc, "limits.max_clones_per_net", cfg.limits.max_clones_per_net, 0, 65535));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
@@ -590,6 +595,30 @@ test "parseToml: [io] / [reputation] / sweep_interval lift" {
     try testing.expectEqual(@as(f64, 10.0), cfg.reputation.clone_refuse_penalty);
     // out-of-range ring_entries rejected
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[io]\nring_entries=4\n", .{}));
+}
+
+test "parseToml: num_shards lifts and defaults to 1" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\num_shards = 4
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u16, 4), cfg.limits.num_shards);
+
+    // Omitted -> single-reactor default.
+    var dflt = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{});
+    defer dflt.deinit(allocator);
+    try testing.expectEqual(@as(u16, 1), dflt.limits.num_shards);
+
+    // Zero shards is invalid (a reactor pool needs >= 1 worker).
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[limits]\nnum_shards=0\n", .{}));
 }
 
 test "parseToml: minimal config keeps defaults" {
