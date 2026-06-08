@@ -39,6 +39,7 @@ pub const Config = struct {
     sasl: Sasl = .{},
     cloak: Cloak = .{},
     tls: Tls = .{},
+    sts: Sts = .{},
 
     pub const Node = struct {
         id: u64 = 0,
@@ -156,6 +157,25 @@ pub const Config = struct {
         key_path: ?[]const u8 = null,
         /// CN/SAN used for the self-signed bootstrap leaf when no files are set.
         dns_name: []const u8 = "localhost",
+    };
+
+    /// IRCv3 STS (Strict Transport Security) advertisement policy. When enabled,
+    /// the daemon advertises an `sts=` capability instructing clients to persist
+    /// a secure-transport upgrade for `duration` seconds on the secure `port`.
+    /// Disabled by default so plaintext deployments are never forced upgrades.
+    /// The actual policy build + per-session advertisement lives in `main.zig`
+    /// via `proto/sts_policy.zig`; this section only surfaces the parsed config.
+    pub const Sts = struct {
+        enabled: bool = false,
+        /// Persistence lifetime in seconds advertised to secure clients. Default
+        /// is 30 days (2592000), the value recommended by the IRCv3 STS spec.
+        duration: u32 = 2_592_000,
+        /// Secure (TLS) port clients should reconnect to when upgrading. Default
+        /// is the conventional IRC-over-TLS port 6697.
+        port: u16 = 6697,
+        /// When true, advertise `preload`, signaling the policy may be shipped in
+        /// client preload lists. Off by default; only opt in deliberately.
+        preload: bool = false,
     };
 
     pub fn initDefaults(allocator: std.mem.Allocator) !Config {
@@ -280,6 +300,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("tls.cert_path"), &cfg.tls.cert_path);
     try setOpt(allocator, resolver, doc.getString("tls.key_path"), &cfg.tls.key_path);
     try setStr(allocator, resolver, doc.getString("tls.dns_name"), &cfg.tls.dns_name);
+
+    // [sts]
+    if (doc.getBool("sts.enabled")) |b| cfg.sts.enabled = b;
+    cfg.sts.duration = @intCast(try uintField(doc, "sts.duration", cfg.sts.duration, 0, std.math.maxInt(u32)));
+    cfg.sts.port = try portField(doc, "sts.port", cfg.sts.port);
+    if (doc.getBool("sts.preload")) |b| cfg.sts.preload = b;
 
     // [[opers]] arrays-of-tables
     if (doc.getArray("opers")) |arr| {
@@ -616,6 +642,39 @@ test "parseToml: [tls] omitted keeps secure defaults" {
     try testing.expectEqual(@as(?[]const u8, null), cfg.tls.cert_path);
     try testing.expectEqual(@as(?[]const u8, null), cfg.tls.key_path);
     try testing.expectEqualStrings("localhost", cfg.tls.dns_name);
+}
+
+test "parseToml: [sts] section projects onto Config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sts]
+        \\enabled = true
+        \\duration = 604800
+        \\port = 7000
+        \\preload = true
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.sts.enabled);
+    try testing.expectEqual(@as(u32, 604800), cfg.sts.duration);
+    try testing.expectEqual(@as(u16, 7000), cfg.sts.port);
+    try testing.expect(cfg.sts.preload);
+}
+
+test "parseToml: [sts] omitted keeps secure defaults" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer cfg.deinit(allocator);
+    // STS off by default; never force-upgrade a plaintext deployment.
+    try testing.expect(!cfg.sts.enabled);
+    try testing.expectEqual(@as(u32, 2_592_000), cfg.sts.duration);
+    try testing.expectEqual(@as(u16, 6697), cfg.sts.port);
+    try testing.expect(!cfg.sts.preload);
 }
 
 test {

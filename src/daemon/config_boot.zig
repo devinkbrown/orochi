@@ -44,6 +44,30 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     return out;
 }
 
+/// Neutral STS boot projection consumed by `main.zig` to enable IRCv3 STS per
+/// session. This struct deliberately holds no wire/policy values — `main.zig`
+/// owns the `proto/sts_policy.zig` build + per-session `enableSts` call; here we
+/// only surface the parsed `[sts]` config so the boot path stays decoupled.
+pub const StsBootConfig = struct {
+    enabled: bool = false,
+    duration: u32 = 2_592_000,
+    port: u16 = 6697,
+    preload: bool = false,
+};
+
+/// Project the parsed `[sts]` config onto the neutral boot struct. Unlike
+/// `mapToServerConfig`, this copies fields verbatim (no zero-means-default
+/// overlay): the parser already carries the secure defaults when `[sts]` is
+/// omitted, so `main.zig` reads an authoritative snapshot.
+pub fn mapStsBootConfig(cfg: config_format.Config) StsBootConfig {
+    return .{
+        .enabled = cfg.sts.enabled,
+        .duration = cfg.sts.duration,
+        .port = cfg.sts.port,
+        .preload = cfg.sts.preload,
+    };
+}
+
 /// Parse `text` and overlay it onto `base`. Returns the mapped Config plus the
 /// owned parsed config (caller must `deinit` it AFTER it is done using the
 /// returned Config, since string fields are borrowed). On parse failure returns
@@ -81,6 +105,8 @@ pub const Loaded = struct {
     /// Parsed `[tls]` intent (strings borrow `parsed`); the live listener and
     /// certificate loading are wired by `main.zig`, not here.
     tls: TlsBootConfig = .{},
+    /// Neutral IRCv3 STS boot projection; `main.zig` consumes this to enable STS.
+    sts: StsBootConfig = .{},
 
     pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
         allocator.free(self.oper_bindings);
@@ -145,6 +171,7 @@ pub fn loadFromText(
         .parsed = parsed,
         .oper_bindings = bindings,
         .tls = mapTlsBootConfig(parsed),
+        .sts = mapStsBootConfig(parsed),
     };
 }
 
@@ -319,6 +346,46 @@ test "tls omitted keeps boot defaults" {
     try testing.expectEqual(@as(u16, 6697), loaded.tls.port);
     try testing.expectEqual(@as(?[]const u8, null), loaded.tls.cert_path);
     try testing.expectEqualStrings("localhost", loaded.tls.dns_name);
+}
+
+test "sts boot projection maps the parsed [sts] section" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sts]
+        \\enabled = true
+        \\duration = 604800
+        \\port = 7000
+        \\preload = true
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expect(loaded.sts.enabled);
+    try testing.expectEqual(@as(u32, 604800), loaded.sts.duration);
+    try testing.expectEqual(@as(u16, 7000), loaded.sts.port);
+    try testing.expect(loaded.sts.preload);
+}
+
+test "sts boot projection defaults when [sts] omitted" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 9
+        \\[listen]
+        \\irc = 6680
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    // STS disabled by default; secure defaults still surface to main.zig.
+    try testing.expect(!loaded.sts.enabled);
+    try testing.expectEqual(@as(u32, 2_592_000), loaded.sts.duration);
+    try testing.expectEqual(@as(u16, 6697), loaded.sts.port);
+    try testing.expect(!loaded.sts.preload);
 }
 
 test "missing required [node].id is rejected" {
