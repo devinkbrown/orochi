@@ -18,6 +18,12 @@ pub const listener_capsule = @import("listener_capsule.zig");
 pub const session_capsule = @import("session_capsule.zig");
 pub const session_snapshot = @import("session_snapshot.zig");
 pub const session_migrate = @import("session_migrate.zig");
+// S2S migration support modules (fsm + signed token + journal + policy + metrics).
+pub const migration_fsm = @import("migration_fsm.zig");
+pub const migration_token = @import("migration_token.zig");
+pub const migration_journal = @import("migration_journal.zig");
+pub const migration_policy = @import("migration_policy.zig");
+pub const migration_metrics = @import("migration_metrics.zig");
 pub const monitor_capsule = @import("monitor_capsule.zig");
 pub const metadata_capsule = @import("metadata_capsule.zig");
 pub const bouncer_buffer_capsule = @import("bouncer_buffer_capsule.zig");
