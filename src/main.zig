@@ -181,6 +181,31 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("mizuchi: cloak key generated (per-boot; set [cloak] secret to persist)\n", .{});
     }
 
+    // Implicit-TLS client listener: when `[tls] enabled`, load the configured
+    // cert/key (or mint a self-signed bootstrap leaf) and stand up the TLS
+    // listener. The chain bytes + signing key live for the server's lifetime
+    // (server.Config borrows them). No STARTTLS — this is a separate TLS port.
+    var tls_loaded: ?mizuchi.daemon.tls_certs.Loaded = null;
+    defer if (tls_loaded) |*t| t.deinit(allocator);
+    if (held) |h| {
+        if (h.tls.enabled) {
+            if (mizuchi.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
+                .enabled = true,
+                .cert_path = h.tls.cert_path,
+                .key_path = h.tls.key_path,
+                .dns_name = h.tls.dns_name,
+            })) |loaded| {
+                tls_loaded = loaded;
+                srv_cfg.tls_port = h.tls.port;
+                srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
+                srv_cfg.tls_signing_key = tls_loaded.?.signing_key;
+                std.debug.print("mizuchi: TLS listener enabled on port {d}\n", .{h.tls.port});
+            } else |err| {
+                std.debug.print("mizuchi: TLS cert error ({s}); TLS disabled\n", .{@errorName(err)});
+            }
+        }
+    }
+
     const Server = mizuchi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // io_uring unavailable (old kernel / sandbox): fall back to the DST boot banner.
