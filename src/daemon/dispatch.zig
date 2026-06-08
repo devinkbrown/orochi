@@ -191,6 +191,10 @@ pub const CapId = enum(u6) {
     bot,
     channel_rename,
     extended_monitor,
+    account_registration,
+    metadata_2,
+    standard_replies,
+    cap_notify,
 };
 
 const CapSet = struct {
@@ -267,6 +271,16 @@ const cap_specs = [_]CapSpec{
     // logs in (IDENTIFY) or out (LOGOUT). The server emits these at the live
     // login/logout sites.
     .{ .id = .account_notify, .name = "account-notify" },
+    // account-registration: REGISTER/VERIFY are live; advertising lets compliant
+    // clients surface nick/account registration.
+    .{ .id = .account_registration, .name = "draft/account-registration" },
+    // metadata-2: METADATA GET/SET/LIST/CLEAR + RPL_KEYVALUE(761)/762/766 are live.
+    .{ .id = .metadata_2, .name = "draft/metadata-2" },
+    // standard-replies: FAIL/WARN/NOTE are emitted across the command surface.
+    .{ .id = .standard_replies, .name = "standard-replies" },
+    // cap-notify: the cap set is static, so CAP NEW/DEL never fire, but advertising
+    // signals support and is required before some clients enable other caps.
+    .{ .id = .cap_notify, .name = "cap-notify" },
 };
 
 const CapReplyKind = enum {
