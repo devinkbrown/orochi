@@ -8844,6 +8844,15 @@ const CompletionHandler = struct {
 
     fn onCompletion(self: *CompletionHandler, completion: ringlane.Completion) void {
         if (self.err != null) return;
+        // World-lock boundary (multithreading Phase B): take the shared world's
+        // write lock once around the whole completion so concurrent reactors
+        // serialize all world (channel/nick/membership) reads + mutations + the
+        // delivery they drive. This is the single outermost acquire — no handler
+        // re-locks the world, so the non-recursive lock can never self-deadlock.
+        // Per-instance state (clients table, send buffers, ring) is reactor-local
+        // and needs no lock. Uncontended with one reactor (a couple of atomics).
+        self.server.world.lockWrite();
+        defer self.server.world.unlockWrite();
         switch (completion) {
             .accept => |event| self.server.handleAccept(event) catch |err| {
                 self.err = err;
