@@ -88,6 +88,7 @@ pub const range_coder = @import("range_coder.zig");
 pub const raptorq = @import("raptorq.zig");
 pub const rateless = @import("rateless.zig");
 pub const ratelimit = @import("ratelimit.zig");
+pub const rcu_map = @import("rcu_map.zig");
 pub const reactor = @import("reactor.zig");
 pub const red_fec = @import("red_fec.zig");
 pub const reed_solomon = @import("reed_solomon.zig");
@@ -229,6 +230,7 @@ test {
     _ = raptorq;
     _ = rateless;
     _ = ratelimit;
+    _ = rcu_map;
     _ = reactor;
     _ = red_fec;
     _ = reed_solomon;
