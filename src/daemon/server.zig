@@ -1078,6 +1078,54 @@ const QueueSink = struct {
     }
 };
 
+/// Per-reactor I/O resources: everything one reactor thread owns privately and
+/// touches without a lock. The shared world + stores stay on `LinuxServer`; this
+/// is the disjoint slice each shard runs on. Single embedded instance today,
+/// reached via `LinuxServer.rx()`; the sharded model turns this into an array
+/// (one per thread) addressed by a thread-local current reactor, with no
+/// call-site changes (every handler already goes through `rx()`).
+const Reactor = struct {
+    /// This reactor's io_uring (accept/recv/send/poll/timeout completions).
+    ring: RingCore,
+    /// Connections pinned to this reactor (recv/send buffers, TlsConn, fd). Never
+    /// touched by another reactor — cross-shard work routes through the fabric.
+    clients: ClientTable,
+    /// The shard index this reactor owns; stamped into each connection's
+    /// `ClientId.shard`. Always 0 in the single-reactor configuration.
+    shard_id: u12 = 0,
+
+    /// Client listener (SO_REUSEPORT per reactor in the sharded model).
+    listener_fd: linux.fd_t,
+    /// S2S listener (-1 = disabled) + its accept-armed flag.
+    s2s_listener_fd: linux.fd_t = -1,
+    /// Implicit-TLS client listener (-1 = disabled) + its accept-armed flag.
+    tls_listener_fd: linux.fd_t = -1,
+
+    accept_armed: bool = false,
+    s2s_accept_armed: bool = false,
+    tls_accept_armed: bool = false,
+    /// Whether the periodic timeout-sweep timer is currently in flight.
+    timer_armed: bool = false,
+
+    /// This reactor's cross-reactor wake eventfd (null if eventfd is unavailable),
+    /// its in-flight poll-arm flag, and a monotonic count of observed wakes. Lets
+    /// another thread `wakeReactor()` make this loop run and drain its mailbox.
+    wake: ?reactor_wake.ReactorWake = null,
+    wake_armed: bool = false,
+    wake_count: std.atomic.Value(u32) = .init(0),
+
+    /// Tear down the reactor's ring, connection table, wake fd, and listeners.
+    /// The caller drains per-connection link/tls/multiline state first.
+    fn deinit(self: *Reactor) void {
+        self.clients.deinit();
+        self.ring.deinit();
+        if (self.wake) |*w| w.deinit();
+        closeFd(self.listener_fd);
+        if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
+        if (self.tls_listener_fd >= 0) closeFd(self.tls_listener_fd);
+    }
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -1089,9 +1137,10 @@ pub const LinuxServer = struct {
     /// (origin_node, hlc). Per-peer seen-sets miss cross-path duplicates in a
     /// cyclic mesh; this global set dedups deliver + re-forward across all paths.
     relay_seen: message_relay.SeenSet,
-    listener_fd: linux.fd_t,
-    ring: RingCore,
-    clients: ClientTable,
+    /// Per-reactor I/O (ring, connection table, listeners, wake). Single embedded
+    /// reactor today; reached through `rx()` so the sharded model can swap it for
+    /// a thread-local current reactor with no call-site changes.
+    io: Reactor,
     world: world_model.World,
     whowas: WhowasStore,
     monitor: monitor.MonitorStore,
@@ -1141,13 +1190,10 @@ pub const LinuxServer = struct {
     /// Seeded once from boot entropy so ids are opaque and disjoint across boots;
     /// the value message-redaction later references. See proto/msgid.zig.
     msgid_gen: msgid_mod.Generator,
-    accept_armed: bool = false,
     /// Oper-set drain mode: when true, new client connections are refused (S2S
     /// links and existing clients are unaffected). Toggled by the DRAIN command
     /// for graceful pre-shutdown / maintenance windows.
     draining: bool = false,
-    /// Whether the periodic timeout-sweep timer is currently in flight.
-    timer_armed: bool = false,
     /// Observability: a lock-free flight recorder (last N structured events,
     /// dumped on oper DEBUG / crash) + per-category level filter.
     trace_recorder: tracelog.FlightRecorder(256) = .{},
@@ -1183,23 +1229,10 @@ pub const LinuxServer = struct {
     /// on deinit. Null/empty until the first successful REHASH.
     reload_parsed: ?config_format.Config = null,
     reload_bindings: []oper_mod.OperBinding = &.{},
-    /// S2S listener (-1 = disabled), its accept-armed flag, and a monotonically
-    /// increasing seed fed to S2sLink.feed for deterministic gossip rng.
-    s2s_listener_fd: linux.fd_t = -1,
-    s2s_accept_armed: bool = false,
+    /// Monotonically increasing seed fed to S2sLink.feed for deterministic gossip
+    /// rng. (The S2S/TLS listener fds, accept-armed flags, and the cross-reactor
+    /// wake eventfd now live on `reactor`.)
     s2s_feed_seq: u64 = 0,
-
-    /// Implicit-TLS client listener (-1 = disabled) + its accept-armed flag.
-    tls_listener_fd: linux.fd_t = -1,
-    tls_accept_armed: bool = false,
-
-    /// This reactor's cross-reactor wake eventfd (null if eventfd is unavailable),
-    /// its in-flight poll-arm flag, and a monotonic count of observed wakes. Lets
-    /// another thread `wakeReactor()` to make this loop run and (once the
-    /// multi-reactor model lands) drain its cross-shard mailbox.
-    wake: ?reactor_wake.ReactorWake = null,
-    wake_armed: bool = false,
-    wake_count: std.atomic.Value(u32) = .init(0),
 
     /// Operator registry (account -> oper class), from config. Borrowed; outlives
     /// the server via the loaded config.
@@ -1208,6 +1241,15 @@ pub const LinuxServer = struct {
     account_services: ?*services_mod.Services = null,
     /// Monotonic millis captured at init, for STATS u uptime.
     start_ms: i64 = 0,
+
+    /// The reactor this call is running on. Single embedded reactor today, so it
+    /// is just `&self.reactor`; when the daemon shards into N reactor threads this
+    /// resolves to the thread-local current reactor (set at each thread's loop
+    /// entry). Centralizing the lookup keeps every handler's `self.rx().ring` /
+    /// `self.rx().clients` access shard-correct with no signature changes.
+    inline fn rx(self: *LinuxServer) *Reactor {
+        return &self.io;
+    }
 
     /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
     /// ring used for accept/recv/send completions.
@@ -1257,14 +1299,17 @@ pub const LinuxServer = struct {
             .config = config,
             .wasm = wasm_bridge.Bridge.init(allocator),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
-            .listener_fd = listener_fd,
-            .s2s_listener_fd = s2s_listener_fd,
-            .tls_listener_fd = tls_listener_fd,
-            // Best-effort: a daemon without eventfd simply runs un-wakeable (the
-            // single reactor never needs an external nudge today).
-            .wake = reactor_wake.ReactorWake.init() catch null,
-            .ring = ring,
-            .clients = clients,
+            .io = .{
+                .ring = ring,
+                .clients = clients,
+                .shard_id = 0,
+                .listener_fd = listener_fd,
+                .s2s_listener_fd = s2s_listener_fd,
+                .tls_listener_fd = tls_listener_fd,
+                // Best-effort: a daemon without eventfd simply runs un-wakeable
+                // (a single reactor never needs an external nudge today).
+                .wake = reactor_wake.ReactorWake.init() catch null,
+            },
             .world = world_model.World.init(allocator),
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, 128),
@@ -1357,7 +1402,7 @@ pub const LinuxServer = struct {
         self.driveDeinit();
         self.wasm.deinit();
         self.relay_seen.deinit();
-        for (self.clients.slots.items) |*slot| {
+        for (self.rx().clients.slots.items) |*slot| {
             if (slot.occupied) {
                 if (slot.value.s2s) |link| {
                     link.deinit();
@@ -1381,7 +1426,6 @@ pub const LinuxServer = struct {
                 closeFd(slot.value.fd);
             }
         }
-        if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
         self.history.deinit();
         self.warden.deinit();
         self.metadata.deinit();
@@ -1427,37 +1471,33 @@ pub const LinuxServer = struct {
         self.monitor.deinit();
         self.whowas.deinit();
         self.world.deinit();
-        self.clients.deinit();
-        self.ring.deinit();
-        if (self.wake) |*w| w.deinit();
-        closeFd(self.listener_fd);
-        if (self.tls_listener_fd >= 0) closeFd(self.tls_listener_fd);
+        self.io.deinit();
         self.* = undefined;
     }
 
     /// Arm the accept SQE if needed. Submission is batched by `runOnce`.
     pub fn armAccept(self: *LinuxServer) !void {
-        if (!self.accept_armed) {
-            try self.ring.submitAccept(listener_token, self.listener_fd);
-            self.accept_armed = true;
+        if (!self.rx().accept_armed) {
+            try self.rx().ring.submitAccept(listener_token, self.rx().listener_fd);
+            self.rx().accept_armed = true;
         }
-        if (self.s2s_listener_fd >= 0 and !self.s2s_accept_armed) {
-            try self.ring.submitAccept(s2s_listener_token, self.s2s_listener_fd);
-            self.s2s_accept_armed = true;
+        if (self.rx().s2s_listener_fd >= 0 and !self.rx().s2s_accept_armed) {
+            try self.rx().ring.submitAccept(s2s_listener_token, self.rx().s2s_listener_fd);
+            self.rx().s2s_accept_armed = true;
         }
-        if (self.tls_listener_fd >= 0 and !self.tls_accept_armed) {
-            try self.ring.submitAccept(tls_listener_token, self.tls_listener_fd);
-            self.tls_accept_armed = true;
+        if (self.rx().tls_listener_fd >= 0 and !self.rx().tls_accept_armed) {
+            try self.rx().ring.submitAccept(tls_listener_token, self.rx().tls_listener_fd);
+            self.rx().tls_accept_armed = true;
         }
     }
 
     /// Keep exactly one poll on the cross-reactor wake eventfd in flight, so a
     /// foreign reactor's `wakeReactor()` makes this loop run.
     fn armWake(self: *LinuxServer) !void {
-        if (self.wake) |w| {
-            if (!self.wake_armed) {
-                try self.ring.submitPollAdd(wake_token, w.fd(), linux.POLL.IN);
-                self.wake_armed = true;
+        if (self.rx().wake) |w| {
+            if (!self.rx().wake_armed) {
+                try self.rx().ring.submitPollAdd(wake_token, w.fd(), linux.POLL.IN);
+                self.rx().wake_armed = true;
             }
         }
     }
@@ -1465,30 +1505,30 @@ pub const LinuxServer = struct {
     /// Wake this reactor from any thread: the in-flight wake poll completes, the
     /// loop runs, and (once the multi-reactor model lands) drains its mailbox.
     pub fn wakeReactor(self: *LinuxServer) void {
-        if (self.wake) |*w| w.wake();
+        if (self.rx().wake) |*w| w.wake();
     }
 
     /// Handle the wake-fd poll completion: drain the eventfd, mark the poll
     /// consumed (re-armed next `runOnce`), and record the wake.
     fn onWakePoll(self: *LinuxServer) void {
-        self.wake_armed = false;
-        if (self.wake) |*w| w.drain();
-        _ = self.wake_count.fetchAdd(1, .monotonic);
+        self.rx().wake_armed = false;
+        if (self.rx().wake) |*w| w.drain();
+        _ = self.rx().wake_count.fetchAdd(1, .monotonic);
         // (multi-reactor: drain this shard's cross-shard mailbox here.)
     }
 
     /// Keep exactly one periodic timeout-sweep timer in flight.
     fn armTimer(self: *LinuxServer) !void {
-        if (self.timer_armed) return;
+        if (self.rx().timer_armed) return;
         const ns = self.config.sweep_interval_ms * std.time.ns_per_ms;
         const ts: linux.kernel_timespec = .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) };
-        try self.ring.submitTimeout(timer_token, &ts);
-        self.timer_armed = true;
+        try self.rx().ring.submitTimeout(timer_token, &ts);
+        self.rx().timer_armed = true;
     }
 
     /// Fired when the periodic timer elapses: run the timeout sweep and re-arm.
     fn onTimerTick(self: *LinuxServer) void {
-        self.timer_armed = false;
+        self.rx().timer_armed = false;
         self.sweepTimeouts();
     }
 
@@ -1500,7 +1540,7 @@ pub const LinuxServer = struct {
         const reg_deadline = self.config.registration_timeout_ms;
         const ping_interval = self.config.ping_interval_ms;
         const ping_grace = self.config.ping_timeout_ms;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             if (c.closing) continue; // already tearing down
@@ -1568,13 +1608,13 @@ pub const LinuxServer = struct {
     }
 
     pub fn s2sBoundPort(self: *LinuxServer) !u16 {
-        if (self.s2s_listener_fd < 0) return error.Unsupported;
-        return socketPort(self.s2s_listener_fd);
+        if (self.rx().s2s_listener_fd < 0) return error.Unsupported;
+        return socketPort(self.rx().s2s_listener_fd);
     }
 
     pub fn tlsBoundPort(self: *LinuxServer) !u16 {
-        if (self.tls_listener_fd < 0) return error.Unsupported;
-        return socketPort(self.tls_listener_fd);
+        if (self.rx().tls_listener_fd < 0) return error.Unsupported;
+        return socketPort(self.rx().tls_listener_fd);
     }
 
     /// Process at least one io_uring completion. Callers may loop this until
@@ -1583,18 +1623,18 @@ pub const LinuxServer = struct {
         try self.armAccept();
         self.armWake() catch {}; // cross-reactor wake poll; non-fatal if it can't arm
         self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
-        _ = try self.ring.submitAndWait(1);
+        _ = try self.rx().ring.submitAndWait(1);
 
         var handler = CompletionHandler{ .server = self };
         var cqes: [ringlane.default_cqe_batch]linux.io_uring_cqe = undefined;
-        _ = try self.ring.reapCompletions(&cqes, 0, &handler);
+        _ = try self.rx().ring.reapCompletions(&cqes, 0, &handler);
         if (handler.err) |err| return err;
 
-        _ = try self.ring.submit();
+        _ = try self.rx().ring.submit();
     }
 
     pub fn boundPort(self: *LinuxServer) !u16 {
-        return socketPort(self.listener_fd);
+        return socketPort(self.rx().listener_fd);
     }
 
     /// Run the reactor loop on the calling thread until `run` is cleared. Wakes
@@ -1613,11 +1653,11 @@ pub const LinuxServer = struct {
         const is_tls = event.token.slot == tls_listener_token.slot;
         if (!event.more) {
             if (is_s2s) {
-                self.s2s_accept_armed = false;
+                self.rx().s2s_accept_armed = false;
             } else if (is_tls) {
-                self.tls_accept_armed = false;
+                self.rx().tls_accept_armed = false;
             } else {
-                self.accept_armed = false;
+                self.rx().accept_armed = false;
             }
         }
         if (event.res < 0) return error.BadCompletion;
@@ -1627,16 +1667,16 @@ pub const LinuxServer = struct {
 
         // Refuse past the reserved cap: alloc beyond capacity would realloc the
         // slot array and move ConnState buffers out from under in-flight I/O.
-        if (self.clients.len() >= self.config.max_clients) {
+        if (self.rx().clients.len() >= self.config.max_clients) {
             closeFd(fd);
             return;
         }
 
-        const id = try self.clients.alloc(ConnState.init(fd));
+        const id = try self.rx().clients.alloc(ConnState.init(fd));
         // Free the slot on any later failure so a half-set-up accept never leaves
         // an occupied slot (which deinit would then try to tear down).
-        errdefer _ = self.clients.free(id);
-        const conn = self.clients.get(id).?;
+        errdefer _ = self.rx().clients.free(id);
+        const conn = self.rx().clients.get(id).?;
         conn.token = try tokenFromId(id);
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
@@ -1657,7 +1697,7 @@ pub const LinuxServer = struct {
                 link.clearOutbound();
             }
             try self.armSendIfNeeded(conn);
-            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             self.stats.onS2sAccept();
             self.traceLog(.info, .s2s, "s2s secured peer accepted");
             return;
@@ -1680,7 +1720,7 @@ pub const LinuxServer = struct {
             // Clear the dangling pointer before the slot is freed if submitRecv
             // fails, so deinit can never observe a freed link.
             errdefer conn.s2s = null;
-            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             self.stats.onS2sAccept();
             self.traceLog(.info, .s2s, "s2s peer accepted");
             return;
@@ -1712,7 +1752,7 @@ pub const LinuxServer = struct {
             }
             if (refuse) {
                 closeFd(conn.fd);
-                _ = self.clients.free(id);
+                _ = self.rx().clients.free(id);
                 self.stats.onAccept();
                 return;
             }
@@ -1726,7 +1766,7 @@ pub const LinuxServer = struct {
             }) catch {
                 self.allocator.destroy(tls);
                 closeFd(conn.fd);
-                _ = self.clients.free(id);
+                _ = self.rx().clients.free(id);
                 self.stats.onAccept();
                 return;
             };
@@ -1737,7 +1777,7 @@ pub const LinuxServer = struct {
             conn.tls = tls;
             conn.is_tls = true;
             self.injectSessionState(conn);
-            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             self.stats.onAccept();
             self.traceLog(.info, .net, "tls client accepted");
             return;
@@ -1796,7 +1836,7 @@ pub const LinuxServer = struct {
         // Make the injected SASL verifiers available before the client can send
         // AUTHENTICATE (during CAP negotiation, pre-registration).
         self.injectSessionState(conn);
-        try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
         self.stats.onAccept();
         self.traceLog(.info, .net, "client accepted");
     }
@@ -1985,7 +2025,7 @@ pub const LinuxServer = struct {
         if (conn.s2s_secured) |_| {
             // Secured initiator: just listen — the responder sends its prekey
             // preamble first, which drives the handshake on recv.
-            try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             return;
         }
         const link = conn.s2s orelse return;
@@ -2003,7 +2043,7 @@ pub const LinuxServer = struct {
             link.clearOutbound();
         }
         try self.armSendIfNeeded(conn);
-        try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+        try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
     }
 
     pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
@@ -2028,7 +2068,7 @@ pub const LinuxServer = struct {
             }
             try self.armSendIfNeeded(conn);
             if (!conn.closing) {
-                try self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+                try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             }
         }
         if (conn.closing and !conn.send_armed and conn.send_len == conn.send_offset) {
@@ -2058,7 +2098,7 @@ pub const LinuxServer = struct {
     }
 
     fn deliver(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) !void {
-        const conn = self.clients.get(id) orelse return error.ClientNotFound;
+        const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
         try appendToConn(conn, bytes);
         try self.armSendIfNeeded(conn);
@@ -2068,7 +2108,7 @@ pub const LinuxServer = struct {
     /// server-time `tag` for recipients that negotiated the server-time cap.
     /// `tag` is precomputed once per event so all recipients share a timestamp.
     fn deliverTimed(self: *LinuxServer, id: client_model.ClientId, tag: []const u8, bytes: []const u8) !void {
-        const conn = self.clients.get(id) orelse return error.ClientNotFound;
+        const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
         if (tag.len != 0 and conn.session.hasCap(.server_time)) {
             try appendToConn(conn, tag);
@@ -2096,7 +2136,7 @@ pub const LinuxServer = struct {
     /// recipient: `@time=…;account=… ` including only the tags whose caps the
     /// recipient negotiated. Used by the PRIVMSG/NOTICE/TAGMSG paths.
     fn deliverTagged(self: *LinuxServer, id: client_model.ClientId, tags: MsgTags, bytes: []const u8) !void {
-        const conn = self.clients.get(id) orelse return error.ClientNotFound;
+        const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
         // Sized for the full @-segment: server-time + account + msgid + relayed
         // client-only tags.
@@ -2180,7 +2220,7 @@ pub const LinuxServer = struct {
     /// scope when a targeted route is not yet known).
     fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage, scope: RelayScope) usize {
         var sent: usize = 0;
-        for (self.clients.slots.items) |*slot| {
+        for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             const c = &slot.value;
             if (c.s2s_secured) |link| {
@@ -2215,7 +2255,7 @@ pub const LinuxServer = struct {
     /// True if any S2S peer link (secured or plaintext) is established — used to
     /// decide whether an unknown-local nick might be reachable across the mesh.
     fn hasEstablishedPeer(self: *LinuxServer) bool {
-        for (self.clients.slots.items) |*slot| {
+        for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             if (slot.value.s2s_secured) |l| {
                 if (l.established()) return true;
@@ -2272,12 +2312,12 @@ pub const LinuxServer = struct {
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
         if (conn.send_armed) return;
         if (conn.send_offset >= conn.send_len) return;
-        try self.ring.submitSend(conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]);
+        try self.rx().ring.submitSend(conn.token, conn.fd, conn.send_buf[conn.send_offset..conn.send_len]);
         conn.send_armed = true;
     }
 
     fn connForToken(self: *LinuxServer, token: RingFdToken) ServerError!*ConnState {
-        return self.clients.get(idFromToken(token)) orelse error.ClientNotFound;
+        return self.rx().clients.get(idFromToken(token)) orelse error.ClientNotFound;
     }
 
     /// Apply server-injected per-session state on a freshly accepted client
@@ -2307,7 +2347,7 @@ pub const LinuxServer = struct {
 
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
-        if (self.clients.get(id)) |conn| {
+        if (self.rx().clients.get(id)) |conn| {
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
                 self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
@@ -2315,7 +2355,7 @@ pub const LinuxServer = struct {
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
                 closeFd(conn.fd);
-                _ = self.clients.free(id);
+                _ = self.rx().clients.free(id);
                 self.stats.onClose(true);
                 return;
             }
@@ -2325,7 +2365,7 @@ pub const LinuxServer = struct {
                 self.allocator.destroy(link);
                 conn.s2s = null;
                 closeFd(conn.fd);
-                _ = self.clients.free(id);
+                _ = self.rx().clients.free(id);
                 self.stats.onClose(true);
                 return;
             }
@@ -2369,7 +2409,7 @@ pub const LinuxServer = struct {
             _ = self.observe.clear(monitorIdFromClient(id));
             try self.broadcastQuit(id, conn, reason);
             closeFd(conn.fd);
-            _ = self.clients.free(id);
+            _ = self.rx().clients.free(id);
         }
     }
 
@@ -2714,7 +2754,7 @@ pub const LinuxServer = struct {
 
             var members = self.world.memberIterator(cv.name) orelse continue;
             while (members.next()) |member| {
-                const mc = self.clients.get(clientIdFromWorld(member.*)) orelse continue;
+                const mc = self.rx().clients.get(clientIdFromWorld(member.*)) orelse continue;
                 if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
                 appendToConn(mc, batch) catch continue;
                 self.armSendIfNeeded(mc) catch {};
@@ -2731,7 +2771,7 @@ pub const LinuxServer = struct {
         while (cit.next()) |cv| {
             var members = self.world.memberIterator(cv.name) orelse continue;
             while (members.next()) |member| {
-                const mconn = self.clients.get(clientIdFromWorld(member.*)) orelse continue;
+                const mconn = self.rx().clients.get(clientIdFromWorld(member.*)) orelse continue;
                 if (mconn.s2s != null or mconn.s2s_secured != null) continue; // skip peer links
                 const nick = mconn.session.displayName();
                 const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
@@ -2753,7 +2793,7 @@ pub const LinuxServer = struct {
 
     fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        for (self.clients.slots.items) |*slot| {
+        for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             if (slot.value.s2s_secured) |link| {
                 if (!link.established()) continue;
@@ -2839,7 +2879,7 @@ pub const LinuxServer = struct {
                 if (!is_self and !auditorium.shouldRelayJoinPart(mrank)) continue;
             }
             const mid = clientIdFromWorld(member.*);
-            const mconn = self.clients.get(mid) orelse continue;
+            const mconn = self.rx().clients.get(mid) orelse continue;
             const body = if (mconn.session.hasCap(.extended_join)) ext else plain;
             try self.deliverTimed(mid, tag, body);
         }
@@ -3135,7 +3175,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
-        const tconn = self.clients.get(clientIdFromWorld(twid)) orelse {
+        const tconn = self.rx().clients.get(clientIdFromWorld(twid)) orelse {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
@@ -3638,13 +3678,13 @@ pub const LinuxServer = struct {
             var it = self.world.memberIterator(target) orelse return;
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
-                const mconn = self.clients.get(clientIdFromWorld(member.*));
+                const mconn = self.rx().clients.get(clientIdFromWorld(member.*));
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
                 try self.emitWhoxRow(conn, req, requester, target, nick, usernameOf(self, member.*), mconn, hp);
             }
         } else if (self.world.findNick(target)) |wid| {
             // Nick target: a single 354 row, no channel context (channel "*").
-            const mconn = self.clients.get(clientIdFromWorld(wid));
+            const mconn = self.rx().clients.get(clientIdFromWorld(wid));
             try self.emitWhoxRow(conn, req, requester, "*", target, usernameOf(self, wid), mconn, 0);
         }
         var endbuf: [default_reply_bytes]u8 = undefined;
@@ -3724,7 +3764,7 @@ pub const LinuxServer = struct {
             var it = self.world.memberIterator(target) orelse return;
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
-                const mconn = self.clients.get(clientIdFromWorld(member.*));
+                const mconn = self.rx().clients.get(clientIdFromWorld(member.*));
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
                 const ctx = who.ReplyContext{
                     .server_name = server_name,
@@ -3745,7 +3785,7 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, "\r\n");
             }
         } else if (self.world.findNick(target)) |wid| {
-            const mconn = self.clients.get(clientIdFromWorld(wid));
+            const mconn = self.rx().clients.get(clientIdFromWorld(wid));
             const ctx = who.ReplyContext{
                 .server_name = server_name,
                 .requester = requester,
@@ -3837,7 +3877,7 @@ pub const LinuxServer = struct {
         var sink = whois.WhoisLineSink{ .lines = &lines_buf, .storage = &storage };
 
         const target_wid = self.world.findNick(target_nick);
-        const target_conn: ?*ConnState = if (target_wid) |w| self.clients.get(clientIdFromWorld(w)) else null;
+        const target_conn: ?*ConnState = if (target_wid) |w| self.rx().clients.get(clientIdFromWorld(w)) else null;
         if (target_wid == null or target_conn == null) {
             whois.writeNoSuchNick(&sink, server_name, conn.session.displayName(), target_nick) catch return;
             for (sink.slice()) |line| try appendToConn(conn, line.bytes);
@@ -3941,7 +3981,7 @@ pub const LinuxServer = struct {
         while (members.next()) |member| {
             const mid = clientIdFromWorld(member.*);
             if (mid.eql(id)) continue;
-            const mconn = self.clients.get(mid) orelse continue;
+            const mconn = self.rx().clients.get(mid) orelse continue;
             if (!mconn.session.hasCap(.invite_notify)) continue;
             try self.deliver(mid, notif);
         }
@@ -4000,7 +4040,7 @@ pub const LinuxServer = struct {
             return;
         }
         var closed: usize = 0;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             if (c.closing) continue;
@@ -4032,7 +4072,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
-        const tconn = self.clients.get(clientIdFromWorld(target_wid)) orelse {
+        const tconn = self.rx().clients.get(clientIdFromWorld(target_wid)) orelse {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
@@ -4125,7 +4165,7 @@ pub const LinuxServer = struct {
             const mm = self.world.memberModes(channel, member.*) orelse continue;
             if (!mm.isOperator()) continue;
             const op_id = clientIdFromWorld(member.*);
-            const opconn = self.clients.get(op_id) orelse continue;
+            const opconn = self.rx().clients.get(op_id) orelse continue;
             try queueNumeric(opconn, .RPL_KNOCK, &.{ channel, mask }, reason);
             try self.armSendIfNeeded(opconn);
         }
@@ -4185,7 +4225,7 @@ pub const LinuxServer = struct {
         var members = self.world.memberIterator(new) orelse return;
         while (members.next()) |member| {
             const mid = clientIdFromWorld(member.*);
-            const mconn = self.clients.get(mid) orelse continue;
+            const mconn = self.rx().clients.get(mid) orelse continue;
             if (mconn.session.hasCap(.channel_rename)) {
                 self.deliver(mid, rline) catch {};
             } else {
@@ -4220,7 +4260,7 @@ pub const LinuxServer = struct {
     /// that connection's send (replies may target clients other than the caller).
     fn flushMonitorReplies(self: *LinuxServer, sink: *const monitor.MonitorReplySink) !void {
         for (sink.slice()) |reply| {
-            const wconn = self.clients.get(clientIdFromMonitor(reply.client)) orelse continue;
+            const wconn = self.rx().clients.get(clientIdFromMonitor(reply.client)) orelse continue;
             const trailing = if (reply.targets.len != 0) reply.targets else reply.text;
             try queueNumeric(wconn, monitorNumeric(reply.numeric), &.{}, trailing);
             try self.armSendIfNeeded(wconn);
@@ -4747,7 +4787,7 @@ pub const LinuxServer = struct {
             return;
         };
         var sent: u32 = 0;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             if (!c.session.registered()) continue;
@@ -4923,7 +4963,7 @@ pub const LinuxServer = struct {
         for (parsed.paramSlice()) |nick| {
             if (n >= targets.len) break;
             const wid = self.world.findNick(nick) orelse continue;
-            const c = self.clients.get(clientIdFromWorld(wid));
+            const c = self.rx().clients.get(clientIdFromWorld(wid));
             targets[n] = .{
                 .nick = nick,
                 .oper = if (c) |cc| cc.session.isOper() else false,
@@ -4979,7 +5019,7 @@ pub const LinuxServer = struct {
         }
         var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
         defer pieces.deinit(self.allocator);
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |e| {
             if (!e.value.session.registered()) continue;
             // Don't carry the requesting oper's own connection: it issued UPGRADE
@@ -5028,17 +5068,17 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} session(s) sealed; re-exec preserving listener", .{prepared.capsule_count}) catch "UPGRADE: re-exec");
 
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
-        _ = linux.fcntl(self.listener_fd, posix.F.SETFD, 0);
+        _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
         _ = linux.fcntl(arena.fd, posix.F.SETFD, 0);
-        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, "/proc/self/exe", arena.fd, self.listener_fd) catch |e| {
-            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, "/proc/self/exe", arena.fd, self.rx().listener_fd) catch |e| {
+            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer plan.deinit(self.allocator);
         plan.commit(self.allocator) catch |e| {
-            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
@@ -5076,17 +5116,17 @@ pub const LinuxServer = struct {
     /// Re-attach one carried-over client: take ownership of its inherited socket
     /// fd, restore its session, and arm recv. Returns true on success.
     fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot) bool {
-        if (self.clients.len() >= self.config.max_clients) {
+        if (self.rx().clients.len() >= self.config.max_clients) {
             closeFd(snap.fd);
             return false;
         }
-        const id = self.clients.alloc(ConnState.init(snap.fd)) catch {
+        const id = self.rx().clients.alloc(ConnState.init(snap.fd)) catch {
             closeFd(snap.fd);
             return false;
         };
-        const conn = self.clients.get(id).?;
+        const conn = self.rx().clients.get(id).?;
         conn.token = tokenFromId(id) catch {
-            _ = self.clients.free(id);
+            _ = self.rx().clients.free(id);
             closeFd(snap.fd);
             return false;
         };
@@ -5106,9 +5146,9 @@ pub const LinuxServer = struct {
         while (cit.next()) |ch| {
             self.world.restoreMember(ch.name, worldIdFromClient(id), .{ .bits = ch.modes }) catch {};
         }
-        self.ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
+        self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
             self.world.removeClient(worldIdFromClient(id));
-            _ = self.clients.free(id);
+            _ = self.rx().clients.free(id);
             closeFd(snap.fd);
             return false;
         };
@@ -5118,16 +5158,16 @@ pub const LinuxServer = struct {
     /// Listener-only upgrade fallback: re-exec preserving just the listening
     /// socket (no state arena). Caller has already done the oper/linux checks.
     fn upgradeListenerOnly(self: *LinuxServer, conn: *ConnState) !void {
-        _ = linux.fcntl(self.listener_fd, posix.F.SETFD, 0);
-        var plan = helix_live.buildListenerExecPlan(self.allocator, "/proc/self/exe", self.listener_fd) catch |e| {
-            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+        _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
+        var plan = helix_live.buildListenerExecPlan(self.allocator, "/proc/self/exe", self.rx().listener_fd) catch |e| {
+            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer plan.deinit(self.allocator);
         plan.commit(self.allocator) catch |e| {
-            _ = linux.fcntl(self.listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
@@ -5143,7 +5183,7 @@ pub const LinuxServer = struct {
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
         const ctx = trace.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |e| {
             if (!e.value.session.registered()) continue;
             const entry = trace.TraceEntry{ .user = .{ .class = "users", .nick = e.value.session.displayName(), .ip = default_host, .connected_seconds = 0, .idle_seconds = 0 } };
@@ -5161,7 +5201,7 @@ pub const LinuxServer = struct {
             return;
         }
         var buf: [default_reply_bytes]u8 = undefined;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |e| {
             const c = e.value;
             if (!c.session.registered()) continue;
@@ -5209,7 +5249,7 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "CONNECT: illegal port number");
             return;
         };
-        if (self.clients.len() >= self.config.max_clients) {
+        if (self.rx().clients.len() >= self.config.max_clients) {
             try self.noticeTo(conn, "CONNECT refused: connection table full");
             return;
         }
@@ -5223,9 +5263,9 @@ pub const LinuxServer = struct {
             closeFd(fd);
             return;
         };
-        const id = try self.clients.alloc(ConnState.init(fd));
-        errdefer _ = self.clients.free(id);
-        const peer = self.clients.get(id).?;
+        const id = try self.rx().clients.alloc(ConnState.init(fd));
+        errdefer _ = self.rx().clients.free(id);
+        const peer = self.rx().clients.get(id).?;
         peer.token = try tokenFromId(id);
         peer.s2s_connect_addr = addr;
 
@@ -5239,7 +5279,7 @@ pub const LinuxServer = struct {
             }
             peer.s2s_secured = link;
             errdefer peer.s2s_secured = null;
-            try self.ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
+            try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
             try self.noticeTo(conn, "CONNECT initiated (secured)");
             return;
         }
@@ -5257,7 +5297,7 @@ pub const LinuxServer = struct {
         peer.s2s = link;
         errdefer peer.s2s = null;
 
-        try self.ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
+        try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
         try self.noticeTo(conn, "CONNECT initiated");
     }
 
@@ -5275,7 +5315,7 @@ pub const LinuxServer = struct {
         const target = parsed.paramSlice()[0];
         // Find the matching peer first, then close it (don't free a slot mid-iter).
         var victim: ?RingFdToken = null;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const link = entry.value.s2s orelse continue;
             if (std.ascii.eqlIgnoreCase(link.remoteName(), target)) {
@@ -5358,7 +5398,7 @@ pub const LinuxServer = struct {
         }
         const mask = parsed.paramSlice()[0];
         var matched: u64 = 0;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             if (!c.session.registered()) continue;
@@ -5535,7 +5575,7 @@ pub const LinuxServer = struct {
     /// the subject for this action. Best-effort; delivery failures are ignored.
     fn notifyObservers(self: *LinuxServer, action: observe_mod.Action, subject: observe_mod.Subject) void {
         if (self.observe.count() == 0) return;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!entry.value.session.isOper()) continue;
             const filter = self.observe.get(observeKey(entry.value)) orelse continue;
@@ -5582,7 +5622,7 @@ pub const LinuxServer = struct {
         } else |_| {}
         // Immediate snapshot: enumerate the currently-matching population so the
         // operator gets present state, not only future transitions.
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!entry.value.session.registered()) continue;
             const subj = observeSubject(entry.value, "present");
@@ -6177,9 +6217,9 @@ pub const LinuxServer = struct {
 
     /// LUSERS — network/user counters (251-255, 265/266).
     pub fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
-        const clients: u64 = @intCast(self.clients.len());
+        const clients: u64 = @intCast(self.rx().clients.len());
         var opers: u64 = 0;
-        var oit = self.clients.iterator();
+        var oit = self.rx().clients.iterator();
         while (oit.next()) |entry| {
             if (entry.value.session.isOper()) opers += 1;
         }
@@ -6699,7 +6739,7 @@ pub const LinuxServer = struct {
         };
         var buf: [default_reply_bytes]u8 = undefined;
         if (self.world.findNick(target)) |wid| {
-            if (self.clients.get(clientIdFromWorld(wid))) |victim| {
+            if (self.rx().clients.get(clientIdFromWorld(wid))) |victim| {
                 if (!victim.closing) {
                     const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Ghosted by {s}\r\n", .{ server_name, conn.session.displayName() }) catch return;
                     appendToConn(victim, ln) catch {};
@@ -7860,7 +7900,7 @@ pub const LinuxServer = struct {
 
     /// Apply `new_host` to every online session of `account` (CHGHOST fan-out).
     fn applyVhostToAccount(self: *LinuxServer, account: []const u8, new_host: []const u8) void {
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             const acct = c.session.account() orelse continue;
@@ -7908,7 +7948,7 @@ pub const LinuxServer = struct {
         };
         var line_buf: [default_reply_bytes]u8 = undefined;
         const line = event_spine.renderOperNote(.{ .server_name = server_name, .event = event }, &line_buf) catch return;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (entry.value.session.subscribesTo(category)) try self.deliver(entry.id, line);
         }
@@ -7994,7 +8034,7 @@ pub const LinuxServer = struct {
     pub fn handleUsers(self: *LinuxServer, conn: *ConnState) !void {
         try queueNumeric(conn, .RPL_USERSSTART, &.{}, "UserID   Terminal  Host");
         var any = false;
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!entry.value.session.registered()) continue;
             any = true;
@@ -8017,7 +8057,7 @@ pub const LinuxServer = struct {
         const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Mizuchi IRC daemon"}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ server_name, server_name }, detail);
         // Reflect each established S2S peer as a 1-hop neighbour.
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const link = entry.value.s2s orelse continue;
             if (!link.established()) continue;
@@ -8035,11 +8075,11 @@ pub const LinuxServer = struct {
         var line_buf: [160]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "{s} [Users: {d}]", .{
             server_name,
-            self.clients.len(),
+            self.rx().clients.len(),
         }) catch return;
         try queueNumeric(conn, .RPL_MAP, &.{}, detail);
         // Established S2S peers as child nodes of this server.
-        var it = self.clients.iterator();
+        var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const link = entry.value.s2s orelse continue;
             if (!link.established() or link.remoteName().len == 0) continue;
@@ -8095,7 +8135,7 @@ pub const LinuxServer = struct {
                 const key = @as(u64, @bitCast(mid));
                 if (seen.contains(key)) continue;
                 seen.put(key, {}) catch {};
-                const mconn = self.clients.get(mid) orelse continue;
+                const mconn = self.rx().clients.get(mid) orelse continue;
                 if (cap) |c| {
                     if (!mconn.session.hasCap(c)) continue;
                 }
@@ -8112,7 +8152,7 @@ pub const LinuxServer = struct {
                 const wid = clientIdFromMonitor(w);
                 if (wid.eql(except)) continue;
                 if (seen.contains(@as(u64, @bitCast(wid)))) continue;
-                const wconn = self.clients.get(wid) orelse continue;
+                const wconn = self.rx().clients.get(wid) orelse continue;
                 if (!wconn.session.hasCap(.extended_monitor)) continue;
                 try self.deliver(wid, msg);
             }
@@ -8147,7 +8187,7 @@ pub const LinuxServer = struct {
             while (members.next()) |member| {
                 const mid = clientIdFromWorld(member.*);
                 if (mid.eql(id) and !echo) continue;
-                const mconn = self.clients.get(mid) orelse continue;
+                const mconn = self.rx().clients.get(mid) orelse continue;
                 if (!mconn.session.hasCap(.message_tags)) continue;
                 try self.deliver(mid, msg);
             }
@@ -8159,7 +8199,7 @@ pub const LinuxServer = struct {
             return;
         }
         const recipient = self.world.findNick(target) orelse return;
-        const rconn = self.clients.get(clientIdFromWorld(recipient)) orelse return;
+        const rconn = self.rx().clients.get(clientIdFromWorld(recipient)) orelse return;
         if (rconn.session.hasCap(.message_tags)) try self.deliver(clientIdFromWorld(recipient), msg);
         if (echo) try self.deliver(id, msg);
     }
@@ -8619,7 +8659,7 @@ pub const LinuxServer = struct {
         // +R regonly-pm: the recipient rejects PMs/notices from unauthenticated
         // senders. Logged-in senders and opers always pass.
         if (conn.session.account() == null and !conn.session.isOper()) {
-            if (self.clients.get(clientIdFromWorld(recipient))) |rconn| {
+            if (self.rx().clients.get(clientIdFromWorld(recipient))) |rconn| {
                 if (rconn.session.umodes.contains(.regonly_pm)) {
                     if (!is_notice) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{target}, "Cannot message this user (+R: identify to a registered account)");
                     return;
@@ -8641,7 +8681,7 @@ pub const LinuxServer = struct {
         // RFC 1459: a PRIVMSG (not NOTICE) to an away user returns RPL_AWAY so
         // the sender sees the auto-reply. NOTICE never auto-responds.
         if (std.ascii.eqlIgnoreCase(command, "PRIVMSG")) {
-            if (self.clients.get(clientIdFromWorld(recipient))) |rconn| {
+            if (self.rx().clients.get(clientIdFromWorld(recipient))) |rconn| {
                 if (rconn.session.awayMessage()) |reason| {
                     try queueNumeric(conn, .RPL_AWAY, &.{target}, reason);
                 }
@@ -8776,7 +8816,7 @@ pub const LinuxServer = struct {
         // peers for this channel. Deduped against already-listed nicks; the stored
         // u4 status IS the MemberModes bitset, so prefixes/auditorium rank apply
         // uniformly. Host is the origin server name (placeholder user).
-        for (self.clients.slots.items) |*slot| {
+        for (self.rx().clients.slots.items) |*slot| {
             if (count >= max_members) break;
             if (!slot.occupied) continue;
             if (slot.value.s2s_secured) |link| {
@@ -8902,7 +8942,7 @@ fn worldIdFromClient(id: client_model.ClientId) world_model.ClientId {
 
 /// The USER-supplied username of the member behind a world client id, or "user".
 fn usernameOf(self: *LinuxServer, world_id: world_model.ClientId) []const u8 {
-    if (self.clients.get(clientIdFromWorld(world_id))) |c| return c.session.username();
+    if (self.rx().clients.get(clientIdFromWorld(world_id))) |c| return c.session.username();
     return "user";
 }
 
@@ -10246,7 +10286,7 @@ test "threaded server: external wakeReactor drives the running reactor loop" {
         else => return err,
     };
     defer server.deinit();
-    if (server.wake == null) return error.SkipZigTest; // eventfd unavailable
+    if (server.rx().wake == null) return error.SkipZigTest; // eventfd unavailable
     const plain_port = try server.boundPort();
 
     var run = std.atomic.Value(bool).init(true);
@@ -10261,11 +10301,11 @@ test "threaded server: external wakeReactor drives the running reactor loop" {
     // completes, the loop runs, and onWakePoll bumps the counter.
     server.wakeReactor();
     var spins: usize = 0;
-    while (server.wake_count.load(.monotonic) == 0) : (spins += 1) {
+    while (server.rx().wake_count.load(.monotonic) == 0) : (spins += 1) {
         if (spins > 5_000_000) return error.TestUnexpectedResult;
         std.Thread.yield() catch {};
     }
-    try std.testing.expect(server.wake_count.load(.monotonic) >= 1);
+    try std.testing.expect(server.rx().wake_count.load(.monotonic) >= 1);
 }
 
 test "ring: poll op fires a completion when a watched eventfd becomes readable" {
