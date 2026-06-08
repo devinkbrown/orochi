@@ -3301,38 +3301,67 @@ pub const LinuxServer = struct {
                 const nick = self.world.nickOf(member.*) orelse continue;
                 const mconn = self.clients.get(clientIdFromWorld(member.*));
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
-                var flags_buf: [4]u8 = undefined;
-                var fl: usize = 0;
-                flags_buf[fl] = if (mconn != null and mconn.?.session.awayMessage() != null) 'G' else 'H';
-                fl += 1;
-                if (hp != 0) {
-                    flags_buf[fl] = hp;
-                    fl += 1;
-                }
-                const ctx = whox.ReplyContext{
-                    .server_name = server_name,
-                    .requester = requester,
-                    .request = req,
-                    .member = .{
-                        .channel = target,
-                        .user = usernameOf(self, member.*),
-                        .host = default_host,
-                        .server = server_name,
-                        .nick = nick,
-                        .flags = flags_buf[0..fl],
-                        .account = if (mconn) |c| (c.session.account() orelse "0") else "0",
-                        .realname = if (mconn) |c| c.session.realname() else nick,
-                    },
-                };
-                const line = whox.buildReply(self.allocator, ctx) catch continue;
-                defer self.allocator.free(line);
-                try appendToConn(conn, line);
+                try self.emitWhoxRow(conn, req, requester, target, nick, usernameOf(self, member.*), mconn, hp);
             }
+        } else if (self.world.findNick(target)) |wid| {
+            // Nick target: a single 354 row, no channel context (channel "*").
+            const mconn = self.clients.get(clientIdFromWorld(wid));
+            try self.emitWhoxRow(conn, req, requester, "*", target, usernameOf(self, wid), mconn, 0);
         }
         var endbuf: [default_reply_bytes]u8 = undefined;
         const end = who.writeEndOfWho(&endbuf, server_name, requester, target) catch return;
         try appendToConn(conn, end);
         try appendToConn(conn, "\r\n");
+    }
+
+    /// Emit one RPL_WHOSPCRPL (354) row. Flags are `<H|G>[*][<prefix>]`: away,
+    /// then oper, then the highest channel prefix (channel targets only).
+    fn emitWhoxRow(
+        self: *LinuxServer,
+        conn: *ConnState,
+        req: whox.Request,
+        requester: []const u8,
+        channel: []const u8,
+        nick: []const u8,
+        username: []const u8,
+        mconn: ?*ConnState,
+        prefix: u8,
+    ) !void {
+        var flags_buf: [6]u8 = undefined;
+        var fl: usize = 0;
+        flags_buf[fl] = if (mconn != null and mconn.?.session.awayMessage() != null) 'G' else 'H';
+        fl += 1;
+        if (mconn != null and mconn.?.session.isOper()) {
+            flags_buf[fl] = '*';
+            fl += 1;
+        }
+        if (prefix != 0) {
+            flags_buf[fl] = prefix;
+            fl += 1;
+        }
+        const idle: u32 = if (mconn) |c|
+            @intCast(@max(0, @divTrunc(self.nowMs() - c.last_activity_ms, 1000)))
+        else
+            0;
+        const ctx = whox.ReplyContext{
+            .server_name = server_name,
+            .requester = requester,
+            .request = req,
+            .member = .{
+                .channel = channel,
+                .user = username,
+                .host = default_host,
+                .server = server_name,
+                .nick = nick,
+                .flags = flags_buf[0..fl],
+                .idle_seconds = idle,
+                .account = if (mconn) |c| (c.session.account() orelse "0") else "0",
+                .realname = if (mconn) |c| c.session.realname() else nick,
+            },
+        };
+        const line = whox.buildReply(self.allocator, ctx) catch return;
+        defer self.allocator.free(line);
+        try appendToConn(conn, line);
     }
 
     pub fn handleWho(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
