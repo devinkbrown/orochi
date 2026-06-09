@@ -17,6 +17,7 @@ const wasm_bridge = @import("../wasm/host/bridge.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const tiered_keys = @import("tiered_keys.zig");
+const svc_akick = @import("svc_akick.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
 const sdp = @import("../proto/sdp.zig");
@@ -1198,6 +1199,8 @@ pub const LinuxServer = struct {
     metadata: metadata_store.DefaultStore,
     props: ircx_prop_store.DefaultStore,
     access: ircx_access_store.AccessStore,
+    /// Per-channel AKICK (registered auto-kick) list — masks matched on JOIN.
+    chan_akick: svc_akick.AkickStore,
     /// Concurrent-connection clone limiter (per exact IP and per /24|/64 prefix).
     /// Limits come from Config; a zero limit disables that dimension.
     clone_limit: clone_limit_mod.CloneLimiter,
@@ -1400,6 +1403,7 @@ pub const LinuxServer = struct {
             .metadata = metadata_store.DefaultStore.init(allocator),
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
+            .chan_akick = svc_akick.AkickStore.init(allocator),
             .clone_limit = clone_limit_mod.CloneLimiter.init(allocator, .{
                 .max_per_ip = config.max_clones_per_ip,
                 .max_per_net = config.max_clones_per_net,
@@ -1506,6 +1510,7 @@ pub const LinuxServer = struct {
         self.metadata.deinit();
         self.props.deinit();
         self.access.deinit();
+        self.chan_akick.deinit();
         self.clone_limit.deinit();
         self.reputation.deinit();
         self.accepts.deinit();
@@ -2955,7 +2960,9 @@ pub const LinuxServer = struct {
         // Residual: commands not (yet) owned by a SerpentRegistry module.
         // Everything above has been migrated into src/daemon/modules/* and is
         // dispatched by the registry block at the top of this function.
-        if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
+        if (std.ascii.eqlIgnoreCase(parsed.command, "AKICK")) {
+            try self.handleAkick(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
@@ -3232,6 +3239,14 @@ pub const LinuxServer = struct {
         // Extended-ban context (account/realname/channels + host glob fallthrough).
         var chan_buf: [64][]const u8 = undefined;
         const ban_ctx = banContextFor(self, conn, wid, mask, &chan_buf);
+        // Registered-channel AKICK: a mask/account match is auto-denied entry
+        // (services-style; overrides an invite). Opers bypass.
+        if (!conn.session.isOper()) {
+            if (self.chan_akick.matchOnJoin(channel, mask, conn.session.account(), self.nowMs())) |ak| {
+                if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, ak.reason);
+                return true;
+            }
+        }
         if (!invited) {
             // +b ban (isBannedCtx honors +e exceptions and extended bans) blocks the join.
             if (self.world.isBannedCtx(channel, ban_ctx)) {
@@ -6013,6 +6028,82 @@ pub const LinuxServer = struct {
     /// IRCX per-channel access list (OWNER/HOST/VOICE/GRANT/DENY). Replies are
     /// RPL_ACCESS{ADD 801,DELETE 802,START 803,ENTRY 804,END 805}. All operations
     /// require channel-operator (or oper).
+    /// AKICK <#channel> <ADD|DEL|LIST> [mask] [:reason] — registered-channel
+    /// auto-kick list. ADD/DEL require channel-op (or oper); a matching mask is
+    /// denied entry on JOIN (see the join gate). Real server command, no
+    /// pseudo-client: replies are server NOTICEs + standard numerics.
+    fn handleAkick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        if (p.len < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "Usage: AKICK <#channel> <ADD|DEL|LIST> [mask] [:reason]");
+            return;
+        }
+        const channel = p[0];
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const sub = p[1];
+        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+        const may_manage = conn.session.isOper() or mm.isOperator();
+        const nick = conn.session.displayName();
+
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            if (!may_manage) {
+                try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+                return;
+            }
+            for (self.chan_akick.list(channel)) |e| {
+                var lb: [512]u8 = undefined;
+                const line = std.fmt.bufPrint(&lb, ":" ++ server_name ++ " NOTICE {s} :AKICK {s} {s} :{s}\r\n", .{ nick, channel, e.mask, e.reason }) catch continue;
+                try appendToConn(conn, line);
+            }
+            var eb: [128]u8 = undefined;
+            const endl = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " NOTICE {s} :End of AKICK list for {s}\r\n", .{ nick, channel }) catch return;
+            try appendToConn(conn, endl);
+            return;
+        }
+
+        if (!may_manage) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            if (p.len < 3) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "Usage: AKICK <#channel> ADD <mask> [:reason]");
+                return;
+            }
+            const reason = if (p.len >= 4) p[3] else "Auto-kicked";
+            self.chan_akick.add(channel, p[2], reason, nick, self.nowMs(), null) catch |err| {
+                const msg = switch (err) {
+                    error.Duplicate => "AKICK mask already present",
+                    error.InvalidMask => "Invalid AKICK mask",
+                    error.ListFull => "AKICK list is full",
+                    else => "AKICK add failed",
+                };
+                var nb: [256]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, msg }) catch return;
+                try appendToConn(conn, nl);
+                return;
+            };
+            var nb: [320]u8 = undefined;
+            const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :AKICK added on {s}: {s}\r\n", .{ nick, channel, p[2] }) catch return;
+            try appendToConn(conn, nl);
+        } else if (std.ascii.eqlIgnoreCase(sub, "DEL")) {
+            if (p.len < 3) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "Usage: AKICK <#channel> DEL <mask>");
+                return;
+            }
+            const removed = self.chan_akick.remove(channel, p[2]) == .removed;
+            var nb: [320]u8 = undefined;
+            const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, if (removed) "AKICK removed" else "AKICK mask not found" }) catch return;
+            try appendToConn(conn, nl);
+        } else {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "AKICK subcommand must be ADD, DEL, or LIST");
+        }
+    }
+
     pub fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const req = ircx_access_store.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCESS"}, "Invalid ACCESS");
