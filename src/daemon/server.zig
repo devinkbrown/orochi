@@ -4468,6 +4468,10 @@ pub const LinuxServer = struct {
             // oper (or the user themselves).
             .is_oper = tconn.session.isOper() and !operHidden(tconn, conn),
             .is_admin = tconn.session.isAdmin() and !operHidden(tconn, conn),
+            .oper_title = if (tconn.session.isOper() and !operHidden(tconn, conn) and tconn.session.operTitle().len > 0)
+                tconn.session.operTitle()
+            else
+                null,
             .is_bot = tconn.session.isBot(),
             // RPL_WHOISCERTFP (276): surface the TLS client-cert fingerprint of a
             // mutual-TLS user (the same value SASL EXTERNAL matches to an account).
@@ -7684,7 +7688,7 @@ pub const LinuxServer = struct {
         const grant = registry.elevate(.{ .name = account }) catch return; // not an operator: silent
         // Capture the granted privilege set + class on the session so handlers
         // can gate sensitive actions on specific privileges, not just is_oper.
-        conn.session.setOperGrant(grant.privileges, grant.class_name);
+        conn.session.setOperGrant(grant.privileges, grant.class_name, grant.title);
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
         // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events.
         conn.session.setEventMask(event_spine.CategoryMask.all());

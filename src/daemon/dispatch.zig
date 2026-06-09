@@ -33,6 +33,7 @@ const MAX_UID_BYTES: usize = 16;
 const MAX_REALNAME_BYTES: usize = 256;
 const MAX_ACCOUNT_BYTES: usize = 64;
 const MAX_CLASS_BYTES: usize = 32;
+const MAX_OPER_TITLE_BYTES: usize = 64;
 const MAX_AWAY_BYTES: usize = 256;
 const MAX_HOST_BYTES: usize = 255;
 
@@ -695,6 +696,8 @@ pub const ClientSession = struct {
     /// privileges via `hasPriv`; the registry still gates the coarse oper flag.
     oper_priv: oper.OperPrivileges = .{},
     oper_class_store: FixedString(MAX_CLASS_BYTES) = .{},
+    /// Optional custom operator title (e.g. "Network Guardian"), shown in WHOIS.
+    oper_title_store: FixedString(MAX_OPER_TITLE_BYTES) = .{},
     /// Quarantined by a Warden `quarantine` action: the client stays connected
     /// but may not JOIN channels or send PRIVMSG/NOTICE (network silence / SHUN).
     restricted: bool = false,
@@ -760,11 +763,17 @@ pub const ClientSession = struct {
         return self.oper_class_store.slice();
     }
 
+    /// The custom operator title, or empty when none is configured.
+    pub fn operTitle(self: *const ClientSession) []const u8 {
+        return self.oper_title_store.slice();
+    }
+
     /// Record the operator grant captured at elevation.
-    pub fn setOperGrant(self: *ClientSession, privileges: oper.OperPrivileges, class_name: []const u8) void {
+    pub fn setOperGrant(self: *ClientSession, privileges: oper.OperPrivileges, class_name: []const u8, title: []const u8) void {
         self.is_oper = true;
         self.oper_priv = privileges;
         self.oper_class_store.set(class_name[0..@min(class_name.len, MAX_CLASS_BYTES)]) catch {};
+        self.oper_title_store.set(title[0..@min(title.len, MAX_OPER_TITLE_BYTES)]) catch {};
     }
 
     /// Whether the client is quarantined (Warden quarantine / SHUN): connected

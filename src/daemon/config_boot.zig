@@ -165,6 +165,7 @@ pub fn loadFromText(
             .account_name = o.account,
             .class_name = if (o.class.len != 0) o.class else "operator",
             .privileges = privileges,
+            .title = o.title,
         };
     }
 

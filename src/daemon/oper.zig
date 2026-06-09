@@ -111,6 +111,8 @@ pub const OperBinding = struct {
     account_name: []const u8,
     class_name: []const u8,
     privileges: OperPrivileges,
+    /// Optional custom WHOIS title (e.g. "Network Guardian"). Empty = generic.
+    title: []const u8 = "",
 };
 
 /// Successful operator elevation.
@@ -118,6 +120,7 @@ pub const OperGrant = struct {
     account_name: []const u8,
     class_name: []const u8,
     privileges: OperPrivileges,
+    title: []const u8 = "",
 
     pub fn has(self: OperGrant, privilege: Privilege) bool {
         return self.privileges.has(privilege);
@@ -213,6 +216,7 @@ pub const OperRegistry = struct {
             .account_name = binding.account_name,
             .class_name = binding.class_name,
             .privileges = binding.privileges,
+            .title = binding.title,
         };
     }
 

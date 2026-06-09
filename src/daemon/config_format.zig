@@ -77,6 +77,9 @@ pub const Config = struct {
     pub const Oper = struct {
         account: []const u8 = "",
         class: []const u8 = "",
+        /// Optional custom title shown in WHOIS (e.g. "Network Guardian"). When
+        /// empty the generic operator/administrator wording is used.
+        title: []const u8 = "",
     };
 
     pub const Mesh = struct {
@@ -205,6 +208,7 @@ pub const Config = struct {
         for (self.opers) |oper| {
             allocator.free(oper.account);
             allocator.free(oper.class);
+            allocator.free(oper.title);
         }
         allocator.free(self.opers);
         for (self.oper_groups) |g| {
@@ -334,7 +338,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
                 try resolveStr(allocator, resolver, c)
             else
                 try allocator.dupe(u8, "");
-            try list.append(allocator, .{ .account = account, .class = class });
+            errdefer allocator.free(class);
+            const title = if (item.getString("title")) |t|
+                try resolveStr(allocator, resolver, t)
+            else
+                try allocator.dupe(u8, "");
+            try list.append(allocator, .{ .account = account, .class = class, .title = title });
         }
         cfg.opers = try list.toOwnedSlice(allocator);
     }

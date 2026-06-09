@@ -93,6 +93,9 @@ pub const WhoisSubject = struct {
     /// Network administrator (server_admin privilege): surfaced in the operator
     /// line as "is a Network Administrator" instead of "is an IRC operator".
     is_admin: bool = false,
+    /// Custom operator title (e.g. "Network Guardian"). When set it replaces the
+    /// generic operator/administrator wording in the RPL_WHOISOPERATOR line.
+    oper_title: ?[]const u8 = null,
     away: ?[]const u8 = null,
     /// TLS client-certificate fingerprint (lowercase hex), surfaced as
     /// RPL_WHOISCERTFP (276) when the target authenticated over a client cert.
@@ -179,7 +182,7 @@ pub fn writeWhoisWith(
         try writeWhoisBotLine(params, sink, server_name, requester_nick, subject.nick);
     }
     if (subject.is_oper) {
-        try writeWhoisOperatorLine(params, sink, server_name, requester_nick, subject.nick, subject.is_admin);
+        try writeWhoisOperatorLine(params, sink, server_name, requester_nick, subject.nick, subject.is_admin, subject.oper_title);
     }
     if (subject.certfp) |fp| {
         try writeWhoisCertfpLine(params, sink, server_name, requester_nick, subject.nick, fp);
@@ -510,11 +513,21 @@ fn writeWhoisOperatorLine(
     requester_nick: []const u8,
     subject_nick: []const u8,
     is_admin: bool,
+    title: ?[]const u8,
 ) WhoisError!void {
     var b = try sink.beginLine();
     b.max_line_bytes = params.max_line_bytes;
     try b.numericPrefix(whois_operator_code, server_name, requester_nick);
     try b.spaceParam(subject_nick);
+    if (title) |t| {
+        if (t.len > 0) {
+            try b.spaceTrailing("is ");
+            try b.appendBytes(t);
+            try b.crlf();
+            try sink.commitLine(&b);
+            return;
+        }
+    }
     try b.spaceTrailing(if (is_admin) "is a Network Administrator" else "is an IRC operator");
     try b.crlf();
     try sink.commitLine(&b);
