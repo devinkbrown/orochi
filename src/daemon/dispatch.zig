@@ -12,6 +12,7 @@ const usermode = @import("../proto/usermode.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const sts_policy = @import("../proto/sts_policy.zig");
 const event_spine = @import("event_spine.zig");
+const oper = @import("oper.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const labeled_response = @import("../proto/labeled_response.zig");
 const msgid = @import("../proto/msgid.zig");
@@ -31,6 +32,7 @@ const MAX_NICK_BYTES: usize = 64;
 const MAX_UID_BYTES: usize = 16;
 const MAX_REALNAME_BYTES: usize = 256;
 const MAX_ACCOUNT_BYTES: usize = 64;
+const MAX_CLASS_BYTES: usize = 32;
 const MAX_AWAY_BYTES: usize = 256;
 const MAX_HOST_BYTES: usize = 255;
 
@@ -688,6 +690,11 @@ pub const ClientSession = struct {
     /// Set once the client completes a successful OPER. Gates oper-only commands
     /// (WALLOPS, REHASH, KILL, ...) and the RPL_WHOISOPERATOR line.
     is_oper: bool = false,
+    /// The granted operator privilege set + class name, captured at elevation.
+    /// Empty for non-opers. Handlers gate sensitive actions on specific
+    /// privileges via `hasPriv`; the registry still gates the coarse oper flag.
+    oper_priv: oper.OperPrivileges = .{},
+    oper_class_store: FixedString(MAX_CLASS_BYTES) = .{},
     /// Quarantined by a Warden `quarantine` action: the client stays connected
     /// but may not JOIN channels or send PRIVMSG/NOTICE (network silence / SHUN).
     restricted: bool = false,
@@ -736,6 +743,28 @@ pub const ClientSession = struct {
     /// Whether the client has completed OPER authentication.
     pub fn isOper(self: *const ClientSession) bool {
         return self.is_oper;
+    }
+
+    /// Whether this operator holds a specific privilege. Non-opers never do.
+    pub fn hasPriv(self: *const ClientSession, privilege: oper.Privilege) bool {
+        return self.is_oper and self.oper_priv.has(privilege);
+    }
+
+    /// Whether this operator is a network administrator (server_admin).
+    pub fn isAdmin(self: *const ClientSession) bool {
+        return self.hasPriv(.server_admin);
+    }
+
+    /// The operator class name (empty for non-opers).
+    pub fn operClass(self: *const ClientSession) []const u8 {
+        return self.oper_class_store.slice();
+    }
+
+    /// Record the operator grant captured at elevation.
+    pub fn setOperGrant(self: *ClientSession, privileges: oper.OperPrivileges, class_name: []const u8) void {
+        self.is_oper = true;
+        self.oper_priv = privileges;
+        self.oper_class_store.set(class_name[0..@min(class_name.len, MAX_CLASS_BYTES)]) catch {};
     }
 
     /// Whether the client is quarantined (Warden quarantine / SHUN): connected

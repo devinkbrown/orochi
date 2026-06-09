@@ -4467,6 +4467,7 @@ pub const LinuxServer = struct {
             // +H hide-oper: suppress operator status unless the requester is an
             // oper (or the user themselves).
             .is_oper = tconn.session.isOper() and !operHidden(tconn, conn),
+            .is_admin = tconn.session.isAdmin() and !operHidden(tconn, conn),
             .is_bot = tconn.session.isBot(),
             // RPL_WHOISCERTFP (276): surface the TLS client-cert fingerprint of a
             // mutual-TLS user (the same value SASL EXTERNAL matches to an account).
@@ -4607,7 +4608,7 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleKill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        // Operator gate enforced by the registry (access=.oper).
+        if (!self.requirePriv(conn, .client_kill)) return;
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KILL"}, "Not enough parameters");
             return;
@@ -5255,7 +5256,7 @@ pub const LinuxServer = struct {
     /// A shunned (non-oper) sender stays connected but their PRIVMSG/NOTICE are
     /// silently dropped. Bare `SHUN` lists active shuns.
     pub fn handleShun(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, adding: bool) !void {
-        // Operator gate enforced by the registry (access=.oper).
+        if (!self.requirePriv(conn, .client_moderate)) return;
         const p = parsed.paramSlice();
         if (adding and p.len == 0) {
             var rows: [256]shun_mod.Shun = undefined;
@@ -5348,6 +5349,7 @@ pub const LinuxServer = struct {
     ///   LIST [match]
     ///   TEST <match> <value>
     pub fn handleWard(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.requirePriv(conn, .client_moderate)) return;
         // Operator gate enforced by the registry (access=.oper).
         const p = parsed.paramSlice();
         if (p.len < 1) {
@@ -5513,7 +5515,9 @@ pub const LinuxServer = struct {
     /// DIE / RESTART — oper-only server shutdown. Clears the reactor run flag so
     /// runThreaded exits after the current iteration.
     pub fn handleDie(self: *LinuxServer, conn: *ConnState, cmd: []const u8) !void {
-        // Operator gate enforced by the registry (access=.oper).
+        // Registry enforces access=.oper; refine per the specific lifecycle priv.
+        const needed: oper_mod.Privilege = if (std.ascii.eqlIgnoreCase(cmd, "RESTART")) .server_restart else .server_shutdown;
+        if (!self.requirePriv(conn, needed)) return;
         var nbuf: [128]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "{s} requested by {s}", .{ cmd, conn.session.displayName() }) catch cmd;
         try self.publishOperEvent(.oper_action, .critical, note);
@@ -5758,6 +5762,7 @@ pub const LinuxServer = struct {
     /// link to a peer. Creates a socket, stands up the outbound-side S2sLink, and
     /// submits an async io_uring connect; the handshake opens on connect completion.
     pub fn handleConnectCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.requirePriv(conn, .mesh_admin)) return;
         // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CONNECT"}, "Not enough parameters");
@@ -5823,6 +5828,7 @@ pub const LinuxServer = struct {
     /// SQUIT <server> [:reason] — oper command: tear down the S2S link to a peer
     /// identified by its (handshake-learned) server name.
     pub fn handleSquit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.requirePriv(conn, .mesh_admin)) return;
         // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SQUIT"}, "Not enough parameters");
@@ -6680,6 +6686,7 @@ pub const LinuxServer = struct {
     /// GEOIP <ip> — oper lookup of the configured MaxMind database. Reports the
     /// rich GeoInfo for the address as NOTICE lines.
     pub fn handleGeoip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.requirePriv(conn, .oper_spy)) return;
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"GEOIP"}, "Usage: GEOIP <ip>");
             return;
@@ -7674,8 +7681,10 @@ pub const LinuxServer = struct {
         if (conn.session.isOper()) return;
         const registry = self.oper_registry orelse return;
         const account = conn.session.account() orelse return;
-        _ = registry.elevate(.{ .name = account }) catch return; // not an operator: silent
-        conn.session.is_oper = true;
+        const grant = registry.elevate(.{ .name = account }) catch return; // not an operator: silent
+        // Capture the granted privilege set + class on the session so handlers
+        // can gate sensitive actions on specific privileges, not just is_oper.
+        conn.session.setOperGrant(grant.privileges, grant.class_name);
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
         // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events.
         conn.session.setEventMask(event_spine.CategoryMask.all());
@@ -8807,23 +8816,28 @@ pub const LinuxServer = struct {
     /// `PRIVS` — report the caller's operator class and privilege set
     /// (RPL_PRIVS 270). Re-derived from the oper registry by account, so it
     /// always reflects the current config binding.
+    /// Require a specific operator privilege for a sensitive action. On failure
+    /// emits ERR_NOPRIVILEGES and returns false. The coarse oper gate is already
+    /// enforced by the registry (access=.oper); this refines it per-action.
+    fn requirePriv(self: *LinuxServer, conn: *ConnState, privilege: oper_mod.Privilege) bool {
+        _ = self;
+        if (conn.session.hasPriv(privilege)) return true;
+        var nb: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&nb, "Permission denied: requires the '{s}' operator privilege", .{@tagName(privilege)}) catch "Permission denied";
+        queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, msg) catch {};
+        return false;
+    }
+
     pub fn handlePrivs(self: *LinuxServer, conn: *ConnState) !void {
+        _ = self;
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
         }
-        const registry = self.oper_registry orelse {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "No operator registry configured");
-            return;
-        };
-        const account = conn.session.account() orelse return;
-        const grant = registry.elevate(.{ .name = account }) catch {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "No operator privileges for your account");
-            return;
-        };
+        // Report the live grant stored on the session (captured at elevation).
         var buf: [default_reply_bytes]u8 = undefined;
         var n: usize = 0;
-        var it = grant.privileges.set.iterator();
+        var it = conn.session.oper_priv.set.iterator();
         while (it.next()) |p| {
             const name = @tagName(p);
             if (n != 0 and n < buf.len) {
@@ -8835,7 +8849,8 @@ pub const LinuxServer = struct {
                 n += name.len;
             }
         }
-        try queueNumeric(conn, .RPL_PRIVS, &.{ conn.session.displayName(), grant.class_name }, buf[0..n]);
+        const class = conn.session.operClass();
+        try queueNumeric(conn, .RPL_PRIVS, &.{ conn.session.displayName(), if (class.len > 0) class else "operator" }, buf[0..n]);
     }
 
     /// `VHOST <newhost>` — oper-only visible-host override. Updates the caller's
@@ -9136,6 +9151,7 @@ pub const LinuxServer = struct {
     /// bindings). Existing sessions keep their current oper state; new SASL logins
     /// observe the reloaded bindings. Without a config path it acknowledges only.
     pub fn handleRehash(self: *LinuxServer, conn: *ConnState) !void {
+        if (!self.requirePriv(conn, .server_rehash)) return;
         // Operator gate enforced by the registry (access=.oper).
         const path = self.config.config_path orelse {
             try queueNumeric(conn, .RPL_REHASHING, &.{"mizuchi.conf"}, "No config file; nothing to reload");

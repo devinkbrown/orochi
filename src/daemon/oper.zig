@@ -34,16 +34,26 @@ pub const VerifiedAccount = struct {
 /// Individual operator capabilities. Names are domain capabilities rather than
 /// command names so the command layer can evolve without changing grants.
 pub const Privilege = enum {
+    // Server lifecycle.
     server_rehash,
     server_restart,
     server_shutdown,
-    client_moderate,
-    channel_moderate,
+    // Moderation.
+    client_moderate, // WARD/SHUN/quarantine and similar client controls
+    channel_moderate, // FORCE*/CLEAR and channel takeover
+    client_kill, // KILL a client off the network
+    // Network / mesh.
+    mesh_admin, // CONNECT/SQUIT and mesh routing control
+    // Services / administration.
     service_admin,
-    mesh_admin,
+    server_admin, // network administrator (the admin tier)
+    oper_grant, // grant/revoke operator status
+    // Visibility / audit.
+    oper_spy, // see private info (GEOIP, OPERSPY, real host/IP)
     event_subscribe,
     audit_read,
-    oper_grant,
+    // Catch-all override for force/sa-style actions.
+    oper_override,
 };
 
 /// A compact flag set of operator capabilities.
