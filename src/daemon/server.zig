@@ -1235,6 +1235,10 @@ pub const LinuxServer = struct {
     /// Web-stats publishing throttle + running peak client count.
     stats_last_write_ms: i64 = 0,
     stats_peak_clients: u64 = 0,
+    /// Ring of recent client-count samples for the stats sparkline.
+    stats_history: [60]u32 = [_]u32{0} ** 60,
+    stats_hist_count: usize = 0,
+    stats_hist_head: usize = 0,
     /// Pending account email/token verifications (REGISTER -> VERIFY).
     account_verifies: account_verify_mod.VerifyStore,
     history: HistoryStore,
@@ -1749,6 +1753,17 @@ pub const LinuxServer = struct {
         }
         if (clients > self.stats_peak_clients) self.stats_peak_clients = clients;
 
+        // Append the current client count to the history ring, then materialize
+        // it oldest→newest for the sparkline.
+        self.stats_history[self.stats_hist_head] = @intCast(@min(clients, std.math.maxInt(u32)));
+        self.stats_hist_head = (self.stats_hist_head + 1) % self.stats_history.len;
+        if (self.stats_hist_count < self.stats_history.len) self.stats_hist_count += 1;
+        var hist_buf: [60]u32 = undefined;
+        const hc = self.stats_hist_count;
+        const hstart = (self.stats_hist_head + self.stats_history.len - hc) % self.stats_history.len;
+        var hi: usize = 0;
+        while (hi < hc) : (hi += 1) hist_buf[hi] = self.stats_history[(hstart + hi) % self.stats_history.len];
+
         // Busiest public channels (skip secret/hidden), kept sorted desc, capped.
         var tops: [20]stats_report.TopChannel = undefined;
         var ntop: usize = 0;
@@ -1777,6 +1792,14 @@ pub const LinuxServer = struct {
             }
         }
 
+        // Assign each top channel a filename slug (post-sort, so links are stable
+        // with the rendered order) for its linked detail page.
+        var slug_store: [20][64]u8 = undefined;
+        for (tops[0..ntop], 0..) |*t, si| {
+            const slen = statsSlug(t.name, &slug_store[si]);
+            t.slug = slug_store[si][0..slen];
+        }
+
         const snapshot = stats_report.Snapshot{
             .server_name = server_name,
             .network = protocol_inventory.network_name,
@@ -1788,6 +1811,11 @@ pub const LinuxServer = struct {
             .channels = self.world.channelCount(),
             .servers = 1,
             .max_clients = self.stats_peak_clients,
+            .connections_total = self.stats.connections_total,
+            .messages_total = self.stats.messages_in_total,
+            .bytes_in = self.stats.bytes_in_total,
+            .bytes_out = self.stats.bytes_out_total,
+            .history = hist_buf[0..hc],
             .top_channels = tops[0..ntop],
         };
 
@@ -1795,6 +1823,62 @@ pub const LinuxServer = struct {
         defer self.allocator.free(buf);
         self.publishStatsFile(io, dir, "stats.json", stats_report.renderJson, snapshot, buf);
         self.publishStatsFile(io, dir, "index.html", stats_report.renderHtml, snapshot, buf);
+
+        // Per-channel detail pages for each listed channel.
+        for (tops[0..ntop]) |t| {
+            var members: [128]stats_report.Member = undefined;
+            var prefix_store: [128][1]u8 = undefined;
+            var mn: usize = 0;
+            if (self.world.memberIterator(t.name)) |mit_const| {
+                var mit = mit_const;
+                while (mit.next()) |wid| {
+                    if (mn == members.len) break;
+                    const mc = self.connFor(clientIdFromWorld(wid.*)) orelse continue;
+                    const mm = self.world.memberModes(t.name, wid.*) orelse world_model.MemberModes.empty();
+                    const hp = mm.highestPrefix();
+                    var pfx: []const u8 = "";
+                    if (hp != 0) {
+                        prefix_store[mn][0] = hp;
+                        pfx = prefix_store[mn][0..1];
+                    }
+                    members[mn] = .{ .nick = mc.session.displayName(), .prefix = pfx };
+                    mn += 1;
+                }
+            }
+            var modes_buf: [40]u8 = undefined;
+            const detail = stats_report.ChannelDetail{
+                .name = t.name,
+                .topic = t.topic,
+                .modes = self.world.channelModeString(t.name, &modes_buf),
+                .member_count = t.members,
+                .members = members[0..mn],
+                .generated_unix = snapshot.generated_unix,
+            };
+            var w = std.Io.Writer.fixed(buf);
+            stats_report.renderChannelHtml(detail, &w) catch continue;
+            var pb: [1024]u8 = undefined;
+            const path = std.fmt.bufPrint(&pb, "{s}/chan_{s}.html", .{ dir, t.slug }) catch continue;
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.buffered() }) catch {};
+        }
+    }
+
+    /// Sanitize a channel name into a filename slug (keep [A-Za-z0-9_-], map the
+    /// rest to '_'); returns the byte length written. Never empty.
+    fn statsSlug(name: []const u8, out: *[64]u8) usize {
+        var n: usize = 0;
+        for (name) |c| {
+            if (n == out.len) break;
+            out[n] = switch (c) {
+                'A'...'Z', 'a'...'z', '0'...'9', '-' => c,
+                else => '_',
+            };
+            n += 1;
+        }
+        if (n == 0) {
+            out[0] = 'c';
+            n = 1;
+        }
+        return n;
     }
 
     fn publishStatsFile(

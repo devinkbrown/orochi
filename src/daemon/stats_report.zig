@@ -14,6 +14,25 @@ pub const TopChannel = struct {
     name: []const u8,
     members: u32,
     topic: []const u8 = "",
+    /// Filename stem of this channel's detail page (without extension). When set,
+    /// the channel name links to `chan_<slug>.html`.
+    slug: []const u8 = "",
+};
+
+/// One member row on a channel detail page.
+pub const Member = struct {
+    nick: []const u8,
+    prefix: []const u8 = "",
+};
+
+/// A single channel's detail snapshot for its own page.
+pub const ChannelDetail = struct {
+    name: []const u8,
+    topic: []const u8 = "",
+    modes: []const u8 = "",
+    member_count: u64 = 0,
+    members: []const Member = &.{},
+    generated_unix: i64 = 0,
 };
 
 /// A complete statistics snapshot. Counts are plain values; string slices are
@@ -32,6 +51,13 @@ pub const Snapshot = struct {
     servers: u64 = 1,
     /// Highest simultaneous client count seen this run.
     max_clients: u64 = 0,
+    /// Lifetime transport counters.
+    connections_total: u64 = 0,
+    messages_total: u64 = 0,
+    bytes_in: u64 = 0,
+    bytes_out: u64 = 0,
+    /// Recent client-count samples, oldest first, for the sparkline.
+    history: []const u32 = &.{},
     /// Busiest channels, already sorted by membership descending by the caller.
     top_channels: []const TopChannel = &.{},
 };
@@ -54,6 +80,16 @@ pub fn renderJson(snapshot: Snapshot, writer: anytype) !void {
     try writer.print(",\n  \"channels\": {d}", .{snapshot.channels});
     try writer.print(",\n  \"servers\": {d}", .{snapshot.servers});
     try writer.print(",\n  \"max_clients\": {d}", .{snapshot.max_clients});
+    try writer.print(",\n  \"connections_total\": {d}", .{snapshot.connections_total});
+    try writer.print(",\n  \"messages_total\": {d}", .{snapshot.messages_total});
+    try writer.print(",\n  \"bytes_in\": {d}", .{snapshot.bytes_in});
+    try writer.print(",\n  \"bytes_out\": {d}", .{snapshot.bytes_out});
+    try writer.writeAll(",\n  \"history\": [");
+    for (snapshot.history, 0..) |h, i| {
+        if (i != 0) try writer.writeAll(", ");
+        try writer.print("{d}", .{h});
+    }
+    try writer.writeAll("]");
     try writer.writeAll(",\n  \"top_channels\": [");
     for (snapshot.top_channels, 0..) |c, i| {
         if (i != 0) try writer.writeAll(",");
@@ -115,11 +151,32 @@ pub fn renderHtml(snapshot: Snapshot, writer: anytype) !void {
 
     try writer.writeAll("</section>\n");
 
+    if (snapshot.history.len >= 2) {
+        try writer.writeAll("<h2>Clients (recent)</h2>\n<div class=\"card spark\">");
+        try sparkline(writer, snapshot.history);
+        try writer.writeAll("</div>\n");
+    }
+
+    try writer.writeAll("<section class=\"grid\">\n");
+    try statCard(writer, "Connections", snapshot.connections_total);
+    try statCard(writer, "Messages", snapshot.messages_total);
+    try byteCard(writer, "Bytes in", snapshot.bytes_in);
+    try byteCard(writer, "Bytes out", snapshot.bytes_out);
+    try writer.writeAll("</section>\n");
+
     if (snapshot.top_channels.len != 0) {
         try writer.writeAll("<h2>Busiest channels</h2>\n<table><thead><tr><th>Channel</th><th>Members</th><th>Topic</th></tr></thead><tbody>\n");
         for (snapshot.top_channels) |c| {
             try writer.writeAll("<tr><td class=\"chan\">");
-            try htmlText(writer, c.name);
+            if (c.slug.len > 0) {
+                try writer.writeAll("<a href=\"chan_");
+                try htmlText(writer, c.slug);
+                try writer.writeAll(".html\">");
+                try htmlText(writer, c.name);
+                try writer.writeAll("</a>");
+            } else {
+                try htmlText(writer, c.name);
+            }
             try writer.print("</td><td class=\"num\">{d}</td><td class=\"topic\">", .{c.members});
             try htmlText(writer, c.topic);
             try writer.writeAll("</td></tr>\n");
@@ -128,6 +185,49 @@ pub fn renderHtml(snapshot: Snapshot, writer: anytype) !void {
     }
 
     try writer.print("<footer>generated at unix {d} · refreshes every 30s</footer>\n", .{snapshot.generated_unix});
+    try writer.writeAll("</main></body></html>\n");
+}
+
+/// Render a single channel's detail page (topic, modes, member roster).
+pub fn renderChannelHtml(detail: ChannelDetail, writer: anytype) !void {
+    try writer.writeAll(
+        \\<!DOCTYPE html>
+        \\<html lang="en"><head><meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<meta http-equiv="refresh" content="30">
+        \\<title>
+    );
+    try htmlText(writer, detail.name);
+    try writer.writeAll("</title>\n<style>\n");
+    try writer.writeAll(css);
+    try writer.writeAll("</style></head><body>\n<main>\n<header><h1>");
+    try htmlText(writer, detail.name);
+    try writer.writeAll("</h1><p class=\"sub\"><a href=\"index.html\">← all channels</a></p></header>\n");
+
+    try writer.writeAll("<section class=\"grid\">\n");
+    try statCard(writer, "Members", detail.member_count);
+    try writer.writeAll("<div class=\"card\"><div class=\"v\">");
+    if (detail.modes.len > 0) try htmlText(writer, detail.modes) else try writer.writeAll("—");
+    try writer.writeAll("</div><div class=\"l\">Modes</div></div>\n</section>\n");
+
+    if (detail.topic.len > 0) {
+        try writer.writeAll("<h2>Topic</h2>\n<div class=\"card\">");
+        try htmlText(writer, detail.topic);
+        try writer.writeAll("</div>\n");
+    }
+
+    if (detail.members.len > 0) {
+        try writer.writeAll("<h2>Members</h2>\n<table><tbody>\n");
+        for (detail.members) |m| {
+            try writer.writeAll("<tr><td class=\"chan\">");
+            try htmlText(writer, m.prefix);
+            try htmlText(writer, m.nick);
+            try writer.writeAll("</td></tr>\n");
+        }
+        try writer.writeAll("</tbody></table>\n");
+    }
+
+    try writer.print("<footer>generated at unix {d} · refreshes every 30s</footer>\n", .{detail.generated_unix});
     try writer.writeAll("</main></body></html>\n");
 }
 
@@ -140,6 +240,31 @@ fn uptimeCard(writer: anytype, secs: u64) !void {
     const h = (secs % 86400) / 3600;
     const m = (secs % 3600) / 60;
     try writer.print("<div class=\"card\"><div class=\"v\">{d}d {d}h {d}m</div><div class=\"l\">Uptime</div></div>\n", .{ d, h, m });
+}
+
+fn byteCard(writer: anytype, label: []const u8, bytes: u64) !void {
+    var v: f64 = @floatFromInt(bytes);
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB", "PB" };
+    var u: usize = 0;
+    while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
+    try writer.print("<div class=\"card\"><div class=\"v\">{d:.1} {s}</div><div class=\"l\">{s}</div></div>\n", .{ v, units[u], label });
+}
+
+/// Inline, dependency-free SVG sparkline. `data` is oldest→newest; the viewBox
+/// stretches to the card width via preserveAspectRatio="none".
+fn sparkline(writer: anytype, data: []const u32) !void {
+    var maxv: u32 = 1;
+    for (data) |v| {
+        if (v > maxv) maxv = v;
+    }
+    const w: usize = (data.len - 1) * 10;
+    try writer.print("<svg viewBox=\"0 0 {d} 40\" preserveAspectRatio=\"none\" class=\"sl\"><polyline points=\"", .{w});
+    for (data, 0..) |v, i| {
+        if (i != 0) try writer.writeByte(' ');
+        const y = 40 - (@as(usize, v) * 40) / maxv;
+        try writer.print("{d},{d}", .{ i * 10, y });
+    }
+    try writer.writeAll("\"/></svg>");
 }
 
 fn htmlText(writer: anytype, s: []const u8) !void {
@@ -175,6 +300,9 @@ const css =
     \\.chan{color:#6ea8fe;font-weight:600}
     \\.num{text-align:right;font-variant-numeric:tabular-nums}
     \\.topic{color:#9aa3b2;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    \\.spark{padding:14px;margin:12px 0}
+    \\.sl{width:100%;height:56px;display:block}
+    \\.sl polyline{fill:none;stroke:#6ea8fe;stroke-width:1.5;vector-effect:non-scaling-stroke}
     \\footer{margin-top:24px;color:#566072;font-size:12px}
 ;
 
@@ -184,9 +312,9 @@ const testing = std.testing;
 
 var test_buf: [32 * 1024]u8 = undefined;
 
-fn renderToBuf(comptime f: anytype, snapshot: Snapshot) ![]const u8 {
+fn renderToBuf(comptime f: anytype, input: anytype) ![]const u8 {
     var w = std.Io.Writer.fixed(&test_buf);
-    try f(snapshot, &w);
+    try f(input, &w);
     return w.buffered();
 }
 
@@ -229,8 +357,40 @@ test "renderHtml escapes and contains the key figures" {
     try testing.expect(std.mem.indexOf(u8, html, ">10<") != null); // client count rendered
 }
 
+test "renderHtml emits a sparkline, transport cards, and channel links" {
+    const hist = [_]u32{ 1, 4, 2, 8 };
+    const chans = [_]TopChannel{.{ .name = "#a", .members = 5, .slug = "_a" }};
+    const snap = Snapshot{
+        .server_name = "s",
+        .bytes_in = 2048,
+        .messages_total = 9,
+        .history = &hist,
+        .top_channels = &chans,
+    };
+    const html = try renderToBuf(renderHtml, snap);
+    try testing.expect(std.mem.indexOf(u8, html, "<polyline points=") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "2.0 KB") != null); // byte card
+    try testing.expect(std.mem.indexOf(u8, html, "href=\"chan__a.html\"") != null); // channel link
+}
+
+test "renderChannelHtml lists members and escapes" {
+    const members = [_]Member{ .{ .nick = "alice", .prefix = "@" }, .{ .nick = "b<ob>" } };
+    const detail = ChannelDetail{
+        .name = "#ops",
+        .topic = "<hi>",
+        .modes = "+mnt",
+        .member_count = 2,
+        .members = &members,
+    };
+    const html = try renderToBuf(renderChannelHtml, detail);
+    try testing.expect(std.mem.indexOf(u8, html, "@alice") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "b&lt;ob&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "&lt;hi&gt;") != null); // topic escaped
+    try testing.expect(std.mem.indexOf(u8, html, "all channels") != null);
+}
+
 test "empty snapshot renders valid JSON with empty channel list" {
-    const json = try renderToBuf(renderJson, .{ .server_name = "x" });
+    const json = try renderToBuf(renderJson, Snapshot{ .server_name = "x" });
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 0), parsed.value.object.get("top_channels").?.array.items.len);

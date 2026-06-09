@@ -37,6 +37,7 @@ pub const Config = struct {
     reputation: Reputation = .{},
     sessions: Sessions = .{},
     media: Media = .{},
+    stats: Stats = .{},
     sasl: Sasl = .{},
     cloak: Cloak = .{},
     tls: Tls = .{},
@@ -133,6 +134,14 @@ pub const Config = struct {
         stun_port: u16 = 0,
     };
 
+    pub const Stats = struct {
+        /// Directory to publish web stats into (stats.json + index.html), e.g. an
+        /// nginx `root`. Empty = disabled.
+        dir: []const u8 = "",
+        /// Minimum interval between stats writes, in ms (parsed from a duration).
+        interval_ms: i64 = 30_000,
+    };
+
     pub const Sasl = struct {
         enabled: bool = false,
         realm: ?[]const u8 = null,
@@ -193,10 +202,13 @@ pub const Config = struct {
         errdefer allocator.free(host);
         const media_host = try allocator.dupe(u8, "127.0.0.1");
         errdefer allocator.free(media_host);
+        const stats_dir = try allocator.dupe(u8, "");
+        errdefer allocator.free(stats_dir);
         return .{
             .listen = .{ .host = host, .media_host = media_host },
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
             .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
+            .stats = .{ .dir = stats_dir },
         };
     }
 
@@ -223,6 +235,7 @@ pub const Config = struct {
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
         if (self.media.stun_host) |value| allocator.free(value);
+        allocator.free(self.stats.dir);
         if (self.cloak.secret) |value| allocator.free(value);
         allocator.free(self.tls.dns_name);
         if (self.tls.cert_path) |value| allocator.free(value);
@@ -296,6 +309,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.media.max_upload_bytes = try uintField(doc, "media.max_upload_bytes", cfg.media.max_upload_bytes, 0, 1024 * 1024 * 1024);
     cfg.media.max_frame_bytes = try uintField(doc, "media.max_frame_bytes", cfg.media.max_frame_bytes, 0, 16 * 1024 * 1024);
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
+
+    try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
+    if (doc.getString("stats.interval")) |s| cfg.stats.interval_ms = @intCast(try durationMs(s));
     cfg.media.stun_port = try portField(doc, "media.stun_port", cfg.media.stun_port);
 
     // [sasl]
