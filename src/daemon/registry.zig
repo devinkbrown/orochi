@@ -450,6 +450,17 @@ pub fn Registry(comptime mods: []const Module) type {
     const numeric_table = comptime buildNumericTable(mods);
     const isupport_table = comptime buildISupportTable(mods);
 
+    // Comptime case-insensitive command name -> command_table index map.
+    // Replaces the former O(commands) linear scan with a length-bucketed
+    // StaticStringMap lookup, so every dispatched command is resolved in
+    // O(commands-of-equal-length) instead of O(total commands).
+    const command_index_map = comptime blk: {
+        const Pair = struct { []const u8, usize };
+        var pairs: [command_table.len]Pair = undefined;
+        for (command_table, 0..) |entry, i| pairs[i] = .{ entry.spec.name, i };
+        break :blk std.StaticStringMapWithEql(usize, std.static_string_map.eqlAsciiIgnoreCase).initComptime(pairs);
+    };
+
     return struct {
         pub const modules = mods;
         pub const commands = command_table;
@@ -460,13 +471,10 @@ pub fn Registry(comptime mods: []const Module) type {
         pub const numerics = numeric_table;
         pub const isupport = isupport_table;
 
+        /// O(1)-ish command resolution via the comptime StaticStringMap.
         pub fn lookupCommand(name: []const u8) ?CommandEntry {
-            for (commands) |entry| {
-                if (std.ascii.eqlIgnoreCase(entry.spec.name, name)) {
-                    return entry;
-                }
-            }
-            return null;
+            const idx = command_index_map.get(name) orelse return null;
+            return commands[idx];
         }
 
         pub fn dispatch(
@@ -919,6 +927,16 @@ test "registry dispatches known commands and reports unknown commands" {
 
     const missing = try R.dispatch(&ctx, "NOPE", &.{});
     try std.testing.expectEqual(DispatchResult.not_found, missing);
+}
+
+test "lookupCommand resolves case-insensitively via the comptime map" {
+    const R = Registry(&.{ coreModule, capModule, lateModule });
+    try std.testing.expect(R.lookupCommand("PING") != null);
+    try std.testing.expect(R.lookupCommand("ping") != null);
+    try std.testing.expect(R.lookupCommand("PoNg") != null);
+    try std.testing.expectEqualStrings("PING", R.lookupCommand("ping").?.spec.name);
+    try std.testing.expect(R.lookupCommand("NOPE") == null);
+    try std.testing.expect(R.lookupCommand("") == null);
 }
 
 test "registry checks command minimum parameters before calling handlers" {
