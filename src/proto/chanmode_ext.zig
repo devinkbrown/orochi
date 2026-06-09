@@ -28,6 +28,7 @@ pub const ExtChannelFlag = enum(u5) {
     auditorium,
     nowhisper,
     nocomicdata,
+    opmoderate,
 };
 
 pub const ModeSpec = struct {
@@ -60,10 +61,12 @@ pub const mode_specs = [_]ModeSpec{
     .{ .flag = .auditorium, .letter = 'x', .name = "AUDITORIUM" },
     .{ .flag = .nowhisper, .letter = 'w', .name = "NOWHISPER" },
     .{ .flag = .nocomicdata, .letter = 'Y', .name = "NOCOMICDATA" },
+    .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
 };
 
 const render_specs = [_]ModeSpec{
     .{ .flag = .clone, .letter = 'E', .name = "CLONE", .requires_oper = true },
+    .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
     .{ .flag = .nocomicdata, .letter = 'Y', .name = "NOCOMICDATA" },
     .{ .flag = .authonly, .letter = 'a', .name = "AUTHONLY" },
     .{ .flag = .cloneable, .letter = 'd', .name = "CLONEABLE" },
@@ -121,7 +124,8 @@ pub const ExtChannelFlags = packed struct(u32) {
     auditorium: bool = false,
     nowhisper: bool = false,
     nocomicdata: bool = false,
-    reserved: u15 = 0,
+    opmoderate: bool = false,
+    reserved: u14 = 0,
 
     pub fn empty() ExtChannelFlags {
         return .{};
@@ -158,6 +162,7 @@ pub const ExtChannelFlags = packed struct(u32) {
             .auditorium => self.auditorium = true,
             .nowhisper => self.nowhisper = true,
             .nocomicdata => self.nocomicdata = true,
+            .opmoderate => self.opmoderate = true,
         }
     }
 
@@ -180,6 +185,7 @@ pub const ExtChannelFlags = packed struct(u32) {
             .auditorium => self.auditorium = false,
             .nowhisper => self.nowhisper = false,
             .nocomicdata => self.nocomicdata = false,
+            .opmoderate => self.opmoderate = false,
         }
     }
 
@@ -202,6 +208,7 @@ pub const ExtChannelFlags = packed struct(u32) {
             .auditorium => self.auditorium,
             .nowhisper => self.nowhisper,
             .nocomicdata => self.nocomicdata,
+            .opmoderate => self.opmoderate,
         };
     }
 

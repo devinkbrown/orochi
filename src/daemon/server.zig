@@ -8849,12 +8849,21 @@ pub const LinuxServer = struct {
                 if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
                 return;
             }
+            // +O opmoderate: instead of dropping a message blocked by +m/+M/+Z,
+            // deliver it to channel ops only (so they can see & act). When set,
+            // the moderation gates below route rather than reject.
+            const opmod = self.world.channelHasExtFlag(chan, .opmoderate);
+            var opmod_route = false;
             // +m moderated: only voiced (+v) or any operator tier may speak.
             if (self.world.channelHasFlag(chan, .moderated)) {
                 const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
                 if (!mm.canSpeakModerated()) {
-                    if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
-                    return;
+                    if (opmod) {
+                        opmod_route = true;
+                    } else {
+                        if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
+                        return;
+                    }
                 }
             }
             // +M moderate-unregistered: an unauthenticated member may speak only
@@ -8862,8 +8871,12 @@ pub const LinuxServer = struct {
             if (self.world.channelHasFlag(chan, .mod_reg) and conn.session.account() == null) {
                 const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
                 if (!mm.canSpeakModerated()) {
-                    if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+M: identify to a registered account to speak)");
-                    return;
+                    if (opmod) {
+                        opmod_route = true;
+                    } else {
+                        if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+M: identify to a registered account to speak)");
+                        return;
+                    }
                 }
             }
             // +Z quiet (MUTE): a member whose mask matches a quiet entry (and is
@@ -8876,8 +8889,12 @@ pub const LinuxServer = struct {
                     var qchan_buf: [64][]const u8 = undefined;
                     const quiet_ctx = banContextFor(self, conn, worldIdFromClient(id), qmask, &qchan_buf);
                     if (qmask.len != 0 and self.world.isMutedCtx(chan, quiet_ctx)) {
-                        if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+Z: you are quieted)");
-                        return;
+                        if (opmod) {
+                            opmod_route = true;
+                        } else {
+                            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+Z: you are quieted)");
+                            return;
+                        }
                     }
                 }
             }
@@ -8902,6 +8919,14 @@ pub const LinuxServer = struct {
             }
             var time_buf: [40]u8 = undefined;
             const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
+            if (opmod_route) {
+                // +O opmoderate: the sender was muted (+m/+M/+Z) but the channel
+                // routes blocked messages to ops instead of dropping them. Deliver
+                // to ops-and-above only (rank >= 2); no sender error, no echo, no
+                // history, no cross-node relay — ops locally see what was attempted.
+                try self.broadcastChannelMinRank(chan, ctags, msg, id, 2);
+                return;
+            }
             if (min_rank == 0) {
                 try self.broadcastChannelTagged(chan, ctags, msg, id);
             } else {
