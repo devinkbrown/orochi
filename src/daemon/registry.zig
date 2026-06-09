@@ -43,6 +43,14 @@ pub const Access = enum {
     registered,
     /// A server operator.
     oper,
+
+    pub fn token(self: Access) []const u8 {
+        return switch (self) {
+            .any => "any",
+            .registered => "user",
+            .oper => "oper",
+        };
+    }
 };
 
 /// Client capabilities presented to the gated dispatcher.
@@ -238,8 +246,34 @@ pub const CommandSpec = struct {
     /// `DispatchCaps.disabled_features`) the command is treated as unavailable.
     /// `null` means the command is always available.
     feature: ?[]const u8 = null,
+    /// One-line human description for registry-driven introspection (COMMANDS).
+    summary: []const u8 = "",
     handler: CommandHandler,
 };
+
+/// Whether `caps` satisfies the command's `access` level. Shared by the gated
+/// dispatcher and by introspection so the two never disagree.
+pub fn accessSatisfied(access: Access, caps: DispatchCaps) bool {
+    return switch (access) {
+        .any => true,
+        .registered => caps.registered,
+        .oper => caps.oper,
+    };
+}
+
+/// Whether a command's `feature` tag is currently disabled by config.
+pub fn featureDisabled(feature: ?[]const u8, caps: DispatchCaps) bool {
+    const f = feature orelse return false;
+    for (caps.disabled_features) |off| {
+        if (std.ascii.eqlIgnoreCase(f, off)) return true;
+    }
+    return false;
+}
+
+/// Whether a command would run for `caps` (feature enabled AND access met).
+pub fn commandAvailable(spec: CommandSpec, caps: DispatchCaps) bool {
+    return !featureDisabled(spec.feature, caps) and accessSatisfied(spec.access, caps);
+}
 
 /// Hook binding exported by a module. `hook` is a typed `HookId`; the handler
 /// stays type-erased at the registry boundary.
@@ -526,15 +560,9 @@ pub fn Registry(comptime mods: []const Module) type {
             const entry = lookupCommand(command_name) orelse return .not_found;
             // Config feature gate: a command tied to a disabled feature is
             // unavailable to everyone (reported as `.disabled`).
-            if (entry.spec.feature) |feature| {
-                for (client_caps.disabled_features) |off| {
-                    if (std.ascii.eqlIgnoreCase(feature, off)) return .disabled;
-                }
-            }
-            switch (entry.spec.access) {
-                .any => {},
-                .registered => if (!client_caps.registered) return .{ .denied = .needs_registered },
-                .oper => if (!client_caps.oper) return .{ .denied = .needs_oper },
+            if (featureDisabled(entry.spec.feature, client_caps)) return .disabled;
+            if (!accessSatisfied(entry.spec.access, client_caps)) {
+                return .{ .denied = if (entry.spec.access == .oper) .needs_oper else .needs_registered };
             }
             if (params.len < entry.spec.min_params) {
                 return .{ .too_few_params = entry.spec.min_params };
@@ -1000,6 +1028,27 @@ test "dispatchGated enforces declared access levels" {
     try std.testing.expectEqual(DispatchResult{ .denied = .needs_oper }, need_oper);
     const oper_ok = try R.dispatchGated(&ctx, "OPERCMD", &.{}, .{ .registered = true, .oper = true });
     try std.testing.expectEqual(DispatchResult.handled, oper_ok);
+}
+
+test "gate helpers: accessSatisfied / featureDisabled / commandAvailable" {
+    const reg_caps = DispatchCaps{ .registered = true, .oper = false };
+    const oper_caps = DispatchCaps{ .registered = true, .oper = true };
+    try std.testing.expect(accessSatisfied(.any, .{ .registered = false, .oper = false }));
+    try std.testing.expect(accessSatisfied(.registered, reg_caps));
+    try std.testing.expect(!accessSatisfied(.oper, reg_caps));
+    try std.testing.expect(accessSatisfied(.oper, oper_caps));
+
+    try std.testing.expect(!featureDisabled(null, reg_caps));
+    try std.testing.expect(!featureDisabled("media", reg_caps));
+    const off = DispatchCaps{ .registered = true, .oper = false, .disabled_features = &.{"media"} };
+    try std.testing.expect(featureDisabled("MEDIA", off)); // case-insensitive
+
+    const open_spec = CommandSpec{ .name = "X", .access = .any, .handler = pongHandler };
+    const media_spec = CommandSpec{ .name = "Y", .access = .any, .feature = "media", .handler = pongHandler };
+    try std.testing.expect(commandAvailable(open_spec, off));
+    try std.testing.expect(!commandAvailable(media_spec, off));
+    try std.testing.expect(commandAvailable(media_spec, reg_caps));
+    try std.testing.expectEqualStrings("oper", Access.oper.token());
 }
 
 test "dispatchGated honors config feature toggles" {
