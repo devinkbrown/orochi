@@ -8919,20 +8919,37 @@ pub const LinuxServer = struct {
             }
             var time_buf: [40]u8 = undefined;
             const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
+            // +f noformat (IRCX NOFORMAT; ophion chm_nocolour): strip mIRC
+            // colour/formatting from the message body for every recipient.
+            var nf_text_buf: [1024]u8 = undefined;
+            var nf_msg_buf: [default_reply_bytes]u8 = undefined;
+            var eff_text = text;
+            var eff_msg = msg;
+            if (self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(text)) {
+                if (color_strip.stripFormatting(text, &nf_text_buf)) |clean| {
+                    var nf_prefix_buf: [320]u8 = undefined;
+                    if (clientPrefix(conn, &nf_prefix_buf)) |pfx| {
+                        if (formatMessage(&nf_msg_buf, pfx, command, &.{target}, clean)) |rebuilt| {
+                            eff_text = clean;
+                            eff_msg = rebuilt;
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+            }
             if (opmod_route) {
                 // +O opmoderate: the sender was muted (+m/+M/+Z) but the channel
                 // routes blocked messages to ops instead of dropping them. Deliver
                 // to ops-and-above only (rank >= 2); no sender error, no echo, no
                 // history, no cross-node relay — ops locally see what was attempted.
-                try self.broadcastChannelMinRank(chan, ctags, msg, id, 2);
+                try self.broadcastChannelMinRank(chan, ctags, eff_msg, id, 2);
                 return;
             }
             if (min_rank == 0) {
-                try self.broadcastChannelTagged(chan, ctags, msg, id);
+                try self.broadcastChannelTagged(chan, ctags, eff_msg, id);
             } else {
-                try self.broadcastChannelMinRank(chan, ctags, msg, id, min_rank);
+                try self.broadcastChannelMinRank(chan, ctags, eff_msg, id, min_rank);
             }
-            if (echo) try self.deliverTagged(id, ctags, msg);
+            if (echo) try self.deliverTagged(id, ctags, eff_msg);
             // Cross-node relay: forward this channel message to mesh peers so
             // remote members of `chan` receive it. Loop-guarded; the far side
             // delivers only to its own local members. Best-effort.
@@ -8948,7 +8965,7 @@ pub const LinuxServer = struct {
                         .source_prefix = prefix,
                         .account = conn.session.account() orelse "",
                         .tags = client_tags orelse "",
-                        .text = text,
+                        .text = eff_text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
                     }, .{ .channel = chan }); // route_table: only peers with members
@@ -8956,7 +8973,7 @@ pub const LinuxServer = struct {
             }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare
             // chan). Only the message body + sender prefix are stored.
-            if (min_rank == 0) self.recordHistory(chan, conn, text);
+            if (min_rank == 0) self.recordHistory(chan, conn, eff_text);
             return;
         }
 
