@@ -23,6 +23,7 @@ const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
 const svc_clonescan = @import("svc_clonescan.zig");
+const svc_lastseen = @import("svc_lastseen.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
@@ -1207,6 +1208,8 @@ pub const LinuxServer = struct {
     welcome: welcome_pack_mod.WelcomePack,
     /// Per-channel services mode-lock specs (MLOCK), keyed by channel name.
     mlocks: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Per-account login/seen history (SEEN), keyed by account name.
+    seen: std.StringHashMapUnmanaged(svc_lastseen.SeenHistory) = .empty,
     /// Pending account email/token verifications (REGISTER -> VERIFY).
     account_verifies: account_verify_mod.VerifyStore,
     history: HistoryStore,
@@ -1553,6 +1556,11 @@ pub const LinuxServer = struct {
                 self.allocator.free(e.value_ptr.*);
             }
             self.mlocks.deinit(self.allocator);
+        }
+        {
+            var it = self.seen.iterator();
+            while (it.next()) |e| self.allocator.free(e.key_ptr.*);
+            self.seen.deinit(self.allocator);
         }
         self.account_verifies.deinit();
         self.activity_subs.deinit();
@@ -2919,6 +2927,12 @@ pub const LinuxServer = struct {
                     const rip = conn.session.realHost();
                     if (rip.len > 0 and self.gags.contains(rip)) conn.gagged = true;
                 }
+                // SEEN: record this account's login for the LASTSEEN history.
+                if (conn.session.account()) |acct| {
+                    var mb: [256]u8 = undefined;
+                    const mask = clientPrefix(conn, &mb) catch "";
+                    self.recordSeen(acct, mask, .login);
+                }
                 // SASL-only oper: elevate now if the (SASL-set) account is bound to
                 // an operator class. Emits 381 + MODE +o after the welcome burst.
                 try self.elevateOperFromAccount(conn);
@@ -3049,6 +3063,8 @@ pub const LinuxServer = struct {
             try self.handleTempmode(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLONES")) {
             try self.handleClones(conn);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SEEN")) {
+            try self.handleSeen(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -6606,6 +6622,53 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Record a login/logout event in an account's SEEN history (no-op for an
+    /// empty account). Keys are owned; the value is allocation-free inline state.
+    fn recordSeen(self: *LinuxServer, account: []const u8, mask: []const u8, event: svc_lastseen.EventKind) void {
+        if (account.len == 0) return;
+        const gop = self.seen.getOrPut(self.allocator, account) catch return;
+        if (!gop.found_existing) {
+            const key = self.allocator.dupe(u8, account) catch {
+                _ = self.seen.remove(account);
+                return;
+            };
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = svc_lastseen.SeenHistory.init();
+        }
+        gop.value_ptr.record(platform.realtimeMillis(), mask, event);
+    }
+
+    /// SEEN <account> — report an account's last-seen / last-login time and its
+    /// recent login/logout history. Available to any registered user.
+    fn handleSeen(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        if (p.len < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SEEN"}, "Usage: SEEN <account>");
+            return;
+        }
+        const account = p[0];
+        const hist = self.seen.getPtr(account) orelse {
+            var nb: [192]u8 = undefined;
+            const note = std.fmt.bufPrint(&nb, "SEEN {s}: no record", .{account}) catch return;
+            try self.noticeTo(conn, note);
+            return;
+        };
+        var sb: [256]u8 = undefined;
+        const summary = std.fmt.bufPrint(&sb, "SEEN {s}: last_seen={d} last_login={d}", .{
+            account,
+            hist.lastSeen() orelse 0,
+            hist.lastLogin() orelse 0,
+        }) catch return;
+        try self.noticeTo(conn, summary);
+        var recs: [svc_lastseen.ring_capacity]svc_lastseen.Record = undefined;
+        const n = hist.recent(svc_lastseen.default_render_count, &recs);
+        for (recs[0..n]) |*r| {
+            var lb: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&lb, "  {s} {d} {s}", .{ r.event.label(), r.timestamp, r.hostmask() }) catch continue;
+            try self.noticeTo(conn, line);
+        }
+    }
+
     /// Compute the aggregation prefix string for an IP: a.b.c.0/24 for IPv4,
     /// the first four hextets + ::/64 for IPv6. Non-IP hosts (e.g. "localhost")
     /// fall back to the host itself. Allocated from `a`.
@@ -9823,6 +9886,12 @@ pub const LinuxServer = struct {
 
     pub fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const reason = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "Client quit";
+        // SEEN: record this account's logout for the LASTSEEN history.
+        if (conn.session.account()) |acct| {
+            var mb: [256]u8 = undefined;
+            const mask = clientPrefix(conn, &mb) catch "";
+            self.recordSeen(acct, mask, .logout);
+        }
         self.recordWhowas(conn); // before removeClient: snapshot the live identity
         try self.broadcastQuit(id, conn, reason);
         self.world.removeClient(worldIdFromClient(id));
