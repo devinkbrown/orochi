@@ -38,6 +38,7 @@ pub const Config = struct {
     sessions: Sessions = .{},
     media: Media = .{},
     stats: Stats = .{},
+    geoip: Geoip = .{},
     sasl: Sasl = .{},
     cloak: Cloak = .{},
     tls: Tls = .{},
@@ -142,6 +143,11 @@ pub const Config = struct {
         interval_ms: i64 = 30_000,
     };
 
+    pub const Geoip = struct {
+        /// Path to a MaxMind GeoIP database (.mmdb). Empty = GeoIP disabled.
+        database: []const u8 = "",
+    };
+
     pub const Sasl = struct {
         enabled: bool = false,
         realm: ?[]const u8 = null,
@@ -204,11 +210,14 @@ pub const Config = struct {
         errdefer allocator.free(media_host);
         const stats_dir = try allocator.dupe(u8, "");
         errdefer allocator.free(stats_dir);
+        const geoip_db = try allocator.dupe(u8, "");
+        errdefer allocator.free(geoip_db);
         return .{
             .listen = .{ .host = host, .media_host = media_host },
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
             .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
             .stats = .{ .dir = stats_dir },
+            .geoip = .{ .database = geoip_db },
         };
     }
 
@@ -236,6 +245,7 @@ pub const Config = struct {
         if (self.sasl.account_db) |value| allocator.free(value);
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
+        allocator.free(self.geoip.database);
         if (self.cloak.secret) |value| allocator.free(value);
         allocator.free(self.tls.dns_name);
         if (self.tls.cert_path) |value| allocator.free(value);
@@ -312,6 +322,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
     if (doc.getString("stats.interval")) |s| cfg.stats.interval_ms = @intCast(try durationMs(s));
+
+    try setStr(allocator, resolver, doc.getString("geoip.database"), &cfg.geoip.database);
     cfg.media.stun_port = try portField(doc, "media.stun_port", cfg.media.stun_port);
 
     // [sasl]
