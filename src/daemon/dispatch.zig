@@ -9,6 +9,7 @@ const sasl = @import("../proto/sasl.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const scram_server = @import("../proto/sasl_scram_server.zig");
 const usermode = @import("../proto/usermode.zig");
+const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const sts_policy = @import("../proto/sts_policy.zig");
 const event_spine = @import("event_spine.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
@@ -24,7 +25,7 @@ pub const DispatchError = error{
 };
 
 const SERVER_NAME = "mizuchi.local";
-const NETWORK_NAME = "Mizuchi";
+const NETWORK_NAME = protocol_inventory.network_name;
 const MAX_PARAMS: usize = 15;
 const MAX_NICK_BYTES: usize = 64;
 const MAX_UID_BYTES: usize = 16;
@@ -42,7 +43,8 @@ const MAX_HOST_BYTES: usize = 255;
 ///   D (flag, never param):    i m n s t C T N M S g
 /// `f`/`j`/`Z` live in the world layer (per-channel storage) rather than the
 /// compact `chanmode.ChannelMode` enum, but are fully parsed and enforced.
-pub const CHANMODES_TOKEN = "CHANMODES=beIZ,k,lfj,imnstCTNMSg";
+/// Sourced from the shared protocol inventory (single source of truth).
+pub const CHANMODES_TOKEN = protocol_inventory.chanmodes_token;
 
 /// Max bytes retained for a captured `@label` value (post-unescape). Matches
 /// the framing helper's `labeled_response.MAX_LABEL_LEN`; longer labels are
@@ -1435,7 +1437,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     try replies.numeric(session, .RPL_YOURHOST, &.{}, "Your host is mizuchi.local, running Mizuchi");
     try replies.numeric(session, .RPL_CREATED, &.{}, "This server was created for deterministic tests");
     try replies.numeric(session, .RPL_MYINFO, &.{ SERVER_NAME, "mizuchi-0.1", "io", "ov" }, "are supported by this server");
-    try replies.numeric(session, .RPL_ISUPPORT, &.{ "NETWORK=" ++ NETWORK_NAME, "CHANTYPES=#&", "NICKLEN=64", "CASEMAPPING=ascii", "PREFIX=(Qqov)!.@+", CHANMODES_TOKEN, "STATUSMSG=!.@+", "BOT=B", "EXTBAN=$,acgmrz", "WHOX", "UTF8ONLY" }, "are supported by this server");
+    try replies.numeric(session, .RPL_ISUPPORT, &protocol_inventory.isupport_tokens, "are supported by this server");
 }
 
 fn emitUnknownCommand(

@@ -191,6 +191,7 @@ pub const permessage_deflate = @import("permessage_deflate.zig");
 pub const pkcs8 = @import("pkcs8.zig");
 pub const playout_delay = @import("playout_delay.zig");
 pub const pli_fir = @import("pli_fir.zig");
+pub const protocol_inventory = @import("protocol_inventory.zig");
 pub const proxy_protocol = @import("proxy_protocol.zig");
 pub const punycode = @import("punycode.zig");
 pub const quic_datagram = @import("quic_datagram.zig");
@@ -497,6 +498,7 @@ test {
     _ = pkcs8;
     _ = playout_delay;
     _ = pli_fir;
+    _ = protocol_inventory;
     _ = proxy_protocol;
     _ = punycode;
     _ = quic_datagram;
