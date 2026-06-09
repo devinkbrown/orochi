@@ -3674,6 +3674,17 @@ pub const LinuxServer = struct {
                         try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
                         continue;
                     };
+                    // Rank protection: you cannot change the status modes of a
+                    // member ranked above you (an owner can't strip a founder, an
+                    // op can't strip an owner, …). Acting on yourself is always
+                    // allowed (e.g. dropping your own status). Server opers bypass.
+                    if (!conn.session.isOper() and !target.eql(worldIdFromClient(id))) {
+                        const target_rank = (self.world.memberModes(channel, target) orelse world_model.MemberModes.empty()).rank();
+                        if (setter.rank() < target_rank) {
+                            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Cannot change the modes of a higher-ranked member");
+                            continue;
+                        }
+                    }
                     const changed = self.world.setMemberMode(channel, target, mode, adding) catch {
                         try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ target_nick, channel }, "They aren't on that channel");
                         continue;
@@ -3963,7 +3974,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ args.user, args.channel }, "They aren't on that channel");
             return;
         };
-        if (kicker.rank() < target_mm.rank()) {
+        if (!conn.session.isOper() and kicker.rank() < target_mm.rank()) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "Cannot kick a higher-ranked member");
             return;
         }
