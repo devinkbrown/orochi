@@ -19,6 +19,7 @@ const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_akill = @import("svc_akill.zig");
+const svc_resv = @import("svc_resv.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
 const sdp = @import("../proto/sdp.zig");
@@ -757,6 +758,7 @@ const Numeric = enum(u16) {
     ERR_BANNEDFROMCHAN = 474,
     ERR_BADCHANNELKEY = 475,
     ERR_NEEDREGGEDNICK = 477,
+    ERR_UNAVAILRESOURCE = 437,
     ERR_NONICKNAMEGIVEN = 431,
     ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
@@ -1204,6 +1206,8 @@ pub const LinuxServer = struct {
     chan_akick: svc_akick.AkickStore,
     /// Network-wide AKILL (services ban) list — host masks matched at registration.
     net_akill: svc_akill.Store,
+    /// Channel-name RESV list — reserved channel globs blocked at JOIN.
+    chan_resv: svc_resv.ChannelResv,
     /// Concurrent-connection clone limiter (per exact IP and per /24|/64 prefix).
     /// Limits come from Config; a zero limit disables that dimension.
     clone_limit: clone_limit_mod.CloneLimiter,
@@ -1408,6 +1412,7 @@ pub const LinuxServer = struct {
             .access = ircx_access_store.AccessStore.init(allocator),
             .chan_akick = svc_akick.AkickStore.init(allocator),
             .net_akill = svc_akill.Store.init(allocator, .{}),
+            .chan_resv = svc_resv.ChannelResv.init(allocator, .{}),
             .clone_limit = clone_limit_mod.CloneLimiter.init(allocator, .{
                 .max_per_ip = config.max_clones_per_ip,
                 .max_per_net = config.max_clones_per_net,
@@ -1516,6 +1521,7 @@ pub const LinuxServer = struct {
         self.access.deinit();
         self.chan_akick.deinit();
         self.net_akill.deinit();
+        self.chan_resv.deinit();
         self.clone_limit.deinit();
         self.reputation.deinit();
         self.accepts.deinit();
@@ -2972,6 +2978,10 @@ pub const LinuxServer = struct {
             try self.handleAkick(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "AKILL")) {
             try self.handleAkill(conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "RESV") or
+            std.ascii.eqlIgnoreCase(parsed.command, "UNRESV"))
+        {
+            try self.handleResv(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -3242,6 +3252,15 @@ pub const LinuxServer = struct {
         if (self.world.channelHasExtFlag(channel, .authonly) and conn.session.account() == null) {
             if (!quiet) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{channel}, "Cannot join channel (+a) - you must be authenticated");
             return true;
+        }
+
+        // Channel RESV: a services-reserved channel name refuses entry for
+        // non-opers (blocks both creation and join). Opers bypass.
+        if (!conn.session.isOper()) {
+            if (self.chan_resv.match(channel, self.nowMs())) |resv| {
+                if (!quiet) try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{channel}, resv.reason);
+                return true;
+            }
         }
 
         var mask_buf: [256]u8 = undefined;
@@ -6208,6 +6227,73 @@ pub const LinuxServer = struct {
                 var eb: [128]u8 = undefined;
                 const endl = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " NOTICE {s} :End of AKILL list\r\n", .{nick}) catch return;
                 try appendToConn(conn, endl);
+            },
+        }
+    }
+
+    /// RESV/UNRESV — reserve a channel-name glob network-wide (oper-only).
+    /// `RESV <pattern> <duration-ms> :reason | RESV DEL <pattern> | RESV LIST`
+    /// and `UNRESV <pattern>`. Reserved names are refused at JOIN for non-opers.
+    fn handleResv(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const nick = conn.session.displayName();
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: RESV is operator-only");
+            return;
+        }
+        const cmd = svc_resv.parseServerCommand(parsed.command, parsed.paramSlice(), self.nowMs()) catch |err| {
+            const msg = switch (err) {
+                error.MissingParameter => "Usage: RESV <#pattern> <duration-ms> :reason | RESV DEL <#pattern> | RESV LIST",
+                error.UnknownCommand => "Unknown RESV command",
+                error.InvalidDuration, error.DurationOverflow => "RESV: invalid duration",
+                error.EmptyPattern, error.PatternTooLong, error.PatternIsNotChannel, error.InvalidPattern => "RESV: pattern must be a valid channel glob (e.g. #help*)",
+                error.ReasonTooLong => "RESV: reason too long",
+                error.SetterTooLong => "RESV: setter too long",
+                error.TooManyReservations => "RESV list is full",
+            };
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RESV"}, msg);
+            return;
+        };
+
+        switch (cmd) {
+            .add => |req| {
+                self.chan_resv.addParsed(req, nick, self.nowMs()) catch |err| {
+                    const msg = switch (err) {
+                        error.TooManyReservations => "RESV list is full",
+                        error.PatternTooLong, error.InvalidPattern, error.PatternIsNotChannel, error.EmptyPattern => "RESV: invalid pattern",
+                        error.ReasonTooLong => "RESV: reason too long",
+                        else => "RESV add failed",
+                    };
+                    var nb: [256]u8 = undefined;
+                    const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, msg }) catch return;
+                    try appendToConn(conn, nl);
+                    return;
+                };
+                var nb: [384]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :RESV added: {s}\r\n", .{ nick, req.pattern }) catch return;
+                try appendToConn(conn, nl);
+            },
+            .remove => |pattern| {
+                const removed = self.chan_resv.remove(pattern);
+                var nb: [320]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, if (removed) "RESV removed" else "RESV pattern not found" }) catch return;
+                try appendToConn(conn, nl);
+            },
+            .list => {
+                var buf: [256]svc_resv.Reservation = undefined;
+                for (self.chan_resv.list(&buf)) |e| {
+                    var line_buf: [768]u8 = undefined;
+                    const ln = std.fmt.bufPrint(&line_buf, ":" ++ server_name ++ " NOTICE {s} :RESV {s} :{s}\r\n", .{ nick, e.pattern, e.reason }) catch continue;
+                    try appendToConn(conn, ln);
+                }
+                var eb: [128]u8 = undefined;
+                const endl = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " NOTICE {s} :End of RESV list\r\n", .{nick}) catch return;
+                try appendToConn(conn, endl);
+            },
+            .sweep => {
+                const n = self.chan_resv.sweep(self.nowMs());
+                var nb: [256]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :RESV swept {d} expired\r\n", .{ nick, n }) catch return;
+                try appendToConn(conn, nl);
             },
         }
     }
