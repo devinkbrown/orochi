@@ -4,6 +4,20 @@
 //! channel membership, and channel topics. It has no S2S/CRDT responsibilities.
 const std = @import("std");
 const rwlock = @import("../substrate/rwlock.zig");
+const ebr = @import("../substrate/ebr.zig");
+const world_rcu = @import("world_rcu.zig");
+
+/// Lazily-created RCU mirror of the nick registry (the lock-free read path).
+/// Heap-allocated so the EBR domain has a stable address: the registered
+/// `participant` and the registry's borrowed `&domain` must stay valid after the
+/// owning `World` is moved (World.init returns by value). Activated on first use
+/// of `findNickRcu`; dormant (null) for any World that never touches it, so the
+/// existing path is byte-for-byte unchanged until the live read flip.
+const RcuNickState = struct {
+    domain: ebr.Domain,
+    participant: *ebr.Participant,
+    nicks: world_rcu.NickRegistry,
+};
 
 /// Opaque client handle value used by the local server world.
 pub const ClientId = packed struct {
@@ -139,6 +153,12 @@ pub const World = struct {
     /// dispatch so `ensureChannel` can stamp a channel's CREATION time without the
     /// pure world taking a clock dependency. 0 until first set.
     clock_unix: i64 = 0,
+    /// Lazily-activated RCU mirror of `nicks` (lock-free reads). Null until the
+    /// first `findNickRcu`; once active, `registerNick`/`unregisterNick` keep it
+    /// in sync. The authoritative map is still `nicks` — this is the parallel
+    /// read path being validated ahead of the live flip (see
+    /// docs/planning/24-multithreading.md, world.zig adoption map).
+    rcu_nicks: ?*RcuNickState = null,
     /// Guards all of the maps above for the multi-reactor model: lookups take the
     /// read lock, mutations (join/part/nick/mode/rename/remove) the write lock.
     /// Every mutation — and its allocation — happens under the exclusive lock, so
@@ -187,7 +207,33 @@ pub const World = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.client_nicks.deinit();
+
+        if (self.rcu_nicks) |r| {
+            // Order: free the live snapshot, drain retired boxes/keys from the
+            // domain limbo, unregister the reader slot, then tear down the
+            // (now-quiescent) domain and free the heap state.
+            r.nicks.deinit();
+            r.domain.drainAll();
+            r.participant.unregister();
+            r.domain.deinit();
+            self.allocator.destroy(r);
+        }
         self.* = undefined;
+    }
+
+    /// Activate (once) and return the lazy RCU nick mirror. Heap-allocated for a
+    /// stable EBR-domain address; see `RcuNickState`.
+    fn ensureRcuNicks(self: *World) !*RcuNickState {
+        if (self.rcu_nicks) |r| return r;
+        const r = try self.allocator.create(RcuNickState);
+        errdefer self.allocator.destroy(r);
+        r.domain = ebr.Domain.init(self.allocator);
+        errdefer r.domain.deinit();
+        r.participant = r.domain.register();
+        errdefer r.participant.unregister();
+        r.nicks = try world_rcu.NickRegistry.init(self.allocator, &r.domain);
+        self.rcu_nicks = r;
+        return r;
     }
 
     /// Register `nick` for `client`, rejecting collisions.
@@ -208,11 +254,18 @@ pub const World = struct {
         errdefer _ = self.nicks.remove(owned);
 
         try self.client_nicks.put(client, owned);
+
+        // Mirror into the lock-free RCU registry when active (best-effort: the
+        // authoritative map is `nicks`; a mirror OOM is swallowed and the live
+        // flip will make the RCU path authoritative with proper error handling).
+        if (self.rcu_nicks) |r| r.nicks.set(r.participant, nick, @bitCast(client)) catch {};
     }
 
     /// Remove any nick owned by `client`.
     pub fn unregisterNick(self: *World, client: ClientId) void {
         if (self.client_nicks.fetchRemove(client)) |removed| {
+            // Mirror-remove using the nick string before it is freed below.
+            if (self.rcu_nicks) |r| r.nicks.remove(r.participant, removed.value) catch {};
             _ = self.nicks.remove(removed.value);
             self.allocator.free(removed.value);
         }
@@ -224,6 +277,16 @@ pub const World = struct {
 
     pub fn findNick(self: *const World, nick: []const u8) ?ClientId {
         return self.nicks.get(nick);
+    }
+
+    /// Lock-free nick lookup via the RCU mirror (activates it on first use). The
+    /// parallel read path being validated against `findNick` ahead of the live
+    /// flip; note it is case-insensitive (an intended refinement over the
+    /// case-sensitive authoritative map, reconciled at the flip).
+    pub fn findNickRcu(self: *World, nick: []const u8) !?ClientId {
+        const r = try self.ensureRcuNicks();
+        if (r.nicks.lookup(r.participant, nick)) |id| return @as(ClientId, @bitCast(id));
+        return null;
     }
 
     /// Join a channel. Returns true when membership was newly added.
@@ -1414,4 +1477,34 @@ test "World mutations + reads are race-free under its RwLock" {
     for (0..writers) |i| {
         try std.testing.expectEqualStrings(ctxs[i].nick, world.nickOf(ctxs[i].client).?);
     }
+}
+
+test "RCU nick mirror matches the authoritative map" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    // Activate the mirror before registering so registerNick keeps it in sync.
+    _ = try world.ensureRcuNicks();
+
+    const alice: ClientId = .{ .shard = 0, .slot = 1, .gen = 1 };
+    const bob: ClientId = .{ .shard = 0, .slot = 2, .gen = 1 };
+    try world.registerNick("Alice", alice);
+    try world.registerNick("Bob", bob);
+
+    // Hits agree with the authoritative map (exact case, apples-to-apples).
+    try std.testing.expectEqual(world.findNick("Alice"), try world.findNickRcu("Alice"));
+    try std.testing.expectEqual(world.findNick("Bob"), try world.findNickRcu("Bob"));
+    try std.testing.expectEqual(@as(?ClientId, alice), try world.findNickRcu("Alice"));
+
+    // Miss is a miss in both.
+    try std.testing.expect((try world.findNickRcu("nobody")) == null);
+
+    // Unregister keeps the mirror in sync.
+    world.unregisterNick(alice);
+    try std.testing.expect((try world.findNickRcu("Alice")) == null);
+    try std.testing.expectEqual(@as(?ClientId, bob), try world.findNickRcu("Bob"));
+
+    // Case-insensitive RCU lookup (an intended refinement over the case-sensitive
+    // authoritative map; reconciled at the live flip).
+    try std.testing.expectEqual(@as(?ClientId, bob), try world.findNickRcu("bob"));
 }
