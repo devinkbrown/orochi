@@ -153,6 +153,7 @@ pub const lusers = @import("lusers.zig");
 pub const markdown = @import("markdown.zig");
 pub const membership_event = @import("membership_event.zig");
 pub const merkle_tree = @import("merkle_tree.zig");
+pub const mesh_event_log = @import("mesh_event_log.zig");
 pub const meshpass = @import("meshpass.zig");
 pub const meshpass_props = @import("meshpass_props.zig");
 pub const mesh_report = @import("mesh_report.zig");
@@ -466,6 +467,7 @@ test {
     _ = markdown;
     _ = membership_event;
     _ = merkle_tree;
+    _ = mesh_event_log;
     _ = meshpass;
     _ = meshpass_props;
     _ = mesh_report;
