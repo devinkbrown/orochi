@@ -4522,10 +4522,7 @@ pub const LinuxServer = struct {
     /// a falsely-flagged host can reconnect immediately. No-op (but reported) if
     /// reputation is disabled or the IP carries no penalty.
     pub fn handleUnreject(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"UNREJECT"}, "Usage: UNREJECT <ip>");
             return;
@@ -4546,10 +4543,7 @@ pub const LinuxServer = struct {
     /// refuses new client connections; `DRAIN OFF` resumes accepting. Existing
     /// clients and S2S links are never affected.
     pub fn handleDrain(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         const off = parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "OFF");
         self.draining = !off;
         var buf: [default_reply_bytes]u8 = undefined;
@@ -4559,10 +4553,7 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleClose(self: *LinuxServer, conn: *ConnState) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         var closed: usize = 0;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
@@ -4582,10 +4573,7 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleKill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KILL"}, "Not enough parameters");
             return;
@@ -5032,10 +5020,7 @@ pub const LinuxServer = struct {
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
     /// ERR_NOOPERMOTD if unset). `OPERMOTD SET :<text>` (oper-only) replaces it.
     pub fn handleOperMotd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         const p = parsed.paramSlice();
         if (p.len >= 1 and std.ascii.eqlIgnoreCase(p[0], "SET")) {
             const text = if (p.len >= 2) p[1] else "";
@@ -5236,10 +5221,7 @@ pub const LinuxServer = struct {
     /// A shunned (non-oper) sender stays connected but their PRIVMSG/NOTICE are
     /// silently dropped. Bare `SHUN` lists active shuns.
     pub fn handleShun(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, adding: bool) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         const p = parsed.paramSlice();
         if (adding and p.len == 0) {
             var rows: [256]shun_mod.Shun = undefined;
@@ -5294,10 +5276,7 @@ pub const LinuxServer = struct {
     /// hostmask/channel audience). Delivered as a server NOTICE.
     pub fn handleGlobal(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         _ = id;
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         const req = global_notice.Request.parse(parsed.paramSlice()) catch {
             try self.noticeTo(conn, "Usage: GLOBAL [<mask>|#channel] :<text>");
             return;
@@ -5335,10 +5314,7 @@ pub const LinuxServer = struct {
     ///   LIST [match]
     ///   TEST <match> <value>
     pub fn handleWard(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         const p = parsed.paramSlice();
         if (p.len < 1) {
             try self.noticeTo(conn, "Usage: WARD <ADD|DEL|LIST|TEST> …");
@@ -5503,10 +5479,7 @@ pub const LinuxServer = struct {
     /// DIE / RESTART — oper-only server shutdown. Clears the reactor run flag so
     /// runThreaded exits after the current iteration.
     pub fn handleDie(self: *LinuxServer, conn: *ConnState, cmd: []const u8) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         var nbuf: [128]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "{s} requested by {s}", .{ cmd, conn.session.displayName() }) catch cmd;
         try self.publishOperEvent(.oper_action, .critical, note);
@@ -5697,10 +5670,7 @@ pub const LinuxServer = struct {
 
     /// TRACE — oper-only: RPL_TRACEUSER (205) per connected client + RPL_ENDOFTRACE (262).
     pub fn handleTrace(self: *LinuxServer, conn: *ConnState) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
         const ctx = trace.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
@@ -5717,10 +5687,7 @@ pub const LinuxServer = struct {
     /// registered user with class, nick, user, visible+real host, account, and
     /// real name; terminated by RPL_TRACEEND (262). Read-only.
     pub fn handleEtrace(self: *LinuxServer, conn: *ConnState) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         var buf: [default_reply_bytes]u8 = undefined;
         var it = self.rx().clients.iterator();
         while (it.next()) |e| {
@@ -5757,10 +5724,7 @@ pub const LinuxServer = struct {
     /// link to a peer. Creates a socket, stands up the outbound-side S2sLink, and
     /// submits an async io_uring connect; the handshake opens on connect completion.
     pub fn handleConnectCmd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; CONNECT is for operators");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CONNECT"}, "Not enough parameters");
             return;
@@ -5825,10 +5789,7 @@ pub const LinuxServer = struct {
     /// SQUIT <server> [:reason] — oper command: tear down the S2S link to a peer
     /// identified by its (handshake-learned) server name.
     pub fn handleSquit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; SQUIT is for operators");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SQUIT"}, "Not enough parameters");
             return;
@@ -5870,10 +5831,7 @@ pub const LinuxServer = struct {
     /// DEBUG — oper command: dump the flight recorder (last N structured events)
     /// to the operator as notices. The "heavy debugging" entry point.
     pub fn handleDebug(self: *LinuxServer, conn: *ConnState) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; DEBUG is for operators");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         var buf: [256]tracelog.RecordedEvent = undefined;
         const events = self.trace_recorder.dump(&buf);
         var line_buf: [320]u8 = undefined;
@@ -5887,10 +5845,7 @@ pub const LinuxServer = struct {
     /// TESTLINE <mask> — oper tool: report the first K/D-line whose mask matches
     /// `mask` (RPL_TESTLINE 725) or RPL_NOTESTLINE 726 if none.
     pub fn handleTestline(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TESTLINE"}, "Not enough parameters");
             return;
@@ -5909,10 +5864,7 @@ pub const LinuxServer = struct {
     /// TESTMASK <mask> — oper tool: count connected clients whose nick!user@host
     /// matches `mask` (RPL_TESTMASK 727).
     pub fn handleTestmask(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TESTMASK"}, "Not enough parameters");
             return;
@@ -9049,10 +9001,7 @@ pub const LinuxServer = struct {
     /// bindings). Existing sessions keep their current oper state; new SASL logins
     /// observe the reloaded bindings. Without a config path it acknowledges only.
     pub fn handleRehash(self: *LinuxServer, conn: *ConnState) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
-            return;
-        }
+        // Operator gate enforced by the registry (access=.oper).
         const path = self.config.config_path orelse {
             try queueNumeric(conn, .RPL_REHASHING, &.{"mizuchi.conf"}, "No config file; nothing to reload");
             return;
