@@ -686,6 +686,9 @@ pub const ClientSession = struct {
     /// Set once the client completes a successful OPER. Gates oper-only commands
     /// (WALLOPS, REHASH, KILL, ...) and the RPL_WHOISOPERATOR line.
     is_oper: bool = false,
+    /// Quarantined by a Warden `quarantine` action: the client stays connected
+    /// but may not JOIN channels or send PRIVMSG/NOTICE (network silence / SHUN).
+    restricted: bool = false,
     /// User modes (+i invisible, +B bot, ...). Set via MODE on the own nick.
     umodes: usermode.UmodeSet = .{},
     /// IRCX Event Spine subscription mask. WALLOPS/SNOMASK/oper notices are
@@ -731,6 +734,17 @@ pub const ClientSession = struct {
     /// Whether the client has completed OPER authentication.
     pub fn isOper(self: *const ClientSession) bool {
         return self.is_oper;
+    }
+
+    /// Whether the client is quarantined (Warden quarantine / SHUN): connected
+    /// but barred from JOIN and PRIVMSG/NOTICE.
+    pub fn isRestricted(self: *const ClientSession) bool {
+        return self.restricted;
+    }
+
+    /// Set or clear the quarantine restriction.
+    pub fn setRestricted(self: *ClientSession, on: bool) void {
+        self.restricted = on;
     }
 
     /// Set or clear a user mode. Returns true if the set changed.

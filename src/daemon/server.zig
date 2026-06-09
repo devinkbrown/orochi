@@ -3234,6 +3234,13 @@ pub const LinuxServer = struct {
         const wid = worldIdFromClient(id);
         const invited = self.world.hasInvite(channel, wid);
 
+        // Warden quarantine (network silence / SHUN): a restricted client may not
+        // join any channel. Opers are never restricted.
+        if (conn.session.isRestricted()) {
+            if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "You are quarantined and cannot join channels");
+            return true;
+        }
+
         // +S TLS-only: join permitted only over a TLS session (implicit-TLS fact;
         // no STARTTLS). Server opers bypass.
         if (self.world.channelHasFlag(channel, .tls_only) and !conn.is_tls and !conn.session.isOper()) {
@@ -6132,7 +6139,7 @@ pub const LinuxServer = struct {
     /// certfp); the first matching Ward decides the outcome by its Action:
     ///   * refuse/expel       → ERROR + close (the network-ban / AKILL role)
     ///   * require_auth        → close unless authenticated to an account
-    ///   * quarantine          → admitted (restriction gating is a follow-up)
+    ///   * quarantine          → admitted but restricted (network silence / SHUN)
     /// Opers are never warded off. Returns true if the connection was closed.
     fn enforceWard(self: *LinuxServer, conn: *ConnState) bool {
         if (self.warden.count() == 0) return false;
@@ -6152,8 +6159,9 @@ pub const LinuxServer = struct {
 
         switch (hit.action) {
             .quarantine => {
-                // Admitted for now; per-session restriction (no join/speak) is a
-                // follow-up once a restricted flag is threaded through the gates.
+                // Admitted but restricted: no JOIN, no PRIVMSG/NOTICE. Enforced
+                // at the JOIN and message gates via session.isRestricted().
+                conn.session.setRestricted(true);
                 return false;
             },
             .require_auth => {
@@ -8894,6 +8902,9 @@ pub const LinuxServer = struct {
     ) !void {
         // +z GAG (IRCX): the server silently discards a gagged user's messages.
         if (conn.gagged) return;
+        // Warden quarantine (network silence / SHUN-via-WARD): a restricted
+        // client's messages are silently dropped before delivery.
+        if (conn.session.isRestricted()) return;
         // SHUN: a network-shunned (non-oper) sender's messages are silently
         // dropped before delivery.
         if (self.shuns.count() > 0 and !conn.session.isOper()) {
