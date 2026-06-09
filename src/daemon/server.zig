@@ -19,6 +19,7 @@ const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
+const svc_forceaction = @import("svc_forceaction.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
@@ -2989,6 +2990,8 @@ pub const LinuxServer = struct {
             std.ascii.eqlIgnoreCase(parsed.command, "UNRESV"))
         {
             try self.handleResv(conn, parsed);
+        } else if (svc_forceaction.ForceActionKind.parse(parsed.command) != null) {
+            try self.handleForceAction(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -6292,6 +6295,112 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, nl);
             },
         }
+    }
+
+    /// FORCEOP / FORCEDEOP / FORCEJOIN / FORCEPART / FORCETOPIC — operator force
+    /// actions over channels and members. Each maps to a real server effect
+    /// (MODE/JOIN/KICK/TOPIC) applied on behalf of the target; no pseudo-client.
+    fn handleForceAction(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        _ = id;
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: force actions are operator-only");
+            return;
+        }
+        // The pure parser expects the verb as argv[0], then the parameters.
+        var argv: [8][]const u8 = undefined;
+        var n: usize = 0;
+        argv[n] = parsed.command;
+        n += 1;
+        for (parsed.paramSlice()) |p| {
+            if (n == argv.len) break;
+            argv[n] = p;
+            n += 1;
+        }
+        const action = svc_forceaction.parseRequest(argv[0..n]) catch |err| {
+            const msg = switch (err) {
+                error.NeedMoreParams => "Not enough parameters",
+                error.TooManyParams => "Too many parameters",
+                error.InvalidChannel => "Invalid channel name",
+                error.InvalidNick => "Invalid nickname",
+                error.TopicTooLong => "Topic too long",
+                error.ReasonTooLong => "Reason too long",
+                error.UnknownAction => "Unknown force action",
+            };
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, msg);
+            return;
+        };
+        switch (action) {
+            .forcejoin => |t| try self.forceJoin(conn, t.channel, t.nick),
+            .forcepart => |t| try self.forcePart(conn, t.channel, t.nick, t.reason),
+            .forceop => |t| try self.forceMemberOp(conn, t.channel, t.nick, true),
+            .forcedeop => |t| try self.forceMemberOp(conn, t.channel, t.nick, false),
+            .forcetopic => |t| try self.forceTopic(conn, t.channel, t.topic),
+        }
+    }
+
+    /// Resolve a target nick to its live (client-id, conn). Emits ERR_NOSUCHNICK
+    /// on `conn` and returns null when the nick is not online.
+    fn resolveTargetConn(self: *LinuxServer, conn: *ConnState, nick: []const u8) ?struct { id: client_model.ClientId, conn: *ConnState } {
+        const twid = self.world.findNick(nick) orelse {
+            queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick") catch {};
+            return null;
+        };
+        const tid = clientIdFromWorld(twid);
+        const tconn = self.rx().clients.get(tid) orelse {
+            queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick") catch {};
+            return null;
+        };
+        return .{ .id = tid, .conn = tconn };
+    }
+
+    fn forceJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8, nick: []const u8) !void {
+        const t = self.resolveTargetConn(conn, nick) orelse return;
+        try self.joinOne(t.id, t.conn, channel, null, 0);
+        try self.noticeTo(conn, "Force action applied");
+    }
+
+    fn forcePart(self: *LinuxServer, conn: *ConnState, channel: []const u8, nick: []const u8, reason: []const u8) !void {
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const t = self.resolveTargetConn(conn, nick) orelse return;
+        const part_reason = if (reason.len > 0) reason else "Removed by operator";
+        try self.partOne(t.id, t.conn, channel, part_reason);
+        try self.noticeTo(conn, "Force action applied");
+    }
+
+    fn forceMemberOp(self: *LinuxServer, conn: *ConnState, channel: []const u8, nick: []const u8, adding: bool) !void {
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const twid = self.world.findNick(nick) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick");
+            return;
+        };
+        const changed = self.world.setMemberMode(channel, twid, .op, adding) catch {
+            try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ nick, channel }, "They aren't on that channel");
+            return;
+        };
+        if (!changed) {
+            try self.noticeTo(conn, "Force action applied (no change)");
+            return;
+        }
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}o {s}\r\n", .{ server_name, channel, if (adding) "+" else "-", nick }) catch return;
+        try self.broadcastChannel(channel, line, null);
+    }
+
+    fn forceTopic(self: *LinuxServer, conn: *ConnState, channel: []const u8, topic: []const u8) !void {
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        try self.world.setTopic(channel, topic);
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ server_name, channel, topic }) catch return;
+        try self.broadcastChannel(channel, line, null);
     }
 
     pub fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
