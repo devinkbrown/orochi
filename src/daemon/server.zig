@@ -3303,6 +3303,9 @@ pub const LinuxServer = struct {
     /// exists. Does NOT call joinOne itself (keeps joinOne's error set clean).
     fn forwardTarget(self: *LinuxServer, conn: *ConnState, channel: []const u8, depth: u8, out: []u8) !?[]const u8 {
         if (depth != 0) return null;
+        // User mode +Q (no-forward): a user who opted out is never redirected to a
+        // +f forward target — the original blocked-JOIN deny numeric fires instead.
+        if (conn.session.hasUmode(.no_forward)) return null;
         const fwd = self.world.forwardOf(channel) orelse return null;
         if (std.ascii.eqlIgnoreCase(fwd, channel)) return null;
         if (!world_model.isChannelName(fwd)) return null;

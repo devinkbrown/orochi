@@ -19,6 +19,7 @@ pub const UserMode = enum(u4) {
     cloaked,
     regonly_pm, // R: reject PMs/notices from unauthenticated senders
     hide_chans, // p: suppress own channel list in WHOIS (opers still see it)
+    no_forward, // Q: never be forwarded to another channel on a blocked JOIN
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
@@ -145,6 +146,7 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .cloaked, .letter = 'x', .name = "cloaked", .policy = .server_managed },
     .{ .mode = .regonly_pm, .letter = 'R', .name = "regonly-pm" },
     .{ .mode = .hide_chans, .letter = 'p', .name = "hide-chans" },
+    .{ .mode = .no_forward, .letter = 'Q', .name = "no-forward" },
 };
 
 pub const DefaultCatalog = Catalog(&default_specs);
@@ -353,6 +355,18 @@ test "bot mode reflected in set and serialized output" {
 
     var out: [2]u8 = undefined;
     try std.testing.expectEqualStrings("+B", try writeModeString(modes, &out));
+}
+
+test "no-forward umode (+Q) round-trips and is client-writable" {
+    try std.testing.expectEqual(@as(?UserMode, .no_forward), modeFromLetter('Q'));
+    try std.testing.expectEqual(@as(?u8, 'Q'), letterOf(.no_forward));
+    try std.testing.expect(DefaultCatalog.isClientWritable(.no_forward));
+
+    var changes_buf: [MAX_MODE_CHANGES]ModeChange = undefined;
+    const changes = try parse("+Q", &changes_buf);
+    var modes = UmodeSet.empty();
+    _ = try apply(&modes, changes, .client);
+    try std.testing.expect(modes.contains(.no_forward));
 }
 
 test "unknown mode rejected" {
