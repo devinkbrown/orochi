@@ -1733,6 +1733,49 @@ pub const LinuxServer = struct {
     /// Publish server/channel stats to the configured web directory (stats.json
     /// + index.html) for static hosting by nginx. Throttled to stats_interval_ms;
     /// best-effort — any I/O error is swallowed so it never disrupts the loop.
+    /// Increment the count for `code` in the parallel tally arrays, appending a
+    /// new bucket if unseen. When full, unknown/overflow folds into "??".
+    fn tallyCountry(codes: [][]const u8, counts: []u32, n: *usize, code: []const u8) void {
+        for (codes[0..n.*], 0..) |existing, i| {
+            if (std.ascii.eqlIgnoreCase(existing, code)) {
+                counts[i] += 1;
+                return;
+            }
+        }
+        if (n.* < codes.len) {
+            codes[n.*] = code;
+            counts[n.*] = 1;
+            n.* += 1;
+            return;
+        }
+        // Table full: fold into an existing "??" bucket if present.
+        for (codes[0..n.*], 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, "??")) {
+                counts[i] += 1;
+                return;
+            }
+        }
+    }
+
+    /// Copy the tally into `out` sorted by count descending (selection sort over
+    /// a tiny fixed set); returns the number of entries written.
+    fn topCountries(codes: []const []const u8, counts: []const u32, out: []stats_report.CountryCount) usize {
+        const n = @min(codes.len, out.len);
+        for (0..n) |i| out[i] = .{ .code = codes[i], .clients = counts[i] };
+        for (0..n) |i| {
+            var max_j = i;
+            for (i + 1..n) |j| {
+                if (out[j].clients > out[max_j].clients) max_j = j;
+            }
+            if (max_j != i) {
+                const tmp = out[i];
+                out[i] = out[max_j];
+                out[max_j] = tmp;
+            }
+        }
+        return n;
+    }
+
     fn maybeWriteStats(self: *LinuxServer) void {
         const dir = self.config.stats_web_dir;
         if (dir.len == 0) return;
@@ -1743,6 +1786,14 @@ pub const LinuxServer = struct {
 
         var clients: u64 = 0;
         var opers: u64 = 0;
+        // Country tally (parallel arrays): code slice borrowed from the loaded
+        // GeoIP database bytes, which outlive this render. Bounded; overflow
+        // beyond the cap is folded into the "??" (unknown) bucket.
+        const max_countries = 24;
+        var cc_codes: [max_countries][]const u8 = undefined;
+        var cc_counts: [max_countries]u32 = undefined;
+        var cc_n: usize = 0;
+        const geodb = self.ensureGeoip();
         var it = self.rx().clients.iterator();
         while (it.next()) |e| {
             const c = e.value;
@@ -1750,8 +1801,23 @@ pub const LinuxServer = struct {
             if (!c.session.registered()) continue;
             clients += 1;
             if (c.session.isOper()) opers += 1;
+            if (geodb) |db| {
+                var code: []const u8 = "??";
+                if (parseGeoIp(c.session.realHost())) |gip| {
+                    if (db.lookupInfo(gip) catch null) |gi| {
+                        if (gi.country_iso) |iso| if (iso.len > 0) {
+                            code = iso;
+                        };
+                    }
+                }
+                tallyCountry(&cc_codes, &cc_counts, &cc_n, code);
+            }
         }
         if (clients > self.stats_peak_clients) self.stats_peak_clients = clients;
+
+        // Sort the country tally descending and surface the top entries.
+        var top_countries: [max_countries]stats_report.CountryCount = undefined;
+        const nctry = topCountries(cc_codes[0..cc_n], cc_counts[0..cc_n], &top_countries);
 
         // Append the current client count to the history ring, then materialize
         // it oldest→newest for the sparkline.
@@ -1817,6 +1883,7 @@ pub const LinuxServer = struct {
             .bytes_out = self.stats.bytes_out_total,
             .history = hist_buf[0..hc],
             .top_channels = tops[0..ntop],
+            .top_countries = top_countries[0..nctry],
         };
 
         const buf = self.allocator.alloc(u8, 256 * 1024) catch return;

@@ -19,6 +19,13 @@ pub const TopChannel = struct {
     slug: []const u8 = "",
 };
 
+/// Aggregate client count for one country (ISO 3166-1 alpha-2 code).
+pub const CountryCount = struct {
+    /// Two-letter ISO country code (e.g. "US"); "??" when geo is unknown.
+    code: []const u8,
+    clients: u32,
+};
+
 /// One member row on a channel detail page.
 pub const Member = struct {
     nick: []const u8,
@@ -60,6 +67,9 @@ pub const Snapshot = struct {
     history: []const u32 = &.{},
     /// Busiest channels, already sorted by membership descending by the caller.
     top_channels: []const TopChannel = &.{},
+    /// Client distribution by country, sorted by count descending by the caller.
+    /// Empty when no GeoIP database is configured.
+    top_countries: []const CountryCount = &.{},
 };
 
 // ── JSON ───────────────────────────────────────────────────────────────────
@@ -100,6 +110,15 @@ pub fn renderJson(snapshot: Snapshot, writer: anytype) !void {
         try writer.writeAll("}");
     }
     if (snapshot.top_channels.len != 0) try writer.writeAll("\n  ");
+    try writer.writeAll("]");
+    try writer.writeAll(",\n  \"top_countries\": [");
+    for (snapshot.top_countries, 0..) |cc, i| {
+        if (i != 0) try writer.writeAll(",");
+        try writer.writeAll("\n    {\"code\": ");
+        try jsonString(writer, cc.code);
+        try writer.print(", \"clients\": {d}}}", .{cc.clients});
+    }
+    if (snapshot.top_countries.len != 0) try writer.writeAll("\n  ");
     try writer.writeAll("]\n}\n");
 }
 
@@ -180,6 +199,16 @@ pub fn renderHtml(snapshot: Snapshot, writer: anytype) !void {
             try writer.print("</td><td class=\"num\">{d}</td><td class=\"topic\">", .{c.members});
             try htmlText(writer, c.topic);
             try writer.writeAll("</td></tr>\n");
+        }
+        try writer.writeAll("</tbody></table>\n");
+    }
+
+    if (snapshot.top_countries.len != 0) {
+        try writer.writeAll("<h2>Clients by country</h2>\n<table><thead><tr><th>Country</th><th>Clients</th></tr></thead><tbody>\n");
+        for (snapshot.top_countries) |cc| {
+            try writer.writeAll("<tr><td class=\"chan\">");
+            try htmlText(writer, cc.code);
+            try writer.print("</td><td class=\"num\">{d}</td></tr>\n", .{cc.clients});
         }
         try writer.writeAll("</tbody></table>\n");
     }
@@ -371,6 +400,23 @@ test "renderHtml emits a sparkline, transport cards, and channel links" {
     try testing.expect(std.mem.indexOf(u8, html, "<polyline points=") != null);
     try testing.expect(std.mem.indexOf(u8, html, "2.0 KB") != null); // byte card
     try testing.expect(std.mem.indexOf(u8, html, "href=\"chan__a.html\"") != null); // channel link
+}
+
+test "country distribution renders in JSON and HTML" {
+    const ctry = [_]CountryCount{ .{ .code = "US", .clients = 8 }, .{ .code = "DE", .clients = 3 } };
+    const snap = Snapshot{ .server_name = "s", .clients = 11, .top_countries = &ctry };
+
+    const json = try renderToBuf(renderJson, snap);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.object.get("top_countries").?.array;
+    try testing.expectEqual(@as(usize, 2), arr.items.len);
+    try testing.expectEqualStrings("US", arr.items[0].object.get("code").?.string);
+    try testing.expectEqual(@as(i64, 8), arr.items[0].object.get("clients").?.integer);
+
+    const html = try renderToBuf(renderHtml, snap);
+    try testing.expect(std.mem.indexOf(u8, html, "Clients by country") != null);
+    try testing.expect(std.mem.indexOf(u8, html, ">US<") != null);
 }
 
 test "renderChannelHtml lists members and escapes" {
