@@ -327,7 +327,7 @@ test "reply builders render ack and error bytes" {
     }, request);
     try std.testing.expectEqualStrings(
         ":alice!u@cloak.example JOIN #mizuchi\r\n" ++
-            ":irc.example 353 alice = #mizuchi :~alice\r\n" ++
+            ":irc.example 353 alice = #mizuchi :!alice\r\n" ++
             ":irc.example 366 alice #mizuchi :End of /NAMES list\r\n",
         ack,
     );

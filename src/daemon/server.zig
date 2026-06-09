@@ -8852,7 +8852,7 @@ pub const LinuxServer = struct {
         // delivery-failure numerics below are suppressed for NOTICE.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
 
-        // STATUSMSG: a leading prefix (~/./@/+) before a channel name restricts
+        // STATUSMSG: a leading prefix (!/./@/+) before a channel name restricts
         // delivery to members of that rank or higher. `chan` is the bare channel
         // for world lookups; `target` keeps the prefix for the displayed line.
         var chan = target;
@@ -9557,7 +9557,7 @@ fn isValidNick(nick: []const u8) bool {
 /// 1). 0 means the char is not a status prefix.
 fn statusPrefixRank(ch: u8) u8 {
     return switch (ch) {
-        '~' => 4,
+        '!' => 4,
         '.' => 3,
         '@' => 2,
         '+' => 1,
@@ -10077,7 +10077,7 @@ test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to
     a.reset();
     try writeAllFd(fd_a, "JOIN #x\r\n");
     try recvUntil(&a, " 353 ", 200); // NAMES
-    try recvUntil(&a, "~A", 200); // founder prefix on A
+    try recvUntil(&a, "!A", 200); // founder prefix on A
     try writeAllFd(fd_b, "JOIN #x\r\n");
     try recvUntil(&b, " 366 B #x ", 200);
 
@@ -11035,7 +11035,7 @@ test "threaded server: NAMES honors multi-prefix cap" {
     // With multi-prefix the NAMES entry carries every held prefix (~@), not just
     // the highest.
     try writeAllFd(fd_a, "NAMES #m\r\n");
-    try recvUntil(&a, "~@A", 200);
+    try recvUntil(&a, "!@A", 200);
 }
 
 test "threaded server: WHISPER delivers to channel co-member only" {
@@ -11145,7 +11145,7 @@ test "threaded server: +x auditorium hides regular members in NAMES" {
     try writeAllFd(fd_c, "NAMES #aud\r\n");
     try recvUntil(c, " 366 C #aud ", 200);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "C") != null);
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "~A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "!A") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "B") == null);
 }
 
@@ -11610,7 +11610,7 @@ test "threaded server: CREATE makes founder channel" {
     a.reset();
     try writeAllFd(fd_a, "CREATE #cr\r\n");
     try recvUntil(&a, " 366 A #cr ", 200);
-    try recvUntil(&a, "~A", 200);
+    try recvUntil(&a, "!A", 200);
 }
 
 test "threaded server: HELP topic + unknown" {

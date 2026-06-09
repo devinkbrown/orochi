@@ -84,7 +84,7 @@ pub const MemberTier = enum(u8) {
             .voice => '+',
             .op => '@',
             .owner => '.',
-            .founder => '~',
+            .founder => '!',
         };
     }
 };
@@ -188,7 +188,7 @@ pub fn buildJoinBroadcastWith(
     return out[0..n];
 }
 
-/// Build initial `RPL_NAMREPLY` for the creator: `~<nick>`.
+/// Build initial `RPL_NAMREPLY` for the creator: `!<nick>`.
 pub fn buildFounderNamesReply(
     out: []u8,
     server_name: []const u8,
@@ -467,7 +467,7 @@ test "parse create args without modes" {
     const result = try parseCreate(&raw);
     try std.testing.expectEqual(.founder, result.creator_status);
     try std.testing.expectEqual(@as(u8, 'Q'), result.creator_status.mode());
-    try std.testing.expectEqual(@as(u8, '~'), result.creator_status.prefix());
+    try std.testing.expectEqual(@as(u8, '!'), result.creator_status.prefix());
 }
 
 test "parse create args with modes" {
@@ -517,7 +517,7 @@ test "create line builders format join and initial names replies" {
     try std.testing.expectEqualStrings(":alice!u@cloak.example JOIN #mizuchi", join);
 
     const names = try buildFounderNamesReply(&buf, "irc.example", "alice", "#mizuchi");
-    try std.testing.expectEqualStrings(":irc.example 353 alice = #mizuchi :~alice", names);
+    try std.testing.expectEqualStrings(":irc.example 353 alice = #mizuchi :!alice", names);
 
     const end = try buildEndOfNamesReply(&buf, "irc.example", "alice", "#mizuchi");
     try std.testing.expectEqualStrings(":irc.example 366 alice #mizuchi :End of /NAMES list", end);

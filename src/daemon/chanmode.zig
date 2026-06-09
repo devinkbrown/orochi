@@ -243,8 +243,8 @@ pub const ChannelModes = struct {
 
 /// Stable member prefix mode identifiers. Builds on the IRCX draft and
 /// adds a Mizuchi-native FOUNDER tier above owner:
-///   founder +Q ('~') > owner +q ('.') > op +o ('@') > voice +v ('+')
-/// → ISUPPORT PREFIX=(Qqov)~.@+. The channel creator is the founder (a single
+///   founder +Q ('!') > owner +q ('.') > op +o ('@') > voice +v ('+')
+/// → ISUPPORT PREFIX=(Qqov)!.@+. The channel creator is the founder (a single
 /// top authority that ops/owners cannot strip). No halfop tier (IRCX `+h` is the
 /// HIDDEN channel mode); IRCX ADMIN aliases OWNER (+q), not a separate wire mode.
 pub const MemberMode = enum(u3) {
@@ -291,7 +291,7 @@ pub const MemberModes = struct {
     }
 
     pub fn highestPrefix(self: MemberModes) u8 {
-        if (self.contains(.founder)) return '~';
+        if (self.contains(.founder)) return '!';
         if (self.contains(.owner)) return '.';
         if (self.contains(.op)) return '@';
         if (self.contains(.voice)) return '+';
@@ -300,16 +300,16 @@ pub const MemberModes = struct {
 
     pub fn allPrefixes(self: MemberModes) PrefixList {
         var out = PrefixList{};
-        if (self.contains(.founder)) appendPrefix(&out, '~');
+        if (self.contains(.founder)) appendPrefix(&out, '!');
         if (self.contains(.owner)) appendPrefix(&out, '.');
         if (self.contains(.op)) appendPrefix(&out, '@');
         if (self.contains(.voice)) appendPrefix(&out, '+');
         return out;
     }
 
-    /// ISUPPORT PREFIX token: (Qqov)~.@+ — Mizuchi founder (~) above the
+    /// ISUPPORT PREFIX token: (Qqov)!.@+ — Mizuchi founder (!) above the
     /// IRCX owner (.) / op (@) / voice (+) tiers.
-    pub const isupport_prefix = "(Qqov)~.@+";
+    pub const isupport_prefix = "(Qqov)!.@+";
 
     /// Operator authority: op or any higher tier (owner/founder).
     pub fn isOperator(self: MemberModes) bool {
@@ -742,12 +742,12 @@ test "member prefix ranking and multi-prefix list" {
     try std.testing.expectEqualStrings(".@+", member.allPrefixes().asSlice());
 
     member.add(.founder);
-    try std.testing.expectEqual(@as(u8, '~'), member.highestPrefix());
-    try std.testing.expectEqualStrings("~.@+", member.allPrefixes().asSlice());
+    try std.testing.expectEqual(@as(u8, '!'), member.highestPrefix());
+    try std.testing.expectEqualStrings("!.@+", member.allPrefixes().asSlice());
 
     member.remove(.op);
-    try std.testing.expectEqual(@as(u8, '~'), member.highestPrefix());
-    try std.testing.expectEqualStrings("~.+", member.allPrefixes().asSlice());
+    try std.testing.expectEqual(@as(u8, '!'), member.highestPrefix());
+    try std.testing.expectEqualStrings("!.+", member.allPrefixes().asSlice());
 }
 
 test "invalid input rejected before channel mutation" {

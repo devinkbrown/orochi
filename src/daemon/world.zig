@@ -474,7 +474,7 @@ pub const World = struct {
     pub fn join(self: *World, name: []const u8, client: ClientId) WorldError!bool {
         const channel = try self.ensureChannel(name);
         // The first member to join a freshly-created channel is its FOUNDER
-        // (Mizuchi founder tier +Q, prefix ~ — above IRCX owner); later
+        // (Mizuchi founder tier +Q, prefix ! — above IRCX owner); later
         // joiners start with no status modes.
         const founding = channel.members.count() == 0;
         const member = try channel.members.getOrPut(client);
@@ -1421,7 +1421,7 @@ test "first joiner founds the channel as operator; later joiners have no status"
     try std.testing.expect(world.memberModes("#x", founder).?.contains(.founder));
     try std.testing.expect(world.memberModes("#x", founder).?.isOperator());
     try std.testing.expect(!world.memberModes("#x", second).?.contains(.founder));
-    try std.testing.expectEqual(@as(u8, '~'), world.memberModes("#x", founder).?.highestPrefix());
+    try std.testing.expectEqual(@as(u8, '!'), world.memberModes("#x", founder).?.highestPrefix());
     try std.testing.expectEqual(@as(u8, 0), world.memberModes("#x", second).?.highestPrefix());
 }
 

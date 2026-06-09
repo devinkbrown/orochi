@@ -88,7 +88,7 @@ pub const Prefix = struct {
     host: []const u8,
 };
 
-/// Mizuchi channel member tiers: founder `~` > owner `.` > op `@` > voice `+`.
+/// Mizuchi channel member tiers: founder `!` > owner `.` > op `@` > voice `+`.
 pub const MemberTier = enum(u8) {
     none = 0,
     voice = 1,
@@ -106,7 +106,7 @@ pub const MemberTier = enum(u8) {
             .voice => "+",
             .op => "@",
             .owner => ".",
-            .founder => "~",
+            .founder => "!",
         };
     }
 };
@@ -694,7 +694,7 @@ test "member tiers preserve Mizuchi ordering" {
     try std.testing.expect(MemberTier.op.isOperator());
     try std.testing.expect(!MemberTier.voice.isOperator());
     try std.testing.expect(!MemberTier.none.isOperator());
-    try std.testing.expectEqualStrings("~", MemberTier.founder.prefix());
+    try std.testing.expectEqualStrings("!", MemberTier.founder.prefix());
     try std.testing.expectEqualStrings(".", MemberTier.owner.prefix());
     try std.testing.expectEqualStrings("@", MemberTier.op.prefix());
     try std.testing.expectEqualStrings("+", MemberTier.voice.prefix());

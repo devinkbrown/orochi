@@ -312,9 +312,9 @@ pub const ChannelModes = struct {
     }
 };
 
-// Wire channel-member status, highest first: founder (+Q ~, Mizuchi) > owner
+// Wire channel-member status, highest first: founder (+Q !, Mizuchi) > owner
 // (+q ., IRCX) > op (+o @) > voice (+v +). No halfop tier (IRCX `+h` is
-// the HIDDEN channel mode). PREFIX=(Qqov)~.@+.
+// the HIDDEN channel mode). PREFIX=(Qqov)!.@+.
 pub const MemberPrefix = packed struct {
     voice: bool = false,
     op: bool = false,

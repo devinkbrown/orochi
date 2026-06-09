@@ -135,7 +135,7 @@ pub fn parseInviteArgsWith(comptime params_config: Params, params: []const []con
 /// Check the INVITE channel preconditions.
 ///
 /// `is_operator` means op-or-higher in Mizuchi's member tiers:
-/// founder `~`, owner `.`, and op `@` all satisfy it. Invite-only channels
+/// founder `!`, owner `.`, and op `@` all satisfy it. Invite-only channels
 /// require that privilege unless the channel has free-invite `+g`.
 pub fn checkInvitePreconditions(flags: InvitePreconditions) InviteCheckResult {
     if (!flags.on_channel) return .deny_not_on_channel;
