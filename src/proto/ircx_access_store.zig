@@ -77,11 +77,13 @@ pub const Level = enum {
     voice,
     host,
     owner,
+    founder,
     grant,
     deny,
 
     pub fn token(self: Level) []const u8 {
         return switch (self) {
+            .founder => "FOUNDER",
             .owner => "OWNER",
             .host => "HOST",
             .voice => "VOICE",
@@ -91,6 +93,7 @@ pub const Level = enum {
     }
 
     pub fn parse(raw: []const u8) ?Level {
+        if (std.ascii.eqlIgnoreCase(raw, "FOUNDER")) return .founder;
         if (std.ascii.eqlIgnoreCase(raw, "OWNER")) return .owner;
         if (std.ascii.eqlIgnoreCase(raw, "HOST")) return .host;
         if (std.ascii.eqlIgnoreCase(raw, "VOICE")) return .voice;
@@ -103,6 +106,7 @@ pub const Level = enum {
         return switch (self) {
             .deny => 50,
             .grant => 40,
+            .founder => 35,
             .owner => 30,
             .host => 20,
             .voice => 10,

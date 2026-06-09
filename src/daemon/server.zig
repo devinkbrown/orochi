@@ -3400,7 +3400,11 @@ pub const LinuxServer = struct {
             if (self.props.getProp(chan_entity, "OWNERKEY")) |ev| {
                 tkeys.setKey(self.allocator, .owner, ev.value) catch {};
             } else |_| {}
+            if (self.props.getProp(chan_entity, "FOUNDERKEY")) |ev| {
+                tkeys.setKey(self.allocator, .founder, ev.value) catch {};
+            } else |_| {}
             switch (tkeys.grantFor(presented)) {
+                .founder => _ = self.world.setMemberMode(join_target, wid, .founder, true) catch {},
                 .owner => _ = self.world.setMemberMode(join_target, wid, .owner, true) catch {},
                 .host => _ = self.world.setMemberMode(join_target, wid, .op, true) catch {},
                 .member, .none => {},
@@ -5985,9 +5989,10 @@ pub const LinuxServer = struct {
     fn accessCanManage(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, level: ?ircx_access_store.Level) bool {
         if (conn.session.isOper()) return true;
         const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse return false;
-        // OWNER-level entries may only be managed by an owner/founder (IRCX
-        // ACCESS write rule); op suffices for HOST/VOICE/etc.
+        // FOUNDER entries are founder-only; OWNER entries owner-or-founder; op
+        // suffices for HOST/VOICE/GRANT/DENY (IRCX ACCESS write rule).
         if (level) |lv| {
+            if (lv == .founder) return mm.contains(.founder);
             if (lv == .owner) return mm.contains(.owner) or mm.contains(.founder);
         }
         return mm.isOperator();

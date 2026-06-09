@@ -6,11 +6,12 @@
 
 const std = @import("std");
 
-pub const Tier = enum(u2) {
+pub const Tier = enum(u3) {
     none = 0,
     member = 1,
     host = 2,
     owner = 3,
+    founder = 4,
 };
 
 pub const KeyError = std.mem.Allocator.Error || error{
@@ -21,6 +22,7 @@ pub const ChannelKeys = struct {
     member_key: ?[]u8 = null,
     host_key: ?[]u8 = null,
     owner_key: ?[]u8 = null,
+    founder_key: ?[]u8 = null,
 
     const Self = @This();
 
@@ -38,6 +40,7 @@ pub const ChannelKeys = struct {
             .member => &self.member_key,
             .host => &self.host_key,
             .owner => &self.owner_key,
+            .founder => &self.founder_key,
         };
 
         if (slot.*) |old| {
@@ -52,6 +55,7 @@ pub const ChannelKeys = struct {
             .member => &self.member_key,
             .host => &self.host_key,
             .owner => &self.owner_key,
+            .founder => &self.founder_key,
         };
 
         if (slot.*) |old| {
@@ -61,10 +65,12 @@ pub const ChannelKeys = struct {
     }
 
     pub fn grantFor(self: *const Self, presented_key: []const u8) Tier {
+        const founder_match = matchesKey(self.founder_key, presented_key);
         const owner_match = matchesKey(self.owner_key, presented_key);
         const host_match = matchesKey(self.host_key, presented_key);
         const member_match = matchesKey(self.member_key, presented_key);
 
+        if (founder_match) return .founder;
         if (owner_match) return .owner;
         if (host_match) return .host;
         if (member_match) return .member;
@@ -72,13 +78,14 @@ pub const ChannelKeys = struct {
     }
 
     pub fn hasAnyKey(self: *const Self) bool {
-        return self.member_key != null or self.host_key != null or self.owner_key != null;
+        return self.member_key != null or self.host_key != null or self.owner_key != null or self.founder_key != null;
     }
 
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
         self.clearKey(allocator, .member);
         self.clearKey(allocator, .host);
         self.clearKey(allocator, .owner);
+        self.clearKey(allocator, .founder);
     }
 };
 
@@ -117,6 +124,25 @@ test "owner key grants owner" {
     try keys.setKey(allocator, .owner, "owner-pass");
 
     try testing.expectEqual(Tier.owner, keys.grantFor("owner-pass"));
+}
+
+test "founder key grants founder, above owner" {
+    const allocator = testing.allocator;
+    var keys = ChannelKeys{};
+    defer keys.deinit(allocator);
+
+    try keys.setKey(allocator, .founder, "founder-pass");
+    try keys.setKey(allocator, .owner, "owner-pass");
+
+    try testing.expectEqual(Tier.founder, keys.grantFor("founder-pass"));
+    try testing.expectEqual(Tier.owner, keys.grantFor("owner-pass"));
+
+    // A secret matching both founder and owner yields founder (highest wins).
+    try keys.setKey(allocator, .owner, "founder-pass");
+    try testing.expectEqual(Tier.founder, keys.grantFor("founder-pass"));
+
+    keys.clearKey(allocator, .founder);
+    try testing.expectEqual(Tier.owner, keys.grantFor("founder-pass"));
 }
 
 test "a key matching member only grants member" {
