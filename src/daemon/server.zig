@@ -20,6 +20,7 @@ const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
+const svc_masskick = @import("svc_masskick.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
@@ -2992,6 +2993,8 @@ pub const LinuxServer = struct {
             try self.handleResv(conn, parsed);
         } else if (svc_forceaction.ForceActionKind.parse(parsed.command) != null) {
             try self.handleForceAction(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLEAR")) {
+            try self.handleClear(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -6401,6 +6404,99 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ server_name, channel, topic }) catch return;
         try self.broadcastChannel(channel, line, null);
+    }
+
+    /// Map a member's channel-status modes to the mass-kick rank ladder.
+    fn masskickRank(mm: world_model.MemberModes) svc_masskick.Rank {
+        if (mm.contains(.founder)) return .founder;
+        if (mm.contains(.owner)) return .owner;
+        if (mm.contains(.op)) return .op;
+        if (mm.contains(.voice)) return .voice;
+        return .member;
+    }
+
+    /// CLEAR <#channel> USERS [KEEP <rank>] [ALLOW <acct[,acct]>] [:reason] —
+    /// mass-kick every member below the keep rank (default: keep founders) that
+    /// is not on the account allowlist. Requires channel founder or server oper.
+    fn handleClear(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // Reassemble the command line for the pure parser ("CLEAR <args...>").
+        var lb: [1024]u8 = undefined;
+        var used: usize = 0;
+        const verb = "CLEAR";
+        @memcpy(lb[0..verb.len], verb);
+        used = verb.len;
+        for (parsed.paramSlice()) |tok| {
+            if (used + 1 + tok.len > lb.len) break;
+            lb[used] = ' ';
+            used += 1;
+            @memcpy(lb[used..][0..tok.len], tok);
+            used += tok.len;
+        }
+        var allow_buf: [16][]const u8 = undefined;
+        const req = svc_masskick.parseClearUsers(lb[0..used], &allow_buf) catch |err| {
+            const reply = svc_masskick.numericForError(err, "*");
+            try self.noticeTo(conn, reply.text);
+            return;
+        };
+        if (!self.world.channelExists(req.channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{req.channel}, "No such channel");
+            return;
+        }
+        const actor_mm = self.world.memberModes(req.channel, worldIdFromClient(id)) orelse blk: {
+            if (conn.session.isOper()) break :blk world_model.MemberModes.empty();
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{req.channel}, "You're not on that channel");
+            return;
+        };
+        const actor = svc_masskick.Actor{
+            .nick = conn.session.displayName(),
+            .rank = masskickRank(actor_mm),
+            .is_oper = conn.session.isOper(),
+        };
+        if (!svc_masskick.canExecuteClearUsers(actor)) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{req.channel}, "CLEAR requires channel founder or operator");
+            return;
+        }
+
+        // Snapshot the membership (nick/account/rank). Borrowed slices stay valid
+        // for the duration of this call.
+        var members: [256]svc_masskick.Member = undefined;
+        var mn: usize = 0;
+        var it = self.world.memberIterator(req.channel) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{req.channel}, "No such channel");
+            return;
+        };
+        while (it.next()) |member| {
+            if (mn == members.len) break;
+            const mid = clientIdFromWorld(member.*);
+            const mconn = self.connFor(mid) orelse continue;
+            const mm = self.world.memberModes(req.channel, member.*) orelse world_model.MemberModes.empty();
+            members[mn] = .{
+                .nick = mconn.session.displayName(),
+                .account = mconn.session.account(),
+                .rank = masskickRank(mm),
+            };
+            mn += 1;
+        }
+
+        var plan_buf: [256]svc_masskick.KickPlanEntry = undefined;
+        const plan = svc_masskick.buildKickPlan(actor, req, members[0..mn], &plan_buf) catch |err| {
+            const reply = svc_masskick.numericForError(err, req.channel);
+            try self.noticeTo(conn, reply.text);
+            return;
+        };
+
+        var kicked: usize = 0;
+        for (plan) |entry| {
+            const twid = self.world.findNick(entry.nick) orelse continue;
+            var line_buf: [default_reply_bytes]u8 = undefined;
+            const line = svc_masskick.formatKickLine(server_name, entry, &line_buf) catch continue;
+            self.broadcastChannel(req.channel, line, null) catch {};
+            self.world.part(req.channel, twid) catch {};
+            kicked += 1;
+        }
+        var nb: [128]u8 = undefined;
+        const note = std.fmt.bufPrint(&nb, "CLEAR {s}: removed {d} user(s)", .{ req.channel, kicked }) catch return;
+        try self.noticeTo(conn, note);
     }
 
     pub fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
