@@ -34,11 +34,35 @@ pub const CommandInvocation = struct {
     params: []const []const u8,
 };
 
-/// Outcome of command lookup and minimum-parameter validation.
+/// Access level a command requires of the invoking client. Enforced centrally
+/// by the dispatcher so handlers no longer hand-roll auth checks.
+pub const Access = enum {
+    /// Any client, including pre-registration.
+    any,
+    /// A fully registered client.
+    registered,
+    /// A server operator.
+    oper,
+};
+
+/// Client capabilities presented to the gated dispatcher.
+pub const DispatchCaps = struct {
+    registered: bool,
+    oper: bool,
+};
+
+/// Why a command was refused before its handler ran.
+pub const DeniedReason = enum {
+    needs_registered,
+    needs_oper,
+};
+
+/// Outcome of command lookup, access gating, and minimum-parameter validation.
 pub const DispatchResult = union(enum) {
     handled,
     not_found,
     too_few_params: usize,
+    denied: DeniedReason,
 };
 
 /// Hook execution result. A stopping hook prevents later bindings from firing.
@@ -202,6 +226,9 @@ pub fn HookPayload(comptime id: HookId) type {
 pub const CommandSpec = struct {
     name: []const u8,
     min_params: usize = 0,
+    /// Minimum client authority. Enforced by the gated dispatcher before the
+    /// handler runs; defaults to `.registered` (the common case).
+    access: Access = .registered,
     handler: CommandHandler,
 };
 
@@ -477,21 +504,40 @@ pub fn Registry(comptime mods: []const Module) type {
             return commands[idx];
         }
 
-        pub fn dispatch(
+        /// Resolve and run a command, enforcing its declared `access` level
+        /// against the caller's `caps` and its `min_params` arity before the
+        /// handler runs. A refused command returns `.denied`; an unknown one
+        /// `.not_found`; an under-supplied one `.too_few_params`.
+        pub fn dispatchGated(
             ctx: *anyopaque,
             command_name: []const u8,
             params: []const []const u8,
+            client_caps: DispatchCaps,
         ) anyerror!DispatchResult {
             const entry = lookupCommand(command_name) orelse return .not_found;
+            switch (entry.spec.access) {
+                .any => {},
+                .registered => if (!client_caps.registered) return .{ .denied = .needs_registered },
+                .oper => if (!client_caps.oper) return .{ .denied = .needs_oper },
+            }
             if (params.len < entry.spec.min_params) {
                 return .{ .too_few_params = entry.spec.min_params };
             }
-
             try entry.spec.handler(ctx, .{
                 .name = entry.spec.name,
                 .params = params,
             });
             return .handled;
+        }
+
+        /// Ungated dispatch (full authority). Kept for callers/tests that have
+        /// already done their own gating; delegates to `dispatchGated`.
+        pub fn dispatch(
+            ctx: *anyopaque,
+            command_name: []const u8,
+            params: []const []const u8,
+        ) anyerror!DispatchResult {
+            return dispatchGated(ctx, command_name, params, .{ .registered = true, .oper = true });
         }
 
         /// Fire all bindings for `id` in priority order (ties by module order),
@@ -911,6 +957,33 @@ const duplicateCommandModule = Module{
         .{ .name = "ping", .handler = pongHandler },
     },
 };
+
+const gatedModule = Module{
+    .id = "gated",
+    .commands = &.{
+        .{ .name = "OPENCMD", .access = .any, .handler = pongHandler },
+        .{ .name = "OPERCMD", .access = .oper, .handler = pongHandler },
+    },
+};
+
+test "dispatchGated enforces declared access levels" {
+    const R = Registry(&.{ coreModule, gatedModule });
+    var ctx = TestCtx{};
+
+    // .any: allowed even unregistered.
+    const open = try R.dispatchGated(&ctx, "OPENCMD", &.{}, .{ .registered = false, .oper = false });
+    try std.testing.expectEqual(DispatchResult.handled, open);
+
+    // .registered (PING default): denied when not registered.
+    const need_reg = try R.dispatchGated(&ctx, "PING", &.{"x"}, .{ .registered = false, .oper = false });
+    try std.testing.expectEqual(DispatchResult{ .denied = .needs_registered }, need_reg);
+
+    // .oper: denied for a registered non-oper, allowed for an oper.
+    const need_oper = try R.dispatchGated(&ctx, "OPERCMD", &.{}, .{ .registered = true, .oper = false });
+    try std.testing.expectEqual(DispatchResult{ .denied = .needs_oper }, need_oper);
+    const oper_ok = try R.dispatchGated(&ctx, "OPERCMD", &.{}, .{ .registered = true, .oper = true });
+    try std.testing.expectEqual(DispatchResult.handled, oper_ok);
+}
 
 test "registry dispatches known commands and reports unknown commands" {
     const R = Registry(&.{ coreModule, capModule, lateModule });

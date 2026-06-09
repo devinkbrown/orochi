@@ -765,6 +765,7 @@ const Numeric = enum(u16) {
     ERR_NEEDREGGEDNICK = 477,
     ERR_UNAVAILRESOURCE = 437,
     ERR_UNKNOWNMODE = 472,
+    ERR_NOTREGISTERED = 451,
     ERR_NONICKNAMEGIVEN = 431,
     ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
@@ -3005,10 +3006,21 @@ pub const LinuxServer = struct {
                 .parsed = parsed,
                 .line = line,
             };
-            switch (try module_manifest.Live.dispatch(&core, parsed.command, parsed.paramSlice())) {
+            const caps = mod_registry.DispatchCaps{
+                .registered = conn.session.registered(),
+                .oper = conn.session.isOper(),
+            };
+            switch (try module_manifest.Live.dispatchGated(&core, parsed.command, parsed.paramSlice(), caps)) {
                 .handled => return,
                 .too_few_params => {
                     try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, "Not enough parameters");
+                    return;
+                },
+                .denied => |reason| {
+                    switch (reason) {
+                        .needs_oper => try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: operator privileges required"),
+                        .needs_registered => try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered"),
+                    }
                     return;
                 },
                 .not_found => {},
@@ -6294,11 +6306,8 @@ pub const LinuxServer = struct {
     /// `RESV <pattern> <duration-ms> :reason | RESV DEL <pattern> | RESV LIST`
     /// and `UNRESV <pattern>`. Reserved names are refused at JOIN for non-opers.
     pub fn handleResv(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // Operator gate is enforced declaratively by the registry (access=.oper).
         const nick = conn.session.displayName();
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: RESV is operator-only");
-            return;
-        }
         const cmd = svc_resv.parseServerCommand(parsed.command, parsed.paramSlice(), self.nowMs()) catch |err| {
             const msg = switch (err) {
                 error.MissingParameter => "Usage: RESV <#pattern> <duration-ms> :reason | RESV DEL <#pattern> | RESV LIST",
@@ -6362,10 +6371,7 @@ pub const LinuxServer = struct {
     /// (MODE/JOIN/KICK/TOPIC) applied on behalf of the target; no pseudo-client.
     pub fn handleForceAction(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         _ = id;
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: force actions are operator-only");
-            return;
-        }
+        // Operator gate is enforced declaratively by the registry (access=.oper).
         // The pure parser expects the verb as argv[0], then the parameters.
         var argv: [8][]const u8 = undefined;
         var n: usize = 0;
@@ -6682,10 +6688,7 @@ pub const LinuxServer = struct {
     /// CLONES — oper report of connection clusters sharing an exact IP or a
     /// /24/64 network prefix (>= 2 members). Read-only snapshot aggregation.
     pub fn handleClones(self: *LinuxServer, conn: *ConnState) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: CLONES is operator-only");
-            return;
-        }
+        // Operator gate is enforced declaratively by the registry (access=.oper).
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
