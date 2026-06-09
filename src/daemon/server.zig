@@ -82,6 +82,8 @@ const auditorium = @import("../proto/auditorium.zig");
 const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
 const geoip = @import("../substrate/geoip.zig");
+const stats_report = @import("stats_report.zig");
+const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const dns = @import("../proto/dns.zig");
@@ -843,6 +845,11 @@ pub const Config = struct {
     /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
     /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
     geoip_db_path: []const u8 = "",
+    /// Directory to publish web stats into (stats.json + index.html), e.g. an
+    /// nginx `root`. Empty = disabled. Written periodically via Config.crypto_io.
+    stats_web_dir: []const u8 = "",
+    /// Minimum interval between web-stats writes, in ms.
+    stats_interval_ms: i64 = 30_000,
     /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
     media_port: u16 = 0,
     /// Host/IP advertised to clients as the server's media (ICE) candidate.
@@ -1225,6 +1232,9 @@ pub const LinuxServer = struct {
     geoip_db: ?geoip.Database = null,
     geoip_bytes: ?[]u8 = null,
     geoip_tried: bool = false,
+    /// Web-stats publishing throttle + running peak client count.
+    stats_last_write_ms: i64 = 0,
+    stats_peak_clients: u64 = 0,
     /// Pending account email/token verifications (REGISTER -> VERIFY).
     account_verifies: account_verify_mod.VerifyStore,
     history: HistoryStore,
@@ -1713,6 +1723,95 @@ pub const LinuxServer = struct {
         self.rx().timer_armed = false;
         self.sweepTimeouts();
         self.sweepTempModes();
+        self.maybeWriteStats();
+    }
+
+    /// Publish server/channel stats to the configured web directory (stats.json
+    /// + index.html) for static hosting by nginx. Throttled to stats_interval_ms;
+    /// best-effort — any I/O error is swallowed so it never disrupts the loop.
+    fn maybeWriteStats(self: *LinuxServer) void {
+        const dir = self.config.stats_web_dir;
+        if (dir.len == 0) return;
+        const io = self.config.crypto_io orelse return;
+        const now = self.nowMs();
+        if (self.stats_last_write_ms != 0 and now - self.stats_last_write_ms < self.config.stats_interval_ms) return;
+        self.stats_last_write_ms = now;
+
+        var clients: u64 = 0;
+        var opers: u64 = 0;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |e| {
+            const c = e.value;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            if (!c.session.registered()) continue;
+            clients += 1;
+            if (c.session.isOper()) opers += 1;
+        }
+        if (clients > self.stats_peak_clients) self.stats_peak_clients = clients;
+
+        // Busiest public channels (skip secret/hidden), kept sorted desc, capped.
+        var tops: [20]stats_report.TopChannel = undefined;
+        var ntop: usize = 0;
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            if (cv.secret or cv.hidden) continue;
+            const entry = stats_report.TopChannel{
+                .name = cv.name,
+                .members = @intCast(@min(cv.members, std.math.maxInt(u32))),
+                .topic = cv.topic,
+            };
+            if (ntop < tops.len) {
+                tops[ntop] = entry;
+                ntop += 1;
+            } else if (entry.members <= tops[ntop - 1].members) {
+                continue;
+            } else {
+                tops[ntop - 1] = entry;
+            }
+            // Bubble the new/replaced entry up to keep descending order.
+            var j = ntop - 1;
+            while (j > 0 and tops[j].members > tops[j - 1].members) : (j -= 1) {
+                const tmp = tops[j];
+                tops[j] = tops[j - 1];
+                tops[j - 1] = tmp;
+            }
+        }
+
+        const snapshot = stats_report.Snapshot{
+            .server_name = server_name,
+            .network = protocol_inventory.network_name,
+            .version = "mizuchi-0.1",
+            .generated_unix = @divTrunc(platform.realtimeMillis(), 1000),
+            .uptime_secs = @intCast(@max(@as(i64, 0), @divTrunc(now - self.start_ms, 1000))),
+            .clients = clients,
+            .opers = opers,
+            .channels = self.world.channelCount(),
+            .servers = 1,
+            .max_clients = self.stats_peak_clients,
+            .top_channels = tops[0..ntop],
+        };
+
+        const buf = self.allocator.alloc(u8, 256 * 1024) catch return;
+        defer self.allocator.free(buf);
+        self.publishStatsFile(io, dir, "stats.json", stats_report.renderJson, snapshot, buf);
+        self.publishStatsFile(io, dir, "index.html", stats_report.renderHtml, snapshot, buf);
+    }
+
+    fn publishStatsFile(
+        self: *LinuxServer,
+        io: anytype,
+        dir: []const u8,
+        name: []const u8,
+        comptime render: anytype,
+        snapshot: stats_report.Snapshot,
+        buf: []u8,
+    ) void {
+        _ = self;
+        var w = std.Io.Writer.fixed(buf);
+        render(snapshot, &w) catch return;
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.buffered() }) catch {};
     }
 
     /// Apply any TEMPMODE reverts whose timer has elapsed as real `-mode` MODE
