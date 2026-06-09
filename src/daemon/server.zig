@@ -3309,6 +3309,9 @@ pub const LinuxServer = struct {
         const fwd = self.world.forwardOf(channel) orelse return null;
         if (std.ascii.eqlIgnoreCase(fwd, channel)) return null;
         if (!world_model.isChannelName(fwd)) return null;
+        // +D disforward (ophion MODE_DISFORWARD): a channel that refuses to be a
+        // forward destination is skipped — the original blocked-JOIN deny fires.
+        if (self.world.channelHasExtFlag(fwd, .disforward)) return null;
         if (fwd.len > out.len) return null;
         @memcpy(out[0..fwd.len], fwd);
         const ftarget = out[0..fwd.len];
@@ -3825,6 +3828,23 @@ pub const LinuxServer = struct {
                         const target = parsed.paramSlice()[arg_index];
                         arg_index += 1;
                         if (!chan_forward.validForwardTarget(target, channel)) continue;
+                        // Target-side permission (ophion check_forward): the target
+                        // must exist, and unless it is +F (freetarget) the setter
+                        // must hold ops there — so you can't dump users into an
+                        // arbitrary channel you don't run.
+                        if (!conn.session.isOper()) {
+                            if (!self.world.channelExists(target)) {
+                                try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
+                                continue;
+                            }
+                            if (!self.world.channelHasExtFlag(target, .freetarget)) {
+                                const tm = self.world.memberModes(target, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+                                if (tm.rank() < 2) {
+                                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{target}, "You're not channel operator on the forward target");
+                                    continue;
+                                }
+                            }
+                        }
                         self.world.setForward(channel, target) catch continue;
                         appendParamMode(&applied, &targets, &emitted_sign, '+', 'f', target);
                     } else {

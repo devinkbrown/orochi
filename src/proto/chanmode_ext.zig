@@ -29,6 +29,8 @@ pub const ExtChannelFlag = enum(u5) {
     nowhisper,
     nocomicdata,
     opmoderate,
+    freetarget,
+    disforward,
 };
 
 pub const ModeSpec = struct {
@@ -62,10 +64,14 @@ pub const mode_specs = [_]ModeSpec{
     .{ .flag = .nowhisper, .letter = 'w', .name = "NOWHISPER" },
     .{ .flag = .nocomicdata, .letter = 'Y', .name = "NOCOMICDATA" },
     .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
+    .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
+    .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
 };
 
 const render_specs = [_]ModeSpec{
+    .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
     .{ .flag = .clone, .letter = 'E', .name = "CLONE", .requires_oper = true },
+    .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
     .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
     .{ .flag = .nocomicdata, .letter = 'Y', .name = "NOCOMICDATA" },
     .{ .flag = .authonly, .letter = 'a', .name = "AUTHONLY" },
@@ -125,7 +131,9 @@ pub const ExtChannelFlags = packed struct(u32) {
     nowhisper: bool = false,
     nocomicdata: bool = false,
     opmoderate: bool = false,
-    reserved: u14 = 0,
+    freetarget: bool = false,
+    disforward: bool = false,
+    reserved: u12 = 0,
 
     pub fn empty() ExtChannelFlags {
         return .{};
@@ -163,6 +171,8 @@ pub const ExtChannelFlags = packed struct(u32) {
             .nowhisper => self.nowhisper = true,
             .nocomicdata => self.nocomicdata = true,
             .opmoderate => self.opmoderate = true,
+            .freetarget => self.freetarget = true,
+            .disforward => self.disforward = true,
         }
     }
 
@@ -186,6 +196,8 @@ pub const ExtChannelFlags = packed struct(u32) {
             .nowhisper => self.nowhisper = false,
             .nocomicdata => self.nocomicdata = false,
             .opmoderate => self.opmoderate = false,
+            .freetarget => self.freetarget = false,
+            .disforward => self.disforward = false,
         }
     }
 
@@ -209,6 +221,8 @@ pub const ExtChannelFlags = packed struct(u32) {
             .nowhisper => self.nowhisper,
             .nocomicdata => self.nocomicdata,
             .opmoderate => self.opmoderate,
+            .freetarget => self.freetarget,
+            .disforward => self.disforward,
         };
     }
 
