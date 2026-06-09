@@ -208,6 +208,7 @@ pub const snote_router = @import("snote_router.zig");
 pub const sound_pack = @import("sound_pack.zig");
 pub const spamtrap = @import("spamtrap.zig");
 pub const spotlight = @import("spotlight.zig");
+pub const stats_report = @import("stats_report.zig");
 pub const status_rotation = @import("status_rotation.zig");
 pub const sticker_set = @import("sticker_set.zig");
 pub const sticky_note = @import("sticky_note.zig");
@@ -510,6 +511,7 @@ test {
     _ = sound_pack;
     _ = spamtrap;
     _ = spotlight;
+    _ = stats_report;
     _ = status_rotation;
     _ = sticker_set;
     _ = sticky_note;
