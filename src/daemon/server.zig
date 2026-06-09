@@ -42,6 +42,7 @@ const ison_userhost = @import("../proto/ison_userhost.zig");
 const lusers = @import("../proto/lusers.zig");
 const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
+const server_about = @import("../proto/server_about.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
@@ -690,6 +691,7 @@ const server_name = "mizuchi.local";
 const default_host = "localhost";
 
 const Numeric = enum(u16) {
+    RPL_ISUPPORT = 5,
     RPL_MAP = 15,
     RPL_MAPEND = 17,
     RPL_PRIVS = 270,
@@ -7758,12 +7760,19 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         const info = serverinfo.VersionInfo{
             .version = server_version,
-            .build = "zig",
+            // build token: compile target so opers can tell binaries apart.
+            .build = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
+            .branding = @tagName(builtin.mode),
             .reply_server = server_name,
-            .description = "Mizuchi IRC daemon",
+            .description = "Mizuchi — pure-Zig mesh IRC daemon",
         };
         const line = serverinfo.writeVersionReply(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, info) catch return;
         try appendToConn(conn, line);
+
+        // Conventional ircd behaviour: VERSION re-advertises ISUPPORT (005) so a
+        // client can refresh feature support without reconnecting. Mirrors the
+        // single-line token set emitted at registration.
+        try queueNumeric(conn, .RPL_ISUPPORT, &protocol_inventory.isupport_tokens, "are supported by this server");
     }
 
     /// NICK <newnick> — registered nick change. Validates, rejects collisions
@@ -9500,14 +9509,33 @@ pub const LinuxServer = struct {
 
     /// INFO — RPL_INFO (371) lines bracketed by RPL_INFOSTART/RPL_ENDOFINFO.
     pub fn handleInfo(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
-        const lines = [_][]const u8{
-            "Mizuchi IRC daemon — a clean-room Zig-native mesh IRC server.",
-            "100% Zig, no C interop. Substrate + crypto + daemon.",
-            "Mesh protocol: Suimyaku (CRDT) + Sazanami (gossip) + Goryu (membership).",
+        const now = self.nowMs();
+        const uptime_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(now - self.start_ms, 1000)));
+        const online_since: i64 = @divTrunc(platform.realtimeMillis(), 1000) - @as(i64, @intCast(uptime_secs));
+        const about = server_about.AboutInfo{
+            .version = server_version,
+            .zig_version = builtin.zig_version_string,
+            .target = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
+            .optimize = @tagName(builtin.mode),
+            .network = protocol_inventory.network_name,
+            .online_since_unix = online_since,
+            .uptime_secs = uptime_secs,
         };
+
+        var body_buf: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&body_buf);
+        server_about.renderInfo(about, &w) catch {};
+        const body = w.buffered();
+
         try queueNumeric(conn, .RPL_INFOSTART, &.{}, server_name);
-        for (lines) |l| try queueNumeric(conn, .RPL_INFO, &.{}, l);
+        var it = std.mem.splitScalar(u8, body, '\n');
+        while (it.next()) |line| {
+            // splitScalar yields a trailing empty segment after the final '\n';
+            // emit blank separators as a single space so the numeric stays valid.
+            const text = if (line.len == 0) " " else line;
+            if (it.peek() == null and line.len == 0) break;
+            try queueNumeric(conn, .RPL_INFO, &.{}, text);
+        }
         try queueNumeric(conn, .RPL_ENDOFINFO, &.{}, "End of /INFO list");
     }
 

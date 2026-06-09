@@ -229,6 +229,7 @@ pub const sdp = @import("sdp.zig");
 pub const sdp_session = @import("sdp_session.zig");
 pub const secure_fns = @import("secure_fns.zig");
 pub const semver = @import("semver.zig");
+pub const server_about = @import("server_about.zig");
 pub const serverinfo = @import("serverinfo.zig");
 pub const server_time_skew = @import("server_time_skew.zig");
 pub const services_alias = @import("services_alias.zig");
@@ -536,6 +537,7 @@ test {
     _ = sdp_session;
     _ = secure_fns;
     _ = semver;
+    _ = server_about;
     _ = serverinfo;
     _ = server_time_skew;
     _ = services_alias;
