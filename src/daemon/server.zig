@@ -22,6 +22,7 @@ const svc_resv = @import("svc_resv.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
+const svc_clonescan = @import("svc_clonescan.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
@@ -3046,6 +3047,8 @@ pub const LinuxServer = struct {
             try self.handleClear(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "TEMPMODE")) {
             try self.handleTempmode(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLONES")) {
+            try self.handleClones(conn);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -6601,6 +6604,84 @@ pub const LinuxServer = struct {
                 try self.noticeTo(conn, "TEMPMODE: swept due reverts");
             },
         }
+    }
+
+    /// Compute the aggregation prefix string for an IP: a.b.c.0/24 for IPv4,
+    /// the first four hextets + ::/64 for IPv6. Non-IP hosts (e.g. "localhost")
+    /// fall back to the host itself. Allocated from `a`.
+    fn netPrefixString(a: std.mem.Allocator, ip: []const u8) std.mem.Allocator.Error![]const u8 {
+        if (std.mem.indexOfScalar(u8, ip, ':') != null) {
+            // IPv6: keep up to the first four groups, then ::/64.
+            var groups: usize = 0;
+            var end: usize = 0;
+            var i: usize = 0;
+            while (i < ip.len and groups < 4) : (i += 1) {
+                if (ip[i] == ':') {
+                    groups += 1;
+                    end = i;
+                }
+            }
+            if (end == 0) return a.dupe(u8, ip);
+            return std.fmt.allocPrint(a, "{s}::/64", .{ip[0..end]});
+        }
+        // IPv4: replace the last octet with 0/24.
+        const last_dot = std.mem.lastIndexOfScalar(u8, ip, '.') orelse return a.dupe(u8, ip);
+        return std.fmt.allocPrint(a, "{s}.0/24", .{ip[0..last_dot]});
+    }
+
+    /// CLONES — oper report of connection clusters sharing an exact IP or a
+    /// /24/64 network prefix (>= 2 members). Read-only snapshot aggregation.
+    fn handleClones(self: *LinuxServer, conn: *ConnState) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: CLONES is operator-only");
+            return;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var conns: std.ArrayListUnmanaged(svc_clonescan.Connection) = .empty;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (!c.session.registered()) continue;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            const ip = c.session.realHost();
+            if (ip.len == 0) continue;
+            const prefix = netPrefixString(a, ip) catch continue;
+            conns.append(a, .{
+                .account = c.session.account(),
+                .ip = ip,
+                .prefix = prefix,
+                .nick = c.session.displayName(),
+            }) catch break;
+        }
+
+        var report = svc_clonescan.scan(self.allocator, conns.items, .{}) catch {
+            try self.noticeTo(conn, "CLONES: scan failed");
+            return;
+        };
+        defer report.deinit();
+
+        if (report.clusterCount() == 0) {
+            try self.noticeTo(conn, "CLONES: no clone clusters found");
+            return;
+        }
+        for (report.clusters) |cluster| {
+            const kind_str = switch (cluster.kind) {
+                .exact_ip => "ip",
+                .net_prefix => "net",
+            };
+            var hb: [256]u8 = undefined;
+            const header = std.fmt.bufPrint(&hb, "CLONES {s} {s} ({d} clients)", .{ kind_str, cluster.key, cluster.members.len }) catch continue;
+            try self.noticeTo(conn, header);
+            for (cluster.members) |member| {
+                var mb: [320]u8 = undefined;
+                const line = std.fmt.bufPrint(&mb, "  {s} {s} {s}", .{ member.nick, member.ip, member.account orelse "*" }) catch continue;
+                try self.noticeTo(conn, line);
+            }
+        }
+        try self.noticeTo(conn, "CLONES: end of report");
     }
 
     /// Whether `conn` may moderate `channel`: server opers or channel operators.
