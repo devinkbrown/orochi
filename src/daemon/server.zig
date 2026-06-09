@@ -6888,6 +6888,23 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// Render a compact `[CC ASn org]` geo tag for an IP into `buf`, or "" when
+    /// no database is configured or the address yields no geo data. Used to
+    /// annotate oper reports (CLONES) with country/ASN context.
+    fn geoTag(self: *LinuxServer, ip_text: []const u8, buf: []u8) []const u8 {
+        const db = self.ensureGeoip() orelse return "";
+        const ip = parseGeoIp(ip_text) orelse return "";
+        const gi = (db.lookupInfo(ip) catch null) orelse return "";
+        const cc = gi.country_iso orelse "??";
+        if (gi.asn) |asn| {
+            const org = gi.asn_org orelse gi.org orelse "";
+            return std.fmt.bufPrint(buf, " [{s} AS{d}{s}{s}]", .{
+                cc, asn, if (org.len > 0) " " else "", org,
+            }) catch "";
+        }
+        return std.fmt.bufPrint(buf, " [{s}]", .{cc}) catch "";
+    }
+
     /// GEOIP <ip> — oper lookup of the configured MaxMind database. Reports the
     /// rich GeoInfo for the address as NOTICE lines.
     pub fn handleGeoip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -7028,8 +7045,10 @@ pub const LinuxServer = struct {
             const header = std.fmt.bufPrint(&hb, "CLONES {s} {s} ({d} clients)", .{ kind_str, cluster.key, cluster.members.len }) catch continue;
             try self.noticeTo(conn, header);
             for (cluster.members) |member| {
-                var mb: [320]u8 = undefined;
-                const line = std.fmt.bufPrint(&mb, "  {s} {s} {s}", .{ member.nick, member.ip, member.account orelse "*" }) catch continue;
+                var gb: [96]u8 = undefined;
+                const geo = self.geoTag(member.ip, &gb);
+                var mb: [416]u8 = undefined;
+                const line = std.fmt.bufPrint(&mb, "  {s} {s} {s}{s}", .{ member.nick, member.ip, member.account orelse "*", geo }) catch continue;
                 try self.noticeTo(conn, line);
             }
         }
