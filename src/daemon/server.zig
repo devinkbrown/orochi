@@ -5574,6 +5574,7 @@ pub const LinuxServer = struct {
                 .realname => facets.realname = p[2],
                 .certfp => facets.certfp = p[2],
                 .country => facets.country = p[2],
+                .asn => facets.asn = p[2],
             }
             if (self.warden.check(facets, platform.realtimeMillis())) |w| {
                 var b: [default_reply_bytes]u8 = undefined;
@@ -5591,7 +5592,7 @@ pub const LinuxServer = struct {
             return;
         }
         const match = warden.Match.parse(p[1]) orelse {
-            try self.noticeTo(conn, "WARD: unknown match facet (address|host|mask|account|realname|certfp|country)");
+            try self.noticeTo(conn, "WARD: unknown match facet (address|host|mask|account|realname|certfp|country|asn)");
             return;
         };
         const pattern = p[2];
@@ -6445,12 +6446,18 @@ pub const LinuxServer = struct {
 
         var mask_buf: [256]u8 = undefined;
         const mask = clientPrefix(conn, &mask_buf) catch "";
-        // GeoIP country facet (e.g. for `WARD ADD country RU ...`). Resolved only
-        // when a database is configured; empty country never matches a ward.
+        // GeoIP country + ASN facets (e.g. `WARD ADD country RU ...` /
+        // `WARD ADD asn 15169 ...`). Resolved only when a database is configured;
+        // empty facets never match a ward.
         var country: []const u8 = "";
+        var asn_buf: [16]u8 = undefined;
+        var asn_str: []const u8 = "";
         if (parseGeoIp(conn.session.realHost())) |gip| {
             if (self.ensureGeoip()) |db| {
-                if (db.lookupInfo(gip) catch null) |gi| country = gi.country_iso orelse "";
+                if (db.lookupInfo(gip) catch null) |gi| {
+                    country = gi.country_iso orelse "";
+                    if (gi.asn) |asn| asn_str = std.fmt.bufPrint(&asn_buf, "{d}", .{asn}) catch "";
+                }
             }
         }
         const facets = warden.Facets{
@@ -6461,6 +6468,7 @@ pub const LinuxServer = struct {
             .realname = conn.session.realname(),
             .certfp = conn.session.tls_certfp orelse "",
             .country = country,
+            .asn = asn_str,
         };
         const hit = self.warden.check(facets, self.nowMs()) orelse return false;
 
