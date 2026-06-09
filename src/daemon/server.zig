@@ -842,6 +842,12 @@ pub const Config = struct {
     /// slots up front so ConnState buffers (targeted by in-flight io_uring I/O)
     /// never move; accepts past the cap are refused.
     max_clients: u31 = 1024,
+    /// Requested number of worker reactor shards (one io_uring loop per shard).
+    /// 1 = the single-reactor model. Values >1 are accepted and carried but
+    /// currently clamped to 1 at `runThreaded` until the per-shard reactor array
+    /// + RCU world adoption land (the substrate — EBR/HAMT/RcuMap/world_rcu/
+    /// reactor_pool/fabric — is already in tree). See docs/planning/24-multithreading.md.
+    num_shards: u16 = 1,
     /// Drop a connection that has not completed registration (NICK+USER) within
     /// this many milliseconds (the io_uring timeout sweep enforces it).
     registration_timeout_ms: i64 = 30_000,
@@ -1655,6 +1661,17 @@ pub const LinuxServer = struct {
     /// threading plan — docs/planning/06-threading.md.)
     pub fn runThreaded(self: *LinuxServer, run: *std.atomic.Value(bool)) void {
         self.shutdown = run; // expose to DIE/RESTART
+        // Multi-reactor is requested via Config.num_shards, but the per-shard
+        // reactor array + RCU world adoption are not wired yet (the substrate is
+        // in tree: EBR, persistent HAMT, RcuMap, world_rcu, reactor_pool, fabric).
+        // Until that lands, honor the request by clamping to a single reactor and
+        // saying so once, rather than silently ignoring the setting.
+        if (self.config.num_shards > 1) {
+            std.debug.print(
+                "mizuchi: num_shards={d} requested; multi-reactor not yet enabled, running 1 reactor\n",
+                .{self.config.num_shards},
+            );
+        }
         while (run.load(.acquire)) {
             self.runOnce() catch return;
         }

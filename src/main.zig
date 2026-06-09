@@ -106,6 +106,9 @@ pub fn main(init: std.process.Init) !void {
             if (mizuchi.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                 held = loaded;
                 srv_cfg = loaded.config;
+                // Carry the requested reactor-shard count onto the live config
+                // ([limits].num_shards lifts via the boot projection).
+                srv_cfg.num_shards = loaded.num_shards;
                 // Enable live REHASH: the server re-reads this same file/resolver.
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;
