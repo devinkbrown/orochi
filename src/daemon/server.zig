@@ -81,6 +81,7 @@ const ircx_modex = @import("../proto/ircx_modex.zig");
 const auditorium = @import("../proto/auditorium.zig");
 const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
+const geoip = @import("../substrate/geoip.zig");
 const accept_list = @import("../proto/accept_list.zig");
 const cloak = @import("../proto/cloak.zig");
 const dns = @import("../proto/dns.zig");
@@ -839,6 +840,9 @@ pub const Config = struct {
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
     disabled_features: []const []const u8 = &.{},
+    /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
+    /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
+    geoip_db_path: []const u8 = "",
     /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
     media_port: u16 = 0,
     /// Host/IP advertised to clients as the server's media (ICE) candidate.
@@ -1216,6 +1220,11 @@ pub const LinuxServer = struct {
     mlocks: std.StringHashMapUnmanaged([]u8) = .empty,
     /// Per-account login/seen history (SEEN), keyed by account name.
     seen: std.StringHashMapUnmanaged(svc_lastseen.SeenHistory) = .empty,
+    /// Lazily-loaded MaxMind GeoIP database (from Config.geoip_db_path) + the
+    /// owned file bytes it borrows. `geoip_tried` guards a single load attempt.
+    geoip_db: ?geoip.Database = null,
+    geoip_bytes: ?[]u8 = null,
+    geoip_tried: bool = false,
     /// Pending account email/token verifications (REGISTER -> VERIFY).
     account_verifies: account_verify_mod.VerifyStore,
     history: HistoryStore,
@@ -1568,6 +1577,7 @@ pub const LinuxServer = struct {
             while (it.next()) |e| self.allocator.free(e.key_ptr.*);
             self.seen.deinit(self.allocator);
         }
+        if (self.geoip_bytes) |b| self.allocator.free(b);
         self.account_verifies.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
@@ -4427,6 +4437,25 @@ pub const LinuxServer = struct {
         }
 
         const tconn = target_conn.?;
+
+        // GeoIP/ASN summary (RPL_WHOISSPECIAL), visible to opers or to the user
+        // themselves, when a MaxMind database is loaded and the IP resolves.
+        var geo_buf: [256]u8 = undefined;
+        var geo_text: ?[]const u8 = null;
+        if (conn.session.isOper() or conn == tconn) {
+            if (parseGeoIp(tconn.session.realHost())) |gip| {
+                if (self.ensureGeoip()) |db| {
+                    if (db.lookupInfo(gip) catch null) |gi| {
+                        const country = gi.country_iso orelse "??";
+                        geo_text = if (gi.asn) |asn|
+                            std.fmt.bufPrint(&geo_buf, "is in {s}, AS{d} {s}", .{ country, asn, gi.asn_org orelse gi.org orelse "" }) catch null
+                        else
+                            std.fmt.bufPrint(&geo_buf, "is in {s}", .{country}) catch null;
+                    }
+                }
+            }
+        }
+
         const subject = whois.WhoisSubject{
             .nick = target_nick,
             .user = tconn.session.username(),
@@ -4434,6 +4463,7 @@ pub const LinuxServer = struct {
             .realname = tconn.session.realname(),
             .account = tconn.session.account(),
             .away = tconn.session.awayMessage(),
+            .geo = geo_text,
             // +H hide-oper: suppress operator status unless the requester is an
             // oper (or the user themselves).
             .is_oper = tconn.session.isOper() and !operHidden(tconn, conn),
@@ -6615,6 +6645,107 @@ pub const LinuxServer = struct {
             var lb: [256]u8 = undefined;
             const line = std.fmt.bufPrint(&lb, "  {s} {d} {s}", .{ r.event.label(), r.timestamp, r.hostmask() }) catch continue;
             try self.noticeTo(conn, line);
+        }
+    }
+
+    /// Lazily load the configured MaxMind GeoIP database on first use. Returns
+    /// the live database, or null when none is configured / it failed to load.
+    fn ensureGeoip(self: *LinuxServer) ?geoip.Database {
+        if (self.geoip_db) |db| return db;
+        if (self.geoip_tried) return null;
+        self.geoip_tried = true;
+        if (self.config.geoip_db_path.len == 0) return null;
+        const io = self.config.crypto_io orelse return null;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.config.geoip_db_path, self.allocator, .limited(256 << 20)) catch return null;
+        const db = geoip.Database.init(bytes) catch {
+            self.allocator.free(bytes);
+            return null;
+        };
+        self.geoip_bytes = bytes;
+        self.geoip_db = db;
+        return db;
+    }
+
+    /// Parse an IPv4 or IPv6 literal into a geoip.Ip, or null if malformed.
+    fn parseGeoIp(text: []const u8) ?geoip.Ip {
+        if (std.Io.net.Ip4Address.parse(text, 0)) |a4| {
+            return geoip.Ip{ .v4 = a4.bytes };
+        } else |_| {}
+        if (std.Io.net.Ip6Address.parse(text, 0)) |a6| {
+            return geoip.Ip{ .v6 = a6.bytes };
+        } else |_| {}
+        return null;
+    }
+
+    /// GEOIP <ip> — oper lookup of the configured MaxMind database. Reports the
+    /// rich GeoInfo for the address as NOTICE lines.
+    pub fn handleGeoip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"GEOIP"}, "Usage: GEOIP <ip>");
+            return;
+        }
+        const target = parsed.paramSlice()[0];
+        const ip = parseGeoIp(target) orelse {
+            try self.noticeTo(conn, "GEOIP: invalid IP address");
+            return;
+        };
+        const db = self.ensureGeoip() orelse {
+            try self.noticeTo(conn, "GEOIP: no database configured");
+            return;
+        };
+        const info = (db.lookupInfo(ip) catch {
+            try self.noticeTo(conn, "GEOIP: database read error");
+            return;
+        }) orelse {
+            var nb: [128]u8 = undefined;
+            const note = std.fmt.bufPrint(&nb, "GEOIP {s}: no data", .{target}) catch return;
+            try self.noticeTo(conn, note);
+            return;
+        };
+
+        var b: [default_reply_bytes]u8 = undefined;
+        const head = std.fmt.bufPrint(&b, "GEOIP {s}: country={s} continent={s} /{d}", .{
+            target,
+            info.country_iso orelse "?",
+            info.continent_code orelse "?",
+            info.prefix_len,
+        }) catch return;
+        try self.noticeTo(conn, head);
+
+        if (info.latitude != null or info.time_zone != null or info.postal_code != null) {
+            const loc = std.fmt.bufPrint(&b, "  loc: {d:.4},{d:.4} +/-{d}km tz={s} postal={s}", .{
+                info.latitude orelse 0,
+                info.longitude orelse 0,
+                info.accuracy_radius orelse 0,
+                info.time_zone orelse "?",
+                info.postal_code orelse "?",
+            }) catch return;
+            try self.noticeTo(conn, loc);
+        }
+        if (info.asn != null or info.isp != null or info.org != null or info.connection_type != null) {
+            const net = std.fmt.bufPrint(&b, "  net: AS{d} {s} isp={s} conn={s}", .{
+                info.asn orelse 0,
+                info.asn_org orelse info.org orelse "?",
+                info.isp orelse "?",
+                info.connection_type orelse "?",
+            }) catch return;
+            try self.noticeTo(conn, net);
+        }
+        const t = info.traits;
+        if (t.is_anonymous or t.is_anonymous_proxy or t.is_anonymous_vpn or t.is_hosting_provider or
+            t.is_public_proxy or t.is_residential_proxy or t.is_satellite_provider or t.is_tor_exit_node)
+        {
+            const flags = std.fmt.bufPrint(&b, "  flags:{s}{s}{s}{s}{s}{s}{s}{s}", .{
+                if (t.is_anonymous) " anon" else "",
+                if (t.is_anonymous_proxy) " anon-proxy" else "",
+                if (t.is_anonymous_vpn) " vpn" else "",
+                if (t.is_hosting_provider) " hosting" else "",
+                if (t.is_public_proxy) " public-proxy" else "",
+                if (t.is_residential_proxy) " residential-proxy" else "",
+                if (t.is_satellite_provider) " satellite" else "",
+                if (t.is_tor_exit_node) " tor" else "",
+            }) catch return;
+            try self.noticeTo(conn, flags);
         }
     }
 
