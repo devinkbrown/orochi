@@ -3068,20 +3068,14 @@ pub const LinuxServer = struct {
             }
         }
 
-        // Residual: commands not (yet) owned by a SerpentRegistry module.
-        // Everything above has been migrated into src/daemon/modules/* and is
-        // dispatched by the registry block at the top of this function.
-        // AKICK / RESV / UNRESV / FORCE* / CLEAR / TEMPMODE / CLONES / SEEN are
-        // now first-class SerpentRegistry commands (modules/services_ext.zig),
-        // resolved by the registry block at the top of this function.
-        if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
-            try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
-            // Client heartbeat reply; accepted, no response required.
-        } else {
-            var sink = QueueSink{ .conn = conn };
-            try processLine(conn, line, &sink);
-        }
+        // Everything daemon-owned is now a SerpentRegistry command, resolved by
+        // the registry block at the top of this function. The only remaining
+        // direct path is the registration-handshake processor (dispatch.zig
+        // command_table: PASS/NICK/USER/CAP/AUTHENTICATE/PING/QUIT) — those
+        // verbs must work both before and after registration, so they live in
+        // the lower layer rather than the post-registration registry.
+        var sink = QueueSink{ .conn = conn };
+        try processLine(conn, line, &sink);
     }
 
     /// Module-facing numeric reply: lets a SerpentRegistry module emit a numeric
