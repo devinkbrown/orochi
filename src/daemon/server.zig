@@ -44,6 +44,7 @@ const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
+const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
@@ -1287,6 +1288,9 @@ pub const LinuxServer = struct {
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
     sessions: sessions_mod.SessionStore,
+    /// Replay tracker for cross-server (mesh-sealed) session reclaim nonces, so a
+    /// captured mesh reclaim token cannot be replayed against this node.
+    session_reclaim_replay: session_reclaim_mesh.ReplayRing(256) = .{},
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Mizuchi media SFU control plane): who is in each call.
@@ -8366,6 +8370,50 @@ pub const LinuxServer = struct {
         return t;
     }
 
+    /// Lifetime of a cross-server (mesh-sealed) reclaim token.
+    const mesh_reclaim_ttl_ms: u64 = 12 * 60 * 60 * 1000;
+
+    /// Lowercase-hex encode `bytes` into `out`, returning the written slice
+    /// (runtime length — `std.fmt.bytesToHex` needs a comptime length).
+    fn toHexLower(bytes: []const u8, out: []u8) []const u8 {
+        const hexchars = "0123456789abcdef";
+        var i: usize = 0;
+        while (i < bytes.len and i * 2 + 1 < out.len) : (i += 1) {
+            out[i * 2] = hexchars[bytes[i] >> 4];
+            out[i * 2 + 1] = hexchars[bytes[i] & 0x0f];
+        }
+        return out[0 .. i * 2];
+    }
+
+    /// Seal a cross-server (mesh) reclaim token for the caller's live session
+    /// and write its lowercase hex into `out_hex`. Returns null when the mesh
+    /// shared key is unset (cross-server reclaim then disabled) or sealing
+    /// fails. `origin_node` is this server, so a peer can redirect the client
+    /// home; `session_id` correlates the session at the origin.
+    fn meshReclaimToken(self: *LinuxServer, account: []const u8, session_id: []const u8, out_hex: []u8) ?[]const u8 {
+        const key = self.config.mesh_pass;
+        if (key.len == 0) return null;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        var nonce: u64 = 0;
+        if (self.config.crypto_io) |io| {
+            var nb: [8]u8 = undefined;
+            io.random(&nb);
+            nonce = std.mem.readInt(u64, &nb, .big);
+        }
+        const fields = session_reclaim_mesh.ReclaimFields{
+            .account = account,
+            .session_id = session_id,
+            .origin_node = server_name,
+            .issued_ms = now,
+            .expiry_ms = now + mesh_reclaim_ttl_ms,
+            .nonce = nonce,
+        };
+        var raw: [512]u8 = undefined;
+        const n = session_reclaim_mesh.seal(key, fields, &raw) catch return null;
+        if (n * 2 > out_hex.len) return null;
+        return toHexLower(raw[0..n], out_hex);
+    }
+
     /// Register a live session for the client's account (once; keeps the token
     /// stable). No-op if the client is not logged in. Called after account login.
     fn trackSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
@@ -8398,6 +8446,14 @@ pub const LinuxServer = struct {
                 const hex = std.fmt.bytesToHex(s.token, .lower);
                 const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION TOKEN :{s}\r\n", .{ server_name, hex }) catch return;
                 try appendToConn(conn, line);
+                // Also offer a mesh-sealed token usable to reclaim/redirect from
+                // ANY node in the mesh (only when a mesh shared key is set).
+                var mbuf: [1024]u8 = undefined;
+                if (self.meshReclaimToken(account, &hex, &mbuf)) |mhex| {
+                    var lb: [1152]u8 = undefined;
+                    const mline = std.fmt.bufPrint(&lb, ":{s} NOTE SESSION MTOKEN :{s}\r\n", .{ server_name, mhex }) catch return;
+                    try appendToConn(conn, mline);
+                }
                 return;
             }
             try self.noticeTo(conn, "SESSION: no token for this session");
@@ -8423,8 +8479,14 @@ pub const LinuxServer = struct {
     pub fn handleSessionResume(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, parsed: *const irc_line.LineView) !void {
         const cid = monitorIdFromClient(id);
         const params = parsed.paramSlice();
-        if (params.len < 2 or params[1].len != 2 * @sizeOf(sessions_mod.Token)) {
+        if (params.len < 2 or params[1].len == 0) {
             try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
+            return;
+        }
+        // A token longer than the local 16-byte form is a mesh-sealed token:
+        // reclaim/redirect it across the mesh.
+        if (params[1].len != 2 * @sizeOf(sessions_mod.Token)) {
+            try self.handleMeshReclaim(id, conn, account, params[1]);
             return;
         }
         var token: sessions_mod.Token = undefined;
@@ -8444,6 +8506,70 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{server_name}) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// Cross-server reclaim: `SESSION RESUME <mesh-token>` where the token is a
+    /// mesh-sealed `session_reclaim_mesh` blob (hex). Verify it under the mesh
+    /// shared key, confirm it is for the caller's OWN authenticated account, then
+    /// either reclaim a detached session held here (grant_local) or tell the
+    /// client which node owns it (grant_redirect). Nonces are replay-protected.
+    fn handleMeshReclaim(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, account: []const u8, tok_hex: []const u8) !void {
+        const key = self.config.mesh_pass;
+        if (key.len == 0) {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "cross-server reclaim is not enabled");
+            return;
+        }
+        if (tok_hex.len % 2 != 0 or tok_hex.len / 2 > 512) {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "malformed reclaim token");
+            return;
+        }
+        var raw: [512]u8 = undefined;
+        const rb = std.fmt.hexToBytes(raw[0 .. tok_hex.len / 2], tok_hex) catch {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token is not valid hex");
+            return;
+        };
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const fields = session_reclaim_mesh.open(key, rb, now) catch |e| {
+            const msg = switch (e) {
+                error.Expired => "reclaim token expired",
+                error.BadMac => "reclaim token failed verification",
+                else => "malformed reclaim token",
+            };
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", msg);
+            return;
+        };
+        // A client may only reclaim sessions of its OWN authenticated account.
+        if (!std.ascii.eqlIgnoreCase(fields.account, account)) {
+            try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token is for a different account");
+            return;
+        }
+        const cid = monitorIdFromClient(id);
+        // Does this node hold a detached session for the account (other than the
+        // caller's own live session)?
+        var ghost: ?sessions_mod.ClientId = null;
+        for (self.sessions.sessions(account)) |s| {
+            if (s.client != cid) {
+                ghost = s.client;
+                break;
+            }
+        }
+        const origin_is_self = std.mem.eql(u8, fields.origin_node, server_name);
+        const seen = self.session_reclaim_replay.check(fields.nonce);
+        var buf: [default_reply_bytes]u8 = undefined;
+        switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, seen, now)) {
+            .grant_local => {
+                if (ghost) |g| _ = self.sessions.remove(account, g);
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed (cross-server)\r\n", .{server_name}) catch return;
+                try appendToConn(conn, line);
+            },
+            .grant_redirect => |node| {
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION REDIRECT :Session lives on {s}; reconnect there to reclaim\r\n", .{ server_name, node }) catch return;
+                try appendToConn(conn, line);
+            },
+            .deny_expired => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token expired"),
+            .deny_replay => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token already used"),
+            .deny_unknown => try self.failReply(conn, "SESSION", "NO_SESSION", "no matching session on origin node"),
+        }
     }
 
     /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR>` — Mizuchi offline mail.
