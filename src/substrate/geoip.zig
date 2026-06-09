@@ -1,10 +1,20 @@
-//! Minimal MaxMind DB GeoIP reader.
+//! MaxMind DB (MMDB) GeoIP reader.
 //!
-//! This is intentionally small: it accepts a memory-mapped file or any
-//! caller-owned byte slice, parses enough metadata to walk the search tree,
-//! and decodes data-section maps well enough to return a country ISO code
-//! and optional ASN. Malformed input returns an error; it never panics on
-//! attacker-controlled database bytes.
+//! Accepts a memory-mapped file or any caller-owned byte slice, parses the
+//! metadata, walks the binary search tree (24/28/32-bit records, IPv4 + IPv6),
+//! and decodes the data section. The decoder handles every MMDB value type
+//! (map, array, pointer, utf8_string, bytes, bool, double, float, and the
+//! uint16/32/64/128 + int32 integers) with full bounds checking — it returns an
+//! error and never panics on attacker-controlled database bytes.
+//!
+//! Extraction is comprehensive: `lookupInfo` decodes a rich `GeoInfo` (country,
+//! continent, registered/represented country, city, lat/lon, accuracy radius,
+//! metro, time zone, postal, ASN + organization, ISP, org, connection type,
+//! domain, user type, anonymity traits, and the matched prefix length) across
+//! GeoIP2 Country/City/ASN/ISP/Connection-Type/Anonymous-IP layouts. Generic
+//! `lookupString`/`lookupUnsigned`/`lookupDouble`/`lookupBool` reach any field
+//! by path (map keys + array indices), `lookupName` reads localized names, and
+//! `databaseType`/`buildEpoch` expose metadata.
 const std = @import("std");
 
 const metadata_marker = "\xab\xcd\xefMaxMind.com";
@@ -47,6 +57,54 @@ pub const Metadata = struct {
 pub const Lookup = struct {
     country_iso: ?[]const u8 = null,
     asn: ?u32 = null,
+};
+
+/// Anonymity / network-class flags (GeoIP2 traits + Anonymous-IP DB). Absent
+/// fields default to false.
+pub const Traits = struct {
+    is_anonymous: bool = false,
+    is_anonymous_proxy: bool = false,
+    is_anonymous_vpn: bool = false,
+    is_hosting_provider: bool = false,
+    is_public_proxy: bool = false,
+    is_residential_proxy: bool = false,
+    is_satellite_provider: bool = false,
+    is_tor_exit_node: bool = false,
+    is_legitimate_proxy: bool = false,
+};
+
+/// A rich GeoIP2 lookup result. Every string slice borrows from the database
+/// buffer; numeric/bool fields are decoded by value. Fields the database does
+/// not carry stay null/false, so one struct serves Country/City/ASN/ISP/
+/// Connection-Type/Anonymous-IP databases alike.
+pub const GeoInfo = struct {
+    country_iso: ?[]const u8 = null,
+    country_in_eu: bool = false,
+    continent_code: ?[]const u8 = null,
+    registered_country_iso: ?[]const u8 = null,
+    represented_country_iso: ?[]const u8 = null,
+
+    city_geoname_id: ?u32 = null,
+    latitude: ?f64 = null,
+    longitude: ?f64 = null,
+    accuracy_radius: ?u32 = null,
+    metro_code: ?u32 = null,
+    time_zone: ?[]const u8 = null,
+    postal_code: ?[]const u8 = null,
+
+    asn: ?u32 = null,
+    asn_org: ?[]const u8 = null,
+    isp: ?[]const u8 = null,
+    org: ?[]const u8 = null,
+    connection_type: ?[]const u8 = null,
+    domain: ?[]const u8 = null,
+    user_type: ?[]const u8 = null,
+
+    traits: Traits = .{},
+
+    /// Prefix length (network mask bits) of the record that matched the IP, as
+    /// walked from the search tree. 0 means a default/root record.
+    prefix_len: u8 = 0,
 };
 
 /// A borrowed, allocation-free MMDB reader.
@@ -144,7 +202,128 @@ pub const Database = struct {
         return out[0..country.len];
     }
 
+    fn dataReader(self: Database) ValueReader {
+        return ValueReader.init(self.bytes, self.metadata.data_start, self.metadata.metadata_start);
+    }
+
+    fn metaReader(self: Database) ValueReader {
+        return ValueReader.init(self.bytes, self.metadata.metadata_start, self.bytes.len);
+    }
+
+    /// Decode every field the database carries for `ip` into a single struct.
+    /// Works across GeoIP2 Country/City/ASN/ISP/Connection-Type/Anonymous-IP and
+    /// equivalent layouts: absent fields simply stay null/false.
+    pub fn lookupInfo(self: Database, ip: Ip) Error!?GeoInfo {
+        const hit = try self.findRecordEx(ip) orelse return null;
+        const r = self.dataReader();
+        const root = try r.expectMap(hit.abs);
+
+        var g = GeoInfo{ .prefix_len = hit.prefix_len };
+        g.country_iso = try r.getUtf8(root, &.{ "country", "iso_code" });
+        g.country_in_eu = (try r.getBool(root, &.{ "country", "is_in_european_union" })) orelse false;
+        g.continent_code = try r.getUtf8(root, &.{ "continent", "code" });
+        g.registered_country_iso = try r.getUtf8(root, &.{ "registered_country", "iso_code" });
+        g.represented_country_iso = try r.getUtf8(root, &.{ "represented_country", "iso_code" });
+
+        g.city_geoname_id = try r.getU32(root, &.{ "city", "geoname_id" });
+        g.latitude = try r.getDouble(root, &.{ "location", "latitude" });
+        g.longitude = try r.getDouble(root, &.{ "location", "longitude" });
+        g.accuracy_radius = try r.getU32(root, &.{ "location", "accuracy_radius" });
+        g.metro_code = try r.getU32(root, &.{ "location", "metro_code" });
+        g.time_zone = try r.getUtf8(root, &.{ "location", "time_zone" });
+        g.postal_code = try r.getUtf8(root, &.{ "postal", "code" });
+
+        g.asn = try r.getU32(root, &.{"autonomous_system_number"});
+        g.asn_org = try r.getUtf8(root, &.{"autonomous_system_organization"});
+        g.isp = try r.getUtf8(root, &.{"isp"});
+        g.org = try r.getUtf8(root, &.{"organization"});
+        g.connection_type = try r.getUtf8(root, &.{"connection_type"});
+        g.domain = try r.getUtf8(root, &.{"domain"});
+        g.user_type = try boolPathStr(r, root, "user_type");
+
+        g.traits = .{
+            .is_anonymous = try boolFlag(r, root, "is_anonymous"),
+            .is_anonymous_proxy = try boolFlag(r, root, "is_anonymous_proxy"),
+            .is_anonymous_vpn = try boolFlag(r, root, "is_anonymous_vpn"),
+            .is_hosting_provider = try boolFlag(r, root, "is_hosting_provider"),
+            .is_public_proxy = try boolFlag(r, root, "is_public_proxy"),
+            .is_residential_proxy = try boolFlag(r, root, "is_residential_proxy"),
+            .is_satellite_provider = try boolFlag(r, root, "is_satellite_provider"),
+            .is_tor_exit_node = try boolFlag(r, root, "is_tor_exit_node"),
+            .is_legitimate_proxy = try boolFlag(r, root, "is_legitimate_proxy"),
+        };
+        return g;
+    }
+
+    /// Generic accessor: the UTF-8 string at `path` for `ip`, or null. `path`
+    /// elements address map keys; a decimal element indexes an array.
+    pub fn lookupString(self: Database, ip: Ip, path: []const []const u8) Error!?[]const u8 {
+        const hit = try self.findRecordEx(ip) orelse return null;
+        const r = self.dataReader();
+        const root = try r.expectMap(hit.abs);
+        return r.getUtf8(root, path);
+    }
+
+    /// Generic accessor: the unsigned integer at `path` for `ip`, or null.
+    pub fn lookupUnsigned(self: Database, ip: Ip, path: []const []const u8) Error!?u64 {
+        const hit = try self.findRecordEx(ip) orelse return null;
+        const r = self.dataReader();
+        const root = try r.expectMap(hit.abs);
+        return r.getUnsigned(root, path);
+    }
+
+    /// Generic accessor: the double at `path` for `ip`, or null.
+    pub fn lookupDouble(self: Database, ip: Ip, path: []const []const u8) Error!?f64 {
+        const hit = try self.findRecordEx(ip) orelse return null;
+        const r = self.dataReader();
+        const root = try r.expectMap(hit.abs);
+        return r.getDouble(root, path);
+    }
+
+    /// Generic accessor: the boolean at `path` for `ip`, or null.
+    pub fn lookupBool(self: Database, ip: Ip, path: []const []const u8) Error!?bool {
+        const hit = try self.findRecordEx(ip) orelse return null;
+        const r = self.dataReader();
+        const root = try r.expectMap(hit.abs);
+        return r.getBool(root, path);
+    }
+
+    /// Localized name (e.g. country/city/subdivision/continent). `entity` is the
+    /// top-level key ("country", "city", "continent", …); the name is read from
+    /// `<entity>.names.<lang>` (e.g. lang "en").
+    pub fn lookupName(self: Database, ip: Ip, entity: []const u8, lang: []const u8) Error!?[]const u8 {
+        const hit = try self.findRecordEx(ip) orelse return null;
+        const r = self.dataReader();
+        const root = try r.expectMap(hit.abs);
+        return r.getUtf8(root, &.{ entity, "names", lang });
+    }
+
+    /// MMDB `database_type` metadata string (e.g. "GeoIP2-City"), or null.
+    pub fn databaseType(self: Database) Error!?[]const u8 {
+        const r = self.metaReader();
+        const root = try r.expectMap(self.metadata.metadata_start);
+        return r.getUtf8(root, &.{"database_type"});
+    }
+
+    /// MMDB `build_epoch` (Unix seconds the database was built), or null.
+    pub fn buildEpoch(self: Database) Error!?u64 {
+        const r = self.metaReader();
+        const root = try r.expectMap(self.metadata.metadata_start);
+        return r.getUnsigned(root, &.{"build_epoch"});
+    }
+
+    /// One record hit: the data-section offset and the matched prefix length.
+    pub const RecordHit = struct {
+        abs: usize,
+        prefix_len: u8,
+    };
+
     fn findRecord(self: Database, ip: Ip) Error!?usize {
+        const hit = try self.findRecordEx(ip) orelse return null;
+        return hit.abs;
+    }
+
+    fn findRecordEx(self: Database, ip: Ip) Error!?RecordHit {
         var ip_buf = [_]u8{0} ** 16;
         const bit_count: usize = switch (ip) {
             .v4 => |v4| if (self.metadata.ip_version == 4) blk: {
@@ -184,7 +363,9 @@ pub const Database = struct {
             const abs = checkedAdd(self.metadata.data_start, @intCast(data_offset)) orelse
                 return Error.InvalidDatabase;
             if (abs >= self.metadata.metadata_start) return Error.InvalidDatabase;
-            return abs;
+            // The prefix length is the number of IP bits consumed to reach the
+            // data record (the depth of the leaf in the search tree).
+            return RecordHit{ .abs = abs, .prefix_len = @intCast(bit_index + 1) };
         }
 
         return null;
@@ -283,14 +464,49 @@ const ValueReader = struct {
         return try self.readUnsignedField(u64, value);
     }
 
+    fn getBool(self: ValueReader, root: Field, path: []const []const u8) Error!?bool {
+        const found = try self.get(root, path) orelse return null;
+        const value = try self.resolveField(found, 0);
+        if (value.value_type != .boolean) return null;
+        // Booleans encode their value in the size field (0 = false, 1 = true);
+        // the payload is empty.
+        return value.size != 0;
+    }
+
+    fn getDouble(self: ValueReader, root: Field, path: []const []const u8) Error!?f64 {
+        const found = try self.get(root, path) orelse return null;
+        const value = try self.resolveField(found, 0);
+        if (value.value_type != .double) return null;
+        if (value.size != 8) return Error.InvalidDatabase;
+        const data = try self.slice(value.payload, 8);
+        return @bitCast(std.mem.readInt(u64, data[0..8], .big));
+    }
+
+    /// Navigate one path step into a map (by key) or an array (by decimal
+    /// index). Returns the addressed field, or null if absent / wrong type.
     fn get(self: ValueReader, root: Field, path: []const []const u8) Error!?Field {
         if (path.len == 0) return root;
-        const map = try self.resolveField(root, 0);
-        if (map.value_type != .map) return null;
+        const node = try self.resolveField(root, 0);
 
-        var cursor = map.payload;
+        if (node.value_type == .array) {
+            const idx = std.fmt.parseInt(usize, path[0], 10) catch return null;
+            if (idx >= node.size) return null;
+            var cursor = node.payload;
+            var i: usize = 0;
+            while (i < idx) : (i += 1) {
+                const item = try self.field(cursor);
+                cursor = item.end;
+            }
+            const value = try self.field(cursor);
+            if (path.len == 1) return value;
+            return self.get(value, path[1..]);
+        }
+
+        if (node.value_type != .map) return null;
+
+        var cursor = node.payload;
         var index: usize = 0;
-        while (index < map.size) : (index += 1) {
+        while (index < node.size) : (index += 1) {
             const key = try self.field(cursor);
             cursor = key.end;
             const value = try self.field(cursor);
@@ -496,6 +712,20 @@ const ValueReader = struct {
     }
 };
 
+/// Read a boolean flag that may live either under `traits.<name>` (GeoIP2
+/// City/ISP) or at the top level (Anonymous-IP DB). Absent ⇒ false.
+fn boolFlag(r: ValueReader, root: Field, name: []const u8) Error!bool {
+    if (try r.getBool(root, &.{ "traits", name })) |v| return v;
+    if (try r.getBool(root, &.{name})) |v| return v;
+    return false;
+}
+
+/// Read a string field that may live under `traits.<name>` or at the top level.
+fn boolPathStr(r: ValueReader, root: Field, name: []const u8) Error!?[]const u8 {
+    if (try r.getUtf8(root, &.{ "traits", name })) |v| return v;
+    return r.getUtf8(root, &.{name});
+}
+
 fn findMetadataStart(bytes: []const u8) ?usize {
     if (bytes.len < metadata_marker.len) return null;
     const search_len = @min(bytes.len, max_metadata_search);
@@ -542,19 +772,29 @@ fn checkedMul(a: usize, b: usize) ?usize {
 const ByteList = std.array_list.Managed(u8);
 
 fn appendHeader(out: *ByteList, value_type: u8, size: usize) !void {
+    // Types 1..7 fit the control byte's 3-bit type field. Types >= 8 use the
+    // extended form: the control type field is 0 and a `value_type - 7` byte
+    // follows the control byte (before any size-extension bytes), mirroring the
+    // reader's `header()` decode.
+    const ctrl_type: u8 = if (value_type >= 8) 0 else value_type;
+    const ext: ?u8 = if (value_type >= 8) value_type - 7 else null;
     if (size < 29) {
-        try out.append((value_type << 5) | @as(u8, @intCast(size)));
+        try out.append((ctrl_type << 5) | @as(u8, @intCast(size)));
+        if (ext) |e| try out.append(e);
     } else if (size < 285) {
-        try out.append((value_type << 5) | 29);
+        try out.append((ctrl_type << 5) | 29);
+        if (ext) |e| try out.append(e);
         try out.append(@intCast(size - 29));
     } else if (size < 65821) {
         const n = size - 285;
-        try out.append((value_type << 5) | 30);
+        try out.append((ctrl_type << 5) | 30);
+        if (ext) |e| try out.append(e);
         try out.append(@intCast(n >> 8));
         try out.append(@intCast(n & 0xff));
     } else {
         const n = size - 65821;
-        try out.append((value_type << 5) | 31);
+        try out.append((ctrl_type << 5) | 31);
+        if (ext) |e| try out.append(e);
         try out.append(@intCast((n >> 16) & 0xff));
         try out.append(@intCast((n >> 8) & 0xff));
         try out.append(@intCast(n & 0xff));
@@ -591,6 +831,21 @@ fn appendUint(out: *ByteList, value_type: ValueType, value: u64) !void {
 
 fn appendMapHeader(out: *ByteList, pairs: usize) !void {
     try appendHeader(out, @intFromEnum(ValueType.map), pairs);
+}
+
+fn appendArrayHeader(out: *ByteList, items: usize) !void {
+    try appendHeader(out, @intFromEnum(ValueType.array), items);
+}
+
+fn appendBool(out: *ByteList, value: bool) !void {
+    try appendHeader(out, @intFromEnum(ValueType.boolean), if (value) 1 else 0);
+}
+
+fn appendDouble(out: *ByteList, value: f64) !void {
+    try appendHeader(out, @intFromEnum(ValueType.double), 8);
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, @bitCast(value), .big);
+    try out.appendSlice(&b);
 }
 
 fn appendPointer(out: *ByteList, pointer: u64) !void {
@@ -882,4 +1137,110 @@ test "random garbage bytes never panic during init or lookup" {
             continue;
         }
     }
+}
+
+test "lookupInfo decodes a full GeoIP2-City-style record" {
+    var bytes = ByteList.init(std.testing.allocator);
+    defer bytes.deinit();
+
+    const record_pointer: u32 = 1 + data_separator_len;
+    try appendNode24(&bytes, 1, record_pointer);
+    try bytes.appendNTimes(0, data_separator_len);
+
+    // Record map (8 top-level keys).
+    try appendMapHeader(&bytes, 8);
+
+    try appendString(&bytes, "continent");
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "code");
+    try appendString(&bytes, "NA");
+
+    try appendString(&bytes, "country");
+    try appendMapHeader(&bytes, 3);
+    try appendString(&bytes, "iso_code");
+    try appendString(&bytes, "US");
+    try appendString(&bytes, "is_in_european_union");
+    try appendBool(&bytes, false);
+    try appendString(&bytes, "names");
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "en");
+    try appendString(&bytes, "United States");
+
+    try appendString(&bytes, "location");
+    try appendMapHeader(&bytes, 4);
+    try appendString(&bytes, "latitude");
+    try appendDouble(&bytes, 37.751);
+    try appendString(&bytes, "longitude");
+    try appendDouble(&bytes, -97.822);
+    try appendString(&bytes, "accuracy_radius");
+    try appendUint(&bytes, .uint16, 1000);
+    try appendString(&bytes, "time_zone");
+    try appendString(&bytes, "America/Chicago");
+
+    try appendString(&bytes, "postal");
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "code");
+    try appendString(&bytes, "67000");
+
+    try appendString(&bytes, "traits");
+    try appendMapHeader(&bytes, 2);
+    try appendString(&bytes, "is_anonymous_vpn");
+    try appendBool(&bytes, true);
+    try appendString(&bytes, "user_type");
+    try appendString(&bytes, "residential");
+
+    try appendString(&bytes, "subdivisions");
+    try appendArrayHeader(&bytes, 1);
+    try appendMapHeader(&bytes, 1);
+    try appendString(&bytes, "iso_code");
+    try appendString(&bytes, "KS");
+
+    try appendString(&bytes, "autonomous_system_number");
+    try appendUint(&bytes, .uint32, 15169);
+    try appendString(&bytes, "autonomous_system_organization");
+    try appendString(&bytes, "Google LLC");
+
+    // Rich metadata (extra keys beyond the required three).
+    try bytes.appendSlice(metadata_marker);
+    try appendMapHeader(&bytes, 5);
+    try appendString(&bytes, "node_count");
+    try appendUint(&bytes, .uint32, 1);
+    try appendString(&bytes, "record_size");
+    try appendUint(&bytes, .uint16, 24);
+    try appendString(&bytes, "ip_version");
+    try appendUint(&bytes, .uint16, 4);
+    try appendString(&bytes, "database_type");
+    try appendString(&bytes, "GeoIP2-City");
+    try appendString(&bytes, "build_epoch");
+    try appendUint(&bytes, .uint64, 1700000000);
+
+    const db = try Database.init(bytes.items);
+    const ip = Ip.fromV4(128, 0, 0, 1);
+
+    const g = try db.lookupInfo(ip) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("US", g.country_iso.?);
+    try std.testing.expect(!g.country_in_eu);
+    try std.testing.expectEqualStrings("NA", g.continent_code.?);
+    try std.testing.expectEqual(@as(?u32, 1000), g.accuracy_radius);
+    try std.testing.expectApproxEqAbs(@as(f64, 37.751), g.latitude.?, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, -97.822), g.longitude.?, 1e-9);
+    try std.testing.expectEqualStrings("America/Chicago", g.time_zone.?);
+    try std.testing.expectEqualStrings("67000", g.postal_code.?);
+    try std.testing.expectEqual(@as(?u32, 15169), g.asn);
+    try std.testing.expectEqualStrings("Google LLC", g.asn_org.?);
+    try std.testing.expect(g.traits.is_anonymous_vpn);
+    try std.testing.expect(!g.traits.is_tor_exit_node);
+    try std.testing.expectEqualStrings("residential", g.user_type.?);
+    try std.testing.expectEqual(@as(u8, 1), g.prefix_len);
+
+    // Generic accessors + array indexing + localized names.
+    try std.testing.expectEqualStrings("KS", (try db.lookupString(ip, &.{ "subdivisions", "0", "iso_code" })).?);
+    try std.testing.expectEqualStrings("United States", (try db.lookupName(ip, "country", "en")).?);
+    try std.testing.expectApproxEqAbs(@as(f64, 37.751), (try db.lookupDouble(ip, &.{ "location", "latitude" })).?, 1e-9);
+    try std.testing.expectEqual(@as(?u64, 15169), try db.lookupUnsigned(ip, &.{"autonomous_system_number"}));
+    try std.testing.expectEqual(@as(?bool, true), try db.lookupBool(ip, &.{ "traits", "is_anonymous_vpn" }));
+
+    // Metadata accessors.
+    try std.testing.expectEqualStrings("GeoIP2-City", (try db.databaseType()).?);
+    try std.testing.expectEqual(@as(?u64, 1700000000), try db.buildEpoch());
 }
