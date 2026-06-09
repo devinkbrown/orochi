@@ -4010,6 +4010,13 @@ pub const LinuxServer = struct {
         try appendToConn(conn, "\r\n");
     }
 
+    /// +H hide-oper: whether `target`'s operator status must be hidden from
+    /// `viewer` — true when the target set +H and the viewer is neither an oper
+    /// nor the target themselves.
+    fn operHidden(target: *ConnState, viewer: *ConnState) bool {
+        return target.session.umodes.contains(.hide_oper) and !viewer.session.isOper() and viewer != target;
+    }
+
     /// Emit one RPL_WHOSPCRPL (354) row. Flags are `<H|G>[*][<prefix>]`: away,
     /// then oper, then the highest channel prefix (channel targets only).
     fn emitWhoxRow(
@@ -4027,7 +4034,7 @@ pub const LinuxServer = struct {
         var fl: usize = 0;
         flags_buf[fl] = if (mconn != null and mconn.?.session.awayMessage() != null) 'G' else 'H';
         fl += 1;
-        if (mconn != null and mconn.?.session.isOper()) {
+        if (mconn != null and mconn.?.session.isOper() and !operHidden(mconn.?, conn)) {
             flags_buf[fl] = '*';
             fl += 1;
         }
@@ -4225,7 +4232,9 @@ pub const LinuxServer = struct {
             .realname = tconn.session.realname(),
             .account = tconn.session.account(),
             .away = tconn.session.awayMessage(),
-            .is_oper = tconn.session.isOper(),
+            // +H hide-oper: suppress operator status unless the requester is an
+            // oper (or the user themselves).
+            .is_oper = tconn.session.isOper() and !operHidden(tconn, conn),
             .is_bot = tconn.session.isBot(),
             // RPL_WHOISCERTFP (276): surface the TLS client-cert fingerprint of a
             // mutual-TLS user (the same value SASL EXTERNAL matches to an account).

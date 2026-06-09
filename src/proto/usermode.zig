@@ -20,6 +20,7 @@ pub const UserMode = enum(u4) {
     regonly_pm, // R: reject PMs/notices from unauthenticated senders
     hide_chans, // p: suppress own channel list in WHOIS (opers still see it)
     no_forward, // Q: never be forwarded to another channel on a blocked JOIN
+    hide_oper, // H: hide operator status from WHOIS/WHO for non-opers
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
@@ -147,6 +148,7 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .regonly_pm, .letter = 'R', .name = "regonly-pm" },
     .{ .mode = .hide_chans, .letter = 'p', .name = "hide-chans" },
     .{ .mode = .no_forward, .letter = 'Q', .name = "no-forward" },
+    .{ .mode = .hide_oper, .letter = 'H', .name = "hide-oper" },
 };
 
 pub const DefaultCatalog = Catalog(&default_specs);
