@@ -5573,6 +5573,7 @@ pub const LinuxServer = struct {
                 .account => facets.account = p[2],
                 .realname => facets.realname = p[2],
                 .certfp => facets.certfp = p[2],
+                .country => facets.country = p[2],
             }
             if (self.warden.check(facets, platform.realtimeMillis())) |w| {
                 var b: [default_reply_bytes]u8 = undefined;
@@ -5590,7 +5591,7 @@ pub const LinuxServer = struct {
             return;
         }
         const match = warden.Match.parse(p[1]) orelse {
-            try self.noticeTo(conn, "WARD: unknown match facet (address|host|mask|account|realname|certfp)");
+            try self.noticeTo(conn, "WARD: unknown match facet (address|host|mask|account|realname|certfp|country)");
             return;
         };
         const pattern = p[2];
@@ -6444,6 +6445,14 @@ pub const LinuxServer = struct {
 
         var mask_buf: [256]u8 = undefined;
         const mask = clientPrefix(conn, &mask_buf) catch "";
+        // GeoIP country facet (e.g. for `WARD ADD country RU ...`). Resolved only
+        // when a database is configured; empty country never matches a ward.
+        var country: []const u8 = "";
+        if (parseGeoIp(conn.session.realHost())) |gip| {
+            if (self.ensureGeoip()) |db| {
+                if (db.lookupInfo(gip) catch null) |gi| country = gi.country_iso orelse "";
+            }
+        }
         const facets = warden.Facets{
             .address = conn.session.realHost(),
             .host = conn.session.host(),
@@ -6451,6 +6460,7 @@ pub const LinuxServer = struct {
             .account = conn.session.account(),
             .realname = conn.session.realname(),
             .certfp = conn.session.tls_certfp orelse "",
+            .country = country,
         };
         const hit = self.warden.check(facets, self.nowMs()) orelse return false;
 

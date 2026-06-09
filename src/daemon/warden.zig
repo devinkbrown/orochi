@@ -26,6 +26,7 @@ pub const Match = enum {
     account, // services account name glob
     realname, // GECOS / realname glob
     certfp, // TLS client-certificate fingerprint glob
+    country, // GeoIP ISO-3166 country code (e.g. RU), glob-matched
 
     pub fn token(self: Match) []const u8 {
         return switch (self) {
@@ -35,6 +36,7 @@ pub const Match = enum {
             .account => "account",
             .realname => "realname",
             .certfp => "certfp",
+            .country => "country",
         };
     }
 
@@ -132,6 +134,7 @@ pub const Facets = struct {
     account: ?[]const u8 = null,
     realname: []const u8 = "",
     certfp: []const u8 = "",
+    country: []const u8 = "",
 
     fn facet(self: Facets, m: Match) []const u8 {
         return switch (m) {
@@ -141,6 +144,7 @@ pub const Facets = struct {
             .account => self.account orelse "",
             .realname => self.realname,
             .certfp => self.certfp,
+            .country => self.country,
         };
     }
 };
@@ -362,6 +366,16 @@ test "address ward matches ipv4 cidr; mask ward globs" {
     try std.testing.expect(reg.check(.{ .address = "192.0.3.50" }, 200) == null);
     const hit = reg.check(.{ .mask = "bob!~b@host.evil.example" }, 200).?;
     try std.testing.expectEqual(Action.expel, hit.action);
+}
+
+test "country ward matches the GeoIP country facet case-insensitively" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.add(mkWard(.country, "RU", .refuse));
+    try std.testing.expect(reg.check(.{ .country = "ru" }, 0) != null);
+    try std.testing.expect(reg.check(.{ .country = "US" }, 0) == null);
+    try std.testing.expect(reg.check(.{}, 0) == null); // no country facet
+    try std.testing.expectEqual(Match.country, Match.parse("COUNTRY").?);
 }
 
 test "absent facet never matches; account ward needs account" {
