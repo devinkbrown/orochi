@@ -21,6 +21,7 @@ const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
+const svc_tempmode = @import("svc_tempmode.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
@@ -761,6 +762,7 @@ const Numeric = enum(u16) {
     ERR_BADCHANNELKEY = 475,
     ERR_NEEDREGGEDNICK = 477,
     ERR_UNAVAILRESOURCE = 437,
+    ERR_UNKNOWNMODE = 472,
     ERR_NONICKNAMEGIVEN = 431,
     ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
@@ -1193,6 +1195,9 @@ pub const LinuxServer = struct {
     /// IRCX +z GAG, keyed by IP: every nick from a gagged IP is silenced, and
     /// the gag persists across reconnect (it lives here, not on the connection).
     gags: gag_set.GagSet,
+    /// TEMPMODE queue: channel flag modes that auto-revert after a duration.
+    /// Due reverts are applied as real MODE changes by the timer sweep.
+    temp_modes: svc_tempmode.TempModeQueue,
     /// Per-account auto-join channel lists, applied on login.
     autojoins: autojoin_mod.AutoJoin,
     /// Per-account grouped-nick sets (GROUP), with a primary nick.
@@ -1406,6 +1411,7 @@ pub const LinuxServer = struct {
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
             .gags = gag_set.GagSet.init(allocator, .{}),
+            .temp_modes = svc_tempmode.TempModeQueue.init(allocator),
             .autojoins = autojoin_mod.AutoJoin.init(allocator),
             .nick_groups = memo_group_mod.NickGroup.init(allocator),
             .welcome = welcome_pack_mod.WelcomePack.init(allocator),
@@ -1535,6 +1541,7 @@ pub const LinuxServer = struct {
         self.guises.deinit();
         self.shuns.deinit();
         self.gags.deinit();
+        self.temp_modes.deinit();
         self.autojoins.deinit();
         self.nick_groups.deinit();
         self.welcome.deinit();
@@ -1680,6 +1687,48 @@ pub const LinuxServer = struct {
     fn onTimerTick(self: *LinuxServer) void {
         self.rx().timer_armed = false;
         self.sweepTimeouts();
+        self.sweepTempModes();
+    }
+
+    /// Apply any TEMPMODE reverts whose timer has elapsed as real `-mode` MODE
+    /// changes broadcast to the channel, then drop the spent entries.
+    fn sweepTempModes(self: *LinuxServer) void {
+        if (self.temp_modes.len() == 0) return;
+        const now = self.nowMs();
+        var actions: [32]svc_tempmode.RevertAction = undefined;
+        while (true) {
+            const n = self.temp_modes.due(now, &actions);
+            if (n == 0) break;
+            for (actions[0..n]) |action| {
+                const mode = channelFlagFromLetter(action.mode_letter) orelse continue;
+                if (!self.world.channelExists(action.channel)) continue;
+                _ = self.world.setChannelFlag(action.channel, mode, false) catch continue;
+                var buf: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} -{c}\r\n", .{ server_name, action.channel, action.mode_letter }) catch continue;
+                self.broadcastChannel(action.channel, line, null) catch {};
+            }
+            _ = self.temp_modes.sweep(now);
+            if (n < actions.len) break; // batch drained
+        }
+    }
+
+    /// Map a channel flag-mode letter to its `ChannelMode`, or null if the letter
+    /// is not a supported boolean channel flag (TEMPMODE handles flags only).
+    fn channelFlagFromLetter(letter: u8) ?world_model.ChannelMode {
+        return switch (letter) {
+            'i' => .invite_only,
+            'm' => .moderated,
+            'n' => .no_external,
+            't' => .topic_ops,
+            's' => .secret,
+            'C' => .no_ctcp,
+            'T' => .no_notice,
+            'N' => .no_nick,
+            'g' => .free_invite,
+            'S' => .tls_only,
+            'M' => .mod_reg,
+            else => null,
+        };
     }
 
     /// Drop connections that have not completed registration within the
@@ -2995,6 +3044,8 @@ pub const LinuxServer = struct {
             try self.handleForceAction(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLEAR")) {
             try self.handleClear(id, conn, parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TEMPMODE")) {
+            try self.handleTempmode(id, conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
@@ -6497,6 +6548,66 @@ pub const LinuxServer = struct {
         var nb: [128]u8 = undefined;
         const note = std.fmt.bufPrint(&nb, "CLEAR {s}: removed {d} user(s)", .{ req.channel, kicked }) catch return;
         try self.noticeTo(conn, note);
+    }
+
+    /// TEMPMODE ADD <#chan> <flag> [param] <duration> | CANCEL <#chan> <flag>
+    /// [param] | SWEEP — schedule an auto-reverting channel flag mode. ADD sets
+    /// the flag now and queues the `-flag` revert; the timer sweep applies it.
+    /// Requires channel operator or server oper. Flag (boolean) modes only.
+    fn handleTempmode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const cmd = svc_tempmode.parseParams(parsed.paramSlice(), self.nowMs()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TEMPMODE"}, "Usage: TEMPMODE ADD <#chan> <flag> [param] <duration> | CANCEL <#chan> <flag> [param] | SWEEP");
+            return;
+        };
+        switch (cmd) {
+            .add => |a| {
+                if (!self.world.channelExists(a.channel)) {
+                    try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{a.channel}, "No such channel");
+                    return;
+                }
+                if (!self.canModerateChannel(id, conn, a.channel)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{a.channel}, "You're not channel operator");
+                    return;
+                }
+                const mode = channelFlagFromLetter(a.mode_letter) orelse {
+                    try queueNumeric(conn, .ERR_UNKNOWNMODE, &.{a.channel}, "TEMPMODE supports boolean channel flags only");
+                    return;
+                };
+                _ = self.world.setChannelFlag(a.channel, mode, true) catch {};
+                _ = self.temp_modes.addParsed(a) catch {
+                    try self.noticeTo(conn, "TEMPMODE: could not schedule (limit or invalid window)");
+                    return;
+                };
+                var buf: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} +{c}\r\n", .{ server_name, a.channel, a.mode_letter }) catch return;
+                try self.broadcastChannel(a.channel, line, null);
+            },
+            .cancel => |c| {
+                if (!self.canModerateChannel(id, conn, c.channel)) {
+                    try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{c.channel}, "You're not channel operator");
+                    return;
+                }
+                const removed = self.temp_modes.cancelAll(c.channel, c.mode_letter, c.param);
+                var nb: [160]u8 = undefined;
+                const note = std.fmt.bufPrint(&nb, "TEMPMODE: cancelled {d} scheduled revert(s)", .{removed}) catch return;
+                try self.noticeTo(conn, note);
+            },
+            .sweep => {
+                if (!conn.session.isOper()) {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "TEMPMODE SWEEP is operator-only");
+                    return;
+                }
+                self.sweepTempModes();
+                try self.noticeTo(conn, "TEMPMODE: swept due reverts");
+            },
+        }
+    }
+
+    /// Whether `conn` may moderate `channel`: server opers or channel operators.
+    fn canModerateChannel(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8) bool {
+        if (conn.session.isOper()) return true;
+        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse return false;
+        return mm.isOperator();
     }
 
     pub fn handleAccess(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
