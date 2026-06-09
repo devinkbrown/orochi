@@ -88,6 +88,10 @@ fn debug(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleDebug(x.conn);
 }
+fn mesh(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleMesh(x.conn);
+}
 
 pub const module = registry.Module{
     .id = "oper.security",
@@ -117,5 +121,7 @@ pub const module = registry.Module{
         .{ .name = "TESTMASK", .access = .oper, .handler = testmask },
         .{ .name = "USERIP", .handler = userip },
         .{ .name = "DEBUG", .access = .oper, .handler = debug },
+        .{ .name = "MESH", .access = .oper, .handler = mesh, .summary = "mesh peer/link health (NETSTAT)" },
+        .{ .name = "NETSTAT", .access = .oper, .handler = mesh, .summary = "alias of MESH" },
     },
 };

@@ -43,6 +43,7 @@ const lusers = @import("../proto/lusers.zig");
 const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
+const mesh_report = @import("../proto/mesh_report.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
@@ -9597,6 +9598,60 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
         }
         try queueNumeric(conn, .RPL_MAPEND, &.{}, "End of /MAP");
+    }
+
+    /// MESH (a.k.a. NETSTAT) — oper view of server-to-server mesh health,
+    /// rendered by the pure `mesh_report` renderer from live S2S link state.
+    /// Per-peer RTT/byte counters surface once the link-health tracker is wired;
+    /// today they show as zero. Operator-gated by the registry (access=.oper).
+    pub fn handleMesh(self: *LinuxServer, conn: *ConnState) !void {
+        var peers: [64]mesh_report.PeerLink = undefined;
+        var npeer: usize = 0;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            if (npeer == peers.len) break;
+            const c = entry.value;
+            // Reflect both plaintext and secured S2S links as mesh peers.
+            var name: []const u8 = "";
+            var established = false;
+            if (c.s2s) |link| {
+                name = link.remoteName();
+                established = link.established();
+            } else if (c.s2s_secured) |link| {
+                name = link.remoteName();
+                established = link.established();
+            } else continue;
+            if (name.len == 0) continue;
+            peers[npeer] = .{
+                .name = name,
+                .state = if (established) .established else .handshaking,
+                .hops = 1,
+            };
+            npeer += 1;
+        }
+
+        var established_peers: u32 = 0;
+        for (peers[0..npeer]) |p| {
+            if (p.state == .established) established_peers += 1;
+        }
+
+        const snap = mesh_report.MeshSnapshot{
+            .local_node = server_name,
+            .peers = peers[0..npeer],
+            // Self plus every established peer is reachable; partition detection
+            // is wired once the substrate detector lands.
+            .reachable_nodes = established_peers + 1,
+            .partitioned_nodes = 0,
+        };
+
+        var body_buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&body_buf);
+        mesh_report.renderMesh(snap, &w) catch {};
+        var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try self.noticeTo(conn, line);
+        }
     }
 
     /// Fan a pre-built message out to every member of every channel `id` shares,
