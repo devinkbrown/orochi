@@ -95,6 +95,7 @@ pub const focus_mode = @import("focus_mode.zig");
 pub const follow_graph = @import("follow_graph.zig");
 pub const font_pref = @import("font_pref.zig");
 pub const friend_list = @import("friend_list.zig");
+pub const gag_set = @import("gag_set.zig");
 pub const geoip_cidr = @import("geoip_cidr.zig");
 pub const guise = @import("guise.zig");
 pub const helix = @import("helix/root.zig");
@@ -396,6 +397,7 @@ test {
     _ = follow_graph;
     _ = font_pref;
     _ = friend_list;
+    _ = gag_set;
     _ = geoip_cidr;
     _ = guise;
     _ = helix;

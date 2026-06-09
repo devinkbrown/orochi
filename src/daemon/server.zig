@@ -19,6 +19,7 @@ const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
+const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
 const sdp = @import("../proto/sdp.zig");
@@ -1185,7 +1186,11 @@ pub const LinuxServer = struct {
     /// Guise: per-account persona wardrobe + operator offer templates.
     guises: guise_mod.Registry,
     /// Network-wide silent mutes (SHUN): shunned senders' messages are dropped.
+    /// A SHUN pattern matches by IP, nick, or nick!user@host glob.
     shuns: shun_mod.ShunList,
+    /// IRCX +z GAG, keyed by IP: every nick from a gagged IP is silenced, and
+    /// the gag persists across reconnect (it lives here, not on the connection).
+    gags: gag_set.GagSet,
     /// Per-account auto-join channel lists, applied on login.
     autojoins: autojoin_mod.AutoJoin,
     /// Per-account grouped-nick sets (GROUP), with a primary nick.
@@ -1398,6 +1403,7 @@ pub const LinuxServer = struct {
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
             .guises = guise_mod.Registry.init(allocator, .{}),
             .shuns = shun_mod.ShunList.init(allocator, .{}),
+            .gags = gag_set.GagSet.init(allocator, .{}),
             .autojoins = autojoin_mod.AutoJoin.init(allocator),
             .nick_groups = memo_group_mod.NickGroup.init(allocator),
             .welcome = welcome_pack_mod.WelcomePack.init(allocator),
@@ -1526,6 +1532,7 @@ pub const LinuxServer = struct {
         self.host_requests.deinit();
         self.guises.deinit();
         self.shuns.deinit();
+        self.gags.deinit();
         self.autojoins.deinit();
         self.nick_groups.deinit();
         self.welcome.deinit();
@@ -2854,6 +2861,12 @@ pub const LinuxServer = struct {
                 // enforced against the freshly registered client's facets,
                 // before oper elevation/welcome.
                 if (self.enforceWard(conn)) return;
+                // Persistent +z GAG: a client reconnecting from a gagged IP is
+                // re-flagged so its messages stay silenced and +z displays.
+                {
+                    const rip = conn.session.realHost();
+                    if (rip.len > 0 and self.gags.contains(rip)) conn.gagged = true;
+                }
                 // SASL-only oper: elevate now if the (SASL-set) account is bound to
                 // an operator class. Emits 381 + MODE +o after the welcome burst.
                 try self.elevateOperFromAccount(conn);
@@ -3539,6 +3552,11 @@ pub const LinuxServer = struct {
     }
 
     /// Apply IRCX +z/-z GAG to another user (operator-only; caller verified oper).
+    ///
+    /// GAG binds to the target's IP address, not the single connection: adding it
+    /// records the IP in the persistent `gags` set, so every nick from that IP is
+    /// silenced and the gag survives reconnection. The per-connection `gagged`
+    /// flag is mirrored onto every live client sharing the IP for display/WHOIS.
     fn applyGag(self: *LinuxServer, conn: *ConnState, target_nick: []const u8, mode_str: []const u8) !void {
         const twid = self.world.findNick(target_nick) orelse {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
@@ -3548,16 +3566,41 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
-        var adding = true;
+        var sign = true;
+        var adding: ?bool = null;
         for (mode_str) |ch| switch (ch) {
-            '+' => adding = true,
-            '-' => adding = false,
-            'z' => tconn.gagged = adding,
+            '+' => sign = true,
+            '-' => sign = false,
+            'z' => adding = sign,
             else => {},
         };
+        const turn_on = adding orelse return; // no 'z' in the mode string
+
+        const ip = tconn.session.realHost();
+        if (turn_on) {
+            if (ip.len > 0) self.gags.add(ip) catch {};
+        } else {
+            if (ip.len > 0) _ = self.gags.remove(ip);
+        }
+        // Mirror the display flag onto every live connection from this IP (and
+        // the target itself, covering the IP-unknown edge case).
+        tconn.gagged = turn_on;
+        if (ip.len > 0) self.mirrorGagFlag(ip, turn_on);
+
         var buf: [128]u8 = undefined;
-        const reflect = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}z\r\n", .{ server_name, target_nick, if (tconn.gagged) "+" else "-" }) catch return;
+        const reflect = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}z\r\n", .{ server_name, target_nick, if (turn_on) "+" else "-" }) catch return;
         try appendToConn(conn, reflect);
+    }
+
+    /// Set the per-connection `gagged` display flag on every registered client
+    /// whose real IP equals `ip`. Silencing itself is authoritative via `gags`.
+    fn mirrorGagFlag(self: *LinuxServer, ip: []const u8, on: bool) void {
+        if (ip.len == 0) return;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (std.ascii.eqlIgnoreCase(c.session.realHost(), ip)) c.gagged = on;
+        }
     }
 
     /// MODE for channel member status modes (+Q/+q/+o/+v, founder +Q is creation-
@@ -6554,7 +6597,7 @@ pub const LinuxServer = struct {
     /// `:sender <CMD> <target> <tag> :<message>` to the target (a nick, or all
     /// members of a channel).
     pub fn handleData(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (conn.gagged) return;
+        if (self.senderSilenced(conn)) return;
         if (parsed.param_count < 3) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, "Not enough parameters");
             return;
@@ -8893,6 +8936,37 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Whether `conn`'s outbound messages must be silently dropped before
+    /// delivery. Unifies the three independent silencing mechanisms so they
+    /// always work together on every message path (PRIVMSG/NOTICE, IRCX DATA,
+    /// reassembled multiline):
+    ///   * +z GAG (IRCX, IP-keyed, oper-set; authoritative via the `gags` set so
+    ///     it survives reconnect and covers every nick on the IP)
+    ///   * Warden quarantine (network silence set by a WARD quarantine action)
+    ///   * SHUN (network-wide silence; matches by IP, nick, or host-mask; opers
+    ///     exempt)
+    fn senderSilenced(self: *LinuxServer, conn: *ConnState) bool {
+        if (conn.gagged) return true;
+        const real_ip = conn.session.realHost();
+        if (real_ip.len > 0 and self.gags.count() > 0 and self.gags.contains(real_ip)) return true;
+        if (conn.session.isRestricted()) return true;
+        if (self.shuns.count() > 0 and !conn.session.isOper()) {
+            const now = self.nowMs();
+            // A SHUN pattern may be an IP, a nick, or a nick!user@host glob — so
+            // test the active shuns against each identity facet the client
+            // presents. Any match silences the sender.
+            const nick = conn.session.displayName();
+            const ip = conn.session.realHost();
+            if (nick.len > 0 and self.shuns.isShunned(nick, now)) return true;
+            if (ip.len > 0 and self.shuns.isShunned(ip, now)) return true;
+            var hm_buf: [320]u8 = undefined;
+            if (clientPrefix(conn, &hm_buf)) |hm| {
+                if (self.shuns.isShunned(hm, now)) return true;
+            } else |_| {}
+        }
+        return false;
+    }
+
     pub fn handleMessage(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -8900,19 +8974,8 @@ pub const LinuxServer = struct {
         parsed: *const irc_line.LineView,
         command: []const u8,
     ) !void {
-        // +z GAG (IRCX): the server silently discards a gagged user's messages.
-        if (conn.gagged) return;
-        // Warden quarantine (network silence / SHUN-via-WARD): a restricted
-        // client's messages are silently dropped before delivery.
-        if (conn.session.isRestricted()) return;
-        // SHUN: a network-shunned (non-oper) sender's messages are silently
-        // dropped before delivery.
-        if (self.shuns.count() > 0 and !conn.session.isOper()) {
-            var hm_buf: [320]u8 = undefined;
-            if (clientPrefix(conn, &hm_buf)) |hm| {
-                if (self.shuns.isShunned(hm, self.nowMs())) return;
-            } else |_| {}
-        }
+        // GAG + quarantine + SHUN are applied together for every message path.
+        if (self.senderSilenced(conn)) return;
         // NOTICE must never generate an automatic error reply (RFC 1459):
         // missing recipient/text is silently dropped to prevent bot reply loops.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
@@ -9057,13 +9120,7 @@ pub const LinuxServer = struct {
         target: []const u8,
         value: []const u8,
     ) !void {
-        if (conn.gagged) return;
-        if (self.shuns.count() > 0 and !conn.session.isOper()) {
-            var hm_buf: [320]u8 = undefined;
-            if (clientPrefix(conn, &hm_buf)) |hm| {
-                if (self.shuns.isShunned(hm, self.nowMs())) return;
-            } else |_| {}
-        }
+        if (self.senderSilenced(conn)) return;
         const cmd = command.token();
         const is_notice = command == .notice;
         if (!try self.messageContentGates(id, conn, cmd, target, value, is_notice)) return;
