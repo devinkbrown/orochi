@@ -10,13 +10,32 @@ const world_rcu = @import("world_rcu.zig");
 /// Lazily-created RCU mirror of the nick registry (the lock-free read path).
 /// Heap-allocated so the EBR domain has a stable address: the registered
 /// `participant` and the registry's borrowed `&domain` must stay valid after the
-/// owning `World` is moved (World.init returns by value). Activated on first use
-/// of `findNickRcu`; dormant (null) for any World that never touches it, so the
-/// existing path is byte-for-byte unchanged until the live read flip.
+/// owning `World` is moved (World.init returns by value). Activated lazily and,
+/// once live, drives EVERY nick read (`findNick`) and collision check — the read
+/// hot path is lock-free at the registry level and case-insensitive (RFC1459-ish
+/// ASCII casemapping; "Alice" and "alice" are the same nick). `client_nicks`
+/// remains the authoritative id->nick reverse index; the RCU registry is
+/// authoritative for nick->id.
 const RcuNickState = struct {
     domain: ebr.Domain,
     participant: *ebr.Participant,
     nicks: world_rcu.NickRegistry,
+};
+
+/// Marker value stored in the RCU channel-existence mirror. The mirror only
+/// answers "does this channel name exist?" (lock-free, case-insensitive); the
+/// authoritative `Channel` records live in `World.channels`. We store the
+/// channel OID as a witness so the value type is a plain integer (no dangling
+/// pointer into the rehash-prone `channels` map).
+const RcuChannelState = struct {
+    domain: ebr.Domain,
+    participant: *ebr.Participant,
+    /// channel name -> OID witness (existence set).
+    names: world_rcu.ChannelRegistry(u32),
+    /// One membership set per live channel, keyed by case-folded channel name.
+    /// The MembershipSet values are heap-allocated for stable addresses (the
+    /// AutoHashMap may rehash). All share the one EBR `domain`/`participant`.
+    members: std.StringHashMapUnmanaged(*world_rcu.MembershipSet) = .empty,
 };
 
 /// Opaque client handle value used by the local server world.
@@ -50,6 +69,34 @@ pub const MessageTarget = union(enum) {
     channel: []const u8,
     nick: ClientId,
 };
+
+/// ASCII case-insensitive hash-map context for `[]const u8` keys, matching the
+/// RCU registries' `CaseInsensitiveBytesContext`. Used for the authoritative
+/// `channels` map so that channel-name lookups (`getPtr`/`get`/`contains`) agree
+/// with the case-insensitive RCU existence/membership mirrors — JOIN "#Room"
+/// then PART "#room" must hit the same channel.
+const CiStringContext = struct {
+    pub fn hash(_: CiStringContext, key: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (key) |c| {
+            const lc = std.ascii.toLower(c);
+            h.update(std.mem.asBytes(&lc));
+        }
+        return h.final();
+    }
+    pub fn eql(_: CiStringContext, a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |ca, cb| {
+            if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+        }
+        return true;
+    }
+};
+
+/// Case-insensitive `[]const u8`-keyed hash map (channel names).
+fn CiStringHashMap(comptime V: type) type {
+    return std.HashMap([]const u8, V, CiStringContext, std.hash_map.default_max_load_percentage);
+}
 
 const chanmode = @import("chanmode.zig");
 const chanmode_ext = @import("../proto/chanmode_ext.zig");
@@ -143,7 +190,7 @@ const Channel = struct {
 /// Owned local nick/channel registry.
 pub const World = struct {
     allocator: std.mem.Allocator,
-    channels: std.StringHashMap(Channel),
+    channels: CiStringHashMap(Channel),
     nicks: std.StringHashMap(ClientId),
     client_nicks: std.AutoHashMap(ClientId, []u8),
     /// Monotonic IRCX object-id source. Each newly-created channel gets the next
@@ -159,6 +206,11 @@ pub const World = struct {
     /// read path being validated ahead of the live flip (see
     /// docs/planning/24-multithreading.md, world.zig adoption map).
     rcu_nicks: ?*RcuNickState = null,
+    /// Lazily-activated RCU mirror of channel existence + per-channel membership
+    /// (lock-free reads for `channelExists`/`isMember`). Null until the first
+    /// channel is created; once active, `ensureChannel`/`removeChannel`/`join`/
+    /// `part`/`removeClient` keep it in sync. Case-insensitive end-to-end.
+    rcu_channels: ?*RcuChannelState = null,
     /// Guards all of the maps above for the multi-reactor model: lookups take the
     /// read lock, mutations (join/part/nick/mode/rename/remove) the write lock.
     /// Every mutation — and its allocation — happens under the exclusive lock, so
@@ -186,7 +238,7 @@ pub const World = struct {
     pub fn init(allocator: std.mem.Allocator) World {
         return .{
             .allocator = allocator,
-            .channels = std.StringHashMap(Channel).init(allocator),
+            .channels = CiStringHashMap(Channel).init(allocator),
             .nicks = std.StringHashMap(ClientId).init(allocator),
             .client_nicks = std.AutoHashMap(ClientId, []u8).init(allocator),
         };
@@ -218,6 +270,25 @@ pub const World = struct {
             r.domain.deinit();
             self.allocator.destroy(r);
         }
+
+        if (self.rcu_channels) |c| {
+            // Free every per-channel membership set's live snapshot, then the
+            // name-existence registry, before draining the shared domain. Same
+            // proven order as the nick mirror: registries → drain → unregister
+            // → domain deinit → destroy.
+            var mit = c.members.iterator();
+            while (mit.next()) |entry| {
+                entry.value_ptr.*.deinit();
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.destroy(entry.value_ptr.*);
+            }
+            c.members.deinit(self.allocator);
+            c.names.deinit();
+            c.domain.drainAll();
+            c.participant.unregister();
+            c.domain.deinit();
+            self.allocator.destroy(c);
+        }
         self.* = undefined;
     }
 
@@ -236,11 +307,113 @@ pub const World = struct {
         return r;
     }
 
-    /// Register `nick` for `client`, rejecting collisions.
+    /// Activate (once) and return the lazy RCU channel/membership mirror.
+    fn ensureRcuChannels(self: *World) !*RcuChannelState {
+        if (self.rcu_channels) |c| return c;
+        const c = try self.allocator.create(RcuChannelState);
+        errdefer self.allocator.destroy(c);
+        c.domain = ebr.Domain.init(self.allocator);
+        errdefer c.domain.deinit();
+        c.participant = c.domain.register();
+        errdefer c.participant.unregister();
+        c.names = try world_rcu.ChannelRegistry(u32).init(self.allocator, &c.domain);
+        errdefer c.names.deinit();
+        c.members = .empty;
+        self.rcu_channels = c;
+        return c;
+    }
+
+    /// Get (creating if absent) the per-channel RCU membership set for `name`.
+    /// Keyed by the case-folded channel name so "#X" and "#x" share one set.
+    fn rcuMembershipSet(self: *World, c: *RcuChannelState, name: []const u8) !*world_rcu.MembershipSet {
+        var key_buf: [foldBufLen]u8 = undefined;
+        const folded = foldName(name, &key_buf);
+        if (c.members.get(folded)) |set| return set;
+
+        const owned_key = try self.allocator.dupe(u8, folded);
+        errdefer self.allocator.free(owned_key);
+        const set = try self.allocator.create(world_rcu.MembershipSet);
+        errdefer self.allocator.destroy(set);
+        set.* = try world_rcu.MembershipSet.init(self.allocator, &c.domain);
+        errdefer set.deinit();
+        try c.members.put(self.allocator, owned_key, set);
+        return set;
+    }
+
+    /// Return the existing per-channel RCU membership set for `name`, or null if
+    /// none has been created. Does not allocate.
+    fn rcuMembershipGet(c: *RcuChannelState, name: []const u8) ?*world_rcu.MembershipSet {
+        var key_buf: [foldBufLen]u8 = undefined;
+        const folded = foldName(name, &key_buf);
+        return c.members.get(folded);
+    }
+
+    /// Re-key the per-channel membership set from `old` to `new` (channel
+    /// rename). Membership is unchanged, so we move the set pointer to the new
+    /// folded key. If the folded keys coincide, nothing to do.
+    fn rcuRenameMembership(self: *World, c: *RcuChannelState, old: []const u8, new: []const u8) void {
+        var ob: [foldBufLen]u8 = undefined;
+        var nb: [foldBufLen]u8 = undefined;
+        const of = foldName(old, &ob);
+        const nf = foldName(new, &nb);
+        if (std.mem.eql(u8, of, nf)) return;
+
+        const kv = c.members.fetchRemove(of) orelse return;
+        // Free the moved-out old key; install the set under a freshly-duped new
+        // key. On dupe/put failure the set is dropped (best-effort) rather than
+        // leaked under the wrong key.
+        self.allocator.free(kv.key);
+        const new_owned = self.allocator.dupe(u8, nf) catch {
+            kv.value.deinit();
+            self.allocator.destroy(kv.value);
+            return;
+        };
+        // If a set already lives under the new key (case-fold collision), drop it
+        // first so we don't leak.
+        if (c.members.fetchRemove(nf)) |existing| {
+            existing.value.deinit();
+            self.allocator.free(existing.key);
+            self.allocator.destroy(existing.value);
+        }
+        c.members.put(self.allocator, new_owned, kv.value) catch {
+            self.allocator.free(new_owned);
+            kv.value.deinit();
+            self.allocator.destroy(kv.value);
+        };
+    }
+
+    /// Drop the per-channel RCU membership set for `name` (channel removed).
+    fn rcuDropMembership(self: *World, c: *RcuChannelState, name: []const u8) void {
+        var key_buf: [foldBufLen]u8 = undefined;
+        const folded = foldName(name, &key_buf);
+        if (c.members.fetchRemove(folded)) |kv| {
+            kv.value.deinit();
+            self.allocator.free(kv.key);
+            self.allocator.destroy(kv.value);
+        }
+    }
+
+    /// Register `nick` for `client`, rejecting collisions. Collision detection
+    /// is CASE-INSENSITIVE (RFC1459-ish ASCII casemapping): registering "Alice"
+    /// then "alice" is a collision, not two entries. The RCU registry is the
+    /// authoritative nick->id source (lock-free reads); `client_nicks` is the
+    /// authoritative id->nick reverse index and `nicks` is kept as a consistent
+    /// case-sensitive fallback mirror.
     pub fn registerNick(self: *World, nick: []const u8, client: ClientId) WorldError!void {
-        if (self.nicks.get(nick)) |existing| {
-            if (existing.eql(client)) return;
-            return error.NickInUse;
+        // Activate the RCU mirror up front so reads are always served from it.
+        const r = try self.ensureRcuNicks();
+
+        // Case-insensitive collision check against the authoritative RCU map.
+        if (r.nicks.lookup(r.participant, nick)) |existing| {
+            if ((@as(ClientId, @bitCast(existing))).eql(client)) {
+                // Same owner: a pure case change ("Alice" -> "ALICE") still
+                // updates the stored display form below; otherwise no-op.
+                if (self.nickOf(client)) |cur| {
+                    if (std.mem.eql(u8, cur, nick)) return;
+                }
+            } else {
+                return error.NickInUse;
+            }
         }
 
         if (self.client_nicks.contains(client)) {
@@ -250,21 +423,21 @@ pub const World = struct {
         const owned = try self.allocator.dupe(u8, nick);
         errdefer self.allocator.free(owned);
 
+        // Authoritative nick->id lives in the RCU registry (case-insensitive).
+        try r.nicks.set(r.participant, nick, @bitCast(client));
+        errdefer r.nicks.remove(r.participant, nick) catch {};
+
         try self.nicks.put(owned, client);
         errdefer _ = self.nicks.remove(owned);
 
         try self.client_nicks.put(client, owned);
-
-        // Mirror into the lock-free RCU registry when active (best-effort: the
-        // authoritative map is `nicks`; a mirror OOM is swallowed and the live
-        // flip will make the RCU path authoritative with proper error handling).
-        if (self.rcu_nicks) |r| r.nicks.set(r.participant, nick, @bitCast(client)) catch {};
     }
 
     /// Remove any nick owned by `client`.
     pub fn unregisterNick(self: *World, client: ClientId) void {
         if (self.client_nicks.fetchRemove(client)) |removed| {
-            // Mirror-remove using the nick string before it is freed below.
+            // Remove from the authoritative RCU map using the nick string before
+            // it is freed below.
             if (self.rcu_nicks) |r| r.nicks.remove(r.participant, removed.value) catch {};
             _ = self.nicks.remove(removed.value);
             self.allocator.free(removed.value);
@@ -275,14 +448,22 @@ pub const World = struct {
         return self.client_nicks.get(client);
     }
 
+    /// Look up the owner of `nick` (CASE-INSENSITIVE). Reads from the lock-free
+    /// RCU registry when active (the common case after any nick registers);
+    /// falls back to the case-sensitive `nicks` map only when the mirror has
+    /// never been activated. `rcu_nicks` is a pointer, so we can pin and look up
+    /// through it even from `*const World`.
     pub fn findNick(self: *const World, nick: []const u8) ?ClientId {
+        if (self.rcu_nicks) |r| {
+            if (r.nicks.lookup(r.participant, nick)) |id| return @as(ClientId, @bitCast(id));
+            return null;
+        }
         return self.nicks.get(nick);
     }
 
-    /// Lock-free nick lookup via the RCU mirror (activates it on first use). The
-    /// parallel read path being validated against `findNick` ahead of the live
-    /// flip; note it is case-insensitive (an intended refinement over the
-    /// case-sensitive authoritative map, reconciled at the flip).
+    /// Lock-free nick lookup via the RCU mirror (activates it on first use).
+    /// Retained for callers that want to force the RCU path; `findNick` now uses
+    /// the same registry once active.
     pub fn findNickRcu(self: *World, nick: []const u8) !?ClientId {
         const r = try self.ensureRcuNicks();
         if (r.nicks.lookup(r.participant, nick)) |id| return @as(ClientId, @bitCast(id));
@@ -302,6 +483,11 @@ pub const World = struct {
                 MemberModes.fromModes(&.{.founder})
             else
                 MemberModes.empty();
+            // Mirror the new membership into the lock-free set.
+            if (self.rcu_channels) |c| {
+                const set = try self.rcuMembershipSet(c, name);
+                try set.add(c.participant, @bitCast(client));
+            }
         }
         return !member.found_existing;
     }
@@ -312,7 +498,14 @@ pub const World = struct {
     pub fn restoreMember(self: *World, name: []const u8, client: ClientId, modes: MemberModes) WorldError!void {
         const channel = try self.ensureChannel(name);
         const member = try channel.members.getOrPut(client);
+        const was_new = !member.found_existing;
         member.value_ptr.* = modes;
+        if (was_new) {
+            if (self.rcu_channels) |c| {
+                const set = try self.rcuMembershipSet(c, name);
+                try set.add(c.participant, @bitCast(client));
+            }
+        }
     }
 
     /// Status modes for `client` in `name`, or null if not a member / no channel.
@@ -474,6 +667,8 @@ pub const World = struct {
         if (!self.channels.contains(old)) return error.NoSuchChannel;
         if (self.channels.contains(new)) return false;
 
+        const oid = if (self.channels.getPtr(old)) |ch| ch.oid else 0;
+
         const new_key = try self.allocator.dupe(u8, new);
         errdefer self.allocator.free(new_key);
         const kv = self.channels.fetchRemove(old).?; // {key, value}
@@ -483,6 +678,21 @@ pub const World = struct {
             return e;
         };
         self.allocator.free(kv.key);
+
+        // Keep the RCU mirrors in step: re-key existence (same OID) and move the
+        // membership set to the new folded key. Best-effort; the authoritative
+        // store is `channels`.
+        if (self.rcu_channels) |c| {
+            self.rcuRenameMembership(c, old, new);
+            // Existence: drop the old folded name only if it no longer maps to a
+            // live channel (case-fold may coincide with `new`), then publish new.
+            var ob: [foldBufLen]u8 = undefined;
+            var nb: [foldBufLen]u8 = undefined;
+            const of = foldName(old, &ob);
+            const nf = foldName(new, &nb);
+            if (!std.mem.eql(u8, of, nf)) c.names.remove(c.participant, old) catch {};
+            c.names.set(c.participant, new, oid) catch {};
+        }
         return true;
     }
 
@@ -794,6 +1004,11 @@ pub const World = struct {
     pub fn part(self: *World, name: []const u8, client: ClientId) WorldError!void {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
         if (!channel.members.remove(client)) return error.NotOnChannel;
+        // Mirror the removal into the lock-free set (best-effort: the
+        // authoritative store is `channel.members`).
+        if (self.rcu_channels) |c| {
+            if (rcuMembershipGet(c, name)) |set| set.remove(c.participant, @bitCast(client)) catch {};
+        }
         // A registered (+r) channel persists across empty: its config, topic,
         // and modes survive when the last member leaves. Unregistered channels
         // are ephemeral and reclaimed here.
@@ -802,12 +1017,26 @@ pub const World = struct {
         }
     }
 
+    /// Whether `client` is a member of `name` (CASE-INSENSITIVE channel name).
+    /// Reads the lock-free RCU membership set when active; falls back to the
+    /// authoritative member map otherwise.
     pub fn isMember(self: *World, name: []const u8, client: ClientId) bool {
+        if (self.rcu_channels) |c| {
+            if (rcuMembershipGet(c, name)) |set|
+                return set.contains(c.participant, @bitCast(client));
+            return false;
+        }
         const channel = self.channels.getPtr(name) orelse return false;
         return channel.members.contains(client);
     }
 
+    /// Whether `name` exists (CASE-INSENSITIVE). Reads the lock-free RCU
+    /// existence mirror when active; falls back to the case-sensitive map
+    /// otherwise. `rcu_channels` is a pointer so this works through `*const`.
     pub fn channelExists(self: *const World, name: []const u8) bool {
+        if (self.rcu_channels) |c| {
+            return c.names.lookup(c.participant, name) != null;
+        }
         return self.channels.contains(name);
     }
 
@@ -825,7 +1054,7 @@ pub const World = struct {
     };
 
     pub const ChannelViewIterator = struct {
-        inner: std.StringHashMap(Channel).Iterator,
+        inner: CiStringHashMap(Channel).Iterator,
 
         pub fn next(self: *ChannelViewIterator) ?ChannelView {
             if (self.inner.next()) |entry| {
@@ -897,7 +1126,14 @@ pub const World = struct {
             var empty_channel: ?[]const u8 = null;
             var it = self.channels.iterator();
             while (it.next()) |entry| {
-                _ = entry.value_ptr.members.remove(client);
+                if (entry.value_ptr.members.remove(client)) {
+                    // Mirror the membership removal for channels that survive;
+                    // removed channels have their whole set dropped below.
+                    if (self.rcu_channels) |c| {
+                        if (rcuMembershipGet(c, entry.key_ptr.*)) |set|
+                            set.remove(c.participant, @bitCast(client)) catch {};
+                    }
+                }
                 // Registered (+r) channels persist across empty; only reclaim
                 // ephemeral channels on the last member's disconnect.
                 if (entry.value_ptr.members.count() == 0 and
@@ -920,9 +1156,23 @@ pub const World = struct {
         if (entry.found_existing) return entry.value_ptr;
 
         const owned_name = try self.allocator.dupe(u8, name);
+        errdefer {
+            self.allocator.free(owned_name);
+            self.channels.removeByPtr(entry.key_ptr);
+        }
+        const oid = self.next_oid;
+
+        // Activate + populate the RCU existence mirror BEFORE finalising the map
+        // entry, so a mirror-alloc failure rolls back cleanly (errdefer above).
+        const c = try self.ensureRcuChannels();
+        try c.names.set(c.participant, name, oid);
+        errdefer c.names.remove(c.participant, name) catch {};
+        // Pre-create the (empty) membership set so isMember/joins are mirrored.
+        _ = try self.rcuMembershipSet(c, name);
+
         entry.key_ptr.* = owned_name;
         entry.value_ptr.* = Channel.init(self.allocator);
-        entry.value_ptr.oid = self.next_oid;
+        entry.value_ptr.oid = oid;
         entry.value_ptr.created_unix = self.clock_unix;
         self.next_oid +%= 1;
         return entry.value_ptr;
@@ -933,10 +1183,29 @@ pub const World = struct {
             const owned_name = entry.key_ptr.*;
             entry.value_ptr.deinit();
             self.channels.removeByPtr(entry.key_ptr);
+            // Tear down the RCU mirrors for this channel (existence + members).
+            if (self.rcu_channels) |c| {
+                c.names.remove(c.participant, owned_name) catch {};
+                self.rcuDropMembership(c, owned_name);
+            }
             self.allocator.free(owned_name);
         }
     }
 };
+
+/// Max length of a name we case-fold into a stack buffer. Channel and nick
+/// names are far shorter in practice; longer names truncate-fold (still
+/// deterministic, only an academic edge case for absurd lengths).
+const foldBufLen = 256;
+
+/// ASCII-lowercase `name` into `buf`, returning the folded slice. Used to key
+/// the per-channel membership-set map case-insensitively, mirroring the
+/// `CaseInsensitiveBytesContext` casemapping the RCU registries use.
+fn foldName(name: []const u8, buf: []u8) []const u8 {
+    const n = @min(name.len, buf.len);
+    for (name[0..n], 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    return buf[0..n];
+}
 
 /// A valid channel name begins with a recognised channel sigil:
 ///   `#`  — standard (network-wide) channel
@@ -1507,4 +1776,126 @@ test "RCU nick mirror matches the authoritative map" {
     // Case-insensitive RCU lookup (an intended refinement over the case-sensitive
     // authoritative map; reconciled at the live flip).
     try std.testing.expectEqual(@as(?ClientId, bob), try world.findNickRcu("bob"));
+}
+
+test "findNick is case-insensitive once the RCU mirror is live" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const alice: ClientId = .{ .shard = 0, .slot = 1, .gen = 1 };
+    try world.registerNick("Alice", alice); // activates the mirror
+
+    // Every casing of the registered nick resolves to the same owner.
+    try std.testing.expectEqual(@as(?ClientId, alice), world.findNick("Alice"));
+    try std.testing.expectEqual(@as(?ClientId, alice), world.findNick("alice"));
+    try std.testing.expectEqual(@as(?ClientId, alice), world.findNick("ALICE"));
+    try std.testing.expectEqual(@as(?ClientId, alice), world.findNick("aLiCe"));
+    // Unknown nick still misses.
+    try std.testing.expectEqual(@as(?ClientId, null), world.findNick("bob"));
+}
+
+test "nick collisions are case-insensitive (Alice then alice collides)" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const alice: ClientId = .{ .shard = 0, .slot = 1, .gen = 1 };
+    const mallory: ClientId = .{ .shard = 0, .slot = 2, .gen = 1 };
+
+    try world.registerNick("Alice", alice);
+    // A different client cannot take any casing of an in-use nick.
+    try std.testing.expectError(error.NickInUse, world.registerNick("alice", mallory));
+    try std.testing.expectError(error.NickInUse, world.registerNick("ALICE", mallory));
+
+    // The original owner may re-assert / change the case of their own nick.
+    try world.registerNick("ALICE", alice);
+    try std.testing.expectEqualStrings("ALICE", world.nickOf(alice).?);
+    try std.testing.expectEqual(@as(?ClientId, alice), world.findNick("alice"));
+
+    // Releasing frees the (case-insensitive) name for someone else.
+    world.unregisterNick(alice);
+    try world.registerNick("alice", mallory);
+    try std.testing.expectEqual(@as(?ClientId, mallory), world.findNick("Alice"));
+}
+
+test "channelExists mirror matches the authoritative map (case-insensitive)" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = testClient(1);
+    try std.testing.expect(!world.channelExists("#room"));
+
+    _ = try world.join("#Room", a); // creates the channel + activates mirror
+
+    // Existence is case-insensitive and agrees across casings.
+    try std.testing.expect(world.channelExists("#Room"));
+    try std.testing.expect(world.channelExists("#room"));
+    try std.testing.expect(world.channelExists("#ROOM"));
+    try std.testing.expect(!world.channelExists("#other"));
+
+    // Emptying the channel reclaims it from the mirror too.
+    try world.part("#room", a);
+    try std.testing.expect(!world.channelExists("#Room"));
+    try std.testing.expect(!world.channelExists("#room"));
+}
+
+test "isMember mirror matches authoritative membership (case-insensitive)" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = testClient(1);
+    const b = testClient(2);
+
+    _ = try world.join("#Chan", a);
+    _ = try world.join("#chan", b); // same channel, different casing
+
+    // Both members are visible through any casing of the channel name.
+    try std.testing.expect(world.isMember("#Chan", a));
+    try std.testing.expect(world.isMember("#CHAN", a));
+    try std.testing.expect(world.isMember("#chan", b));
+    try std.testing.expect(!world.isMember("#chan", testClient(9)));
+    try std.testing.expect(!world.isMember("#nope", a));
+
+    // Part removes from the mirror; the other member stays.
+    try world.part("#chan", a);
+    try std.testing.expect(!world.isMember("#Chan", a));
+    try std.testing.expect(world.isMember("#Chan", b));
+
+    // Disconnect path clears membership too.
+    world.removeClient(b);
+    try std.testing.expect(!world.channelExists("#chan"));
+    try std.testing.expect(!world.isMember("#chan", b));
+}
+
+test "registered channel keeps RCU membership across empty, then reclaims" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = testClient(1);
+    _ = try world.join("#reg", a);
+    _ = try world.setChannelExtFlag("#reg", .registered, true);
+
+    // Last member leaves: registered channel persists (mirror still says exists),
+    // but the member is gone from the membership mirror.
+    try world.part("#reg", a);
+    try std.testing.expect(world.channelExists("#reg"));
+    try std.testing.expect(!world.isMember("#reg", a));
+
+    // Re-join repopulates the mirror.
+    _ = try world.join("#REG", a);
+    try std.testing.expect(world.isMember("#reg", a));
+}
+
+test "renameChannel keeps RCU existence and membership mirrors in step" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = testClient(1);
+    _ = try world.join("#old", a);
+    try std.testing.expect(try world.renameChannel("#old", "#new"));
+
+    try std.testing.expect(!world.channelExists("#old"));
+    try std.testing.expect(world.channelExists("#new"));
+    try std.testing.expect(world.channelExists("#NEW"));
+    try std.testing.expect(world.isMember("#new", a));
+    try std.testing.expect(!world.isMember("#old", a));
 }
