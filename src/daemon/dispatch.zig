@@ -773,7 +773,8 @@ pub const ClientSession = struct {
         self.event_mask = mask;
     }
 
-    /// Render active user modes as "+iB" into `out` (caller-owned, >= 9 bytes).
+    /// Render active user modes as "+iB" into `out` (caller-owned, >= 16 bytes
+    /// to hold '+', the derived 'o', and every catalog letter).
     pub fn umodeString(self: *const ClientSession, out: []u8) []const u8 {
         var n: usize = 0;
         if (n < out.len) {
@@ -785,19 +786,12 @@ pub const ClientSession = struct {
             out[n] = 'o';
             n += 1;
         }
-        const letters = [_]struct { m: usermode.UserMode, c: u8 }{
-            .{ .m = .invisible, .c = 'i' },
-            .{ .m = .bot, .c = 'B' },
-            .{ .m = .registered, .c = 'r' },
-            .{ .m = .secure_tls, .c = 'Z' },
-            .{ .m = .deaf, .c = 'D' },
-            .{ .m = .callerid, .c = 'g' },
-            .{ .m = .no_ctcp, .c = 'T' },
-            .{ .m = .cloaked, .c = 'x' },
-        };
-        for (letters) |l| {
-            if (self.umodes.contains(l.m) and n < out.len) {
-                out[n] = l.c;
+        // Catalog-driven so display always matches the parser's letters and
+        // every settable mode (R/p/Q/H included) round-trips. The catalog is the
+        // single source of truth for user-mode letters.
+        for (usermode.default_specs) |spec| {
+            if (self.umodes.contains(spec.mode) and n < out.len) {
+                out[n] = spec.letter;
                 n += 1;
             }
         }
@@ -2012,4 +2006,28 @@ test "host accessor prefers visible host, falls back to real then empty" {
     session.setVisibleHost("cloak-abcd.example");
     try std.testing.expectEqualStrings("cloak-abcd.example", session.host()); // cloak wins
     try std.testing.expectEqualStrings("203.0.113.7", session.realHost()); // real preserved
+}
+
+test "umodeString renders catalog letters for every settable mode, incl R/p/Q/H" {
+    var session = ClientSession.init();
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("+", session.umodeString(&buf)); // none set
+
+    // +o is derived from is_oper and leads the string.
+    session.is_oper = true;
+    _ = session.setUmode(.invisible, true);
+    _ = session.setUmode(.regonly_pm, true); // R — was invisible in the old display
+    _ = session.setUmode(.hide_chans, true); // p
+    _ = session.setUmode(.no_forward, true); // Q
+    _ = session.setUmode(.hide_oper, true); // H
+    const s = session.umodeString(&buf);
+    try std.testing.expect(std.mem.startsWith(u8, s, "+o"));
+    inline for (.{ 'i', 'R', 'p', 'Q', 'H' }) |c| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, s, c) != null);
+    }
+    // Letters match the catalog/parser exactly: no_ctcp is C (not T).
+    _ = session.setUmode(.no_ctcp, true);
+    const s2 = session.umodeString(&buf);
+    try std.testing.expect(std.mem.indexOfScalar(u8, s2, 'C') != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, s2, 'T') == null);
 }
