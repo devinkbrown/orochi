@@ -3049,23 +3049,10 @@ pub const LinuxServer = struct {
         // Residual: commands not (yet) owned by a SerpentRegistry module.
         // Everything above has been migrated into src/daemon/modules/* and is
         // dispatched by the registry block at the top of this function.
-        if (std.ascii.eqlIgnoreCase(parsed.command, "AKICK")) {
-            try self.handleAkick(id, conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "RESV") or
-            std.ascii.eqlIgnoreCase(parsed.command, "UNRESV"))
-        {
-            try self.handleResv(conn, parsed);
-        } else if (svc_forceaction.ForceActionKind.parse(parsed.command) != null) {
-            try self.handleForceAction(id, conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLEAR")) {
-            try self.handleClear(id, conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "TEMPMODE")) {
-            try self.handleTempmode(id, conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "CLONES")) {
-            try self.handleClones(conn);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SEEN")) {
-            try self.handleSeen(conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
+        // AKICK / RESV / UNRESV / FORCE* / CLEAR / TEMPMODE / CLONES / SEEN are
+        // now first-class SerpentRegistry commands (modules/services_ext.zig),
+        // resolved by the registry block at the top of this function.
+        if (std.ascii.eqlIgnoreCase(parsed.command, "SUMMON")) {
             try queueNumeric(conn, .ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "PONG")) {
             // Client heartbeat reply; accepted, no response required.
@@ -6181,7 +6168,7 @@ pub const LinuxServer = struct {
     /// auto-kick list. ADD/DEL require channel-op (or oper); a matching mask is
     /// denied entry on JOIN (see the join gate). Real server command, no
     /// pseudo-client: replies are server NOTICEs + standard numerics.
-    fn handleAkick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleAkick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const p = parsed.paramSlice();
         if (p.len < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "Usage: AKICK <#channel> <ADD|DEL|LIST> [mask] [:reason]");
@@ -6306,7 +6293,7 @@ pub const LinuxServer = struct {
     /// RESV/UNRESV — reserve a channel-name glob network-wide (oper-only).
     /// `RESV <pattern> <duration-ms> :reason | RESV DEL <pattern> | RESV LIST`
     /// and `UNRESV <pattern>`. Reserved names are refused at JOIN for non-opers.
-    fn handleResv(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleResv(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const nick = conn.session.displayName();
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: RESV is operator-only");
@@ -6373,7 +6360,7 @@ pub const LinuxServer = struct {
     /// FORCEOP / FORCEDEOP / FORCEJOIN / FORCEPART / FORCETOPIC — operator force
     /// actions over channels and members. Each maps to a real server effect
     /// (MODE/JOIN/KICK/TOPIC) applied on behalf of the target; no pseudo-client.
-    fn handleForceAction(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleForceAction(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         _ = id;
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: force actions are operator-only");
@@ -6488,7 +6475,7 @@ pub const LinuxServer = struct {
     /// CLEAR <#channel> USERS [KEEP <rank>] [ALLOW <acct[,acct]>] [:reason] —
     /// mass-kick every member below the keep rank (default: keep founders) that
     /// is not on the account allowlist. Requires channel founder or server oper.
-    fn handleClear(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleClear(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         // Reassemble the command line for the pure parser ("CLEAR <args...>").
         var lb: [1024]u8 = undefined;
         var used: usize = 0;
@@ -6573,7 +6560,7 @@ pub const LinuxServer = struct {
     /// [param] | SWEEP — schedule an auto-reverting channel flag mode. ADD sets
     /// the flag now and queues the `-flag` revert; the timer sweep applies it.
     /// Requires channel operator or server oper. Flag (boolean) modes only.
-    fn handleTempmode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleTempmode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const cmd = svc_tempmode.parseParams(parsed.paramSlice(), self.nowMs()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TEMPMODE"}, "Usage: TEMPMODE ADD <#chan> <flag> [param] <duration> | CANCEL <#chan> <flag> [param] | SWEEP");
             return;
@@ -6640,7 +6627,7 @@ pub const LinuxServer = struct {
 
     /// SEEN <account> — report an account's last-seen / last-login time and its
     /// recent login/logout history. Available to any registered user.
-    fn handleSeen(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+    pub fn handleSeen(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const p = parsed.paramSlice();
         if (p.len < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SEEN"}, "Usage: SEEN <account>");
@@ -6694,7 +6681,7 @@ pub const LinuxServer = struct {
 
     /// CLONES — oper report of connection clusters sharing an exact IP or a
     /// /24/64 network prefix (>= 2 members). Read-only snapshot aggregation.
-    fn handleClones(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleClones(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: CLONES is operator-only");
             return;
