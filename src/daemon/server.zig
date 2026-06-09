@@ -157,6 +157,11 @@ const node_identity = @import("node_identity.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
 const tls_conn = @import("tls_conn.zig");
 const reactor_wake = @import("reactor_wake.zig");
+const shard_mod = @import("shard.zig");
+const reactor_pool_mod = @import("reactor_pool.zig");
+const reuseport = @import("reuseport.zig");
+const reactor_fabric = @import("reactor_fabric.zig");
+const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
 const config_format = @import("config_format.zig");
 const services_mod = @import("services.zig");
@@ -1151,10 +1156,18 @@ pub const LinuxServer = struct {
     /// (origin_node, hlc). Per-peer seen-sets miss cross-path duplicates in a
     /// cyclic mesh; this global set dedups deliver + re-forward across all paths.
     relay_seen: message_relay.SeenSet,
-    /// Per-reactor I/O (ring, connection table, listeners, wake). Single embedded
-    /// reactor today; reached through `rx()` so the sharded model can swap it for
-    /// a thread-local current reactor with no call-site changes.
-    io: Reactor,
+    /// Per-reactor I/O (ring, connection table, listeners, wake). One entry per
+    /// shard, heap-allocated at init (`reactors.len == clamped num_shards`).
+    /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
+    /// every handler resolves to the reactor whose ring produced its completion.
+    reactors: []Reactor,
+    /// Cross-shard outbound delivery fabric (per-shard mailbox + wake + shared
+    /// pool). Null in the single-reactor configuration (no cross-shard handoff is
+    /// ever needed); allocated by `runThreaded` when `reactors.len > 1`.
+    fabric: ?reactor_fabric.ReactorFabric = null,
+    /// Worker-thread pool that owns the per-shard reactor threads while
+    /// `runThreaded` runs the multi-reactor topology. Idle in single-reactor mode.
+    pool: reactor_pool_mod.ReactorPool(*LinuxServer),
     world: world_model.World,
     whowas: WhowasStore,
     monitor: monitor.MonitorStore,
@@ -1262,24 +1275,40 @@ pub const LinuxServer = struct {
     /// entry). Centralizing the lookup keeps every handler's `self.rx().ring` /
     /// `self.rx().clients` access shard-correct with no signature changes.
     inline fn rx(self: *LinuxServer) *Reactor {
-        return current_reactor orelse &self.io;
+        return current_reactor orelse &self.reactors[0];
     }
 
-    /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
-    /// ring used for accept/recv/send completions.
-    pub fn init(allocator: std.mem.Allocator, config: Config) !LinuxServer {
-        if (builtin.os.tag != .linux) return error.Unsupported;
+    /// Clamp the configured shard count to `[1, max_shards]`. A zero (unset) or
+    /// out-of-range request collapses to a single reactor — the safe default.
+    fn clampShards(config: Config) u12 {
+        const requested: usize = if (config.num_shards == 0) 1 else config.num_shards;
+        const capped = @min(requested, shard_mod.max_shards);
+        return @intCast(@max(@as(usize, 1), capped));
+    }
 
-        // Adopt an inherited listening socket from a Helix UPGRADE handoff if one
-        // was passed (port stays bound across execve); otherwise bind fresh.
-        const listener_fd = if (config.inherited_listener_fd) |fd| blk: {
+    /// Build one shard's `Reactor`: its own ring, connection table (reserved to
+    /// `max_clients`), wake eventfd, and listeners stamped with `shard_id`. When
+    /// `reuse_port` is set every listener is a `SO_REUSEPORT` socket so N reactors
+    /// can share the same `(host, port)` and the kernel load-balances accepts;
+    /// the single-reactor path keeps the plain `createListener` sockets (and the
+    /// inherited-fd upgrade handoff) for byte-identical behavior. On any partial
+    /// failure every fd/resource already created for this shard is released.
+    fn initReactor(allocator: std.mem.Allocator, config: Config, shard_id: u12, reuse_port: bool) !Reactor {
+        const listener_fd = if (!reuse_port and config.inherited_listener_fd != null) blk: {
+            const fd = config.inherited_listener_fd.?;
             std.debug.print("mizuchi: adopting inherited listener fd {d}\n", .{fd});
             break :blk fd;
-        } else try createListener(config.host, config.port, config.backlog);
+        } else if (reuse_port)
+            try reuseport.createReusePortListener(config.host, config.port, config.backlog)
+        else
+            try createListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
 
         const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0)
-            try createListener(config.host, config.s2s_port, config.backlog)
+            (if (reuse_port)
+                try reuseport.createReusePortListener(config.host, config.s2s_port, config.backlog)
+            else
+                try createListener(config.host, config.s2s_port, config.backlog))
         else
             -1;
         errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
@@ -1288,7 +1317,10 @@ pub const LinuxServer = struct {
         // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
         // same convention the plaintext listener uses.
         const tls_listener_fd: linux.fd_t = if (config.tls_cert_chain.len != 0 and config.tls_signing_key != null)
-            try createListener(config.host, config.tls_port, config.backlog)
+            (if (reuse_port)
+                try reuseport.createReusePortListener(config.host, config.tls_port, config.backlog)
+            else
+                try createListener(config.host, config.tls_port, config.backlog))
         else
             -1;
         errdefer if (tls_listener_fd >= 0) closeFd(tls_listener_fd);
@@ -1299,31 +1331,56 @@ pub const LinuxServer = struct {
         };
         errdefer ring.deinit();
 
-        var whowas_store = try WhowasStore.init(allocator);
-        errdefer whowas_store.deinit();
-
         // Reserve the full connection table up front so ConnState buffers never
-        // move under in-flight io_uring I/O (a realloc would corrupt them).
-        var clients = ClientTable.init(allocator, 0);
+        // move under in-flight io_uring I/O (a realloc would corrupt them). Each
+        // reactor owns a disjoint slab keyed by its own `shard_id`.
+        var clients = ClientTable.init(allocator, shard_id);
         errdefer clients.deinit();
         try clients.reserve(config.max_clients);
+
+        return .{
+            .ring = ring,
+            .clients = clients,
+            .shard_id = shard_id,
+            .listener_fd = listener_fd,
+            .s2s_listener_fd = s2s_listener_fd,
+            .tls_listener_fd = tls_listener_fd,
+            // Best-effort: a daemon without eventfd simply runs un-wakeable (a
+            // single reactor never needs an external nudge; multi-reactor needs it
+            // for cross-shard delivery, so a failure there degrades to busier polls).
+            .wake = reactor_wake.ReactorWake.init() catch null,
+        };
+    }
+
+    /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
+    /// ring used for accept/recv/send completions.
+    pub fn init(allocator: std.mem.Allocator, config: Config) !LinuxServer {
+        if (builtin.os.tag != .linux) return error.Unsupported;
+
+        const shard_count = clampShards(config);
+        // For >1 shard EVERY listener (shard 0 included) must be SO_REUSEPORT or
+        // the kernel rejects the second bind on the shared port. The single-shard
+        // path keeps plain sockets so its behavior is byte-identical to before.
+        const reuse_port = shard_count > 1;
+
+        const reactors = try allocator.alloc(Reactor, shard_count);
+        errdefer allocator.free(reactors);
+        var built: usize = 0;
+        errdefer for (reactors[0..built]) |*r| r.deinit();
+        while (built < shard_count) : (built += 1) {
+            reactors[built] = try initReactor(allocator, config, @intCast(built), reuse_port);
+        }
+
+        var whowas_store = try WhowasStore.init(allocator);
+        errdefer whowas_store.deinit();
 
         return .{
             .allocator = allocator,
             .config = config,
             .wasm = wasm_bridge.Bridge.init(allocator),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
-            .io = .{
-                .ring = ring,
-                .clients = clients,
-                .shard_id = 0,
-                .listener_fd = listener_fd,
-                .s2s_listener_fd = s2s_listener_fd,
-                .tls_listener_fd = tls_listener_fd,
-                // Best-effort: a daemon without eventfd simply runs un-wakeable
-                // (a single reactor never needs an external nudge today).
-                .wake = reactor_wake.ReactorWake.init() catch null,
-            },
+            .reactors = reactors,
+            .pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(allocator),
             .world = world_model.World.init(allocator),
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, 128),
@@ -1416,28 +1473,32 @@ pub const LinuxServer = struct {
         self.driveDeinit();
         self.wasm.deinit();
         self.relay_seen.deinit();
-        for (self.rx().clients.slots.items) |*slot| {
-            if (slot.occupied) {
-                if (slot.value.s2s) |link| {
-                    link.deinit();
-                    self.allocator.destroy(link);
-                    slot.value.s2s = null;
+        // Tear down every connection owned by every shard's reactor (each reactor
+        // owns a disjoint slab). Single-reactor mode just walks `reactors[0]`.
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (slot.occupied) {
+                    if (slot.value.s2s) |link| {
+                        link.deinit();
+                        self.allocator.destroy(link);
+                        slot.value.s2s = null;
+                    }
+                    if (slot.value.s2s_secured) |link| {
+                        link.deinit();
+                        self.allocator.destroy(link);
+                        slot.value.s2s_secured = null;
+                    }
+                    if (slot.value.multiline) |ms| {
+                        self.allocator.destroy(ms);
+                        slot.value.multiline = null;
+                    }
+                    if (slot.value.tls) |t| {
+                        t.deinit();
+                        self.allocator.destroy(t);
+                        slot.value.tls = null;
+                    }
+                    closeFd(slot.value.fd);
                 }
-                if (slot.value.s2s_secured) |link| {
-                    link.deinit();
-                    self.allocator.destroy(link);
-                    slot.value.s2s_secured = null;
-                }
-                if (slot.value.multiline) |ms| {
-                    self.allocator.destroy(ms);
-                    slot.value.multiline = null;
-                }
-                if (slot.value.tls) |t| {
-                    t.deinit();
-                    self.allocator.destroy(t);
-                    slot.value.tls = null;
-                }
-                closeFd(slot.value.fd);
             }
         }
         self.history.deinit();
@@ -1485,7 +1546,12 @@ pub const LinuxServer = struct {
         self.monitor.deinit();
         self.whowas.deinit();
         self.world.deinit();
-        self.io.deinit();
+        // Join any worker threads (no-op if runThreaded already joined), then tear
+        // down each reactor's ring/table/wake/listeners and free the slice + fabric.
+        self.pool.deinit();
+        for (self.reactors) |*reactor| reactor.deinit();
+        self.allocator.free(self.reactors);
+        if (self.fabric) |*f| f.deinit();
         self.* = undefined;
     }
 
@@ -1522,13 +1588,63 @@ pub const LinuxServer = struct {
         if (self.rx().wake) |*w| w.wake();
     }
 
+    /// Wake EVERY reactor's wake eventfd from any thread. Each reactor keeps a
+    /// poll on its own wake fd in flight (`armWake` each `runOnce`), so this makes
+    /// every blocked `submitAndWait(1)` return at once. Used by the stop path: a
+    /// SO_REUSEPORT throwaway connection only nudges the one reactor the kernel
+    /// happens to route it to, leaving the others blocked forever in
+    /// `submitAndWait`; an explicit wake-all is what lets `pool.join()` complete.
+    pub fn wakeAllReactors(self: *LinuxServer) void {
+        for (self.reactors) |*r| {
+            if (r.wake) |*w| w.wake();
+        }
+    }
+
+    /// Cooperative multi-reactor stop: clear the shared run flag, then wake every
+    /// reactor so each blocked loop returns from `submitAndWait`, re-checks the
+    /// (now false) flag, and exits — letting `runThreaded`'s `pool.join()` finish.
+    /// Callable from any thread (e.g. a test driver, or DIE/RESTART). Without the
+    /// wake-all a reactor with no pending completion would never observe the clear.
+    pub fn requestStop(self: *LinuxServer, run: *std.atomic.Value(bool)) void {
+        run.store(false, .release);
+        self.wakeAllReactors();
+    }
+
     /// Handle the wake-fd poll completion: drain the eventfd, mark the poll
-    /// consumed (re-armed next `runOnce`), and record the wake.
+    /// consumed (re-armed next `runOnce`), record the wake, then drain this
+    /// shard's cross-shard mailbox and flush the handed-off bytes to the local
+    /// connections they target.
     fn onWakePoll(self: *LinuxServer) void {
         self.rx().wake_armed = false;
         if (self.rx().wake) |*w| w.drain();
         _ = self.rx().wake_count.fetchAdd(1, .monotonic);
-        // (multi-reactor: drain this shard's cross-shard mailbox here.)
+        self.drainFabric();
+    }
+
+    /// Drain every cross-shard delivery addressed to THIS reactor's shard and
+    /// append each handoff's bytes to the local connection it targets, then arm
+    /// send and release the pooled buffer. Runs under the world write lock (the
+    /// completion bracket), so it is serialized against every other reactor's
+    /// world access. The connection lookup uses THIS reactor's slab — the only
+    /// reactor that may touch these send buffers. A handoff whose target slot is
+    /// gone (the connection closed before its bytes arrived) is dropped; its
+    /// buffer is still released so the pool never leaks.
+    fn drainFabric(self: *LinuxServer) void {
+        const fabric = if (self.fabric) |*f| f else return;
+        const my_shard = self.rx().shard_id;
+        var msgs: [64]reactor_fabric.DeliverMsg = undefined;
+        while (true) {
+            const n = fabric.drain(my_shard, &msgs);
+            if (n == 0) break;
+            for (msgs[0..n]) |msg| {
+                defer fabric.release(msg.buf);
+                const bytes = fabric.bytes(msg.buf);
+                const conn = self.rx().clients.get(msg.to) orelse continue;
+                if (conn.closing) continue;
+                appendToConn(conn, bytes) catch continue;
+                self.armSendIfNeeded(conn) catch {};
+            }
+        }
     }
 
     /// Keep exactly one periodic timeout-sweep timer in flight.
@@ -1635,9 +1751,10 @@ pub const LinuxServer = struct {
     /// their own stop condition is satisfied.
     pub fn runOnce(self: *LinuxServer) !void {
         // Bind this thread to its reactor so every handler's rx() resolves to the
-        // reactor whose ring produced the completions (single embedded reactor
-        // today; one per shard once threads are spawned).
-        current_reactor = &self.io;
+        // reactor whose ring produced the completions. A multi-reactor worker has
+        // already bound its own shard before looping (so we never clobber it);
+        // single-reactor callers and direct-test invocations bind shard 0 here.
+        if (current_reactor == null) current_reactor = &self.reactors[0];
         try self.armAccept();
         self.armWake() catch {}; // cross-reactor wake poll; non-fatal if it can't arm
         self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
@@ -1647,6 +1764,13 @@ pub const LinuxServer = struct {
         var cqes: [ringlane.default_cqe_batch]linux.io_uring_cqe = undefined;
         _ = try self.rx().ring.reapCompletions(&cqes, 0, &handler);
         if (handler.err) |err| return err;
+
+        // Belt-and-suspenders against a lost wake: drain any cross-shard handoffs
+        // addressed to this reactor every iteration, not only on the wake-poll
+        // completion. Cheap when empty (one lock-free pop returning 0). Each
+        // reactor drains only its own mailbox into its own connections, so this is
+        // reactor-local and needs no world lock. No-op in single-reactor mode.
+        if (self.fabric != null) self.drainFabric();
 
         _ = try self.rx().ring.submit();
     }
@@ -1661,17 +1785,59 @@ pub const LinuxServer = struct {
     /// threading plan — docs/planning/06-threading.md.)
     pub fn runThreaded(self: *LinuxServer, run: *std.atomic.Value(bool)) void {
         self.shutdown = run; // expose to DIE/RESTART
-        // Multi-reactor is requested via Config.num_shards, but the per-shard
-        // reactor array + RCU world adoption are not wired yet (the substrate is
-        // in tree: EBR, persistent HAMT, RcuMap, world_rcu, reactor_pool, fabric).
-        // Until that lands, honor the request by clamping to a single reactor and
-        // saying so once, rather than silently ignoring the setting.
-        if (self.config.num_shards > 1) {
-            std.debug.print(
-                "mizuchi: num_shards={d} requested; multi-reactor not yet enabled, running 1 reactor\n",
-                .{self.config.num_shards},
-            );
+
+        // Single reactor: run the loop in-line on the calling thread, byte-identical
+        // to the historical path (no pool, no fabric, no extra threads).
+        if (self.reactors.len <= 1) {
+            current_reactor = &self.reactors[0];
+            while (run.load(.acquire)) {
+                self.runOnce() catch return;
+            }
+            return;
         }
+
+        // Multi-reactor: stand up the shared cross-shard delivery fabric (one
+        // mailbox + wake per shard, one shared buffer pool), then spawn one worker
+        // thread per shard. Each worker owns exactly one reactor for its lifetime.
+        // If the fabric cannot be created (no eventfd, OOM) fall back to a single
+        // in-line reactor rather than running without cross-shard delivery.
+        self.fabric = reactor_fabric.ReactorFabric.init(self.allocator, self.reactors.len) catch |err| {
+            std.debug.print(
+                "mizuchi: cross-shard fabric init failed ({s}); running 1 reactor\n",
+                .{@errorName(err)},
+            );
+            current_reactor = &self.reactors[0];
+            while (run.load(.acquire)) {
+                self.runOnce() catch return;
+            }
+            return;
+        };
+
+        std.debug.print("mizuchi: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
+        self.pool.start(self.reactors.len, self, run, reactorWorker) catch |err| {
+            std.debug.print(
+                "mizuchi: reactor pool spawn failed ({s}); running 1 reactor\n",
+                .{@errorName(err)},
+            );
+            if (self.fabric) |*f| f.deinit();
+            self.fabric = null;
+            current_reactor = &self.reactors[0];
+            while (run.load(.acquire)) {
+                self.runOnce() catch return;
+            }
+            return;
+        };
+        // Block here until the run flag clears and every worker has exited, so the
+        // caller's `runThreaded` returning means the daemon has fully stopped.
+        self.pool.join();
+    }
+
+    /// One reactor worker thread: bind this thread to its shard's reactor, then
+    /// loop `runOnce` (which arms accept/wake/timer and reaps completions) until
+    /// the shared run flag clears. Each worker touches only its own reactor's ring
+    /// and connection slab; cross-shard work crosses via the fabric.
+    fn reactorWorker(self: *LinuxServer, shard: u12, run: *reactor_pool_mod.RunFlag) void {
+        current_reactor = &self.reactors[shard];
         while (run.load(.acquire)) {
             self.runOnce() catch return;
         }
@@ -2126,24 +2292,132 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// The single cross-shard-aware outbound byte sink. Every "write a finished
+    /// line (or lines) to the connection behind `id`" path funnels here so the
+    /// shard decision is made in exactly one place:
+    ///
+    ///   * `id` on THIS reactor's shard  → append to its local send buffer and arm
+    ///     send, exactly as the single-reactor path always did (no copy, no lock).
+    ///   * `id` on ANOTHER shard          → copy the bytes into pooled `DeliverBuf`s
+    ///     (chunked to the pool's per-buffer max, FIFO-ordered), hand each off to
+    ///     the owning shard's fabric mailbox, and wake that reactor. The target
+    ///     reactor drains its mailbox in `onWakePoll`, appends to the local conn,
+    ///     and releases the buffer. A connection's send buffer / ring is therefore
+    ///     never touched by a non-owning reactor.
+    ///
+    /// Returns `error.ClientNotFound` only for a LOCAL miss (stale/closed slot);
+    /// a cross-shard handoff cannot see the target's liveness, so it best-effort
+    /// enqueues and the owning reactor drops the bytes if the slot is gone.
+    fn enqueueDelivery(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) !void {
+        // Local fast path (always taken in single-reactor mode, where shard_id==0
+        // and every id carries shard 0).
+        if (id.shard == self.rx().shard_id) {
+            const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
+            if (conn.closing) return;
+            try appendToConn(conn, bytes);
+            try self.armSendIfNeeded(conn);
+            return;
+        }
+        // Cross-shard: hand off through the fabric. Absent a fabric (should not
+        // happen while multiple reactors run) the bytes are dropped rather than
+        // touching another reactor's connection.
+        const fabric = if (self.fabric) |*f| f else return;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const end = @min(off + deliver_handle.max_bytes, bytes.len);
+            const chunk = bytes[off..end];
+            // Retry acquire on momentary pool exhaustion; the target drains
+            // continuously so a buffer frees shortly. Bounded so a wedged target
+            // cannot spin this forever.
+            var spins: usize = 0;
+            const buf = while (true) {
+                if (fabric.acquire(chunk)) |b| break b;
+                spins += 1;
+                if (spins > 4096) return; // give up on this chunk; never block the reactor
+                std.atomic.spinLoopHint();
+            };
+            // Likewise retry a full inbox briefly, then drop to avoid a stall.
+            var pushed = false;
+            var psp: usize = 0;
+            while (psp < 4096) : (psp += 1) {
+                if (fabric.sendTo(id.shard, .{ .to = id, .buf = buf })) {
+                    pushed = true;
+                    break;
+                }
+                std.atomic.spinLoopHint();
+            }
+            if (!pushed) {
+                fabric.release(buf);
+                return;
+            }
+            off = end;
+        }
+        // Wake the OWNING reactor through its own wake eventfd (the one it arms a
+        // poll on each loop). Its wake-poll completion runs `drainFabric`, which
+        // consumes the mailbox we just pushed to. We deliberately do not use the
+        // fabric's own wake fds: the reactor loop only watches `Reactor.wake`, so
+        // unifying on it reuses the existing arm/poll plumbing.
+        if (self.reactors[id.shard].wake) |*w| w.wake();
+    }
+
     fn deliver(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) !void {
-        const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
-        if (conn.closing) return;
-        try appendToConn(conn, bytes);
-        try self.armSendIfNeeded(conn);
+        return self.enqueueDelivery(id, bytes);
+    }
+
+    /// Shard-aware equivalent of `queueNumeric` + arm: format the numeric for the
+    /// connection behind `id` (using its display name read from the owning reactor
+    /// under the world lock) and route the bytes through `enqueueDelivery` (local
+    /// append or cross-shard fabric handoff). Use this wherever a numeric must go
+    /// to a connection that is NOT the one currently being processed and may live
+    /// on another shard.
+    fn deliverNumeric(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        code: Numeric,
+        params: []const []const u8,
+        trailing: []const u8,
+    ) !void {
+        const target = self.connFor(id) orelse return;
+        if (target.closing) return;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = try formatNumericLine(&line_buf, target.session.displayName(), code, params, trailing);
+        try self.enqueueDelivery(id, line);
+    }
+
+    /// Look up the connection behind `id` on its OWNING reactor's slab, whatever
+    /// shard that is. Safe for READ-ONLY inspection of the connection's session
+    /// (caps, away, umodes, display name): every such field is mutated only while
+    /// holding `world.lockWrite`, which brackets the whole completion, so a read
+    /// here is serialized against that connection's own command processing. NEVER
+    /// write to a returned foreign connection's send buffer or arm its ring — that
+    /// is its reactor's job; route bytes there through `enqueueDelivery`.
+    fn connFor(self: *LinuxServer, id: client_model.ClientId) ?*ConnState {
+        if (id.shard >= self.reactors.len) return null;
+        return self.reactors[id.shard].clients.get(id);
     }
 
     /// Deliver `bytes` (a complete `:prefix ...` line), prepending the IRCv3
     /// server-time `tag` for recipients that negotiated the server-time cap.
     /// `tag` is precomputed once per event so all recipients share a timestamp.
     fn deliverTimed(self: *LinuxServer, id: client_model.ClientId, tag: []const u8, bytes: []const u8) !void {
-        const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
+        const conn = self.connFor(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
+        // Cap inspection is a serialized read of the owning reactor's session; the
+        // byte handoff below routes to that reactor (local append or fabric).
         if (tag.len != 0 and conn.session.hasCap(.server_time)) {
-            try appendToConn(conn, tag);
+            // Concatenate so the tag + line cross the shard boundary as one ordered
+            // unit (two enqueues could interleave a foreign reactor's drain).
+            if (id.shard != self.rx().shard_id) {
+                var joined: [default_reply_bytes]u8 = undefined;
+                if (tag.len + bytes.len <= joined.len) {
+                    @memcpy(joined[0..tag.len], tag);
+                    @memcpy(joined[tag.len .. tag.len + bytes.len], bytes);
+                    return self.enqueueDelivery(id, joined[0 .. tag.len + bytes.len]);
+                }
+            }
+            try self.enqueueDelivery(id, tag);
         }
-        try appendToConn(conn, bytes);
-        try self.armSendIfNeeded(conn);
+        try self.enqueueDelivery(id, bytes);
     }
 
     /// Per-event message tags available to attach (server-time value WITHOUT the
@@ -2165,15 +2439,24 @@ pub const LinuxServer = struct {
     /// recipient: `@time=…;account=… ` including only the tags whose caps the
     /// recipient negotiated. Used by the PRIVMSG/NOTICE/TAGMSG paths.
     fn deliverTagged(self: *LinuxServer, id: client_model.ClientId, tags: MsgTags, bytes: []const u8) !void {
-        const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
+        const conn = self.connFor(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
         // Sized for the full @-segment: server-time + account + msgid + relayed
-        // client-only tags.
+        // client-only tags. Built from a serialized read of the owning reactor's
+        // negotiated caps; the bytes then route to that reactor via enqueueDelivery.
         var tagbuf: [256]u8 = undefined;
         const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
-        if (prefix.len != 0) try appendToConn(conn, prefix);
-        try appendToConn(conn, bytes);
-        try self.armSendIfNeeded(conn);
+        if (prefix.len != 0 and id.shard != self.rx().shard_id) {
+            // Cross-shard: send prefix + line as one ordered unit.
+            var joined: [default_reply_bytes]u8 = undefined;
+            if (prefix.len + bytes.len <= joined.len) {
+                @memcpy(joined[0..prefix.len], prefix);
+                @memcpy(joined[prefix.len .. prefix.len + bytes.len], bytes);
+                return self.enqueueDelivery(id, joined[0 .. prefix.len + bytes.len]);
+            }
+        }
+        if (prefix.len != 0) try self.enqueueDelivery(id, prefix);
+        try self.enqueueDelivery(id, bytes);
     }
 
     fn broadcastChannelTagged(
@@ -2783,10 +3066,12 @@ pub const LinuxServer = struct {
 
             var members = self.world.memberIterator(cv.name) orelse continue;
             while (members.next()) |member| {
-                const mc = self.rx().clients.get(clientIdFromWorld(member.*)) orelse continue;
+                const mid = clientIdFromWorld(member.*);
+                const mc = self.connFor(mid) orelse continue;
                 if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
-                appendToConn(mc, batch) catch continue;
-                self.armSendIfNeeded(mc) catch {};
+                // Route via the shard-aware sink: local append or cross-shard
+                // handoff (the batch is chunked to the pool's per-buffer max).
+                self.enqueueDelivery(mid, batch) catch continue;
             }
         }
     }
@@ -2908,7 +3193,7 @@ pub const LinuxServer = struct {
                 if (!is_self and !auditorium.shouldRelayJoinPart(mrank)) continue;
             }
             const mid = clientIdFromWorld(member.*);
-            const mconn = self.rx().clients.get(mid) orelse continue;
+            const mconn = self.connFor(mid) orelse continue;
             const body = if (mconn.session.hasCap(.extended_join)) ext else plain;
             try self.deliverTimed(mid, tag, body);
         }
@@ -3707,13 +3992,13 @@ pub const LinuxServer = struct {
             var it = self.world.memberIterator(target) orelse return;
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
-                const mconn = self.rx().clients.get(clientIdFromWorld(member.*));
+                const mconn = self.connFor(clientIdFromWorld(member.*));
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
                 try self.emitWhoxRow(conn, req, requester, target, nick, usernameOf(self, member.*), mconn, hp);
             }
         } else if (self.world.findNick(target)) |wid| {
             // Nick target: a single 354 row, no channel context (channel "*").
-            const mconn = self.rx().clients.get(clientIdFromWorld(wid));
+            const mconn = self.connFor(clientIdFromWorld(wid));
             try self.emitWhoxRow(conn, req, requester, "*", target, usernameOf(self, wid), mconn, 0);
         }
         var endbuf: [default_reply_bytes]u8 = undefined;
@@ -3793,7 +4078,7 @@ pub const LinuxServer = struct {
             var it = self.world.memberIterator(target) orelse return;
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
-                const mconn = self.rx().clients.get(clientIdFromWorld(member.*));
+                const mconn = self.connFor(clientIdFromWorld(member.*));
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
                 const ctx = who.ReplyContext{
                     .server_name = server_name,
@@ -3814,7 +4099,7 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, "\r\n");
             }
         } else if (self.world.findNick(target)) |wid| {
-            const mconn = self.rx().clients.get(clientIdFromWorld(wid));
+            const mconn = self.connFor(clientIdFromWorld(wid));
             const ctx = who.ReplyContext{
                 .server_name = server_name,
                 .requester = requester,
@@ -3906,7 +4191,7 @@ pub const LinuxServer = struct {
         var sink = whois.WhoisLineSink{ .lines = &lines_buf, .storage = &storage };
 
         const target_wid = self.world.findNick(target_nick);
-        const target_conn: ?*ConnState = if (target_wid) |w| self.rx().clients.get(clientIdFromWorld(w)) else null;
+        const target_conn: ?*ConnState = if (target_wid) |w| self.connFor(clientIdFromWorld(w)) else null;
         if (target_wid == null or target_conn == null) {
             whois.writeNoSuchNick(&sink, server_name, conn.session.displayName(), target_nick) catch return;
             for (sink.slice()) |line| try appendToConn(conn, line.bytes);
@@ -4010,7 +4295,7 @@ pub const LinuxServer = struct {
         while (members.next()) |member| {
             const mid = clientIdFromWorld(member.*);
             if (mid.eql(id)) continue;
-            const mconn = self.rx().clients.get(mid) orelse continue;
+            const mconn = self.connFor(mid) orelse continue;
             if (!mconn.session.hasCap(.invite_notify)) continue;
             try self.deliver(mid, notif);
         }
@@ -4194,9 +4479,7 @@ pub const LinuxServer = struct {
             const mm = self.world.memberModes(channel, member.*) orelse continue;
             if (!mm.isOperator()) continue;
             const op_id = clientIdFromWorld(member.*);
-            const opconn = self.rx().clients.get(op_id) orelse continue;
-            try queueNumeric(opconn, .RPL_KNOCK, &.{ channel, mask }, reason);
-            try self.armSendIfNeeded(opconn);
+            try self.deliverNumeric(op_id, .RPL_KNOCK, &.{ channel, mask }, reason);
         }
         try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
     }
@@ -4254,7 +4537,7 @@ pub const LinuxServer = struct {
         var members = self.world.memberIterator(new) orelse return;
         while (members.next()) |member| {
             const mid = clientIdFromWorld(member.*);
-            const mconn = self.rx().clients.get(mid) orelse continue;
+            const mconn = self.connFor(mid) orelse continue;
             if (mconn.session.hasCap(.channel_rename)) {
                 self.deliver(mid, rline) catch {};
             } else {
@@ -4289,10 +4572,9 @@ pub const LinuxServer = struct {
     /// that connection's send (replies may target clients other than the caller).
     fn flushMonitorReplies(self: *LinuxServer, sink: *const monitor.MonitorReplySink) !void {
         for (sink.slice()) |reply| {
-            const wconn = self.rx().clients.get(clientIdFromMonitor(reply.client)) orelse continue;
+            const wid = clientIdFromMonitor(reply.client);
             const trailing = if (reply.targets.len != 0) reply.targets else reply.text;
-            try queueNumeric(wconn, monitorNumeric(reply.numeric), &.{}, trailing);
-            try self.armSendIfNeeded(wconn);
+            try self.deliverNumeric(wid, monitorNumeric(reply.numeric), &.{}, trailing);
         }
     }
 
@@ -4992,7 +5274,7 @@ pub const LinuxServer = struct {
         for (parsed.paramSlice()) |nick| {
             if (n >= targets.len) break;
             const wid = self.world.findNick(nick) orelse continue;
-            const c = self.rx().clients.get(clientIdFromWorld(wid));
+            const c = self.connFor(clientIdFromWorld(wid));
             targets[n] = .{
                 .nick = nick,
                 .oper = if (c) |cc| cc.session.isOper() else false,
@@ -8164,7 +8446,7 @@ pub const LinuxServer = struct {
                 const key = @as(u64, @bitCast(mid));
                 if (seen.contains(key)) continue;
                 seen.put(key, {}) catch {};
-                const mconn = self.rx().clients.get(mid) orelse continue;
+                const mconn = self.connFor(mid) orelse continue;
                 if (cap) |c| {
                     if (!mconn.session.hasCap(c)) continue;
                 }
@@ -8181,7 +8463,7 @@ pub const LinuxServer = struct {
                 const wid = clientIdFromMonitor(w);
                 if (wid.eql(except)) continue;
                 if (seen.contains(@as(u64, @bitCast(wid)))) continue;
-                const wconn = self.rx().clients.get(wid) orelse continue;
+                const wconn = self.connFor(wid) orelse continue;
                 if (!wconn.session.hasCap(.extended_monitor)) continue;
                 try self.deliver(wid, msg);
             }
@@ -8216,7 +8498,7 @@ pub const LinuxServer = struct {
             while (members.next()) |member| {
                 const mid = clientIdFromWorld(member.*);
                 if (mid.eql(id) and !echo) continue;
-                const mconn = self.rx().clients.get(mid) orelse continue;
+                const mconn = self.connFor(mid) orelse continue;
                 if (!mconn.session.hasCap(.message_tags)) continue;
                 try self.deliver(mid, msg);
             }
@@ -8228,7 +8510,7 @@ pub const LinuxServer = struct {
             return;
         }
         const recipient = self.world.findNick(target) orelse return;
-        const rconn = self.rx().clients.get(clientIdFromWorld(recipient)) orelse return;
+        const rconn = self.connFor(clientIdFromWorld(recipient)) orelse return;
         if (rconn.session.hasCap(.message_tags)) try self.deliver(clientIdFromWorld(recipient), msg);
         if (echo) try self.deliver(id, msg);
     }
@@ -8688,7 +8970,7 @@ pub const LinuxServer = struct {
         // +R regonly-pm: the recipient rejects PMs/notices from unauthenticated
         // senders. Logged-in senders and opers always pass.
         if (conn.session.account() == null and !conn.session.isOper()) {
-            if (self.rx().clients.get(clientIdFromWorld(recipient))) |rconn| {
+            if (self.connFor(clientIdFromWorld(recipient))) |rconn| {
                 if (rconn.session.umodes.contains(.regonly_pm)) {
                     if (!is_notice) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{target}, "Cannot message this user (+R: identify to a registered account)");
                     return;
@@ -8710,7 +8992,7 @@ pub const LinuxServer = struct {
         // RFC 1459: a PRIVMSG (not NOTICE) to an away user returns RPL_AWAY so
         // the sender sees the auto-reply. NOTICE never auto-responds.
         if (std.ascii.eqlIgnoreCase(command, "PRIVMSG")) {
-            if (self.rx().clients.get(clientIdFromWorld(recipient))) |rconn| {
+            if (self.connFor(clientIdFromWorld(recipient))) |rconn| {
                 if (rconn.session.awayMessage()) |reason| {
                     try queueNumeric(conn, .RPL_AWAY, &.{target}, reason);
                 }
@@ -8962,7 +9244,14 @@ fn tokenFromId(id: client_model.ClientId) ServerError!RingFdToken {
 }
 
 fn idFromToken(token: RingFdToken) client_model.ClientId {
-    return .{ .shard = 0, .slot = @intCast(token.slot), .gen = token.gen };
+    // A completion's token always names a connection on the reactor whose ring
+    // produced it — i.e. the reactor bound to this thread. Stamp that reactor's
+    // shard so the reconstructed id matches the slab that allocated it (the slab
+    // is keyed by `shard`, so a 0 here would miss on any shard but 0). Off any
+    // reactor thread (direct test calls), `current_reactor` is null and we fall
+    // back to shard 0 — the single-reactor identity, exactly as before.
+    const shard_id: u12 = if (current_reactor) |r| r.shard_id else 0;
+    return .{ .shard = shard_id, .slot = @intCast(token.slot), .gen = token.gen };
 }
 
 fn worldIdFromClient(id: client_model.ClientId) world_model.ClientId {
@@ -8971,7 +9260,7 @@ fn worldIdFromClient(id: client_model.ClientId) world_model.ClientId {
 
 /// The USER-supplied username of the member behind a world client id, or "user".
 fn usernameOf(self: *LinuxServer, world_id: world_model.ClientId) []const u8 {
-    if (self.rx().clients.get(clientIdFromWorld(world_id))) |c| return c.session.username();
+    if (self.connFor(clientIdFromWorld(world_id))) |c| return c.session.username();
     return "user";
 }
 
@@ -9091,14 +9380,18 @@ fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     conn.send_len += bytes.len;
 }
 
-fn queueNumeric(
-    conn: *ConnState,
+/// Format a server numeric line (`:<server> <code> <nick> <params> :<trailing>`)
+/// into `line_buf`, returning the written slice. Factored out of `queueNumeric`
+/// so a cross-shard delivery can build the recipient's numeric from a serialized
+/// read of its display name without touching its send buffer.
+fn formatNumericLine(
+    line_buf: []u8,
+    nick: []const u8,
     code: Numeric,
     params: []const []const u8,
     trailing: []const u8,
-) ServerError!void {
-    var line_buf: [default_reply_bytes]u8 = undefined;
-    var out = Buf{ .storage = &line_buf };
+) ServerError![]const u8 {
+    var out = Buf{ .storage = line_buf };
     var code_buf: [3]u8 = undefined;
 
     try out.appendByte(':');
@@ -9106,7 +9399,7 @@ fn queueNumeric(
     try out.appendByte(' ');
     try out.append(formatNumericCode(code, &code_buf));
     try out.appendByte(' ');
-    try out.append(conn.session.displayName());
+    try out.append(nick);
     for (params) |param| {
         try out.appendByte(' ');
         try out.append(param);
@@ -9114,8 +9407,18 @@ fn queueNumeric(
     try out.append(" :");
     try out.append(trailing);
     try out.append("\r\n");
+    return out.written();
+}
 
-    try appendToConn(conn, out.written());
+fn queueNumeric(
+    conn: *ConnState,
+    code: Numeric,
+    params: []const []const u8,
+    trailing: []const u8,
+) ServerError!void {
+    var line_buf: [default_reply_bytes]u8 = undefined;
+    const line = try formatNumericLine(&line_buf, conn.session.displayName(), code, params, trailing);
+    try appendToConn(conn, line);
 }
 
 /// Append a parameterised mode change (`+k key`, `+l 50`, `+b mask`) to the
@@ -9576,6 +9879,96 @@ test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
     try writeAllFd(fd_a, "PRIVMSG #x :hi\r\n");
     // Real username (alice) now flows through (not the old "user" placeholder).
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #x :hi\r\n", 200);
+}
+
+test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
+    // Two reactor threads, SO_REUSEPORT listeners — the kernel may place each
+    // client on either reactor. Several clients in one channel raise the odds two
+    // of them land on DIFFERENT shards; a PRIVMSG must still reach every member,
+    // which exercises the cross-shard fabric handoff end to end. Repeated rounds
+    // make a race-driven drop/dup fail rather than slip through.
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+    }) catch |err| switch (err) {
+        // No io_uring / no perms / no SO_REUSEPORT in this sandbox: skip, don't fail.
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    // A single reactor (clamped, or fabric/pool unavailable) cannot test cross
+    // shard; skip so this only asserts when the multi-reactor topology is live.
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        // Clear the flag AND wake every reactor's wake eventfd. A SO_REUSEPORT
+        // throwaway connection only nudges whichever reactor the kernel routes it
+        // to; the other worker would stay blocked in submitAndWait forever and
+        // pool.join() would hang. wakeAllReactors makes every blocked loop return,
+        // observe run==false, and exit so the join (and this thread) completes.
+        server.requestStop(&run);
+        thr.join();
+    }
+
+    // Connect a handful of clients; with round-robin kernel placement across two
+    // reactors this all-but-guarantees the channel spans both shards.
+    const n_clients = 6;
+    var fds: [n_clients]linux.fd_t = undefined;
+    var clients: [n_clients]LiveClient = undefined;
+    var connected: usize = 0;
+    defer for (fds[0..connected]) |fd| closeFd(fd);
+    for (0..n_clients) |i| {
+        fds[i] = connectLoopback(port) catch |err| switch (err) {
+            error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+            else => return err,
+        };
+        connected += 1;
+        clients[i] = LiveClient{ .fd = fds[i] };
+    }
+
+    // Register each client with a distinct nick and join the shared channel.
+    var nick_buf: [n_clients][8]u8 = undefined;
+    for (0..n_clients) |i| {
+        const nick = std.fmt.bufPrint(&nick_buf[i], "U{d}", .{i}) catch unreachable;
+        var reg_buf: [64]u8 = undefined;
+        const reg = std.fmt.bufPrint(&reg_buf, "NICK {s}\r\nUSER u{d} 0 * :User {d}\r\n", .{ nick, i, i }) catch unreachable;
+        try writeAllFd(fds[i], reg);
+    }
+    for (0..n_clients) |i| {
+        var need: [12]u8 = undefined;
+        const needle = std.fmt.bufPrint(&need, " 001 U{d} ", .{i}) catch unreachable;
+        try recvUntil(&clients[i], needle, 400);
+    }
+    for (0..n_clients) |i| {
+        try writeAllFd(fds[i], "JOIN #shard\r\n");
+        var need: [20]u8 = undefined;
+        const needle = std.fmt.bufPrint(&need, " 366 U{d} #shard ", .{i}) catch unreachable;
+        try recvUntil(&clients[i], needle, 400);
+    }
+
+    // Several rounds: each round a different sender messages the channel; every
+    // OTHER client must receive it. A line that crossed shards rode the fabric.
+    const rounds = 4;
+    for (0..rounds) |r| {
+        const sender = r % n_clients;
+        for (0..n_clients) |i| clients[i].reset();
+        var line_buf: [48]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "PRIVMSG #shard :round{d}\r\n", .{r}) catch unreachable;
+        try writeAllFd(fds[sender], line);
+
+        var exp_buf: [40]u8 = undefined;
+        const expected = std.fmt.bufPrint(&exp_buf, "PRIVMSG #shard :round{d}\r\n", .{r}) catch unreachable;
+        for (0..n_clients) |i| {
+            if (i == sender) continue;
+            // Whether U{i} shares the sender's reactor or not, the message must
+            // arrive — proving local AND cross-shard delivery in one assertion.
+            try recvUntil(&clients[i], expected, 400);
+        }
+    }
 }
 
 test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to-end" {
