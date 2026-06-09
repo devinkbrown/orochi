@@ -69,6 +69,8 @@ pub const ScramStore = struct {
     /// Maps canonical account name -> SCRAM material. Keys and salt bytes owned.
     entries: std.StringHashMapUnmanaged(Entry),
     lock: rwlock.RwLock = .{},
+    /// Optional durable backfill source consulted by `resolve` on a miss.
+    loader: ?Loader = null,
 
     /// Create an empty store backed by `allocator`.
     pub fn init(allocator: std.mem.Allocator) ScramStore {
@@ -181,6 +183,112 @@ pub const ScramStore = struct {
         try self.entries.put(self.allocator, owned_key, new_entry);
     }
 
+    /// Insert a PRECOMPUTED SCRAM record (salt, iterations, stored_key,
+    /// server_key) directly, WITHOUT re-deriving from a password. Used to
+    /// repopulate the store from durable storage after a restart. Overwrites any
+    /// existing entry for the account.
+    pub fn importRecord(self: *ScramStore, account: []const u8, record: sasl.ScramRecord) ScramStoreError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        if (account.len == 0 or account.len > MAX_ACCOUNT_LEN) return error.InvalidAccount;
+
+        const owned_salt = self.allocator.dupe(u8, record.salt) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned_salt);
+
+        const new_entry = Entry{
+            .salt = owned_salt,
+            .iterations = record.iterations,
+            .stored_key = record.stored_key,
+            .server_key = record.server_key,
+        };
+
+        if (self.entries.getEntry(account)) |existing| {
+            secureZero(existing.value_ptr.salt);
+            self.allocator.free(existing.value_ptr.salt);
+            secureZero(&existing.value_ptr.stored_key);
+            secureZero(&existing.value_ptr.server_key);
+            existing.value_ptr.* = new_entry;
+            return;
+        }
+
+        const owned_key = self.allocator.dupe(u8, account) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned_key);
+        try self.entries.put(self.allocator, owned_key, new_entry);
+    }
+
+    /// Backfill source for `resolve`: when an account is missing from the live
+    /// store, `loadFn` is consulted (e.g. a durable on-disk mirror). The returned
+    /// record's `salt` need only stay valid for the duration of the call —
+    /// `resolve` copies it via `importRecord` before returning.
+    pub const Loader = struct {
+        ptr: *anyopaque,
+        loadFn: *const fn (ptr: *anyopaque, account: []const u8) ?sasl.ScramRecord,
+    };
+
+    /// Attach (or clear) the backfill loader consulted on a `resolve` miss.
+    pub fn setLoader(self: *ScramStore, loader: ?Loader) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        self.loader = loader;
+    }
+
+    /// Resolve SCRAM credentials for `account`: the live store first, then the
+    /// backfill loader (caching a hit via `importRecord`). This is the path the
+    /// mechrouter uses, so a SCRAM login works after a restart even before any
+    /// in-memory entry exists. Returns null when unknown everywhere.
+    pub fn resolve(self: *ScramStore, account: []const u8) ?sasl.ScramRecord {
+        if (self.lookup(account)) |r| return r;
+        const loader = blk: {
+            self.lock.lockShared();
+            defer self.lock.unlockShared();
+            break :blk self.loader;
+        } orelse return null;
+        const loaded = loader.loadFn(loader.ptr, account) orelse return null;
+        self.importRecord(account, loaded) catch return null;
+        return self.lookup(account);
+    }
+
+    /// Number of bytes `serializeRecord` writes: u32 iterations, u16 salt length,
+    /// the salt, then the two fixed-size digests.
+    pub const serialized_max = 4 + 2 + salt_len + digest_len + digest_len;
+
+    /// Serialize a record into `out` (length `serialized_max` for a `salt_len`
+    /// salt); returns the written slice. Caller persists these bytes.
+    pub fn serializeRecord(record: sasl.ScramRecord, out: []u8) ?[]const u8 {
+        const total = 6 + record.salt.len + digest_len + digest_len;
+        if (record.salt.len > std.math.maxInt(u16) or out.len < total) return null;
+        std.mem.writeInt(u32, out[0..4], record.iterations, .big);
+        std.mem.writeInt(u16, out[4..6], @intCast(record.salt.len), .big);
+        var off: usize = 6;
+        @memcpy(out[off..][0..record.salt.len], record.salt);
+        off += record.salt.len;
+        @memcpy(out[off..][0..digest_len], &record.stored_key);
+        off += digest_len;
+        @memcpy(out[off..][0..digest_len], &record.server_key);
+        off += digest_len;
+        return out[0..off];
+    }
+
+    /// Parse bytes produced by `serializeRecord`. The returned record's `salt`
+    /// borrows `bytes` (copy it if it must outlive them). Null on malformed input.
+    pub fn deserializeRecord(bytes: []const u8) ?sasl.ScramRecord {
+        if (bytes.len < 6) return null;
+        const iterations = std.mem.readInt(u32, bytes[0..4], .big);
+        const sl = std.mem.readInt(u16, bytes[4..6], .big);
+        const need = 6 + @as(usize, sl) + digest_len + digest_len;
+        if (bytes.len < need) return null;
+        var rec = sasl.ScramRecord{
+            .salt = bytes[6 .. 6 + sl],
+            .iterations = iterations,
+            .stored_key = undefined,
+            .server_key = undefined,
+        };
+        @memcpy(&rec.stored_key, bytes[6 + sl ..][0..digest_len]);
+        @memcpy(&rec.server_key, bytes[6 + sl + digest_len ..][0..digest_len]);
+        return rec;
+    }
+
     /// Look up SCRAM credentials for `account`, returning a `ScramRecord` whose
     /// `salt` slice borrows store-owned memory. The record stays valid until the
     /// entry is overwritten or the store is torn down. Returns null for an
@@ -209,8 +317,8 @@ pub const ScramStore = struct {
     }
 
     fn lookupThunk(ptr: *anyopaque, username: []const u8) ?sasl.ScramRecord {
-        const self: *const ScramStore = @ptrCast(@alignCast(ptr));
-        return self.lookup(username);
+        const self: *ScramStore = @ptrCast(@alignCast(ptr));
+        return self.resolve(username);
     }
 };
 
@@ -357,6 +465,51 @@ test "ScramStore concurrent writers and readers preserve entries" {
             try std.testing.expect(store.lookup(name) != null);
         }
     }
+}
+
+test "serialize/deserialize round-trips a SCRAM record" {
+    var store = ScramStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.deriveAndStore("alice", "pencil");
+    const rec = store.lookup("alice").?;
+
+    var buf: [ScramStore.serialized_max]u8 = undefined;
+    const bytes = ScramStore.serializeRecord(rec, &buf).?;
+    const back = ScramStore.deserializeRecord(bytes).?;
+
+    try std.testing.expectEqual(rec.iterations, back.iterations);
+    try std.testing.expectEqualSlices(u8, rec.salt, back.salt);
+    try std.testing.expectEqualSlices(u8, &rec.stored_key, &back.stored_key);
+    try std.testing.expectEqualSlices(u8, &rec.server_key, &back.server_key);
+    try std.testing.expect(ScramStore.deserializeRecord("short") == null);
+}
+
+const TestLoader = struct {
+    bytes: []const u8,
+    fn load(ptr: *anyopaque, account: []const u8) ?sasl.ScramRecord {
+        const self: *TestLoader = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, account, "alice")) return null;
+        return ScramStore.deserializeRecord(self.bytes);
+    }
+};
+
+test "resolve backfills a missing account from the loader, then caches" {
+    var src = ScramStore.init(std.testing.allocator);
+    defer src.deinit();
+    try src.deriveAndStore("alice", "pencil");
+    var buf: [ScramStore.serialized_max]u8 = undefined;
+    const bytes = ScramStore.serializeRecord(src.lookup("alice").?, &buf).?;
+
+    var cold = ScramStore.init(std.testing.allocator);
+    defer cold.deinit();
+    var loader = TestLoader{ .bytes = bytes };
+    cold.setLoader(.{ .ptr = &loader, .loadFn = TestLoader.load });
+
+    try std.testing.expect(cold.lookup("alice") == null); // not cached yet
+    const resolved = cold.resolve("alice").?; // backfills from loader
+    try std.testing.expectEqual(src.lookup("alice").?.iterations, resolved.iterations);
+    try std.testing.expect(cold.lookup("alice") != null); // now cached in-memory
+    try std.testing.expect(cold.resolve("bob") == null); // loader declines
 }
 
 test {

@@ -169,6 +169,9 @@ pub fn main(init: std.process.Init) !void {
                 account_services = mizuchi.daemon.services.Services.init(&account_store.?, null);
                 account_services.attachScramStore(&scram_store);
                 account_services.attachCertfpBinds(&certfp_binds);
+                // Backfill SCRAM credentials from the durable mirror on a miss,
+                // so a SCRAM-SHA-256 login resolves after a restart.
+                scram_store.setLoader(account_services.scramLoader());
                 account_checker = .{ .services = &account_services };
                 external_bridge = .{ .services = &account_services };
                 srv_cfg.sasl_checker = account_checker.checker();

@@ -4,6 +4,7 @@ const std = @import("std");
 const store_mod = @import("store.zig");
 const toml = @import("../proto/toml.zig");
 const scram_store_mod = @import("scram_store.zig");
+const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 
@@ -296,6 +297,32 @@ pub const Services = struct {
         }
     }
 
+    /// Mirror an account's derived SCRAM tuple into the durable store, keyed by
+    /// account. Best-effort; the in-memory SCRAM store is authoritative live.
+    fn persistScram(self: *Services, scram: *ScramStore, account: []const u8) void {
+        const rec = scram.lookup(account) orelse return;
+        var vbuf: [ScramStore.serialized_max]u8 = undefined;
+        const value = ScramStore.serializeRecord(rec, &vbuf) orelse return;
+        var kb: [scram_key_max]u8 = undefined;
+        const key = scramKey(&kb, account) orelse return;
+        self.store.family(.props).put(key, value) catch {};
+    }
+
+    /// A backfill loader for the SCRAM store that reads this services' durable
+    /// mirror, so a SCRAM login resolves after a restart. The returned record's
+    /// salt borrows store memory and is copied by the SCRAM store before caching.
+    pub fn scramLoader(self: *Services) ScramStore.Loader {
+        return .{ .ptr = self, .loadFn = scramLoadThunk };
+    }
+
+    fn scramLoadThunk(ptr: *anyopaque, account: []const u8) ?sasl.ScramRecord {
+        const self: *Services = @ptrCast(@alignCast(ptr));
+        var kb: [scram_key_max]u8 = undefined;
+        const key = scramKey(&kb, account) orelse return null;
+        const bytes = self.store.family(.props).get(key) orelse return null;
+        return ScramStore.deserializeRecord(bytes);
+    }
+
     /// The account a certfp is bound to, if any (SASL EXTERNAL verification).
     /// Falls back to the durable store when the in-memory cache is cold (e.g.
     /// immediately after a restart, before any CERTADD has repopulated it).
@@ -341,6 +368,11 @@ pub const Services = struct {
         // error.InvalidRecord rather than leaving a half-registered account.
         if (self.scram) |scram| {
             scram.deriveAndStore(record.name.asSlice(), password) catch return error.InvalidRecord;
+            // Persist the derived SCRAM tuple so a SCRAM-SHA-256 login still works
+            // after a restart (the in-memory store is otherwise re-seeded only on
+            // a fresh register/identify). Best-effort: a mirror failure must not
+            // roll back the already-persisted PLAIN account record.
+            self.persistScram(scram, record.name.asSlice());
         }
         return .{ .registered_account = .{ .name = record.name } };
     }
@@ -696,6 +728,15 @@ fn certfpKey(buf: []u8, fingerprint: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, certfp_key_prefix ++ "{s}", .{fingerprint}) catch null;
 }
 
+/// Durable-store key prefix for persisted SCRAM credential tuples (props family).
+const scram_key_prefix = "scram:";
+const scram_key_max = scram_key_prefix.len + account_max;
+
+/// Build the props-family key for an account's SCRAM tuple, or null if too long.
+fn scramKey(buf: []u8, account: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, scram_key_prefix ++ "{s}", .{account}) catch null;
+}
+
 fn accountKey(input: []const u8) ServiceError!AccountName {
     if (input.len == 0 or input.len > account_max) return error.InvalidName;
     var out = AccountName{};
@@ -1009,6 +1050,36 @@ test "certfp binding persists across store reopen" {
         try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
         // An unknown fingerprint still returns null.
         try std.testing.expect(services.accountForCertfp("b" ** 64) == null);
+    }
+}
+
+test "scram credentials persist across store reopen via loader" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-scram.wal");
+        defer store.deinit();
+        var scram = ScramStore.init(std.testing.allocator);
+        defer scram.deinit();
+        var services = Services.init(&store, null);
+        services.attachScramStore(&scram);
+        var scratch: [record_max]u8 = undefined;
+        _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+        try std.testing.expect(scram.lookup("alice") != null);
+    }
+    {
+        // Reopen with a COLD in-memory SCRAM store + the durable loader.
+        var store = try openTestStore(tmp, "services-scram.wal");
+        defer store.deinit();
+        var scram = ScramStore.init(std.testing.allocator);
+        defer scram.deinit();
+        var services = Services.init(&store, null);
+        services.attachScramStore(&scram);
+        scram.setLoader(services.scramLoader());
+        try std.testing.expect(scram.lookup("alice") == null); // cold cache
+        try std.testing.expect(scram.resolve("alice") != null); // backfilled from disk
+        try std.testing.expect(scram.resolve("nobody") == null);
     }
 }
 
