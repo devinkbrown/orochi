@@ -77,6 +77,31 @@ pub const OperPrivileges = struct {
         self.set.insert(privilege);
     }
 
+    /// Pack the privilege set into a portable u64 bitmask (one bit per Privilege,
+    /// by enum ordinal). Used to carry privileges in signed cross-mesh oper
+    /// grants. Stable as long as the Privilege enum only appends new members.
+    pub fn toBits(self: OperPrivileges) u64 {
+        var bits: u64 = 0;
+        inline for (@typeInfo(Privilege).@"enum".fields) |f| {
+            if (self.set.contains(@field(Privilege, f.name))) {
+                bits |= @as(u64, 1) << @intCast(f.value);
+            }
+        }
+        return bits;
+    }
+
+    /// Rebuild a privilege set from a u64 bitmask produced by `toBits`. Unknown
+    /// bits (from a newer peer) are ignored.
+    pub fn fromBits(bits: u64) OperPrivileges {
+        var out = OperPrivileges.empty;
+        inline for (@typeInfo(Privilege).@"enum".fields) |f| {
+            if (bits & (@as(u64, 1) << @intCast(f.value)) != 0) {
+                out.set.insert(@field(Privilege, f.name));
+            }
+        }
+        return out;
+    }
+
     pub fn has(self: OperPrivileges, privilege: Privilege) bool {
         return self.set.contains(privilege);
     }
@@ -319,6 +344,19 @@ fn isBoundedAccountName(comptime params: Params, account_name: []const u8) bool 
 
 fn accountNameEqual(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+test "privilege bitmask round-trips through toBits/fromBits" {
+    const orig = OperPrivileges.initMany(&.{ .client_kill, .server_admin, .oper_spy });
+    const bits = orig.toBits();
+    const back = OperPrivileges.fromBits(bits);
+    try std.testing.expect(back.has(.client_kill));
+    try std.testing.expect(back.has(.server_admin));
+    try std.testing.expect(back.has(.oper_spy));
+    try std.testing.expect(!back.has(.server_shutdown));
+    // empty round-trips to empty; unknown high bits are ignored.
+    try std.testing.expectEqual(@as(u64, 0), OperPrivileges.empty.toBits());
+    try std.testing.expectEqual(@as(usize, 0), OperPrivileges.fromBits(1 << 63).count());
 }
 
 test "known SASL account elevates to configured operator class" {
