@@ -217,7 +217,6 @@ pub const svc_acctmeta = @import("svc_acctmeta.zig");
 pub const svc_acctnotify = @import("svc_acctnotify.zig");
 pub const svc_acctsilence = @import("svc_acctsilence.zig");
 pub const svc_akick = @import("svc_akick.zig");
-pub const svc_akill = @import("svc_akill.zig");
 pub const svc_chanaccess_index = @import("svc_chanaccess_index.zig");
 pub const svc_chanbadwords = @import("svc_chanbadwords.zig");
 pub const svc_chanclear = @import("svc_chanclear.zig");
@@ -519,7 +518,6 @@ test {
     _ = svc_acctnotify;
     _ = svc_acctsilence;
     _ = svc_akick;
-    _ = svc_akill;
     _ = svc_chanaccess_index;
     _ = svc_chanbadwords;
     _ = svc_chanclear;

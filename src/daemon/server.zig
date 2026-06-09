@@ -18,7 +18,6 @@ const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
-const svc_akill = @import("svc_akill.zig");
 const svc_resv = @import("svc_resv.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
@@ -1204,8 +1203,6 @@ pub const LinuxServer = struct {
     access: ircx_access_store.AccessStore,
     /// Per-channel AKICK (registered auto-kick) list — masks matched on JOIN.
     chan_akick: svc_akick.AkickStore,
-    /// Network-wide AKILL (services ban) list — host masks matched at registration.
-    net_akill: svc_akill.Store,
     /// Channel-name RESV list — reserved channel globs blocked at JOIN.
     chan_resv: svc_resv.ChannelResv,
     /// Concurrent-connection clone limiter (per exact IP and per /24|/64 prefix).
@@ -1411,7 +1408,6 @@ pub const LinuxServer = struct {
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
             .chan_akick = svc_akick.AkickStore.init(allocator),
-            .net_akill = svc_akill.Store.init(allocator, .{}),
             .chan_resv = svc_resv.ChannelResv.init(allocator, .{}),
             .clone_limit = clone_limit_mod.CloneLimiter.init(allocator, .{
                 .max_per_ip = config.max_clones_per_ip,
@@ -1520,7 +1516,6 @@ pub const LinuxServer = struct {
         self.props.deinit();
         self.access.deinit();
         self.chan_akick.deinit();
-        self.net_akill.deinit();
         self.chan_resv.deinit();
         self.clone_limit.deinit();
         self.reputation.deinit();
@@ -2855,9 +2850,10 @@ pub const LinuxServer = struct {
             try processLine(conn, line, &sink);
             if (conn.session.registered()) {
                 try self.registerConnNick(id, conn);
-                // Network AKILL: a services-set host ban refuses the freshly
-                // registered client. Checked before oper elevation/welcome.
-                if (self.enforceAkill(conn)) return;
+                // Warden: a network/node ban (Match × Scope × Action) is
+                // enforced against the freshly registered client's facets,
+                // before oper elevation/welcome.
+                if (self.enforceWard(conn)) return;
                 // SASL-only oper: elevate now if the (SASL-set) account is bound to
                 // an operator class. Emits 381 + MODE +o after the welcome burst.
                 try self.elevateOperFromAccount(conn);
@@ -2976,8 +2972,6 @@ pub const LinuxServer = struct {
         // dispatched by the registry block at the top of this function.
         if (std.ascii.eqlIgnoreCase(parsed.command, "AKICK")) {
             try self.handleAkick(id, conn, parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.command, "AKILL")) {
-            try self.handleAkill(conn, parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.command, "RESV") or
             std.ascii.eqlIgnoreCase(parsed.command, "UNRESV"))
         {
@@ -6133,102 +6127,53 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Refuse a freshly registered client whose nick!user@host matches an
-    /// active network AKILL. Returns true if the connection was closed.
-    fn enforceAkill(self: *LinuxServer, conn: *ConnState) bool {
-        if (self.net_akill.count() == 0) return false;
+    /// Enforce the Warden registry against a freshly registered client. The
+    /// client presents its identity facets (address/host/mask/account/realname/
+    /// certfp); the first matching Ward decides the outcome by its Action:
+    ///   * refuse/expel       → ERROR + close (the network-ban / AKILL role)
+    ///   * require_auth        → close unless authenticated to an account
+    ///   * quarantine          → admitted (restriction gating is a follow-up)
+    /// Opers are never warded off. Returns true if the connection was closed.
+    fn enforceWard(self: *LinuxServer, conn: *ConnState) bool {
+        if (self.warden.count() == 0) return false;
+        if (conn.session.isOper()) return false;
+
         var mask_buf: [256]u8 = undefined;
-        const mask = clientPrefix(conn, &mask_buf) catch return false;
-        const hit = self.net_akill.matches(mask, self.nowMs()) orelse return false;
-        var eb: [640]u8 = undefined;
-        const el = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " ERROR :Closing Link: {s} (AKILL: {s})\r\n", .{ conn.session.displayName(), hit.reason }) catch {
-            conn.close_reason = "AKILL";
-            conn.closing = true;
-            return true;
+        const mask = clientPrefix(conn, &mask_buf) catch "";
+        const facets = warden.Facets{
+            .address = conn.session.realHost(),
+            .host = conn.session.host(),
+            .mask = mask,
+            .account = conn.session.account(),
+            .realname = conn.session.realname(),
+            .certfp = conn.session.tls_certfp orelse "",
         };
-        appendToConn(conn, el) catch {};
-        conn.close_reason = "AKILL";
+        const hit = self.warden.check(facets, self.nowMs()) orelse return false;
+
+        switch (hit.action) {
+            .quarantine => {
+                // Admitted for now; per-session restriction (no join/speak) is a
+                // follow-up once a restricted flag is threaded through the gates.
+                return false;
+            },
+            .require_auth => {
+                // Authenticated subjects pass; everyone else is refused.
+                if (conn.session.account() != null) return false;
+                return self.closeWarded(conn, hit.reason);
+            },
+            .refuse, .expel => return self.closeWarded(conn, hit.reason),
+        }
+    }
+
+    /// Emit a Warden close ERROR and mark the connection for teardown.
+    fn closeWarded(self: *LinuxServer, conn: *ConnState, reason: []const u8) bool {
+        var eb: [640]u8 = undefined;
+        const el = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " ERROR :Closing Link: {s} (Banned: {s})\r\n", .{ conn.session.displayName(), reason }) catch null;
+        if (el) |line| appendToConn(conn, line) catch {};
+        conn.close_reason = "Banned (WARD)";
         conn.closing = true;
         self.armSendIfNeeded(conn) catch {};
         return true;
-    }
-
-    /// AKILL <ADD <duration> <mask> :reason | DEL <mask> | LIST> — network ban
-    /// management (oper-only). Records are matched at client registration.
-    fn handleAkill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        const nick = conn.session.displayName();
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: AKILL is operator-only");
-            return;
-        }
-        const p = parsed.paramSlice();
-        if (p.len == 0) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKILL"}, "Usage: AKILL <ADD <duration> <mask> :reason | DEL <mask> | LIST>");
-            return;
-        }
-        // Reconstruct the subcommand line for the pure parser (params are
-        // already space-split; the trailing reason rejoins cleanly).
-        var lb: [1024]u8 = undefined;
-        var used: usize = 0;
-        for (p, 0..) |tok, i| {
-            const sep: usize = if (i == 0) 0 else 1;
-            if (used + sep + tok.len > lb.len) break;
-            if (sep == 1) {
-                lb[used] = ' ';
-                used += 1;
-            }
-            @memcpy(lb[used..][0..tok.len], tok);
-            used += tok.len;
-        }
-        const cmd = svc_akill.parseCommand(lb[0..used], nick, self.nowMs()) catch |err| {
-            const msg = switch (err) {
-                error.EmptyCommand, error.UnknownCommand => "AKILL subcommand must be ADD, DEL, or LIST",
-                error.MissingDuration => "AKILL ADD requires a duration (e.g. 1h, 7d, perm)",
-                error.MissingMask => "AKILL requires a host mask",
-                error.MissingReason => "AKILL ADD requires a reason",
-                error.TrailingInput => "AKILL: unexpected trailing input",
-                error.InvalidDuration, error.DurationTooLarge, error.InvalidExpiry => "AKILL: invalid duration",
-            };
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKILL"}, msg);
-            return;
-        };
-
-        switch (cmd) {
-            .add => |entry| {
-                _ = self.net_akill.add(entry) catch |err| {
-                    const msg = switch (err) {
-                        error.TooManyEntries => "AKILL list is full",
-                        error.MaskTooLong => "AKILL mask too long",
-                        error.ReasonTooLong => "AKILL reason too long",
-                        else => "AKILL add failed",
-                    };
-                    var nb: [256]u8 = undefined;
-                    const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, msg }) catch return;
-                    try appendToConn(conn, nl);
-                    return;
-                };
-                var nb: [384]u8 = undefined;
-                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :AKILL added: {s}\r\n", .{ nick, entry.mask }) catch return;
-                try appendToConn(conn, nl);
-            },
-            .remove => |mask| {
-                const removed = self.net_akill.remove(mask);
-                var nb: [320]u8 = undefined;
-                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, if (removed) "AKILL removed" else "AKILL mask not found" }) catch return;
-                try appendToConn(conn, nl);
-            },
-            .list => {
-                var buf: [256]svc_akill.Akill = undefined;
-                for (self.net_akill.list(&buf)) |e| {
-                    var line_buf: [768]u8 = undefined;
-                    const ln = std.fmt.bufPrint(&line_buf, ":" ++ server_name ++ " NOTICE {s} :AKILL {s} :{s}\r\n", .{ nick, e.mask, e.reason }) catch continue;
-                    try appendToConn(conn, ln);
-                }
-                var eb: [128]u8 = undefined;
-                const endl = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " NOTICE {s} :End of AKILL list\r\n", .{nick}) catch return;
-                try appendToConn(conn, endl);
-            },
-        }
     }
 
     /// RESV/UNRESV — reserve a channel-name glob network-wide (oper-only).
