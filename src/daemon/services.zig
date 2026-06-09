@@ -286,15 +286,29 @@ pub const Services = struct {
 
         const binds = self.certfp_binds orelse return error.InvalidFingerprint;
         try binds.bind(account, fingerprint);
+        // Mirror the binding into the durable store, keyed by fingerprint, so it
+        // survives a restart. In-memory is authoritative for this session; the
+        // store is a best-effort durable mirror (a WAL hiccup must not fail the
+        // already-applied in-memory bind).
+        var kb: [certfp_key_max]u8 = undefined;
+        if (certfpKey(&kb, fingerprint)) |k| {
+            self.store.family(.props).put(k, account) catch {};
+        }
     }
 
     /// The account a certfp is bound to, if any (SASL EXTERNAL verification).
+    /// Falls back to the durable store when the in-memory cache is cold (e.g.
+    /// immediately after a restart, before any CERTADD has repopulated it).
     pub fn accountForCertfp(self: *const Services, fingerprint: []const u8) ?[]const u8 {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
 
-        const binds = self.certfp_binds orelse return null;
-        return binds.accountForFingerprint(fingerprint);
+        if (self.certfp_binds) |binds| {
+            if (binds.accountForFingerprint(fingerprint)) |acct| return acct;
+        }
+        var kb: [certfp_key_max]u8 = undefined;
+        const k = certfpKey(&kb, fingerprint) orelse return null;
+        return self.store.family(.props).get(k);
     }
 
     pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
@@ -672,6 +686,16 @@ fn validateMask(input: []const u8) ServiceError!Mask {
     return Mask.init(input) catch error.InvalidValue;
 }
 
+/// Durable-store key prefix for certfp→account bindings (props family). The
+/// prefix keeps these out of the channel-access keyspace that shares `.props`.
+const certfp_key_prefix = "certfp:";
+const certfp_key_max = certfp_key_prefix.len + 128;
+
+/// Build the props-family key for a certfp binding, or null if it would not fit.
+fn certfpKey(buf: []u8, fingerprint: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, certfp_key_prefix ++ "{s}", .{fingerprint}) catch null;
+}
+
 fn accountKey(input: []const u8) ServiceError!AccountName {
     if (input.len == 0 or input.len > account_max) return error.InvalidName;
     var out = AccountName{};
@@ -955,6 +979,36 @@ test "account persists across store reopen" {
         const result = try services.accountInfo("ALICE");
         try std.testing.expectEqualStrings("alice@example.test", result.account_info.email.asSlice());
         _ = try services.identifyAccount("alice", "correct horse battery staple");
+    }
+}
+
+test "certfp binding persists across store reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fp = "a" ** 64; // 64-hex placeholder fingerprint
+
+    {
+        var store = try openTestStore(tmp, "services-certfp.wal");
+        defer store.deinit();
+        var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+        defer binds.deinit();
+        var services = Services.init(&store, null);
+        services.attachCertfpBinds(&binds);
+        try services.bindCertfp("alice", fp);
+        try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
+    }
+    {
+        // Reopen with a COLD in-memory cache: the binding must come from the
+        // durable store via the lazy fallback.
+        var store = try openTestStore(tmp, "services-certfp.wal");
+        defer store.deinit();
+        var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+        defer binds.deinit();
+        var services = Services.init(&store, null);
+        services.attachCertfpBinds(&binds);
+        try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
+        // An unknown fingerprint still returns null.
+        try std.testing.expect(services.accountForCertfp("b" ** 64) == null);
     }
 }
 
