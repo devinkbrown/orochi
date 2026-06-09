@@ -36,7 +36,7 @@ pub const module = registry.Module{
         .{ .name = "VHOST", .handler = vhost },
         .{ .name = "PRIVS", .handler = privs },
         .{ .name = "FILTER", .handler = filter },
-        .{ .name = "MEDIA", .handler = media },
+        .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "TEGAMI", .handler = tegami },
         .{ .name = "ACTIVITY", .handler = activity },
     },

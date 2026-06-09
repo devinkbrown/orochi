@@ -49,6 +49,9 @@ pub const Access = enum {
 pub const DispatchCaps = struct {
     registered: bool,
     oper: bool,
+    /// Feature toggles that are turned OFF by config. A command whose
+    /// `feature` tag appears here is treated as unavailable (`.disabled`).
+    disabled_features: []const []const u8 = &.{},
 };
 
 /// Why a command was refused before its handler ran.
@@ -57,12 +60,14 @@ pub const DeniedReason = enum {
     needs_oper,
 };
 
-/// Outcome of command lookup, access gating, and minimum-parameter validation.
+/// Outcome of command lookup, feature/access gating, and arity validation.
 pub const DispatchResult = union(enum) {
     handled,
     not_found,
     too_few_params: usize,
     denied: DeniedReason,
+    /// The command exists but its feature toggle is disabled by config.
+    disabled,
 };
 
 /// Hook execution result. A stopping hook prevents later bindings from firing.
@@ -229,6 +234,10 @@ pub const CommandSpec = struct {
     /// Minimum client authority. Enforced by the gated dispatcher before the
     /// handler runs; defaults to `.registered` (the common case).
     access: Access = .registered,
+    /// Optional config feature toggle. When the named feature is disabled (see
+    /// `DispatchCaps.disabled_features`) the command is treated as unavailable.
+    /// `null` means the command is always available.
+    feature: ?[]const u8 = null,
     handler: CommandHandler,
 };
 
@@ -515,6 +524,13 @@ pub fn Registry(comptime mods: []const Module) type {
             client_caps: DispatchCaps,
         ) anyerror!DispatchResult {
             const entry = lookupCommand(command_name) orelse return .not_found;
+            // Config feature gate: a command tied to a disabled feature is
+            // unavailable to everyone (reported as `.disabled`).
+            if (entry.spec.feature) |feature| {
+                for (client_caps.disabled_features) |off| {
+                    if (std.ascii.eqlIgnoreCase(feature, off)) return .disabled;
+                }
+            }
             switch (entry.spec.access) {
                 .any => {},
                 .registered => if (!client_caps.registered) return .{ .denied = .needs_registered },
@@ -963,6 +979,7 @@ const gatedModule = Module{
     .commands = &.{
         .{ .name = "OPENCMD", .access = .any, .handler = pongHandler },
         .{ .name = "OPERCMD", .access = .oper, .handler = pongHandler },
+        .{ .name = "MEDIACMD", .access = .any, .feature = "media", .handler = pongHandler },
     },
 };
 
@@ -983,6 +1000,22 @@ test "dispatchGated enforces declared access levels" {
     try std.testing.expectEqual(DispatchResult{ .denied = .needs_oper }, need_oper);
     const oper_ok = try R.dispatchGated(&ctx, "OPERCMD", &.{}, .{ .registered = true, .oper = true });
     try std.testing.expectEqual(DispatchResult.handled, oper_ok);
+}
+
+test "dispatchGated honors config feature toggles" {
+    const R = Registry(&.{ coreModule, gatedModule });
+    var ctx = TestCtx{};
+    const caps_on = DispatchCaps{ .registered = true, .oper = false };
+    const caps_off = DispatchCaps{ .registered = true, .oper = false, .disabled_features = &.{"media"} };
+
+    // Feature enabled (default): the command runs.
+    try std.testing.expectEqual(DispatchResult.handled, try R.dispatchGated(&ctx, "MEDIACMD", &.{}, caps_on));
+    // Feature disabled by config: reported as .disabled, handler not called.
+    const before = ctx.command_count;
+    try std.testing.expectEqual(DispatchResult.disabled, try R.dispatchGated(&ctx, "MEDIACMD", &.{}, caps_off));
+    try std.testing.expectEqual(before, ctx.command_count);
+    // Untagged commands are unaffected by the disabled set.
+    try std.testing.expectEqual(DispatchResult.handled, try R.dispatchGated(&ctx, "OPENCMD", &.{}, caps_off));
 }
 
 test "registry dispatches known commands and reports unknown commands" {

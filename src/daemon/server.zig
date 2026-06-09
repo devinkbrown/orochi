@@ -766,6 +766,7 @@ const Numeric = enum(u16) {
     ERR_UNAVAILRESOURCE = 437,
     ERR_UNKNOWNMODE = 472,
     ERR_NOTREGISTERED = 451,
+    ERR_UNKNOWNCOMMAND = 421,
     ERR_NONICKNAMEGIVEN = 431,
     ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
@@ -834,6 +835,10 @@ pub const ServerError = error{
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16,
+    /// Registry command feature toggles disabled by config. A registry command
+    /// whose `feature` tag appears here is rejected at dispatch as unavailable.
+    /// Borrowed; outlives the server (owned by main/config). Empty = all on.
+    disabled_features: []const []const u8 = &.{},
     /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
     media_port: u16 = 0,
     /// Host/IP advertised to clients as the server's media (ICE) candidate.
@@ -3009,6 +3014,7 @@ pub const LinuxServer = struct {
             const caps = mod_registry.DispatchCaps{
                 .registered = conn.session.registered(),
                 .oper = conn.session.isOper(),
+                .disabled_features = self.config.disabled_features,
             };
             switch (try module_manifest.Live.dispatchGated(&core, parsed.command, parsed.paramSlice(), caps)) {
                 .handled => return,
@@ -3021,6 +3027,10 @@ pub const LinuxServer = struct {
                         .needs_oper => try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: operator privileges required"),
                         .needs_registered => try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered"),
                     }
+                    return;
+                },
+                .disabled => {
+                    try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{parsed.command}, "Command disabled by configuration");
                     return;
                 },
                 .not_found => {},
