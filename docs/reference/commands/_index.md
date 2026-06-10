@@ -1,0 +1,132 @@
+# Mizuchi Command Reference
+
+Mizuchi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C Ophion, not a clone. This reference documents only the current registered-client source surface: the `dispatchRegistered` path in `src/daemon/server.zig:3413`, the lower connection command table it falls back to in `src/daemon/dispatch.zig:1233`, and the enabled `SerpentRegistry` modules in `src/daemon/modules/manifest.zig:23`.
+
+Registry commands default to registered-client access unless the command table says `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:239`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:3450`). Numeric names and codes are verified against `src/proto/numeric.zig:9` and the server-local enum in `src/daemon/server.zig:701`.
+
+| Command | Summary | Reference |
+|---|---|---|
+| `PASS` | Pre-registration password marker; after registration returns reregister error. | [connection.md](connection.md#pass) |
+| `NICK` | Set registration nick or change registered nick. | [connection.md](connection.md#nick) |
+| `USER` | Pre-registration username and realname. | [connection.md](connection.md#user) |
+| `CAP` | IRCv3 capability negotiation. | [connection.md](connection.md#cap) |
+| `AUTHENTICATE` | SASL PLAIN, EXTERNAL, or SCRAM-SHA-256 exchange. | [connection.md](connection.md#authenticate) |
+| `PING` | Server heartbeat request; replies with `PONG`. | [connection.md](connection.md#ping) |
+| `PONG` | No-op heartbeat acknowledgement. | [connection.md](connection.md#pong) |
+| `QUIT` | Close the registered or pre-registered session. | [connection.md](connection.md#quit) |
+| `PRIVMSG` | Send text to a nick or channel. | [messaging.md](messaging.md#privmsg) |
+| `NOTICE` | Send no-error text to a nick or channel. | [messaging.md](messaging.md#notice) |
+| `TAGMSG` | Send IRCv3 tag-only messages. | [messaging.md](messaging.md#tagmsg) |
+| `REDACT` | Redact a known message id. | [messaging.md](messaging.md#redact) |
+| `CHATHISTORY` | Query channel history batches. | [messaging.md](messaging.md#chathistory) |
+| `MARKREAD` | Set bouncer read markers. | [messaging.md](messaging.md#markread) |
+| `METADATA` | IRCv3 metadata get/list/set/delete. | [messaging.md](messaging.md#metadata) |
+| `MONITOR` | Track online/offline nicks. | [messaging.md](messaging.md#monitor) |
+| `SILENCE` | Manage caller-side sender masks. | [messaging.md](messaging.md#silence) |
+| `ACCEPT` | Manage caller-id allow list. | [messaging.md](messaging.md#accept) |
+| `JOIN` | Join one or more channels. | [channels.md](channels.md#join) |
+| `PART` | Leave one or more channels. | [channels.md](channels.md#part) |
+| `NAMES` | List channel members. | [channels.md](channels.md#names) |
+| `MODE` | Query/set user or channel modes. | [channels.md](channels.md#mode) |
+| `KICK` | Remove a channel member. | [channels.md](channels.md#kick) |
+| `INVITE` | Invite a nick to a channel. | [channels.md](channels.md#invite) |
+| `TOPIC` | Query or set channel topic. | [channels.md](channels.md#topic) |
+| `KNOCK` | Request entry to a channel. | [channels.md](channels.md#knock) |
+| `CREATE` | IRCX create-or-join channel. | [channels.md](channels.md#create) |
+| `RENAME` | Rename a channel. | [channels.md](channels.md#rename) |
+| `AKICK` | Registered-channel auto-kick list. | [channels.md](channels.md#akick) |
+| `CLEAR` | Mass-kick below a keep rank. | [channels.md](channels.md#clear) |
+| `TEMPMODE` | Schedule or cancel temporary channel modes. | [channels.md](channels.md#tempmode) |
+| `SEEN` | Show an account's last-seen/login history. | [accounts-services.md](accounts-services.md#seen) |
+| `ISON` | Return online subset of nick list. | [queries.md](queries.md#ison) |
+| `USERHOST` | Return user/host tuples for nicks. | [queries.md](queries.md#userhost) |
+| `WHOIS` | Return local WHOIS sequence. | [queries.md](queries.md#whois) |
+| `LIST` | List visible channels. | [queries.md](queries.md#list) |
+| `WHO` | Return WHO or WHOX rows. | [queries.md](queries.md#who) |
+| `WHOWAS` | Query WHOWAS history. | [queries.md](queries.md#whowas) |
+| `AWAY` | Set or clear away state. | [queries.md](queries.md#away) |
+| `SETNAME` | Change realname and notify capable peers. | [queries.md](queries.md#setname) |
+| `HELP` | Return built-in help text. | [queries.md](queries.md#help) |
+| `HELPOP` | Alias of `HELP`. | [queries.md](queries.md#helpop) |
+| `AUTOJOIN` | Manage account autojoin list. | [queries.md](queries.md#autojoin) |
+| `GROUP` | Account grouping placeholder. | [queries.md](queries.md#group) |
+| `WELCOME` | Replay welcome text. | [queries.md](queries.md#welcome) |
+| `SUMMON` | Disabled command; returns 445. | [queries.md](queries.md#summon) |
+| `VERSION` | Show server version. | [informational.md](informational.md#version) |
+| `TIME` | Show server time. | [informational.md](informational.md#time) |
+| `ADMIN` | Show configured admin contact. | [informational.md](informational.md#admin) |
+| `INFO` | Show implementation info. | [informational.md](informational.md#info) |
+| `MOTD` | Show configured MOTD. | [informational.md](informational.md#motd) |
+| `LUSERS` | Show local/global user summary. | [informational.md](informational.md#lusers) |
+| `USERS` | Show registered users. | [informational.md](informational.md#users) |
+| `STATS` | Show stats; `z` is oper-only inside handler. | [informational.md](informational.md#stats) |
+| `TRACE` | Oper trace of local users. | [informational.md](informational.md#trace) |
+| `ETRACE` | Oper extended trace rows. | [informational.md](informational.md#etrace) |
+| `MODULES` | Oper registry module inventory. | [informational.md](informational.md#modules) |
+| `MODLIST` | Alias of `MODULES`. | [informational.md](informational.md#modlist) |
+| `COMMANDS` | Discover command registry entries. | [informational.md](informational.md#commands) |
+| `OPER` | Disabled password OPER; use SASL account elevation. | [oper-moderation.md](oper-moderation.md#oper) |
+| `REHASH` | Reload configuration. | [oper-moderation.md](oper-moderation.md#rehash) |
+| `KILL` | Disconnect a user. | [oper-moderation.md](oper-moderation.md#kill) |
+| `CLOSE` | Close unknown/unregistered clients. | [oper-moderation.md](oper-moderation.md#close) |
+| `DRAIN` | Toggle listener drain state. | [oper-moderation.md](oper-moderation.md#drain) |
+| `UNREJECT` | Clear an IP reject throttle. | [oper-moderation.md](oper-moderation.md#unreject) |
+| `WARD` | Unified Warden ban registry. | [oper-moderation.md](oper-moderation.md#ward) |
+| `SHUN` | Mark a user as gagged. | [oper-moderation.md](oper-moderation.md#shun) |
+| `UNSHUN` | Clear a user gag. | [oper-moderation.md](oper-moderation.md#unshun) |
+| `GLOBAL` | Send global notice. | [oper-moderation.md](oper-moderation.md#global) |
+| `OPERMOTD` | Show or set operator MOTD. | [oper-moderation.md](oper-moderation.md#opermotd) |
+| `DIE` | Stop the server. | [oper-moderation.md](oper-moderation.md#die) |
+| `RESTART` | Stop through restart privilege path. | [oper-moderation.md](oper-moderation.md#restart) |
+| `CONNECT` | Open outbound S2S link. | [oper-moderation.md](oper-moderation.md#connect) |
+| `SQUIT` | Tear down S2S link. | [oper-moderation.md](oper-moderation.md#squit) |
+| `TESTLINE` | Probe Warden match. | [oper-moderation.md](oper-moderation.md#testline) |
+| `TESTMASK` | Count clients matching hostmask. | [oper-moderation.md](oper-moderation.md#testmask) |
+| `USERIP` | Show nick IP-style data. | [oper-moderation.md](oper-moderation.md#userip) |
+| `DEBUG` | Dump flight recorder. | [oper-moderation.md](oper-moderation.md#debug) |
+| `GEOIP` | Oper MaxMind lookup. | [oper-moderation.md](oper-moderation.md#geoip) |
+| `CLONES` | Oper clone cluster report. | [oper-moderation.md](oper-moderation.md#clones) |
+| `RESV` | Reserve channel-name glob. | [oper-moderation.md](oper-moderation.md#resv) |
+| `UNRESV` | Remove channel reservation. | [oper-moderation.md](oper-moderation.md#unresv) |
+| `FORCEOP` | Force channel op. | [oper-moderation.md](oper-moderation.md#forceop) |
+| `FORCEDEOP` | Force channel deop. | [oper-moderation.md](oper-moderation.md#forcedeop) |
+| `FORCEJOIN` | Force a user to join. | [oper-moderation.md](oper-moderation.md#forcejoin) |
+| `FORCEPART` | Force a user to part. | [oper-moderation.md](oper-moderation.md#forcepart) |
+| `FORCETOPIC` | Force channel topic. | [oper-moderation.md](oper-moderation.md#forcetopic) |
+| `MESH` | Mesh peer report, log, grants, quorum summary. | [mesh-ops.md](mesh-ops.md#mesh) |
+| `NETSTAT` | Alias of `MESH`. | [mesh-ops.md](mesh-ops.md#netstat) |
+| `ROUTE` | Mesh route report. | [mesh-ops.md](mesh-ops.md#route) |
+| `NETHEALTH` | Mesh liveness report. | [mesh-ops.md](mesh-ops.md#nethealth) |
+| `LINKS` | Mesh peer links. | [mesh-ops.md](mesh-ops.md#links) |
+| `MAP` | Mesh topology map. | [mesh-ops.md](mesh-ops.md#map) |
+| `UPGRADE` | Helix hot in-place upgrade. | [mesh-ops.md](mesh-ops.md#upgrade) |
+| `REGISTER` | Register an account and log in. | [accounts-services.md](accounts-services.md#register) |
+| `VERIFY` | Verify account email token. | [accounts-services.md](accounts-services.md#verify) |
+| `IDENTIFY` | Log in to account. | [accounts-services.md](accounts-services.md#identify) |
+| `LOGOUT` | Log out account and revoke derived oper. | [accounts-services.md](accounts-services.md#logout) |
+| `DROP` | Delete account by password. | [accounts-services.md](accounts-services.md#drop) |
+| `ACCOUNTINFO` | Show account flags. | [accounts-services.md](accounts-services.md#accountinfo) |
+| `SASLINFO` | Show SASL mechanisms and current auth state. | [accounts-services.md](accounts-services.md#saslinfo) |
+| `ACCOUNTSET` | Set account email or flags. | [accounts-services.md](accounts-services.md#accountset) |
+| `GHOST` | Disconnect stale nick after account password check. | [accounts-services.md](accounts-services.md#ghost) |
+| `CHANNEL` | Real server channel services command. | [accounts-services.md](accounts-services.md#channel) |
+| `CS` | Alias of `CHANNEL`. | [accounts-services.md](accounts-services.md#cs) |
+| `SESSION` | List, token, or resume account sessions. | [accounts-services.md](accounts-services.md#session) |
+| `CERTADD` | Bind TLS client certificate fingerprint. | [accounts-services.md](accounts-services.md#certadd) |
+| `TEGAMI` | Offline account messages. | [accounts-services.md](accounts-services.md#tegami) |
+| `VHOST` | Vhost wardrobe, requests, offers, and oper set. | [accounts-services.md](accounts-services.md#vhost) |
+| `PRIVS` | Show oper class and privileges. | [accounts-services.md](accounts-services.md#privs) |
+| `FILTER` | Oper content filter list/add/delete. | [accounts-services.md](accounts-services.md#filter) |
+| `IRCX` | Enable/report IRCX mode. | [ircx.md](ircx.md#ircx) |
+| `ISIRCX` | Report IRCX support. | [ircx.md](ircx.md#isircx) |
+| `DATA` | IRCX typed directed message. | [ircx.md](ircx.md#data) |
+| `REQUEST` | Alias family of `DATA`. | [ircx.md](ircx.md#request) |
+| `REPLY` | Alias family of `DATA`. | [ircx.md](ircx.md#reply) |
+| `WHISPER` | IRCX channel-scoped private message. | [ircx.md](ircx.md#whisper) |
+| `PROP` | IRCX property get/list/set/delete. | [ircx.md](ircx.md#prop) |
+| `ACCESS` | IRCX channel access list. | [ircx.md](ircx.md#access) |
+| `EVENT` | Event Spine subscriptions and broadcast. | [ircx.md](ircx.md#event) |
+| `MODEX` | IRCX named-mode front-end. | [ircx.md](ircx.md#modex) |
+| `LISTX` | IRCX extended channel list. | [ircx.md](ircx.md#listx) |
+| `MEDIA` | Media control plane. | [media.md](media.md#media) |
+| `ACTIVITY` | Activity/presence updates. | [media.md](media.md#activity) |
