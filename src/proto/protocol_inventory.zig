@@ -23,6 +23,8 @@ pub const isupport_tokens = [_][]const u8{
     "NETWORK=" ++ network_name,
     "CHANTYPES=#&",
     "NICKLEN=64",
+    // TOPICLEN must match the daemon's enforced topic_len_max (server.zig).
+    "TOPICLEN=390",
     "CASEMAPPING=ascii",
     "PREFIX=(Qqov)!.@+",
     chanmodes_token,

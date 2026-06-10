@@ -10791,13 +10791,28 @@ pub const LinuxServer = struct {
             return;
         }
 
-        const text = parsed.paramSlice()[1];
+        // Cap the topic at TOPICLEN (advertised in ISUPPORT). Truncate on a UTF-8
+        // codepoint boundary so the stored topic stays valid under UTF8ONLY, and
+        // broadcast the truncated form so every member sees the same text.
+        const text = utf8TruncateBytes(parsed.paramSlice()[1], topic_len_max);
         try self.world.setTopic(channel, text);
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "TOPIC", &.{channel}, text);
         try self.broadcastChannel(channel, msg, null);
+    }
+
+    /// Maximum stored topic length in bytes (advertised as TOPICLEN).
+    const topic_len_max: usize = 390;
+
+    /// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint:
+    /// if the cut would land inside a multibyte sequence, back off to its start.
+    fn utf8TruncateBytes(s: []const u8, max: usize) []const u8 {
+        if (s.len <= max) return s;
+        var i = max;
+        while (i > 0 and (s[i] & 0xC0) == 0x80) i -= 1; // skip back over continuation bytes
+        return s[0..i];
     }
 
     pub fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -12725,6 +12740,17 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     // Too few params → FAIL CHATHISTORY NEED_MORE_PARAMS, never silence.
     try writeAllFd(fd_a, "CHATHISTORY LATEST\r\n");
     try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
+}
+
+test "utf8TruncateBytes caps length without splitting a codepoint" {
+    // ASCII: exact byte cut.
+    try std.testing.expectEqualStrings("hello", LinuxServer.utf8TruncateBytes("hello world", 5));
+    // Short input passes through unchanged.
+    try std.testing.expectEqualStrings("hi", LinuxServer.utf8TruncateBytes("hi", 10));
+    // "é" is 0xC3 0xA9; cutting mid-sequence backs off to the codepoint start.
+    const s = "a\u{00e9}b"; // a, é (2 bytes), b -> 4 bytes total
+    try std.testing.expectEqualStrings("a", LinuxServer.utf8TruncateBytes(s, 2));
+    try std.testing.expectEqualStrings("a\u{00e9}", LinuxServer.utf8TruncateBytes(s, 3));
 }
 
 test "threaded server: USERHOST reflects live away state" {
