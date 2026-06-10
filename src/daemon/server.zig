@@ -874,6 +874,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = try std.fmt.allocPrint(allocator, "MAXTARGETS={d}", .{cfg.maxtargets});
         } else if (std.mem.startsWith(u8, tok, "MONITOR=")) {
             out[i] = try std.fmt.allocPrint(allocator, "MONITOR={d}", .{cfg.monitorlimit});
+        } else if (std.mem.startsWith(u8, tok, "SILENCE=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "SILENCE={d}", .{cfg.silencelimit});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -930,6 +932,9 @@ pub const Config = struct {
     /// Max MONITOR targets per client (advertised as MONITOR, enforced by the
     /// MonitorStore). Configurable via `[limits] monitorlimit`.
     monitorlimit: u32 = 128,
+    /// Max SILENCE masks per client (advertised as SILENCE, enforced by the
+    /// silence Store). Configurable via `[limits] silencelimit`.
+    silencelimit: u32 = 32,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -1547,7 +1552,7 @@ pub const LinuxServer = struct {
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, config.monitorlimit),
             .read_markers = read_marker_store.DefaultStore.init(allocator),
-            .silence = silence.Store.init(allocator),
+            .silence = silence.Store.initWithParams(allocator, .{ .max_masks_per_owner = config.silencelimit }),
             .observe = observe_mod.Registry.init(allocator, .{}),
             .oper_motd = oper_motd_mod.OperMotd.init(allocator),
             .host_requests = host_request_mod.Queue.init(allocator, .{}),
@@ -12896,7 +12901,7 @@ test "threaded server: PRIVMSG beyond MAXTARGETS yields ERR_TOOMANYTARGETS" {
 }
 
 test "buildIsupportTokens replaces length tokens with configured values" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25, .chanlimit = 12, .maxtargets = 3, .monitorlimit = 64 });
+    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25, .chanlimit = 12, .maxtargets = 3, .monitorlimit = 64, .silencelimit = 16 });
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
     var hits: usize = 0;
@@ -12910,10 +12915,11 @@ test "buildIsupportTokens replaces length tokens with configured values" {
         if (std.mem.eql(u8, tok, "CHANLIMIT=#&:12")) hits += 1;
         if (std.mem.eql(u8, tok, "MAXTARGETS=3")) hits += 1;
         if (std.mem.eql(u8, tok, "MONITOR=64")) hits += 1;
+        if (std.mem.eql(u8, tok, "SILENCE=16")) hits += 1;
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expectEqual(@as(usize, 9), hits);
+    try std.testing.expectEqual(@as(usize, 10), hits);
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 
