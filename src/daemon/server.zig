@@ -857,7 +857,9 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     const out = try allocator.alloc([]const u8, base.len);
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
-        if (std.mem.startsWith(u8, tok, "TOPICLEN=")) {
+        if (std.mem.startsWith(u8, tok, "NETWORK=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "NETWORK={s}", .{cfg.network_name});
+        } else if (std.mem.startsWith(u8, tok, "TOPICLEN=")) {
             out[i] = try std.fmt.allocPrint(allocator, "TOPICLEN={d}", .{cfg.topiclen});
         } else if (std.mem.startsWith(u8, tok, "AWAYLEN=")) {
             out[i] = try std.fmt.allocPrint(allocator, "AWAYLEN={d}", .{cfg.awaylen});
@@ -904,6 +906,16 @@ pub fn freeIsupportTokens(allocator: std.mem.Allocator, tokens: []const []const 
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16,
+    /// Network name advertised in ISUPPORT `NETWORK=` and the welcome burst.
+    /// Configurable via `[network] name`; installed into the protocol_inventory
+    /// override at boot.
+    network_name: []const u8 = protocol_inventory.network_name,
+    /// MOTD text served by the MOTD command, split on newlines. Empty = the
+    /// built-in default MOTD. Configurable via `[motd] text` (supports @file:).
+    motd_text_raw: []const u8 = "",
+    /// ADMIN command contact details. Configurable via `[admin] location/email`.
+    admin_location: []const u8 = "Mizuchi IRC network",
+    admin_email: []const u8 = "admin@mizuchi.local",
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -1991,7 +2003,7 @@ pub const LinuxServer = struct {
 
         const snapshot = stats_report.Snapshot{
             .server_name = server_name,
-            .network = protocol_inventory.network_name,
+            .network = protocol_inventory.currentNetworkName(),
             .version = "mizuchi-0.1",
             .generated_unix = @divTrunc(platform.realtimeMillis(), 1000),
             .uptime_secs = @intCast(@max(@as(i64, 0), @divTrunc(now - self.start_ms, 1000))),
@@ -8026,11 +8038,23 @@ pub const LinuxServer = struct {
 
     /// MOTD (375/372/376).
     pub fn handleMotd(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [8]motd.MotdLine = undefined;
         var sink = motd.MotdLineSink{ .lines = &lines_buf };
-        motd.writeMotdRepliesForRequester(&out_buf, server_name, conn.session.displayName(), &motd_text, &sink) catch return;
+        // Configured MOTD ([motd] text) is split on newlines into lines; an
+        // empty config falls back to the built-in default text.
+        var cfg_lines: [32][]const u8 = undefined;
+        const lines: []const []const u8 = if (self.config.motd_text_raw.len != 0) blk: {
+            var n: usize = 0;
+            var it = std.mem.splitScalar(u8, self.config.motd_text_raw, '\n');
+            while (it.next()) |l| {
+                if (n == cfg_lines.len) break;
+                cfg_lines[n] = std.mem.trimEnd(u8, l, "\r");
+                n += 1;
+            }
+            break :blk cfg_lines[0..n];
+        } else &motd_text;
+        motd.writeMotdRepliesForRequester(&out_buf, server_name, conn.session.displayName(), lines, &sink) catch return;
         for (sink.slice()) |line| {
             try appendToConn(conn, line.bytes);
             try appendToConn(conn, "\r\n");
@@ -8049,14 +8073,13 @@ pub const LinuxServer = struct {
 
     /// ADMIN (256/257/258/259).
     pub fn handleAdmin(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [4]serverinfo.ReplyLine = undefined;
         var sink = serverinfo.ReplyLineSink{ .lines = &lines_buf };
         serverinfo.writeAdminReplies(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, .{
             .reply_server = server_name,
-            .location1 = "Mizuchi IRC network",
-            .email = "admin@mizuchi.local",
+            .location1 = self.config.admin_location,
+            .email = self.config.admin_email,
         }, &sink) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
     }
@@ -10072,7 +10095,7 @@ pub const LinuxServer = struct {
             .zig_version = builtin.zig_version_string,
             .target = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
             .optimize = @tagName(builtin.mode),
-            .network = protocol_inventory.network_name,
+            .network = protocol_inventory.currentNetworkName(),
             .online_since_unix = online_since,
             .uptime_secs = uptime_secs,
         };

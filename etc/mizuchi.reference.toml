@@ -1,0 +1,225 @@
+# =============================================================================
+# Mizuchi — reference configuration
+# =============================================================================
+# This file documents every configuration section and key the daemon accepts,
+# with its type, default, and accepted range. It is exhaustive: copy it, delete
+# what you don't need, and edit the rest. All keys are optional EXCEPT the two
+# marked REQUIRED ([node].id and [listen].irc).
+#
+# Format: TOML v1.0 (parsed by src/proto/toml.zig).
+#
+# String indirection: any string value may use
+#   "env:NAME"     -> value of environment variable NAME
+#   "@file:/path"  -> contents of the file at /path
+# so secrets need not live in this file.
+#
+# Schema source of truth: src/daemon/config_format.zig (parseToml) and
+# src/daemon/config_boot.zig (mapping to the live server).
+# =============================================================================
+
+
+# --- [node] — sovereign mesh identity ----------------------------------------
+[node]
+# REQUIRED. The 64-bit sovereign node id; keys the mesh registry and the CRDT
+# replica lane. Must be >= 1. Choose a stable, network-unique value.
+id = 1
+
+# Optional Ed25519 identity keypair (hex), enabling PQ-secured S2S links. When
+# secret_key is set the daemon derives its node identity and runs the Tsumugi
+# (X-Wing + Ed25519) handshake for secured peers. Omit for plaintext-only mesh.
+# public_key = "env:MIZUCHI_NODE_PUBKEY"
+# secret_key = "env:MIZUCHI_NODE_SECKEY"
+
+
+# --- [network] — network presentation ----------------------------------------
+[network]
+# Network name advertised in ISUPPORT NETWORK= and the registration welcome
+# burst. Default: "Mizuchi".
+name = "Mizuchi"
+
+
+# --- [motd] — message of the day ---------------------------------------------
+[motd]
+# MOTD text served by the MOTD command, split on newlines into lines. Supports
+# @file: to load from disk. When unset, the built-in default MOTD is served.
+# text = "@file:/etc/mizuchi/motd.txt"
+# text = """
+# Welcome to ExampleNet.
+# Be excellent to each other.
+# """
+
+
+# --- [admin] — ADMIN command contact details ---------------------------------
+[admin]
+# Shown in the ADMIN reply (RPL_ADMINLOC1 / RPL_ADMINEMAIL).
+location = "Mizuchi IRC network"
+email = "admin@mizuchi.local"
+
+
+# --- [listen] — listener sockets ---------------------------------------------
+[listen]
+# Bind address for all TCP listeners. Default: "127.0.0.1".
+host = "0.0.0.0"
+# REQUIRED. Plaintext IRC port. Must be non-zero.
+irc = 6667
+# WebSocket port for browser clients (0 = disabled).
+ws = 0
+# WebTransport (HTTP/3) port for browser clients (0 = disabled).
+webtransport = 0
+# Server-to-server (mesh) listener port (0 = disabled / leaf node).
+s2s = 0
+# UDP port for the media (SFU) transport plane (0 = ephemeral).
+media = 0
+# UDP port for the native OPVOX/OPVIS media leg (0 = ephemeral).
+native_media = 0
+# IPv4 advertised to clients as the server media (ICE) candidate.
+media_host = "127.0.0.1"
+
+
+# --- [tls] — TLS listener (modern-only; no STARTTLS) -------------------------
+[tls]
+# Stand up a TLS listener. When enabled with no cert_path/key_path, the daemon
+# bootstraps a self-signed Ed25519 leaf using dns_name as the CN/SAN.
+enabled = false
+# TLS port (conventional IRCS port is 6697).
+port = 6697
+# On-disk PEM/DER material; set both to load instead of bootstrapping.
+# cert_path = "/etc/mizuchi/tls/cert.pem"
+# key_path  = "/etc/mizuchi/tls/key.pem"
+# CN/SAN for the self-signed bootstrap leaf.
+dns_name = "irc.example.net"
+# Request a client certificate (mTLS) so SASL EXTERNAL can match the presented
+# fingerprint to an account.
+request_client_cert = false
+
+
+# --- [sts] — IRCv3 Strict Transport Security ---------------------------------
+[sts]
+# Advertise an sts= capability telling clients to persist a secure-transport
+# upgrade. Leave off for plaintext deployments so clients are never forced.
+enabled = false
+# Persistence lifetime advertised to secure clients, in seconds (default 30d).
+duration = 2592000
+# Secure (TLS) port clients should reconnect to when upgrading.
+port = 6697
+# Advertise `preload` (opt in only deliberately).
+preload = false
+
+
+# --- [mesh] — server-to-server / Suimyaku mesh -------------------------------
+[mesh]
+# Mesh realm; peers must share a realm to link. Default: "local".
+realm = "local"
+# Shared passphrase for plaintext S2S admission (MeshPass). For secured links
+# use [node].secret_key instead.
+# mesh_pass = "env:MIZUCHI_MESH_PASS"
+# Trusted peer identity roots (array of hex public keys), for secured links.
+# trust_roots = ["env:PEER_A_PUBKEY", "env:PEER_B_PUBKEY"]
+
+
+# --- [limits] — capacity, timeouts, and advertised protocol limits -----------
+[limits]
+backlog = 128          # listen() backlog (1..32767)
+max_clients = 1024     # max concurrent clients (1..32767)
+num_shards = 1         # worker reactor shards (1..max_shards)
+# Connection timeouts (duration strings, e.g. "30s", "2m"):
+handshake_timeout = "30s"   # registration must complete within this
+ping_interval = "2m"        # idle interval before a PING is sent
+ping_timeout = "1m"         # unanswered-PING grace before disconnect
+sweep_interval = "2s"       # timeout-sweep timer granularity
+# Advertised + enforced length/count limits (also appear in ISUPPORT 005):
+topiclen = 390         # TOPICLEN  (1..8192)
+awaylen = 256          # AWAYLEN   (1..256)
+kicklen = 307          # KICKLEN   (1..400)
+nicklen = 64           # NICKLEN   (1..64)
+channellen = 64        # CHANNELLEN (2..200)
+maxlist = 100          # per-channel cap on each list mode +b/+e/+I/+Z (1..10000)
+chanlimit = 50         # max channels a non-oper may join (1..10000)
+maxtargets = 4         # max targets per PRIVMSG/NOTICE (1..64)
+monitorlimit = 128     # max MONITOR targets per client (1..100000)
+silencelimit = 32      # max SILENCE masks per client (1..256)
+# Anti-abuse:
+max_clones_per_ip = 0          # 0 = unlimited (0..65535)
+max_clones_per_net = 0         # 0 = unlimited (0..65535)
+reputation_refuse_threshold = 0  # refuse connections above this penalty (0 = off)
+reputation_half_life = "1m"    # decay half-life of the reputation penalty
+
+
+# --- [io] — io_uring tuning --------------------------------------------------
+[io]
+ring_entries = 32      # io_uring SQ entries per reactor (8..4096)
+
+
+# --- [reputation] — decaying IP-reputation penalty weights -------------------
+[reputation]
+registration_timeout_penalty = 50.0   # added when a client times out (0..1000)
+clone_refuse_penalty = 25.0           # added when a clone is refused (0..1000)
+
+
+# --- [sessions] — multi-session / bouncer registry sizing --------------------
+[sessions]
+max_accounts = 65536   # distinct accounts tracked (1..2^32)
+max_per_account = 64   # live sessions per account (1..1000000)
+
+
+# --- [sasl] — SASL authentication + account store ----------------------------
+[sasl]
+# Enable SASL (PLAIN/SCRAM/EXTERNAL). Required for accounts and SASL-only opers.
+enabled = false
+# Optional SASL realm.
+# realm = "example.net"
+# WAL-backed account store path (relative to the daemon cwd). When set, the
+# daemon opens it and verifies SASL credentials against it.
+# account_db = "/var/lib/mizuchi/accounts.db"
+
+
+# --- [[opers]] — operator bindings (SASL-only) -------------------------------
+# Operators are granted by ACCOUNT, never by password. Each block binds a SASL
+# account to a privilege class; the account auto-elevates on login.
+# [[opers]]
+# account = "alice"
+# class   = "netadmin"
+# title   = "Network Guardian"   # optional; shown in WHOIS
+
+
+# --- [[oper_groups]] — role-based privilege classes --------------------------
+# A named privilege set, optionally inheriting another group's privileges.
+# Referenced by an [[opers]] block's `class`.
+# [[oper_groups]]
+# name       = "netadmin"
+# privileges = ["kill", "ward", "rehash", "upgrade", "mesh"]
+# inherits   = "oper"
+
+
+# --- [cloak] — hostname cloaking ---------------------------------------------
+[cloak]
+# Secret passphrase for HMAC host cloaking. When set, every client's real IP is
+# cloaked with a key derived from this secret (stable across restarts). When
+# absent, a random per-boot key is used (privacy on by default, but cloaks
+# change each restart).
+# secret = "env:MIZUCHI_CLOAK_SECRET"
+
+
+# --- [media] — voice/video (SFU) ---------------------------------------------
+[media]
+enabled = false
+max_upload_bytes = 16777216   # 16 MiB upload cap (0..1 GiB)
+max_frame_bytes = 65536       # 64 KiB per media frame (0..16 MiB)
+# STUN server (IPv4 literal) queried at boot for the reflexive media candidate;
+# with stun_port set, overrides listen.media_host on success.
+# stun_host = "stun.example.net"
+# stun_port = 3478
+
+
+# --- [stats] — web stats publication -----------------------------------------
+[stats]
+# Directory to publish stats.json + index.html into (e.g. an nginx root).
+# Empty = disabled.
+# dir = "/var/www/mizuchi"
+interval = "30s"       # minimum interval between stats writes
+
+
+# --- [geoip] — GeoIP enrichment ----------------------------------------------
+[geoip]
+# Path to a MaxMind .mmdb database. Empty = GeoIP disabled.
+# database = "/usr/share/GeoIP/GeoLite2-City.mmdb"

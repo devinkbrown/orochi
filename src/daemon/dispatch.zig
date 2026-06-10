@@ -1005,7 +1005,9 @@ pub const ReplyCtx = struct {
     network_name: []const u8 = NETWORK_NAME,
 
     pub fn init(storage: []u8) ReplyCtx {
-        return .{ .storage = storage };
+        // Pick up the configured network name (set once at boot) at runtime; the
+        // field default stays comptime-known for struct initialization.
+        return .{ .storage = storage, .network_name = protocol_inventory.currentNetworkName() };
     }
 
     pub fn written(self: *const ReplyCtx) []const u8 {

@@ -11,8 +11,26 @@
 
 const std = @import("std");
 
-/// Network name advertised in ISUPPORT `NETWORK=` and elsewhere.
+/// Default network name advertised in ISUPPORT `NETWORK=` and the welcome
+/// burst. Operators override it via `[network] name` (see `setNetworkName`).
 pub const network_name = "Mizuchi";
+
+/// Boot-time override of the advertised network name. Write-once at startup
+/// (before any client traffic), so no lock is needed; reads see a stable value.
+var network_name_override: ?[]const u8 = null;
+
+/// The network name to advertise (config override if set, else the default).
+pub fn currentNetworkName() []const u8 {
+    return network_name_override orelse network_name;
+}
+
+/// Install the configured network name. Call once at boot before serving.
+/// A null or empty value leaves the default in place.
+pub fn setNetworkName(name: ?[]const u8) void {
+    if (name) |n| {
+        if (n.len != 0) network_name_override = n;
+    }
+}
 
 /// Channel-mode advertisement token (`CHANMODES=<A>,<B>,<C>,<D>`).
 pub const chanmodes_token = "CHANMODES=beIZ,k,lfj,imnstCTNMSg";

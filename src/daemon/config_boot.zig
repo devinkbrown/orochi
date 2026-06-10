@@ -17,6 +17,10 @@ const og_mod = @import("operator_groups.zig");
 /// the returned Config is used.
 pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.Config {
     var out = base;
+    if (cfg.network.name.len != 0) out.network_name = cfg.network.name;
+    if (cfg.motd.text) |t| out.motd_text_raw = t;
+    if (cfg.admin.location.len != 0) out.admin_location = cfg.admin.location;
+    if (cfg.admin.email.len != 0) out.admin_email = cfg.admin.email;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;

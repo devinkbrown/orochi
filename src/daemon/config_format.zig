@@ -28,6 +28,9 @@ pub const Resolver = struct {
 
 pub const Config = struct {
     node: Node = .{},
+    network: Network = .{},
+    motd: Motd = .{},
+    admin: Admin = .{},
     listen: Listen = .{},
     opers: []Oper = &.{},
     oper_groups: []OperGroup = &.{},
@@ -48,6 +51,25 @@ pub const Config = struct {
         id: u64 = 0,
         public_key: ?[]const u8 = null,
         secret_key: ?[]const u8 = null,
+    };
+
+    /// Network-wide presentation. `name` is advertised in ISUPPORT `NETWORK=`
+    /// and the registration welcome burst.
+    pub const Network = struct {
+        name: []const u8 = "Mizuchi",
+    };
+
+    /// Message of the Day. `text` is served by the MOTD command (split on
+    /// newlines into lines). Supports `@file:path` to load from a file; when
+    /// empty the daemon's built-in default MOTD is served.
+    pub const Motd = struct {
+        text: ?[]const u8 = null,
+    };
+
+    /// ADMIN command response (RPL_ADMIN*). Operator/network contact details.
+    pub const Admin = struct {
+        location: []const u8 = "Mizuchi IRC network",
+        email: []const u8 = "admin@mizuchi.local",
     };
 
     pub const Listen = struct {
@@ -233,6 +255,11 @@ pub const Config = struct {
         const geoip_db = try allocator.dupe(u8, "");
         errdefer allocator.free(geoip_db);
         return .{
+            .network = .{ .name = try allocator.dupe(u8, "Mizuchi") },
+            .admin = .{
+                .location = try allocator.dupe(u8, "Mizuchi IRC network"),
+                .email = try allocator.dupe(u8, "admin@mizuchi.local"),
+            },
             .listen = .{ .host = host, .media_host = media_host },
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
             .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
@@ -244,6 +271,10 @@ pub const Config = struct {
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.node.public_key) |value| allocator.free(value);
         if (self.node.secret_key) |value| allocator.free(value);
+        allocator.free(self.network.name);
+        if (self.motd.text) |value| allocator.free(value);
+        allocator.free(self.admin.location);
+        allocator.free(self.admin.email);
         allocator.free(self.listen.host);
         allocator.free(self.listen.media_host);
         for (self.opers) |oper| {
@@ -291,6 +322,16 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     }
     try setOpt(allocator, resolver, doc.getString("node.public_key"), &cfg.node.public_key);
     try setOpt(allocator, resolver, doc.getString("node.secret_key"), &cfg.node.secret_key);
+
+    // [network]
+    try setStr(allocator, resolver, doc.getString("network.name"), &cfg.network.name);
+
+    // [motd] — `text` may use `@file:path` to load from disk.
+    try setOpt(allocator, resolver, doc.getString("motd.text"), &cfg.motd.text);
+
+    // [admin]
+    try setStr(allocator, resolver, doc.getString("admin.location"), &cfg.admin.location);
+    try setStr(allocator, resolver, doc.getString("admin.email"), &cfg.admin.email);
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);
