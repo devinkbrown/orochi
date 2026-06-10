@@ -12,6 +12,18 @@ fn rehash(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleRehash(x.conn);
 }
+fn grant(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleGrant(x.conn, x.parsed);
+}
+fn revoke(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleRevoke(x.conn, x.parsed);
+}
+fn grants(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleGrants(x.conn);
+}
 fn kill(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleKill(x.conn, x.parsed);
@@ -109,6 +121,9 @@ pub const module = registry.Module{
         // declaratively by the registry (access=.oper).
         .{ .name = "OPER", .handler = oper },
         .{ .name = "REHASH", .access = .oper, .handler = rehash },
+        .{ .name = "GRANT", .access = .oper, .handler = grant, .summary = "grant a registered account operator authority network-wide" },
+        .{ .name = "REVOKE", .access = .oper, .handler = revoke, .summary = "revoke a runtime operator grant network-wide" },
+        .{ .name = "GRANTS", .access = .oper, .handler = grants, .summary = "list live runtime operator grants" },
         .{ .name = "KILL", .access = .oper, .handler = kill },
         .{ .name = "CLOSE", .access = .oper, .handler = close },
         .{ .name = "DRAIN", .access = .oper, .handler = drain },

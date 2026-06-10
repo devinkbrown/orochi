@@ -1486,6 +1486,9 @@ pub const LinuxServer = struct {
     /// an operator authenticated on a peer node be recognized here without the
     /// password ever crossing the mesh. See proto/oper_cred_share.zig.
     oper_grants: oper_cred_share.Registry = .{},
+    /// Strictly-increasing incarnation counter for minted oper grants, so a later
+    /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
+    grant_incarnation: u64 = 0,
     /// Account services backend (borrowed; owned by main).
     account_services: ?*services_mod.Services = null,
     /// Monotonic millis captured at init, for STATS u uptime.
@@ -8608,9 +8611,14 @@ pub const LinuxServer = struct {
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
         if (accepted) {
             self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
-            // Retroactively elevate any already-connected sessions of this
-            // account so recognition is immediate, not deferred to next login.
-            self.elevateGrantedSessions(fields.account);
+            if (fields.privilege_bits == 0) {
+                // Revocation tombstone: drop oper from any connected sessions.
+                self.deElevateSessions(fields.account);
+            } else {
+                // Retroactively elevate any already-connected sessions of this
+                // account so recognition is immediate, not deferred to next login.
+                self.elevateGrantedSessions(fields.account);
+            }
         }
         return accepted;
     }
@@ -8638,22 +8646,25 @@ pub const LinuxServer = struct {
     /// can recognize them. Stored locally too (self-trust); the S2S layer
     /// broadcasts it to peers. Best-effort: silently no-ops without a node key.
     fn mintOperGrant(self: *LinuxServer, account: []const u8, privileges: oper_mod.OperPrivileges, class_name: []const u8, title: []const u8) void {
-        // Only meaningful when this node can sign for broadcast to peers.
-        const kp = self.meshSignKey() orelse return;
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        // Strictly-increasing incarnation so a later GRANT/REVOKE always wins,
+        // even when issued within the same millisecond.
+        self.grant_incarnation = @max(now, self.grant_incarnation + 1);
         const fields = oper_cred_share.GrantFields{
             .account = account,
             .privilege_bits = privileges.toBits(),
             .class = class_name,
             .title = title,
             .issuer_node = server_name,
-            .incarnation = now,
+            .incarnation = self.grant_incarnation,
             .issued_ms = now,
             .expiry_ms = now + oper_grant_ttl_ms,
         };
+        // Record locally first so a single node (no [node] key) still grants.
         _ = self.oper_grants.upsert(fields);
         // Sign once and broadcast to every authenticated peer so they recognize
-        // this operator (best-effort; a sign failure just skips propagation).
+        // this grant (best-effort; no node key => local-only, no propagation).
+        const kp = self.meshSignKey() orelse return;
         var buf: [oper_cred_share.max_grant_len]u8 = undefined;
         const n = oper_cred_share.sign(kp, fields, &buf) catch return;
         self.broadcastOperGrant(buf[0..n]);
@@ -8695,6 +8706,7 @@ pub const LinuxServer = struct {
         if (!from_local) {
             const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
             const g = self.oper_grants.lookup(account, now) orelse return; // not an operator anywhere
+            if (g.privilege_bits == 0) return; // zero-privilege grant = revocation tombstone
             privileges = oper_mod.OperPrivileges.fromBits(g.privilege_bits);
             class_name = g.class;
             title = g.title;
@@ -8715,6 +8727,138 @@ pub const LinuxServer = struct {
         const nick = conn.session.displayName();
         const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, "+o" }, null);
         try appendToConn(conn, msg);
+    }
+
+    /// Drop operator status from every connected session of `account` (a
+    /// REVOKE / revocation-tombstone arriving from a peer). Config-bound opers
+    /// are left alone — their authority comes from `[[opers]]`, not a grant.
+    fn deElevateSessions(self: *LinuxServer, account: []const u8) void {
+        if (self.oper_registry) |reg| {
+            if (reg.lookup(account) != null) return; // configured oper; not grant-revocable
+        }
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const c = &slot.value;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            if (!c.session.registered() or !c.session.isOper()) continue;
+            const acct = c.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
+            c.session.clearOper();
+            var msg_buf: [default_reply_bytes]u8 = undefined;
+            const nick = c.session.displayName();
+            const msg = formatMessage(&msg_buf, server_name, "MODE", &.{ nick, "-o" }, null) catch continue;
+            appendToConn(c, msg) catch {};
+            appendToConn(c, ":" ++ server_name ++ " NOTICE * :Your operator authority has been revoked.\r\n") catch {};
+            self.armSendIfNeeded(c) catch {};
+        }
+    }
+
+    /// Resolve a GRANT's privilege set: an explicit comma-separated privilege-name
+    /// list when supplied, otherwise a class preset — admin/netadmin/sa => full
+    /// authority (incl. oper_grant); any other class => a standard operator set.
+    fn grantPrivileges(class: []const u8, priv_list: []const u8) ?oper_mod.OperPrivileges {
+        if (priv_list.len != 0) {
+            var names: [16][]const u8 = undefined;
+            var n: usize = 0;
+            var it = std.mem.splitScalar(u8, priv_list, ',');
+            while (it.next()) |raw| {
+                const name = std.mem.trim(u8, raw, " \t");
+                if (name.len == 0) continue;
+                if (n >= names.len) break;
+                names[n] = name;
+                n += 1;
+            }
+            return oper_mod.OperPrivileges.fromNames(names[0..n]) catch null;
+        }
+        const eqi = std.ascii.eqlIgnoreCase;
+        if (eqi(class, "admin") or eqi(class, "netadmin") or eqi(class, "sa")) {
+            return oper_mod.OperPrivileges.full;
+        }
+        return oper_mod.OperPrivileges.initMany(&.{
+            .server_rehash, .client_moderate, .channel_moderate, .client_kill,
+            .mesh_admin,    .oper_spy,        .event_subscribe,  .audit_read,
+            .oper_override,
+        });
+    }
+
+    /// GRANT <account> <class> [priv,priv,...] — give a registered account
+    /// operator authority network-wide. Requires the `oper_grant` privilege. Mints
+    /// a signed grant (recorded locally, propagated to secured peers, and honored
+    /// on the account's next login) and elevates already-connected sessions now.
+    pub fn handleGrant(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.hasPriv(.oper_grant)) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
+            return;
+        }
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"GRANT"}, "Usage: GRANT <account> <class> [priv,priv,...]");
+            return;
+        }
+        const account = parsed.paramSlice()[0];
+        const class = parsed.paramSlice()[1];
+        const priv_list = if (parsed.param_count >= 3) parsed.paramSlice()[2] else "";
+
+        // Best-effort: verify the target is a registered account.
+        if (self.account_services) |svc| {
+            _ = svc.accountInfo(account) catch {
+                try self.noticeTo(conn, "GRANT: no such registered account");
+                return;
+            };
+        }
+        const privs = grantPrivileges(class, priv_list) orelse {
+            try self.noticeTo(conn, "GRANT: unknown privilege name in list");
+            return;
+        };
+        self.mintOperGrant(account, privs, class, "");
+        self.elevateGrantedSessions(account);
+
+        var b: [256]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&b, "GRANT: {s} is now an operator (class {s})", .{ account, class }) catch "GRANT applied");
+        self.notifyObservers(.oper_up, observeSubject(conn, account));
+    }
+
+    /// REVOKE <account> — remove operator authority from a runtime-granted account
+    /// network-wide: a zero-privilege tombstone supersedes the grant (propagated to
+    /// peers + honored on next login) and connected sessions are de-elevated now.
+    /// Configured `[[opers]]` accounts are not revocable this way.
+    pub fn handleRevoke(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.hasPriv(.oper_grant)) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (oper_grant required)");
+            return;
+        }
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"REVOKE"}, "Usage: REVOKE <account>");
+            return;
+        }
+        const account = parsed.paramSlice()[0];
+        if (self.oper_registry) |reg| {
+            if (reg.lookup(account) != null) {
+                try self.noticeTo(conn, "REVOKE: that account is a configured operator; edit [[opers]] and REHASH");
+                return;
+            }
+        }
+        self.mintOperGrant(account, oper_mod.OperPrivileges.empty, "revoked", "");
+        self.deElevateSessions(account);
+        var b: [256]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: operator authority removed from {s}", .{account}) catch "REVOKE applied");
+        self.notifyObservers(.oper_up, observeSubject(conn, account));
+    }
+
+    /// GRANTS — list the live runtime operator grants (account, class, scope).
+    pub fn handleGrants(self: *LinuxServer, conn: *ConnState) !void {
+        try self.noticeTo(conn, "Runtime operator grants:");
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        var it = self.oper_grants.liveIterator(now);
+        var count: usize = 0;
+        while (it.next()) |g| {
+            if (g.privilege_bits == 0) continue; // tombstones are not active grants
+            count += 1;
+            var b: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "  {s}  class={s}  issuer={s}", .{ g.account, g.class, g.issuer_node }) catch continue;
+            try self.noticeTo(conn, line);
+        }
+        var b: [64]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&b, "End of grants ({d}).", .{count}) catch "End of grants.");
     }
 
     // --- Account command family (Phase 2) ----------------------------------
@@ -14397,6 +14541,26 @@ test "threaded server: IRCv3 extended-join per-recipient format" {
     a.reset();
     try writeAllFd(fd_b, "JOIN #e\r\n");
     try recvUntil(&a, ":B!bob@localhost JOIN #e * :Bob\r\n", 200);
+}
+
+test "GRANT privilege resolution: class presets, explicit list, tombstone" {
+    const P = oper_mod.Privilege;
+    // admin/netadmin/sa => full authority (carries oper_grant).
+    try std.testing.expect(LinuxServer.grantPrivileges("admin", "").?.has(.oper_grant));
+    try std.testing.expect(LinuxServer.grantPrivileges("netadmin", "").?.has(.server_admin));
+    // A plain class is an operator but NOT a grantor.
+    const op = LinuxServer.grantPrivileges("oper", "").?;
+    try std.testing.expect(op.has(.client_kill));
+    try std.testing.expect(!op.has(.oper_grant));
+    // An explicit privilege list takes exactly those privileges.
+    const custom = LinuxServer.grantPrivileges("x", "client_kill, oper_spy").?;
+    try std.testing.expect(custom.has(.client_kill) and custom.has(.oper_spy));
+    try std.testing.expect(!custom.has(.server_rehash));
+    try std.testing.expect(LinuxServer.grantPrivileges("x", "not_a_privilege") == null);
+    // The revocation tombstone is the unique privilege_bits == 0 grant.
+    try std.testing.expectEqual(@as(u64, 0), oper_mod.OperPrivileges.empty.toBits());
+    try std.testing.expect(LinuxServer.grantPrivileges("admin", "").?.toBits() != 0);
+    _ = P;
 }
 
 test "threaded server: MONITOR online/offline/list end-to-end" {
