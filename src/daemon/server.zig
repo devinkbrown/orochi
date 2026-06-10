@@ -2185,7 +2185,7 @@ pub const LinuxServer = struct {
                 if (!self.world.channelExists(action.channel)) continue;
                 _ = self.world.setChannelFlag(action.channel, mode, false) catch continue;
                 var buf: [128]u8 = undefined;
-                const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} -{c}\r\n", .{ server_name, action.channel, action.mode_letter }) catch continue;
+                const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} -{c}\r\n", .{ self.serverName(), action.channel, action.mode_letter }) catch continue;
                 self.broadcastChannel(action.channel, line, null) catch {};
             }
             _ = self.temp_modes.sweep(now);
@@ -2233,7 +2233,7 @@ pub const LinuxServer = struct {
                 // (handleSend) calls closeConn for the proper io_uring-integrated
                 // teardown (shutdown in-flight recv, free slot). Never closeFd here.
                 self.penalizePeer(c, self.config.reg_timeout_penalty);
-                appendToConn(c, ":" ++ server_name ++ " ERROR :Registration timeout\r\n") catch {};
+                emitServerLine(c, "ERROR :Registration timeout");
                 c.close_reason = "Registration timeout";
                 c.closing = true;
                 self.armSendIfNeeded(c) catch {};
@@ -2273,14 +2273,14 @@ pub const LinuxServer = struct {
             // with no inbound traffic the connection is dropped (Ping timeout).
             if (c.awaiting_pong) {
                 if (now - c.ping_sent_ms <= ping_grace) continue;
-                appendToConn(c, ":" ++ server_name ++ " ERROR :Ping timeout\r\n") catch {};
+                emitServerLine(c, "ERROR :Ping timeout");
                 c.close_reason = "Ping timeout";
                 c.closing = true;
                 self.armSendIfNeeded(c) catch {};
                 continue;
             }
             if (now - c.last_activity_ms <= ping_interval) continue;
-            appendToConn(c, "PING :" ++ server_name ++ "\r\n") catch {};
+            emitPing(c);
             c.awaiting_pong = true;
             c.ping_sent_ms = now;
             self.armSendIfNeeded(c) catch {};
@@ -2534,7 +2534,7 @@ pub const LinuxServer = struct {
 
         // Drain mode: refuse new client connections (oper-initiated maintenance).
         if (self.draining) {
-            appendToConn(conn, ":" ++ server_name ++ " ERROR :Server is draining; try again later\r\n") catch {};
+            emitServerLine(conn, "ERROR :Server is draining; try again later");
             conn.close_reason = "Server draining";
             conn.closing = true;
             self.armSendIfNeeded(conn) catch {};
@@ -2547,7 +2547,7 @@ pub const LinuxServer = struct {
         if (self.reputationOn()) {
             if (conn.peer_addr) |addr| {
                 if (self.reputation.shouldRefuse(addr, self.nowU64())) {
-                    appendToConn(conn, ":" ++ server_name ++ " ERROR :Connection refused (reputation)\r\n") catch {};
+                    emitServerLine(conn, "ERROR :Connection refused (reputation)");
                     conn.close_reason = "Reputation";
                     conn.closing = true;
                     self.armSendIfNeeded(conn) catch {};
@@ -2567,7 +2567,7 @@ pub const LinuxServer = struct {
             } else |err| switch (err) {
                 error.TooManyPerIp, error.TooManyPerNet => {
                     self.penalizePeer(conn, self.config.clone_refuse_penalty);
-                    appendToConn(conn, ":" ++ server_name ++ " ERROR :Too many connections from your host\r\n") catch {};
+                    emitServerLine(conn, "ERROR :Too many connections from your host");
                     conn.close_reason = "Too many connections";
                     conn.closing = true;
                     self.armSendIfNeeded(conn) catch {};
@@ -3680,7 +3680,7 @@ pub const LinuxServer = struct {
             var ref_buf: [16]u8 = undefined;
             const ref = netsplit_batch.makeBatchRef(&ref_buf, @intCast(@max(@as(i64, 0), self.nowMs())));
             var batch_buf: [8192]u8 = undefined;
-            const batch = netsplit_batch.writeNetsplit(&batch_buf, ref, server_name, remote_name, ghosts[0..n]) catch continue;
+            const batch = netsplit_batch.writeNetsplit(&batch_buf, ref, self.serverName(), remote_name, ghosts[0..n]) catch continue;
 
             var members = self.world.memberIterator(cv.name) orelse continue;
             while (members.next()) |member| {
@@ -3958,7 +3958,7 @@ pub const LinuxServer = struct {
         @memcpy(out[0..fwd.len], fwd);
         const ftarget = out[0..fwd.len];
         var lb: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&lb, ":{s} 470 {s} {s} {s} :Forwarding to another channel\r\n", .{ server_name, conn.session.displayName(), channel, ftarget }) catch return null;
+        const line = std.fmt.bufPrint(&lb, ":{s} 470 {s} {s} {s} :Forwarding to another channel\r\n", .{ self.serverName(), conn.session.displayName(), channel, ftarget }) catch return null;
         try appendToConn(conn, line);
         return ftarget;
     }
@@ -4182,7 +4182,7 @@ pub const LinuxServer = struct {
         if (ip.len > 0) self.mirrorGagFlag(ip, turn_on);
 
         var buf: [128]u8 = undefined;
-        const reflect = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}z\r\n", .{ server_name, target_nick, if (turn_on) "+" else "-" }) catch return;
+        const reflect = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}z\r\n", .{ self.serverName(), target_nick, if (turn_on) "+" else "-" }) catch return;
         try appendToConn(conn, reflect);
     }
 
@@ -4707,7 +4707,7 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [8]ison_userhost.ReplyLine = undefined;
         var sink = ison_userhost.ReplyLineSink{ .lines = &lines_buf };
-        ison_userhost.writeIsonReplies(&out_buf, server_name, conn.session.displayName(), online_buf[0..count], alwaysOnline, &sink) catch return;
+        ison_userhost.writeIsonReplies(&out_buf, self.serverName(), conn.session.displayName(), online_buf[0..count], alwaysOnline, &sink) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
     }
 
@@ -4728,7 +4728,7 @@ pub const LinuxServer = struct {
             count += 1;
         }
         var out_buf: [default_reply_bytes]u8 = undefined;
-        const line = ison_userhost.writeUserhostReply(&out_buf, server_name, conn.session.displayName(), targets[0..count]) catch return;
+        const line = ison_userhost.writeUserhostReply(&out_buf, self.serverName(), conn.session.displayName(), targets[0..count]) catch return;
         try appendToConn(conn, line);
     }
 
@@ -4751,7 +4751,7 @@ pub const LinuxServer = struct {
             try self.emitWhoxRow(conn, req, requester, "*", target, usernameOf(self, wid), mconn, 0);
         }
         var endbuf: [default_reply_bytes]u8 = undefined;
-        const end = who.writeEndOfWho(&endbuf, server_name, requester, target) catch return;
+        const end = who.writeEndOfWho(&endbuf, self.serverName(), requester, target) catch return;
         try appendToConn(conn, end);
         try appendToConn(conn, "\r\n");
     }
@@ -4800,7 +4800,7 @@ pub const LinuxServer = struct {
                 .channel = channel,
                 .user = username,
                 .host = if (mconn) |c| hostOf(c) else default_host,
-                .server = server_name,
+                .server = self.serverName(),
                 .nick = nick,
                 .flags = flags_buf[0..fl],
                 .idle_seconds = idle,
@@ -4844,7 +4844,7 @@ pub const LinuxServer = struct {
                         .nick = nick,
                         .user = usernameOf(self, member.*),
                         .host = if (mconn) |c| hostOf(c) else default_host,
-                        .server = server_name,
+                        .server = self.serverName(),
                         .realname = if (mconn) |c| c.session.realname() else nick,
                         .account = if (mconn) |c| c.session.account() else null,
                     },
@@ -4864,7 +4864,7 @@ pub const LinuxServer = struct {
                     .nick = target,
                     .user = usernameOf(self, wid),
                     .host = if (mconn) |c| hostOf(c) else default_host,
-                    .server = server_name,
+                    .server = self.serverName(),
                     .realname = if (mconn) |c| c.session.realname() else target,
                     .account = if (mconn) |c| c.session.account() else null,
                 },
@@ -4875,7 +4875,7 @@ pub const LinuxServer = struct {
             } else |_| {}
         }
 
-        const end = who.writeEndOfWho(&buf, server_name, requester, target) catch return;
+        const end = who.writeEndOfWho(&buf, self.serverName(), requester, target) catch return;
         try appendToConn(conn, end);
         try appendToConn(conn, "\r\n");
     }
@@ -4949,7 +4949,7 @@ pub const LinuxServer = struct {
         const target_wid = self.world.findNick(target_nick);
         const target_conn: ?*ConnState = if (target_wid) |w| self.connFor(clientIdFromWorld(w)) else null;
         if (target_wid == null or target_conn == null) {
-            whois.writeNoSuchNick(&sink, server_name, conn.session.displayName(), target_nick) catch return;
+            whois.writeNoSuchNick(&sink, self.serverName(), conn.session.displayName(), target_nick) catch return;
             for (sink.slice()) |line| try appendToConn(conn, line.bytes);
             return;
         }
@@ -5025,7 +5025,7 @@ pub const LinuxServer = struct {
                 break :blk memberships[0..if (hide) 0 else nchan];
             },
         };
-        whois.writeWhois(&sink, server_name, conn.session.displayName(), subject) catch return;
+        whois.writeWhois(&sink, self.serverName(), conn.session.displayName(), subject) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
     }
 
@@ -5064,7 +5064,7 @@ pub const LinuxServer = struct {
         self.world.addInvite(args.channel, target) catch {};
 
         var num_buf: [default_reply_bytes]u8 = undefined;
-        const inviting = invite.buildInvitingNumeric(&num_buf, server_name, conn.session.displayName(), args.nick, args.channel) catch return;
+        const inviting = invite.buildInvitingNumeric(&num_buf, self.serverName(), conn.session.displayName(), args.nick, args.channel) catch return;
         try appendToConn(conn, inviting);
         try appendToConn(conn, "\r\n");
 
@@ -5115,7 +5115,7 @@ pub const LinuxServer = struct {
         const cleared = self.reputation.clear(addr);
         var buf: [default_reply_bytes]u8 = undefined;
         const state = if (cleared) "cleared" else "had no penalty";
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :UNREJECT {s}: {s}\r\n", .{ server_name, conn.session.displayName(), ip_text, state }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :UNREJECT {s}: {s}\r\n", .{ self.serverName(), conn.session.displayName(), ip_text, state }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -5128,7 +5128,7 @@ pub const LinuxServer = struct {
         self.draining = !off;
         var buf: [default_reply_bytes]u8 = undefined;
         const state = if (self.draining) "enabled (refusing new connections)" else "disabled (accepting connections)";
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :DRAIN {s}\r\n", .{ server_name, conn.session.displayName(), state }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :DRAIN {s}\r\n", .{ self.serverName(), conn.session.displayName(), state }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -5141,14 +5141,14 @@ pub const LinuxServer = struct {
             if (c.closing) continue;
             if (c.s2s != null or c.s2s_secured != null) continue;
             if (c.session.registered()) continue;
-            appendToConn(c, ":" ++ server_name ++ " ERROR :Closing unregistered connection\r\n") catch {};
+            emitServerLine(c, "ERROR :Closing unregistered connection");
             c.close_reason = "Closed by operator";
             c.closing = true;
             self.armSendIfNeeded(c) catch {};
             closed += 1;
         }
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :CLOSE: {d} unregistered connection(s) closed\r\n", .{ server_name, conn.session.displayName(), closed }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :CLOSE: {d} unregistered connection(s) closed\r\n", .{ self.serverName(), conn.session.displayName(), closed }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -5211,13 +5211,13 @@ pub const LinuxServer = struct {
                 .host = rec.host,
                 .realname = rec.realname,
                 .signoff_time = rec.signoff_time,
-                .server = server_name,
+                .server = self.serverName(),
             };
         }
 
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
-        whowas_reply.emitWhowas(&scratch, server_name, conn.session.displayName(), target, entries[0..n], &sink) catch return;
+        whowas_reply.emitWhowas(&scratch, self.serverName(), conn.session.displayName(), target, entries[0..n], &sink) catch return;
     }
 
     /// KNOCK <channel> [:reason] — ask for an invite to a +i channel. Channel
@@ -5685,16 +5685,16 @@ pub const LinuxServer = struct {
         const nick = conn.session.displayName();
         var buf: [default_reply_bytes]u8 = undefined;
         if (self.oper_motd.isEmpty()) {
-            const line = oper_motd_mod.buildNoOperMotd(&buf, server_name, nick) catch return;
+            const line = oper_motd_mod.buildNoOperMotd(&buf, self.serverName(), nick) catch return;
             try appendToConn(conn, line);
             return;
         }
-        if (oper_motd_mod.buildOperMotdStart(&buf, server_name, nick)) |line| try appendToConn(conn, line) else |_| {}
+        if (oper_motd_mod.buildOperMotdStart(&buf, self.serverName(), nick)) |line| try appendToConn(conn, line) else |_| {}
         for (self.oper_motd.lines()) |l| {
             var lb: [default_reply_bytes]u8 = undefined;
-            if (oper_motd_mod.buildOperMotdLine(&lb, server_name, nick, l)) |line| try appendToConn(conn, line) else |_| {}
+            if (oper_motd_mod.buildOperMotdLine(&lb, self.serverName(), nick, l)) |line| try appendToConn(conn, line) else |_| {}
         }
-        if (oper_motd_mod.buildOperMotdEnd(&buf, server_name, nick)) |line| try appendToConn(conn, line) else |_| {}
+        if (oper_motd_mod.buildOperMotdEnd(&buf, self.serverName(), nick)) |line| try appendToConn(conn, line) else |_| {}
     }
 
     /// `AUTOJOIN <ADD|DEL|LIST> [#channel]` — manage the caller's per-account
@@ -5709,7 +5709,7 @@ pub const LinuxServer = struct {
             const chans = self.autojoins.list(account) catch &.{};
             for (chans) |c| {
                 var b: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :AUTOJOIN {s}\r\n", .{ server_name, conn.session.displayName(), c }) catch continue;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :AUTOJOIN {s}\r\n", .{ self.serverName(), conn.session.displayName(), c }) catch continue;
                 try appendToConn(conn, line);
             }
             try self.noticeTo(conn, "AUTOJOIN: end of list");
@@ -5753,7 +5753,7 @@ pub const LinuxServer = struct {
             for (nicks) |nk| {
                 var b: [default_reply_bytes]u8 = undefined;
                 const star: []const u8 = if (std.ascii.eqlIgnoreCase(nk, primary)) " (primary)" else "";
-                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :GROUP {s}{s}\r\n", .{ server_name, conn.session.displayName(), nk, star }) catch continue;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :GROUP {s}{s}\r\n", .{ self.serverName(), conn.session.displayName(), nk, star }) catch continue;
                 try appendToConn(conn, line);
             }
             try self.noticeTo(conn, "GROUP: end of list");
@@ -5815,7 +5815,7 @@ pub const LinuxServer = struct {
         if (p.len == 0 or std.ascii.eqlIgnoreCase(p[0], "SHOW")) {
             for (self.welcome.lines()) |l| {
                 var b: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :WELCOME :{s}\r\n", .{ server_name, conn.session.displayName(), l }) catch continue;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :WELCOME :{s}\r\n", .{ self.serverName(), conn.session.displayName(), l }) catch continue;
                 try appendToConn(conn, line);
             }
             try self.noticeTo(conn, "WELCOME: end of pack");
@@ -5856,7 +5856,7 @@ pub const LinuxServer = struct {
         const lines = (self.welcome.deliverOnce(account) catch return) orelse return;
         for (lines) |l| {
             var b: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :[Welcome] {s}\r\n", .{ server_name, conn.session.displayName(), l }) catch continue;
+            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :[Welcome] {s}\r\n", .{ self.serverName(), conn.session.displayName(), l }) catch continue;
             appendToConn(conn, line) catch {};
         }
     }
@@ -5878,7 +5878,7 @@ pub const LinuxServer = struct {
             var rows: [256]shun_mod.Shun = undefined;
             for (self.shuns.list(&rows)) |s| {
                 var b: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :SHUN {s} by {s} :{s}\r\n", .{ server_name, conn.session.displayName(), s.mask, s.set_by, s.reason }) catch continue;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :SHUN {s} by {s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), s.mask, s.set_by, s.reason }) catch continue;
                 try appendToConn(conn, line);
             }
             try self.noticeTo(conn, "SHUN: end of list");
@@ -5933,7 +5933,7 @@ pub const LinuxServer = struct {
             return;
         };
         var line_buf: [default_reply_bytes]u8 = undefined;
-        const line = global_notice.formatLine(&line_buf, server_name, req.text) catch {
+        const line = global_notice.formatLine(&line_buf, self.serverName(), req.text) catch {
             try self.noticeTo(conn, "GLOBAL: message too long");
             return;
         };
@@ -5979,7 +5979,7 @@ pub const LinuxServer = struct {
             const wards = self.warden.list(only, &rows);
             for (wards) |w| {
                 var b: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :WARD {s} {s} {s}/{s} by {s} :{s}\r\n", .{ server_name, conn.session.displayName(), w.match.token(), w.pattern, w.scope.token(), w.action.token(), w.set_by, w.reason }) catch continue;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :WARD {s} {s} {s}/{s} by {s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), w.match.token(), w.pattern, w.scope.token(), w.action.token(), w.set_by, w.reason }) catch continue;
                 try appendToConn(conn, line);
             }
             try self.noticeTo(conn, "WARD: end of list");
@@ -6125,7 +6125,7 @@ pub const LinuxServer = struct {
             n += 1;
         }
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = userip.writeUseripReply(&buf, server_name, conn.session.displayName(), targets[0..n]) catch return;
+        const line = userip.writeUseripReply(&buf, self.serverName(), conn.session.displayName(), targets[0..n]) catch return;
         try appendToConn(conn, line);
         if (!std.mem.endsWith(u8, line, "\n")) try appendToConn(conn, "\r\n");
     }
@@ -6336,7 +6336,7 @@ pub const LinuxServer = struct {
             const entry = trace.TraceEntry{ .user = .{ .class = "users", .nick = e.value.session.displayName(), .ip = default_host, .connected_seconds = 0, .idle_seconds = 0 } };
             trace.emitTrace(ctx, &.{entry}, &scratch, &sink) catch {};
         }
-        trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = server_name }}, &scratch, &sink) catch {};
+        trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = self.serverName() }}, &scratch, &sink) catch {};
     }
 
     /// `ETRACE` (oper) — extended TRACE: one RPL_ETRACE (709) line per local
@@ -6352,7 +6352,7 @@ pub const LinuxServer = struct {
             if (c.s2s != null or c.s2s_secured != null) continue;
             const acct = c.session.account() orelse "0";
             const line = std.fmt.bufPrint(&buf, ":{s} 709 {s} users User {s} {s} {s} {s} {s} :{s}\r\n", .{
-                server_name,
+                protocol_inventory.currentServerName(),
                 conn.session.displayName(),
                 c.session.displayName(),
                 c.session.username(),
@@ -6363,7 +6363,7 @@ pub const LinuxServer = struct {
             }) catch continue;
             appendToConn(conn, line) catch {};
         }
-        const endl = std.fmt.bufPrint(&buf, ":{s} 262 {s} {s} :End of ETRACE\r\n", .{ server_name, conn.session.displayName(), server_name }) catch return;
+        const endl = std.fmt.bufPrint(&buf, ":{s} 262 {s} {s} :End of ETRACE\r\n", .{ self.serverName(), conn.session.displayName(), protocol_inventory.currentServerName() }) catch return;
         try appendToConn(conn, endl);
     }
 
@@ -6473,9 +6473,8 @@ pub const LinuxServer = struct {
 
     /// Send a server NOTICE to a single connection.
     fn noticeTo(self: *LinuxServer, conn: *ConnState, text: []const u8) !void {
-        _ = self;
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ server_name, conn.session.displayName(), text }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), text }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -6712,7 +6711,7 @@ pub const LinuxServer = struct {
             const filter = self.observe.get(observeKey(entry.value)) orelse continue;
             if (!observe_mod.Registry.matches(filter, subject, action)) continue;
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = observe_mod.Registry.formatNote(&buf, server_name, action, subject) orelse continue;
+            const line = observe_mod.Registry.formatNote(&buf, self.serverName(), action, subject) orelse continue;
             self.deliver(entry.id, line) catch {};
         }
     }
@@ -6725,7 +6724,7 @@ pub const LinuxServer = struct {
             if (self.observe.get(key)) |f| {
                 try self.noticeTo(conn, "OBSERVE: active");
                 var lbuf: [default_reply_bytes]u8 = undefined;
-                if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :filter {s}\r\n", .{ server_name, f.mask })) |line| {
+                if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :filter {s}\r\n", .{ self.serverName(), f.mask })) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
             } else {
@@ -6748,7 +6747,7 @@ pub const LinuxServer = struct {
             return;
         };
         var hbuf: [default_reply_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&hbuf, ":{s} NOTE EVENT OBSERVE :watching {s}\r\n", .{ server_name, params[1] })) |line| {
+        if (std.fmt.bufPrint(&hbuf, ":{s} NOTE EVENT OBSERVE :watching {s}\r\n", .{ self.serverName(), params[1] })) |line| {
             try appendToConn(conn, line);
         } else |_| {}
         // Immediate snapshot: enumerate the currently-matching population so the
@@ -6761,7 +6760,7 @@ pub const LinuxServer = struct {
             const mask_str = std.fmt.bufPrint(&hm, "{s}!{s}@{s}", .{ subj.nick, subj.user, subj.host }) catch continue;
             if (!observe_mod.globMatch(params[1], mask_str)) continue;
             var lbuf: [default_reply_bytes]u8 = undefined;
-            if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :present {s}!{s}@{s} acct={s}\r\n", .{ server_name, subj.nick, subj.user, subj.host, subj.account orelse "*" })) |line| {
+            if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :present {s}!{s}@{s} acct={s}\r\n", .{ self.serverName(), subj.nick, subj.user, subj.host, subj.account orelse "*" })) |line| {
                 try appendToConn(conn, line);
             } else |_| {}
         }
@@ -6813,11 +6812,11 @@ pub const LinuxServer = struct {
             }
             for (self.chan_akick.list(channel)) |e| {
                 var lb: [512]u8 = undefined;
-                const line = std.fmt.bufPrint(&lb, ":" ++ server_name ++ " NOTICE {s} :AKICK {s} {s} :{s}\r\n", .{ nick, channel, e.mask, e.reason }) catch continue;
+                const line = std.fmt.bufPrint(&lb, ":{s} NOTICE {s} :AKICK {s} {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, channel, e.mask, e.reason }) catch continue;
                 try appendToConn(conn, line);
             }
             var eb: [128]u8 = undefined;
-            const endl = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " NOTICE {s} :End of AKICK list for {s}\r\n", .{ nick, channel }) catch return;
+            const endl = std.fmt.bufPrint(&eb, ":{s} NOTICE {s} :End of AKICK list for {s}\r\n", .{ protocol_inventory.currentServerName(), nick, channel }) catch return;
             try appendToConn(conn, endl);
             return;
         }
@@ -6841,12 +6840,12 @@ pub const LinuxServer = struct {
                     else => "AKICK add failed",
                 };
                 var nb: [256]u8 = undefined;
-                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, msg }) catch return;
+                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, msg }) catch return;
                 try appendToConn(conn, nl);
                 return;
             };
             var nb: [320]u8 = undefined;
-            const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :AKICK added on {s}: {s}\r\n", .{ nick, channel, p[2] }) catch return;
+            const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :AKICK added on {s}: {s}\r\n", .{ protocol_inventory.currentServerName(), nick, channel, p[2] }) catch return;
             try appendToConn(conn, nl);
         } else if (std.ascii.eqlIgnoreCase(sub, "DEL")) {
             if (p.len < 3) {
@@ -6855,7 +6854,7 @@ pub const LinuxServer = struct {
             }
             const removed = self.chan_akick.remove(channel, p[2]) == .removed;
             var nb: [320]u8 = undefined;
-            const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, if (removed) "AKICK removed" else "AKICK mask not found" }) catch return;
+            const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, if (removed) "AKICK removed" else "AKICK mask not found" }) catch return;
             try appendToConn(conn, nl);
         } else {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "AKICK subcommand must be ADD, DEL, or LIST");
@@ -6920,7 +6919,7 @@ pub const LinuxServer = struct {
     /// Emit a Warden close ERROR and mark the connection for teardown.
     fn closeWarded(self: *LinuxServer, conn: *ConnState, reason: []const u8) bool {
         var eb: [640]u8 = undefined;
-        const el = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " ERROR :Closing Link: {s} (Banned: {s})\r\n", .{ conn.session.displayName(), reason }) catch null;
+        const el = std.fmt.bufPrint(&eb, ":{s} ERROR :Closing Link: {s} (Banned: {s})\r\n", .{ protocol_inventory.currentServerName(), conn.session.displayName(), reason }) catch null;
         if (el) |line| appendToConn(conn, line) catch {};
         conn.close_reason = "Banned (WARD)";
         conn.closing = true;
@@ -6958,35 +6957,35 @@ pub const LinuxServer = struct {
                         else => "RESV add failed",
                     };
                     var nb: [256]u8 = undefined;
-                    const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, msg }) catch return;
+                    const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, msg }) catch return;
                     try appendToConn(conn, nl);
                     return;
                 };
                 var nb: [384]u8 = undefined;
-                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :RESV added: {s}\r\n", .{ nick, req.pattern }) catch return;
+                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :RESV added: {s}\r\n", .{ protocol_inventory.currentServerName(), nick, req.pattern }) catch return;
                 try appendToConn(conn, nl);
             },
             .remove => |pattern| {
                 const removed = self.chan_resv.remove(pattern);
                 var nb: [320]u8 = undefined;
-                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :{s}\r\n", .{ nick, if (removed) "RESV removed" else "RESV pattern not found" }) catch return;
+                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, if (removed) "RESV removed" else "RESV pattern not found" }) catch return;
                 try appendToConn(conn, nl);
             },
             .list => {
                 var buf: [256]svc_resv.Reservation = undefined;
                 for (self.chan_resv.list(&buf)) |e| {
                     var line_buf: [768]u8 = undefined;
-                    const ln = std.fmt.bufPrint(&line_buf, ":" ++ server_name ++ " NOTICE {s} :RESV {s} :{s}\r\n", .{ nick, e.pattern, e.reason }) catch continue;
+                    const ln = std.fmt.bufPrint(&line_buf, ":{s} NOTICE {s} :RESV {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, e.pattern, e.reason }) catch continue;
                     try appendToConn(conn, ln);
                 }
                 var eb: [128]u8 = undefined;
-                const endl = std.fmt.bufPrint(&eb, ":" ++ server_name ++ " NOTICE {s} :End of RESV list\r\n", .{nick}) catch return;
+                const endl = std.fmt.bufPrint(&eb, ":{s} NOTICE {s} :End of RESV list\r\n", .{ protocol_inventory.currentServerName(), nick}) catch return;
                 try appendToConn(conn, endl);
             },
             .sweep => {
                 const n = self.chan_resv.sweep(self.nowMs());
                 var nb: [256]u8 = undefined;
-                const nl = std.fmt.bufPrint(&nb, ":" ++ server_name ++ " NOTICE {s} :RESV swept {d} expired\r\n", .{ nick, n }) catch return;
+                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :RESV swept {d} expired\r\n", .{ protocol_inventory.currentServerName(), nick, n }) catch return;
                 try appendToConn(conn, nl);
             },
         }
@@ -7080,7 +7079,7 @@ pub const LinuxServer = struct {
             return;
         }
         var buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}o {s}\r\n", .{ server_name, channel, if (adding) "+" else "-", nick }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} {s}o {s}\r\n", .{ self.serverName(), channel, if (adding) "+" else "-", nick }) catch return;
         try self.broadcastChannel(channel, line, null);
     }
 
@@ -7091,7 +7090,7 @@ pub const LinuxServer = struct {
         }
         try self.world.setTopic(channel, topic);
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ server_name, channel, topic }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ self.serverName(), channel, topic }) catch return;
         try self.broadcastChannel(channel, line, null);
     }
 
@@ -7178,7 +7177,7 @@ pub const LinuxServer = struct {
         for (plan) |entry| {
             const twid = self.world.findNick(entry.nick) orelse continue;
             var line_buf: [default_reply_bytes]u8 = undefined;
-            const line = svc_masskick.formatKickLine(server_name, entry, &line_buf) catch continue;
+            const line = svc_masskick.formatKickLine(protocol_inventory.currentServerName(), entry, &line_buf) catch continue;
             self.broadcastChannel(req.channel, line, null) catch {};
             self.world.part(req.channel, twid) catch {};
             kicked += 1;
@@ -7217,7 +7216,7 @@ pub const LinuxServer = struct {
                     return;
                 };
                 var buf: [128]u8 = undefined;
-                const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} +{c}\r\n", .{ server_name, a.channel, a.mode_letter }) catch return;
+                const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} +{c}\r\n", .{ self.serverName(), a.channel, a.mode_letter }) catch return;
                 try self.broadcastChannel(a.channel, line, null);
             },
             .cancel => |c| {
@@ -7833,21 +7832,21 @@ pub const LinuxServer = struct {
     fn propEmitBuiltin(conn: *ConnState, entity: ircx_prop_store.Entity, key: []const u8, value: []const u8) !void {
         var buf: [default_reply_bytes]u8 = undefined;
         const ev = ircx_prop_store.EntryView{ .entity = entity, .key = key, .value = value, .owner = "*", .access = .user };
-        const line = ircx_prop_store.buildPropListReply(server_name, conn.session.displayName(), ev, &buf) catch return;
+        const line = ircx_prop_store.buildPropListReply(protocol_inventory.currentServerName(), conn.session.displayName(), ev, &buf) catch return;
         try appendToConn(conn, line);
         try appendToConn(conn, "\r\n");
     }
 
     fn propEmitEntry(conn: *ConnState, entry: ircx_prop_store.EntryView) !void {
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = ircx_prop_store.buildPropListReply(server_name, conn.session.displayName(), entry, &buf) catch return;
+        const line = ircx_prop_store.buildPropListReply(protocol_inventory.currentServerName(), conn.session.displayName(), entry, &buf) catch return;
         try appendToConn(conn, line);
         try appendToConn(conn, "\r\n");
     }
 
     fn propEmitEnd(conn: *ConnState, entity: ircx_prop_store.Entity) !void {
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = ircx_prop_store.buildPropEndReply(server_name, conn.session.displayName(), entity, &buf) catch return;
+        const line = ircx_prop_store.buildPropEndReply(protocol_inventory.currentServerName(), conn.session.displayName(), entity, &buf) catch return;
         try appendToConn(conn, line);
         try appendToConn(conn, "\r\n");
     }
@@ -8096,7 +8095,7 @@ pub const LinuxServer = struct {
         // Announce the founder grant to the channel (server-sourced MODE +Q nick).
         var line_buf: [default_reply_bytes]u8 = undefined;
         const nick = conn.session.displayName();
-        const msg = try formatMessage(&line_buf, server_name, "MODE", &.{ channel, "+Q", nick }, null);
+        const msg = try formatMessage(&line_buf, self.serverName(), "MODE", &.{ channel, "+Q", nick }, null);
         try self.broadcastChannel(channel, msg, null);
         try self.sendTopicReply(conn, channel);
         try self.sendNames(conn, channel);
@@ -8208,7 +8207,7 @@ pub const LinuxServer = struct {
             parsed.paramSlice()[0]
         else
             "HELP";
-        const reply = help_db.buildHelpLookupReply(self.allocator, server_name, conn.session.displayName(), topic) catch return;
+        const reply = help_db.buildHelpLookupReply(self.allocator, self.serverName(), conn.session.displayName(), topic) catch return;
         defer self.allocator.free(reply);
         try appendToConn(conn, reply);
     }
@@ -8348,7 +8347,7 @@ pub const LinuxServer = struct {
             .account = conn.session.account(),
             .host = conn.session.host(),
             .network = protocol_inventory.currentNetworkName(),
-            .server = server_name,
+            .server = self.serverName(),
             .version = server_version,
             .time = formatServerTime(&time_buf),
             .users = self.countRegisteredUsers(),
@@ -8375,7 +8374,7 @@ pub const LinuxServer = struct {
         var out_buf: [8192]u8 = undefined;
         var lines_buf: [64]motd.MotdLine = undefined;
         var sink = motd.MotdLineSink{ .lines = &lines_buf };
-        motd.writeMotdRepliesForRequester(&out_buf, server_name, conn.session.displayName(), line_slices[0..n], &sink) catch return;
+        motd.writeMotdRepliesForRequester(&out_buf, self.serverName(), conn.session.displayName(), line_slices[0..n], &sink) catch return;
         for (sink.slice()) |line| {
             try appendToConn(conn, line.bytes);
             try appendToConn(conn, "\r\n");
@@ -8397,7 +8396,7 @@ pub const LinuxServer = struct {
         var lines_buf: [4]serverinfo.ReplyLine = undefined;
         var sink = serverinfo.ReplyLineSink{ .lines = &lines_buf };
         serverinfo.writeAdminReplies(&out_buf, .{ .server_name = self.serverName(), .requester = conn.session.displayName() }, .{
-            .reply_server = server_name,
+            .reply_server = protocol_inventory.currentServerName(),
             .location1 = self.config.admin_location,
             .email = self.config.admin_email,
         }, &sink) catch return;
@@ -8470,7 +8469,7 @@ pub const LinuxServer = struct {
         conn.nick_claimed_at_ms = self.nowMs();
         var b: [default_reply_bytes]u8 = undefined;
         const secs: u64 = @intCast(@divFloor(self.config.nick_grace_ms, 1000));
-        const note = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :Nick {s} is registered — IDENTIFY within {d}s or you'll be renamed to a Guest nick.\r\n", .{ server_name, nick, nick, secs }) catch return;
+        const note = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :Nick {s} is registered — IDENTIFY within {d}s or you'll be renamed to a Guest nick.\r\n", .{ self.serverName(), nick, nick, secs }) catch return;
         appendToConn(conn, note) catch {};
     }
 
@@ -8504,7 +8503,7 @@ pub const LinuxServer = struct {
                 const mm = self.world.memberModes(entry.key_ptr.*, wid) orelse world_model.MemberModes.empty();
                 if (!mm.isOperator()) {
                     var nb: [default_reply_bytes]u8 = undefined;
-                    const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Cannot change nick while on {s} (+N)\r\n", .{ server_name, old, entry.key_ptr.* }) catch return;
+                    const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Cannot change nick while on {s} (+N)\r\n", .{ self.serverName(), old, entry.key_ptr.* }) catch return;
                     try appendToConn(conn, note);
                     return;
                 }
@@ -8699,7 +8698,7 @@ pub const LinuxServer = struct {
             .privilege_bits = privileges.toBits(),
             .class = class_name,
             .title = title,
-            .issuer_node = server_name,
+            .issuer_node = protocol_inventory.currentServerName(),
             .incarnation = self.grant_incarnation,
             .issued_ms = now,
             .expiry_ms = now + oper_grant_ttl_ms,
@@ -8712,7 +8711,7 @@ pub const LinuxServer = struct {
         var buf: [oper_cred_share.max_grant_len]u8 = undefined;
         const n = oper_cred_share.sign(kp, fields, &buf) catch return;
         self.broadcastOperGrant(buf[0..n]);
-        self.logMeshEvent(.oper_grant_out, account, server_name);
+        self.logMeshEvent(.oper_grant_out, account, self.serverName());
     }
 
     /// Broadcast a signed oper grant to every established **secured** peer. The
@@ -8790,9 +8789,9 @@ pub const LinuxServer = struct {
             c.session.clearOper();
             var msg_buf: [default_reply_bytes]u8 = undefined;
             const nick = c.session.displayName();
-            const msg = formatMessage(&msg_buf, server_name, "MODE", &.{ nick, "-o" }, null) catch continue;
+            const msg = formatMessage(&msg_buf, self.serverName(), "MODE", &.{ nick, "-o" }, null) catch continue;
             appendToConn(c, msg) catch {};
-            appendToConn(c, ":" ++ server_name ++ " NOTICE * :Your operator authority has been revoked.\r\n") catch {};
+            emitServerLine(c, "NOTICE * :Your operator authority has been revoked.");
             self.armSendIfNeeded(c) catch {};
         }
     }
@@ -9000,7 +8999,7 @@ pub const LinuxServer = struct {
         loginSession(conn, account);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ server_name, account }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ self.serverName(), account }) catch return;
         try appendToConn(conn, line);
         // Optional email verification: when a real contact is supplied (not "*"),
         // issue a token the user confirms with VERIFY. The account is usable
@@ -9040,7 +9039,7 @@ pub const LinuxServer = struct {
         loginSession(conn, account);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ server_name, conn.session.displayName(), account }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
         try appendToConn(conn, line);
         try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
@@ -9067,10 +9066,10 @@ pub const LinuxServer = struct {
         if (was_oper) {
             conn.session.clearOper();
             const nick = conn.session.displayName();
-            const mode = std.fmt.bufPrint(&buf, ":{s} MODE {s} :-o\r\n", .{ server_name, nick }) catch return;
+            const mode = std.fmt.bufPrint(&buf, ":{s} MODE {s} :-o\r\n", .{ self.serverName(), nick }) catch return;
             try appendToConn(conn, mode);
         }
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ server_name, conn.session.displayName() }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -9087,7 +9086,7 @@ pub const LinuxServer = struct {
             return;
         };
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ server_name, conn.session.displayName(), account }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -9107,7 +9106,7 @@ pub const LinuxServer = struct {
         };
         const info = result.account_info;
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ server_name, conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ self.serverName(), conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -9119,13 +9118,13 @@ pub const LinuxServer = struct {
         else
             "(none configured)";
         var buf: [default_reply_bytes]u8 = undefined;
-        const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :SASL mechanisms: {s}\r\n", .{ server_name, conn.session.displayName(), mechs }) catch return;
+        const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :SASL mechanisms: {s}\r\n", .{ self.serverName(), conn.session.displayName(), mechs }) catch return;
         try appendToConn(conn, m);
         var buf2: [default_reply_bytes]u8 = undefined;
         const status = if (conn.session.account()) |acct|
-            std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are logged in as {s}\r\n", .{ server_name, conn.session.displayName(), acct }) catch return
+            std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are logged in as {s}\r\n", .{ self.serverName(), conn.session.displayName(), acct }) catch return
         else
-            std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are not logged in\r\n", .{ server_name, conn.session.displayName() }) catch return;
+            std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are not logged in\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
         try appendToConn(conn, status);
     }
 
@@ -9138,7 +9137,7 @@ pub const LinuxServer = struct {
         const fp = conn.session.tls_certfp orelse return self.failReply(conn, "CERTADD", "NO_CLIENT_CERT", "No TLS client certificate presented on this connection");
         svc.bindCertfp(account, fp) catch return self.failReply(conn, "CERTADD", "CERT_ADD_FAILED", "Could not bind certificate");
         var buf: [default_reply_bytes]u8 = undefined;
-        const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Certificate fingerprint {s} bound to {s}\r\n", .{ server_name, conn.session.displayName(), fp, account }) catch return;
+        const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Certificate fingerprint {s} bound to {s}\r\n", .{ self.serverName(), conn.session.displayName(), fp, account }) catch return;
         try appendToConn(conn, m);
     }
 
@@ -9170,7 +9169,7 @@ pub const LinuxServer = struct {
             return;
         };
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} updated ({s})\r\n", .{ server_name, conn.session.displayName(), account, p[2] }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} updated ({s})\r\n", .{ self.serverName(), conn.session.displayName(), account, p[2] }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -9192,7 +9191,7 @@ pub const LinuxServer = struct {
         if (self.world.findNick(target)) |wid| {
             if (self.rx().clients.get(clientIdFromWorld(wid))) |victim| {
                 if (!victim.closing) {
-                    const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Ghosted by {s}\r\n", .{ server_name, conn.session.displayName() }) catch return;
+                    const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Ghosted by {s}\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
                     appendToConn(victim, ln) catch {};
                     victim.close_reason = "Ghosted";
                     victim.closing = true;
@@ -9200,7 +9199,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Ghost session for {s} removed\r\n", .{ server_name, conn.session.displayName(), target }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Ghost session for {s} removed\r\n", .{ self.serverName(), conn.session.displayName(), target }) catch return;
         try appendToConn(conn, line);
     }
 
@@ -9208,7 +9207,7 @@ pub const LinuxServer = struct {
     /// real server NOTICEs — Orochi has NO pseudo-clients).
     fn channelNotice(conn: *ConnState, comptime fmt: []const u8, args: anytype) !void {
         var buf: [default_reply_bytes]u8 = undefined;
-        const head = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :", .{ server_name, conn.session.displayName() }) catch return;
+        const head = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :", .{ protocol_inventory.currentServerName(), conn.session.displayName() }) catch return;
         try appendToConn(conn, head);
         var body: [default_reply_bytes]u8 = undefined;
         const msg = std.fmt.bufPrint(&body, fmt ++ "\r\n", args) catch return;
@@ -9363,7 +9362,7 @@ pub const LinuxServer = struct {
         const fields = session_reclaim_mesh.ReclaimFields{
             .account = account,
             .session_id = session_id,
-            .origin_node = server_name,
+            .origin_node = protocol_inventory.currentServerName(),
             .issued_ms = now,
             .expiry_ms = now + mesh_reclaim_ttl_ms,
             .nonce = nonce,
@@ -9404,14 +9403,14 @@ pub const LinuxServer = struct {
             for (self.sessions.sessions(account)) |s| {
                 if (s.client != cid) continue;
                 const hex = std.fmt.bytesToHex(s.token, .lower);
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION TOKEN :{s}\r\n", .{ server_name, hex }) catch return;
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION TOKEN :{s}\r\n", .{ self.serverName(), hex }) catch return;
                 try appendToConn(conn, line);
                 // Also offer a mesh-sealed token usable to reclaim/redirect from
                 // ANY node in the mesh (only when a mesh shared key is set).
                 var mbuf: [1024]u8 = undefined;
                 if (self.meshReclaimToken(account, &hex, &mbuf)) |mhex| {
                     var lb: [1152]u8 = undefined;
-                    const mline = std.fmt.bufPrint(&lb, ":{s} NOTE SESSION MTOKEN :{s}\r\n", .{ server_name, mhex }) catch return;
+                    const mline = std.fmt.bufPrint(&lb, ":{s} NOTE SESSION MTOKEN :{s}\r\n", .{ self.serverName(), mhex }) catch return;
                     try appendToConn(conn, mline);
                 }
                 return;
@@ -9425,10 +9424,10 @@ pub const LinuxServer = struct {
             idx += 1;
             const current: []const u8 = if (s.client == cid) "*" else "-";
             const state: []const u8 = if (s.attached) "attached" else "detached";
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION LIST :{s} #{d} signon={d} {s}\r\n", .{ server_name, current, idx, s.signon_ms, state }) catch continue;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION LIST :{s} #{d} signon={d} {s}\r\n", .{ self.serverName(), current, idx, s.signon_ms, state }) catch continue;
             try appendToConn(conn, line);
         }
-        const end = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION :End of session list\r\n", .{server_name}) catch return;
+        const end = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION :End of session list\r\n", .{protocol_inventory.currentServerName()}) catch return;
         try appendToConn(conn, end);
     }
 
@@ -9464,7 +9463,7 @@ pub const LinuxServer = struct {
         }
         _ = self.sessions.remove(account, ghost); // reclaim consumes the ghost
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{server_name}) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed\r\n", .{protocol_inventory.currentServerName()}) catch return;
         try appendToConn(conn, line);
     }
 
@@ -9513,17 +9512,17 @@ pub const LinuxServer = struct {
                 break;
             }
         }
-        const origin_is_self = std.mem.eql(u8, fields.origin_node, server_name);
+        const origin_is_self = std.mem.eql(u8, fields.origin_node, self.serverName());
         const seen = self.session_reclaim_replay.check(fields.nonce);
         var buf: [default_reply_bytes]u8 = undefined;
         switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, seen, now)) {
             .grant_local => {
                 if (ghost) |g| _ = self.sessions.remove(account, g);
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed (cross-server)\r\n", .{server_name}) catch return;
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed (cross-server)\r\n", .{protocol_inventory.currentServerName()}) catch return;
                 try appendToConn(conn, line);
             },
             .grant_redirect => |node| {
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION REDIRECT :Session lives on {s}; reconnect there to reclaim\r\n", .{ server_name, node }) catch return;
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION REDIRECT :Session lives on {s}; reconnect there to reclaim\r\n", .{ self.serverName(), node }) catch return;
                 try appendToConn(conn, line);
             },
             .deny_expired => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token expired"),
@@ -9555,7 +9554,7 @@ pub const LinuxServer = struct {
             };
             const n = self.tegami.clear(acct);
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Cleared {d} message(s)\r\n", .{ server_name, n }) catch return;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Cleared {d} message(s)\r\n", .{ self.serverName(), n }) catch return;
             try appendToConn(conn, line);
             return;
         }
@@ -9596,11 +9595,11 @@ pub const LinuxServer = struct {
     fn tegamiList(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
         for (self.tegami.pending(account)) |m| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ server_name, m.from, m.text }) catch continue;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ self.serverName(), m.from, m.text }) catch continue;
             try appendToConn(conn, line);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE TEGAMI :End of tegami ({d})\r\n", .{ server_name, self.tegami.count(account) }) catch return;
+        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE TEGAMI :End of tegami ({d})\r\n", .{ self.serverName(), self.tegami.count(account) }) catch return;
         try appendToConn(conn, end);
     }
 
@@ -9611,7 +9610,7 @@ pub const LinuxServer = struct {
         if (msgs.len == 0) return;
         for (msgs) |m| {
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ server_name, m.from, m.text }) catch continue;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :from {s} :{s}\r\n", .{ self.serverName(), m.from, m.text }) catch continue;
             try appendToConn(conn, line);
         }
         _ = self.tegami.clear(account);
@@ -9693,7 +9692,7 @@ pub const LinuxServer = struct {
             self.native_media.setSelection(channel, nick, .{ .max_spatial = max_spatial, .max_temporal = max_temporal });
             var lbuf: [160]u8 = undefined;
             const lline = std.fmt.bufPrint(&lbuf, ":{s} NOTE MEDIA {s} LAYER spatial<={d} temporal<={d}\r\n", .{
-                server_name, channel, max_spatial, max_temporal,
+                protocol_inventory.currentServerName(), channel, max_spatial, max_temporal,
             }) catch return;
             try appendToConn(conn, lline);
             return;
@@ -9755,18 +9754,18 @@ pub const LinuxServer = struct {
             _ = self.transcript.push(channel, nick, text, platform.realtimeMillis()) catch {}; // retention is best-effort
             // Live fan-out (text may contain spaces, so use a trailing `:` param).
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} CAPTION {s} :{s}\r\n", .{ server_name, channel, nick, text }) catch return;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} CAPTION {s} :{s}\r\n", .{ self.serverName(), channel, nick, text }) catch return;
             try self.broadcastChannel(channel, line, null);
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "TRANSCRIPT")) {
             for (self.transcript.recent(channel)) |c| {
                 var buf: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} TRANSCRIPT {s} :{s}\r\n", .{ server_name, channel, c.speaker, c.text }) catch continue;
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} TRANSCRIPT {s} :{s}\r\n", .{ self.serverName(), channel, c.speaker, c.text }) catch continue;
                 try appendToConn(conn, line);
             }
             var end_buf: [default_reply_bytes]u8 = undefined;
-            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of transcript ({d})\r\n", .{ server_name, channel, self.transcript.recent(channel).len }) catch return;
+            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of transcript ({d})\r\n", .{ self.serverName(), channel, self.transcript.recent(channel).len }) catch return;
             try appendToConn(conn, end);
             return;
         }
@@ -9850,9 +9849,9 @@ pub const LinuxServer = struct {
     fn broadcastMediaEvent(self: *LinuxServer, channel: []const u8, verb: []const u8, nick: []const u8, kind: []const u8) !void {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = if (kind.len != 0)
-            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s} {s}\r\n", .{ server_name, channel, verb, nick, kind }) catch return
+            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s} {s}\r\n", .{ self.serverName(), channel, verb, nick, kind }) catch return
         else
-            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s}\r\n", .{ server_name, channel, verb, nick }) catch return;
+            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s}\r\n", .{ self.serverName(), channel, verb, nick }) catch return;
         try self.broadcastChannel(channel, line, null);
     }
 
@@ -9919,7 +9918,7 @@ pub const LinuxServer = struct {
     fn formatMediaCodecLine(buf: []u8, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) ?[]const u8 {
         var w = Buf{ .storage = buf };
         w.append(":") catch return null;
-        w.append(server_name) catch return null;
+        w.append(protocol_inventory.currentServerName()) catch return null;
         w.append(" NOTE MEDIA ") catch return null;
         w.append(channel) catch return null;
         w.appendByte(' ') catch return null;
@@ -9989,7 +9988,7 @@ pub const LinuxServer = struct {
             const cand_host = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
             var tbuf: [400]u8 = undefined;
             const tline = std.fmt.bufPrint(&tbuf, ":{s} NOTE MEDIA {s} TRANSPORT ufrag={s} pwd={s} candidate={s}:{d} srtp={s}\r\n", .{
-                server_name, channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
+                protocol_inventory.currentServerName(), channel, creds.ufragSlice(), creds.pwdSlice(), cand_host, self.media_plane.port, srtp_b64,
             }) catch return;
             try appendToConn(conn, tline);
         }
@@ -10002,7 +10001,7 @@ pub const LinuxServer = struct {
             self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
             var nbuf: [256]u8 = undefined;
             const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=OPVOX/OPVIS\r\n", .{
-                server_name, channel, self.config.media_host, self.native_media.port, stream_id,
+                protocol_inventory.currentServerName(), channel, self.config.media_host, self.native_media.port, stream_id,
             }) catch return;
             try appendToConn(conn, nline);
         }
@@ -10098,7 +10097,7 @@ pub const LinuxServer = struct {
         for (buf_stats[0..n]) |s| {
             var buf: [default_reply_bytes]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} leg=webrtc ice={s} ssrc={x} rx_pkts={d} rx_bytes={d}\r\n", .{
-                server_name, channel, s.name(), if (s.connected) "connected" else "pending", s.ssrc, s.rx_packets, s.rx_bytes,
+                protocol_inventory.currentServerName(), channel, s.name(), if (s.connected) "connected" else "pending", s.ssrc, s.rx_packets, s.rx_bytes,
             }) catch continue;
             try appendToConn(conn, line);
         }
@@ -10108,12 +10107,12 @@ pub const LinuxServer = struct {
         for (native_stats[0..nn]) |s| {
             var buf: [default_reply_bytes]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} STATS {s} leg=native stream={d} rx_pkts={d} rx_bytes={d}\r\n", .{
-                server_name, channel, s.name(), s.stream_id, s.rx_packets, s.rx_bytes,
+                protocol_inventory.currentServerName(), channel, s.name(), s.stream_id, s.rx_packets, s.rx_bytes,
             }) catch continue;
             try appendToConn(conn, line);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of media stats ({d})\r\n", .{ server_name, channel, n + nn }) catch return;
+        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of media stats ({d})\r\n", .{ self.serverName(), channel, n + nn }) catch return;
         try appendToConn(conn, end);
     }
 
@@ -10145,11 +10144,11 @@ pub const LinuxServer = struct {
             const pos = self.media_rooms.positionOf(channel, p.id.slice());
             const hand: []const u8 = if (self.media_rooms.handRaised(channel, p.id.slice())) "hand" else "-";
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s} {d} {d} {s}\r\n", .{ server_name, channel, p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} ROSTER {s} {s} {s} {d} {d} {s}\r\n", .{ self.serverName(), channel, p.id.slice(), kinds_buf[0..n], breakout, pos.x, pos.y, hand }) catch continue;
             try appendToConn(conn, line);
         }
         var end_buf: [default_reply_bytes]u8 = undefined;
-        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of roster ({d})\r\n", .{ server_name, channel, self.media_rooms.roster(channel).len }) catch return;
+        const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE MEDIA {s} :End of roster ({d})\r\n", .{ self.serverName(), channel, self.media_rooms.roster(channel).len }) catch return;
         try appendToConn(conn, end);
     }
 
@@ -10165,11 +10164,11 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
             var buf: [default_reply_bytes]u8 = undefined;
             for (self.content_filter.list(), 0..) |p, i| {
-                const line = std.fmt.bufPrint(&buf, ":{s} NOTE FILTER LIST :#{d} {s}\r\n", .{ server_name, i + 1, p }) catch continue;
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE FILTER LIST :#{d} {s}\r\n", .{ self.serverName(), i + 1, p }) catch continue;
                 try appendToConn(conn, line);
             }
             var end_buf: [default_reply_bytes]u8 = undefined;
-            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE FILTER :End of filter list ({d})\r\n", .{ server_name, self.content_filter.list().len }) catch return;
+            const end = std.fmt.bufPrint(&end_buf, ":{s} NOTE FILTER :End of filter list ({d})\r\n", .{ self.serverName(), self.content_filter.list().len }) catch return;
             try appendToConn(conn, end);
             return;
         }
@@ -10304,7 +10303,7 @@ pub const LinuxServer = struct {
         try self.notifyCommonChannels(id, msg, .chghost, id, conn.session.displayName());
         if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
         var note_buf: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&note_buf, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ server_name, conn.session.displayName(), new_host }) catch return;
+        const note = std.fmt.bufPrint(&note_buf, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ self.serverName(), conn.session.displayName(), new_host }) catch return;
         try appendToConn(conn, note);
     }
 
@@ -10343,7 +10342,7 @@ pub const LinuxServer = struct {
             const pending = self.host_requests.pendingList(&buf) catch &.{};
             for (pending) |r| {
                 var b: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST pending {s} -> {s}\r\n", .{ server_name, conn.session.displayName(), r.account, r.vhost }) catch continue;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST pending {s} -> {s}\r\n", .{ self.serverName(), conn.session.displayName(), r.account, r.vhost }) catch continue;
                 try appendToConn(conn, line);
             }
             try self.noticeTo(conn, "VHOST: end of pending list");
@@ -10388,13 +10387,13 @@ pub const LinuxServer = struct {
         if (conn.session.account()) |account| {
             for (self.guises.personas(account)) |p| {
                 var b: [default_reply_bytes]u8 = undefined;
-                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST persona {s} = {s} ({s})\r\n", .{ server_name, conn.session.displayName(), p.name, p.host, p.source.token() }) catch continue;
+                const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST persona {s} = {s} ({s})\r\n", .{ self.serverName(), conn.session.displayName(), p.name, p.host, p.source.token() }) catch continue;
                 try appendToConn(conn, line);
             }
         }
         for (self.guises.offerList()) |o| {
             var b: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST offer {s} :{s}\r\n", .{ server_name, conn.session.displayName(), o.template, o.label }) catch continue;
+            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST offer {s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), o.template, o.label }) catch continue;
             try appendToConn(conn, line);
         }
         try self.noticeTo(conn, "VHOST: USE <name> to wear a persona, CLAIM <host> for an offer, REQUEST <host> to ask");
@@ -10431,7 +10430,7 @@ pub const LinuxServer = struct {
     pub fn handleVhostOfferList(self: *LinuxServer, conn: *ConnState) !void {
         for (self.guises.offerList()) |o| {
             var b: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST offer {s} :{s}\r\n", .{ server_name, conn.session.displayName(), o.template, o.label }) catch continue;
+            const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :VHOST offer {s} :{s}\r\n", .{ self.serverName(), conn.session.displayName(), o.template, o.label }) catch continue;
             try appendToConn(conn, line);
         }
         try self.noticeTo(conn, "VHOST: end of offer list");
@@ -10503,7 +10502,7 @@ pub const LinuxServer = struct {
         try self.notifyCommonChannels(id, msg, .chghost, id, conn.session.displayName());
         if (conn.session.hasCap(.chghost)) try appendToConn(conn, msg);
         var nb: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ server_name, conn.session.displayName(), new_host }) catch return;
+        const note = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Your host is now {s}\r\n", .{ self.serverName(), conn.session.displayName(), new_host }) catch return;
         try appendToConn(conn, note);
     }
 
@@ -10614,7 +10613,7 @@ pub const LinuxServer = struct {
         server_about.renderInfo(about, &w) catch {};
         const body = w.buffered();
 
-        try queueNumeric(conn, .RPL_INFOSTART, &.{}, server_name);
+        try queueNumeric(conn, .RPL_INFOSTART, &.{}, self.serverName());
         var it = std.mem.splitScalar(u8, body, '\n');
         while (it.next()) |line| {
             // splitScalar yields a trailing empty segment after the final '\n';
@@ -10652,13 +10651,13 @@ pub const LinuxServer = struct {
     pub fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Orochi IRC daemon"}) catch return;
-        try queueNumeric(conn, .RPL_LINKS, &.{ server_name, server_name }, detail);
+        try queueNumeric(conn, .RPL_LINKS, &.{ self.serverName(), protocol_inventory.currentServerName() }, detail);
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const rname = establishedPeerName(entry.value) orelse continue;
             var lbuf: [128]u8 = undefined;
             const ldetail = std.fmt.bufPrint(&lbuf, "1 {s}", .{"Suimyaku peer"}) catch continue;
-            try queueNumeric(conn, .RPL_LINKS, &.{ rname, server_name }, ldetail);
+            try queueNumeric(conn, .RPL_LINKS, &.{ rname, protocol_inventory.currentServerName() }, ldetail);
         }
         try queueNumeric(conn, .RPL_ENDOFLINKS, &.{"*"}, "End of /LINKS list");
     }
@@ -10680,7 +10679,7 @@ pub const LinuxServer = struct {
     pub fn handleMap(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [160]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "{s} [Users: {d}]", .{
-            server_name,
+            protocol_inventory.currentServerName(),
             self.countRegisteredUsers(),
         }) catch return;
         try queueNumeric(conn, .RPL_MAP, &.{}, detail);
@@ -10810,7 +10809,7 @@ pub const LinuxServer = struct {
         const now_split = det.isPartitioned(local_id);
         if (now_split != self.partition_split) {
             self.partition_split = now_split;
-            self.logMeshEvent(if (now_split) .split else .heal, server_name, if (now_split) "lost reachability to part of the mesh" else "regained full mesh reachability");
+            self.logMeshEvent(if (now_split) .split else .heal, self.serverName(), if (now_split) "lost reachability to part of the mesh" else "regained full mesh reachability");
         }
     }
 
@@ -10903,7 +10902,7 @@ pub const LinuxServer = struct {
         }
 
         const snap = mesh_report.MeshSnapshot{
-            .local_node = server_name,
+            .local_node = protocol_inventory.currentServerName(),
             .peers = peers[0..npeer],
             .reachable_nodes = reachable_nodes,
             .partitioned_nodes = partitioned_nodes,
@@ -10965,11 +10964,11 @@ pub const LinuxServer = struct {
         var names: [64][]const u8 = undefined;
         const np = self.collectPeers(&names);
         var routes: [65]route_report.RouteEntry = undefined;
-        routes[0] = .{ .dest = server_name, .next_hop = "", .distance = 0, .reachable = true };
+        routes[0] = .{ .dest = protocol_inventory.currentServerName(), .next_hop = "", .distance = 0, .reachable = true };
         for (names[0..np], 0..) |name, i| {
             routes[i + 1] = .{ .dest = name, .next_hop = name, .distance = 1, .reachable = true };
         }
-        const snap = route_report.RouteSnapshot{ .local_node = server_name, .routes = routes[0 .. np + 1] };
+        const snap = route_report.RouteSnapshot{ .local_node = protocol_inventory.currentServerName(), .routes = routes[0 .. np + 1] };
         var body_buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&body_buf);
         route_report.renderRoutes(snap, &w) catch {};
@@ -10988,7 +10987,7 @@ pub const LinuxServer = struct {
         var names: [63][]const u8 = undefined;
         const np = self.collectPeers(&names);
         var nodes: [64]swim_report.NodeStatus = undefined;
-        nodes[0] = .{ .node = server_name, .health = .alive, .last_ack_ms_ago = 0 };
+        nodes[0] = .{ .node = protocol_inventory.currentServerName(), .health = .alive, .last_ack_ms_ago = 0 };
         for (names[0..np], 0..) |name, i| {
             var rtt: u32 = 0;
             var idle: u64 = 0;
@@ -10998,7 +10997,7 @@ pub const LinuxServer = struct {
             }
             nodes[i + 1] = .{ .node = name, .health = .alive, .last_ack_ms_ago = idle, .rtt_ms = rtt };
         }
-        const snap = swim_report.HealthSnapshot{ .local_node = server_name, .nodes = nodes[0 .. np + 1] };
+        const snap = swim_report.HealthSnapshot{ .local_node = protocol_inventory.currentServerName(), .nodes = nodes[0 .. np + 1] };
         var body_buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&body_buf);
         swim_report.renderHealth(snap, &w) catch {};
@@ -11846,7 +11845,7 @@ pub const LinuxServer = struct {
         var sink = names_reply.NamesLineSink{ .lines = &lines_buf };
         // 353 visibility symbol: '@' for secret (+s), '=' otherwise.
         const channel_status: u8 = if (self.world.channelHasFlag(channel, .secret)) '@' else '=';
-        names_reply.writeNamesReplies(&out_buf, server_name, conn.session.displayName(), channel, channel_status, members_buf[0..count], caps, &sink) catch {
+        names_reply.writeNamesReplies(&out_buf, self.serverName(), conn.session.displayName(), channel, channel_status, members_buf[0..count], caps, &sink) catch {
             // Oversized channel for this single pass: still close the list out.
             try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
             return;
@@ -12016,7 +12015,7 @@ fn monitorNumeric(n: monitor.MonitorNumeric) Numeric {
 fn wasmReplyCb(ctx: *anyopaque, text: []const u8) void {
     const core: *module_core.Core = @ptrCast(@alignCast(ctx));
     var buf: [600]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ server_name, core.conn.session.displayName(), text }) catch return;
+    const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), core.conn.session.displayName(), text }) catch return;
     appendToConn(core.conn, line) catch {};
 }
 fn wasmLogCb(_: *anyopaque, text: []const u8) void {
@@ -12094,7 +12093,7 @@ fn formatNumericLine(
     var code_buf: [3]u8 = undefined;
 
     try out.appendByte(':');
-    try out.append(server_name);
+    try out.append(protocol_inventory.currentServerName());
     try out.appendByte(' ');
     try out.append(formatNumericCode(code, &code_buf));
     try out.appendByte(' ');
@@ -12200,6 +12199,22 @@ fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
 
 /// Parse a dotted-quad IPv4 literal ("a.b.c.d") into 4 octets, or null if it is
 /// not a well-formed IPv4 address.
+/// Emit a server-prefixed control line `:<server_name> <rest>\r\n` to a
+/// connection (pre-disconnect ERROR lines, the revoke NOTICE, etc., which have
+/// no other reply context). Uses the configured per-node server name.
+fn emitServerLine(conn: *ConnState, comptime rest: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, ":{s} " ++ rest ++ "\r\n", .{protocol_inventory.currentServerName()}) catch return;
+    appendToConn(conn, line) catch {};
+}
+
+/// Emit a keepalive `PING :<server_name>\r\n` from this node.
+fn emitPing(conn: *ConnState) void {
+    var buf: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "PING :{s}\r\n", .{protocol_inventory.currentServerName()}) catch return;
+    appendToConn(conn, line) catch {};
+}
+
 /// True if `s` contains a tab or newline (a field separator for the grants file).
 fn hasSep(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, '\t') != null or std.mem.indexOfScalar(u8, s, '\n') != null;
