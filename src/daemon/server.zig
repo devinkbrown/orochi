@@ -4485,7 +4485,8 @@ pub const LinuxServer = struct {
             const mconn = self.connFor(clientIdFromWorld(wid));
             const is_oper = if (mconn) |mc| mc.session.isOper() else false;
             const is_away = if (mconn) |mc| mc.session.awayMessage() != null else false;
-            targets[count] = .{ .nick = nick, .is_oper = is_oper, .is_away = is_away, .user = usernameOf(self, wid), .host = default_host };
+            const vhost = if (mconn) |mc| hostOf(mc) else default_host;
+            targets[count] = .{ .nick = nick, .is_oper = is_oper, .is_away = is_away, .user = usernameOf(self, wid), .host = vhost };
             count += 1;
         }
         var out_buf: [default_reply_bytes]u8 = undefined;
@@ -4560,7 +4561,7 @@ pub const LinuxServer = struct {
             .member = .{
                 .channel = channel,
                 .user = username,
-                .host = default_host,
+                .host = if (mconn) |c| hostOf(c) else default_host,
                 .server = server_name,
                 .nick = nick,
                 .flags = flags_buf[0..fl],
@@ -4604,7 +4605,7 @@ pub const LinuxServer = struct {
                     .client = .{
                         .nick = nick,
                         .user = usernameOf(self, member.*),
-                        .host = default_host,
+                        .host = if (mconn) |c| hostOf(c) else default_host,
                         .server = server_name,
                         .realname = if (mconn) |c| c.session.realname() else nick,
                         .account = if (mconn) |c| c.session.account() else null,
@@ -4624,7 +4625,7 @@ pub const LinuxServer = struct {
                 .client = .{
                     .nick = target,
                     .user = usernameOf(self, wid),
-                    .host = default_host,
+                    .host = if (mconn) |c| hostOf(c) else default_host,
                     .server = server_name,
                     .realname = if (mconn) |c| c.session.realname() else target,
                     .account = if (mconn) |c| c.session.account() else null,
@@ -4754,7 +4755,7 @@ pub const LinuxServer = struct {
         const subject = whois.WhoisSubject{
             .nick = target_nick,
             .user = tconn.session.username(),
-            .host = default_host,
+            .host = hostOf(tconn),
             .realname = tconn.session.realname(),
             .account = tconn.session.account(),
             .away = tconn.session.awayMessage(),
