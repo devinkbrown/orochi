@@ -42,6 +42,7 @@ const ison_userhost = @import("../proto/ison_userhost.zig");
 const lusers = @import("../proto/lusers.zig");
 const motd = @import("../proto/motd.zig");
 const motd_template = @import("../proto/motd_template.zig");
+const weather_units = @import("../proto/weather_units.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
@@ -331,7 +332,9 @@ const server_version = "mizuchi-0.1";
 /// begin right after the prior line so an inactive branch leaves no blank line.
 const default_motd_template =
     "{greeting}, {nick}! Welcome to {network}.\n" ++
-    "You're on {server} ({version}) — {users} users online right now.{if:account}\n" ++
+    "You're on {server} ({version}) — {users} users online right now.{if:weather}\n" ++
+    "Weather — {weather}.{/if}{if:news}\n" ++
+    "Headlines — {news}.{/if}{if:account}\n" ++
     "Signed in as {account}; your services and saved settings are active.{else}\n" ++
     "Tip: register your account to reserve your nick and unlock services.{/if}{if:oper}\n" ++
     "Operator privileges are active on this connection — wield them with care.{/if}{if:secure}{else}\n" ++
@@ -924,6 +927,19 @@ pub const Config = struct {
     /// ADMIN command contact details. Configurable via `[admin] location/email`.
     admin_location: []const u8 = "Mizuchi IRC network",
     admin_email: []const u8 = "admin@mizuchi.local",
+    /// Localized weather for the MOTD `{weather}` placeholder (`[weather]`).
+    /// `weather_source` is a key=value file refreshed by an external updater;
+    /// the daemon reads + localizes it per MOTD request.
+    weather_enabled: bool = false,
+    weather_location: []const u8 = "",
+    weather_country: []const u8 = "",
+    weather_units: []const u8 = "auto",
+    weather_source: []const u8 = "",
+    /// Headlines for the MOTD `{news}` placeholder (`[news]`). `news_source` is
+    /// a one-headline-per-line file; `news_count` are joined into one line.
+    news_enabled: bool = false,
+    news_source: []const u8 = "",
+    news_count: u32 = 3,
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -8045,6 +8061,43 @@ pub const LinuxServer = struct {
     }
 
     /// MOTD (375/372/376).
+    /// Read + localize the configured weather source into `out` for the MOTD
+    /// `{weather}` placeholder; empty on disabled/missing/unreadable source.
+    fn motdWeatherLine(self: *LinuxServer, io: std.Io, out: []u8) []const u8 {
+        if (!self.config.weather_enabled or self.config.weather_source.len == 0) return "";
+        const content = std.Io.Dir.cwd().readFileAlloc(io, self.config.weather_source, self.allocator, .limited(4096)) catch return "";
+        defer self.allocator.free(content);
+        const f = weather_units.parseForecast(content);
+        const country = if (self.config.weather_country.len != 0) self.config.weather_country else f.country;
+        const loc = if (self.config.weather_location.len != 0) self.config.weather_location else f.location;
+        const sys = weather_units.resolveSystem(self.config.weather_units, country);
+        return weather_units.renderLine(out, loc, f.reading, sys);
+    }
+
+    /// Read the configured news source into `out` (first `news_count` non-empty
+    /// headlines joined with " | ") for the MOTD `{news}` placeholder.
+    fn motdNewsLine(self: *LinuxServer, io: std.Io, out: []u8) []const u8 {
+        if (!self.config.news_enabled or self.config.news_source.len == 0) return "";
+        const content = std.Io.Dir.cwd().readFileAlloc(io, self.config.news_source, self.allocator, .limited(8192)) catch return "";
+        defer self.allocator.free(content);
+        var n: u32 = 0;
+        var w: usize = 0;
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |raw| {
+            if (n >= self.config.news_count) break;
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            const sep: []const u8 = if (n == 0) "" else " | ";
+            if (w + sep.len + line.len > out.len) break;
+            @memcpy(out[w..][0..sep.len], sep);
+            w += sep.len;
+            @memcpy(out[w..][0..line.len], line);
+            w += line.len;
+            n += 1;
+        }
+        return out[0..w];
+    }
+
     pub fn handleMotd(self: *LinuxServer, conn: *ConnState) !void {
         // The MOTD is a personalized template: the configured [motd] text, or
         // the built-in default. It is expanded per connection (greeting by time
@@ -8058,6 +8111,17 @@ pub const LinuxServer = struct {
         var time_buf: [64]u8 = undefined;
         const now_ms = platform.realtimeMillis();
         const epoch_s: u64 = @intCast(@max(@as(i64, 0), @divFloor(now_ms, 1000)));
+
+        // Optional localized weather + news, read fresh from their source files.
+        var weather_buf: [256]u8 = undefined;
+        var news_buf: [512]u8 = undefined;
+        var weather_line: []const u8 = "";
+        var news_line: []const u8 = "";
+        if (self.config.crypto_io) |io| {
+            weather_line = self.motdWeatherLine(io, &weather_buf);
+            news_line = self.motdNewsLine(io, &news_buf);
+        }
+
         const vars = motd_template.Vars{
             .nick = conn.session.displayName(),
             .account = conn.session.account(),
@@ -8070,6 +8134,8 @@ pub const LinuxServer = struct {
             .is_oper = conn.session.isOper(),
             .secure = conn.is_tls,
             .hour = @intCast(@mod(@divFloor(epoch_s, 3600), 24)),
+            .weather = weather_line,
+            .news = news_line,
         };
 
         var expanded_buf: [4096]u8 = undefined;

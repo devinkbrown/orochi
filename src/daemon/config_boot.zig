@@ -21,6 +21,14 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.motd.text) |t| out.motd_text_raw = t;
     if (cfg.admin.location.len != 0) out.admin_location = cfg.admin.location;
     if (cfg.admin.email.len != 0) out.admin_email = cfg.admin.email;
+    out.weather_enabled = cfg.weather.enabled;
+    if (cfg.weather.location) |v| out.weather_location = v;
+    if (cfg.weather.country) |v| out.weather_country = v;
+    if (cfg.weather.units) |v| out.weather_units = v;
+    if (cfg.weather.source) |v| out.weather_source = v;
+    out.news_enabled = cfg.news.enabled;
+    if (cfg.news.source) |v| out.news_source = v;
+    out.news_count = cfg.news.count;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;

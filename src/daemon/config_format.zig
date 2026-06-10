@@ -31,6 +31,8 @@ pub const Config = struct {
     network: Network = .{},
     motd: Motd = .{},
     admin: Admin = .{},
+    weather: Weather = .{},
+    news: News = .{},
     listen: Listen = .{},
     opers: []Oper = &.{},
     oper_groups: []OperGroup = &.{},
@@ -70,6 +72,30 @@ pub const Config = struct {
     pub const Admin = struct {
         location: []const u8 = "Mizuchi IRC network",
         email: []const u8 = "admin@mizuchi.local",
+    };
+
+    /// Localized weather for the MOTD `{weather}` placeholder. The daemon reads
+    /// `source` (a key=value file written by an external updater: temp_c,
+    /// wind_kph, precip_mm, desc, location, country) and renders it in the units
+    /// for `units` ("auto" uses `country`/the file's country).
+    pub const Weather = struct {
+        enabled: bool = false,
+        /// Display location override (else the source file's `location`).
+        location: ?[]const u8 = null,
+        /// ISO country code for unit selection (else the file's `country`).
+        country: ?[]const u8 = null,
+        /// Unit override: "auto" | "metric" | "imperial" | "uk".
+        units: ?[]const u8 = null,
+        /// Path to the key=value source file.
+        source: ?[]const u8 = null,
+    };
+
+    /// Headlines for the MOTD `{news}` placeholder. The daemon reads `source`
+    /// (one headline per line) and joins the first `count` into a single line.
+    pub const News = struct {
+        enabled: bool = false,
+        source: ?[]const u8 = null,
+        count: u32 = 3,
     };
 
     pub const Listen = struct {
@@ -275,6 +301,11 @@ pub const Config = struct {
         if (self.motd.text) |value| allocator.free(value);
         allocator.free(self.admin.location);
         allocator.free(self.admin.email);
+        if (self.weather.location) |v| allocator.free(v);
+        if (self.weather.country) |v| allocator.free(v);
+        if (self.weather.units) |v| allocator.free(v);
+        if (self.weather.source) |v| allocator.free(v);
+        if (self.news.source) |v| allocator.free(v);
         allocator.free(self.listen.host);
         allocator.free(self.listen.media_host);
         for (self.opers) |oper| {
@@ -332,6 +363,18 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [admin]
     try setStr(allocator, resolver, doc.getString("admin.location"), &cfg.admin.location);
     try setStr(allocator, resolver, doc.getString("admin.email"), &cfg.admin.email);
+
+    // [weather]
+    if (doc.getBool("weather.enabled")) |b| cfg.weather.enabled = b;
+    try setOpt(allocator, resolver, doc.getString("weather.location"), &cfg.weather.location);
+    try setOpt(allocator, resolver, doc.getString("weather.country"), &cfg.weather.country);
+    try setOpt(allocator, resolver, doc.getString("weather.units"), &cfg.weather.units);
+    try setOpt(allocator, resolver, doc.getString("weather.source"), &cfg.weather.source);
+
+    // [news]
+    if (doc.getBool("news.enabled")) |b| cfg.news.enabled = b;
+    try setOpt(allocator, resolver, doc.getString("news.source"), &cfg.news.source);
+    cfg.news.count = @intCast(try uintField(doc, "news.count", cfg.news.count, 1, 20));
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);

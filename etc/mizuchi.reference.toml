@@ -67,6 +67,37 @@ location = "Mizuchi IRC network"
 email = "admin@mizuchi.local"
 
 
+# --- [weather] — localized weather for the MOTD {weather} placeholder --------
+[weather]
+# When enabled, the daemon reads `source` (refreshed by an external updater) and
+# renders it in the units the region uses (°F/mph for the US, °C/km/h elsewhere,
+# °C/mph for the UK) into the MOTD {weather} variable.
+enabled = false
+# Path to a key=value source file. The updater writes lines like:
+#   location=Austin
+#   country=US
+#   temp_c=22.0
+#   wind_kph=20
+#   desc=Partly cloudy
+# Example updater (cron, every 10 min):
+#   curl -s 'wttr.in/Austin?format=j1' | jq -r ... > /var/lib/mizuchi/weather.kv
+# source = "/var/lib/mizuchi/weather.kv"
+# Override the display location (else the file's `location`).
+# location = "Austin, TX"
+# ISO country code for unit selection (else the file's `country`).
+# country = "US"
+# Unit override: "auto" (default, by country) | "metric" | "imperial" | "uk".
+# units = "auto"
+
+# --- [news] — headlines for the MOTD {news} placeholder ----------------------
+[news]
+enabled = false
+# Path to a file with one headline per line; the first `count` are joined.
+# Example updater: curl an RSS/JSON feed, write headlines, one per line.
+# source = "/var/lib/mizuchi/news.txt"
+count = 3
+
+
 # --- [listen] — listener sockets ---------------------------------------------
 [listen]
 # Bind address for all TCP listeners. Default: "127.0.0.1".

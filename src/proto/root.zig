@@ -293,6 +293,7 @@ pub const utf8_width = @import("utf8_width.zig");
 pub const uuid = @import("uuid.zig");
 pub const varint = @import("varint.zig");
 pub const vp8_payload = @import("vp8_payload.zig");
+pub const weather_units = @import("weather_units.zig");
 pub const websocket_props = @import("websocket_props.zig");
 pub const websocket = @import("websocket.zig");
 pub const webtransport = @import("webtransport.zig");
@@ -608,6 +609,7 @@ test {
     _ = uuid;
     _ = varint;
     _ = vp8_payload;
+    _ = weather_units;
     _ = websocket_props;
     _ = websocket;
     _ = webtransport;

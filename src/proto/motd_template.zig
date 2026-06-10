@@ -35,6 +35,10 @@ pub const Vars = struct {
     secure: bool = false,
     /// Server-local hour [0,23] for the time-of-day `{greeting}`.
     hour: u8 = 12,
+    /// Pre-rendered, locale-correct weather line (empty = unavailable).
+    weather: []const u8 = "",
+    /// Pre-rendered news headline(s) line (empty = unavailable).
+    news: []const u8 = "",
 };
 
 pub const Error = error{ BufTooSmall, MalformedTemplate };
@@ -134,6 +138,8 @@ fn evalCond(cond: []const u8, vars: Vars) bool {
     if (std.mem.eql(u8, cond, "oper")) return vars.is_oper;
     if (std.mem.eql(u8, cond, "account")) return vars.account != null;
     if (std.mem.eql(u8, cond, "secure")) return vars.secure;
+    if (std.mem.eql(u8, cond, "weather")) return vars.weather.len != 0;
+    if (std.mem.eql(u8, cond, "news")) return vars.news.len != 0;
     return false;
 }
 
@@ -157,6 +163,10 @@ fn substitute(key: []const u8, vars: Vars, w: *Writer) Error!bool {
         try w.write(vars.date);
     } else if (std.mem.eql(u8, key, "greeting")) {
         try w.write(greetingFor(vars.hour));
+    } else if (std.mem.eql(u8, key, "weather")) {
+        try w.write(vars.weather);
+    } else if (std.mem.eql(u8, key, "news")) {
+        try w.write(vars.news);
     } else if (std.mem.eql(u8, key, "users")) {
         try w.writeU64(vars.users);
     } else if (std.mem.eql(u8, key, "opers")) {
@@ -239,6 +249,16 @@ test "substitutes known variables" {
 
 test "unknown keys and braces are left verbatim" {
     try expectExpand("a {bogus} b {{lit}} c", .{}, "a {bogus} b {lit} c");
+}
+
+test "weather and news substitute, with conditional gating on presence" {
+    try expectExpand(
+        "{if:account}{account}{else}guest{/if} — {weather}",
+        .{ .account = "alice", .weather = "Austin: 72°F, wind 8 mph" },
+        "alice — Austin: 72°F, wind 8 mph",
+    );
+    // Absent weather/news expand to empty.
+    try expectExpand("[{weather}][{news}]", .{}, "[][]");
 }
 
 test "greeting reflects the hour" {
