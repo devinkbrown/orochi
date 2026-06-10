@@ -92,6 +92,14 @@ fn mesh(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMesh(x.conn, x.parsed);
 }
+fn route(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleRoute(x.conn);
+}
+fn nethealth(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleNethealth(x.conn);
+}
 
 pub const module = registry.Module{
     .id = "oper.security",
@@ -123,5 +131,7 @@ pub const module = registry.Module{
         .{ .name = "DEBUG", .access = .oper, .handler = debug },
         .{ .name = "MESH", .access = .oper, .handler = mesh, .summary = "mesh peer/link health (NETSTAT)" },
         .{ .name = "NETSTAT", .access = .oper, .handler = mesh, .summary = "alias of MESH" },
+        .{ .name = "ROUTE", .access = .oper, .handler = route, .summary = "mesh routing table" },
+        .{ .name = "NETHEALTH", .access = .oper, .handler = nethealth, .summary = "mesh node liveness (SWIM view)" },
     },
 };

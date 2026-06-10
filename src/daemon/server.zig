@@ -45,6 +45,8 @@ const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
+const route_report = @import("../proto/route_report.zig");
+const swim_report = @import("../proto/swim_report.zig");
 const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
 const oper_cred_share = @import("../proto/oper_cred_share.zig");
@@ -9931,6 +9933,81 @@ pub const LinuxServer = struct {
         var body_buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&body_buf);
         mesh_report.renderMesh(snap, &w) catch {};
+        var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try self.noticeTo(conn, line);
+        }
+    }
+
+    /// Collect this node's established S2S peer names into `out`, returning the
+    /// count. Shared by ROUTE and NETHEALTH so they reflect the same live view.
+    fn collectPeers(self: *LinuxServer, out: [][]const u8) usize {
+        var n: usize = 0;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            if (n == out.len) break;
+            const c = entry.value;
+            var name: []const u8 = "";
+            var established = false;
+            if (c.s2s) |l| {
+                name = l.remoteName();
+                established = l.established();
+            } else if (c.s2s_secured) |l| {
+                name = l.remoteName();
+                established = l.established();
+            } else continue;
+            if (!established or name.len == 0) continue;
+            out[n] = name;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// ROUTE — oper view of the mesh routing table: this node (distance 0) plus a
+    /// one-hop route to every established peer. Rendered by the pure route_report
+    /// renderer. Multi-hop routes light up when the route table substrate lands.
+    pub fn handleRoute(self: *LinuxServer, conn: *ConnState) !void {
+        var names: [64][]const u8 = undefined;
+        const np = self.collectPeers(&names);
+        var routes: [65]route_report.RouteEntry = undefined;
+        routes[0] = .{ .dest = server_name, .next_hop = "", .distance = 0, .reachable = true };
+        for (names[0..np], 0..) |name, i| {
+            routes[i + 1] = .{ .dest = name, .next_hop = name, .distance = 1, .reachable = true };
+        }
+        const snap = route_report.RouteSnapshot{ .local_node = server_name, .routes = routes[0 .. np + 1] };
+        var body_buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&body_buf);
+        route_report.renderRoutes(snap, &w) catch {};
+        var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try self.noticeTo(conn, line);
+        }
+    }
+
+    /// NETHEALTH — oper view of mesh node liveness (SWIM-style): this node plus
+    /// each established peer, with link RTT and idle time from the health table.
+    /// Rendered by the pure swim_report renderer.
+    pub fn handleNethealth(self: *LinuxServer, conn: *ConnState) !void {
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        var names: [63][]const u8 = undefined;
+        const np = self.collectPeers(&names);
+        var nodes: [64]swim_report.NodeStatus = undefined;
+        nodes[0] = .{ .node = server_name, .health = .alive, .last_ack_ms_ago = 0 };
+        for (names[0..np], 0..) |name, i| {
+            var rtt: u32 = 0;
+            var idle: u64 = 0;
+            if (self.peer_health.get(name)) |h| {
+                rtt = h.snapshotRtt();
+                idle = h.idleMs(now);
+            }
+            nodes[i + 1] = .{ .node = name, .health = .alive, .last_ack_ms_ago = idle, .rtt_ms = rtt };
+        }
+        const snap = swim_report.HealthSnapshot{ .local_node = server_name, .nodes = nodes[0 .. np + 1] };
+        var body_buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&body_buf);
+        swim_report.renderHealth(snap, &w) catch {};
         var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
