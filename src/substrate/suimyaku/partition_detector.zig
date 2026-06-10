@@ -458,11 +458,125 @@ fn appendUnique(buf: []NodeId, len: usize, id: NodeId) usize {
     return len;
 }
 
+/// Persistent "expected membership" set for partition transition detection.
+///
+/// A live mesh view (assembled from peer registries) self-heals: when a link
+/// drops, the nodes reachable only through it vanish from the current topology,
+/// so a snapshot can never tell a partition apart from a graceful departure.
+/// `SeenSet` remembers every node id observed, with the time it was last seen,
+/// so a node that disappears stays "expected" — and therefore shows up as
+/// unreachable (a split) — until it ages out past a TTL, at which point its
+/// removal heals the view. Fixed-capacity, allocation-free.
+pub fn SeenSet(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        const Entry = struct { node_id: NodeId, last_seen_ms: u64 };
+
+        entries: [cap]Entry = undefined,
+        len: usize = 0,
+
+        /// Record `id` as seen at `now_ms`, refreshing an existing entry or
+        /// inserting a new one (dropped silently when at capacity).
+        pub fn observe(self: *Self, id: NodeId, now_ms: u64) void {
+            for (self.entries[0..self.len]) |*e| {
+                if (e.node_id == id) {
+                    e.last_seen_ms = now_ms;
+                    return;
+                }
+            }
+            if (self.len < cap) {
+                self.entries[self.len] = .{ .node_id = id, .last_seen_ms = now_ms };
+                self.len += 1;
+            }
+        }
+
+        /// Drop entries not seen within `ttl_ms` of `now_ms`, returning the count
+        /// removed. Order is not preserved (swap-remove).
+        pub fn prune(self: *Self, now_ms: u64, ttl_ms: u64) usize {
+            var removed: usize = 0;
+            var i: usize = 0;
+            while (i < self.len) {
+                if (now_ms >= self.entries[i].last_seen_ms +| ttl_ms) {
+                    self.entries[i] = self.entries[self.len - 1];
+                    self.len -= 1;
+                    removed += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            return removed;
+        }
+
+        /// Copy the current node ids into `out`, returning the count written.
+        pub fn ids(self: *const Self, out: []NodeId) usize {
+            var n: usize = 0;
+            for (self.entries[0..self.len]) |e| {
+                if (n == out.len) break;
+                out[n] = e.node_id;
+                n += 1;
+            }
+            return n;
+        }
+
+        pub fn count(self: *const Self) usize {
+            return self.len;
+        }
+    };
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
 
 const testing = std.testing;
+
+test "SeenSet: observe inserts, refreshes, and dedupes" {
+    var s = SeenSet(8){};
+    s.observe(10, 100);
+    s.observe(20, 100);
+    s.observe(10, 200); // refresh, not a new entry
+    try testing.expectEqual(@as(usize, 2), s.count());
+
+    var buf: [8]NodeId = undefined;
+    const n = s.ids(&buf);
+    try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "SeenSet: prune drops entries past the TTL, keeps fresh ones" {
+    var s = SeenSet(8){};
+    s.observe(10, 1_000); // stale at now=10_000 with ttl=5_000
+    s.observe(20, 8_000); // fresh
+    const removed = s.prune(10_000, 5_000);
+    try testing.expectEqual(@as(usize, 1), removed);
+    try testing.expectEqual(@as(usize, 1), s.count());
+
+    var buf: [8]NodeId = undefined;
+    const n = s.ids(&buf);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(NodeId, 20), buf[0]);
+}
+
+test "SeenSet: a dropped node stays known until it ages out, then heals" {
+    // Model the split/heal lifecycle: node 1 (local) stays live and is
+    // re-observed each refresh; node 2 was last seen at t=1000, then dropped.
+    var s = SeenSet(8){};
+    s.observe(1, 1_000);
+    s.observe(2, 1_000);
+    // At t=2000 node 2 is still within TTL -> still "expected" (would be a split
+    // if it is now unreachable). Local node 1 is refreshed as it stays live.
+    s.observe(1, 2_000);
+    try testing.expectEqual(@as(usize, 0), s.prune(2_000, 5_000));
+    try testing.expectEqual(@as(usize, 2), s.count());
+    // Local keeps being refreshed; node 2 is not. At t=7000 node 2 has aged out
+    // (last seen 1000, 7000 >= 6000) -> forgotten, healing the view; node 1
+    // (last seen 6000) survives.
+    s.observe(1, 6_000);
+    try testing.expectEqual(@as(usize, 1), s.prune(7_000, 5_000));
+    try testing.expectEqual(@as(usize, 1), s.count());
+    var buf: [8]NodeId = undefined;
+    try testing.expectEqual(@as(usize, 1), s.ids(&buf));
+    try testing.expectEqual(@as(NodeId, 1), buf[0]);
+}
 
 test "analyze: lone node is fully reachable, no partition" {
     const stats = analyze(1, &.{});
