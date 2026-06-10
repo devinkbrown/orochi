@@ -103,6 +103,7 @@ pub const highlight_words = @import("highlight_words.zig");
 pub const history_optout = @import("history_optout.zig");
 pub const honeypot = @import("honeypot.zig");
 pub const host_request = @import("host_request.zig");
+pub const http_fetch = @import("http_fetch.zig");
 pub const idle_kick = @import("idle_kick.zig");
 pub const invite_token = @import("invite_token.zig");
 pub const ip_reputation = @import("ip_reputation.zig");
@@ -407,6 +408,7 @@ test {
     _ = history_optout;
     _ = honeypot;
     _ = host_request;
+    _ = http_fetch;
     _ = idle_kick;
     _ = invite_token;
     _ = ip_reputation;

@@ -8,7 +8,10 @@ const hash = @import("hash.zig");
 
 pub const MaxDerLen = 1024 * 1024;
 pub const MaxDepth = 16;
-pub const DefaultMaxDnsNames = 16;
+// CDN/shared certs routinely carry many SAN dNSName entries (wildcards for
+// dozens of subdomains), so the default bound is generous enough to parse
+// real-world leaf certificates from public hosts.
+pub const DefaultMaxDnsNames = 192;
 pub const DefaultMaxIpAddresses = 16;
 
 pub const Error = error{

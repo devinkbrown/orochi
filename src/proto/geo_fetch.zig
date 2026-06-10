@@ -122,38 +122,66 @@ pub fn parseWeather(body: []const u8) Error!Weather {
     };
 }
 
-/// Extract up to `out.len` headline titles from an RSS/Atom body. The feed's own
-/// `<title>` (the first one encountered) is skipped. CDATA wrappers are unwrapped
-/// and basic XML entities are NOT decoded (titles are emitted verbatim, trimmed).
-/// Returned slices borrow `body`. Returns the filled prefix of `out`.
+/// Extract up to `out.len` headline titles from an RSS/Atom body. Only the first
+/// `<title>` *inside each `<item>` (RSS) or `<entry>` (Atom)* is taken, so the
+/// channel/feed and `<image>` titles are never mistaken for headlines. CDATA
+/// wrappers are unwrapped; titles are emitted verbatim (trimmed). Returned slices
+/// borrow `body`. Returns the filled prefix of `out`.
 pub fn parseRssTitles(body: []const u8, out: [][]const u8) [][]const u8 {
     var count: usize = 0;
-    var seen_feed_title = false;
     var cursor: usize = 0;
     while (count < out.len) {
-        const open_rel = std.mem.indexOf(u8, body[cursor..], "<title") orelse break;
-        const open = cursor + open_rel;
-        // Skip to the end of the opening tag '>'.
-        const gt_rel = std.mem.indexOfScalar(u8, body[open..], '>') orelse break;
-        const content_start = open + gt_rel + 1;
-        const close_rel = std.mem.indexOf(u8, body[content_start..], "</title>") orelse break;
-        const content_end = content_start + close_rel;
-        cursor = content_end + "</title>".len;
+        // Advance to the next item/entry element.
+        const item = nextItemStart(body, cursor) orelse break;
+        // Bound the search to this item so we take its own <title>, not a later one.
+        const item_end = itemEnd(body, item.content_start);
+        cursor = item_end;
 
-        var title = body[content_start..content_end];
-        title = unwrapCdata(title);
-        title = std.mem.trim(u8, title, " \t\r\n");
-
-        if (!seen_feed_title) {
-            // The first <title> is the channel/feed name; skip it.
-            seen_feed_title = true;
-            continue;
-        }
+        const region = body[item.content_start..item_end];
+        const title = firstTitle(region) orelse continue;
         if (title.len == 0) continue;
         out[count] = title;
         count += 1;
     }
     return out[0..count];
+}
+
+const ItemStart = struct { content_start: usize };
+
+/// Find the next `<item`/`<entry` element opening at or after `from`.
+fn nextItemStart(body: []const u8, from: usize) ?ItemStart {
+    var best: ?usize = null;
+    inline for (.{ "<item", "<entry" }) |tag| {
+        if (std.mem.indexOf(u8, body[from..], tag)) |rel| {
+            const at = from + rel;
+            if (best == null or at < best.?) best = at;
+        }
+    }
+    const open = best orelse return null;
+    const gt_rel = std.mem.indexOfScalar(u8, body[open..], '>') orelse return null;
+    return .{ .content_start = open + gt_rel + 1 };
+}
+
+/// End offset of the item beginning at `start` (its closing tag or EOF).
+fn itemEnd(body: []const u8, start: usize) usize {
+    var end = body.len;
+    inline for (.{ "</item>", "</entry>" }) |tag| {
+        if (std.mem.indexOf(u8, body[start..], tag)) |rel| {
+            const at = start + rel;
+            if (at < end) end = at;
+        }
+    }
+    return end;
+}
+
+/// First `<title>...</title>` content within `region`, CDATA-unwrapped + trimmed.
+fn firstTitle(region: []const u8) ?[]const u8 {
+    const open = std.mem.indexOf(u8, region, "<title") orelse return null;
+    const gt_rel = std.mem.indexOfScalar(u8, region[open..], '>') orelse return null;
+    const content_start = open + gt_rel + 1;
+    const close_rel = std.mem.indexOf(u8, region[content_start..], "</title>") orelse return null;
+    const raw = region[content_start .. content_start + close_rel];
+    return std.mem.trim(u8, unwrapCdata(std.mem.trim(u8, raw, " \t\r\n")), " \t\r\n");
 }
 
 // ---- internals --------------------------------------------------------------
