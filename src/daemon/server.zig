@@ -45,6 +45,7 @@ const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
+const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
 const oper_cred_share = @import("../proto/oper_cred_share.zig");
 const invite = @import("../proto/invite.zig");
@@ -1296,6 +1297,9 @@ pub const LinuxServer = struct {
     /// Recent mesh events (peer up/down, oper grant, …) for the `MESH LOG` oper
     /// audit view. Bounded ring; oldest entries roll off.
     mesh_log: mesh_event_log.MeshEventLog(128) = .{},
+    /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
+    /// keyed by remote server name, surfaced in the MESH peer table.
+    peer_health: link_health_mod.Registry = .{},
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Mizuchi media SFU control plane): who is in each call.
@@ -2529,7 +2533,9 @@ pub const LinuxServer = struct {
         if (!was and link.established()) {
             self.traceLog(.info, .s2s, "s2s secured link established");
             self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
+            self.markPeerHealth(link.remoteName(), .established);
         }
+        if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
         // Drain inbound cross-node user messages over the secured link.
         if (link.takeInbound()) |inbound| {
             for (inbound) |*owned| {
@@ -2552,7 +2558,10 @@ pub const LinuxServer = struct {
             conn.closing = true;
             return;
         };
-        if (!was and link.established()) self.logMeshEvent(.peer_up, link.remoteName(), "link established");
+        if (!was and link.established()) {
+            self.logMeshEvent(.peer_up, link.remoteName(), "link established");
+            self.markPeerHealth(link.remoteName(), .established);
+        }
         const out = link.outbound();
         if (out.len != 0) {
             appendToConn(conn, out) catch {
@@ -2561,6 +2570,7 @@ pub const LinuxServer = struct {
             };
             link.clearOutbound();
         }
+        if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
         // Drain inbound cross-node user messages and deliver to local clients.
         if (link.takeInbound()) |inbound| {
             for (inbound) |*owned| {
@@ -3028,7 +3038,10 @@ pub const LinuxServer = struct {
         if (self.rx().clients.get(id)) |conn| {
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
-                if (link.remoteName().len != 0) self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
+                if (link.remoteName().len != 0) {
+                    self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
+                    _ = self.peer_health.remove(link.remoteName());
+                }
                 self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 link.deinit();
                 self.allocator.destroy(link);
@@ -3039,7 +3052,10 @@ pub const LinuxServer = struct {
                 return;
             }
             if (conn.s2s) |link| {
-                if (link.remoteName().len != 0) self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
+                if (link.remoteName().len != 0) {
+                    self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
+                    _ = self.peer_health.remove(link.remoteName());
+                }
                 self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 link.deinit();
                 self.allocator.destroy(link);
@@ -9826,10 +9842,29 @@ pub const LinuxServer = struct {
         });
     }
 
+    /// Mark a peer's link state in the health table (best-effort). Used at the
+    /// S2S establish/drop transitions so MESH shows accurate state + uptime.
+    fn markPeerHealth(self: *LinuxServer, name: []const u8, state: link_health_mod.PeerState) void {
+        if (name.len == 0) return;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const h = self.peer_health.upsert(name, now) catch return;
+        h.transition(state, now);
+    }
+
+    /// Account inbound/outbound bytes for a peer link (best-effort), feeding the
+    /// MESH throughput columns. No-op when the peer has no health entry yet.
+    fn accountPeerBytes(self: *LinuxServer, name: []const u8, in_bytes: u64, out_bytes: u64) void {
+        if (name.len == 0) return;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const h = self.peer_health.get(name) orelse return;
+        if (in_bytes != 0) h.addIn(in_bytes, now);
+        if (out_bytes != 0) h.addOut(out_bytes, now);
+    }
+
     /// MESH (a.k.a. NETSTAT) — oper view of server-to-server mesh health,
-    /// rendered by the pure `mesh_report` renderer from live S2S link state.
-    /// Per-peer RTT/byte counters surface once the link-health tracker is wired;
-    /// today they show as zero. Operator-gated by the registry (access=.oper).
+    /// rendered by the pure `mesh_report` renderer from live S2S link state,
+    /// enriched with per-peer link health (RTT, byte counters, time-in-state)
+    /// from the live health table. Operator-gated by the registry (access=.oper).
     pub fn handleMesh(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         // `MESH LOG` renders the recent mesh-event audit ring instead of peers.
         if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "LOG")) {
@@ -9861,11 +9896,21 @@ pub const LinuxServer = struct {
                 established = link.established();
             } else continue;
             if (name.len == 0) continue;
-            peers[npeer] = .{
+            var peer = mesh_report.PeerLink{
                 .name = name,
                 .state = if (established) .established else .handshaking,
                 .hops = 1,
             };
+            // Enrich with live link health (rtt, bytes, time-in-state) when known.
+            if (self.peer_health.get(name)) |h| {
+                const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+                peer.rtt_ms = h.snapshotRtt();
+                peer.bytes_in = h.bytes_in;
+                peer.bytes_out = h.bytes_out;
+                const now_unix = @divTrunc(platform.realtimeMillis(), 1000);
+                peer.since_unix = now_unix - @as(i64, @intCast(h.since(now) / 1000));
+            }
+            peers[npeer] = peer;
             npeer += 1;
         }
 
