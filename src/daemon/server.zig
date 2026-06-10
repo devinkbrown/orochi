@@ -844,9 +844,47 @@ pub const ServerError = error{
     TooManyParams,
 } || world_model.WorldError || std.mem.Allocator.Error;
 
+/// Build a config-driven ISUPPORT token list: a copy of the static defaults
+/// with the length tokens (TOPICLEN) replaced by their configured values. The
+/// returned slice and its dynamic entries are owned by `allocator`; install via
+/// `protocol_inventory.setIsupportOverride` and free with `freeIsupportTokens`.
+pub fn buildIsupportTokens(allocator: std.mem.Allocator, topiclen: u32) ![]const []const u8 {
+    const base = protocol_inventory.isupport_tokens;
+    const out = try allocator.alloc([]const u8, base.len);
+    errdefer allocator.free(out);
+    for (base, 0..) |tok, i| {
+        if (std.mem.startsWith(u8, tok, "TOPICLEN=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "TOPICLEN={d}", .{topiclen});
+        } else {
+            out[i] = tok; // static comptime data; borrowed, not freed
+        }
+    }
+    return out;
+}
+
+/// Free a token list built by `buildIsupportTokens`: the dynamic (allocPrint'd)
+/// entries — identified as those NOT pointing into the static defaults — then
+/// the slice itself.
+pub fn freeIsupportTokens(allocator: std.mem.Allocator, tokens: []const []const u8) void {
+    for (tokens) |tok| {
+        var is_static = false;
+        for (protocol_inventory.isupport_tokens) |s| {
+            if (tok.ptr == s.ptr) {
+                is_static = true;
+                break;
+            }
+        }
+        if (!is_static) allocator.free(tok);
+    }
+    allocator.free(tokens);
+}
+
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16,
+    /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
+    /// enforced by handleTopic). Configurable via `[limits] topiclen`.
+    topiclen: u32 = 390,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -7894,7 +7932,7 @@ pub const LinuxServer = struct {
         // Conventional ircd behaviour: VERSION re-advertises ISUPPORT (005) so a
         // client can refresh feature support without reconnecting. Mirrors the
         // single-line token set emitted at registration.
-        try queueNumeric(conn, .RPL_ISUPPORT, &protocol_inventory.isupport_tokens, "are supported by this server");
+        try queueNumeric(conn, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
     }
 
     /// NICK <newnick> — registered nick change. Validates, rejects collisions
@@ -10791,10 +10829,11 @@ pub const LinuxServer = struct {
             return;
         }
 
-        // Cap the topic at TOPICLEN (advertised in ISUPPORT). Truncate on a UTF-8
-        // codepoint boundary so the stored topic stays valid under UTF8ONLY, and
-        // broadcast the truncated form so every member sees the same text.
-        const text = utf8TruncateBytes(parsed.paramSlice()[1], topic_len_max);
+        // Cap the topic at the configured TOPICLEN (advertised in ISUPPORT).
+        // Truncate on a UTF-8 codepoint boundary so the stored topic stays valid
+        // under UTF8ONLY, and broadcast the truncated form so every member sees
+        // the same text.
+        const text = utf8TruncateBytes(parsed.paramSlice()[1], self.config.topiclen);
         try self.world.setTopic(channel, text);
 
         var prefix_buf: [256]u8 = undefined;
@@ -10802,9 +10841,6 @@ pub const LinuxServer = struct {
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "TOPIC", &.{channel}, text);
         try self.broadcastChannel(channel, msg, null);
     }
-
-    /// Maximum stored topic length in bytes (advertised as TOPICLEN).
-    const topic_len_max: usize = 390;
 
     /// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint:
     /// if the cut would land inside a multibyte sequence, back off to its start.
@@ -12740,6 +12776,20 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     // Too few params → FAIL CHATHISTORY NEED_MORE_PARAMS, never silence.
     try writeAllFd(fd_a, "CHATHISTORY LATEST\r\n");
     try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
+}
+
+test "buildIsupportTokens replaces TOPICLEN with the configured value" {
+    const tokens = try buildIsupportTokens(std.testing.allocator, 512);
+    defer freeIsupportTokens(std.testing.allocator, tokens);
+
+    var found = false;
+    for (tokens) |tok| {
+        if (std.mem.eql(u8, tok, "TOPICLEN=512")) found = true;
+        // static tokens carry through unchanged.
+        if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
+    }
+    try std.testing.expect(found);
+    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 
 test "utf8TruncateBytes caps length without splitting a codepoint" {

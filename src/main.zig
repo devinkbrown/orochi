@@ -126,6 +126,12 @@ pub fn main(init: std.process.Init) !void {
     // tokens, etc.); PQ-secured S2S below is the only feature gated on a key.
     srv_cfg.crypto_io = init.io;
 
+    // Advertise config-driven length limits (TOPICLEN) in ISUPPORT. Built once
+    // here, before any connection is served; owned for the process lifetime.
+    if (mizuchi.daemon.server.buildIsupportTokens(allocator, srv_cfg.topiclen)) |tokens| {
+        mizuchi.proto.protocol_inventory.setIsupportOverride(tokens);
+    } else |_| {}
+
     // PQ-secured S2S: if the config supplies node.secret_key, derive this node's
     // Tsumugi identity and enable the secured handshake (TOFU) on S2S links. The
     // identity outlives the server (the server borrows a pointer to it). Without a

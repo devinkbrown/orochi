@@ -35,6 +35,23 @@ pub const isupport_tokens = [_][]const u8{
     "UTF8ONLY",
 };
 
+/// Runtime override for the advertised ISUPPORT tokens, built from config at
+/// boot (limits like TOPICLEN). Null = the static defaults above. Written once
+/// before any connection is served and read-only thereafter, so it needs no
+/// synchronization. Tests that never set it keep the static defaults.
+var isupport_override: ?[]const []const u8 = null;
+
+/// The ISUPPORT tokens to advertise: the config-built override if set, else the
+/// static defaults.
+pub fn currentIsupport() []const []const u8 {
+    return isupport_override orelse &isupport_tokens;
+}
+
+/// Install (or clear with null) the config-driven ISUPPORT token override.
+pub fn setIsupportOverride(slice: ?[]const []const u8) void {
+    isupport_override = slice;
+}
+
 test "isupport tokens are well-formed key[=value] pairs" {
     for (isupport_tokens) |token| {
         try std.testing.expect(token.len > 0);

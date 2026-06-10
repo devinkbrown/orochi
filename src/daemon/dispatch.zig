@@ -1486,7 +1486,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     try replies.numeric(session, .RPL_YOURHOST, &.{}, "Your host is mizuchi.local, running Mizuchi");
     try replies.numeric(session, .RPL_CREATED, &.{}, "This server was created for deterministic tests");
     try replies.numeric(session, .RPL_MYINFO, &.{ SERVER_NAME, "mizuchi-0.1", "io", "ov" }, "are supported by this server");
-    try replies.numeric(session, .RPL_ISUPPORT, &protocol_inventory.isupport_tokens, "are supported by this server");
+    try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
 }
 
 fn emitUnknownCommand(
