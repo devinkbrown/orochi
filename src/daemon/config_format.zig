@@ -33,6 +33,7 @@ pub const Config = struct {
     admin: Admin = .{},
     weather: Weather = .{},
     news: News = .{},
+    geo: Geo = .{},
     listen: Listen = .{},
     opers: []Oper = &.{},
     oper_groups: []OperGroup = &.{},
@@ -96,6 +97,16 @@ pub const Config = struct {
         enabled: bool = false,
         source: ?[]const u8 = null,
         count: u32 = 3,
+    };
+
+    /// Live `!weather`/`!news` fantasy bot. When enabled the daemon fetches
+    /// wttr.in + the bundled RSS feeds in a background thread.
+    pub const Geo = struct {
+        enabled: bool = false,
+        /// Skip TLS verification for public read-only news feeds.
+        news_insecure_tls: bool = true,
+        /// Fallback `!weather` location when a user has no GeoIP/`location` meta.
+        default_location: ?[]const u8 = null,
     };
 
     pub const Listen = struct {
@@ -306,6 +317,7 @@ pub const Config = struct {
         if (self.weather.units) |v| allocator.free(v);
         if (self.weather.source) |v| allocator.free(v);
         if (self.news.source) |v| allocator.free(v);
+        if (self.geo.default_location) |v| allocator.free(v);
         allocator.free(self.listen.host);
         allocator.free(self.listen.media_host);
         for (self.opers) |oper| {
@@ -375,6 +387,11 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("news.enabled")) |b| cfg.news.enabled = b;
     try setOpt(allocator, resolver, doc.getString("news.source"), &cfg.news.source);
     cfg.news.count = @intCast(try uintField(doc, "news.count", cfg.news.count, 1, 20));
+
+    // [geo]
+    if (doc.getBool("geo.enabled")) |b| cfg.geo.enabled = b;
+    if (doc.getBool("geo.news_insecure_tls")) |b| cfg.geo.news_insecure_tls = b;
+    try setOpt(allocator, resolver, doc.getString("geo.default_location"), &cfg.geo.default_location);
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);

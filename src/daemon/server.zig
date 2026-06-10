@@ -93,6 +93,7 @@ const auditorium = @import("../proto/auditorium.zig");
 const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
 const geoip = @import("../substrate/geoip.zig");
+const geo_services = @import("geo_services.zig");
 const stats_report = @import("stats_report.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const accept_list = @import("../proto/accept_list.zig");
@@ -940,6 +941,16 @@ pub const Config = struct {
     news_enabled: bool = false,
     news_source: []const u8 = "",
     news_count: u32 = 3,
+    /// Live `!weather`/`!news` fantasy bot (`[geo]`). When enabled the daemon
+    /// fetches wttr.in (weather) + the news_sources RSS feeds in a background
+    /// thread and serves them to channel `!weather`/`!news` commands.
+    geo_enabled: bool = false,
+    /// Skip TLS verification for news feeds (public read-only data) so the
+    /// best-effort clean-room TLS reaches more hosts. `[geo] news_insecure_tls`.
+    geo_news_insecure_tls: bool = true,
+    /// Fallback location for `!weather` when a user has no GeoIP/`location`
+    /// metadata. `[geo] default_location`.
+    geo_default_location: []const u8 = "",
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -1378,6 +1389,9 @@ pub const LinuxServer = struct {
     history: HistoryStore,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
+    /// Background weather/news cache backing `!weather`/`!news` (lazy-started on
+    /// first fantasy use; heap-owned so its address is stable for the thread).
+    geo: *geo_services.Service,
     props: ircx_prop_store.DefaultStore,
     access: ircx_access_store.AccessStore,
     /// Per-channel AKICK (registered auto-kick) list — masks matched on JOIN.
@@ -1581,6 +1595,15 @@ pub const LinuxServer = struct {
         var whowas_store = try WhowasStore.init(allocator);
         errdefer whowas_store.deinit();
 
+        const geo_ptr = try allocator.create(geo_services.Service);
+        errdefer allocator.destroy(geo_ptr);
+        geo_ptr.* = geo_services.Service.init(allocator, .{
+            .weather_enabled = config.geo_enabled,
+            .news_enabled = config.geo_enabled,
+            .news_insecure_tls = config.geo_news_insecure_tls,
+            .max_headlines = @intCast(@min(config.news_count, 5)),
+        });
+
         return .{
             .allocator = allocator,
             .config = config,
@@ -1611,6 +1634,7 @@ pub const LinuxServer = struct {
             .history = HistoryStore.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
+            .geo = geo_ptr,
             .props = ircx_prop_store.DefaultStore.init(allocator),
             .access = ircx_access_store.AccessStore.init(allocator),
             .chan_akick = svc_akick.AkickStore.init(allocator),
@@ -1686,6 +1710,8 @@ pub const LinuxServer = struct {
 
     pub fn deinit(self: *LinuxServer) void {
         self.driveDeinit();
+        self.geo.stop();
+        self.allocator.destroy(self.geo);
         self.wasm.deinit();
         self.relay_seen.deinit();
         // Tear down every connection owned by every shard's reactor (each reactor
@@ -3405,6 +3431,9 @@ pub const LinuxServer = struct {
                 self.maybeApplyApprovedVhost(id, conn);
                 // Auto-join the account's configured channels.
                 self.applyAutojoin(id, conn);
+                // Set the client's `location`/`country` metadata from GeoIP (or
+                // the configured default) so `!weather` has a per-user location.
+                self.setGeoLocation(conn);
                 self.deliverWelcome(conn);
                 self.emitClientRegistered(id, conn);
                 self.evaluateNickProtection(conn);
@@ -7253,6 +7282,92 @@ pub const LinuxServer = struct {
         self.geoip_bytes = bytes;
         self.geoip_db = db;
         return db;
+    }
+
+    /// On registration, record the client's `location` (city or country) and
+    /// `country` (ISO) metadata from GeoIP, falling back to the configured
+    /// default location. This gives `!weather` a per-user location with no
+    /// per-request lookup, and the country drives imperial/metric unit choice.
+    fn setGeoLocation(self: *LinuxServer, conn: *ConnState) void {
+        const nick = conn.session.displayName();
+        if (nick.len == 0) return;
+        if (self.ensureGeoip()) |db| {
+            if (parseGeoIp(conn.session.realHost())) |ip| {
+                var cc_buf: [4]u8 = undefined;
+                const country = db.lookupCountry(ip, &cc_buf) catch null;
+                const city = db.lookupName(ip, "city", "en") catch null;
+                if (country) |c| _ = self.metadata.set(nick, "country", c) catch {};
+                const loc = city orelse country;
+                if (loc) |l| {
+                    _ = self.metadata.set(nick, "location", l) catch {};
+                    return;
+                }
+            }
+        }
+        if (self.config.geo_default_location.len > 0) {
+            _ = self.metadata.set(nick, "location", self.config.geo_default_location) catch {};
+        }
+    }
+
+    /// Read a metadata string for `nick`/`key`, or "" if unset.
+    fn metaValue(self: *LinuxServer, nick: []const u8, key: []const u8) []const u8 {
+        if (self.metadata.get(nick, key)) |ev| return ev.value else |_| return "";
+    }
+
+    /// Post a server NOTICE to every member of `chan` (the fantasy-bot reply
+    /// channel, e.g. the `!weather` answer). Best-effort; a full buffer is ignored.
+    fn fantasyReply(self: *LinuxServer, chan: []const u8, text: []const u8) void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ server_name, chan, text }) catch return;
+        self.broadcastChannel(chan, line, null) catch {};
+    }
+
+    /// Channel fantasy dispatch: a member's PRIVMSG starting with `!` may invoke
+    /// the weather/news bot. The triggering message is still delivered to the
+    /// channel normally; this only posts the answer. `!news` is gated by the +W
+    /// channel mode (see handleFantasyNews).
+    fn handleFantasy(self: *LinuxServer, conn: *ConnState, chan: []const u8, text: []const u8) void {
+        const sp = std.mem.indexOfScalar(u8, text, ' ');
+        const cmd = if (sp) |i| text[0..i] else text;
+        const rest = if (sp) |i| std.mem.trim(u8, text[i + 1 ..], " \t") else "";
+        const eqi = std.ascii.eqlIgnoreCase;
+        if (eqi(cmd, "!weather") or eqi(cmd, "!w") or eqi(cmd, "!wx")) {
+            self.handleFantasyWeather(conn, chan, rest);
+        }
+    }
+
+    /// `!weather [location]` — serve cached weather for the argument, or the
+    /// sender's `location` metadata, localized to their `country`.
+    fn handleFantasyWeather(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8) void {
+        if (!self.config.geo_enabled) return;
+        self.geo.start(); // lazy-start the fetcher thread on first use
+        const nick = conn.session.displayName();
+
+        const location = if (arg.len > 0)
+            arg[0..@min(arg.len, 80)]
+        else
+            self.metaValue(nick, "location");
+        if (location.len == 0) {
+            self.fantasyReply(chan, "Set your location first: METADATA SET location <place>  (or use !weather <place>)");
+            return;
+        }
+
+        const country = self.metaValue(nick, "country");
+        const sys = weather_units.resolveSystem(self.config.weather_units, country);
+
+        var loc_out: [64]u8 = undefined;
+        var desc_out: [48]u8 = undefined;
+        if (self.geo.getWeather(location, &loc_out, &desc_out)) |view| {
+            var line_buf: [160]u8 = undefined;
+            const line = weather_units.renderLine(&line_buf, view.location, view.reading, sys);
+            var out: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&out, "Weather — {s}", .{line}) catch return;
+            self.fantasyReply(chan, msg);
+        } else {
+            var out: [160]u8 = undefined;
+            const msg = std.fmt.bufPrint(&out, "Fetching weather for {s}… try again in a moment.", .{location[0..@min(location.len, 80)]}) catch return;
+            self.fantasyReply(chan, msg);
+        }
     }
 
     /// Parse an IPv4 or IPv6 literal into a geoip.Ip, or null if malformed.
@@ -11117,6 +11232,12 @@ pub const LinuxServer = struct {
                         }
                     }
                 }
+            }
+            // Fantasy bot: a speaker's PRIVMSG beginning with '!' may invoke the
+            // weather/news bot. The message is still delivered to the channel
+            // normally below; this only posts the server's answer as a NOTICE.
+            if (!is_notice and text.len > 1 and text[0] == '!') {
+                self.handleFantasy(conn, chan, text);
             }
             // Op-bypass gates (+C no-ctcp, +T no-notice). Ops/voiced-or-higher and
             // server opers are exempt; ACTION is never treated as blockable CTCP.

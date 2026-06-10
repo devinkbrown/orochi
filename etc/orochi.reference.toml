@@ -101,6 +101,25 @@ enabled = false
 count = 3
 
 
+# --- [geo] — live !weather / !news fantasy bot -------------------------------
+[geo]
+# When enabled, the daemon answers in-channel `!weather [place]` and (in +W
+# channels) `!news`/`!localnews` by fetching live data in a BACKGROUND thread
+# (never blocking the reactor) and caching it. All sources are key-free:
+#   weather -> wttr.in (plain HTTP); news -> bundled RSS feeds (src/proto/
+#   news_sources.zig, ported from ophion). First request for a new location
+#   replies "fetching… try again"; subsequent ones serve from cache.
+# `!weather` uses each user's `location` metadata (set on connect from GeoIP, or
+# `default_location` below), localized to their country (°F/mph for US/LR/MM,
+# else °C/km-h). Users can override per call: `!weather Tokyo`.
+enabled = false
+# Skip TLS verification for the public read-only news feeds so the best-effort
+# clean-room TLS reaches more hosts. Weather is plain HTTP and unaffected.
+news_insecure_tls = true
+# Fallback !weather location when a client has no GeoIP / `location` metadata.
+# default_location = "Austin, TX"
+
+
 # --- [listen] — listener sockets ---------------------------------------------
 [listen]
 # Bind address for all TCP listeners. Default: "127.0.0.1".
