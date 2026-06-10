@@ -34,6 +34,7 @@ pub const Config = struct {
     weather: Weather = .{},
     news: News = .{},
     geo: Geo = .{},
+    oper: OperSection = .{},
     listen: Listen = .{},
     opers: []Oper = &.{},
     oper_groups: []OperGroup = &.{},
@@ -110,6 +111,12 @@ pub const Config = struct {
         /// Directory of updater-written headline files; when set, `!news` reads
         /// these instead of doing in-daemon TLS fetches.
         news_cache_dir: ?[]const u8 = null,
+    };
+
+    /// Operator subsystem settings (distinct from the `[[opers]]` bindings).
+    pub const OperSection = struct {
+        /// Path for persisting runtime GRANT/REVOKE grants across restarts.
+        grants_path: ?[]const u8 = null,
     };
 
     pub const Listen = struct {
@@ -322,6 +329,7 @@ pub const Config = struct {
         if (self.news.source) |v| allocator.free(v);
         if (self.geo.default_location) |v| allocator.free(v);
         if (self.geo.news_cache_dir) |v| allocator.free(v);
+        if (self.oper.grants_path) |v| allocator.free(v);
         allocator.free(self.listen.host);
         allocator.free(self.listen.media_host);
         for (self.opers) |oper| {
@@ -397,6 +405,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("geo.news_insecure_tls")) |b| cfg.geo.news_insecure_tls = b;
     try setOpt(allocator, resolver, doc.getString("geo.default_location"), &cfg.geo.default_location);
     try setOpt(allocator, resolver, doc.getString("geo.news_cache_dir"), &cfg.geo.news_cache_dir);
+
+    // [oper]
+    try setOpt(allocator, resolver, doc.getString("oper.grants_path"), &cfg.oper.grants_path);
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);

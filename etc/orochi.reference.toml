@@ -243,6 +243,15 @@ enabled = false
 # account_db = "/var/lib/orochi/accounts.db"
 
 
+# --- [oper] — operator subsystem settings ------------------------------------
+[oper]
+# Path for persisting runtime GRANT/REVOKE operator grants. When set, the active
+# grants (from the GRANT command) are written here on change and reloaded at
+# boot, so runtime-granted opers survive a restart. Revoked accounts are dropped
+# from the file. Leave unset to keep runtime grants in-memory only.
+# grants_path = "/var/lib/orochi/oper_grants.tsv"
+
+
 # --- [[opers]] — operator bindings (SASL-only) -------------------------------
 # Operators are granted by ACCOUNT, never by password. Each block binds a SASL
 # account to a privilege class; the account auto-elevates on login.

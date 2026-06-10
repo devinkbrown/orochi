@@ -956,6 +956,10 @@ pub const Config = struct {
     /// `!news` is served from these files (robust full coverage) instead of
     /// in-daemon TLS fetches. `[geo] news_cache_dir`.
     geo_news_cache_dir: []const u8 = "",
+    /// Path for persisting runtime operator grants (GRANT/REVOKE). When set, the
+    /// active grants are written here on change and reloaded at boot so they
+    /// survive a restart. `[oper] grants_path`.
+    oper_grants_path: []const u8 = "",
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -1685,6 +1689,8 @@ pub const LinuxServer = struct {
     pub fn start(self: *LinuxServer) void {
         self.driveLifecycle(.init);
         self.driveLifecycle(.ready);
+        // Restore runtime operator grants persisted by a previous run.
+        self.loadGrants();
         // Optional STUN-based reflexive-candidate discovery at boot (before the
         // pump thread starts). Configured as an IPv4 literal + port.
         if (self.config.media_stun_port != 0) {
@@ -8816,6 +8822,7 @@ pub const LinuxServer = struct {
         };
         self.mintOperGrant(account, privs, class, "");
         self.elevateGrantedSessions(account);
+        self.persistGrants();
 
         var b: [256]u8 = undefined;
         try self.noticeTo(conn, std.fmt.bufPrint(&b, "GRANT: {s} is now an operator (class {s})", .{ account, class }) catch "GRANT applied");
@@ -8844,6 +8851,7 @@ pub const LinuxServer = struct {
         }
         self.mintOperGrant(account, oper_mod.OperPrivileges.empty, "revoked", "");
         self.deElevateSessions(account);
+        self.persistGrants();
         var b: [256]u8 = undefined;
         try self.noticeTo(conn, std.fmt.bufPrint(&b, "REVOKE: operator authority removed from {s}", .{account}) catch "REVOKE applied");
         self.notifyObservers(.oper_up, observeSubject(conn, account));
@@ -8864,6 +8872,52 @@ pub const LinuxServer = struct {
         }
         var b: [64]u8 = undefined;
         try self.noticeTo(conn, std.fmt.bufPrint(&b, "End of grants ({d}).", .{count}) catch "End of grants.");
+    }
+
+    /// Persist the active runtime operator grants to `[oper] grants_path` (tab-
+    /// separated account/privbits/class/title, one per line). Tombstones
+    /// (privilege_bits == 0) are omitted, so a revoked account is simply absent
+    /// and is not restored. No-op when no path is configured.
+    fn persistGrants(self: *LinuxServer) void {
+        if (self.config.oper_grants_path.len == 0) return;
+        var buf: [16 * 1024]u8 = undefined;
+        var len: usize = 0;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        var it = self.oper_grants.liveIterator(now);
+        while (it.next()) |g| {
+            if (g.privilege_bits == 0) continue;
+            // Skip any field carrying a separator byte (keeps the format simple).
+            if (hasSep(g.account) or hasSep(g.class) or hasSep(g.title)) continue;
+            const line = std.fmt.bufPrint(buf[len..], "{s}\t{d}\t{s}\t{s}\n", .{ g.account, g.privilege_bits, g.class, g.title }) catch break;
+            len += line.len;
+        }
+        writeFileAbs(self.allocator, self.config.oper_grants_path, buf[0..len]);
+    }
+
+    /// Reload persisted runtime grants at boot: re-mint each into the registry so
+    /// previously-granted accounts elevate on their next login. Called once from
+    /// `start`. No-op without a configured path / readable file.
+    fn loadGrants(self: *LinuxServer) void {
+        if (self.config.oper_grants_path.len == 0) return;
+        const io = self.config.crypto_io orelse return;
+        const text = std.Io.Dir.cwd().readFileAlloc(io, self.config.oper_grants_path, self.allocator, .limited(1 << 20)) catch return;
+        defer self.allocator.free(text);
+        var restored: usize = 0;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \r\t");
+            if (line.len == 0 or line[0] == '#') continue;
+            var f = std.mem.splitScalar(u8, line, '\t');
+            const account = f.next() orelse continue;
+            const bits_s = f.next() orelse continue;
+            const class = f.next() orelse "operator";
+            const title = f.next() orelse "";
+            const bits = std.fmt.parseInt(u64, std.mem.trim(u8, bits_s, " "), 10) catch continue;
+            if (account.len == 0 or bits == 0) continue;
+            self.mintOperGrant(account, oper_mod.OperPrivileges.fromBits(bits), class, title);
+            restored += 1;
+        }
+        if (restored != 0) std.debug.print("orochi: restored {d} runtime operator grant(s)\n", .{restored});
     }
 
     // --- Account command family (Phase 2) ----------------------------------
@@ -12113,6 +12167,36 @@ fn clientPrefix(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
 
 /// Parse a dotted-quad IPv4 literal ("a.b.c.d") into 4 octets, or null if it is
 /// not a well-formed IPv4 address.
+/// True if `s` contains a tab or newline (a field separator for the grants file).
+fn hasSep(s: []const u8) bool {
+    return std.mem.indexOfScalar(u8, s, '\t') != null or std.mem.indexOfScalar(u8, s, '\n') != null;
+}
+
+/// Atomically-ish write `bytes` to `path` (O_CREAT|O_TRUNC, 0600) via raw
+/// syscalls. Best-effort: a failure is silently ignored (persistence is a
+/// convenience, never a correctness dependency).
+fn writeFileAbs(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) void {
+    const zpath = allocator.dupeZ(u8, path) catch return;
+    defer allocator.free(zpath);
+    const rc = linux.open(zpath, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    if (posix.errno(rc) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const w = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        switch (posix.errno(w)) {
+            .SUCCESS => {
+                const n: usize = @intCast(w);
+                if (n == 0) break;
+                off += n;
+            },
+            .INTR => {},
+            else => break,
+        }
+    }
+}
+
 fn parseIp4(s: []const u8) ?[4]u8 {
     var out: [4]u8 = undefined;
     var it = std.mem.splitScalar(u8, s, '.');
