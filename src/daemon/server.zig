@@ -7386,11 +7386,16 @@ pub const LinuxServer = struct {
     /// the weather/news bot. The triggering message is still delivered to the
     /// channel normally; this only posts the answer. `!news` is gated by the +W
     /// channel mode (see handleFantasyNews).
-    fn handleFantasy(self: *LinuxServer, conn: *ConnState, chan: []const u8, text: []const u8) void {
+    fn handleFantasy(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chan: []const u8, text: []const u8) void {
         const sp = std.mem.indexOfScalar(u8, text, ' ');
         const cmd = if (sp) |i| text[0..i] else text;
         const rest = if (sp) |i| std.mem.trim(u8, text[i + 1 ..], " \t") else "";
         const eqi = std.ascii.eqlIgnoreCase;
+        // !setweather is a chanop config command (not a bot reply): no cooldown.
+        if (eqi(cmd, "!setweather") or eqi(cmd, "!sw")) {
+            self.handleFantasySetWeather(id, conn, chan, rest);
+            return;
+        }
         const is_weather = eqi(cmd, "!weather") or eqi(cmd, "!w") or eqi(cmd, "!wx");
         const is_news = eqi(cmd, "!news") or eqi(cmd, "!n");
         const is_local = eqi(cmd, "!localnews");
@@ -7430,19 +7435,46 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    /// `!weather [location]` — serve cached weather for the argument, or the
-    /// sender's `location` metadata, localized to their `country`.
+    /// `!setweather <location>|clear` — set or clear this channel's default
+    /// `!weather` location (used when a member has no argument/`location` meta).
+    /// Stored as the channel's `weather_location` metadata; chanop/oper only.
+    fn handleFantasySetWeather(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, chan: []const u8, arg: []const u8) void {
+        if (!self.config.geo_enabled) return;
+        const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+        if (!mm.isOperator() and !conn.session.isOper()) {
+            self.fantasyReply(chan, "You need channel operator status to set the channel weather location.");
+            return;
+        }
+        if (arg.len == 0) {
+            self.fantasyReply(chan, "Usage: !setweather <location>  |  !setweather clear");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(arg, "clear")) {
+            self.metadata.delete(chan, "weather_location") catch {};
+            self.fantasyReply(chan, "Channel weather location cleared.");
+            return;
+        }
+        const loc = arg[0..@min(arg.len, 80)];
+        _ = self.metadata.set(chan, "weather_location", loc) catch {
+            self.fantasyReply(chan, "Could not set the channel weather location.");
+            return;
+        };
+        var b: [160]u8 = undefined;
+        self.fantasyReply(chan, std.fmt.bufPrint(&b, "Channel weather location set to {s}.", .{loc}) catch "Channel weather location set.");
+    }
+
+    /// `!weather [location]` — serve cached weather for the argument, the sender's
+    /// `location` metadata, or the channel's `!setweather` default; localized to
+    /// the sender's `country`.
     fn handleFantasyWeather(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8) void {
         if (!self.config.geo_enabled) return;
         self.geo.start(); // lazy-start the fetcher thread on first use
         const nick = conn.session.displayName();
 
-        const location = if (arg.len > 0)
-            arg[0..@min(arg.len, 80)]
-        else
-            self.metaValue(nick, "location");
+        var location = if (arg.len > 0) arg[0..@min(arg.len, 80)] else self.metaValue(nick, "location");
+        if (location.len == 0) location = self.metaValue(chan, "weather_location"); // channel default
         if (location.len == 0) {
-            self.fantasyReply(chan, "Set your location first: METADATA SET location <place>  (or use !weather <place>)");
+            self.fantasyReply(chan, "Set your location first: METADATA SET location <place>  (or use !weather <place>, or a chanop can !setweather <place>)");
             return;
         }
 
@@ -11571,7 +11603,7 @@ pub const LinuxServer = struct {
             // weather/news bot. The message is still delivered to the channel
             // normally below; this only posts the server's answer as a NOTICE.
             if (!is_notice and text.len > 1 and text[0] == '!') {
-                self.handleFantasy(conn, chan, text);
+                self.handleFantasy(id, conn, chan, text);
             }
             // Op-bypass gates (+C no-ctcp, +T no-notice). Ops/voiced-or-higher and
             // server opers are exempt; ACTION is never treated as blockable CTCP.

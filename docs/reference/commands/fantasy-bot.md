@@ -17,15 +17,25 @@ with `[geo] enabled = true` (see [config.md](../config.md#geo)).
 ## !weather
 
 - Syntax: `!weather [location]` (aliases `!w`, `!wx`)
-- Description: Reports current weather. With an argument it uses that location;
-  otherwise it uses the requesting user's `location` metadata (set on connect
-  from GeoIP, or `[geo] default_location`). The reading is localized to the
-  user's `country` metadata — °F/mph for US/LR/MM, otherwise °C/km·h.
+- Description: Reports current weather. Location resolution order: the command
+  argument → the user's `location` metadata (set on connect from GeoIP) → the
+  channel's `!setweather` default → `[geo] default_location`. The reading is
+  localized to the user's `country` metadata — °F/mph for US/LR/MM, else °C/km·h.
 - Privileges: Any channel member able to speak.
 - Replies: A server `NOTICE` to the channel, e.g.
   `Weather — Austin: 72°F, Partly cloudy, wind 12 mph`, or a "fetching" notice on
   a cache miss.
 - Sources: `src/daemon/server.zig:handleFantasyWeather`, `src/proto/weather_units.zig`
+
+## !setweather
+
+- Syntax: `!setweather <location>` / `!setweather clear` (alias `!sw`)
+- Description: Sets (or clears) this channel's default `!weather` location, used
+  when a member runs `!weather` with no argument and has no `location` metadata.
+  Stored as the channel's `weather_location` metadata.
+- Privileges: Channel operator (any op-or-higher tier) or server oper.
+- Replies: A confirmation `NOTICE` to the channel. Not rate-limited.
+- Sources: `src/daemon/server.zig:handleFantasySetWeather`
 
 ## !news
 
