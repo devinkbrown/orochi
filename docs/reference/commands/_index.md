@@ -67,6 +67,9 @@ Registry commands default to registered-client access unless the command table s
 | `COMMANDS` | Discover command registry entries. | [informational.md](informational.md#commands) |
 | `OPER` | Disabled password OPER; use SASL account elevation. | [oper-moderation.md](oper-moderation.md#oper) |
 | `REHASH` | Reload configuration. | [oper-moderation.md](oper-moderation.md#rehash) |
+| `GRANT` | Grant a registered account operator authority network-wide. | [oper-moderation.md](oper-moderation.md#grant) |
+| `REVOKE` | Revoke a runtime operator grant network-wide. | [oper-moderation.md](oper-moderation.md#revoke) |
+| `GRANTS` | List live runtime operator grants. | [oper-moderation.md](oper-moderation.md#grants) |
 | `KILL` | Disconnect a user. | [oper-moderation.md](oper-moderation.md#kill) |
 | `CLOSE` | Close unknown/unregistered clients. | [oper-moderation.md](oper-moderation.md#close) |
 | `DRAIN` | Toggle listener drain state. | [oper-moderation.md](oper-moderation.md#drain) |
@@ -130,3 +133,10 @@ Registry commands default to registered-client access unless the command table s
 | `LISTX` | IRCX extended channel list. | [ircx.md](ircx.md#listx) |
 | `MEDIA` | Media control plane. | [media.md](media.md#media) |
 | `ACTIVITY` | Activity/presence updates. | [media.md](media.md#activity) |
+
+## In-channel fantasy commands
+
+Not registry commands: a channel `PRIVMSG` beginning with `!` may invoke the
+server's weather/news bot (`!weather`/`!w`/`!wx`, `!news`/`!n`, `!localnews`),
+answered as a server `NOTICE`. See [fantasy-bot.md](fantasy-bot.md). `!news`/
+`!localnews` require the channel mode `+W` (news-wire).

@@ -1,0 +1,71 @@
+# Weather / News Fantasy Bot
+
+Orochi answers a small set of in-channel `!` "fantasy" commands directly from the
+server — there are no pseudo-clients (`src/daemon/server.zig:11150`,
+`handleFantasy`). The triggering message is still delivered to the channel
+normally; the server posts the answer as a `NOTICE` sourced from this node's
+`server_name` and relays it once across the mesh, so members on every node see a
+single reply from the replying server (`src/daemon/server.zig:fantasyReply`).
+
+All data sources are **key-free**: weather from `wttr.in` (plain HTTP), news from
+the RSS feeds bundled in `src/proto/news_sources.zig` (ported from ophion).
+Fetching runs on a dedicated background thread (`src/daemon/geo_services.zig`) so
+the reactor never blocks; the first request for a new location/feed replies
+"fetching… try again in a moment", then serves from a TTL cache. Enable the bot
+with `[geo] enabled = true` (see [config.md](../config.md#geo)).
+
+## !weather
+
+- Syntax: `!weather [location]` (aliases `!w`, `!wx`)
+- Description: Reports current weather. With an argument it uses that location;
+  otherwise it uses the requesting user's `location` metadata (set on connect
+  from GeoIP, or `[geo] default_location`). The reading is localized to the
+  user's `country` metadata — °F/mph for US/LR/MM, otherwise °C/km·h.
+- Privileges: Any channel member able to speak.
+- Replies: A server `NOTICE` to the channel, e.g.
+  `Weather — Austin: 72°F, Partly cloudy, wind 12 mph`, or a "fetching" notice on
+  a cache miss.
+- Sources: `src/daemon/server.zig:handleFantasyWeather`, `src/proto/weather_units.zig`
+
+## !news
+
+- Syntax: `!news [source]` (alias `!n`)
+- Description: Posts the latest headlines for a named source (`bbc`, `npr`,
+  `guardian`, … from `src/proto/news_sources.zig`), defaulting to BBC World.
+- Privileges: Channel member; **only responds in channels with mode `+W`**
+  (news-wire — see [modes.md](../protocol/modes.md)). Silent otherwise.
+- Replies: A `News — <source>:` header followed by numbered headline `NOTICE`s.
+- Sources: `src/daemon/server.zig:handleFantasyNews`
+
+## !localnews
+
+- Syntax: `!localnews [CC]`
+- Description: Like `!news` but for a country's default feed (ISO 3166-1 code,
+  e.g. `JP`, `GB`); defaults to the user's GeoIP `country` metadata.
+- Privileges: Channel member; requires `+W`.
+- Replies: As `!news`, using the country feed.
+- Sources: `src/daemon/server.zig:handleFantasyNews`, `src/proto/news_sources.zig` (`country_feeds`)
+
+## Location metadata
+
+On registration the daemon records two IRCv3 METADATA keys on the client's own
+nick (`src/daemon/server.zig:setGeoLocation`):
+
+- `location` — GeoIP city (or country), else `[geo] default_location`.
+- `country` — GeoIP ISO country code, used for weather unit selection.
+
+Users can override their location at any time with `METADATA SET location <place>`
+or per-call with `!weather <place>`.
+
+## News updater (full feed coverage)
+
+The in-daemon TLS reaches only some feeds. For robust full coverage set
+`[geo] news_cache_dir` and run the bundled key-free updater from cron — it uses
+`curl` (system CA bundle) to fetch every feed and writes one-headline-per-line
+files the daemon reads:
+
+```
+*/5 * * * * /path/to/orochi/tools/news_update.sh /var/lib/orochi/news 10
+```
+
+See `tools/news_update.sh` and [config.md](../config.md#geo).

@@ -1,6 +1,6 @@
 # Orochi Modes
 
-This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSg` from `src/proto/protocol_inventory.zig:36`; the advertised status-prefix token is `PREFIX=(Qqov)!.@+` from `src/proto/protocol_inventory.zig:56` and `src/daemon/chanmode.zig:310`.
+This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgW` from `src/proto/protocol_inventory.zig:36`; the advertised status-prefix token is `PREFIX=(Qqov)!.@+` from `src/proto/protocol_inventory.zig:56` and `src/daemon/chanmode.zig:310`.
 
 ## User Modes
 
@@ -80,6 +80,7 @@ List modes are capped by `World.max_list_entries`; exceeding the cap returns `ER
 | `g` | free-invite | none | Channel op or higher. | Any member may INVITE while `+i`. | `src/daemon/chanmode.zig:106`, `src/daemon/chanmode.zig:28` |
 | `S` | tls-only | none | Channel op or higher. | JOIN only over TLS; non-TLS gets `ERR_SECUREONLYCHAN`. | `src/daemon/chanmode.zig:107`, `src/daemon/server.zig:3770` |
 | `M` | moderate-unregistered | none | Channel op or higher. | Unauthenticated members need voice/operator tier to speak. | `src/daemon/chanmode.zig:108`, `src/daemon/server.zig:10989` |
+| `W` | news-wire | none | Channel op or higher. | Enables the in-channel `!news`/`!localnews` bot in this channel; silent without it. | `src/daemon/chanmode.zig:109`, `src/daemon/server.zig:11155` |
 
 The generic `chanmode.zig` catalog includes only `b e I k l i m n t s C T N g S M` (`src/daemon/chanmode.zig:92`). The live server also implements `Z`, `j`, `f`, `p`, `h`, and IRCX extended flags in `server.zig` / `world.zig`.
 

@@ -5,7 +5,10 @@ Stateless server information commands are registered by `query.info` (`src/daemo
 ## VERSION
 
 - Syntax: `VERSION`
-- Description: Returns the current daemon version text.
+- Description: Returns the current daemon version text. The build token embeds
+  the compile target and the **git revision** the binary was built from
+  (e.g. `x86_64-linux-<shorthash>`, suffixed `-dirty` for an unclean tree),
+  captured at build time via `build.zig` `gitCommit` → `@import("build_info")`.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_VERSION 351`.

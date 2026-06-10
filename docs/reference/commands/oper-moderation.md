@@ -24,6 +24,48 @@ The operator/security module registers oper and moderation commands (`src/daemon
 - Example: `REHASH`
 - Sources: `src/daemon/modules/oper_security.zig:111`, `src/daemon/server.zig:10031`
 
+## GRANT
+
+- Syntax: `GRANT <account> <class> [priv,priv,...]`
+- Description: Gives a registered account operator authority network-wide. Mints a
+  signed grant recorded locally, propagated to secured S2S peers, and honored on
+  the account's next SASL login; already-connected sessions are elevated
+  immediately. Privileges come from the class preset (`admin`/`netadmin`/`sa` →
+  full, incl. `oper_grant`; any other class → a standard operator set) or an
+  explicit comma-separated privilege-name list. Persisted across restart when
+  `[oper] grants_path` is set.
+- Privileges: Oper holding the `oper_grant` privilege.
+- Parameters: Target account; class label; optional privilege list.
+- Replies: Server notice confirming the grant.
+- Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`; notice on unknown account/privilege.
+- Example: `GRANT alice netadmin`
+- Sources: `src/daemon/modules/oper_security.zig:115`, `src/daemon/server.zig:handleGrant`
+
+## REVOKE
+
+- Syntax: `REVOKE <account>`
+- Description: Removes a runtime operator grant network-wide. A zero-privilege
+  tombstone supersedes the grant (propagated to peers, honored on next login) and
+  connected sessions are de-elevated immediately (`MODE -o` + notice). Configured
+  `[[opers]]` accounts are not revocable this way (edit config + `REHASH`).
+- Privileges: Oper holding the `oper_grant` privilege.
+- Parameters: Target account.
+- Replies: Server notice confirming the revocation.
+- Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`.
+- Example: `REVOKE alice`
+- Sources: `src/daemon/modules/oper_security.zig:116`, `src/daemon/server.zig:handleRevoke`
+
+## GRANTS
+
+- Syntax: `GRANTS`
+- Description: Lists the live runtime operator grants (account, class, issuer node). Tombstoned (revoked) accounts are omitted.
+- Privileges: Oper.
+- Parameters: None.
+- Replies: Server notices, one per active grant, then an end marker.
+- Errors: `ERR_NOPRIVILEGES 481`.
+- Example: `GRANTS`
+- Sources: `src/daemon/modules/oper_security.zig:117`, `src/daemon/server.zig:handleGrants`
+
 ## KILL
 
 - Syntax: `KILL <nick> [:reason]`

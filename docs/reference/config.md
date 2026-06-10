@@ -38,6 +38,7 @@ Source: struct at `src/daemon/config_format.zig:56`, parsing at `src/daemon/conf
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `name` | string | `"Orochi"` | any string | Network name advertised in ISUPPORT `NETWORK=` and the welcome burst (`src/main.zig:129`). |
+| `server_name` | string or null | `"orochi.local"` | any hostname | This node's own server name — the source prefix of all server-originated lines (welcome numerics, the `!weather`/`!news` bot replies, ERROR/PING) and the identity presented to S2S peers. MUST be unique per node in a mesh so replies/identities don't collide (`src/proto/protocol_inventory.zig` `setServerName`). |
 
 ## `[motd]`
 
@@ -92,6 +93,22 @@ Headlines for the MOTD `{news}` placeholder.
 | `enabled` | bool | `false` | — | Enable the `{news}` MOTD line. |
 | `source` | string or null | unset | path | File with one headline per line; the first `count` are joined with `" | "`. Supports `@file:`. |
 | `count` | integer | `3` | `1..20` | Number of headlines to show. |
+
+## `[geo]`
+
+The live in-channel `!weather`/`!news` bot (see
+[commands/fantasy-bot.md](commands/fantasy-bot.md)). When enabled the daemon
+fetches `wttr.in` (weather) and the bundled RSS feeds (news) on a background
+thread and serves them to channel fantasy commands. All sources are key-free.
+
+Source: struct at `src/daemon/config_format.zig` (`Geo`), mapping at `src/daemon/config_boot.zig`.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `enabled` | bool | `false` | — | Enable the `!weather`/`!news` bot. |
+| `news_insecure_tls` | bool | `true` | — | Skip TLS verification for the public read-only news feeds, so the best-effort clean-room TLS reaches more hosts. Weather is plain HTTP and unaffected. |
+| `default_location` | string or null | unset | any string | Fallback `!weather` location when a user has no GeoIP / `location` metadata. |
+| `news_cache_dir` | string or null | unset | path | Directory of headline files written by `tools/news_update.sh` (one headline per line, `src_<key>.txt` / `cc_<cc>.txt`). When set, `!news` reads these files instead of fetching live — robust full coverage of every feed regardless of the in-daemon TLS reach. |
 
 ## `[listen]`
 
@@ -248,6 +265,16 @@ Source: struct at `src/daemon/config_format.zig:229`, parsing at `src/daemon/con
 | `preload` | bool | `false` | `true` or `false` | Adds `preload` to the STS value (`src/main.zig:252`). |
 
 STS is omitted entirely unless a policy is present; this prevents clients from being stranded by a nonexistent TLS listener (`src/daemon/dispatch.zig:369`).
+
+## `[oper]`
+
+Operator subsystem settings, distinct from the per-operator `[[opers]]` bindings
+below. Source: struct at `src/daemon/config_format.zig` (`OperSection`), mapping
+at `src/daemon/config_boot.zig`.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `grants_path` | string or null | unset | path | File for persisting runtime `GRANT`/`REVOKE` operator grants. When set, active grants are written here on change and reloaded at boot, so runtime-granted opers survive a restart; revoked accounts are dropped. See [commands/oper-moderation.md](commands/oper-moderation.md#grant). |
 
 ## `[[opers]]`
 
