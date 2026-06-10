@@ -4480,9 +4480,12 @@ pub const LinuxServer = struct {
         for (parsed.paramSlice()) |nick| {
             if (count >= targets.len) break;
             const wid = self.world.findNick(nick) orelse continue;
-            // oper/away and host are not tracked per-client yet (M2 placeholder);
-            // username is now the real USER-supplied value.
-            targets[count] = .{ .nick = nick, .is_oper = false, .is_away = false, .user = usernameOf(self, wid), .host = default_host };
+            // Reflect live per-client oper (`*`) and away (`-`/`+`) state from the
+            // target's session, as RPL_USERHOST requires.
+            const mconn = self.connFor(clientIdFromWorld(wid));
+            const is_oper = if (mconn) |mc| mc.session.isOper() else false;
+            const is_away = if (mconn) |mc| mc.session.awayMessage() != null else false;
+            targets[count] = .{ .nick = nick, .is_oper = is_oper, .is_away = is_away, .user = usernameOf(self, wid), .host = default_host };
             count += 1;
         }
         var out_buf: [default_reply_bytes]u8 = undefined;
@@ -12654,6 +12657,38 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     // Too few params → FAIL CHATHISTORY NEED_MORE_PARAMS, never silence.
     try writeAllFd(fd_a, "CHATHISTORY LATEST\r\n");
     try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
+}
+
+test "threaded server: USERHOST reflects live away state" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    // Present and here → `A=+`.
+    try writeAllFd(fd_a, "USERHOST A\r\n");
+    try recvUntil(&a, "A=+", 200);
+    a.reset();
+    try writeAllFd(fd_a, "AWAY :brb\r\n");
+    try recvUntil(&a, " 306 ", 200); // RPL_NOWAWAY
+    a.reset();
+    // Now away → `A=-`.
+    try writeAllFd(fd_a, "USERHOST A\r\n");
+    try recvUntil(&a, "A=-", 200);
 }
 
 test "threaded server: NAMES honors multi-prefix cap" {
