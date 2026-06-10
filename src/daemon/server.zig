@@ -5306,7 +5306,18 @@ pub const LinuxServer = struct {
     /// ring; emits a `chathistory` BATCH of PRIVMSG lines (msgid+server-time).
     pub fn handleChathistory(self: *LinuxServer, conn: *ConnState, line: []const u8) !void {
         const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-        const req = chathistory_cmd.parse(trimmed) catch return; // malformed: silent (FAIL TODO)
+        const req = chathistory_cmd.parse(trimmed) catch |err| {
+            // IRCv3 chathistory: malformed requests get a typed standard reply,
+            // `FAIL CHATHISTORY <code> :<reason>`, never silence.
+            const code = @tagName(chathistory_cmd.failCode(err));
+            const reason: []const u8 = switch (err) {
+                error.NEED_MORE_PARAMS => "Missing CHATHISTORY parameters",
+                error.INVALID_TARGET => "Invalid CHATHISTORY target",
+                else => "Invalid CHATHISTORY parameters",
+            };
+            try self.failReply(conn, "CHATHISTORY", code, reason);
+            return;
+        };
         var buf: [64]lotus.Message = undefined;
         var target: []const u8 = "";
         var found: []const lotus.Message = buf[0..0];
@@ -12609,6 +12620,31 @@ test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
     // Overlong-encoded slash (C0 AF) is invalid UTF-8 → FAIL ... INVALID_UTF8.
     try writeAllFd(fd_a, "PRIVMSG A :bad\xC0\xAF\r\n");
     try recvUntil(&a, "FAIL PRIVMSG INVALID_UTF8", 200);
+}
+
+test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    // Too few params → FAIL CHATHISTORY NEED_MORE_PARAMS, never silence.
+    try writeAllFd(fd_a, "CHATHISTORY LATEST\r\n");
+    try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
 }
 
 test "threaded server: NAMES honors multi-prefix cap" {
