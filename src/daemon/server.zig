@@ -10165,6 +10165,22 @@ pub const LinuxServer = struct {
             }
             return;
         }
+        // `MESH GRANTS` lists the cross-mesh operator grants this node currently
+        // recognizes (account, class, title, issuer, remaining TTL).
+        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "GRANTS")) {
+            const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+            var it = self.oper_grants.liveIterator(now);
+            var any = false;
+            var lb: [default_reply_bytes]u8 = undefined;
+            while (it.next()) |g| {
+                any = true;
+                const ttl_s: u64 = if (g.expiry_ms > now) (g.expiry_ms - now) / 1000 else 0;
+                const line = std.fmt.bufPrint(&lb, "grant account={s} class={s} title={s} issuer={s} ttl={d}s", .{ g.account, g.class, g.title, g.issuer_node, ttl_s }) catch continue;
+                try self.noticeTo(conn, line);
+            }
+            if (!any) try self.noticeTo(conn, "no cross-mesh operator grants recognized");
+            return;
+        }
 
         var peers: [64]mesh_report.PeerLink = undefined;
         var npeer: usize = 0;

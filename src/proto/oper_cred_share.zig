@@ -397,6 +397,31 @@ pub fn Sized(comptime cap: usize) type {
             return self.slots[idx].view();
         }
 
+        /// Iterator over the live (unexpired-at-`now_ms`) grants. Each yielded
+        /// `GrantFields` borrows the registry's slot buffers — valid only until
+        /// the next mutation. Order is slot order, not insertion order.
+        pub const LiveIterator = struct {
+            reg: *const Self,
+            now_ms: u64,
+            idx: usize = 0,
+
+            pub fn next(self: *LiveIterator) ?GrantFields {
+                while (self.idx < cap) {
+                    const i = self.idx;
+                    self.idx += 1;
+                    if (!self.reg.used[i]) continue;
+                    if (self.now_ms >= self.reg.slots[i].expiry_ms) continue;
+                    return self.reg.slots[i].view();
+                }
+                return null;
+            }
+        };
+
+        /// Walk the grants live at `now_ms`. Expired/empty slots are skipped.
+        pub fn liveIterator(self: *const Self, now_ms: u64) LiveIterator {
+            return .{ .reg = self, .now_ms = now_ms };
+        }
+
         /// Drop every entry that has expired at `now_ms`. Returns the number of
         /// entries removed.
         pub fn prune(self: *Self, now_ms: u64) usize {
@@ -578,6 +603,35 @@ test "registry insert then lookup returns the grant" {
     try testing.expectEqual(@as(usize, 1), reg.count());
     try testing.expect(found != null);
     try expectFieldsEqual(fields, found.?);
+}
+
+test "liveIterator yields live grants and skips the expired" {
+    // Arrange: two accounts, one live and one expired at the query time.
+    var reg = Registry.init();
+    var live = sampleFields();
+    live.account = "oper_live";
+    live.expiry_ms = 10_000;
+    var expired = sampleFields();
+    expired.account = "oper_expired";
+    expired.expiry_ms = 4_000;
+    _ = reg.upsert(live);
+    _ = reg.upsert(expired);
+
+    // Act: walk the grants live at now=5_000 (expired one is past its window).
+    var it = reg.liveIterator(5_000);
+    var seen_live = false;
+    var seen_expired = false;
+    var n: usize = 0;
+    while (it.next()) |g| {
+        n += 1;
+        if (std.mem.eql(u8, g.account, "oper_live")) seen_live = true;
+        if (std.mem.eql(u8, g.account, "oper_expired")) seen_expired = true;
+    }
+
+    // Assert: only the live grant surfaces.
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(seen_live);
+    try testing.expect(!seen_expired);
 }
 
 test "registry supersedes on strictly higher incarnation" {
