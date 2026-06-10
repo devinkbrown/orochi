@@ -8298,8 +8298,32 @@ pub const LinuxServer = struct {
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
-        if (accepted) self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
+        if (accepted) {
+            self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
+            // Retroactively elevate any already-connected sessions of this
+            // account so recognition is immediate, not deferred to next login.
+            self.elevateGrantedSessions(fields.account);
+        }
         return accepted;
+    }
+
+    /// Elevate every already-registered local session for `account` that is not
+    /// yet an operator, using the live grant registry. Called when a cross-mesh
+    /// grant is ingested so an account that was already connected here gains oper
+    /// status without re-authenticating. Same-shard only (the multi-reactor model
+    /// keeps each client on one worker); peer/link connections are skipped.
+    fn elevateGrantedSessions(self: *LinuxServer, account: []const u8) void {
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const c = &slot.value;
+            if (c.s2s != null or c.s2s_secured != null) continue; // not a client
+            if (!c.session.registered() or c.session.isOper()) continue;
+            const acct = c.session.account() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
+            self.elevateOperFromAccount(c) catch continue;
+            // Flush the YOUREOPER numeric + MODE reflection promptly.
+            self.armSendIfNeeded(c) catch {};
+        }
     }
 
     /// Mint + store a signed grant for a locally-elevated operator so peer nodes
