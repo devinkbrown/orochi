@@ -94,6 +94,7 @@ const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
 const geoip = @import("../substrate/geoip.zig");
 const geo_services = @import("geo_services.zig");
+const news_sources = @import("../proto/news_sources.zig");
 const stats_report = @import("stats_report.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const accept_list = @import("../proto/accept_list.zig");
@@ -4370,7 +4371,7 @@ pub const LinuxServer = struct {
                         targets.append(target_nick) catch break;
                     }
                 },
-                'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M' => {
+                'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M', 'W' => {
                     const mode: world_model.ChannelMode = switch (ch) {
                         'i' => .invite_only,
                         'm' => .moderated,
@@ -4383,6 +4384,7 @@ pub const LinuxServer = struct {
                         'g' => .free_invite,
                         'S' => .tls_only,
                         'M' => .mod_reg,
+                        'W' => .news_wire,
                         else => unreachable,
                     };
                     const changed = self.world.setChannelFlag(channel, mode, adding) catch continue;
@@ -7333,6 +7335,10 @@ pub const LinuxServer = struct {
         const eqi = std.ascii.eqlIgnoreCase;
         if (eqi(cmd, "!weather") or eqi(cmd, "!w") or eqi(cmd, "!wx")) {
             self.handleFantasyWeather(conn, chan, rest);
+        } else if (eqi(cmd, "!news") or eqi(cmd, "!n")) {
+            self.handleFantasyNews(conn, chan, rest, false);
+        } else if (eqi(cmd, "!localnews")) {
+            self.handleFantasyNews(conn, chan, rest, true);
         }
     }
 
@@ -7367,6 +7373,58 @@ pub const LinuxServer = struct {
             var out: [160]u8 = undefined;
             const msg = std.fmt.bufPrint(&out, "Fetching weather for {s}… try again in a moment.", .{location[0..@min(location.len, 80)]}) catch return;
             self.fantasyReply(chan, msg);
+        }
+    }
+
+    /// `!news [source]` / `!localnews [CC]` — only in +W (news-wire) channels.
+    /// `local` resolves a country feed (arg CC, else the sender's `country`
+    /// metadata); otherwise a named source (arg key, else the default source).
+    fn handleFantasyNews(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8, local: bool) void {
+        if (!self.config.geo_enabled) return;
+        // Gated by the +W channel mode: silent in channels that haven't enabled it.
+        if (!self.world.channelHasFlag(chan, .news_wire)) return;
+        self.geo.start();
+
+        var keybuf: [80]u8 = undefined;
+        var name: []const u8 = "";
+        var key: []const u8 = "";
+        if (local) {
+            const cc = if (arg.len >= 2) arg[0..2] else self.metaValue(conn.session.displayName(), "country");
+            if (cc.len == 0) {
+                self.fantasyReply(chan, "Unknown country — try: !localnews <CC>  (e.g. !localnews JP)");
+                return;
+            }
+            const feed = news_sources.countryFeed(cc) orelse {
+                self.fantasyReply(chan, "No country feed for that code. Try !news for general headlines.");
+                return;
+            };
+            name = feed.name;
+            key = std.fmt.bufPrint(&keybuf, "cc:{s}", .{cc}) catch return;
+        } else {
+            const src = if (arg.len > 0)
+                (news_sources.sourceByKey(arg) orelse {
+                    self.fantasyReply(chan, "Unknown source. Try !news (default) or a key like bbc/npr/guardian.");
+                    return;
+                })
+            else
+                news_sources.defaultSource();
+            name = src.name;
+            key = std.fmt.bufPrint(&keybuf, "src:{s}", .{src.key}) catch return;
+        }
+
+        var out: [512]u8 = undefined;
+        var lines: [5][]const u8 = undefined;
+        if (self.geo.getNews(key, &out, &lines)) |got| {
+            var hb: [128]u8 = undefined;
+            self.fantasyReply(chan, std.fmt.bufPrint(&hb, "News — {s}:", .{name}) catch name);
+            for (got, 1..) |headline, n| {
+                var lb: [320]u8 = undefined;
+                const line = std.fmt.bufPrint(&lb, "  {d}. {s}", .{ n, headline }) catch continue;
+                self.fantasyReply(chan, line);
+            }
+        } else {
+            var fb: [128]u8 = undefined;
+            self.fantasyReply(chan, std.fmt.bufPrint(&fb, "Fetching {s} headlines… try again in a moment.", .{name}) catch return);
         }
     }
 

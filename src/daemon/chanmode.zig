@@ -10,7 +10,7 @@ pub const DEFAULT_MAX_LIST_ENTRY_BYTES: usize = 256;
 pub const MAX_SERIALIZED_MODES: usize = 256;
 
 /// Known compact channel mode identifiers.
-pub const ChannelMode = enum(u4) {
+pub const ChannelMode = enum(u5) {
     ban,
     exempt,
     invex,
@@ -28,6 +28,7 @@ pub const ChannelMode = enum(u4) {
     free_invite, // g: any member may INVITE while +i
     tls_only, // S: join only permitted over a TLS session
     mod_reg, // M: mute unauthenticated members (speak needs an account or +v)
+    news_wire, // W: enable the in-channel !news/!localnews fantasy bot
 };
 
 /// Channel MODE operation direction.
@@ -106,6 +107,7 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .free_invite, .letter = 'g', .name = "free-invite", .kind = .flag_d },
     .{ .mode = .tls_only, .letter = 'S', .name = "tls-only", .kind = .flag_d },
     .{ .mode = .mod_reg, .letter = 'M', .name = "moderate-unregistered", .kind = .flag_d },
+    .{ .mode = .news_wire, .letter = 'W', .name = "news-wire", .kind = .flag_d },
 };
 
 /// Caller-owned storage for one type-A channel mode list.
@@ -168,6 +170,7 @@ pub const ChannelModes = struct {
     free_invite: bool = false,
     tls_only: bool = false,
     mod_reg: bool = false,
+    news_wire: bool = false,
 
     pub fn init(
         ban_storage: [][]const u8,
@@ -198,6 +201,7 @@ pub const ChannelModes = struct {
             .free_invite => self.free_invite,
             .tls_only => self.tls_only,
             .mod_reg => self.mod_reg,
+            .news_wire => self.news_wire,
             else => false,
         };
     }
@@ -233,6 +237,7 @@ pub const ChannelModes = struct {
             .free_invite => &self.free_invite,
             .tls_only => &self.tls_only,
             .mod_reg => &self.mod_reg,
+            .news_wire => &self.news_wire,
             else => return false,
         };
         if (slot.* == enabled) return false;
@@ -467,6 +472,7 @@ pub fn letterOf(mode: ChannelMode) u8 {
         .free_invite => 'g',
         .tls_only => 'S',
         .mod_reg => 'M',
+        .news_wire => 'W',
     };
 }
 
@@ -567,7 +573,7 @@ fn applyOne(modes: *ChannelModes, change: AppliedChange) ChanModeError!bool {
                 return true;
             },
         },
-        .invite_only, .moderated, .no_external, .topic_ops, .secret, .no_ctcp, .no_notice, .no_nick, .free_invite, .tls_only, .mod_reg => {
+        .invite_only, .moderated, .no_external, .topic_ops, .secret, .no_ctcp, .no_notice, .no_nick, .free_invite, .tls_only, .mod_reg, .news_wire => {
             return modes.setFlag(change.mode, change.op == .add);
         },
     }

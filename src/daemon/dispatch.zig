@@ -1849,11 +1849,11 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     try std.testing.expectEqualStrings("beIZ", class_a);
     try std.testing.expectEqualStrings("k", class_b);
     try std.testing.expectEqualStrings("lfj", class_c);
-    try std.testing.expectEqualStrings("imnstCTNMSg", class_d);
+    try std.testing.expectEqualStrings("imnstCTNMSgW", class_d);
 
     // Letters backed by the compact chanmode.ChannelMode enum must resolve in the
     // catalog with the matching protocol class.
-    const enum_letters = "beIklimnstCTNMSg";
+    const enum_letters = "beIklimnstCTNMSgW";
     for (enum_letters) |letter| {
         const spec = chanmode.specFromLetter(letter) orelse {
             std.debug.print("CHANMODES advertises '{c}' but chanmode has no spec\n", .{letter});
@@ -1871,7 +1871,7 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
 
     // The advertisement must not leak any letter the handler does not enforce.
     // The full enforced set across both layers:
-    const enforced = "beIZklfjimnstCTNMSg";
+    const enforced = "beIZklfjimnstCTNMSgW";
     for (class_a) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_b) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_c) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
