@@ -5346,7 +5346,26 @@ pub const LinuxServer = struct {
                     .msgid => {},
                 }
             },
-            .between => |r| target = r.target,
+            .between => |r| {
+                target = r.target;
+                const n = @min(@as(usize, r.limit), buf.len);
+                // Timestamp range only (msgid selectors need msgid->ts resolution,
+                // not yet wired). Collect oldest-first after the low bound, then
+                // trim to those strictly before the high bound.
+                if (r.start == .timestamp and r.end == .timestamp) {
+                    const lo = @min(r.start.timestamp, r.end.timestamp);
+                    const hi = @max(r.start.timestamp, r.end.timestamp);
+                    const raw = self.history.after(target, lo, n, buf[0..n]) catch buf[0..0];
+                    var k: usize = 0;
+                    for (raw) |m| {
+                        if (m.timestamp < hi) {
+                            buf[k] = m; // safe in-place compaction (k <= source index)
+                            k += 1;
+                        }
+                    }
+                    found = buf[0..k];
+                }
+            },
             .around => |r| target = r.target,
         }
 

@@ -359,6 +359,31 @@ test "latest before and after page visible messages correctly" {
     try expectIds(after_page, &.{ "m3", "m4", "m5" });
 }
 
+test "between window composes after() with an upper-bound filter" {
+    // Mirrors the CHATHISTORY BETWEEN wiring in the daemon: collect oldest-first
+    // after the low bound, then keep only those strictly before the high bound.
+    const Store = Lotus(.{ .max_targets = 1, .max_per_target = 8, .max_text = 32 });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try appendForTest(&store, "#lotus", "m1", 1, "one");
+    try appendForTest(&store, "#lotus", "m2", 2, "two");
+    try appendForTest(&store, "#lotus", "m3", 3, "three");
+    try appendForTest(&store, "#lotus", "m4", 4, "four");
+    try appendForTest(&store, "#lotus", "m5", 5, "five");
+
+    // BETWEEN (1, 5): strictly between -> m2, m3, m4.
+    var buf: [8]Message = undefined;
+    const raw = try store.after("#lotus", 1, buf.len, &buf);
+    var k: usize = 0;
+    for (raw) |m| {
+        if (m.timestamp < 5) {
+            buf[k] = m;
+            k += 1;
+        }
+    }
+    try expectIds(buf[0..k], &.{ "m2", "m3", "m4" });
+}
+
 test "redact hides reads but keeps slot" {
     const Store = Lotus(.{ .max_targets = 1, .max_per_target = 3, .max_text = 32 });
     var store = Store.init(std.testing.allocator);
