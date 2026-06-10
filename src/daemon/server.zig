@@ -861,6 +861,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = try std.fmt.allocPrint(allocator, "KICKLEN={d}", .{cfg.kicklen});
         } else if (std.mem.startsWith(u8, tok, "NICKLEN=")) {
             out[i] = try std.fmt.allocPrint(allocator, "NICKLEN={d}", .{cfg.nicklen});
+        } else if (std.mem.startsWith(u8, tok, "CHANNELLEN=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "CHANNELLEN={d}", .{cfg.channellen});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -901,6 +903,9 @@ pub const Config = struct {
     /// pre-registration dispatch path via the runtime-limits holder). Capped by
     /// the nick store (64). Configurable via `[limits] nicklen`.
     nicklen: u32 = 64,
+    /// Maximum channel-name length in bytes (advertised as CHANNELLEN, enforced
+    /// by joinOne). Configurable via `[limits] channellen`.
+    channellen: u32 = 64,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -3815,7 +3820,9 @@ pub const LinuxServer = struct {
     }
 
     fn joinOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, key: ?[]const u8, depth: u8) !void {
-        if (!world_model.isChannelName(channel)) {
+        // Reject malformed or over-long channel names (CHANNELLEN, advertised in
+        // ISUPPORT and enforced here — the name validator checks only the prefix).
+        if (!world_model.isChannelName(channel) or channel.len > self.config.channellen) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -12800,20 +12807,20 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
 }
 
 test "buildIsupportTokens replaces length tokens with configured values" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100 });
+    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50 });
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
-    var found_topic = false;
-    var found_away = false;
-    var found_kick = false;
+    var hits: usize = 0;
     for (tokens) |tok| {
-        if (std.mem.eql(u8, tok, "TOPICLEN=512")) found_topic = true;
-        if (std.mem.eql(u8, tok, "AWAYLEN=200")) found_away = true;
-        if (std.mem.eql(u8, tok, "KICKLEN=100")) found_kick = true;
+        if (std.mem.eql(u8, tok, "TOPICLEN=512")) hits += 1;
+        if (std.mem.eql(u8, tok, "AWAYLEN=200")) hits += 1;
+        if (std.mem.eql(u8, tok, "KICKLEN=100")) hits += 1;
+        if (std.mem.eql(u8, tok, "NICKLEN=30")) hits += 1;
+        if (std.mem.eql(u8, tok, "CHANNELLEN=50")) hits += 1;
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expect(found_topic and found_away and found_kick);
+    try std.testing.expectEqual(@as(usize, 5), hits);
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 

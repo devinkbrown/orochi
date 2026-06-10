@@ -28,6 +28,7 @@ pub const isupport_tokens = [_][]const u8{
     "TOPICLEN=390",
     "AWAYLEN=256",
     "KICKLEN=307",
+    "CHANNELLEN=64",
     "CASEMAPPING=ascii",
     "PREFIX=(Qqov)!.@+",
     chanmodes_token,
