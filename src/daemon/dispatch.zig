@@ -776,6 +776,17 @@ pub const ClientSession = struct {
         self.oper_title_store.set(title[0..@min(title.len, MAX_OPER_TITLE_BYTES)]) catch {};
     }
 
+    /// Drop operator status. Because oper is SASL-account-derived, ending the
+    /// account login that granted it must also revoke +o, the privilege set,
+    /// class/title, and the oper-notice event subscriptions.
+    pub fn clearOper(self: *ClientSession) void {
+        self.is_oper = false;
+        self.oper_priv = .{};
+        self.oper_class_store = .{};
+        self.oper_title_store = .{};
+        self.event_mask = .{};
+    }
+
     /// Whether the client is quarantined (Warden quarantine / SHUN): connected
     /// but barred from JOIN and PRIVMSG/NOTICE.
     pub fn isRestricted(self: *const ClientSession) bool {
@@ -1685,6 +1696,19 @@ test "enabled sts policy advertises a well-formed value" {
     replies.clear();
     try dispatchText(&session, &replies, "CAP LS 302");
     try expectNotContains(replies.written(), "sts=");
+}
+
+test "clearOper revokes operator status, privileges, and class" {
+    var s = ClientSession.init();
+    s.setOperGrant(oper.OperPrivileges.full, "netadmin", "Network Admin");
+    try std.testing.expect(s.isOper());
+    try std.testing.expect(s.hasPriv(.server_admin));
+    try std.testing.expectEqualStrings("netadmin", s.operClass());
+
+    s.clearOper();
+    try std.testing.expect(!s.isOper());
+    try std.testing.expect(!s.hasPriv(.server_admin));
+    try std.testing.expectEqualStrings("", s.operClass());
 }
 
 test "short parameters emit ERR_NEEDMOREPARAMS" {

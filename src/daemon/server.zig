@@ -8218,7 +8218,9 @@ pub const LinuxServer = struct {
         self.evaluateNickProtection(conn);
     }
 
-    /// `LOGOUT` — drop the session's account login (does not affect oper for now).
+    /// `LOGOUT` — drop the session's account login. Because operator status is
+    /// SASL-account-derived (no password OPER), logging out also revokes oper:
+    /// otherwise an operator could log out yet retain +o and its privileges.
     pub fn handleLogout(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
         // Drop this connection's live session before clearing the account binding
         // (the session is keyed by account; logout fully ends it, no reclaim).
@@ -8226,8 +8228,15 @@ pub const LinuxServer = struct {
         // account-notify: tell common channels this user is no longer logged in
         // (emit BEFORE clearing the account so the prefix/state is still valid).
         self.emitAccountChange(id, conn, "*");
+        const was_oper = conn.session.isOper();
         conn.session.logout();
         var buf: [default_reply_bytes]u8 = undefined;
+        if (was_oper) {
+            conn.session.clearOper();
+            const nick = conn.session.displayName();
+            const mode = std.fmt.bufPrint(&buf, ":{s} MODE {s} :-o\r\n", .{ server_name, nick }) catch return;
+            try appendToConn(conn, mode);
+        }
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ server_name, conn.session.displayName() }) catch return;
         try appendToConn(conn, line);
     }
