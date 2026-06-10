@@ -190,6 +190,13 @@ pub const Client = struct {
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
     leaf_key: ?LeafPublicKey = null,
+    /// Owned storage for the leaf RSA key's modulus/exponent. The parsed key
+    /// borrows the certificate SPKI bytes, which live in `hs_plain` and are
+    /// consumed (shifted) after the Certificate message — so an RSA key would
+    /// dangle by the time the server CertificateVerify is verified. We copy
+    /// n/e here and re-point the key. (EC/Ed25519 keys are value types.)
+    leaf_rsa_n: [rsa_verify.max_bytes]u8 = undefined,
+    leaf_rsa_e: [16]u8 = undefined,
     last_alert: ?tls_alert.Alert = null,
 
     // --- Test-only client-certificate support (mutual TLS) ---
@@ -666,6 +673,18 @@ pub const Client = struct {
             try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name);
         }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
+        // The RSA variant borrows the SPKI bytes (in hs_plain); copy n/e into
+        // owned storage so the key survives the post-message consume of hs_plain.
+        if (self.leaf_key) |lk| {
+            if (lk == .rsa) {
+                const n = lk.rsa.n;
+                const e = lk.rsa.e;
+                if (n.len > self.leaf_rsa_n.len or e.len > self.leaf_rsa_e.len) return error.BadCertificate;
+                @memcpy(self.leaf_rsa_n[0..n.len], n);
+                @memcpy(self.leaf_rsa_e[0..e.len], e);
+                self.leaf_key = .{ .rsa = .{ .n = self.leaf_rsa_n[0..n.len], .e = self.leaf_rsa_e[0..e.len] } };
+            }
+        }
     }
 
     fn verifyCertificateVerify(self: *Client, body: []const u8) Error!void {

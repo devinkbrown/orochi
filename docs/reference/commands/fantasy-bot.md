@@ -69,7 +69,9 @@ or per-call with `!weather <place>`.
 
 ## News updater (full feed coverage)
 
-The in-daemon TLS reaches only some feeds. For robust full coverage set
+The in-daemon TLS (clean-room, TLS 1.3) verifies ECDSA and RSA leaf certs, so it
+reaches the great majority of feeds directly; a TLS-1.2-only host is the main
+exception. For guaranteed full coverage regardless, set
 `[geo] news_cache_dir` and run the bundled key-free updater from cron — it uses
 `curl` (system CA bundle) to fetch every feed and writes one-headline-per-line
 files the daemon reads:
