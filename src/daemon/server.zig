@@ -5366,7 +5366,38 @@ pub const LinuxServer = struct {
                     found = buf[0..k];
                 }
             },
-            .around => |r| target = r.target,
+            .around => |r| {
+                target = r.target;
+                // Timestamp pivot only (msgid needs msgid->ts resolution). Return
+                // up to `limit` messages centred on the pivot: ~half strictly
+                // before it (reversed to chronological order) followed by the
+                // pivot and later, oldest-first.
+                if (r.center == .timestamp) {
+                    const center = r.center.timestamp;
+                    const total = @min(@as(usize, r.limit), buf.len);
+                    const half = total / 2;
+                    var before_buf: [64]lotus.Message = undefined;
+                    var after_buf: [64]lotus.Message = undefined;
+                    const bn = @min(half, before_buf.len);
+                    const before_part = self.history.before(target, center, bn, before_buf[0..bn]) catch before_buf[0..0];
+                    const remaining = total - before_part.len;
+                    const an = @min(remaining, after_buf.len);
+                    const after_part = self.history.after(target, center -| 1, an, after_buf[0..an]) catch after_buf[0..0];
+                    var k: usize = 0;
+                    var i: usize = before_part.len; // before_part is newest-first; emit reversed
+                    while (i > 0 and k < buf.len) {
+                        i -= 1;
+                        buf[k] = before_part[i];
+                        k += 1;
+                    }
+                    for (after_part) |m| {
+                        if (k == buf.len) break;
+                        buf[k] = m;
+                        k += 1;
+                    }
+                    found = buf[0..k];
+                }
+            },
         }
 
         var cmsgs: [64]chathistory_cmd.Message = undefined;

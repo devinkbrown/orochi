@@ -384,6 +384,42 @@ test "between window composes after() with an upper-bound filter" {
     try expectIds(buf[0..k], &.{ "m2", "m3", "m4" });
 }
 
+test "around window composes before() reversed + after() at the pivot" {
+    // Mirrors the CHATHISTORY AROUND wiring: ~half strictly before the pivot
+    // (reversed to chronological), then the pivot and later, oldest-first.
+    const Store = Lotus(.{ .max_targets = 1, .max_per_target = 8, .max_text = 32 });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try appendForTest(&store, "#lotus", "m1", 1, "one");
+    try appendForTest(&store, "#lotus", "m2", 2, "two");
+    try appendForTest(&store, "#lotus", "m3", 3, "three");
+    try appendForTest(&store, "#lotus", "m4", 4, "four");
+    try appendForTest(&store, "#lotus", "m5", 5, "five");
+
+    // AROUND pivot=3, limit=4 -> half=2 before (m1,m2) + pivot/after (m3,m4).
+    const center: u64 = 3;
+    const total: usize = 4;
+    const half = total / 2;
+    var before_buf: [8]Message = undefined;
+    var after_buf: [8]Message = undefined;
+    const before_part = try store.before("#lotus", center, half, before_buf[0..half]);
+    const remaining = total - before_part.len;
+    const after_part = try store.after("#lotus", center - 1, remaining, after_buf[0..remaining]);
+    var out: [8]Message = undefined;
+    var k: usize = 0;
+    var i: usize = before_part.len;
+    while (i > 0) {
+        i -= 1;
+        out[k] = before_part[i];
+        k += 1;
+    }
+    for (after_part) |m| {
+        out[k] = m;
+        k += 1;
+    }
+    try expectIds(out[0..k], &.{ "m1", "m2", "m3", "m4" });
+}
+
 test "redact hides reads but keeps slot" {
     const Store = Lotus(.{ .max_targets = 1, .max_per_target = 3, .max_text = 32 });
     var store = Store.init(std.testing.allocator);
