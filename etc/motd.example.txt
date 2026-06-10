@@ -1,0 +1,21 @@
+{greeting}, {nick} — welcome to {network}!
+
+       ___                 _     _
+      / _ \ _ __ ___   ___| |__ (_)
+     | | | | '__/ _ \ / __| '_ \| |
+     | |_| | | | (_) | (__| | | | |
+      \___/|_|  \___/ \___|_| |_|_|    大蛇
+
+  Connected to {server} (running {version}) — {users} users online.{if:weather}
+  Weather — {weather}.{/if}{if:news}
+  Headlines — {news}.{/if}
+
+{if:account}  Signed in as {account}. Your services and saved settings are active.{else}  You are browsing as a guest — register your account to reserve your nick
+  and unlock services (see REGISTER).{/if}{if:oper}
+  [*] Operator privileges are active on this connection — wield them with care.{/if}{if:secure}{else}
+  [!] This connection is not encrypted. Reconnect over TLS for privacy.{/if}
+
+  #root is home base — type LIST to explore the network.
+  Be excellent to each other.
+
+  -- The {network} staff

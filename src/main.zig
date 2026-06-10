@@ -3,13 +3,30 @@ const std = @import("std");
 const builtin = @import("builtin");
 const orochi = @import("orochi");
 
-/// ${VAR} resolver for the config parser — reads the process environment map
+/// Shared context for the config-string resolver. Both `env:NAME` and
+/// `@file:path` indirection run through a single `?*anyopaque` ctx, so it
+/// carries everything either lookup needs: the process environment map and an
+/// `Io` handle for reading `@file:` payloads off disk.
+const ResolverCtx = struct {
+    environ_map: *std.process.Environ.Map,
+    io: std.Io,
+};
+
+/// `env:NAME` resolver for the config parser — reads the process environment map
 /// (Zig 0.16 delivers the environment via `std.process.Init.environ_map`, which
 /// we thread through the resolver `ctx`). Returns an owned dupe of the value.
 fn envLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
-    const map: *std.process.Environ.Map = @ptrCast(@alignCast(ctx orelse return error.EnvironmentVariableNotFound));
-    const value = map.get(name) orelse return error.EnvironmentVariableNotFound;
+    const rc: *ResolverCtx = @ptrCast(@alignCast(ctx orelse return error.EnvironmentVariableNotFound));
+    const value = rc.environ_map.get(name) orelse return error.EnvironmentVariableNotFound;
     return allocator.dupe(u8, value);
+}
+
+/// `@file:path` resolver for the config parser — loads the file's contents
+/// (relative to the daemon cwd) as the string value, so secrets and large text
+/// blobs (e.g. `[motd] text = "@file:etc/motd.example.txt"`) can live on disk.
+fn fileLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) anyerror![]const u8 {
+    const rc: *ResolverCtx = @ptrCast(@alignCast(ctx orelse return error.FileNotFound));
+    return std.Io.Dir.cwd().readFileAlloc(rc.io, path, allocator, .limited(1 << 20));
 }
 
 /// Services → live-world bridge: a channel registration marks the live channel
@@ -29,13 +46,18 @@ fn svcDropChannel(ctx: *anyopaque, channel: []const u8) orochi.daemon.services.S
 pub fn main(init: std.process.Init) !void {
     std.debug.print(
         \\
-        \\  Orochi {s}  (水蛟)
+        \\  Orochi {s}  (大蛇)
         \\  Zig-native mesh IRC daemon — Suimyaku + Tsumugi mesh
         \\
         \\
     , .{orochi.version});
 
     const allocator = init.gpa;
+
+    // Resolver context for `env:`/`@file:` config indirection. Lives on `main`'s
+    // frame for the whole process, so the resolver stored on the live config
+    // (used by REHASH) never dangles.
+    var resolver_ctx = ResolverCtx{ .environ_map = init.environ_map, .io = init.io };
 
     // Default config (6680; 6667/6697 belong to the local eshmaki server). A
     // config file path may be passed as argv[1]: present values override the
@@ -98,8 +120,9 @@ pub fn main(init: std.process.Init) !void {
         } else {
             const path = first;
             const resolver = orochi.daemon.config_format.Resolver{
-            .ctx = init.environ_map,
+            .ctx = @ptrCast(&resolver_ctx),
             .env = envLookup,
+            .file = fileLookup,
         };
         if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
             defer allocator.free(text); // string fields are duped by the parser

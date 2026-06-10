@@ -53,7 +53,9 @@ name = "Orochi"
 #   {if:oper}You have operator privileges.{/if}
 #   {if:secure}{else}This link is not encrypted.{/if}
 #
-# text = "@file:/etc/orochi/motd.txt"
+# A ready-to-use annotated example ships in etc/motd.example.txt:
+# text = "@file:etc/motd.example.txt"
+# Or inline:
 # text = """
 # {greeting}, {nick}! Welcome to {network} ({users} online).
 # {if:account}Signed in as {account}.{else}Register to reserve your nick.{/if}
@@ -79,9 +81,9 @@ enabled = false
 #   temp_c=22.0
 #   wind_kph=20
 #   desc=Partly cloudy
-# Example updater (cron, every 10 min):
+# A ready sample ships in etc/weather.example.kv. Example updater (cron):
 #   curl -s 'wttr.in/Austin?format=j1' | jq -r ... > /var/lib/orochi/weather.kv
-# source = "/var/lib/orochi/weather.kv"
+# source = "etc/weather.example.kv"
 # Override the display location (else the file's `location`).
 # location = "Austin, TX"
 # ISO country code for unit selection (else the file's `country`).
@@ -93,8 +95,9 @@ enabled = false
 [news]
 enabled = false
 # Path to a file with one headline per line; the first `count` are joined.
+# A ready sample ships in etc/news.example.txt.
 # Example updater: curl an RSS/JSON feed, write headlines, one per line.
-# source = "/var/lib/orochi/news.txt"
+# source = "etc/news.example.txt"
 count = 3
 
 

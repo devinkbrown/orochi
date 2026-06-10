@@ -1,6 +1,6 @@
 # Orochi — Architecture Brief (source of truth)
 
-**Orochi** (水蛟 — the coiling water-dragon) is the successor to the **ophion** IRC
+**Orochi** (大蛇 — the eight-forked great serpent) is the successor to the **ophion** IRC
 daemon. It is a **100% clean-slate, Zig-native** system: the daemon *and its entire
 substrate* (the libop systems library and the opssl crypto/TLS library) are
 **rewritten from scratch in Zig**. ophion, libop, and opssl are **reference only** —

@@ -1,0 +1,5 @@
+# Sample news source for [news] source. One headline per line; the daemon shows
+# the first [news].count, joined with " | ". Lines starting with # are ignored.
+Orochi 0.1 ships personalized MOTDs with localized weather
+Suimyaku mesh adds live partition + quorum detection
+New: in-place Helix upgrades keep connections alive
