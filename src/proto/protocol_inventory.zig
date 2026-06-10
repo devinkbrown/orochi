@@ -31,6 +31,7 @@ pub const isupport_tokens = [_][]const u8{
     "CHANNELLEN=64",
     "MAXLIST=beIZ:100",
     "CHANLIMIT=#&:50",
+    "MAXTARGETS=4",
     "CASEMAPPING=ascii",
     "PREFIX=(Qqov)!.@+",
     chanmodes_token,

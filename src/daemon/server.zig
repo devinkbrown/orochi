@@ -727,6 +727,7 @@ const Numeric = enum(u16) {
     RPL_BANLIST = 367,
     ERR_BANLISTFULL = 478,
     ERR_TOOMANYCHANNELS = 405,
+    ERR_TOOMANYTARGETS = 407,
     RPL_ENDOFBANLIST = 368,
     RPL_QUIETLIST = 728,
     RPL_ENDOFQUIETLIST = 729,
@@ -869,6 +870,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = try std.fmt.allocPrint(allocator, "MAXLIST=beIZ:{d}", .{cfg.maxlist});
         } else if (std.mem.startsWith(u8, tok, "CHANLIMIT=")) {
             out[i] = try std.fmt.allocPrint(allocator, "CHANLIMIT=#&:{d}", .{cfg.chanlimit});
+        } else if (std.mem.startsWith(u8, tok, "MAXTARGETS=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "MAXTARGETS={d}", .{cfg.maxtargets});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -918,6 +921,10 @@ pub const Config = struct {
     /// Max channels a non-oper client may be in (advertised as CHANLIMIT,
     /// enforced by joinOne). Configurable via `[limits] chanlimit`.
     chanlimit: u32 = 50,
+    /// Max comma-separated targets accepted in one PRIVMSG/NOTICE (advertised as
+    /// MAXTARGETS, enforced by handleMessage). Configurable via `[limits]
+    /// maxtargets`.
+    maxtargets: u32 = 4,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -10475,10 +10482,17 @@ pub const LinuxServer = struct {
         const text = parsed.paramSlice()[1];
         if (!try self.messageContentGates(id, conn, command, parsed.paramSlice()[0], text, is_notice)) return;
 
-        // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target.
+        // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target, capped
+        // at MAXTARGETS to bound fan-out / resist spam amplification.
         var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
+        var ntarget: u32 = 0;
         while (targets.next()) |target| {
             if (target.len == 0) continue;
+            ntarget += 1;
+            if (ntarget > self.config.maxtargets) {
+                try queueNumeric(conn, .ERR_TOOMANYTARGETS, &.{target}, "Too many recipients");
+                break;
+            }
             try self.messageOne(id, conn, command, target, text, parsed.tags_raw);
         }
     }
@@ -12851,8 +12865,33 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
 }
 
+test "threaded server: PRIVMSG beyond MAXTARGETS yields ERR_TOOMANYTARGETS" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    // 5 targets > default MAXTARGETS (4) -> ERR_TOOMANYTARGETS (407).
+    try writeAllFd(fd_a, "PRIVMSG a,b,c,d,e :hi\r\n");
+    try recvUntil(&a, " 407 ", 200);
+}
+
 test "buildIsupportTokens replaces length tokens with configured values" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25, .chanlimit = 12 });
+    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25, .chanlimit = 12, .maxtargets = 3 });
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
     var hits: usize = 0;
@@ -12864,10 +12903,11 @@ test "buildIsupportTokens replaces length tokens with configured values" {
         if (std.mem.eql(u8, tok, "CHANNELLEN=50")) hits += 1;
         if (std.mem.eql(u8, tok, "MAXLIST=beIZ:25")) hits += 1;
         if (std.mem.eql(u8, tok, "CHANLIMIT=#&:12")) hits += 1;
+        if (std.mem.eql(u8, tok, "MAXTARGETS=3")) hits += 1;
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expectEqual(@as(usize, 7), hits);
+    try std.testing.expectEqual(@as(usize, 8), hits);
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 
