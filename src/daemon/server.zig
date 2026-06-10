@@ -1388,6 +1388,13 @@ pub const LinuxServer = struct {
     /// Recent mesh events (peer up/down, oper grant, …) for the `MESH LOG` oper
     /// audit view. Bounded ring; oldest entries roll off.
     mesh_log: mesh_event_log.MeshEventLog(128) = .{},
+    /// Persistent expected-membership set for split/heal transition detection:
+    /// remembers every node id observed so a vanished node still registers as a
+    /// split until it ages out (see updatePartitionTransitions).
+    partition_seen: partition_detector.SeenSet(partition_detector.max_nodes) = .{},
+    /// Whether the local node was partitioned at the last transition check, so a
+    /// crossing emits exactly one .split / .heal mesh event.
+    partition_split: bool = false,
     /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
     /// keyed by remote server name, surfaced in the MESH peer table.
     peer_health: link_health_mod.Registry = .{},
@@ -2629,6 +2636,7 @@ pub const LinuxServer = struct {
             self.traceLog(.info, .s2s, "s2s secured link established");
             self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
             self.markPeerHealth(link.remoteName(), .established);
+            self.updatePartitionTransitions();
         }
         if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
         // Drain inbound cross-node user messages over the secured link.
@@ -2669,6 +2677,7 @@ pub const LinuxServer = struct {
         if (!was and link.established()) {
             self.logMeshEvent(.peer_up, link.remoteName(), "link established");
             self.markPeerHealth(link.remoteName(), .established);
+            self.updatePartitionTransitions();
         }
         const out = link.outbound();
         if (out.len != 0) {
@@ -3154,6 +3163,7 @@ pub const LinuxServer = struct {
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
+                self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true);
@@ -3168,6 +3178,7 @@ pub const LinuxServer = struct {
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s = null;
+                self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true);
@@ -10185,6 +10196,92 @@ pub const LinuxServer = struct {
     /// rendered by the pure `mesh_report` renderer from live S2S link state,
     /// enriched with per-peer link health (RTT, byte counters, time-in-state)
     /// from the live health table. Operator-gated by the registry (access=.oper).
+    /// TTL after which a node not re-observed in the mesh topology is forgotten
+    /// (and a split it caused heals). Generous so brief flaps do not churn.
+    const partition_seen_ttl_ms: u64 = 5 * 60 * 1000;
+
+    /// Gather the multi-hop mesh topology from `self`'s perspective: an explicit
+    /// local<->peer edge per established direct link plus each peer's gossiped
+    /// server registry. Returns the number of `partition_detector.TopoNode`
+    /// entries written to `out`.
+    fn assembleMeshTopology(self: *LinuxServer, local_id: u64, out: []partition_detector.TopoNode) usize {
+        var tn: usize = 0;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            if (tn >= out.len) break;
+            const c = entry.value;
+            if (c.s2s) |l| {
+                if (!l.established()) continue;
+                if (l.remoteNodeId()) |rid| {
+                    if (tn < out.len) {
+                        out[tn] = .{ .node_id = rid, .uplink = local_id };
+                        tn += 1;
+                    }
+                }
+                tn += l.collectTopology(out[tn..]);
+            } else if (c.s2s_secured) |l| {
+                if (!l.established()) continue;
+                if (l.peerShortId()) |rid| {
+                    if (tn < out.len) {
+                        out[tn] = .{ .node_id = rid, .uplink = local_id };
+                        tn += 1;
+                    }
+                }
+                tn += l.collectTopology(out[tn..]);
+            }
+        }
+        return tn;
+    }
+
+    /// Recompute mesh reachability and emit a `.split` / `.heal` mesh event when
+    /// the local node crosses a partition boundary. Observes the live topology
+    /// into the persistent SeenSet (so a node lost with its peer link stays
+    /// "expected" and registers as unreachable), ages out nodes past the TTL
+    /// (healing stale splits), then runs the detector over the remembered node
+    /// set. Best-effort; call at S2S link establish/drop transitions.
+    fn updatePartitionTransitions(self: *LinuxServer) void {
+        const ident = self.config.node_identity orelse return;
+        const local_id = ident.shortId();
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+
+        var topo: [partition_detector.max_nodes]partition_detector.TopoNode = undefined;
+        const tn = self.assembleMeshTopology(local_id, &topo);
+
+        // Remember the local node and every node currently in view, then forget
+        // anything not seen within the TTL.
+        self.partition_seen.observe(local_id, now);
+        for (topo[0..tn]) |t| {
+            self.partition_seen.observe(t.node_id, now);
+            if (t.uplink) |up| self.partition_seen.observe(up, now);
+        }
+        _ = self.partition_seen.prune(now, partition_seen_ttl_ms);
+
+        // Known node set = everything still remembered; edges = the live topology.
+        var ids: [partition_detector.max_nodes]u64 = undefined;
+        const idn = self.partition_seen.ids(&ids);
+        var live: [partition_detector.max_nodes]partition_detector.Liveness = undefined;
+        for (0..idn) |i| live[i] = .alive;
+        var edges: [partition_detector.max_nodes]partition_detector.Edge = undefined;
+        var en: usize = 0;
+        for (topo[0..tn]) |t| {
+            if (t.uplink) |up| {
+                if (up == t.node_id) continue;
+                if (en < edges.len) {
+                    edges[en] = .{ .a = t.node_id, .b = up };
+                    en += 1;
+                }
+            }
+        }
+
+        var det = partition_detector.Detector.init();
+        det.update(ids[0..idn], live[0..idn], edges[0..en]) catch return;
+        const now_split = det.isPartitioned(local_id);
+        if (now_split != self.partition_split) {
+            self.partition_split = now_split;
+            self.logMeshEvent(if (now_split) .split else .heal, server_name, if (now_split) "lost reachability to part of the mesh" else "regained full mesh reachability");
+        }
+    }
+
     pub fn handleMesh(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         // `MESH LOG` renders the recent mesh-event audit ring instead of peers.
         if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "LOG")) {
@@ -10266,31 +10363,7 @@ pub const LinuxServer = struct {
         if (self.config.node_identity) |ident| {
             const local_id = ident.shortId();
             var topo: [partition_detector.max_nodes]partition_detector.TopoNode = undefined;
-            var tn: usize = 0;
-            var pit = self.rx().clients.iterator();
-            while (pit.next()) |entry| {
-                if (tn >= topo.len) break;
-                const c = entry.value;
-                if (c.s2s) |l| {
-                    if (!l.established()) continue;
-                    if (l.remoteNodeId()) |rid| {
-                        if (tn < topo.len) {
-                            topo[tn] = .{ .node_id = rid, .uplink = local_id };
-                            tn += 1;
-                        }
-                    }
-                    tn += l.collectTopology(topo[tn..]);
-                } else if (c.s2s_secured) |l| {
-                    if (!l.established()) continue;
-                    if (l.peerShortId()) |rid| {
-                        if (tn < topo.len) {
-                            topo[tn] = .{ .node_id = rid, .uplink = local_id };
-                            tn += 1;
-                        }
-                    }
-                    tn += l.collectTopology(topo[tn..]);
-                }
-            }
+            const tn = self.assembleMeshTopology(local_id, &topo);
             const stats = partition_detector.analyze(local_id, topo[0..tn]);
             reachable_nodes = @intCast(stats.reachable);
             partitioned_nodes = @intCast(stats.partitioned);
