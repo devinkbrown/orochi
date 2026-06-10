@@ -82,6 +82,10 @@ pub const Established = struct {
     send_nonce: Nonce96,
     recv_nonce: Nonce96,
     peer_node_id: NodeId,
+    /// The peer's authenticated raw Ed25519 signing public key (verified against
+    /// `peer_node_id` during the AKE). Used to verify peer-signed artifacts such
+    /// as cross-mesh operator grants.
+    peer_node_key: sign.PublicKey,
     accepted_bands: u128,
     accepted_features: u128,
 
@@ -237,7 +241,7 @@ pub const Initiator = struct {
         if (!try sign.verifyCtx(m2_sig_domain, &sig_digest, body.sig, body.node_key)) return error.BadSignature;
 
         self.state = .established;
-        return deriveEstablished(.initiator, &first, &second, self.m1_wire, bytes, body.node_id, body.accepted_bands, body.accepted_features);
+        return deriveEstablished(.initiator, &first, &second, self.m1_wire, bytes, body.node_id, body.node_key, body.accepted_bands, body.accepted_features);
     }
 
     fn buildM1Payload(self: *Initiator, prefix: []const u8) Error![]u8 {
@@ -333,7 +337,7 @@ pub const Responder = struct {
         try out.appendSlice(self.allocator, sealed);
         const wire = try out.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(wire);
-        self.established = try deriveEstablished(.responder, &first, &enc2.shared, bytes, wire, body.node_id, expected_bands, expected_features);
+        self.established = try deriveEstablished(.responder, &first, &enc2.shared, bytes, wire, body.node_id, body.node_key, expected_bands, expected_features);
         self.state = .m2_sent;
         return wire;
     }
@@ -411,7 +415,7 @@ fn updateInt(comptime T: type, h: *Blake3, value: T) void {
     h.update(&b);
 }
 
-fn deriveEstablished(role: Role, first: *const xwing.SharedSecret, second: *const xwing.SharedSecret, m1: []const u8, m2: []const u8, peer: NodeId, bands: u128, features: u128) Error!Established {
+fn deriveEstablished(role: Role, first: *const xwing.SharedSecret, second: *const xwing.SharedSecret, m1: []const u8, m2: []const u8, peer: NodeId, peer_key: sign.PublicKey, bands: u128, features: u128) Error!Established {
     var hs: [32]u8 = undefined;
     var h = Blake3.init(.{});
     h.update("MZ-TSUMUGI-XWING-IK-v1");
@@ -433,8 +437,8 @@ fn deriveEstablished(role: Role, first: *const xwing.SharedSecret, second: *cons
     try Hkdf.expand(&root, "s2c nonce gen0", &s2c_nonce);
 
     return switch (role) {
-        .initiator => .{ .root_key = root, .send_key = ChainKey.init(c2s_key), .recv_key = ChainKey.init(s2c_key), .send_nonce = c2s_nonce, .recv_nonce = s2c_nonce, .peer_node_id = peer, .accepted_bands = bands, .accepted_features = features },
-        .responder => .{ .root_key = root, .send_key = ChainKey.init(s2c_key), .recv_key = ChainKey.init(c2s_key), .send_nonce = s2c_nonce, .recv_nonce = c2s_nonce, .peer_node_id = peer, .accepted_bands = bands, .accepted_features = features },
+        .initiator => .{ .root_key = root, .send_key = ChainKey.init(c2s_key), .recv_key = ChainKey.init(s2c_key), .send_nonce = c2s_nonce, .recv_nonce = s2c_nonce, .peer_node_id = peer, .peer_node_key = peer_key, .accepted_bands = bands, .accepted_features = features },
+        .responder => .{ .root_key = root, .send_key = ChainKey.init(s2c_key), .recv_key = ChainKey.init(c2s_key), .send_nonce = s2c_nonce, .recv_nonce = c2s_nonce, .peer_node_id = peer, .peer_node_key = peer_key, .accepted_bands = bands, .accepted_features = features },
     };
 }
 

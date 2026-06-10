@@ -122,6 +122,12 @@ pub const SecuredLink = struct {
     pub fn peerShortId(self: *const SecuredLink) ?u64 {
         return if (self.session) |s| s.peerShortId() else null;
     }
+
+    /// The peer's authenticated raw Ed25519 signing public key (null before the
+    /// AKE establishes). Verifies peer-signed cross-mesh operator grants.
+    pub fn peerNodeKey(self: *const SecuredLink) ?[32]u8 {
+        return if (self.session) |s| s.peerNodeKey() else null;
+    }
     pub fn channelMembers(self: *const SecuredLink, channel: []const u8) []const s2s_peer.MemberInfo {
         return if (self.inner) |l| l.channelMembers(channel) else &.{};
     }
@@ -155,6 +161,22 @@ pub const SecuredLink = struct {
     pub fn takeInbound(self: *SecuredLink) anyerror![]s2s_peer.InboundMessage {
         const link = self.inner orelse return &.{};
         return link.takeInbound();
+    }
+
+    /// Forward a signed cross-mesh operator grant to the peer over the secured
+    /// CRDT link (no-op until established). Outbound bytes accumulate in `out`.
+    pub fn sendOperGrant(self: *SecuredLink, signed: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendOperGrant(signed);
+        try self.drainInner();
+    }
+
+    /// Drain queued inbound oper-grant payloads decoded by the inner link. Caller
+    /// owns + frees each slice and the outer slice. Verify each against
+    /// `peerNodeKey()` before trusting it.
+    pub fn takeOperGrants(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeOperGrants();
     }
 
     fn writeFramed(self: *SecuredLink, payload: []const u8) anyerror!void {
@@ -365,6 +387,10 @@ fn runScenario(split: bool) !void {
     // TOFU: each side adopted the other's bridged identity.
     try testing.expectEqual(idb.shortId(), a.peerShortId().?);
     try testing.expectEqual(ida.shortId(), b.peerShortId().?);
+    // Each side recovered the peer's authenticated raw Ed25519 sign key — the
+    // key cross-mesh oper grants are verified against.
+    try testing.expectEqualSlices(u8, &idb.sign_kp.public_key, &a.peerNodeKey().?);
+    try testing.expectEqualSlices(u8, &ida.sign_kp.public_key, &b.peerNodeKey().?);
 }
 
 test "secured link: TOFU preamble + IK handshake + CRDT over a whole-buffer stream" {

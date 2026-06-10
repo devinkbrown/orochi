@@ -2638,6 +2638,19 @@ pub const LinuxServer = struct {
             }
             self.allocator.free(inbound);
         } else |_| {}
+        // Drain inbound cross-mesh oper grants. Each is verified against the
+        // peer's authenticated Ed25519 key from the Tsumugi handshake before it
+        // can confer operator authority locally — an unverifiable grant is
+        // silently dropped by applyMeshGrant.
+        if (link.peerNodeKey()) |peer_key| {
+            if (link.takeOperGrants()) |grants| {
+                for (grants) |g| {
+                    _ = self.applyMeshGrant(g, peer_key);
+                    self.allocator.free(g);
+                }
+                self.allocator.free(grants);
+            } else |_| {}
+        }
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
@@ -8294,7 +8307,7 @@ pub const LinuxServer = struct {
     /// broadcasts it to peers. Best-effort: silently no-ops without a node key.
     fn mintOperGrant(self: *LinuxServer, account: []const u8, privileges: oper_mod.OperPrivileges, class_name: []const u8, title: []const u8) void {
         // Only meaningful when this node can sign for broadcast to peers.
-        if (self.meshSignKey() == null) return;
+        const kp = self.meshSignKey() orelse return;
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         const fields = oper_cred_share.GrantFields{
             .account = account,
@@ -8307,7 +8320,26 @@ pub const LinuxServer = struct {
             .expiry_ms = now + oper_grant_ttl_ms,
         };
         _ = self.oper_grants.upsert(fields);
-        // (Broadcast over S2S to peers is wired where grant frames are sent.)
+        // Sign once and broadcast to every authenticated peer so they recognize
+        // this operator (best-effort; a sign failure just skips propagation).
+        var buf: [oper_cred_share.max_grant_len]u8 = undefined;
+        const n = oper_cred_share.sign(kp, fields, &buf) catch return;
+        self.broadcastOperGrant(buf[0..n]);
+        self.logMeshEvent(.oper_grant_out, account, server_name);
+    }
+
+    /// Broadcast a signed oper grant to every established **secured** peer. The
+    /// plaintext S2S path is deliberately skipped: a grant only carries authority
+    /// over a link whose peer identity the Tsumugi handshake authenticated.
+    fn broadcastOperGrant(self: *LinuxServer, signed: []const u8) void {
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const link = slot.value.s2s_secured orelse continue;
+            if (!link.established()) continue;
+            link.sendOperGrant(signed) catch continue;
+            self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+            link.clearOutbound();
+        }
     }
 
     fn elevateOperFromAccount(self: *LinuxServer, conn: *ConnState) !void {

@@ -195,6 +195,18 @@ pub const S2sLink = struct {
     pub fn takeInbound(self: *S2sLink) ![]s2s_peer.InboundMessage {
         return self.peer.takeInbound();
     }
+
+    /// Forward a signed cross-mesh operator grant to the peer (best-effort; only
+    /// meaningful once established). `signed` is opaque `oper_cred_share` bytes.
+    pub fn sendOperGrant(self: *S2sLink, signed: []const u8) !void {
+        try self.peer.sendOperGrant(self.sink(), signed);
+    }
+
+    /// Drain queued inbound oper-grant payloads decoded from this peer. Caller
+    /// owns + frees each slice and the outer slice.
+    pub fn takeOperGrants(self: *S2sLink) ![][]u8 {
+        return self.peer.takeOperGrants();
+    }
 };
 
 test "two links handshake and converge over a byte loopback" {
@@ -299,6 +311,50 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
         now += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#chat").len);
+}
+
+test "OPER_GRANT payload round-trips across the link into takeOperGrants" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.mizuchi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.mizuchi" });
+    defer b.deinit();
+
+    // Establish, then A sends an opaque signed grant blob; pump to B.
+    try a.start(10);
+    const grant = "signed-oper-grant-bytes-opaque-to-the-link";
+    try a.sendOperGrant(grant);
+    var now: u64 = 11;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const grants = try b.takeOperGrants();
+    defer {
+        for (grants) |g| allocator.free(g);
+        allocator.free(grants);
+    }
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try std.testing.expectEqualSlices(u8, grant, grants[0]);
+    // Drained: a second take yields nothing.
+    const empty = try b.takeOperGrants();
+    defer allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "consumeOutbound drops a partial-send prefix" {

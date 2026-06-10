@@ -126,6 +126,17 @@ pub const Session = struct {
         };
     }
 
+    /// The peer's authenticated raw Ed25519 signing public key (null before
+    /// establish). Verifies peer-signed artifacts such as cross-mesh oper grants.
+    pub fn peerNodeKey(self: *const Session) ?[32]u8 {
+        if (!self.done) return null;
+        const est = switch (self.inner) {
+            .initiator => if (self.init_est) |*e| e else null,
+            .responder => |*r| if (r.established) |*e| e else null,
+        } orelse return null;
+        return est.peer_node_key;
+    }
+
     /// The u64 mesh routing handle for the peer — pass as `S2sPeer.remote_node_id`.
     pub fn peerShortId(self: *const Session) ?u64 {
         if (!self.done) return null;
