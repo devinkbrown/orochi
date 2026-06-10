@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
         \\  Zig-native mesh IRC daemon — Suimyaku + Tsumugi mesh
         \\
         \\
-    , .{orochi.version});
+    , .{orochi.version_full});
 
     const allocator = init.gpa;
 

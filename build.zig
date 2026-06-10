@@ -68,6 +68,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = needs_libc,
     });
 
+    // Embed the current git revision (short hash, suffixed "-dirty" when the
+    // working tree has uncommitted changes) so the running binary can report
+    // exactly which commit it was built from (banner + VERSION). Available to
+    // module source as `@import("build_info").git_commit`.
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "git_commit", gitCommit(b));
+    mod.addImport("build_info", build_info.createModule());
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -255,3 +263,29 @@ pub fn build(b: *std.Build) void {
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
 }
+
+/// Capture the current git revision at configure time: the short commit hash,
+/// suffixed "-dirty" when the working tree has uncommitted changes. Returns
+/// "unknown" when git is unavailable or this is not a checkout, so builds from a
+/// source tarball still succeed. The `-C <build_root>` keeps it correct
+/// regardless of the build's working directory.
+fn gitCommit(b: *std.Build) []const u8 {
+    const root = b.build_root.path orelse ".";
+    const hash = b.runAllowFail(
+        &.{ "git", "-C", root, "rev-parse", "--short", "HEAD" },
+        &code,
+        .ignore,
+    ) catch return "unknown";
+    const short = std.mem.trim(u8, hash, " \r\n\t");
+    if (short.len == 0) return "unknown";
+
+    const status = b.runAllowFail(
+        &.{ "git", "-C", root, "status", "--porcelain", "--untracked-files=no" },
+        &code,
+        .ignore,
+    ) catch "";
+    const dirty = std.mem.trim(u8, status, " \r\n\t").len != 0;
+    return if (dirty) b.fmt("{s}-dirty", .{short}) else b.dupe(short);
+}
+
+var code: u8 = 0;

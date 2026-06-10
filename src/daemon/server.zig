@@ -95,6 +95,7 @@ const tracelog = @import("../substrate/trace.zig");
 const geoip = @import("../substrate/geoip.zig");
 const geo_services = @import("geo_services.zig");
 const news_sources = @import("../proto/news_sources.zig");
+const build_info = @import("build_info");
 const stats_report = @import("stats_report.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const accept_list = @import("../proto/accept_list.zig");
@@ -8408,8 +8409,9 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         const info = serverinfo.VersionInfo{
             .version = server_version,
-            // build token: compile target so opers can tell binaries apart.
-            .build = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
+            // build token: compile target + git revision so opers can tell
+            // binaries apart and pin the exact source commit.
+            .build = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ build_info.git_commit,
             .branding = @tagName(builtin.mode),
             .reply_server = self.serverName(),
             .description = "Orochi — pure-Zig mesh IRC daemon",
@@ -10598,7 +10600,7 @@ pub const LinuxServer = struct {
         const uptime_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(now - self.start_ms, 1000)));
         const online_since: i64 = @divTrunc(platform.realtimeMillis(), 1000) - @as(i64, @intCast(uptime_secs));
         const about = server_about.AboutInfo{
-            .version = server_version,
+            .version = server_version ++ " (" ++ build_info.git_commit ++ ")",
             .zig_version = builtin.zig_version_string,
             .target = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
             .optimize = @tagName(builtin.mode),
