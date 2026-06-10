@@ -117,6 +117,9 @@ pub const S2sPeer = struct {
     /// daemon to drain + deliver to local clients (the daemon owns delivery; the
     /// peer driver stays substrate-pure). Loop-guarded by `seen`.
     inbound: std.ArrayListUnmanaged(message_relay.Owned) = .empty,
+    /// Inbound signed oper-grant payloads (raw oper_cred_share bytes) decoded
+    /// from OPER_GRANT frames, awaiting the daemon to verify + ingest them.
+    inbound_grants: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -171,6 +174,8 @@ pub const S2sPeer = struct {
     pub fn deinit(self: *S2sPeer) void {
         for (self.inbound.items) |*owned| owned.deinit(self.allocator);
         self.inbound.deinit(self.allocator);
+        for (self.inbound_grants.items) |g| self.allocator.free(g);
+        self.inbound_grants.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -275,7 +280,26 @@ pub const S2sPeer = struct {
             .QUIT => self.closeRemote(),
             .MEMBERSHIP => try self.recvMembership(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
+            .OPER_GRANT => try self.recvOperGrant(frame.payload),
         }
+    }
+
+    /// Queue an inbound signed oper-grant payload for the daemon to verify (against
+    /// this peer's identity) and ingest. A copy is taken; oversize/alloc failures
+    /// drop it rather than fault the link.
+    fn recvOperGrant(self: *S2sPeer, payload: []const u8) !void {
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.inbound_grants.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued inbound oper-grant payloads (caller owns + frees each slice).
+    pub fn takeOperGrants(self: *S2sPeer) ![][]u8 {
+        return self.inbound_grants.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed oper-grant to this peer (best-effort; only once established).
+    pub fn sendOperGrant(self: *S2sPeer, sink: ByteSink, signed: []const u8) !void {
+        try emitFrame(self.allocator, sink, .OPER_GRANT, signed);
     }
 
     /// Decode an inbound cross-node MESSAGE and queue it for the daemon to

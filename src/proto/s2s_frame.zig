@@ -33,6 +33,9 @@ pub const FrameType = enum(u8) {
     QUIT = 0x07,
     MEMBERSHIP = 0x08,
     MESSAGE = 0x09,
+    /// Signed cross-mesh operator authorization grant (oper_cred_share bytes),
+    /// verified against the sending peer's identity on receipt.
+    OPER_GRANT = 0x0A,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -48,6 +51,8 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.PONG) => .PONG,
             @intFromEnum(FrameType.QUIT) => .QUIT,
             @intFromEnum(FrameType.MEMBERSHIP) => .MEMBERSHIP,
+            @intFromEnum(FrameType.MESSAGE) => .MESSAGE,
+            @intFromEnum(FrameType.OPER_GRANT) => .OPER_GRANT,
             else => null,
         };
     }
@@ -161,6 +166,9 @@ const all_frame_types = [_]FrameType{
     .PING,
     .PONG,
     .QUIT,
+    .MEMBERSHIP,
+    .MESSAGE,
+    .OPER_GRANT,
 };
 
 test "encode/decode round-trip each type" {
