@@ -725,6 +725,7 @@ const Numeric = enum(u16) {
     RPL_NAMREPLY = 353,
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
+    ERR_BANLISTFULL = 478,
     RPL_ENDOFBANLIST = 368,
     RPL_QUIETLIST = 728,
     RPL_ENDOFQUIETLIST = 729,
@@ -863,6 +864,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = try std.fmt.allocPrint(allocator, "NICKLEN={d}", .{cfg.nicklen});
         } else if (std.mem.startsWith(u8, tok, "CHANNELLEN=")) {
             out[i] = try std.fmt.allocPrint(allocator, "CHANNELLEN={d}", .{cfg.channellen});
+        } else if (std.mem.startsWith(u8, tok, "MAXLIST=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "MAXLIST=beIZ:{d}", .{cfg.maxlist});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -906,6 +909,9 @@ pub const Config = struct {
     /// Maximum channel-name length in bytes (advertised as CHANNELLEN, enforced
     /// by joinOne). Configurable via `[limits] channellen`.
     channellen: u32 = 64,
+    /// Per-channel cap on each list mode (+b/+e/+I/+Z) — advertised as MAXLIST
+    /// and enforced by world.listAddMask. Configurable via `[limits] maxlist`.
+    maxlist: u32 = 100,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -1515,7 +1521,11 @@ pub const LinuxServer = struct {
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .reactors = reactors,
             .pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(allocator),
-            .world = world_model.World.init(allocator),
+            .world = blk: {
+                var w = world_model.World.init(allocator);
+                w.max_list_entries = config.maxlist;
+                break :blk w;
+            },
             .whowas = whowas_store,
             .monitor = monitor.MonitorStore.init(allocator, 128),
             .read_markers = read_marker_store.DefaultStore.init(allocator),
@@ -4049,6 +4059,15 @@ pub const LinuxServer = struct {
     /// only) gated by tier rank, flag modes (i/m/n/t/s), and parameterised modes
     /// (+k key, +l limit, +b ban; `MODE #c b` lists bans). User-target MODE is not
     /// handled on this path.
+    /// Emit ERR_BANLISTFULL (478) when a channel list mode add hit the cap; other
+    /// errors (e.g. NoSuchChannel) are swallowed by the MODE loop as before.
+    fn maybeListFull(self: *LinuxServer, conn: *ConnState, channel: []const u8, mask: []const u8, err: anyerror) ServerError!void {
+        _ = self;
+        if (err == error.ListFull) {
+            try queueNumeric(conn, .ERR_BANLISTFULL, &.{ channel, mask }, "Channel list is full");
+        }
+    }
+
     pub fn handleMode(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MODE"}, "Not enough parameters");
@@ -4297,7 +4316,10 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addBan(channel, mask) catch continue)
+                        (self.world.addBan(channel, mask) catch |e| {
+                            try self.maybeListFull(conn, channel, mask, e);
+                            continue;
+                        })
                     else
                         (self.world.removeBan(channel, mask) catch continue);
                     if (changed) {
@@ -4314,7 +4336,10 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addExempt(channel, mask) catch continue)
+                        (self.world.addExempt(channel, mask) catch |e| {
+                            try self.maybeListFull(conn, channel, mask, e);
+                            continue;
+                        })
                     else
                         (self.world.removeExempt(channel, mask) catch continue);
                     if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'e', mask);
@@ -4328,7 +4353,10 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addInvex(channel, mask) catch continue)
+                        (self.world.addInvex(channel, mask) catch |e| {
+                            try self.maybeListFull(conn, channel, mask, e);
+                            continue;
+                        })
                     else
                         (self.world.removeInvex(channel, mask) catch continue);
                     if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'I', mask);
@@ -4343,7 +4371,10 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addMute(channel, mask) catch continue)
+                        (self.world.addMute(channel, mask) catch |e| {
+                            try self.maybeListFull(conn, channel, mask, e);
+                            continue;
+                        })
                     else
                         (self.world.removeMute(channel, mask) catch continue);
                     if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'Z', mask);
@@ -12807,7 +12838,7 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
 }
 
 test "buildIsupportTokens replaces length tokens with configured values" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50 });
+    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25 });
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
     var hits: usize = 0;
@@ -12817,10 +12848,11 @@ test "buildIsupportTokens replaces length tokens with configured values" {
         if (std.mem.eql(u8, tok, "KICKLEN=100")) hits += 1;
         if (std.mem.eql(u8, tok, "NICKLEN=30")) hits += 1;
         if (std.mem.eql(u8, tok, "CHANNELLEN=50")) hits += 1;
+        if (std.mem.eql(u8, tok, "MAXLIST=beIZ:25")) hits += 1;
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expectEqual(@as(usize, 5), hits);
+    try std.testing.expectEqual(@as(usize, 6), hits);
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 

@@ -63,6 +63,8 @@ pub const WorldError = std.mem.Allocator.Error || error{
     NotOnChannel,
     NoSuchNick,
     UnsupportedMode,
+    /// A channel list mode (+b/+e/+I/+Z) is at its `max_list_entries` cap.
+    ListFull,
 };
 
 pub const MessageTarget = union(enum) {
@@ -190,6 +192,8 @@ const Channel = struct {
 /// Owned local nick/channel registry.
 pub const World = struct {
     allocator: std.mem.Allocator,
+    /// Per-channel cap on each list mode (+b/+e/+I/+Z); set from config at boot.
+    max_list_entries: usize = 100,
     channels: CiStringHashMap(Channel),
     nicks: std.StringHashMap(ClientId),
     client_nicks: std.AutoHashMap(ClientId, []u8),
@@ -728,13 +732,7 @@ pub const World = struct {
     /// Add a +b ban mask. Returns true if newly added (false if already present).
     pub fn addBan(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
-        for (channel.bans.items) |b| {
-            if (std.mem.eql(u8, b, mask)) return false;
-        }
-        const owned = try self.allocator.dupe(u8, mask);
-        errdefer self.allocator.free(owned);
-        try channel.bans.append(self.allocator, owned);
-        return true;
+        return self.listAddMask(&channel.bans, mask);
     }
 
     /// Remove a +b ban mask. Returns true if it existed.
@@ -760,6 +758,8 @@ pub const World = struct {
         for (list.items) |m| {
             if (std.mem.eql(u8, m, mask)) return false;
         }
+        // Cap channel list modes to bound memory and resist ban-list flooding.
+        if (list.items.len >= self.max_list_entries) return error.ListFull;
         const owned = try self.allocator.dupe(u8, mask);
         errdefer self.allocator.free(owned);
         try list.append(self.allocator, owned);
@@ -1224,6 +1224,23 @@ pub fn isChannelName(name: []const u8) bool {
 
 fn testClient(slot: u20) ClientId {
     return .{ .shard = 0, .slot = slot, .gen = 1 };
+}
+
+test "channel list modes are capped at max_list_entries" {
+    var world = World.init(std.testing.allocator);
+    world.max_list_entries = 2;
+    defer world.deinit();
+    _ = try world.join("#c", testClient(1)); // creates the channel
+
+    try std.testing.expect(try world.addBan("#c", "a!*@*"));
+    try std.testing.expect(try world.addBan("#c", "b!*@*"));
+    try std.testing.expectError(error.ListFull, world.addBan("#c", "c!*@*"));
+    // Each list mode has its own independent cap.
+    try std.testing.expect(try world.addExempt("#c", "e1!*@*"));
+    try std.testing.expect(try world.addExempt("#c", "e2!*@*"));
+    try std.testing.expectError(error.ListFull, world.addExempt("#c", "e3!*@*"));
+    // A duplicate is a no-op (false), not a cap error.
+    try std.testing.expect(!try world.addBan("#c", "a!*@*"));
 }
 
 test "isChannelName accepts #, &, and %#/%& but not bare names or ^" {

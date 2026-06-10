@@ -109,6 +109,8 @@ pub const Config = struct {
         nicklen: u32 = 64,
         /// Maximum channel-name length in bytes (advertised as CHANNELLEN).
         channellen: u32 = 64,
+        /// Per-channel cap on each list mode +b/+e/+I/+Z (advertised as MAXLIST).
+        maxlist: u32 = 100,
         max_clones_per_ip: u32 = 0,
         max_clones_per_net: u32 = 0,
         reputation_refuse_threshold: u32 = 0,
@@ -311,6 +313,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.kicklen = @intCast(try uintField(doc, "limits.kicklen", cfg.limits.kicklen, 1, 400));
     cfg.limits.nicklen = @intCast(try uintField(doc, "limits.nicklen", cfg.limits.nicklen, 1, 64));
     cfg.limits.channellen = @intCast(try uintField(doc, "limits.channellen", cfg.limits.channellen, 2, 200));
+    cfg.limits.maxlist = @intCast(try uintField(doc, "limits.maxlist", cfg.limits.maxlist, 1, 10000));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
     if (doc.getString("limits.handshake_timeout")) |s| cfg.limits.handshake_timeout_ms = try durationMs(s);
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);
