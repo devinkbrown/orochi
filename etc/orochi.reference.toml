@@ -118,6 +118,12 @@ enabled = false
 news_insecure_tls = true
 # Fallback !weather location when a client has no GeoIP / `location` metadata.
 # default_location = "Austin, TX"
+# Directory of headline files written by tools/news_update.sh (curl + system CA,
+# so it covers EVERY feed, including those the in-daemon clean-room TLS can't
+# reach). When set, !news reads these files instead of fetching live — robust,
+# key-free, never blocks. Run the updater from cron, e.g.:
+#   */5 * * * * /path/to/orochi/tools/news_update.sh /var/lib/orochi/news 10
+# news_cache_dir = "/var/lib/orochi/news"
 
 
 # --- [listen] — listener sockets ---------------------------------------------

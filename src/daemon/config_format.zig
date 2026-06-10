@@ -107,6 +107,9 @@ pub const Config = struct {
         news_insecure_tls: bool = true,
         /// Fallback `!weather` location when a user has no GeoIP/`location` meta.
         default_location: ?[]const u8 = null,
+        /// Directory of updater-written headline files; when set, `!news` reads
+        /// these instead of doing in-daemon TLS fetches.
+        news_cache_dir: ?[]const u8 = null,
     };
 
     pub const Listen = struct {
@@ -318,6 +321,7 @@ pub const Config = struct {
         if (self.weather.source) |v| allocator.free(v);
         if (self.news.source) |v| allocator.free(v);
         if (self.geo.default_location) |v| allocator.free(v);
+        if (self.geo.news_cache_dir) |v| allocator.free(v);
         allocator.free(self.listen.host);
         allocator.free(self.listen.media_host);
         for (self.opers) |oper| {
@@ -392,6 +396,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("geo.enabled")) |b| cfg.geo.enabled = b;
     if (doc.getBool("geo.news_insecure_tls")) |b| cfg.geo.news_insecure_tls = b;
     try setOpt(allocator, resolver, doc.getString("geo.default_location"), &cfg.geo.default_location);
+    try setOpt(allocator, resolver, doc.getString("geo.news_cache_dir"), &cfg.geo.news_cache_dir);
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);

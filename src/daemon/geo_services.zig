@@ -12,6 +12,7 @@
 //!     headlines keyed by source key (`src:bbc`) or country (`cc:US`).
 const std = @import("std");
 const linux = std.os.linux;
+const posix = std.posix;
 const http_fetch = @import("http_fetch.zig");
 const geo_fetch = @import("../proto/geo_fetch.zig");
 const weather_units = @import("../proto/weather_units.zig");
@@ -37,6 +38,12 @@ pub const Options = struct {
     /// Skip TLS cert verification for news feeds (public read-only data). Lets
     /// the best-effort clean-room TLS reach more hosts; off by default.
     news_insecure_tls: bool = false,
+    /// Directory of headline files written by a key-free updater (tools/
+    /// news_update.sh: one headline per line, file `<key>.txt` where key is the
+    /// cache key with ':' -> '_', e.g. `src_bbc.txt` / `cc_us.txt`). When set,
+    /// news is served from these files instead of in-daemon TLS fetches — robust
+    /// full coverage of all feeds regardless of the clean-room TLS reach.
+    news_cache_dir: []const u8 = "",
     max_headlines: u8 = 3,
 };
 
@@ -303,6 +310,13 @@ pub const Service = struct {
     }
 
     fn fetchNews(self: *Service, k: []const u8) void {
+        // File-cache path (preferred when configured): read headlines an external
+        // key-free updater has written. Robust full coverage, no in-daemon TLS.
+        if (self.opts.news_cache_dir.len != 0) {
+            self.fetchNewsFromFile(k);
+            return;
+        }
+        // Live path: best-effort in-daemon RSS-over-TLS fetch.
         const url = newsUrlForKey(k) orelse return;
         const u = http_fetch.parseUrl(url) catch return;
         var req_buf: [1024]u8 = undefined;
@@ -315,15 +329,45 @@ pub const Service = struct {
 
         var titles: [max_headlines][]const u8 = undefined;
         const got = geo_fetch.parseRssTitles(geo_fetch.httpBody(resp), &titles);
-        if (got.len == 0) return;
+        self.storeNews(k, got);
+    }
 
+    /// Read `<news_cache_dir>/<key with ':'->'_'>.txt` (one headline per line,
+    /// `#` comments skipped) and cache its headlines. Thread-safe blocking file
+    /// read (raw syscalls; never touches the reactor io).
+    fn fetchNewsFromFile(self: *Service, k: []const u8) void {
+        var name_buf: [max_key]u8 = undefined;
+        const fname = fileKey(k, &name_buf);
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}.txt", .{ self.opts.news_cache_dir, fname }) catch return;
+
+        var file_buf: [16 * 1024]u8 = undefined;
+        const contents = readFileZ(path, &file_buf) orelse return;
+
+        var titles: [max_headlines][]const u8 = undefined;
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, contents, '\n');
+        while (it.next()) |raw| {
+            if (n >= titles.len) break;
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            titles[n] = line;
+            n += 1;
+        }
+        self.storeNews(k, titles[0..n]);
+    }
+
+    /// Copy `headlines` into the news cache entry for `k` (mutex-guarded). No-op
+    /// when empty, so a failed fetch leaves any prior data intact.
+    fn storeNews(self: *Service, k: []const u8, headlines: []const []const u8) void {
+        if (headlines.len == 0) return;
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const e = self.reserveNews(k);
         e.count = 0;
         var off: usize = 0;
-        const want = @min(got.len, @as(usize, self.opts.max_headlines));
-        for (got[0..want]) |t| {
+        const want = @min(headlines.len, @as(usize, self.opts.max_headlines));
+        for (headlines[0..want]) |t| {
             const clipped = t[0..@min(t.len, max_headline)];
             if (off + clipped.len > e.text.len) break;
             @memcpy(e.text[off .. off + clipped.len], clipped);
@@ -335,6 +379,35 @@ pub const Service = struct {
         e.state = .ready;
     }
 };
+
+/// Map a cache key ("src:bbc"/"cc:us") to its file stem ("src_bbc"/"cc_us").
+fn fileKey(k: []const u8, buf: []u8) []const u8 {
+    const n = @min(buf.len, k.len);
+    for (k[0..n], 0..) |c, i| buf[i] = if (c == ':') '_' else c;
+    return buf[0..n];
+}
+
+/// Blocking read of a small file via raw syscalls (fetcher-thread safe), or null.
+fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const r = linux.read(fd, buf[total..].ptr, buf.len - total);
+        switch (posix.errno(r)) {
+            .SUCCESS => {
+                const got: usize = @intCast(r);
+                if (got == 0) break;
+                total += got;
+            },
+            .INTR => continue,
+            else => return null,
+        }
+    }
+    return buf[0..total];
+}
 
 /// Blocking acquire on the tryLock-only `std.atomic.Mutex` (codebase idiom).
 /// Cache contention is near-zero (one fetcher thread vs. rare fantasy commands).

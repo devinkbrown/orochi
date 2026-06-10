@@ -952,6 +952,10 @@ pub const Config = struct {
     /// Fallback location for `!weather` when a user has no GeoIP/`location`
     /// metadata. `[geo] default_location`.
     geo_default_location: []const u8 = "",
+    /// Directory of headline files written by tools/news_update.sh. When set,
+    /// `!news` is served from these files (robust full coverage) instead of
+    /// in-daemon TLS fetches. `[geo] news_cache_dir`.
+    geo_news_cache_dir: []const u8 = "",
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -1605,6 +1609,7 @@ pub const LinuxServer = struct {
             .weather_enabled = config.geo_enabled,
             .news_enabled = config.geo_enabled,
             .news_insecure_tls = config.geo_news_insecure_tls,
+            .news_cache_dir = config.geo_news_cache_dir,
             .max_headlines = @intCast(@min(config.news_count, 5)),
         });
 

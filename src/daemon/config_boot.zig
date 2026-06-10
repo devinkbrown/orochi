@@ -32,6 +32,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.geo_enabled = cfg.geo.enabled;
     out.geo_news_insecure_tls = cfg.geo.news_insecure_tls;
     if (cfg.geo.default_location) |v| out.geo_default_location = v;
+    if (cfg.geo.news_cache_dir) |v| out.geo_news_cache_dir = v;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
