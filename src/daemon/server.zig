@@ -10262,6 +10262,7 @@ pub const LinuxServer = struct {
         // node identity is configured (single-node / unsigned mesh).
         var reachable_nodes: u32 = established_peers + 1;
         var partitioned_nodes: u32 = 0;
+        var mesh_partitioned = false;
         if (self.config.node_identity) |ident| {
             const local_id = ident.shortId();
             var topo: [partition_detector.max_nodes]partition_detector.TopoNode = undefined;
@@ -10293,6 +10294,7 @@ pub const LinuxServer = struct {
             const stats = partition_detector.analyze(local_id, topo[0..tn]);
             reachable_nodes = @intCast(stats.reachable);
             partitioned_nodes = @intCast(stats.partitioned);
+            mesh_partitioned = stats.is_partitioned;
         }
 
         const snap = mesh_report.MeshSnapshot{
@@ -10310,6 +10312,21 @@ pub const LinuxServer = struct {
             if (line.len == 0) continue;
             try self.noticeTo(conn, line);
         }
+
+        // Split-brain summary: a strict majority of known nodes reachable from
+        // here holds quorum (reachable > partitioned). Operators read this to
+        // tell an intact mesh from a minority island they should not act on.
+        const known_total = reachable_nodes + partitioned_nodes;
+        const has_quorum = reachable_nodes > partitioned_nodes;
+        var sb: [default_reply_bytes]u8 = undefined;
+        const status = if (!mesh_partitioned)
+            "intact"
+        else if (has_quorum)
+            "PARTITIONED (quorum held)"
+        else
+            "PARTITIONED (NO QUORUM — minority island)";
+        const summary = std.fmt.bufPrint(&sb, "mesh {s}: {d}/{d} nodes reachable", .{ status, reachable_nodes, known_total }) catch return;
+        try self.noticeTo(conn, summary);
     }
 
     /// Collect this node's established S2S peer names into `out`, returning the
