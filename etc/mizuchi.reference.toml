@@ -38,14 +38,25 @@ id = 1
 name = "Mizuchi"
 
 
-# --- [motd] — message of the day ---------------------------------------------
+# --- [motd] — message of the day (personalized template) ---------------------
 [motd]
-# MOTD text served by the MOTD command, split on newlines into lines. Supports
-# @file: to load from disk. When unset, the built-in default MOTD is served.
+# MOTD text served by the MOTD command. It is a PER-CONNECTION TEMPLATE: each
+# client sees it expanded with their own details. Split on newlines into lines;
+# supports @file: to load from disk. When unset, a personalized default is used.
+#
+# Substitutions ({key} -> value; unknown keys left verbatim; {{ }} = literal):
+#   {nick} {account} {host} {network} {server} {version} {time} {date}
+#   {users} {opers} {channels}        live network figures
+#   {greeting}                        "Good morning/afternoon/evening" by hour
+# Conditionals ({if:COND}...{else}...{/if}; COND = oper | account | secure):
+#   {if:account}Welcome back, {account}!{else}Please register.{/if}
+#   {if:oper}You have operator privileges.{/if}
+#   {if:secure}{else}This link is not encrypted.{/if}
+#
 # text = "@file:/etc/mizuchi/motd.txt"
 # text = """
-# Welcome to ExampleNet.
-# Be excellent to each other.
+# {greeting}, {nick}! Welcome to {network} ({users} online).
+# {if:account}Signed in as {account}.{else}Register to reserve your nick.{/if}
 # """
 
 

@@ -168,6 +168,7 @@ pub const mode_lock = @import("mode_lock.zig");
 pub const monitor = @import("monitor.zig");
 pub const monitor_props = @import("monitor_props.zig");
 pub const motd = @import("motd.zig");
+pub const motd_template = @import("motd_template.zig");
 pub const msgedit = @import("msgedit.zig");
 pub const msgedit_store = @import("msgedit_store.zig");
 pub const msgid = @import("msgid.zig");
@@ -482,6 +483,7 @@ test {
     _ = monitor;
     _ = monitor_props;
     _ = motd;
+    _ = motd_template;
     _ = msgedit;
     _ = msgedit_store;
     _ = msgid;

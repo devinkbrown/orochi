@@ -41,6 +41,7 @@ const kick = @import("../proto/kick.zig");
 const ison_userhost = @import("../proto/ison_userhost.zig");
 const lusers = @import("../proto/lusers.zig");
 const motd = @import("../proto/motd.zig");
+const motd_template = @import("../proto/motd_template.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
@@ -325,10 +326,17 @@ fn isMultilineOpen(parsed: *const irc_line.LineView) bool {
 }
 
 const server_version = "mizuchi-0.1";
-const motd_text = [_][]const u8{
-    "Welcome to Mizuchi — a clean-room, Zig-native IRCX/IRCv3 daemon.",
-    "Suimyaku mesh + Tsumugi forward-secret links.",
-};
+/// Personalized default MOTD, expanded per connection by `motd_template`
+/// (operators override the whole thing via `[motd] text`). Conditional blocks
+/// begin right after the prior line so an inactive branch leaves no blank line.
+const default_motd_template =
+    "{greeting}, {nick}! Welcome to {network}.\n" ++
+    "You're on {server} ({version}) — {users} users online right now.{if:account}\n" ++
+    "Signed in as {account}; your services and saved settings are active.{else}\n" ++
+    "Tip: register your account to reserve your nick and unlock services.{/if}{if:oper}\n" ++
+    "Operator privileges are active on this connection — wield them with care.{/if}{if:secure}{else}\n" ++
+    "Note: this link is not encrypted — reconnect over TLS for privacy.{/if}\n" ++
+    "Mizuchi — a clean-room, Zig-native IRCX/IRCv3 daemon: Suimyaku CRDT mesh, forward-secret Tsumugi links.";
 
 /// Sink adapter that writes complete (CRLF-terminated) builder lines to a conn.
 const ConnLineSink = struct {
@@ -8038,23 +8046,49 @@ pub const LinuxServer = struct {
 
     /// MOTD (375/372/376).
     pub fn handleMotd(self: *LinuxServer, conn: *ConnState) !void {
-        var out_buf: [default_reply_bytes]u8 = undefined;
-        var lines_buf: [8]motd.MotdLine = undefined;
+        // The MOTD is a personalized template: the configured [motd] text, or
+        // the built-in default. It is expanded per connection (greeting by time
+        // of day, the client's nick/account/host, live figures, and oper/login/
+        // TLS conditionals) before being split into numeric reply lines.
+        const template = if (self.config.motd_text_raw.len != 0)
+            self.config.motd_text_raw
+        else
+            default_motd_template;
+
+        var time_buf: [64]u8 = undefined;
+        const now_ms = platform.realtimeMillis();
+        const epoch_s: u64 = @intCast(@max(@as(i64, 0), @divFloor(now_ms, 1000)));
+        const vars = motd_template.Vars{
+            .nick = conn.session.displayName(),
+            .account = conn.session.account(),
+            .host = conn.session.host(),
+            .network = protocol_inventory.currentNetworkName(),
+            .server = server_name,
+            .version = server_version,
+            .time = formatServerTime(&time_buf),
+            .users = self.countRegisteredUsers(),
+            .is_oper = conn.session.isOper(),
+            .secure = conn.is_tls,
+            .hour = @intCast(@mod(@divFloor(epoch_s, 3600), 24)),
+        };
+
+        var expanded_buf: [4096]u8 = undefined;
+        // On overflow/malformed template, fall back to serving the raw text.
+        const expanded = motd_template.expand(template, vars, &expanded_buf) catch template;
+
+        var line_slices: [64][]const u8 = undefined;
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, expanded, '\n');
+        while (it.next()) |l| {
+            if (n == line_slices.len) break;
+            line_slices[n] = std.mem.trimEnd(u8, l, "\r");
+            n += 1;
+        }
+
+        var out_buf: [8192]u8 = undefined;
+        var lines_buf: [64]motd.MotdLine = undefined;
         var sink = motd.MotdLineSink{ .lines = &lines_buf };
-        // Configured MOTD ([motd] text) is split on newlines into lines; an
-        // empty config falls back to the built-in default text.
-        var cfg_lines: [32][]const u8 = undefined;
-        const lines: []const []const u8 = if (self.config.motd_text_raw.len != 0) blk: {
-            var n: usize = 0;
-            var it = std.mem.splitScalar(u8, self.config.motd_text_raw, '\n');
-            while (it.next()) |l| {
-                if (n == cfg_lines.len) break;
-                cfg_lines[n] = std.mem.trimEnd(u8, l, "\r");
-                n += 1;
-            }
-            break :blk cfg_lines[0..n];
-        } else &motd_text;
-        motd.writeMotdRepliesForRequester(&out_buf, server_name, conn.session.displayName(), lines, &sink) catch return;
+        motd.writeMotdRepliesForRequester(&out_buf, server_name, conn.session.displayName(), line_slices[0..n], &sink) catch return;
         for (sink.slice()) |line| {
             try appendToConn(conn, line.bytes);
             try appendToConn(conn, "\r\n");

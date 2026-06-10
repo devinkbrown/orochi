@@ -9,6 +9,7 @@ pub const crypto = @import("crypto/root.zig");
 pub const daemon = @import("daemon/root.zig");
 pub const proto = @import("proto/root.zig");
 pub const substrate = @import("substrate/root.zig");
+pub const wasm_transport_root = @import("wasm_transport_root.zig");
 // gen:mods:end
 
 /// MizuWasm — pure-Zig sandboxed control-plane plugin host (subdir, not scanned
@@ -28,6 +29,7 @@ test {
     _ = daemon;
     _ = proto;
     _ = substrate;
+    _ = wasm_transport_root;
     // gen:tests:end
     _ = wasm_host;
     _ = browser_transport;
