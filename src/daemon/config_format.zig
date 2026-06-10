@@ -101,6 +101,8 @@ pub const Config = struct {
         ping_timeout_ms: u64 = 60_000,
         /// Maximum stored channel topic length in bytes (advertised as TOPICLEN).
         topiclen: u32 = 390,
+        /// Maximum away-message length in bytes (advertised as AWAYLEN).
+        awaylen: u32 = 256,
         max_clones_per_ip: u32 = 0,
         max_clones_per_net: u32 = 0,
         reputation_refuse_threshold: u32 = 0,
@@ -299,6 +301,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.max_clones_per_ip = @intCast(try uintField(doc, "limits.max_clones_per_ip", cfg.limits.max_clones_per_ip, 0, 65535));
     cfg.limits.max_clones_per_net = @intCast(try uintField(doc, "limits.max_clones_per_net", cfg.limits.max_clones_per_net, 0, 65535));
     cfg.limits.topiclen = @intCast(try uintField(doc, "limits.topiclen", cfg.limits.topiclen, 1, 8192));
+    cfg.limits.awaylen = @intCast(try uintField(doc, "limits.awaylen", cfg.limits.awaylen, 1, 256));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
     if (doc.getString("limits.handshake_timeout")) |s| cfg.limits.handshake_timeout_ms = try durationMs(s);
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);

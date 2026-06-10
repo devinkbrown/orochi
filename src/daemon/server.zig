@@ -848,13 +848,15 @@ pub const ServerError = error{
 /// with the length tokens (TOPICLEN) replaced by their configured values. The
 /// returned slice and its dynamic entries are owned by `allocator`; install via
 /// `protocol_inventory.setIsupportOverride` and free with `freeIsupportTokens`.
-pub fn buildIsupportTokens(allocator: std.mem.Allocator, topiclen: u32) ![]const []const u8 {
+pub fn buildIsupportTokens(allocator: std.mem.Allocator, topiclen: u32, awaylen: u32) ![]const []const u8 {
     const base = protocol_inventory.isupport_tokens;
     const out = try allocator.alloc([]const u8, base.len);
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "TOPICLEN=")) {
             out[i] = try std.fmt.allocPrint(allocator, "TOPICLEN={d}", .{topiclen});
+        } else if (std.mem.startsWith(u8, tok, "AWAYLEN=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "AWAYLEN={d}", .{awaylen});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -885,6 +887,9 @@ pub const Config = struct {
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
+    /// Maximum away-message length in bytes (advertised as AWAYLEN, enforced by
+    /// handleAway). Configurable via `[limits] awaylen`; hard-capped by storage.
+    awaylen: u32 = 256,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -8077,8 +8082,10 @@ pub const LinuxServer = struct {
     /// the away-notify cap is negotiated by peers, an `AWAY` state change is
     /// announced to all common-channel members.
     pub fn handleAway(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // Cap the away reason at the configured AWAYLEN (advertised in ISUPPORT),
+        // truncated on a UTF-8 codepoint boundary so it stays valid under UTF8ONLY.
         const reason: ?[]const u8 = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
-            parsed.paramSlice()[0]
+            utf8TruncateBytes(parsed.paramSlice()[0], self.config.awaylen)
         else
             null;
 
@@ -12778,17 +12785,20 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
 }
 
-test "buildIsupportTokens replaces TOPICLEN with the configured value" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, 512);
+test "buildIsupportTokens replaces TOPICLEN and AWAYLEN with configured values" {
+    const tokens = try buildIsupportTokens(std.testing.allocator, 512, 200);
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
-    var found = false;
+    var found_topic = false;
+    var found_away = false;
     for (tokens) |tok| {
-        if (std.mem.eql(u8, tok, "TOPICLEN=512")) found = true;
+        if (std.mem.eql(u8, tok, "TOPICLEN=512")) found_topic = true;
+        if (std.mem.eql(u8, tok, "AWAYLEN=200")) found_away = true;
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expect(found);
+    try std.testing.expect(found_topic);
+    try std.testing.expect(found_away);
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 

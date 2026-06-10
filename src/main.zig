@@ -128,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Advertise config-driven length limits (TOPICLEN) in ISUPPORT. Built once
     // here, before any connection is served; owned for the process lifetime.
-    if (mizuchi.daemon.server.buildIsupportTokens(allocator, srv_cfg.topiclen)) |tokens| {
+    if (mizuchi.daemon.server.buildIsupportTokens(allocator, srv_cfg.topiclen, srv_cfg.awaylen)) |tokens| {
         mizuchi.proto.protocol_inventory.setIsupportOverride(tokens);
     } else |_| {}
 
