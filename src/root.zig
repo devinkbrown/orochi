@@ -15,6 +15,11 @@ pub const substrate = @import("substrate/root.zig");
 /// by genroots). See docs/planning/17-module-system.md §8.
 pub const wasm_host = @import("wasm/host/root.zig");
 
+/// Browser transport shim core (line framing + IRCv3 parse/escape for Ocean's
+/// in-page WASM client). The `wasm32-freestanding` export wrapper lives in
+/// `wasm/transport_shim.zig`; this is the std-only, natively-tested core (#32).
+pub const browser_transport = @import("wasm/browser_transport.zig");
+
 test {
     // 0.16 dropped refAllDeclsRecursive; reference each package so its tests run.
     std.testing.refAllDecls(@This());
@@ -25,4 +30,5 @@ test {
     _ = substrate;
     // gen:tests:end
     _ = wasm_host;
+    _ = browser_transport;
 }

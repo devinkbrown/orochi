@@ -193,8 +193,22 @@ pub fn build(b: *std.Build) void {
     const wasm = b.addExecutable(.{ .name = "opcodec", .root_module = wasm_mod });
     wasm.entry = .disabled; // a library of exports, not an entry-point program
     wasm.rdynamic = true; // keep the `export fn`s in the final module
-    const wasm_step = b.step("wasm", "Build the OPVOX/OPVIS codec WASM module");
+    const wasm_step = b.step("wasm", "Build the Ocean browser WASM modules");
     wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
+
+    // Browser transport shim (#32): line framing + IRCv3 parse/escape over the
+    // browser's WebSocket byte stream. Imports the std-only `irc_line` parser by
+    // relative path, so no extra module wiring is needed.
+    const wasm_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm_transport_root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+        .strip = true,
+    });
+    const wasm_transport = b.addExecutable(.{ .name = "mizuchi_transport", .root_module = wasm_transport_mod });
+    wasm_transport.entry = .disabled;
+    wasm_transport.rdynamic = true;
+    wasm_step.dependOn(&b.addInstallArtifact(wasm_transport, .{}).step);
 
     // `zig build check` — semantic analysis without producing a binary. This is
     // the fast inner-loop / editor (ZLS) target: it surfaces type errors quickly
