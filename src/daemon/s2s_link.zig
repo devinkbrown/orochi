@@ -18,6 +18,7 @@
 const std = @import("std");
 
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
+const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
@@ -206,6 +207,11 @@ pub const S2sLink = struct {
     /// owns + frees each slice and the outer slice.
     pub fn takeOperGrants(self: *S2sLink) ![][]u8 {
         return self.peer.takeOperGrants();
+    }
+
+    /// Copy this peer's known-server topology into `out` for partition analysis.
+    pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
+        return self.peer.collectTopology(out);
     }
 };
 

@@ -44,6 +44,7 @@ const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
+const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
 const route_report = @import("../proto/route_report.zig");
 const swim_report = @import("../proto/swim_report.zig");
@@ -10254,13 +10255,51 @@ pub const LinuxServer = struct {
             if (p.state == .established) established_peers += 1;
         }
 
+        // Reachability/partition over the multi-hop mesh: assemble the topology
+        // from each established peer's gossiped registry plus an explicit
+        // local<->peer edge per direct link, then run the partition detector from
+        // this node's perspective. Falls back to the direct-peer count when no
+        // node identity is configured (single-node / unsigned mesh).
+        var reachable_nodes: u32 = established_peers + 1;
+        var partitioned_nodes: u32 = 0;
+        if (self.config.node_identity) |ident| {
+            const local_id = ident.shortId();
+            var topo: [partition_detector.max_nodes]partition_detector.TopoNode = undefined;
+            var tn: usize = 0;
+            var pit = self.rx().clients.iterator();
+            while (pit.next()) |entry| {
+                if (tn >= topo.len) break;
+                const c = entry.value;
+                if (c.s2s) |l| {
+                    if (!l.established()) continue;
+                    if (l.remoteNodeId()) |rid| {
+                        if (tn < topo.len) {
+                            topo[tn] = .{ .node_id = rid, .uplink = local_id };
+                            tn += 1;
+                        }
+                    }
+                    tn += l.collectTopology(topo[tn..]);
+                } else if (c.s2s_secured) |l| {
+                    if (!l.established()) continue;
+                    if (l.peerShortId()) |rid| {
+                        if (tn < topo.len) {
+                            topo[tn] = .{ .node_id = rid, .uplink = local_id };
+                            tn += 1;
+                        }
+                    }
+                    tn += l.collectTopology(topo[tn..]);
+                }
+            }
+            const stats = partition_detector.analyze(local_id, topo[0..tn]);
+            reachable_nodes = @intCast(stats.reachable);
+            partitioned_nodes = @intCast(stats.partitioned);
+        }
+
         const snap = mesh_report.MeshSnapshot{
             .local_node = server_name,
             .peers = peers[0..npeer],
-            // Self plus every established peer is reachable; partition detection
-            // is wired once the substrate detector lands.
-            .reachable_nodes = established_peers + 1,
-            .partitioned_nodes = 0,
+            .reachable_nodes = reachable_nodes,
+            .partitioned_nodes = partitioned_nodes,
         };
 
         var body_buf: [4096]u8 = undefined;

@@ -20,6 +20,7 @@ const hs = @import("../crypto/tsumugi_handshake.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 const s2s_link = @import("s2s_link.zig");
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
+const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 
 pub const Role = tsumugi_session.Role;
 
@@ -177,6 +178,13 @@ pub const SecuredLink = struct {
     pub fn takeOperGrants(self: *SecuredLink) anyerror![][]u8 {
         const link = self.inner orelse return &.{};
         return link.takeOperGrants();
+    }
+
+    /// Copy this peer's known-server topology into `out` for partition analysis
+    /// (empty until the inner CRDT link is established).
+    pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {
+        const link = self.inner orelse return 0;
+        return link.collectTopology(out);
     }
 
     fn writeFramed(self: *SecuredLink, payload: []const u8) anyerror!void {

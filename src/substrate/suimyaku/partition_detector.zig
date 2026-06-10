@@ -377,10 +377,157 @@ fn slicesEqual(a: []const NodeId, b: []const NodeId) bool {
 }
 
 // ===========================================================================
+// One-shot snapshot analysis
+// ===========================================================================
+
+/// One node in an assembled mesh topology: a node id and the parent it is
+/// reachable through (its uplink). A null uplink contributes no edge.
+pub const TopoNode = struct {
+    node_id: NodeId,
+    uplink: ?NodeId = null,
+};
+
+/// Point-in-time partition statistics from the local node's perspective.
+pub const Stats = struct {
+    /// Distinct known nodes (local plus every node id / uplink in the topology).
+    known: usize,
+    /// Nodes reachable from local over the current edges (includes local).
+    reachable: usize,
+    /// Known nodes NOT reachable from local (`known - reachable`).
+    partitioned: usize,
+    /// Connected components among the known nodes.
+    components: usize,
+    /// True when at least one known node is unreachable from local.
+    is_partitioned: bool,
+};
+
+/// Analyze a mesh topology from `local`'s perspective. `topo` lists known nodes
+/// with their uplink (parent) edges; `local` is always treated as a known live
+/// node even if absent from `topo`. Each (node_id, uplink) pair contributes an
+/// undirected edge. All nodes are treated as live. Nodes beyond `max_nodes` are
+/// ignored. Allocation-free.
+pub fn analyze(local: NodeId, topo: []const TopoNode) Stats {
+    var ids: [max_nodes]NodeId = undefined;
+    var n: usize = 0;
+    ids[0] = local;
+    n = 1;
+    for (topo) |t| {
+        n = appendUnique(&ids, n, t.node_id);
+        if (t.uplink) |up| n = appendUnique(&ids, n, up);
+    }
+
+    var edges: [max_nodes]Edge = undefined;
+    var en: usize = 0;
+    for (topo) |t| {
+        if (t.uplink) |up| {
+            if (up == t.node_id) continue;
+            if (en < edges.len) {
+                edges[en] = .{ .a = t.node_id, .b = up };
+                en += 1;
+            }
+        }
+    }
+
+    var live: [max_nodes]Liveness = undefined;
+    for (0..n) |i| live[i] = .alive;
+
+    var det = Detector.init();
+    det.update(ids[0..n], live[0..n], edges[0..en]) catch {
+        return .{ .known = n, .reachable = n, .partitioned = 0, .components = 1, .is_partitioned = false };
+    };
+
+    var rbuf: [max_nodes]NodeId = undefined;
+    const reached = @min(det.reachableFrom(local, &rbuf), n);
+    return .{
+        .known = n,
+        .reachable = reached,
+        .partitioned = n - reached,
+        .components = det.componentCount(),
+        .is_partitioned = det.isPartitioned(local),
+    };
+}
+
+fn appendUnique(buf: []NodeId, len: usize, id: NodeId) usize {
+    for (buf[0..len]) |existing| {
+        if (existing == id) return len;
+    }
+    if (len < buf.len) {
+        buf[len] = id;
+        return len + 1;
+    }
+    return len;
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
 const testing = std.testing;
+
+test "analyze: lone node is fully reachable, no partition" {
+    const stats = analyze(1, &.{});
+    try testing.expectEqual(@as(usize, 1), stats.known);
+    try testing.expectEqual(@as(usize, 1), stats.reachable);
+    try testing.expectEqual(@as(usize, 0), stats.partitioned);
+    try testing.expectEqual(@as(usize, 1), stats.components);
+    try testing.expect(!stats.is_partitioned);
+}
+
+test "analyze: star of direct peers is one reachable component" {
+    // local=1, peers 2 and 3 both uplinked to 1.
+    const topo = [_]TopoNode{
+        .{ .node_id = 2, .uplink = 1 },
+        .{ .node_id = 3, .uplink = 1 },
+    };
+    const stats = analyze(1, &topo);
+    try testing.expectEqual(@as(usize, 3), stats.known);
+    try testing.expectEqual(@as(usize, 3), stats.reachable);
+    try testing.expectEqual(@as(usize, 0), stats.partitioned);
+    try testing.expectEqual(@as(usize, 1), stats.components);
+    try testing.expect(!stats.is_partitioned);
+}
+
+test "analyze: multi-hop chain counts transitively reachable nodes" {
+    // local=1 -> 2 -> 3 (node 3 reachable via 2, two hops).
+    const topo = [_]TopoNode{
+        .{ .node_id = 2, .uplink = 1 },
+        .{ .node_id = 3, .uplink = 2 },
+    };
+    const stats = analyze(1, &topo);
+    try testing.expectEqual(@as(usize, 3), stats.known);
+    try testing.expectEqual(@as(usize, 3), stats.reachable);
+    try testing.expectEqual(@as(usize, 0), stats.partitioned);
+    try testing.expect(!stats.is_partitioned);
+}
+
+test "analyze: an island the local node cannot reach is partitioned" {
+    // {1,2} connected; {3,4} a separate island (3 uplinked to 4, 4 rootless).
+    const topo = [_]TopoNode{
+        .{ .node_id = 2, .uplink = 1 },
+        .{ .node_id = 3, .uplink = 4 },
+        .{ .node_id = 4, .uplink = null },
+    };
+    const stats = analyze(1, &topo);
+    try testing.expectEqual(@as(usize, 4), stats.known);
+    try testing.expectEqual(@as(usize, 2), stats.reachable);
+    try testing.expectEqual(@as(usize, 2), stats.partitioned);
+    try testing.expectEqual(@as(usize, 2), stats.components);
+    try testing.expect(stats.is_partitioned);
+}
+
+test "analyze: duplicate topology entries from multiple peers dedupe" {
+    // The same nodes/edges reported twice (as two peers' registries would).
+    const topo = [_]TopoNode{
+        .{ .node_id = 2, .uplink = 1 },
+        .{ .node_id = 3, .uplink = 1 },
+        .{ .node_id = 2, .uplink = 1 },
+        .{ .node_id = 3, .uplink = 1 },
+    };
+    const stats = analyze(1, &topo);
+    try testing.expectEqual(@as(usize, 3), stats.known);
+    try testing.expectEqual(@as(usize, 3), stats.reachable);
+    try testing.expectEqual(@as(usize, 0), stats.partitioned);
+}
 
 test "fully-connected mesh: not partitioned, single component, quorum" {
     // Arrange: a triangle a-b-c, all alive.

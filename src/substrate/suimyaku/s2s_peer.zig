@@ -31,6 +31,7 @@ const handshake_version: u8 = 1;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
+const partition_detector = @import("partition_detector.zig");
 
 pub const ByteSink = struct {
     ptr: *anyopaque,
@@ -258,6 +259,20 @@ pub const S2sPeer = struct {
 
     pub fn routeNickNode(self: *const S2sPeer, nick: []const u8) ?NodeId {
         return self.routes.nickNode(nick);
+    }
+
+    /// Copy this peer's known-server registry into `out` as (node_id, uplink)
+    /// topology entries for partition analysis, returning the count written. The
+    /// gossiped registry encodes the mesh as a tree via each node's uplink.
+    pub fn collectTopology(self: *const S2sPeer, out: []partition_detector.TopoNode) usize {
+        const nodes = self.registry.list();
+        var n: usize = 0;
+        for (nodes) |node| {
+            if (n == out.len) break;
+            out[n] = .{ .node_id = node.node_id, .uplink = node.uplink };
+            n += 1;
+        }
+        return n;
     }
 
     pub fn repairRoot(self: *const S2sPeer) !anti_entropy_repair.Hash {
