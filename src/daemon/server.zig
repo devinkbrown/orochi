@@ -726,6 +726,7 @@ const Numeric = enum(u16) {
     RPL_ENDOFNAMES = 366,
     RPL_BANLIST = 367,
     ERR_BANLISTFULL = 478,
+    ERR_TOOMANYCHANNELS = 405,
     RPL_ENDOFBANLIST = 368,
     RPL_QUIETLIST = 728,
     RPL_ENDOFQUIETLIST = 729,
@@ -866,6 +867,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = try std.fmt.allocPrint(allocator, "CHANNELLEN={d}", .{cfg.channellen});
         } else if (std.mem.startsWith(u8, tok, "MAXLIST=")) {
             out[i] = try std.fmt.allocPrint(allocator, "MAXLIST=beIZ:{d}", .{cfg.maxlist});
+        } else if (std.mem.startsWith(u8, tok, "CHANLIMIT=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "CHANLIMIT=#&:{d}", .{cfg.chanlimit});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -912,6 +915,9 @@ pub const Config = struct {
     /// Per-channel cap on each list mode (+b/+e/+I/+Z) — advertised as MAXLIST
     /// and enforced by world.listAddMask. Configurable via `[limits] maxlist`.
     maxlist: u32 = 100,
+    /// Max channels a non-oper client may be in (advertised as CHANLIMIT,
+    /// enforced by joinOne). Configurable via `[limits] chanlimit`.
+    chanlimit: u32 = 50,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -3840,6 +3846,14 @@ pub const LinuxServer = struct {
         // Enforce channel modes only when joining an EXISTING channel as a new
         // member. Creating a fresh channel (founder path) bypasses all gates.
         const wid = worldIdFromClient(id);
+        // CHANLIMIT: cap how many channels a non-oper may be in. Only a NEW join
+        // counts; re-JOIN of a channel already joined is a no-op and exempt.
+        if (!conn.session.isOper() and !self.world.isMember(channel, wid) and
+            self.world.channelCountOf(wid) >= self.config.chanlimit)
+        {
+            try queueNumeric(conn, .ERR_TOOMANYCHANNELS, &.{channel}, "You have joined too many channels");
+            return;
+        }
         var clone_buf: [160]u8 = undefined;
         var fwd_buf: [80]u8 = undefined;
         var join_target = channel;
@@ -12838,7 +12852,7 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
 }
 
 test "buildIsupportTokens replaces length tokens with configured values" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25 });
+    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100, .nicklen = 30, .channellen = 50, .maxlist = 25, .chanlimit = 12 });
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
     var hits: usize = 0;
@@ -12849,10 +12863,11 @@ test "buildIsupportTokens replaces length tokens with configured values" {
         if (std.mem.eql(u8, tok, "NICKLEN=30")) hits += 1;
         if (std.mem.eql(u8, tok, "CHANNELLEN=50")) hits += 1;
         if (std.mem.eql(u8, tok, "MAXLIST=beIZ:25")) hits += 1;
+        if (std.mem.eql(u8, tok, "CHANLIMIT=#&:12")) hits += 1;
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expectEqual(@as(usize, 6), hits);
+    try std.testing.expectEqual(@as(usize, 7), hits);
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 

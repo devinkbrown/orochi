@@ -1078,6 +1078,16 @@ pub const World = struct {
     /// reverse index yet). Returns the count written, capped at `out.len`.
     /// Channel-name slices borrow from world storage and stay valid until the
     /// channel is removed.
+    /// Count how many channels `client` is a member of (no buffer needed).
+    pub fn channelCountOf(self: *World, client: ClientId) usize {
+        var n: usize = 0;
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.members.contains(client)) n += 1;
+        }
+        return n;
+    }
+
     pub fn channelsOf(self: *World, client: ClientId, out: [][]const u8) usize {
         var n: usize = 0;
         var it = self.channels.iterator();
@@ -1224,6 +1234,19 @@ pub fn isChannelName(name: []const u8) bool {
 
 fn testClient(slot: u20) ClientId {
     return .{ .shard = 0, .slot = slot, .gen = 1 };
+}
+
+test "channelCountOf counts a client's memberships" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = testClient(1);
+    try std.testing.expectEqual(@as(usize, 0), world.channelCountOf(a));
+    _ = try world.join("#one", a);
+    _ = try world.join("#two", a);
+    _ = try world.join("#two", a); // re-join is a no-op
+    try std.testing.expectEqual(@as(usize, 2), world.channelCountOf(a));
+    _ = world.part("#one", a) catch {};
+    try std.testing.expectEqual(@as(usize, 1), world.channelCountOf(a));
 }
 
 test "channel list modes are capped at max_list_entries" {
