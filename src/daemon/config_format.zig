@@ -108,6 +108,8 @@ pub const Config = struct {
         enabled: bool = false,
         /// Skip TLS verification for public read-only news feeds.
         news_insecure_tls: bool = true,
+        /// Min ms between bot replies per channel (anti-flood). 0 = disabled.
+        cmd_cooldown_ms: u32 = 3000,
         /// Fallback `!weather` location when a user has no GeoIP/`location` meta.
         default_location: ?[]const u8 = null,
         /// Directory of updater-written headline files; when set, `!news` reads
@@ -407,6 +409,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [geo]
     if (doc.getBool("geo.enabled")) |b| cfg.geo.enabled = b;
     if (doc.getBool("geo.news_insecure_tls")) |b| cfg.geo.news_insecure_tls = b;
+    cfg.geo.cmd_cooldown_ms = @intCast(try uintField(doc, "geo.cmd_cooldown_ms", cfg.geo.cmd_cooldown_ms, 0, 600000));
     try setOpt(allocator, resolver, doc.getString("geo.default_location"), &cfg.geo.default_location);
     try setOpt(allocator, resolver, doc.getString("geo.news_cache_dir"), &cfg.geo.news_cache_dir);
 

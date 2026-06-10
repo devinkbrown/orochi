@@ -32,6 +32,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.news_count = cfg.news.count;
     out.geo_enabled = cfg.geo.enabled;
     out.geo_news_insecure_tls = cfg.geo.news_insecure_tls;
+    out.geo_cmd_cooldown_ms = cfg.geo.cmd_cooldown_ms;
     if (cfg.geo.default_location) |v| out.geo_default_location = v;
     if (cfg.geo.news_cache_dir) |v| out.geo_news_cache_dir = v;
     if (cfg.oper.grants_path) |v| out.oper_grants_path = v;

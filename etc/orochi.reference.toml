@@ -121,6 +121,9 @@ enabled = false
 # Skip TLS verification for the public read-only news feeds so the best-effort
 # clean-room TLS reaches more hosts. Weather is plain HTTP and unaffected.
 news_insecure_tls = true
+# Minimum interval between bot replies in a single channel, in ms (anti-flood,
+# so a user can't spam !weather to flood the channel). 0 disables. Range 0..600000.
+cmd_cooldown_ms = 3000
 # Fallback !weather location when a client has no GeoIP / `location` metadata.
 # default_location = "Austin, TX"
 # Directory of headline files written by tools/news_update.sh (curl + system CA,

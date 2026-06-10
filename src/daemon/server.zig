@@ -712,6 +712,11 @@ const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
 const server_name = "orochi.local";
 const default_host = "localhost";
 
+/// Number of channels tracked for the fantasy-bot per-channel cooldown.
+const fantasy_cooldown_slots = 64;
+/// One tracked channel's last fantasy-bot reply time.
+const FantasyCooldown = struct { key: [64]u8 = undefined, len: usize = 0, ts_ms: i64 = 0 };
+
 const Numeric = enum(u16) {
     RPL_ISUPPORT = 5,
     RPL_MAP = 15,
@@ -955,6 +960,9 @@ pub const Config = struct {
     /// Skip TLS verification for news feeds (public read-only data) so the
     /// best-effort clean-room TLS reaches more hosts. `[geo] news_insecure_tls`.
     geo_news_insecure_tls: bool = true,
+    /// Minimum interval between fantasy-bot (`!weather`/`!news`) replies in a
+    /// single channel, in ms (anti-flood). 0 disables. `[geo] cmd_cooldown_ms`.
+    geo_cmd_cooldown_ms: u32 = 3000,
     /// Fallback location for `!weather` when a user has no GeoIP/`location`
     /// metadata. `[geo] default_location`.
     geo_default_location: []const u8 = "",
@@ -1407,6 +1415,9 @@ pub const LinuxServer = struct {
     /// Background weather/news cache backing `!weather`/`!news` (lazy-started on
     /// first fantasy use; heap-owned so its address is stable for the thread).
     geo: *geo_services.Service,
+    /// Per-channel fantasy-bot cooldown (anti-flood): the last reply time in each
+    /// of a small set of recently-active channels. Bounded; oldest slot evicted.
+    fantasy_cooldown: [fantasy_cooldown_slots]FantasyCooldown = [_]FantasyCooldown{.{}} ** fantasy_cooldown_slots,
     props: ircx_prop_store.DefaultStore,
     access: ircx_access_store.AccessStore,
     /// Per-channel AKICK (registered auto-kick) list — masks matched on JOIN.
@@ -7380,13 +7391,43 @@ pub const LinuxServer = struct {
         const cmd = if (sp) |i| text[0..i] else text;
         const rest = if (sp) |i| std.mem.trim(u8, text[i + 1 ..], " \t") else "";
         const eqi = std.ascii.eqlIgnoreCase;
-        if (eqi(cmd, "!weather") or eqi(cmd, "!w") or eqi(cmd, "!wx")) {
+        const is_weather = eqi(cmd, "!weather") or eqi(cmd, "!w") or eqi(cmd, "!wx");
+        const is_news = eqi(cmd, "!news") or eqi(cmd, "!n");
+        const is_local = eqi(cmd, "!localnews");
+        if (!(is_weather or is_news or is_local)) return;
+        // Anti-flood: rate-limit bot replies per channel so a user can't spam
+        // `!weather` to flood the channel or hammer the fetcher.
+        if (!self.fantasyCooldownOk(chan)) return;
+        if (is_weather) {
             self.handleFantasyWeather(conn, chan, rest);
-        } else if (eqi(cmd, "!news") or eqi(cmd, "!n")) {
+        } else if (is_news) {
             self.handleFantasyNews(conn, chan, rest, false);
-        } else if (eqi(cmd, "!localnews")) {
+        } else {
             self.handleFantasyNews(conn, chan, rest, true);
         }
+    }
+
+    /// Per-channel fantasy-bot rate limit. Returns true (and records the time) if
+    /// the bot may reply in `chan` now; false if it is still within the cooldown
+    /// window and should stay silent. A new channel claims the oldest slot.
+    fn fantasyCooldownOk(self: *LinuxServer, chan: []const u8) bool {
+        const cd: i64 = self.config.geo_cmd_cooldown_ms;
+        if (cd == 0) return true;
+        const now = self.nowMs();
+        var oldest: *FantasyCooldown = &self.fantasy_cooldown[0];
+        for (&self.fantasy_cooldown) |*e| {
+            if (e.len != 0 and std.ascii.eqlIgnoreCase(e.key[0..e.len], chan)) {
+                if (now - e.ts_ms < cd) return false;
+                e.ts_ms = now;
+                return true;
+            }
+            if (e.ts_ms < oldest.ts_ms) oldest = e;
+        }
+        const n = @min(chan.len, oldest.key.len);
+        @memcpy(oldest.key[0..n], chan[0..n]);
+        oldest.len = n;
+        oldest.ts_ms = now;
+        return true;
     }
 
     /// `!weather [location]` — serve cached weather for the argument, or the

@@ -107,6 +107,7 @@ Source: struct at `src/daemon/config_format.zig` (`Geo`), mapping at `src/daemon
 |---|---|---:|---|---|
 | `enabled` | bool | `false` | — | Enable the `!weather`/`!news` bot. |
 | `news_insecure_tls` | bool | `true` | — | Skip TLS verification for the public read-only news feeds, so the best-effort clean-room TLS reaches more hosts. Weather is plain HTTP and unaffected. |
+| `cmd_cooldown_ms` | integer | `3000` | `0..600000` | Minimum interval between bot replies in a single channel (anti-flood). 0 disables. |
 | `default_location` | string or null | unset | any string | Fallback `!weather` location when a user has no GeoIP / `location` metadata. |
 | `news_cache_dir` | string or null | unset | path | Directory of headline files written by `tools/news_update.sh` (one headline per line, `src_<key>.txt` / `cc_<cc>.txt`). When set, `!news` reads these files instead of fetching live — robust full coverage of every feed regardless of the in-daemon TLS reach. |
 
