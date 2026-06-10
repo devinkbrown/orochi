@@ -90,7 +90,7 @@ fn debug(c: *anyopaque, _: I) anyerror!void {
 }
 fn mesh(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
-    try x.server.handleMesh(x.conn);
+    try x.server.handleMesh(x.conn, x.parsed);
 }
 
 pub const module = registry.Module{

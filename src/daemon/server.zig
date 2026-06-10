@@ -44,6 +44,7 @@ const motd = @import("../proto/motd.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
+const mesh_event_log = @import("../proto/mesh_event_log.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
 const oper_cred_share = @import("../proto/oper_cred_share.zig");
 const invite = @import("../proto/invite.zig");
@@ -1292,6 +1293,9 @@ pub const LinuxServer = struct {
     /// Replay tracker for cross-server (mesh-sealed) session reclaim nonces, so a
     /// captured mesh reclaim token cannot be replayed against this node.
     session_reclaim_replay: session_reclaim_mesh.ReplayRing(256) = .{},
+    /// Recent mesh events (peer up/down, oper grant, …) for the `MESH LOG` oper
+    /// audit view. Bounded ring; oldest entries roll off.
+    mesh_log: mesh_event_log.MeshEventLog(128) = .{},
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Mizuchi media SFU control plane): who is in each call.
@@ -2522,7 +2526,10 @@ pub const LinuxServer = struct {
             };
             link.clearOutbound();
         }
-        if (!was and link.established()) self.traceLog(.info, .s2s, "s2s secured link established");
+        if (!was and link.established()) {
+            self.traceLog(.info, .s2s, "s2s secured link established");
+            self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
+        }
         // Drain inbound cross-node user messages over the secured link.
         if (link.takeInbound()) |inbound| {
             for (inbound) |*owned| {
@@ -2539,11 +2546,13 @@ pub const LinuxServer = struct {
 
     fn driveS2s(self: *LinuxServer, conn: *ConnState, link: *s2s_link.S2sLink, bytes: []const u8) void {
         self.s2s_feed_seq +%= 1;
+        const was = link.established();
         const now: u64 = @intCast(@max(0, self.nowMs()));
         link.feed(bytes, now, self.s2s_feed_seq) catch {
             conn.closing = true;
             return;
         };
+        if (!was and link.established()) self.logMeshEvent(.peer_up, link.remoteName(), "link established");
         const out = link.outbound();
         if (out.len != 0) {
             appendToConn(conn, out) catch {
@@ -3019,6 +3028,7 @@ pub const LinuxServer = struct {
         if (self.rx().clients.get(id)) |conn| {
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
+                if (link.remoteName().len != 0) self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
                 self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 link.deinit();
                 self.allocator.destroy(link);
@@ -3029,6 +3039,7 @@ pub const LinuxServer = struct {
                 return;
             }
             if (conn.s2s) |link| {
+                if (link.remoteName().len != 0) self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
                 self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 link.deinit();
                 self.allocator.destroy(link);
@@ -8011,7 +8022,9 @@ pub const LinuxServer = struct {
         const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer_pubkey) catch return false;
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
-        return self.oper_grants.upsert(fields) != .stale_ignored;
+        const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
+        if (accepted) self.logMeshEvent(.oper_grant_in, fields.account, fields.issuer_node);
+        return accepted;
     }
 
     /// Mint + store a signed grant for a locally-elevated operator so peer nodes
@@ -9802,11 +9815,35 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .RPL_MAPEND, &.{}, "End of /MAP");
     }
 
+    /// Record a mesh event (peer up/down, oper grant, …) into the bounded audit
+    /// ring surfaced by `MESH LOG`. Best-effort; never fails a caller.
+    fn logMeshEvent(self: *LinuxServer, kind: mesh_event_log.MeshEventKind, subject: []const u8, detail: []const u8) void {
+        self.mesh_log.push(.{
+            .kind = kind,
+            .ts_unix = @divTrunc(platform.realtimeMillis(), 1000),
+            .subject = subject,
+            .detail = detail,
+        });
+    }
+
     /// MESH (a.k.a. NETSTAT) — oper view of server-to-server mesh health,
     /// rendered by the pure `mesh_report` renderer from live S2S link state.
     /// Per-peer RTT/byte counters surface once the link-health tracker is wired;
     /// today they show as zero. Operator-gated by the registry (access=.oper).
-    pub fn handleMesh(self: *LinuxServer, conn: *ConnState) !void {
+    pub fn handleMesh(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // `MESH LOG` renders the recent mesh-event audit ring instead of peers.
+        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "LOG")) {
+            var body_buf: [8192]u8 = undefined;
+            var lw = std.Io.Writer.fixed(&body_buf);
+            mesh_event_log.render(&self.mesh_log, &lw) catch {};
+            var lines = std.mem.splitScalar(u8, lw.buffered(), '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try self.noticeTo(conn, line);
+            }
+            return;
+        }
+
         var peers: [64]mesh_report.PeerLink = undefined;
         var npeer: usize = 0;
         var it = self.rx().clients.iterator();
