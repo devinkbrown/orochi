@@ -7942,23 +7942,43 @@ pub const LinuxServer = struct {
 
     /// LUSERS — network/user counters (251-255, 265/266).
     pub fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
-        const clients: u64 = @intCast(self.rx().clients.len());
+        // Classify connections: registered local users vs unknown (still in
+        // registration) vs established S2S peers (counted as servers, never
+        // users). Previously every connection — S2S links and half-registered
+        // sockets included — was lumped into `users`, and `unknown` was always 0.
+        var users: u64 = 0;
+        var unknown: u64 = 0;
         var opers: u64 = 0;
-        var oit = self.rx().clients.iterator();
-        while (oit.next()) |entry| {
-            if (entry.value.session.isOper()) opers += 1;
+        var servers: u64 = 1; // this node
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (c.s2s) |link| {
+                if (link.established()) servers += 1;
+                continue;
+            }
+            if (c.s2s_secured) |link| {
+                if (link.established()) servers += 1;
+                continue;
+            }
+            if (c.session.registered()) {
+                users += 1;
+                if (c.session.isOper()) opers += 1;
+            } else {
+                unknown += 1;
+            }
         }
         const counts = lusers.Counts{
-            .users = clients,
+            .users = users,
             .invisible = 0,
-            .servers = 1,
+            .servers = servers,
             .opers = opers,
-            .unknown = 0,
+            .unknown = unknown,
             .channels = @intCast(self.world.channelCount()),
-            .local_clients = clients,
-            .local_max = clients,
-            .global_clients = clients,
-            .global_max = clients,
+            .local_clients = users,
+            .local_max = users,
+            .global_clients = users,
+            .global_max = users,
         };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
@@ -12964,6 +12984,31 @@ test "threaded server: USERHOST reflects live away state" {
     // Now away → `A=-`.
     try writeAllFd(fd_a, "USERHOST A\r\n");
     try recvUntil(&a, "A=-", 200);
+}
+
+test "threaded server: LUSERS counts one registered user" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "LUSERS\r\n");
+    // RPL_LUSERCLIENT (251): "There are 1 users and 0 invisible on 1 servers".
+    try recvUntil(&a, "There are 1 users", 200);
 }
 
 test "threaded server: NAMES honors multi-prefix cap" {
