@@ -5307,6 +5307,16 @@ pub const LinuxServer = struct {
     /// CHATHISTORY <sub> <target> <criteria...> <limit> — IRCv3 history replay.
     /// Supports LATEST and BEFORE/AFTER with timestamp selectors over the Lotus
     /// ring; emits a `chathistory` BATCH of PRIVMSG lines (msgid+server-time).
+    /// Resolve a CHATHISTORY selector to a server timestamp: a timestamp passes
+    /// through; a msgid is looked up in `target`'s history. Null when a msgid is
+    /// unknown (the caller then returns an empty result for that bound).
+    fn resolveSelector(self: *LinuxServer, target: []const u8, sel: chathistory_cmd.Selector) ?u64 {
+        return switch (sel) {
+            .timestamp => |ts| ts,
+            .msgid => |id| self.history.timestampOf(target, id),
+        };
+    }
+
     pub fn handleChathistory(self: *LinuxServer, conn: *ConnState, line: []const u8) !void {
         const trimmed = std.mem.trimEnd(u8, line, "\r\n");
         const req = chathistory_cmd.parse(trimmed) catch |err| {
@@ -5333,47 +5343,47 @@ pub const LinuxServer = struct {
             .before => |r| {
                 target = r.target;
                 const n = @min(@as(usize, r.limit), buf.len);
-                switch (r.selector) {
-                    .timestamp => |ts| found = self.history.before(target, ts, n, buf[0..n]) catch buf[0..0],
-                    .msgid => {},
+                // timestamp directly, or a msgid resolved to its timestamp.
+                if (self.resolveSelector(target, r.selector)) |ts| {
+                    found = self.history.before(target, ts, n, buf[0..n]) catch buf[0..0];
                 }
             },
             .after => |r| {
                 target = r.target;
                 const n = @min(@as(usize, r.limit), buf.len);
-                switch (r.selector) {
-                    .timestamp => |ts| found = self.history.after(target, ts, n, buf[0..n]) catch buf[0..0],
-                    .msgid => {},
+                if (self.resolveSelector(target, r.selector)) |ts| {
+                    found = self.history.after(target, ts, n, buf[0..n]) catch buf[0..0];
                 }
             },
             .between => |r| {
                 target = r.target;
                 const n = @min(@as(usize, r.limit), buf.len);
-                // Timestamp range only (msgid selectors need msgid->ts resolution,
-                // not yet wired). Collect oldest-first after the low bound, then
-                // trim to those strictly before the high bound.
-                if (r.start == .timestamp and r.end == .timestamp) {
-                    const lo = @min(r.start.timestamp, r.end.timestamp);
-                    const hi = @max(r.start.timestamp, r.end.timestamp);
-                    const raw = self.history.after(target, lo, n, buf[0..n]) catch buf[0..0];
-                    var k: usize = 0;
-                    for (raw) |m| {
-                        if (m.timestamp < hi) {
-                            buf[k] = m; // safe in-place compaction (k <= source index)
-                            k += 1;
+                // Collect oldest-first after the low bound, then trim to those
+                // strictly before the high bound. Each bound is a timestamp or a
+                // msgid resolved to its timestamp.
+                if (self.resolveSelector(target, r.start)) |s| {
+                    if (self.resolveSelector(target, r.end)) |e| {
+                        const lo = @min(s, e);
+                        const hi = @max(s, e);
+                        const raw = self.history.after(target, lo, n, buf[0..n]) catch buf[0..0];
+                        var k: usize = 0;
+                        for (raw) |m| {
+                            if (m.timestamp < hi) {
+                                buf[k] = m; // safe in-place compaction (k <= source index)
+                                k += 1;
+                            }
                         }
+                        found = buf[0..k];
                     }
-                    found = buf[0..k];
                 }
             },
             .around => |r| {
                 target = r.target;
-                // Timestamp pivot only (msgid needs msgid->ts resolution). Return
-                // up to `limit` messages centred on the pivot: ~half strictly
-                // before it (reversed to chronological order) followed by the
-                // pivot and later, oldest-first.
-                if (r.center == .timestamp) {
-                    const center = r.center.timestamp;
+                // Return up to `limit` messages centred on the pivot (a timestamp
+                // or a msgid resolved to its timestamp): ~half strictly before it
+                // (reversed to chronological order) followed by the pivot and
+                // later, oldest-first.
+                if (self.resolveSelector(target, r.center)) |center| {
                     const total = @min(@as(usize, r.limit), buf.len);
                     const half = total / 2;
                     var before_buf: [64]lotus.Message = undefined;

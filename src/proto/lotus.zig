@@ -191,6 +191,14 @@ pub fn Lotus(comptime params: Params) type {
             entry.text = owned_text;
         }
 
+        /// Resolve a message's server timestamp by its msgid within `target`, or
+        /// null when no such message exists. Translates CHATHISTORY msgid
+        /// selectors into the timestamp bounds the paging queries operate on.
+        pub fn timestampOf(self: *Self, target: []const u8, msgid: []const u8) ?u64 {
+            const found = self.findNewest(target, msgid) catch return null;
+            return found.timestamp;
+        }
+
         pub fn storedCount(self: *const Self, target: []const u8) Error!usize {
             try validateTarget(target);
             const log = self.targets.get(target) orelse return 0;
@@ -382,6 +390,19 @@ test "between window composes after() with an upper-bound filter" {
         }
     }
     try expectIds(buf[0..k], &.{ "m2", "m3", "m4" });
+}
+
+test "timestampOf resolves a msgid to its timestamp" {
+    const Store = Lotus(.{ .max_targets = 1, .max_per_target = 4, .max_text = 32 });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try appendForTest(&store, "#lotus", "m1", 11, "one");
+    try appendForTest(&store, "#lotus", "m2", 22, "two");
+
+    try std.testing.expectEqual(@as(?u64, 22), store.timestampOf("#lotus", "m2"));
+    try std.testing.expectEqual(@as(?u64, 11), store.timestampOf("#lotus", "m1"));
+    try std.testing.expectEqual(@as(?u64, null), store.timestampOf("#lotus", "nope"));
+    try std.testing.expectEqual(@as(?u64, null), store.timestampOf("#absent", "m1"));
 }
 
 test "around window composes before() reversed + after() at the pivot" {
