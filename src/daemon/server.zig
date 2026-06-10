@@ -4773,6 +4773,11 @@ pub const LinuxServer = struct {
             .certfp = tconn.session.tls_certfp,
             // RPL_WHOISSECURE (671): the target is connected over TLS.
             .is_secure = tconn.is_tls,
+            // RPL_WHOISACTUALLY (338): real host/IP, shown only to opers or self.
+            .actual_host = if (conn.session.isOper() or conn == tconn) blk: {
+                const rh = tconn.session.realHost();
+                break :blk if (rh.len > 0) rh else null;
+            } else null,
             // +p hide-chans: suppress the channel list unless the requester is the
             // user themselves or an oper.
             .channels = blk: {

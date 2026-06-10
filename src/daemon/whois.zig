@@ -27,6 +27,7 @@ const whois_bot_code = numeric.Numeric.RPL_WHOISBOT;
 const whois_operator_code = numeric.Numeric.RPL_WHOISOPERATOR;
 const whois_certfp_code = numeric.Numeric.RPL_WHOISCERTFP;
 const whois_secure_code = numeric.Numeric.RPL_WHOISSECURE;
+const whois_actually_code = numeric.Numeric.RPL_WHOISACTUALLY;
 const whois_special_code = numeric.Numeric.RPL_WHOISSPECIAL;
 const away_code = numeric.Numeric.RPL_AWAY;
 const endofwhois_code = numeric.Numeric.RPL_ENDOFWHOIS;
@@ -103,6 +104,9 @@ pub const WhoisSubject = struct {
     certfp: ?[]const u8 = null,
     /// RPL_WHOISSECURE (671) when the target is connected over TLS.
     is_secure: bool = false,
+    /// RPL_WHOISACTUALLY (338): the target's real host/IP, shown only to opers
+    /// (or the user themselves). Null suppresses the line.
+    actual_host: ?[]const u8 = null,
     /// Free-form GeoIP/ASN summary, surfaced as RPL_WHOISSPECIAL (320). Built by
     /// the daemon from the MaxMind database when one is loaded.
     geo: ?[]const u8 = null,
@@ -176,6 +180,9 @@ pub fn writeWhoisWith(
 
     try writeWhoisUserLine(params, sink, server_name, requester_nick, subject);
     try writeWhoisServerLine(params, sink, server_name, requester_nick, subject.nick, subject_server, subject_server_info);
+    if (subject.actual_host) |host| {
+        try writeWhoisActuallyLine(params, sink, server_name, requester_nick, subject.nick, host);
+    }
     try writeWhoisIdleLine(params, sink, server_name, requester_nick, subject);
     try writeWhoisChannelLines(params, sink, server_name, requester_nick, subject.nick, subject.channels);
     if (subject.account) |account| {
@@ -590,6 +597,24 @@ fn writeWhoisSecureLine(
     try sink.commitLine(&b);
 }
 
+fn writeWhoisActuallyLine(
+    comptime params: Params,
+    sink: *WhoisLineSink,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    subject_nick: []const u8,
+    actual_host: []const u8,
+) WhoisError!void {
+    var b = try sink.beginLine();
+    b.max_line_bytes = params.max_line_bytes;
+    try b.numericPrefix(whois_actually_code, server_name, requester_nick);
+    try b.spaceParam(subject_nick);
+    try b.spaceParam(actual_host);
+    try b.spaceTrailing("Is actually using host");
+    try b.crlf();
+    try sink.commitLine(&b);
+}
+
 fn writeAwayLine(
     comptime params: Params,
     sink: *WhoisLineSink,
@@ -812,6 +837,29 @@ test "secure connection emits RPL_WHOISSECURE 671 before end" {
     }
     try std.testing.expect(found_671);
     try std.testing.expect(idx_671 < idx_end); // before End of /WHOIS
+}
+
+test "actual_host emits RPL_WHOISACTUALLY 338 after the server line" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.actual_host = "203.0.113.7";
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    const lines = sink.slice();
+    var idx_312: usize = 0;
+    var idx_338: ?usize = null;
+    for (lines, 0..) |line, i| {
+        if (std.mem.indexOf(u8, line.bytes, " 312 ") != null) idx_312 = i;
+        if (std.mem.indexOf(u8, line.bytes, " 338 ") != null) {
+            idx_338 = i;
+            try std.testing.expectEqualStrings(":irc.example 338 dan alice 203.0.113.7 :Is actually using host\r\n", line.bytes);
+        }
+    }
+    try std.testing.expect(idx_338 != null);
+    try std.testing.expect(idx_338.? == idx_312 + 1); // immediately after the server line
 }
 
 test "ERR_NOSUCHNICK builder emits 401" {
