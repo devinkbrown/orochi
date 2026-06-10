@@ -1007,7 +1007,7 @@ pub const ReplyCtx = struct {
     pub fn init(storage: []u8) ReplyCtx {
         // Pick up the configured network name (set once at boot) at runtime; the
         // field default stays comptime-known for struct initialization.
-        return .{ .storage = storage, .network_name = protocol_inventory.currentNetworkName() };
+        return .{ .storage = storage, .network_name = protocol_inventory.currentNetworkName(), .server_name = protocol_inventory.currentServerName() };
     }
 
     pub fn written(self: *const ReplyCtx) []const u8 {
@@ -1493,7 +1493,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     try replies.numeric(session, .RPL_WELCOME, &.{}, "Welcome to the Orochi IRC Network");
     try replies.numeric(session, .RPL_YOURHOST, &.{}, "Your host is orochi.local, running Orochi");
     try replies.numeric(session, .RPL_CREATED, &.{}, "This server was created for deterministic tests");
-    try replies.numeric(session, .RPL_MYINFO, &.{ SERVER_NAME, "orochi-0.1", "io", "ov" }, "are supported by this server");
+    try replies.numeric(session, .RPL_MYINFO, &.{ replies.server_name, "orochi-0.1", "io", "ov" }, "are supported by this server");
     try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
 }
 

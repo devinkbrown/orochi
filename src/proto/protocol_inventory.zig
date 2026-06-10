@@ -32,6 +32,26 @@ pub fn setNetworkName(name: ?[]const u8) void {
     }
 }
 
+/// Default server name (this node's own name, the source prefix of
+/// server-originated lines). Operators override it via `[network] server_name`.
+pub const server_name = "orochi.local";
+
+/// Boot-time override of this server's name. Write-once at startup; per-node so
+/// mesh servers don't collide in source prefixes / S2S identity.
+var server_name_override: ?[]const u8 = null;
+
+/// The server name to use (config override if set, else the default).
+pub fn currentServerName() []const u8 {
+    return server_name_override orelse server_name;
+}
+
+/// Install the configured server name. Call once at boot before serving.
+pub fn setServerName(name: ?[]const u8) void {
+    if (name) |n| {
+        if (n.len != 0) server_name_override = n;
+    }
+}
+
 /// Channel-mode advertisement token (`CHANMODES=<A>,<B>,<C>,<D>`).
 pub const chanmodes_token = "CHANMODES=beIZ,k,lfj,imnstCTNMSgW";
 

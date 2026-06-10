@@ -923,6 +923,11 @@ pub const Config = struct {
     /// Configurable via `[network] name`; installed into the protocol_inventory
     /// override at boot.
     network_name: []const u8 = protocol_inventory.network_name,
+    /// This server's own name (the source prefix in server-originated lines and
+    /// the identity presented to S2S peers). MUST be unique per node in a mesh so
+    /// replies/identities don't collide. Configurable via `[network] server_name`;
+    /// defaults to the build-time `server_name` constant.
+    server_name: []const u8 = server_name,
     /// MOTD text served by the MOTD command, split on newlines. Empty = the
     /// built-in default MOTD. Configurable via `[motd] text` (supports @file:).
     motd_text_raw: []const u8 = "",
@@ -2067,7 +2072,7 @@ pub const LinuxServer = struct {
         }
 
         const snapshot = stats_report.Snapshot{
-            .server_name = server_name,
+            .server_name = self.serverName(),
             .network = protocol_inventory.currentNetworkName(),
             .version = "orochi-0.1",
             .generated_unix = @divTrunc(platform.realtimeMillis(), 1000),
@@ -2452,7 +2457,7 @@ pub const LinuxServer = struct {
                 // remote_node_id is learned from the inbound handshake.
                 .remote_node_id = 0,
                 .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
-                .server_name = server_name,
+                .server_name = self.serverName(),
             });
             errdefer link.deinit();
             conn.s2s = link;
@@ -2686,7 +2691,7 @@ pub const LinuxServer = struct {
                 .now_ms = wall,
             },
             .rng = self.config.crypto_io.?,
-            .server_name = server_name,
+            .server_name = self.serverName(),
             .local_epoch_ms = wall,
         });
         return link;
@@ -4787,7 +4792,7 @@ pub const LinuxServer = struct {
         else
             0;
         const ctx = whox.ReplyContext{
-            .server_name = server_name,
+            .server_name = self.serverName(),
             .requester = requester,
             .request = req,
             .member = .{
@@ -4831,7 +4836,7 @@ pub const LinuxServer = struct {
                 const mconn = self.connFor(clientIdFromWorld(member.*));
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
                 const ctx = who.ReplyContext{
-                    .server_name = server_name,
+                    .server_name = self.serverName(),
                     .requester = requester,
                     .target = target,
                     .client = .{
@@ -4851,7 +4856,7 @@ pub const LinuxServer = struct {
         } else if (self.world.findNick(target)) |wid| {
             const mconn = self.connFor(clientIdFromWorld(wid));
             const ctx = who.ReplyContext{
-                .server_name = server_name,
+                .server_name = self.serverName(),
                 .requester = requester,
                 .target = target,
                 .client = .{
@@ -4896,7 +4901,7 @@ pub const LinuxServer = struct {
         var adapter = Adapter{ .it = self.world.channelIterator(), .filters = &filters };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSinkCRLF{ .conn = conn };
-        list.emitList(Adapter, &adapter, request, .{ .server_name = server_name, .requester = conn.session.displayName(), .now_seconds = 0 }, &scratch, &sink) catch return;
+        list.emitList(Adapter, &adapter, request, .{ .server_name = self.serverName(), .requester = conn.session.displayName(), .now_seconds = 0 }, &scratch, &sink) catch return;
     }
 
     /// LISTX [<filter>] — IRCX extended channel list (811/812/817). Filter terms
@@ -4907,7 +4912,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LISTX"}, "Invalid LISTX filter");
             return;
         };
-        const ctx = listx.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+        const ctx = listx.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
         var buf: [default_reply_bytes]u8 = undefined;
         if (listx.writeListxStart(&buf, ctx)) |line| try appendToConn(conn, line) else |_| {}
         var it = self.world.channelIterator();
@@ -6323,7 +6328,7 @@ pub const LinuxServer = struct {
         // Operator gate enforced by the registry (access=.oper).
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
-        const ctx = trace.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+        const ctx = trace.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
         var it = self.rx().clients.iterator();
         while (it.next()) |e| {
             if (!e.value.session.registered()) continue;
@@ -6427,7 +6432,7 @@ pub const LinuxServer = struct {
             .local_node_id = self.config.node_id,
             .remote_node_id = 0,
             .local_epoch_ms = @intCast(@max(0, platform.realtimeMillis())),
-            .server_name = server_name,
+            .server_name = self.serverName(),
         });
         errdefer link.deinit();
         peer.s2s = link;
@@ -6553,7 +6558,7 @@ pub const LinuxServer = struct {
         }
         if (req.changes.len == 0) {
             // Query: collect active mode letters (base + IRCX-extended) as names.
-            const ctx = ircx_modex.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+            const ctx = ircx_modex.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
             var names: [32][]const u8 = undefined;
             var nn: usize = 0;
             var flags_buf: [16]u8 = undefined;
@@ -7330,12 +7335,40 @@ pub const LinuxServer = struct {
         if (self.metadata.get(nick, key)) |ev| return ev.value else |_| return "";
     }
 
-    /// Post a server NOTICE to every member of `chan` (the fantasy-bot reply
-    /// channel, e.g. the `!weather` answer). Best-effort; a full buffer is ignored.
+    /// This node's own server name (the source prefix for server-originated
+    /// lines). Configurable per node so mesh nodes don't collide; falls back to
+    /// the build-time constant.
+    fn serverName(self: *const LinuxServer) []const u8 {
+        return if (self.config.server_name.len != 0) self.config.server_name else server_name;
+    }
+
+    /// Post a server NOTICE answer to `chan` from THIS server (the replier). The
+    /// fantasy bot only ever runs on the requesting user's own server, so the
+    /// answer is generated exactly once: it is delivered to local members AND
+    /// relayed to peers (so members on other nodes see the one reply, sourced
+    /// from this node's name). No peer regenerates it — no cross-server collision.
     fn fantasyReply(self: *LinuxServer, chan: []const u8, text: []const u8) void {
+        const origin = self.serverName();
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ server_name, chan, text }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ origin, chan, text }) catch return;
         self.broadcastChannel(chan, line, null) catch {};
+
+        // Relay across the mesh so remote members of the channel see the reply,
+        // attributed to this (the replying) server. Deduped via relay_seen.
+        if (self.hasEstablishedPeer()) {
+            const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+            _ = self.relay_seen.observe(self.config.node_id, hlc);
+            const relay_msg = s2s_link.RelayMessage{
+                .verb = .notice,
+                .target = chan,
+                .source_nick = origin,
+                .source_prefix = origin,
+                .text = text,
+                .origin_node = self.config.node_id,
+                .hlc = hlc,
+            };
+            _ = self.relayToPeers(relay_msg, .{ .channel = chan });
+        }
     }
 
     /// Channel fantasy dispatch: a member's PRIVMSG starting with `!` may invoke
@@ -7632,7 +7665,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCESS"}, "Invalid ACCESS");
             return;
         };
-        const ctx = ircx_access_store.ReplyContext{ .server_name = server_name, .requester = conn.session.displayName() };
+        const ctx = ircx_access_store.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
         var buf: [default_reply_bytes]u8 = undefined;
         switch (req) {
             .list => |sel| {
@@ -8244,7 +8277,7 @@ pub const LinuxServer = struct {
         };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
-        lusers.emit(.{ .server_name = server_name, .requester = conn.session.displayName() }, counts, &scratch, &sink) catch return;
+        lusers.emit(.{ .server_name = self.serverName(), .requester = conn.session.displayName() }, counts, &scratch, &sink) catch return;
     }
 
     /// MOTD (375/372/376).
@@ -8350,11 +8383,10 @@ pub const LinuxServer = struct {
 
     /// TIME (391) — current wall-clock server time.
     pub fn handleTime(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
         var tbuf: [64]u8 = undefined;
         const tstr = formatServerTime(&tbuf);
         var out_buf: [default_reply_bytes]u8 = undefined;
-        const line = serverinfo.writeTimeReply(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, server_name, tstr) catch return;
+        const line = serverinfo.writeTimeReply(&out_buf, .{ .server_name = self.serverName(), .requester = conn.session.displayName() }, self.serverName(), tstr) catch return;
         try appendToConn(conn, line);
     }
 
@@ -8363,7 +8395,7 @@ pub const LinuxServer = struct {
         var out_buf: [default_reply_bytes]u8 = undefined;
         var lines_buf: [4]serverinfo.ReplyLine = undefined;
         var sink = serverinfo.ReplyLineSink{ .lines = &lines_buf };
-        serverinfo.writeAdminReplies(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, .{
+        serverinfo.writeAdminReplies(&out_buf, .{ .server_name = self.serverName(), .requester = conn.session.displayName() }, .{
             .reply_server = server_name,
             .location1 = self.config.admin_location,
             .email = self.config.admin_email,
@@ -8373,17 +8405,16 @@ pub const LinuxServer = struct {
 
     /// VERSION (351).
     pub fn handleVersion(self: *LinuxServer, conn: *ConnState) !void {
-        _ = self;
         var out_buf: [default_reply_bytes]u8 = undefined;
         const info = serverinfo.VersionInfo{
             .version = server_version,
             // build token: compile target so opers can tell binaries apart.
             .build = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
             .branding = @tagName(builtin.mode),
-            .reply_server = server_name,
+            .reply_server = self.serverName(),
             .description = "Orochi — pure-Zig mesh IRC daemon",
         };
-        const line = serverinfo.writeVersionReply(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, info) catch return;
+        const line = serverinfo.writeVersionReply(&out_buf, .{ .server_name = self.serverName(), .requester = conn.session.displayName() }, info) catch return;
         try appendToConn(conn, line);
 
         // Conventional ircd behaviour: VERSION re-advertises ISUPPORT (005) so a
@@ -10493,7 +10524,7 @@ pub const LinuxServer = struct {
             .message = message,
         };
         var line_buf: [default_reply_bytes]u8 = undefined;
-        const line = event_spine.renderOperNote(.{ .server_name = server_name, .event = event }, &line_buf) catch return;
+        const line = event_spine.renderOperNote(.{ .server_name = self.serverName(), .event = event }, &line_buf) catch return;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (entry.value.session.subscribesTo(category)) try self.deliver(entry.id, line);

@@ -61,6 +61,8 @@ pub const Config = struct {
     /// and the registration welcome burst.
     pub const Network = struct {
         name: []const u8 = "Orochi",
+        /// This server's own name (source prefix + S2S identity). Unique per node.
+        server_name: ?[]const u8 = null,
     };
 
     /// Message of the Day. `text` is served by the MOTD command (split on
@@ -319,6 +321,7 @@ pub const Config = struct {
         if (self.node.public_key) |value| allocator.free(value);
         if (self.node.secret_key) |value| allocator.free(value);
         allocator.free(self.network.name);
+        if (self.network.server_name) |v| allocator.free(v);
         if (self.motd.text) |value| allocator.free(value);
         allocator.free(self.admin.location);
         allocator.free(self.admin.email);
@@ -380,6 +383,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [network]
     try setStr(allocator, resolver, doc.getString("network.name"), &cfg.network.name);
+    try setOpt(allocator, resolver, doc.getString("network.server_name"), &cfg.network.server_name);
 
     // [motd] — `text` may use `@file:path` to load from disk.
     try setOpt(allocator, resolver, doc.getString("motd.text"), &cfg.motd.text);

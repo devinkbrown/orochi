@@ -152,6 +152,7 @@ pub fn main(init: std.process.Init) !void {
     // Install the configured network name before building ISUPPORT, so the
     // NETWORK= token and the welcome burst both reflect it. Write-once at boot.
     orochi.proto.protocol_inventory.setNetworkName(srv_cfg.network_name);
+    orochi.proto.protocol_inventory.setServerName(srv_cfg.server_name);
     // Advertise config-driven length limits (TOPICLEN) in ISUPPORT. Built once
     // here, before any connection is served; owned for the process lifetime.
     if (orochi.daemon.server.buildIsupportTokens(allocator, srv_cfg)) |tokens| {
