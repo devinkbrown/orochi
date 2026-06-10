@@ -69,6 +69,7 @@ pub const Numeric = enum(u16) {
     RPL_GLOBALUSERS = 266,
     RPL_PRIVS = 270,
     RPL_WHOISCERTFP = 276,
+    RPL_WHOISSECURE = 671,
     RPL_ACCEPTLIST = 281,
     RPL_ENDOFACCEPT = 282,
     RPL_NONE = 300,

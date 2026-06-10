@@ -4771,6 +4771,8 @@ pub const LinuxServer = struct {
             // RPL_WHOISCERTFP (276): surface the TLS client-cert fingerprint of a
             // mutual-TLS user (the same value SASL EXTERNAL matches to an account).
             .certfp = tconn.session.tls_certfp,
+            // RPL_WHOISSECURE (671): the target is connected over TLS.
+            .is_secure = tconn.is_tls,
             // +p hide-chans: suppress the channel list unless the requester is the
             // user themselves or an oper.
             .channels = blk: {

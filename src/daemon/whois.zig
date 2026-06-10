@@ -26,6 +26,7 @@ const whois_logged_in_code = numeric.Numeric.RPL_WHOISLOGGEDIN;
 const whois_bot_code = numeric.Numeric.RPL_WHOISBOT;
 const whois_operator_code = numeric.Numeric.RPL_WHOISOPERATOR;
 const whois_certfp_code = numeric.Numeric.RPL_WHOISCERTFP;
+const whois_secure_code = numeric.Numeric.RPL_WHOISSECURE;
 const whois_special_code = numeric.Numeric.RPL_WHOISSPECIAL;
 const away_code = numeric.Numeric.RPL_AWAY;
 const endofwhois_code = numeric.Numeric.RPL_ENDOFWHOIS;
@@ -100,6 +101,8 @@ pub const WhoisSubject = struct {
     /// TLS client-certificate fingerprint (lowercase hex), surfaced as
     /// RPL_WHOISCERTFP (276) when the target authenticated over a client cert.
     certfp: ?[]const u8 = null,
+    /// RPL_WHOISSECURE (671) when the target is connected over TLS.
+    is_secure: bool = false,
     /// Free-form GeoIP/ASN summary, surfaced as RPL_WHOISSPECIAL (320). Built by
     /// the daemon from the MaxMind database when one is loaded.
     geo: ?[]const u8 = null,
@@ -186,6 +189,9 @@ pub fn writeWhoisWith(
     }
     if (subject.certfp) |fp| {
         try writeWhoisCertfpLine(params, sink, server_name, requester_nick, subject.nick, fp);
+    }
+    if (subject.is_secure) {
+        try writeWhoisSecureLine(params, sink, server_name, requester_nick, subject.nick);
     }
     if (subject.geo) |geo_text| {
         try writeWhoisGeoLine(params, sink, server_name, requester_nick, subject.nick, geo_text);
@@ -568,6 +574,22 @@ fn writeWhoisCertfpLine(
     try sink.commitLine(&b);
 }
 
+fn writeWhoisSecureLine(
+    comptime params: Params,
+    sink: *WhoisLineSink,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    subject_nick: []const u8,
+) WhoisError!void {
+    var b = try sink.beginLine();
+    b.max_line_bytes = params.max_line_bytes;
+    try b.numericPrefix(whois_secure_code, server_name, requester_nick);
+    try b.spaceParam(subject_nick);
+    try b.spaceTrailing("is using a secure connection");
+    try b.crlf();
+    try sink.commitLine(&b);
+}
+
 fn writeAwayLine(
     comptime params: Params,
     sink: *WhoisLineSink,
@@ -765,6 +787,31 @@ test "full WHOIS sequence emits every supported numeric in order" {
     try std.testing.expectEqualStrings(":irc.example 335 dan alice :is a bot\r\n", lines[5].bytes);
     try std.testing.expectEqualStrings(":irc.example 301 dan alice :writing tests\r\n", lines[6].bytes);
     try std.testing.expectEqualStrings(":irc.example 318 dan alice :End of /WHOIS list\r\n", lines[7].bytes);
+}
+
+test "secure connection emits RPL_WHOISSECURE 671 before end" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.is_secure = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    const lines = sink.slice();
+    var found_671 = false;
+    var idx_671: usize = 0;
+    var idx_end: usize = 0;
+    for (lines, 0..) |line, i| {
+        if (std.mem.indexOf(u8, line.bytes, " 671 ") != null) {
+            found_671 = true;
+            idx_671 = i;
+            try std.testing.expectEqualStrings(":irc.example 671 dan alice :is using a secure connection\r\n", line.bytes);
+        }
+        if (std.mem.indexOf(u8, line.bytes, " 318 ") != null) idx_end = i;
+    }
+    try std.testing.expect(found_671);
+    try std.testing.expect(idx_671 < idx_end); // before End of /WHOIS
 }
 
 test "ERR_NOSUCHNICK builder emits 401" {
