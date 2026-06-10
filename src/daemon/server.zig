@@ -7941,6 +7941,20 @@ pub const LinuxServer = struct {
     }
 
     /// LUSERS — network/user counters (251-255, 265/266).
+    /// Count registered local user clients (excludes S2S links and connections
+    /// still in registration). Shared by LUSERS and MAP so their user totals
+    /// agree and never include peer links or half-open sockets.
+    fn countRegisteredUsers(self: *LinuxServer) u64 {
+        var n: u64 = 0;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            if (c.session.registered()) n += 1;
+        }
+        return n;
+    }
+
     pub fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         // Classify connections: registered local users vs unknown (still in
         // registration) vs established S2S peers (counted as servers, never
@@ -10057,7 +10071,7 @@ pub const LinuxServer = struct {
         var line_buf: [160]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "{s} [Users: {d}]", .{
             server_name,
-            self.rx().clients.len(),
+            self.countRegisteredUsers(),
         }) catch return;
         try queueNumeric(conn, .RPL_MAP, &.{}, detail);
         // Established S2S peers as child nodes of this server.
