@@ -100,6 +100,7 @@ pub const frame = @import("frame.zig");
 pub const frame_marking = @import("frame_marking.zig");
 pub const frame_props = @import("frame_props.zig");
 pub const gcounter = @import("gcounter.zig");
+pub const geo_fetch = @import("geo_fetch.zig");
 pub const global_notice = @import("global_notice.zig");
 pub const glob_set = @import("glob_set.zig");
 pub const happy_eyeballs = @import("happy_eyeballs.zig");
@@ -416,6 +417,7 @@ test {
     _ = frame_marking;
     _ = frame_props;
     _ = gcounter;
+    _ = geo_fetch;
     _ = global_notice;
     _ = glob_set;
     _ = happy_eyeballs;
