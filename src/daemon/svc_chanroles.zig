@@ -1,4 +1,4 @@
-//! Named per-channel role definitions for the Mizuchi daemon.
+//! Named per-channel role definitions for the Orochi daemon.
 //!
 //! This is a pure data/parser/logic module. It models real IRC command input
 //! (`CHANROLE ...` or `CHANNEL ROLE ...`) and numeric reply codes; it does not

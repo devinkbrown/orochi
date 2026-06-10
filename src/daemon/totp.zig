@@ -1,4 +1,4 @@
-//! Time-based one-time password support for Mizuchi account safeguards.
+//! Time-based one-time password support for Orochi account safeguards.
 //!
 //! The module keeps the protocol surface small: RFC 4648 base32 decoding,
 //! RFC 4226 HOTP, RFC 6238 TOTP, skew-window verification, and otpauth URI
@@ -307,10 +307,10 @@ test "skew window accepts adjacent step and rejects distant code" {
 }
 
 test "provisioning URI percent encodes label and issuer" {
-    const uri = try provisioningUri(std.testing.allocator, "alice@example.net", "Mizuchi Core", "JBSWY3DPEHPK3PXP");
+    const uri = try provisioningUri(std.testing.allocator, "alice@example.net", "Orochi Core", "JBSWY3DPEHPK3PXP");
     defer std.testing.allocator.free(uri);
     try std.testing.expectEqualStrings(
-        "otpauth://totp/Mizuchi%20Core:alice%40example.net?secret=JBSWY3DPEHPK3PXP&issuer=Mizuchi%20Core",
+        "otpauth://totp/Orochi%20Core:alice%40example.net?secret=JBSWY3DPEHPK3PXP&issuer=Orochi%20Core",
         uri,
     );
 }

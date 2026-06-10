@@ -1,4 +1,4 @@
-//! Focus Mode for the Mizuchi IRC daemon.
+//! Focus Mode for the Orochi IRC daemon.
 //!
 //! Each account can toggle a personal "focus" state. While focused, the
 //! account's client is expected to suppress message notifications, except

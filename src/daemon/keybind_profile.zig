@@ -1,4 +1,4 @@
-//! Per-account opaque client keybind blobs for the Mizuchi IRC daemon.
+//! Per-account opaque client keybind blobs for the Orochi IRC daemon.
 //!
 //! Clients may stash a small, server-opaque blob of keybind configuration
 //! keyed by account name. The daemon never interprets the contents; it only

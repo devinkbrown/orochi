@@ -5,7 +5,7 @@
 //! state: callers provide subscriber storage, publish sinks, and render buffers.
 const std = @import("std");
 
-/// Mizuchi event categories. These replace untyped oper broadcast channels.
+/// Orochi event categories. These replace untyped oper broadcast channels.
 pub const EventCategory = enum(u6) {
     connect,
     disconnect,
@@ -456,7 +456,7 @@ test "unsubscribe removes selected categories and drops empty subscribers" {
 test "render output is structured NOTE event line with tags" {
     var out: [256]u8 = undefined;
     const line = try renderOperNote(.{
-        .server_name = "mizuchi.local",
+        .server_name = "orochi.local",
         .event = .{
             .category = .server_link,
             .severity = .notice,
@@ -466,7 +466,7 @@ test "render output is structured NOTE event line with tags" {
     }, &out);
 
     try std.testing.expectEqualStrings(
-        "@event-category=server_link;event-severity=notice;event-timestamp-ms=17000042 :mizuchi.local NOTE EVENT SERVER_LINK :mesh link established\r\n",
+        "@event-category=server_link;event-severity=notice;event-timestamp-ms=17000042 :orochi.local NOTE EVENT SERVER_LINK :mesh link established\r\n",
         line,
     );
 }
@@ -513,7 +513,7 @@ test "renderer validates unsafe wire text and caller-owned output size" {
     var out: [64]u8 = undefined;
 
     try std.testing.expectError(error.InvalidMessage, renderOperNote(.{
-        .server_name = "mizuchi.local",
+        .server_name = "orochi.local",
         .event = .{
             .category = .@"error",
             .severity = .@"error",
@@ -523,7 +523,7 @@ test "renderer validates unsafe wire text and caller-owned output size" {
     }, &out));
 
     try std.testing.expectError(error.OutputTooSmall, renderOperNote(.{
-        .server_name = "mizuchi.local",
+        .server_name = "orochi.local",
         .event = .{
             .category = .connect,
             .severity = .info,

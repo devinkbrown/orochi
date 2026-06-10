@@ -1,4 +1,4 @@
-//! Per-account highlight keyword lists for the Mizuchi daemon.
+//! Per-account highlight keyword lists for the Orochi daemon.
 //!
 //! Each account owns a small list of keywords (max `max_words`, each at most
 //! `max_word_len` bytes). Clients use these words to decide when to raise a

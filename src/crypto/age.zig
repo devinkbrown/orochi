@@ -462,14 +462,14 @@ test "wrong identity fails while the right identity succeeds" {
     defer wrong.wipe();
     var rng = DeterministicIo{ .state = 0x9999 };
 
-    const sealed = try encrypt(allocator, rng.io(), recipient.public_key, "mizuchi secret");
+    const sealed = try encrypt(allocator, rng.io(), recipient.public_key, "orochi secret");
     defer allocator.free(sealed);
 
     try testing.expectError(error.AuthenticationFailed, decrypt(allocator, wrong.secret_key, sealed));
 
     const opened = try decrypt(allocator, recipient.secret_key, sealed);
     defer allocator.free(opened);
-    try testing.expectEqualSlices(u8, "mizuchi secret", opened);
+    try testing.expectEqualSlices(u8, "orochi secret", opened);
 }
 
 test "tampered header MAC is rejected" {

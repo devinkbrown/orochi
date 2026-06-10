@@ -1,4 +1,4 @@
-//! TLS 1.3 handshake FSM for Mizuchi (RFC 8446, one-RTT, X25519, no PSK).
+//! TLS 1.3 handshake FSM for Orochi (RFC 8446, one-RTT, X25519, no PSK).
 //!
 //! This module is pure caller-buffered orchestration. It consumes the local
 //! TLS policy/state vocabulary, HKDF TLS 1.3 schedule, record-layer framing,

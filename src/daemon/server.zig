@@ -326,7 +326,7 @@ fn isMultilineOpen(parsed: *const irc_line.LineView) bool {
         std.mem.eql(u8, parsed.params[1], multiline.draft_multiline_batch);
 }
 
-const server_version = "mizuchi-0.1";
+const server_version = "orochi-0.1";
 /// Personalized default MOTD, expanded per connection by `motd_template`
 /// (operators override the whole thing via `[motd] text`). Conditional blocks
 /// begin right after the prior line so an inactive branch leaves no blank line.
@@ -339,7 +339,7 @@ const default_motd_template =
     "Tip: register your account to reserve your nick and unlock services.{/if}{if:oper}\n" ++
     "Operator privileges are active on this connection — wield them with care.{/if}{if:secure}{else}\n" ++
     "Note: this link is not encrypted — reconnect over TLS for privacy.{/if}\n" ++
-    "Mizuchi — a clean-room, Zig-native IRCX/IRCv3 daemon: Suimyaku CRDT mesh, forward-secret Tsumugi links.";
+    "Orochi — a clean-room, Zig-native IRCX/IRCv3 daemon: Suimyaku CRDT mesh, forward-secret Tsumugi links.";
 
 /// Sink adapter that writes complete (CRLF-terminated) builder lines to a conn.
 const ConnLineSink = struct {
@@ -706,7 +706,7 @@ const wake_token: RingFdToken = .{ .slot = 4, .gen = 0 };
 const default_reply_bytes: usize = 8192;
 const default_recv_bytes: usize = 4096;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
-const server_name = "mizuchi.local";
+const server_name = "orochi.local";
 const default_host = "localhost";
 
 const Numeric = enum(u16) {
@@ -925,8 +925,8 @@ pub const Config = struct {
     /// built-in default MOTD. Configurable via `[motd] text` (supports @file:).
     motd_text_raw: []const u8 = "",
     /// ADMIN command contact details. Configurable via `[admin] location/email`.
-    admin_location: []const u8 = "Mizuchi IRC network",
-    admin_email: []const u8 = "admin@mizuchi.local",
+    admin_location: []const u8 = "Orochi IRC network",
+    admin_email: []const u8 = "admin@orochi.local",
     /// Localized weather for the MOTD `{weather}` placeholder (`[weather]`).
     /// `weather_source` is a key=value file refreshed by an external updater;
     /// the daemon reads + localizes it per MOTD request.
@@ -1309,7 +1309,7 @@ threadlocal var current_reactor: ?*Reactor = null;
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    /// MizuWasm control-plane plugin bridge: loaded third-party plugins whose
+    /// OroWasm control-plane plugin bridge: loaded third-party plugins whose
     /// declared commands are dispatched after the comptime registry misses.
     /// Empty by default (no plugins) => the consult is a fast miss.
     wasm: wasm_bridge.Bridge,
@@ -1436,7 +1436,7 @@ pub const LinuxServer = struct {
     peer_health: link_health_mod.Registry = .{},
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
-    /// Per-channel media rooms (Mizuchi media SFU control plane): who is in each call.
+    /// Per-channel media rooms (Orochi media SFU control plane): who is in each call.
     media_rooms: media_room.MediaRooms,
     /// Media transport plane: UDP socket + ICE/STUN endpoint registry + pump
     /// thread. Started on boot (`start`), torn down on `deinit`.
@@ -1503,7 +1503,7 @@ pub const LinuxServer = struct {
     fn initReactor(allocator: std.mem.Allocator, config: Config, shard_id: u12, reuse_port: bool) !Reactor {
         const listener_fd = if (!reuse_port and config.inherited_listener_fd != null) blk: {
             const fd = config.inherited_listener_fd.?;
-            std.debug.print("mizuchi: adopting inherited listener fd {d}\n", .{fd});
+            std.debug.print("orochi: adopting inherited listener fd {d}\n", .{fd});
             break :blk fd;
         } else if (reuse_port)
             try reuseport.createReusePortListener(config.host, config.port, config.backlog)
@@ -1663,10 +1663,10 @@ pub const LinuxServer = struct {
         // leg). Independent of the WebRTC plane below; a bind failure logs and
         // the daemon keeps serving IRC.
         self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
-            std.debug.print("mizuchi: native media transport disabled ({s})\n", .{@errorName(e)});
+            std.debug.print("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
         };
         if (self.native_media.port != 0) {
-            std.debug.print("mizuchi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
+            std.debug.print("orochi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
             // Bridge native frames to any opt-in WebRTC members of each channel.
             self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
         }
@@ -1674,12 +1674,12 @@ pub const LinuxServer = struct {
         // Bring the media transport plane online (bind UDP + pump thread). Media
         // is optional: a bind failure logs and the daemon keeps serving IRC.
         self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
-            std.debug.print("mizuchi: media plane disabled ({s})\n", .{@errorName(e)});
+            std.debug.print("orochi: media plane disabled ({s})\n", .{@errorName(e)});
             return;
         };
         var host_buf: [16]u8 = undefined;
         const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
-        std.debug.print("mizuchi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
+        std.debug.print("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
         // Bridge WebRTC RTP frames to any native members of each channel.
         self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
     }
@@ -2028,7 +2028,7 @@ pub const LinuxServer = struct {
         const snapshot = stats_report.Snapshot{
             .server_name = server_name,
             .network = protocol_inventory.currentNetworkName(),
-            .version = "mizuchi-0.1",
+            .version = "orochi-0.1",
             .generated_unix = @divTrunc(platform.realtimeMillis(), 1000),
             .uptime_secs = @intCast(@max(@as(i64, 0), @divTrunc(now - self.start_ms, 1000))),
             .clients = clients,
@@ -2306,7 +2306,7 @@ pub const LinuxServer = struct {
         // in-line reactor rather than running without cross-shard delivery.
         self.fabric = reactor_fabric.ReactorFabric.init(self.allocator, self.reactors.len) catch |err| {
             std.debug.print(
-                "mizuchi: cross-shard fabric init failed ({s}); running 1 reactor\n",
+                "orochi: cross-shard fabric init failed ({s}); running 1 reactor\n",
                 .{@errorName(err)},
             );
             current_reactor = &self.reactors[0];
@@ -2316,10 +2316,10 @@ pub const LinuxServer = struct {
             return;
         };
 
-        std.debug.print("mizuchi: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
+        std.debug.print("orochi: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
         self.pool.start(self.reactors.len, self, run, reactorWorker) catch |err| {
             std.debug.print(
-                "mizuchi: reactor pool spawn failed ({s}); running 1 reactor\n",
+                "orochi: reactor pool spawn failed ({s}); running 1 reactor\n",
                 .{@errorName(err)},
             );
             if (self.fabric) |*f| f.deinit();
@@ -3492,7 +3492,7 @@ pub const LinuxServer = struct {
             }
         }
 
-        // MizuWasm control-plane plugins: a loaded third-party plugin may own this
+        // OroWasm control-plane plugins: a loaded third-party plugin may own this
         // command. Consulted after the comptime registry misses; empty by default.
         if (self.wasm.count() > 0 and self.wasm.hasCommand(parsed.command)) {
             var wcore = module_core.Core{
@@ -3557,7 +3557,7 @@ pub const LinuxServer = struct {
                 .ready => m.on_ready,
             };
             if (fn_opt) |f| f(self) catch |err| {
-                std.debug.print("mizuchi: module {s} on_{s} failed: {s}\n", .{ m.id, @tagName(phase), @errorName(err) });
+                std.debug.print("orochi: module {s} on_{s} failed: {s}\n", .{ m.id, @tagName(phase), @errorName(err) });
             };
         }
     }
@@ -4019,7 +4019,7 @@ pub const LinuxServer = struct {
         // NAMES burst on JOIN (it can still request NAMES explicitly).
         if (!conn.session.hasCap(.no_implicit_names)) try self.sendNames(conn, join_target);
 
-        // Bouncer rewind: a reconnecting client with mizuchi/bouncer gets the
+        // Bouncer rewind: a reconnecting client with orochi/bouncer gets the
         // channel messages it missed (everything after its stored read marker)
         // replayed as a chathistory BATCH right after the NAMES burst.
         try self.replayRewindOnJoin(conn, join_target);
@@ -5473,13 +5473,13 @@ pub const LinuxServer = struct {
         return @intCast(total_ms);
     }
 
-    /// Bouncer rewind: when a `mizuchi/bouncer` client (re)joins a channel,
+    /// Bouncer rewind: when a `orochi/bouncer` client (re)joins a channel,
     /// replay the messages it missed — everything after its stored read marker —
     /// as a `chathistory` BATCH. No marker means there is nothing to rewind to
     /// (a fresh client has read everything), so we stay silent rather than dump
     /// the full ring. No-op for clients without the cap or without an account.
     fn replayRewindOnJoin(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
-        if (!conn.session.hasCap(.mizuchi_bouncer)) return;
+        if (!conn.session.hasCap(.orochi_bouncer)) return;
         const owner = conn.session.account() orelse return;
         const marker = (self.read_markers.get(owner, channel) catch null) orelse return;
         const marker_ms = markerToMillis(marker.slice()) orelse return;
@@ -6152,7 +6152,7 @@ pub const LinuxServer = struct {
             .epoch = @intCast(@max(0, now)),
             .now_ms = now,
             .timeout_ms = 5000,
-            .arena_name = "mizuchi-helix",
+            .arena_name = "orochi-helix",
             .pieces = pieces.items,
             .fds = &.{},
         }) catch |e| {
@@ -6192,7 +6192,7 @@ pub const LinuxServer = struct {
         if (comptime builtin.os.tag != .linux) return;
         const arena_fd = self.config.resume_arena_fd orelse return;
         const caps = helix_live.readArena(self.allocator, arena_fd) catch |e| {
-            std.debug.print("mizuchi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
+            std.debug.print("orochi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
             return;
         };
         defer {
@@ -6209,7 +6209,7 @@ pub const LinuxServer = struct {
         // The arena is fully consumed; close the inherited memfd.
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
-        std.debug.print("mizuchi: UPGRADE resume — re-attached {d} client connection(s)\n", .{adopted});
+        std.debug.print("orochi: UPGRADE resume — re-attached {d} client connection(s)\n", .{adopted});
     }
 
     /// Re-attach one carried-over client: take ownership of its inherited socket
@@ -7718,7 +7718,7 @@ pub const LinuxServer = struct {
     /// IRCX / ISIRCX — IRCX discovery + opt-in (draft-pfenning §IRCX). `IRCX`
     /// enables IRCX mode for the session; `ISIRCX` only queries. Both reply with
     /// RPL_IRCX (800): `<state> <version> <package-list> <maxmsg> <option-list>`.
-    /// Mizuchi advertises its SASL mechanisms as the package list.
+    /// Orochi advertises its SASL mechanisms as the package list.
     pub fn handleIrcx(self: *LinuxServer, conn: *ConnState, enable: bool) !void {
         _ = self;
         if (enable) conn.ircx = true;
@@ -8194,7 +8194,7 @@ pub const LinuxServer = struct {
             .build = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
             .branding = @tagName(builtin.mode),
             .reply_server = server_name,
-            .description = "Mizuchi — pure-Zig mesh IRC daemon",
+            .description = "Orochi — pure-Zig mesh IRC daemon",
         };
         const line = serverinfo.writeVersionReply(&out_buf, .{ .server_name = server_name, .requester = conn.session.displayName() }, info) catch return;
         try appendToConn(conn, line);
@@ -8398,7 +8398,7 @@ pub const LinuxServer = struct {
     /// single configured oper block; success sets the session oper flag, emits
     /// RPL_YOUREOPER (381) and the +o umode reflection.
     pub fn handleOper(self: *LinuxServer, conn: *ConnState, _: *const irc_line.LineView) !void {
-        // OPER is disabled: Mizuchi grants operator status SASL-only. A client is
+        // OPER is disabled: Orochi grants operator status SASL-only. A client is
         // elevated automatically on SASL login when its account has an `[oper]`
         // binding (see elevateOperFromAccount). There is no password credential.
         _ = self;
@@ -8796,7 +8796,7 @@ pub const LinuxServer = struct {
     }
 
     /// Emit a `NOTICE` from the server to this connection (services replies use
-    /// real server NOTICEs — Mizuchi has NO pseudo-clients).
+    /// real server NOTICEs — Orochi has NO pseudo-clients).
     fn channelNotice(conn: *ConnState, comptime fmt: []const u8, args: anytype) !void {
         var buf: [default_reply_bytes]u8 = undefined;
         const head = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :", .{ server_name, conn.session.displayName() }) catch return;
@@ -9123,7 +9123,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR>` — Mizuchi offline mail.
+    /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR>` — Orochi offline mail.
     /// SEND stores a message for an account (delivered when it next logs in);
     /// LIST shows the caller's own pending mail; CLEAR discards it. SEND requires
     /// the sender to be logged in (so recipients can see who wrote).
@@ -9209,7 +9209,7 @@ pub const LinuxServer = struct {
     }
 
     /// `MEDIA <JOIN|LEAVE|MUTE|UNMUTE|SPEAKING|ROSTER> <#chan> [kind] [arg]` —
-    /// Mizuchi media control plane. Drives the per-channel SFU participant model and
+    /// Orochi media control plane. Drives the per-channel SFU participant model and
     /// broadcasts room presence to channel members as `NOTE MEDIA` events so
     /// clients can render the call. The media bytes flow over the transport
     /// substrate, not this control socket. Caller must be a channel member.
@@ -10132,7 +10132,7 @@ pub const LinuxServer = struct {
         if (!self.requirePriv(conn, .server_rehash)) return;
         // Operator gate enforced by the registry (access=.oper).
         const path = self.config.config_path orelse {
-            try queueNumeric(conn, .RPL_REHASHING, &.{"mizuchi.conf"}, "No config file; nothing to reload");
+            try queueNumeric(conn, .RPL_REHASHING, &.{"orochi.conf"}, "No config file; nothing to reload");
             return;
         };
         const io = self.config.crypto_io orelse {
@@ -10242,7 +10242,7 @@ pub const LinuxServer = struct {
     /// plaintext and PQ-secured links, matching the MESH peer view.
     pub fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [128]u8 = undefined;
-        const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Mizuchi IRC daemon"}) catch return;
+        const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Orochi IRC daemon"}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ server_name, server_name }, detail);
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
@@ -10926,7 +10926,7 @@ pub const LinuxServer = struct {
                 } else |_| {}
             }
             if (filtered) {
-                if (!is_notice) try self.failReply(conn, command, "MIZUCHI_FILTERED", "Message blocked by the content filter");
+                if (!is_notice) try self.failReply(conn, command, "OROCHI_FILTERED", "Message blocked by the content filter");
                 return false;
             }
         }
@@ -11595,7 +11595,7 @@ fn monitorNumeric(n: monitor.MonitorNumeric) Numeric {
     };
 }
 
-/// MizuWasm host callbacks: route a plugin's granted hostcalls to the live
+/// OroWasm host callbacks: route a plugin's granted hostcalls to the live
 /// connection. `ctx` is the per-invocation `*module_core.Core`. A plugin reply is
 /// framed as a server NOTICE to the requesting client.
 fn wasmReplyCb(ctx: *anyopaque, text: []const u8) void {
@@ -11605,7 +11605,7 @@ fn wasmReplyCb(ctx: *anyopaque, text: []const u8) void {
     appendToConn(core.conn, line) catch {};
 }
 fn wasmLogCb(_: *anyopaque, text: []const u8) void {
-    std.debug.print("mizuchi: wasm-plugin: {s}\n", .{text});
+    std.debug.print("orochi: wasm-plugin: {s}\n", .{text});
 }
 fn wasmNowCb(_: *anyopaque) i64 {
     return platform.monotonicMillis();
@@ -11920,9 +11920,9 @@ fn socketPort(fd: linux.fd_t) ServerError!u16 {
 
 // --- SASL-oper test fixtures (oper is SASL-only) ---------------------------
 
-/// Test PLAIN verifier: accepts the account "admin" / password "mizuchi".
+/// Test PLAIN verifier: accepts the account "admin" / password "orochi".
 fn testOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
-    return std.mem.eql(u8, creds.authcid, "admin") and std.mem.eql(u8, creds.password, "mizuchi");
+    return std.mem.eql(u8, creds.authcid, "admin") and std.mem.eql(u8, creds.password, "orochi");
 }
 var test_oper_anchor: u8 = 0;
 const test_oper_checker = sasl.PlainChecker{ .ptr = &test_oper_anchor, .verifyFn = testOperVerify };
@@ -11945,7 +11945,7 @@ fn operTestConfig(port: u16) Config {
 /// before NICK/USER so the client is elevated automatically at registration.
 fn saslAdminPrelude(fd: linux.fd_t) ServerError!void {
     var b64: [64]u8 = undefined;
-    const enc = std.base64.standard.Encoder.encode(&b64, "\x00admin\x00mizuchi");
+    const enc = std.base64.standard.Encoder.encode(&b64, "\x00admin\x00orochi");
     var line: [128]u8 = undefined;
     try writeAllFd(fd, "CAP REQ :sasl\r\n");
     try writeAllFd(fd, "AUTHENTICATE PLAIN\r\n");
@@ -12077,11 +12077,11 @@ test "processLine registration sequence emits welcome numerics" {
 
     try processLine(&conn, "NICK kain", &sink);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
-    try processLine(&conn, "USER kain 0 * :Kain Mizuchi", &sink);
+    try processLine(&conn, "USER kain 0 * :Kain Orochi", &sink);
 
     try std.testing.expect(conn.session.registered());
     try expectCodesInOrder(sink.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
-    try expectContains(sink.written(), "Welcome to the Mizuchi IRC Network");
+    try expectContains(sink.written(), "Welcome to the Orochi IRC Network");
 }
 
 test "processLine rejects malformed input without writing" {

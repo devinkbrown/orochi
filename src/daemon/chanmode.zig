@@ -21,7 +21,7 @@ pub const ChannelMode = enum(u4) {
     no_external,
     topic_ops,
     secret,
-    // Mizuchi Tier-1 boolean flags (see docs/mode_rearchitecture.md).
+    // Orochi Tier-1 boolean flags (see docs/mode_rearchitecture.md).
     no_ctcp, // C: block channel CTCP (except ACTION) from non-ops
     no_notice, // T: block channel NOTICE from non-ops
     no_nick, // N: block nick changes by non-ops while joined
@@ -242,7 +242,7 @@ pub const ChannelModes = struct {
 };
 
 /// Stable member prefix mode identifiers. Builds on the IRCX draft and
-/// adds a Mizuchi-native FOUNDER tier above owner:
+/// adds a Orochi-native FOUNDER tier above owner:
 ///   founder +Q ('!') > owner +q ('.') > op +o ('@') > voice +v ('+')
 /// → ISUPPORT PREFIX=(Qqov)!.@+. The channel creator is the founder (a single
 /// top authority that ops/owners cannot strip). No halfop tier (IRCX `+h` is the
@@ -307,7 +307,7 @@ pub const MemberModes = struct {
         return out;
     }
 
-    /// ISUPPORT PREFIX token: (Qqov)!.@+ — Mizuchi founder (!) above the
+    /// ISUPPORT PREFIX token: (Qqov)!.@+ — Orochi founder (!) above the
     /// IRCX owner (.) / op (@) / voice (+) tiers.
     pub const isupport_prefix = "(Qqov)!.@+";
 

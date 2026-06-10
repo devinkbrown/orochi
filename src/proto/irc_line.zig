@@ -227,21 +227,21 @@ test "parses untagged line without prefix" {
 }
 
 test "parses prefix and normal params" {
-    const line = try parseLine(":nick!user@host JOIN #mizuchi key");
+    const line = try parseLine(":nick!user@host JOIN #orochi key");
     try std.testing.expectEqualStrings("nick!user@host", line.prefix.?);
     try std.testing.expectEqualStrings("JOIN", line.command);
     try std.testing.expectEqual(@as(usize, 2), line.param_count);
-    try std.testing.expectEqualStrings("#mizuchi", line.paramSlice()[0]);
+    try std.testing.expectEqualStrings("#orochi", line.paramSlice()[0]);
     try std.testing.expectEqualStrings("key", line.paramSlice()[1]);
 }
 
 test "parses trailing param with spaces" {
-    const line = try parseLine(":a PRIVMSG #chan :hello there from mizuchi");
+    const line = try parseLine(":a PRIVMSG #chan :hello there from orochi");
     try std.testing.expectEqualStrings("PRIVMSG", line.command);
     try std.testing.expectEqual(@as(usize, 2), line.param_count);
     try std.testing.expectEqualStrings("#chan", line.paramSlice()[0]);
-    try std.testing.expectEqualStrings("hello there from mizuchi", line.paramSlice()[1]);
-    try std.testing.expectEqualStrings("hello there from mizuchi", line.trailing.?);
+    try std.testing.expectEqualStrings("hello there from orochi", line.paramSlice()[1]);
+    try std.testing.expectEqualStrings("hello there from orochi", line.trailing.?);
 }
 
 test "strips CRLF and single line endings" {

@@ -1,4 +1,4 @@
-//! Pure nickname hold/forbid policy for Mizuchi services.
+//! Pure nickname hold/forbid policy for Orochi services.
 //!
 //! This module owns no IRC I/O and imports no daemon/protocol code. It models
 //! the service data and command parsing for real server-side commands that can

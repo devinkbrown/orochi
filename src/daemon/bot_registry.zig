@@ -1,4 +1,4 @@
-//! Bot account registry and announcement gating for the Mizuchi IRC daemon.
+//! Bot account registry and announcement gating for the Orochi IRC daemon.
 //!
 //! Tracks which accounts are recognized bots, whether they are permitted to
 //! publish announcements, the scope of those announcements, and enforces a

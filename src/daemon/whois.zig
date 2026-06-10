@@ -176,7 +176,7 @@ pub fn writeWhoisWith(
     try validateSubjectWith(params, subject);
 
     const subject_server = subject.server orelse server_name;
-    const subject_server_info = subject.server_info orelse "Mizuchi IRC daemon";
+    const subject_server_info = subject.server_info orelse "Orochi IRC daemon";
 
     try writeWhoisUserLine(params, sink, server_name, requester_nick, subject);
     try writeWhoisServerLine(params, sink, server_name, requester_nick, subject.nick, subject_server, subject_server_info);
@@ -805,7 +805,7 @@ test "full WHOIS sequence emits every supported numeric in order" {
     const lines = sink.slice();
     try std.testing.expectEqual(@as(usize, 8), lines.len);
     try std.testing.expectEqualStrings(":irc.example 311 dan alice auser host.example * :Alice Example\r\n", lines[0].bytes);
-    try std.testing.expectEqualStrings(":irc.example 312 dan alice leaf.example :Mizuchi IRC daemon\r\n", lines[1].bytes);
+    try std.testing.expectEqualStrings(":irc.example 312 dan alice leaf.example :Orochi IRC daemon\r\n", lines[1].bytes);
     try std.testing.expectEqualStrings(":irc.example 317 dan alice 42 1700000000 :seconds idle, signon time\r\n", lines[2].bytes);
     try std.testing.expectEqualStrings(":irc.example 319 dan alice :@#zig +#chat\r\n", lines[3].bytes);
     try std.testing.expectEqualStrings(":irc.example 330 dan alice alice-account :is logged in as\r\n", lines[4].bytes);
@@ -911,7 +911,7 @@ test "no account bot away or channels omits optional numerics" {
     const lines = sink.slice();
     try std.testing.expectEqual(@as(usize, 4), lines.len);
     try std.testing.expectEqualStrings(":irc.example 311 dan bob buser host.example * :Bob Example\r\n", lines[0].bytes);
-    try std.testing.expectEqualStrings(":irc.example 312 dan bob irc.example :Mizuchi IRC daemon\r\n", lines[1].bytes);
+    try std.testing.expectEqualStrings(":irc.example 312 dan bob irc.example :Orochi IRC daemon\r\n", lines[1].bytes);
     try std.testing.expectEqualStrings(":irc.example 317 dan bob 0 1 :seconds idle, signon time\r\n", lines[2].bytes);
     try std.testing.expectEqualStrings(":irc.example 318 dan bob :End of /WHOIS list\r\n", lines[3].bytes);
 }

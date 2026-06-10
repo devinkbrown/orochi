@@ -1,6 +1,6 @@
-# Mizuchi Mesh and S2S Architecture
+# Orochi Mesh and S2S Architecture
 
-This document describes the Suimyaku mesh and server-to-server layer as it exists in the current source tree. The planning documents define the direction: Suimyaku is the S2S CRDT mesh, Tsumugi is the secure handshake layer, Sazanami is gossip, and Goryu is the CRDT library ([docs/planning/04-suimyaku-mesh.md:5](../planning/04-suimyaku-mesh.md:5)); the S2S protocol plan explicitly rejects TS6/SID identity in favor of a sovereign node identity ([docs/planning/09-s2s-protocol.md:3](../planning/09-s2s-protocol.md:3), [docs/planning/09-s2s-protocol.md:6](../planning/09-s2s-protocol.md:6)). The code today implements a clean-room Mizuchi mesh, not a C Ophion clone.
+This document describes the Suimyaku mesh and server-to-server layer as it exists in the current source tree. The planning documents define the direction: Suimyaku is the S2S CRDT mesh, Tsumugi is the secure handshake layer, Sazanami is gossip, and Goryu is the CRDT library ([docs/planning/04-suimyaku-mesh.md:5](../planning/04-suimyaku-mesh.md:5)); the S2S protocol plan explicitly rejects TS6/SID identity in favor of a sovereign node identity ([docs/planning/09-s2s-protocol.md:3](../planning/09-s2s-protocol.md:3), [docs/planning/09-s2s-protocol.md:6](../planning/09-s2s-protocol.md:6)). The code today implements a clean-room Orochi mesh, not a C Ophion clone.
 
 ## Layer Map
 

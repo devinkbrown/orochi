@@ -1,4 +1,4 @@
-//! Per-(account, channel) personal sticky note storage for the Mizuchi daemon.
+//! Per-(account, channel) personal sticky note storage for the Orochi daemon.
 //!
 //! Each account may pin one short personal note per channel. Notes are private
 //! to the account that authored them. Storage is keyed by a composite of the

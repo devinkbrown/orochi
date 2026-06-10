@@ -42,7 +42,7 @@ The server-level route is:
 | Prereg dispatch | `dispatch.dispatchLine` handles labels, validates table lookup/arity/prereg state, runs a handler, syncs registration, and maybe emits the welcome burst. | `src/daemon/dispatch.zig:1111`, `src/daemon/dispatch.zig:1116`, `src/daemon/dispatch.zig:1140`, `src/daemon/dispatch.zig:1146`, `src/daemon/dispatch.zig:1151`, `src/daemon/dispatch.zig:1157`, `src/daemon/dispatch.zig:1166` |
 | Registered dispatch entry | Registered non-PING lines enter `dispatchRegistered`. | `src/daemon/server.zig:3394`, `src/daemon/server.zig:3402`, `src/daemon/server.zig:3413` |
 | Registry first | `dispatchRegistered` creates `module_core.Core`, computes caps, and calls `module_manifest.Live.dispatchGated`. | `src/daemon/server.zig:3433`, `src/daemon/server.zig:3437`, `src/daemon/server.zig:3445`, `src/daemon/server.zig:3450` |
-| Registry miss | If no registry command matches, MizuWasm plugins may own the command. | `src/daemon/server.zig:3471`, `src/daemon/server.zig:3473`, `src/daemon/server.zig:3488` |
+| Registry miss | If no registry command matches, OroWasm plugins may own the command. | `src/daemon/server.zig:3471`, `src/daemon/server.zig:3473`, `src/daemon/server.zig:3488` |
 | Lower fallback | The remaining direct path is `processLine` for the registration-handshake command table; this keeps PASS/NICK/USER/CAP/AUTHENTICATE/PING/QUIT usable after registration where applicable. | `src/daemon/server.zig:3502`, `src/daemon/server.zig:3504`, `src/daemon/server.zig:3508` |
 
 Current-code divergence from older planning/request wording: `dispatchRegistered` no longer has a large post-registration daemon-owned if/else command chain. The source comment says "Everything daemon-owned is now a SerpentRegistry command." Evidence: `src/daemon/server.zig:3502`.
@@ -103,7 +103,7 @@ ISUPPORT comes from `src/proto/protocol_inventory.zig`, not from module declarat
 
 | Token/source | Evidence |
 | --- | --- |
-| Default network name `Mizuchi` | `src/proto/protocol_inventory.zig:16` |
+| Default network name `Orochi` | `src/proto/protocol_inventory.zig:16` |
 | `CHANMODES=beIZ,k,lfj,imnstCTNMSg` | `src/proto/protocol_inventory.zig:36` |
 | Static token array | `src/proto/protocol_inventory.zig:40` |
 | Runtime ISUPPORT override | `src/proto/protocol_inventory.zig:65`, `src/proto/protocol_inventory.zig:73`, `src/proto/protocol_inventory.zig:78` |

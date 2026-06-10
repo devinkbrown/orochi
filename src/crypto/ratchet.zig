@@ -1,4 +1,4 @@
-//! Self-contained symmetric + X25519 double ratchet for Mizuchi channels.
+//! Self-contained symmetric + X25519 double ratchet for Orochi channels.
 const std = @import("std");
 
 const X25519 = std.crypto.dh.X25519;
@@ -29,7 +29,7 @@ pub const RootKey = struct {
 
     fn derive(self: RootKey, dh_output: Key) RootStep {
         var out: [64]u8 = undefined;
-        hkdf(&out, &self.bytes, &dh_output, "mizuchi ratchet root v1");
+        hkdf(&out, &self.bytes, &dh_output, "orochi ratchet root v1");
         return .{
             .root = .{ .bytes = out[0..32].* },
             .chain = .{ .bytes = out[32..64].* },
@@ -46,7 +46,7 @@ pub const ChainKey = struct {
 
     pub fn advance(self: *ChainKey) Key {
         var out: [64]u8 = undefined;
-        hkdf(&out, "mizuchi ratchet chain salt v1", &self.bytes, "message");
+        hkdf(&out, "orochi ratchet chain salt v1", &self.bytes, "message");
         self.bytes = out[32..64].*;
         return out[0..32].*;
     }
@@ -297,7 +297,7 @@ fn allZero(bytes: []const u8) bool {
 
 fn messageMaterial(message_key: Key) MessageMaterial {
     var out: [Aead.key_length + Aead.nonce_length]u8 = undefined;
-    hkdf(&out, "mizuchi ratchet message salt v1", &message_key, "aead");
+    hkdf(&out, "orochi ratchet message salt v1", &message_key, "aead");
     return .{
         .key = out[0..Aead.key_length].*,
         .nonce = out[Aead.key_length..][0..Aead.nonce_length].*,

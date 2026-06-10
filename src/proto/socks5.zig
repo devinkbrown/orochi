@@ -368,19 +368,19 @@ test "username password auth exchange encode decode" {
     const allocator = std.testing.allocator;
 
     const encoded = try encodeUserPassRequest(allocator, .{
-        .username = "mizuchi",
+        .username = "example",
         .password = "river-pass",
     });
     defer allocator.free(encoded);
 
     try std.testing.expectEqualSlices(
         u8,
-        &.{ 0x01, 0x07, 'm', 'i', 'z', 'u', 'c', 'h', 'i', 0x0a, 'r', 'i', 'v', 'e', 'r', '-', 'p', 'a', 's', 's' },
+        &.{ 0x01, 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x0a, 'r', 'i', 'v', 'e', 'r', '-', 'p', 'a', 's', 's' },
         encoded,
     );
 
     const decoded = try decodeUserPassRequest(encoded);
-    try std.testing.expectEqualStrings("mizuchi", decoded.username);
+    try std.testing.expectEqualStrings("example", decoded.username);
     try std.testing.expectEqualStrings("river-pass", decoded.password);
 
     const success = try encodeUserPassResponse(allocator, .{ .status = .success });

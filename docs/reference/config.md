@@ -1,10 +1,10 @@
-# Mizuchi Configuration Reference
+# Orochi Configuration Reference
 
 This is the complete operator-facing reference for the current daemon TOML format. It is verified against `Config` and `parseToml` in `src/daemon/config_format.zig:29`, `src/daemon/config_format.zig:310`, and the live boot projection in `src/daemon/config_boot.zig:18`.
 
-Mizuchi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C Ophion, not a clone. The daemon target is 64-bit only (`build.zig:20`, `build.zig:24`), uses implicit TLS rather than STARTTLS (`src/main.zig:216`, `src/main.zig:219`), and uses Zig-native MizuStore persistence rather than LMDB (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
+Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C Ophion, not a clone. The daemon target is 64-bit only (`build.zig:20`, `build.zig:24`), uses implicit TLS rather than STARTTLS (`src/main.zig:216`, `src/main.zig:219`), and uses Zig-native OroStore persistence rather than LMDB (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
 
-Use `etc/mizuchi.reference.toml` as the runnable example and copy from it when building an instance config. The two required parsed keys are `[node].id >= 1` and `[listen].irc != 0`; missing either makes `parseToml` fail (`src/daemon/config_format.zig:478`).
+Use `etc/orochi.reference.toml` as the runnable example and copy from it when building an instance config. The two required parsed keys are `[node].id >= 1` and `[listen].irc != 0`; missing either makes `parseToml` fail (`src/daemon/config_format.zig:478`).
 
 ## Format Rules
 
@@ -37,7 +37,7 @@ Source: struct at `src/daemon/config_format.zig:56`, parsing at `src/daemon/conf
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `name` | string | `"Mizuchi"` | any string | Network name advertised in ISUPPORT `NETWORK=` and the welcome burst (`src/main.zig:129`). |
+| `name` | string | `"Orochi"` | any string | Network name advertised in ISUPPORT `NETWORK=` and the welcome burst (`src/main.zig:129`). |
 
 ## `[motd]`
 
@@ -55,8 +55,8 @@ Source: struct at `src/daemon/config_format.zig:69`, parsing at `src/daemon/conf
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `location` | string | `"Mizuchi IRC network"` | any string | ADMIN command location line (`src/daemon/server.zig:916`). |
-| `email` | string | `"admin@mizuchi.local"` | any string | ADMIN command contact email (`src/daemon/server.zig:916`). |
+| `location` | string | `"Orochi IRC network"` | any string | ADMIN command location line (`src/daemon/server.zig:916`). |
+| `email` | string | `"admin@orochi.local"` | any string | ADMIN command contact email (`src/daemon/server.zig:916`). |
 
 ## `[listen]`
 
@@ -176,7 +176,7 @@ Source: struct at `src/daemon/config_format.zig:193`, parsing at `src/daemon/con
 |---|---|---:|---|---|
 | `enabled` | bool | `false` | `true` or `false` | Parsed but not currently used as the runtime gate; `account_db` controls live SASL store wiring (`src/daemon/config_format.zig:401`, `src/main.zig:177`). |
 | `realm` | string or null | unset | any string | Parsed but not currently consumed by `main.zig` or `mapToServerConfig` (`src/daemon/config_format.zig:402`). |
-| `account_db` | string or null | unset | path string | Opens the MizuStore account backend; when opened, PLAIN, SCRAM-SHA-256, and EXTERNAL are wired (`src/main.zig:178`, `src/main.zig:193`). |
+| `account_db` | string or null | unset | path string | Opens the OroStore account backend; when opened, PLAIN, SCRAM-SHA-256, and EXTERNAL are wired (`src/main.zig:178`, `src/main.zig:193`). |
 
 ## `[cloak]`
 
@@ -199,7 +199,7 @@ Source: struct at `src/daemon/config_format.zig:208`, parsing at `src/daemon/con
 | `dns_name` | string | `"localhost"` | any string | CN/SAN for self-signed bootstrap cert when files are absent (`src/main.zig:224`). |
 | `request_client_cert` | bool | `false` | `true` or `false` | Requests client certs so SASL EXTERNAL can match cert fingerprints (`src/main.zig:234`, `src/daemon/sasl_bridge.zig:70`). |
 
-Mizuchi has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig:216`, `src/daemon/dispatch.zig:369`).
+Orochi has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig:216`, `src/daemon/dispatch.zig:369`).
 
 ## `[sts]`
 
@@ -264,8 +264,8 @@ These keys are accepted by `parseToml` but do not currently change live daemon b
 | Operator class name length | `64` bytes | `src/daemon/oper.zig:11` |
 | Operator group inheritance depth | `32` links | `src/daemon/operator_groups.zig:11` |
 | IRCv3 multiline max bytes/lines/ref/target | `4096`, `24`, `64`, `128` | `src/daemon/server.zig:1096` |
-| MizuStore default max record bytes | `16 MiB` | `src/daemon/store.zig:11` |
-| MizuStore default max WAL bytes | `256 MiB` | `src/daemon/store.zig:12` |
-| MizuStore default changefeed capacity | `64` | `src/daemon/store.zig:13` |
+| OroStore default max record bytes | `16 MiB` | `src/daemon/store.zig:11` |
+| OroStore default max WAL bytes | `256 MiB` | `src/daemon/store.zig:12` |
+| OroStore default changefeed capacity | `64` | `src/daemon/store.zig:13` |
 
-MizuStore has its own internal `Config.applyToml` helper for `[storage]`, but `[storage]` is not part of the current daemon `config_format.Config` sections requested here (`src/daemon/store.zig:26`, `src/daemon/store.zig:37`).
+OroStore has its own internal `Config.applyToml` helper for `[storage]`, but `[storage]` is not part of the current daemon `config_format.Config` sections requested here (`src/daemon/store.zig:26`, `src/daemon/store.zig:37`).

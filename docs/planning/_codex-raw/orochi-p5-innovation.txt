@@ -1,8 +1,8 @@
-You are a visionary systems researcher with 100% design freedom. Your job for "Mizuchi" — a
+You are a visionary systems researcher with 100% design freedom. Your job for "Orochi" — a
 clean-slate, fully Zig-native successor to the ophion IRC daemon (the daemon AND its substrate
 libraries are being rewritten in Zig) — is twofold: (1) HEAVILY INVENT new technologies that make
 this server categorically better than anything before it, and (2) define the build/test strategy
-and the phased delivery roadmap. Read the shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+and the phased delivery roadmap. Read the shared brief first: /home/kain/orochi/docs/BRIEF.md
 
 Study for grounding (cite file:line):
 - Build: /home/kain/ophion/meson.build, /home/kain/libop/meson.build, /home/kain/opssl/meson.build

@@ -1,4 +1,4 @@
-//! MizuWasm host package root.
+//! OroWasm host package root.
 const std = @import("std");
 
 pub const abi = @import("abi.zig");

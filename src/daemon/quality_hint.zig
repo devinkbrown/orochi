@@ -1,4 +1,4 @@
-//! QualityHint — per-(channel, participant) media bitrate hints for the Mizuchi
+//! QualityHint — per-(channel, participant) media bitrate hints for the Orochi
 //! IRC daemon.
 //!
 //! Each entry records a suggested media bitrate, expressed in kilobits per

@@ -1,6 +1,6 @@
-# Mizuchi 🐉
+# Orochi 🐉
 
-**Mizuchi** (水蛟 — the coiling water-dragon) is the successor to the
+**Orochi** (水蛟 — the coiling water-dragon) is the successor to the
 [ophion](https://github.com/devinkbrown/ophion) IRC daemon: a **100% clean-slate,
 fully Zig-native** rewrite. The daemon *and its entire substrate* — the systems
 library and the crypto/TLS stack — are written from scratch in Zig with **no C
@@ -33,7 +33,7 @@ server-to-server protocol with the native **Suimyaku + Tsumugi** cryptographic m
 | `src/substrate` | Ringlane io_uring reactor, lock-free queues, allocators, and the Suimyaku math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Sazanami, sketches) + the Deterministic Ocean simulator |
 | `src/crypto` | `Secret(T)`, SHA-2/HMAC/HKDF, AEADs, X25519 + ML-KEM key schedule, Tsumugi ratchet |
 | `src/proto` | zero-copy IRCv3 parser, CoilPack wire codec, CAP FSM, Suimyaku frame layer, SASL |
-| `src/daemon` | SerpentRegistry (comptime modules), client/channel model, command dispatch, MizuStore, the M1 server |
+| `src/daemon` | SerpentRegistry (comptime modules), client/channel model, command dispatch, OroStore, the M1 server |
 
 ## Build & run
 ```sh

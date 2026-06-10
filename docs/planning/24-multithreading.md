@@ -2,7 +2,7 @@
 
 ## Goal
 
-Mizuchi must scale across cores: one io_uring reactor on a single thread cannot
+Orochi must scale across cores: one io_uring reactor on a single thread cannot
 saturate a many-core box for a large network. The target is **N worker threads,
 each owning its own io_uring reactor** and a disjoint slice of the connection
 table, coordinating through lock-free queues rather than shared mutable state on

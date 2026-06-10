@@ -1,14 +1,14 @@
-# Mizuchi Architecture Overview
+# Orochi Architecture Overview
 
-Mizuchi is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.16.0"` and has no package dependencies listed under `.dependencies`, so the current tree is built from the checked-in Zig source. Evidence: `build.zig.zon:28`, `build.zig.zon:34`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, and adds the MizuWasm host and browser transport shim roots. Evidence: `src/root.zig:8`, `src/root.zig:16`, `src/root.zig:21`.
+Orochi is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.16.0"` and has no package dependencies listed under `.dependencies`, so the current tree is built from the checked-in Zig source. Evidence: `build.zig.zon:28`, `build.zig.zon:34`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, and adds the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:8`, `src/root.zig:16`, `src/root.zig:21`.
 
-This overview covers the client-facing daemon, local world, module dispatch, reactor model, media, Helix upgrade, and MizuWasm. Mesh/S2S and cryptography are intentionally out of scope here; use [mesh-s2s.md](mesh-s2s.md) and [crypto.md](crypto.md).
+This overview covers the client-facing daemon, local world, module dispatch, reactor model, media, Helix upgrade, and OroWasm. Mesh/S2S and cryptography are intentionally out of scope here; use [mesh-s2s.md](mesh-s2s.md) and [crypto.md](crypto.md).
 
 ## Major Subsystems
 
 | Area | Current source of truth | What it owns | Evidence |
 | --- | --- | --- | --- |
-| Build/package | `build.zig`, `build.zig.zon` | Zig package metadata, `mizuchi` executable, test/run steps, 64-bit daemon target guard | `build.zig:20`, `build.zig:87`, `build.zig.zon:28` |
+| Build/package | `build.zig`, `build.zig.zon` | Zig package metadata, `orochi` executable, test/run steps, 64-bit daemon target guard | `build.zig:20`, `build.zig:87`, `build.zig.zon:28` |
 | Daemon server | `src/daemon/server.zig` | Linux TCP server, Ringlane io_uring wrapper, connection table, registration integration, live stores, registry/WASM dispatch, media/upgrade wiring | `src/daemon/server.zig:1`, `src/daemon/server.zig:466`, `src/daemon/server.zig:1285` |
 | Pre-registration dispatch | `src/daemon/dispatch.zig` | PASS/NICK/USER/CAP/AUTHENTICATE/PING/PONG/QUIT, CAP/labeled-response handling, welcome burst | `src/daemon/dispatch.zig:1`, `src/daemon/dispatch.zig:1111`, `src/daemon/dispatch.zig:1233` |
 | Protocol inventory | `src/proto/protocol_inventory.zig` | Canonical network name, ISUPPORT tokens, CHANMODES, runtime advertised-limit override | `src/proto/protocol_inventory.zig:1`, `src/proto/protocol_inventory.zig:40`, `src/proto/protocol_inventory.zig:73` |
@@ -17,7 +17,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | Reactor/threading | `src/daemon/server.zig`, `src/daemon/reactor_pool.zig`, `src/daemon/reactor_fabric.zig`, `src/substrate/reactor.zig` | io_uring completion loop, per-reactor connection slabs, optional worker pool, cross-shard delivery fabric, deterministic time seam | `src/daemon/server.zig:1229`, `src/daemon/reactor_pool.zig:1`, `src/daemon/reactor_fabric.zig:1`, `src/substrate/reactor.zig:1` |
 | Media | `src/substrate/suimyaku/media.zig`, `src/daemon/media_room.zig`, `src/daemon/media_plane.zig`, `src/daemon/native_media_transport.zig`, `src/daemon/media_bridge.zig` | SFU participant model, per-channel rooms, RTP/STUN media plane, native OPVOX/OPVIS UDP leg, cross-leg rewrap | `src/substrate/suimyaku/media.zig:1`, `src/daemon/media_room.zig:1`, `src/daemon/media_plane.zig:1`, `src/daemon/native_media_transport.zig:1`, `src/daemon/media_bridge.zig:1` |
 | Helix upgrade | `src/daemon/modules/upgrade.zig`, `src/daemon/server.zig`, `src/daemon/helix/live.zig`, `src/daemon/helix/handoff.zig` | UPGRADE command, sealed memfd arena, listener/session fd inheritance, successor adoption | `src/daemon/modules/upgrade.zig:1`, `src/daemon/server.zig:6070`, `src/daemon/helix/live.zig:1`, `src/daemon/helix/handoff.zig:1` |
-| MizuWasm | `src/wasm/host/*`, `src/wasm/opcodec_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser OPVOX/OPVIS exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/opcodec_wasm.zig:1` |
+| OroWasm | `src/wasm/host/*`, `src/wasm/opcodec_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser OPVOX/OPVIS exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/opcodec_wasm.zig:1` |
 
 ## End-to-End Client Request Flow
 
@@ -29,7 +29,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | 4 | Before registration, the server handles IRCX enable/query and pre-away locally, then calls `processLine`, which adapts into `dispatch.dispatchLine`. | `src/daemon/server.zig:3340`, `src/daemon/server.zig:3349`, `src/daemon/server.zig:3354`, `src/daemon/server.zig:1194`, `src/daemon/server.zig:1213` |
 | 5 | When `dispatchLine` completes registration, the server registers the nick in `World`, enforces Warden/gag/session/seen hooks, autojoins, sends the welcome burst, fires the registry `client_registered` hook, and evaluates nick protection. | `src/daemon/server.zig:3355`, `src/daemon/server.zig:3356`, `src/daemon/server.zig:3360`, `src/daemon/server.zig:3376`, `src/daemon/server.zig:3383`, `src/daemon/server.zig:3384`, `src/daemon/server.zig:3385` |
 | 6 | After registration, PING still uses `processLine`, but other lines enter `dispatchRegistered`. | `src/daemon/server.zig:3394`, `src/daemon/server.zig:3402`, `src/daemon/server.zig:3413` |
-| 7 | `dispatchRegistered` first refreshes the world's wall-clock, routes multiline batches if negotiated, dispatches through SerpentRegistry, then through MizuWasm plugins, then falls back to the lower preregistration dispatcher for handshake verbs. | `src/daemon/server.zig:3423`, `src/daemon/server.zig:3429`, `src/daemon/server.zig:3450`, `src/daemon/server.zig:3473`, `src/daemon/server.zig:3508` |
+| 7 | `dispatchRegistered` first refreshes the world's wall-clock, routes multiline batches if negotiated, dispatches through SerpentRegistry, then through OroWasm plugins, then falls back to the lower preregistration dispatcher for handshake verbs. | `src/daemon/server.zig:3423`, `src/daemon/server.zig:3429`, `src/daemon/server.zig:3450`, `src/daemon/server.zig:3473`, `src/daemon/server.zig:3508` |
 | 8 | Finished output is queued to a connection-local send buffer or handed to the owning shard through `enqueueDelivery`; send completions drain the buffer and close when needed. | `src/daemon/server.zig:2800`, `src/daemon/server.zig:2819`, `src/daemon/server.zig:2826`, `src/daemon/server.zig:2779` |
 
 ## Source Tree Map
@@ -42,7 +42,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | `src/proto/` | Protocol codecs/builders/inventory used by daemon and modules | `src/proto/protocol_inventory.zig:1`, `src/proto/protocol_inventory.zig:40` |
 | `src/substrate/` | Lower-level runtime primitives: reactor seam, transport stack, queues, EBR/HAMT, media transport helpers | `src/substrate/reactor.zig:1`, `src/substrate/transport_stack.zig:1`, `src/daemon/world_rcu.zig:9` |
 | `src/crypto/` | Cryptography namespace; not covered here | `src/root.zig:8` |
-| `src/wasm/` | MizuWasm host, browser transport shim, and OPVOX/OPVIS browser exports | `src/root.zig:16`, `src/root.zig:21`, `src/wasm/opcodec_wasm.zig:1` |
+| `src/wasm/` | OroWasm host, browser transport shim, and OPVOX/OPVIS browser exports | `src/root.zig:16`, `src/root.zig:21`, `src/wasm/opcodec_wasm.zig:1` |
 
 ## Architecture Index
 
@@ -52,7 +52,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | [01-reactor-threading.md](01-reactor-threading.md) | Ringlane/io_uring reactor, worker shards, world locking, live multithreading status |
 | [02-world-dispatch-modules.md](02-world-dispatch-modules.md) | `World`, preregistration dispatch, SerpentRegistry modules, hooks, introspection |
 | [03-media.md](03-media.md) | SFU/session model, media rooms, RTP/STUN plane, native OPVOX/OPVIS transport, WASM shims |
-| [04-upgrade-wasm.md](04-upgrade-wasm.md) | Helix UPGRADE handoff and MizuWasm plugin host |
+| [04-upgrade-wasm.md](04-upgrade-wasm.md) | Helix UPGRADE handoff and OroWasm plugin host |
 | [mesh-s2s.md](mesh-s2s.md) | Mesh/S2S architecture; separate document |
 | [crypto.md](crypto.md) | Cryptography architecture; separate document |
 

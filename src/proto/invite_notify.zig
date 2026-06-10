@@ -294,16 +294,16 @@ test "invite-notify line build" {
         .nick = "alice",
         .user = "user",
         .host = "cloak.example",
-    }, "bob", "#mizuchi");
+    }, "bob", "#orochi");
 
-    try std.testing.expectEqualStrings(":alice!user@cloak.example INVITE bob #mizuchi", line);
+    try std.testing.expectEqualStrings(":alice!user@cloak.example INVITE bob #orochi", line);
 }
 
 test "rpl inviting numeric build" {
     var buf: [128]u8 = undefined;
-    const line = try buildInvitingNumeric(&buf, "irc.example", "alice", "bob", "#mizuchi");
+    const line = try buildInvitingNumeric(&buf, "irc.example", "alice", "bob", "#orochi");
 
-    try std.testing.expectEqualStrings(":irc.example 341 alice bob #mizuchi", line);
+    try std.testing.expectEqualStrings(":irc.example 341 alice bob #orochi", line);
 }
 
 test "cap and privilege gated recipient selection" {
@@ -345,11 +345,11 @@ test "builders report output too small" {
 
     try std.testing.expectError(
         error.OutputTooSmall,
-        buildInviteNotifyLine(&small, prefix, "bob", "#mizuchi"),
+        buildInviteNotifyLine(&small, prefix, "bob", "#orochi"),
     );
     try std.testing.expectError(
         error.OutputTooSmall,
-        buildInvitingNumeric(&small, "irc.example", "alice", "bob", "#mizuchi"),
+        buildInvitingNumeric(&small, "irc.example", "alice", "bob", "#orochi"),
     );
 }
 
@@ -360,7 +360,7 @@ test "invalid attacker-controlled fields rejected" {
     try std.testing.expectError(error.NickTooLong, validateNickWith(.{ .max_nick_bytes = 3 }, "alice"));
     try std.testing.expectError(error.InvalidUser, validateUser("bad:user"));
     try std.testing.expectError(error.InvalidHost, validateHost("bad host.example"));
-    try std.testing.expectError(error.InvalidChannel, validateChannel("mizuchi"));
+    try std.testing.expectError(error.InvalidChannel, validateChannel("orochi"));
     try std.testing.expectError(error.InvalidChannel, validateChannel("#bad,channel"));
     try std.testing.expectError(error.ChannelTooLong, validateChannelWith(.{ .max_channel_bytes = 3 }, "#chan"));
     try std.testing.expectError(error.InvalidServerName, validateServerName("irc example"));
@@ -369,12 +369,12 @@ test "invalid attacker-controlled fields rejected" {
         .nick = "alice",
         .user = "bad user",
         .host = "cloak.example",
-    }, "bob", "#mizuchi"));
+    }, "bob", "#orochi"));
     try std.testing.expectError(error.InvalidNick, buildInviteNotifyLine(&buf, .{
         .nick = "alice",
         .user = "user",
         .host = "cloak.example",
-    }, "bad\nnick", "#mizuchi"));
+    }, "bad\nnick", "#orochi"));
     try std.testing.expectError(error.InvalidChannel, buildInvitingNumeric(
         &buf,
         "irc.example",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mizuchi announce bot — lives in #root on IRCXNet (eshmaki.me) and announces build
+"""Orochi announce bot — lives in #root on IRCXNet (eshmaki.me) and announces build
 stats, changelog, progress, and planning, with the feature set of a normal IRC bot:
 IRCv3 CAP negotiation + optional SASL PLAIN, nick recovery (433), CTCP, rich
 !commands (channel + PM), admin (say/announce/topic/raw), auto-rejoin on KICK,
@@ -7,10 +7,10 @@ uptime, throttled git commit watcher, periodic heartbeat, non-blocking paced
 output, and auto-reconnect with exponential backoff.
 
 Config via env:
-  MIZ_SERVER MIZ_PORT MIZ_NICK MIZ_CHANNEL MIZ_REPO MIZ_ADMIN
-  MIZ_PASS        — server password (PASS), optional
-  MIZ_SASL_USER   — SASL PLAIN account, optional (enables SASL when the server offers it)
-  MIZ_SASL_PASS   — SASL PLAIN password (defaults to MIZ_PASS)
+  ORO_SERVER ORO_PORT ORO_NICK ORO_CHANNEL ORO_REPO ORO_ADMIN
+  ORO_PASS        — server password (PASS), optional
+  ORO_SASL_USER   — SASL PLAIN account, optional (enables SASL when the server offers it)
+  ORO_SASL_PASS   — SASL PLAIN password (defaults to ORO_PASS)
 """
 from __future__ import annotations
 
@@ -24,15 +24,15 @@ import subprocess
 import time
 from collections import deque
 
-SERVER = os.environ.get("MIZ_SERVER", "127.0.0.1")
-PORT = int(os.environ.get("MIZ_PORT", "6667"))
-NICK = os.environ.get("MIZ_NICK", "Mizuchi")
-CHANNEL = os.environ.get("MIZ_CHANNEL", "#root")
-REPO = os.environ.get("MIZ_REPO", "/home/kain/mizuchi")
-ADMIN = os.environ.get("MIZ_ADMIN", "")  # nick allowed to run admin cmds
-PASSWORD = os.environ.get("MIZ_PASS", "")
-SASL_USER = os.environ.get("MIZ_SASL_USER", "")
-SASL_PASS = os.environ.get("MIZ_SASL_PASS", PASSWORD)
+SERVER = os.environ.get("ORO_SERVER", "127.0.0.1")
+PORT = int(os.environ.get("ORO_PORT", "6667"))
+NICK = os.environ.get("ORO_NICK", "Orochi")
+CHANNEL = os.environ.get("ORO_CHANNEL", "#root")
+REPO = os.environ.get("ORO_REPO", "/home/kain/orochi")
+ADMIN = os.environ.get("ORO_ADMIN", "")  # nick allowed to run admin cmds
+PASSWORD = os.environ.get("ORO_PASS", "")
+SASL_USER = os.environ.get("ORO_SASL_USER", "")
+SASL_PASS = os.environ.get("ORO_SASL_PASS", PASSWORD)
 
 POLL_SECS = 15  # how often to check git HEAD for new commits
 HEARTBEAT_SECS = 6 * 3600
@@ -40,7 +40,7 @@ SEND_INTERVAL = 0.4  # min seconds between queued outbound lines (anti-flood)
 RECONNECT_MIN, RECONNECT_MAX = 6, 300
 # IRCv3 caps we use if the server offers them (graceful degrade otherwise).
 WANT_CAPS = {"server-time", "message-tags", "account-tag", "echo-message"}
-VERSION = "Mizuchi-announce 2.1 (Zig 0.16 IRC daemon build bot)"
+VERSION = "Orochi-announce 2.1 (Zig 0.16 IRC daemon build bot)"
 START = time.time()
 
 # mIRC formatting + a fuller, deliberate palette.
@@ -170,7 +170,7 @@ def stats_lines() -> list[str]:
 
 def project_lines() -> list[str]:
     return [
-        f"{B}{MAG}\U0001f409 Mizuchi{RST} (水蛟) — a clean-room, from-scratch Zig 0.16 IRC + realtime daemon. A totally new architecture.",
+        f"{B}{MAG}\U0001f409 Orochi{RST} (水蛟) — a clean-room, from-scratch Zig 0.16 IRC + realtime daemon. A totally new architecture.",
         f"IRCv3/IRCX + accounts/SASL, multi-session bouncer, and a full media conferencing surface "
         f"(rooms, breakout, spatial audio, live captions/transcripts, raise-hand/reactions).",
         f"Mesh = {B}Suimyaku{RST} (水脈 CRDT) over {B}Tsumugi{RST} (紬 PQ-hybrid ratchet), gossip = "
@@ -274,7 +274,7 @@ class Bot:
         if PASSWORD:
             self.send_raw(f"PASS {PASSWORD}")
         self.send_raw(f"NICK {self.nick}")
-        self.send_raw(f"USER {NICK} 0 * :Mizuchi build announcer")
+        self.send_raw(f"USER {NICK} 0 * :Orochi build announcer")
 
     def loop(self) -> None:
         buf = b""
@@ -380,7 +380,7 @@ class Bot:
 
     def set_topic(self) -> None:
         self.send_raw(
-            f"TOPIC {CHANNEL} :Mizuchi M2 · {git('rev-parse','--short','HEAD')} · "
+            f"TOPIC {CHANNEL} :Orochi M2 · {git('rev-parse','--short','HEAD')} · "
             f"{test_count()} tests · {module_count()} modules · !help"
         )
 
@@ -572,7 +572,7 @@ class Bot:
 
 def main() -> None:
     logging.basicConfig(
-        level=logging.DEBUG if os.environ.get("MIZ_DEBUG") else logging.INFO,
+        level=logging.DEBUG if os.environ.get("ORO_DEBUG") else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
     Bot().run()

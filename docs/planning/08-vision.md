@@ -1,4 +1,4 @@
-# 08 — The Mizuchi Vision (design brief)
+# 08 — The Orochi Vision (design brief)
 
 > Synthesized 2026-06-04 from a codex design consultation + the owner's directive
 > to "make the IRC vision amazing." This is the north star the parity work

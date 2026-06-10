@@ -1,4 +1,4 @@
-//! Server-facing adapter for dispatching MizuWasm plugins as IRC commands.
+//! Server-facing adapter for dispatching OroWasm plugins as IRC commands.
 //!
 //! The bridge keeps the daemon API small: load modules, find the plugin that
 //! owns a command, and run that exported handler with live host callbacks. The

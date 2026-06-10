@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live Helix UPGRADE smoke test.
 
-Boots a Mizuchi daemon with an account DB + an [[opers]] binding, registers an
+Boots a Orochi daemon with an account DB + an [[opers]] binding, registers an
 operator account, logs in over SASL (auto-elevates to oper), issues UPGRADE, and
 verifies the hot re-exec:
 
@@ -10,7 +10,7 @@ verifies the hot re-exec:
   * session state is carried across the handoff (sealed/recovered log lines),
   * the port stays bound (same PID) and still serves IRC after the upgrade.
 
-Usage: python3 tools/upgrade_smoke.py [path-to-mizuchi-binary]
+Usage: python3 tools/upgrade_smoke.py [path-to-orochi-binary]
 Exit code 0 = PASS.
 """
 import base64
@@ -25,7 +25,7 @@ HOST = "127.0.0.1"
 ACCT = "admin"
 PASSWORD = "secretpass0"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "zig-out", "bin", "mizuchi")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "zig-out", "bin", "orochi")
 DB = "/tmp/mz_upgrade_accts.db"
 CONF = "/tmp/mz_upgrade.toml"
 LOG = "/tmp/mz_upgrade.log"

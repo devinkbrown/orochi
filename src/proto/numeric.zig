@@ -1,6 +1,6 @@
 //! IRC numeric replies and errors.
 //!
-//! Mizuchi keeps numerics as compile-time protocol metadata: the enum is the
+//! Orochi keeps numerics as compile-time protocol metadata: the enum is the
 //! source of truth, and `numericTable` is derived from it for lookup and
 //! validation.
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! Pure CLEAR USERS mass-kick planning for the Mizuchi daemon.
+//! Pure CLEAR USERS mass-kick planning for the Orochi daemon.
 //!
 //! This module parses a real IRC command shape (`CLEAR <channel> USERS ...`),
 //! plans real `KICK` commands from an injected membership snapshot, and can

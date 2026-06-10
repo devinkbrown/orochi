@@ -1,11 +1,11 @@
 //! IRCv3 standard-replies composer.
 //!
-//! Standard replies are Mizuchi's typed error/warning/note primitive for native
+//! Standard replies are Orochi's typed error/warning/note primitive for native
 //! services and command handlers. The hot path is allocation-free: callers pass
 //! command, code, context, description, and a destination buffer.
 const std = @import("std");
 
-/// Mizuchi's modern IRC line-body ceiling. Send paths may choose a lower cap.
+/// Orochi's modern IRC line-body ceiling. Send paths may choose a lower cap.
 pub const MAX_LINE_BODY: usize = 8191;
 
 /// Traditional IRC line body limit without CRLF.
@@ -26,7 +26,7 @@ pub const ReplyType = enum {
     }
 };
 
-/// Common IRCv3 standard-replies and Mizuchi/IRCX service reply codes.
+/// Common IRCv3 standard-replies and Orochi/IRCX service reply codes.
 ///
 /// The enum tag name is the wire token. Keep codes uppercase and descriptive so
 /// service results can carry this type directly.
@@ -369,11 +369,11 @@ test "builds FAIL WARN and NOTE replies" {
 test "builds replies with context params" {
     var buf: [256]u8 = undefined;
     const line = try fail("PROP", .INVALID_PROPERTY, "Property cannot be set")
-        .withContext(&.{ "#mizuchi", "topic.locked" })
+        .withContext(&.{ "#orochi", "topic.locked" })
         .write(&buf);
 
     try std.testing.expectEqualStrings(
-        "FAIL PROP INVALID_PROPERTY #mizuchi topic.locked :Property cannot be set",
+        "FAIL PROP INVALID_PROPERTY #orochi topic.locked :Property cannot be set",
         line,
     );
 }

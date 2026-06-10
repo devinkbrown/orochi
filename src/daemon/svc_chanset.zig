@@ -1,7 +1,7 @@
-//! Registered-channel SET options for Mizuchi services.
+//! Registered-channel SET options for Orochi services.
 //!
 //! Per-channel persistent settings that the services layer applies to a
-//! REGISTERED channel. These are NOT pseudo-client toggles: in Mizuchi services
+//! REGISTERED channel. These are NOT pseudo-client toggles: in Orochi services
 //! are real server commands, so a `CHANNEL SET <#chan> <option> <value>` command
 //! parses through `ChanSetStore.set` and the resulting `ChannelSettings` is read
 //! back by the world when a channel is created/joined/topic-changed.
@@ -331,11 +331,11 @@ test "set and clear each boolean option" {
     const enums = [_]Option{ .guard, .keeptopic, .topiclock, .restricted, .private, .fantasy };
 
     inline for (opts, enums) |name, opt| {
-        try store.set("#mizuchi", name, "on");
-        try testing.expect(store.get("#mizuchi").get(opt));
+        try store.set("#orochi", name, "on");
+        try testing.expect(store.get("#orochi").get(opt));
 
-        try store.set("#mizuchi", name, "off");
-        try testing.expect(!store.get("#mizuchi").get(opt));
+        try store.set("#orochi", name, "off");
+        try testing.expect(!store.get("#orochi").get(opt));
     }
 
     // All back to default -> entry pruned.
@@ -364,13 +364,13 @@ test "channel keys are case-insensitive" {
     var store = ChanSetStore.init(testing.allocator);
     defer store.deinit();
 
-    try store.set("#MizuChi", "guard", "on");
-    try testing.expect(store.get("#mizuchi").guard);
-    try testing.expect(store.get("#MIZUCHI").guard);
+    try store.set("#Example", "guard", "on");
+    try testing.expect(store.get("#example").guard);
+    try testing.expect(store.get("#EXAMPLE").guard);
     try testing.expectEqual(@as(usize, 1), store.count());
 
-    store.clear("#MIZUCHI");
-    try testing.expect(!store.get("#mizuchi").guard);
+    store.clear("#EXAMPLE");
+    try testing.expect(!store.get("#example").guard);
     try testing.expectEqual(@as(usize, 0), store.count());
 }
 
@@ -379,9 +379,9 @@ test "KEEPTOPIC text is retained and updatable" {
     defer store.deinit();
 
     try store.set("#chan", "keeptopic", "on");
-    try store.setTopic("#chan", "Welcome to Mizuchi");
+    try store.setTopic("#chan", "Welcome to Orochi");
     try testing.expect(store.get("#chan").keeptopic);
-    try testing.expectEqualStrings("Welcome to Mizuchi", store.get("#chan").topic);
+    try testing.expectEqualStrings("Welcome to Orochi", store.get("#chan").topic);
 
     // Update replaces, no leak.
     try store.setTopic("#chan", "New topic");

@@ -1,6 +1,6 @@
 //! CoilPack low-level wire primitives.
 //!
-//! CoilPack is Mizuchi's canonical, self-describing, signature-stable binary
+//! CoilPack is Orochi's canonical, self-describing, signature-stable binary
 //! format. This file intentionally stays at the atom layer that Codec Loom
 //! will emit: little-endian fixed integers, minimal unsigned LEB128 varints,
 //! length-prefixed byte strings, booleans, and the fixed SUIMYAKU frame header.

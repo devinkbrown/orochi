@@ -1,4 +1,4 @@
-//! Per-account SCRAM-SHA-256 credential store for the Mizuchi IRC daemon.
+//! Per-account SCRAM-SHA-256 credential store for the Orochi IRC daemon.
 //!
 //! The account database (see `services.zig`) only persists a PBKDF2 password
 //! hash, which is enough to verify PLAIN but carries no SCRAM-specific material.

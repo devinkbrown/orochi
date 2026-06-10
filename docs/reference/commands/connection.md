@@ -21,7 +21,7 @@ These commands are accepted through the lower command table used by `dispatchReg
 - Parameters: `nick` is required.
 - Replies: On registered nick change, broadcasts a `NICK` line to visible peers.
 - Errors: `ERR_ERRONEUSNICKNAME 432`, `ERR_NICKNAMEINUSE 433`, `ERR_NONICKNAMEGIVEN 431`, `ERR_NEEDMOREPARAMS 461`.
-- Example: `NICK mizu`
+- Example: `NICK suzu`
 - Sources: `src/daemon/dispatch.zig:1235`, `src/daemon/dispatch.zig:1263`, `src/daemon/modules/user_query.zig:80`, `src/daemon/server.zig:8157`
 
 ## USER
@@ -32,7 +32,7 @@ These commands are accepted through the lower command table used by `dispatchReg
 - Parameters: Four parameters are required by the lower command table; the handler uses parameter 1 as username and parameter 4 as realname.
 - Replies: May complete registration and emit welcome numerics when `NICK`, `USER`, and capability negotiation permit it.
 - Errors: `ERR_ALREADYREGISTRED 462`; `ERR_NEEDMOREPARAMS 461`.
-- Example: `USER mizu 0 * :Mizuchi User`
+- Example: `USER suzu 0 * :Orochi User`
 - Sources: `src/daemon/dispatch.zig:1236`, `src/daemon/dispatch.zig:1283`, `src/daemon/dispatch.zig:1482`
 
 ## CAP

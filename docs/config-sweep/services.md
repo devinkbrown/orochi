@@ -1,4 +1,4 @@
-# Mizuchi services / daemon-state config sweep
+# Orochi services / daemon-state config sweep
 
 READ-ONLY inventory of hardcoded operational/tuning constants in the services and
 daemon-state area, scoped to: services.zig, sessions.zig, oper.zig, store.zig,
@@ -53,7 +53,7 @@ wire constants and is NOT included; the operational store tunables live in store
 | announce_board.zig:16 | `max_body_len` | `1000` | max announcement body length | `bouncer.announce_body_max_len` | uint | 1000 | 128..8192 |
 
 ## [storage]
-(MizuStore append-only log + snapshot + changefeed.)
+(OroStore append-only log + snapshot + changefeed.)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|

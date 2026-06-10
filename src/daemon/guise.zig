@@ -1,4 +1,4 @@
-//! Guise — Mizuchi's reinvented virtual-host system.
+//! Guise — Orochi's reinvented virtual-host system.
 //!
 //! Legacy ircds treat a vhost as a single string an operator hangs on a user,
 //! or a flat pool of literal offers a user can TAKE one at a time.

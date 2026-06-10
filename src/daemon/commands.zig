@@ -7,7 +7,7 @@
 const std = @import("std");
 const client_model = @import("client.zig");
 
-const server_name = "mizuchi.local";
+const server_name = "orochi.local";
 
 pub const ClientId = client_model.ClientId;
 pub const Client = client_model.Client;
@@ -749,31 +749,31 @@ test "join names privmsg part mode and errors" {
     try std.testing.expect(capture.contains(alice, " 461 alice JOIN :Not enough parameters"));
     capture.clear();
 
-    var join_a = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#mizuchi"});
+    var join_a = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#orochi"});
     _ = try handleJoin(&join_a);
-    var join_b = makeCtx(&network, &clients, capture.sink(), &scratch, bob, &.{"#mizuchi"});
+    var join_b = makeCtx(&network, &clients, capture.sink(), &scratch, bob, &.{"#orochi"});
     _ = try handleJoin(&join_b);
-    var names = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#mizuchi"});
+    var names = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#orochi"});
     _ = try handleNames(&names);
-    try std.testing.expect(capture.contains(alice, " 353 alice = #mizuchi :@alice bob"));
-    try std.testing.expect(capture.contains(alice, " 366 alice #mizuchi :End of /NAMES list"));
+    try std.testing.expect(capture.contains(alice, " 353 alice = #orochi :@alice bob"));
+    try std.testing.expect(capture.contains(alice, " 366 alice #orochi :End of /NAMES list"));
 
     capture.clear();
-    var msg = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{ "#mizuchi", "hello bob" });
+    var msg = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{ "#orochi", "hello bob" });
     _ = try handlePrivmsg(&msg);
-    try std.testing.expect(capture.contains(bob, ":alice PRIVMSG #mizuchi :hello bob"));
-    try std.testing.expect(!capture.contains(alice, ":alice PRIVMSG #mizuchi :hello bob"));
+    try std.testing.expect(capture.contains(bob, ":alice PRIVMSG #orochi :hello bob"));
+    try std.testing.expect(!capture.contains(alice, ":alice PRIVMSG #orochi :hello bob"));
 
-    var mode = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{ "#mizuchi", "+o", "bob" });
+    var mode = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{ "#orochi", "+o", "bob" });
     _ = try handleMode(&mode);
-    try std.testing.expect(isOp(&network, try ChannelName.initLower("#mizuchi"), try Uid.init("002BOB")));
+    try std.testing.expect(isOp(&network, try ChannelName.initLower("#orochi"), try Uid.init("002BOB")));
 
-    var part = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#mizuchi"});
+    var part = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#orochi"});
     _ = try handlePart(&part);
-    try std.testing.expect(!network.hasMember(try ChannelName.initLower("#mizuchi"), try Uid.init("001ALICE"), sessionFor(alice)));
+    try std.testing.expect(!network.hasMember(try ChannelName.initLower("#orochi"), try Uid.init("001ALICE"), sessionFor(alice)));
 
     capture.clear();
-    var not_on = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#mizuchi"});
+    var not_on = makeCtx(&network, &clients, capture.sink(), &scratch, alice, &.{"#orochi"});
     _ = try handlePart(&not_on);
-    try std.testing.expect(capture.contains(alice, " 442 alice #mizuchi :You're not on that channel"));
+    try std.testing.expect(capture.contains(alice, " 442 alice #orochi :You're not on that channel"));
 }

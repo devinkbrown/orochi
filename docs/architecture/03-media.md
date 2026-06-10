@@ -1,6 +1,6 @@
 # Media Architecture
 
-Mizuchi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN UDP plane, a native OPVOX/OPVIS UDP leg, header-only cross-leg rewrap, a congestion/loss transport stack substrate, and browser/WASM codec exports. This document covers current source only.
+Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN UDP plane, a native OPVOX/OPVIS UDP leg, header-only cross-leg rewrap, a congestion/loss transport stack substrate, and browser/WASM codec exports. This document covers current source only.
 
 ## SFU Control Plane
 
@@ -44,7 +44,7 @@ Mizuchi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STU
 
 ## Native OPVOX/OPVIS Transport
 
-`src/daemon/native_media_transport.zig` is the daemon-owned native UDP leg for Mizuchi's OPVOX/OPVIS codec framing. It forwards `opcodec_frame` datagrams, not RTP, and never transcodes. Evidence: `src/daemon/native_media_transport.zig:1`, `src/daemon/native_media_transport.zig:2`, `src/daemon/native_media_transport.zig:3`, `src/daemon/native_media_transport.zig:15`.
+`src/daemon/native_media_transport.zig` is the daemon-owned native UDP leg for Orochi's OPVOX/OPVIS codec framing. It forwards `opcodec_frame` datagrams, not RTP, and never transcodes. Evidence: `src/daemon/native_media_transport.zig:1`, `src/daemon/native_media_transport.zig:2`, `src/daemon/native_media_transport.zig:3`, `src/daemon/native_media_transport.zig:15`.
 
 | Path | Behavior | Evidence |
 | --- | --- | --- |

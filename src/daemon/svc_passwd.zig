@@ -1,6 +1,6 @@
 //! Account password management as real server commands.
 //!
-//! Mizuchi exposes password changes and resets as first-class server commands
+//! Orochi exposes password changes and resets as first-class server commands
 //! (`SET PASSWORD`, `RESETPASS`), never via pseudo-clients. This module is the
 //! pure decision core for those commands:
 //!

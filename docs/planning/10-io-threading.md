@@ -77,7 +77,7 @@ Shards never touch each other's memory. They exchange MESSAGES only.
 
 The 2025 critique of pure TPC is real: a single fat task (TLS/X-Wing handshake,
 RIBLT decode, media transcode, BLAKE3 over a large object) can stall a shard and
-spike tail latency. Mizuchi answer:
+spike tail latency. Orochi answer:
 
 - **Hot reactors stay strictly thread-per-core** (I/O, parsing, routing, CRDT
   joins — all short, homogeneous, cache-local).

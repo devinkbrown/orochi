@@ -1,4 +1,4 @@
-//! Account-keyed WATCH notification state for Mizuchi.
+//! Account-keyed WATCH notification state for Orochi.
 //!
 //! This module is deliberately pure: it owns only data structures, parses the
 //! real IRC `WATCH` command shape, and reports real WATCH numerics for callers
@@ -565,15 +565,15 @@ test "add is idempotent and list is account keyed case-insensitively" {
     var store = WatchStore.init(testing.allocator);
     defer store.deinit();
 
-    try testing.expect(try store.add("Alice", .{ .kind = .nick, .name = "Mizuki" }));
-    try testing.expect(!try store.add("alice", .{ .kind = .nick, .name = "mizuki" }));
+    try testing.expect(try store.add("Alice", .{ .kind = .nick, .name = "Suzuki" }));
+    try testing.expect(!try store.add("alice", .{ .kind = .nick, .name = "suzuki" }));
     try testing.expect(try store.add("ALICE", .{ .kind = .account, .name = "Bob_Account" }));
 
     const list = try store.list("alice");
     try testing.expectEqual(@as(usize, 2), list.len);
-    try expectWatched(list[0], .nick, "mizuki");
+    try expectWatched(list[0], .nick, "suzuki");
     try expectWatched(list[1], .account, "bob_account");
-    try testing.expect(try store.isWatching("ALIce", .{ .kind = .nick, .name = "MIZUKI" }));
+    try testing.expect(try store.isWatching("ALIce", .{ .kind = .nick, .name = "SUZUKI" }));
 }
 
 test "reverse index selects only watchers of changed target" {

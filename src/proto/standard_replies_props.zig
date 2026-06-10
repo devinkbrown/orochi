@@ -74,8 +74,8 @@ test "caller buffers are respected while enforcing the 512 octet IRC line limit"
 
     for (0..bounds_iterations) |iteration| {
         const command = validMiddleToken(random, &command_buf, iteration, "CMD");
-        const code = validCodeToken(random, &code_buf, iteration, "MIZUCHI_CODE");
-        const context_one = validMiddleToken(random, &context_one_buf, iteration + 9, "#mizuchi");
+        const code = validCodeToken(random, &code_buf, iteration, "OROCHI_CODE");
+        const context_one = validMiddleToken(random, &context_one_buf, iteration + 9, "#orochi");
         const context_two = validMiddleToken(random, &context_two_buf, iteration + 17, "property.name");
         const description = descriptionCandidate(random, &description_buf, iteration);
         const contexts = [_][]const u8{ context_one, context_two };
@@ -147,7 +147,7 @@ test "valid structured replies parse back to the original command code contexts 
                 &context_storage[index],
                 iteration + index * 19,
                 switch (index) {
-                    0 => "#mizuchi",
+                    0 => "#orochi",
                     1 => "prop.locked",
                     2 => "account",
                     else => "mesh-a",

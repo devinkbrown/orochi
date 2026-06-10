@@ -1,4 +1,4 @@
-//! Daemon-owned native media transport: the live UDP leg for Mizuchi's own
+//! Daemon-owned native media transport: the live UDP leg for Orochi's own
 //! codec (OPVOX/OPVIS). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
 //! carries `opcodec_frame` datagrams instead of RTP, and forwards them through a
 //! per-channel `NativeMediaLink` (stream_id → publisher → recipients).

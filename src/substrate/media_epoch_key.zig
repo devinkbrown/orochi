@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const media_label = "mizuchi/media";
+const media_label = "orochi/media";
 
 pub const key_len: usize = 16;
 pub const salt_len: usize = 14;

@@ -1,6 +1,6 @@
-# Mizuchi Numeric Replies
+# Orochi Numeric Replies
 
-This reference documents current source only. Mizuchi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C ophion, not a clone. Numeric values are drawn from the daemon-local enum in `src/daemon/server.zig:701` and the shared protocol enum in `src/proto/numeric.zig:9`; pre-registration numerics are also emitted by `src/daemon/dispatch.zig:141`.
+This reference documents current source only. Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C ophion, not a clone. Numeric values are drawn from the daemon-local enum in `src/daemon/server.zig:701` and the shared protocol enum in `src/proto/numeric.zig:9`; pre-registration numerics are also emitted by `src/daemon/dispatch.zig:141`.
 
 ## Source Inventories
 
@@ -14,8 +14,8 @@ This reference documents current source only. Mizuchi is a pure-Zig 0.16 clean-r
 
 | Value | Name | When Emitted | Message Text | Evidence |
 | ---: | --- | --- | --- | --- |
-| 001 | `RPL_WELCOME` | Registration completes in the pre-registration dispatcher. | `Welcome to the Mizuchi IRC Network` | `src/daemon/dispatch.zig:142`, `src/daemon/dispatch.zig:1493`, `src/proto/numeric.zig:10` |
-| 002 | `RPL_YOURHOST` | Registration welcome burst. | `Your host is mizuchi.local, running Mizuchi` | `src/daemon/dispatch.zig:143`, `src/daemon/dispatch.zig:1494`, `src/proto/numeric.zig:11` |
+| 001 | `RPL_WELCOME` | Registration completes in the pre-registration dispatcher. | `Welcome to the Orochi IRC Network` | `src/daemon/dispatch.zig:142`, `src/daemon/dispatch.zig:1493`, `src/proto/numeric.zig:10` |
+| 002 | `RPL_YOURHOST` | Registration welcome burst. | `Your host is orochi.local, running Orochi` | `src/daemon/dispatch.zig:143`, `src/daemon/dispatch.zig:1494`, `src/proto/numeric.zig:11` |
 | 003 | `RPL_CREATED` | Registration welcome burst. | `This server was created for deterministic tests` | `src/daemon/dispatch.zig:144`, `src/daemon/dispatch.zig:1495`, `src/proto/numeric.zig:12` |
 | 004 | `RPL_MYINFO` | Registration welcome burst. | `are supported by this server` with server/version/user/channel mode params. | `src/daemon/dispatch.zig:145`, `src/daemon/dispatch.zig:1496`, `src/proto/numeric.zig:13` |
 | 005 | `RPL_ISUPPORT` | Registration burst and live support query path. | `are supported by this server` | `src/daemon/dispatch.zig:146`, `src/daemon/dispatch.zig:1497`, `src/daemon/server.zig:702`, `src/daemon/server.zig:8105`, `src/proto/numeric.zig:14` |

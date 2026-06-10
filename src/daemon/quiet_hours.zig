@@ -1,4 +1,4 @@
-//! quiet_hours.zig — per-account daily do-not-disturb windows for the Mizuchi daemon.
+//! quiet_hours.zig — per-account daily do-not-disturb windows for the Orochi daemon.
 //!
 //! Each account may register a single recurring "quiet" window expressed in
 //! minutes-of-day (0..=1439). A window where `start_min > end_min` wraps past

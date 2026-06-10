@@ -615,11 +615,11 @@ test "PROP set/get/list round-trip and validation rejects bad names" {
     var store = PropertyStore.init(std.testing.allocator);
     defer store.deinit();
 
-    const channel = try Entity.init(.channel, "#mizuchi");
+    const channel = try Entity.init(.channel, "#orochi");
     try store.set(channel, "Topic", "Zig IRCX");
 
     const got = (try store.get(channel, "topic")).?;
-    try std.testing.expectEqualStrings("#mizuchi", got.entity.id);
+    try std.testing.expectEqualStrings("#orochi", got.entity.id);
     try std.testing.expectEqual(EntityScope.channel, got.entity.scope);
     try std.testing.expectEqualStrings("Topic", got.name);
     try std.testing.expectEqualStrings("Zig IRCX", got.value);
@@ -638,18 +638,18 @@ test "ACCESS add/remove and hostmask match positive and negative" {
     var store = AccessStore.init(std.testing.allocator);
     defer store.deinit();
 
-    try store.add("#mizuchi", "*!user@*.example.net", .host);
-    try store.add("#mizuchi", "friend!*@host.example.net", .voice);
+    try store.add("#orochi", "*!user@*.example.net", .host);
+    try store.add("#orochi", "friend!*@host.example.net", .voice);
 
-    const hit = (try store.matchHostmask("#mizuchi", "nick!user@shell.example.net")).?;
+    const hit = (try store.matchHostmask("#orochi", "nick!user@shell.example.net")).?;
     try std.testing.expectEqual(AccessLevel.host, hit.level);
     try std.testing.expectEqualStrings("*!user@*.example.net", hit.mask);
 
-    try std.testing.expectEqual(@as(?AccessEntryView, null), try store.matchHostmask("#mizuchi", "nick!user@else.invalid"));
+    try std.testing.expectEqual(@as(?AccessEntryView, null), try store.matchHostmask("#orochi", "nick!user@else.invalid"));
 
-    try std.testing.expect(try store.remove("#mizuchi", "*!user@*.example.net"));
-    try std.testing.expect(!try store.remove("#mizuchi", "*!user@*.example.net"));
-    try std.testing.expectEqual(@as(?AccessEntryView, null), try store.matchHostmask("#mizuchi", "nick!user@shell.example.net"));
+    try std.testing.expect(try store.remove("#orochi", "*!user@*.example.net"));
+    try std.testing.expect(!try store.remove("#orochi", "*!user@*.example.net"));
+    try std.testing.expectEqual(@as(?AccessEntryView, null), try store.matchHostmask("#orochi", "nick!user@shell.example.net"));
 }
 
 test "IRCX enable parse" {

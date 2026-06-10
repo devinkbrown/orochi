@@ -1,7 +1,7 @@
 //! Persistent (immutable) hash array-mapped trie — PersistentMap(K, V, Context).
 //!
 //! This is a 32-way HAMT with **structural sharing** and **reference-counted
-//! nodes**. It is the data structure backing Mizuchi's lock-free RCU world
+//! nodes**. It is the data structure backing Orochi's lock-free RCU world
 //! snapshots: a published root is an immutable point-in-time view that any
 //! number of readers may traverse with no locks and no allocation, while a
 //! writer concurrently derives the *next* version.

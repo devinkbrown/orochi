@@ -1,4 +1,4 @@
-//! Clean-room channel operator restoration scoring for Mizuchi.
+//! Clean-room channel operator restoration scoring for Orochi.
 //!
 //! The daemon feeds observations when trusted channel state shows an identity
 //! holding operator status. This module keeps a bounded, time-decayed model per

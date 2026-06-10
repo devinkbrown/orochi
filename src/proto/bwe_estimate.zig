@@ -1,4 +1,4 @@
-//! Delay-based bandwidth estimator for Mizuchi's SFU layer.
+//! Delay-based bandwidth estimator for Orochi's SFU layer.
 //!
 //! This module turns transport-wide-congestion-control (TWCC) feedback into a
 //! target send bitrate that the SFU uses to drive simulcast layer selection.

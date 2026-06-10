@@ -1,4 +1,4 @@
-//! Per-account locale preferences for the Mizuchi IRC daemon.
+//! Per-account locale preferences for the Orochi IRC daemon.
 //!
 //! Stores a short locale string (for example "en-US") for each account name.
 //! Both the account key and the locale value are owned heap copies, so callers

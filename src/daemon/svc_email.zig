@@ -2,7 +2,7 @@
 //!
 //! This module is the pure-logic spine behind the real server command
 //! `ACCOUNT SET EMAIL <addr>` and its confirmation `ACCOUNT VERIFY EMAIL
-//! <token>`.  Per the Mizuchi architecture there are **no pseudo-clients**:
+//! <token>`.  Per the Orochi architecture there are **no pseudo-clients**:
 //! email changes flow through genuine server commands and numerics, and this
 //! file owns the syntactic + state-machine half of that flow.
 //!

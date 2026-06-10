@@ -1,5 +1,5 @@
 //! ComposeDraft: per-(account, target) saved draft message text for the
-//! Mizuchi IRC daemon.
+//! Orochi IRC daemon.
 //!
 //! Each draft is keyed by a composite "account\x00target" string and maps to
 //! an owned copy of the draft text. Drafts are capped at `max_draft_bytes`

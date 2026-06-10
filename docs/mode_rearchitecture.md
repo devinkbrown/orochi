@@ -1,18 +1,18 @@
 # Mode Re-architecture: Legacy Channel & User Modes
 
-Decision document for the Mizuchi IRC daemon.
+Decision document for the Orochi IRC daemon.
 
 Status: design decision record. Scope: deciding, for each channel/user mode found in
-the legacy ircds (charybdis / UnrealIRCd / InspIRCd lineage) that Mizuchi does **not**
-yet implement, whether to **KEEP** (reimplement Mizuchi-native), **DROP** (obsolete,
-legacy, or redundant), or mark **ALREADY-COVERED** (Mizuchi achieves the effect by
+the legacy ircds (charybdis / UnrealIRCd / InspIRCd lineage) that Orochi does **not**
+yet implement, whether to **KEEP** (reimplement Orochi-native), **DROP** (obsolete,
+legacy, or redundant), or mark **ALREADY-COVERED** (Orochi achieves the effect by
 another mechanism).
 
 ---
 
 ## 1. Philosophy
 
-Mizuchi is a clean-room daemon, not a port. We are not obligated to carry forward the
+Orochi is a clean-room daemon, not a port. We are not obligated to carry forward the
 accreted single-letter mode flags that legacy ircds accumulated over twenty years. The
 guiding principles for this review:
 
@@ -22,7 +22,7 @@ guiding principles for this review:
    account property, a network policy, or a broadcast event belongs in the account
    system, configuration, or the **Event Spine**, not in a `MODE` letter.
 
-2. **Account integration over flags.** Mizuchi has first-class accounts (operators are
+2. **Account integration over flags.** Orochi has first-class accounts (operators are
    SASL-only; there is no password `OPER`). Effects that key off "is this user
    authenticated / registered" are expressed against the account identity directly,
    and where a channel-level toggle is still wanted it is exposed through the named
@@ -40,7 +40,7 @@ guiding principles for this review:
 5. **Cloaking is automatic.** Hostnames are cloaked at connect time for every user. There
    is no user-toggled cloak.
 
-6. **Don't duplicate what IRCX already names.** Mizuchi ships an IRCX-style named-mode
+6. **Don't duplicate what IRCX already names.** Orochi ships an IRCX-style named-mode
    layer (`MODEX`, `PROP`, `ACCESS`, `OWNER`). Several legacy letter-modes map directly
    onto existing IRCX named flags; those are ALREADY-COVERED and should not get a second,
    redundant letter.
@@ -65,42 +65,42 @@ to the implementing module.
 
 ## 2. Channel Modes
 
-| Legacy | Meaning | Decision | Rationale & Mizuchi-native design |
+| Legacy | Meaning | Decision | Rationale & Orochi-native design |
 |--------|---------|----------|-----------------------------------|
 | `p` | private | **ALREADY-COVERED** | IRCX `PRIVATE(p)` exists in `chanmode_ext.zig`. The legacy `+p`/`+s` split is collapsed: `SECRET(s)` hides from `LIST`/`WHOIS`, `PRIVATE(p)` suppresses membership disclosure. No new letter. |
 | `c` | strip mIRC color/formatting | **ALREADY-COVERED** | IRCX `NOFORMAT(f)` already strips formatting/color. Keep the named form; do not add a second `c`. |
-| `C` | block CTCP to channel | **KEEP** | Distinct from NOFORMAT (CTCP is a message class, not formatting). Mizuchi-native: channel flag `NOCTCP`, MODE letter **`C`**. Drops CTCP (except ACTION) addressed to the channel; ops bypass. Mirrors the user-mode `no-ctcp(C)` already shipped. |
-| `g` | free invite (anyone may `/invite`) | **KEEP** | Useful with `+i`. Mizuchi-native: flag `FREEINVITE`, MODE letter **`g`** — lets any member (not only ops) invite while `+i` is set. Cheap flag, frequently toggled, belongs as a letter. |
-| `z` | reduced/op moderation (blocked msgs redirected to ops) | **KEEP** | Complements `+m`/`+b`: messages that *would* be blocked are instead delivered to ops as an Event-Spine `chan.moderation.held` signal. Mizuchi-native: flag `OPMODERATE`, MODE letter **`U`** (legacy `z` collides with our IRCX `SERVICE(z)`; pick a free letter). Held messages surface to ops via the Event Spine, not as raw NOTICEs. |
-| `T` | block channel NOTICEs | **KEEP** | Anti-spam staple. Mizuchi-native: flag `NONOTICE`, MODE letter **`T`**. Blocks `NOTICE` to the channel from non-ops. |
-| `N` | block nick changes while in channel | **KEEP** | Useful for moderated/event channels. Mizuchi-native: flag `NONICK`, MODE letter **`N`**. While set, members below op cannot change nick while joined. |
-| `S` | TLS-only channel | **KEEP** | Redefined for implicit-TLS: join is permitted only if the joining session was accepted over TLS (connection fact, no STARTTLS). Mizuchi-native: flag `TLSONLY`, MODE letter **`S`**. Non-TLS join → `ERR_SECUREONLYCHAN`. |
+| `C` | block CTCP to channel | **KEEP** | Distinct from NOFORMAT (CTCP is a message class, not formatting). Orochi-native: channel flag `NOCTCP`, MODE letter **`C`**. Drops CTCP (except ACTION) addressed to the channel; ops bypass. Mirrors the user-mode `no-ctcp(C)` already shipped. |
+| `g` | free invite (anyone may `/invite`) | **KEEP** | Useful with `+i`. Orochi-native: flag `FREEINVITE`, MODE letter **`g`** — lets any member (not only ops) invite while `+i` is set. Cheap flag, frequently toggled, belongs as a letter. |
+| `z` | reduced/op moderation (blocked msgs redirected to ops) | **KEEP** | Complements `+m`/`+b`: messages that *would* be blocked are instead delivered to ops as an Event-Spine `chan.moderation.held` signal. Orochi-native: flag `OPMODERATE`, MODE letter **`U`** (legacy `z` collides with our IRCX `SERVICE(z)`; pick a free letter). Held messages surface to ops via the Event Spine, not as raw NOTICEs. |
+| `T` | block channel NOTICEs | **KEEP** | Anti-spam staple. Orochi-native: flag `NONOTICE`, MODE letter **`T`**. Blocks `NOTICE` to the channel from non-ops. |
+| `N` | block nick changes while in channel | **KEEP** | Useful for moderated/event channels. Orochi-native: flag `NONICK`, MODE letter **`N`**. While set, members below op cannot change nick while joined. |
+| `S` | TLS-only channel | **KEEP** | Redefined for implicit-TLS: join is permitted only if the joining session was accepted over TLS (connection fact, no STARTTLS). Orochi-native: flag `TLSONLY`, MODE letter **`S`**. Non-TLS join → `ERR_SECUREONLYCHAN`. |
 | `O` | oper-only channel | **DROP / fold into IRCX** | The IRCX `ACCESS` list with a `DENY`/`GRANT` entry keyed on operator identity expresses this precisely and auditable-y. A blunt "opers only" bit is too coarse; use `ACCESS #chan ADD DENY *` + grant for opers. No new letter. |
-| `A` | admin-only channel | **DROP** | Same reasoning as `O`, and Mizuchi has no separate "admin" oper class to gate on. Express via `ACCESS`. |
+| `A` | admin-only channel | **DROP** | Same reasoning as `O`, and Orochi has no separate "admin" oper class to gate on. Express via `ACCESS`. |
 | `r` | registered-account-only join | **KEEP** | Common, distinct from registered-*channel*. Reuse the IRCX named flag **`AUTHONLY(a)`** which already gates join on an authenticated account — so this is effectively ALREADY-COVERED by `AUTHONLY`. No new `r` channel letter (our `r` already means REGISTERED-channel). |
-| `M` | mute unauthenticated users (may join, can't speak) | **KEEP** | Softer than `AUTHONLY`. Mizuchi-native: flag `MODREG` (moderate-unregistered), MODE letter **`M`**. Unauthenticated members are treated as un-voiced under `+m`-like rules; authenticated speak freely. Account-integrated. |
-| `P` | permanent channel (survives empty) | **KEEP** | Real operational need. But it is config/operator policy, not a casual toggle. Mizuchi-native: a **persistent-channel** property set via `PROP #chan PERSIST :1` (IRCX PROP), oper-gated, with the underlying CRDT channel object retained by the substrate. Surfaced read-only as MODE letter **`P`** for client display. |
+| `M` | mute unauthenticated users (may join, can't speak) | **KEEP** | Softer than `AUTHONLY`. Orochi-native: flag `MODREG` (moderate-unregistered), MODE letter **`M`**. Unauthenticated members are treated as un-voiced under `+m`-like rules; authenticated speak freely. Account-integrated. |
+| `P` | permanent channel (survives empty) | **KEEP** | Real operational need. But it is config/operator policy, not a casual toggle. Orochi-native: a **persistent-channel** property set via `PROP #chan PERSIST :1` (IRCX PROP), oper-gated, with the underlying CRDT channel object retained by the substrate. Surfaced read-only as MODE letter **`P`** for client display. |
 | `F` / `f` | forward / free forward-target | **DROP** | Channel forwarding (bounce a blocked joiner to another channel) is rarely understood, frequently abused for ad-channels, and interacts badly with a mesh/CRDT membership model. Provide nothing; rejected joins get a clear numeric, not a silent redirect. |
 | `Q` | block forwarding *into* this channel | **DROP** | Only exists to defend against `F`/`f`; with forwarding dropped it is meaningless. |
 | `L` | limit-redirect (overflow → other channel) | **DROP** | Same family as `F`; overflow on `+l` returns `ERR_CHANNELISFULL`, no silent redirect. Predictable failure beats hidden routing. |
-| `D` / `d` | delayed / cloaked join (hide joins until speak) | **KEEP** | Strong anti-spam / large-channel UX win. Mizuchi-native: flag `DELAYJOIN`, MODE letter **`D`**. Joins are withheld from the channel until the member sends a message or is op'd; revealed via a normal `JOIN` at that point. Integrates with the Event Spine for the deferred reveal. (Subsumes both legacy `+D` and `+d`.) |
-| `j` | join throttle `n:t` | **KEEP** | Effective flood control. Mizuchi-native: param flag `THROTTLE`, MODE letter **`j`**, parameter `joins:seconds`. Enforced per-channel with a token-bucket; excess joins get `ERR_TOOMANYJOINS`. Type-C-style (param on set, bare on unset). |
-| `q` (quiet list) | quiet ban (mute without ban) | **KEEP (renamed)** | The letter `q` is the Mizuchi **owner** member tier (+q `.`), so a quiet *cannot* reuse `q`. Mizuchi-native: a type-A list mode `MUTE`, MODE letter **`Z`** (`+Z mask`), matched like `+b` but only suppressing speech, not join. Equivalent expressiveness to legacy `~q:`/extban quiets without the letter collision. |
+| `D` / `d` | delayed / cloaked join (hide joins until speak) | **KEEP** | Strong anti-spam / large-channel UX win. Orochi-native: flag `DELAYJOIN`, MODE letter **`D`**. Joins are withheld from the channel until the member sends a message or is op'd; revealed via a normal `JOIN` at that point. Integrates with the Event Spine for the deferred reveal. (Subsumes both legacy `+D` and `+d`.) |
+| `j` | join throttle `n:t` | **KEEP** | Effective flood control. Orochi-native: param flag `THROTTLE`, MODE letter **`j`**, parameter `joins:seconds`. Enforced per-channel with a token-bucket; excess joins get `ERR_TOOMANYJOINS`. Type-C-style (param on set, bare on unset). |
+| `q` (quiet list) | quiet ban (mute without ban) | **KEEP (renamed)** | The letter `q` is the Orochi **owner** member tier (+q `.`), so a quiet *cannot* reuse `q`. Orochi-native: a type-A list mode `MUTE`, MODE letter **`Z`** (`+Z mask`), matched like `+b` but only suppressing speech, not join. Equivalent expressiveness to legacy `~q:`/extban quiets without the letter collision. |
 
 ---
 
 ## 3. User Modes
 
-| Legacy | Meaning | Decision | Rationale & Mizuchi-native design |
+| Legacy | Meaning | Decision | Rationale & Orochi-native design |
 |--------|---------|----------|-----------------------------------|
 | `i` | invisible (hidden from `WHO`/no-shared-channel `WHOIS`) | **ALREADY-COVERED** | Shipped as `invisible(i)` in `usermode.zig`. |
 | `B` | bot flag | **ALREADY-COVERED** | Shipped as `bot(B)` with IRCv3 `bot` tag in `usermode.zig`. |
 | `D` | deaf (drop channel messages) | **ALREADY-COVERED** | Shipped as `deaf(D)` in `usermode.zig`. |
 | `g` | caller-id / server-side ignore (accept-list gating of PMs) | **ALREADY-COVERED** | Shipped as `callerid(g)` in `usermode.zig`. Pairs with an `ACCEPT` command for the allow-list. |
-| `o` | operator | **KEEP (server-managed)** | Operators exist but are **SASL-only** — there is no password `OPER`. Mizuchi-native: user mode `oper`, letter **`o`**, `policy = server_managed` (set by the daemon on successful operator-class SASL auth, never client-writable; clients may only `-o` to deopper themselves). |
-| `R` | reg-only PMs / block messages from unauthenticated users | **KEEP** | Anti-spam staple, account-integrated. Mizuchi-native: user mode `regonly-pm`, letter **`R`**, `client_writable`. PMs/notices from unauthenticated senders are rejected with `ERR_NONONREG` while set. |
-| `p` | hide channel list in own `WHOIS` | **KEEP** | Genuine privacy control distinct from `+i`. Mizuchi-native: user mode `hide-chans`, letter **`p`**, `client_writable`. Suppresses the `RPL_WHOISCHANNELS` line for this user (opers still see it). |
-| `Z` | connected via TLS | **ALREADY-COVERED** | Shipped as `secure-tls(z)` in `usermode.zig`, `policy = server_managed`, set at accept time from the implicit-TLS connection fact (no STARTTLS path). We use lowercase `z`; that is the canonical Mizuchi letter. |
+| `o` | operator | **KEEP (server-managed)** | Operators exist but are **SASL-only** — there is no password `OPER`. Orochi-native: user mode `oper`, letter **`o`**, `policy = server_managed` (set by the daemon on successful operator-class SASL auth, never client-writable; clients may only `-o` to deopper themselves). |
+| `R` | reg-only PMs / block messages from unauthenticated users | **KEEP** | Anti-spam staple, account-integrated. Orochi-native: user mode `regonly-pm`, letter **`R`**, `client_writable`. PMs/notices from unauthenticated senders are rejected with `ERR_NONONREG` while set. |
+| `p` | hide channel list in own `WHOIS` | **KEEP** | Genuine privacy control distinct from `+i`. Orochi-native: user mode `hide-chans`, letter **`p`**, `client_writable`. Suppresses the `RPL_WHOISCHANNELS` line for this user (opers still see it). |
+| `Z` | connected via TLS | **ALREADY-COVERED** | Shipped as `secure-tls(z)` in `usermode.zig`, `policy = server_managed`, set at accept time from the implicit-TLS connection fact (no STARTTLS path). We use lowercase `z`; that is the canonical Orochi letter. |
 | `x` | host cloak toggle | **DROP** | Cloaking is automatic on connect for everyone. There is nothing to toggle. (Note: `usermode.zig` carries a server-managed `cloaked(x)` purely as a *read-only indicator* that the auto-cloak is applied; it is not user-settable.) |
 | `w` | receive WALLOPS | **DROP** | WALLOPS is an Event-Spine event with a subscription, not a user mode. Already-covered by Event Spine. |
 | `s` | snomask / server notices | **DROP** | Snomasks are Event-Spine event subscriptions, not a `+s` user mode. Already-covered by Event Spine. |

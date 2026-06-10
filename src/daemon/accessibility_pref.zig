@@ -1,4 +1,4 @@
-//! Per-account accessibility preferences for the Mizuchi IRC daemon.
+//! Per-account accessibility preferences for the Orochi IRC daemon.
 //!
 //! Stores a small set of per-account accessibility toggles. Unset accounts
 //! resolve to an all-false default, so callers can query freely without first

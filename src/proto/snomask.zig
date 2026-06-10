@@ -2,7 +2,7 @@
 //!
 //! This parser accepts both raw snomask strings (`+cf-k`) and MODE-shaped
 //! strings (`MODE oper +s cf`). Unknown letters are ignored so older peers can
-//! send letters that Mizuchi no longer routes as separate notice channels.
+//! send letters that Orochi no longer routes as separate notice channels.
 const std = @import("std");
 const root = @import("root");
 const event_spine = if (@hasDecl(root, "daemon")) root.daemon.event_spine else StandaloneEventSpine;

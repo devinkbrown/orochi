@@ -369,8 +369,8 @@ fn expectSessionEqual(expected: SessionInput, actual: *const Session) !void {
 test "round-trip several sessions" {
     const allocator = std.testing.allocator;
     const bounds = Bounds{};
-    const alice_channels = [_][]const u8{ "#mizuchi", "#ops" };
-    const bob_channels = [_][]const u8{"#mizuchi"};
+    const alice_channels = [_][]const u8{ "#orochi", "#ops" };
+    const bob_channels = [_][]const u8{"#orochi"};
     const sessions = [_]SessionInput{
         .{},
         .{ .listener_fds = &.{ 3, 4, 9 } },

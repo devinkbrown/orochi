@@ -497,9 +497,9 @@ test "apply command mutates store and reports result" {
 
 test "format join delivery uses server NOTICE not pseudo clients" {
     var buf: [256]u8 = undefined;
-    const line = try formatJoinNotice(&buf, "irc.mizuchi.test", "alice", "#zig", "Welcome to Zig");
+    const line = try formatJoinNotice(&buf, "irc.orochi.test", "alice", "#zig", "Welcome to Zig");
 
-    try testing.expectEqualStrings(":irc.mizuchi.test NOTICE alice :[#zig] Welcome to Zig\r\n", line);
+    try testing.expectEqualStrings(":irc.orochi.test NOTICE alice :[#zig] Welcome to Zig\r\n", line);
     try testing.expect(std.mem.indexOf(u8, line, "ChanServ") == null);
     try testing.expect(std.mem.indexOf(u8, line, "NickServ") == null);
     try testing.expect(std.mem.indexOf(u8, line, "OperServ") == null);
@@ -507,10 +507,10 @@ test "format join delivery uses server NOTICE not pseudo clients" {
 
 test "format numeric emits three digit real IRC replies" {
     var buf: [256]u8 = undefined;
-    const line = try formatNumeric(&buf, "irc.mizuchi.test", "alice", .rpl_text, &.{ "#zig", "ENTRYMSG" }, "Welcome to Zig");
+    const line = try formatNumeric(&buf, "irc.orochi.test", "alice", .rpl_text, &.{ "#zig", "ENTRYMSG" }, "Welcome to Zig");
 
     try testing.expectEqual(@as(u16, 304), numericCode(.rpl_text));
-    try testing.expectEqualStrings(":irc.mizuchi.test 304 alice #zig ENTRYMSG :Welcome to Zig\r\n", line);
+    try testing.expectEqualStrings(":irc.orochi.test 304 alice #zig ENTRYMSG :Welcome to Zig\r\n", line);
 }
 
 test "formatters reject unsafe wire bytes and small buffers" {

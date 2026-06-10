@@ -1,4 +1,4 @@
-//! Mizuchi daemon configuration: a typed `Config` projected from standard TOML.
+//! Orochi daemon configuration: a typed `Config` projected from standard TOML.
 //!
 //! The canonical config format is **TOML v1.0** (parsed by `proto/toml.zig`).
 //! `parseToml` reads a TOML document and overlays it onto a defaulted `Config`,
@@ -58,7 +58,7 @@ pub const Config = struct {
     /// Network-wide presentation. `name` is advertised in ISUPPORT `NETWORK=`
     /// and the registration welcome burst.
     pub const Network = struct {
-        name: []const u8 = "Mizuchi",
+        name: []const u8 = "Orochi",
     };
 
     /// Message of the Day. `text` is served by the MOTD command (split on
@@ -70,8 +70,8 @@ pub const Config = struct {
 
     /// ADMIN command response (RPL_ADMIN*). Operator/network contact details.
     pub const Admin = struct {
-        location: []const u8 = "Mizuchi IRC network",
-        email: []const u8 = "admin@mizuchi.local",
+        location: []const u8 = "Orochi IRC network",
+        email: []const u8 = "admin@orochi.local",
     };
 
     /// Localized weather for the MOTD `{weather}` placeholder. The daemon reads
@@ -113,7 +113,7 @@ pub const Config = struct {
         media_host: []const u8 = "",
     };
 
-    /// An operator binding. Mizuchi grants oper SASL-only: `account` is the SASL
+    /// An operator binding. Orochi grants oper SASL-only: `account` is the SASL
     /// account elevated on login (no password — SASL is the auth), and `class`
     /// names its privilege class. There is no OPER-password credential.
     /// A role-based operator group: a named privilege set (optionally inheriting
@@ -281,10 +281,10 @@ pub const Config = struct {
         const geoip_db = try allocator.dupe(u8, "");
         errdefer allocator.free(geoip_db);
         return .{
-            .network = .{ .name = try allocator.dupe(u8, "Mizuchi") },
+            .network = .{ .name = try allocator.dupe(u8, "Orochi") },
             .admin = .{
-                .location = try allocator.dupe(u8, "Mizuchi IRC network"),
-                .email = try allocator.dupe(u8, "admin@mizuchi.local"),
+                .location = try allocator.dupe(u8, "Orochi IRC network"),
+                .email = try allocator.dupe(u8, "admin@orochi.local"),
             },
             .listen = .{ .host = host, .media_host = media_host },
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
@@ -793,8 +793,8 @@ test "parseToml: [tls] section projects onto Config" {
         \\[tls]
         \\enabled = true
         \\port = 7000
-        \\cert_path = "/etc/mizuchi/leaf.pem"
-        \\key_path = "/etc/mizuchi/leaf.key"
+        \\cert_path = "/etc/orochi/leaf.pem"
+        \\key_path = "/etc/orochi/leaf.key"
         \\dns_name = "irc.example.test"
         \\
     ;
@@ -806,8 +806,8 @@ test "parseToml: [tls] section projects onto Config" {
     // Assert
     try testing.expect(cfg.tls.enabled);
     try testing.expectEqual(@as(u16, 7000), cfg.tls.port);
-    try testing.expectEqualStrings("/etc/mizuchi/leaf.pem", cfg.tls.cert_path.?);
-    try testing.expectEqualStrings("/etc/mizuchi/leaf.key", cfg.tls.key_path.?);
+    try testing.expectEqualStrings("/etc/orochi/leaf.pem", cfg.tls.cert_path.?);
+    try testing.expectEqualStrings("/etc/orochi/leaf.key", cfg.tls.key_path.?);
     try testing.expectEqualStrings("irc.example.test", cfg.tls.dns_name);
 }
 

@@ -208,7 +208,7 @@ fn readStr(bytes: []const u8, pos: *usize) Error![]const u8 {
 
 test "round-trip account with three markers" {
     const markers = [_]Marker{
-        .{ .target = "#mizuchi", .timestamp_ms = 1_717_000_000_000, .msgid = "" },
+        .{ .target = "#orochi", .timestamp_ms = 1_717_000_000_000, .msgid = "" },
         .{ .target = "#helix", .timestamp_ms = 1_717_000_500_123, .msgid = "abc123def456" },
         .{ .target = "Suzuki", .timestamp_ms = 1_717_001_000_999, .msgid = "" },
     };
@@ -226,7 +226,7 @@ test "round-trip account with three markers" {
     try std.testing.expectEqualStrings(original.account, decoded.account);
     try std.testing.expectEqual(@as(usize, 3), decoded.markers.len);
 
-    try std.testing.expectEqualStrings("#mizuchi", decoded.markers[0].target);
+    try std.testing.expectEqualStrings("#orochi", decoded.markers[0].target);
     try std.testing.expectEqual(@as(i64, 1_717_000_000_000), decoded.markers[0].timestamp_ms);
     try std.testing.expectEqualStrings("", decoded.markers[0].msgid);
 

@@ -1,4 +1,4 @@
-//! Ed25519 signatures for Mizuchi identity and authorization boundaries.
+//! Ed25519 signatures for Orochi identity and authorization boundaries.
 //!
 //! This module wraps Zig 0.16's `std.crypto.sign.Ed25519` key/public/signature
 //! encodings while keeping private key material behind `Secret(T)`. Signing is
@@ -29,7 +29,7 @@ pub const SignError = std.crypto.errors.IdentityElementError ||
 
 pub const VerifyError = StdEd25519.Signature.VerifyError;
 
-const domain_prefix_magic = "mizuchi-ed25519ctx-v1";
+const domain_prefix_magic = "orochi-ed25519ctx-v1";
 
 /// Ed25519 key pair. `secret_key` is seed || public key, matching std/RFC
 /// Ed25519 storage, and is wiped by `deinit`.
@@ -248,10 +248,10 @@ test "tampered signature is rejected" {
         "4449c5697b326919703bac031cae7f60"));
     defer kp.deinit();
 
-    var sig = try kp.sign("mizuchi");
+    var sig = try kp.sign("orochi");
     sig[32] ^= 0x01;
 
-    try std.testing.expect(!try verify("mizuchi", sig, kp.public_key));
+    try std.testing.expect(!try verify("orochi", sig, kp.public_key));
 }
 
 test "domain separation prevents cross-use" {

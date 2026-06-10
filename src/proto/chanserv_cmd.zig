@@ -1,4 +1,4 @@
-//! Pure parser and reply formatter for Mizuchi-native channel registration commands.
+//! Pure parser and reply formatter for Orochi-native channel registration commands.
 //!
 //! `parse` accepts a tokenized IRC command where `args[0]` is `CHANNEL` or its
 //! short alias `CS`. Parse results borrow slices from the caller-provided token
@@ -529,7 +529,7 @@ fn ownedArgs(tokens: []const []const u8) ![][]const u8 {
 
 test "parse register with optional password borrows args" {
     // Arrange
-    const args = try ownedArgs(&.{ "CHANNEL", "REGISTER", "#mizuchi", "correct-horse" });
+    const args = try ownedArgs(&.{ "CHANNEL", "REGISTER", "#orochi", "correct-horse" });
     defer std.testing.allocator.free(args);
 
     // Act
@@ -537,7 +537,7 @@ test "parse register with optional password borrows args" {
 
     // Assert
     try std.testing.expectEqual(Subcommand.register, request.subcommand());
-    try std.testing.expectEqualStrings("#mizuchi", request.register.channel);
+    try std.testing.expectEqualStrings("#orochi", request.register.channel);
     try std.testing.expectEqualStrings("correct-horse", request.register.password.?);
 }
 

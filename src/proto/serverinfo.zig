@@ -541,10 +541,10 @@ fn sampleContext() ReplyContext {
 
 fn sampleVersion() VersionInfo {
     return .{
-        .version = "mizuchi",
+        .version = "orochi",
         .build = "9f7c14a",
         .reply_server = "irc.example.test",
-        .description = "Mizuchi IRCX daemon",
+        .description = "Orochi IRCX daemon",
     };
 }
 
@@ -554,7 +554,7 @@ test "VERSION builds RPL_VERSION 351" {
     const line = try writeVersionReply(&out, sampleContext(), sampleVersion());
 
     try std.testing.expectEqualStrings(
-        ":irc.example.test 351 alice mizuchi(9f7c14a). irc.example.test :Mizuchi IRCX daemon\r\n",
+        ":irc.example.test 351 alice orochi(9f7c14a). irc.example.test :Orochi IRCX daemon\r\n",
         line,
     );
 }
@@ -567,7 +567,7 @@ test "VERSION includes optional branding tag" {
     const line = try writeVersionReply(&out, sampleContext(), info);
 
     try std.testing.expectEqualStrings(
-        ":irc.example.test 351 alice mizuchi(9f7c14a,dev). irc.example.test :Mizuchi IRCX daemon\r\n",
+        ":irc.example.test 351 alice orochi(9f7c14a,dev). irc.example.test :Orochi IRCX daemon\r\n",
         line,
     );
 }
@@ -665,7 +665,7 @@ test "validation rejects control bytes before output" {
     try std.testing.expectError(
         error.InvalidDescription,
         writeVersionReply(&out, sampleContext(), .{
-            .version = "mizuchi",
+            .version = "orochi",
             .build = "9f7c14a",
             .reply_server = "irc.example.test",
             .description = "bad\rdescription",

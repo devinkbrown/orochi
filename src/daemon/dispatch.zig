@@ -25,7 +25,7 @@ pub const DispatchError = error{
     TextTooLong,
 };
 
-const SERVER_NAME = "mizuchi.local";
+const SERVER_NAME = "orochi.local";
 const NETWORK_NAME = protocol_inventory.network_name;
 const MAX_PARAMS: usize = 15;
 const MAX_NICK_BYTES: usize = 64;
@@ -233,7 +233,7 @@ pub const CapId = enum(u6) {
     account_notify,
     invite_notify,
     account_tag,
-    mizuchi_bouncer,
+    orochi_bouncer,
     chghost,
     no_implicit_names,
     chathistory,
@@ -301,10 +301,10 @@ const cap_specs = [_]CapSpec{
     .{ .id = .extended_join, .name = "extended-join" },
     .{ .id = .invite_notify, .name = "invite-notify" },
     .{ .id = .account_tag, .name = "account-tag" },
-    // mizuchi/bouncer: opt-in to automatic rewind (replay of missed channel
+    // orochi/bouncer: opt-in to automatic rewind (replay of missed channel
     // history on (re)join, bounded by the client's read marker). Multi-session
     // reclaim (SESSION RESUME) works without it; this only enables auto-replay.
-    .{ .id = .mizuchi_bouncer, .name = "mizuchi/bouncer" },
+    .{ .id = .orochi_bouncer, .name = "orochi/bouncer" },
     // chghost: receive a native CHGHOST line when a common user's host changes
     // (VHOST). Clients without it see the new host on the user's next message.
     .{ .id = .chghost, .name = "chghost" },
@@ -1179,7 +1179,7 @@ fn emitLabeled(out: *ReplyCtx, label: []const u8, raw: []const u8) DispatchError
 /// Batch reference used for labeled-response BATCH framing. Per-dispatch
 /// uniqueness is not required by the spec since the open/close bracket the
 /// label's own lines on a single connection.
-const LABELED_BATCH_REF = "mizu-label";
+const LABELED_BATCH_REF = "suzu-label";
 
 /// Adapter exposing `ReplyCtx` as a labeled_response sink (`appendLine`).
 const ReplyCtxSink = struct {
@@ -1490,10 +1490,10 @@ fn maybeCompleteRegistration(session: *ClientSession, replies: *ReplyCtx) Dispat
 }
 
 fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
-    try replies.numeric(session, .RPL_WELCOME, &.{}, "Welcome to the Mizuchi IRC Network");
-    try replies.numeric(session, .RPL_YOURHOST, &.{}, "Your host is mizuchi.local, running Mizuchi");
+    try replies.numeric(session, .RPL_WELCOME, &.{}, "Welcome to the Orochi IRC Network");
+    try replies.numeric(session, .RPL_YOURHOST, &.{}, "Your host is orochi.local, running Orochi");
     try replies.numeric(session, .RPL_CREATED, &.{}, "This server was created for deterministic tests");
-    try replies.numeric(session, .RPL_MYINFO, &.{ SERVER_NAME, "mizuchi-0.1", "io", "ov" }, "are supported by this server");
+    try replies.numeric(session, .RPL_MYINFO, &.{ SERVER_NAME, "orochi-0.1", "io", "ov" }, "are supported by this server");
     try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
 }
 
@@ -1595,7 +1595,7 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     try s.setRealname("Alice Example");
     s.loginAs("alice");
     s.setRealHost("10.0.0.7");
-    s.setVisibleHost("cloak-ab12.mizuchi");
+    s.setVisibleHost("cloak-ab12.orochi");
     s.setAway("brb");
     s.is_oper = true;
 
@@ -1611,7 +1611,7 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     try std.testing.expect(s2.logged_in);
     try std.testing.expectEqualStrings("alice", s2.account().?);
     try std.testing.expectEqualStrings("10.0.0.7", s2.real_host_store.slice());
-    try std.testing.expectEqualStrings("cloak-ab12.mizuchi", s2.host_store.slice());
+    try std.testing.expectEqualStrings("cloak-ab12.orochi", s2.host_store.slice());
     try std.testing.expectEqualStrings("brb", s2.awayMessage().?);
     try std.testing.expect(s2.isOper());
     try std.testing.expect(s2.registered());
@@ -1629,7 +1629,7 @@ test "full registration handshake emits welcome numerics" {
     try std.testing.expect(!session.registered());
     try std.testing.expectEqual(@as(usize, 0), replies.written().len);
 
-    try dispatchText(&session, &replies, "USER kain 0 * :Kain Mizuchi");
+    try dispatchText(&session, &replies, "USER kain 0 * :Kain Orochi");
     try std.testing.expect(session.registered());
     try expectCodesInOrder(replies.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
     // ISUPPORT advertises extended-ban support so clients enable $-typed bans.
@@ -1650,7 +1650,7 @@ test "CAP negotiation holds registration until CAP END" {
     replies.clear();
 
     try dispatchText(&session, &replies, "NICK kain");
-    try dispatchText(&session, &replies, "USER kain 0 * :Kain Mizuchi");
+    try dispatchText(&session, &replies, "USER kain 0 * :Kain Orochi");
     try std.testing.expect(!session.registered());
     try expectNotContains(replies.written(), " 001 ");
 
@@ -1900,7 +1900,7 @@ test "labeled single-line reply echoes @label on the one line" {
     try dispatchText(&session, &replies, "@label=ping-1 PING :tok");
     // Single line: tagged directly (no BATCH wrapper).
     try expectContains(replies.written(), "@label=ping-1 ");
-    try expectContains(replies.written(), "PONG mizuchi.local :tok\r\n");
+    try expectContains(replies.written(), "PONG orochi.local :tok\r\n");
     try expectNotContains(replies.written(), "BATCH");
 }
 
@@ -1914,7 +1914,7 @@ test "labeled multi-line reply is wrapped in a labeled-response BATCH" {
     // burst under one label -> BATCH framing.
     try dispatchText(&session, &replies, "NICK kain");
     replies.clear();
-    try dispatchText(&session, &replies, "@label=reg-1 USER kain 0 * :Kain Mizuchi");
+    try dispatchText(&session, &replies, "@label=reg-1 USER kain 0 * :Kain Orochi");
     try std.testing.expect(session.registered());
 
     const out = replies.written();
@@ -1943,7 +1943,7 @@ test "label is ignored when the labeled-response cap is not negotiated" {
 
     try dispatchText(&session, &replies, "@label=ping-1 PING :tok");
     try expectNotContains(replies.written(), "@label=");
-    try expectContains(replies.written(), "PONG mizuchi.local :tok\r\n");
+    try expectContains(replies.written(), "PONG orochi.local :tok\r\n");
 }
 
 const TestExternalChecker = struct {

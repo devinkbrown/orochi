@@ -1,6 +1,6 @@
 //! Epoch-based reclamation (EBR), the classic 3-epoch scheme (Fraser/Harris).
 //!
-//! EBR is the memory-reclamation foundation of Mizuchi's lock-free world.
+//! EBR is the memory-reclamation foundation of Orochi's lock-free world.
 //! Readers `pin` into the current global epoch, traverse shared immutable
 //! structures lock-free, then `unpin`. Writers `retire` nodes they have
 //! unlinked; a retired node is freed only after a *grace period* during which
@@ -80,7 +80,7 @@
 //! ## Usage model
 //!
 //! `register` claims one `Participant` slot per reader thread. `retire` and
-//! `advance` are the writer side; Mizuchi serializes writers per shard, so
+//! `advance` are the writer side; Orochi serializes writers per shard, so
 //! `retire`/`advance` are expected to be called from a single writer context
 //! per domain (or externally synchronized). The read path is fully concurrent.
 
@@ -90,7 +90,7 @@ const testing = std.testing;
 pub const cache_line_bytes: usize = 64;
 
 /// Maximum number of concurrently registered participants. Registration beyond
-/// this asserts. 256 is ample for Mizuchi's sharded reactor + worker pool.
+/// this asserts. 256 is ample for Orochi's sharded reactor + worker pool.
 pub const max_participants: usize = 256;
 
 /// Number of epochs in the rotation. The classic scheme uses 3.

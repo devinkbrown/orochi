@@ -1,4 +1,4 @@
-//! Role-based operator groups for Mizuchi.
+//! Role-based operator groups for Orochi.
 //!
 //! Operator groups are named privilege bundles with optional parent links. They
 //! compose the daemon's existing `oper.OperPrivileges` flags without redefining

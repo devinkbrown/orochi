@@ -37,7 +37,7 @@ test "ELIST parser returns requests or typed errors for arbitrary bytes" {
         "TOPICONLY",
         "#miz*",
         "!#secret",
-        ">1,<100,C>10,T<99,TOPICONLY,#mizu*,!#old",
+        ">1,<100,C>10,T<99,TOPICONLY,#suzu*,!#old",
     };
 
     for (corpus) |param| {
@@ -288,8 +288,8 @@ fn randomPossiblyInvalidChannel(random: std.Random, iteration: usize, storage: *
 
 fn randomChannel(random: std.Random, iteration: usize) list.ChannelInfo {
     const names = [_][]const u8{
-        "#mizuchi",
-        "#MIZUCHI",
+        "#orochi",
+        "#OROCHI",
         "#ops",
         "#secret",
         "",

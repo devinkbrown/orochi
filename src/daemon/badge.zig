@@ -1,4 +1,4 @@
-//! Per-account badge-label registry for the Mizuchi IRC daemon.
+//! Per-account badge-label registry for the Orochi IRC daemon.
 //!
 //! A `Badge` maps an account name to a small, bounded set of badge labels.
 //! Both account names and badge labels are owned (heap-duplicated) by the

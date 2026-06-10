@@ -6,7 +6,7 @@
 > sovereign `node_id` is the *single* mesh identity; there is **no TS6 server-id
 > (SID)** anywhere (purged in `aaa3cb2`).
 
-This document is the deep-research design for Mizuchi's server-to-server linking
+This document is the deep-research design for Orochi's server-to-server linking
 protocol. It supersedes the S2S portions of [04-suimyaku-mesh.md](04-suimyaku-mesh.md)
 where they conflict, and is grounded in current (2025–2026) distributed-systems
 prior art rather than legacy IRC server linking.

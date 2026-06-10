@@ -408,8 +408,8 @@ test "world migration round-trip recovers every channel and ban entry intact" {
 
     const allocator = std.testing.allocator;
 
-    // Channel "#mizuchi": 4 members, non-null key, real topic.
-    const mizuchi_members = [_]Member{
+    // Channel "#orochi": 4 members, non-null key, real topic.
+    const orochi_members = [_]Member{
         .{ .nick = "founder", .status = 0x80 },
         .{ .nick = "op", .status = 0x40 },
         .{ .nick = "voiced", .status = 0x01 },
@@ -423,7 +423,7 @@ test "world migration round-trip recovers every channel and ban entry intact" {
 
     const channels = [_]WorldCapsule{
         .{
-            .name = "#mizuchi",
+            .name = "#orochi",
             .topic = "Welcome to the deep",
             .topic_setter = "Suimyaku!user@host",
             .topic_ts = 1_700_000_000,
@@ -432,7 +432,7 @@ test "world migration round-trip recovers every channel and ban entry intact" {
             .modes = 0x1234_5678,
             .key = "s3cr3t",
             .limit = 256,
-            .members = &mizuchi_members,
+            .members = &orochi_members,
         },
         .{
             .name = "#deep",
@@ -449,7 +449,7 @@ test "world migration round-trip recovers every channel and ban entry intact" {
     };
 
     // Ban lists spanning all four mask kinds across two channels.
-    const mizuchi_bans = [_]MaskEntry{
+    const orochi_bans = [_]MaskEntry{
         .{ .kind = .ban, .mask = "*!*@spam.example.org", .setter = "op!u@host", .set_ts = 1_700_000_001 },
         .{ .kind = .exempt, .mask = "trusted!*@*.good.net", .setter = "founder!f@h", .set_ts = 1_700_000_002 },
         .{ .kind = .invex, .mask = "vip!*@vip.example.com", .setter = "", .set_ts = 1_700_000_003 },
@@ -461,11 +461,11 @@ test "world migration round-trip recovers every channel and ban entry intact" {
     };
 
     const bans = [_]BanCapsule{
-        .{ .channel = "#mizuchi", .entries = &mizuchi_bans },
+        .{ .channel = "#orochi", .entries = &orochi_bans },
         .{ .channel = "#deep", .entries = &deep_bans },
     };
 
-    const total_ban_entries = mizuchi_bans.len + deep_bans.len; // 6
+    const total_ban_entries = orochi_bans.len + deep_bans.len; // 6
 
     const outcome = try roundTrip(allocator, &channels, &bans);
 

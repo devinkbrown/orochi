@@ -1,6 +1,6 @@
-//! Account nick RECOVER / RELEASE decision logic for the Mizuchi IRC daemon.
+//! Account nick RECOVER / RELEASE decision logic for the Orochi IRC daemon.
 //!
-//! Mizuchi services are REAL server commands, NEVER pseudo-clients. There is no
+//! Orochi services are REAL server commands, NEVER pseudo-clients. There is no
 //! NickServ. An account owner issues RECOVER or RELEASE as first-class server
 //! commands and the daemon answers with numerics. This module is the PURE state
 //! machine that decides what the daemon should *do* in response — it performs no

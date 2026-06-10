@@ -146,9 +146,9 @@ test "all-valid batch passes" {
     const kp1 = StdEd25519.KeyPair.generate(io);
     const kp2 = StdEd25519.KeyPair.generate(io);
     const entries = [_]Element{
-        try signedElement(kp1, "mizuchi batch one"),
-        try signedElement(kp2, "mizuchi batch two"),
-        try signedElement(kp1, "mizuchi batch three"),
+        try signedElement(kp1, "orochi batch one"),
+        try signedElement(kp2, "orochi batch two"),
+        try signedElement(kp1, "orochi batch three"),
     };
 
     const result = try verifyBatch(allocator, io, entries.len, entries);

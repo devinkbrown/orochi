@@ -88,7 +88,7 @@ pub const Verifier = struct {
     ///
     /// `random_bytes` must contain at least `params.token_bytes` bytes. The
     /// token is lowercase hexadecimal and is the exact TXT value the user must
-    /// publish at `_mizuchi-verify.<domain>`. The returned token is borrowed
+    /// publish at `_orochi-verify.<domain>`. The returned token is borrowed
     /// from the verifier and remains valid until the entry is mutated.
     pub fn issue(
         self: *Self,
@@ -128,7 +128,7 @@ pub const Verifier = struct {
     pub fn recordName(self: *const Self, domain: []const u8, out: []u8) []const u8 {
         validateDomain(self.params, domain) catch return out[0..0];
 
-        const prefix = "_mizuchi-verify.";
+        const prefix = "_orochi-verify.";
         const needed = prefix.len + domain.len;
         if (out.len < needed) return out[0..0];
 
@@ -344,7 +344,7 @@ test "issue returns token and recordName formats lowercase TXT name" {
 
     // Assert.
     try testing.expectEqualStrings("abcdef", token);
-    try testing.expectEqualStrings("_mizuchi-verify.example.com", record);
+    try testing.expectEqualStrings("_orochi-verify.example.com", record);
     const stored = verifier.pending("alice", "example.com").?;
     try testing.expectEqualStrings("example.com", stored.domain);
 }

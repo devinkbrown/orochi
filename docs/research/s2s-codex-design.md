@@ -1,6 +1,6 @@
 # Codex S2S Design: Suimyaku Link Protocol
 
-> Clean-room Mizuchi S2S target. New design only; no source changes. This
+> Clean-room Orochi S2S target. New design only; no source changes. This
 > document turns the current Suimyaku/Tsumugi/Goryu research into a byte-level,
 > implementable protocol. Current `u64` node ids in `src/substrate/suimyaku/*`
 > are treated as transitional replica lanes; the protocol identity is
@@ -11,7 +11,7 @@
 Claude's design has the right ingredients: delta-CRDT state, RIBLT repair,
 Merkle/prolly indexing, HyParView/Plumtree dissemination, witnessed SWIM,
 PQ-hybrid transport, and a DST-testable Reactor seam. The gap is a protocol
-contract. Mizuchi should ship a small secure substrate where every byte, state
+contract. Orochi should ship a small secure substrate where every byte, state
 transition, authority claim, and repair step is independently verifiable.
 
 This design keeps the ambition but narrows the risk:
@@ -587,7 +587,7 @@ Acceptance:
 - Meshes with fewer than 3 live witnesses stay suspect-only; they do not
   hard-delete peers.
 
-## 11. Novel Mizuchi Additions
+## 11. Novel Orochi Additions
 
 ### 11.1 Kiri-Caps: Convergent Capabilities
 

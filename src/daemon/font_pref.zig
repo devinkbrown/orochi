@@ -1,4 +1,4 @@
-//! Per-account font preference store for the Mizuchi IRC daemon.
+//! Per-account font preference store for the Orochi IRC daemon.
 //!
 //! Tracks a display font family name and point size for each account. Both the
 //! map keys (account names) and the family strings are heap-owned, so callers

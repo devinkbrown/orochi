@@ -21,7 +21,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 - Parameters: `target` and text.
 - Replies: Delivery line to recipients.
 - Errors: `ERR_NEEDMOREPARAMS 461`; most delivery errors are intentionally suppressed.
-- Example: `NOTICE mizu :heads up`
+- Example: `NOTICE suzu :heads up`
 - Sources: `src/daemon/modules/messaging.zig:48`, `src/daemon/server.zig:10740`, `src/daemon/server.zig:10941`
 
 ## TAGMSG

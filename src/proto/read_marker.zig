@@ -415,7 +415,7 @@ fn isLeapYear(year: u16) bool {
 
 test "set and get round-trip with response emission" {
     var store = DefaultStore.init();
-    const params = [_][]const u8{ "#Mizu", "timestamp=2026-06-02T08:09:10.123Z" };
+    const params = [_][]const u8{ "#Suzu", "timestamp=2026-06-02T08:09:10.123Z" };
 
     const parsed = try parseClient(&params);
     const set = switch (parsed) {
@@ -426,7 +426,7 @@ test "set and get round-trip with response emission" {
     const result = try store.set(7, set.target, set.timestamp);
     try std.testing.expect(result.changed);
 
-    const got = try store.get(7, "#mizu");
+    const got = try store.get(7, "#suzu");
     const timestamp = switch (got) {
         .timestamp => |value| value,
         .unset => return error.InvalidTimestamp,
@@ -434,9 +434,9 @@ test "set and get round-trip with response emission" {
     try std.testing.expectEqualStrings("2026-06-02T08:09:10.123Z", timestamp.slice());
 
     var line_buf: [96]u8 = undefined;
-    const line = try writeResponse("#Mizu", result.marker, &line_buf);
+    const line = try writeResponse("#Suzu", result.marker, &line_buf);
     try std.testing.expectEqualStrings(
-        "MARKREAD #Mizu timestamp=2026-06-02T08:09:10.123Z\r\n",
+        "MARKREAD #Suzu timestamp=2026-06-02T08:09:10.123Z\r\n",
         line,
     );
 }

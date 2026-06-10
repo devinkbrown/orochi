@@ -31,7 +31,7 @@ pub const MAX_SCRAM_USERNAME: usize = 128;
 pub const MAX_SCRAM_NONCE: usize = 128;
 pub const MAX_SCRAM_SALT: usize = 128;
 
-/// SASL mechanisms implemented by Mizuchi M0.
+/// SASL mechanisms implemented by Orochi M0.
 pub const Mechanism = enum {
     plain,
     external,

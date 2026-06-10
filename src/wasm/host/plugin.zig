@@ -1,4 +1,4 @@
-//! MizuWasm plugin store lifecycle and hostcall capability enforcement.
+//! OroWasm plugin store lifecycle and hostcall capability enforcement.
 //!
 //! The host owns every registration keyed by `PluginHandle`. Dropping a plugin
 //! removes its command/hook rows and deinitializes its interpreter instance; no

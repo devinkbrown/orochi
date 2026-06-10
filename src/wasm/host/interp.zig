@@ -1,4 +1,4 @@
-//! Minimal pure-Zig wasm32 interpreter for MizuWasm control-plane plugins.
+//! Minimal pure-Zig wasm32 interpreter for OroWasm control-plane plugins.
 //!
 //! This is intentionally an MVP interpreter, not a general-purpose runtime. It
 //! parses a small wasm32 module subset, executes integer/local/control/memory

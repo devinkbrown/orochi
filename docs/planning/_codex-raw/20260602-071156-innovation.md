@@ -4,7 +4,7 @@ Planning only. I did not modify files.
 
 ## Grounding
 
-Mizuchi is a clean-slate Zig rewrite of daemon, substrate, and crypto, with ophion/libop/opssl as reference only, while preserving IRCv3, IRCX, SASL, services, WebSocket, CHATHISTORY, voice/video, and replacing TS6 with LADON+VEIL (`/home/kain/mizuchi/docs/BRIEF.md:3-12`). The brief explicitly asks for invented technologies, aggressive `comptime`, pinned Zig, x86-64/ARM64 cross-compilation, and constant-time crypto by construction (`/home/kain/mizuchi/docs/BRIEF.md:14-30`, `/home/kain/mizuchi/docs/BRIEF.md:45-54`).
+Orochi is a clean-slate Zig rewrite of daemon, substrate, and crypto, with ophion/libop/opssl as reference only, while preserving IRCv3, IRCX, SASL, services, WebSocket, CHATHISTORY, voice/video, and replacing TS6 with LADON+VEIL (`/home/kain/orochi/docs/BRIEF.md:3-12`). The brief explicitly asks for invented technologies, aggressive `comptime`, pinned Zig, x86-64/ARM64 cross-compilation, and constant-time crypto by construction (`/home/kain/orochi/docs/BRIEF.md:14-30`, `/home/kain/orochi/docs/BRIEF.md:45-54`).
 
 Ophion’s current build gives the baseline to improve: 64-bit enforcement, hardening flags, sanitizers, io_uring probing, opssl session export, kTLS detection, subprojects, tests, fuzz targets, and shim upgrade summary (`/home/kain/ophion/meson.build:23-67`, `/home/kain/ophion/meson.build:155-179`, `/home/kain/ophion/meson.build:236-255`, `/home/kain/ophion/meson.build:262-353`, `/home/kain/ophion/meson.build:682-736`). libop already probes event/syscall features and kTLS/session-export defines (`/home/kain/libop/meson.build:45-87`, `/home/kain/libop/meson.build:119-128`). opssl already contains kTLS, PQ toggles, CPU feature probing, TLS/crypto sources, and a no-LTO constant-time AES S-box workaround (`/home/kain/opssl/meson.build:62-98`, `/home/kain/opssl/meson.build:170-232`, `/home/kain/opssl/meson.build:265-288`).
 
@@ -16,7 +16,7 @@ LADON is already a binary mesh concept with 8-byte frames, MessagePack payloads,
 
 Problem: IRC daemons still spend too much complexity on “which fd is armed, which buffer owns this read, which write queue is safe after migration.” Ophion already probes io_uring and has per-shard event tests (`/home/kain/ophion/meson.build:236-255`, `/home/kain/ophion/tests/meson.build:44-99`).
 
-How: Ringlane is Mizuchi’s Linux fast path: one io_uring per shard, registered socket files, registered fixed buffers, multishot accept/recv, batched send, provided-buffer rings, and optional zero-copy send for bulk history/media. Every connection owns a typed `ConnSlot` index, not a pointer, so handoff/state snapshots are stable. Non-Linux targets use the same `Reactor` interface over kqueue/epoll/poll without pretending io_uring exists.
+How: Ringlane is Orochi’s Linux fast path: one io_uring per shard, registered socket files, registered fixed buffers, multishot accept/recv, batched send, provided-buffer rings, and optional zero-copy send for bulk history/media. Every connection owns a typed `ConnSlot` index, not a pointer, so handoff/state snapshots are stable. Non-Linux targets use the same `Reactor` interface over kqueue/epoll/poll without pretending io_uring exists.
 
 Risk: io_uring feature availability varies by kernel. Mitigation: build-time target gates plus runtime capability probes, with conformance tests run against both Ringlane and portable reactors.
 
@@ -62,7 +62,7 @@ Risk: schema bugs become systemic. Mitigation: independent reference decoder in 
 
 ### 7. `Secret(T)` / VeilSafe
 
-Problem: “constant-time by convention” is not enough for a native crypto rewrite. The brief requires no secret-dependent branches or memory access (`/home/kain/mizuchi/docs/BRIEF.md:45-54`).
+Problem: “constant-time by convention” is not enough for a native crypto rewrite. The brief requires no secret-dependent branches or memory access (`/home/kain/orochi/docs/BRIEF.md:45-54`).
 
 How: `Secret(T)` is a type wrapper that forbids `if`, `switch`, table indexing, logging, formatting, equality branching, and allocator movement unless the method is marked constant-time. VeilSafe is the crypto subsystem policy: secret arrays are page-tagged when possible, zeroized through verified destructors, and exported only through typed migration capsules.
 
@@ -72,7 +72,7 @@ Risk: Zig cannot prove microarchitectural constant time alone. Mitigation: compi
 
 Problem: mesh CRDTs, SWIM, ratchets, mode repair, netsplits, and live upgrade cannot be validated well with only black-box scripts. Ophion already tests private spawned daemons and LADON fake peers in Python (`/home/kain/ophion/tests/s2s_helpers.py:470-476`, `/home/kain/ophion/tests/s2s_helpers.py:852-910`).
 
-How: Deterministic Ocean is a TigerBeetle-style simulation harness. It runs hundreds of virtual Mizuchi nodes in one process with deterministic time, packet loss, reordering, crash/restart, disk faults, key rotation, and random operator commands. Every run records a seed, event log, and minimized counterexample.
+How: Deterministic Ocean is a TigerBeetle-style simulation harness. It runs hundreds of virtual Orochi nodes in one process with deterministic time, packet loss, reordering, crash/restart, disk faults, key rotation, and random operator commands. Every run records a seed, event log, and minimized counterexample.
 
 Risk: simulator diverges from production. Mitigation: same protocol/state-machine code is linked into simulator and daemon; only sockets/time/storage are virtualized.
 
@@ -88,7 +88,7 @@ Risk: overhead and developer fatigue. Mitigation: fault points are compile-time 
 
 Problem: Ophion’s shim path is powerful but externalized. It transfers plain/kTLS FDs, uses opssl session export for non-kTLS TLS, serializes clients, servers, channel state, media blobs, LADON, VEIL, MessagePack state, and raw send queues (`/home/kain/ophion/ircd/restart.c:135-151`, `/home/kain/ophion/ircd/restart.c:174-190`, `/home/kain/ophion/ircd/restart.c:197-265`, `/home/kain/ophion/ircd/session_migrate.c:728-757`, `/home/kain/ophion/ircd/session_migrate.c:2916-3064`).
 
-How: Helix Upgrade replaces the shim with a native, minimal `mizuchi-supervisor` mode compiled from the same Zig tree. The supervisor owns listener FDs and a sealed memfd handoff arena. Old daemon freezes accept, quiesces shards, snapshots typed state capsules, exports TLS/kTLS/VEIL capsules, passes FDs through Unix domain sockets, and waits for new daemon health attestation before old process exits. kTLS state uses kernel socket continuity where available; non-kTLS TLS uses native TLS session capsules; VEIL uses ratchet capsules; mesh CRDT state uses Merkle checkpoint capsules.
+How: Helix Upgrade replaces the shim with a native, minimal `orochi-supervisor` mode compiled from the same Zig tree. The supervisor owns listener FDs and a sealed memfd handoff arena. Old daemon freezes accept, quiesces shards, snapshots typed state capsules, exports TLS/kTLS/VEIL capsules, passes FDs through Unix domain sockets, and waits for new daemon health attestation before old process exits. kTLS state uses kernel socket continuity where available; non-kTLS TLS uses native TLS session capsules; VEIL uses ratchet capsules; mesh CRDT state uses Merkle checkpoint capsules.
 
 Risk: compatibility across binary versions. Mitigation: every capsule has a schema id, min/max supported version, semantic validator, and simulator upgrade tests across the last N released schemas.
 
@@ -138,13 +138,13 @@ Risk: accidental incompatibility with IRC expectations. Mitigation: policy outpu
 
 Use a Zig workspace with packages:
 
-- `mizuchi-substrate`: reactor, allocators, arenas, intrusive collections, lock-free queues, HLC, CRDTs, Merkle sync, simulation runtime.
-- `mizuchi-crypto`: TLS 1.3, X.509, PQ-hybrid KEM/signature experiments, VEIL, `Secret(T)`, session/export capsules.
-- `mizuchi-proto`: IRC/IRCv3/IRCX/LADON/VEIL schemas, generated codecs, golden vectors.
-- `mizuchi-daemon`: server core, services, module registry, policy VM, storage, media.
-- `mizuchi-tools`: config validator, keygen, trace reader, corpus minimizer, upgrade capsule inspector.
+- `orochi-substrate`: reactor, allocators, arenas, intrusive collections, lock-free queues, HLC, CRDTs, Merkle sync, simulation runtime.
+- `orochi-crypto`: TLS 1.3, X.509, PQ-hybrid KEM/signature experiments, VEIL, `Secret(T)`, session/export capsules.
+- `orochi-proto`: IRC/IRCv3/IRCX/LADON/VEIL schemas, generated codecs, golden vectors.
+- `orochi-daemon`: server core, services, module registry, policy VM, storage, media.
+- `orochi-tools`: config validator, keygen, trace reader, corpus minimizer, upgrade capsule inspector.
 
-`build.zig.zon` pins `minimum_zig_version` and dependency hashes. Because Zig is pre-1.0, compiler upgrades are explicit “toolchain PRs” with full simulator and conformance runs, matching the brief’s pinning requirement (`/home/kain/mizuchi/docs/BRIEF.md:48-49`).
+`build.zig.zon` pins `minimum_zig_version` and dependency hashes. Because Zig is pre-1.0, compiler upgrades are explicit “toolchain PRs” with full simulator and conformance runs, matching the brief’s pinning requirement (`/home/kain/orochi/docs/BRIEF.md:48-49`).
 
 Targets:
 
@@ -168,7 +168,7 @@ Build modes:
 
 Keep Ophion’s useful shape: self-contained C tests and pytest private-daemon tests exist today (`/home/kain/ophion/tests/meson.build:1-12`, `/home/kain/ophion/tests/meson.build:106-134`), fuzz targets are opt-in libFuzzer binaries (`/home/kain/ophion/fuzz/meson.build:25-47`), and upgrade tests cover startup/drain/kTLS/S2S survival (`/home/kain/ophion/tests/test_upgrade.py:5-34`, `/home/kain/ophion/tests/test_ktls_upgrade.py:5-26`, `/home/kain/ophion/tests/test_s2s_upgrade.py:5-34`).
 
-Mizuchi test layers:
+Orochi test layers:
 
 - Unit: `std.testing` for allocators, codecs, CRDTs, reactor contracts, crypto primitives, policy VM.
 - Golden protocol: IRCv3 registration/CAP/SASL, IRCX commands/properties/access/events, LADON frame vectors, VEIL ratchet vectors.

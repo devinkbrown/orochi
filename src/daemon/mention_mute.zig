@@ -1,4 +1,4 @@
-//! Per-(account, channel) mention-mute registry for the Mizuchi IRC daemon.
+//! Per-(account, channel) mention-mute registry for the Orochi IRC daemon.
 //!
 //! A `MentionMute` records which (account, channel) pairs have suppressed
 //! mention notifications. Each pair is stored as a single composite key of the

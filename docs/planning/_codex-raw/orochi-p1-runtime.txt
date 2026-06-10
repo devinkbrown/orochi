@@ -1,7 +1,7 @@
 You are a world-class systems architect with 100% design freedom. Design — from scratch, in Zig —
-the SYSTEMS SUBSTRATE for "Mizuchi", a clean-slate Zig successor to the ophion IRC daemon. This
+the SYSTEMS SUBSTRATE for "Orochi", a clean-slate Zig successor to the ophion IRC daemon. This
 substrate REPLACES the C library "libop" entirely; there is NO C interop to preserve. Read the
-shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+shared brief first: /home/kain/orochi/docs/BRIEF.md
 
 MANDATE: invent. This is not a port. Use Zig comptime aggressively. Propose novel primitives where
 they help. The existing libop is REFERENCE ONLY — study it for what problems it solves and where it

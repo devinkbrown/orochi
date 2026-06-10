@@ -76,7 +76,7 @@ The channel command module registers the base membership and moderation commands
 - Parameters: Channel; optional topic.
 - Replies: `RPL_TOPIC 332`, `RPL_NOTOPIC 331`, or `TOPIC` broadcast.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`.
-- Example: `TOPIC #zig :Mizuchi development`
+- Example: `TOPIC #zig :Orochi development`
 - Sources: `src/daemon/modules/channel_ops.zig:58`, `src/daemon/server.zig:11168`, `src/daemon/server.zig:11231`
 
 ## KNOCK

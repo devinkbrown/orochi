@@ -1,4 +1,4 @@
-//! RFC 6464 / RFC 6465 audio-level header-extension value codec for Mizuchi.
+//! RFC 6464 / RFC 6465 audio-level header-extension value codec for Orochi.
 //!
 //! This module is a pure, allocation-free codec for the *typed value* layer of
 //! the RTP audio-level header extension. It encodes and decodes only the

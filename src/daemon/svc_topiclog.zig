@@ -472,7 +472,7 @@ test "render standalone history uses only server numerics" {
     var buf: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
     const emitted = try renderTopicHistory(&writer, .{
-        .server_name = "mizuchi.local",
+        .server_name = "orochi.local",
         .requester = "kain",
         .channel = "#ops",
         .limit = 2,
@@ -480,10 +480,10 @@ test "render standalone history uses only server numerics" {
 
     try testing.expectEqual(@as(usize, 4), emitted);
     try testing.expectEqualStrings(
-        ":mizuchi.local 332 kain #ops :newest\r\n" ++
-            ":mizuchi.local 333 kain #ops alice 10\r\n" ++
-            ":mizuchi.local 332 kain #ops :older topic\r\n" ++
-            ":mizuchi.local 333 kain #ops bob 9\r\n",
+        ":orochi.local 332 kain #ops :newest\r\n" ++
+            ":orochi.local 333 kain #ops alice 10\r\n" ++
+            ":orochi.local 332 kain #ops :older topic\r\n" ++
+            ":orochi.local 333 kain #ops bob 9\r\n",
         writer.buffered(),
     );
 }
@@ -498,26 +498,26 @@ test "renderRecent applies limit and empty history emits 331" {
     var buf: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
     try testing.expectEqual(@as(usize, 2), try log.renderRecent(&writer, .{
-        .server_name = "mizuchi.local",
+        .server_name = "orochi.local",
         .requester = "kain",
         .channel = "#ops",
         .limit = 1,
     }));
     try testing.expectEqualStrings(
-        ":mizuchi.local 332 kain #ops :second\r\n" ++
-            ":mizuchi.local 333 kain #ops bob 20\r\n",
+        ":orochi.local 332 kain #ops :second\r\n" ++
+            ":orochi.local 333 kain #ops bob 20\r\n",
         writer.buffered(),
     );
 
     var empty_buf: [128]u8 = undefined;
     var empty_writer = std.Io.Writer.fixed(&empty_buf);
     try testing.expectEqual(@as(usize, 1), try log.renderRecent(&empty_writer, .{
-        .server_name = "mizuchi.local",
+        .server_name = "orochi.local",
         .requester = "kain",
         .channel = "#none",
     }));
     try testing.expectEqualStrings(
-        ":mizuchi.local 331 kain #none :No topic history is available\r\n",
+        ":orochi.local 331 kain #none :No topic history is available\r\n",
         empty_writer.buffered(),
     );
 }

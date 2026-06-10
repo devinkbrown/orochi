@@ -12,7 +12,7 @@ const std = @import("std");
 /// Build/identity context for the INFO body. All strings are borrowed for the
 /// duration of the render call.
 pub const AboutInfo = struct {
-    /// Daemon version string, e.g. "mizuchi-0.1".
+    /// Daemon version string, e.g. "orochi-0.1".
     version: []const u8,
     /// Compiler version the binary was built with (builtin.zig_version_string).
     zig_version: []const u8 = "",
@@ -33,7 +33,7 @@ pub const AboutInfo = struct {
 /// in its own numeric). The architecture lines are deliberately editorial: this
 /// is the one place the daemon describes what it actually is.
 pub fn renderInfo(info: AboutInfo, writer: anytype) !void {
-    try writer.writeAll("Mizuchi — a clean-room, pure-Zig mesh IRC daemon.\n");
+    try writer.writeAll("Orochi — a clean-room, pure-Zig mesh IRC daemon.\n");
     try writer.print("Version {s}", .{info.version});
     if (info.zig_version.len != 0 or info.target.len != 0 or info.optimize.len != 0) {
         try writer.writeAll(" (");
@@ -112,18 +112,18 @@ test "formatUptime drops leading zero units" {
 test "renderInfo includes identity, build, and uptime" {
     var buf: [1024]u8 = undefined;
     const out = try renderToBuf(.{
-        .version = "mizuchi-0.1",
+        .version = "orochi-0.1",
         .zig_version = "0.16.0",
         .target = "x86_64-linux",
         .optimize = "ReleaseFast",
-        .network = "Mizuchi",
+        .network = "Orochi",
         .online_since_unix = 1_700_000_000,
         .uptime_secs = 3661,
     }, &buf);
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "Version mizuchi-0.1 (zig 0.16.0, x86_64-linux, ReleaseFast)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Version orochi-0.1 (zig 0.16.0, x86_64-linux, ReleaseFast)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Suimyaku CRDT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Network:  Mizuchi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Network:  Orochi") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Running since 1700000000 (up 1h 01m 01s)") != null);
     // Every line is non-empty-terminated by '\n'; never a bare CR.
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
@@ -131,7 +131,7 @@ test "renderInfo includes identity, build, and uptime" {
 
 test "renderInfo omits the build parens when no build info is present" {
     var buf: [1024]u8 = undefined;
-    const out = try renderToBuf(.{ .version = "mizuchi-0.1" }, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Version mizuchi-0.1\n") != null);
+    const out = try renderToBuf(.{ .version = "orochi-0.1" }, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Version orochi-0.1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "(zig") == null);
 }

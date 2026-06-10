@@ -1,4 +1,4 @@
-//! Known-answer tests for Mizuchi's TLS 1.3 SHA-256 key schedule.
+//! Known-answer tests for Orochi's TLS 1.3 SHA-256 key schedule.
 //!
 //! The vectors are from RFC 8448, Section 3, "Simple 1-RTT Handshake".  The
 //! public `Tls13Sha256` API reaches the zero-PSK early secret, the derived

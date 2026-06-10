@@ -1,4 +1,4 @@
-//! theme_pref.zig — Per-account UI theme preference store for the Mizuchi daemon.
+//! theme_pref.zig — Per-account UI theme preference store for the Orochi daemon.
 //!
 //! Each account may pin a single theme name (a short identifier such as
 //! "abyss" or "shoal"). Names are bounded to keep memory predictable across a
@@ -142,11 +142,11 @@ test "clear removes an entry and reports presence" {
     var prefs = ThemePref.init(std.testing.allocator);
     defer prefs.deinit();
 
-    try prefs.set("mizuki", "tide");
-    try std.testing.expect(prefs.clear("mizuki"));
-    try std.testing.expect(prefs.get("mizuki") == null);
+    try prefs.set("suzuki", "tide");
+    try std.testing.expect(prefs.clear("suzuki"));
+    try std.testing.expect(prefs.get("suzuki") == null);
     // Clearing a missing account is a no-op returning false.
-    try std.testing.expect(!prefs.clear("mizuki"));
+    try std.testing.expect(!prefs.clear("suzuki"));
 }
 
 comptime {

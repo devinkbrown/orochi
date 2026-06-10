@@ -1,4 +1,4 @@
-//! In-process IRC services over MizuStore with typed results and no IRC I/O.
+//! In-process IRC services over OroStore with typed results and no IRC I/O.
 const std = @import("std");
 
 const store_mod = @import("store.zig");
@@ -8,7 +8,7 @@ const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 
-pub const MizuStore = store_mod.MizuStore;
+pub const OroStore = store_mod.OroStore;
 pub const ScramStore = scram_store_mod.ScramStore;
 
 const account_max = 32;
@@ -56,8 +56,8 @@ const missing_account_salt: [salt_len]u8 = .{
 
 pub const channel_access_family = store_mod.Family.props;
 
-const StorePutError = @typeInfo(@typeInfo(@TypeOf(MizuStore.put)).@"fn".return_type.?).error_union.error_set;
-const StoreDeleteError = @typeInfo(@typeInfo(@TypeOf(MizuStore.delete)).@"fn".return_type.?).error_union.error_set;
+const StorePutError = @typeInfo(@typeInfo(@TypeOf(OroStore.put)).@"fn".return_type.?).error_union.error_set;
+const StoreDeleteError = @typeInfo(@typeInfo(@TypeOf(OroStore.delete)).@"fn".return_type.?).error_union.error_set;
 const Pbkdf2Error = @typeInfo(@typeInfo(@TypeOf(std.crypto.pwhash.pbkdf2)).@"fn".return_type.?).error_union.error_set;
 
 pub const ServiceError = StorePutError || StoreDeleteError || Pbkdf2Error || error{
@@ -237,7 +237,7 @@ const AkickRecord = struct {
 };
 
 pub const Services = struct {
-    store: *MizuStore,
+    store: *OroStore,
     state: ?StateHook = null,
     cfg: Config = .{},
     /// Optional SCRAM-SHA-256 credential mirror. When set, account registration
@@ -253,11 +253,11 @@ pub const Services = struct {
     certfp_binds: ?*certfp_bind_mod.CertfpBindStore = null,
     lock: rwlock.RwLock = .{},
 
-    pub fn init(store: *MizuStore, state: ?StateHook) Services {
+    pub fn init(store: *OroStore, state: ?StateHook) Services {
         return .{ .store = store, .state = state };
     }
 
-    pub fn initWithConfig(store: *MizuStore, state: ?StateHook, cfg: Config) Services {
+    pub fn initWithConfig(store: *OroStore, state: ?StateHook, cfg: Config) Services {
         return .{ .store = store, .state = state, .cfg = cfg };
     }
 
@@ -945,8 +945,8 @@ fn sameBytes(comptime len: usize, a: *const [len]u8, b: *const [len]u8) bool {
     return std.crypto.timing_safe.eql([len]u8, a.*, b.*);
 }
 
-fn openTestStore(tmp: std.testing.TmpDir, name: []const u8) !MizuStore {
-    return MizuStore.open(std.testing.allocator, std.testing.io, tmp.dir, name);
+fn openTestStore(tmp: std.testing.TmpDir, name: []const u8) !OroStore {
+    return OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, name);
 }
 
 test "register and identify account" {
@@ -1094,14 +1094,14 @@ test "channel register and access grant" {
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
-    const registered = try services.registerChannel("#Mizuchi", "alice", &scratch);
-    try std.testing.expectEqualStrings("#mizuchi", registered.registered_channel.name.asSlice());
+    const registered = try services.registerChannel("#Orochi", "alice", &scratch);
+    try std.testing.expectEqualStrings("#orochi", registered.registered_channel.name.asSlice());
     try std.testing.expectEqualStrings("alice", registered.registered_channel.founder.asSlice());
 
-    const granted = try services.channelAccess("#mizuchi", "alice", "bob", .grant, .op, &scratch);
+    const granted = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
     try std.testing.expectEqual(AccessLevel.op, granted.access.level);
 
-    const queried = try services.channelAccess("#mizuchi", "bob", "bob", .query, .voice, &scratch);
+    const queried = try services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch);
     try std.testing.expectEqual(AccessLevel.op, queried.access.level);
 }
 
@@ -1117,12 +1117,12 @@ test "non-admin channel mutations are forbidden" {
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
     _ = try services.registerAccount("carol", "carol correct battery staple", &scratch);
-    _ = try services.registerChannel("#mizuchi", "alice", &scratch);
+    _ = try services.registerChannel("#orochi", "alice", &scratch);
 
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#mizuchi", "bob", "carol", .grant, .op, &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAccess("#mizuchi", "bob", "carol", .revoke, .op, &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAkick("#mizuchi", "bob", "*!*@bad.test", .add, "bad", &scratch));
-    try std.testing.expectError(error.Forbidden, services.channelAkick("#mizuchi", "bob", "*!*@bad.test", .remove, "", &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "carol", .grant, .op, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAccess("#orochi", "bob", "carol", .revoke, .op, &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "*!*@bad.test", .add, "bad", &scratch));
+    try std.testing.expectError(error.Forbidden, services.channelAkick("#orochi", "bob", "*!*@bad.test", .remove, "", &scratch));
 }
 
 test "missing access and akick removals return not found" {
@@ -1136,10 +1136,10 @@ test "missing access and akick removals return not found" {
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
     _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
-    _ = try services.registerChannel("#mizuchi", "alice", &scratch);
+    _ = try services.registerChannel("#orochi", "alice", &scratch);
 
-    try std.testing.expectError(error.NotFound, services.channelAccess("#mizuchi", "alice", "bob", .revoke, .op, &scratch));
-    try std.testing.expectError(error.NotFound, services.channelAkick("#mizuchi", "alice", "*!*@missing.test", .remove, "", &scratch));
+    try std.testing.expectError(error.NotFound, services.channelAccess("#orochi", "alice", "bob", .revoke, .op, &scratch));
+    try std.testing.expectError(error.NotFound, services.channelAkick("#orochi", "alice", "*!*@missing.test", .remove, "", &scratch));
 }
 
 test "drop account and channel" {
@@ -1152,9 +1152,9 @@ test "drop account and channel" {
     var scratch: [record_max]u8 = undefined;
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
-    _ = try services.registerChannel("#mizuchi", "alice", &scratch);
-    _ = try services.dropChannel("#mizuchi", "alice");
-    try std.testing.expectError(error.NotFound, services.channelInfo("#mizuchi"));
+    _ = try services.registerChannel("#orochi", "alice", &scratch);
+    _ = try services.dropChannel("#orochi", "alice");
+    try std.testing.expectError(error.NotFound, services.channelInfo("#orochi"));
 
     _ = try services.dropAccount("alice", "correct horse battery staple");
     try std.testing.expectError(error.NotFound, services.accountInfo("alice"));
@@ -1194,13 +1194,13 @@ test "state hook fires on channel register and drop" {
     var scratch: [record_max]u8 = undefined;
 
     _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
-    _ = try services.registerChannel("#Mizuchi", "alice", &scratch);
+    _ = try services.registerChannel("#Orochi", "alice", &scratch);
     // The canonical (lowercased) channel name is bridged to the live world.
-    try std.testing.expectEqualStrings("#mizuchi", rec.created[0..rec.created_len]);
+    try std.testing.expectEqualStrings("#orochi", rec.created[0..rec.created_len]);
     try std.testing.expectEqual(@as(usize, 0), rec.dropped_len);
 
-    _ = try services.dropChannel("#mizuchi", "alice");
-    try std.testing.expectEqualStrings("#mizuchi", rec.dropped[0..rec.dropped_len]);
+    _ = try services.dropChannel("#orochi", "alice");
+    try std.testing.expectEqualStrings("#orochi", rec.dropped[0..rec.dropped_len]);
 }
 
 test "Config default preserves historical pbkdf2 rounds" {

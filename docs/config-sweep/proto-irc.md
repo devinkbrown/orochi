@@ -1,4 +1,4 @@
-# Mizuchi IRC protocol-layer hardcoded constant sweep (`src/proto/*.zig`)
+# Orochi IRC protocol-layer hardcoded constant sweep (`src/proto/*.zig`)
 
 READ-ONLY survey. Scope: IRC protocol layer only. Excludes `tls_*`, `tls12_*`, `dtls_*`, `acme_*`, `toml.zig` (owned by other agents) and the non-IRC crypto/codec/transport modules (asn1/der/pem/pkcs8/csr/ocsp/x509/ed25519/cbor/merkle/gcounter/orset/quorum/skiplist/reservoir/rendezvous/snowflake/uuid/varint/punycode/idna/base32/base64url/percent/mime/levenshtein/semver/glob/hostmask/wildcard/word_wrap/utf8_width/numeric_range/humanize/color_strip/casemap/quic/http*/stun/ice/sdp/rtp/opus/vp8/webtransport/socks5/proxy_protocol/happy_eyeballs/secure_fns/meshpass/cidr_match etc.).
 Excludes IRC numerics, RFC wire constants, enum discriminants, type widths, fuzz/test iteration counts.
@@ -28,7 +28,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | isupport.zig:254 | default_tokens PREFIX | `(qaohv)~&@%+` | Channel membership prefixes/modes (policy) | limits.prefix | string | `(qaohv)~&@%+` | – |
 | isupport.zig:255 | default_tokens CHANMODES | `b,k,l,imnpst` | Channel mode classes A,B,C,D (policy) | limits.chanmodes | string | `b,k,l,imnpst` | – |
 | isupport.zig:260 | default_tokens CASEMAPPING | `ascii` | Casemapping policy | limits.casemapping | string | `ascii` | – |
-| isupport.zig:261 | default_tokens NETWORK | `Mizuchi` | Advertised network name | limits.network | string | `Mizuchi` | – |
+| isupport.zig:261 | default_tokens NETWORK | `Orochi` | Advertised network name | limits.network | string | `Orochi` | – |
 | isupport.zig:262 | default_tokens ELIST | `CMNTU` | Supported LIST filter flags | limits.elist | string | `CMNTU` | – |
 | isupport.zig:268 | default_tokens STATUSMSG | `~&@%+` | Prefixes usable for STATUSMSG targets | limits.statusmsg | string | `~&@%+` | – |
 | isupport.zig:269 | default_tokens TARGMAX | `JOIN:,WHOIS:1,PRIVMSG:,NOTICE:,MONITOR:` | Per-command target maxima | limits.targmax | string | (as shown) | – |

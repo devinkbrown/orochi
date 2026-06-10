@@ -1,4 +1,4 @@
-//! Per-account UI accent color preferences for the Mizuchi daemon.
+//! Per-account UI accent color preferences for the Orochi daemon.
 //!
 //! Each account may store a single accent color expressed as a short string
 //! (for example "#aabbccff"). Colors are validated to be non-empty and at most

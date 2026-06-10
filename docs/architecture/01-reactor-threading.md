@@ -1,6 +1,6 @@
 # Reactor and Threading
 
-Mizuchi's live Linux server is built around a Ringlane wrapper over `std.os.linux.IoUring`. The file comment defines the socket path: accept TCP clients, receive IRC bytes through `Ring`, feed complete CRLF lines into the pure command core, and send queued replies back through `Ring`. Evidence: `src/daemon/server.zig:1`, `src/daemon/server.zig:3`, `src/daemon/server.zig:4`.
+Orochi's live Linux server is built around a Ringlane wrapper over `std.os.linux.IoUring`. The file comment defines the socket path: accept TCP clients, receive IRC bytes through `Ring`, feed complete CRLF lines into the pure command core, and send queued replies back through `Ring`. Evidence: `src/daemon/server.zig:1`, `src/daemon/server.zig:3`, `src/daemon/server.zig:4`.
 
 ## Ringlane Reactor Core
 

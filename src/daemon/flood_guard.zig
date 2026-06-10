@@ -243,7 +243,7 @@ test "burst then throttle then recover" {
     const allocator = std.testing.allocator;
     var guard = TestGuard.init(0);
 
-    const line = try std.fmt.allocPrint(allocator, "PING :{s}\r\n", .{"mizuchi"});
+    const line = try std.fmt.allocPrint(allocator, "PING :{s}\r\n", .{"orochi"});
     defer allocator.free(line);
 
     try std.testing.expectEqual(Decision.allow, guard.classifyRaw(0, line));

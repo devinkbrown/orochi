@@ -1,4 +1,4 @@
-# Mizuchi Mesh (Suimyaku) — Hardcoded Operational/Tuning Constants
+# Orochi Mesh (Suimyaku) — Hardcoded Operational/Tuning Constants
 
 Survey of `src/substrate/suimyaku/*.zig` (excluding `media.zig`).
 Scope: CRDT mesh, s2s_peer, gossip/plumtree/hyparview dissemination, SWIM membership,

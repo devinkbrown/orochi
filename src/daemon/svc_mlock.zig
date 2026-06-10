@@ -1,6 +1,6 @@
 //! Standalone services MLOCK data model.
 //!
-//! Services in Mizuchi are real server commands and numerics, not pseudo-client
+//! Services in Orochi are real server commands and numerics, not pseudo-client
 //! users. This module intentionally owns only pure parsing and reconciliation:
 //! callers keep channel state and emit any resulting MODE replies themselves.
 const std = @import("std");

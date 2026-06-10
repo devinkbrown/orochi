@@ -10,7 +10,7 @@ const irc_line = @import("irc_line.zig");
 pub const MAX_MSGID_LEN: usize = 255;
 
 /// Reaction payload bound. IRCv3 intentionally leaves reaction values open;
-/// Mizuchi caps bytes at the protocol edge before moderation/storage.
+/// Orochi caps bytes at the protocol edge before moderation/storage.
 pub const MAX_REACTION_LEN: usize = 128;
 
 /// Optional redaction reason and edit body safety bound for this edge parser.
@@ -232,7 +232,7 @@ pub fn redactAuthorized(auth_msgid: []const u8, redact: Redact) bool {
     return authorizationKeyMatches(auth_msgid, redact.msgid);
 }
 
-/// Render a PRIVMSG/NOTICE/TAGMSG with Mizuchi draft interaction tags.
+/// Render a PRIVMSG/NOTICE/TAGMSG with Orochi draft interaction tags.
 pub fn buildInteraction(message: BuildInteraction, out: []u8) ParseError![]const u8 {
     try validateBuildInteraction(message);
 
@@ -544,19 +544,19 @@ test "reply and reaction tag round-trip" {
     var out: [160]u8 = undefined;
     const rendered = try buildInteraction(.{
         .command = .tagmsg,
-        .target = "#mizuchi",
+        .target = "#orochi",
         .reply_to = "msg-Alpha_123",
         .reaction = .{ .value = "looks good" },
     }, &out);
     try std.testing.expectEqualStrings(
-        "@+draft/reply=msg-Alpha_123;+draft/react=looks\\sgood TAGMSG #mizuchi",
+        "@+draft/reply=msg-Alpha_123;+draft/react=looks\\sgood TAGMSG #orochi",
         rendered,
     );
 
     var scratch = InteractionScratch{};
     const parsed = try parseInteraction(rendered, &scratch);
     try std.testing.expectEqual(.tagmsg, parsed.command);
-    try std.testing.expectEqualStrings("#mizuchi", parsed.target);
+    try std.testing.expectEqualStrings("#orochi", parsed.target);
     try std.testing.expectEqualStrings("msg-Alpha_123", parsed.reply_to.?);
     try std.testing.expectEqual(.add, parsed.reaction.?.mode);
     try std.testing.expectEqualStrings("looks good", parsed.reaction.?.value);
@@ -578,8 +578,8 @@ test "typing tag round-trip" {
 }
 
 test "redact parse and authorization-key msgid check" {
-    const redact = try parseRedact("REDACT #mizuchi G6PuDDBWQYmu3HmXXOAPzA :wrong paste");
-    try std.testing.expectEqualStrings("#mizuchi", redact.target);
+    const redact = try parseRedact("REDACT #orochi G6PuDDBWQYmu3HmXXOAPzA :wrong paste");
+    try std.testing.expectEqualStrings("#orochi", redact.target);
     try std.testing.expectEqualStrings("G6PuDDBWQYmu3HmXXOAPzA", redact.msgid);
     try std.testing.expectEqualStrings("wrong paste", redact.reason.?);
     try std.testing.expect(redactAuthorized("G6PuDDBWQYmu3HmXXOAPzA", redact));
@@ -590,12 +590,12 @@ test "edit references are keyed by msgid" {
     var out: [160]u8 = undefined;
     const rendered = try buildInteraction(.{
         .command = .privmsg,
-        .target = "#mizuchi",
+        .target = "#orochi",
         .body = "patched message",
         .edit_of = "server1-1480339715754191-21",
     }, &out);
     try std.testing.expectEqualStrings(
-        "@+draft/edit=server1-1480339715754191-21 PRIVMSG #mizuchi :patched message",
+        "@+draft/edit=server1-1480339715754191-21 PRIVMSG #orochi :patched message",
         rendered,
     );
 

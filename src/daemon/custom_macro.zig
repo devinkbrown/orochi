@@ -1,4 +1,4 @@
-//! Per-account custom text macros for the Mizuchi IRC daemon.
+//! Per-account custom text macros for the Orochi IRC daemon.
 //!
 //! A macro maps a short name to an expansion string, scoped to the owning
 //! account. Lookups use a composite key of "account\x00name" so that distinct

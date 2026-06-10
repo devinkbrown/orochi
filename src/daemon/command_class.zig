@@ -1,6 +1,6 @@
 //! Read/write access classifier for the multi-reactor dispatch spine.
 //!
-//! Mizuchi runs sharded reactor threads that all share one world model
+//! Orochi runs sharded reactor threads that all share one world model
 //! (channels, the nick registry, memberships, the persistent stores, IRCX
 //! entity props, account/oper state, mesh routing, ...). To let read-only
 //! traffic fan out across reactor threads, the reactor takes the shared-world

@@ -1,4 +1,4 @@
-//! Per-account SECURE / ENFORCE *settings* layer for the Mizuchi IRC daemon.
+//! Per-account SECURE / ENFORCE *settings* layer for the Orochi IRC daemon.
 //!
 //! This is the policy-configuration complement to `nick_enforcement.zig`. Where
 //! that module owns the protection *mechanism* (the grace timer, the claim

@@ -183,7 +183,7 @@ test "snapshot encode/decode round-trips identity + flags" {
         .realname = "Alice Example",
         .account = "alice",
         .real_host = "10.0.0.5",
-        .host = "cloak-ab12.mizuchi",
+        .host = "cloak-ab12.orochi",
         .away = "biab",
         .logged_in = true,
         .away_active = true,
@@ -210,7 +210,7 @@ test "snapshot encode/decode round-trips identity + flags" {
     try testing.expectEqualStrings("Alice Example", got.realname);
     try testing.expectEqualStrings("alice", got.account);
     try testing.expectEqualStrings("10.0.0.5", got.real_host);
-    try testing.expectEqualStrings("cloak-ab12.mizuchi", got.host);
+    try testing.expectEqualStrings("cloak-ab12.orochi", got.host);
     try testing.expectEqualStrings("biab", got.away);
     try testing.expect(got.logged_in and got.away_active and !got.is_oper);
 }

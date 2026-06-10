@@ -97,7 +97,7 @@ test "hand-crafted valid-ish DER certificates parse and keep slices in input" {
     const cert = try x509.parse(with_san);
     try expectCertificateSlicesWithin(with_san, cert);
     try std.testing.expectEqualSlices(u8, &.{ 0x2b, 0x65, 0x70 }, cert.signature_algorithm_oid);
-    try std.testing.expectEqualSlices(u8, "mizuchi.test", cert.san_dns[0]);
+    try std.testing.expectEqualSlices(u8, "orochi.test", cert.san_dns[0]);
     try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, cert.san_ips[0].slice());
     try std.testing.expect(cert.basic_constraints_ca);
 }
@@ -412,7 +412,7 @@ fn buildExtensions(out: []u8) BuilderError![]const u8 {
 fn buildSubjectAltNameExtension(out: []u8) BuilderError![]const u8 {
     var names_body_buf: [48]u8 = undefined;
     var names_body = DerBuilder.init(&names_body_buf);
-    try names_body.tlv(x509.Tag.san_dns_name, "mizuchi.test");
+    try names_body.tlv(x509.Tag.san_dns_name, "orochi.test");
     try names_body.tlv(x509.Tag.san_ip_address, &.{ 127, 0, 0, 1 });
 
     var names_seq_buf: [56]u8 = undefined;

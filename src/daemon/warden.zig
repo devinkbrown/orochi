@@ -1,7 +1,7 @@
 //! Warden — the network ban registry. The network ban registry for admins and opers.
 //! checkpoints where travellers presented papers and were admitted or refused.
 //!
-//! Mizuchi replaces the legacy single-letter ban alphabet (K/D/G/Z/X/Q-line),
+//! Orochi replaces the legacy single-letter ban alphabet (K/D/G/Z/X/Q-line),
 //! whose semantics overlapped and confused "what is matched" with "what
 //! happens" and "where it applies", with one coherent entry — a `Ward` — built
 //! from three ORTHOGONAL axes:

@@ -11,7 +11,7 @@
 //!   - marked:    an oper note is attached for review; purely informational
 //!   - noexpire:  account is exempt from inactivity expiry
 //!
-//! Mizuchi services are real server commands and numerics, never pseudo-clients,
+//! Orochi services are real server commands and numerics, never pseudo-clients,
 //! so this store is consumed directly by an oper command handler.
 
 const std = @import("std");

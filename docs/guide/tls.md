@@ -1,6 +1,6 @@
 # TLS and STS
 
-Mizuchi is modern-only: TLS is implicit on a separate listener and there is no STARTTLS command path (`src/main.zig:216`, `src/main.zig:219`, `src/daemon/dispatch.zig:369`). A TLS-first deployment should enable `[tls]` and usually `[sts]`, while still providing the currently required `[listen].irc` parser key.
+Orochi is modern-only: TLS is implicit on a separate listener and there is no STARTTLS command path (`src/main.zig:216`, `src/main.zig:219`, `src/daemon/dispatch.zig:369`). A TLS-first deployment should enable `[tls]` and usually `[sts]`, while still providing the currently required `[listen].irc` parser key.
 
 ## TLS Listener
 
@@ -8,8 +8,8 @@ Mizuchi is modern-only: TLS is implicit on a separate listener and there is no S
 [tls]
 enabled = true
 port = 6697
-cert_path = "/etc/mizuchi/tls/cert.pem"
-key_path = "/etc/mizuchi/tls/key.pem"
+cert_path = "/etc/orochi/tls/cert.pem"
+key_path = "/etc/orochi/tls/key.pem"
 dns_name = "irc.example.net"
 request_client_cert = false
 ```

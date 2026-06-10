@@ -1,6 +1,6 @@
 //! Helix upgrade capsules: schema-versioned state records over CoilPack.
 //!
-//! A capsule is the only state shape that may cross a Mizuchi binary upgrade.
+//! A capsule is the only state shape that may cross a Orochi binary upgrade.
 //! Compatibility is negotiated per schema id and version range. Payload fields
 //! use Cap'n-Proto-style ordinal evolution: append new ordinals, never reorder.
 

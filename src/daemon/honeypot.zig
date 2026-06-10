@@ -1,4 +1,4 @@
-//! Mizuchi connection-IP honeypot / decoy registry.
+//! Orochi connection-IP honeypot / decoy registry.
 //!
 //! Operators register decoy IPv4 addresses, CIDR ranges, glob patterns, or
 //! listener ports that legitimate clients should never touch. Any connection

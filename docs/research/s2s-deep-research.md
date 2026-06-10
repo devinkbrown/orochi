@@ -1,11 +1,11 @@
 # S2S Deep Research — algorithms, math, crypto, transport (reference)
 
-> Captured 2026-06-05. Reference corpus for Mizuchi's clean-room S2S linking
+> Captured 2026-06-05. Reference corpus for Orochi's clean-room S2S linking
 > protocol ([../planning/09-s2s-protocol.md](../planning/09-s2s-protocol.md)).
 > Mandate: extremely state-of-the-art, verifiable, secure, media-ready,
 > no technical debt, sovereign `node_id` identity (no SID). Every technique below
 > is evaluated for "do we adopt, adapt, or reject," and Part V synthesizes them
-> into a novel Mizuchi design.
+> into a novel Orochi design.
 
 ---
 
@@ -102,7 +102,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 - **PQNoise** (Yawning Angel et al., CCS '22): post-quantum Noise variants;
   hybrid = classical pattern ⊕ PQ counterpart. Near-identical timing to classical
   under normal loss; PQ falls behind under high packet loss (bigger keys/cts).
-- Mizuchi (**Tsumugi**): Noise-IK *shape* with the **X-Wing hybrid KEM** as the
+- Orochi (**Tsumugi**): Noise-IK *shape* with the **X-Wing hybrid KEM** as the
   KEX primitive; static identity = the node Ed25519 key; transcript binds both
   `node_id`s + MeshPasses + realm root + negotiated bands (downgrade-resistant).
 
@@ -138,13 +138,13 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
   along tree edges; **lazy push** = gossip of message-id *digests* on non-tree
   edges. Missing id → `GRAFT` (heal/add tree edge); redundant eager delivery →
   `PRUNE` (shed). Steady-state = tree-efficient; churn = gossip-resilient.
-- Mizuchi: lazy-push carries **RIBLT digests / dot ids**; eager-push carries the
+- Orochi: lazy-push carries **RIBLT digests / dot ids**; eager-push carries the
   signed δ-CRDT deltas.
 
 ### III.3 Witnessed SWIM — ADOPT (our hardening)
 - SWIM: direct ping → indirect `PING_REQ` to k random witnesses → SUSPECT
   (incarnation) → DEAD; piggybacked membership gossip.
-- **Witnessed** variant (Mizuchi vision invariant): suspicion carries a **signed
+- **Witnessed** variant (Orochi vision invariant): suspicion carries a **signed
   witness set**; transition to DEAD needs a **quorum** — no peer may declare
   another DEAD alone (Byzantine/flaky resistance).
 
@@ -155,7 +155,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 ### IV.1 Linux — io_uring data plane (primary)
 - **IORING_OP_SEND_ZC** (zero-copy send): data goes user-mem → NIC, no CPU copy,
   with **registered buffers**; completion + notification (`F_NOTIF`) signal when the
-  buffer is reusable. (Mizuchi already arms sends; ZC is the upgrade.)
+  buffer is reusable. (Orochi already arms sends; ZC is the upgrade.)
 - **io_uring ZC-Rx** (`IORING_RECV_MULTISHOT` + zero-copy receive): payloads land
   directly in userspace pages; headers still go through the kernel TCP stack
   (unlike DPDK). No mmap/alignment constraints (unlike `TCP_ZEROCOPY_RECEIVE`).
@@ -210,7 +210,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 
 ---
 
-## Part V — Synthesis: the invented Mizuchi design
+## Part V — Synthesis: the invented Orochi design
 
 Two new named subsystems, each a deliberate fusion of the above:
 
@@ -302,7 +302,7 @@ control (the MoQ/QUIC head-of-line lesson, pre-baked).
 - **eBPF/USDT observability + flight-recorder ring buffers + deterministic
   record/replay** — overwriteable ring-buffer "tape recorder" of recent events;
   USDT probes for app-protocol tracing; deterministic replay from a recorded
-  trace. → **ADOPT as the model for Mizuchi's debug/log spine** (§Part VIII): an
+  trace. → **ADOPT as the model for Orochi's debug/log spine** (§Part VIII): an
   in-process flight recorder + structured trace, DST-replayable.
 
 ## Part VII — Frontier tech (invention fuel)
@@ -327,14 +327,14 @@ control (the MoQ/QUIC head-of-line lesson, pre-baked).
   for MeshPass + realm/channel auth:** make admission/roles a *convergent
   capability CRDT* (revocation converges without a coordinator) and enable
   **server-blind E2EE channels** as a future privacy tier. This is the strongest
-  match to Mizuchi's "signed authority facts + rename-not-kill + sovereign keys."
+  match to Orochi's "signed authority facts + rename-not-kill + sovereign keys."
 - **RaptorQ fountain FEC (GF(256))** — generate unlimited repair symbols on the
   fly; receiver decodes from *any* k(1+ε) symbols → tolerates high loss without
   ARQ round-trips. → **ADOPT for media bands** (audio/video over the QUIC datagram
   path) and for **mesh burst dissemination over lossy links** (FEC the BURST so a
   joining peer needs no retransmit). Note the kinship: RaptorQ (rateless FEC) and
   RIBLT (rateless reconciliation) are the *same rateless idea* applied to loss vs.
-  difference — a unifying design aesthetic for Mizuchi.
+  difference — a unifying design aesthetic for Orochi.
 - **SmartNIC / DPU / P4 offload** — push parse/match-action/crypto to the NIC;
   P4-programmable dataplanes; RDMA-capable DPUs. → **WATCH:** Ryūsen's transport
   seam should keep an **offload hook** (e.g., kTLS→NIC, P4 steering) so a DPU
@@ -343,7 +343,7 @@ control (the MoQ/QUIC head-of-line lesson, pre-baked).
 
 **Cross-cutting invention thread — "everything rateless."** RIBLT (reconcile),
 RaptorQ (transmit), Nova-style folding (verify): three rateless/streamed
-primitives. A Mizuchi-original synthesis is a **single rateless pipe**: a peer
+primitives. A Orochi-original synthesis is a **single rateless pipe**: a peer
 emits one coded stream that simultaneously (a) reconciles set difference, (b) is
 FEC-protected against loss, and (c) carries a running convergence proof — the
 receiver pulls until it has converged *and* verified, with bandwidth ∝ actual

@@ -1,6 +1,6 @@
 //! Read-Copy-Update (RCU) concurrent map — `RcuMap(K, V, Context)`.
 //!
-//! `RcuMap` is the lock-free-read concurrent map of Mizuchi's sharded reactor
+//! `RcuMap` is the lock-free-read concurrent map of Orochi's sharded reactor
 //! world. It composes two committed substrates into the classic RCU
 //! publish/retire pattern:
 //!

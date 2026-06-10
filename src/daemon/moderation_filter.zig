@@ -1,4 +1,4 @@
-//! Mizuchi moderation filter: rule-driven abuse handling with action ladders.
+//! Orochi moderation filter: rule-driven abuse handling with action ladders.
 //!
 //! The engine keeps operator-defined rules grouped by moderation surface and
 //! uses the daemon's Koshi content matcher as the scan index for each surface.

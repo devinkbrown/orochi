@@ -6,7 +6,7 @@
 //!   * the Ed25519 static keypair (signs prekeys + transcripts),
 //!   * an X-Wing KEM keypair (seed = BLAKE3("MZ-KEM" ++ seed), domain-separated
 //!     so the KEM key can't be confused with the signing key),
-//!   * the 20-byte node id = BLAKE3-160(Ed25519 public key) — Mizuchi's sole
+//!   * the 20-byte node id = BLAKE3-160(Ed25519 public key) — Orochi's sole
 //!     identity (matches tsumugi_handshake's convention),
 //!   * the realm id = BLAKE3(realm string), so an operator can name a realm
 //!     ("local") and get a stable 32-byte RealmId.

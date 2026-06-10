@@ -1,4 +1,4 @@
-//! Mizuchi account nickname aliases.
+//! Orochi account nickname aliases.
 //!
 //! Each account owns a bounded insertion-ordered alias list. Returned slices are
 //! borrowed and stay valid until the next mutation of this store.

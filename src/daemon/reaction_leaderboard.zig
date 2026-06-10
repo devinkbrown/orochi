@@ -1,5 +1,5 @@
 //! ReactionLeaderboard — per-channel tally of reactions contributed by each
-//! account, used by the Mizuchi daemon to surface "most reactive" members.
+//! account, used by the Orochi daemon to surface "most reactive" members.
 //!
 //! Storage model: a single flat hash map keyed by a composite byte string
 //! "<channel>\x00<account>" that maps to a u64 contribution counter. Every key

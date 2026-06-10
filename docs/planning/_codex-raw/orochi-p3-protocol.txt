@@ -1,7 +1,7 @@
 You are a world-class daemon architect with 100% design freedom. Design — from scratch, in Zig —
-the DAEMON CORE, the comptime MODULE SYSTEM, and the FULL FEATURE-PARITY map for "Mizuchi", a
+the DAEMON CORE, the comptime MODULE SYSTEM, and the FULL FEATURE-PARITY map for "Orochi", a
 clean-slate Zig successor to the ophion IRC daemon. Everything is Zig-native; NO C interop. Read
-the shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+the shared brief first: /home/kain/orochi/docs/BRIEF.md
 
 MANDATE: invent. Replace ophion's MAPI v4 dynamic-.so machinery with something far better using
 comptime. ophion is REFERENCE ONLY — mine it for the complete feature list and protocol behavior,

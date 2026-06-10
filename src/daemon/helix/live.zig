@@ -117,11 +117,11 @@ pub fn handOff(prepared: *Prepared, fds: []const handoff.Fd, arena_fd: handoff.F
 }
 
 /// Environment-variable names used to pass inherited fds across execve to the successor.
-pub const env_arena_fd = "MIZUCHI_HELIX_ARENA_FD";
-pub const env_control_fd = "MIZUCHI_HELIX_CONTROL_FD";
+pub const env_arena_fd = "OROCHI_HELIX_ARENA_FD";
+pub const env_control_fd = "OROCHI_HELIX_CONTROL_FD";
 /// The inherited listening-socket fd, preserved across execve so the successor
 /// keeps the port bound (no connection-refused window during an UPGRADE).
-pub const env_listen_fd = "MIZUCHI_HELIX_LISTEN_FD";
+pub const env_listen_fd = "OROCHI_HELIX_LISTEN_FD";
 
 pub const ExecPlan = struct {
     argv: []const [:0]const u8,
@@ -424,15 +424,15 @@ test "readArena round-trips the sealed capsule stream" {
 
 test "exec plan with listener carries the listen fd env entry" {
     const allocator = std.testing.allocator;
-    var plan = try buildExecPlanWithListener(allocator, "/tmp/mizuchi", 10, 11, 12);
+    var plan = try buildExecPlanWithListener(allocator, "/tmp/orochi", 10, 11, 12);
     defer plan.deinit(allocator);
 
-    try std.testing.expectEqualStrings("/tmp/mizuchi", plan.argv[0]);
+    try std.testing.expectEqualStrings("/tmp/orochi", plan.argv[0]);
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
     try std.testing.expectEqual(@as(usize, 3), plan.envp.len);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_ARENA_FD=10", plan.envp[0]);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_LISTEN_FD=12", plan.envp[2]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=10", plan.envp[0]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=12", plan.envp[2]);
 }
 
 test "ExecPlan.commit execve's the target (fork + /bin/true)" {
@@ -463,8 +463,8 @@ test "arena+listener exec plan carries both fds, no control" {
     var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, 6);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), plan.envp.len);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_ARENA_FD=5", plan.envp[0]);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=5", plan.envp[0]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=6", plan.envp[1]);
     try std.testing.expectEqual(@as(handoff.Fd, -1), plan.control_fd);
 }
 
@@ -475,11 +475,11 @@ test "listener-only exec plan carries just the listen fd" {
     try std.testing.expectEqualStrings("/proc/self/exe", plan.argv[0]);
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
     try std.testing.expectEqual(@as(usize, 1), plan.envp.len);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_LISTEN_FD=7", plan.envp[0]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_LISTEN_FD=7", plan.envp[0]);
 }
 
 test "readFdFromEnvBlock parses the listen fd, absent -> null" {
-    const block = "FOO=bar\x00MIZUCHI_HELIX_LISTEN_FD=37\x00BAZ=qux\x00";
+    const block = "FOO=bar\x00OROCHI_HELIX_LISTEN_FD=37\x00BAZ=qux\x00";
     try std.testing.expectEqual(@as(?handoff.Fd, 37), readFdFromEnvBlock(block, env_listen_fd));
     const none = "FOO=bar\x00BAZ=qux\x00";
     try std.testing.expectEqual(@as(?handoff.Fd, null), readFdFromEnvBlock(none, env_listen_fd));
@@ -488,11 +488,11 @@ test "readFdFromEnvBlock parses the listen fd, absent -> null" {
 test "exec plan owns argv and envp without committing" {
     const allocator = std.testing.allocator;
 
-    var plan = try buildExecPlan(allocator, "/tmp/mizuchi", 10, 11);
+    var plan = try buildExecPlan(allocator, "/tmp/orochi", 10, 11);
     defer plan.deinit(allocator);
 
-    try std.testing.expectEqualStrings("/tmp/mizuchi", plan.argv[0]);
+    try std.testing.expectEqualStrings("/tmp/orochi", plan.argv[0]);
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_ARENA_FD=10", plan.envp[0]);
-    try std.testing.expectEqualStrings("MIZUCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=10", plan.envp[0]);
+    try std.testing.expectEqualStrings("OROCHI_HELIX_CONTROL_FD=11", plan.envp[1]);
 }

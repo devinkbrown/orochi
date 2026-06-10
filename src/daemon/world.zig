@@ -478,7 +478,7 @@ pub const World = struct {
     pub fn join(self: *World, name: []const u8, client: ClientId) WorldError!bool {
         const channel = try self.ensureChannel(name);
         // The first member to join a freshly-created channel is its FOUNDER
-        // (Mizuchi founder tier +Q, prefix ! — above IRCX owner); later
+        // (Orochi founder tier +Q, prefix ! — above IRCX owner); later
         // joiners start with no status modes.
         const founding = channel.members.count() == 0;
         const member = try channel.members.getOrPut(client);

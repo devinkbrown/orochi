@@ -1,4 +1,4 @@
-//! Mizuchi server-notice router — category → subscriber-set fan-out by `u64` id.
+//! Orochi server-notice router — category → subscriber-set fan-out by `u64` id.
 //!
 //! This is a deliberately small, pure mapping layer that sits *beside* the typed
 //! Event Spine (`event_spine.zig`), not on top of it. The Event Spine keys
@@ -370,12 +370,12 @@ test "maskOf returns the live mask or null" {
 
 test "formatSnote renders a tag-free legacy notice line" {
     var out: [256]u8 = undefined;
-    const line = try formatSnote("mizuchi.local", .kill, "user removed by oper", &out);
+    const line = try formatSnote("orochi.local", .kill, "user removed by oper", &out);
     try testing.expectEqualStrings(
-        ":mizuchi.local NOTICE * :*** KILL: user removed by oper\r\n",
+        ":orochi.local NOTICE * :*** KILL: user removed by oper\r\n",
         line,
     );
-    try testing.expectEqual(snoteLen("mizuchi.local", .kill, "user removed by oper"), line.len);
+    try testing.expectEqual(snoteLen("orochi.local", .kill, "user removed by oper"), line.len);
 }
 
 test "formatSnote validates server name, text, and buffer size" {
@@ -383,10 +383,10 @@ test "formatSnote validates server name, text, and buffer size" {
 
     try testing.expectError(error.InvalidServerName, formatSnote("", .connect, "hi", &out));
     try testing.expectError(error.InvalidServerName, formatSnote("bad name", .connect, "hi", &out));
-    try testing.expectError(error.InvalidText, formatSnote("mizuchi.local", .connect, "bad\nline", &out));
+    try testing.expectError(error.InvalidText, formatSnote("orochi.local", .connect, "bad\nline", &out));
 
     var tiny: [8]u8 = undefined;
-    try testing.expectError(error.OutputTooSmall, formatSnote("mizuchi.local", .connect, "connected", &tiny));
+    try testing.expectError(error.OutputTooSmall, formatSnote("orochi.local", .connect, "connected", &tiny));
 }
 
 test "init resets undefined slot storage to inactive" {

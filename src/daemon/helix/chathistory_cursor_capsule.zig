@@ -203,7 +203,7 @@ fn readStr(bytes: []const u8, pos: *usize) Error![]const u8 {
 test "round-trip an account with three cursors" {
     const cursors = [_]Cursor{
         .{ .target = "#zig", .last_msgid = "msg-abc-001", .last_ts_ms = 1_700_000_000_000 },
-        .{ .target = "#mizuchi", .last_msgid = "msg-def-777", .last_ts_ms = -42 },
+        .{ .target = "#orochi", .last_msgid = "msg-def-777", .last_ts_ms = -42 },
         .{ .target = "alice", .last_msgid = "", .last_ts_ms = 9_223_372_036_854_775_807 },
     };
     const original = ChatHistoryCursorCapsule{
@@ -224,7 +224,7 @@ test "round-trip an account with three cursors" {
     try std.testing.expectEqualStrings("msg-abc-001", decoded.cursors[0].last_msgid);
     try std.testing.expectEqual(@as(i64, 1_700_000_000_000), decoded.cursors[0].last_ts_ms);
 
-    try std.testing.expectEqualStrings("#mizuchi", decoded.cursors[1].target);
+    try std.testing.expectEqualStrings("#orochi", decoded.cursors[1].target);
     try std.testing.expectEqualStrings("msg-def-777", decoded.cursors[1].last_msgid);
     try std.testing.expectEqual(@as(i64, -42), decoded.cursors[1].last_ts_ms);
 

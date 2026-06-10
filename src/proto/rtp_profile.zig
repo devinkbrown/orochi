@@ -1,8 +1,8 @@
-//! RTP-like media transport profile helpers for Mizuchi media bands.
+//! RTP-like media transport profile helpers for Orochi media bands.
 //!
 //! This module deliberately does not own sockets or scheduling. It provides the
 //! byte-level packet header, RFC 3550-style jitter/loss accounting, and a small
-//! RTCP-like SR/RR report format suitable for embedding inside Mizuchi media
+//! RTCP-like SR/RR report format suitable for embedding inside Orochi media
 //! frames.
 const std = @import("std");
 
@@ -413,7 +413,7 @@ test "header round-trip" {
 }
 
 test "packet framing round-trip preserves payload slice" {
-    const payload = "mizuchi-media";
+    const payload = "orochi-media";
     const packet = Packet{
         .header = .{
             .marker = false,

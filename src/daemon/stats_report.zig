@@ -350,9 +350,9 @@ fn renderToBuf(comptime f: anytype, input: anytype) ![]const u8 {
 test "renderJson emits well-formed, escaped JSON" {
     const chans = [_]TopChannel{.{ .name = "#ops", .members = 12, .topic = "a \"quote\" & <tag>" }};
     const snap = Snapshot{
-        .server_name = "mizu.example",
-        .network = "Mizuchi",
-        .version = "mizuchi-0.1",
+        .server_name = "suzu.example",
+        .network = "Orochi",
+        .version = "orochi-0.1",
         .generated_unix = 1700000000,
         .uptime_secs = 3661,
         .clients = 42,
@@ -366,7 +366,7 @@ test "renderJson emits well-formed, escaped JSON" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    try testing.expectEqualStrings("mizu.example", root.get("server").?.string);
+    try testing.expectEqualStrings("suzu.example", root.get("server").?.string);
     try testing.expectEqual(@as(i64, 42), root.get("clients").?.integer);
     const top = root.get("top_channels").?.array;
     try testing.expectEqual(@as(usize, 1), top.items.len);

@@ -91,7 +91,7 @@ fn append(out: []u8, len: *usize, bytes: []const u8) Utf8GuardError!void {
 
 test "valid utf8 message bodies pass" {
     try std.testing.expect(isValidMessageBody(""));
-    try std.testing.expect(isValidMessageBody("PRIVMSG #mizuchi :hello"));
+    try std.testing.expect(isValidMessageBody("PRIVMSG #orochi :hello"));
 
     const euro = [_]u8{ 0xE2, 0x82, 0xAC };
     try std.testing.expect(isValidMessageBody(&euro));

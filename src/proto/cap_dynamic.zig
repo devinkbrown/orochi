@@ -306,6 +306,6 @@ test "invalid cap name rejected" {
 
     try std.testing.expectError(
         error.InvalidCapName,
-        buildCapNew(&fixture.sink, "alice", &.{"mizuchi/prop-notify"}),
+        buildCapNew(&fixture.sink, "alice", &.{"orochi/prop-notify"}),
     );
 }

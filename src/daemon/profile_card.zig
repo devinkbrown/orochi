@@ -1,4 +1,4 @@
-//! Mizuchi per-account profile cards.
+//! Orochi per-account profile cards.
 //!
 //! Field values are owned by this store. Returned cards contain borrowed slices
 //! and remain valid until the next mutation for the same account.
@@ -138,12 +138,12 @@ test "setField creates a card and get returns all fields" {
     defer cards.deinit();
 
     try testing.expect(cards.get("alice") == null);
-    try cards.setField("alice", .bio, "Mizuchi user");
+    try cards.setField("alice", .bio, "Orochi user");
     try cards.setField("alice", .url, "https://example.test/alice");
     try cards.setField("alice", .pronouns, "she/her");
 
     const card = cards.get("alice").?;
-    try testing.expectEqualStrings("Mizuchi user", card.bio);
+    try testing.expectEqualStrings("Orochi user", card.bio);
     try testing.expectEqualStrings("https://example.test/alice", card.url);
     try testing.expectEqualStrings("she/her", card.pronouns);
 }

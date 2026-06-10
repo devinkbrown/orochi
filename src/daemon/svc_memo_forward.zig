@@ -2,7 +2,7 @@
 //!
 //! This module deliberately imports only `std`: it owns no daemon integration
 //! and creates no pseudo-client identity. Callers translate parsed commands and
-//! numeric hints into Mizuchi's real server command/numeric path.
+//! numeric hints into Orochi's real server command/numeric path.
 
 const std = @import("std");
 

@@ -1,6 +1,6 @@
-# Upgrade and MizuWasm
+# Upgrade and OroWasm
 
-This document covers Helix in-place upgrade and the MizuWasm control-plane plugin host. Cryptographic details are out of scope; see [crypto.md](crypto.md).
+This document covers Helix in-place upgrade and the OroWasm control-plane plugin host. Cryptographic details are out of scope; see [crypto.md](crypto.md).
 
 ## Helix UPGRADE Command
 
@@ -21,7 +21,7 @@ The `UPGRADE` command is a SerpentRegistry module command in `ops.upgrade`. The 
 
 ## Successor Adoption
 
-The successor path is driven by `mizuchi --supervisor`. `main.zig` checks Helix handoff environment fds, adopts the inherited listener fd into server config, stores the arena fd for later session adoption, then boots normally. Evidence: `src/main.zig:51`, `src/main.zig:57`, `src/main.zig:58`, `src/main.zig:61`, `src/main.zig:68`, `src/main.zig:75`.
+The successor path is driven by `orochi --supervisor`. `main.zig` checks Helix handoff environment fds, adopts the inherited listener fd into server config, stores the arena fd for later session adoption, then boots normally. Evidence: `src/main.zig:51`, `src/main.zig:57`, `src/main.zig:58`, `src/main.zig:61`, `src/main.zig:68`, `src/main.zig:75`.
 
 After the server starts and its ring exists, `main.zig` calls `srv.adoptInheritedSessions()`. Evidence: `src/main.zig:280`, `src/main.zig:292`, `src/main.zig:294`.
 
@@ -40,9 +40,9 @@ After the server starts and its ring exists, `main.zig` calls `srv.adoptInherite
 
 `handOff` can pass fds over the control socket and advance to `awaiting_attestation`, but the live `handleUpgrade` path currently uses the environment-based arena/listener exec plan rather than `handOff`. Evidence for `handOff`: `src/daemon/helix/live.zig:92`, `src/daemon/helix/live.zig:99`, `src/daemon/helix/live.zig:113`; evidence for live path: `src/daemon/server.zig:6148`.
 
-## MizuWasm Host
+## OroWasm Host
 
-MizuWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/root.zig`, and the server owns a `wasm_bridge.Bridge` in `LinuxServer`. Evidence: `src/root.zig:14`, `src/root.zig:16`, `src/daemon/server.zig:1288`, `src/daemon/server.zig:1291`, `src/daemon/server.zig:1563`.
+OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/root.zig`, and the server owns a `wasm_bridge.Bridge` in `LinuxServer`. Evidence: `src/root.zig:14`, `src/root.zig:16`, `src/daemon/server.zig:1288`, `src/daemon/server.zig:1291`, `src/daemon/server.zig:1563`.
 
 ## Plugin Dispatch Path
 
@@ -79,7 +79,7 @@ MizuWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/ro
 
 ## Browser WASM Is Separate
 
-`src/wasm/opcodec_wasm.zig` exports browser/client codec functions for OPVOX and OPVIS. It is a `wasm32-freestanding` codec surface and should not be confused with the daemon's MizuWasm plugin host. Evidence: `src/wasm/opcodec_wasm.zig:1`, `src/wasm/opcodec_wasm.zig:3`, `src/wasm/opcodec_wasm.zig:17`, `src/wasm/opcodec_wasm.zig:35`.
+`src/wasm/opcodec_wasm.zig` exports browser/client codec functions for OPVOX and OPVIS. It is a `wasm32-freestanding` codec surface and should not be confused with the daemon's OroWasm plugin host. Evidence: `src/wasm/opcodec_wasm.zig:1`, `src/wasm/opcodec_wasm.zig:3`, `src/wasm/opcodec_wasm.zig:17`, `src/wasm/opcodec_wasm.zig:35`.
 
 ## Planning Notes and Divergences
 

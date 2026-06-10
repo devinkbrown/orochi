@@ -164,7 +164,7 @@ test "formatAge humanizes minute hour and day boundaries" {
 
 test "renderHealth renders a single-node mesh without witnesses" {
     const nodes = [_]NodeStatus{.{
-        .node = "mizu-a",
+        .node = "suzu-a",
         .health = .alive,
         .incarnation = 7,
         .last_ack_ms_ago = 0,
@@ -172,15 +172,15 @@ test "renderHealth renders a single-node mesh without witnesses" {
     }};
     var buf: [4096]u8 = undefined;
     const out = try renderToBuf(&buf, .{
-        .local_node = "mizu-a",
+        .local_node = "suzu-a",
         .nodes = &nodes,
         .probe_period_ms = 1_200,
     });
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "Local node: mizu-a\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Local node: suzu-a\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Probe period: 1.2s\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Counts: 1 alive / 0 suspect / 0 dead\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "mizu-a  alive             7       0ms  1ms\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "suzu-a  alive             7       0ms  1ms\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Witnesses:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Summary: 1 alive / 0 suspect / 0 dead\n") != null);
 }

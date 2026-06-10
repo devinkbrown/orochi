@@ -837,7 +837,7 @@ fn makeHlc(wall_ms: u64, logical: u16) !Hlc {
 
 test "network state converges when replicas apply operations in different orders" {
     const allocator = std.testing.allocator;
-    const chan = try ChannelName.init("#mizuchi");
+    const chan = try ChannelName.init("#orochi");
     const uid_a = try Uid.init("001AAAAAA");
     const uid_b = try Uid.init("002BBBBBB");
     const nick_a = try Nick.init("alice");

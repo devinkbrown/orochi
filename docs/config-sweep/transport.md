@@ -1,6 +1,6 @@
-# Mizuchi Transport Subsystem — Hardcoded Config Sweep
+# Orochi Transport Subsystem — Hardcoded Config Sweep
 
-READ-ONLY survey of `/home/kain/mizuchi/src/substrate/` transport files. Lists operationally/performance-meaningful hardcoded literals to be lifted into a TOML config. Excludes wire-format/spec constants, crypto, enum discriminants, type widths, and pure test values.
+READ-ONLY survey of `/home/kain/orochi/src/substrate/` transport files. Lists operationally/performance-meaningful hardcoded literals to be lifted into a TOML config. Excludes wire-format/spec constants, crypto, enum discriminants, type widths, and pure test values.
 
 Files surveyed: ryusen.zig, bbr.zig, l4s.zig, twcc.zig, transport_stack.zig, sim_net.zig, pacing.zig, pmtud.zig, cc_cubic.zig, loss_recovery.zig, backoff.zig, multipath.zig, flow.zig, gcra.zig.
 

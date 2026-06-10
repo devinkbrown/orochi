@@ -1,4 +1,4 @@
-//! ECDSA over NIST P-256 with SHA-256 for Mizuchi's TLS and X.509 surfaces.
+//! ECDSA over NIST P-256 with SHA-256 for Orochi's TLS and X.509 surfaces.
 //!
 //! This module wraps Zig 0.16's `std.crypto.sign.ecdsa.EcdsaP256Sha256`,
 //! exposing the curve that TLS 1.2/1.3 ECDHE_ECDSA cipher suites and ECDSA
@@ -189,7 +189,7 @@ const testing = std.testing;
 test "sign then verify round-trips to true" {
     // Arrange
     const kp = KeyPair.generate(testing.io);
-    const msg = "mizuchi ecdsa p256 message";
+    const msg = "orochi ecdsa p256 message";
 
     // Act
     const sig = try sign(msg, kp);

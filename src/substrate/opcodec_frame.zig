@@ -1,4 +1,4 @@
-//! Opcodec media framing layer — container/packetization for Mizuchi media bands.
+//! Opcodec media framing layer — container/packetization for Orochi media bands.
 //!
 //! NOT the audio/video codec itself: this is the wire container that carries
 //! encoded payloads over Suimyaku mesh "media bands".

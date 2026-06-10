@@ -1,4 +1,4 @@
-//! Per-account watch lists for the Mizuchi IRC daemon.
+//! Per-account watch lists for the Orochi IRC daemon.
 //!
 //! Each account may register a set of *target* accounts it wishes to be
 //! notified about when those targets come online. This module only tracks the

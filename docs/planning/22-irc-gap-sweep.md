@@ -27,7 +27,7 @@ Verified there are **three distinct numeric enums**, each live on its own path:
 
 Command dispatch: `LinuxServer.dispatchRegistered` (server.zig:2199) consults the
 comptime `SerpentRegistry` (`modules/manifest.zig` → `Live.dispatch`) first, then
-MizuWasm plugins, then a residual block (SUMMON/PONG) and finally falls through
+OroWasm plugins, then a residual block (SUMMON/PONG) and finally falls through
 to `dispatch.zig processLine` for preregistration commands.
 
 ---
@@ -120,7 +120,7 @@ Group D (flag): `i m n s t C T N M S g` — all **PRESENT** (chanmode.zig:98-108
 
 **Blocker:** the `u4 ChannelMode` enum is at capacity, so `Z`/`f`/`j` cannot be
 added without the parameterized-mode rework (matches MEMORY note
-`project_mizuchi_gap_closing`). **Action:** either widen to `u5` + add real
+`project_orochi_gap_closing`). **Action:** either widen to `u5` + add real
 `f`/`j`/`Z` handlers, or correct ISUPPORT to `beI,k,l,imnstCTNMSg` to stop
 false-advertising. Common modes also missing: `R` (regonly-join — note `R` exists
 as a *umode*), `c` (no-color/strip), `O`/`A` (oper/admin-only) — all MISSING.
@@ -149,7 +149,7 @@ as a *umode*), `c` (no-color/strip), `O`/`A` (oper/admin-only) — all MISSING.
 - `world.isChannelName` (world.zig:860) accepts **`#`, `&`, `%#`, `%&`** — i.e.
   more than advertised. **MISMATCH** — PARTIAL.
   - **`&`** local channels — accepted by parser but **not advertised** → clients won't offer them. Either advertise `CHANTYPES=#&` or drop `&` from the parser.
-  - **`%#`/`%&`** — a Mizuchi-specific membership/UTF8 prefix accepted by the parser, also unadvertised.
+  - **`%#`/`%&`** — a Orochi-specific membership/UTF8 prefix accepted by the parser, also unadvertised.
 - IRCX-specific prefixes (`%` UTF8/quiet-style, `!` safe-channel) — `!` not handled; `%` handled non-standardly. PARTIAL.
 - **Action:** reconcile parser ↔ ISUPPORT (low effort, real interop value).
 
@@ -194,7 +194,7 @@ Cap table: `dispatch.zig:168` (`CapId`, `u6`) + `cap_specs` (line 217).
 sasl (PLAIN only), multi-prefix, userhost-in-names, away-notify, setname,
 extended-join, invite-notify, account-tag, account-notify, chghost,
 no-implicit-names, batch, bot, extended-monitor, channel-rename (draft),
-mizuchi/bouncer, draft/chathistory, draft/message-redaction, draft/read-marker,
+orochi/bouncer, draft/chathistory, draft/message-redaction, draft/read-marker,
 draft/typing, draft/react, draft/reply.
 
 **MISSING caps (backing command/data often already exists):**
@@ -207,7 +207,7 @@ draft/typing, draft/react, draft/reply.
 6. **draft/metadata-2** — MISSING (cap) — METADATA command + 761/762 numerics live (server.zig:5730) but cap/notify unadvertised. Cheap.
 7. **draft/multiline** — MISSING — `proto/multiline.zig`/`multiline_assembler.zig` exist; not wired to a cap. Lower priority.
 8. **utf8only** — PARTIAL — enforced + advertised via **ISUPPORT `UTF8ONLY`** (server.zig:7937), but **not** as the IRCv3 cap. Acceptable (ISUPPORT is the ratified surface).
-9. **soju.im/* (bouncer-networks etc.)** — MISSING — `mizuchi/bouncer` is the native analogue; soju compat not provided. Optional.
+9. **soju.im/* (bouncer-networks etc.)** — MISSING — `orochi/bouncer` is the native analogue; soju compat not provided. Optional.
 10. **draft/event-playback** — MISSING — chathistory present; event-playback not. Optional.
 11. **sasl EXTERNAL/SCRAM mechanisms** — PARTIAL — `proto/sasl_external*`, `sasl_scram*` exist but `cap_specs` advertises `sasl=PLAIN` only and `handleAuthenticate` only routes PLAIN. Medium value (EXTERNAL/certfp).
 

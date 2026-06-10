@@ -1,4 +1,4 @@
-//! Atheme-style per-channel FLAGS access model for Mizuchi.
+//! Atheme-style per-channel FLAGS access model for Orochi.
 //!
 //! This complements the IRCX ACCESS list (`src/proto/ircx_access_store.zig`),
 //! which assigns exactly one discrete `Level` per mask, and the unified

@@ -1,4 +1,4 @@
-//! Standalone services role-template store for Mizuchi.
+//! Standalone services role-template store for Orochi.
 //!
 //! Services remain real server commands and numerics: this module models a
 //! `SVCTEMPLATE` command surface and intentionally contains no pseudo-client

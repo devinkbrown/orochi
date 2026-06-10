@@ -2,7 +2,7 @@
 //!
 //! Backs the REGISTER / DROP channel commands: it maps an owning account to a
 //! channel via a `ChannelRecord` keyed by case-insensitive channel name. This
-//! is pure record-keeping — services in Mizuchi are real server commands and
+//! is pure record-keeping — services in Orochi are real server commands and
 //! numerics, never pseudo-clients, so this module owns no transport, no live
 //! world state, and no protocol formatting. It just stores the registration
 //! facts and owns every string it returns.
@@ -250,8 +250,8 @@ test "register stores a record and returns a borrowed view" {
     var store = testStore();
     defer store.deinit();
 
-    const rec = try store.register("#mizuchi", "kain", "the lair", 100);
-    try testing.expectEqualStrings("#mizuchi", rec.name);
+    const rec = try store.register("#orochi", "kain", "the lair", 100);
+    try testing.expectEqualStrings("#orochi", rec.name);
     try testing.expectEqualStrings("kain", rec.founder_account);
     try testing.expectEqualStrings("the lair", rec.description);
     try testing.expectEqual(@as(i64, 100), rec.registered_at);

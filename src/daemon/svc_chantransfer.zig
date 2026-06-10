@@ -1,4 +1,4 @@
-//! Pure channel-founder transfer state for Mizuchi services.
+//! Pure channel-founder transfer state for Orochi services.
 //!
 //! This file deliberately imports only `std`: it owns no daemon state, performs
 //! no IRC I/O, and never models services as pseudo-clients. Callers bridge these
@@ -57,7 +57,7 @@ pub const ParseError = error{
     InvalidTimestamp,
 };
 
-/// Numeric hints for a server-command bridge. Success numerics are Mizuchi-local
+/// Numeric hints for a server-command bridge. Success numerics are Orochi-local
 /// service numerics; failures map to standard IRC numerics where possible.
 pub const TransferNumeric = enum(u16) {
     RPL_CHANTRANSFERPENDING = 806,
@@ -605,7 +605,7 @@ fn seedStore() !Store {
     _ = try store.addAccount("alice");
     _ = try store.addAccount("bob");
     _ = try store.addAccount("carol");
-    _ = try store.registerChannel("#mizuchi", "alice");
+    _ = try store.registerChannel("#orochi", "alice");
     return store;
 }
 
@@ -613,9 +613,9 @@ test "initiate creates a pending founder transfer token" {
     var store = try seedStore();
     defer store.deinit();
 
-    const result = try store.initiateAt("#Mizuchi", "ALICE", "bob", 100);
+    const result = try store.initiateAt("#Orochi", "ALICE", "bob", 100);
     try testing.expectEqual(TransferNumeric.RPL_CHANTRANSFERPENDING, result.numeric);
-    try testing.expectEqualStrings("#mizuchi", result.pending.channel);
+    try testing.expectEqualStrings("#orochi", result.pending.channel);
     try testing.expectEqualStrings("alice", result.pending.from_account);
     try testing.expectEqualStrings("bob", result.pending.to_account);
     try testing.expectEqual(@as(u64, 100), result.pending.created_ms);
@@ -628,13 +628,13 @@ test "recipient confirmation commits and consumes pending transfer" {
     var store = try seedStore();
     defer store.deinit();
 
-    const initiated = try store.initiate("#mizuchi", "alice", "bob");
+    const initiated = try store.initiate("#orochi", "alice", "bob");
     const done = try store.confirm(initiated.pending.token, "BOB");
     try testing.expectEqual(TransferNumeric.RPL_CHANTRANSFERDONE, done.numeric);
-    try testing.expectEqualStrings("#mizuchi", done.channel.asSlice());
+    try testing.expectEqualStrings("#orochi", done.channel.asSlice());
     try testing.expectEqualStrings("alice", done.old_founder.asSlice());
     try testing.expectEqualStrings("bob", done.new_founder.asSlice());
-    try testing.expectEqualStrings("bob", store.founderOf("#MIZUCHI").?);
+    try testing.expectEqualStrings("bob", store.founderOf("#OROCHI").?);
     try testing.expectEqual(@as(usize, 0), store.pendingCount());
 }
 
@@ -642,9 +642,9 @@ test "non-recipient cannot confirm token" {
     var store = try seedStore();
     defer store.deinit();
 
-    const initiated = try store.initiate("#mizuchi", "alice", "bob");
+    const initiated = try store.initiate("#orochi", "alice", "bob");
     try testing.expectError(error.ConfirmingAccountMismatch, store.confirm(initiated.pending.token, "carol"));
-    try testing.expectEqualStrings("alice", store.founderOf("#mizuchi").?);
+    try testing.expectEqualStrings("alice", store.founderOf("#orochi").?);
     try testing.expectEqual(@as(usize, 1), store.pendingCount());
 }
 
@@ -652,36 +652,36 @@ test "only current founder can initiate transfer" {
     var store = try seedStore();
     defer store.deinit();
 
-    try testing.expectError(error.NotFounder, store.initiate("#mizuchi", "bob", "carol"));
+    try testing.expectError(error.NotFounder, store.initiate("#orochi", "bob", "carol"));
 }
 
 test "transfer target must be a known account and not self" {
     var store = try seedStore();
     defer store.deinit();
 
-    try testing.expectError(error.SameAccount, store.initiate("#mizuchi", "alice", "ALICE"));
-    try testing.expectError(error.AccountUnknown, store.initiate("#mizuchi", "alice", "mallory"));
+    try testing.expectError(error.SameAccount, store.initiate("#orochi", "alice", "ALICE"));
+    try testing.expectError(error.AccountUnknown, store.initiate("#orochi", "alice", "mallory"));
 }
 
 test "only one pending transfer per channel" {
     var store = try seedStore();
     defer store.deinit();
 
-    _ = try store.initiate("#mizuchi", "alice", "bob");
-    try testing.expectError(error.PendingExists, store.initiate("#MIZUCHI", "alice", "carol"));
+    _ = try store.initiate("#orochi", "alice", "bob");
+    try testing.expectError(error.PendingExists, store.initiate("#OROCHI", "alice", "carol"));
 }
 
 test "founder or recipient can cancel, unrelated account cannot" {
     var store = try seedStore();
     defer store.deinit();
 
-    const initiated = try store.initiate("#mizuchi", "alice", "bob");
+    const initiated = try store.initiate("#orochi", "alice", "bob");
     try testing.expectError(error.CancelAccountMismatch, store.cancel(initiated.pending.token, "carol"));
 
     var cancelled = try store.cancel(initiated.pending.token, "ALICE");
     defer store.deinitCancelled(&cancelled);
     try testing.expectEqual(TransferNumeric.RPL_CHANTRANSFERCANCELLED, cancelled.numeric);
-    try testing.expectEqualStrings("#mizuchi", cancelled.pending.channel);
+    try testing.expectEqualStrings("#orochi", cancelled.pending.channel);
     try testing.expectEqualStrings("bob", cancelled.pending.to_account);
     try testing.expectEqual(@as(usize, 0), store.pendingCount());
 }
@@ -718,7 +718,7 @@ test "expire removes all due pending transfers" {
 }
 
 test "account and channel validation reject malformed names" {
-    try testing.expectError(error.InvalidChannel, validateChannel("mizuchi"));
+    try testing.expectError(error.InvalidChannel, validateChannel("orochi"));
     try testing.expectError(error.InvalidChannel, validateChannel("#bad name"));
     try testing.expectError(error.InvalidAccount, validateAccount(""));
     try testing.expectError(error.InvalidAccount, validateAccount("bad!acct"));
@@ -735,8 +735,8 @@ test "capacity limits are enforced without leaking" {
 }
 
 test "parse real CHANNEL transfer commands" {
-    const init = try parseCommand(&.{ "CHANNEL", "TRANSFER", "#mizuchi", "bob" });
-    try testing.expectEqualStrings("#mizuchi", init.initiate.channel);
+    const init = try parseCommand(&.{ "CHANNEL", "TRANSFER", "#orochi", "bob" });
+    try testing.expectEqualStrings("#orochi", init.initiate.channel);
     try testing.expectEqualStrings("bob", init.initiate.to_account);
 
     const token = try TransferToken.parse("0123456789abcdef0123456789abcdef");
@@ -751,13 +751,13 @@ test "parse real CHANNEL transfer commands" {
 }
 
 test "parser rejects pseudo-client service syntax" {
-    try testing.expectError(error.InvalidCommand, parseCommand(&.{ "PRIVMSG", "ChanServ", ":TRANSFER", "#mizuchi", "bob" }));
-    try testing.expectError(error.InvalidCommand, parseCommand(&.{ "ChanServ", "TRANSFER", "#mizuchi", "bob" }));
+    try testing.expectError(error.InvalidCommand, parseCommand(&.{ "PRIVMSG", "ChanServ", ":TRANSFER", "#orochi", "bob" }));
+    try testing.expectError(error.InvalidCommand, parseCommand(&.{ "ChanServ", "TRANSFER", "#orochi", "bob" }));
 }
 
 test "parser validates arity and token form" {
-    try testing.expectError(error.NeedMoreParams, parseCommand(&.{ "CHANNEL", "TRANSFER", "#mizuchi" }));
-    try testing.expectError(error.TooManyParams, parseCommand(&.{ "CHANNEL", "TRANSFER", "#mizuchi", "bob", "extra" }));
+    try testing.expectError(error.NeedMoreParams, parseCommand(&.{ "CHANNEL", "TRANSFER", "#orochi" }));
+    try testing.expectError(error.TooManyParams, parseCommand(&.{ "CHANNEL", "TRANSFER", "#orochi", "bob", "extra" }));
     try testing.expectError(error.InvalidToken, parseCommand(&.{ "CHANNEL", "TRANSFER-CONFIRM", "not-a-token" }));
     try testing.expectError(error.InvalidTimestamp, parseCommand(&.{ "CHANNEL", "TRANSFER-EXPIRE", "soon" }));
 }

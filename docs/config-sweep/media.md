@@ -1,4 +1,4 @@
-# Mizuchi media subsystem — hardcoded operational/tuning constant sweep
+# Orochi media subsystem — hardcoded operational/tuning constant sweep
 
 READ-ONLY survey. Scope: substrate media primitives (`media_session.zig`,
 `audio_mix.zig`, `opcodec_frame.zig`, `red_fec.zig`, `proto/rtp_profile.zig`,

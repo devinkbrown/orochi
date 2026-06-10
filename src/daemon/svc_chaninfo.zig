@@ -554,17 +554,17 @@ fn sampleRecord() ChannelRecord {
     const flags = [_][]const u8{ "private", "secure", "guarded" };
     const settings = [_]Setting{
         .{ .key = "mlock", .value = "+nt" },
-        .{ .key = "entrymsg", .value = "Welcome to Mizuchi" },
+        .{ .key = "entrymsg", .value = "Welcome to Orochi" },
     };
     return .{
-        .channel = "#mizuchi",
+        .channel = "#orochi",
         .founder = "alice",
         .registered_at = 1_700_000_000,
         .last_used_at = 1_700_000_900,
         .description = "Pure-Zig IRC daemon work",
         .flags = &flags,
         .settings = &settings,
-        .successor = "#mizuchi-next",
+        .successor = "#orochi-next",
     };
 }
 
@@ -592,17 +592,17 @@ test "renderer emits ordered RPL-style channel info lines" {
     defer rendered.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 11), rendered.lines.len);
-    try testing.expectEqualStrings(":irc.example.test 373 bob #mizuchi :Channel information follows\r\n", rendered.lines[0]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Channel: #mizuchi\r\n", rendered.lines[1]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Founder: alice\r\n", rendered.lines[2]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Registered: 1700000000\r\n", rendered.lines[3]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Last used: 1700000900\r\n", rendered.lines[4]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Description: Pure-Zig IRC daemon work\r\n", rendered.lines[5]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Flags: private secure guarded\r\n", rendered.lines[6]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Setting mlock: +nt\r\n", rendered.lines[7]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Setting entrymsg: Welcome to Mizuchi\r\n", rendered.lines[8]);
-    try testing.expectEqualStrings(":irc.example.test 371 bob #mizuchi :Successor: #mizuchi-next\r\n", rendered.lines[9]);
-    try testing.expectEqualStrings(":irc.example.test 374 bob #mizuchi :End of channel information\r\n", rendered.lines[10]);
+    try testing.expectEqualStrings(":irc.example.test 373 bob #orochi :Channel information follows\r\n", rendered.lines[0]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Channel: #orochi\r\n", rendered.lines[1]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Founder: alice\r\n", rendered.lines[2]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Registered: 1700000000\r\n", rendered.lines[3]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Last used: 1700000900\r\n", rendered.lines[4]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Description: Pure-Zig IRC daemon work\r\n", rendered.lines[5]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Flags: private secure guarded\r\n", rendered.lines[6]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Setting mlock: +nt\r\n", rendered.lines[7]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Setting entrymsg: Welcome to Orochi\r\n", rendered.lines[8]);
+    try testing.expectEqualStrings(":irc.example.test 371 bob #orochi :Successor: #orochi-next\r\n", rendered.lines[9]);
+    try testing.expectEqualStrings(":irc.example.test 374 bob #orochi :End of channel information\r\n", rendered.lines[10]);
 }
 
 test "renderer appends an end line after optional fields" {
@@ -658,24 +658,24 @@ test "appendInfoLines can extend a caller-owned list" {
 
 test "parser reads a full key-value channel record" {
     var owned = try parseRecord(testing.allocator,
-        \\channel=#mizuchi
+        \\channel=#orochi
         \\founder=Alice
         \\registered_at=1700000000
         \\last_used_at=1700000900
         \\description=Pure-Zig IRC daemon work
         \\flags=private, secure,guarded
         \\setting.mlock=+nt
-        \\setting.entrymsg=Welcome to Mizuchi
-        \\successor=#mizuchi-next
+        \\setting.entrymsg=Welcome to Orochi
+        \\successor=#orochi-next
     );
     defer owned.deinit(testing.allocator);
 
     const record = owned.asRecord();
-    try testing.expectEqualStrings("#mizuchi", record.channel);
+    try testing.expectEqualStrings("#orochi", record.channel);
     try testing.expectEqualStrings("Alice", record.founder);
     try testing.expect(record.hasFlag("SECURE"));
-    try testing.expectEqualStrings("Welcome to Mizuchi", record.settingValue("entrymsg").?);
-    try testing.expectEqualStrings("#mizuchi-next", record.successor.?);
+    try testing.expectEqualStrings("Welcome to Orochi", record.settingValue("entrymsg").?);
+    try testing.expectEqualStrings("#orochi-next", record.successor.?);
 }
 
 test "parsed records render through the public formatter" {

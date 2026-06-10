@@ -1,6 +1,6 @@
 //! Multi-session registry: account -> set of live client sessions (Phase 3).
 //!
-//! Mizuchi treats an *account* as the durable identity and each connection as a
+//! Orochi treats an *account* as the durable identity and each connection as a
 //! *session* of that account. This store tracks, per account, the live sessions
 //! (client id + a reclaim token + signon time) so the daemon can list a user's
 //! devices (`SESSION`), reclaim a dropped session by token, and route per-account

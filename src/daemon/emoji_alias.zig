@@ -1,4 +1,4 @@
-//! Per-account custom emoji shortcode aliases for the Mizuchi IRC daemon.
+//! Per-account custom emoji shortcode aliases for the Orochi IRC daemon.
 //!
 //! Each account may register its own shortcode -> replacement mappings, e.g.
 //! ":shrug:" -> "¯\\_(ツ)_/¯". Lookups are scoped per account so two accounts

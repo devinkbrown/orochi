@@ -1,4 +1,4 @@
-//! Object-capability admission grants for the Mizuchi mesh.
+//! Object-capability admission grants for the Orochi mesh.
 //!
 //! This module is intentionally self-contained. A grant body is encoded with a
 //! fixed-order canonical binary format and signed with Ed25519. Delegation is a
@@ -24,7 +24,7 @@ pub const Caps = u64;
 /// Maximum scope size accepted by the stack-backed canonical encoder.
 pub const max_scope_len = 1024;
 
-const magic = "MIZUCHI-ADMISSION-GRANT-v1";
+const magic = "OROCHI-ADMISSION-GRANT-v1";
 const fixed_encoded_len = magic.len + public_key_len * 2 + 4 + @sizeOf(Caps) + @sizeOf(u64) * 2 + grant_id_len;
 const public_key_len = Ed25519.PublicKey.encoded_length;
 const signature_len = Ed25519.Signature.encoded_length;
@@ -297,12 +297,12 @@ test "issue verify authorize accept" {
     const issuer = try testKey(1);
     const subject = try testKey(2);
     const read = capBit(0);
-    const grant = makeGrant(issuer, subject, "#mizuchi", read, 9);
+    const grant = makeGrant(issuer, subject, "#orochi", read, 9);
     const signed = try issueGrant(grant, issuer);
 
     try verifyGrant(signed.grant, signed.signature);
     try verifyChain(issuer.public_key.toBytes(), &.{signed}, 1_500);
-    try std.testing.expect(authorize(&.{signed}, subject.public_key.toBytes(), "#mizuchi", read, 1_500, &revocations));
+    try std.testing.expect(authorize(&.{signed}, subject.public_key.toBytes(), "#orochi", read, 1_500, &revocations));
 }
 
 test "expired grant is rejected" {

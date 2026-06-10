@@ -224,7 +224,7 @@ test "two links handshake and converge over a byte loopback" {
         .local_node_id = 1,
         .remote_node_id = 2,
         .local_epoch_ms = 1000,
-        .server_name = "a.mizuchi",
+        .server_name = "a.orochi",
     });
     defer a.deinit();
 
@@ -234,7 +234,7 @@ test "two links handshake and converge over a byte loopback" {
         .local_node_id = 2,
         .remote_node_id = 1,
         .local_epoch_ms = 1001,
-        .server_name = "b.mizuchi",
+        .server_name = "b.orochi",
     });
     defer b.deinit();
 
@@ -271,10 +271,10 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.mizuchi" });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.mizuchi" });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
     defer b.deinit();
 
     // Establish, then A announces alice (op) on #chat; pump to B.
@@ -323,10 +323,10 @@ test "OPER_GRANT payload round-trips across the link into takeOperGrants" {
     const allocator = std.testing.allocator;
 
     var a: S2sLink = undefined;
-    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.mizuchi" });
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
     defer a.deinit();
     var b: S2sLink = undefined;
-    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.mizuchi" });
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
     defer b.deinit();
 
     // Establish, then A sends an opaque signed grant blob; pump to B.
@@ -371,7 +371,7 @@ test "consumeOutbound drops a partial-send prefix" {
         .local_node_id = 1,
         .remote_node_id = 2,
         .local_epoch_ms = 1000,
-        .server_name = "a.mizuchi",
+        .server_name = "a.orochi",
     });
     defer link.deinit();
 

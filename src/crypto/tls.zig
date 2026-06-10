@@ -1,4 +1,4 @@
-//! TLS record and handshake skeleton for Mizuchi.
+//! TLS record and handshake skeleton for Orochi.
 //!
 //! This is deliberately not a full wire-complete TLS stack. It provides the
 //! security-critical seams that the rest of the stack can build on: hardened
@@ -197,7 +197,7 @@ pub fn isCompressionAllowed(method: u8) bool {
     return method == 0;
 }
 
-/// Renegotiation is never enabled in Mizuchi's TLS policy.
+/// Renegotiation is never enabled in Orochi's TLS policy.
 pub fn isRenegotiationAllowed() bool {
     return false;
 }
@@ -525,7 +525,7 @@ pub const CertificateVerifier = struct {
         chain: CertificateChain,
         context: CertificateVerifyContext,
     ) CertificateVerifyError!void {
-        // TODO(x509): route to Mizuchi's DER/X.509 verifier module.
+        // TODO(x509): route to Orochi's DER/X.509 verifier module.
         try self.verifyFn(self.ptr, chain, context);
     }
 };

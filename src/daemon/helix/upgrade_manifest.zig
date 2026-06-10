@@ -22,7 +22,7 @@ const std = @import("std");
 // module is rooted at this file's directory, and capsule.zig transitively
 // imports `../../proto/coilpack.zig`, which escapes that root. Keeping this
 // codec free of that import lets it be tested standalone. Callers in the full
-// `mizuchi` module pass `@intFromEnum(capsule.CapsuleKind.x)` for `kind`.
+// `orochi` module pass `@intFromEnum(capsule.CapsuleKind.x)` for `kind`.
 
 /// File magic identifying an arena manifest record.
 pub const magic = [_]u8{ 'H', 'M', 'A', 'N' };

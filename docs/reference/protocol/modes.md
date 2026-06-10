@@ -1,4 +1,4 @@
-# Mizuchi Modes
+# Orochi Modes
 
 This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSg` from `src/proto/protocol_inventory.zig:36`; the advertised status-prefix token is `PREFIX=(Qqov)!.@+` from `src/proto/protocol_inventory.zig:56` and `src/daemon/chanmode.zig:310`.
 
@@ -21,7 +21,7 @@ This page documents current source only. The advertised channel-mode token is `C
 | `Q` | no-forward | client-writable | User. | User opt-out of channel forward behavior. | `src/proto/usermode.zig:150` |
 | `H` | hide-oper | client-writable | User. | Hides operator status from WHOIS/WHO for non-opers. | `src/proto/usermode.zig:151` |
 
-Mizuchi divergence: legacy wallops/snomask do not use user `+w`. Operator notifications ride the Event Spine as `NOTE EVENT ...`; the comment explicitly says this replaces legacy snote/wallops broadcast channels (`src/daemon/server.zig:10009`).
+Orochi divergence: legacy wallops/snomask do not use user `+w`. Operator notifications ride the Event Spine as `NOTE EVENT ...`; the comment explicitly says this replaces legacy snote/wallops broadcast channels (`src/daemon/server.zig:10009`).
 
 ## Member Status Modes and Prefixes
 

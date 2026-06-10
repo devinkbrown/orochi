@@ -1,6 +1,6 @@
 # Zig 0.16 notes + worker integration rules (READ FIRST)
 
-Mizuchi targets **Zig 0.16.0**. The std library changed a lot vs older Zig; code
+Orochi targets **Zig 0.16.0**. The std library changed a lot vs older Zig; code
 written from memory of 0.11–0.14 will NOT compile. Verify everything by compiling.
 
 ## Confirmed 0.16 API facts (hit during scaffolding)
@@ -52,7 +52,7 @@ isolation. Iterate until green. Do not hand back code you have not compiled.
 - `docs/BRIEF.md` — mission + locked decisions.
 
 ## CLEAN-ROOM / NO-LEGACY MANDATE (applies to every module — highest priority)
-Mizuchi is a **clean-room, modern, inventive** IRC daemon. Do NOT port legacy IRC behavior or copy
+Orochi is a **clean-room, modern, inventive** IRC daemon. Do NOT port legacy IRC behavior or copy
 ophion/charybdis/ratbox code. Every system is designed from first principles for an IRCX/IRCv3 + CRDT
 mesh world.
 
@@ -66,7 +66,7 @@ mesh world.
   **Suimyaku mesh** (nodes/peers), NOT a TS6 spanning tree. Implement them as mesh introspection.
 - ident / RFC1413 lookups → dead protocol; identity = TLS certfp / SASL.
 - TS6 / netburst / SJOIN / text S2S → **Suimyaku** binary CRDT mesh only.
-- Embedded Python / CPython modules → **WASM plugins** (MizuWasm) or native Zig only. NO Python.
+- Embedded Python / CPython modules → **WASM plugins** (OroWasm) or native Zig only. NO Python.
 - DCC special-casing, legacy STATS letter soup, ctcp-flood quirks → omit or modernize.
 
 **Positive mandate:** prefer IRCv3 (standard-replies, message-tags, batch, labeled-response, CHATHISTORY),
@@ -80,7 +80,7 @@ with IRCv3 standard-replies (FAIL/WARN/NOTE) + structured numerics — NOT pseud
 The services.zig backend stays I/O-free (typed results); the daemon command layer wraps it natively.
 
 ## CROSS-PLATFORM MANDATE (Linux, macOS, BSD, Windows)
-Mizuchi targets **x86_64/aarch64 on linux, macos, freebsd, and windows**. Write portable code:
+Orochi targets **x86_64/aarch64 on linux, macos, freebsd, and windows**. Write portable code:
 - NEVER call `std.os.linux.*` directly in portable modules. Gate OS-specifics behind
   `comptime switch (@import("builtin").os.tag)`. Provide a portable fallback for every fast path.
 - **Reactor:** io_uring is a Linux-only fast path behind the `Reactor` seam. The portable backend is

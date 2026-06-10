@@ -291,13 +291,13 @@ test "parse accepts valid tag safe channel names" {
     const amp = try parse("&operators");
     const local = try parse("+local");
     const bang = try parse("!abcdecontext");
-    const unicode = try parse("#mizu\xe3\x81\xa1");
+    const unicode = try parse("#suzu\xe3\x81\xa1");
 
     try std.testing.expectEqualStrings("#chan", hash);
     try std.testing.expectEqualStrings("&operators", amp);
     try std.testing.expectEqualStrings("+local", local);
     try std.testing.expectEqualStrings("!abcdecontext", bang);
-    try std.testing.expectEqualStrings("#mizu\xe3\x81\xa1", unicode);
+    try std.testing.expectEqualStrings("#suzu\xe3\x81\xa1", unicode);
 }
 
 test "parse rejects missing malformed and oversized channel names" {

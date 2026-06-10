@@ -3,14 +3,14 @@
 Planning only. I did not modify files. One requested consumer, `/home/kain/ophion/ircd/recv.c`, is not present; the actual receive path is `packet.c`, whose header identifies packet I/O and flood control at `/home/kain/ophion/ircd/packet.c:3` and `read_packet()` at `/home/kain/ophion/ircd/packet.c:454`.
 
 **Ground Truth**
-Mizuchi is explicitly clean-slate Zig: daemon and substrate are rewritten from scratch, with Ophion/libop only as reference material `/home/kain/mizuchi/docs/BRIEF.md:3`, `/home/kain/mizuchi/docs/BRIEF.md:6`. The brief already names the substrate scope: io_uring, lock-free concurrency, allocators/arenas, data structures, CRDTs, clocks, Merkle delta sync, and gossip `/home/kain/mizuchi/docs/BRIEF.md:32`.
+Orochi is explicitly clean-slate Zig: daemon and substrate are rewritten from scratch, with Ophion/libop only as reference material `/home/kain/orochi/docs/BRIEF.md:3`, `/home/kain/orochi/docs/BRIEF.md:6`. The brief already names the substrate scope: io_uring, lock-free concurrency, allocators/arenas, data structures, CRDTs, clocks, Merkle delta sync, and gossip `/home/kain/orochi/docs/BRIEF.md:32`.
 
 libop currently provides a callback/timer API via `op_event_add`, `op_event_post_pri`, and cancellable handles `/home/kain/libop/include/op_event.h:37`, `/home/kain/libop/include/op_event.h:88`, `/home/kain/libop/include/op_event.h:94`; fd wrappers and callback rearming through `op_open`, `op_setselect`, `op_read`, `op_write`, TLS/WebSocket helpers, and fd passing `/home/kain/libop/include/op_commio.h:95`, `/home/kain/libop/include/op_commio.h:156`, `/home/kain/libop/include/op_commio.h:184`, `/home/kain/libop/include/op_commio.h:214`. It also has a lock-free MPSC send queue `/home/kain/libop/include/op_sendbuf.h:81`, Vyukov MPMC `/home/kain/libop/include/op_mpmc.h:1`, SPSC rings `/home/kain/libop/include/op_spsc.h:1`, arenas `/home/kain/libop/include/op_arena.h:63`, slabs `/home/kain/libop/include/op_balloc.h:81`, and LADON math primitives such as OR-Set, vector clocks, HLC, Merkle, Bloom, and HLL `/home/kain/libop/include/op_crdt.h:159`, `/home/kain/libop/include/op_vclock.h:96`, `/home/kain/libop/include/op_hlc.h:60`, `/home/kain/libop/include/op_merkle.h:109`, `/home/kain/libop/include/op_bloom.h:37`, `/home/kain/libop/include/op_hll.h:59`.
 
 The lesson is not “port this.” The C io_uring backend is still a poll compatibility layer `/home/kain/libop/src/io_uring.c:5`; multishot recv/buf_ring is scaffolded but disabled until callback APIs change `/home/kain/libop/src/io_uring.c:107`. The thread pool has strong work-stealing ideas, but also C compromises like intentionally leaked deque buffers during growth `/home/kain/libop/src/thread_pool.c:111` and eventfd/pipe wakeups `/home/kain/libop/src/thread_pool.c:600`. The substrate should keep the ownership patterns and replace the API shape.
 
 **1. Module Layout**
-Reusable package: `mizuchi-substrate`.
+Reusable package: `orochi-substrate`.
 
 ```text
 substrate/
@@ -48,7 +48,7 @@ substrate/
 Public API is Zig-native: `Loop(Config)`, `Pool(Config)`, `Queue(T, Config)`, `Arena(.conn)`, `DeltaSet(Key, Config)`. No `void *` callback ABI.
 
 **2. Event Loop**
-Mizuchi’s loop is io_uring-first, not poll-rearmed. Ophion currently accepts with `op_accept_tcp()` after `op_listen()` `/home/kain/ophion/ircd/listener.c:412`, `/home/kain/ophion/ircd/listener.c:428`, then pins clients to accepting shards `/home/kain/ophion/ircd/listener.c:1085`. Make that the type system’s default.
+Orochi’s loop is io_uring-first, not poll-rearmed. Ophion currently accepts with `op_accept_tcp()` after `op_listen()` `/home/kain/ophion/ircd/listener.c:412`, `/home/kain/ophion/ircd/listener.c:428`, then pins clients to accepting shards `/home/kain/ophion/ircd/listener.c:1085`. Make that the type system’s default.
 
 ```zig
 const Kernel = struct {
@@ -175,7 +175,7 @@ Comptime-generated:
 Non-negotiable: containers carry allocator ownership explicitly and expose telemetry hooks.
 
 **6. LADON Math Substrate**
-LADON already uses SWIM, CRDT anti-entropy, VEIL-wrapped frames, and binary frame classes `/home/kain/ophion/docs/protocols/ladon/overview.md:8`, `/home/kain/ophion/docs/protocols/ladon/wire-protocol.md:41`. The current C CRDTs are fixed-size: 32 replicas, 64 overflow dots, 4 dots per element `/home/kain/libop/include/op_crdt.h:54`, `/home/kain/libop/include/op_crdt.h:171`. Mizuchi should make those policy parameters.
+LADON already uses SWIM, CRDT anti-entropy, VEIL-wrapped frames, and binary frame classes `/home/kain/ophion/docs/protocols/ladon/overview.md:8`, `/home/kain/ophion/docs/protocols/ladon/wire-protocol.md:41`. The current C CRDTs are fixed-size: 32 replicas, 64 overflow dots, 4 dots per element `/home/kain/libop/include/op_crdt.h:54`, `/home/kain/libop/include/op_crdt.h:171`. Orochi should make those policy parameters.
 
 ```zig
 pub fn DotSet(comptime Key: type, comptime cfg: CrdtCfg) type {
@@ -231,10 +231,10 @@ Improvements:
 
 **8. Risks & Open Questions**
 - Zig’s Linux/io_uring surface may lag kernel features; substrate may need thin syscall wrappers.
-- SQPOLL and fixed files complicate hot upgrade and fd passing. Decide early whether Mizuchi preserves Ophion-style shim migration.
+- SQPOLL and fixed files complicate hot upgrade and fd passing. Decide early whether Orochi preserves Ophion-style shim migration.
 - `send_zc` lifetime tracking is only worth it for server links and large fanout; normal IRC lines may be faster through copy/writev.
 - Futex pool should be model-checked with litmus tests on ARM64.
 - CRDT tombstone GC depends on accurate live-peer membership. SWIM false suspicions must not delete causality needed by a recovering peer.
 - Need a target minimum Linux kernel per deployment tier.
-- Decide whether SCTP survives into Mizuchi; Ophion still branches for SCTP listener setup `/home/kain/ophion/ircd/listener.c:347`.
+- Decide whether SCTP survives into Orochi; Ophion still branches for SCTP listener setup `/home/kain/ophion/ircd/listener.c:347`.
 

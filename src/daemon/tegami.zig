@@ -1,4 +1,4 @@
-//! Tegami (手紙) — Mizuchi-native offline messaging keyed by account.
+//! Tegami (手紙) — Orochi-native offline messaging keyed by account.
 //!
 //! The bouncer rewind replays *channel* history a session missed; Tegami covers
 //! the other gap: a direct message left for an account that has no attached

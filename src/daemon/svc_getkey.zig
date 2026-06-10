@@ -1,4 +1,4 @@
-//! Pure GETKEY authorization helpers for Mizuchi services.
+//! Pure GETKEY authorization helpers for Orochi services.
 //!
 //! This module intentionally imports only `std`. It does not know about daemon
 //! state, clients, numerics, storage, or service dispatch. Integration code
@@ -64,7 +64,7 @@ pub const ParseError = error{
 
 /// Decide whether a requester may retrieve the target channel's key.
 ///
-/// Mizuchi services are real server commands, not pseudo-clients. This function
+/// Orochi services are real server commands, not pseudo-clients. This function
 /// only answers the policy question: founder, owner, and global oper are
 /// allowed; voice/op/none are denied.
 pub fn authorize(rank: Rank, is_oper: bool) Decision {
@@ -217,9 +217,9 @@ test "rank helper exposes getkey-capable tiers" {
 }
 
 test "parseCommand accepts bare and prefixed real GETKEY commands" {
-    const bare = try parseCommand("GETKEY #mizuchi");
+    const bare = try parseCommand("GETKEY #orochi");
     try std.testing.expect(bare.source == null);
-    try std.testing.expectEqualStrings("#mizuchi", bare.channel);
+    try std.testing.expectEqualStrings("#orochi", bare.channel);
 
     const mixed_case = try parseCommand("  :irc.example.net GeTkEy &ops\t");
     try std.testing.expectEqualStrings("irc.example.net", mixed_case.source.?);
@@ -236,7 +236,7 @@ test "parseCommand rejects malformed commands" {
 }
 
 test "parseCommand rejects invalid channel parameters" {
-    try std.testing.expectError(ParseError.InvalidChannel, parseCommand("GETKEY mizuchi"));
+    try std.testing.expectError(ParseError.InvalidChannel, parseCommand("GETKEY orochi"));
     try std.testing.expectError(ParseError.InvalidChannel, parseCommand("GETKEY #"));
     try std.testing.expectError(ParseError.InvalidChannel, parseCommand("GETKEY :#x"));
     try std.testing.expectError(ParseError.InvalidChannel, parseCommand("GETKEY #x,y"));

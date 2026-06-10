@@ -1,4 +1,4 @@
-# 06 — Threading & Concurrency (Mizuchi)
+# 06 — Threading & Concurrency (Orochi)
 
 > Studied ophion/libop's model, then designed a better one for an io_uring-native,
 > DST-first, mesh-native daemon. This is the plan the M1→M3 server builds toward.
@@ -18,17 +18,17 @@
    pool. The single dispatch thread is the structural bottleneck; sharing of client
    state is guarded by per-fd `pflags_lock`.
 
-## Why Mizuchi can do better
+## Why Orochi can do better
 
 - **io_uring is already async.** Submit/complete + multishot accept/recv +
   `IORING_OP_MSG_RING` mean we never block in a "poll" call the way `epoll_wait`
-  does. So Mizuchi **needs no separate poll-thread** — that whole layer disappears.
+  does. So Orochi **needs no separate poll-thread** — that whole layer disappears.
 - **Share-nothing sharding beats a central dispatch thread + locks.** One central
   protocol thread is a bottleneck and forces `pflags_lock`. Instead, partition the
   world: each shard owns a disjoint set of connections AND the channels/state for
   those connections, so the hot path takes **zero locks**.
 - **Mesh-native cross-shard.** A channel whose members span shards is the same
-  problem as a channel spanning servers — Mizuchi already has the Suimyaku CRDT +
+  problem as a channel spanning servers — Orochi already has the Suimyaku CRDT +
   Sazanami gossip. Shards can be treated as in-process mesh peers, so ONE model
   covers intra-process and S2S. (Aspirational end-state; the message-passing
   primitive is the immediate win.)
@@ -36,7 +36,7 @@
   the whole daemon on ONE deterministic thread via `SimReactor`; production uses the
   threaded io_uring backend. Determinism is not sacrificed for parallelism.
 
-## Mizuchi design: share-nothing sharded reactors
+## Orochi design: share-nothing sharded reactors
 
 ```
             ┌──────── Shard 0 ────────┐   ┌──────── Shard 1 ────────┐

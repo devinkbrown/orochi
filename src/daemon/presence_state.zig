@@ -1,4 +1,4 @@
-//! Mizuchi account presence state.
+//! Orochi account presence state.
 //!
 //! Tracks explicit per-account presence plus optional custom text. Missing
 //! accounts read as online with no custom text.

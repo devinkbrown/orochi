@@ -876,7 +876,7 @@ fn testKey(seed: u8) !KeyPair {
 }
 
 fn sampleSnapshot() Snapshot {
-    const channels = [_][]const u8{ "#mizuchi", "#helix" };
+    const channels = [_][]const u8{ "#orochi", "#helix" };
     return .{
         .nick = "kain",
         .umodes = "+iwx",
@@ -894,7 +894,7 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     var target = MigrationTarget.init(allocator, origin.publicKey());
     defer target.deinit();
 
-    const channels = [_][]const u8{ "#mizuchi", "#helix" };
+    const channels = [_][]const u8{ "#orochi", "#helix" };
     const snapshot = Snapshot{ .nick = "kain", .umodes = "+iwx", .channels = channels[0..] };
 
     // Act
@@ -908,7 +908,7 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     try testing.expectEqualStrings("kain", capsule.snapshot.nick);
     try testing.expectEqualStrings("+iwx", capsule.snapshot.umodes);
     try testing.expectEqual(@as(usize, 2), capsule.snapshot.channels.len);
-    try testing.expectEqualStrings("#mizuchi", capsule.snapshot.channels[0]);
+    try testing.expectEqualStrings("#orochi", capsule.snapshot.channels[0]);
     try testing.expectEqualStrings("#helix", capsule.snapshot.channels[1]);
     try testing.expectEqualStrings("kain", capsule.account);
     try testing.expectEqual(@as(u64, 0xABCD), capsule.token.nonce);

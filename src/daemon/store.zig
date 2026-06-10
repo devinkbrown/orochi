@@ -1,4 +1,4 @@
-//! MizuStore embedded persistence skeleton.
+//! OroStore embedded persistence skeleton.
 //!
 //! This is intentionally small, Zig-native, and standalone: an in-memory typed
 //! key/value store backed by a checksummed append-only log, with snapshot
@@ -75,7 +75,7 @@ pub const Mutation = struct {
 
 pub fn ColumnFamily(comptime store_family: Family) type {
     return struct {
-        store: *MizuStore,
+        store: *OroStore,
 
         pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
             try self.store.put(store_family, key, value);
@@ -91,7 +91,7 @@ pub fn ColumnFamily(comptime store_family: Family) type {
     };
 }
 
-pub const MizuStore = struct {
+pub const OroStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
@@ -110,7 +110,7 @@ pub const MizuStore = struct {
         io: std.Io,
         dir: std.Io.Dir,
         wal_path: []const u8,
-    ) !MizuStore {
+    ) !OroStore {
         return openWithConfig(allocator, io, dir, wal_path, .{});
     }
 
@@ -121,14 +121,14 @@ pub const MizuStore = struct {
         dir: std.Io.Dir,
         wal_path: []const u8,
         cfg: Config,
-    ) !MizuStore {
+    ) !OroStore {
         const owned_wal = try allocator.dupe(u8, wal_path);
         const owned_snapshot = std.mem.concat(allocator, u8, &.{ wal_path, ".snap" }) catch |err| {
             allocator.free(owned_wal);
             return err;
         };
 
-        var store = MizuStore{
+        var store = OroStore{
             .allocator = allocator,
             .io = io,
             .dir = dir,
@@ -146,7 +146,7 @@ pub const MizuStore = struct {
         return store;
     }
 
-    pub fn deinit(self: *MizuStore) void {
+    pub fn deinit(self: *OroStore) void {
         if (self.wal_file) |file| file.close(self.io);
         for (&self.maps) |*map| map.deinit();
         self.changefeed.deinit();
@@ -156,28 +156,28 @@ pub const MizuStore = struct {
     }
 
     /// Returns the comptime-typed API for one column family.
-    pub fn family(self: *MizuStore, comptime store_family: Family) ColumnFamily(store_family) {
+    pub fn family(self: *OroStore, comptime store_family: Family) ColumnFamily(store_family) {
         return .{ .store = self };
     }
 
-    pub fn put(self: *MizuStore, store_family: Family, key: []const u8, value: []const u8) !void {
+    pub fn put(self: *OroStore, store_family: Family, key: []const u8, value: []const u8) !void {
         try self.appendRecord(.put, store_family, key, value);
         try self.applyPut(store_family, key, value);
         try self.recordMutation(store_family, .put, key, value);
     }
 
-    pub fn get(self: *const MizuStore, store_family: Family, key: []const u8) ?[]const u8 {
+    pub fn get(self: *const OroStore, store_family: Family, key: []const u8) ?[]const u8 {
         return self.maps[familyIndex(store_family)].get(key);
     }
 
-    pub fn delete(self: *MizuStore, store_family: Family, key: []const u8) !void {
+    pub fn delete(self: *OroStore, store_family: Family, key: []const u8) !void {
         try self.appendRecord(.delete, store_family, key, "");
         try self.applyDelete(store_family, key);
         try self.recordMutation(store_family, .delete, key, null);
     }
 
     /// Writes current state to a snapshot and truncates the WAL.
-    pub fn snapshotAndTruncate(self: *MizuStore) !void {
+    pub fn snapshotAndTruncate(self: *OroStore) !void {
         var snapshot = try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true });
         defer snapshot.deinit(self.io);
 
@@ -210,17 +210,17 @@ pub const MizuStore = struct {
         try self.syncDir();
     }
 
-    pub fn changeCount(self: *const MizuStore) usize {
+    pub fn changeCount(self: *const OroStore) usize {
         return self.changefeed.count;
     }
 
     /// Returns recent mutations oldest-first. The returned slices are owned by
     /// the store and remain valid until the changefeed overwrites them.
-    pub fn changeAt(self: *const MizuStore, index: usize) ?Mutation {
+    pub fn changeAt(self: *const OroStore, index: usize) ?Mutation {
         return self.changefeed.at(index);
     }
 
-    fn ensureWal(self: *MizuStore) !void {
+    fn ensureWal(self: *OroStore) !void {
         if (self.wal_file) |_| return;
         const file = try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
         self.wal_file = file;
@@ -232,7 +232,7 @@ pub const MizuStore = struct {
         wal,
     };
 
-    fn replayFile(self: *MizuStore, path: []const u8, replay_kind: ReplayKind) !void {
+    fn replayFile(self: *OroStore, path: []const u8, replay_kind: ReplayKind) !void {
         var file = self.dir.openFile(self.io, path, .{ .mode = .read_only, .allow_directory = false }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -289,7 +289,7 @@ pub const MizuStore = struct {
     }
 
     fn appendRecord(
-        self: *MizuStore,
+        self: *OroStore,
         kind: MutationKind,
         store_family: Family,
         key: []const u8,
@@ -302,7 +302,7 @@ pub const MizuStore = struct {
         self.wal_offset = next_offset;
     }
 
-    fn applyPayload(self: *MizuStore, payload: []const u8) !void {
+    fn applyPayload(self: *OroStore, payload: []const u8) !void {
         if (payload.len == 0) return StoreError.BadRecord;
 
         if (payload[0] == meta_kind_next_seq) {
@@ -337,16 +337,16 @@ pub const MizuStore = struct {
         try self.applyPut(store_family, key, value);
     }
 
-    fn applyPut(self: *MizuStore, store_family: Family, key: []const u8, value: []const u8) !void {
+    fn applyPut(self: *OroStore, store_family: Family, key: []const u8, value: []const u8) !void {
         try self.maps[familyIndex(store_family)].put(key, value);
     }
 
-    fn applyDelete(self: *MizuStore, store_family: Family, key: []const u8) !void {
+    fn applyDelete(self: *OroStore, store_family: Family, key: []const u8) !void {
         self.maps[familyIndex(store_family)].delete(key);
     }
 
     fn recordMutation(
-        self: *MizuStore,
+        self: *OroStore,
         store_family: Family,
         kind: MutationKind,
         key: []const u8,
@@ -362,7 +362,7 @@ pub const MizuStore = struct {
         self.next_seq += 1;
     }
 
-    fn syncDir(self: *MizuStore) !void {
+    fn syncDir(self: *OroStore) !void {
         var dir_file = try self.dir.openFile(self.io, ".", .{ .mode = .read_only, .allow_directory = true });
         defer dir_file.close(self.io);
         try dir_file.sync(self.io);
@@ -599,8 +599,8 @@ fn writeU64(bytes: *[8]u8, value: u64) void {
     std.mem.writeInt(u64, bytes, value, .little);
 }
 
-fn openTestStore(tmp: std.testing.TmpDir, name: []const u8) !MizuStore {
-    return MizuStore.open(std.testing.allocator, std.testing.io, tmp.dir, name);
+fn openTestStore(tmp: std.testing.TmpDir, name: []const u8) !OroStore {
+    return OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, name);
 }
 
 test "put/get round-trip per family" {
@@ -814,7 +814,7 @@ test "openWithConfig honours a smaller record limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store = try MizuStore.openWithConfig(
+    var store = try OroStore.openWithConfig(
         std.testing.allocator,
         std.testing.io,
         tmp.dir,

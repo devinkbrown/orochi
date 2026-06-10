@@ -1,6 +1,6 @@
 # Quickstart
 
-Mizuchi is a pure-Zig 0.16 clean-room IRC daemon. The build package declares Zig `0.16.0` as the minimum supported compiler (`build.zig.zon:28`), and the daemon build rejects 32-bit targets (`build.zig:20`, `build.zig:24`).
+Orochi is a pure-Zig 0.16 clean-room IRC daemon. The build package declares Zig `0.16.0` as the minimum supported compiler (`build.zig.zon:28`), and the daemon build rejects 32-bit targets (`build.zig:20`, `build.zig:24`).
 
 ## Build
 
@@ -10,7 +10,7 @@ From the repository root:
 zig build
 ```
 
-The default build installs the `mizuchi` executable under `zig-out/bin` (`build.zig:87`, `build.zig:119`).
+The default build installs the `orochi` executable under `zig-out/bin` (`build.zig:87`, `build.zig:119`).
 
 For a fast semantic check:
 
@@ -33,14 +33,14 @@ host = "127.0.0.1"
 irc = 6680
 ```
 
-Save that as a local TOML file, or start from the runnable reference at `etc/mizuchi.reference.toml`. Current source still requires `[listen].irc` even for TLS-first deployments.
+Save that as a local TOML file, or start from the runnable reference at `etc/orochi.reference.toml`. Current source still requires `[listen].irc` even for TLS-first deployments.
 
 ## First Run
 
 Run with an explicit config path:
 
 ```sh
-zig build run -- etc/mizuchi.reference.toml
+zig build run -- etc/orochi.reference.toml
 ```
 
 `src/main.zig` treats the first non-command argument as the config file path, reads up to 1 MiB, parses it, maps it onto `server.Config`, and stores the path for live `REHASH` (`src/main.zig:99`, `src/main.zig:104`, `src/main.zig:106`, `src/main.zig:112`). If the file is missing or invalid, current boot logs the error and keeps defaults instead of aborting (`src/main.zig:116`, `src/main.zig:119`).

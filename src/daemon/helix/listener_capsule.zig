@@ -228,7 +228,7 @@ test "round-trip with non-null config_path and distinct fd indices" {
         .node_id = 0xDEAD_BEEF_CAFE_F00D,
         .epoch = 0x0102_0304_0506_0708,
         .started_unix = 1_700_000_000,
-        .config_path = "/etc/mizuchi/mizuchi.conf",
+        .config_path = "/etc/orochi/orochi.conf",
         .irc_listener_fd_index = 3,
         .s2s_listener_fd_index = 7,
         .media_fd_index = 11,

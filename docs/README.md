@@ -1,6 +1,6 @@
-# Mizuchi documentation
+# Orochi documentation
 
-Mizuchi is a pure-Zig (0.16) clean-room IRC daemon — a bespoke successor to the
+Orochi is a pure-Zig (0.16) clean-room IRC daemon — a bespoke successor to the
 C `ophion` daemon, not a clone. It speaks IRCv3 + IRCX, runs a custom Suimyaku
 CRDT mesh with forward-secret Tsumugi server links, and ships its own pure-Zig
 TLS (opssl), media codecs (OPVOX/OPVIS), and in-place upgrade (Helix).
@@ -15,7 +15,7 @@ from convention or from the design notes in `planning/`, the docs flag it.
 - [Mesh & S2S](architecture/mesh-s2s.md) — Suimyaku CRDT, links, partition detection, oper-grant sharing
 - [Cryptography](architecture/crypto.md) — Tsumugi handshake, opssl, signing, sealed tokens
 - [Media](architecture/03-media.md) — SFU, transport stack, codecs, WASM shims
-- [Upgrade & WASM host](architecture/04-upgrade-wasm.md) — Helix in-place upgrade, MizuWasm plugins
+- [Upgrade & WASM host](architecture/04-upgrade-wasm.md) — Helix in-place upgrade, OroWasm plugins
 
 ## Command reference
 - [Index](reference/commands/_index.md) — every command, one line each
@@ -38,7 +38,7 @@ from convention or from the design notes in `planning/`, the docs flag it.
 
 ## Configuration
 - [Config reference](reference/config.md) — every section and key
-- [`etc/mizuchi.reference.toml`](../etc/mizuchi.reference.toml) — runnable annotated example
+- [`etc/orochi.reference.toml`](../etc/orochi.reference.toml) — runnable annotated example
 
 ## Operator guide
 - [Quickstart](guide/00-quickstart.md)
@@ -47,7 +47,7 @@ from convention or from the design notes in `planning/`, the docs flag it.
 - [Operators](guide/operators.md) — SASL-only oper setup
 - [Mesh / S2S linking](guide/mesh.md)
 - [In-place upgrade](guide/upgrade.md)
-- [Persistence](guide/persistence.md) — MizuStore
+- [Persistence](guide/persistence.md) — OroStore
 
 ## Design notes
 `planning/` holds the original design intent (PRDs, architecture spikes). It is

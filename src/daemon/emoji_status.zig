@@ -1,4 +1,4 @@
-//! Per-account short status text/emoji store for the Mizuchi IRC daemon.
+//! Per-account short status text/emoji store for the Orochi IRC daemon.
 //!
 //! Each account may carry a tiny presence string (an emoji, a mood, a brief
 //! "away" blurb). Status values are capped at MAX_STATUS_BYTES to keep them
@@ -100,15 +100,15 @@ test "set/get/overwrite" {
     try std.testing.expectEqualStrings("🐉", store.get("akira").?);
 
     // Unknown account returns null.
-    try std.testing.expect(store.get("mizuki") == null);
+    try std.testing.expect(store.get("suzuki") == null);
 
     // Overwrite frees the old value and exposes the new one.
     try store.set("akira", "afk");
     try std.testing.expectEqualStrings("afk", store.get("akira").?);
 
     // A second account coexists.
-    try store.set("mizuki", "online");
-    try std.testing.expectEqualStrings("online", store.get("mizuki").?);
+    try store.set("suzuki", "online");
+    try std.testing.expectEqualStrings("online", store.get("suzuki").?);
     try std.testing.expectEqualStrings("afk", store.get("akira").?);
 }
 

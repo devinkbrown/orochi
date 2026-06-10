@@ -1,10 +1,10 @@
 # IRCv3 spec coverage (source: github.com/ircv3/ircv3-specifications)
 
-Full extension catalog from the IRCv3 specifications repo, mapped to Mizuchi modules.
+Full extension catalog from the IRCv3 specifications repo, mapped to Orochi modules.
 Status: ✅ implemented · 🔧 in-flight · ⬜ TODO · ❌ removed (clean-room/no-legacy).
 Always implement to the actual spec text; this table is the work map, not the spec.
 
-| IRCv3 extension | Mizuchi | Status |
+| IRCv3 extension | Orochi | Status |
 |---|---|---|
 | capability-negotiation | `proto/cap.zig` | ✅ |
 | message-tags | `proto/irc_line.zig` (parse) + `proto/msgtags.zig` (emit) | ✅ |
@@ -46,6 +46,6 @@ Always implement to the actual spec text; this table is the work map, not the sp
 | **webirc** | — | ❌ removed (clean-room: WebSocket only) |
 | deprecated: tls (STARTTLS), sasl-dh-* | — | ❌ removed (TLS-native / modern SASL) |
 
-Notes: `metadata` (IRCv3) and IRCX `PROP` are two takes on the same idea — Mizuchi should expose ONE
+Notes: `metadata` (IRCv3) and IRCX `PROP` are two takes on the same idea — Orochi should expose ONE
 unified property system (lean IRCX PROP, expose a metadata-compatible view). `oper-tag` integrates with
 the SASL-only oper system. `labeled-response` should ride the `batch` machinery.

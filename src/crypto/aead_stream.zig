@@ -250,14 +250,14 @@ test "multi-chunk round-trip preserves plaintext and final marker" {
     var enc = Encryptor.initWithNonce(fixed_key, fixed_nonce);
     var dec = Decryptor.init(fixed_key);
 
-    const s0 = try enc.push(testing.allocator, "mizuchi ", false);
+    const s0 = try enc.push(testing.allocator, "orochi ", false);
     defer testing.allocator.free(s0);
     const s1 = try enc.push(testing.allocator, "stream ", false);
     defer testing.allocator.free(s1);
     const s2 = try enc.push(testing.allocator, "aead", true);
     defer testing.allocator.free(s2);
 
-    try expectPull(&dec, s0, "mizuchi ", false);
+    try expectPull(&dec, s0, "orochi ", false);
     try expectPull(&dec, s1, "stream ", false);
     try expectPull(&dec, s2, "aead", true);
     try dec.finish();

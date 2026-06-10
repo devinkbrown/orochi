@@ -1,4 +1,4 @@
-//! Per-account birthday tracking for the Mizuchi IRC daemon.
+//! Per-account birthday tracking for the Orochi IRC daemon.
 //!
 //! Stores an optional birthday (month + day) per account. The year is
 //! deliberately omitted to preserve member privacy; only the calendar date

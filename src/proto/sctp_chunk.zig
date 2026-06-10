@@ -240,7 +240,7 @@ fn writeU32(out: []u8, value: u32) void {
 }
 
 test "common header and DATA chunk round trip" {
-    const user_data = "mizuchi";
+    const user_data = "example";
     const data_len = DataHeader.len + user_data.len;
     const chunk_len = 4 + data_len;
     const packet_len = CommonHeader.len + chunk_len + 1;

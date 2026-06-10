@@ -1,4 +1,4 @@
-//! Mizuchi library root — re-exports the package namespaces.
+//! Orochi library root — re-exports the package namespaces.
 //! See docs/planning/00-architecture.md for the canonical design.
 const std = @import("std");
 
@@ -12,7 +12,7 @@ pub const substrate = @import("substrate/root.zig");
 pub const wasm_transport_root = @import("wasm_transport_root.zig");
 // gen:mods:end
 
-/// MizuWasm — pure-Zig sandboxed control-plane plugin host (subdir, not scanned
+/// OroWasm — pure-Zig sandboxed control-plane plugin host (subdir, not scanned
 /// by genroots). See docs/planning/17-module-system.md §8.
 pub const wasm_host = @import("wasm/host/root.zig");
 

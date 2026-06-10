@@ -1,13 +1,13 @@
-# 23 — IRCv3 upstream research (current spec set vs Mizuchi)
+# 23 — IRCv3 upstream research (current spec set vs Orochi)
 
 Sourced from the live IRCv3 spec index + recent spec PRs (June 2026). Maps every
-upstream capability to Mizuchi's status. This complements the in-tree gap sweep
+upstream capability to Orochi's status. This complements the in-tree gap sweep
 (`22-irc-gap-sweep.md`) with the *authoritative upstream list*, including the
 newest additions the user flagged.
 
 ## Newest upstream additions (2024–2026) — the "new things"
 - **account-extban** (ratified Jul 2024) — ISUPPORT token to build an EXTBAN
-  targeting an account. Mizuchi already has extban `a`; verify it matches the
+  targeting an account. Orochi already has extban `a`; verify it matches the
   ratified `account-extban` ISUPPORT token + semantics (ban/exempt/invex).
 - **pre-away** (draft) — allow `AWAY` during registration / mark a connection as
   not user-initiated (auto-away systems). MISSING.
@@ -15,13 +15,13 @@ newest additions the user flagged.
   new command + a batch type delimiting ISUPPORT bursts. MISSING.
 - **network-icon** (draft, Nov 2025) — ISUPPORT token advertising a network icon.
   MISSING (trivial token; pairs well with Ocean).
-- **SCRAM-SHA-256** SASL mechanism + **EXTERNAL** — Mizuchi has the server modules
+- **SCRAM-SHA-256** SASL mechanism + **EXTERNAL** — Orochi has the server modules
   (sasl_scram_server, sasl_scram512_server, sasl_external) but advertises only
   `sasl=PLAIN`. PARTIAL — just advertise the mechs in the cap value.
 - **msgid** — unique message-id tag. MISSING.
 - **WebSocket transport** — ratified transport; relevant to the browser/Ocean path.
 
-## Ratified/stable — Mizuchi status
+## Ratified/stable — Orochi status
 | Cap | Status |
 |---|---|
 | cap-notify | **MISSING** |
@@ -47,7 +47,7 @@ newest additions the user flagged.
 | WEBIRC | **excluded by project decision** |
 | WebSocket transport | MISSING (browser/Ocean path) |
 
-## Work-in-progress / draft — Mizuchi status
+## Work-in-progress / draft — Orochi status
 | Cap | Status |
 |---|---|
 | account-registration | PARTIAL — REGISTER/VERIFY exist, **cap unadvertised** |
@@ -63,7 +63,7 @@ newest additions the user flagged.
 | multiline | MISSING |
 | SNI | MISSING (modern TLS; review vs implicit-TLS stance) |
 
-## Client-only tags — Mizuchi status
+## Client-only tags — Orochi status
 reply ✅ · react ✅ · typing ✅ · **channel-context** ❌ (MISSING)
 
 ## Deprecated (do NOT implement)

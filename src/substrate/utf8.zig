@@ -7,7 +7,7 @@
 //! compares folded bytes/scalars directly without allocating.
 const std = @import("std");
 
-/// IRC casemapping variants Mizuchi accepts for client-visible identifiers.
+/// IRC casemapping variants Orochi accepts for client-visible identifiers.
 pub const Casemapping = enum {
     ascii,
     rfc1459,
@@ -459,10 +459,10 @@ test "nick validity is bounded and mapping aware" {
 }
 
 test "channel name validity rejects missing prefixes separators and invalid utf8" {
-    try std.testing.expect(isValidChannel(.ascii, "#mizuchi"));
-    try std.testing.expect(isValidChannel(.rfc1459, "#Mizu[\\~]"));
+    try std.testing.expect(isValidChannel(.ascii, "#orochi"));
+    try std.testing.expect(isValidChannel(.rfc1459, "#Suzu[\\~]"));
     try std.testing.expect(isValidChannel(.utf8_only, "#d\xC3\xA9j\xC3\xA0"));
-    try std.testing.expect(!isValidChannel(.ascii, "mizuchi"));
+    try std.testing.expect(!isValidChannel(.ascii, "orochi"));
     try std.testing.expect(!isValidChannel(.ascii, "#bad name"));
     try std.testing.expect(!isValidChannel(.ascii, "#bad,chan"));
     try std.testing.expect(!isValidChannel(.ascii, "#d\xC3\xA9j\xC3\xA0"));

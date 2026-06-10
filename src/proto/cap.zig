@@ -41,10 +41,10 @@ pub const CapId = enum(u6) {
     message_editing,
     message_redaction,
     typing,
-    mizuchi_prop_notify,
-    mizuchi_session_sync,
-    mizuchi_bouncer,
-    mizuchi_suimyaku_media,
+    orochi_prop_notify,
+    orochi_session_sync,
+    orochi_bouncer,
+    orochi_suimyaku_media,
 };
 
 pub const CAP_COUNT: usize = @typeInfo(CapId).@"enum".fields.len;
@@ -402,10 +402,10 @@ const default_specs = [_]CapSpec{
     .{ .id = .message_editing, .name = "message-editing" },
     .{ .id = .message_redaction, .name = "message-redaction" },
     .{ .id = .typing, .name = "typing" },
-    .{ .id = .mizuchi_prop_notify, .name = "mizuchi/prop-notify" },
-    .{ .id = .mizuchi_session_sync, .name = "mizuchi/session-sync" },
-    .{ .id = .mizuchi_bouncer, .name = "mizuchi/bouncer" },
-    .{ .id = .mizuchi_suimyaku_media, .name = "mizuchi/suimyaku-media" },
+    .{ .id = .orochi_prop_notify, .name = "orochi/prop-notify" },
+    .{ .id = .orochi_session_sync, .name = "orochi/session-sync" },
+    .{ .id = .orochi_bouncer, .name = "orochi/bouncer" },
+    .{ .id = .orochi_suimyaku_media, .name = "orochi/suimyaku-media" },
 };
 
 fn parseRequestedSet(registry: CapRegistry, raw_list: []const u8) ?RequestedSet {

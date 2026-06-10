@@ -1,6 +1,6 @@
 //! GLOBOPS / oper-broadcast routing core.
 //!
-//! In Mizuchi an operator broadcast (the classic GLOBOPS) is **not** a `+w`
+//! In Orochi an operator broadcast (the classic GLOBOPS) is **not** a `+w`
 //! umode and **not** a pseudo-client message: it is published through the
 //! Event Spine to the opers who have subscribed to the `globops` snomask
 //! category. This module is the pure, allocation-free decision-and-format

@@ -405,7 +405,7 @@ pub fn LayerDeclaration(comptime capacity: usize) type {
 
 /// Codecs negotiable on a Suimyaku media session.
 ///
-/// The native plane is OPVOX/OPVIS-first — Mizuchi's own `opcodec`
+/// The native plane is OPVOX/OPVIS-first — Orochi's own `opcodec`
 /// implementation (see `opcodec_frame`), which is what capable clients use. The
 /// standard hardware codecs below exist ONLY as the interop set for the WebRTC
 /// mobile gateway (phones that need hardware decode); the SFU still never

@@ -1,4 +1,4 @@
-//! Kakehashi (架け橋, "bridge") — the SFU media bridge between Mizuchi's native
+//! Kakehashi (架け橋, "bridge") — the SFU media bridge between Orochi's native
 //! Suimyaku media plane (opcodec frames over CoilPack/ryusen + secure_channel)
 //! and the WebRTC gateway (RTP/SRTP, for mobile / hardware-codec clients).
 //!

@@ -1,8 +1,8 @@
 You are a distributed-systems + protocol architect with 100% design freedom. Design — from scratch,
-in Zig — the PROTOCOL LAYER for "Mizuchi", a clean-slate Zig successor to the ophion IRC daemon:
+in Zig — the PROTOCOL LAYER for "Orochi", a clean-slate Zig successor to the ophion IRC daemon:
 (A) the client-facing IRC line protocol, and (B) the SERVER-TO-SERVER "step up" replacing legacy
 TS6 with the native LADON + VEIL cryptographic mesh. Everything Zig-native; NO C interop. Read the
-shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+shared brief first: /home/kain/orochi/docs/BRIEF.md
 
 MANDATE: invent. The LADON/VEIL specs are the conceptual FOUNDATION — read them faithfully, then
 innovate beyond them where a from-scratch design allows. ophion/libop are reference only.

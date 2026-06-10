@@ -70,9 +70,9 @@ test "open close framing preserves stack nesting order" {
         var opened_count: usize = 0;
         while (opened_count < depth) : (opened_count += 1) {
             const opened = switch (opened_count % 4) {
-                0 => try session.open(.netjoin, &.{ "#mizuchi", "mesh-a" }, &out),
+                0 => try session.open(.netjoin, &.{ "#orochi", "mesh-a" }, &out),
                 1 => try session.open(.netsplit, &.{ "mesh-a", "mesh-b" }, &out),
-                2 => try session.open(.chathistory, &.{ "#mizuchi", "latest" }, &out),
+                2 => try session.open(.chathistory, &.{ "#orochi", "latest" }, &out),
                 else => try session.open(.labeled, &.{"label-1"}, &out),
             };
             stack[opened_count] = opened.ref;
@@ -185,7 +185,7 @@ test "wrapped message tags stay within configured line limits" {
     @memset(&too_long, 'B');
     try std.testing.expectError(error.InvalidLine, session.wrapLine(&too_long, &out));
 
-    const duplicate_batch = "@time=1;batch=evil PRIVMSG #mizuchi :x";
+    const duplicate_batch = "@time=1;batch=evil PRIVMSG #orochi :x";
     try std.testing.expectError(error.DuplicateBatchTag, session.wrapLine(duplicate_batch, &out));
 }
 
@@ -392,7 +392,7 @@ fn fillBiasedBytes(random: std.Random, out: []u8, iteration: usize) void {
 
 fn fillCommandBytes(random: std.Random, out: []u8) void {
     if (out.len == 0) return;
-    const prefix = "PRIVMSG #mizuchi :";
+    const prefix = "PRIVMSG #orochi :";
     const copy_len = @min(prefix.len, out.len);
     @memcpy(out[0..copy_len], prefix[0..copy_len]);
     for (out[copy_len..]) |*byte| {

@@ -1,4 +1,4 @@
-# Mizuchi ISUPPORT (005)
+# Orochi ISUPPORT (005)
 
 `src/proto/protocol_inventory.zig` is the source of truth for static `RPL_ISUPPORT` tokens (`src/proto/protocol_inventory.zig:1`, `src/proto/protocol_inventory.zig:40`). At boot, `main.zig` installs the configured network name, builds config-driven ISUPPORT tokens, and stores runtime limits before serving clients (`src/main.zig:129`, `src/main.zig:134`, `src/main.zig:139`).
 
@@ -8,7 +8,7 @@ The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()`
 
 | Token | Default Value | Meaning | Config / Runtime Notes | Evidence |
 | --- | --- | --- | --- | --- |
-| `NETWORK` | `Mizuchi` | Advertised network name. | Default is `network_name`; operators can override via `[network] name`, installed by `setNetworkName` and rewritten by `buildIsupportTokens`. | `src/proto/protocol_inventory.zig:14`, `src/proto/protocol_inventory.zig:40`, `src/daemon/server.zig:860`, `src/main.zig:129` |
+| `NETWORK` | `Orochi` | Advertised network name. | Default is `network_name`; operators can override via `[network] name`, installed by `setNetworkName` and rewritten by `buildIsupportTokens`. | `src/proto/protocol_inventory.zig:14`, `src/proto/protocol_inventory.zig:40`, `src/daemon/server.zig:860`, `src/main.zig:129` |
 | `CHANTYPES` | `#&` | Channel name prefixes accepted/advertised. | Static token. | `src/proto/protocol_inventory.zig:42` |
 | `NICKLEN` | `64` | Maximum nick length in bytes. | Config-overridable via `[limits]`; pre-registration NICK enforcement reads `currentLimits().nicklen`. | `src/proto/protocol_inventory.zig:43`, `src/proto/protocol_inventory.zig:82`, `src/daemon/server.zig:868`, `src/daemon/dispatch.zig:1269` |
 | `TOPICLEN` | `390` | Maximum topic bytes. | Config-overridable via `[limits]`; TOPIC truncates to configured `topiclen` on UTF-8 boundary. | `src/proto/protocol_inventory.zig:46`, `src/daemon/server.zig:862`, `src/daemon/server.zig:11195` |
@@ -21,7 +21,7 @@ The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()`
 | `MONITOR` | `128` | Maximum MONITOR targets. | Config-overridable via `[limits]`; MONITOR handler maps list-full to `ERR_MONLISTFULL`. | `src/proto/protocol_inventory.zig:53`, `src/daemon/server.zig:878`, `src/daemon/server.zig:5267`, `src/daemon/server.zig:5280` |
 | `SILENCE` | `32` | Maximum SILENCE masks. | Config-overridable via `[limits]`; SILENCE query emits 271/272. | `src/proto/protocol_inventory.zig:54`, `src/daemon/server.zig:880`, `src/daemon/server.zig:5382` |
 | `CASEMAPPING` | `ascii` | Case-folding policy for identifiers. | World maps use ASCII case-insensitive contexts for nicks/channels. | `src/proto/protocol_inventory.zig:55`, `src/daemon/world.zig:75` |
-| `PREFIX` | `(Qqov)!.@+` | Member status modes and their prefix characters. | Founder `Q`/`!` is Mizuchi-native and ranks above owner. | `src/proto/protocol_inventory.zig:56`, `src/daemon/chanmode.zig:244`, `src/daemon/chanmode.zig:310` |
+| `PREFIX` | `(Qqov)!.@+` | Member status modes and their prefix characters. | Founder `Q`/`!` is Orochi-native and ranks above owner. | `src/proto/protocol_inventory.zig:56`, `src/daemon/chanmode.zig:244`, `src/daemon/chanmode.zig:310` |
 | `CHANMODES` | `beIZ,k,lfj,imnstCTNMSg` | Four channel-mode classes: list, param-always, param-on-set, flag. | Static token from `chanmodes_token`. Live server also accepts extra IRCX extended flags; see `modes.md`. | `src/proto/protocol_inventory.zig:35`, `src/proto/protocol_inventory.zig:57`, `src/daemon/server.zig:4500` |
 | `STATUSMSG` | `!.@+` | Allowed status-target prefixes for channel messages. | Server maps `!`, `.`, `@`, `+` to minimum delivery ranks. | `src/proto/protocol_inventory.zig:58`, `src/daemon/server.zig:10946`, `src/daemon/server.zig:11031` |
 | `BOT` | `B` | Bot user mode letter. | Mirrors user mode `+B` and IRCv3 bot support. | `src/proto/protocol_inventory.zig:59`, `src/proto/usermode.zig:141` |

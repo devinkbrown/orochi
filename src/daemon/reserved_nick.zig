@@ -1,4 +1,4 @@
-//! Reserved nickname registry for the Mizuchi IRC daemon.
+//! Reserved nickname registry for the Orochi IRC daemon.
 //!
 //! Maps a reserved nickname to the account that owns it. Nickname comparison
 //! is case-insensitive (folded to lowercase ASCII), so `Spirit`, `spirit`, and

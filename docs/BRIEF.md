@@ -1,13 +1,13 @@
-# Mizuchi — Architecture Brief (source of truth)
+# Orochi — Architecture Brief (source of truth)
 
-**Mizuchi** (水蛟 — the coiling water-dragon) is the successor to the **ophion** IRC
+**Orochi** (水蛟 — the coiling water-dragon) is the successor to the **ophion** IRC
 daemon. It is a **100% clean-slate, Zig-native** system: the daemon *and its entire
 substrate* (the libop systems library and the opssl crypto/TLS library) are
 **rewritten from scratch in Zig**. ophion, libop, and opssl are **reference only** —
 we mine them for the feature inventory, the hard-won lessons, and the Suimyaku/Tsumugi
 conceptual foundation, then design something better.
 
-Mizuchi keeps ophion's full feature surface (IRCv3, IRCX, SASL, in-process
+Orochi keeps ophion's full feature surface (IRCv3, IRCX, SASL, in-process
 services, WebSocket, CHATHISTORY, voice/video) and replaces the legacy **TS6** S2S
 protocol with the native **Suimyaku + Tsumugi** cryptographic mesh.
 
@@ -57,7 +57,7 @@ name it and specify it well enough to build.
 - ophion source: `/home/kain/ophion` (ircd/, modules/, include/)
 - libop (reference): `/home/kain/libop` (include/, src/)
 - opssl (reference): `/home/kain/opssl` (include/opssl/, src/)
-# Reference specs below are ophion's OLD names, superseded in Mizuchi by the
+# Reference specs below are ophion's OLD names, superseded in Orochi by the
 # invented names: LADON -> Suimyaku (S2S CRDT mesh), VEIL -> Tsumugi (PQ ratchet),
 # SWIM -> Sazanami (gossip), crdt -> Goryu. Cited only as historical inventory.
 - Suimyaku (was LADON) reference spec: `/home/kain/ophion/docs/protocols/ladon/`

@@ -8,7 +8,7 @@ const std = @import("std");
 const numeric = @import("numeric.zig");
 const limits_config = @import("limits_config.zig");
 
-// MODEX is a Mizuchi extension, not in draft-pfenning IRCX. Use numerics past the
+// MODEX is a Orochi extension, not in draft-pfenning IRCX. Use numerics past the
 // draft-reserved IRCX block (800-819) to avoid colliding with IRCRPL_EVENTADD/DEL
 // (806/807). See docs/reference/ircx/README.md.
 pub const RPL_MODEXLIST: u16 = 820;

@@ -88,7 +88,7 @@ pub const Prefix = struct {
     host: []const u8,
 };
 
-/// Mizuchi channel member tiers: founder `!` > owner `.` > op `@` > voice `+`.
+/// Orochi channel member tiers: founder `!` > owner `.` > op `@` > voice `+`.
 pub const MemberTier = enum(u8) {
     none = 0,
     voice = 1,
@@ -688,7 +688,7 @@ test "recipient and text limits are enforced" {
     try validateTextWith(.{ .require_utf8 = false }, "raw\xff");
 }
 
-test "member tiers preserve Mizuchi ordering" {
+test "member tiers preserve Orochi ordering" {
     try std.testing.expect(MemberTier.founder.isOperator());
     try std.testing.expect(MemberTier.owner.isOperator());
     try std.testing.expect(MemberTier.op.isOperator());

@@ -19,7 +19,7 @@ const ScramStore = scram_store_mod.ScramStore;
 /// against the account store.
 ///
 /// LIFETIME: each connection copies the returned fat pointer, so this
-/// `ServicesPlainChecker` (and the `Services` + `MizuStore` it points at) MUST
+/// `ServicesPlainChecker` (and the `Services` + `OroStore` it points at) MUST
 /// outlive every connection — own it in the same scope as the `Server`, never a
 /// stack temporary.
 pub const ServicesPlainChecker = struct {
@@ -93,10 +93,10 @@ pub const ServicesExternalLookup = struct {
 };
 
 test "services-backed PLAIN checker verifies registered accounts" {
-    const MizuStore = services_mod.MizuStore;
+    const OroStore = services_mod.OroStore;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = try MizuStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge.wal");
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge.wal");
     defer store.deinit();
 
     var services = Services.init(&store, null);
@@ -117,11 +117,11 @@ test "services-backed PLAIN checker verifies registered accounts" {
 }
 
 test "services-backed EXTERNAL verifier maps a bound certfp to its account" {
-    const MizuStore = services_mod.MizuStore;
+    const OroStore = services_mod.OroStore;
     const certfp_bind_mod = @import("certfp_bind.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = try MizuStore.open(std.testing.allocator, std.testing.io, tmp.dir, "extbridge.wal");
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "extbridge.wal");
     defer store.deinit();
 
     var services = Services.init(&store, null);
@@ -188,10 +188,10 @@ fn runScramExchange(
 
 test "registered account completes a SCRAM-SHA-256 exchange via the bridge lookup" {
     // Arrange: register an account through Services with a SCRAM mirror attached.
-    const MizuStore = services_mod.MizuStore;
+    const OroStore = services_mod.OroStore;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = try MizuStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-scram.wal");
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-scram.wal");
     defer store.deinit();
 
     var scram = ScramStore.init(std.testing.allocator);
@@ -220,10 +220,10 @@ test "registered account completes a SCRAM-SHA-256 exchange via the bridge looku
 
 test "SCRAM-SHA-256 exchange rejects the wrong password for a registered account" {
     // Arrange
-    const MizuStore = services_mod.MizuStore;
+    const OroStore = services_mod.OroStore;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = try MizuStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-scram-bad.wal");
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-scram-bad.wal");
     defer store.deinit();
 
     var scram = ScramStore.init(std.testing.allocator);

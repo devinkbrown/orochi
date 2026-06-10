@@ -1,6 +1,6 @@
-//! svc_xop — XOP template tiers for the Mizuchi services layer.
+//! svc_xop — XOP template tiers for the Orochi services layer.
 //!
-//! Mizuchi exposes channel access management through real server commands and
+//! Orochi exposes channel access management through real server commands and
 //! numerics (never pseudo-clients). The fine-grained model is a per-account
 //! flag list (cf. the channel-access FLAGS surface). XOP layers a small set of
 //! *named role tiers* on top of that model: FOUNDER / SOP / AOP / HOP / VOP.

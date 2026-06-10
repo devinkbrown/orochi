@@ -1,11 +1,11 @@
 # Mesh and S2S
 
-Mizuchi S2S uses the Suimyaku mesh runtime. Configure identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
+Orochi S2S uses the Suimyaku mesh runtime. Configure identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
 
 ```toml
 [node]
 id = 1
-secret_key = "env:MIZUCHI_NODE_SECKEY"
+secret_key = "env:OROCHI_NODE_SECKEY"
 
 [listen]
 irc = 6680
@@ -13,7 +13,7 @@ s2s = 7700
 
 [mesh]
 realm = "example"
-mesh_pass = "env:MIZUCHI_MESH_PASS"
+mesh_pass = "env:OROCHI_MESH_PASS"
 ```
 
 `[listen].s2s` maps to `server.Config.s2s_port`; `0` disables the inbound S2S listener (`src/daemon/config_boot.zig:26`, `src/daemon/server.zig:1046`). The server binds it alongside the IRC listener when non-zero (`src/daemon/server.zig:1490`).

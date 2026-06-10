@@ -582,7 +582,7 @@ test "canOperspy gates only on explicit grant" {
 
 test "etrace line content for user and operator" {
     // Arrange
-    const fmt = Formatter.init("mizuchi.test", "rootoper");
+    const fmt = Formatter.init("orochi.test", "rootoper");
     var out: [512]u8 = undefined;
 
     // Act
@@ -590,7 +590,7 @@ test "etrace line content for user and operator" {
 
     // Assert
     try testing.expectEqualStrings(
-        ":mizuchi.test 205 rootoper user Alice alice@home.alice.example.test alice 42 :Alice Liddell\r\n",
+        ":orochi.test 205 rootoper user Alice alice@home.alice.example.test alice 42 :Alice Liddell\r\n",
         user_line,
     );
 
@@ -602,48 +602,48 @@ test "etrace line content for user and operator" {
     var out2: [512]u8 = undefined;
     const oper_line = try fmt.etrace(&out2, oper_snap);
     try testing.expectEqualStrings(
-        ":mizuchi.test 204 rootoper oper Alice alice@home.alice.example.test * 0 :<unknown>\r\n",
+        ":orochi.test 204 rootoper oper Alice alice@home.alice.example.test * 0 :<unknown>\r\n",
         oper_line,
     );
 }
 
 test "scan and operspy lines reveal hosts per gate" {
     // Arrange
-    const fmt = Formatter.init("mizuchi.test", "rootoper");
+    const fmt = Formatter.init("orochi.test", "rootoper");
     const snap = sampleClient();
     var out: [512]u8 = undefined;
 
     // Act
     const public_line = try fmt.scanLine(&out, snap, false);
     try testing.expectEqualStrings(
-        ":mizuchi.test 249 rootoper :Alice alice@cloak-1234.example.test alice modes=iw\r\n",
+        ":orochi.test 249 rootoper :Alice alice@cloak-1234.example.test alice modes=iw\r\n",
         public_line,
     );
 
     var out2: [512]u8 = undefined;
     const spy_line = try fmt.operspyLine(&out2, snap);
     try testing.expectEqualStrings(
-        ":mizuchi.test 249 rootoper :Alice alice@home.alice.example.test alice modes=iw\r\n",
+        ":orochi.test 249 rootoper :Alice alice@home.alice.example.test alice modes=iw\r\n",
         spy_line,
     );
 }
 
 test "terminator lines format correctly" {
     // Arrange
-    const fmt = Formatter.init("mizuchi.test", "rootoper");
+    const fmt = Formatter.init("orochi.test", "rootoper");
     var out: [256]u8 = undefined;
 
     // Act / Assert
     const trace_end = try fmt.endOfTrace(&out, "Al*");
     try testing.expectEqualStrings(
-        ":mizuchi.test 262 rootoper Al* :End of TRACE\r\n",
+        ":orochi.test 262 rootoper Al* :End of TRACE\r\n",
         trace_end,
     );
 
     var out2: [256]u8 = undefined;
     const stats_end = try fmt.endOfStats(&out2, "");
     try testing.expectEqualStrings(
-        ":mizuchi.test 219 rootoper * :End of operator query\r\n",
+        ":orochi.test 219 rootoper * :End of operator query\r\n",
         stats_end,
     );
 }
@@ -663,14 +663,14 @@ test "numeric format pads to three digits" {
 
 test "formatter respects line byte bound and small buffers" {
     // Arrange
-    const fmt = Formatter.initWithParams(.{ .max_line_bytes = 16 }, "mizuchi.test", "rootoper");
+    const fmt = Formatter.initWithParams(.{ .max_line_bytes = 16 }, "orochi.test", "rootoper");
     var out: [512]u8 = undefined;
 
     // Act / Assert: the rendered line exceeds the 16-byte cap.
     try testing.expectError(error.OutputTooSmall, fmt.etrace(&out, sampleClient()));
 
     // A too-small output buffer also reports OutputTooSmall.
-    const ok_fmt = Formatter.init("mizuchi.test", "rootoper");
+    const ok_fmt = Formatter.init("orochi.test", "rootoper");
     var tiny: [8]u8 = undefined;
     try testing.expectError(error.OutputTooSmall, ok_fmt.scanLine(&tiny, sampleClient(), false));
 }

@@ -1,4 +1,4 @@
-//! Per-account metadata for the Mizuchi IRC daemon.
+//! Per-account metadata for the Orochi IRC daemon.
 //!
 //! This module is deliberately separate from IRCv3 METADATA. It models one real
 //! server command, `ACCTMETA`, plus numeric reply metadata that a daemon command
@@ -17,7 +17,7 @@ pub const max_timezone_bytes: usize = 48;
 
 const field_count: usize = 4;
 
-/// Mizuchi-local server numerics for the `ACCTMETA` command surface.
+/// Orochi-local server numerics for the `ACCTMETA` command surface.
 pub const Numeric = enum(u16) {
     RPL_ACCTMETA = 778,
     RPL_ACCTMETAEND = 779,

@@ -1,4 +1,4 @@
-//! poll_schedule.zig — Mizuchi IRC daemon
+//! poll_schedule.zig — Orochi IRC daemon
 //!
 //! Scheduled future channel polls. A `PollSchedule` holds a bounded set of
 //! pending poll launches, each keyed by a monotonically-assigned 64-bit id and
@@ -145,7 +145,7 @@ test "schedule assigns unique ids and tracks pending count" {
     try std.testing.expectEqual(@as(usize, 0), sched.pending());
 
     const a = try sched.schedule("#zig", "Tabs or spaces?", 1_000);
-    const b = try sched.schedule("#mizuchi", "Best fish?", 2_000);
+    const b = try sched.schedule("#orochi", "Best fish?", 2_000);
 
     try std.testing.expect(a != b);
     try std.testing.expectEqual(@as(usize, 2), sched.pending());

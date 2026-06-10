@@ -1,5 +1,5 @@
-//! mizuchi-daemon — core, SerpentRegistry (comptime modules), CapProof
-//! permission lattice, services, MizuStore, media. Skeleton; see planning/03.
+//! orochi-daemon — core, SerpentRegistry (comptime modules), CapProof
+//! permission lattice, services, OroStore, media. Skeleton; see planning/03.
 const std = @import("std");
 const substrate = @import("../substrate/root.zig");
 
@@ -618,7 +618,7 @@ pub const Daemon = struct {
     /// the boot path and the DST clock seam are wired end-to-end.
     pub fn boot(self: *Daemon) void {
         std.debug.print(
-            "mizuchi: boot ok (monotonic clock = {d} ms) — TCP listener: TODO (M1)\n",
+            "orochi: boot ok (monotonic clock = {d} ms) — TCP listener: TODO (M1)\n",
             .{self.reactor.nowMillis()},
         );
     }

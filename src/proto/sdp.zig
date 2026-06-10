@@ -1,4 +1,4 @@
-//! SDP-lite media band descriptors for Mizuchi media negotiation.
+//! SDP-lite media band descriptors for Orochi media negotiation.
 //!
 //! This is not RFC SDP. It is a compact canonical descriptor with fixed field
 //! order, length-prefixed fields, and unsigned LEB128 varints for scalar values.

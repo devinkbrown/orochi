@@ -4,11 +4,11 @@ Planning only. I did not modify files.
 
 **Evidence Anchors**
 
-Mizuchi is explicitly clean-slate Zig, replacing libop/opssl rather than porting them [BRIEF.md](/home/kain/mizuchi/docs/BRIEF.md:3), with crypto/TLS required to be TLS 1.3-first, PQ-hybrid, and constant-time by construction [BRIEF.md](/home/kain/mizuchi/docs/BRIEF.md:37). opssl is useful as inventory: it exposes TLS 1.2/1.3, PQ group IDs, Ed25519, RSA-PSS, AEADs, session export, and kTLS [types.h](/home/kain/opssl/include/opssl/types.h:24), [crypto.h](/home/kain/opssl/include/opssl/crypto.h:181), [conn.h](/home/kain/opssl/include/opssl/conn.h:162), [ktls.h](/home/kain/opssl/include/opssl/ktls.h:1). VEIL currently wraps LADON frames after Ed25519/X25519 LADON auth using X25519, HKDF-SHA-256, and ChaCha20-Poly1305 [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:6).
+Orochi is explicitly clean-slate Zig, replacing libop/opssl rather than porting them [BRIEF.md](/home/kain/orochi/docs/BRIEF.md:3), with crypto/TLS required to be TLS 1.3-first, PQ-hybrid, and constant-time by construction [BRIEF.md](/home/kain/orochi/docs/BRIEF.md:37). opssl is useful as inventory: it exposes TLS 1.2/1.3, PQ group IDs, Ed25519, RSA-PSS, AEADs, session export, and kTLS [types.h](/home/kain/opssl/include/opssl/types.h:24), [crypto.h](/home/kain/opssl/include/opssl/crypto.h:181), [conn.h](/home/kain/opssl/include/opssl/conn.h:162), [ktls.h](/home/kain/opssl/include/opssl/ktls.h:1). VEIL currently wraps LADON frames after Ed25519/X25519 LADON auth using X25519, HKDF-SHA-256, and ChaCha20-Poly1305 [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:6).
 
 **Architecture**
 
-Mizuchi gets one Zig package, `mizuchi.crypto`, with no C interop and no generic “SSL context” clone. The stack is split into:
+Orochi gets one Zig package, `orochi.crypto`, with no C interop and no generic “SSL context” clone. The stack is split into:
 
 `primitive`: hashes, MACs, AEADs, KEX, signatures, XOFs, RNG.
 
@@ -20,7 +20,7 @@ Mizuchi gets one Zig package, `mizuchi.crypto`, with no C interop and no generic
 
 `keyring`: capability handles, secure allocation, zeroization, live-upgrade import/export.
 
-opssl’s C API has opaque handles and a thread-local error stack [types.h](/home/kain/opssl/include/opssl/types.h:16), [err.h](/home/kain/opssl/include/opssl/err.h:17); Mizuchi should instead use Zig error unions and typed states. No global error stack, no nullable success codes, no “wrong state but runtime check” if the protocol phase is known at compile time.
+opssl’s C API has opaque handles and a thread-local error stack [types.h](/home/kain/opssl/include/opssl/types.h:16), [err.h](/home/kain/opssl/include/opssl/err.h:17); Orochi should instead use Zig error unions and typed states. No global error stack, no nullable success codes, no “wrong state but runtime check” if the protocol phase is known at compile time.
 
 **Primitive Layer**
 
@@ -36,7 +36,7 @@ Ed25519: default identity and certificate key. opssl exposes Ed25519 keygen/sign
 
 P-256/P-384: support for public TLS interoperability and CA chains, not for LADON identity. opssl has P-curve APIs [crypto.h](/home/kain/opssl/include/opssl/crypto.h:244), constant-time ECC intent [ecc.c](/home/kain/opssl/src/crypto/ecc.c:1), and P-256 swaps/ladders [ecc.c](/home/kain/opssl/src/crypto/ecc.c:439). Zig improvement: `Curve(comptime P)` generates limb width, modulus, Montgomery constants, field ops, and scalar validation.
 
-RSA-PSS: verify-only in Mizuchi core. opssl exposes RSA sign/verify [crypto.h](/home/kain/opssl/include/opssl/crypto.h:339), but Mizuchi should not generate or use RSA server keys. Keep RSA-PSS and RSA-PKCS1-v1_5 verification only for legacy X.509 chains. No RSA private operation in the daemon.
+RSA-PSS: verify-only in Orochi core. opssl exposes RSA sign/verify [crypto.h](/home/kain/opssl/include/opssl/crypto.h:339), but Orochi should not generate or use RSA server keys. Keep RSA-PSS and RSA-PKCS1-v1_5 verification only for legacy X.509 chains. No RSA private operation in the daemon.
 
 ML-KEM-768/1024: default PQ component for TLS and VEIL root ratchets. opssl exposes ML-KEM sizes and APIs [crypto.h](/home/kain/opssl/include/opssl/crypto.h:278); its implementation follows FIPS 203 [mlkem.c](/home/kain/opssl/src/crypto/mlkem.c:1) with branch-free reduction [mlkem.c](/home/kain/opssl/src/crypto/mlkem.c:266) and implicit rejection selection [mlkem.c](/home/kain/opssl/src/crypto/mlkem.c:673). Zig improvement: `MlKem(.ml_kem_768)` and `MlKem(.ml_kem_1024)` generate parameter-specific polynomial/vector dimensions, eliminating runtime level switches and wrong-size buffers.
 
@@ -92,7 +92,7 @@ pub const CtBool = struct {
 };
 ```
 
-This is stronger than opssl’s convention-level constant-time helpers [constant_time.c](/home/kain/opssl/src/crypto/constant_time.c:30), [platform.h](/home/kain/opssl/include/opssl/platform.h:44): Mizuchi makes the unsafe thing unavailable in normal crypto code, and the verifier catches escapes.
+This is stronger than opssl’s convention-level constant-time helpers [constant_time.c](/home/kain/opssl/src/crypto/constant_time.c:30), [platform.h](/home/kain/opssl/include/opssl/platform.h:44): Orochi makes the unsafe thing unavailable in normal crypto code, and the verifier catches escapes.
 
 **AEAD Interface**
 
@@ -123,9 +123,9 @@ pub fn Aead(comptime alg: AeadAlg) type {
 
 **TLS**
 
-Mizuchi core should drop TLS 1.2. opssl supports TLS 1.2 and 1.3 [types.h](/home/kain/opssl/include/opssl/types.h:24), and its record layer branches between both formats [record.c](/home/kain/opssl/src/tls/record.c:5). That complexity directly expands the bug surface. Mizuchi is a clean-slate server, and IRC clients needing TLS 1.2 can terminate through a compatibility proxy. Core TLS is TLS 1.3 only.
+Orochi core should drop TLS 1.2. opssl supports TLS 1.2 and 1.3 [types.h](/home/kain/opssl/include/opssl/types.h:24), and its record layer branches between both formats [record.c](/home/kain/opssl/src/tls/record.c:5). That complexity directly expands the bug surface. Orochi is a clean-slate server, and IRC clients needing TLS 1.2 can terminate through a compatibility proxy. Core TLS is TLS 1.3 only.
 
-Default groups: `X25519MLKEM768` first, then `P256MLKEM768`, then `X25519`. opssl already defines hybrid group IDs [types.h](/home/kain/opssl/include/opssl/types.h:135), but current TLS 1.3 key-share generation mostly handles X25519/P-256/P-384 [tls13.c](/home/kain/opssl/src/tls/tls13.c:583). Mizuchi should implement actual hybrid shares as structured concatenations and transcript-bind the group tuple.
+Default groups: `X25519MLKEM768` first, then `P256MLKEM768`, then `X25519`. opssl already defines hybrid group IDs [types.h](/home/kain/opssl/include/opssl/types.h:135), but current TLS 1.3 key-share generation mostly handles X25519/P-256/P-384 [tls13.c](/home/kain/opssl/src/tls/tls13.c:583). Orochi should implement actual hybrid shares as structured concatenations and transcript-bind the group tuple.
 
 State machine: generated from a comptime transition table.
 
@@ -144,11 +144,11 @@ pub fn Tls13Conn(comptime role: Role, comptime state: State) type {
 }
 ```
 
-No `OPSSL_HS_*` runtime enum equivalent should drive correctness. opssl’s C connection stores `is_tls13`, sequence numbers, traffic secrets, key-update flags, and postquantum booleans together [handshake.c](/home/kain/opssl/src/tls/handshake.c:73); Mizuchi splits these into phase-specific types.
+No `OPSSL_HS_*` runtime enum equivalent should drive correctness. opssl’s C connection stores `is_tls13`, sequence numbers, traffic secrets, key-update flags, and postquantum booleans together [handshake.c](/home/kain/opssl/src/tls/handshake.c:73); Orochi splits these into phase-specific types.
 
-Records: TLS 1.3 nonce is `iv XOR seq`, as opssl documents [record.c](/home/kain/opssl/src/tls/record.c:49). Mizuchi record keys own a `Seq64` that refuses wrap. KeyUpdate consumes the old write state and returns a new one.
+Records: TLS 1.3 nonce is `iv XOR seq`, as opssl documents [record.c](/home/kain/opssl/src/tls/record.c:49). Orochi record keys own a `Seq64` that refuses wrap. KeyUpdate consumes the old write state and returns a new one.
 
-kTLS: keep first-class Linux kTLS. opssl supports promotion, late promotion, adoption, and key extraction [ktls.h](/home/kain/opssl/include/opssl/ktls.h:20). Mizuchi adds a `KtlaSnapshot` with exact seq, cipher, IV, key, and kernel ownership state. Session export/import is sealed with a daemon-local migration key, unlike raw blobs; opssl’s export/import exists [conn.h](/home/kain/opssl/include/opssl/conn.h:162) and serializes sequence numbers [handshake.c](/home/kain/opssl/src/tls/handshake.c:3312).
+kTLS: keep first-class Linux kTLS. opssl supports promotion, late promotion, adoption, and key extraction [ktls.h](/home/kain/opssl/include/opssl/ktls.h:20). Orochi adds a `KtlaSnapshot` with exact seq, cipher, IV, key, and kernel ownership state. Session export/import is sealed with a daemon-local migration key, unlike raw blobs; opssl’s export/import exists [conn.h](/home/kain/opssl/include/opssl/conn.h:162) and serializes sequence numbers [handshake.c](/home/kain/opssl/src/tls/handshake.c:3312).
 
 0-RTT: disabled for client IRC and S2S state changes. TLS PSK resumption is allowed, early data is not accepted by default. opssl even notes no early_data server handling in one ticket path [handshake.c](/home/kain/opssl/src/tls/handshake.c:2846).
 
@@ -156,25 +156,25 @@ kTLS: keep first-class Linux kTLS. opssl supports promotion, late promotion, ado
 
 Minimum X.509: DER parser, PEM decoder, TBSCertificate, SPKI, SAN DNS/IP, validity, key usage/ext key usage, basic constraints, signature algorithm, and chain verification. opssl supports chain loading, SPKI extraction, fingerprinting, trust store, CRL/OCSP, and Ed25519 raw keys [cert.h](/home/kain/opssl/include/opssl/cert.h:17), [cert.h](/home/kain/opssl/include/opssl/cert.h:53), [cert.h](/home/kain/opssl/include/opssl/cert.h:58), [cert.h](/home/kain/opssl/include/opssl/cert.h:145).
 
-Mizuchi policy:
+Orochi policy:
 
 Certfp uses SHA-256 of DER by default, with SPKI-SHA256 available for stable identity binding.
 
-Ed25519 certs are first-class for Mizuchi-managed identities.
+Ed25519 certs are first-class for Orochi-managed identities.
 
 RSA private keys are rejected for local config; RSA verify is accepted for public chains.
 
 OCSP/CRL are optional modules, not core substrate. Local CRL loading is fine; network OCSP fetch inside crypto code is not.
 
-**Tsumugi Transport** (Mizuchi's PQ ratchet; "VEIL" below is the superseded ophion spec cited as inventory)
+**Tsumugi Transport** (Orochi's PQ ratchet; "VEIL" below is the superseded ophion spec cited as inventory)
 
 Current VEIL summary: after LADON `AUTH`/`AUTH_OK`, both sides derive a shared X25519 secret; VEIL initializes root/send/recv chain keys, ephemeral X25519 keys, nonce base, and counters [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:19). Frames are `VEIL_HANDSHAKE`, `VEIL_HANDSHAKE_RESP`, `VEIL_RATCHET`, and optional `VEIL_GROUP_KEY` [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:10). Per-message keys are `HKDF-Expand(chain, "veil-msg")`; chains advance with `"veil-chain"` [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:59). Nonces are 8-byte base plus counter, and the counter is duplicated in the frame [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:68). Skipped keys tolerate reordering up to 256 frames and state commits only after AEAD success [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:85). Rotation is every 300 seconds or 50,000 decrypted frames, and state is serializable for hot upgrade [veil-security.md](/home/kain/ophion/docs/protocols/veil-security.md:100).
 
-Mizuchi **Tsumugi** (the PQ-hybrid ratchet that replaces VEIL; runs over the **Suimyaku** mesh that replaces LADON):
+Orochi **Tsumugi** (the PQ-hybrid ratchet that replaces VEIL; runs over the **Suimyaku** mesh that replaces LADON):
 
 Identity: Ed25519 long-term server identity signs `suimyaku-auth-v2 || server_id || x25519_pub || mlkem_pk || nonce || capabilities`.
 
-Forward secrecy: initial root is `HKDF-Extract("mizuchi-tsumugi-v2", X25519_ss || MLKEM_ss || transcript_hash)`.
+Forward secrecy: initial root is `HKDF-Extract("orochi-tsumugi-v2", X25519_ss || MLKEM_ss || transcript_hash)`.
 
 Frame crypto: ChaCha20-Poly1305 default; AES-GCM allowed only if both sides advertise hardware support. AAD is `Suimyaku outer header || tsumugi generation || counter || frame kind || sender id`.
 
@@ -223,7 +223,7 @@ pub fn VeilLink(comptime tag: VeilStateTag) type {
 
 **RNG, Storage, Zeroization, Fault Hardening**
 
-RNG: use OS CSPRNG directly for seeding and keygen, with per-worker ChaCha20/HKDF-DRBG only for high-volume nonces and ML-KEM noise. opssl uses getrandom/getentropy/arc4random and tracks fork PID [random.c](/home/kain/opssl/src/crypto/random.c:2); Mizuchi should reseed on fork, hot-upgrade import, and VM snapshot detection.
+RNG: use OS CSPRNG directly for seeding and keygen, with per-worker ChaCha20/HKDF-DRBG only for high-volume nonces and ML-KEM noise. opssl uses getrandom/getentropy/arc4random and tracks fork PID [random.c](/home/kain/opssl/src/crypto/random.c:2); Orochi should reseed on fork, hot-upgrade import, and VM snapshot detection.
 
 Key storage: `KeyHandle(.tls_ticket)`, `KeyHandle(.veil_root)`, etc. Handles live in mlocked, DONTDUMP arenas with guard pages when possible. opssl has mlock plus wipe [platform.c](/home/kain/opssl/src/crypto/platform.c:77); Zig wraps every key with `defer key.wipe()` and compile-time purpose tags.
 

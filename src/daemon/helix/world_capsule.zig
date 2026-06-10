@@ -275,7 +275,7 @@ test "round-trip with non-null key, members, and topic" {
     };
 
     const original = WorldCapsule{
-        .name = "#mizuchi",
+        .name = "#orochi",
         .topic = "Welcome to the deep",
         .topic_setter = "Suimyaku!user@host",
         .topic_ts = 1_700_000_000,

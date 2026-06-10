@@ -273,7 +273,7 @@ test "full upgrade round-trip preserves state and descriptors" {
             .nick = "Suimyaku",
             .user = "ident0",
             .realname = "Stream Vein",
-            .host = "node0.mizuchi",
+            .host = "node0.orochi",
             .account = "acct-zero",
         },
         .{
@@ -283,7 +283,7 @@ test "full upgrade round-trip preserves state and descriptors" {
             .nick = "Tsumugi",
             .user = "ident1",
             .realname = "Weaver",
-            .host = "node1.mizuchi",
+            .host = "node1.orochi",
             .account = null, // null account variant
         },
         .{
@@ -293,7 +293,7 @@ test "full upgrade round-trip preserves state and descriptors" {
             .nick = "Koshi",
             .user = "ident2",
             .realname = "Spine",
-            .host = "node2.mizuchi",
+            .host = "node2.orochi",
             .account = "acct-two",
         },
     };

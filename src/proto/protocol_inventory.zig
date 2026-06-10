@@ -13,7 +13,7 @@ const std = @import("std");
 
 /// Default network name advertised in ISUPPORT `NETWORK=` and the welcome
 /// burst. Operators override it via `[network] name` (see `setNetworkName`).
-pub const network_name = "Mizuchi";
+pub const network_name = "Orochi";
 
 /// Boot-time override of the advertised network name. Write-once at startup
 /// (before any client traffic), so no lock is needed; reads see a stable value.

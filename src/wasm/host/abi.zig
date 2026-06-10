@@ -1,4 +1,4 @@
-//! Versioned, permissioned MizuWasm host API schema.
+//! Versioned, permissioned OroWasm host API schema.
 //!
 //! This file is deliberately only a schema: no host pointers, no packed guest
 //! structs, and no single global ABI integer that decides compatibility. Each

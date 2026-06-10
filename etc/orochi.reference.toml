@@ -1,5 +1,5 @@
 # =============================================================================
-# Mizuchi — reference configuration
+# Orochi — reference configuration
 # =============================================================================
 # This file documents every configuration section and key the daemon accepts,
 # with its type, default, and accepted range. It is exhaustive: copy it, delete
@@ -27,15 +27,15 @@ id = 1
 # Optional Ed25519 identity keypair (hex), enabling PQ-secured S2S links. When
 # secret_key is set the daemon derives its node identity and runs the Tsumugi
 # (X-Wing + Ed25519) handshake for secured peers. Omit for plaintext-only mesh.
-# public_key = "env:MIZUCHI_NODE_PUBKEY"
-# secret_key = "env:MIZUCHI_NODE_SECKEY"
+# public_key = "env:OROCHI_NODE_PUBKEY"
+# secret_key = "env:OROCHI_NODE_SECKEY"
 
 
 # --- [network] — network presentation ----------------------------------------
 [network]
 # Network name advertised in ISUPPORT NETWORK= and the registration welcome
-# burst. Default: "Mizuchi".
-name = "Mizuchi"
+# burst. Default: "Orochi".
+name = "Orochi"
 
 
 # --- [motd] — message of the day (personalized template) ---------------------
@@ -53,7 +53,7 @@ name = "Mizuchi"
 #   {if:oper}You have operator privileges.{/if}
 #   {if:secure}{else}This link is not encrypted.{/if}
 #
-# text = "@file:/etc/mizuchi/motd.txt"
+# text = "@file:/etc/orochi/motd.txt"
 # text = """
 # {greeting}, {nick}! Welcome to {network} ({users} online).
 # {if:account}Signed in as {account}.{else}Register to reserve your nick.{/if}
@@ -63,8 +63,8 @@ name = "Mizuchi"
 # --- [admin] — ADMIN command contact details ---------------------------------
 [admin]
 # Shown in the ADMIN reply (RPL_ADMINLOC1 / RPL_ADMINEMAIL).
-location = "Mizuchi IRC network"
-email = "admin@mizuchi.local"
+location = "Orochi IRC network"
+email = "admin@orochi.local"
 
 
 # --- [weather] — localized weather for the MOTD {weather} placeholder --------
@@ -80,8 +80,8 @@ enabled = false
 #   wind_kph=20
 #   desc=Partly cloudy
 # Example updater (cron, every 10 min):
-#   curl -s 'wttr.in/Austin?format=j1' | jq -r ... > /var/lib/mizuchi/weather.kv
-# source = "/var/lib/mizuchi/weather.kv"
+#   curl -s 'wttr.in/Austin?format=j1' | jq -r ... > /var/lib/orochi/weather.kv
+# source = "/var/lib/orochi/weather.kv"
 # Override the display location (else the file's `location`).
 # location = "Austin, TX"
 # ISO country code for unit selection (else the file's `country`).
@@ -94,7 +94,7 @@ enabled = false
 enabled = false
 # Path to a file with one headline per line; the first `count` are joined.
 # Example updater: curl an RSS/JSON feed, write headlines, one per line.
-# source = "/var/lib/mizuchi/news.txt"
+# source = "/var/lib/orochi/news.txt"
 count = 3
 
 
@@ -126,8 +126,8 @@ enabled = false
 # TLS port (conventional IRCS port is 6697).
 port = 6697
 # On-disk PEM/DER material; set both to load instead of bootstrapping.
-# cert_path = "/etc/mizuchi/tls/cert.pem"
-# key_path  = "/etc/mizuchi/tls/key.pem"
+# cert_path = "/etc/orochi/tls/cert.pem"
+# key_path  = "/etc/orochi/tls/key.pem"
 # CN/SAN for the self-signed bootstrap leaf.
 dns_name = "irc.example.net"
 # Request a client certificate (mTLS) so SASL EXTERNAL can match the presented
@@ -154,7 +154,7 @@ preload = false
 realm = "local"
 # Shared passphrase for plaintext S2S admission (MeshPass). For secured links
 # use [node].secret_key instead.
-# mesh_pass = "env:MIZUCHI_MESH_PASS"
+# mesh_pass = "env:OROCHI_MESH_PASS"
 # Trusted peer identity roots (array of hex public keys), for secured links.
 # trust_roots = ["env:PEER_A_PUBKEY", "env:PEER_B_PUBKEY"]
 
@@ -212,7 +212,7 @@ enabled = false
 # realm = "example.net"
 # WAL-backed account store path (relative to the daemon cwd). When set, the
 # daemon opens it and verifies SASL credentials against it.
-# account_db = "/var/lib/mizuchi/accounts.db"
+# account_db = "/var/lib/orochi/accounts.db"
 
 
 # --- [[opers]] — operator bindings (SASL-only) -------------------------------
@@ -239,7 +239,7 @@ enabled = false
 # cloaked with a key derived from this secret (stable across restarts). When
 # absent, a random per-boot key is used (privacy on by default, but cloaks
 # change each restart).
-# secret = "env:MIZUCHI_CLOAK_SECRET"
+# secret = "env:OROCHI_CLOAK_SECRET"
 
 
 # --- [media] — voice/video (SFU) ---------------------------------------------
@@ -257,7 +257,7 @@ max_frame_bytes = 65536       # 64 KiB per media frame (0..16 MiB)
 [stats]
 # Directory to publish stats.json + index.html into (e.g. an nginx root).
 # Empty = disabled.
-# dir = "/var/www/mizuchi"
+# dir = "/var/www/orochi"
 interval = "30s"       # minimum interval between stats writes
 
 

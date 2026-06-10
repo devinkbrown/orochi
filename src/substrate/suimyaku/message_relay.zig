@@ -236,7 +236,7 @@ fn expectRoundTrip(msg: RelayMessage) !void {
 test "relay messages round-trip for each verb" {
     try expectRoundTrip(.{
         .verb = .privmsg,
-        .target = "#mizuchi",
+        .target = "#orochi",
         .source_nick = "alice",
         .source_prefix = "alice!u@example.invalid",
         .account = "alice",
@@ -260,7 +260,7 @@ test "relay messages round-trip for each verb" {
 
     try expectRoundTrip(.{
         .verb = .tagmsg,
-        .target = "#mizuchi",
+        .target = "#orochi",
         .source_nick = "carol",
         .source_prefix = "carol!u@example.invalid",
         .account = "",

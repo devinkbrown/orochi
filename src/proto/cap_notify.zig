@@ -294,7 +294,7 @@ test "DEL notification omits values exactly" {
     var storage: [256]u8 = undefined;
     var sink = LineSink{ .lines = &line_slots, .storage = &storage };
 
-    try emitDel(&sink, "mizuchi.test", "akari", &.{
+    try emitDel(&sink, "orochi.test", "akari", &.{
         .{ .name = "away-notify" },
         .{ .name = "chghost" },
     });
@@ -302,7 +302,7 @@ test "DEL notification omits values exactly" {
     const lines = sink.slice();
     try std.testing.expectEqual(@as(usize, 1), lines.len);
     try std.testing.expectEqualStrings(
-        ":mizuchi.test CAP akari DEL :away-notify chghost\r\n",
+        ":orochi.test CAP akari DEL :away-notify chghost\r\n",
         lines[0],
     );
 }

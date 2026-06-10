@@ -1,4 +1,4 @@
-//! Mizuchi oper server-notice masks (snomask) — a pure, allocation-free bitset
+//! Orochi oper server-notice masks (snomask) — a pure, allocation-free bitset
 //! over server-notice categories plus a small `+/-` spec parser.
 //!
 //! A snomask is an operator's *subscription set* over the categories of notice

@@ -1,4 +1,4 @@
-# Mizuchi config sweep — crypto / TLS / ACME (READ-ONLY survey)
+# Orochi config sweep — crypto / TLS / ACME (READ-ONLY survey)
 
 Scope: `src/crypto/*` (named files), `src/daemon/acme_*.zig`, `src/proto/tls_*.zig`, `src/proto/acme_*.zig`.
 Only operationally/perf-meaningful hardcoded literals are listed. Cryptographic domain constants are excluded (see note at bottom).

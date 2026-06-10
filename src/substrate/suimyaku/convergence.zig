@@ -685,7 +685,7 @@ fn stateHash(ns: *const NetworkState) anti_entropy.Hash {
     for (ns.topics.items) |entry| fold.add(hashTopicEntry(entry));
 
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.network-state.v1");
+    h.update("orochi.suimyaku.network-state.v1");
     updateU64(&h, ns.users.items.len);
     updateU64(&h, ns.nick_claims.items.len);
     updateU64(&h, ns.channels.items.len);
@@ -756,7 +756,7 @@ fn topicKey(buf: []u8, channel: state_mod.ChannelName) ![]const u8 {
 
 fn hashUserEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.user.v1");
+    h.update("orochi.suimyaku.state.user.v1");
     updateInline(&h, entry.uid);
     updateUserProfileRegister(&h, entry.profile);
     updatePresenceRegister(&h, entry.presence);
@@ -765,7 +765,7 @@ fn hashUserEntry(entry: anytype) anti_entropy.Hash {
 
 fn hashNickClaim(claim: state_mod.NickClaim) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.nick.v1");
+    h.update("orochi.suimyaku.state.nick.v1");
     updateInline(&h, claim.nick);
     updateInline(&h, claim.uid);
     updateU64(&h, claim.authority);
@@ -776,7 +776,7 @@ fn hashNickClaim(claim: state_mod.NickClaim) anti_entropy.Hash {
 
 fn hashChannelRoot(channel: state_mod.ChannelRoot) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.channel.v1");
+    h.update("orochi.suimyaku.state.channel.v1");
     updateInline(&h, channel.name);
     updateHlc(&h, channel.birth_hlc);
     updateBool(&h, channel.has_birth);
@@ -787,7 +787,7 @@ fn hashChannelRoot(channel: state_mod.ChannelRoot) anti_entropy.Hash {
 
 fn hashMembershipEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.membership.v1");
+    h.update("orochi.suimyaku.state.membership.v1");
     updateMembershipKey(&h, entry.value);
     updateDotList(&h, entry.dots.items);
     return finalHash(&h);
@@ -795,7 +795,7 @@ fn hashMembershipEntry(entry: anytype) anti_entropy.Hash {
 
 fn hashPrefixModeEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.prefix-mode.v1");
+    h.update("orochi.suimyaku.state.prefix-mode.v1");
     updatePrefixModeKey(&h, entry.key);
     updateAuthToggle(&h, entry.toggle);
     return finalHash(&h);
@@ -803,7 +803,7 @@ fn hashPrefixModeEntry(entry: anytype) anti_entropy.Hash {
 
 fn hashBooleanModeEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.boolean-mode.v1");
+    h.update("orochi.suimyaku.state.boolean-mode.v1");
     updateBooleanModeKey(&h, entry.key);
     updateU8(&h, @intFromEnum(entry.toggle.policy));
     updateBool(&h, entry.toggle.enabled);
@@ -814,7 +814,7 @@ fn hashBooleanModeEntry(entry: anytype) anti_entropy.Hash {
 
 fn hashParamModeEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.param-mode.v1");
+    h.update("orochi.suimyaku.state.param-mode.v1");
     updateParamModeKey(&h, entry.key);
     updateParamModeRegister(&h, entry.register);
     return finalHash(&h);
@@ -822,7 +822,7 @@ fn hashParamModeEntry(entry: anytype) anti_entropy.Hash {
 
 fn hashBanSetEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.ban.v1");
+    h.update("orochi.suimyaku.state.ban.v1");
     updateBanKey(&h, entry.value);
     updateDotList(&h, entry.dots.items);
     return finalHash(&h);
@@ -830,7 +830,7 @@ fn hashBanSetEntry(entry: anytype) anti_entropy.Hash {
 
 fn hashBanMetadataEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.ban-metadata.v1");
+    h.update("orochi.suimyaku.state.ban-metadata.v1");
     updateBanKey(&h, entry.key);
     updateBanMetadataRegister(&h, entry.register);
     return finalHash(&h);
@@ -838,7 +838,7 @@ fn hashBanMetadataEntry(entry: anytype) anti_entropy.Hash {
 
 fn hashTopicEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.topic.v1");
+    h.update("orochi.suimyaku.state.topic.v1");
     updateInline(&h, entry.channel);
     updateTopicRegister(&h, entry.register);
     return finalHash(&h);
@@ -854,7 +854,7 @@ fn hashCausalContext(cc: anytype) anti_entropy.Hash {
     }
 
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.causal-context.v1");
+    h.update("orochi.suimyaku.state.causal-context.v1");
     updateU64(&h, count);
     h.update(&fold.acc);
     return finalHash(&h);
@@ -862,7 +862,7 @@ fn hashCausalContext(cc: anytype) anti_entropy.Hash {
 
 fn hashDot(dot: state_mod.Dot) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("mizuchi.suimyaku.state.dot.v1");
+    h.update("orochi.suimyaku.state.dot.v1");
     updateU64(&h, dot.replica);
     updateU64(&h, dot.counter);
     return finalHash(&h);

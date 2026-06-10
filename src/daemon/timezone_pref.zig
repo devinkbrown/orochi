@@ -1,4 +1,4 @@
-//! Per-account timezone preferences for the Mizuchi IRC daemon.
+//! Per-account timezone preferences for the Orochi IRC daemon.
 //!
 //! Each account may associate a single timezone identifier (IANA-style, e.g.
 //! "America/New_York") together with a cached UTC offset in minutes. Storage is

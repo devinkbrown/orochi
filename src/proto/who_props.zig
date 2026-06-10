@@ -185,7 +185,7 @@ fn baseContext() who.ReplyContext {
     return .{
         .server_name = "irc.example.test",
         .requester = "dan",
-        .target = "#mizuchi",
+        .target = "#orochi",
         .client = .{
             .nick = "alice",
             .user = "auser",
@@ -197,7 +197,7 @@ fn baseContext() who.ReplyContext {
             .account = "alice",
         },
         .member = .{
-            .channel = "#mizuchi",
+            .channel = "#orochi",
             .channel_prefix = null,
             .hops = 1,
             .distance = 2,
@@ -285,7 +285,7 @@ fn fillToken(random: std.Random, out: []u8, fallback: []const u8, iteration: usi
 }
 
 fn fillChannel(random: std.Random, out: []u8, iteration: usize) []const u8 {
-    const body = fillToken(random, out[1..], "mizuchi", iteration);
+    const body = fillToken(random, out[1..], "orochi", iteration);
     out[0] = '#';
     return out[0 .. 1 + body.len];
 }

@@ -1,6 +1,6 @@
 //! Ringlane io_uring reactor (skeleton).
 //!
-//! Ringlane is Mizuchi's Linux fast path (planning/05, "Ringlane I/O"): one
+//! Ringlane is Orochi's Linux fast path (planning/05, "Ringlane I/O"): one
 //! io_uring per shard, multishot accept/recv, provided-buffer rings, batched
 //! send, optional zero-copy send. This file is the io_uring-backed core that the
 //! `Reactor` seam (`src/substrate/reactor.zig`) will eventually dispatch to on

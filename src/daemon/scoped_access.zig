@@ -1,4 +1,4 @@
-//! Unified scoped access-list storage for Mizuchi.
+//! Unified scoped access-list storage for Orochi.
 //!
 //! A single ordered store carries both grants and restrictions. Entries own
 //! their text fields after insertion, and callers pass an allocator to every

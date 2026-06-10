@@ -126,7 +126,7 @@ pub fn parseListx(params: []const []const u8) ListError!Request {
     return parse(.listx, params);
 }
 
-/// Parse LIST or LISTX parameters. Mizuchi accepts a single comma-separated
+/// Parse LIST or LISTX parameters. Orochi accepts a single comma-separated
 /// filter parameter for both commands.
 pub fn parse(command: Command, params: []const []const u8) ListError!Request {
     return parseWithMax(MAX_FILTERS, command, params);

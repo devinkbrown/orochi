@@ -1,4 +1,4 @@
-//! Deterministic IRCX channel object identifiers for Mizuchi.
+//! Deterministic IRCX channel object identifiers for Orochi.
 const std = @import("std");
 
 pub const Oid = u32;

@@ -1,4 +1,4 @@
-//! PinBoard: a per-channel general notes board for the Mizuchi IRC daemon.
+//! PinBoard: a per-channel general notes board for the Orochi IRC daemon.
 //!
 //! Each channel owns an ordered list of pinned notes (capped at `max_notes`).
 //! Notes carry a monotonically increasing identifier, the note text, the

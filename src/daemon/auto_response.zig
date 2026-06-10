@@ -1,4 +1,4 @@
-//! Per-account auto-reply text for the Mizuchi IRC daemon.
+//! Per-account auto-reply text for the Orochi IRC daemon.
 //!
 //! Holds an optional auto-response message per account, used when a client is
 //! marked away or busy. Each entry pairs an `enabled` flag with the stored text.

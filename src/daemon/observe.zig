@@ -1,4 +1,4 @@
-//! Mizuchi OBSERVE — operator observation subscriptions on the Event Spine.
+//! Orochi OBSERVE — operator observation subscriptions on the Event Spine.
 //!
 //! This is NOT a stateless "spy and dump" query. An operator declares a standing
 //! *interest mask* with `EVENT OBSERVE <mask>`; the daemon then keeps that filter
@@ -255,10 +255,10 @@ test "set enforces limits" {
 test "formatNote renders with and without detail" {
     const subj = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .account = "bob" };
     var buf: [256]u8 = undefined;
-    const a = Registry.formatNote(&buf, "mizuchi.local", .connect, subj).?;
+    const a = Registry.formatNote(&buf, "orochi.local", .connect, subj).?;
     try std.testing.expect(std.mem.indexOf(u8, a, "NOTE EVENT OBSERVE :connect bob!~b@10.0.0.4 acct=bob") != null);
     var buf2: [256]u8 = undefined;
     const subj2 = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .detail = "-> robert" };
-    const b = Registry.formatNote(&buf2, "mizuchi.local", .nick, subj2).?;
+    const b = Registry.formatNote(&buf2, "orochi.local", .nick, subj2).?;
     try std.testing.expect(std.mem.indexOf(u8, b, "acct=* -> robert") != null);
 }

@@ -1,4 +1,4 @@
-//! mizuchi-proto — IRC/IRCv3/IRCX/SUIMYAKU/TSUMUGI schemas, the comptime codec
+//! orochi-proto — IRC/IRCv3/IRCX/SUIMYAKU/TSUMUGI schemas, the comptime codec
 //! generator (Codec Loom) and the canonical wire format (CoilPack).
 //! Skeleton; see planning/04.
 

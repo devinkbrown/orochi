@@ -1,4 +1,4 @@
-# Mizuchi daemon core — hardcoded operational/tuning constant sweep
+# Orochi daemon core — hardcoded operational/tuning constant sweep
 
 Scope: `src/daemon/server.zig`, `src/daemon/dispatch.zig`, `src/daemon/client.zig`
 (accept-loop, timeout sweep, and listener logic all live in `server.zig`).
@@ -66,9 +66,9 @@ mapped through `config_boot.zig`. Other rows are NOT yet liftable via TOML.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
-| server.zig:540 | `server_name` | `"mizuchi.local"` | server name in numerics/prefixes/ERROR lines — borderline (identity, not tuning) | `node.server_name` (NEW) | string | mizuchi.local | – |
-| dispatch.zig:20 | `SERVER_NAME` | `"mizuchi.local"` | server name in dispatch-layer replies (isolation/test path mirror) — borderline | `node.server_name` (reuse) | string | mizuchi.local | – |
-| dispatch.zig:21 | `NETWORK_NAME` | `"Mizuchi"` | network name advertised in ISUPPORT — borderline (identity) | `node.network_name` (NEW) | string | Mizuchi | – |
+| server.zig:540 | `server_name` | `"orochi.local"` | server name in numerics/prefixes/ERROR lines — borderline (identity, not tuning) | `node.server_name` (NEW) | string | orochi.local | – |
+| dispatch.zig:20 | `SERVER_NAME` | `"orochi.local"` | server name in dispatch-layer replies (isolation/test path mirror) — borderline | `node.server_name` (reuse) | string | orochi.local | – |
+| dispatch.zig:21 | `NETWORK_NAME` | `"Orochi"` | network name advertised in ISUPPORT — borderline (identity) | `node.network_name` (NEW) | string | Orochi | – |
 
 ---
 

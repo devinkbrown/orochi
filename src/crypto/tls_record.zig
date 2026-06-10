@@ -315,7 +315,7 @@ test "seal/open round-trip" {
     defer cipher.deinit();
 
     const iv = hex("000102030405060708090a0b");
-    const plaintext = "mizuchi tls record payload";
+    const plaintext = "orochi tls record payload";
     const padding_len = 5;
     const inner_len = plaintext.len + 1 + padding_len;
 

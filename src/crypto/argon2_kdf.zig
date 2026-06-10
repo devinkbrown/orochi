@@ -1,4 +1,4 @@
-//! mizuchi-crypto — Argon2id password hashing for account credentials.
+//! orochi-crypto — Argon2id password hashing for account credentials.
 //!
 //! This is the modern upgrade path away from PBKDF2 for storing account
 //! passwords. Argon2id is a memory-hard KDF (winner of the Password Hashing

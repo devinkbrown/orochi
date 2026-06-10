@@ -1,7 +1,7 @@
 # 19 — Media Client Implementation Guide
 
 Status: **reference**. This is the complete, self-contained contract for implementing a
-client that makes a voice/video call through the Mizuchi SFU. Everything here is the
+client that makes a voice/video call through the Orochi SFU. Everything here is the
 *server's* observed behaviour — you can implement a client in any language against it
 without reading the Zig source. Companion to [18-media-transport.md](18-media-transport.md)
 (architecture) — this doc is the byte-level "how".
@@ -71,7 +71,7 @@ profile (set by the first OFFER). Reply `ANSWER-ACK codecs=<intersection> fec=..
 
 ### The TRANSPORT line — parse this
 ```
-:mizuchi.local NOTE MEDIA #call TRANSPORT ufrag=dHD3gY59 pwd=LsaRAE0Yzxz1xYSd9++9E+u6 candidate=127.0.0.1:37190 srtp=14K23wcnM2X9VEfpw3tvX+RQs7rRzb7Y/qbezPQI
+:orochi.local NOTE MEDIA #call TRANSPORT ufrag=dHD3gY59 pwd=LsaRAE0Yzxz1xYSd9++9E+u6 candidate=127.0.0.1:37190 srtp=14K23wcnM2X9VEfpw3tvX+RQs7rRzb7Y/qbezPQI
 ```
 - `ufrag` — 8 chars. Your STUN USERNAME is `"<ufrag>:<anything>"` (server reads only the
   part before `:`; put your own ICE ufrag after it, any value works today).

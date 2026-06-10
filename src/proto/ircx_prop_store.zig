@@ -659,7 +659,7 @@ test "set get overwrite delete and list properties" {
     var store = DefaultStore.init(std.testing.allocator);
     defer store.deinit();
 
-    const entity = try Entity.fromId("#Mizuchi");
+    const entity = try Entity.fromId("#Orochi");
     const setter = Setter{ .id = "alice", .access = .owner };
 
     const first = try store.setProp(entity, "topic", "first", setter);
@@ -675,7 +675,7 @@ test "set get overwrite delete and list properties" {
 
     _ = try store.setProp(entity, "SUBJECT", "zig", setter);
     var out: [4]EntryView = undefined;
-    const listed = try store.listProps(try Entity.fromId("#mizuchi"), &out);
+    const listed = try store.listProps(try Entity.fromId("#orochi"), &out);
     try std.testing.expectEqual(@as(usize, 2), listed.len);
     try std.testing.expectEqualStrings("SUBJECT", listed[0].key);
     try std.testing.expectEqualStrings("TOPIC", listed[1].key);

@@ -1,4 +1,4 @@
-//! `mizuchi acme-issue` entry: assemble the clean-room ACME stack into a single
+//! `orochi acme-issue` entry: assemble the clean-room ACME stack into a single
 //! out-of-band issuance run. Generates distinct ES256 (ECDSA P-256) account and
 //! certificate keys, loads trust anchors from a CA bundle, starts the loopback
 //! HTTP-01 listener (which nginx proxies `/.well-known/acme-challenge/` to), and
@@ -70,7 +70,7 @@ pub fn applyToml(opts: *Options, doc: *const toml.Document) void {
 /// Print a one-line usage summary for the acme-issue subcommand.
 pub fn usage() void {
     std.debug.print(
-        \\usage: mizuchi acme-issue --domain <fqdn> --out <path> [options]
+        \\usage: orochi acme-issue --domain <fqdn> --out <path> [options]
         \\  --domain <fqdn>        domain to issue for (required)
         \\  --out <path>           cert chain output path (required; kain-owned dir)
         \\  --key-out <path>       cert key output path (default: <out>.key.pem)

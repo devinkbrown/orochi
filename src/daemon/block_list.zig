@@ -1,4 +1,4 @@
-//! Mizuchi account block lists.
+//! Orochi account block lists.
 //!
 //! Stores owned account names and blocked-account names in bounded per-account
 //! lists. Returned slices are borrowed and stay valid until the next mutation.

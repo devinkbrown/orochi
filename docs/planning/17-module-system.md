@@ -4,7 +4,7 @@ Status: **design + active build**. This is the consolidated synthesis of six dee
 reports (Zig-native module idioms, IRCd module-system mistakes, in-process upgrades,
 cross-language plugin systems, upgrade engineering, WASM verdict) reconciled with the
 vocabulary already laid down in `05-innovation.md` (SerpentRegistry, Helix Upgrade, Event
-Spine, CoilPack, MizuWasm, Codec Loom) and the code that already exists
+Spine, CoilPack, OroWasm, Codec Loom) and the code that already exists
 (`src/daemon/registry.zig`).
 
 The thesis, in one line: **the core is compiled in (comptime registry, zero ABI boundary,
@@ -41,7 +41,7 @@ lifecycle, Helix Upgrade, and the WASM boundary.
 
 From `ircd-mistakes-and-wasm.md`. Every line is a hard rule for this design.
 
-| # | Anti-pattern (seen in C lineage) | Mizuchi countermeasure |
+| # | Anti-pattern (seen in C lineage) | Orochi countermeasure |
 |---|---|---|
 | AP-1 | Cross-binary struct/vtable ABI as the load contract | **No ABI boundary for core** — modules are comptime-composed into one binary. Cross-version state uses a typed wire schema (CoilPack), never a memory layout. |
 | AP-2 | Coarse global version integer → fleet recompile | No global ABI integer. Cross-version negotiation is **per-capsule schema id + min/max**, and (for WASM) per-host-function. |
@@ -257,7 +257,7 @@ handler call; passing `&core` as ctx is the whole integration. Module handlers
 
 ---
 
-## 7. Helix Upgrade (in-process upgrade) — `mizuchi --supervisor`
+## 7. Helix Upgrade (in-process upgrade) — `orochi --supervisor`
 
 The clean-room replacement for ophion's externalized shim. Same binary, `--supervisor` mode.
 
@@ -293,7 +293,7 @@ CoilPack), `helix/attest.zig`.
 
 ---
 
-## 8. MizuWasm — sandboxed third-party control-plane plugins (optional layer)
+## 8. OroWasm — sandboxed third-party control-plane plugins (optional layer)
 
 **Verdict (from `ircd-mistakes-and-wasm.md`): worth it, but narrowly.** WASM is the right
 answer for *untrusted third-party extensions* and the wrong answer for *core*. It replaces
@@ -318,7 +318,7 @@ Hard boundaries:
 - Time + randomness flow through hostcalls ⇒ plugins are replayable under the deterministic
   simulator (an advantage no native `.so` model can offer).
 
-MizuWasm is **phase-last** and opt-in. The comptime registry ships and proves itself first;
+OroWasm is **phase-last** and opt-in. The comptime registry ships and proves itself first;
 WASM plugs into the *same* `Module`/`HookId`/`Services` contract as a sandboxed producer of
 registry entries owned by the host handle.
 
@@ -336,7 +336,7 @@ The seam is the only serial, collision-prone step; everything after fans out.
 | **W0** | This design doc | — | done |
 | **W1** | Typed `HookId`+payload map + lifecycle fields in `registry.zig`; `module_core.zig` (`Core`/`Services`); wire `Live.dispatch` into `dispatchRegistered` (strangler-fig); migrate first batch (query/info: VERSION/TIME/ADMIN/INFO/MOTD/LUSERS/USERS/MAP/LINKS). Build green. | **No — serial (me)** | main |
 | **W2a** | Helix Upgrade supervisor skeleton (new files) | Yes — disjoint | agent/codex worktree |
-| **W2b** | MizuWasm host API schema + interpreter MVP (new files) | Yes — disjoint | agent/codex worktree |
+| **W2b** | OroWasm host API schema + interpreter MVP (new files) | Yes — disjoint | agent/codex worktree |
 | **W2c** | Migrate channel-ops family into `modules/channel_ops.zig` | Yes — disjoint manifest section | agent/codex worktree |
 | **W2d** | Migrate accounts/services family into `modules/accounts.zig` | Yes — disjoint | agent/codex worktree |
 | **W2e** | Migrate IRCX family into `modules/ircx.zig` | Yes — disjoint | agent/codex worktree |
@@ -357,6 +357,6 @@ fold in by hand.
 - Golden: existing IRC/IRCv3/IRCX goldens must stay green through every wave (behavior is
   preserved — handlers are *moved*, not rewritten).
 - Upgrade: Deterministic Ocean mixed-version capsule campaigns for Helix.
-- WASM: replay determinism + fuel/memory-limit enforcement tests for MizuWasm.
+- WASM: replay determinism + fuel/memory-limit enforcement tests for OroWasm.
 - CI: build every feature-combo manifest (Ghostty's lesson — unreferenced comptime branches
   rot silently).

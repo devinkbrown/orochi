@@ -1,6 +1,6 @@
 # Helix Upgrade
 
-Mizuchi's in-place upgrade workflow is Helix. The operator-facing command is `UPGRADE`, implemented as an oper-only hot re-exec on Linux (`src/daemon/server.zig:6070`, `src/daemon/server.zig:6076`).
+Orochi's in-place upgrade workflow is Helix. The operator-facing command is `UPGRADE`, implemented as an oper-only hot re-exec on Linux (`src/daemon/server.zig:6070`, `src/daemon/server.zig:6076`).
 
 ## Preconditions
 
@@ -17,7 +17,7 @@ Mizuchi's in-place upgrade workflow is Helix. The operator-facing command is `UP
 5. The successor starts in `--supervisor` mode, adopts the inherited listener fd, keeps the port bound, and stores the inherited arena fd for session adoption (`src/main.zig:51`, `src/main.zig:57`, `src/main.zig:61`, `src/main.zig:68`).
 6. After the new server starts, it reads the arena and re-attaches carried-over client connections best-effort (`src/main.zig:292`, `src/daemon/server.zig:6163`, `src/daemon/server.zig:6178`).
 
-The Helix live path uses environment variables for inherited fds: `MIZUCHI_HELIX_ARENA_FD`, `MIZUCHI_HELIX_CONTROL_FD`, and `MIZUCHI_HELIX_LISTEN_FD` (`src/daemon/helix/live.zig:119`).
+The Helix live path uses environment variables for inherited fds: `OROCHI_HELIX_ARENA_FD`, `OROCHI_HELIX_CONTROL_FD`, and `OROCHI_HELIX_LISTEN_FD` (`src/daemon/helix/live.zig:119`).
 
 ## Fallbacks
 

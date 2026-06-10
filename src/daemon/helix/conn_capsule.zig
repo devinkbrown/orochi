@@ -226,7 +226,7 @@ test "round-trip with non-null account and high caps bits" {
         .fd_index = 0xDEAD_BEEF,
         .caps = (@as(u128, 1) << 127) | (@as(u128, 1) << 64) | 0x1234,
         .flags = .{ .registered = true, .is_tls = true, .ircx = true },
-        .nick = "Mizuchi",
+        .nick = "Orochi",
         .user = "ident",
         .realname = "Real Name Here",
         .host = "host.example.org",

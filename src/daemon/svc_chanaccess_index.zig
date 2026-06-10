@@ -1,6 +1,6 @@
-//! Reverse channel-access index for the Mizuchi IRC daemon.
+//! Reverse channel-access index for the Orochi IRC daemon.
 //!
-//! The primary channel-access tables in Mizuchi are keyed by channel: each
+//! The primary channel-access tables in Orochi are keyed by channel: each
 //! registered channel owns a list of (account, level) grants. That layout
 //! answers "who has access to this channel" cheaply but makes the inverse
 //! question — "which channels does this account hold access in" — an O(all

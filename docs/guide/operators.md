@@ -1,12 +1,12 @@
 # Operators
 
-Mizuchi operators are SASL-only. `OPER` never accepts a password; it returns an error telling the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
+Orochi operators are SASL-only. `OPER` never accepts a password; it returns an error telling the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
 
 ## Account Binding
 
 ```toml
 [sasl]
-account_db = "/var/lib/mizuchi/accounts.wal"
+account_db = "/var/lib/orochi/accounts.wal"
 
 [[opers]]
 account = "alice"
@@ -14,7 +14,7 @@ class = "netadmin"
 title = "Network Guardian"
 ```
 
-`account_db` opens a MizuStore account backend and wires PLAIN, SCRAM-SHA-256, and EXTERNAL into the live server (`src/main.zig:177`, `src/main.zig:193`). `[[opers]].account` is required and must be non-empty (`src/daemon/config_format.zig:433`, `src/daemon/config_format.zig:481`). `class` names an operator group, and `title` is optional WHOIS/operator display text (`src/daemon/config_format.zig:436`, `src/daemon/config_format.zig:441`).
+`account_db` opens a OroStore account backend and wires PLAIN, SCRAM-SHA-256, and EXTERNAL into the live server (`src/main.zig:177`, `src/main.zig:193`). `[[opers]].account` is required and must be non-empty (`src/daemon/config_format.zig:433`, `src/daemon/config_format.zig:481`). `class` names an operator group, and `title` is optional WHOIS/operator display text (`src/daemon/config_format.zig:436`, `src/daemon/config_format.zig:441`).
 
 ## Privilege Classes
 

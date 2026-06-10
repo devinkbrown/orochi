@@ -24,7 +24,7 @@ pub const PublicKey = [public_key_len]u8;
 pub const SecretKey = [secret_key_len]u8;
 pub const Secret = [secret_len]u8;
 
-const suite_label = "mizuchi-treekem-v1";
+const suite_label = "orochi-treekem-v1";
 
 /// Historic default for the maximum TreeKEM group size.
 pub const default_max_members: usize = 1024;

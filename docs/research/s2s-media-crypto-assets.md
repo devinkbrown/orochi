@@ -1,12 +1,12 @@
 # S2S Media/Crypto Asset Study: opssl and opcodec
 
 This is a design mapping, not an import plan. `opssl` and `opcodec` are
-owner-built C reference libraries from the Ophion ecosystem. Mizuchi remains
+owner-built C reference libraries from the Ophion ecosystem. Orochi remains
 clean-room, pure Zig in core: no C ABI, no linked C library, no inherited LADON
 identity model. These libraries are useful as blueprints for algorithms, module
 boundaries, tests, and operational lessons.
 
-The relevant Mizuchi context is:
+The relevant Orochi context is:
 
 - Suimyaku S2S has a sovereign `node_id = BLAKE3-160(Ed25519 verify key)`.
   There are no SIDs.
@@ -98,13 +98,13 @@ Notable APIs and wire facts:
 - `opsec` uses per-sender key derivation, nonce XOR salt, generation ratchet,
   512-packet anti-replay, previous-key grace
 - `opfec` is XOR 1D/2D FEC up to 8 packets with interleaving; useful as a
-  first-pass local recovery model, not sufficient as Mizuchi's long-term
+  first-pass local recovery model, not sufficient as Orochi's long-term
   rateless media FEC
 - `opjit` tracks reorder, adaptive delay, NACK entries, burst loss
 - `netadapt` tracks RTT/loss/jitter, Kalman-like BWE, stable/probing/draining/
   recovery, codec quality and FEC recommendations
 
-## opssl -> Mizuchi Crypto and Transport
+## opssl -> Orochi Crypto and Transport
 
 ### What To Port To Zig
 
@@ -129,7 +129,7 @@ Port algorithms and discipline, not the C API shape.
 - Implement the hybrid combiner explicitly. Do not use naive
   `HKDF(x25519_ss || mlkem_ss)`.
 - Tsumugi should derive:
-  `root = KDF("mizuchi-tsumugi-xwing-v1", x25519_ss || mlkem_ss ||
+  `root = KDF("orochi-tsumugi-xwing-v1", x25519_ss || mlkem_ss ||
   x25519_pub_i || x25519_pub_r || mlkem_ct || transcript_hash ||
   meshpass_hash || negotiated_bands)`.
 - Use SHA3/SHAKE or HKDF-HMAC with careful domain separation. The deep research
@@ -148,7 +148,7 @@ Port algorithms and discipline, not the C API shape.
 
 `crypto/aead.zig` and `proto/tsumugi.zig`
 
-- Mizuchi already has AEAD and Tsumugi ratchet code. opssl reinforces that
+- Orochi already has AEAD and Tsumugi ratchet code. opssl reinforces that
   ChaCha20-Poly1305 and AES-GCM are the right primitives.
 - S2S default remains ChaCha20-Poly1305 because it is fast on non-AES hardware
   and matches opcodec `secure`. AES-GCM is a negotiated fast path only when both
@@ -166,7 +166,7 @@ Port algorithms and discipline, not the C API shape.
   forms; SHA1 only for explicit legacy compatibility, never as a security
   default.
 - `opssl_x509_get_spki`, `opssl_x509_fingerprint`, and
-  `opssl_conn_export_keying_material` are the blueprint. In Mizuchi the APIs
+  `opssl_conn_export_keying_material` are the blueprint. In Orochi the APIs
   should feed existing `proto/certfp.zig`, `proto/sasl_external_verify.zig`,
   and the web/TLS listener path.
 
@@ -250,7 +250,7 @@ traffic keys cross process boundaries.
 
 For non-kTLS TLS links, use the session-export idea: serialize cipher suite,
 traffic secrets, IVs, sequence numbers, pending records, and handshake state.
-In Mizuchi this should be `Tls13SessionSnapshot`, sealed and versioned like
+In Orochi this should be `Tls13SessionSnapshot`, sealed and versioned like
 `TsumugiLinkSnapshot`.
 
 ### Session Export/Import And `/UPGRADE`
@@ -272,7 +272,7 @@ migration: Tsumugi ratchet, Ryusen transport, Goryu anti-entropy work, and media
 track control state must move as one coherent object. The invariant is "no
 re-handshake, no replay window reset, no lost causal position."
 
-## opcodec -> Mizuchi Media Bands
+## opcodec -> Orochi Media Bands
 
 ### Band Layout
 
@@ -296,13 +296,13 @@ Map opcodec/LADON as follows:
 - Data-channel/whiteboard/annotation style payloads can use separate media-data
   bands only after core media control exists.
 
-Do not preserve LADON's 8-bit media frame type registry as Mizuchi's identity
+Do not preserve LADON's 8-bit media frame type registry as Orochi's identity
 model. Treat those type bytes as source taxonomy only.
 
 ### SID-Free, NodeId-Based Media Identity
 
 LADON data frames carry nick, channel, `sender_id`, seq, FEC info, and encrypted
-payload. Mizuchi should separate identity from hot-path compact handles:
+payload. Orochi should separate identity from hot-path compact handles:
 
 ```text
 MediaTrackAnnounce {
@@ -384,7 +384,7 @@ OPVIS maps cleanly to media bands:
   a server-side WASM mixer decodes the stream.
 
 For B-frames, carry both decode timestamp and presentation timestamp. LADON's
-historical DTS/PTS split is the right idea; Mizuchi should make it explicit:
+historical DTS/PTS split is the right idea; Orochi should make it explicit:
 
 ```text
 VideoFrameTiming {
@@ -418,7 +418,7 @@ Server path:
 - Default server media role is relay, not decode. It validates control rights,
   schedules bands, forwards frames, and observes congestion metadata.
 - Mixing, recording, moderation preview, transcription, and transcoding are
-  separate services. Those can run in MizuWasm sandboxes or external workers.
+  separate services. Those can run in OroWasm sandboxes or external workers.
 
 ### Does opcodec `secure` Compose With Tsumugi?
 
@@ -433,7 +433,7 @@ Use one of three modes:
    encrypted Tsumugi frame. Relays that terminate Tsumugi can inspect only the
    metadata needed for scheduling and authorization.
 2. `media_e2ee`: optional client-to-client or publisher-to-subscriber privacy.
-   An inner opcodec-style `opsec` envelope protects media payload from Mizuchi
+   An inner opcodec-style `opsec` envelope protects media payload from Orochi
    relays. Tsumugi still protects link metadata and routing.
 3. `mixed_service`: server-side mixer/transcoder is authorized to decrypt media.
    The media key is issued to the mixer service by signed control-plane policy.
@@ -441,7 +441,7 @@ Use one of three modes:
 If `opsec` is used, it must be domain-separated from Tsumugi:
 
 - independent media root key derived by a named exporter:
-  `HKDF(tsumugi_exporter, "mizuchi media e2ee v1", track_id || epoch)`
+  `HKDF(tsumugi_exporter, "orochi media e2ee v1", track_id || epoch)`
 - separate counters and epochs
 - AAD includes `track_id`, `seq`, `timestamp`, codec id, and owner `node_id`
 - inner `sender_id` replaced or bound to `node_id + track_id`
@@ -466,7 +466,7 @@ opcodec `fec` is useful as a first local-recovery tool:
 - predictable overhead
 - good for small burst loss when latency budget is tight
 
-Mizuchi's long-term media FEC should be RaptorQ-style rateless FEC for bands >=64:
+Orochi's long-term media FEC should be RaptorQ-style rateless FEC for bands >=64:
 
 - sender emits source symbols plus repair symbols
 - receiver decodes after any `k + epsilon` symbols
@@ -532,9 +532,9 @@ Core infrastructure must be pure Zig:
 
 Reason: these pieces own trust boundaries, key material, admission, live
 migration, and mesh correctness. They must be inspectable, testable, and
-deterministic inside Mizuchi.
+deterministic inside Orochi.
 
-### MizuWasm Sandbox
+### OroWasm Sandbox
 
 Candidate WASM components:
 
@@ -548,7 +548,7 @@ Reason: media codecs are large, math-heavy, and less central to S2S trust. A
 WASM sandbox gives memory isolation, deterministic resource limits, and a clean
 host ABI while avoiding C interop in core.
 
-MizuWasm host ABI should be narrow:
+OroWasm host ABI should be narrow:
 
 ```text
 alloc/free frame buffers
@@ -628,7 +628,7 @@ Do not port directly:
 
 ### Phase 6: Browser And WASM Prototype
 
-- Define MizuWasm ABI for OPVOX/OPVIS-style codecs.
+- Define OroWasm ABI for OPVOX/OPVIS-style codecs.
 - Prototype browser WebSocket media fallback and WebTransport preferred path.
 - Keep browser codec keying separate: short-lived track keys only, no Tsumugi
   root exposure.
@@ -644,7 +644,7 @@ Do not port directly:
 ## Risks
 
 - **License contamination:** both libraries are GPL. Treat as blueprint unless
-  Mizuchi's licensing explicitly permits direct code translation.
+  Orochi's licensing explicitly permits direct code translation.
 - **Constant-time regressions in Zig:** Zig makes APIs safer but does not
   magically prevent timing leaks. CT wrappers and tests are mandatory.
 - **ML-KEM implementation complexity:** NTT, rejection sampling, and implicit
@@ -659,7 +659,7 @@ Do not port directly:
   pin, zeroize, single-use, and suppress core dumps around upgrade windows.
 - **Media starving control:** scheduler policy must be tested under overload so
   media bands cannot delay membership, anti-entropy, pings, or IRC events.
-- **Server-side codec attack surface:** decode/transcode only in MizuWasm or a
+- **Server-side codec attack surface:** decode/transcode only in OroWasm or a
   separate worker process with resource limits.
 - **Browser fragmentation:** WebTransport is the right media target, but
   WebSocket must remain a functional fallback.
@@ -675,7 +675,7 @@ exporters, kTLS-aware migration, and session snapshot design.
 
 Do not port opcodec into core. Use its OPVOX/OPVIS module taxonomy, frame
 timing, `secure` concepts, `fec`, `jitter`, and `netadapt` as the design
-blueprint for media bands. Relay media by default; decode only in MizuWasm or an
+blueprint for media bands. Relay media by default; decode only in OroWasm or an
 authorized worker. Keep Tsumugi as the S2S security authority, reserve inner
 opcodec-style AEAD for optional media E2EE, and make media congestion/feed-back
 serve Ryusen without ever blocking core IRC and CRDT convergence.

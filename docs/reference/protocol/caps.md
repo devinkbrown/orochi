@@ -1,4 +1,4 @@
-# Mizuchi IRCv3 Capabilities
+# Orochi IRCv3 Capabilities
 
 This reference documents the capability registry in `src/proto/cap.zig` only. The registry advertises client capabilities whose `kind` is `.client` and `advertised` is true (`src/proto/cap.zig:103`, `src/proto/cap.zig:140`, `src/proto/cap.zig:164`). CAP LS 302 appends `=<value>` only when a `value_302` exists and the client requested 302 (`src/proto/cap.zig:150`, `src/proto/cap.zig:465`).
 
@@ -38,10 +38,10 @@ This reference documents the capability registry in `src/proto/cap.zig` only. Th
 | `message-editing` | none | Message editing capability. | `src/proto/cap.zig:401` |
 | `message-redaction` | none | Message redaction capability. | `src/proto/cap.zig:402` |
 | `typing` | none | Typing indicator capability. | `src/proto/cap.zig:403` |
-| `mizuchi/prop-notify` | none | Mizuchi vendor cap for property notifications. | `src/proto/cap.zig:404`, `src/proto/cap.zig:405` |
-| `mizuchi/session-sync` | none | Mizuchi vendor cap for session synchronization. | `src/proto/cap.zig:405`, `src/proto/cap.zig:406` |
-| `mizuchi/bouncer` | none | Mizuchi vendor cap for bouncer-style behavior. | `src/proto/cap.zig:406`, `src/proto/cap.zig:407` |
-| `mizuchi/suimyaku-media` | none | Mizuchi vendor cap for Suimyaku media. | `src/proto/cap.zig:407`, `src/proto/cap.zig:408` |
+| `orochi/prop-notify` | none | Orochi vendor cap for property notifications. | `src/proto/cap.zig:404`, `src/proto/cap.zig:405` |
+| `orochi/session-sync` | none | Orochi vendor cap for session synchronization. | `src/proto/cap.zig:405`, `src/proto/cap.zig:406` |
+| `orochi/bouncer` | none | Orochi vendor cap for bouncer-style behavior. | `src/proto/cap.zig:406`, `src/proto/cap.zig:407` |
+| `orochi/suimyaku-media` | none | Orochi vendor cap for Suimyaku media. | `src/proto/cap.zig:407`, `src/proto/cap.zig:408` |
 
 ## Negotiation Behavior
 
@@ -54,4 +54,4 @@ This reference documents the capability registry in `src/proto/cap.zig` only. Th
 
 ## Vendor Caps
 
-The current `src/proto/cap.zig` vendor namespace is `mizuchi/*`: `mizuchi/prop-notify`, `mizuchi/session-sync`, `mizuchi/bouncer`, and `mizuchi/suimyaku-media` (`src/proto/cap.zig:405`). No `ocean/*` capability appears in this source file; do not document an Ocean vendor cap unless one is added to the registry.
+The current `src/proto/cap.zig` vendor namespace is `orochi/*`: `orochi/prop-notify`, `orochi/session-sync`, `orochi/bouncer`, and `orochi/suimyaku-media` (`src/proto/cap.zig:405`). No `ocean/*` capability appears in this source file; do not document an Ocean vendor cap unless one is added to the registry.

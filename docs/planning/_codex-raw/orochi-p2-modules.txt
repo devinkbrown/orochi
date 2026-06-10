@@ -1,7 +1,7 @@
 You are a world-class cryptographic-engineering architect with 100% design freedom. Design — from
-scratch, in Zig — the CRYPTO + TLS + VEIL-TRANSPORT substrate for "Mizuchi", a clean-slate Zig
+scratch, in Zig — the CRYPTO + TLS + VEIL-TRANSPORT substrate for "Orochi", a clean-slate Zig
 successor to the ophion IRC daemon. This REPLACES the C library "opssl" entirely; NO C interop.
-Read the shared brief first: /home/kain/mizuchi/docs/BRIEF.md
+Read the shared brief first: /home/kain/orochi/docs/BRIEF.md
 
 MANDATE: invent. Use comptime to make crypto safer and faster than a C library can. The existing
 opssl is REFERENCE ONLY — study its primitives and design decisions, then design a better,

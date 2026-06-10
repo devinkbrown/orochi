@@ -294,22 +294,22 @@ fn checkedAdd(a: usize, b: usize) ?usize {
 test "assembles newline joins and concat joins" {
     var out: [128]u8 = undefined;
     const body = [_][]const u8{
-        "@batch=abc PRIVMSG #mizuchi :hello",
-        "@batch=abc PRIVMSG #mizuchi :",
-        "@batch=abc PRIVMSG #mizuchi :how is ",
-        "@batch=abc;draft/multiline-concat PRIVMSG #mizuchi :everyone?",
+        "@batch=abc PRIVMSG #orochi :hello",
+        "@batch=abc PRIVMSG #orochi :",
+        "@batch=abc PRIVMSG #orochi :how is ",
+        "@batch=abc;draft/multiline-concat PRIVMSG #orochi :everyone?",
     };
 
     const msg = try assemble(
         .{ .max_bytes = 128, .max_lines = 8 },
-        "BATCH +abc draft/multiline #mizuchi",
+        "BATCH +abc draft/multiline #orochi",
         &body,
         "BATCH -abc",
         &out,
     );
 
     try std.testing.expectEqual(.privmsg, msg.command);
-    try std.testing.expectEqualStrings("#mizuchi", msg.target);
+    try std.testing.expectEqualStrings("#orochi", msg.target);
     try std.testing.expectEqual(@as(usize, 4), msg.line_count);
     try std.testing.expectEqualStrings("hello\n\nhow is everyone?", msg.value);
 }

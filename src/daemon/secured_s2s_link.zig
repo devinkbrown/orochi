@@ -374,7 +374,7 @@ fn runScenario(split: bool) !void {
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.mizuchi",
+        .server_name = "a.orochi",
     });
     defer a.deinit();
     var b = try SecuredLink.init(.{
@@ -384,7 +384,7 @@ fn runScenario(split: bool) !void {
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.mizuchi",
+        .server_name = "b.orochi",
     });
     defer b.deinit();
 
@@ -426,7 +426,7 @@ test "a trust-pin mismatch rejects the peer prekey" {
         .local_prekey = pre_a,
         .cfg = cfgFor(ida.realm, "mp"),
         .rng = rng.io(),
-        .server_name = "a.mizuchi",
+        .server_name = "a.orochi",
         .expected_remote = [_]u8{0xFF} ** 20,
     });
     defer a.deinit();
@@ -437,7 +437,7 @@ test "a trust-pin mismatch rejects the peer prekey" {
         .local_prekey = pre_b,
         .cfg = cfgFor(idb.realm, ""),
         .rng = rng.io(),
-        .server_name = "b.mizuchi",
+        .server_name = "b.orochi",
     });
     defer b.deinit();
 

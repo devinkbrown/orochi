@@ -673,10 +673,10 @@ test "end to end parse view render keeps rows pure over input slices" {
     try testing.expectEqualStrings("RootOper", view.rows[1].nick);
     try testing.expectEqualStrings("alice", view.rows[2].nick);
 
-    const fmt = Formatter.init("mizuchi.test", "RootOper");
+    const fmt = Formatter.init("orochi.test", "RootOper");
     var line: [256]u8 = undefined;
     try testing.expectEqualStrings(
-        ":mizuchi.test 204 RootOper Oper sessions RootOper (198.51.100.7) 90 0 tls root\r\n",
+        ":orochi.test 204 RootOper Oper sessions RootOper (198.51.100.7) 90 0 tls root\r\n",
         try fmt.traceLine(&line, view.rows[1]),
     );
 }

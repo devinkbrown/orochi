@@ -3,7 +3,7 @@
 > Source: IETF Internet-Draft "Extensions to the Internet Relay Chat Protocol
 > (IRCX)", Pfenning/Abraham (Microsoft), July 1998.
 > https://www.ietf.org/archive/id/draft-pfenning-irc-extensions-04.txt
-> Captured 2026-06-05 as Mizuchi's authoritative IRCX reference. This is the
+> Captured 2026-06-05 as Orochi's authoritative IRCX reference. This is the
 > normative extraction; the ophion implementation notes are in the sibling
 > `ircx-protocol-ophion.md` + `m_ircx_*.md` files.
 

@@ -1,4 +1,4 @@
-# 00 — Mizuchi Master Architecture (synthesis)
+# 00 — Orochi Master Architecture (synthesis)
 
 This document integrates the five research tracks (`01`–`05`) — produced by parallel
 Codex deep-dives into the real ophion/libop/opssl code + Suimyaku/Tsumugi specs, plus Claude
@@ -13,7 +13,7 @@ authority).
 ## 0. Thesis
 
 ophion's S2S complexity is largely **TS6 compatibility scar tissue** (text S2S +
-`STARTMSGPACK` + `MSEQ`/`HASHCHECK`/`RESYNC` repair bolt-ons all coexisting). Mizuchi
+`STARTMSGPACK` + `MSEQ`/`HASHCHECK`/`RESYNC` repair bolt-ons all coexisting). Orochi
 owes no backward compatibility, so the clean-slate Zig design is **smaller and more
 principled, not bigger**: one pure binary mesh protocol, one anti-entropy mechanism
 (Merkle delta sync), one language top-to-bottom.
@@ -26,7 +26,7 @@ principled, not bigger**: one pure binary mesh protocol, one anti-entropy mechan
 | Scope | **Full rewrite** — daemon + substrate (libop) + crypto (opssl) all Zig-native | 100% freedom; no C interop |
 | Transport | **TCP + Tsumugi framing** baseline; transport-agnostic so QUIC can slot in later | Control + less surface now; MeshQUIC/MASQUE deferred to media phases |
 | Tsumugi crypto | **PQ-hybrid from day one** (X25519 + ML-KEM-768) | Harvest-now-decrypt-later resistance; revives original ambition |
-| Extensibility | **Sandboxed WASM plugins** (MizuWasm); core modules are comptime Zig | Deterministic, hot-reloadable, sandboxed, runs inside the simulator |
+| Extensibility | **Sandboxed WASM plugins** (OroWasm); core modules are comptime Zig | Deterministic, hot-reloadable, sandboxed, runs inside the simulator |
 | Testing | **DST-first from M0** (Deterministic Ocean) | Only credible way to trust self-written CRDT mesh + crypto |
 | S2S migration | **Clean break, no TS6 in core** | A bridge, if ever, is a separate lower-authority gateway process |
 | Nick collision | **Rename loser to its UID, never kill** | ophion rule, baked into the CRDT merge function |
@@ -34,16 +34,16 @@ principled, not bigger**: one pure binary mesh protocol, one anti-entropy mechan
 ## 2. Workspace (multi-package Zig)
 
 ```
-mizuchi-substrate   reactor (Ringlane), allocators/arenas, lock-free queues,
+orochi-substrate   reactor (Ringlane), allocators/arenas, lock-free queues,
                     data structures, Suimyaku math (CRDT/HLC/vclock/Merkle/sketches),
                     simulation runtime (Deterministic Ocean), Fault Loom
-mizuchi-crypto      primitives, TLS 1.3 + hardened 1.2, X.509-min, Tsumugi v2, Secret(T)/ctcheck,
+orochi-crypto      primitives, TLS 1.3 + hardened 1.2, X.509-min, Tsumugi v2, Secret(T)/ctcheck,
                     capability keyring, session/upgrade capsules
-mizuchi-proto       IRC/IRCv3/IRCX/Suimyaku/Tsumugi schemas → generated codecs (Codec Loom),
+orochi-proto       IRC/IRCv3/IRCX/Suimyaku/Tsumugi schemas → generated codecs (Codec Loom),
                     canonical wire format (CoilPack), golden vectors
-mizuchi-daemon      core, SerpentRegistry modules, CapProof, services, MizuStore,
-                    MizuWasm host, media
-mizuchi-tools       config validator, keygen, trace reader, capsule inspector,
+orochi-daemon      core, SerpentRegistry modules, CapProof, services, OroStore,
+                    OroWasm host, media
+orochi-tools       config validator, keygen, trace reader, capsule inspector,
                     corpus minimizer
 ```
 
@@ -94,15 +94,15 @@ mizuchi-tools       config validator, keygen, trace reader, capsule inspector,
   don't compile; generates trace labels + fuzz generators. (Subsumes "Phantom TLS".)
 - **FlowForge** — structured concurrency: per-client serial execution, cancellable
   transactions, deadline propagation handler→store→network.
-- **MizuStore** — Zig-native embedded store: checksummed WAL + snapshots, typed column
+- **OroStore** — Zig-native embedded store: checksummed WAL + snapshots, typed column
   families, generated migrations, CRDT-aware changefeed (feeds services sync + Suimyaku).
-- **MizuWasm** — sandboxed WASM plugin host (fuel/memory limits, no raw pointers,
+- **OroWasm** — sandboxed WASM plugin host (fuel/memory limits, no raw pointers,
   deterministic hostcalls, manifest-declared permissions). Replaces embedded CPython.
 - **Aegis** — optional bounded inline policy VM (no heap/syscalls) for per-channel rules
   (media policy, anti-spam, join gates) where a full WASM call is overkill.
 - **Lotus** — content-addressed (BLAKE3) append-log history store backing CHATHISTORY;
   redactions are tombstones; Merkle roots replicate via Suimyaku anti-entropy.
-- **Helix Upgrade** — native `mizuchi-supervisor` mode (same Zig tree): owns listener
+- **Helix Upgrade** — native `orochi-supervisor` mode (same Zig tree): owns listener
   FDs, sealed memfd handoff arena, typed session/TLS/kTLS/Tsumugi/CRDT capsules with
   schema ids + health attestation before old process exits. Replaces ophion's shim.
 - **Event Spine** — typed structured event bus; metrics/trace/IRCX-EVENT/audit/services
@@ -150,7 +150,7 @@ unauthenticated local claims.
 ## 5. Roadmap (see `05` for full table)
 
 M0 Bootline → M1 Reactor/Substrate → M2 IRC core → M3 IRCv3 core → M4 SASL+TLS1.3 →
-M5/M6 IRCX parity → M7 Services (+MizuStore) → M8–M11 Suimyaku/Tsumugi mesh
+M5/M6 IRCX parity → M7 Services (+OroStore) → M8–M11 Suimyaku/Tsumugi mesh
 (handshake → CRDT model → Sazanami+Merkle → Tsumugi v2) → M12 Lotus history → M13 Media →
 M14 MASQUE relay → M15 Helix upgrade → M16 hardening (XDP/Aegis/CapProof) → M17 RC soak.
 

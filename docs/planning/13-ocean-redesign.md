@@ -1,7 +1,7 @@
-# Ocean redesign + Mizuchi caps (tasks #16 / #17)
+# Ocean redesign + Orochi caps (tasks #16 / #17)
 
 Condensed from a read-only investigation of /home/kain/onyx (Ocean, PROPRIETARY —
-never push) and /home/kain/mizuchi.
+never push) and /home/kain/orochi.
 
 ## Ocean today (facts)
 - Next.js 16 (React 19, App Router), TS5, Tailwind 4, Zustand 5, Vitest+Playwright,
@@ -24,7 +24,7 @@ message tree, reactions with reactor avatar stacks, global `/` Spotlight command
 palette, dedicated `/forum` route (tag browse + trending), role badges = live
 permission indicators, draggable voice PIP, inline property/topic edit.
 
-## #17 new server caps (map to Mizuchi subsystems)
+## #17 new server caps (map to Orochi subsystems)
 | Cap | Wire | Subsystem |
 |---|---|---|
 | ophion/presence-sync | MONITOR + activity in tags (status/channel/typing/speaking) | Event Spine + Store |
@@ -43,7 +43,7 @@ permission indicators, draggable voice PIP, inline property/topic edit.
 5. Activity stream subscription.
 6. (future) spatial voice.
 
-Mizuchi targets: `store.zig` (UserActivity, MessageReaction, ThreadMetadata),
+Orochi targets: `store.zig` (UserActivity, MessageReaction, ThreadMetadata),
 `event_spine.zig` (ActivityChanged/ReactionAdded/ThreadStateChanged), `dispatch.zig`
 (ROLEMX, THREAD, PROP families), Goryu CRDT (reactions/thread state convergence),
 Lotus (thread index). Ocean: PresenceRibbon, ThreadSidebar, SpotlightSearch,

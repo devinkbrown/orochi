@@ -292,17 +292,17 @@ fn appendByte(line: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: u8) 
 }
 
 test "parse redact and edit requests" {
-    const redact = try parseRedact("REDACT #mizuchi G6PuDDBWQYmu3HmXXOAPzA :wrong paste");
-    try std.testing.expectEqualStrings("#mizuchi", redact.target);
+    const redact = try parseRedact("REDACT #orochi G6PuDDBWQYmu3HmXXOAPzA :wrong paste");
+    try std.testing.expectEqualStrings("#orochi", redact.target);
     try std.testing.expectEqualStrings("G6PuDDBWQYmu3HmXXOAPzA", redact.msgid);
     try std.testing.expectEqualStrings("wrong paste", redact.reason.?);
 
     var scratch = Scratch{};
     const edit = try parseEdit(
-        "@+draft/edit=server1-1480339715754191-21 PRIVMSG #mizuchi :patched message",
+        "@+draft/edit=server1-1480339715754191-21 PRIVMSG #orochi :patched message",
         &scratch,
     );
-    try std.testing.expectEqualStrings("#mizuchi", edit.target);
+    try std.testing.expectEqualStrings("#orochi", edit.target);
     try std.testing.expectEqualStrings("server1-1480339715754191-21", edit.msgid);
     try std.testing.expectEqualStrings("patched message", edit.text);
 
@@ -323,7 +323,7 @@ test "apply edit and redact over caller records" {
     defer allocator.free(records[1].text);
 
     const edited = try applyEdit(allocator, &records, .{
-        .target = "#mizuchi",
+        .target = "#orochi",
         .msgid = "m1",
         .text = "one edited",
     }, .{ .allowed = true });
@@ -335,7 +335,7 @@ test "apply edit and redact over caller records" {
     try std.testing.expect(!records[0].tombstone);
 
     const redacted = try applyRedact(&records, .{
-        .target = "#mizuchi",
+        .target = "#orochi",
         .msgid = "m2",
     }, .{ .allowed = true });
     try std.testing.expectEqual(@as(usize, 1), redacted.index);
@@ -346,36 +346,36 @@ test "build notification bytes" {
     const allocator = std.testing.allocator;
 
     const edit = try buildEditNotification(allocator, .{
-        .target = "#mizuchi",
+        .target = "#orochi",
         .msgid = "m1",
         .revision = 2,
         .text = "patched message",
     });
     defer allocator.free(edit);
     try std.testing.expectEqualStrings(
-        "@msgid=m1;+draft/edit=m1;+draft/revision=2 PRIVMSG #mizuchi :patched message",
+        "@msgid=m1;+draft/edit=m1;+draft/revision=2 PRIVMSG #orochi :patched message",
         edit,
     );
 
     const redact = try buildRedactNotification(allocator, .{
-        .target = "#mizuchi",
+        .target = "#orochi",
         .msgid = "m1",
         .reason = "wrong paste",
     });
     defer allocator.free(redact);
     try std.testing.expectEqualStrings(
-        "@msgid=m1;+draft/redact=m1 TAGMSG #mizuchi :wrong paste",
+        "@msgid=m1;+draft/redact=m1 TAGMSG #orochi :wrong paste",
         redact,
     );
 }
 
 test "reject malformed requests and notifications" {
     var scratch = Scratch{};
-    try std.testing.expectError(error.MissingMsgid, parseRedact("REDACT #mizuchi"));
+    try std.testing.expectError(error.MissingMsgid, parseRedact("REDACT #orochi"));
     try std.testing.expectError(error.MissingEditBody, parseEdit("@+draft/edit=abc TAGMSG #c", &scratch));
     try std.testing.expectError(error.InvalidCommand, parseEdit("@+draft/edit=abc NOTICE #c :body", &scratch));
     try std.testing.expectError(error.InvalidMsgid, buildRedactNotification(std.testing.allocator, .{
-        .target = "#mizuchi",
+        .target = "#orochi",
         .msgid = ":bad",
     }));
 }
@@ -390,7 +390,7 @@ test "permission denied does not mutate records" {
     };
 
     try std.testing.expectError(error.PermissionDenied, applyEdit(allocator, &records, .{
-        .target = "#mizuchi",
+        .target = "#orochi",
         .msgid = "m1",
         .text = "after",
     }, .{ .allowed = false }));
@@ -400,7 +400,7 @@ test "permission denied does not mutate records" {
     try std.testing.expect(!records[0].tombstone);
 
     try std.testing.expectError(error.PermissionDenied, applyRedact(&records, .{
-        .target = "#mizuchi",
+        .target = "#orochi",
         .msgid = "m1",
     }, .{ .allowed = false }));
     try std.testing.expect(!records[0].tombstone);

@@ -10,7 +10,7 @@ therefore intentionally out of scope.
 server-time, message-tags, echo-message, sasl (PLAIN), multi-prefix,
 userhost-in-names, away-notify, setname, extended-join, invite-notify,
 account-tag, account-notify, chghost, no-implicit-names, batch, bot,
-extended-monitor, mizuchi/bouncer, and drafts: chathistory, message-redaction,
+extended-monitor, orochi/bouncer, and drafts: chathistory, message-redaction,
 read-marker, typing, react, reply, channel-rename.
 
 Commands live: CAP, AUTHENTICATE, NICK/USER, METADATA, MONITOR, TAGMSG, REGISTER,

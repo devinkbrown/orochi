@@ -1,4 +1,4 @@
-//! ChannelRole — custom per-(channel, member) role labels for the Mizuchi daemon.
+//! ChannelRole — custom per-(channel, member) role labels for the Orochi daemon.
 //!
 //! Each (channel, member) pair maps to an owned label string of at most
 //! `max_label_len` bytes. Keys are encoded as "channel\x00member" so that
@@ -198,17 +198,17 @@ test "clearMember removes one entry and reports presence" {
     var roles = ChannelRole.init(allocator);
     defer roles.deinit();
 
-    try roles.setRole("#river", "mizu", "guide");
+    try roles.setRole("#river", "suzu", "guide");
     try roles.setRole("#river", "tsuchi", "scout");
 
-    try std.testing.expect(roles.clearMember("#river", "mizu"));
-    try std.testing.expect(roles.getRole("#river", "mizu") == null);
+    try std.testing.expect(roles.clearMember("#river", "suzu"));
+    try std.testing.expect(roles.getRole("#river", "suzu") == null);
 
     // The sibling entry is untouched.
     try std.testing.expectEqualStrings("scout", roles.getRole("#river", "tsuchi").?);
 
     // Clearing an absent member returns false.
-    try std.testing.expect(!roles.clearMember("#river", "mizu"));
+    try std.testing.expect(!roles.clearMember("#river", "suzu"));
     try std.testing.expect(!roles.clearMember("#nowhere", "ghost"));
 }
 

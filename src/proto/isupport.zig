@@ -259,7 +259,7 @@ pub const default_tokens = [_]Token{
     .{ .name = "TOPICLEN", .value = "512" },
     .{ .name = "AWAYLEN", .value = "390" },
     .{ .name = "CASEMAPPING", .value = "ascii" },
-    .{ .name = "NETWORK", .value = "Mizuchi" },
+    .{ .name = "NETWORK", .value = "Orochi" },
     .{ .name = "ELIST", .value = "CMNTU" },
     .{ .name = "MONITOR", .value = "512" },
     .{ .name = "CHATHISTORY", .value = "1000" },
@@ -514,7 +514,7 @@ test "token map adds replaces and formats tokens" {
 
 test "value and valueless tokens emit distinct parameters" {
     const tokens = [_]Token{
-        try Token.valued("NETWORK", "Mizuchi"),
+        try Token.valued("NETWORK", "Orochi"),
         try Token.valueless("UTF8ONLY"),
     };
     var line_slots: [2]ReplyLine = undefined;
@@ -529,7 +529,7 @@ test "value and valueless tokens emit distinct parameters" {
 
     try std.testing.expectEqual(@as(usize, 1), sink.slice().len);
     try std.testing.expectEqualStrings(
-        ":irc.test 005 dan NETWORK=Mizuchi UTF8ONLY :are supported by this server\r\n",
+        ":irc.test 005 dan NETWORK=Orochi UTF8ONLY :are supported by this server\r\n",
         sink.slice()[0].bytes,
     );
 }

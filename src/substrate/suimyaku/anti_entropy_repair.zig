@@ -522,7 +522,7 @@ fn readUintLe(bytes: []const u8) u64 {
 }
 fn entityHash(key: []const u8, payload: []const u8) Hash {
     var h = Sha256.init(.{});
-    h.update("mizuchi.suimyaku.anti_entropy_repair.entity.v1");
+    h.update("orochi.suimyaku.anti_entropy_repair.entity.v1");
     h.update(key);
     h.update(payload);
     var out: Hash = undefined;

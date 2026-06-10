@@ -17,13 +17,13 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // Mizuchi targets 64-bit only (native x86_64/aarch64; the wasm32 browser
+    // Orochi targets 64-bit only (native x86_64/aarch64; the wasm32 browser
     // codec below is the lone, deliberate exception). Reject a 32-bit daemon
     // target at configure time with a clear message instead of a confusing later
     // failure.
     if (target.result.ptrBitWidth() != 64) {
         std.debug.panic(
-            "Mizuchi is 64-bit only; target '{s}' is {d}-bit. Use a 64-bit target (e.g. x86_64-linux, aarch64-linux).",
+            "Orochi is 64-bit only; target '{s}' is {d}-bit. Use a 64-bit target (e.g. x86_64-linux, aarch64-linux).",
             .{ @tagName(target.result.cpu.arch), target.result.ptrBitWidth() },
         );
     }
@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("mizuchi", .{
+    const mod = b.addModule("orochi", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
         // in this file, which means that if you have declarations that you
@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "mizuchi",
+        .name = "orochi",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -102,12 +102,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "mizuchi" is the name you will use in your source code to
-                // import this module (e.g. `@import("mizuchi")`). The name is
+                // Here "orochi" is the name you will use in your source code to
+                // import this module (e.g. `@import("orochi")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "mizuchi", .module = mod },
+                .{ .name = "orochi", .module = mod },
             },
         }),
     });
@@ -184,7 +184,7 @@ pub fn build(b: *std.Build) void {
         .strip = true,
     });
     // The codecs depend only on std, so expose them as standalone wasm-targeted
-    // modules (the full mizuchi root pulls in io_uring/sockets and won't build
+    // modules (the full orochi root pulls in io_uring/sockets and won't build
     // freestanding).
     const wasm_adpcm = b.createModule(.{ .root_source_file = b.path("src/substrate/opvox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
     const wasm_opvis = b.createModule(.{ .root_source_file = b.path("src/substrate/opvis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
@@ -205,7 +205,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .strip = true,
     });
-    const wasm_transport = b.addExecutable(.{ .name = "mizuchi_transport", .root_module = wasm_transport_mod });
+    const wasm_transport = b.addExecutable(.{ .name = "orochi_transport", .root_module = wasm_transport_mod });
     wasm_transport.entry = .disabled;
     wasm_transport.rdynamic = true;
     wasm_step.dependOn(&b.addInstallArtifact(wasm_transport, .{}).step);
@@ -215,13 +215,13 @@ pub fn build(b: *std.Build) void {
     // and skips the (slow) machine-code emit + link the default install does.
     const check_step = b.step("check", "Type-check the daemon without emitting a binary");
     const check_exe = b.addExecutable(.{
-        .name = "mizuchi-check",
+        .name = "orochi-check",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
-            .imports = &.{.{ .name = "mizuchi", .module = mod }},
+            .imports = &.{.{ .name = "orochi", .module = mod }},
         }),
     });
     check_exe.generated_bin = null; // analyze only; do not codegen/link an artifact
@@ -231,14 +231,14 @@ pub fn build(b: *std.Build) void {
     // installed to zig-out/bin, independent of the default step's optimize mode.
     const release_step = b.step("release", "Build an optimized, stripped daemon (ReleaseFast)");
     const release_exe = b.addExecutable(.{
-        .name = "mizuchi",
+        .name = "orochi",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = .ReleaseFast,
             .link_libc = needs_libc,
             .strip = true,
-            .imports = &.{.{ .name = "mizuchi", .module = mod }},
+            .imports = &.{.{ .name = "orochi", .module = mod }},
         }),
     });
     release_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);

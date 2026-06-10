@@ -1,4 +1,4 @@
-//! Channel-name RESV registry for the Mizuchi IRC daemon.
+//! Channel-name RESV registry for the Orochi IRC daemon.
 //!
 //! This module is intentionally standalone: it imports only `std`, owns all
 //! reservation data it stores, and models real server command/numeric surfaces

@@ -207,9 +207,9 @@ test "transposition is not a single edit" {
 test "withinK accepts close values and rejects rows that exceed the threshold" {
     // Arrange.
     const allocator = std.testing.allocator;
-    const close_left = try allocator.dupe(u8, "mizuchi");
+    const close_left = try allocator.dupe(u8, "example");
     defer allocator.free(close_left);
-    const close_right = try allocator.dupe(u8, "mizuki");
+    const close_right = try allocator.dupe(u8, "exempla");
     defer allocator.free(close_right);
     const far_left = try allocator.dupe(u8, "aaaaaaaaaa");
     defer allocator.free(far_left);

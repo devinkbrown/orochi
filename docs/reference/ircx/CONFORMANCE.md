@@ -1,8 +1,8 @@
-# IRCX draft conformance — Mizuchi implementation status
+# IRCX draft conformance — Orochi implementation status
 
-> Heavy gap analysis of draft-pfenning-irc-extensions-04 vs Mizuchi's live
+> Heavy gap analysis of draft-pfenning-irc-extensions-04 vs Orochi's live
 > daemon. Clean-room ("our design"): we implement the draft's *semantics*, using
-> Mizuchi's identity/mode model where it deliberately improves on the draft
+> Orochi's identity/mode model where it deliberately improves on the draft
 > (founder +Q, WALLOPS→Event-Spine, node_id identity, conformant numerics).
 > Status: ✅ done · 🟡 partial · ❌ missing. Goal: drive ❌/🟡 → ✅.
 
@@ -26,7 +26,7 @@ alignment decision; fill residual 9xx error set.
 ## Commands
 | Cmd | Status | Notes |
 | --- | --- | --- |
-| AUTH (IRCX legacy SASL) | 🟡 | Mizuchi uses IRCv3 SASL (CAP/AUTHENTICATE); ircx_auth lib exists. Deliberate: CAP path primary. |
+| AUTH (IRCX legacy SASL) | 🟡 | Orochi uses IRCv3 SASL (CAP/AUTHENTICATE); ircx_auth lib exists. Deliberate: CAP path primary. |
 | ACCESS (801–805, OWNER/HOST/VOICE/GRANT/DENY) | ✅ | live, channel-op gated; OWNER needs owner/founder |
 | PROP (818/819) | ✅ | live; secret-key read filter; denial 913 |
 | EVENT (806–810, types CHANNEL/MEMBER/…) | 🟡 | wired ADD/DEL/LIST over Event-Spine categories; numerics+types not draft-aligned (decide: conform vs document divergence) |
@@ -52,17 +52,17 @@ alignment decision; fill residual 9xx error set.
 ## Objects / identity
 | Feature | Status | Notes |
 | --- | --- | --- |
-| OID (8-hex object ids; `0` prefix) | ❌ | CREATE/PROP OID; decide if Mizuchi adopts OIDs or uses node-scoped ids |
+| OID (8-hex object ids; `0` prefix) | ❌ | CREATE/PROP OID; decide if Orochi adopts OIDs or uses node-scoped ids |
 | UTF8 chan/nick (`%#`, `'`, `^` prefixes) | ❌ | UTF8ONLY cap exists; full IRCX UTF8 prefixing not done |
 | Object types for ACCESS (`$` server, `*` net) | 🟡 | channel/nick yes; server/network scope TBD |
 
 ## User modes (umodes)
-| Draft umode | Mizuchi | Notes |
+| Draft umode | Orochi | Notes |
 | --- | --- | --- |
-| +q OWNER (`.` prefix) | ✅ (as member mode) | Mizuchi models owner as a *channel member* mode (+q owner `.`), plus founder +Q `~` above it — cleaner than a umode. Deliberate divergence. |
+| +q OWNER (`.` prefix) | ✅ (as member mode) | Orochi models owner as a *channel member* mode (+q owner `.`), plus founder +Q `~` above it — cleaner than a umode. Deliberate divergence. |
 | +z GAG (sysop-only; server drops user's msgs) | ❌ | add as an oper tool (silently drop a user's PRIVMSG/NOTICE) |
-| (Mizuchi-native) +o oper | ✅ | RPL_UMODEIS reflects +o (item 90) |
-| (Mizuchi-native) +i invisible / +B bot / +r registered / +Z secure-tls / +D deaf / +g callerid / +T no-ctcp / +x cloaked | ✅ | richer than the draft; our design |
+| (Orochi-native) +o oper | ✅ | RPL_UMODEIS reflects +o (item 90) |
+| (Orochi-native) +i invisible / +B bot / +r registered / +Z secure-tls / +D deaf / +g callerid / +T no-ctcp / +x cloaked | ✅ | richer than the draft; our design |
 
 ## Behaviors
 | Behavior | Status | Notes |
@@ -76,7 +76,7 @@ alignment decision; fill residual 9xx error set.
 | UTF8 escape sequences in IRCX strings | 🟡 | UTF8ONLY cap; full escape handling TBD |
 
 ## Numerics (errors 900–927)
-🟡 — Mizuchi maps a subset to its own enum. Conformant where it matters
+🟡 — Orochi maps a subset to its own enum. Conformant where it matters
 (NOWHISPER 923, NOACCESS 913). Audit/add: 900 BADCOMMAND, 903 BADLEVEL,
 905 BADPROPERTY, 906 BADVALUE, 907 RESOURCE, 908 SECURITY, 912 UNKNOWNPACKAGE,
 914 DUPACCESS, 915 MISACCESS, 916 TOOMANYACCESSES, 918–921 EVENT*, 924 NOSUCHOBJECT,
@@ -100,7 +100,7 @@ These resolve the six open questions from `docs/planning/14-ircx-remainder.md`.
 | 6a KNOCK gating | **Additive** — KNOCK accepted when `+i` OR `+u`; neither ⇒ 713 open. | ✅ DONE (`handleKnock`) |
 | 5 9xx numerics | **Adopt** the IRCX error taxonomy in the live `Numeric` enum (inert until emitted). | ✅ DONE (900/903/905/907/908/912/914/915/916/924/925/926/927) |
 | 6b NOFORMAT `+f` | **Advertise-only (path A)** — `+f` is settable and rendered in MODE; clients strip formatting. No relay/tag change. | ✅ satisfied by existing ext-MODE rendering |
-| 4 EVENT | **Document the Event-Spine divergence (path B)** — Mizuchi keeps the richer native event taxonomy (matches WALLOPS→Event-Spine); does not force-map 806–810/918–921. | 🟡 documented; native taxonomy stands |
+| 4 EVENT | **Document the Event-Spine divergence (path B)** — Orochi keeps the richer native event taxonomy (matches WALLOPS→Event-Spine); does not force-map 806–810/918–921. | 🟡 documented; native taxonomy stands |
 | 2 OID | **Adopt** real per-channel OIDs (8-hex, `0` prefix) + `World.next_oid`; CREATION timestamp follows. | ⬜ remaining (centralized in `world.ensureChannel`; clock threading for CREATION) |
 | 1 CLONEABLE/CLONE | **Adopt**, takeover **oper-only**; clone copies limit/key/modes into a `+E` `#chan<n>`. | ⬜ remaining (hot JOIN path `joinOne`; 926/927 now available) |
 | 3 UTF8 prefixes | **Do `%#`/`%&`/`&`/`'` first; DEFER `^`→hex** display (needs a transliteration layer) to a separate task. | ⬜ remaining (broad: `world.isChannelName` + ~8 callers) |

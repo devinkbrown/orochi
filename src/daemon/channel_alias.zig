@@ -1,4 +1,4 @@
-//! Per-account personal channel aliases for the Mizuchi IRC daemon.
+//! Per-account personal channel aliases for the Orochi IRC daemon.
 //!
 //! Each account may register short, private aliases that resolve to a full
 //! channel name. Aliases are scoped to the owning account: two accounts may

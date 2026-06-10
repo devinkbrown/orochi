@@ -1,4 +1,4 @@
-//! Clean-room TOML v1.0.0 parser for the Mizuchi daemon.
+//! Clean-room TOML v1.0.0 parser for the Orochi daemon.
 //!
 //! Bytes in, typed tree out. The parser is PURE: it performs no file, network,
 //! or environment access. Callers supply an allocator and the raw document text
@@ -22,7 +22,7 @@
 //!
 //! Datetimes: TOML offset/local date-times, local dates, and local times are
 //! NOT given a dedicated typed variant. They are CAPTURED VERBATIM AS STRINGS
-//! (the `.string` Value). This is a deliberate, documented deferral — Mizuchi's
+//! (the `.string` Value). This is a deliberate, documented deferral — Orochi's
 //! config consumers want the raw RFC 3339 text and parse it downstream, so a
 //! bespoke datetime type would be dead weight here. See `looksLikeDateTime`.
 //!
@@ -1018,7 +1018,7 @@ test "parse bare key value pairs of every scalar type" {
     // Arrange
     const allocator = std.testing.allocator;
     const src =
-        \\name = "mizuchi"
+        \\name = "orochi"
         \\port = 6697
         \\ratio = 3.14
         \\enabled = true
@@ -1030,7 +1030,7 @@ test "parse bare key value pairs of every scalar type" {
     defer doc.deinit(allocator);
 
     // Assert
-    try std.testing.expectEqualStrings("mizuchi", doc.getString("name").?);
+    try std.testing.expectEqualStrings("orochi", doc.getString("name").?);
     try std.testing.expectEqual(@as(i64, 6697), doc.getInt("port").?);
     try std.testing.expectEqual(@as(u64, 6697), doc.getUint("port").?);
     try std.testing.expectApproxEqAbs(@as(f64, 3.14), doc.getFloat("ratio").?, 1e-9);
@@ -1508,7 +1508,7 @@ test "no leaks under a large mixed document" {
     // Arrange
     const allocator = std.testing.allocator;
     const src =
-        \\title = "Mizuchi"
+        \\title = "Orochi"
         \\[owner]
         \\name = "Tom"
         \\dob = 1979-05-27T07:32:00Z
@@ -1537,7 +1537,7 @@ test "no leaks under a large mixed document" {
     defer doc.deinit(allocator);
 
     // Assert
-    try std.testing.expectEqualStrings("Mizuchi", doc.getString("title").?);
+    try std.testing.expectEqualStrings("Orochi", doc.getString("title").?);
     try std.testing.expectEqualStrings("Tom", doc.getString("owner.name").?);
     try std.testing.expectEqual(@as(i64, 8001), doc.getArray("database.ports").?[1].integer);
     try std.testing.expectEqualStrings("10.0.0.2", doc.getString("servers.beta.ip").?);

@@ -1,6 +1,6 @@
 //! Verifiable Random Function over Edwards25519 + SHA-512.
 //!
-//! NOTE: this is a BESPOKE Mizuchi VRF, NOT RFC 9381 ECVRF. It is internally
+//! NOTE: this is a BESPOKE Orochi VRF, NOT RFC 9381 ECVRF. It is internally
 //! consistent (prove/verify round-trip, deterministic beta, tamper-rejecting)
 //! and suitable for closed-mesh leader election, but it deliberately differs
 //! from RFC 9381 — custom suite string, a 128-bit challenge, hash-to-curve via
@@ -114,7 +114,7 @@ fn hashToCurve(pk: PublicKey, alpha: []const u8) !Curve {
     while (ctr <= 255) : (ctr += 1) {
         var digest: [Sha512.digest_length]u8 = undefined;
         var h = Sha512.init(.{});
-        h.update("Mizuchi-ECVRF-Edwards25519-SHA512-TAI:H2C");
+        h.update("Orochi-ECVRF-Edwards25519-SHA512-TAI:H2C");
         h.update(&pk);
         h.update(alpha);
         h.update(&.{@as(u8, @intCast(ctr))});
@@ -133,7 +133,7 @@ fn hashToCurve(pk: PublicKey, alpha: []const u8) !Curve {
 fn nonce(prefix: [32]u8, h_bytes: [Curve.encoded_length]u8) Scalar {
     var digest: [Sha512.digest_length]u8 = undefined;
     var h = Sha512.init(.{});
-    h.update("Mizuchi-ECVRF-Edwards25519-SHA512-TAI:nonce");
+    h.update("Orochi-ECVRF-Edwards25519-SHA512-TAI:nonce");
     h.update(&prefix);
     h.update(&h_bytes);
     h.final(&digest);
@@ -143,7 +143,7 @@ fn nonce(prefix: [32]u8, h_bytes: [Curve.encoded_length]u8) Scalar {
 fn challenge(h: Curve, gamma: Curve, u: Curve, v: Curve, pk: PublicKey) [Proof.challenge_length]u8 {
     var digest: [Sha512.digest_length]u8 = undefined;
     var st = Sha512.init(.{});
-    st.update("Mizuchi-ECVRF-Edwards25519-SHA512-TAI:challenge");
+    st.update("Orochi-ECVRF-Edwards25519-SHA512-TAI:challenge");
     st.update(&pk);
     updatePoint(&st, h);
     updatePoint(&st, gamma);
@@ -167,7 +167,7 @@ fn cToScalar(c: [Proof.challenge_length]u8) Scalar {
 fn betaFromGamma(gamma: Curve) Beta {
     var beta: Beta = undefined;
     var h = Sha512.init(.{});
-    h.update("Mizuchi-ECVRF-Edwards25519-SHA512-TAI:beta");
+    h.update("Orochi-ECVRF-Edwards25519-SHA512-TAI:beta");
     const gamma_bytes = gamma.toBytes();
     h.update(&gamma_bytes);
     h.final(&beta);
@@ -184,7 +184,7 @@ fn fixedSeed(byte: u8) Seed {
 
 test "prove then verify succeeds and yields beta" {
     const seed = fixedSeed(0x42);
-    const alpha = "mizuchi vrf alpha";
+    const alpha = "orochi vrf alpha";
     const pk = try publicKey(seed);
     const proof = try prove(seed, alpha);
     const beta = verify(pk, alpha, proof) orelse return error.ExpectedValidProof;

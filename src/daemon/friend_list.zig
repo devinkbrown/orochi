@@ -1,4 +1,4 @@
-//! Mizuchi account contact lists.
+//! Orochi account contact lists.
 //!
 //! Stores owned account and friend names in bounded per-account lists. Returned
 //! slices are borrowed and stay valid until the next mutation of this store.

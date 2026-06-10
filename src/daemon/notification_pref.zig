@@ -1,4 +1,4 @@
-//! Per-account notification preference storage for the Mizuchi daemon.
+//! Per-account notification preference storage for the Orochi daemon.
 //!
 //! Each account maps to a small set of notification flags. Flags are packed
 //! into a single byte so the table stays compact even with many accounts.
@@ -147,11 +147,11 @@ test "set overwrites existing entry without leaking key" {
     var prefs = NotificationPref.init(std.testing.allocator);
     defer prefs.deinit();
 
-    try prefs.set("mizu", Flags.default);
+    try prefs.set("suzu", Flags.default);
     const replacement: Flags = .{ .mentions = false, .dms = false, .channels = true };
-    try prefs.set("mizu", replacement);
+    try prefs.set("suzu", replacement);
 
-    const got = prefs.get("mizu");
+    const got = prefs.get("suzu");
     try std.testing.expect(!got.mentions);
     try std.testing.expect(got.channels);
     try std.testing.expectEqual(@as(u32, 1), prefs.table.count());

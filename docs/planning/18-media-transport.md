@@ -7,7 +7,7 @@ This document consolidates the architecture and the on-the-wire contract so the 
 Ocean client can be built against it and the remaining arcs (DTLS-SRTP, RTCP/NACK) have a
 stable base to extend.
 
-The thesis, in one line: **Mizuchi is its own selective-forwarding unit — a participant
+The thesis, in one line: **Orochi is its own selective-forwarding unit — a participant
 runs ICE to the server, the server distributes one SRTP key per call over the
 TLS-protected IRC link, and the server relays opaque ciphertext between participants
 without ever seeing plaintext.** Everything is clean-room pure Zig on the existing
@@ -34,7 +34,7 @@ without ever seeing plaintext.** Everything is clean-room pure Zig on the existi
 ## 1. Architecture
 
 ```
-  IRC client (TLS)                         Mizuchi daemon
+  IRC client (TLS)                         Orochi daemon
   ─────────────────                        ─────────────────────────────────
   MEDIA OFFER  ───────────────────────▶    mediaOffer:
                                              • media_session.negotiate (codecs/FEC)

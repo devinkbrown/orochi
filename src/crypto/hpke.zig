@@ -381,14 +381,14 @@ test "single-shot base mode round trip" {
     var sealed = try sealBaseDeterministic(
         allocator,
         r.public_key,
-        "mizuchi hpke info",
+        "orochi hpke info",
         "aad",
         "hello hpke",
         testSeed(0x44),
     );
     defer sealed.deinit(allocator);
 
-    const opened = try openBase(allocator, sealed.enc, r.secret_key, "mizuchi hpke info", "aad", sealed.ct);
+    const opened = try openBase(allocator, sealed.enc, r.secret_key, "orochi hpke info", "aad", sealed.ct);
     defer opened.deinit(allocator);
     try testing.expectEqualSlices(u8, "hello hpke", opened.bytes);
 }

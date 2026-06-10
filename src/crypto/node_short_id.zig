@@ -1,6 +1,6 @@
 //! Identity bridge: canonical 20-byte node id  ->  u64 mesh routing handle.
 //!
-//! Mizuchi's SOLE identity is the 20-byte `BLAKE3-160(Ed25519 public key)` node
+//! Orochi's SOLE identity is the 20-byte `BLAKE3-160(Ed25519 public key)` node
 //! id (no SID/TS6). The Suimyaku CRDT/gossip layer (`s2s_peer`, `gossip_round`,
 //! `route_table`) keys peers by a compact `u64` for cheap hashing and wire
 //! economy. This module derives that u64 *from* the canonical id so the two

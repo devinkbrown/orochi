@@ -1,4 +1,4 @@
-//! Account-owned nickname enforcement policy for the Mizuchi IRC daemon.
+//! Account-owned nickname enforcement policy for the Orochi IRC daemon.
 //!
 //! Modern services behavior: when a connection uses a nickname that maps to a
 //! registered account but the connection is NOT authenticated to that account,

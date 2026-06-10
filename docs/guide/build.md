@@ -1,6 +1,6 @@
 # Build Guide
 
-Mizuchi is built with Zig's build system and has no package dependencies in `build.zig.zon` (`build.zig.zon:34`). Linux builds do not link libc; macOS and BSD targets link libc only for platform syscalls that require it (`build.zig:40`, `build.zig:43`).
+Orochi is built with Zig's build system and has no package dependencies in `build.zig.zon` (`build.zig.zon:34`). Linux builds do not link libc; macOS and BSD targets link libc only for platform syscalls that require it (`build.zig:40`, `build.zig:43`).
 
 ## Requirements
 
@@ -11,7 +11,7 @@ Mizuchi is built with Zig's build system and has no package dependencies in `bui
 
 | Command | What it does | Source |
 |---|---|---|
-| `zig build` | Builds and installs `zig-out/bin/mizuchi`. | `build.zig:87`, `build.zig:119` |
+| `zig build` | Builds and installs `zig-out/bin/orochi`. | `build.zig:87`, `build.zig:119` |
 | `zig build run -- <config.toml>` | Builds, installs, then runs the daemon with forwarded args. | `build.zig:126`, `build.zig:143` |
 | `zig build test` | Runs module tests and executable-root tests. | `build.zig:150`, `build.zig:161`, `build.zig:172` |
 | `zig build test -Dtest-filter=<text>` | Runs tests whose names contain the filter. | `build.zig:36`, `build.zig:38` |

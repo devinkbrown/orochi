@@ -260,15 +260,15 @@ test "parse CREATE without modes" {
     const allocator = std.testing.allocator;
     const params = try allocator.alloc([]const u8, 1);
     defer allocator.free(params);
-    params[0] = "#mizuchi";
+    params[0] = "#orochi";
 
     const request = try parseParams(params);
-    try std.testing.expectEqualStrings("#mizuchi", request.channel);
+    try std.testing.expectEqualStrings("#orochi", request.channel);
     try std.testing.expectEqual(@as(?[]const u8, null), request.requestedModes());
     try std.testing.expectEqual(.founder, request.creator_status);
 
-    const line_request = try parse("CREATE #mizuchi\r\n");
-    try std.testing.expectEqualStrings("#mizuchi", line_request.channel);
+    const line_request = try parse("CREATE #orochi\r\n");
+    try std.testing.expectEqualStrings("#orochi", line_request.channel);
     try std.testing.expect(line_request.initial_modes == null);
 }
 
@@ -276,11 +276,11 @@ test "parse CREATE with modes and iterate changes" {
     const allocator = std.testing.allocator;
     const params = try allocator.alloc([]const u8, 2);
     defer allocator.free(params);
-    params[0] = "#mizuchi";
+    params[0] = "#orochi";
     params[1] = "+nt-i";
 
     const request = try parseParams(params);
-    try std.testing.expectEqualStrings("#mizuchi", request.channel);
+    try std.testing.expectEqualStrings("#orochi", request.channel);
     try std.testing.expectEqualStrings("+nt-i", request.requestedModes().?);
 
     var it = request.initial_modes.?.iterator();
@@ -289,7 +289,7 @@ test "parse CREATE with modes and iterate changes" {
     try std.testing.expectEqual(ModeChange{ .op = .remove, .mode = 'i' }, it.next().?);
     try std.testing.expectEqual(@as(?ModeChange, null), it.next());
 
-    const line_request = try parse("CREATE #mizuchi :+nt\r\n");
+    const line_request = try parse("CREATE #orochi :+nt\r\n");
     try std.testing.expectEqualStrings("+nt", line_request.requestedModes().?);
 }
 
@@ -299,19 +299,19 @@ test "validation rejects malformed CREATE input" {
     defer allocator.free(missing);
     try std.testing.expectError(error.MissingChannel, parseParams(missing));
 
-    const bad_channel = [_][]const u8{"mizuchi"};
+    const bad_channel = [_][]const u8{"orochi"};
     try std.testing.expectError(error.InvalidChannel, parseParams(&bad_channel));
 
-    const too_many = [_][]const u8{ "#mizuchi", "+nt", "extra" };
+    const too_many = [_][]const u8{ "#orochi", "+nt", "extra" };
     try std.testing.expectError(error.TooManyParameters, parseParams(&too_many));
 
-    const bad_modes = [_][]const u8{ "#mizuchi", "+n t" };
+    const bad_modes = [_][]const u8{ "#orochi", "+n t" };
     try std.testing.expectError(error.InvalidModes, parseParams(&bad_modes));
 
-    const sign_only = [_][]const u8{ "#mizuchi", "+-" };
+    const sign_only = [_][]const u8{ "#orochi", "+-" };
     try std.testing.expectError(error.InvalidModes, parseParams(&sign_only));
 
-    try std.testing.expectError(error.UnknownCommand, parse("JOIN #mizuchi"));
+    try std.testing.expectError(error.UnknownCommand, parse("JOIN #orochi"));
 }
 
 test "reply builders render ack and error bytes" {
@@ -319,16 +319,16 @@ test "reply builders render ack and error bytes" {
     const out = try allocator.alloc(u8, 512);
     defer allocator.free(out);
 
-    const request = try parse("CREATE #mizuchi +nt");
+    const request = try parse("CREATE #orochi +nt");
     const ack = try buildAckReplies(out, .{
         .server_name = "irc.example",
         .recipient_nick = "alice",
         .creator = .{ .nick = "alice", .user = "u", .host = "cloak.example" },
     }, request);
     try std.testing.expectEqualStrings(
-        ":alice!u@cloak.example JOIN #mizuchi\r\n" ++
-            ":irc.example 353 alice = #mizuchi :!alice\r\n" ++
-            ":irc.example 366 alice #mizuchi :End of /NAMES list\r\n",
+        ":alice!u@cloak.example JOIN #orochi\r\n" ++
+            ":irc.example 353 alice = #orochi :!alice\r\n" ++
+            ":irc.example 366 alice #orochi :End of /NAMES list\r\n",
         ack,
     );
 
@@ -348,7 +348,7 @@ test "reply builders validate requests and buffer size" {
     const out = try allocator.alloc(u8, 16);
     defer allocator.free(out);
 
-    const request = try parse("CREATE #mizuchi");
+    const request = try parse("CREATE #orochi");
     try std.testing.expectError(error.OutputTooSmall, buildAckReplies(out, .{
         .server_name = "irc.example",
         .recipient_nick = "alice",

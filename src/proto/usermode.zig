@@ -7,7 +7,7 @@ const std = @import("std");
 
 pub const MAX_MODE_CHANGES: usize = mode_count;
 
-/// Stable Mizuchi user-mode identifiers.
+/// Stable Orochi user-mode identifiers.
 pub const UserMode = enum(u4) {
     invisible,
     bot,
@@ -135,7 +135,7 @@ pub const UmodeError = error{
     OutputTooSmall,
 };
 
-/// Default modern Mizuchi modes.
+/// Default modern Orochi modes.
 pub const default_specs = [_]ModeSpec{
     .{ .mode = .invisible, .letter = 'i', .name = "invisible" },
     .{ .mode = .bot, .letter = 'B', .name = "bot", .ircv3 = "bot" },
@@ -252,17 +252,17 @@ pub fn Catalog(comptime specs: []const ModeSpec) type {
     };
 }
 
-/// Parse with the default Mizuchi mode catalog.
+/// Parse with the default Orochi mode catalog.
 pub fn parse(input: []const u8, out: []ModeChange) UmodeError![]const ModeChange {
     return DefaultCatalog.parse(input, out);
 }
 
-/// Apply with the default Mizuchi mode catalog.
+/// Apply with the default Orochi mode catalog.
 pub fn apply(set: *UmodeSet, changes: []const ModeChange, source: ApplySource) UmodeError!ApplySummary {
     return DefaultCatalog.apply(set, changes, source);
 }
 
-/// Serialize with the default Mizuchi mode catalog.
+/// Serialize with the default Orochi mode catalog.
 pub fn writeModeString(set: UmodeSet, out: []u8) UmodeError![]const u8 {
     return DefaultCatalog.writeModeString(set, out);
 }

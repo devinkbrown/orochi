@@ -226,16 +226,16 @@ test "set advances only forward and get returns latest" {
     const newer = try Timestamp.parseParam("timestamp=2026-06-02T08:09:11.000Z");
     const oldest = try Timestamp.parseParam("timestamp=2026-06-02T08:09:09.999Z");
 
-    try std.testing.expect((try store.set("acct", "#Mizu", older)).changed);
-    try std.testing.expect((try store.set("acct", "#mizu", newer)).changed);
+    try std.testing.expect((try store.set("acct", "#Suzu", older)).changed);
+    try std.testing.expect((try store.set("acct", "#suzu", newer)).changed);
 
-    const ignored = try store.set("acct", "#MIZU", oldest);
+    const ignored = try store.set("acct", "#SUZU", oldest);
     try std.testing.expect(!ignored.changed);
     try std.testing.expectEqualStrings("2026-06-02T08:09:11.000Z", ignored.timestamp.slice());
 
-    const got = (try store.get("acct", "#mizu")).?;
+    const got = (try store.get("acct", "#suzu")).?;
     try std.testing.expectEqualStrings("2026-06-02T08:09:11.000Z", got.slice());
-    try std.testing.expectEqual(@as(?Timestamp, null), try store.get("other", "#mizu"));
+    try std.testing.expectEqual(@as(?Timestamp, null), try store.get("other", "#suzu"));
 }
 
 test "parse GET SET and malformed MARKREAD" {

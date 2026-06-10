@@ -1,4 +1,4 @@
-//! TURN relay allocation model for Mizuchi's media relay plane.
+//! TURN relay allocation model for Orochi's media relay plane.
 //!
 //! This module is deliberately socket-free. The daemon owns UDP/TCP sockets,
 //! STUN authentication, and packet I/O; this file only tracks allocation state,

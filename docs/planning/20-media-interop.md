@@ -31,14 +31,14 @@ any mode.
 
 ### The hard rule: the server never encodes/decodes/transcodes
 
-Mizuchi is a **selective-forwarding unit**, not an MCU. The SFU only ever **forwards opaque
+Orochi is a **selective-forwarding unit**, not an MCU. The SFU only ever **forwards opaque
 codec payloads** and **rewraps transport headers**. No media encode/decode/transcode runs
 on the server — ever. Consequences:
 
 - An **all-default call** uses OPVOX/OPVIS for everyone (incl. mobile via WASM); the SFU
   forwards one opaque stream — zero codec work, perfect parity.
 - If a participant **opts into** the standard-codec fallback, the call **converges on one
-  codec every participant supports** (`kakehashi.selectCommon`). Every Mizuchi client can
+  codec every participant supports** (`kakehashi.selectCommon`). Every Orochi client can
   also speak the standard stack, so a shared codec always exists; the forwarded stream is
   understood by all with zero server codec work. The server does **not** bridge by
   transcoding — convergence (or per-kind disable) is a **client** responsibility; the SFU

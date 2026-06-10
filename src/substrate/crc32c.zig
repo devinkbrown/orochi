@@ -130,7 +130,7 @@ test "final is non-destructive and resumable" {
 }
 
 test "matches std.hash.crc Crc32Iscsi" {
-    const data = "mizuchi frame integrity";
+    const data = "orochi frame integrity";
     const Crc32Iscsi = std.hash.crc.Crc32Iscsi;
     try testing.expectEqual(Crc32Iscsi.hash(data), crc32c(data));
 }

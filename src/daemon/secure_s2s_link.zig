@@ -283,7 +283,7 @@ test "secure link: AKE authenticates, bridges identity, then CRDT converges" {
         .local_prekey_secret = &fx.i_kem.secret_key,
         .responder_prekey = fx.r_pre,
         .cfg = fx.cfg_i,
-        .server_name = "a.mizuchi",
+        .server_name = "a.orochi",
     });
     defer a.deinit();
     var b = SecureLink.init(.{
@@ -293,7 +293,7 @@ test "secure link: AKE authenticates, bridges identity, then CRDT converges" {
         .local_prekey = fx.r_pre,
         .local_prekey_secret = &fx.r_kem.secret_key,
         .cfg = fx.cfg_r,
-        .server_name = "b.mizuchi",
+        .server_name = "b.orochi",
     });
     defer b.deinit();
 
@@ -320,7 +320,7 @@ test "secure link stays unestablished if the AKE never starts" {
         .local_prekey = fx.r_pre,
         .local_prekey_secret = &fx.r_kem.secret_key,
         .cfg = fx.cfg_r,
-        .server_name = "b.mizuchi",
+        .server_name = "b.orochi",
     });
     defer b.deinit();
     try testing.expect(!b.isEstablished());

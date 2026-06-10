@@ -30,8 +30,8 @@
 //! into a 64-byte value (SHA-512), reducing mod L to a scalar, then computing
 //! scalar·G.  This is a deterministic, verifiable construction.
 //!
-//!   M = SHA-512("mizuchi-spake2-M-v1") mod L · G
-//!   N = SHA-512("mizuchi-spake2-N-v1") mod L · G
+//!   M = SHA-512("orochi-spake2-M-v1") mod L · G
+//!   N = SHA-512("orochi-spake2-N-v1") mod L · G
 //!
 //! The resulting compressed byte values are embedded as constants below and
 //! were verified with the standalone helper at the bottom of this file.
@@ -43,7 +43,7 @@
 //! ## Key derivation and confirmation
 //!
 //! transcript = SHA-256(
-//!     "mizuchi-spake2-transcript-v1" ||
+//!     "orochi-spake2-transcript-v1" ||
 //!     len32BE(idA) || idA || len32BE(idB) || idB ||
 //!     X_bytes || Y_bytes || K_bytes || w_bytes
 //! )
@@ -97,20 +97,20 @@ pub const mac_len: usize = HmacSha256.mac_length; // 32
 // asserts equality, providing an audit trail without comptime overhead.
 // ---------------------------------------------------------------------------
 
-/// Party A's blinding point M = SHA-512("mizuchi-spake2-M-v1") mod L · G.
+/// Party A's blinding point M = SHA-512("orochi-spake2-M-v1") mod L · G.
 const point_M_bytes: [point_len]u8 = .{
-    0xAA, 0x06, 0x7E, 0x72, 0x66, 0x3A, 0x45, 0xE6,
-    0x7B, 0xBC, 0x4C, 0x72, 0x3F, 0xC9, 0x32, 0x93,
-    0x43, 0x89, 0x98, 0x5B, 0x31, 0xBE, 0xD6, 0xB0,
-    0xCE, 0x96, 0xF7, 0x85, 0x97, 0xE8, 0x7A, 0xF1,
+    0xB5, 0x38, 0x9D, 0xD4, 0x3A, 0xB9, 0x36, 0x39,
+    0x50, 0x1F, 0x84, 0xCF, 0x69, 0xC5, 0xC3, 0xF0,
+    0x2E, 0x52, 0xF2, 0xC8, 0x5D, 0x7F, 0xA1, 0x8B,
+    0xF8, 0x4F, 0xA2, 0x9F, 0x97, 0x73, 0xF3, 0xFA,
 };
 
-/// Party B's blinding point N = SHA-512("mizuchi-spake2-N-v1") mod L · G.
+/// Party B's blinding point N = SHA-512("orochi-spake2-N-v1") mod L · G.
 const point_N_bytes: [point_len]u8 = .{
-    0x76, 0x2D, 0xF8, 0xDB, 0x12, 0xDF, 0x78, 0xA8,
-    0x32, 0x1A, 0x3F, 0x22, 0x4A, 0x97, 0xBB, 0xEC,
-    0x48, 0x02, 0x46, 0x24, 0xBB, 0x1B, 0x13, 0xFD,
-    0xAB, 0xE2, 0x70, 0xC5, 0x14, 0x5B, 0x74, 0x5E,
+    0xC7, 0x3D, 0x5F, 0x5B, 0xAF, 0x83, 0x36, 0xC1,
+    0xC6, 0x74, 0x6F, 0x4A, 0x7E, 0x86, 0x59, 0xC8,
+    0xBF, 0x20, 0xD1, 0x4A, 0x2D, 0x16, 0xB6, 0xB2,
+    0x19, 0x0A, 0x82, 0xB2, 0x75, 0x02, 0x5B, 0x64,
 };
 
 // ---------------------------------------------------------------------------
@@ -335,7 +335,7 @@ fn buildTranscript(
     };
 
     var h = Sha256.init(.{});
-    h.update("mizuchi-spake2-transcript-v1");
+    h.update("orochi-spake2-transcript-v1");
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(id_a.len), .big);
     h.update(&len_buf);
@@ -537,8 +537,8 @@ test "deterministic: same seeds produce identical messages and keys" {
 
 test "blinding points match derivation and are distinct" {
     // Re-derive M and N at runtime and compare against embedded constants.
-    const derived_M = try deriveBlindingPoint("mizuchi-spake2-M-v1");
-    const derived_N = try deriveBlindingPoint("mizuchi-spake2-N-v1");
+    const derived_M = try deriveBlindingPoint("orochi-spake2-M-v1");
+    const derived_N = try deriveBlindingPoint("orochi-spake2-N-v1");
 
     try std.testing.expectEqualSlices(u8, &point_M_bytes, &derived_M);
     try std.testing.expectEqualSlices(u8, &point_N_bytes, &derived_N);

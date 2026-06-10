@@ -171,7 +171,7 @@ fn bootstrap(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) Err
 
 /// Fixed nonzero serial for bootstrap leaves; uniqueness across boots is not
 /// required since these are ephemeral, single-host certificates.
-const bootstrap_serial = [_]u8{ 0x4d, 0x49, 0x5a, 0x55 }; // "MIZU"
+const bootstrap_serial = [_]u8{ 0x53, 0x55, 0x5a, 0x55 }; // "SUZU"
 
 /// True when `bytes` looks like PEM (carries the BEGIN armor).
 fn isPem(bytes: []const u8) bool {

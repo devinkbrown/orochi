@@ -1,6 +1,6 @@
 # Accounts And Services Commands
 
-Account and service commands are registered by the `accounts` module (`src/daemon/modules/accounts.zig:59`) and feature/service modules. Mizuchi services are real server commands and server notices; there are no pseudo-clients in these handlers (`src/daemon/server.zig:8698`, `src/daemon/server.zig:8709`).
+Account and service commands are registered by the `accounts` module (`src/daemon/modules/accounts.zig:59`) and feature/service modules. Orochi services are real server commands and server notices; there are no pseudo-clients in these handlers (`src/daemon/server.zig:8698`, `src/daemon/server.zig:8709`).
 
 ## REGISTER
 

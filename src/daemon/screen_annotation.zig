@@ -1,4 +1,4 @@
-//! Per-channel screen-share annotation tracking for the Mizuchi daemon.
+//! Per-channel screen-share annotation tracking for the Orochi daemon.
 //!
 //! Each channel owns a bounded FIFO ring (capacity `ring_cap`) of annotation
 //! ops emitted during a screen share. When the ring is full the oldest op is

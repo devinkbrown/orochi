@@ -1,4 +1,4 @@
-//! Registered-channel expiry policy for Mizuchi services.
+//! Registered-channel expiry policy for Orochi services.
 //!
 //! This module is intentionally standalone: it models service-owned channel
 //! registration metadata and expiry decisions without importing daemon or proto
@@ -254,8 +254,8 @@ pub fn validChannelName(channel: []const u8) bool {
 }
 
 test "parse sidecar record borrows fields" {
-    const record = try parseRecord("CX1|#mizuchi|123456|1");
-    try std.testing.expectEqualStrings("#mizuchi", record.channel);
+    const record = try parseRecord("CX1|#orochi|123456|1");
+    try std.testing.expectEqualStrings("#orochi", record.channel);
     try std.testing.expectEqual(@as(u64, 123456), record.last_used_ms);
     try std.testing.expectEqual(@as(u32, 1), record.flags);
     try std.testing.expect(record.noexpire(default_noexpire_mask));
@@ -263,12 +263,12 @@ test "parse sidecar record borrows fields" {
 
 test "parse rejects malformed records" {
     try std.testing.expectError(error.EmptyRecord, parseRecord(""));
-    try std.testing.expectError(error.UnsupportedVersion, parseRecord("C1|#mizuchi|10|0"));
-    try std.testing.expectError(error.MissingField, parseRecord("CX1|#mizuchi|10"));
-    try std.testing.expectError(error.InvalidChannel, parseRecord("CX1|mizuchi|10|0"));
-    try std.testing.expectError(error.InvalidLastUsed, parseRecord("CX1|#mizuchi|soon|0"));
-    try std.testing.expectError(error.InvalidFlags, parseRecord("CX1|#mizuchi|10|no"));
-    try std.testing.expectError(error.TrailingField, parseRecord("CX1|#mizuchi|10|0|extra"));
+    try std.testing.expectError(error.UnsupportedVersion, parseRecord("C1|#orochi|10|0"));
+    try std.testing.expectError(error.MissingField, parseRecord("CX1|#orochi|10"));
+    try std.testing.expectError(error.InvalidChannel, parseRecord("CX1|orochi|10|0"));
+    try std.testing.expectError(error.InvalidLastUsed, parseRecord("CX1|#orochi|soon|0"));
+    try std.testing.expectError(error.InvalidFlags, parseRecord("CX1|#orochi|10|no"));
+    try std.testing.expectError(error.TrailingField, parseRecord("CX1|#orochi|10|0|extra"));
 }
 
 test "format sidecar record and parse round trip" {
@@ -293,12 +293,12 @@ test "format rejects invalid channel and small buffers" {
 }
 
 test "validChannelName enforces standalone IRC-safe basics" {
-    try std.testing.expect(validChannelName("#mizuchi"));
+    try std.testing.expect(validChannelName("#orochi"));
     try std.testing.expect(validChannelName("&local"));
     try std.testing.expect(validChannelName("+modeless"));
     try std.testing.expect(validChannelName("!safe"));
     try std.testing.expect(!validChannelName("#"));
-    try std.testing.expect(!validChannelName("mizuchi"));
+    try std.testing.expect(!validChannelName("orochi"));
     try std.testing.expect(!validChannelName("#bad name"));
     try std.testing.expect(!validChannelName("#bad,chan"));
     try std.testing.expect(!validChannelName("#bad:chan"));
@@ -350,10 +350,10 @@ test "ExpiryIndex tracks activity and preserves flags on touch" {
     var index = ExpiryIndex.init(std.testing.allocator);
     defer index.deinit();
 
-    try index.put(.{ .channel = "#mizuchi", .last_used_ms = 10, .flags = default_noexpire_mask });
-    try index.touch("#Mizuchi", 20);
+    try index.put(.{ .channel = "#orochi", .last_used_ms = 10, .flags = default_noexpire_mask });
+    try index.touch("#Orochi", 20);
 
-    const record = index.get("#mizuchi") orelse return error.TestUnexpectedNull;
+    const record = index.get("#orochi") orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(@as(usize, 1), index.count());
     try std.testing.expectEqual(@as(u64, 20), record.last_used_ms);
     try std.testing.expect(record.noexpire(default_noexpire_mask));

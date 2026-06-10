@@ -1,4 +1,4 @@
-//! Compound RTCP packet parser/builder for RFC 3550 packet types used by Mizuchi.
+//! Compound RTCP packet parser/builder for RFC 3550 packet types used by Orochi.
 const std = @import("std");
 const rtp_profile = @import("rtp_profile.zig");
 

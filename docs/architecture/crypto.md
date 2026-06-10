@@ -1,13 +1,13 @@
 # Cryptography and Secure-Channel Architecture
 
-This document describes the cryptography that exists in the current Mizuchi
+This document describes the cryptography that exists in the current Orochi
 source tree. Intent notes from `docs/planning/02-crypto-tsumugi.md` and the
 opssl design inventory are included only where they match current code or where
 they clarify direction; current behavior is cited to `src/`.
 
 ## Scope and Stance
 
-Mizuchi is a clean-slate Zig-native successor to ophion; the brief explicitly
+Orochi is a clean-slate Zig-native successor to ophion; the brief explicitly
 states that the daemon, substrate, and opssl crypto/TLS library are rewritten
 from scratch in Zig and that ophion/libop/opssl are reference material only
 (`docs/BRIEF.md:3`, `docs/BRIEF.md:4`, `docs/BRIEF.md:5`,
@@ -278,7 +278,7 @@ configured (`src/daemon/server.zig:2582`, `src/daemon/server.zig:2583`,
 
 ## opssl TLS Library and Daemon Use
 
-In Mizuchi naming, "opssl" refers to the pure-Zig successor library in
+In Orochi naming, "opssl" refers to the pure-Zig successor library in
 `src/crypto` and `src/proto/tls_*`; it is not the old C library. The user-facing
 ABOUT text names "opssl" as "a from-scratch pure-Zig TLS and primitive library"
 (`src/proto/server_about.zig:62`).

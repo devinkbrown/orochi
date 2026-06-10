@@ -1,4 +1,4 @@
-//! privacy_pref.zig — Per-account privacy preference store for the Mizuchi daemon.
+//! privacy_pref.zig — Per-account privacy preference store for the Orochi daemon.
 //!
 //! Each account may opt in or out of a small set of privacy-affecting behaviors.
 //! Preferences are kept in memory keyed by account name. Accounts that have never
