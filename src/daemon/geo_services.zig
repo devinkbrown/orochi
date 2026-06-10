@@ -316,7 +316,13 @@ pub const Service = struct {
             self.fetchNewsFromFile(k);
             return;
         }
-        // Live path: best-effort in-daemon RSS-over-TLS fetch.
+        // Live path: best-effort in-daemon RSS-over-TLS fetch. NOTE: the
+        // clean-room crypto/tls_client reaches ECDSA hosts (e.g. BBC) but fails
+        // BadSignature on some rsa_pss_rsae_sha256 (0x0804) hosts (e.g. NPR,
+        // Guardian) — diagnosed to a clean-room TLS handshake issue, NOT the
+        // RSA-PSS primitive (rsa_verify.verifyPss is proven correct against a
+        // real 2048-bit OpenSSL vector; see its test). Use `news_cache_dir` +
+        // tools/news_update.sh for guaranteed full coverage.
         const url = newsUrlForKey(k) orelse return;
         const u = http_fetch.parseUrl(url) catch return;
         var req_buf: [1024]u8 = undefined;
