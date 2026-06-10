@@ -10078,19 +10078,16 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .RPL_ENDOFUSERS, &.{}, "End of users");
     }
 
-    /// LINKS — single-node mesh view: just this server (RPL_LINKS 364 /
-    /// RPL_ENDOFLINKS 365). Reimagined for Suimyaku once S2S lands.
+    /// LINKS — Suimyaku mesh view: this server plus every established S2S peer as
+    /// a 1-hop neighbour (RPL_LINKS 364 / RPL_ENDOFLINKS 365). Reflects both
+    /// plaintext and PQ-secured links, matching the MESH peer view.
     pub fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Mizuchi IRC daemon"}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ server_name, server_name }, detail);
-        // Reflect each established S2S peer as a 1-hop neighbour.
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            const link = entry.value.s2s orelse continue;
-            if (!link.established()) continue;
-            const rname = link.remoteName();
-            if (rname.len == 0) continue;
+            const rname = establishedPeerName(entry.value) orelse continue;
             var lbuf: [128]u8 = undefined;
             const ldetail = std.fmt.bufPrint(&lbuf, "1 {s}", .{"Suimyaku peer"}) catch continue;
             try queueNumeric(conn, .RPL_LINKS, &.{ rname, server_name }, ldetail);
@@ -10098,7 +10095,20 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .RPL_ENDOFLINKS, &.{"*"}, "End of /LINKS list");
     }
 
-    /// MAP — network topology. Single node today (RPL_MAP 015 / RPL_MAPEND 017).
+    /// The remote name of an established S2S peer on `conn` (plaintext or
+    /// secured), or null when the connection is not an established peer. Shared
+    /// by LINKS and MAP so both reflect the same live mesh neighbours as MESH.
+    fn establishedPeerName(conn: *const ConnState) ?[]const u8 {
+        if (conn.s2s) |l| {
+            if (l.established() and l.remoteName().len != 0) return l.remoteName();
+        } else if (conn.s2s_secured) |l| {
+            if (l.established() and l.remoteName().len != 0) return l.remoteName();
+        }
+        return null;
+    }
+
+    /// MAP — network topology: this server with each established S2S peer (both
+    /// plaintext and secured) as a child node (RPL_MAP 015 / RPL_MAPEND 017).
     pub fn handleMap(self: *LinuxServer, conn: *ConnState) !void {
         var line_buf: [160]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "{s} [Users: {d}]", .{
@@ -10106,13 +10116,11 @@ pub const LinuxServer = struct {
             self.countRegisteredUsers(),
         }) catch return;
         try queueNumeric(conn, .RPL_MAP, &.{}, detail);
-        // Established S2S peers as child nodes of this server.
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            const link = entry.value.s2s orelse continue;
-            if (!link.established() or link.remoteName().len == 0) continue;
+            const rname = establishedPeerName(entry.value) orelse continue;
             var pbuf: [160]u8 = undefined;
-            const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{link.remoteName()}) catch continue;
+            const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{rname}) catch continue;
             try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
         }
         try queueNumeric(conn, .RPL_MAPEND, &.{}, "End of /MAP");
