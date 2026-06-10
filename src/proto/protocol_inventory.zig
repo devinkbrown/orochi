@@ -27,6 +27,7 @@ pub const isupport_tokens = [_][]const u8{
     // boot override swaps these to the configured values.
     "TOPICLEN=390",
     "AWAYLEN=256",
+    "KICKLEN=307",
     "CASEMAPPING=ascii",
     "PREFIX=(Qqov)!.@+",
     chanmodes_token,

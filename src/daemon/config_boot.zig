@@ -32,6 +32,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.max_clients = cfg.limits.max_clients;
     out.topiclen = cfg.limits.topiclen;
     out.awaylen = cfg.limits.awaylen;
+    out.kicklen = cfg.limits.kicklen;
     if (cfg.limits.handshake_timeout_ms != 0) out.registration_timeout_ms = @intCast(cfg.limits.handshake_timeout_ms);
     if (cfg.limits.ping_interval_ms != 0) out.ping_interval_ms = @intCast(cfg.limits.ping_interval_ms);
     if (cfg.limits.ping_timeout_ms != 0) out.ping_timeout_ms = @intCast(cfg.limits.ping_timeout_ms);

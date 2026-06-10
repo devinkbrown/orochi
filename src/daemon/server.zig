@@ -848,15 +848,17 @@ pub const ServerError = error{
 /// with the length tokens (TOPICLEN) replaced by their configured values. The
 /// returned slice and its dynamic entries are owned by `allocator`; install via
 /// `protocol_inventory.setIsupportOverride` and free with `freeIsupportTokens`.
-pub fn buildIsupportTokens(allocator: std.mem.Allocator, topiclen: u32, awaylen: u32) ![]const []const u8 {
+pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     const base = protocol_inventory.isupport_tokens;
     const out = try allocator.alloc([]const u8, base.len);
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "TOPICLEN=")) {
-            out[i] = try std.fmt.allocPrint(allocator, "TOPICLEN={d}", .{topiclen});
+            out[i] = try std.fmt.allocPrint(allocator, "TOPICLEN={d}", .{cfg.topiclen});
         } else if (std.mem.startsWith(u8, tok, "AWAYLEN=")) {
-            out[i] = try std.fmt.allocPrint(allocator, "AWAYLEN={d}", .{awaylen});
+            out[i] = try std.fmt.allocPrint(allocator, "AWAYLEN={d}", .{cfg.awaylen});
+        } else if (std.mem.startsWith(u8, tok, "KICKLEN=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "KICKLEN={d}", .{cfg.kicklen});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -890,6 +892,9 @@ pub const Config = struct {
     /// Maximum away-message length in bytes (advertised as AWAYLEN, enforced by
     /// handleAway). Configurable via `[limits] awaylen`; hard-capped by storage.
     awaylen: u32 = 256,
+    /// Maximum kick-comment length in bytes (advertised as KICKLEN, enforced by
+    /// handleKick). Configurable via `[limits] kicklen`.
+    kicklen: u32 = 307,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
@@ -4492,8 +4497,11 @@ pub const LinuxServer = struct {
         }
 
         const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = hostOf(conn) };
+        // Cap the kick comment at the configured KICKLEN (advertised in ISUPPORT),
+        // truncated on a UTF-8 codepoint boundary.
+        const reason = utf8TruncateBytes(args.reason, self.config.kicklen);
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, args.reason) catch return;
+        const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
         try self.broadcastChannel(args.channel, msg, null);
         self.world.part(args.channel, target) catch {};
     }
@@ -12785,20 +12793,21 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
 }
 
-test "buildIsupportTokens replaces TOPICLEN and AWAYLEN with configured values" {
-    const tokens = try buildIsupportTokens(std.testing.allocator, 512, 200);
+test "buildIsupportTokens replaces length tokens with configured values" {
+    const tokens = try buildIsupportTokens(std.testing.allocator, .{ .port = 0, .topiclen = 512, .awaylen = 200, .kicklen = 100 });
     defer freeIsupportTokens(std.testing.allocator, tokens);
 
     var found_topic = false;
     var found_away = false;
+    var found_kick = false;
     for (tokens) |tok| {
         if (std.mem.eql(u8, tok, "TOPICLEN=512")) found_topic = true;
         if (std.mem.eql(u8, tok, "AWAYLEN=200")) found_away = true;
+        if (std.mem.eql(u8, tok, "KICKLEN=100")) found_kick = true;
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expect(found_topic);
-    try std.testing.expect(found_away);
+    try std.testing.expect(found_topic and found_away and found_kick);
     try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
 }
 
