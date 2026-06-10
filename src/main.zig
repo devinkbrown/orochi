@@ -131,6 +131,9 @@ pub fn main(init: std.process.Init) !void {
     if (mizuchi.daemon.server.buildIsupportTokens(allocator, srv_cfg)) |tokens| {
         mizuchi.proto.protocol_inventory.setIsupportOverride(tokens);
     } else |_| {}
+    // NICKLEN is enforced in the pre-registration dispatch path, which reads the
+    // runtime-limits holder rather than a config handle.
+    mizuchi.proto.protocol_inventory.setRuntimeLimits(.{ .nicklen = srv_cfg.nicklen });
 
     // PQ-secured S2S: if the config supplies node.secret_key, derive this node's
     // Tsumugi identity and enable the secured handshake (TOFU) on S2S links. The

@@ -105,6 +105,8 @@ pub const Config = struct {
         awaylen: u32 = 256,
         /// Maximum kick-comment length in bytes (advertised as KICKLEN).
         kicklen: u32 = 307,
+        /// Maximum nick length in bytes (advertised as NICKLEN; capped at 64).
+        nicklen: u32 = 64,
         max_clones_per_ip: u32 = 0,
         max_clones_per_net: u32 = 0,
         reputation_refuse_threshold: u32 = 0,
@@ -305,6 +307,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.topiclen = @intCast(try uintField(doc, "limits.topiclen", cfg.limits.topiclen, 1, 8192));
     cfg.limits.awaylen = @intCast(try uintField(doc, "limits.awaylen", cfg.limits.awaylen, 1, 256));
     cfg.limits.kicklen = @intCast(try uintField(doc, "limits.kicklen", cfg.limits.kicklen, 1, 400));
+    cfg.limits.nicklen = @intCast(try uintField(doc, "limits.nicklen", cfg.limits.nicklen, 1, 64));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
     if (doc.getString("limits.handshake_timeout")) |s| cfg.limits.handshake_timeout_ms = try durationMs(s);
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);

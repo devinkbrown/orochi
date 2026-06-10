@@ -859,6 +859,8 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = try std.fmt.allocPrint(allocator, "AWAYLEN={d}", .{cfg.awaylen});
         } else if (std.mem.startsWith(u8, tok, "KICKLEN=")) {
             out[i] = try std.fmt.allocPrint(allocator, "KICKLEN={d}", .{cfg.kicklen});
+        } else if (std.mem.startsWith(u8, tok, "NICKLEN=")) {
+            out[i] = try std.fmt.allocPrint(allocator, "NICKLEN={d}", .{cfg.nicklen});
         } else {
             out[i] = tok; // static comptime data; borrowed, not freed
         }
@@ -895,6 +897,10 @@ pub const Config = struct {
     /// Maximum kick-comment length in bytes (advertised as KICKLEN, enforced by
     /// handleKick). Configurable via `[limits] kicklen`.
     kicklen: u32 = 307,
+    /// Maximum nick length in bytes (advertised as NICKLEN, enforced in the
+    /// pre-registration dispatch path via the runtime-limits holder). Capped by
+    /// the nick store (64). Configurable via `[limits] nicklen`.
+    nicklen: u32 = 64,
     /// Registry command feature toggles disabled by config. A registry command
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.

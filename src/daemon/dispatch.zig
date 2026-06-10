@@ -1264,6 +1264,12 @@ fn handleNick(ctx: DispatchCtx) DispatchError!void {
         try ctx.replies.numeric(ctx.session, .ERR_ERRONEUSNICKNAME, &.{"*"}, "Erroneous nickname");
         return;
     }
+    // Enforce the configured NICKLEN (the pre-registration path reads it from the
+    // boot-set runtime limits, since it has no server/config handle).
+    if (nick.len > protocol_inventory.currentLimits().nicklen) {
+        try ctx.replies.numeric(ctx.session, .ERR_ERRONEUSNICKNAME, &.{nick}, "Erroneous nickname (too long)");
+        return;
+    }
 
     try ctx.session.client.identity.nick.set(nick);
     ctx.session.registration.nick_seen = true;
@@ -1696,6 +1702,23 @@ test "enabled sts policy advertises a well-formed value" {
     replies.clear();
     try dispatchText(&session, &replies, "CAP LS 302");
     try expectNotContains(replies.written(), "sts=");
+}
+
+test "NICK rejects nicks longer than the configured NICKLEN" {
+    protocol_inventory.setRuntimeLimits(.{ .nicklen = 8 });
+    defer protocol_inventory.setRuntimeLimits(.{}); // restore default for other tests
+
+    var session = ClientSession.init();
+    var storage: [512]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "NICK thisnickistoolong"); // 17 > 8
+    try std.testing.expect(std.mem.indexOf(u8, replies.written(), " 432 ") != null);
+
+    // A nick within the limit is accepted (no 432).
+    replies.clear();
+    try dispatchText(&session, &replies, "NICK shortn"); // 6 <= 8
+    try std.testing.expect(std.mem.indexOf(u8, replies.written(), " 432 ") == null);
 }
 
 test "clearOper revokes operator status, privileges, and class" {

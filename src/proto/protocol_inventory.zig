@@ -55,6 +55,26 @@ pub fn setIsupportOverride(slice: ?[]const []const u8) void {
     isupport_override = slice;
 }
 
+/// Config-driven limits that the pre-registration dispatch path (which has no
+/// server/config handle) must consult — e.g. NICKLEN, enforced in handleNick.
+pub const RuntimeLimits = struct {
+    /// Maximum nick length in bytes (hard-capped by the nick store).
+    nicklen: u32 = 64,
+};
+
+/// Active runtime limits. Written once at boot before any connection is served
+/// and read-only thereafter, so it needs no synchronization. Defaults match the
+/// static ISUPPORT advertisement, so tests that never set it behave unchanged.
+var active_limits: RuntimeLimits = .{};
+
+pub fn currentLimits() RuntimeLimits {
+    return active_limits;
+}
+
+pub fn setRuntimeLimits(limits: RuntimeLimits) void {
+    active_limits = limits;
+}
+
 test "isupport tokens are well-formed key[=value] pairs" {
     for (isupport_tokens) |token| {
         try std.testing.expect(token.len > 0);
