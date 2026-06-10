@@ -45,9 +45,20 @@ Source: struct at `src/daemon/config_format.zig:62`, parsing at `src/daemon/conf
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `text` | string or null | unset | any string | MOTD body served by `MOTD`; newlines are split into MOTD lines. Supports `@file:` at parser level (`src/daemon/config_format.zig:62`, `src/daemon/config_format.zig:495`). |
+| `text` | string or null | unset | any string | MOTD body served by `MOTD`; newlines are split into MOTD lines. Supports `@file:` at parser level. |
 
-When omitted or empty after mapping, the server uses its built-in MOTD default (`src/daemon/server.zig:913`).
+The MOTD is a **per-connection template** expanded by `src/proto/motd_template.zig`
+before being split into lines. When omitted or empty, the server serves a
+personalized built-in default.
+
+Substitutions (`{key}`; unknown keys left verbatim; `{{`/`}}` emit literal braces):
+`{nick}` `{account}` `{host}` `{network}` `{server}` `{version}` `{time}` `{date}`
+`{users}` `{opers}` `{channels}`, plus `{greeting}` (a time-of-day greeting) and
+`{weather}` / `{news}` (see `[weather]` / `[news]`).
+
+Conditionals: `{if:COND}…{else}…{/if}` where `COND` is `oper`, `account`, `secure`,
+`weather`, or `news` (the last two true when that line is available); conditionals
+nest. Example: `{if:account}Welcome back, {account}!{else}Please register.{/if}`
 
 ## `[admin]`
 
@@ -57,6 +68,30 @@ Source: struct at `src/daemon/config_format.zig:69`, parsing at `src/daemon/conf
 |---|---|---:|---|---|
 | `location` | string | `"Orochi IRC network"` | any string | ADMIN command location line (`src/daemon/server.zig:916`). |
 | `email` | string | `"admin@orochi.local"` | any string | ADMIN command contact email (`src/daemon/server.zig:916`). |
+
+## `[weather]`
+
+Localized weather for the MOTD `{weather}` placeholder. The daemon reads `source`
+(a `key=value` file refreshed by an external updater) and renders it in the units
+the region uses (`src/proto/weather_units.zig`; `src/daemon/server.zig` `handleMotd`).
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `enabled` | bool | `false` | — | Enable the `{weather}` MOTD line. |
+| `source` | string or null | unset | path | `key=value` file (`temp_c`, `wind_kph`, `precip_mm`, `desc`, `location`, `country`); read fresh per `MOTD`. Supports `@file:`. |
+| `location` | string or null | unset | any string | Display location override (else the file's `location`). |
+| `country` | string or null | unset | ISO code | Country for unit selection (else the file's `country`). |
+| `units` | string or null | unset (`auto`) | `auto`/`metric`/`imperial`/`uk` | Unit override. `auto` = by country: US + territories → °F/mph; GB → °C/mph; else °C/km/h. |
+
+## `[news]`
+
+Headlines for the MOTD `{news}` placeholder.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `enabled` | bool | `false` | — | Enable the `{news}` MOTD line. |
+| `source` | string or null | unset | path | File with one headline per line; the first `count` are joined with `" | "`. Supports `@file:`. |
+| `count` | integer | `3` | `1..20` | Number of headlines to show. |
 
 ## `[listen]`
 

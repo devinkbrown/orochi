@@ -49,7 +49,7 @@ Stateless server information commands are registered by `query.info` (`src/daemo
 ## MOTD
 
 - Syntax: `MOTD`
-- Description: Returns configured MOTD lines or no-MOTD error.
+- Description: Returns the Message of the Day, or the no-MOTD error if none is configured. The MOTD is a **personalized per-connection template** (`src/proto/motd_template.zig`): each client's lines are expanded with their own details — a time-of-day greeting, their nick/account/host, live network figures, and oper/login/TLS-aware conditionals — and, when enabled, localized weather (`{weather}`) and headlines (`{news}`). Operators set the body (or override the default) via `[motd] text`; see the config reference for the full placeholder and conditional syntax.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_MOTDSTART 375`, `RPL_MOTD 372`, `RPL_ENDOFMOTD 376`.
