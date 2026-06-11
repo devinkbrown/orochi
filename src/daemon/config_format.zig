@@ -167,6 +167,10 @@ pub const Config = struct {
         realm: []const u8 = "",
         trust_roots: []const []const u8 = &.{},
         mesh_pass: ?[]const u8 = null,
+        /// Peers this node dials automatically at boot (and re-dials while the
+        /// link is down), each a "host:port" string (IPv6 hosts bracketed,
+        /// e.g. "[::1]:6900"). Empty = no auto-connect.
+        connect: []const []const u8 = &.{},
     };
 
     pub const Limits = struct {
@@ -370,6 +374,7 @@ pub const Config = struct {
         allocator.free(self.oper_groups);
         allocator.free(self.mesh.realm);
         freeStringList(allocator, self.mesh.trust_roots);
+        freeStringList(allocator, self.mesh.connect);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
@@ -452,6 +457,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getArray("mesh.trust_roots")) |arr| {
         freeStringList(allocator, cfg.mesh.trust_roots);
         cfg.mesh.trust_roots = try ownStringArray(allocator, resolver, arr);
+    }
+    if (doc.getArray("mesh.connect")) |arr| {
+        freeStringList(allocator, cfg.mesh.connect);
+        cfg.mesh.connect = try ownStringArray(allocator, resolver, arr);
     }
 
     // [limits]
@@ -727,6 +736,7 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
         \\[mesh]
         \\realm = "ircxnet"
         \\trust_roots = ["root-a", "root-b"]
+        \\connect = ["ircx.us:6900", "[::1]:7900"]
         \\[[opers]]
         \\account = "admin"
         \\class = "netadmin"
@@ -739,6 +749,9 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
     try testing.expectEqualStrings("ircxnet", cfg.mesh.realm);
     try testing.expectEqual(@as(usize, 2), cfg.mesh.trust_roots.len);
     try testing.expectEqualStrings("root-b", cfg.mesh.trust_roots[1]);
+    try testing.expectEqual(@as(usize, 2), cfg.mesh.connect.len);
+    try testing.expectEqualStrings("ircx.us:6900", cfg.mesh.connect[0]);
+    try testing.expectEqualStrings("[::1]:7900", cfg.mesh.connect[1]);
     try testing.expectEqual(@as(usize, 2), cfg.opers.len);
     try testing.expectEqualStrings("admin", cfg.opers[0].account);
     try testing.expectEqualStrings("netadmin", cfg.opers[0].class);

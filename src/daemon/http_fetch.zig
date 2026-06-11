@@ -227,7 +227,11 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
 
 // ---- DNS (A-record over UDP, blocking) --------------------------------------
 
-fn resolveHostA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
+/// Resolve `host` to an address: IP literals parse directly; otherwise a
+/// blocking A-record query against the system resolvers, bounded by
+/// `timeout_ms` per nameserver. Public so the daemon's mesh auto-connect can
+/// dial configured "host:port" peers by name (same blocking-DNS contract).
+pub fn resolveHostA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
     if (net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
 
     var conf_buf: [4096]u8 = undefined;

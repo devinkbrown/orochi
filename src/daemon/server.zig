@@ -120,6 +120,7 @@ const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const tls_server = @import("../crypto/tls_server.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
+const http_fetch = @import("http_fetch.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -1180,6 +1181,11 @@ pub const Config = struct {
     node_identity: ?*const node_identity.NodeIdentity = null,
     crypto_io: ?std.Io = null,
     mesh_pass: []const u8 = "",
+    /// `[mesh].connect` — peers ("host:port"; IPv6 hosts bracketed) this node
+    /// dials automatically at boot and re-dials while the link is down, so the
+    /// S2S mesh stays up without an oper CONNECT. Strings are borrowed (owned
+    /// by the parsed config in main). Empty = no auto-connect (default).
+    mesh_connect: []const []const u8 = &.{},
     /// Operator registry from config `[oper]` blocks (account -> class/privileges).
     /// Oper is SASL-only: a client is elevated on SASL login if its account has a
     /// binding here. Null/empty = no operators (the OPER command never grants).
@@ -1449,6 +1455,15 @@ pub const LinuxServer = struct {
     /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
     /// every handler resolves to the reactor whose ring produced its completion.
     reactors: []Reactor,
+    /// `[mesh].connect` auto-dial table — one slot per valid configured peer,
+    /// parsed once at init (invalid specs are logged and dropped). Owned by
+    /// reactor 0 at run time: the boot dial and the sweep re-dials run only on
+    /// reactor 0's thread, the same reactor that owns the outbound ConnStates.
+    mesh_dials: []MeshDial = &.{},
+    /// One-shot boot-dial latch. Written only by reactor 0's thread; the boot
+    /// check confirms "this is reactor 0" before reading it, so no other shard
+    /// ever touches the flag.
+    mesh_dials_booted: bool = false,
     /// Cross-shard outbound delivery fabric (per-shard mailbox + wake + shared
     /// pool). Null in the single-reactor configuration (no cross-shard handoff is
     /// ever needed); allocated by `runThreaded` when `reactors.len > 1`.
@@ -1741,6 +1756,31 @@ pub const LinuxServer = struct {
         var whowas_store = try WhowasStore.init(allocator);
         errdefer whowas_store.deinit();
 
+        // Parse the [mesh].connect auto-dial table once: invalid "host:port"
+        // specs are logged and dropped so one typo never blocks the others.
+        var mesh_dials: []MeshDial = &.{};
+        if (config.mesh_connect.len != 0) {
+            var valid: usize = 0;
+            for (config.mesh_connect) |spec| {
+                if (parseHostPort(spec) != null) {
+                    valid += 1;
+                } else {
+                    std.debug.print("orochi: mesh auto-connect: bad peer spec '{s}' (want host:port); ignored\n", .{spec});
+                }
+            }
+            if (valid != 0) {
+                const dials = try allocator.alloc(MeshDial, valid);
+                var n: usize = 0;
+                for (config.mesh_connect) |spec| {
+                    const hp = parseHostPort(spec) orelse continue;
+                    dials[n] = .{ .spec = spec, .host = hp.host, .port = hp.port };
+                    n += 1;
+                }
+                mesh_dials = dials;
+            }
+        }
+        errdefer if (mesh_dials.len != 0) allocator.free(mesh_dials);
+
         const geo_ptr = try allocator.create(geo_services.Service);
         errdefer allocator.destroy(geo_ptr);
         geo_ptr.* = geo_services.Service.init(allocator, .{
@@ -1758,6 +1798,7 @@ pub const LinuxServer = struct {
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .tls_ticket_key = tls_ticket_key,
             .reactors = reactors,
+            .mesh_dials = mesh_dials,
             .pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(allocator),
             .world = blk: {
                 var w = world_model.World.init(allocator);
@@ -1977,6 +2018,7 @@ pub const LinuxServer = struct {
         self.pool.deinit();
         for (self.reactors) |*reactor| reactor.deinit();
         self.allocator.free(self.reactors);
+        if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
         if (self.fabric) |*f| f.deinit();
         self.* = undefined;
     }
@@ -2091,6 +2133,9 @@ pub const LinuxServer = struct {
         self.rx().timer_armed = false;
         self.sweepTimeouts();
         self.sweepTempModes();
+        // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
+        // rate-capped per peer, no-op while a dial is in flight or established).
+        self.sweepMeshAutoConnect(false);
         self.maybeWriteStats();
     }
 
@@ -2468,6 +2513,17 @@ pub const LinuxServer = struct {
         // already bound its own shard before looping (so we never clobber it);
         // single-reactor callers and direct-test invocations bind shard 0 here.
         if (current_reactor == null) current_reactor = &self.reactors[0];
+        // Mesh auto-connect boot pass: once the loop is serving (listeners armed
+        // by this same iteration), reactor 0 dials every [mesh].connect peer.
+        // The reactor-0 check runs FIRST so only one thread ever reads or writes
+        // the latch; later link drops are re-dialed by the sweep timer.
+        if (self.rx() == &self.reactors[0] and !self.mesh_dials_booted) {
+            self.mesh_dials_booted = true;
+            for (self.mesh_dials) |dial| {
+                std.debug.print("orochi: mesh auto-connect -> {s}:{d}\n", .{ dial.host, dial.port });
+            }
+            self.sweepMeshAutoConnect(true);
+        }
         try self.armAccept();
         self.armWake() catch {}; // cross-reactor wake poll; non-fatal if it can't arm
         self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
@@ -7008,16 +7064,29 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "CONNECT refused: connection table full");
             return;
         }
-        const fd = socketTcp() catch {
-            try self.noticeTo(conn, "CONNECT failed: cannot create socket");
+        _ = self.initiateS2sConnect(host, port) catch |err| {
+            try self.noticeTo(conn, switch (err) {
+                error.InvalidAddress => "CONNECT failed: invalid host",
+                else => "CONNECT failed: cannot create socket",
+            });
             return;
         };
+        try self.noticeTo(conn, if (self.s2sSecured()) "CONNECT initiated (secured)" else "CONNECT initiated");
+    }
+
+    /// Open an outbound S2S link to `host:port`: resolve the address (IPv4
+    /// literal or blocking DNS), create the socket + ConnState, stand up the
+    /// outbound-side link (PQ-secured when `s2sSecured()`, else the plaintext
+    /// handshake), and submit the async io_uring connect — the completion lands
+    /// in `handleConnect`. Shared by the oper CONNECT command and the
+    /// `[mesh].connect` auto-connect path; the new ConnState belongs to the
+    /// calling reactor (same ownership as an inbound accept). Returns the new
+    /// connection's token so callers can track the dial.
+    fn initiateS2sConnect(self: *LinuxServer, host: []const u8, port: u16) ServerError!RingFdToken {
+        if (self.rx().clients.len() >= self.config.max_clients) return error.SocketUnavailable;
+        const addr = try sockaddrForHost(host, port, 2_000);
+        const fd = try socketTcp();
         errdefer closeFd(fd);
-        const addr = sockaddrIn(host, port) catch {
-            try self.noticeTo(conn, "CONNECT failed: invalid host");
-            closeFd(fd);
-            return;
-        };
         const id = try self.rx().clients.alloc(ConnState.init(fd));
         errdefer _ = self.rx().clients.free(id);
         const peer = self.rx().clients.get(id).?;
@@ -7035,8 +7104,7 @@ pub const LinuxServer = struct {
             peer.s2s_secured = link;
             errdefer peer.s2s_secured = null;
             try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
-            try self.noticeTo(conn, "CONNECT initiated (secured)");
-            return;
+            return peer.token;
         }
 
         const link = try self.allocator.create(s2s_link.S2sLink);
@@ -7053,7 +7121,37 @@ pub const LinuxServer = struct {
         errdefer peer.s2s = null;
 
         try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
-        try self.noticeTo(conn, "CONNECT initiated");
+        return peer.token;
+    }
+
+    /// Dial every configured `[mesh].connect` peer whose outbound link is not
+    /// up (boot pass + periodic re-dial from the sweep timer). Reactor-0 only:
+    /// the dial table and every ConnState it creates belong to reactor 0, so no
+    /// other shard ever touches them. `force` skips the re-dial rate cap (boot).
+    /// A peer with a live dial (connect in flight or link established) is
+    /// skipped, so attempts never pile up; a failed/closed dial frees its slot
+    /// (generation mismatch on the saved token) and re-arms here.
+    fn sweepMeshAutoConnect(self: *LinuxServer, force: bool) void {
+        if (self.mesh_dials.len == 0) return;
+        if (self.rx() != &self.reactors[0]) return;
+        const now = self.nowMs();
+        for (self.mesh_dials) |*dial| {
+            if (dial.token) |tok| {
+                if (self.rx().clients.get(idFromToken(tok))) |peer| {
+                    // Same slot AND same generation: our dial still owns it.
+                    if (peer.token.slot == tok.slot and peer.token.gen == tok.gen and !peer.closing) continue;
+                }
+                dial.token = null; // dial's connection is gone — eligible again
+            }
+            if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) continue;
+            dial.last_attempt_ms = now;
+            if (self.initiateS2sConnect(dial.host, dial.port)) |tok| {
+                dial.token = tok;
+                std.debug.print("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
+            } else |err| {
+                std.debug.print("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+            }
+        }
     }
 
     /// SQUIT <server> [:reason] — oper command: tear down the S2S link to a peer
@@ -13450,12 +13548,80 @@ fn createListener(host: []const u8, port: u16, backlog: u31) ServerError!linux.f
     return fd;
 }
 
+/// One parsed `[mesh].connect` peer spec. Slices borrow the input spec.
+pub const HostPort = struct { host: []const u8, port: u16 };
+
+/// Split a "host:port" peer spec. IPv6 hosts may be bracketed ("[::1]:6900");
+/// an unbracketed spec splits on the LAST colon so "::1:6900" also resolves to
+/// host "::1". Returns null for an empty host, a missing port separator, or a
+/// port outside 1..65535.
+pub fn parseHostPort(spec: []const u8) ?HostPort {
+    if (spec.len == 0) return null;
+    var host: []const u8 = undefined;
+    var port_text: []const u8 = undefined;
+    if (spec[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, spec, ']') orelse return null;
+        if (close < 2) return null; // "[]" — empty host
+        if (close + 1 >= spec.len or spec[close + 1] != ':') return null;
+        host = spec[1..close];
+        port_text = spec[close + 2 ..];
+    } else {
+        const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
+        if (colon == 0) return null;
+        host = spec[0..colon];
+        port_text = spec[colon + 1 ..];
+    }
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return null;
+    if (port == 0) return null;
+    return .{ .host = host, .port = port };
+}
+
+/// Minimum interval between re-dial attempts to one [mesh].connect peer whose
+/// link is down. The boot pass dials immediately; afterwards the sweep timer
+/// re-dials at most this often per peer (no duplicate dial while one is in
+/// flight or established — see `MeshDial.token`).
+const mesh_redial_interval_ms: i64 = 10_000;
+
+/// One [mesh].connect auto-dial slot. Owned (and only touched) by reactor 0,
+/// the reactor that owns every outbound ConnState the dial creates.
+const MeshDial = struct {
+    /// The configured "host:port" spec verbatim (borrowed from Config), for logs.
+    spec: []const u8,
+    /// Parsed host/port (slices borrow `spec`).
+    host: []const u8,
+    port: u16,
+    /// Token of the live outbound ConnState created by the last dial — set
+    /// while a connect is in flight or the link is up. Cleared when that slot
+    /// is gone (generation mismatch), which is the re-dial signal.
+    token: ?RingFdToken = null,
+    /// Monotonic ms of the last dial attempt (rate cap for re-dials). 0 =
+    /// never dialed (the forced boot pass always fires regardless).
+    last_attempt_ms: i64 = 0,
+};
+
 fn sockaddrIn(host: []const u8, port: u16) ServerError!posix.sockaddr.in {
     const parsed = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidAddress;
     return .{
         .port = std.mem.nativeToBig(u16, parsed.port),
         .addr = @bitCast(parsed.bytes),
     };
+}
+
+/// `sockaddrIn` with hostname support: IPv4 literals parse directly; anything
+/// else goes through a blocking DNS A-record lookup (bounded by `timeout_ms`
+/// per nameserver), so `[mesh].connect = ["ircx.us:6900"]` and oper
+/// `CONNECT ircx.us 6900` both dial by name. IPv6 results are rejected — the
+/// S2S dial path is sockaddr_in (IPv4) end to end.
+fn sockaddrForHost(host: []const u8, port: u16, timeout_ms: u31) ServerError!posix.sockaddr.in {
+    if (sockaddrIn(host, port)) |addr| return addr else |_| {}
+    const resolved = http_fetch.resolveHostA(host, port, timeout_ms) catch return error.InvalidAddress;
+    switch (resolved) {
+        .ip4 => |a4| return .{
+            .port = std.mem.nativeToBig(u16, a4.port),
+            .addr = @bitCast(a4.bytes),
+        },
+        .ip6 => return error.InvalidAddress,
+    }
 }
 
 fn socketTcp() ServerError!linux.fd_t {
@@ -17281,6 +17447,107 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     a.reset();
     try writeAllFd(fd_a, "SQUIT remote.test\r\n");
     try recvUntil(&a, "SQUIT complete", 200);
+}
+
+test "parseHostPort: host:port split, bad port rejected, IPv6 brackets" {
+    // Plain host + numeric port.
+    const hp = parseHostPort("ircx.us:6900").?;
+    try std.testing.expectEqualStrings("ircx.us", hp.host);
+    try std.testing.expectEqual(@as(u16, 6900), hp.port);
+    // IPv4 literal.
+    const v4 = parseHostPort("127.0.0.1:7000").?;
+    try std.testing.expectEqualStrings("127.0.0.1", v4.host);
+    try std.testing.expectEqual(@as(u16, 7000), v4.port);
+    // Bracketed IPv6.
+    const v6 = parseHostPort("[::1]:6900").?;
+    try std.testing.expectEqualStrings("::1", v6.host);
+    try std.testing.expectEqual(@as(u16, 6900), v6.port);
+    // Unbracketed IPv6 splits on the LAST colon.
+    const v6b = parseHostPort("::1:6900").?;
+    try std.testing.expectEqualStrings("::1", v6b.host);
+    try std.testing.expectEqual(@as(u16, 6900), v6b.port);
+    // Rejected: missing port, empty host, bad/zero/oversized port, broken brackets.
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort(""));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("ircx.us"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort(":6900"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("ircx.us:"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("ircx.us:nope"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("ircx.us:0"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("ircx.us:65536"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("[]:6900"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("[::1]6900"));
+    try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("[::1]"));
+}
+
+test "threaded server: [mesh].connect auto-links two nodes without an oper" {
+    const alloc = std.testing.allocator;
+
+    // Node 2 (the dial target) boots first so its ephemeral S2S port is known
+    // before node 1's config is built.
+    var node2 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = 0,
+        .node_id = 2,
+        .server_name = "node2.test",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+    const s2s_port = node2.s2sBoundPort() catch return error.SkipZigTest;
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    defer {
+        run2.store(false, .release);
+        if (connectLoopback(node2.boundPort() catch 0)) |wfd| closeFd(wfd) else |_| {}
+        thr2.join();
+    }
+
+    // Node 1 carries node 2 in [mesh].connect — NO oper session, no CONNECT
+    // command: the boot pass must dial and link on its own.
+    var spec_buf: [32]u8 = undefined;
+    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{s2s_port});
+    const peers = [_][]const u8{spec};
+    var node1 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = 0,
+        .node_id = 1,
+        .server_name = "node1.test",
+        .mesh_connect = &peers,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+    var run1 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    defer {
+        run1.store(false, .release);
+        if (connectLoopback(port1)) |wfd| closeFd(wfd) else |_| {}
+        thr1.join();
+    }
+
+    // Observable readiness gate (same shape as the oper CONNECT test): a plain
+    // client on node 1 polls LINKS until node 2's handshake-learned name shows,
+    // proving the auto-dialed S2S link established without any oper command.
+    const fd_c = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var c = LiveClient{ .fd = fd_c };
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&c, " 001 C ", 200);
+
+    var linked = false;
+    var probes: usize = 0;
+    while (probes < 120 and !linked) : (probes += 1) {
+        c.reset();
+        try writeAllFd(fd_c, "LINKS\r\n");
+        recvUntil(&c, " 365 ", 80) catch {};
+        if (std.mem.indexOf(u8, c.written(), "node2.test") != null) linked = true;
+    }
+    try std.testing.expect(linked);
 }
 
 test {

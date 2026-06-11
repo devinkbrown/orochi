@@ -204,6 +204,11 @@ realm = "local"
 # mesh_pass = "env:OROCHI_MESH_PASS"
 # Trusted peer identity roots (array of hex public keys), for secured links.
 # trust_roots = ["env:PEER_A_PUBKEY", "env:PEER_B_PUBKEY"]
+# Auto-connect peers: each "host:port" is dialed at boot and re-dialed while
+# its S2S link is down, so the mesh stays linked without an oper CONNECT.
+# Hostnames resolve via DNS (A record); IPv6 hosts are bracketed ("[::1]:6900").
+# Requires [listen].s2s on the remote node. Empty/absent = no auto-connect.
+# connect = ["ircx.us:6900"]
 
 
 # --- [limits] — capacity, timeouts, and advertised protocol limits -----------

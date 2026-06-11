@@ -81,6 +81,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.session_max_accounts = cfg.sessions.max_accounts;
     out.session_max_per_account = cfg.sessions.max_per_account;
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
+    // [mesh].connect — peers this node auto-dials at boot (strings borrow cfg).
+    if (cfg.mesh.connect.len != 0) out.mesh_connect = cfg.mesh.connect;
     return out;
 }
 
@@ -246,6 +248,8 @@ test "config text overlays the server config" {
         \\s2s = 7700
         \\[limits]
         \\max_clients = 2048
+        \\[mesh]
+        \\connect = ["ircx.us:6900"]
         \\
     ;
     const base = server.Config{ .port = 6680 };
@@ -257,6 +261,8 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u16, 7700), loaded.config.s2s_port);
     try testing.expectEqual(@as(u64, 42), loaded.config.node_id);
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
+    try testing.expectEqual(@as(usize, 1), loaded.config.mesh_connect.len);
+    try testing.expectEqualStrings("ircx.us:6900", loaded.config.mesh_connect[0]);
 }
 
 test "media listen overlays media port and candidate host" {
