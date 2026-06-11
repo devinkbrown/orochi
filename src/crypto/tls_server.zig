@@ -7,8 +7,8 @@
 //! Ed25519 or ECDSA-P256 leaf certificate (CertificateVerify signed with the
 //! matching TLS 1.3 scheme), and the AES-128-GCM / ChaCha20-Poly1305 suites.
 //! Interop is pinned by loopback tests against the in-repo standards client
-//! `tls_client.Client`. RSA certs, HelloRetryRequest, and 0-RTT are intentionally
-//! out of scope here and rejected with a typed error.
+//! `tls_client.Client`. RSA certs and HelloRetryRequest are intentionally out of
+//! scope here and rejected with a typed error.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -89,6 +89,11 @@ pub const Config = struct {
     ticket_key: ?tls_resumption.TicketKey = null,
     /// Lifetime advertised in NewSessionTicket.
     ticket_lifetime_seconds: u32 = 86_400,
+    /// Maximum TLS 1.3 early data bytes advertised in NewSessionTicket and
+    /// sealed into the local ticket. Zero disables 0-RTT acceptance. This module
+    /// does not implement anti-replay; callers must layer single-use tickets or
+    /// a replay cache above it before accepting non-idempotent early data.
+    max_early_data_size: u32 = 0,
 };
 
 pub const SigningKey = union(enum) {
@@ -181,6 +186,10 @@ pub const Server = struct {
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
     resumed: bool = false,
+    early_data_offered: bool = false,
+    early_data_accepted: bool = false,
+    early_data_done: bool = false,
+    accepted_early_data_limit: u32 = 0,
     legacy_session_id: [32]u8 = [_]u8{0} ** 32,
     session_id_len: usize = 0,
 
@@ -190,6 +199,9 @@ pub const Server = struct {
     /// Post-handshake records the server must send back (a KeyUpdate reply when
     /// the client requested one). Drained by the caller via `takePendingSend`.
     post_handshake_send: std.ArrayList(u8) = .empty,
+    /// Decrypted accepted 0-RTT application bytes. Ownership transfers through
+    /// `takeEarlyData`; bytes are accumulated before the handshake completes.
+    early_data_buf: std.ArrayList(u8) = .empty,
 
     /// mTLS: whether a CertificateRequest is sent + the client flight verified.
     request_client_cert: bool = false,
@@ -216,11 +228,13 @@ pub const Server = struct {
     server_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_hs_keys: TrafficKeys = .{},
     server_hs_keys: TrafficKeys = .{},
+    client_early_keys: TrafficKeys = .{},
     client_app_keys: TrafficKeys = .{},
     server_app_keys: TrafficKeys = .{},
 
     hs_read_seq: u64 = 0,
     hs_write_seq: u64 = 0,
+    early_read_seq: u64 = 0,
     app_read_seq: u64 = 0,
     app_write_seq: u64 = 0,
 
@@ -262,10 +276,12 @@ pub const Server = struct {
         secureZero(&self.server_app_secret);
         self.client_hs_keys.wipe();
         self.server_hs_keys.wipe();
+        self.client_early_keys.wipe();
         self.client_app_keys.wipe();
         self.server_app_keys.wipe();
         self.transcript.deinit(self.allocator);
         self.recv_buf.deinit(self.allocator);
+        self.early_data_buf.deinit(self.allocator);
         self.client_flight.deinit(self.allocator);
         self.post_handshake_send.deinit(self.allocator);
         if (self.client_cert_der) |der| self.allocator.free(der);
@@ -298,6 +314,18 @@ pub const Server = struct {
         return self.resumed;
     }
 
+    /// True when this handshake accepted the client's TLS 1.3 0-RTT offer.
+    pub fn earlyDataAccepted(self: *const Server) bool {
+        return self.early_data_accepted;
+    }
+
+    /// Take ownership of accepted 0-RTT application bytes accumulated before
+    /// EndOfEarlyData. Returns null when no accepted early data is buffered.
+    pub fn takeEarlyData(self: *Server) Error!?[]u8 {
+        if (self.early_data_buf.items.len == 0) return null;
+        return try self.early_data_buf.toOwnedSlice(self.allocator);
+    }
+
     pub fn feed(self: *Server, received: []const u8) Error!FeedResult {
         if (self.state == .idle or self.state == .connected) return error.BadState;
         try self.recv_buf.appendSlice(self.allocator, received);
@@ -315,6 +343,11 @@ pub const Server = struct {
             try self.appendTranscript(msg.raw);
             const reply = try self.buildServerFlight(msg.body, msg.raw);
             consumePrefix(&self.recv_buf, rec.wire_len);
+            if (self.early_data_accepted) {
+                try self.processAcceptedEarlyRecords();
+            } else if (self.early_data_offered) {
+                self.skipRejectedEarlyRecords();
+            }
             // mTLS expects Certificate -> CertificateVerify -> Finished; otherwise
             // just the client Finished.
             self.state = if (self.request_client_cert and !self.resumed) .wait_client_cert else .wait_client_finished;
@@ -328,13 +361,27 @@ pub const Server = struct {
         // message sub-state machine until Finished completes the handshake.
         const suite = self.selected_suite orelse return error.BadState;
         while (self.state != .connected) {
+            if (self.early_data_accepted and !self.early_data_done) {
+                const before = self.recv_buf.items.len;
+                try self.processAcceptedEarlyRecords();
+                if (!self.early_data_done) {
+                    if (self.recv_buf.items.len == before) break;
+                    continue;
+                }
+            }
             const rec = completePlainRecord(self.recv_buf.items) orelse break;
             if (rec.content_type == .change_cipher_spec) {
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
             }
             if (rec.content_type != .application_data) return error.BadRecord;
-            const opened = try openRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
+            const opened = openRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]) catch |err| {
+                if (self.early_data_offered and !self.early_data_accepted and err == error.BadRecord) {
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    continue;
+                }
+                return err;
+            };
             self.hs_read_seq += 1;
             defer self.allocator.free(opened.content);
             consumePrefix(&self.recv_buf, rec.wire_len);
@@ -585,6 +632,7 @@ pub const Server = struct {
         var p256_share: ?[]const u8 = null;
         var psk_modes_ok = false;
         var psk_ext: ?[]const u8 = null;
+        var offered_early_data = false;
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
             switch (ext.typed()) {
@@ -603,6 +651,10 @@ pub const Server = struct {
                 },
                 .alpn => self.maybeSelectAlpn(ext.data),
                 .psk_key_exchange_modes => psk_modes_ok = pskModesAllowDhe(ext.data),
+                .early_data => {
+                    if (ext.data.len != 0) return error.BadHandshake;
+                    offered_early_data = true;
+                },
                 .pre_shared_key => {
                     if (it.remaining() != 0) return error.BadHandshake;
                     psk_ext = ext.data;
@@ -614,15 +666,25 @@ pub const Server = struct {
         if (!offered_tls13) return error.ProtocolVersion;
         self.selected_suite = full_suite;
         self.resumed = false;
+        self.early_data_offered = offered_early_data;
+        self.early_data_accepted = false;
+        self.early_data_done = !offered_early_data;
+        self.accepted_early_data_limit = 0;
         self.accepted_psk_len = 0;
         if (psk_ext) |ext| {
             if (psk_modes_ok) {
                 if (try self.tryAcceptPsk(suites_block, raw, ext)) |suite| {
                     self.selected_suite = suite;
                     self.resumed = true;
+                    if (offered_early_data and self.accepted_early_data_limit > 0) {
+                        self.early_data_accepted = true;
+                        self.early_data_done = false;
+                        try self.deriveClientEarlyTrafficKeys();
+                    }
                 }
             }
         }
+        if (!self.early_data_accepted) self.early_data_done = true;
 
         // Prefer X25519; fall back to secp256r1 when it is the only group offered.
         if (x25519_share) |peer| {
@@ -662,6 +724,7 @@ pub const Server = struct {
 
         @memcpy(self.accepted_psk[0..opened.opened.psk.len], opened.opened.psk);
         self.accepted_psk_len = opened.opened.psk.len;
+        self.accepted_early_data_limit = opened.opened.max_early_data_size;
         return suite;
     }
 
@@ -745,6 +808,7 @@ pub const Server = struct {
             try alpn_builder.add(proto);
             try ext_builder.addTyped(.alpn, try alpn_builder.finish());
         }
+        if (self.early_data_accepted) try ext_builder.addTyped(.early_data, "");
         try self.emit(out, .encrypted_extensions, try ext_builder.finish());
     }
 
@@ -880,6 +944,26 @@ pub const Server = struct {
         }
     }
 
+    fn deriveClientEarlyTrafficKeys(self: *Server) Error!void {
+        switch (self.hashAlg()) {
+            .sha256 => try self.deriveClientEarlyTrafficKeysT(Sha256),
+            .sha384 => try self.deriveClientEarlyTrafficKeysT(Sha384),
+        }
+    }
+
+    fn deriveClientEarlyTrafficKeysT(self: *Server, comptime KS: type) Error!void {
+        if (self.accepted_psk_len != KS.hash_len) return error.BadHandshake;
+        var early = KS.earlySecret(self.accepted_psk[0..self.accepted_psk_len]);
+        defer early.wipe();
+        const th = KS.transcriptHash(self.transcript.items);
+        var traffic = try KS.deriveSecret(&early, "c e traffic", &th);
+        defer traffic.wipe();
+        var traffic_bytes = traffic.declassify();
+        defer secureZero(&traffic_bytes);
+        try deriveTrafficKeys(self.selected_suite.?, &traffic_bytes, &self.client_early_keys);
+        self.early_read_seq = 0;
+    }
+
     fn deriveHandshakeKeysT(self: *Server, comptime KS: type, shared_secret: [32]u8) Error!void {
         const psk = if (self.resumed) blk: {
             if (self.accepted_psk_len != KS.hash_len) return error.BadHandshake;
@@ -977,8 +1061,16 @@ pub const Server = struct {
             psk[0..psk_len],
             &ticket_nonce,
             currentUnixMs(),
+            self.config.max_early_data_size,
         );
         defer self.allocator.free(sealed);
+
+        var ticket_ext_storage: [16]u8 = undefined;
+        var ticket_ext_builder = try tls_extension.Builder.begin(&ticket_ext_storage);
+        var early_ext: [4]u8 = undefined;
+        std.mem.writeInt(u32, &early_ext, self.config.max_early_data_size, .big);
+        try ticket_ext_builder.addTyped(.early_data, &early_ext);
+        const ticket_extensions = try ticket_ext_builder.finish();
 
         var ticket_body_buf: [512]u8 = undefined;
         const ticket_body = try tls_session_ticket.encode(&ticket_body_buf, .{
@@ -986,7 +1078,7 @@ pub const Server = struct {
             .ticket_age_add = ticket_age_add,
             .ticket_nonce = &ticket_nonce,
             .ticket = sealed,
-            .extensions = "",
+            .extensions = ticket_extensions[2..],
         });
 
         var hs: std.ArrayList(u8) = .empty;
@@ -1010,6 +1102,52 @@ pub const Server = struct {
     fn appendTranscript(self: *Server, bytes: []const u8) Error!void {
         try self.transcript.appendSlice(self.allocator, bytes);
     }
+
+    fn processAcceptedEarlyRecords(self: *Server) Error!void {
+        const suite = self.selected_suite orelse return error.BadState;
+        while (!self.early_data_done) {
+            const rec = completePlainRecord(self.recv_buf.items) orelse return;
+            if (rec.content_type == .change_cipher_spec) {
+                consumePrefix(&self.recv_buf, rec.wire_len);
+                continue;
+            }
+            if (rec.content_type != .application_data) return error.BadRecord;
+            const opened = try openRecordAlloc(self.allocator, suite, &self.client_early_keys, self.early_read_seq, self.recv_buf.items[0..rec.wire_len]);
+            self.early_read_seq += 1;
+            defer self.allocator.free(opened.content);
+            consumePrefix(&self.recv_buf, rec.wire_len);
+            switch (opened.content_type) {
+                .application_data => {
+                    if (opened.content.len > self.accepted_early_data_limit or
+                        self.early_data_buf.items.len > self.accepted_early_data_limit - opened.content.len)
+                    {
+                        return error.BadRecord;
+                    }
+                    try self.early_data_buf.appendSlice(self.allocator, opened.content);
+                },
+                .handshake => {
+                    var off: usize = 0;
+                    const msg = try parseHandshake(opened.content, &off);
+                    if (off != opened.content.len or msg.typ != .end_of_early_data or msg.body.len != 0) {
+                        return error.BadHandshake;
+                    }
+                    self.early_data_done = true;
+                },
+                else => return error.BadRecord,
+            }
+        }
+    }
+
+    fn skipRejectedEarlyRecords(self: *Server) void {
+        while (completePlainRecord(self.recv_buf.items)) |rec| {
+            if (rec.content_type == .change_cipher_spec) {
+                consumePrefix(&self.recv_buf, rec.wire_len);
+                continue;
+            }
+            if (rec.content_type != .application_data) return;
+            consumePrefix(&self.recv_buf, rec.wire_len);
+        }
+    }
 };
 
 fn activeSigningKey(config: Config) ?SigningKey {
@@ -1025,6 +1163,7 @@ const HandshakeType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
     new_session_ticket = 4,
+    end_of_early_data = 5,
     encrypted_extensions = 8,
     certificate_request = 13,
     certificate = 11,
@@ -1539,6 +1678,194 @@ test "loopback: TLS 1.3 PSK-DHE session resumption and binder tamper fallback" {
     _ = try tamper_server.feed(tcfin);
     try std.testing.expect(tamper_server.handshakeDone());
     try std.testing.expect(!tamper_server.acceptedSessionTicket());
+}
+
+test "loopback: TLS 1.3 PSK-DHE resumption accepts 0-RTT early data" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xA0} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xA0, 0x13 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 4096,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, 0);
+    try resumed_client.setEarlyData("GET /early");
+
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    const rsflight = switch (try resumed_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rsflight);
+    try std.testing.expect(resumed_server.acceptedSessionTicket());
+    try std.testing.expect(resumed_server.earlyDataAccepted());
+    const early = (try resumed_server.takeEarlyData()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(early);
+    try std.testing.expectEqualStrings("GET /early", early);
+
+    const rcfin = switch (try resumed_client.feed(rsflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rcfin);
+    try std.testing.expectEqual(@as(?bool, true), resumed_client.earlyDataAccepted());
+    try std.testing.expect(resumed_client.handshakeDone());
+    _ = try resumed_server.feed(rcfin);
+    try std.testing.expect(resumed_server.handshakeDone());
+
+    const s2c = try resumed_server.encrypt("early down");
+    defer alloc.free(s2c);
+    const got_c = try resumed_client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("early down", got_c);
+    const c2s = try resumed_client.encrypt("early up");
+    defer alloc.free(c2s);
+    const got_s = try resumed_server.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("early up", got_s);
+}
+
+test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limit is zero" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xA1} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xA1, 0x13 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 0,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    const decoded = try tls_resumption.decodeStoredSession(stored);
+    const forged = try tls_resumption.encodeStoredSession(alloc, .{
+        .suite = decoded.suite,
+        .ticket_lifetime = decoded.ticket_lifetime,
+        .ticket_age_add = decoded.ticket_age_add,
+        .ticket = decoded.ticket,
+        .psk = decoded.psk,
+        .max_early_data_size = 4096,
+    });
+    defer alloc.free(forged);
+
+    var resumed_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(forged, 0);
+    try resumed_client.setEarlyData("GET /early");
+
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    const rsflight = switch (try resumed_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rsflight);
+    try std.testing.expect(resumed_server.acceptedSessionTicket());
+    try std.testing.expect(!resumed_server.earlyDataAccepted());
+    try std.testing.expect((try resumed_server.takeEarlyData()) == null);
+
+    const rcfin = switch (try resumed_client.feed(rsflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rcfin);
+    try std.testing.expectEqual(@as(?bool, false), resumed_client.earlyDataAccepted());
+    try std.testing.expect(resumed_client.handshakeDone());
+    _ = try resumed_server.feed(rcfin);
+    try std.testing.expect(resumed_server.handshakeDone());
 }
 
 test "loopback: tls_client completes a handshake against tls_server with ECDSA-P256 leaf" {
