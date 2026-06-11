@@ -54,14 +54,21 @@ pub const Tag = struct {
     pub const utc_time = 0x17;
     pub const generalized_time = 0x18;
     pub const context_0_constructed = 0xA0;
+    pub const context_1_constructed = 0xA1;
     pub const context_3_constructed = 0xA3;
     pub const san_dns_name = 0x82;
     pub const san_ip_address = 0x87;
 };
 
+/// Maximum dNSName subtrees per direction (permitted/excluded) retained from a
+/// NameConstraints extension. Real CAs use a handful; excess subtrees are
+/// rejected rather than silently dropped.
+pub const MaxNameConstraints = 24;
+
 const Oid = struct {
     const subject_alt_name = [_]u8{ 0x55, 0x1D, 0x11 };
     const basic_constraints = [_]u8{ 0x55, 0x1D, 0x13 };
+    const name_constraints = [_]u8{ 0x55, 0x1D, 0x1E };
     const key_usage = [_]u8{ 0x55, 0x1D, 0x0F };
     const extended_key_usage = [_]u8{ 0x55, 0x1D, 0x25 };
     // id-kp-serverAuth (1.3.6.1.5.5.7.3.1) and anyExtendedKeyUsage (2.5.29.37.0).
@@ -201,6 +208,15 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         /// anyExtendedKeyUsage is listed.
         eku_present: bool,
         eku_server_auth: bool,
+        /// NameConstraints extension (2.5.29.30) dNSName subtrees. Only meaningful
+        /// when `name_constraints_present`. When `nc_permitted_dns_count > 0`, a
+        /// constrained dNSName must match one permitted subtree; it must match no
+        /// excluded subtree. Other GeneralName types are not enforced here.
+        name_constraints_present: bool,
+        nc_permitted_dns: [MaxNameConstraints][]const u8,
+        nc_permitted_dns_count: usize,
+        nc_excluded_dns: [MaxNameConstraints][]const u8,
+        nc_excluded_dns_count: usize,
 
         pub fn parse(der: []const u8) Error!Self {
             var cert = Self{
@@ -221,6 +237,11 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .key_usage_cert_sign = false,
                 .eku_present = false,
                 .eku_server_auth = false,
+                .name_constraints_present = false,
+                .nc_permitted_dns = undefined,
+                .nc_permitted_dns_count = 0,
+                .nc_excluded_dns = undefined,
+                .nc_excluded_dns_count = 0,
             };
             try parseInto(Self, &cert, der);
             return cert;
@@ -407,6 +428,51 @@ fn parseExtensions(comptime CertType: type, cert: *CertType, parent: DerReader, 
             try parseKeyUsage(CertType, cert, one, value.value);
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.extended_key_usage)) {
             try parseExtendedKeyUsage(CertType, cert, one, value.value);
+        } else if (std.mem.eql(u8, oid_tlv.value, &Oid.name_constraints)) {
+            try parseNameConstraints(CertType, cert, one, value.value);
+        }
+    }
+}
+
+/// NameConstraints (RFC 5280 §4.2.1.10): SEQUENCE { permittedSubtrees [0],
+/// excludedSubtrees [1] }, each GeneralSubtrees = SEQUENCE OF GeneralSubtree.
+/// Only dNSName bases are retained; minimum/maximum and other name types are
+/// ignored (we do not enforce base distances).
+fn parseNameConstraints(comptime CertType: type, cert: *CertType, parent: DerReader, value: []const u8) Error!void {
+    var inner = try nestedBytes(parent, value);
+    const seq_tlv = try inner.readExpected(Tag.sequence);
+    try inner.expectEmpty();
+    cert.name_constraints_present = true;
+
+    var nc = try inner.child(seq_tlv);
+    while (nc.hasRemaining()) {
+        const tag = try nc.peekTag();
+        const tlv = try nc.readTlv();
+        if (tag == Tag.context_0_constructed) {
+            try collectDnsSubtrees(CertType, nc, tlv, &cert.nc_permitted_dns, &cert.nc_permitted_dns_count);
+        } else if (tag == Tag.context_1_constructed) {
+            try collectDnsSubtrees(CertType, nc, tlv, &cert.nc_excluded_dns, &cert.nc_excluded_dns_count);
+        }
+    }
+}
+
+fn collectDnsSubtrees(
+    comptime CertType: type,
+    parent: DerReader,
+    subtrees_tlv: Tlv,
+    out: *[MaxNameConstraints][]const u8,
+    count: *usize,
+) Error!void {
+    _ = CertType;
+    var subs = try parent.child(subtrees_tlv);
+    while (subs.hasRemaining()) {
+        const gs_tlv = try subs.readExpected(Tag.sequence);
+        var gs = try subs.child(gs_tlv);
+        const base = try gs.readTlv(); // GeneralName (minimum/maximum ignored)
+        if (base.tag == Tag.san_dns_name) {
+            if (count.* >= out.len) return error.TooManySan;
+            out[count.*] = base.value;
+            count.* += 1;
         }
     }
 }

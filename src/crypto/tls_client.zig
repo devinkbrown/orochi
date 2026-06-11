@@ -1548,6 +1548,8 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
         // A CA in the path must be allowed to sign certificates and be valid now.
         if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
         if (now) |t| try x509_verify.validateParsedAt(issuer, t);
+        // RFC 5280 §4.2.1.10: a CA's NameConstraints bind the leaf's SAN dNSNames.
+        try enforceNameConstraints(issuer, leaf);
     }
 
     const last = chain[chain.len - 1];
@@ -1623,6 +1625,49 @@ fn dnsPatternMatches(pattern: []const u8, name: []const u8) bool {
     if (!asciiEndsWithIgnoreCase(name, suffix)) return false;
     const prefix = name[0 .. name.len - suffix.len];
     return prefix.len != 0 and std.mem.indexOfScalar(u8, prefix, '.') == null;
+}
+
+/// Enforce an issuing CA's NameConstraints (dNSName) against the leaf's SAN
+/// dNSNames (RFC 5280 §4.2.1.10). Each leaf name must match no excluded subtree
+/// and, when permitted dNSName subtrees exist, at least one permitted subtree.
+fn enforceNameConstraints(issuer: x509.Certificate, leaf: x509.Certificate) Error!void {
+    if (!issuer.name_constraints_present) return;
+    var li: usize = 0;
+    while (li < leaf.san_dns_count) : (li += 1) {
+        const name = leaf.san_dns[li];
+        var ei: usize = 0;
+        while (ei < issuer.nc_excluded_dns_count) : (ei += 1) {
+            if (dnsConstraintMatches(issuer.nc_excluded_dns[ei], name)) return error.BadCertificate;
+        }
+        if (issuer.nc_permitted_dns_count > 0) {
+            var ok = false;
+            var pi: usize = 0;
+            while (pi < issuer.nc_permitted_dns_count) : (pi += 1) {
+                if (dnsConstraintMatches(issuer.nc_permitted_dns[pi], name)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return error.BadCertificate;
+        }
+    }
+}
+
+/// dNSName name-constraint match (RFC 5280): the constraint matches the name and
+/// any name with additional left-hand labels. An empty constraint matches all; a
+/// leading-dot constraint matches strict subdomains only.
+fn dnsConstraintMatches(constraint: []const u8, name: []const u8) bool {
+    if (constraint.len == 0) return true;
+    if (constraint[0] == '.') return asciiEndsWithIgnoreCase(name, constraint);
+    if (asciiEqlIgnoreCase(name, constraint)) return true;
+    // name == "<labels>." ++ constraint
+    if (name.len > constraint.len + 1 and
+        name[name.len - constraint.len - 1] == '.' and
+        asciiEqlIgnoreCase(name[name.len - constraint.len ..], constraint))
+    {
+        return true;
+    }
+    return false;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -1964,6 +2009,45 @@ test "HelloRetryRequest: client echoes the cookie, reuses its random, rejects a 
     const hrr2 = try buildTestHrr(allocator, &client.legacy_session_id, cookie);
     defer allocator.free(hrr2);
     try std.testing.expectError(error.BadHandshake, client.feed(hrr2));
+}
+
+test "dnsConstraintMatches follows RFC 5280 subtree rules" {
+    try std.testing.expect(dnsConstraintMatches("example.com", "example.com"));
+    try std.testing.expect(dnsConstraintMatches("example.com", "host.example.com"));
+    try std.testing.expect(dnsConstraintMatches("example.com", "a.b.example.com"));
+    try std.testing.expect(!dnsConstraintMatches("example.com", "notexample.com"));
+    try std.testing.expect(!dnsConstraintMatches("example.com", "example.com.evil.com"));
+    try std.testing.expect(!dnsConstraintMatches("example.com", "other.com"));
+    // Empty constraint matches everything; leading-dot matches subdomains only.
+    try std.testing.expect(dnsConstraintMatches("", "anything.test"));
+    try std.testing.expect(dnsConstraintMatches(".example.com", "host.example.com"));
+    try std.testing.expect(!dnsConstraintMatches(".example.com", "example.com"));
+}
+
+test "enforceNameConstraints applies permitted + excluded dNSName subtrees" {
+    var issuer = std.mem.zeroes(x509.Certificate);
+    issuer.name_constraints_present = true;
+    issuer.nc_permitted_dns[0] = "example.com";
+    issuer.nc_permitted_dns_count = 1;
+    issuer.nc_excluded_dns[0] = "bad.example.com";
+    issuer.nc_excluded_dns_count = 1;
+
+    var leaf = std.mem.zeroes(x509.Certificate);
+    leaf.san_dns_count = 1;
+
+    leaf.san_dns[0] = "host.example.com"; // permitted, not excluded
+    try enforceNameConstraints(issuer, leaf);
+
+    leaf.san_dns[0] = "host.other.com"; // outside the permitted subtree
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
+
+    leaf.san_dns[0] = "bad.example.com"; // excluded wins over permitted
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
+
+    // A CA without NameConstraints imposes nothing.
+    const plain = std.mem.zeroes(x509.Certificate);
+    leaf.san_dns[0] = "anything.test";
+    try enforceNameConstraints(plain, leaf);
 }
 
 test {
