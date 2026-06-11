@@ -194,6 +194,7 @@ const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
 const config_format = @import("config_format.zig");
 const services_mod = @import("services.zig");
+const certfp_bind_mod = @import("certfp_bind.zig");
 const account_register = @import("../proto/account_register.zig");
 const account_notify = @import("../proto/account_notify.zig");
 const sessions_mod = @import("sessions.zig");
@@ -7148,7 +7149,7 @@ pub const LinuxServer = struct {
                     try appendToConn(conn, ln);
                 }
                 var eb: [128]u8 = undefined;
-                const endl = std.fmt.bufPrint(&eb, ":{s} NOTICE {s} :End of RESV list\r\n", .{ protocol_inventory.currentServerName(), nick}) catch return;
+                const endl = std.fmt.bufPrint(&eb, ":{s} NOTICE {s} :End of RESV list\r\n", .{ protocol_inventory.currentServerName(), nick }) catch return;
                 try appendToConn(conn, endl);
             },
             .sweep => {
@@ -9191,6 +9192,7 @@ pub const LinuxServer = struct {
             error.AlreadyExists => "ACCOUNT_EXISTS",
             error.InvalidName => "BAD_ACCOUNT_NAME",
             error.InvalidPassword => "INVALID_PASSWORD",
+            error.Forbidden => "ACCOUNT_FORBIDDEN",
             else => "TEMPORARILY_UNAVAILABLE",
         };
     }
@@ -9337,7 +9339,113 @@ pub const LinuxServer = struct {
         };
         const info = result.account_info;
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :account={s} flags={d}\r\n", .{ self.serverName(), conn.session.displayName(), info.name.asSlice(), info.flags }) catch return;
+        const line = std.fmt.bufPrint(
+            &buf,
+            ":{s} NOTICE {s} :account={s} flags={d} suspended={} forbidden={} noexpire={}\r\n",
+            .{
+                self.serverName(),
+                conn.session.displayName(),
+                info.name.asSlice(),
+                info.flags,
+                (info.flags & services_mod.account_flag_suspended) != 0,
+                (info.flags & services_mod.account_flag_forbidden) != 0,
+                (info.flags & services_mod.account_flag_noexpire) != 0,
+            },
+        ) catch return;
+        try appendToConn(conn, line);
+    }
+
+    /// `ACCOUNT <SUSPEND|UNSUSPEND|FORBID|UNFORBID|NOEXPIRE|INFO> <account>`
+    /// — operator account lifecycle administration. The registry gates this to
+    /// opers; this handler requires the narrower `service_admin` privilege.
+    pub fn handleAccountAdmin(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.hasPriv(.service_admin)) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied (service_admin required)");
+            return;
+        }
+        const svc = self.account_services orelse return self.failReply(conn, "ACCOUNT", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count < 2) {
+            try self.failReply(conn, "ACCOUNT", "NEED_MORE_PARAMS", "Usage: ACCOUNT <SUSPEND|UNSUSPEND|FORBID|UNFORBID|NOEXPIRE|INFO> <account> [on|off]");
+            return;
+        }
+
+        const p = parsed.paramSlice();
+        const sub = p[0];
+        const target = p[1];
+        var scratch: [1024]u8 = undefined;
+
+        if (std.ascii.eqlIgnoreCase(sub, "SUSPEND")) {
+            const info = svc.setAccountSuspended(target, true, &scratch) catch return self.failReply(conn, "ACCOUNT", "ACCOUNT_UNKNOWN", "No such account");
+            return self.noticeAccountAdmin(conn, "SUSPEND", info);
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "UNSUSPEND")) {
+            const info = svc.setAccountSuspended(target, false, &scratch) catch return self.failReply(conn, "ACCOUNT", "ACCOUNT_UNKNOWN", "No such account");
+            return self.noticeAccountAdmin(conn, "UNSUSPEND", info);
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "FORBID")) {
+            const info = svc.setAccountForbidden(target, true, &scratch) catch |err| {
+                return self.failReply(conn, "ACCOUNT", accountAdminFailCode(err), "Could not forbid account");
+            };
+            return self.noticeAccountAdmin(conn, "FORBID", info);
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "UNFORBID")) {
+            const info = svc.setAccountForbidden(target, false, &scratch) catch |err| {
+                return self.failReply(conn, "ACCOUNT", accountAdminFailCode(err), "Could not unforbid account");
+            };
+            return self.noticeAccountAdmin(conn, "UNFORBID", info);
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "NOEXPIRE")) {
+            const enabled = if (parsed.param_count >= 3)
+                parseOnOff(p[2]) orelse return self.failReply(conn, "ACCOUNT", "INVALID_VALUE", "NOEXPIRE value must be on or off")
+            else
+                true;
+            const info = svc.setAccountNoExpire(target, enabled, &scratch) catch |err| {
+                return self.failReply(conn, "ACCOUNT", accountAdminFailCode(err), "Could not update account");
+            };
+            return self.noticeAccountAdmin(conn, if (enabled) "NOEXPIRE on" else "NOEXPIRE off", info);
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "INFO")) {
+            const info = svc.adminAccountInfo(target) catch |err| {
+                return self.failReply(conn, "ACCOUNT", accountAdminFailCode(err), "No such account");
+            };
+            return self.noticeAccountAdmin(conn, "INFO", info);
+        }
+
+        try self.failReply(conn, "ACCOUNT", "INVALID_SUBCOMMAND", "Use SUSPEND, UNSUSPEND, FORBID, UNFORBID, NOEXPIRE, or INFO");
+    }
+
+    fn accountAdminFailCode(err: anyerror) []const u8 {
+        return switch (err) {
+            error.NotFound => "ACCOUNT_UNKNOWN",
+            error.InvalidName => "BAD_ACCOUNT_NAME",
+            error.BufferTooSmall => "TEMPORARILY_UNAVAILABLE",
+            else => "TEMPORARILY_UNAVAILABLE",
+        };
+    }
+
+    fn parseOnOff(value: []const u8) ?bool {
+        if (std.ascii.eqlIgnoreCase(value, "on")) return true;
+        if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+        return null;
+    }
+
+    fn noticeAccountAdmin(self: *LinuxServer, conn: *ConnState, action: []const u8, info: services_mod.AccountAdminInfo) !void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            ":{s} NOTICE {s} :ACCOUNT {s} {s} registered={} flags={d} suspended={} forbidden={} noexpire={}\r\n",
+            .{
+                self.serverName(),
+                conn.session.displayName(),
+                action,
+                info.name.asSlice(),
+                info.registered,
+                info.flags,
+                info.suspended(),
+                info.forbidden(),
+                info.noexpire(),
+            },
+        ) catch return;
         try appendToConn(conn, line);
     }
 
@@ -9369,6 +9477,43 @@ pub const LinuxServer = struct {
         svc.bindCertfp(account, fp) catch return self.failReply(conn, "CERTADD", "CERT_ADD_FAILED", "Could not bind certificate");
         var buf: [default_reply_bytes]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Certificate fingerprint {s} bound to {s}\r\n", .{ self.serverName(), conn.session.displayName(), fp, account }) catch return;
+        try appendToConn(conn, m);
+    }
+
+    pub fn handleCertList(self: *LinuxServer, conn: *ConnState) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "CERTLIST", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const account = conn.session.account() orelse return self.failReply(conn, "CERTLIST", "NOT_LOGGED_IN", "Log in before listing certificates");
+        var fps_buf: [16][]const u8 = undefined;
+        const fps = svc.listCertfps(account, fps_buf[0..]) catch return self.failReply(conn, "CERTLIST", "CERT_LIST_FAILED", "Could not list certificates");
+        if (fps.len == 0) {
+            try self.noticeTo(conn, "CERTLIST: no certificate fingerprints bound");
+            return;
+        }
+        for (fps) |fp| {
+            var buf: [default_reply_bytes]u8 = undefined;
+            const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :CERTLIST {s}\r\n", .{ self.serverName(), conn.session.displayName(), fp }) catch return;
+            try appendToConn(conn, m);
+        }
+    }
+
+    pub fn handleCertDel(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "CERTDEL", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const account = conn.session.account() orelse return self.failReply(conn, "CERTDEL", "NOT_LOGGED_IN", "Log in before deleting a certificate");
+        if (parsed.param_count < 1) {
+            try self.failReply(conn, "CERTDEL", "NEED_MORE_PARAMS", "Usage: CERTDEL <fingerprint>");
+            return;
+        }
+        const fp = parsed.paramSlice()[0];
+        svc.deleteCertfp(account, fp) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.Forbidden => "CERT_NOT_OWNED",
+                error.NotFound => "CERT_NOT_FOUND",
+                else => "CERT_DEL_FAILED",
+            };
+            return self.failReply(conn, "CERTDEL", code, "Certificate fingerprint is not bound to your account");
+        };
+        var buf: [default_reply_bytes]u8 = undefined;
+        const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Certificate fingerprint {s} removed from {s}\r\n", .{ self.serverName(), conn.session.displayName(), fp, account }) catch return;
         try appendToConn(conn, m);
     }
 
@@ -12924,6 +13069,152 @@ test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #x :hi\r\n", 200);
 }
 
+test "threaded server: CERTLIST and CERTDEL use authenticated account bindings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-cert.wal");
+    defer store.deinit();
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    var services = services_mod.Services.init(&store, null);
+    services.attachCertfpBinds(&binds);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+
+    try writeAllFd(fd, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&client, " 001 A ", 200);
+    try writeAllFd(fd, "REGISTER alice * correcthorse\r\n");
+    try recvUntil(&client, "REGISTER SUCCESS alice", 200);
+
+    const own_fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const other_fp = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try services.bindCertfp("alice", own_fp);
+    try services.bindCertfp("bob", other_fp);
+
+    client.reset();
+    try writeAllFd(fd, "CERTLIST\r\n");
+    try recvUntil(&client, own_fp, 200);
+
+    client.reset();
+    try writeAllFd(fd, "CERTDEL bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n");
+    try recvUntil(&client, "FAIL CERTDEL CERT_NOT_OWNED", 200);
+
+    client.reset();
+    try writeAllFd(fd, "CERTDEL aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    try recvUntil(&client, "removed from alice", 200);
+
+    client.reset();
+    try writeAllFd(fd, "CERTLIST\r\n");
+    try recvUntil(&client, "CERTLIST: no certificate fingerprints bound", 200);
+}
+
+test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-account-admin.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    const fd_user = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_user);
+    var admin = LiveClient{ .fd = fd_admin };
+    var user = LiveClient{ .fd = fd_user };
+
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try writeAllFd(fd_user, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&admin, " 381 Oper ", 200);
+    try recvUntil(&user, " 001 Bob ", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "ACCOUNT FORBID reserved\r\n");
+    try recvUntil(&admin, "ACCOUNT FORBID reserved registered=false", 200);
+
+    user.reset();
+    try writeAllFd(fd_user, "REGISTER reserved * correcthorse\r\n");
+    try recvUntil(&user, "FAIL REGISTER ACCOUNT_FORBIDDEN", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "ACCOUNT UNFORBID reserved\r\n");
+    try recvUntil(&admin, "ACCOUNT UNFORBID reserved", 200);
+
+    user.reset();
+    try writeAllFd(fd_user, "REGISTER bob * correcthorse\r\n");
+    try recvUntil(&user, "REGISTER SUCCESS bob", 200);
+    user.reset();
+    try writeAllFd(fd_user, "LOGOUT\r\n");
+    try recvUntil(&user, "You are now logged out", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "ACCOUNT SUSPEND bob\r\n");
+    try recvUntil(&admin, "suspended=true", 200);
+    admin.reset();
+    try writeAllFd(fd_admin, "ACCOUNT INFO bob\r\n");
+    try recvUntil(&admin, "ACCOUNT INFO bob registered=true", 200);
+    try recvUntil(&admin, "suspended=true", 200);
+
+    user.reset();
+    try writeAllFd(fd_user, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&user, " 464 Bob ", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "ACCOUNT UNSUSPEND bob\r\n");
+    try recvUntil(&admin, "suspended=false", 200);
+
+    user.reset();
+    try writeAllFd(fd_user, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&user, "You are now identified as bob", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "ACCOUNT NOEXPIRE bob on\r\n");
+    try recvUntil(&admin, "noexpire=true", 200);
+    admin.reset();
+    try writeAllFd(fd_admin, "ACCOUNT NOEXPIRE bob off\r\n");
+    try recvUntil(&admin, "noexpire=false", 200);
+}
+
 test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
     // Two reactor threads, SO_REUSEPORT listeners — the kernel may place each
     // client on either reactor. Several clients in one channel raise the odds two
@@ -13735,8 +14026,7 @@ test "threaded server: draft/multiline batch reassembles + splits to recipient" 
     // fresh line. The reassembled value is "Line1more\nLine2" and is delivered to
     // B as two separate PRIVMSGs.
     b.reset();
-    try writeAllFd(fd_a,
-        "BATCH +z draft/multiline #m\r\n" ++
+    try writeAllFd(fd_a, "BATCH +z draft/multiline #m\r\n" ++
         "@batch=z PRIVMSG #m :Line1\r\n" ++
         "@batch=z;draft/multiline-concat PRIVMSG #m :more\r\n" ++
         "@batch=z PRIVMSG #m :Line2\r\n" ++

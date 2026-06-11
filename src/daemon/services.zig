@@ -143,10 +143,33 @@ pub const AkickAction = enum { add, remove, query };
 pub const AccountRef = struct { name: AccountName };
 pub const ChannelRef = struct { name: ChannelName };
 
+pub const account_flag_suspended: u32 = 1 << 0;
+pub const account_flag_forbidden: u32 = 1 << 1;
+pub const account_flag_noexpire: u32 = 1 << 2;
+
 pub const AccountInfo = struct {
     name: AccountName,
     email: Email = Email.empty(),
     flags: u32 = 0,
+};
+
+pub const AccountAdminInfo = struct {
+    name: AccountName,
+    email: Email = Email.empty(),
+    flags: u32 = 0,
+    registered: bool = false,
+
+    pub fn suspended(self: AccountAdminInfo) bool {
+        return (self.flags & account_flag_suspended) != 0;
+    }
+
+    pub fn forbidden(self: AccountAdminInfo) bool {
+        return (self.flags & account_flag_forbidden) != 0;
+    }
+
+    pub fn noexpire(self: AccountAdminInfo) bool {
+        return (self.flags & account_flag_noexpire) != 0;
+    }
 };
 
 pub const ChannelInfo = struct {
@@ -199,6 +222,10 @@ const AccountRecord = struct {
 
     fn info(self: AccountRecord) AccountInfo {
         return .{ .name = self.name, .email = self.email, .flags = self.flags };
+    }
+
+    fn adminInfo(self: AccountRecord) AccountAdminInfo {
+        return .{ .name = self.name, .email = self.email, .flags = self.flags, .registered = true };
     }
 };
 
@@ -295,6 +322,44 @@ pub const Services = struct {
         if (certfpKey(&kb, fingerprint)) |k| {
             self.store.family(.props).put(k, account) catch {};
         }
+        self.addCertfpListEntry(account, fingerprint) catch {};
+    }
+
+    /// List certfps bound to `account` by CERTADD. Output slices borrow durable
+    /// store memory and remain valid until the next mutation.
+    pub fn listCertfps(self: *Services, account: []const u8, out: [][]const u8) ServiceError![]const []const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const key = try accountKey(account);
+        var kb: [certfp_account_key_max]u8 = undefined;
+        const list_key = certfpAccountKey(&kb, key.asSlice()) orelse return error.BufferTooSmall;
+        const value = self.store.family(.props).get(list_key) orelse return out[0..0];
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, value, '\n');
+        while (it.next()) |fp| {
+            if (fp.len == 0) continue;
+            if (count >= out.len) return error.BufferTooSmall;
+            out[count] = fp;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    /// Remove a certfp from `account`. Returns NotFound when the fingerprint is
+    /// unbound, and Forbidden when another account owns it.
+    pub fn deleteCertfp(self: *Services, account: []const u8, fingerprint: []const u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try accountKey(account);
+        const owner = try self.certfpOwnerUnlocked(fingerprint);
+        if (!std.ascii.eqlIgnoreCase(owner, key.asSlice())) return error.Forbidden;
+
+        if (self.certfp_binds) |binds| _ = binds.unbind(fingerprint);
+        var fp_key_buf: [certfp_key_max]u8 = undefined;
+        if (certfpKey(&fp_key_buf, fingerprint)) |fp_key| self.store.family(.props).delete(fp_key) catch {};
+        try self.removeCertfpListEntry(key.asSlice(), fingerprint);
     }
 
     /// Mirror an account's derived SCRAM tuple into the durable store, keyed by
@@ -330,12 +395,22 @@ pub const Services = struct {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
 
+        return @constCast(self).accountForCertfpUnlocked(fingerprint) catch null;
+    }
+
+    fn accountForCertfpUnlocked(self: *Services, fingerprint: []const u8) ServiceError![]const u8 {
+        const acct = try self.certfpOwnerUnlocked(fingerprint);
+        if (try self.accountSuspendedUnlocked(acct)) return error.AuthFailed;
+        return acct;
+    }
+
+    fn certfpOwnerUnlocked(self: *Services, fingerprint: []const u8) ServiceError![]const u8 {
         if (self.certfp_binds) |binds| {
             if (binds.accountForFingerprint(fingerprint)) |acct| return acct;
         }
         var kb: [certfp_key_max]u8 = undefined;
-        const k = certfpKey(&kb, fingerprint) orelse return null;
-        return self.store.family(.props).get(k);
+        const k = certfpKey(&kb, fingerprint) orelse return error.NotFound;
+        return self.store.family(.props).get(k) orelse error.NotFound;
     }
 
     pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
@@ -343,6 +418,7 @@ pub const Services = struct {
         defer self.lock.unlockExclusive();
 
         const key = try accountKey(name);
+        if (self.accountForbiddenUnlocked(key.asSlice())) return error.Forbidden;
         if (self.store.family(.accounts).get(key.asSlice()) != null) return error.AlreadyExists;
         try validatePassword(password);
 
@@ -388,6 +464,7 @@ pub const Services = struct {
         };
         const record = try decodeAccount(value);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
+        if ((record.flags & account_flag_suspended) != 0) return error.AuthFailed;
         return .{ .identified = .{ .name = record.name } };
     }
 
@@ -438,6 +515,72 @@ pub const Services = struct {
 
         const record = try self.loadAccount(name);
         return .{ .account_info = record.info() };
+    }
+
+    pub fn setAccountSuspended(self: *Services, name: []const u8, suspended: bool, scratch: []u8) ServiceError!AccountAdminInfo {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var record = try self.loadAccount(name);
+        setFlag(&record.flags, account_flag_suspended, suspended);
+        try self.saveAccount(record, scratch);
+        return record.adminInfo();
+    }
+
+    pub fn setAccountNoExpire(self: *Services, name: []const u8, noexpire: bool, scratch: []u8) ServiceError!AccountAdminInfo {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var record = try self.loadAccount(name);
+        setFlag(&record.flags, account_flag_noexpire, noexpire);
+        try self.saveAccount(record, scratch);
+        return record.adminInfo();
+    }
+
+    /// Reserve or unreserve an account name. Registered accounts record the
+    /// forbidden bit in their account record; unregistered names use a durable
+    /// props-family reservation so REGISTER can reject the name later.
+    pub fn setAccountForbidden(self: *Services, name: []const u8, forbidden: bool, scratch: []u8) ServiceError!AccountAdminInfo {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try accountKey(name);
+        var kb: [forbidden_account_key_max]u8 = undefined;
+        const reservation_key = forbiddenAccountKey(&kb, key.asSlice()) orelse return error.BufferTooSmall;
+
+        if (self.store.family(.accounts).get(key.asSlice())) |value| {
+            var record = try decodeAccount(value);
+            setFlag(&record.flags, account_flag_forbidden, forbidden);
+            try self.saveAccount(record, scratch);
+            if (forbidden) {
+                try self.store.family(.props).put(reservation_key, "1");
+            } else {
+                try self.store.family(.props).delete(reservation_key);
+            }
+            return record.adminInfo();
+        }
+
+        if (forbidden) {
+            try self.store.family(.props).put(reservation_key, "1");
+            return .{ .name = key, .flags = account_flag_forbidden, .registered = false };
+        }
+        if (self.store.family(.props).get(reservation_key) == null) return error.NotFound;
+        try self.store.family(.props).delete(reservation_key);
+        return .{ .name = key, .registered = false };
+    }
+
+    pub fn adminAccountInfo(self: *Services, name: []const u8) ServiceError!AccountAdminInfo {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const key = try accountKey(name);
+        if (self.store.family(.accounts).get(key.asSlice())) |value| {
+            return (try decodeAccount(value)).adminInfo();
+        }
+        if (self.accountForbiddenUnlocked(key.asSlice())) {
+            return .{ .name = key, .flags = account_flag_forbidden, .registered = false };
+        }
+        return error.NotFound;
     }
 
     pub fn registerChannel(self: *Services, channel: []const u8, founder: []const u8, scratch: []u8) ServiceError!CommandResult {
@@ -630,10 +773,86 @@ pub const Services = struct {
         return .{ .channel_info = record.info() };
     }
 
+    fn addCertfpListEntry(self: *Services, account: []const u8, fingerprint: []const u8) ServiceError!void {
+        const key = try accountKey(account);
+        var kb: [certfp_account_key_max]u8 = undefined;
+        const list_key = certfpAccountKey(&kb, key.asSlice()) orelse return error.BufferTooSmall;
+        const existing = self.store.family(.props).get(list_key) orelse "";
+
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |fp| {
+            if (std.ascii.eqlIgnoreCase(fp, fingerprint)) return;
+        }
+
+        var out: [certfp_list_value_max]u8 = undefined;
+        if (existing.len == 0) {
+            const value = std.fmt.bufPrint(&out, "{s}", .{fingerprint}) catch return error.BufferTooSmall;
+            try self.store.family(.props).put(list_key, value);
+            return;
+        }
+        const value = std.fmt.bufPrint(&out, "{s}\n{s}", .{ existing, fingerprint }) catch return error.BufferTooSmall;
+        try self.store.family(.props).put(list_key, value);
+    }
+
+    fn removeCertfpListEntry(self: *Services, account: []const u8, fingerprint: []const u8) ServiceError!void {
+        var kb: [certfp_account_key_max]u8 = undefined;
+        const list_key = certfpAccountKey(&kb, account) orelse return error.BufferTooSmall;
+        const existing = self.store.family(.props).get(list_key) orelse return error.NotFound;
+
+        var out: [certfp_list_value_max]u8 = undefined;
+        var len: usize = 0;
+        var removed = false;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |fp| {
+            if (fp.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(fp, fingerprint)) {
+                removed = true;
+                continue;
+            }
+            if (len != 0) {
+                if (len >= out.len) return error.BufferTooSmall;
+                out[len] = '\n';
+                len += 1;
+            }
+            if (len + fp.len > out.len) return error.BufferTooSmall;
+            @memcpy(out[len..][0..fp.len], fp);
+            len += fp.len;
+        }
+        if (!removed) return error.NotFound;
+        if (len == 0) {
+            try self.store.family(.props).delete(list_key);
+        } else {
+            try self.store.family(.props).put(list_key, out[0..len]);
+        }
+    }
+
+    fn accountSuspendedUnlocked(self: *Services, account: []const u8) ServiceError!bool {
+        const key = try accountKey(account);
+        const value = self.store.family(.accounts).get(key.asSlice()) orelse return false;
+        const record = try decodeAccount(value);
+        return (record.flags & account_flag_suspended) != 0;
+    }
+
+    fn accountForbiddenUnlocked(self: *Services, account: []const u8) bool {
+        const key = accountKey(account) catch return false;
+        if (self.store.family(.accounts).get(key.asSlice())) |value| {
+            const record = decodeAccount(value) catch return false;
+            if ((record.flags & account_flag_forbidden) != 0) return true;
+        }
+        var kb: [forbidden_account_key_max]u8 = undefined;
+        const reservation_key = forbiddenAccountKey(&kb, key.asSlice()) orelse return false;
+        return self.store.family(.props).get(reservation_key) != null;
+    }
+
     fn loadAccount(self: *Services, name: []const u8) ServiceError!AccountRecord {
         const key = try accountKey(name);
         const value = self.store.family(.accounts).get(key.asSlice()) orelse return error.NotFound;
         return decodeAccount(value);
+    }
+
+    fn saveAccount(self: *Services, record: AccountRecord, scratch: []u8) ServiceError!void {
+        const encoded = try encodeAccount(record, scratch);
+        try self.store.family(.accounts).put(record.name.asSlice(), encoded);
     }
 
     fn loadChannel(self: *Services, channel: []const u8) ServiceError!ChannelRecord {
@@ -722,10 +941,23 @@ fn validateMask(input: []const u8) ServiceError!Mask {
 /// prefix keeps these out of the channel-access keyspace that shares `.props`.
 const certfp_key_prefix = "certfp:";
 const certfp_key_max = certfp_key_prefix.len + 128;
+const certfp_account_key_prefix = "certfps:";
+const certfp_account_key_max = certfp_account_key_prefix.len + account_max;
+const certfp_list_value_max = 16 * 64 + 15;
+const forbidden_account_key_prefix = "acctforbid:";
+const forbidden_account_key_max = forbidden_account_key_prefix.len + account_max;
 
 /// Build the props-family key for a certfp binding, or null if it would not fit.
 fn certfpKey(buf: []u8, fingerprint: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, certfp_key_prefix ++ "{s}", .{fingerprint}) catch null;
+}
+
+fn certfpAccountKey(buf: []u8, account: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, certfp_account_key_prefix ++ "{s}", .{account}) catch null;
+}
+
+fn forbiddenAccountKey(buf: []u8, account: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, forbidden_account_key_prefix ++ "{s}", .{account}) catch null;
 }
 
 /// Durable-store key prefix for persisted SCRAM credential tuples (props family).
@@ -769,6 +1001,14 @@ fn isAccountChar(byte: u8) bool {
 fn asciiLower(byte: u8) u8 {
     if (byte >= 'A' and byte <= 'Z') return byte + ('a' - 'A');
     return byte;
+}
+
+fn setFlag(flags: *u32, bit: u32, enabled: bool) void {
+    if (enabled) {
+        flags.* |= bit;
+    } else {
+        flags.* &= ~bit;
+    }
 }
 
 fn hasCtlOrSep(input: []const u8) bool {
@@ -1050,6 +1290,80 @@ test "certfp binding persists across store reopen" {
         try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
         // An unknown fingerprint still returns null.
         try std.testing.expect(services.accountForCertfp("b" ** 64) == null);
+    }
+}
+
+test "certfp list and delete enforce account ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fp_alice = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const fp_bob = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    var store = try openTestStore(tmp, "services-certfp-list.wal");
+    defer store.deinit();
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    var services = Services.init(&store, null);
+    services.attachCertfpBinds(&binds);
+
+    try services.bindCertfp("alice", fp_alice);
+    try services.bindCertfp("bob", fp_bob);
+
+    var listed_buf: [4][]const u8 = undefined;
+    var listed = try services.listCertfps("alice", listed_buf[0..]);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings(fp_alice, listed[0]);
+
+    try std.testing.expectError(error.Forbidden, services.deleteCertfp("alice", fp_bob));
+    try services.deleteCertfp("alice", fp_alice);
+    listed = try services.listCertfps("alice", listed_buf[0..]);
+    try std.testing.expectEqual(@as(usize, 0), listed.len);
+    try std.testing.expect(services.accountForCertfp(fp_alice) == null);
+}
+
+test "account lifecycle flags round-trip and persist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-account-lifecycle.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var scratch: [record_max]u8 = undefined;
+
+        _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+        var info = try services.setAccountSuspended("alice", true, &scratch);
+        try std.testing.expect(info.suspended());
+        try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", "correct horse battery staple"));
+
+        info = try services.setAccountSuspended("alice", false, &scratch);
+        try std.testing.expect(!info.suspended());
+        _ = try services.identifyAccount("alice", "correct horse battery staple");
+
+        info = try services.setAccountForbidden("alice", true, &scratch);
+        try std.testing.expect(info.forbidden());
+        info = try services.setAccountNoExpire("alice", true, &scratch);
+        try std.testing.expect(info.noexpire());
+
+        const reserved = try services.setAccountForbidden("Reserved", true, &scratch);
+        try std.testing.expect(!reserved.registered);
+        try std.testing.expect(reserved.forbidden());
+        try std.testing.expectError(error.Forbidden, services.registerAccount("reserved", "correct horse battery staple", &scratch));
+    }
+    {
+        var store = try openTestStore(tmp, "services-account-lifecycle.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+
+        const info = try services.adminAccountInfo("ALICE");
+        try std.testing.expect(info.registered);
+        try std.testing.expect(info.forbidden());
+        try std.testing.expect(info.noexpire());
+        try std.testing.expect(!info.suspended());
+
+        const reserved = try services.adminAccountInfo("reserved");
+        try std.testing.expect(!reserved.registered);
+        try std.testing.expect(reserved.forbidden());
     }
 }
 

@@ -29,6 +29,10 @@ fn accountInfo(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleAccountInfo(x.conn, x.parsed);
 }
+fn account(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleAccountAdmin(x.conn, x.parsed);
+}
 fn saslInfo(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleSaslInfo(x.conn);
@@ -53,6 +57,14 @@ fn certAdd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleCertAdd(x.conn);
 }
+fn certList(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleCertList(x.conn);
+}
+fn certDel(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleCertDel(x.conn, x.parsed);
+}
 
 pub const module = registry.Module{
     .id = "accounts",
@@ -63,6 +75,7 @@ pub const module = registry.Module{
         .{ .name = "LOGOUT", .handler = logout },
         .{ .name = "DROP", .handler = drop },
         .{ .name = "ACCOUNTINFO", .handler = accountInfo },
+        .{ .name = "ACCOUNT", .access = .oper, .handler = account, .summary = "administer account lifecycle flags" },
         .{ .name = "SASLINFO", .handler = saslInfo },
         .{ .name = "ACCOUNTSET", .handler = accountSet },
         .{ .name = "GHOST", .handler = ghost },
@@ -70,5 +83,7 @@ pub const module = registry.Module{
         .{ .name = "CS", .handler = channel },
         .{ .name = "SESSION", .handler = session },
         .{ .name = "CERTADD", .handler = certAdd },
+        .{ .name = "CERTLIST", .handler = certList },
+        .{ .name = "CERTDEL", .handler = certDel },
     },
 };
