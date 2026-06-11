@@ -258,6 +258,8 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
                 srv_cfg.tls_signing_key = tls_loaded.?.signing_key;
                 srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
+                srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
+                srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
                 std.debug.print("orochi: TLS listener enabled on port {d}\n", .{h.tls.port});
                 if (h.tls.enable_tls12) {
                     if (orochi.daemon.tls_certs.bootstrapTls12(allocator, init.io, h.tls.dns_name)) |t12| {

@@ -115,6 +115,8 @@ const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
 const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
+const tls_server = @import("../crypto/tls_server.zig");
+const tls_resumption = @import("../crypto/tls_resumption.zig");
 
 /// Per-channel cross-leg media bridge (native ↔ opt-in WebRTC roster).
 const Bridge = media_bridge_mod.ChannelBridge(native_media_mod.max_call_participants);
@@ -1114,6 +1116,13 @@ pub const Config = struct {
     tls_cert_chain: []const []const u8 = &.{},
     /// Ed25519 key matching the leaf cert's SPKI; signs each TLS CertificateVerify.
     tls_signing_key: ?std.crypto.sign.Ed25519.KeyPair = null,
+    /// Enable TLS 1.3 NewSessionTicket issuance and PSK resumption on the live
+    /// TLS listener. Default false keeps the listener's historical full-handshake
+    /// behavior byte-identical.
+    tls_enable_resumption: bool = false,
+    /// Maximum 0-RTT early application bytes advertised in issued tickets.
+    /// Zero disables early data while still allowing 1-RTT PSK resumption.
+    tls_early_data_max_size: u32 = 0,
     /// Optional hardened TLS 1.2 leg. When `tls12_signing_key` is set, the TLS
     /// listener accepts TLS 1.2 ECDHE-AEAD clients (routed by version-dispatch in
     /// tls_conn) presenting this ECDSA-P256 leaf; otherwise the listener is
@@ -1350,6 +1359,13 @@ threadlocal var current_reactor: ?*Reactor = null;
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    /// Process-wide TLS 1.3 resumption key. Generated once at daemon init when
+    /// resumption is enabled, then copied into every per-connection TLS config so
+    /// a ticket issued on one reactor can resume on another.
+    tls_ticket_key: tls_resumption.TicketKey = [_]u8{0} ** @sizeOf(tls_resumption.TicketKey),
+    /// Shared anti-replay ring for accepted 0-RTT binders. The guard is
+    /// internally synchronized because all reactor threads share it.
+    tls_replay_guard: tls_resumption.ReplayGuard = .{},
     /// OroWasm control-plane plugin bridge: loaded third-party plugins whose
     /// declared commands are dispatched after the comptime registry misses.
     /// Empty by default (no plugins) => the consult is a fast miss.
@@ -1628,6 +1644,9 @@ pub const LinuxServer = struct {
             reactors[built] = try initReactor(allocator, config, @intCast(built), reuse_port);
         }
 
+        var tls_ticket_key: tls_resumption.TicketKey = [_]u8{0} ** @sizeOf(tls_resumption.TicketKey);
+        if (config.tls_enable_resumption) secure_fns.randomBytes(&tls_ticket_key);
+
         var whowas_store = try WhowasStore.init(allocator);
         errdefer whowas_store.deinit();
 
@@ -1646,6 +1665,7 @@ pub const LinuxServer = struct {
             .config = config,
             .wasm = wasm_bridge.Bridge.init(allocator),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
+            .tls_ticket_key = tls_ticket_key,
             .reactors = reactors,
             .pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(allocator),
             .world = blk: {
@@ -1745,6 +1765,25 @@ pub const LinuxServer = struct {
         std.debug.print("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
         // Bridge WebRTC RTP frames to any native members of each channel.
         self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
+    }
+
+    /// Build the TLS 1.3 config for one accepted client. Certificate material is
+    /// borrowed from `Config`; resumption state is process-wide and shared by all
+    /// per-connection TLS engines so tickets survive reactor/thread boundaries.
+    fn tls13Config(self: *LinuxServer) tls_server.Config {
+        var cfg = tls_server.Config{
+            .cert_chain = self.config.tls_cert_chain,
+            .signing_key = self.config.tls_signing_key.?,
+            .request_client_cert = self.config.tls_request_client_cert,
+        };
+        if (self.config.tls_enable_resumption) {
+            cfg.enable_session_tickets = true;
+            cfg.ticket_key = self.tls_ticket_key;
+            cfg.replay_guard = &self.tls_replay_guard;
+            cfg.now_unix_seconds = @divTrunc(platform.realtimeMillis(), 1000);
+            cfg.max_early_data_size = self.config.tls_early_data_max_size;
+        }
+        return cfg;
     }
 
     pub fn deinit(self: *LinuxServer) void {
@@ -2525,20 +2564,12 @@ pub const LinuxServer = struct {
             if (self.config.tls12_signing_key) |ec_key| {
                 // Hardened TLS 1.2 enabled: version-dispatch between the 1.3 and
                 // 1.2 engines on the first ClientHello.
-                tls.* = tls_conn.TlsConn.initDual(self.allocator, .{
-                    .cert_chain = self.config.tls_cert_chain,
-                    .signing_key = self.config.tls_signing_key.?,
-                    .request_client_cert = self.config.tls_request_client_cert,
-                }, .{
+                tls.* = tls_conn.TlsConn.initDual(self.allocator, self.tls13Config(), .{
                     .cert_chain = self.config.tls12_cert_chain,
                     .ecdsa_p256_signing_key = ec_key,
                 });
             } else {
-                tls.* = tls_conn.TlsConn.init(self.allocator, .{
-                    .cert_chain = self.config.tls_cert_chain,
-                    .signing_key = self.config.tls_signing_key.?,
-                    .request_client_cert = self.config.tls_request_client_cert,
-                }) catch {
+                tls.* = tls_conn.TlsConn.init(self.allocator, self.tls13Config()) catch {
                     self.allocator.destroy(tls);
                     closeFd(conn.fd);
                     _ = self.rx().clients.free(id);

@@ -117,6 +117,8 @@ pub const TlsBootConfig = struct {
     dns_name: []const u8 = "localhost",
     request_client_cert: bool = false,
     enable_tls12: bool = false,
+    enable_resumption: bool = false,
+    early_data_max_size: u32 = 0,
 };
 
 /// Project the parsed `[tls]` section onto the neutral boot struct. Borrows
@@ -130,6 +132,8 @@ pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
         .dns_name = cfg.tls.dns_name,
         .request_client_cert = cfg.tls.request_client_cert,
         .enable_tls12 = cfg.tls.enable_tls12,
+        .enable_resumption = cfg.tls.enable_resumption,
+        .early_data_max_size = cfg.tls.early_data_max_size,
     };
 }
 

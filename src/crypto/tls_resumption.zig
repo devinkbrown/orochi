@@ -50,17 +50,25 @@ pub const StoredSession = struct {
 /// Largest PSK binder this guard retains (SHA-384 digest size).
 pub const max_binder_len: usize = max_hash_len;
 
+/// Blocking acquire for the project's try-lock-only atomic mutex. TLS accepts
+/// run on reactor threads, so the shared replay cache must serialize without
+/// depending on `std.Thread.Mutex`.
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.Thread.yield() catch {};
+}
+
 /// Bounded single-use guard against 0-RTT early-data replay (RFC 8446 §8): it
 /// records the PSK binders of accepted 0-RTT attempts and reports a repeat as a
 /// replay. A fixed ring of `capacity` recent binders bounds memory; a binder
 /// evicted after `capacity` distinct attempts could be replayed, but the ticket
 /// lifetime window bounds that exposure further.
 ///
-/// NOT internally synchronized: a caller sharing one guard across threads must
-/// serialize `checkAndRecord` (the live daemon would hold a lock around it).
+/// Internally synchronized with a small spin/yield mutex so one guard may be
+/// shared by all daemon reactor threads.
 pub const ReplayGuard = struct {
     pub const capacity: usize = 2048;
 
+    mutex: std.atomic.Mutex = .unlocked,
     entries: [capacity][max_binder_len]u8 = undefined,
     lens: [capacity]u8 = [_]u8{0} ** capacity,
     next: usize = 0,
@@ -69,6 +77,13 @@ pub const ReplayGuard = struct {
     /// Returns true when `binder` is fresh (and records it); false when it was
     /// already seen (a replay) or is malformed.
     pub fn checkAndRecord(self: *ReplayGuard, binder: []const u8) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.checkAndRecordLocked(binder);
+    }
+
+    /// Locked implementation for the bounded ring lookup + insert.
+    fn checkAndRecordLocked(self: *ReplayGuard, binder: []const u8) bool {
         if (binder.len == 0 or binder.len > max_binder_len) return false;
         const limit = if (self.wrapped) capacity else self.next;
         var i: usize = 0;

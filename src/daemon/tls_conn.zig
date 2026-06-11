@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const tls_server = @import("../crypto/tls_server.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_record = @import("../crypto/tls_record.zig");
+const tls_resumption = @import("../crypto/tls_resumption.zig");
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("tls_conn requires a 64-bit target");
@@ -211,12 +212,20 @@ pub const TlsConn = struct {
     /// Feed one complete handshake-phase record to the chosen engine.
     fn feedRecord(self: *TlsConn, record: []const u8) Error!void {
         switch (self.engine) {
-            .tls13 => |*s| switch (try s.feed(record)) {
-                .need_more => {},
-                .bytes_to_send => |flight| {
-                    defer self.allocator.free(flight);
-                    try self.send_buf.appendSlice(self.allocator, flight);
-                },
+            .tls13 => |*s| {
+                switch (try s.feed(record)) {
+                    .need_more => {},
+                    .bytes_to_send => |flight| {
+                        defer self.allocator.free(flight);
+                        try self.send_buf.appendSlice(self.allocator, flight);
+                    },
+                }
+                if (s.handshakeDone()) {
+                    if (try s.takeEarlyData()) |early| {
+                        defer self.allocator.free(early);
+                        try self.plain_buf.appendSlice(self.allocator, early);
+                    }
+                }
             },
             .tls12 => |*s| switch (try s.feed(record)) {
                 .need_more => {},
@@ -398,6 +407,100 @@ test "onInbound drives a full handshake against tls_client and streams app data 
     const got = try client.decrypt(cipher);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("hello client", got);
+}
+
+test "shared ticket key and replay guard resume across TlsConn instances" {
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x68} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const ticket_key = [_]u8{0x24} ** @sizeOf(tls_resumption.TicketKey);
+    var guard = tls_resumption.ReplayGuard{};
+
+    var conn1 = try TlsConn.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .ticket_key = ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_000,
+        .max_early_data_size = 4096,
+    });
+    defer conn1.deinit();
+    var client1 = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client1.deinit();
+
+    const ch1 = try client1.start();
+    defer alloc.free(ch1);
+    const sh1 = try conn1.onInbound(ch1);
+    const cfin1 = switch (try client1.feed(sh1.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin1);
+    const fin1 = try conn1.onInbound(cfin1);
+    try std.testing.expect(conn1.handshakeDone());
+    try std.testing.expect(fin1.handshake_bytes.len != 0);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client1.decryptApp(fin1.handshake_bytes));
+    const stored = client1.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var conn2 = try TlsConn.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .ticket_key = ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_001,
+        .max_early_data_size = 4096,
+    });
+    defer conn2.deinit();
+    var client2 = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client2.deinit();
+    try client2.setSessionTicket(stored, 1000);
+    try client2.setEarlyData("EARLY hello");
+
+    const rch = try client2.start();
+    defer alloc.free(rch);
+    const sh2 = try conn2.onInbound(rch);
+    try std.testing.expect(switch (conn2.engine) {
+        .tls13 => |*s| s.acceptedSessionTicket(),
+        else => false,
+    });
+    try std.testing.expect(switch (conn2.engine) {
+        .tls13 => |*s| s.earlyDataAccepted(),
+        else => false,
+    });
+    const cfin2 = switch (try client2.feed(sh2.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin2);
+    try std.testing.expectEqual(@as(?bool, true), client2.earlyDataAccepted());
+    const fin2 = try conn2.onInbound(cfin2);
+    try std.testing.expect(conn2.handshakeDone());
+    try std.testing.expectEqualStrings("EARLY hello", fin2.plaintext);
+
+    var conn3 = try TlsConn.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_001,
+        .max_early_data_size = 4096,
+    });
+    defer conn3.deinit();
+    const replay = try conn3.onInbound(rch);
+    try std.testing.expect(replay.handshake_bytes.len != 0);
+    try std.testing.expect(switch (conn3.engine) {
+        .tls13 => |*s| s.acceptedSessionTicket(),
+        else => false,
+    });
+    try std.testing.expect(!switch (conn3.engine) {
+        .tls13 => |*s| s.earlyDataAccepted(),
+        else => true,
+    });
 }
 
 test "onInbound reassembles a handshake record split across two calls" {

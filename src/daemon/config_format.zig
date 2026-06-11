@@ -281,6 +281,13 @@ pub const Config = struct {
         /// always presents a freshly bootstrapped ECDSA-P256 leaf (the 1.2 engine
         /// signs ServerKeyExchange with ecdsa_secp256r1_sha256).
         enable_tls12: bool = false,
+        /// Enable TLS 1.3 session tickets and PSK resumption on the live TLS
+        /// listener. Off by default so existing deployments keep full-handshake
+        /// behavior unless they explicitly opt in.
+        enable_resumption: bool = false,
+        /// Maximum accepted TLS 1.3 0-RTT early application bytes advertised in
+        /// issued tickets. Zero disables early data while keeping PSK resumption.
+        early_data_max_size: u32 = 0,
     };
 
     /// IRCv3 STS (Strict Transport Security) advertisement policy. When enabled,
