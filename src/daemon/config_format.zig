@@ -126,7 +126,13 @@ pub const Config = struct {
     pub const Listen = struct {
         host: []const u8 = "",
         irc: u16 = 0,
+        /// Secure-WebSocket (wss) port for browser clients; 0 = disabled.
+        /// Requires `[tls]` to be enabled (the listener reuses its certificate).
         ws: u16 = 0,
+        /// TESTING ONLY: allow the `ws` listener without TLS (plain `ws://`)
+        /// when no certificate is configured. Browsers require wss on the
+        /// production page, so this defaults OFF.
+        ws_plain: bool = false,
         webtransport: u16 = 0,
         s2s: u16 = 0,
         /// UDP port for the media (SFU) transport plane; 0 = ephemeral.
@@ -433,6 +439,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);
     cfg.listen.irc = try portField(doc, "listen.irc", cfg.listen.irc);
     cfg.listen.ws = try portField(doc, "listen.ws", cfg.listen.ws);
+    if (doc.getBool("listen.ws_plain")) |b| cfg.listen.ws_plain = b;
     cfg.listen.webtransport = try portField(doc, "listen.webtransport", cfg.listen.webtransport);
     cfg.listen.s2s = try portField(doc, "listen.s2s", cfg.listen.s2s);
     cfg.listen.media = try portField(doc, "listen.media", cfg.listen.media);

@@ -289,6 +289,22 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Native secure-WebSocket (wss) browser listener (`[listen] ws`): rides the
+    // SAME cert chain + signing key loaded for the implicit-TLS listener above,
+    // so the leg is genuine wss under the daemon's real certificate. Browsers
+    // require wss on the production page, so a cert-less ws port is refused
+    // unless the testing-only `[listen] ws_plain` flag is set.
+    if (srv_cfg.ws_enabled) {
+        if (srv_cfg.tls_cert_chain.len != 0) {
+            std.debug.print("orochi: WebSocket (wss) listener enabled on port {d}\n", .{srv_cfg.ws_port});
+        } else if (srv_cfg.ws_allow_plain) {
+            std.debug.print("orochi: WebSocket listener on port {d} WITHOUT TLS ([listen] ws_plain testing mode)\n", .{srv_cfg.ws_port});
+        } else {
+            srv_cfg.ws_enabled = false;
+            std.debug.print("orochi: [listen] ws ignored — no TLS certificate loaded (enable [tls]; browsers require wss)\n", .{});
+        }
+    }
+
     // IRCv3 STS: when an operator enables `[sts]` AND a TLS listener is live,
     // build the advertised wire value so each session's `sts` cap is offered.
     // STS without a live TLS port would strand clients, so require both.

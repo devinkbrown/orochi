@@ -39,6 +39,14 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
+    if (cfg.listen.ws != 0) {
+        // Secure-WebSocket browser listener intent. The live listener only
+        // stands up once main.zig has loaded the TLS certificate (or in the
+        // testing-only `ws_plain` mode) — see server.initReactor's gate.
+        out.ws_enabled = true;
+        out.ws_port = cfg.listen.ws;
+        out.ws_allow_plain = cfg.listen.ws_plain;
+    }
     if (cfg.listen.media != 0) out.media_port = cfg.listen.media;
     if (cfg.listen.native_media != 0) out.native_media_port = cfg.listen.native_media;
     if (cfg.listen.media_host.len != 0) out.media_host = cfg.listen.media_host;

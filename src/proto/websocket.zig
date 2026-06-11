@@ -308,6 +308,100 @@ pub fn encodeFrame(
     return out[0 .. header_len + payload.len];
 }
 
+/// Frame-stream faults surfaced by `Deframer` beyond per-frame decode errors:
+/// RFC 6455 §5.4 fragmentation-state violations and reassembly-buffer overflow.
+pub const DeframeError = FrameError || error{
+    UnexpectedContinuation,
+    NestedFragmentation,
+    BufferFull,
+};
+
+/// One semantic event popped from a client-to-server frame stream.
+pub const DeframeEvent = union(enum) {
+    /// Unmasked payload of one text/binary/continuation DATA frame. `fin` marks
+    /// the end of the WebSocket message (so a line-oriented consumer can treat
+    /// the frame boundary as a message terminator even without a trailing CRLF).
+    data: struct { payload: []const u8, fin: bool },
+    /// Client ping; the caller should answer with a pong echoing the payload.
+    ping: []const u8,
+    /// Client pong (unsolicited or answering a server ping); informational.
+    pong: void,
+    /// Client close; payload is the optional status code + reason. The caller
+    /// should echo a close frame and tear the connection down.
+    close: []const u8,
+};
+
+/// Incremental client-to-server frame decoder for a live connection: frames may
+/// arrive split across arbitrary recv chunks (or TLS records), so `feed` buffers
+/// wire bytes and `next` pops complete frames one at a time. Enforces the RFC
+/// 6455 client rules (masking required, canonical lengths, control frames never
+/// fragmented) plus cross-frame fragmentation-state validity. Allocation-free;
+/// a returned `data`/`ping`/`close` payload is valid until the next `feed`/`next`.
+pub fn Deframer(comptime max_frame_size: usize) type {
+    return struct {
+        const Self = @This();
+        pub const max_frame = max_frame_size;
+        /// Header (2) + extended length (8) + mask key (4) on top of the payload.
+        const max_overhead = 14;
+
+        /// Reassembly buffer for wire bytes of the (possibly partial) next frame.
+        buf: [max_frame_size + max_overhead]u8 = undefined,
+        len: usize = 0,
+        /// Unmask destination; `data`/`ping`/`close` payload slices point here.
+        payload_buf: [max_frame_size]u8 = undefined,
+        /// True while a fragmented DATA message is open (a non-FIN text/binary
+        /// frame was seen and its closing FIN continuation has not arrived yet).
+        fragmented: bool = false,
+
+        /// Buffer inbound wire bytes. `error.BufferFull` only when a frame's wire
+        /// size exceeds capacity (oversize *declared* lengths are rejected earlier
+        /// by `next` as `PayloadTooLarge`, straight from the frame header).
+        pub fn feed(self: *Self, bytes: []const u8) error{BufferFull}!void {
+            if (self.len + bytes.len > self.buf.len) return error.BufferFull;
+            @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+            self.len += bytes.len;
+        }
+
+        /// Pop the next complete frame as a semantic event, or null when more
+        /// wire bytes are needed. Any error is fatal to the stream: the caller
+        /// must close the connection (RFC 6455 §10.7).
+        pub fn next(self: *Self) DeframeError!?DeframeEvent {
+            if (self.len == 0) return null;
+            const res = decodeFrame(
+                max_frame_size,
+                .client_to_server,
+                self.buf[0..self.len],
+                &self.payload_buf,
+            ) catch |err| switch (err) {
+                error.Truncated => return null,
+                else => return err,
+            };
+            // Consume the frame's wire bytes; the payload was already copied
+            // (unmasked) into `payload_buf`, so sliding `buf` is safe.
+            const rem = self.len - res.consumed;
+            std.mem.copyForwards(u8, self.buf[0..rem], self.buf[res.consumed..self.len]);
+            self.len = rem;
+
+            const frame = res.frame;
+            switch (frame.opcode) {
+                .text, .binary => {
+                    if (self.fragmented) return error.NestedFragmentation;
+                    self.fragmented = !frame.fin;
+                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin } };
+                },
+                .continuation => {
+                    if (!self.fragmented) return error.UnexpectedContinuation;
+                    if (frame.fin) self.fragmented = false;
+                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin } };
+                },
+                .ping => return .{ .ping = frame.payload },
+                .pong => return .pong,
+                .close => return .{ .close = frame.payload },
+            }
+        }
+    };
+}
+
 /// Return the next complete IRC line in a text-frame payload, excluding CR/LF.
 pub fn nextIrcLine(payload: []const u8) ?IrcLine {
     const lf = std.mem.indexOfScalar(u8, payload, '\n') orelse return null;
@@ -543,6 +637,98 @@ test "invalid control and length encodings are rejected" {
 
     const noncanonical = [_]u8{ 0x81, 0xfe, 0x00, 0x7d, 1, 2, 3, 4 };
     try std.testing.expectError(error.NonCanonicalLength, decodeFrame(128, .client_to_server, &noncanonical, &payload_buf));
+}
+
+test "deframer reassembles a frame split across arbitrary feeds" {
+    var d = Deframer(256){};
+    const frame = [_]u8{ 0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58 };
+    // Feed one byte at a time: no event until the final byte lands.
+    for (frame, 0..) |byte, i| {
+        try d.feed(&.{byte});
+        if (i + 1 < frame.len) {
+            try std.testing.expect((try d.next()) == null);
+        }
+    }
+    const ev = (try d.next()).?;
+    try std.testing.expectEqualStrings("Hello", ev.data.payload);
+    try std.testing.expect(ev.data.fin);
+    try std.testing.expect((try d.next()) == null);
+}
+
+test "deframer pops multiple frames from one feed and tracks fragmentation" {
+    var d = Deframer(256){};
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    var buf_c: [64]u8 = undefined;
+    const key = [4]u8{ 9, 8, 7, 6 };
+    // text(!fin "NICK ") + ping("hb") interleaved + continuation(fin "w")
+    const f1 = try encodeFrame(256, .{ .fin = false, .opcode = .text, .mask_key = key }, "NICK ", &buf_a);
+    const f2 = try encodeFrame(256, .{ .opcode = .ping, .mask_key = key }, "hb", &buf_b);
+    const f3 = try encodeFrame(256, .{ .opcode = .continuation, .mask_key = key }, "w", &buf_c);
+    try d.feed(f1);
+    try d.feed(f2);
+    try d.feed(f3);
+
+    const first = (try d.next()).?;
+    try std.testing.expectEqualStrings("NICK ", first.data.payload);
+    try std.testing.expect(!first.data.fin);
+    const mid = (try d.next()).?;
+    try std.testing.expectEqualStrings("hb", mid.ping);
+    const last = (try d.next()).?;
+    try std.testing.expectEqualStrings("w", last.data.payload);
+    try std.testing.expect(last.data.fin);
+    try std.testing.expect((try d.next()) == null);
+}
+
+test "deframer rejects fragmentation-state violations and unmasked frames" {
+    // Continuation with no open message.
+    {
+        var d = Deframer(64){};
+        var buf: [32]u8 = undefined;
+        const f = try encodeFrame(64, .{ .opcode = .continuation, .mask_key = .{ 1, 2, 3, 4 } }, "x", &buf);
+        try d.feed(f);
+        try std.testing.expectError(error.UnexpectedContinuation, d.next());
+    }
+    // New text frame while a fragmented message is open.
+    {
+        var d = Deframer(64){};
+        var buf_a: [32]u8 = undefined;
+        var buf_b: [32]u8 = undefined;
+        const f1 = try encodeFrame(64, .{ .fin = false, .opcode = .text, .mask_key = .{ 1, 2, 3, 4 } }, "a", &buf_a);
+        const f2 = try encodeFrame(64, .{ .opcode = .text, .mask_key = .{ 1, 2, 3, 4 } }, "b", &buf_b);
+        try d.feed(f1);
+        try d.feed(f2);
+        _ = (try d.next()).?;
+        try std.testing.expectError(error.NestedFragmentation, d.next());
+    }
+    // Clients MUST mask: an unmasked client frame is a stream-fatal error.
+    {
+        var d = Deframer(64){};
+        const unmasked = [_]u8{ 0x81, 0x05, 'H', 'e', 'l', 'l', 'o' };
+        try d.feed(&unmasked);
+        try std.testing.expectError(error.UnmaskedClientFrame, d.next());
+    }
+}
+
+test "deframer surfaces close and pong and rejects oversize declared frames" {
+    var d = Deframer(32){};
+    var buf: [32]u8 = undefined;
+    const close = try encodeFrame(32, .{ .opcode = .close, .mask_key = .{ 5, 5, 5, 5 } }, &.{ 0x03, 0xe8 }, &buf);
+    try d.feed(close);
+    const ev = (try d.next()).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0xe8 }, ev.close);
+
+    var d2 = Deframer(32){};
+    const pong = try encodeFrame(32, .{ .opcode = .pong, .mask_key = .{ 5, 5, 5, 5 } }, "", &buf);
+    try d2.feed(pong);
+    try std.testing.expect(std.meta.activeTag((try d2.next()).?) == .pong);
+
+    // Declared length above capacity is rejected from the header alone, before
+    // the payload ever arrives (so feed() can never be tricked into overflow).
+    var d3 = Deframer(32){};
+    const oversize_header = [_]u8{ 0x81, 0x80 | 126, 0x01, 0x00 }; // 256-byte declared payload
+    try d3.feed(&oversize_header);
+    try std.testing.expectError(error.PayloadTooLarge, d3.next());
 }
 
 test "irc line helper extracts complete lines only" {

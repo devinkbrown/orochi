@@ -101,6 +101,7 @@ const build_info = @import("build_info");
 const stats_report = @import("stats_report.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const accept_list = @import("../proto/accept_list.zig");
+const websocket = @import("../proto/websocket.zig");
 const cloak = @import("../proto/cloak.zig");
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
@@ -711,6 +712,9 @@ const tls_listener_token: RingFdToken = .{ .slot = 3, .gen = 0 };
 /// multi-reactor model lands, another reactor `wake()`s this fd to make the loop
 /// run and drain its cross-shard mailbox.
 const wake_token: RingFdToken = .{ .slot = 4, .gen = 0 };
+/// Distinct accept token for the secure-WebSocket (wss) browser listener, so
+/// handleAccept can tell it apart from the plaintext/S2S/TLS listeners.
+const ws_listener_token: RingFdToken = .{ .slot = 5, .gen = 0 };
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
@@ -1146,6 +1150,19 @@ pub const Config = struct {
     /// TLS 1.3-only. The 1.2 ServerKeyExchange is signed with ecdsa_secp256r1_sha256.
     tls12_cert_chain: []const []const u8 = &.{},
     tls12_signing_key: ?ecdsa_p256.KeyPair = null,
+    /// Native secure-WebSocket (wss) browser listener (`[listen] ws`). When
+    /// enabled, accepts on `ws_port` run the SAME TLS engine as the implicit-TLS
+    /// listener (the cert chain + signing key above must be present), then an
+    /// HTTP/1.1 WebSocket Upgrade; after the 101 the connection is an ordinary
+    /// IRC client whose lines travel one-per-text-frame (RFC 6455).
+    ws_enabled: bool = false,
+    /// Port for the wss listener; 0 = ephemeral bind (tests), same convention
+    /// as the other listeners.
+    ws_port: u16 = 0,
+    /// TESTING ONLY: stand the ws listener up WITHOUT TLS (plain `ws://`) when
+    /// no certificate is configured. Browsers require wss on the production
+    /// page; this exists for local debugging (`[listen] ws_plain`). Default OFF.
+    ws_allow_plain: bool = false,
     /// This node's sovereign mesh identity — the single id that keys the server
     /// registry, the CRDT replica lane, and gossip/routing. No legacy server-id
     /// (SID): one identity. MUST be unique per node and non-zero. The default is a
@@ -1201,6 +1218,33 @@ const MultilineAssembler = multiline.Assembler(multiline_cfg);
 const MultilineState = struct {
     assembler: MultilineAssembler = MultilineAssembler.init(),
     out: [multiline_cfg.max_bytes]u8 = undefined,
+};
+
+/// Per-connection WebSocket adapter for a `[listen] ws` browser client. Sits
+/// between the (optional) TLS layer and the IRC line parser: inbound plaintext
+/// first completes the HTTP/1.1 Upgrade handshake, then is deframed per RFC
+/// 6455 and fed to the normal line buffer; outbound IRC bytes are cut on CRLF
+/// boundaries and wrapped one-line-per-text-frame (the IRCv3 WebSocket
+/// convention — no trailing CRLF inside a frame). Heap-owned (the reassembly
+/// buffers are large); freed in closeConn/deinit, exactly like `tls`.
+const WsState = struct {
+    /// Largest single inbound frame accepted (declared lengths above this are
+    /// rejected from the header alone). Comfortably above the max tagged IRC
+    /// line; a browser IRC client sends one line per frame.
+    const max_frame = default_reply_bytes;
+    const Phase = enum { handshake, open };
+
+    phase: Phase = .handshake,
+    /// HTTP Upgrade request head accumulator (request line + headers only).
+    http_buf: [2048]u8 = undefined,
+    http_len: usize = 0,
+    /// Incremental RFC 6455 client-to-server frame decoder.
+    deframer: websocket.Deframer(max_frame) = .{},
+    /// Outbound line accumulator: a single IRC line may arrive at the send seam
+    /// in several appendToConn calls (tag prefix + body), so frames are cut on
+    /// CRLF boundaries here rather than per append.
+    tx_buf: [default_reply_bytes]u8 = undefined,
+    tx_len: usize = 0,
 };
 
 pub const ConnState = struct {
@@ -1269,6 +1313,11 @@ pub const ConnState = struct {
     /// decrypted through this adapter and outbound bytes encrypted, transparently
     /// to the IRC layer. Heap-owned; freed in closeConn/deinit.
     tls: ?*tls_conn.TlsConn = null,
+    /// Non-null for a `[listen] ws` WebSocket client: inbound (decrypted)
+    /// bytes run the HTTP Upgrade then RFC 6455 deframing before the IRC line
+    /// parser, and outbound IRC lines are wrapped in text frames before the
+    /// TLS seam. Heap-owned; freed in closeConn/deinit.
+    ws: ?*WsState = null,
     /// Stable backing for `session.tls_certfp` (the presented client cert's
     /// lowercase-hex SHA-256), populated once the mTLS handshake completes.
     certfp_buf: [certfp.fingerprint_len]u8 = undefined,
@@ -1339,10 +1388,13 @@ const Reactor = struct {
     s2s_listener_fd: linux.fd_t = -1,
     /// Implicit-TLS client listener (-1 = disabled) + its accept-armed flag.
     tls_listener_fd: linux.fd_t = -1,
+    /// Secure-WebSocket (wss) browser listener (-1 = disabled) + accept flag.
+    ws_listener_fd: linux.fd_t = -1,
 
     accept_armed: bool = false,
     s2s_accept_armed: bool = false,
     tls_accept_armed: bool = false,
+    ws_accept_armed: bool = false,
     /// Whether the periodic timeout-sweep timer is currently in flight.
     timer_armed: bool = false,
 
@@ -1362,6 +1414,7 @@ const Reactor = struct {
         closeFd(self.listener_fd);
         if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
         if (self.tls_listener_fd >= 0) closeFd(self.tls_listener_fd);
+        if (self.ws_listener_fd >= 0) closeFd(self.ws_listener_fd);
     }
 };
 
@@ -1576,6 +1629,14 @@ pub const LinuxServer = struct {
         return @intCast(@max(@as(usize, 1), capped));
     }
 
+    /// Cert presence is the "TLS configured" signal (main.zig only supplies a
+    /// chain when `[tls]` is enabled): a leaf chain plus any supported signing
+    /// key. Shared by the implicit-TLS and wss listener gates.
+    fn certReady(config: Config) bool {
+        return config.tls_cert_chain.len != 0 and
+            (config.tls_signing_key != null or config.tls_rsa_signing_key != null or config.tls_ecdsa_signing_key != null);
+    }
+
     /// Build one shard's `Reactor`: its own ring, connection table (reserved to
     /// `max_clients`), wake eventfd, and listeners stamped with `shard_id`. When
     /// `reuse_port` is set every listener is a `SO_REUSEPORT` socket so N reactors
@@ -1606,7 +1667,7 @@ pub const LinuxServer = struct {
         // Cert presence is the "TLS configured" signal (main.zig only supplies a
         // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
         // same convention the plaintext listener uses.
-        const tls_listener_fd: linux.fd_t = if (config.tls_cert_chain.len != 0 and (config.tls_signing_key != null or config.tls_rsa_signing_key != null or config.tls_ecdsa_signing_key != null))
+        const tls_listener_fd: linux.fd_t = if (certReady(config))
             (if (reuse_port)
                 try reuseport.createReusePortListener(config.host, config.tls_port, config.backlog)
             else
@@ -1614,6 +1675,18 @@ pub const LinuxServer = struct {
         else
             -1;
         errdefer if (tls_listener_fd >= 0) closeFd(tls_listener_fd);
+
+        // Secure-WebSocket (wss) browser listener: gated on `ws_enabled` AND the
+        // same cert-presence signal as the TLS listener (browsers require wss).
+        // The testing-only plain mode stands it up without a certificate.
+        const ws_listener_fd: linux.fd_t = if (config.ws_enabled and (certReady(config) or config.ws_allow_plain))
+            (if (reuse_port)
+                try reuseport.createReusePortListener(config.host, config.ws_port, config.backlog)
+            else
+                try createListener(config.host, config.ws_port, config.backlog))
+        else
+            -1;
+        errdefer if (ws_listener_fd >= 0) closeFd(ws_listener_fd);
 
         var ring = RingCore.init(config.ring_entries, config.features) catch |err| {
             if (ringlane.isUnsupportedInitError(err)) return error.Unsupported;
@@ -1635,6 +1708,7 @@ pub const LinuxServer = struct {
             .listener_fd = listener_fd,
             .s2s_listener_fd = s2s_listener_fd,
             .tls_listener_fd = tls_listener_fd,
+            .ws_listener_fd = ws_listener_fd,
             // Best-effort: a daemon without eventfd simply runs un-wakeable (a
             // single reactor never needs an external nudge; multi-reactor needs it
             // for cross-shard delivery, so a failure there degrades to busier polls).
@@ -1835,6 +1909,10 @@ pub const LinuxServer = struct {
                         self.allocator.destroy(t);
                         slot.value.tls = null;
                     }
+                    if (slot.value.ws) |w| {
+                        self.allocator.destroy(w);
+                        slot.value.ws = null;
+                    }
                     closeFd(slot.value.fd);
                 }
             }
@@ -1916,6 +1994,10 @@ pub const LinuxServer = struct {
         if (self.rx().tls_listener_fd >= 0 and !self.rx().tls_accept_armed) {
             try self.rx().ring.submitAccept(tls_listener_token, self.rx().tls_listener_fd);
             self.rx().tls_accept_armed = true;
+        }
+        if (self.rx().ws_listener_fd >= 0 and !self.rx().ws_accept_armed) {
+            try self.rx().ring.submitAccept(ws_listener_token, self.rx().ws_listener_fd);
+            self.rx().ws_accept_armed = true;
         }
     }
 
@@ -2373,6 +2455,11 @@ pub const LinuxServer = struct {
         return socketPort(self.rx().tls_listener_fd);
     }
 
+    pub fn wsBoundPort(self: *LinuxServer) !u16 {
+        if (self.rx().ws_listener_fd < 0) return error.Unsupported;
+        return socketPort(self.rx().ws_listener_fd);
+    }
+
     /// Process at least one io_uring completion. Callers may loop this until
     /// their own stop condition is satisfied.
     pub fn runOnce(self: *LinuxServer) !void {
@@ -2489,11 +2576,14 @@ pub const LinuxServer = struct {
     pub fn handleAccept(self: *LinuxServer, event: ringlane.AcceptEvent) !void {
         const is_s2s = event.token.slot == s2s_listener_token.slot;
         const is_tls = event.token.slot == tls_listener_token.slot;
+        const is_ws = event.token.slot == ws_listener_token.slot;
         if (!event.more) {
             if (is_s2s) {
                 self.rx().s2s_accept_armed = false;
             } else if (is_tls) {
                 self.rx().tls_accept_armed = false;
+            } else if (is_ws) {
+                self.rx().ws_accept_armed = false;
             } else {
                 self.rx().accept_armed = false;
             }
@@ -2624,6 +2714,84 @@ pub const LinuxServer = struct {
             try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
             self.stats.onAccept();
             self.traceLog(.info, .net, "tls client accepted");
+            return;
+        }
+
+        if (is_ws) {
+            // Secure-WebSocket browser client. Refusals are silent for the same
+            // reason as the TLS listener: an IRC ERROR line is garbage both
+            // mid-TLS-handshake and to an HTTP/WebSocket peer.
+            self.captureClientHost(conn);
+            var refuse = self.draining;
+            if (!refuse and self.reputationOn()) {
+                if (conn.peer_addr) |addr| {
+                    if (self.reputation.shouldRefuse(addr, self.nowU64())) refuse = true;
+                }
+            }
+            if (!refuse) {
+                if (conn.peer_addr) |addr| {
+                    if (self.clone_limit.register(addr)) {
+                        conn.clone_counted = true;
+                    } else |err| switch (err) {
+                        error.TooManyPerIp, error.TooManyPerNet => {
+                            self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                            refuse = true;
+                        },
+                        error.NoSpaceLeft => {},
+                    }
+                }
+            }
+            if (refuse) {
+                closeFd(conn.fd);
+                _ = self.rx().clients.free(id);
+                self.stats.onAccept();
+                return;
+            }
+            // WebSocket adapter state first (HTTP upgrade, frame (de)coding).
+            const ws = try self.allocator.create(WsState);
+            ws.* = .{};
+            errdefer {
+                conn.ws = null;
+                self.allocator.destroy(ws);
+            }
+            conn.ws = ws;
+            // Then the SAME TLS engine as the implicit-TLS listener, so the leg
+            // is genuine wss under the daemon's real certificate. The cert-less
+            // path is only reachable in the gated `ws_allow_plain` testing mode
+            // (the listener does not exist otherwise).
+            if (certReady(self.config)) {
+                const tls = try self.allocator.create(tls_conn.TlsConn);
+                if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
+                    tls.* = tls_conn.TlsConn.initDual(self.allocator, self.tls13Config(), .{
+                        .cert_chain = self.config.tls12_cert_chain,
+                        .ecdsa_p256_signing_key = self.config.tls12_signing_key,
+                        .rsa_signing_key = self.config.tls_rsa_signing_key,
+                    });
+                } else {
+                    tls.* = tls_conn.TlsConn.init(self.allocator, self.tls13Config()) catch {
+                        self.allocator.destroy(tls);
+                        conn.ws = null;
+                        self.allocator.destroy(ws);
+                        closeFd(conn.fd);
+                        _ = self.rx().clients.free(id);
+                        self.stats.onAccept();
+                        return;
+                    };
+                }
+                conn.tls = tls;
+                conn.is_tls = true;
+            }
+            // Tear the TLS engine back down if arming the first recv fails (the
+            // inner block's scope has ended, so this guard lives out here).
+            errdefer if (conn.tls) |t| {
+                t.deinit();
+                self.allocator.destroy(t);
+                conn.tls = null;
+            };
+            self.injectSessionState(conn);
+            try self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf);
+            self.stats.onAccept();
+            self.traceLog(.info, .net, "ws client accepted");
             return;
         }
 
@@ -2933,6 +3101,10 @@ pub const LinuxServer = struct {
                 self.driveS2s(conn, link, chunk);
             } else if (conn.tls != null) {
                 try self.driveTls(id, conn, chunk);
+            } else if (conn.ws != null) {
+                // Plain-ws testing mode only (the production ws listener always
+                // carries TLS, so its bytes route through driveTls above).
+                try self.driveWs(id, conn, chunk);
             } else {
                 try self.feedBytes(id, conn, chunk);
             }
@@ -3386,6 +3558,11 @@ pub const LinuxServer = struct {
                 self.allocator.destroy(t);
                 conn.tls = null;
             }
+            // And the WebSocket adapter, if any.
+            if (conn.ws) |w| {
+                self.allocator.destroy(w);
+                conn.ws = null;
+            }
             // Release this connection's clone-limiter slot (only if it was counted;
             // refused accepts and addr-less peers never registered).
             if (conn.clone_counted) {
@@ -3477,7 +3654,60 @@ pub const LinuxServer = struct {
             };
         }
         if (outcome.plaintext.len != 0) {
-            try self.feedBytes(id, conn, outcome.plaintext);
+            if (conn.ws != null) {
+                // wss browser client: decrypted bytes are HTTP-upgrade/WebSocket
+                // frames, not bare IRC lines.
+                try self.driveWs(id, conn, outcome.plaintext);
+            } else {
+                try self.feedBytes(id, conn, outcome.plaintext);
+            }
+        }
+    }
+
+    /// Drive a WebSocket client's decrypted (or, in the gated plain-ws testing
+    /// mode, raw) inbound bytes: finish the HTTP/1.1 Upgrade first, then deframe
+    /// RFC 6455 frames and feed data payloads into the normal IRC line buffer.
+    /// Handshake and frame faults close only this connection (the same
+    /// per-connection firewall as driveTls / processLiveLine).
+    fn driveWs(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, bytes: []const u8) !void {
+        const ws = conn.ws.?;
+        var rest = bytes;
+        if (ws.phase == .handshake) {
+            // The queued 101/refusal bytes are flushed by handleRecv's
+            // armSendIfNeeded after this call returns.
+            rest = wsDriveHandshake(conn, ws, rest) orelse return;
+            if (ws.phase != .open) return; // request head still incomplete
+        }
+        if (rest.len == 0) return;
+        ws.deframer.feed(rest) catch {
+            conn.closing = true;
+            return;
+        };
+        while (true) {
+            const event = ws.deframer.next() catch {
+                conn.closing = true;
+                return;
+            } orelse break;
+            switch (event) {
+                .data => |d| {
+                    try self.feedBytes(id, conn, d.payload);
+                    if (conn.closing) return;
+                    // IRCv3 WebSocket convention: the frame boundary terminates
+                    // the IRC message even without a trailing CRLF. Synthesize
+                    // one so both frame-per-message clients and CRLF-framing
+                    // clients parse identically.
+                    if (d.fin and conn.line_len != 0) try self.feedBytes(id, conn, "\r\n");
+                    if (conn.closing) return;
+                },
+                .ping => |payload| wsQueueControl(conn, .pong, payload),
+                .pong => {},
+                .close => |payload| {
+                    // Echo the close (status code included) and drain-close.
+                    wsQueueControl(conn, .close, payload);
+                    conn.closing = true;
+                    return;
+                },
+            }
         }
     }
 
@@ -12827,9 +13057,19 @@ const Buf = struct {
 };
 
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
-    // Implicit-TLS: once the handshake is live, every app-layer write is encrypted
-    // into TLS records before it reaches the wire buffer. Pre-handshake writes (the
-    // server's own handshake flight, queued by driveTls) pass through untouched.
+    // WebSocket clients: once upgraded, outbound IRC bytes are cut on CRLF
+    // boundaries and wrapped one-line-per-text-frame before the TLS seam. The
+    // HTTP 101/refusal responses themselves bypass this (phase != .open yet).
+    if (conn.ws) |ws| {
+        if (ws.phase == .open) return wsAppendToConn(conn, ws, bytes);
+    }
+    return appendSecuredToConn(conn, bytes);
+}
+
+/// TLS seam: once the handshake is live, every app-layer write is encrypted
+/// into TLS records before it reaches the wire buffer. Pre-handshake writes (the
+/// server's own handshake flight, queued by driveTls) pass through untouched.
+fn appendSecuredToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     if (conn.tls) |t| {
         if (t.handshakeDone()) {
             const ciphertext = t.write(bytes) catch return error.OutputTooSmall;
@@ -12837,6 +13077,109 @@ fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
         }
     }
     return rawAppendToConn(conn, bytes);
+}
+
+/// Cut the outbound byte stream on CRLF boundaries and emit one WebSocket text
+/// frame per complete IRC line (CRLF stripped, per the IRCv3 WebSocket
+/// convention). A line delivered across several appends (tag prefix + body) is
+/// accumulated in `tx_buf` until its terminator arrives.
+fn wsAppendToConn(conn: *ConnState, ws: *WsState, bytes: []const u8) ServerError!void {
+    var rest = bytes;
+    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        const seg = rest[0 .. nl + 1];
+        rest = rest[nl + 1 ..];
+        var line: []const u8 = seg;
+        if (ws.tx_len != 0) {
+            if (ws.tx_len + seg.len > ws.tx_buf.len) return error.OutputTooSmall;
+            @memcpy(ws.tx_buf[ws.tx_len..][0..seg.len], seg);
+            line = ws.tx_buf[0 .. ws.tx_len + seg.len];
+            ws.tx_len = 0;
+        }
+        // Strip the terminator ('\n', plus a preceding '\r' when present).
+        var end = line.len - 1;
+        if (end > 0 and line[end - 1] == '\r') end -= 1;
+        try wsFrameOut(conn, line[0..end]);
+    }
+    if (rest.len != 0) {
+        if (ws.tx_len + rest.len > ws.tx_buf.len) return error.OutputTooSmall;
+        @memcpy(ws.tx_buf[ws.tx_len..][0..rest.len], rest);
+        ws.tx_len += rest.len;
+    }
+}
+
+/// Wrap one finished IRC line in an unmasked server-to-client text frame and
+/// hand it to the TLS seam (one frame = one TLS record on a wss leg).
+fn wsFrameOut(conn: *ConnState, line: []const u8) ServerError!void {
+    var frame_buf: [WsState.max_frame + 10]u8 = undefined;
+    const frame = websocket.encodeFrame(WsState.max_frame, .{ .opcode = .text }, line, &frame_buf) catch
+        return error.OutputTooSmall;
+    return appendSecuredToConn(conn, frame);
+}
+
+/// Queue a small control frame (pong / close echo; payload <= 125 bytes per
+/// RFC 6455 §5.5). Best-effort: an over-long payload is simply dropped and a
+/// full send buffer drain-closes the connection.
+fn wsQueueControl(conn: *ConnState, opcode: websocket.Opcode, payload: []const u8) void {
+    var frame_buf: [2 + 125]u8 = undefined;
+    const frame = websocket.encodeFrame(125, .{ .opcode = opcode }, payload, &frame_buf) catch return;
+    appendSecuredToConn(conn, frame) catch {
+        conn.closing = true;
+    };
+}
+
+/// Accumulate HTTP Upgrade bytes for a handshake-phase WebSocket connection.
+/// On a complete request head: validate it, queue the 101 (with the computed
+/// Sec-WebSocket-Accept) and flip to `.open`, returning any bytes that arrived
+/// pipelined behind the request (early frames). Returns an empty slice while
+/// the head is still incomplete, and null when the request was refused (an
+/// HTTP error response is queued and the connection drain-closes).
+///
+/// permessage-deflate is deliberately NOT negotiated: omitting the extension
+/// from the 101 is RFC 7692-compliant and clients fall back to plain frames.
+fn wsDriveHandshake(conn: *ConnState, ws: *WsState, bytes: []const u8) ?[]const u8 {
+    if (ws.http_len + bytes.len > ws.http_buf.len) {
+        wsRefuseHttp(conn, "400 Bad Request");
+        return null;
+    }
+    @memcpy(ws.http_buf[ws.http_len..][0..bytes.len], bytes);
+    ws.http_len += bytes.len;
+
+    const head_end = std.mem.indexOf(u8, ws.http_buf[0..ws.http_len], "\r\n\r\n") orelse
+        return ws.http_buf[0..0];
+    const request = ws.http_buf[0 .. head_end + 4];
+
+    var response_buf: [websocket.MAX_RESPONSE_LEN]u8 = undefined;
+    const response = websocket.buildHandshakeResponse(request, &response_buf) catch |err| {
+        // A well-formed GET that simply isn't a WebSocket upgrade gets the
+        // RFC 6455 §4.2.2 hint; everything else is a plain bad request.
+        switch (err) {
+            error.MissingUpgrade,
+            error.InvalidUpgrade,
+            error.MissingConnection,
+            error.InvalidConnection,
+            error.MissingVersion,
+            error.UnsupportedVersion,
+            => wsRefuseHttp(conn, "426 Upgrade Required"),
+            else => wsRefuseHttp(conn, "400 Bad Request"),
+        }
+        return null;
+    };
+    appendSecuredToConn(conn, response) catch {
+        conn.closing = true;
+        return null;
+    };
+    ws.phase = .open;
+    return ws.http_buf[head_end + 4 .. ws.http_len];
+}
+
+/// Queue a terse HTTP refusal for a non-upgrade (or malformed) request on the
+/// ws listener and drain-close the connection.
+fn wsRefuseHttp(conn: *ConnState, comptime status: []const u8) void {
+    const upgrade_hint = if (comptime std.mem.startsWith(u8, status, "426")) "Upgrade: websocket\r\n" else "";
+    const response = "HTTP/1.1 " ++ status ++ "\r\n" ++ upgrade_hint ++
+        "Connection: close\r\nContent-Length: 0\r\n\r\n";
+    appendSecuredToConn(conn, response) catch {};
+    conn.closing = true;
 }
 
 fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
@@ -14859,6 +15202,345 @@ test "threaded server: implicit-TLS client handshakes + registers over the wire"
         }
     }
     try expectContains(plain.items, " 001 T ");
+}
+
+test "threaded server: ws upgrade + framed registration (plain testing mode)" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .ws_enabled = true,
+        .ws_port = 0,
+        .ws_allow_plain = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const ws_port = try server.wsBoundPort();
+    const plain_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+
+    // HTTP/1.1 Upgrade with the canonical RFC 6455 sample key, so the expected
+    // Sec-WebSocket-Accept value is the well-known constant.
+    try writeAllFd(fd, "GET /irc HTTP/1.1\r\n" ++
+        "Host: irc.test:8080\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+
+    var rbuf: [4096]u8 = undefined;
+    var head: std.ArrayList(u8) = .empty;
+    defer head.deinit(alloc);
+    var guard: usize = 0;
+    while (std.mem.indexOf(u8, head.items, "\r\n\r\n") == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try head.appendSlice(alloc, rbuf[0..n]);
+    }
+    try expectContains(head.items, "HTTP/1.1 101 Switching Protocols");
+    try expectContains(head.items, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+    // Registration framed one-message-per-frame WITHOUT a trailing CRLF (the
+    // IRCv3 WebSocket convention; the server synthesizes the terminator) and
+    // masked, as clients MUST mask.
+    var fbuf: [256]u8 = undefined;
+    try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .text, .mask_key = .{ 1, 2, 3, 4 } }, "NICK WS", &fbuf));
+    try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .text, .mask_key = .{ 5, 6, 7, 8 } }, "USER w 0 * :Web Tester", &fbuf));
+
+    // The welcome burst must come back FRAMED: unmasked server text frames
+    // whose concatenated payloads contain the 001.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(alloc);
+    try wire.appendSlice(alloc, head.items[std.mem.indexOf(u8, head.items, "\r\n\r\n").? + 4 ..]);
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(alloc);
+    guard = 0;
+    outer: while (true) : (guard += 1) {
+        if (guard > 256) return error.TestUnexpectedResult;
+        while (true) {
+            const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
+                error.Truncated => break,
+                else => return err,
+            };
+            try std.testing.expectEqual(websocket.Opcode.text, res.frame.opcode);
+            try std.testing.expect(!res.frame.masked); // servers MUST NOT mask
+            try lines.appendSlice(alloc, res.frame.payload);
+            try lines.append(alloc, '\n');
+            std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
+            wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
+            if (std.mem.indexOf(u8, lines.items, " 001 WS ") != null) break :outer;
+        }
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try wire.appendSlice(alloc, rbuf[0..n]);
+    }
+    try expectContains(lines.items, " 001 WS ");
+
+    // Control plane: a masked client ping is answered with an unmasked pong
+    // echoing the payload (RFC 6455 §5.5.2/§5.5.3).
+    try writeAllFd(fd, try websocket.encodeFrame(256, .{ .opcode = .ping, .mask_key = .{ 9, 9, 9, 9 } }, "hb", &fbuf));
+    guard = 0;
+    while (true) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
+            error.Truncated => {
+                const n = try readFd(fd, &rbuf);
+                if (n == 0) return error.TestUnexpectedResult;
+                try wire.appendSlice(alloc, rbuf[0..n]);
+                continue;
+            },
+            else => return err,
+        };
+        const got_pong = res.frame.opcode == .pong;
+        if (got_pong) try std.testing.expectEqualStrings("hb", res.frame.payload);
+        std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
+        wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
+        if (got_pong) break;
+    }
+}
+
+test "threaded server: wss listener — TLS handshake, upgrade, framed welcome" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    // Self-signed Ed25519 leaf, exactly like the implicit-TLS listener test:
+    // the wss listener must serve the SAME certificate material.
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x52} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x52, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{der};
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = kp,
+        .ws_enabled = true,
+        .ws_port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const ws_port = try server.wsBoundPort();
+    const plain_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+    defer client.deinit();
+
+    // TLS 1.3 handshake on the ws port — the same engine as the TLS listener.
+    const ch = try client.start();
+    defer alloc.free(ch);
+    try writeAllFd(fd, ch);
+    var rbuf: [4096]u8 = undefined;
+    var guard: usize = 0;
+    while (!client.handshakeDone()) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        switch (try client.feed(rbuf[0..n])) {
+            .bytes_to_send => |b| {
+                defer alloc.free(b);
+                try writeAllFd(fd, b);
+            },
+            .need_more => {},
+        }
+    }
+
+    // HTTP/1.1 WebSocket upgrade THROUGH the encrypted channel (genuine wss).
+    const upgrade = try client.encrypt("GET /irc HTTP/1.1\r\n" ++
+        "Host: irc.test:8080\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+    defer alloc.free(upgrade);
+    try writeAllFd(fd, upgrade);
+
+    // Read + decrypt records until the 101 head completes.
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(alloc);
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(alloc);
+    guard = 0;
+    while (std.mem.indexOf(u8, plain.items, "\r\n\r\n") == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try cipher.appendSlice(alloc, rbuf[0..n]);
+        // Drain every complete TLS record (5-byte header + big-endian length).
+        while (cipher.items.len >= 5) {
+            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+            const wire_len = 5 + @as(usize, body_len);
+            if (cipher.items.len < wire_len) break;
+            switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                .application_data => |pt| {
+                    defer alloc.free(pt);
+                    try plain.appendSlice(alloc, pt);
+                },
+                .control => {},
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+        }
+    }
+    try expectContains(plain.items, "HTTP/1.1 101 Switching Protocols");
+    try expectContains(plain.items, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+    // Registration as a masked client text frame carrying CRLF-framed lines
+    // (the other inbound style; the plain-ws test covers frame-per-message).
+    var fbuf: [256]u8 = undefined;
+    const reg_frame = try websocket.encodeFrame(
+        256,
+        .{ .opcode = .text, .mask_key = .{ 0xa, 0xb, 0xc, 0xd } },
+        "NICK WSS\r\nUSER w 0 * :Web Tester\r\n",
+        &fbuf,
+    );
+    const reg = try client.encrypt(reg_frame);
+    defer alloc.free(reg);
+    try writeAllFd(fd, reg);
+
+    // Decrypt + deframe until the framed 001 arrives.
+    const head_len = std.mem.indexOf(u8, plain.items, "\r\n\r\n").? + 4;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(alloc);
+    try wire.appendSlice(alloc, plain.items[head_len..]);
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(alloc);
+    guard = 0;
+    outer: while (true) : (guard += 1) {
+        if (guard > 256) return error.TestUnexpectedResult;
+        while (true) {
+            const res = websocket.decodeFrame(8192, .server_to_client, wire.items, &.{}) catch |err| switch (err) {
+                error.Truncated => break,
+                else => return err,
+            };
+            try std.testing.expectEqual(websocket.Opcode.text, res.frame.opcode);
+            try std.testing.expect(!res.frame.masked);
+            try lines.appendSlice(alloc, res.frame.payload);
+            try lines.append(alloc, '\n');
+            std.mem.copyForwards(u8, wire.items[0 .. wire.items.len - res.consumed], wire.items[res.consumed..]);
+            wire.shrinkRetainingCapacity(wire.items.len - res.consumed);
+            if (std.mem.indexOf(u8, lines.items, " 001 WSS ") != null) break :outer;
+        }
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try cipher.appendSlice(alloc, rbuf[0..n]);
+        while (cipher.items.len >= 5) {
+            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+            const wire_len = 5 + @as(usize, body_len);
+            if (cipher.items.len < wire_len) break;
+            switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                .application_data => |pt| {
+                    defer alloc.free(pt);
+                    try wire.appendSlice(alloc, pt);
+                },
+                .control => {},
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+        }
+    }
+    try expectContains(lines.items, " 001 WSS ");
+}
+
+test "threaded server: ws listener rejects a non-upgrade HTTP request" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .ws_enabled = true,
+        .ws_port = 0,
+        .ws_allow_plain = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const ws_port = try server.wsBoundPort();
+    const plain_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // A plain GET without the WebSocket headers gets a clean 426 + close, and
+    // the server keeps running (a fresh client can still register: the
+    // per-connection error firewall held).
+    const fd = connectLoopback(ws_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    try writeAllFd(fd, "GET / HTTP/1.1\r\nHost: irc.test\r\n\r\n");
+    var rbuf: [1024]u8 = undefined;
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    var guard: usize = 0;
+    while (std.mem.indexOf(u8, got.items, "\r\n\r\n") == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) break; // server may close right after the refusal
+        try got.appendSlice(alloc, rbuf[0..n]);
+    }
+    try expectContains(got.items, "HTTP/1.1 426 Upgrade Required");
+    try expectContains(got.items, "Upgrade: websocket");
+
+    // The reactor survived: a second, well-formed upgrade still works.
+    const fd2 = connectLoopback(ws_port) catch return error.SkipZigTest;
+    defer closeFd(fd2);
+    try writeAllFd(fd2, "GET /irc HTTP/1.1\r\n" ++
+        "Host: irc.test\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n");
+    var head2: std.ArrayList(u8) = .empty;
+    defer head2.deinit(alloc);
+    guard = 0;
+    while (std.mem.indexOf(u8, head2.items, "\r\n\r\n") == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd2, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try head2.appendSlice(alloc, rbuf[0..n]);
+    }
+    try expectContains(head2.items, "HTTP/1.1 101 Switching Protocols");
 }
 
 test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {

@@ -140,8 +140,15 @@ cmd_cooldown_ms = 3000
 host = "0.0.0.0"
 # REQUIRED. Plaintext IRC port. Must be non-zero.
 irc = 6667
-# WebSocket port for browser clients (0 = disabled).
+# Secure-WebSocket (wss) port for browser clients (0 = disabled). The listener
+# reuses the [tls] certificate: clients connect with wss:// (e.g.
+# wss://eshmaki.me:8080), the daemon completes the TLS + HTTP/1.1 WebSocket
+# upgrade, and the connection then behaves as a normal IRC client (one IRC
+# message per text frame, RFC 6455). Requires [tls] enabled.
 ws = 0
+# TESTING ONLY: stand the ws listener up WITHOUT TLS (plain ws://) when no
+# certificate is configured. Browsers require wss in production; default off.
+ws_plain = false
 # WebTransport (HTTP/3) port for browser clients (0 = disabled).
 webtransport = 0
 # Server-to-server (mesh) listener port (0 = disabled / leaf node).
