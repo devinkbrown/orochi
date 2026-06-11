@@ -24,6 +24,7 @@ pub const ocsp = @import("ocsp.zig");
 pub const pake = @import("pake.zig");
 pub const random = @import("random.zig");
 pub const ratchet = @import("ratchet.zig");
+pub const rsa_sign = @import("rsa_sign.zig");
 pub const rsa_verify = @import("rsa_verify.zig");
 pub const sasl_scram_client = @import("sasl_scram_client.zig");
 pub const sct = @import("sct.zig");
@@ -82,6 +83,7 @@ test {
     _ = pake;
     _ = random;
     _ = ratchet;
+    _ = rsa_sign;
     _ = rsa_verify;
     _ = sasl_scram_client;
     _ = sct;

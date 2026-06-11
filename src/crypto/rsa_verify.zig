@@ -81,19 +81,19 @@ inline fn mulAddWord(a: u64, b: u64, acc: u64, carry: u64) Wide {
 // Fixed-capacity big integer (little-endian limbs).
 // ---------------------------------------------------------------------------
 
-const Big = struct {
+pub const Big = struct {
     limbs: [max_limbs]u64 = [_]u64{0} ** max_limbs,
     len: usize = 0, // number of significant limbs (no trailing zero limb)
 
-    fn normalize(self: *Big) void {
+    pub fn normalize(self: *Big) void {
         while (self.len > 0 and self.limbs[self.len - 1] == 0) self.len -= 1;
     }
 
-    fn isZero(self: *const Big) bool {
+    pub fn isZero(self: *const Big) bool {
         return self.len == 0;
     }
 
-    fn fromBytesBE(bytes: []const u8) Error!Big {
+    pub fn fromBytesBE(bytes: []const u8) Error!Big {
         if (bytes.len > max_bytes) return error.TooLarge;
         var b = Big{};
         // Walk big-endian bytes least-significant first, packing into u64 limbs.
@@ -117,7 +117,7 @@ const Big = struct {
     }
 
     /// Write big-endian into `out` (left-zero-padded to out.len).
-    fn toBytesBE(self: *const Big, out: []u8) void {
+    pub fn toBytesBE(self: *const Big, out: []u8) void {
         @memset(out, 0);
         var limb_idx: usize = 0;
         while (limb_idx < self.len) : (limb_idx += 1) {
@@ -132,7 +132,7 @@ const Big = struct {
     }
 
     /// Compare self vs other: .lt / .eq / .gt.
-    fn cmp(self: *const Big, other: *const Big) std.math.Order {
+    pub fn cmp(self: *const Big, other: *const Big) std.math.Order {
         if (self.len != other.len) return if (self.len < other.len) .lt else .gt;
         var i = self.len;
         while (i > 0) {
@@ -145,7 +145,7 @@ const Big = struct {
     }
 
     /// self -= other (requires self >= other).
-    fn subAssign(self: *Big, other: *const Big) void {
+    pub fn subAssign(self: *Big, other: *const Big) void {
         var borrow: u64 = 0;
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
@@ -162,7 +162,7 @@ const Big = struct {
     }
 
     /// product = a * b (schoolbook, asm-accelerated inner loop).
-    fn mul(a: *const Big, b: *const Big) Big {
+    pub fn mul(a: *const Big, b: *const Big) Big {
         var p = Big{};
         if (a.isZero() or b.isZero()) return p;
         var j: usize = 0;
@@ -183,20 +183,20 @@ const Big = struct {
     }
 
     /// Test bit `idx` (0 = least significant).
-    fn bit(self: *const Big, idx: usize) u1 {
+    pub fn bit(self: *const Big, idx: usize) u1 {
         const limb = idx / 64;
         if (limb >= self.len) return 0;
         return @truncate(self.limbs[limb] >> @intCast(idx % 64));
     }
 
-    fn bitLen(self: *const Big) usize {
+    pub fn bitLen(self: *const Big) usize {
         if (self.len == 0) return 0;
         const top = self.limbs[self.len - 1];
         return (self.len - 1) * 64 + (64 - @clz(top));
     }
 
     /// self <<= 1.
-    fn shlOne(self: *Big) void {
+    pub fn shlOne(self: *Big) void {
         var carry: u64 = 0;
         var i: usize = 0;
         const limbs_to_touch = @min(self.len + 1, max_limbs);
@@ -210,7 +210,7 @@ const Big = struct {
     }
 
     /// Reduce x modulo n via textbook binary long division; returns x mod n.
-    fn mod(x: *const Big, n: *const Big) Big {
+    pub fn mod(x: *const Big, n: *const Big) Big {
         var r = Big{};
         if (n.isZero()) return r;
         var i = x.bitLen();
@@ -230,7 +230,7 @@ const Big = struct {
 
 /// out = base^exp mod n (all big-endian byte slices). `out` is the modulus
 /// byte length, left-zero-padded.
-fn modExp(base_be: []const u8, exp_be: []const u8, mod_be: []const u8, out: []u8) Error!void {
+pub fn modExp(base_be: []const u8, exp_be: []const u8, mod_be: []const u8, out: []u8) Error!void {
     const n = try Big.fromBytesBE(mod_be);
     const e = try Big.fromBytesBE(exp_be);
     var b = try Big.fromBytesBE(base_be);
@@ -316,7 +316,7 @@ pub fn verifyPkcs1v15(pub_key: PublicKey, alg: HashAlg, digest: []const u8, sign
 }
 
 /// MGF1 mask generation (RFC 8017 §B.2.1) with the given hash.
-fn mgf1(alg: HashAlg, seed: []const u8, mask: []u8) void {
+pub fn mgf1(alg: HashAlg, seed: []const u8, mask: []u8) void {
     const h_len = alg.digestLen();
     var counter: u32 = 0;
     var off: usize = 0;
