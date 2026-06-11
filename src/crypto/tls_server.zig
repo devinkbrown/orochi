@@ -90,10 +90,19 @@ pub const Config = struct {
     /// Lifetime advertised in NewSessionTicket.
     ticket_lifetime_seconds: u32 = 86_400,
     /// Maximum TLS 1.3 early data bytes advertised in NewSessionTicket and
-    /// sealed into the local ticket. Zero disables 0-RTT acceptance. This module
-    /// does not implement anti-replay; callers must layer single-use tickets or
-    /// a replay cache above it before accepting non-idempotent early data.
+    /// sealed into the local ticket. Zero disables 0-RTT acceptance.
     max_early_data_size: u32 = 0,
+    /// Current wall-clock time (Unix seconds), supplied by the caller (this pure
+    /// engine takes no clock). When set, it stamps issued NewSessionTickets and
+    /// enforces the ticket lifetime on resumption (expired/future tickets are
+    /// rejected, falling back to a full handshake). When null, lifetime is not
+    /// enforced (back-compatible).
+    now_unix_seconds: ?i64 = null,
+    /// Shared 0-RTT anti-replay guard. When set, accepted-early-data is gated on
+    /// the guard (a replayed PSK binder still resumes via 1-RTT but its early
+    /// data is not accepted). The caller owns it and must serialize access if it
+    /// is shared across threads. Null keeps the prior no-anti-replay behavior.
+    replay_guard: ?*tls_resumption.ReplayGuard = null,
 };
 
 pub const SigningKey = union(enum) {
@@ -190,6 +199,9 @@ pub const Server = struct {
     early_data_accepted: bool = false,
     early_data_done: bool = false,
     accepted_early_data_limit: u32 = 0,
+    /// PSK binder of the accepted resumption (for the 0-RTT anti-replay check).
+    accepted_binder: [tls_resumption.max_binder_len]u8 = undefined,
+    accepted_binder_len: usize = 0,
     legacy_session_id: [32]u8 = [_]u8{0} ** 32,
     session_id_len: usize = 0,
 
@@ -676,7 +688,14 @@ pub const Server = struct {
                 if (try self.tryAcceptPsk(suites_block, raw, ext)) |suite| {
                     self.selected_suite = suite;
                     self.resumed = true;
-                    if (offered_early_data and self.accepted_early_data_limit > 0) {
+                    // Accept 0-RTT only when the limit is non-zero AND this PSK
+                    // binder has not been seen before (anti-replay). A replay
+                    // still resumes via 1-RTT; only its early data is refused.
+                    const replay_ok = if (self.config.replay_guard) |g|
+                        g.checkAndRecord(self.accepted_binder[0..self.accepted_binder_len])
+                    else
+                        true;
+                    if (offered_early_data and self.accepted_early_data_limit > 0 and replay_ok) {
                         self.early_data_accepted = true;
                         self.early_data_done = false;
                         try self.deriveClientEarlyTrafficKeys();
@@ -716,6 +735,17 @@ pub const Server = struct {
         if (opened.opened.psk.len != suite.hashLen()) return null;
         if (binder.len != suite.hashLen()) return null;
 
+        // Ticket-lifetime enforcement (when the caller supplies a clock and the
+        // ticket carries a real issue time): reject expired or future tickets,
+        // falling back to a full handshake.
+        if (self.config.now_unix_seconds) |now_s| {
+            const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
+            if (issued_s != 0) {
+                if (now_s < issued_s) return null;
+                if (now_s - issued_s > @as(i64, self.config.ticket_lifetime_seconds)) return null;
+            }
+        }
+
         const binder_list_offset = tls_psk.binderListOffset(psk_ext) catch return null;
         const psk_body_offset = findPskExtensionBodyOffset(client_hello_raw) catch return null;
         const truncated_len = psk_body_offset + binder_list_offset;
@@ -725,6 +755,8 @@ pub const Server = struct {
         @memcpy(self.accepted_psk[0..opened.opened.psk.len], opened.opened.psk);
         self.accepted_psk_len = opened.opened.psk.len;
         self.accepted_early_data_limit = opened.opened.max_early_data_size;
+        @memcpy(self.accepted_binder[0..binder.len], binder);
+        self.accepted_binder_len = binder.len;
         return suite;
     }
 
@@ -1060,7 +1092,7 @@ pub const Server = struct {
             @intFromEnum(suite),
             psk[0..psk_len],
             &ticket_nonce,
-            currentUnixMs(),
+            if (self.config.now_unix_seconds) |s| s * 1000 else 0,
             self.config.max_early_data_size,
         );
         defer self.allocator.free(sealed);
@@ -1302,13 +1334,6 @@ fn osEntropy(buf: []u8) Error!void {
 
 fn secureZero(buf: []u8) void {
     std.crypto.secureZero(u8, buf);
-}
-
-fn currentUnixMs() i64 {
-    // Zig 0.16's minimal std.time surface in this environment has no wall-clock
-    // syscall wrapper. The sealed ticket still carries the issued_time field;
-    // lifetime enforcement is left to the caller's ticket-retention policy.
-    return 0;
 }
 
 fn writePlainRecord(allocator: Allocator, typ: tls_record.ContentType, fragment: []const u8) Error![]u8 {
@@ -1773,6 +1798,171 @@ test "loopback: TLS 1.3 PSK-DHE resumption accepts 0-RTT early data" {
     const got_s = try resumed_server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("early up", got_s);
+}
+
+test "loopback: an expired resumption ticket is rejected (lifetime enforced)" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xB1} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xB1, 0x13 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    const t0: i64 = 1_700_000_000;
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .ticket_lifetime_seconds = 100,
+        .now_unix_seconds = t0, // stamps the ticket's issue time
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    _ = try client.decryptApp(ticket_record);
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    // Resume past the 100s lifetime: the server must refuse the PSK and run a
+    // full handshake (no resumption).
+    var resumed_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .ticket_lifetime_seconds = 100,
+        .now_unix_seconds = t0 + 101,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, 0);
+
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    const rsflight = switch (try resumed_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rsflight);
+    try std.testing.expect(!resumed_server.acceptedSessionTicket());
+}
+
+test "loopback: a replayed 0-RTT ClientHello is resumed but its early data refused" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0xC2} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0xC2, 0x13 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+        .max_early_data_size = 4096,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    _ = try client.decryptApp(ticket_record);
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, 0);
+    try resumed_client.setEarlyData("REPLAY ME");
+    const rch = try resumed_client.start(); // the exact bytes an attacker would replay
+    defer alloc.free(rch);
+
+    var guard = tls_resumption.ReplayGuard{};
+
+    // First delivery: 0-RTT accepted.
+    var server_a = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+        .replay_guard = &guard,
+    });
+    defer server_a.deinit();
+    const a_flight = switch (try server_a.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(a_flight);
+    try std.testing.expect(server_a.acceptedSessionTicket());
+    try std.testing.expect(server_a.earlyDataAccepted());
+
+    // Replay of the identical ClientHello to a second server sharing the guard:
+    // still resumes (1-RTT) but the early data is refused.
+    var server_b = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+        .max_early_data_size = 4096,
+        .replay_guard = &guard,
+    });
+    defer server_b.deinit();
+    const b_flight = switch (try server_b.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(b_flight);
+    try std.testing.expect(server_b.acceptedSessionTicket());
+    try std.testing.expect(!server_b.earlyDataAccepted());
 }
 
 test "loopback: TLS 1.3 PSK-DHE resumption rejects 0-RTT when sealed ticket limit is zero" {

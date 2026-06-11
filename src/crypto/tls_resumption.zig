@@ -47,6 +47,60 @@ pub const StoredSession = struct {
     max_early_data_size: u32 = 0,
 };
 
+/// Largest PSK binder this guard retains (SHA-384 digest size).
+pub const max_binder_len: usize = max_hash_len;
+
+/// Bounded single-use guard against 0-RTT early-data replay (RFC 8446 §8): it
+/// records the PSK binders of accepted 0-RTT attempts and reports a repeat as a
+/// replay. A fixed ring of `capacity` recent binders bounds memory; a binder
+/// evicted after `capacity` distinct attempts could be replayed, but the ticket
+/// lifetime window bounds that exposure further.
+///
+/// NOT internally synchronized: a caller sharing one guard across threads must
+/// serialize `checkAndRecord` (the live daemon would hold a lock around it).
+pub const ReplayGuard = struct {
+    pub const capacity: usize = 2048;
+
+    entries: [capacity][max_binder_len]u8 = undefined,
+    lens: [capacity]u8 = [_]u8{0} ** capacity,
+    next: usize = 0,
+    wrapped: bool = false,
+
+    /// Returns true when `binder` is fresh (and records it); false when it was
+    /// already seen (a replay) or is malformed.
+    pub fn checkAndRecord(self: *ReplayGuard, binder: []const u8) bool {
+        if (binder.len == 0 or binder.len > max_binder_len) return false;
+        const limit = if (self.wrapped) capacity else self.next;
+        var i: usize = 0;
+        while (i < limit) : (i += 1) {
+            if (self.lens[i] == binder.len and
+                std.mem.eql(u8, self.entries[i][0..binder.len], binder))
+            {
+                return false;
+            }
+        }
+        @memcpy(self.entries[self.next][0..binder.len], binder);
+        self.lens[self.next] = @intCast(binder.len);
+        self.next += 1;
+        if (self.next == capacity) {
+            self.next = 0;
+            self.wrapped = true;
+        }
+        return true;
+    }
+};
+
+test "ReplayGuard reports repeats and bounds memory" {
+    var g = ReplayGuard{};
+    const a = [_]u8{0xAA} ** 32;
+    const b = [_]u8{0xBB} ** 48;
+    try std.testing.expect(g.checkAndRecord(&a)); // fresh
+    try std.testing.expect(!g.checkAndRecord(&a)); // replay
+    try std.testing.expect(g.checkAndRecord(&b)); // different
+    try std.testing.expect(!g.checkAndRecord(&b)); // replay
+    try std.testing.expect(!g.checkAndRecord("")); // malformed
+}
+
 /// Seal a server-side ticket blob with a caller-supplied AEAD nonce.
 pub fn sealTicket(
     allocator: Allocator,
