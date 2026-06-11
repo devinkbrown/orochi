@@ -82,6 +82,8 @@ const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
+const chathistory_targets = @import("../proto/chathistory_targets.zig");
+const msgedit = @import("../proto/msgedit.zig");
 const warden = @import("warden.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
@@ -5614,19 +5616,68 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Record a channel message into the CHATHISTORY ring (Lotus). msgid is a
-    /// monotonic server counter; sender is the full nick!user@host prefix.
-    fn recordHistory(self: *LinuxServer, target: []const u8, conn: *ConnState, text: []const u8) void {
-        self.msg_seq += 1;
+    fn lowerCopy(out: []u8, value: []const u8) ?[]const u8 {
+        if (value.len > out.len) return null;
+        for (value, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
+        return out[0..value.len];
+    }
+
+    fn bytesLess(a: []const u8, b: []const u8) bool {
+        const n = @min(a.len, b.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (a[i] != b[i]) return a[i] < b[i];
+        }
+        return a.len < b.len;
+    }
+
+    fn dmHistoryKey(a: []const u8, b: []const u8, out: []u8) ?[]const u8 {
+        var la_buf: [128]u8 = undefined;
+        var lb_buf: [128]u8 = undefined;
+        const la = lowerCopy(&la_buf, a) orelse return null;
+        const lb = lowerCopy(&lb_buf, b) orelse return null;
+        const first = if (bytesLess(la, lb)) la else lb;
+        const second = if (bytesLess(la, lb)) lb else la;
+        return std.fmt.bufPrint(out, "$dm:{s}:{s}", .{ first, second }) catch null;
+    }
+
+    fn historyKeyForTarget(self: *LinuxServer, conn: *ConnState, target: []const u8, out: []u8) []const u8 {
+        _ = self;
+        if (world_model.isChannelName(target)) return target;
+        return dmHistoryKey(conn.session.displayName(), target, out) orelse target;
+    }
+
+    /// Record a message into the CHATHISTORY ring (Lotus). The msgid is the same
+    /// server-minted IRCv3 `msgid` delivered to clients.
+    fn recordHistory(self: *LinuxServer, store_target: []const u8, conn: *ConnState, msgid: []const u8, text: []const u8) void {
         const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
-        // Unique, time-ordered, node-embedded msgid (falls back to the counter
-        // only if the snowflake clock overflows).
-        const sf = self.snowflake.next(ts) catch self.msg_seq;
-        var id_buf: [24]u8 = undefined;
-        const msgid = std.fmt.bufPrint(&id_buf, "{d}", .{sf}) catch return;
         var prefix_buf: [256]u8 = undefined;
         const sender = clientPrefix(conn, &prefix_buf) catch return;
-        _ = self.history.append(target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts }) catch {};
+        _ = self.history.append(store_target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts }) catch {};
+    }
+
+    fn latestActivityInWindow(
+        self: *LinuxServer,
+        store_target: []const u8,
+        query: chathistory_targets.TargetsQuery,
+    ) ?u64 {
+        if (query.to_ms < 0) return null;
+        const lo: u64 = if (query.from_ms <= 0) 0 else @intCast(query.from_ms);
+        const hi: u64 = @intCast(query.to_ms);
+        var one: [1]lotus.Message = undefined;
+        const found = self.history.before(store_target, hi +| 1, 1, &one) catch return null;
+        if (found.len == 0) return null;
+        if (found[0].timestamp < lo) return null;
+        return found[0].timestamp;
+    }
+
+    fn historyMessageByMsgid(self: *LinuxServer, store_target: []const u8, msgid: []const u8) ?lotus.Message {
+        var buf: [256]lotus.Message = undefined;
+        const found = self.history.latest(store_target, buf.len, &buf) catch return null;
+        for (found) |message| {
+            if (msgedit.authorizationKeyMatches(message.msgid, msgid)) return message;
+        }
+        return null;
     }
 
     /// Convert a fixed-width `YYYY-MM-DDThh:mm:ss.sssZ` read-marker timestamp to
@@ -5693,8 +5744,63 @@ pub const LinuxServer = struct {
         };
     }
 
-    pub fn handleChathistory(self: *LinuxServer, conn: *ConnState, line: []const u8) !void {
+    fn chathistoryTargetsFail(self: *LinuxServer, conn: *ConnState, err: chathistory_targets.ParseError) !void {
+        const reason: []const u8 = switch (err) {
+            error.NeedMoreParams => "Missing CHATHISTORY parameters",
+            else => "Invalid CHATHISTORY parameters",
+        };
+        try self.failReply(conn, "CHATHISTORY", "INVALID_PARAMS", reason);
+    }
+
+    fn handleChathistoryTargets(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+        const query = chathistory_targets.TargetsQuery.parse(line) catch |err| {
+            try self.chathistoryTargetsFail(conn, err);
+            return;
+        };
+
+        var index = chathistory_targets.TargetIndex.init(self.allocator, .{ .max_targets = 512, .max_query_limit = 64 });
+        defer index.deinit();
+
+        var chans: [128][]const u8 = undefined;
+        const chan_count = self.world.channelsOf(worldIdFromClient(id), &chans);
+        for (chans[0..chan_count]) |channel| {
+            if (self.latestActivityInWindow(channel, query)) |ts| {
+                index.touch(channel, @intCast(ts)) catch {};
+            }
+        }
+
+        const requester_wid = worldIdFromClient(id);
+        var nick_it = self.world.client_nicks.iterator();
+        while (nick_it.next()) |entry| {
+            if (entry.key_ptr.*.eql(requester_wid)) continue;
+            const peer = entry.value_ptr.*;
+            var key_buf: [320]u8 = undefined;
+            const store_key = dmHistoryKey(conn.session.displayName(), peer, &key_buf) orelse continue;
+            if (self.latestActivityInWindow(store_key, query)) |ts| {
+                index.touch(peer, @intCast(ts)) catch {};
+            }
+        }
+
+        var out: [64]chathistory_targets.Target = undefined;
+        const targets = index.query(query, &out) catch out[0..0];
+        var reply: [default_reply_bytes * 4]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&reply);
+        try writer.print("BATCH +1 chathistory-targets\r\n", .{});
+        for (targets) |target| {
+            var line_buf: [192]u8 = undefined;
+            const detail = chathistory_targets.formatTargetLine(&line_buf, target) catch continue;
+            try writer.print(":{s} CHATHISTORY TARGETS {s}\r\n", .{ self.serverName(), detail });
+        }
+        try writer.print("BATCH -1\r\n", .{});
+        try appendToConn(conn, writer.buffered());
+    }
+
+    pub fn handleChathistory(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
         const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        if (std.ascii.startsWithIgnoreCase(trimmed, "CHATHISTORY TARGETS")) {
+            try self.handleChathistoryTargets(id, conn, trimmed);
+            return;
+        }
         const req = chathistory_cmd.parse(trimmed) catch |err| {
             // IRCv3 chathistory: malformed requests get a typed standard reply,
             // `FAIL CHATHISTORY <code> :<reason>`, never silence.
@@ -5713,35 +5819,43 @@ pub const LinuxServer = struct {
         switch (req) {
             .latest => |r| {
                 target = r.target;
+                var key_buf: [320]u8 = undefined;
+                const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
-                found = self.history.latest(target, n, buf[0..n]) catch buf[0..0];
+                found = self.history.latest(store_target, n, buf[0..n]) catch buf[0..0];
             },
             .before => |r| {
                 target = r.target;
+                var key_buf: [320]u8 = undefined;
+                const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
                 // timestamp directly, or a msgid resolved to its timestamp.
-                if (self.resolveSelector(target, r.selector)) |ts| {
-                    found = self.history.before(target, ts, n, buf[0..n]) catch buf[0..0];
+                if (self.resolveSelector(store_target, r.selector)) |ts| {
+                    found = self.history.before(store_target, ts, n, buf[0..n]) catch buf[0..0];
                 }
             },
             .after => |r| {
                 target = r.target;
+                var key_buf: [320]u8 = undefined;
+                const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
-                if (self.resolveSelector(target, r.selector)) |ts| {
-                    found = self.history.after(target, ts, n, buf[0..n]) catch buf[0..0];
+                if (self.resolveSelector(store_target, r.selector)) |ts| {
+                    found = self.history.after(store_target, ts, n, buf[0..n]) catch buf[0..0];
                 }
             },
             .between => |r| {
                 target = r.target;
+                var key_buf: [320]u8 = undefined;
+                const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
                 // Collect oldest-first after the low bound, then trim to those
                 // strictly before the high bound. Each bound is a timestamp or a
                 // msgid resolved to its timestamp.
-                if (self.resolveSelector(target, r.start)) |s| {
-                    if (self.resolveSelector(target, r.end)) |e| {
+                if (self.resolveSelector(store_target, r.start)) |s| {
+                    if (self.resolveSelector(store_target, r.end)) |e| {
                         const lo = @min(s, e);
                         const hi = @max(s, e);
-                        const raw = self.history.after(target, lo, n, buf[0..n]) catch buf[0..0];
+                        const raw = self.history.after(store_target, lo, n, buf[0..n]) catch buf[0..0];
                         var k: usize = 0;
                         for (raw) |m| {
                             if (m.timestamp < hi) {
@@ -5755,20 +5869,22 @@ pub const LinuxServer = struct {
             },
             .around => |r| {
                 target = r.target;
+                var key_buf: [320]u8 = undefined;
+                const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 // Return up to `limit` messages centred on the pivot (a timestamp
                 // or a msgid resolved to its timestamp): ~half strictly before it
                 // (reversed to chronological order) followed by the pivot and
                 // later, oldest-first.
-                if (self.resolveSelector(target, r.center)) |center| {
+                if (self.resolveSelector(store_target, r.center)) |center| {
                     const total = @min(@as(usize, r.limit), buf.len);
                     const half = total / 2;
                     var before_buf: [64]lotus.Message = undefined;
                     var after_buf: [64]lotus.Message = undefined;
                     const bn = @min(half, before_buf.len);
-                    const before_part = self.history.before(target, center, bn, before_buf[0..bn]) catch before_buf[0..0];
+                    const before_part = self.history.before(store_target, center, bn, before_buf[0..bn]) catch before_buf[0..0];
                     const remaining = total - before_part.len;
                     const an = @min(remaining, after_buf.len);
-                    const after_part = self.history.after(target, center -| 1, an, after_buf[0..an]) catch after_buf[0..0];
+                    const after_part = self.history.after(store_target, center -| 1, an, after_buf[0..an]) catch after_buf[0..0];
                     var k: usize = 0;
                     var i: usize = before_part.len; // before_part is newest-first; emit reversed
                     while (i > 0 and k < buf.len) {
@@ -8398,6 +8514,22 @@ pub const LinuxServer = struct {
                 self.metadata.delete(store_target, key) catch {};
                 try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, "");
             }
+        } else if (std.ascii.eqlIgnoreCase(sub, "CLEAR")) {
+            if (!self.metadataCanWrite(id, conn, target)) {
+                try queueNumeric(conn, .ERR_KEYNOPERMISSION, &.{ target, "*" }, "permission denied");
+                try queueNumeric(conn, .RPL_METADATAEND, &.{}, "end of metadata");
+                return;
+            }
+            var views: [64]metadata_store.EntryView = undefined;
+            const all = self.metadata.list(store_target, &views) catch views[0..0];
+            for (all) |ev| {
+                var key_buf: [128]u8 = undefined;
+                if (ev.key.len > key_buf.len) continue;
+                @memcpy(key_buf[0..ev.key.len], ev.key);
+                const key = key_buf[0..ev.key.len];
+                self.metadata.delete(store_target, key) catch {};
+                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, "");
+            }
         }
         try queueNumeric(conn, .RPL_METADATAEND, &.{}, "end of metadata");
     }
@@ -8430,6 +8562,65 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "REDACT", &.{ channel, msgid }, reason);
         try self.broadcastChannel(channel, msg, null);
+    }
+
+    /// EDIT <target> <msgid> :text — draft/message-editing. Only the original
+    /// sender may edit a message; channel operators cannot edit other users'
+    /// messages. The history ring is updated so CHATHISTORY replays the new text.
+    pub fn handleEdit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+        const edit = msgedit.parseEditCommand(line) catch |err| {
+            const reason: []const u8 = switch (err) {
+                error.MissingTarget, error.MissingMsgid, error.MissingEditBody => "Missing EDIT parameters",
+                else => "Invalid EDIT parameters",
+            };
+            try self.failReply(conn, "EDIT", "INVALID_PARAMS", reason);
+            return;
+        };
+
+        var key_buf: [320]u8 = undefined;
+        const store_target = self.historyKeyForTarget(conn, edit.target, &key_buf);
+        if (world_model.isChannelName(edit.target)) {
+            if (!self.world.channelExists(edit.target)) {
+                try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{edit.target}, "No such channel");
+                return;
+            }
+            if (!self.world.isMember(edit.target, worldIdFromClient(id))) {
+                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{edit.target}, "You're not on that channel");
+                return;
+            }
+        } else if (self.world.findNick(edit.target) == null) {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{edit.target}, "No such nick");
+            return;
+        }
+
+        const original = self.historyMessageByMsgid(store_target, edit.msgid) orelse {
+            try self.failReply(conn, "EDIT", "UNKNOWN_MSGID", "Unknown message id");
+            return;
+        };
+        var current_prefix_buf: [256]u8 = undefined;
+        const current_prefix = try clientPrefix(conn, &current_prefix_buf);
+        if (!std.mem.eql(u8, original.sender, current_prefix)) {
+            try self.failReply(conn, "EDIT", "PERMISSION_DENIED", "Only the original sender may edit a message");
+            return;
+        }
+
+        self.history.edit(store_target, edit.msgid, edit.text) catch {
+            try self.failReply(conn, "EDIT", "EDIT_FAILED", "Could not edit message");
+            return;
+        };
+
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &msg_buf,
+            "@msgid={s};+draft/edit={s};+draft/revision=1 :{s} PRIVMSG {s} :{s}\r\n",
+            .{ edit.msgid, edit.msgid, current_prefix, edit.target, edit.text },
+        ) catch return;
+        if (world_model.isChannelName(edit.target)) {
+            try self.broadcastChannel(edit.target, msg, null);
+        } else if (self.world.findNick(edit.target)) |recipient| {
+            try self.deliver(clientIdFromWorld(recipient), msg);
+            try appendToConn(conn, msg);
+        }
     }
 
     /// HELP / HELPOP [topic] — static help topics (704/705/706, 524 if unknown).
@@ -12006,7 +12197,7 @@ pub const LinuxServer = struct {
             }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare
             // chan). Only the message body + sender prefix are stored.
-            if (min_rank == 0) self.recordHistory(chan, conn, eff_text);
+            if (min_rank == 0) self.recordHistory(chan, conn, message_id, eff_text);
             return;
         }
 
@@ -12066,6 +12257,12 @@ pub const LinuxServer = struct {
         const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
         try self.deliverTagged(clientIdFromWorld(recipient), dtags, msg);
         if (echo) try self.deliverTagged(id, dtags, msg);
+        if (!is_notice) {
+            var dm_key_buf: [320]u8 = undefined;
+            if (dmHistoryKey(conn.session.displayName(), target, &dm_key_buf)) |store_target| {
+                self.recordHistory(store_target, conn, message_id, text);
+            }
+        }
 
         // RFC 1459: a PRIVMSG (not NOTICE) to an away user returns RPL_AWAY so
         // the sender sees the auto-reply. NOTICE never auto-responds.
@@ -13021,6 +13218,20 @@ fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
         if (n == 0) return error.ConnectionReset;
         client.len += n;
     }
+}
+
+fn extractMsgid(bytes: []const u8) ?[]const u8 {
+    const marker = "msgid=";
+    const start = (std.mem.indexOf(u8, bytes, marker) orelse return null) + marker.len;
+    var end = start;
+    while (end < bytes.len and bytes[end] != ';' and bytes[end] != ' ') : (end += 1) {}
+    if (end == start) return null;
+    return bytes[start..end];
+}
+
+fn waitMillis(ms: i64) void {
+    const deadline = platform.monotonicMillis() + ms;
+    while (platform.monotonicMillis() < deadline) {}
 }
 
 test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
@@ -15067,6 +15278,66 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     try recvUntil(&a, " 727 ", 200);
 }
 
+test "threaded server: EDIT updates own message history and rejects others" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "CAP LS 302\r\n");
+    try recvUntil(&a, "draft/message-editing", 200);
+    a.reset();
+    try writeAllFd(fd_a, "CAP REQ :message-tags echo-message\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #edit\r\n");
+    try recvUntil(&a, " 366 A #edit ", 200);
+    try writeAllFd(fd_b, "JOIN #edit\r\n");
+    try recvUntil(&b, " 366 B #edit ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG #edit :before\r\n");
+    try recvUntil(&a, "PRIVMSG #edit :before", 200);
+    const msgid = extractMsgid(a.written()) orelse return error.TestUnexpectedResult;
+    var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+    try std.testing.expect(msgid.len <= msgid_buf.len);
+    @memcpy(msgid_buf[0..msgid.len], msgid);
+    const saved_msgid = msgid_buf[0..msgid.len];
+
+    var edit_line: [256]u8 = undefined;
+    const own_edit = std.fmt.bufPrint(&edit_line, "EDIT #edit {s} :after\r\n", .{saved_msgid}) catch unreachable;
+    a.reset();
+    try writeAllFd(fd_a, own_edit);
+    try recvUntil(&a, "+draft/edit=", 200);
+    try recvUntil(&a, "PRIVMSG #edit :after", 200);
+
+    b.reset();
+    const bad_edit = std.fmt.bufPrint(&edit_line, "EDIT #edit {s} :hijack\r\n", .{saved_msgid}) catch unreachable;
+    try writeAllFd(fd_b, bad_edit);
+    try recvUntil(&b, "FAIL EDIT PERMISSION_DENIED", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY LATEST #edit * 10\r\n");
+    try recvUntil(&a, "PRIVMSG #edit :after", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "PRIVMSG #edit :before") == null);
+}
+
 test "threaded server: ACCEPT add + list" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -15133,6 +15404,38 @@ test "threaded server: METADATA set then get" {
     b.reset();
     try writeAllFd(fd_b, "METADATA * GET url\r\n");
     try recvUntil(&b, " 766 B * url ", 200);
+}
+
+test "threaded server: METADATA clear removes writable keys" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "METADATA * SET url :http://x\r\n");
+    try recvUntil(&a, " 762 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "METADATA * CLEAR\r\n");
+    try recvUntil(&a, " 761 A * url * :", 200);
+    try recvUntil(&a, " 762 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "METADATA * GET url\r\n");
+    try recvUntil(&a, " 766 A * url ", 200);
 }
 
 test "threaded server: WHOX field-selected reply" {
@@ -15357,6 +15660,73 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-one", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
     try recvUntil(&a, "BATCH -1", 200);
+}
+
+test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #t1\r\n");
+    try recvUntil(&a, " 366 A #t1 ", 200);
+    try writeAllFd(fd_b, "JOIN #t1\r\n");
+    try recvUntil(&b, " 366 B #t1 ", 200);
+    try writeAllFd(fd_a, "JOIN #t2\r\n");
+    try recvUntil(&a, " 366 A #t2 ", 200);
+    try writeAllFd(fd_b, "JOIN #t2\r\n");
+    try recvUntil(&b, " 366 B #t2 ", 200);
+
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #t1 :one\r\n");
+    try recvUntil(&a, "PRIVMSG #t1 :one", 200);
+    waitMillis(2);
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG A :dm\r\n");
+    try recvUntil(&a, "PRIVMSG A :dm", 200);
+    waitMillis(2);
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #t2 :two\r\n");
+    try recvUntil(&a, "PRIVMSG #t2 :two", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY TARGETS * * 10\r\n");
+    try recvUntil(&a, "BATCH +1 chathistory-targets", 200);
+    try recvUntil(&a, "CHATHISTORY TARGETS #t1 timestamp=", 200);
+    try recvUntil(&a, "CHATHISTORY TARGETS b timestamp=", 200);
+    try recvUntil(&a, "CHATHISTORY TARGETS #t2 timestamp=", 200);
+    const written = a.written();
+    const i_t1 = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS #t1 timestamp=").?;
+    const i_dm = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS b timestamp=").?;
+    const i_t2 = std.mem.indexOf(u8, written, "CHATHISTORY TARGETS #t2 timestamp=").?;
+    try std.testing.expect(i_t1 < i_dm);
+    try std.testing.expect(i_dm < i_t2);
+
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY TARGETS timestamp=2099-01-01T00:00:00.000Z timestamp=1970-01-01T00:00:00.000Z 2\r\n");
+    try recvUntil(&a, "CHATHISTORY TARGETS #t1 timestamp=", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY TARGETS bogus * 5\r\n");
+    try recvUntil(&a, "FAIL CHATHISTORY INVALID_PARAMS", 200);
 }
 
 test "threaded server: MARKREAD set then get" {

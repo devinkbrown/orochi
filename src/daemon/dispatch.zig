@@ -238,6 +238,7 @@ pub const CapId = enum(u6) {
     no_implicit_names,
     chathistory,
     message_redaction,
+    message_editing,
     read_marker,
     typing,
     react,
@@ -316,12 +317,14 @@ const cap_specs = [_]CapSpec{
     // message-tag relay, so advertising them cannot strand a client:
     //   draft/chathistory     -> CHATHISTORY command (emits a `chathistory` BATCH)
     //   draft/message-redaction -> REDACT command
+    //   draft/message-editing -> EDIT command
     //   draft/read-marker     -> MARKREAD command
     //   draft/typing/react/reply -> relayed as client-only tags on TAGMSG
     //   batch                 -> server emits BATCH (chathistory, netsplit)
     //   bot                   -> +B bot flag surfaced in WHOIS (335)
     .{ .id = .chathistory, .name = "draft/chathistory" },
     .{ .id = .message_redaction, .name = "draft/message-redaction" },
+    .{ .id = .message_editing, .name = "draft/message-editing" },
     .{ .id = .read_marker, .name = "draft/read-marker" },
     .{ .id = .typing, .name = "draft/typing" },
     .{ .id = .react, .name = "draft/react" },

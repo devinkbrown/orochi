@@ -20,9 +20,13 @@ fn redact(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleRedact(x.id, x.conn, x.parsed);
 }
+fn edit(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleEdit(x.id, x.conn, x.line);
+}
 fn chathistory(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
-    try x.server.handleChathistory(x.conn, x.line);
+    try x.server.handleChathistory(x.id, x.conn, x.line);
 }
 fn markread(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
@@ -48,6 +52,7 @@ pub const module = registry.Module{
         .{ .name = "NOTICE", .handler = notice },
         .{ .name = "TAGMSG", .handler = tagmsg },
         .{ .name = "REDACT", .handler = redact },
+        .{ .name = "EDIT", .handler = edit },
         .{ .name = "CHATHISTORY", .handler = chathistory },
         .{ .name = "MARKREAD", .handler = markread },
         .{ .name = "METADATA", .handler = metadata },

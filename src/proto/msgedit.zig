@@ -117,6 +117,13 @@ pub const Redact = struct {
     reason: ?[]const u8 = null,
 };
 
+/// Parsed `EDIT <target> <msgid> :<text>` command.
+pub const EditCommand = struct {
+    target: []const u8,
+    msgid: []const u8,
+    text: []const u8,
+};
+
 /// Caller-facing builder shape for message interactions.
 pub const BuildInteraction = struct {
     command: MessageCommand = .tagmsg,
@@ -210,6 +217,24 @@ pub fn parseRedact(input: []const u8) ParseError!Redact {
         .target = params[0],
         .msgid = params[1],
         .reason = line.trailing,
+    };
+}
+
+/// Parse `EDIT <target> <msgid> :<text>`.
+pub fn parseEditCommand(input: []const u8) ParseError!EditCommand {
+    const line = try parseTaggedLine(input);
+    if (!std.ascii.eqlIgnoreCase(line.command, "EDIT")) return error.InvalidCommand;
+    const params = line.paramSlice();
+    if (params.len == 0) return error.MissingTarget;
+    if (params.len < 2) return error.MissingMsgid;
+    const text = line.trailing orelse return error.MissingEditBody;
+    try validateTarget(params[0]);
+    if (!isValidMsgid(params[1])) return error.InvalidMsgid;
+    try validateText(text, MAX_TEXT_VALUE_LEN);
+    return .{
+        .target = params[0],
+        .msgid = params[1],
+        .text = text,
     };
 }
 
@@ -584,6 +609,16 @@ test "redact parse and authorization-key msgid check" {
     try std.testing.expectEqualStrings("wrong paste", redact.reason.?);
     try std.testing.expect(redactAuthorized("G6PuDDBWQYmu3HmXXOAPzA", redact));
     try std.testing.expect(!redactAuthorized("G6PuDDBWQYmu3HmXXOAPzz", redact));
+}
+
+test "edit command parse" {
+    const edit = try parseEditCommand("EDIT #orochi G6PuDDBWQYmu3HmXXOAPzA :patched message");
+    try std.testing.expectEqualStrings("#orochi", edit.target);
+    try std.testing.expectEqualStrings("G6PuDDBWQYmu3HmXXOAPzA", edit.msgid);
+    try std.testing.expectEqualStrings("patched message", edit.text);
+
+    try std.testing.expectError(error.MissingEditBody, parseEditCommand("EDIT #orochi G6PuDDBWQYmu3HmXXOAPzA"));
+    try std.testing.expectError(error.InvalidMsgid, parseEditCommand("EDIT #orochi :bad :text"));
 }
 
 test "edit references are keyed by msgid" {
