@@ -189,6 +189,10 @@ pub const Client = struct {
     legacy_session_id: [32]u8,
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
+    /// Owned storage for `selected_alpn`: the negotiated protocol is read from the
+    /// EncryptedExtensions body in `hs_plain`, which is consumed after the message,
+    /// so the borrowed slice would dangle for any post-handshake reader. Copy it.
+    selected_alpn_buf: [256]u8 = undefined,
     leaf_key: ?LeafPublicKey = null,
     /// Owned storage for the leaf RSA key's modulus/exponent. The parsed key
     /// borrows the certificate SPKI bytes, which live in `hs_plain` and are
@@ -632,7 +636,10 @@ pub const Client = struct {
                         if (std.mem.eql(u8, offered, selected)) ok = true;
                     }
                     if (!ok) return error.BadHandshake;
-                    self.selected_alpn = selected;
+                    // Copy into owned storage; `selected` borrows hs_plain.
+                    if (selected.len > self.selected_alpn_buf.len) return error.BadHandshake;
+                    @memcpy(self.selected_alpn_buf[0..selected.len], selected);
+                    self.selected_alpn = self.selected_alpn_buf[0..selected.len];
                 },
                 // key_share / supported_versions / signature_algorithms belong to
                 // ServerHello/CertificateRequest and are illegal here. server_name
