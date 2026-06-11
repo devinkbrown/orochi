@@ -4,19 +4,22 @@
 //! (§8.1.1 / §9.1.1) for SHA-256/384/512 digests, using the verifier module's
 //! fixed-capacity bignum and modular exponentiation primitives.
 //!
-//! Side-channel posture: this module performs CRT recombination when complete
-//! CRT parameters are present, but the underlying bignum/modexp routines are
-//! variable-time and base blinding is not implemented. It is correct and useful
-//! for enabling RSA certificate signatures in this tree, but it is not hardened
-//! as a general-purpose hostile-local-attacker private-key engine.
+//! Side-channel posture: this module performs RFC-standard RSA base blinding
+//! before every private operation: m' = m * r^e mod n, s' = (m')^d mod n,
+//! s = s' * r^-1 mod n. That randomizes the modular exponentiation base for
+//! both CRT and non-CRT signing paths. The underlying fixed-capacity bignum
+//! multiply, reduction, inverse, and exponentiation routines remain
+//! variable-time; blinding is the primary defense against remote timing leakage
+//! from secret-exponent private operations.
 
 const std = @import("std");
+const crypto_random = @import("random.zig");
 const rsa_verify = @import("rsa_verify.zig");
 
 const Big = rsa_verify.Big;
 
 /// Errors returned by RSA signing.
-pub const Error = rsa_verify.Error || error{
+pub const Error = rsa_verify.Error || crypto_random.Error || error{
     /// The private key is empty, internally inconsistent, or has partial CRT
     /// parameters.
     InvalidKey,
@@ -137,15 +140,185 @@ fn privateOp(priv: PrivateKey, representative: []const u8, out: []u8) Error![]co
     if (out.len < k) return error.NoSpaceLeft;
 
     const n_big = try Big.fromBytesBE(priv.n);
+    if (n_big.isZero() or n_big.limbs[0] & 1 == 0) return error.InvalidKey;
     const m_big = try Big.fromBytesBE(representative);
     if (m_big.cmp(&n_big) != .lt) return error.InvalidInput;
+
+    var rinv = Big{};
+    var blinded: [rsa_verify.max_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &blinded);
+    try blindRepresentative(priv, &n_big, &m_big, blinded[0..k], &rinv);
+
+    var blinded_sig: [rsa_verify.max_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &blinded_sig);
+    try privateOpRaw(priv, blinded[0..k], blinded_sig[0..k]);
+
+    const s_prime = try Big.fromBytesBE(blinded_sig[0..k]);
+    var unblinded = s_prime.mul(&rinv);
+    unblinded = unblinded.mod(&n_big);
+    unblinded.toBytesBE(out[0..k]);
+    return out[0..k];
+}
+
+fn privateOpRaw(priv: PrivateKey, representative: []const u8, out: []u8) Error!void {
+    const k = priv.n.len;
+    if (out.len < k) return error.NoSpaceLeft;
 
     if (hasCrt(priv)) {
         try privateOpCrt(priv, representative, out[0..k]);
     } else {
         try modExpMont(representative, priv.d, priv.n, out[0..k]);
     }
-    return out[0..k];
+}
+
+/// Blind an encoded message representative before applying the RSA private
+/// exponent. `r` is freshly sampled in [2, n - 1), rejected unless gcd(r,n)=1,
+/// and inverted with the binary extended-GCD helper used for unblinding.
+fn blindRepresentative(priv: PrivateKey, n: *const Big, m: *const Big, out: []u8, rinv_out: *Big) Error!void {
+    const k = priv.n.len;
+    if (out.len != k) return error.NoSpaceLeft;
+
+    while (true) {
+        var r_bytes: [rsa_verify.max_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &r_bytes);
+        try randomBlindingBase(n, r_bytes[0..k]);
+
+        const r = try Big.fromBytesBE(r_bytes[0..k]);
+        const rinv = modInverseOdd(&r, n) catch |err| switch (err) {
+            error.InvalidInput => continue,
+            else => |e| return e,
+        };
+
+        var r_to_e: [rsa_verify.max_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &r_to_e);
+        try modExpMont(r_bytes[0..k], priv.e, priv.n, r_to_e[0..k]);
+
+        const re_big = try Big.fromBytesBE(r_to_e[0..k]);
+        var blinded = m.mul(&re_big);
+        blinded = blinded.mod(n);
+        blinded.toBytesBE(out);
+        rinv_out.* = rinv;
+        return;
+    }
+}
+
+/// Sample a candidate blinding base uniformly by rejection from the bit width of
+/// `n`, accepting only the RFC blinding range [2, n - 1). The gcd check is done
+/// by modular inversion so the rare non-coprime candidate is retried there.
+fn randomBlindingBase(n: *const Big, out: []u8) Error!void {
+    const n_bits = n.bitLen();
+    if (n_bits == 0) return error.InvalidKey;
+    const random_len = (n_bits + 7) / 8;
+    if (random_len == 0 or random_len > out.len) return error.InvalidKey;
+
+    const one = oneBig();
+    const two = twoBig();
+    var n_minus_one = n.*;
+    n_minus_one.subAssign(&one);
+    if (n_minus_one.cmp(&two) != .gt) return error.InvalidKey;
+
+    while (true) {
+        @memset(out, 0);
+        const start = out.len - random_len;
+        try crypto_random.fillOsEntropy(out[start..]);
+        const top_unused = random_len * 8 - n_bits;
+        if (top_unused != 0) {
+            const keep: u8 = @as(u8, 0xff) >> @intCast(top_unused);
+            out[start] &= keep;
+        }
+
+        const r = try Big.fromBytesBE(out);
+        if (r.cmp(&two) == .lt) continue;
+        if (r.cmp(&n_minus_one) != .lt) continue;
+        return;
+    }
+}
+
+/// Compute a^-1 mod odd `modulus` with the binary extended GCD algorithm.
+///
+/// The coefficient state is always kept in [0, modulus), avoiding a signed Big
+/// type. Halving an odd coefficient adds the odd modulus first, then shifts the
+/// now-even value. If the gcd is not one, `InvalidInput` is returned so callers
+/// can reject the candidate blinding base and sample a new `r`.
+fn modInverseOdd(a: *const Big, modulus: *const Big) Error!Big {
+    if (modulus.isZero() or modulus.limbs[0] & 1 == 0) return error.InvalidKey;
+
+    const one = oneBig();
+    var u = a.mod(modulus);
+    if (u.isZero()) return error.InvalidInput;
+    var v = modulus.*;
+    var x1 = one;
+    var x2 = Big{};
+
+    while (u.cmp(&one) != .eq and v.cmp(&one) != .eq) {
+        if (u.isZero() or v.isZero()) return error.InvalidInput;
+
+        while (isEven(&u)) {
+            shrOne(&u);
+            x1 = try halveCoeffModOdd(&x1, modulus);
+        }
+        while (isEven(&v)) {
+            shrOne(&v);
+            x2 = try halveCoeffModOdd(&x2, modulus);
+        }
+
+        if (u.cmp(&v) != .lt) {
+            u.subAssign(&v);
+            x1 = try subMod(&x1, &x2, modulus);
+        } else {
+            v.subAssign(&u);
+            x2 = try subMod(&x2, &x1, modulus);
+        }
+    }
+
+    return if (u.cmp(&one) == .eq) x1 else x2;
+}
+
+fn halveCoeffModOdd(x: *const Big, modulus: *const Big) Error!Big {
+    var out = x.*;
+    if (isEven(&out)) {
+        shrOne(&out);
+        return out;
+    }
+
+    out = try addBig(&out, modulus);
+    shrOne(&out);
+    return out;
+}
+
+fn subMod(a: *const Big, b: *const Big, modulus: *const Big) Error!Big {
+    var out = a.*;
+    if (out.cmp(b) == .lt) out = try addBig(&out, modulus);
+    out.subAssign(b);
+    return out;
+}
+
+fn isEven(x: *const Big) bool {
+    return x.isZero() or x.limbs[0] & 1 == 0;
+}
+
+fn shrOne(x: *Big) void {
+    var carry: u64 = 0;
+    var i = x.len;
+    while (i > 0) {
+        i -= 1;
+        const next_carry = x.limbs[i] & 1;
+        x.limbs[i] = (x.limbs[i] >> 1) | (carry << 63);
+        carry = next_carry;
+    }
+    x.normalize();
+}
+
+fn oneBig() Big {
+    var one = Big{ .len = 1 };
+    one.limbs[0] = 1;
+    return one;
+}
+
+fn twoBig() Big {
+    var two = Big{ .len = 1 };
+    two.limbs[0] = 2;
+    return two;
 }
 
 fn privateOpCrt(priv: PrivateKey, representative: []const u8, out: []u8) Error!void {
@@ -356,6 +529,21 @@ const rsa_dp = [_]u8{ 0x1a, 0x1b, 0xe6, 0x2e, 0x7e, 0x8e, 0x98, 0x43, 0xd2, 0xef
 const rsa_dq = [_]u8{ 0x90, 0x77, 0x9a, 0xab, 0xf7, 0xb2, 0xad, 0xfa, 0xbd, 0xa7, 0x63, 0x50, 0x7f, 0xd7, 0x90, 0xe1, 0x0e, 0xec, 0x41, 0xb2, 0x01, 0xae, 0xbf, 0x0f, 0xa8, 0x0f, 0x61, 0xa3, 0x35, 0xe7, 0x9b, 0xd9, 0xa6, 0x75, 0xd0, 0xbd, 0x46, 0xee, 0x2c, 0xd5, 0x03, 0xd5, 0xb0, 0x9a, 0x45, 0x75, 0x56, 0xae, 0x38, 0x8f, 0x95, 0xc0, 0x3e, 0x27, 0x4e, 0x66, 0x6d, 0x90, 0xdd, 0xec, 0xa2, 0xfb, 0x54, 0xa7, 0xb4, 0x92, 0x19, 0xa6, 0x20, 0x09, 0x2a, 0x90, 0xff, 0xc5, 0x6a, 0x66, 0x28, 0x9d, 0xe4, 0x4f, 0x2a, 0xed, 0x0c, 0x23, 0xd4, 0x35, 0xd9, 0xca, 0xa4, 0x1d, 0x4b, 0xe2, 0x86, 0xae, 0xcc, 0x44, 0x32, 0xa5, 0x55, 0xf5, 0xae, 0xec, 0x0e, 0x01, 0x64, 0x22, 0xbe, 0xa7, 0xeb, 0xca, 0xb7, 0x19, 0x15, 0x79, 0x17, 0x24, 0xdb, 0x8e, 0xed, 0x31, 0xa1, 0x7a, 0xfc, 0xe7, 0x6b, 0x91, 0x65, 0xd3 };
 const rsa_qinv = [_]u8{ 0xc4, 0xca, 0xe1, 0x78, 0x93, 0x8b, 0x60, 0x71, 0x7e, 0x4d, 0x04, 0x84, 0xc1, 0x44, 0xc5, 0x48, 0xb2, 0x75, 0xf8, 0x7d, 0xd2, 0x72, 0x3c, 0xfe, 0x1b, 0x6a, 0x5b, 0xa6, 0x83, 0x05, 0xb1, 0x54, 0xd1, 0xc8, 0x6c, 0x89, 0x47, 0x16, 0xbd, 0x9d, 0x5b, 0x4f, 0x97, 0x4f, 0x51, 0xad, 0x98, 0x94, 0x2f, 0xa2, 0x60, 0x05, 0x18, 0x88, 0x96, 0x93, 0x1a, 0x73, 0x20, 0x6b, 0x77, 0x8b, 0x94, 0x6f, 0x96, 0xc6, 0x44, 0x3f, 0x67, 0xbb, 0xb1, 0x86, 0x1c, 0xe8, 0xa2, 0xe9, 0xd4, 0x38, 0xbe, 0xfd, 0xb6, 0xcb, 0x1b, 0x7f, 0x41, 0x3e, 0xdc, 0x5b, 0x15, 0x5b, 0x43, 0x66, 0x60, 0x32, 0x0f, 0x3c, 0xd2, 0x6b, 0x0f, 0x65, 0xa9, 0xf5, 0x86, 0xf9, 0x57, 0x25, 0x7b, 0x81, 0xe7, 0xc4, 0x10, 0x85, 0x61, 0x50, 0xab, 0xf4, 0xbb, 0x8f, 0x69, 0x1b, 0xea, 0xbe, 0xcf, 0x7e, 0x42, 0x8a, 0x2f, 0x8c };
 
+// Fast self-contained signing key for randomized blinding stress tests:
+// n = M521 = 2^521 - 1, e = d = n - 2. Since M521 is prime, exponent -1 is its
+// own inverse modulo n - 1, so sign/verify round-trips without external vectors.
+const m521_n = blk: {
+    var n: [66]u8 = [_]u8{0xff} ** 66;
+    n[0] = 0x01;
+    break :blk n;
+};
+const m521_ed = blk: {
+    var ed: [66]u8 = [_]u8{0xff} ** 66;
+    ed[0] = 0x01;
+    ed[65] = 0xfd;
+    break :blk ed;
+};
+
 fn testPrivateKey() PrivateKey {
     return .{
         .n = &rsa_n,
@@ -405,4 +593,42 @@ test "signPss with a real RSA-2048 key and fixed salt verifies and rejects tampe
     bad_sig[12] ^= 0x01;
     try testing.expect(!rsa_verify.verifyPss(pub_key, .sha256, &digest, &bad_sig, salt.len));
     try testing.expect(!rsa_verify.verifyPss(pub_key, .sha256, &digest, got, salt.len - 1));
+}
+
+test "blinded PKCS1 signing verifies across many random blinding bases and stays deterministic" {
+    const digest = hexToBytes("24ddade2122077b86a4ea8ed269ec44c16e3c7105d30c28c3a7060bc718f89a5");
+    const priv = PrivateKey{ .n = &m521_n, .e = &m521_ed, .d = &m521_ed };
+    const pub_key = rsa_verify.PublicKey{ .n = priv.n, .e = priv.e };
+
+    var first: [rsa_verify.max_bytes]u8 = undefined;
+    const first_sig = try signPkcs1v15(priv, .sha256, &digest, &first);
+    try testing.expect(rsa_verify.verifyPkcs1v15(pub_key, .sha256, &digest, first_sig));
+
+    var i: usize = 0;
+    while (i < 25) : (i += 1) {
+        var sig: [rsa_verify.max_bytes]u8 = undefined;
+        const got = try signPkcs1v15(priv, .sha256, &digest, &sig);
+        try testing.expect(rsa_verify.verifyPkcs1v15(pub_key, .sha256, &digest, got));
+        try testing.expectEqualSlices(u8, first_sig, got);
+    }
+}
+
+test "modular inverse returns rinv where r * rinv mod n is one" {
+    const n = try Big.fromBytesBE(&rsa_n);
+    const cases = [_][]const u8{
+        &[_]u8{0x02},
+        &[_]u8{0x03},
+        &[_]u8{0x11},
+        &[_]u8{0x01, 0x00, 0x01},
+        &[_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x42 },
+    };
+
+    const one = oneBig();
+    for (cases) |case| {
+        const r = try Big.fromBytesBE(case);
+        const rinv = try modInverseOdd(&r, &n);
+        var product = r.mul(&rinv);
+        product = product.mod(&n);
+        try testing.expectEqual(std.math.Order.eq, product.cmp(&one));
+    }
 }
