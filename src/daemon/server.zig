@@ -3845,6 +3845,11 @@ pub const LinuxServer = struct {
             };
             if (conn.session.registered()) {
                 try self.registerConnNick(id, conn);
+                // Complete the registration burst after the 001-005 numerics
+                // (emitted by the dispatch welcome): LUSERS (251-255) then the
+                // MOTD (375/372/376 or 422), as every ircd does on connect.
+                self.handleLusers(conn) catch {};
+                self.handleMotd(conn) catch {};
                 // Warden: a network/node ban (Match × Scope × Action) is
                 // enforced against the freshly registered client's facets,
                 // before oper elevation/welcome.
@@ -7082,7 +7087,7 @@ pub const LinuxServer = struct {
     /// `[mesh].connect` auto-connect path; the new ConnState belongs to the
     /// calling reactor (same ownership as an inbound accept). Returns the new
     /// connection's token so callers can track the dial.
-    fn initiateS2sConnect(self: *LinuxServer, host: []const u8, port: u16) ServerError!RingFdToken {
+    fn initiateS2sConnect(self: *LinuxServer, host: []const u8, port: u16) !RingFdToken {
         if (self.rx().clients.len() >= self.config.max_clients) return error.SocketUnavailable;
         const addr = try sockaddrForHost(host, port, 2_000);
         const fd = try socketTcp();
@@ -15368,6 +15373,132 @@ test "threaded server: implicit-TLS client handshakes + registers over the wire"
         }
     }
     try expectContains(plain.items, " 001 T ");
+}
+
+test "threaded server: mTLS client cert binds CertFP for SASL EXTERNAL (WHOIS 276)" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const sign = @import("../crypto/sign.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const proto_certfp = @import("../proto/certfp.zig");
+    const alloc = std.testing.allocator;
+
+    const server_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** Ed25519.KeyPair.seed_length);
+    const client_seed = [_]u8{0x62} ** Ed25519.KeyPair.seed_length;
+    const client_kp = try Ed25519.KeyPair.generateDeterministic(client_seed);
+    const client_sign = try sign.KeyPair.fromSeed(client_seed);
+
+    var server_cert_buf: [1024]u8 = undefined;
+    const server_der = try x509_selfsign.buildSelfSigned(&server_cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x61, 0x01 },
+        .key_pair = server_kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var client_cert_buf: [1024]u8 = undefined;
+    const client_der = try x509_selfsign.buildSelfSigned(&client_cert_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x62, 0x01 },
+        .key_pair = client_kp,
+    });
+    var expected_fp: proto_certfp.Fingerprint = undefined;
+    proto_certfp.computeHex(client_der, &expected_fp);
+
+    const chain = [_][]const u8{server_der};
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = server_kp,
+        .tls_request_client_cert = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const tls_port = try server.tlsBoundPort();
+    const plain_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(tls_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+    defer client.deinit();
+    client.setClientCertForTest(client_der, client_sign);
+
+    // mTLS handshake over the live socket: the daemon's CertificateRequest must
+    // be well-formed and the client's Certificate/CertificateVerify accepted.
+    const ch = try client.start();
+    defer alloc.free(ch);
+    try writeAllFd(fd, ch);
+    var rbuf: [4096]u8 = undefined;
+    var guard: usize = 0;
+    while (!client.handshakeDone()) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        switch (try client.feed(rbuf[0..n])) {
+            .bytes_to_send => |b| {
+                defer alloc.free(b);
+                try writeAllFd(fd, b);
+            },
+            .need_more => {},
+        }
+    }
+
+    // Register, then WHOIS self: RPL_WHOISCERTFP (276) must surface the exact
+    // fingerprint SASL EXTERNAL matches (session.tls_certfp).
+    const reg = try client.encrypt("NICK T\r\nUSER t 0 * :Tester\r\nWHOIS T\r\n");
+    defer alloc.free(reg);
+    try writeAllFd(fd, reg);
+
+    var expected_line_buf: [128]u8 = undefined;
+    const expected_line = try std.fmt.bufPrint(
+        &expected_line_buf,
+        " 276 T T :has client certificate fingerprint {s}",
+        .{expected_fp[0..]},
+    );
+
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(alloc);
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(alloc);
+    guard = 0;
+    while (std.mem.indexOf(u8, plain.items, expected_line) == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(fd, &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try cipher.appendSlice(alloc, rbuf[0..n]);
+        while (cipher.items.len >= 5) {
+            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+            const wire_len = 5 + @as(usize, body_len);
+            if (cipher.items.len < wire_len) break;
+            switch (try client.decryptApp(cipher.items[0..wire_len])) {
+                .application_data => |pt| {
+                    defer alloc.free(pt);
+                    try plain.appendSlice(alloc, pt);
+                },
+                .control => {},
+            }
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+        }
+    }
+    try expectContains(plain.items, expected_line);
 }
 
 test "threaded server: ws upgrade + framed registration (plain testing mode)" {
