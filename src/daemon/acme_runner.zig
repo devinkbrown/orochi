@@ -122,6 +122,7 @@ fn httpsRequest(
         .server_name = url.host,
         .trust_anchors = trust_anchors,
         .alpn_protocols = &.{"http/1.1"},
+        .now_unix_seconds = wallClockSeconds(),
     });
     defer tc.deinit();
 
@@ -177,6 +178,12 @@ fn httpsRequest(
                     try plaintext.appendSlice(allocator, pt);
                 },
                 .control => {}, // post-handshake record (e.g. NewSessionTicket): ignore
+            }
+            // A server KeyUpdate may queue a reply we must write back before
+            // reading further under the rotated keys.
+            if (try tc.takePendingSend()) |reply| {
+                defer allocator.free(reply);
+                try writeAll(fd, reply);
             }
             consumePrefix(&pending, rec_len);
             // Stop as soon as the HTTP message is complete, so we never decrypt a
@@ -599,6 +606,13 @@ fn frameRecordLen(buf: []const u8) ?usize {
     const total = 5 + @as(usize, len);
     if (buf.len < total) return null;
     return total;
+}
+
+/// Wall-clock time in Unix seconds, used to reject expired ACME server certs.
+fn wallClockSeconds() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
 }
 
 fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {

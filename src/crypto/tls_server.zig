@@ -122,6 +122,10 @@ pub const Server = struct {
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
 
+    /// Post-handshake records the server must send back (a KeyUpdate reply when
+    /// the client requested one). Drained by the caller via `takePendingSend`.
+    post_handshake_send: std.ArrayList(u8) = .empty,
+
     /// mTLS: whether a CertificateRequest is sent + the client flight verified.
     request_client_cert: bool = false,
     /// Decrypted client-flight handshake bytes accumulated across records, so a
@@ -180,6 +184,7 @@ pub const Server = struct {
         self.transcript.deinit(self.allocator);
         self.recv_buf.deinit(self.allocator);
         self.client_flight.deinit(self.allocator);
+        self.post_handshake_send.deinit(self.allocator);
         if (self.client_cert_der) |der| self.allocator.free(der);
         self.* = undefined;
     }
@@ -336,8 +341,85 @@ pub const Server = struct {
         const opened = try openRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_read_seq, record);
         self.app_read_seq += 1;
         errdefer self.allocator.free(opened.content);
+        if (opened.content_type == .handshake) {
+            // On error the function-scoped errdefer frees opened.content; on
+            // success free it here (no application bytes to return).
+            try self.handlePostHandshake(opened.content);
+            self.allocator.free(opened.content);
+            return self.allocator.alloc(u8, 0);
+        }
         if (opened.content_type != .application_data) return error.BadRecord;
         return opened.content;
+    }
+
+    /// Take ownership of any queued post-handshake bytes the caller must write to
+    /// the socket (a KeyUpdate reply). Returns null when nothing is queued.
+    pub fn takePendingSend(self: *Server) Error!?[]u8 {
+        if (self.post_handshake_send.items.len == 0) return null;
+        return try self.post_handshake_send.toOwnedSlice(self.allocator);
+    }
+
+    /// Initiate a KeyUpdate towards the client: returns the record to send (caller
+    /// owns) and rotates the server→client application keys. When `request_peer`
+    /// is true the client is asked to update its keys in return.
+    pub fn initiateKeyUpdate(self: *Server, request_peer: bool) Error![]u8 {
+        if (self.state != .connected) return error.BadState;
+        const request: KeyUpdateRequest = if (request_peer) .requested else .not_requested;
+        return self.buildKeyUpdateRecord(request);
+    }
+
+    /// Process a decrypted post-handshake handshake fragment. A KeyUpdate rotates
+    /// the client→server application keys and, when update_requested, queues our
+    /// own KeyUpdate(update_not_requested) reply and rotates the server→client
+    /// keys (RFC 8446 §4.6.3). Other messages are ignored.
+    fn handlePostHandshake(self: *Server, fragment: []const u8) Error!void {
+        var off: usize = 0;
+        while (parseHandshakeMaybe(fragment, &off)) |msg| {
+            if (msg.typ == .key_update) {
+                if (msg.body.len != 1) return error.BadHandshake;
+                const request = msg.body[0];
+                if (request != @intFromEnum(KeyUpdateRequest.not_requested) and
+                    request != @intFromEnum(KeyUpdateRequest.requested))
+                {
+                    return error.BadHandshake;
+                }
+                try self.applyKeyUpdate(&self.client_app_secret, &self.client_app_keys);
+                self.app_read_seq = 0;
+                if (request == @intFromEnum(KeyUpdateRequest.requested)) {
+                    const reply = try self.buildKeyUpdateRecord(.not_requested);
+                    defer self.allocator.free(reply);
+                    try self.post_handshake_send.appendSlice(self.allocator, reply);
+                }
+            }
+        }
+    }
+
+    /// Build one KeyUpdate record sealed under the *current* server send keys,
+    /// then rotate the server→client application keys so subsequent records use
+    /// the new keys.
+    fn buildKeyUpdateRecord(self: *Server, request: KeyUpdateRequest) Error![]u8 {
+        const suite = self.selected_suite orelse return error.BadState;
+        var hs: std.ArrayList(u8) = .empty;
+        defer hs.deinit(self.allocator);
+        try writeHandshake(self.allocator, &hs, .key_update, &[_]u8{@intFromEnum(request)});
+        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .handshake, hs.items);
+        errdefer self.allocator.free(record);
+        self.app_write_seq += 1;
+        try self.applyKeyUpdate(&self.server_app_secret, &self.server_app_keys);
+        self.app_write_seq = 0;
+        return record;
+    }
+
+    /// In-place KeyUpdate of one traffic secret and its derived keys.
+    fn applyKeyUpdate(self: *Server, secret: *[Sha256.hash_len]u8, keys: *TrafficKeys) Error!void {
+        const suite = self.selected_suite orelse return error.BadState;
+        var cur = Sha256.SecretBytes.init(secret.*);
+        defer cur.wipe();
+        var next: [Sha256.hash_len]u8 = undefined;
+        try Sha256.hkdfExpandLabel(&cur, "traffic upd", "", &next);
+        @memcpy(secret, &next);
+        secureZero(&next);
+        try deriveTrafficKeys(suite, secret.*, keys);
     }
 
     fn buildServerFlight(self: *Server, client_hello_body: []const u8) Error![]u8 {
@@ -606,7 +688,13 @@ const HandshakeType = enum(u8) {
     certificate = 11,
     certificate_verify = 15,
     finished = 20,
+    key_update = 24,
     _,
+};
+
+const KeyUpdateRequest = enum(u8) {
+    not_requested = 0,
+    requested = 1,
 };
 
 const HandshakeMsg = struct { typ: HandshakeType, body: []const u8, raw: []const u8 };
@@ -897,6 +985,110 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("hello server", got_s);
+}
+
+test "loopback: client rejects an expired server certificate when a clock is supplied" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x44} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    // Validity window entirely in 2024.
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200, // 2024-01-01
+        .not_after = 1_706_745_600, // 2024-02-01
+        .serial = &.{ 0x12, 0x34 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    // Client clock is in 2033 — well past not_after.
+    var client = try tls_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{der},
+        .now_unix_seconds = 2_000_000_000,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    try std.testing.expectError(error.Expired, client.feed(sflight));
+}
+
+test "loopback: post-handshake KeyUpdate rotates keys both directions" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x12, 0x34 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    // Server initiates a KeyUpdate and asks the client to update in return.
+    const ku = try server.initiateKeyUpdate(true);
+    defer alloc.free(ku);
+    const consumed = try client.decrypt(ku); // rotates server->client recv keys
+    defer alloc.free(consumed);
+    try std.testing.expectEqual(@as(usize, 0), consumed.len);
+
+    // Server->client data now flows under the rotated server send keys.
+    const s2c = try server.encrypt("after server rekey");
+    defer alloc.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("after server rekey", got_c);
+
+    // The client queued its own KeyUpdate reply (because update was requested).
+    const reply = (try client.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(reply);
+    const consumed_s = try server.decrypt(reply); // rotates client->server recv keys
+    defer alloc.free(consumed_s);
+    try std.testing.expectEqual(@as(usize, 0), consumed_s.len);
+
+    // Client->server data now flows under the rotated client send keys.
+    const c2s = try client.encrypt("after client rekey");
+    defer alloc.free(c2s);
+    const got_s = try server.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("after client rekey", got_s);
 }
 
 test "mTLS: server requests + verifies a client cert and exposes its leaf DER" {

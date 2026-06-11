@@ -120,6 +120,13 @@ pub const TlsConn = struct {
             consumePrefix(&self.recv_buf, wire_len);
         }
 
+        // A post-handshake KeyUpdate from the client makes the inner server queue
+        // its own KeyUpdate reply; send it back alongside any handshake flight.
+        if (try self.server.takePendingSend()) |reply| {
+            defer self.allocator.free(reply);
+            try self.send_buf.appendSlice(self.allocator, reply);
+        }
+
         return .{
             .handshake_bytes = self.send_buf.items,
             .plaintext = self.plain_buf.items,

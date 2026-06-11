@@ -83,6 +83,12 @@ pub const Options = struct {
     server_name: []const u8,
     trust_anchors: []const []const u8,
     alpn_protocols: []const []const u8 = &.{},
+    /// Current wall-clock time (Unix seconds) used to reject expired and
+    /// not-yet-valid certificates in the chain. When null the validity window is
+    /// not checked — callers that can supply a trustworthy clock (the live HTTPS
+    /// and ACME paths) should always set it; loopback tests with fixed fixtures
+    /// leave it null.
+    now_unix_seconds: ?i64 = null,
 };
 
 pub const FeedResult = union(enum) {
@@ -115,7 +121,13 @@ const HandshakeType = enum(u8) {
     certificate_request = 13,
     certificate_verify = 15,
     finished = 20,
+    key_update = 24,
     _,
+};
+
+const KeyUpdateRequest = enum(u8) {
+    not_requested = 0,
+    requested = 1,
 };
 
 const CipherSuite = enum(u16) {
@@ -184,6 +196,9 @@ pub const Client = struct {
     alpn_protocols: []const []const u8,
 
     state: State = .idle,
+    /// Wall-clock time (Unix seconds) for certificate validity checks, or null to
+    /// skip the validity window (see `Options.now_unix_seconds`).
+    verify_time: ?i64 = null,
     x25519_pair: kx.X25519Kx.KeyPair,
     p256_pair: ecdh_p256.KeyPair,
     legacy_session_id: [32]u8,
@@ -202,6 +217,10 @@ pub const Client = struct {
     leaf_rsa_n: [rsa_verify.max_bytes]u8 = undefined,
     leaf_rsa_e: [16]u8 = undefined,
     last_alert: ?tls_alert.Alert = null,
+
+    /// Post-handshake records the client must send back (a KeyUpdate response
+    /// when the peer requested one). Drained by the caller via `takePendingSend`.
+    post_handshake_send: std.ArrayList(u8) = .empty,
 
     // --- Test-only client-certificate support (mutual TLS) ---
     // Existing behavior is fully preserved when no client cert is configured:
@@ -261,6 +280,7 @@ pub const Client = struct {
             .server_name = name,
             .trust_anchors = anchors,
             .alpn_protocols = alpn,
+            .verify_time = options.now_unix_seconds,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
             .p256_pair = try ecdh_p256.generate(),
             .legacy_session_id = session_id,
@@ -285,6 +305,7 @@ pub const Client = struct {
         self.transcript.deinit(self.allocator);
         self.recv_buf.deinit(self.allocator);
         self.hs_plain.deinit(self.allocator);
+        self.post_handshake_send.deinit(self.allocator);
         self.allocator.free(self.server_name);
         self.allocator.free(self.trust_anchors);
         self.allocator.free(self.alpn_protocols);
@@ -378,15 +399,23 @@ pub const Client = struct {
             self.last_alert = try tls_alert.parse(opened.content);
             return error.TlsAlert;
         }
+        if (opened.content_type == .handshake) {
+            // On error the function-scoped errdefer frees opened.content; on
+            // success free it here (no application bytes to return).
+            try self.handlePostHandshake(opened.content);
+            self.allocator.free(opened.content);
+            return self.allocator.alloc(u8, 0);
+        }
         if (opened.content_type != .application_data) return error.BadRecord;
         return opened.content;
     }
 
     /// Post-handshake-aware read of one decrypted record. Returns the decrypted
-    /// application bytes, or `.control` for benign post-handshake handshake
-    /// records the one-shot client ignores (e.g. NewSessionTicket). Alerts raise
-    /// `error.TlsAlert`. Note: a post-handshake KeyUpdate is *not* honored here
-    /// (treated as control); a one-shot request never triggers a server rekey.
+    /// application bytes, or `.control` for post-handshake handshake records
+    /// (NewSessionTicket is ignored; a KeyUpdate rotates the server→client keys
+    /// and, when the peer set update_requested, queues our own KeyUpdate reply in
+    /// `post_handshake_send` — flush it with `takePendingSend`). Alerts raise
+    /// `error.TlsAlert`.
     pub fn decryptApp(self: *Client, record: []const u8) Error!AppRead {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
@@ -400,7 +429,8 @@ pub const Client = struct {
                 return error.TlsAlert;
             },
             .handshake => {
-                self.allocator.free(opened.content);
+                defer self.allocator.free(opened.content);
+                try self.handlePostHandshake(opened.content);
                 return .control;
             },
             else => {
@@ -408,6 +438,71 @@ pub const Client = struct {
                 return error.BadRecord;
             },
         }
+    }
+
+    /// Take ownership of any queued post-handshake bytes the caller must write to
+    /// the socket (currently a KeyUpdate reply). Returns null when nothing is
+    /// queued; otherwise the caller owns and must free the returned slice.
+    pub fn takePendingSend(self: *Client) Error!?[]u8 {
+        if (self.post_handshake_send.items.len == 0) return null;
+        return try self.post_handshake_send.toOwnedSlice(self.allocator);
+    }
+
+    /// Process a decrypted post-handshake handshake fragment. NewSessionTicket
+    /// and other informational messages are ignored; a KeyUpdate rotates the
+    /// server→client application keys and, when the peer requested an update,
+    /// queues our own KeyUpdate(update_not_requested) reply and rotates the
+    /// client→server keys (RFC 8446 §4.6.3). The fragment may carry more than one
+    /// handshake message.
+    fn handlePostHandshake(self: *Client, fragment: []const u8) Error!void {
+        var off: usize = 0;
+        while (parseHandshakeMaybe(fragment, &off)) |msg| {
+            if (msg.typ == .key_update) {
+                if (msg.body.len != 1) return error.BadHandshake;
+                const request = msg.body[0];
+                if (request != @intFromEnum(KeyUpdateRequest.not_requested) and
+                    request != @intFromEnum(KeyUpdateRequest.requested))
+                {
+                    return error.BadHandshake;
+                }
+                // Rotate the receive (server) application traffic secret + keys.
+                try self.applyKeyUpdate(&self.server_app_secret, &self.server_app_keys);
+                self.app_read_seq = 0;
+                if (request == @intFromEnum(KeyUpdateRequest.requested)) {
+                    try self.sendKeyUpdate(.not_requested);
+                }
+            }
+            // Other post-handshake messages (e.g. NewSessionTicket) are ignored.
+        }
+    }
+
+    /// Emit a KeyUpdate of our own (encrypted under the *current* send keys),
+    /// queue it for the caller, then rotate the client→server application keys so
+    /// the next application record uses the new keys (RFC 8446 §4.6.3).
+    fn sendKeyUpdate(self: *Client, request: KeyUpdateRequest) Error!void {
+        const suite = self.selected_suite orelse return error.BadState;
+        var hs: std.ArrayList(u8) = .empty;
+        defer hs.deinit(self.allocator);
+        try writeHandshake(self.allocator, &hs, .key_update, &[_]u8{@intFromEnum(request)});
+        const record = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .handshake, hs.items);
+        defer self.allocator.free(record);
+        self.app_write_seq += 1;
+        try self.post_handshake_send.appendSlice(self.allocator, record);
+        try self.applyKeyUpdate(&self.client_app_secret, &self.client_app_keys);
+        self.app_write_seq = 0;
+    }
+
+    /// In-place KeyUpdate of one traffic secret: secret' =
+    /// HKDF-Expand-Label(secret, "traffic upd", "", Hash.length); re-derive keys.
+    fn applyKeyUpdate(self: *Client, secret: *[Sha256.hash_len]u8, keys: *TrafficKeys) Error!void {
+        const suite = self.selected_suite orelse return error.BadState;
+        var cur = Sha256.SecretBytes.init(secret.*);
+        defer cur.wipe();
+        var next: [Sha256.hash_len]u8 = undefined;
+        try Sha256.hkdfExpandLabel(&cur, "traffic upd", "", &next);
+        @memcpy(secret, &next);
+        secureZero(&next);
+        try deriveTrafficKeys(suite, secret.*, keys);
     }
 
     fn writeClientHello(self: *Client, out: *std.ArrayList(u8)) Error!void {
@@ -677,7 +772,7 @@ pub const Client = struct {
         if (count == 0) return error.EmptyCertificateChain;
         const chain = chain_buf[0..count];
         if (!self.skip_cert_verify_for_test) {
-            try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name);
+            try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name, self.verify_time);
         }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         // The RSA variant borrows the SPKI bytes (in hs_plain); copy n/e into
@@ -1139,17 +1234,26 @@ fn verifySignatureScheme(key: LeafPublicKey, scheme: tls_signature_scheme.Signat
     }
 }
 
-fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const u8, server_name: []const u8) Error!void {
+fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const u8, server_name: []const u8, now: ?i64) Error!void {
     if (chain.len == 0) return error.EmptyCertificateChain;
     if (anchors.len == 0) return error.UnknownCa;
     const leaf = try x509.parse(chain[0]);
     if (!dnsNameMatchesCert(server_name, leaf)) return error.CertificateNameMismatch;
+    // Reject expired / not-yet-valid leaf certificates when a clock is supplied.
+    if (now) |t| try x509_verify.validateParsedAt(leaf, t);
+    // The leaf must be usable for TLS server authentication: when an
+    // ExtendedKeyUsage extension is present it has to list serverAuth (or
+    // anyExtendedKeyUsage). Absent EKU is permitted (unrestricted).
+    if (leaf.eku_present and !leaf.eku_server_auth) return error.BadCertificate;
 
     var i: usize = 0;
     while (i + 1 < chain.len) : (i += 1) {
         try verifyIssuedBy(chain[i], chain[i + 1]);
         const issuer = try x509.parse(chain[i + 1]);
         if (!issuer.basic_constraints_ca) return error.BadCertificate;
+        // A CA in the path must be allowed to sign certificates and be valid now.
+        if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
+        if (now) |t| try x509_verify.validateParsedAt(issuer, t);
     }
 
     const last = chain[chain.len - 1];

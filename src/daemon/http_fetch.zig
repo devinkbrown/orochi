@@ -117,6 +117,7 @@ fn getTls(
         .server_name = host,
         .trust_anchors = opts.trust_anchors,
         .alpn_protocols = &.{"http/1.1"},
+        .now_unix_seconds = wallClockSeconds(),
     });
     defer tc.deinit();
     if (opts.insecure_skip_verify) tc.skipServerCertVerifyForTest();
@@ -164,6 +165,12 @@ fn getTls(
                 },
                 .control => {},
             }
+            // A server KeyUpdate (surfaced as .control) may queue a reply we must
+            // write back before continuing to read under the rotated keys.
+            if (try tc.takePendingSend()) |reply| {
+                defer allocator.free(reply);
+                try writeAll(fd, reply);
+            }
             consumePrefix(&pending, rec_len);
             if (http1.isComplete(plaintext.items)) break :read_loop;
         }
@@ -193,6 +200,13 @@ fn readHttp(allocator: std.mem.Allocator, fd: linux.fd_t, max_bytes: usize) Erro
         if (http1.isComplete(acc.items)) break;
     }
     return acc.toOwnedSlice(allocator);
+}
+
+/// Wall-clock time in Unix seconds, used to reject expired server certificates.
+fn wallClockSeconds() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
 }
 
 // ---- TLS record framing (mirrors acme_runner) -------------------------------

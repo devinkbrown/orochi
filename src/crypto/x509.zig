@@ -62,6 +62,11 @@ pub const Tag = struct {
 const Oid = struct {
     const subject_alt_name = [_]u8{ 0x55, 0x1D, 0x11 };
     const basic_constraints = [_]u8{ 0x55, 0x1D, 0x13 };
+    const key_usage = [_]u8{ 0x55, 0x1D, 0x0F };
+    const extended_key_usage = [_]u8{ 0x55, 0x1D, 0x25 };
+    // id-kp-serverAuth (1.3.6.1.5.5.7.3.1) and anyExtendedKeyUsage (2.5.29.37.0).
+    const eku_server_auth = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01 };
+    const eku_any = [_]u8{ 0x55, 0x1D, 0x25, 0x00 };
 };
 
 pub const TimeKind = enum { utc, generalized };
@@ -186,6 +191,16 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
         san_ips: [max_ip_addresses]IpAddress,
         san_ip_count: usize,
         basic_constraints_ca: bool,
+        /// KeyUsage extension (2.5.29.15). `key_usage_present` is false when the
+        /// extension is absent; the bit fields are only meaningful when present.
+        key_usage_present: bool,
+        key_usage_digital_signature: bool,
+        key_usage_cert_sign: bool,
+        /// ExtendedKeyUsage extension (2.5.29.37). `eku_present` is false when
+        /// absent. `eku_server_auth` is true when id-kp-serverAuth or
+        /// anyExtendedKeyUsage is listed.
+        eku_present: bool,
+        eku_server_auth: bool,
 
         pub fn parse(der: []const u8) Error!Self {
             var cert = Self{
@@ -201,6 +216,11 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
                 .san_ips = undefined,
                 .san_ip_count = 0,
                 .basic_constraints_ca = false,
+                .key_usage_present = false,
+                .key_usage_digital_signature = false,
+                .key_usage_cert_sign = false,
+                .eku_present = false,
+                .eku_server_auth = false,
             };
             try parseInto(Self, &cert, der);
             return cert;
@@ -383,6 +403,45 @@ fn parseExtensions(comptime CertType: type, cert: *CertType, parent: DerReader, 
             try parseSubjectAltName(CertType, cert, one, value.value);
         } else if (std.mem.eql(u8, oid_tlv.value, &Oid.basic_constraints)) {
             cert.basic_constraints_ca = try parseBasicConstraints(one, value.value);
+        } else if (std.mem.eql(u8, oid_tlv.value, &Oid.key_usage)) {
+            try parseKeyUsage(CertType, cert, one, value.value);
+        } else if (std.mem.eql(u8, oid_tlv.value, &Oid.extended_key_usage)) {
+            try parseExtendedKeyUsage(CertType, cert, one, value.value);
+        }
+    }
+}
+
+/// KeyUsage is a DER BIT STRING; bit 0 (MSB of the first content byte) is
+/// digitalSignature and bit 5 is keyCertSign (RFC 5280 §4.2.1.3).
+fn parseKeyUsage(comptime CertType: type, cert: *CertType, parent: DerReader, value: []const u8) Error!void {
+    var inner = try nestedBytes(parent, value);
+    const bits = try inner.readExpected(Tag.bit_string);
+    try inner.expectEmpty();
+    if (bits.value.len < 1) return error.InvalidBitString;
+    const unused = bits.value[0];
+    if (unused > 7) return error.InvalidBitString;
+    cert.key_usage_present = true;
+    if (bits.value.len >= 2) {
+        cert.key_usage_digital_signature = (bits.value[1] & 0x80) != 0;
+        cert.key_usage_cert_sign = (bits.value[1] & 0x04) != 0;
+    }
+}
+
+/// ExtendedKeyUsage is a SEQUENCE OF KeyPurposeId (OID). serverAuth or
+/// anyExtendedKeyUsage marks the cert usable for TLS server authentication.
+fn parseExtendedKeyUsage(comptime CertType: type, cert: *CertType, parent: DerReader, value: []const u8) Error!void {
+    var inner = try nestedBytes(parent, value);
+    const seq_tlv = try inner.readExpected(Tag.sequence);
+    try inner.expectEmpty();
+    cert.eku_present = true;
+    var seq = try inner.child(seq_tlv);
+    while (seq.hasRemaining()) {
+        const oid_tlv = try seq.readExpected(Tag.oid);
+        try validateOid(oid_tlv.value);
+        if (std.mem.eql(u8, oid_tlv.value, &Oid.eku_server_auth) or
+            std.mem.eql(u8, oid_tlv.value, &Oid.eku_any))
+        {
+            cert.eku_server_auth = true;
         }
     }
 }
@@ -638,6 +697,13 @@ test "parse embedded certificate and compute certfp" {
     try std.testing.expectEqual(@as(usize, 1), cert.san_ip_count);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, cert.san_ips[0].slice());
     try std.testing.expect(!cert.basic_constraints_ca);
+    // The fixture carries a KeyUsage extension (digitalSignature only) and no
+    // ExtendedKeyUsage extension.
+    try std.testing.expect(cert.key_usage_present);
+    try std.testing.expect(cert.key_usage_digital_signature);
+    try std.testing.expect(!cert.key_usage_cert_sign);
+    try std.testing.expect(!cert.eku_present);
+    try std.testing.expect(!cert.eku_server_auth);
 
     var cert_hex: [64]u8 = undefined;
     var spki_hex: [64]u8 = undefined;
