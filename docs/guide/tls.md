@@ -21,8 +21,17 @@ Set `request_client_cert = true` when using SASL EXTERNAL. The TLS engine reques
 ## Protocol capabilities
 
 Orochi ships a clean-room, pure-Zig TLS 1.3 stack (`src/crypto/tls_client.zig`,
-`src/crypto/tls_server.zig`). It is **TLS 1.3 only** — TLS 1.2/1.1/1.0, STARTTLS,
-renegotiation, and record compression all fail closed.
+`src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses **TLS 1.3**;
+TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.
+
+A **hardened TLS 1.2** client + server engine also exists as standalone modules
+(`src/crypto/tls12{,_client,_server}.zig`) for interop where 1.3 is unavailable.
+It is deliberately restricted to **ECDHE key exchange with AEAD suites only** —
+ECDHE-ECDSA/RSA with AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305 over
+secp256r1 — with no CBC, RC4, static-RSA key exchange, compression, or
+renegotiation. The TLS 1.2 PRF, key schedule, GCM (RFC 5288) / ChaCha20-Poly1305
+(RFC 7905) record layer, and Finished are all implemented and loopback-tested.
+Server-side ServerKeyExchange signing is ECDSA-P256.
 
 **Cipher suites:** `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
 `TLS_CHACHA20_POLY1305_SHA256` (the full RFC 8446 mandatory set; the key schedule
