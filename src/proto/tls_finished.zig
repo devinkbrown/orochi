@@ -19,62 +19,73 @@ const std = @import("std");
 const hkdf = @import("../crypto/hkdf_tls13.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
 
-/// Length in bytes of every secret and MAC handled here (SHA-256 digest size).
+/// Length in bytes of the SHA-256 Finished secret/MAC (default cipher suite).
 pub const mac_len: usize = 32;
 
-const Schedule = hkdf.Sha256;
+/// Generic Finished-MAC surface for one TLS 1.3 key schedule + its HMAC. The
+/// secret and MAC length follow the schedule's digest size (32 for SHA-256, 48
+/// for SHA-384).
+pub fn FinishedFor(comptime Schedule: type, comptime Hmac: type) type {
+    return struct {
+        const Self = @This();
+        pub const len = Schedule.hash_len;
 
-comptime {
-    // The plain-bytes API below assumes the SHA-256 key schedule uses 32-byte
-    // secrets/digests. Guard against an upstream change to that invariant.
-    std.debug.assert(Schedule.hash_len == mac_len);
-    std.debug.assert(HmacSha256.mac_length == mac_len);
+        comptime {
+            std.debug.assert(Hmac.mac_length == len);
+        }
+
+        /// finished_key = HKDF-Expand-Label(base_key, "finished", "", Hash.length)
+        pub fn finishedKey(base_key: [len]u8) [len]u8 {
+            const secret = Schedule.SecretBytes.init(base_key);
+            var out: [len]u8 = undefined;
+            // Empty context + a Hash.length output is always within HKDF bounds.
+            Schedule.hkdfExpandLabel(&secret, "finished", "", &out) catch unreachable;
+            return out;
+        }
+
+        /// verify_data = HMAC(finished_key(base_key), transcript_hash)
+        pub fn verifyData(base_key: [len]u8, transcript_hash: [len]u8) [len]u8 {
+            const fk = Self.finishedKey(base_key);
+            var out: [len]u8 = undefined;
+            Hmac.create(&out, &transcript_hash, &fk);
+            return out;
+        }
+
+        /// Constant-time check of a received Finished verify_data.
+        pub fn verify(base_key: [len]u8, transcript_hash: [len]u8, received: []const u8) bool {
+            if (received.len != len) return false;
+            const expected = Self.verifyData(base_key, transcript_hash);
+            return std.crypto.timing_safe.eql([len]u8, expected, received[0..len].*);
+        }
+    };
 }
 
-/// Derive the Finished key from a handshake traffic secret.
-///
-///     finished_key = HKDF-Expand-Label(base_key, "finished", "", 32)
-///
-/// `base_key` is the client_handshake_traffic_secret or
-/// server_handshake_traffic_secret depending on which side's Finished is being
-/// produced or checked. The expansion cannot fail for a fixed 32-byte output,
-/// so the (impossible) HKDF error path is treated as a programming bug.
+/// Pick the Finished surface for a key schedule (SHA-256 or SHA-384).
+pub fn For(comptime Schedule: type) type {
+    return FinishedFor(Schedule, switch (Schedule) {
+        hkdf.Sha256 => HmacSha256,
+        hkdf.Sha384 => HmacSha384,
+        else => @compileError("unsupported Finished schedule"),
+    });
+}
+
+pub const Sha256F = For(hkdf.Sha256);
+pub const Sha384F = For(hkdf.Sha384);
+
+// --- SHA-256 free-function API (back-compat; the default cipher suite) -------
+
 pub fn finishedKey(base_key: [mac_len]u8) [mac_len]u8 {
-    const secret = Schedule.SecretBytes.init(base_key);
-    var out: [mac_len]u8 = undefined;
-    // HKDF-Expand-Label with an empty context and a 32-byte output length is
-    // always within HKDF's bounds, so this never returns an error.
-    Schedule.hkdfExpandLabel(&secret, "finished", "", &out) catch unreachable;
-    return out;
+    return Sha256F.finishedKey(base_key);
 }
 
-/// Compute Finished verify_data over a transcript hash.
-///
-///     verify_data = HMAC-SHA256(finished_key(base_key), transcript_hash)
-///
-/// `transcript_hash` is Transcript-Hash of the handshake messages up to but not
-/// including the Finished being produced.
 pub fn verifyData(base_key: [mac_len]u8, transcript_hash: [mac_len]u8) [mac_len]u8 {
-    const fk = finishedKey(base_key);
-    var out: [mac_len]u8 = undefined;
-    HmacSha256.create(&out, &transcript_hash, &fk);
-    return out;
+    return Sha256F.verifyData(base_key, transcript_hash);
 }
 
-/// Constant-time check of a received Finished verify_data.
-///
-/// Returns true only when `received` is exactly `mac_len` bytes and equals the
-/// locally computed verify_data. The comparison is constant time with respect
-/// to byte contents to avoid leaking how many leading bytes matched.
-pub fn verify(
-    base_key: [mac_len]u8,
-    transcript_hash: [mac_len]u8,
-    received: []const u8,
-) bool {
-    if (received.len != mac_len) return false;
-    const expected = verifyData(base_key, transcript_hash);
-    return std.crypto.timing_safe.eql([mac_len]u8, expected, received[0..mac_len].*);
+pub fn verify(base_key: [mac_len]u8, transcript_hash: [mac_len]u8, received: []const u8) bool {
+    return Sha256F.verify(base_key, transcript_hash, received);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,14 +119,25 @@ test "finishedKey differs from the base key it is derived from" {
 test "finishedKey reuses the shared key schedule primitive" {
     // Arrange
     const base_key = [_]u8{0x5C} ** mac_len;
-    const secret = Schedule.SecretBytes.init(base_key);
+    const secret = hkdf.Sha256.SecretBytes.init(base_key);
 
     // Act
     const via_module = finishedKey(base_key);
-    const via_schedule = (try Schedule.finishedKey(&secret)).declassify();
+    const via_schedule = (try hkdf.Sha256.finishedKey(&secret)).declassify();
 
     // Assert
     try std.testing.expectEqualSlices(u8, &via_schedule, &via_module);
+}
+
+test "SHA-384 Finished surface produces 48-byte verify_data" {
+    const base_key = [_]u8{0x24} ** Sha384F.len;
+    const transcript = [_]u8{0x42} ** Sha384F.len;
+    try std.testing.expectEqual(@as(usize, 48), Sha384F.len);
+    const mac = Sha384F.verifyData(base_key, transcript);
+    try std.testing.expect(Sha384F.verify(base_key, transcript, &mac));
+    var tampered = mac;
+    tampered[0] ^= 1;
+    try std.testing.expect(!Sha384F.verify(base_key, transcript, &tampered));
 }
 
 test "verifyData round-trips with verify returning true" {

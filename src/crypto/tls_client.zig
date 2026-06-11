@@ -30,6 +30,9 @@ const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = hkdf_tls13.Sha256;
+const Sha384 = hkdf_tls13.Sha384;
+/// Largest TLS 1.3 transcript-hash / traffic-secret length we handle (SHA-384).
+const max_hash_len = Sha384.hash_len;
 
 /// Opt-in handshake tracing (set by out-of-band tools like acme_runner).
 pub var debug_log: bool = false;
@@ -43,8 +46,11 @@ fn dbg(comptime fmt: []const u8, args: anytype) void {
     if (debug_log) std.debug.print("tls: " ++ fmt ++ "\n", args);
 }
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+
+const HashAlg = enum { sha256, sha384 };
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("tls_client requires a 64-bit target");
@@ -132,11 +138,13 @@ const KeyUpdateRequest = enum(u8) {
 
 const CipherSuite = enum(u16) {
     tls_aes_128_gcm_sha256 = 0x1301,
+    tls_aes_256_gcm_sha384 = 0x1302,
     tls_chacha20_poly1305_sha256 = 0x1303,
 
     fn fromWire(v: u16) Error!CipherSuite {
         return switch (v) {
             0x1301 => .tls_aes_128_gcm_sha256,
+            0x1302 => .tls_aes_256_gcm_sha384,
             0x1303 => .tls_chacha20_poly1305_sha256,
             else => error.UnsupportedCipherSuite,
         };
@@ -145,6 +153,7 @@ const CipherSuite = enum(u16) {
     fn keyLen(self: CipherSuite) usize {
         return switch (self) {
             .tls_aes_128_gcm_sha256 => Aes128Gcm.key_length,
+            .tls_aes_256_gcm_sha384 => Aes256Gcm.key_length,
             .tls_chacha20_poly1305_sha256 => ChaCha20Poly1305.key_length,
         };
     }
@@ -152,7 +161,22 @@ const CipherSuite = enum(u16) {
     fn tagLen(self: CipherSuite) usize {
         return switch (self) {
             .tls_aes_128_gcm_sha256 => Aes128Gcm.tag_length,
+            .tls_aes_256_gcm_sha384 => Aes256Gcm.tag_length,
             .tls_chacha20_poly1305_sha256 => ChaCha20Poly1305.tag_length,
+        };
+    }
+
+    fn hashAlg(self: CipherSuite) HashAlg {
+        return switch (self) {
+            .tls_aes_256_gcm_sha384 => .sha384,
+            else => .sha256,
+        };
+    }
+
+    fn hashLen(self: CipherSuite) usize {
+        return switch (self.hashAlg()) {
+            .sha256 => Sha256.hash_len,
+            .sha384 => Sha384.hash_len,
         };
     }
 };
@@ -243,18 +267,23 @@ pub const Client = struct {
     /// Test-only: offer secp256r1 as the sole key-exchange group, so the server's
     /// P-256 fallback path can be exercised over the loopback.
     force_p256_only_for_test: bool = false,
+    /// Test-only: offer TLS_AES_256_GCM_SHA384 as the sole cipher suite, so the
+    /// SHA-384 key schedule is exercised end-to-end over the loopback.
+    force_aes256_only_for_test: bool = false,
 
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
     hs_plain: std.ArrayList(u8) = .empty,
 
-    early_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
-    handshake_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
-    master_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
-    client_hs_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
-    server_hs_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
-    client_app_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
-    server_app_secret: [Sha256.hash_len]u8 = [_]u8{0} ** Sha256.hash_len,
+    // Traffic secrets are stored at the maximum hash length (SHA-384); only the
+    // first `selected_suite.hashLen()` bytes are live for a given connection.
+    early_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    client_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    server_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_hs_keys: TrafficKeys = .{},
     server_hs_keys: TrafficKeys = .{},
     client_app_keys: TrafficKeys = .{},
@@ -372,6 +401,11 @@ pub const Client = struct {
     /// Test-only: offer secp256r1 as the sole supported group + key share.
     pub fn offerOnlyP256ForTest(self: *Client) void {
         self.force_p256_only_for_test = true;
+    }
+
+    /// Test-only: offer TLS_AES_256_GCM_SHA384 as the sole cipher suite.
+    pub fn offerOnlyAes256ForTest(self: *Client) void {
+        self.force_aes256_only_for_test = true;
     }
 
     /// Raw (still-encrypted) record bytes received but not consumed by the
@@ -502,15 +536,12 @@ pub const Client = struct {
 
     /// In-place KeyUpdate of one traffic secret: secret' =
     /// HKDF-Expand-Label(secret, "traffic upd", "", Hash.length); re-derive keys.
-    fn applyKeyUpdate(self: *Client, secret: *[Sha256.hash_len]u8, keys: *TrafficKeys) Error!void {
+    fn applyKeyUpdate(self: *Client, secret: *[max_hash_len]u8, keys: *TrafficKeys) Error!void {
         const suite = self.selected_suite orelse return error.BadState;
-        var cur = Sha256.SecretBytes.init(secret.*);
-        defer cur.wipe();
-        var next: [Sha256.hash_len]u8 = undefined;
-        try Sha256.hkdfExpandLabel(&cur, "traffic upd", "", &next);
-        @memcpy(secret, &next);
-        secureZero(&next);
-        try deriveTrafficKeys(suite, secret.*, keys);
+        switch (self.hashAlg()) {
+            .sha256 => try applyKeyUpdateT(Sha256, suite, secret, keys),
+            .sha384 => try applyKeyUpdateT(Sha384, suite, secret, keys),
+        }
     }
 
     fn writeClientHello(self: *Client, out: *std.ArrayList(u8)) Error!void {
@@ -526,9 +557,15 @@ pub const Client = struct {
         try body.append(self.allocator, @intCast(self.legacy_session_id.len));
         try body.appendSlice(self.allocator, &self.legacy_session_id);
 
-        try appendU16(self.allocator, &body, 4);
-        try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_chacha20_poly1305_sha256));
-        try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+        if (self.force_aes256_only_for_test) {
+            try appendU16(self.allocator, &body, 2);
+            try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_aes_256_gcm_sha384));
+        } else {
+            try appendU16(self.allocator, &body, 6);
+            try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_aes_256_gcm_sha384));
+            try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_chacha20_poly1305_sha256));
+            try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+        }
 
         try body.append(self.allocator, 1);
         try body.append(self.allocator, 0);
@@ -811,15 +848,16 @@ pub const Client = struct {
         const sig_len = std.mem.readInt(u16, body[2..4], .big);
         if (body.len != 4 + @as(usize, sig_len)) return error.BadHandshake;
         const sig_bytes = body[4..];
-        const th = Sha256.transcriptHash(self.transcript.items);
-        const input = certificateVerifyInput(&th);
+        var th: [max_hash_len]u8 = undefined;
+        const th_len = self.transcriptHash(&th);
+        var in_buf: [cert_verify_input_max]u8 = undefined;
+        const input = buildCertVerifyInput(&in_buf, certificate_verify_context, th[0..th_len]);
         const leaf = self.leaf_key orelse return error.BadCertificate;
-        try verifySignatureScheme(leaf, scheme, &input, sig_bytes);
+        try verifySignatureScheme(leaf, scheme, input, sig_bytes);
     }
 
     fn verifyFinished(self: *Client, body: []const u8) Error!void {
-        const th = Sha256.transcriptHash(self.transcript.items);
-        if (!tls_finished.verify(self.server_hs_secret, th, body)) return error.FinishedMismatch;
+        if (!self.finishedVerify(&self.server_hs_secret, body)) return error.FinishedMismatch;
     }
 
     fn writeClientFinishedRecord(self: *Client) Error![]u8 {
@@ -839,11 +877,12 @@ pub const Client = struct {
             }
         }
 
-        const th = Sha256.transcriptHash(self.transcript.items);
-        const verify_data = tls_finished.verifyData(self.client_hs_secret, th);
+        var vd_buf: [max_hash_len]u8 = undefined;
+        const vd_len = self.finishedVerifyData(&self.client_hs_secret, &vd_buf);
+        const verify_data = vd_buf[0..vd_len];
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
-        try writeHandshake(self.allocator, &hs, .finished, &verify_data);
+        try writeHandshake(self.allocator, &hs, .finished, verify_data);
         try self.appendTranscript(hs.items);
         const record = try sealRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_write_seq, .handshake, hs.items);
         defer self.allocator.free(record);
@@ -875,9 +914,11 @@ pub const Client = struct {
     /// configured Ed25519 key over the "client CertificateVerify" context.
     fn appendClientCertificateVerify(self: *Client, out: *std.ArrayList(u8), suite: CipherSuite) Error!void {
         const key_pair = self.client_key_pair orelse return error.BadState;
-        const th = Sha256.transcriptHash(self.transcript.items);
-        const input = clientCertificateVerifyInput(&th);
-        const sig = key_pair.sign(&input) catch return error.BadSignature;
+        var th: [max_hash_len]u8 = undefined;
+        const th_len = self.transcriptHash(&th);
+        var in_buf: [cert_verify_input_max]u8 = undefined;
+        const input = buildCertVerifyInput(&in_buf, client_certificate_verify_context, th[0..th_len]);
+        const sig = key_pair.sign(input) catch return error.BadSignature;
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
         try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
@@ -903,43 +944,118 @@ pub const Client = struct {
         try out.appendSlice(self.allocator, record);
     }
 
+    /// Negotiated transcript-hash algorithm (defaults to SHA-256 before the
+    /// ServerHello selects a suite).
+    fn hashAlg(self: *const Client) HashAlg {
+        const suite = self.selected_suite orelse return .sha256;
+        return suite.hashAlg();
+    }
+
+    fn hashLen(self: *const Client) usize {
+        return switch (self.hashAlg()) {
+            .sha256 => Sha256.hash_len,
+            .sha384 => Sha384.hash_len,
+        };
+    }
+
+    /// Transcript-Hash of the handshake so far, written into `out`; returns the
+    /// digest length (32 for SHA-256, 48 for SHA-384).
+    fn transcriptHash(self: *const Client, out: *[max_hash_len]u8) usize {
+        switch (self.hashAlg()) {
+            .sha256 => {
+                const d = Sha256.transcriptHash(self.transcript.items);
+                @memcpy(out[0..d.len], &d);
+                return d.len;
+            },
+            .sha384 => {
+                const d = Sha384.transcriptHash(self.transcript.items);
+                @memcpy(out[0..d.len], &d);
+                return d.len;
+            },
+        }
+    }
+
+    /// Constant-time Finished verify against the negotiated hash.
+    fn finishedVerify(self: *const Client, base_key: *const [max_hash_len]u8, received: []const u8) bool {
+        var th: [max_hash_len]u8 = undefined;
+        _ = self.transcriptHash(&th);
+        return switch (self.hashAlg()) {
+            .sha256 => tls_finished.Sha256F.verify(base_key[0..Sha256.hash_len].*, th[0..Sha256.hash_len].*, received),
+            .sha384 => tls_finished.Sha384F.verify(base_key[0..Sha384.hash_len].*, th[0..Sha384.hash_len].*, received),
+        };
+    }
+
+    /// Finished verify_data for our own Finished, written into `out`; returns len.
+    fn finishedVerifyData(self: *const Client, base_key: *const [max_hash_len]u8, out: *[max_hash_len]u8) usize {
+        var th: [max_hash_len]u8 = undefined;
+        _ = self.transcriptHash(&th);
+        switch (self.hashAlg()) {
+            .sha256 => {
+                const v = tls_finished.Sha256F.verifyData(base_key[0..Sha256.hash_len].*, th[0..Sha256.hash_len].*);
+                @memcpy(out[0..v.len], &v);
+                return v.len;
+            },
+            .sha384 => {
+                const v = tls_finished.Sha384F.verifyData(base_key[0..Sha384.hash_len].*, th[0..Sha384.hash_len].*);
+                @memcpy(out[0..v.len], &v);
+                return v.len;
+            },
+        }
+    }
+
     fn deriveHandshakeKeys(self: *Client, shared_secret: [32]u8) Error!void {
-        var early = Sha256.earlySecret("");
+        switch (self.hashAlg()) {
+            .sha256 => try self.deriveHandshakeKeysT(Sha256, shared_secret),
+            .sha384 => try self.deriveHandshakeKeysT(Sha384, shared_secret),
+        }
+    }
+
+    fn deriveHandshakeKeysT(self: *Client, comptime KS: type, shared_secret: [32]u8) Error!void {
+        var early = KS.earlySecret("");
         defer early.wipe();
-        self.early_secret = early.declassify();
+        self.early_secret[0..KS.hash_len].* = early.declassify();
 
-        var handshake = try Sha256.handshakeSecret(&early, &shared_secret);
+        var handshake = try KS.handshakeSecret(&early, &shared_secret);
         defer handshake.wipe();
-        self.handshake_secret = handshake.declassify();
+        self.handshake_secret[0..KS.hash_len].* = handshake.declassify();
 
-        const th = Sha256.transcriptHash(self.transcript.items);
-        var traffic = try Sha256.handshakeTrafficSecrets(&handshake, &th);
+        const th = KS.transcriptHash(self.transcript.items);
+        var traffic = try KS.handshakeTrafficSecrets(&handshake, &th);
         defer traffic.wipe();
-        self.client_hs_secret = traffic.client.declassify();
-        self.server_hs_secret = traffic.server.declassify();
+        self.client_hs_secret[0..KS.hash_len].* = traffic.client.declassify();
+        self.server_hs_secret[0..KS.hash_len].* = traffic.server.declassify();
 
-        var master = try Sha256.masterSecret(&handshake);
+        var master = try KS.masterSecret(&handshake);
         defer master.wipe();
-        self.master_secret = master.declassify();
+        self.master_secret[0..KS.hash_len].* = master.declassify();
 
         const suite = self.selected_suite orelse return error.BadState;
-        try deriveTrafficKeys(suite, self.client_hs_secret, &self.client_hs_keys);
-        try deriveTrafficKeys(suite, self.server_hs_secret, &self.server_hs_keys);
+        try deriveTrafficKeys(suite, self.client_hs_secret[0..KS.hash_len], &self.client_hs_keys);
+        try deriveTrafficKeys(suite, self.server_hs_secret[0..KS.hash_len], &self.server_hs_keys);
         self.hs_read_seq = 0;
         self.hs_write_seq = 0;
     }
 
     fn deriveApplicationKeys(self: *Client) Error!void {
-        var master = Sha256.SecretBytes.init(self.master_secret);
+        switch (self.hashAlg()) {
+            .sha256 => try self.deriveApplicationKeysT(Sha256),
+            .sha384 => try self.deriveApplicationKeysT(Sha384),
+        }
+    }
+
+    fn deriveApplicationKeysT(self: *Client, comptime KS: type) Error!void {
+        var sk: [KS.hash_len]u8 = undefined;
+        @memcpy(&sk, self.master_secret[0..KS.hash_len]);
+        var master = KS.SecretBytes.init(sk);
         defer master.wipe();
-        const th = Sha256.transcriptHash(self.transcript.items);
-        var traffic = try Sha256.applicationTrafficSecrets(&master, &th);
+        const th = KS.transcriptHash(self.transcript.items);
+        var traffic = try KS.applicationTrafficSecrets(&master, &th);
         defer traffic.wipe();
-        self.client_app_secret = traffic.client.declassify();
-        self.server_app_secret = traffic.server.declassify();
+        self.client_app_secret[0..KS.hash_len].* = traffic.client.declassify();
+        self.server_app_secret[0..KS.hash_len].* = traffic.server.declassify();
         const suite = self.selected_suite orelse return error.BadState;
-        try deriveTrafficKeys(suite, self.client_app_secret, &self.client_app_keys);
-        try deriveTrafficKeys(suite, self.server_app_secret, &self.server_app_keys);
+        try deriveTrafficKeys(suite, self.client_app_secret[0..KS.hash_len], &self.client_app_keys);
+        try deriveTrafficKeys(suite, self.server_app_secret[0..KS.hash_len], &self.server_app_keys);
         self.app_read_seq = 0;
         self.app_write_seq = 0;
     }
@@ -1029,6 +1145,12 @@ fn sealRecordAlloc(
             Aes128Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
             @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
         },
+        .tls_aes_256_gcm_sha384 => {
+            const key = keys.key[0..Aes256Gcm.key_length].*;
+            var tag: [Aes256Gcm.tag_length]u8 = undefined;
+            Aes256Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
+            @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
+        },
         .tls_chacha20_poly1305_sha256 => {
             const key = keys.key[0..ChaCha20Poly1305.key_length].*;
             var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
@@ -1059,6 +1181,11 @@ fn openRecordAlloc(
             const tag = parsed.encrypted_record[clen..][0..Aes128Gcm.tag_length].*;
             Aes128Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.BadRecord;
         },
+        .tls_aes_256_gcm_sha384 => {
+            const key = keys.key[0..Aes256Gcm.key_length].*;
+            const tag = parsed.encrypted_record[clen..][0..Aes256Gcm.tag_length].*;
+            Aes256Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.BadRecord;
+        },
         .tls_chacha20_poly1305_sha256 => {
             const key = keys.key[0..ChaCha20Poly1305.key_length].*;
             const tag = parsed.encrypted_record[clen..][0..ChaCha20Poly1305.tag_length].*;
@@ -1071,12 +1198,36 @@ fn openRecordAlloc(
     return .{ .content_type = opened.content_type, .content = content };
 }
 
-fn deriveTrafficKeys(suite: CipherSuite, secret_bytes: [Sha256.hash_len]u8, out: *TrafficKeys) Error!void {
-    var secret = Sha256.SecretBytes.init(secret_bytes);
+fn deriveTrafficKeys(suite: CipherSuite, secret_bytes: []const u8, out: *TrafficKeys) Error!void {
+    switch (suite.hashAlg()) {
+        .sha256 => try deriveTrafficKeysT(Sha256, suite, secret_bytes, out),
+        .sha384 => try deriveTrafficKeysT(Sha384, suite, secret_bytes, out),
+    }
+}
+
+fn deriveTrafficKeysT(comptime KS: type, suite: CipherSuite, secret_bytes: []const u8, out: *TrafficKeys) Error!void {
+    if (secret_bytes.len < KS.hash_len) return error.BadState;
+    var sk: [KS.hash_len]u8 = undefined;
+    @memcpy(&sk, secret_bytes[0..KS.hash_len]);
+    var secret = KS.SecretBytes.init(sk);
     defer secret.wipe();
     out.wipe();
-    try Sha256.hkdfExpandLabel(&secret, "key", "", out.key[0..suite.keyLen()]);
-    try Sha256.hkdfExpandLabel(&secret, "iv", "", &out.iv);
+    try KS.hkdfExpandLabel(&secret, "key", "", out.key[0..suite.keyLen()]);
+    try KS.hkdfExpandLabel(&secret, "iv", "", &out.iv);
+}
+
+/// In-place KeyUpdate of a traffic secret stored in a `[max_hash_len]u8` field;
+/// only the schedule's digest-length prefix is live.
+fn applyKeyUpdateT(comptime KS: type, suite: CipherSuite, secret: *[max_hash_len]u8, keys: *TrafficKeys) Error!void {
+    var sk: [KS.hash_len]u8 = undefined;
+    @memcpy(&sk, secret[0..KS.hash_len]);
+    var cur = KS.SecretBytes.init(sk);
+    defer cur.wipe();
+    var next: [KS.hash_len]u8 = undefined;
+    try KS.hkdfExpandLabel(&cur, "traffic upd", "", &next);
+    @memcpy(secret[0..KS.hash_len], &next);
+    secureZero(&next);
+    try deriveTrafficKeys(suite, secret[0..KS.hash_len], keys);
 }
 
 fn buildSniBody(out: []u8, name: []const u8) Error![]const u8 {
@@ -1175,30 +1326,23 @@ const Cursor = struct {
     }
 };
 
-fn certificateVerifyInput(transcript_hash: *const [Sha256.hash_len]u8) [64 + certificate_verify_context.len + 1 + Sha256.hash_len]u8 {
-    var out: [64 + certificate_verify_context.len + 1 + Sha256.hash_len]u8 = undefined;
-    @memset(out[0..64], 0x20);
-    @memcpy(out[64..][0..certificate_verify_context.len], certificate_verify_context);
-    out[64 + certificate_verify_context.len] = 0;
-    @memcpy(out[64 + certificate_verify_context.len + 1 ..], transcript_hash);
-    return out;
-}
-
 const certificate_verify_context = "TLS 1.3, server CertificateVerify";
-
-/// CertificateVerify signed input for the *client*'s CertificateVerify. The
-/// context string differs from the server's (RFC 8446 §4.4.3); the framing of
-/// 64 spaces + context + 0x00 separator + transcript hash is identical.
-fn clientCertificateVerifyInput(transcript_hash: *const [Sha256.hash_len]u8) [64 + client_certificate_verify_context.len + 1 + Sha256.hash_len]u8 {
-    var out: [64 + client_certificate_verify_context.len + 1 + Sha256.hash_len]u8 = undefined;
-    @memset(out[0..64], 0x20);
-    @memcpy(out[64..][0..client_certificate_verify_context.len], client_certificate_verify_context);
-    out[64 + client_certificate_verify_context.len] = 0;
-    @memcpy(out[64 + client_certificate_verify_context.len + 1 ..], transcript_hash);
-    return out;
-}
-
 const client_certificate_verify_context = "TLS 1.3, client CertificateVerify";
+/// 64 spaces + the longest context + 1 separator + the longest transcript hash.
+const cert_verify_input_max = 64 + client_certificate_verify_context.len + 1 + max_hash_len;
+
+/// Build the CertificateVerify signed content (RFC 8446 §4.4.3): 64 0x20 bytes,
+/// the context string, a 0x00 separator, then the transcript hash. Written into
+/// `out`; the returned slice is the used prefix. `context` is the server or
+/// client context string and `transcript_hash` is 32 or 48 bytes.
+fn buildCertVerifyInput(out: *[cert_verify_input_max]u8, context: []const u8, transcript_hash: []const u8) []const u8 {
+    @memset(out[0..64], 0x20);
+    @memcpy(out[64..][0..context.len], context);
+    out[64 + context.len] = 0;
+    const tail = 64 + context.len + 1;
+    @memcpy(out[tail..][0..transcript_hash.len], transcript_hash);
+    return out[0 .. tail + transcript_hash.len];
+}
 
 fn verifySignatureScheme(key: LeafPublicKey, scheme: tls_signature_scheme.SignatureScheme, msg: []const u8, sig: []const u8) Error!void {
     switch (scheme) {
