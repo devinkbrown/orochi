@@ -1,0 +1,456 @@
+//! Strict, allocation-free X.509 Certificate Revocation List parser.
+//!
+//! This module parses the RFC 5280 §5 `CertificateList` structure and exposes
+//! issuer/update metadata plus an on-demand iterator over revoked certificate
+//! serial numbers. It deliberately does not verify the CRL signature; callers
+//! must authenticate the CRL through their certificate-path policy before
+//! trusting revocation results.
+const std = @import("std");
+const x509 = @import("x509.zig");
+
+pub const Error = x509.Error;
+pub const Time = x509.Time;
+
+/// Parsed CRL data. All slices point into caller-owned `der`.
+pub const CertificateRevocationList = struct {
+    der: []const u8,
+    tbs_der: []const u8,
+    issuer_der: []const u8,
+    this_update: Time,
+    next_update: ?Time,
+    tbs_signature_algorithm_oid: []const u8,
+    signature_algorithm_oid: []const u8,
+    signature_value: []const u8,
+    revoked_certificates_der: []const u8,
+
+    /// Return an on-demand iterator over revoked serial-number INTEGER values.
+    pub fn revokedSerials(self: CertificateRevocationList) RevokedSerialIterator {
+        return .{ .reader = x509.DerReader.init(self.revoked_certificates_der) };
+    }
+};
+
+/// Iterator over `revokedCertificates`. Each returned slice is the DER INTEGER
+/// contents for `userCertificate`, including any required DER sign-padding byte.
+pub const RevokedSerialIterator = struct {
+    reader: x509.DerReader,
+
+    pub fn next(self: *RevokedSerialIterator) Error!?[]const u8 {
+        if (!self.reader.hasRemaining()) return null;
+
+        const entry_tlv = try self.reader.readExpected(x509.Tag.sequence);
+        var entry = try self.reader.child(entry_tlv);
+        const serial_tlv = try entry.readExpected(x509.Tag.integer);
+        try validatePositiveInteger(serial_tlv.value);
+
+        _ = try parseTime(try entry.readTlv());
+        if (entry.hasRemaining()) {
+            const extensions_tlv = try entry.readExpected(x509.Tag.sequence);
+            try validateExtensions(entry, extensions_tlv);
+        }
+        try entry.expectEmpty();
+        return serial_tlv.value;
+    }
+};
+
+/// Parse a DER RFC 5280 CertificateList.
+pub fn parse(der: []const u8) Error!CertificateRevocationList {
+    if (der.len == 0) return error.EmptyInput;
+    if (der.len > x509.MaxDerLen) return error.Oversize;
+
+    var parsed = CertificateRevocationList{
+        .der = der,
+        .tbs_der = &.{},
+        .issuer_der = &.{},
+        .this_update = emptyTime(),
+        .next_update = null,
+        .tbs_signature_algorithm_oid = &.{},
+        .signature_algorithm_oid = &.{},
+        .signature_value = &.{},
+        .revoked_certificates_der = &.{},
+    };
+
+    var top = x509.DerReader.init(der);
+    const crl_tlv = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+
+    var crl = try top.child(crl_tlv);
+    const tbs_tlv = try crl.readExpected(x509.Tag.sequence);
+    parsed.tbs_der = tbs_tlv.raw;
+    try parseTbs(&parsed, crl, tbs_tlv);
+
+    const signature_algorithm_tlv = try crl.readExpected(x509.Tag.sequence);
+    parsed.signature_algorithm_oid = try parseAlgorithmOid(crl, signature_algorithm_tlv);
+
+    const signature_tlv = try crl.readExpected(x509.Tag.bit_string);
+    parsed.signature_value = try bitStringBytes(signature_tlv);
+    try crl.expectEmpty();
+
+    if (parsed.issuer_der.len == 0 or
+        parsed.tbs_signature_algorithm_oid.len == 0 or
+        parsed.signature_algorithm_oid.len == 0)
+    {
+        return error.MissingField;
+    }
+    return parsed;
+}
+
+/// Return true when `serial` exactly matches a revoked `userCertificate` value.
+pub fn isRevoked(parsed: CertificateRevocationList, serial: []const u8) bool {
+    var serials = parsed.revokedSerials();
+    while (true) {
+        const revoked = serials.next() catch return false;
+        const candidate = revoked orelse return false;
+        if (std.mem.eql(u8, candidate, serial)) return true;
+    }
+}
+
+fn parseTbs(parsed: *CertificateRevocationList, parent: x509.DerReader, tbs_tlv: x509.Tlv) Error!void {
+    var tbs = try parent.child(tbs_tlv);
+
+    if (tbs.hasRemaining() and try tbs.peekTag() == x509.Tag.integer) {
+        try parseVersion(try tbs.readTlv());
+    }
+
+    const signature_tlv = try tbs.readExpected(x509.Tag.sequence);
+    parsed.tbs_signature_algorithm_oid = try parseAlgorithmOid(tbs, signature_tlv);
+
+    const issuer_tlv = try tbs.readExpected(x509.Tag.sequence);
+    parsed.issuer_der = issuer_tlv.raw;
+
+    parsed.this_update = try parseTime(try tbs.readTlv());
+    if (tbs.hasRemaining()) {
+        const tag = try tbs.peekTag();
+        if (tag == x509.Tag.utc_time or tag == x509.Tag.generalized_time) {
+            parsed.next_update = try parseTime(try tbs.readTlv());
+        }
+    }
+
+    var saw_revoked = false;
+    var saw_extensions = false;
+    while (tbs.hasRemaining()) {
+        const tag = try tbs.peekTag();
+        if (tag == x509.Tag.sequence and !saw_revoked and !saw_extensions) {
+            const revoked_tlv = try tbs.readExpected(x509.Tag.sequence);
+            parsed.revoked_certificates_der = revoked_tlv.value;
+            try validateRevokedCertificates(tbs, revoked_tlv);
+            saw_revoked = true;
+        } else if (tag == x509.Tag.context_0_constructed and !saw_extensions) {
+            try validateCrlExtensions(tbs, try tbs.readTlv());
+            saw_extensions = true;
+        } else {
+            return error.InvalidTag;
+        }
+    }
+}
+
+fn parseVersion(version_tlv: x509.Tlv) Error!void {
+    try validateDerInteger(version_tlv.value);
+    if (version_tlv.value.len != 1 or version_tlv.value[0] > 1) return error.InvalidCertificate;
+}
+
+fn validateRevokedCertificates(parent: x509.DerReader, revoked_tlv: x509.Tlv) Error!void {
+    var serials = RevokedSerialIterator{ .reader = try parent.child(revoked_tlv) };
+    while (try serials.next()) |_| {}
+}
+
+fn validateCrlExtensions(parent: x509.DerReader, explicit_tlv: x509.Tlv) Error!void {
+    var explicit = try parent.child(explicit_tlv);
+    const extensions_tlv = try explicit.readExpected(x509.Tag.sequence);
+    try explicit.expectEmpty();
+    try validateExtensions(explicit, extensions_tlv);
+}
+
+fn validateExtensions(parent: x509.DerReader, extensions_tlv: x509.Tlv) Error!void {
+    var extensions = try parent.child(extensions_tlv);
+    while (extensions.hasRemaining()) {
+        const extension_tlv = try extensions.readExpected(x509.Tag.sequence);
+        var extension = try extensions.child(extension_tlv);
+
+        const oid_tlv = try extension.readExpected(x509.Tag.oid);
+        try validateOid(oid_tlv.value);
+
+        if (extension.hasRemaining() and try extension.peekTag() == x509.Tag.boolean) {
+            _ = try parseBoolean(try extension.readTlv());
+        }
+
+        _ = try extension.readExpected(x509.Tag.octet_string);
+        try extension.expectEmpty();
+    }
+}
+
+fn parseAlgorithmOid(parent: x509.DerReader, seq_tlv: x509.Tlv) Error![]const u8 {
+    var algorithm = try parent.child(seq_tlv);
+    const oid_tlv = try algorithm.readExpected(x509.Tag.oid);
+    try validateOid(oid_tlv.value);
+    if (algorithm.hasRemaining()) {
+        _ = try algorithm.readTlv();
+    }
+    try algorithm.expectEmpty();
+    return oid_tlv.value;
+}
+
+fn bitStringBytes(tlv: x509.Tlv) Error![]const u8 {
+    if (tlv.tag != x509.Tag.bit_string or tlv.value.len == 0) return error.InvalidBitString;
+    const unused_bits = tlv.value[0];
+    if (unused_bits > 7) return error.InvalidBitString;
+    if (tlv.value.len == 1 and unused_bits != 0) return error.InvalidBitString;
+    return tlv.value[1..];
+}
+
+fn parseBoolean(tlv: x509.Tlv) Error!bool {
+    if (tlv.tag != x509.Tag.boolean or tlv.value.len != 1) return error.InvalidBoolean;
+    return switch (tlv.value[0]) {
+        0x00 => false,
+        0xFF => true,
+        else => error.InvalidBoolean,
+    };
+}
+
+fn validatePositiveInteger(value: []const u8) Error!void {
+    try validateDerInteger(value);
+    if ((value[0] & 0x80) != 0) return error.InvalidInteger;
+}
+
+fn validateDerInteger(value: []const u8) Error!void {
+    if (value.len == 0) return error.InvalidInteger;
+    if (value.len > 1) {
+        if (value[0] == 0x00 and (value[1] & 0x80) == 0) return error.InvalidInteger;
+        if (value[0] == 0xFF and (value[1] & 0x80) != 0) return error.InvalidInteger;
+    }
+}
+
+fn validateOid(value: []const u8) Error!void {
+    if (value.len == 0) return error.InvalidOid;
+    var at_arc_start = true;
+    var ended_arc = false;
+    for (value) |byte| {
+        if (at_arc_start and byte == 0x80) return error.InvalidOid;
+        ended_arc = (byte & 0x80) == 0;
+        at_arc_start = ended_arc;
+    }
+    if (!ended_arc) return error.InvalidOid;
+}
+
+fn parseTime(tlv: x509.Tlv) Error!Time {
+    return switch (tlv.tag) {
+        x509.Tag.utc_time => parseUtcTime(tlv.value),
+        x509.Tag.generalized_time => parseGeneralizedTime(tlv.value),
+        else => error.InvalidTime,
+    };
+}
+
+fn parseUtcTime(bytes: []const u8) Error!Time {
+    if (bytes.len != 13 or bytes[12] != 'Z') return error.InvalidTime;
+    const yy = try twoDigits(bytes[0..2], 0, 99);
+    const year: i32 = if (yy >= 50) 1900 + @as(i32, yy) else 2000 + @as(i32, yy);
+    const month = try twoDigits(bytes[2..4], 1, 12);
+    const day = try twoDigits(bytes[4..6], 1, 31);
+    const hour = try twoDigits(bytes[6..8], 0, 23);
+    const minute = try twoDigits(bytes[8..10], 0, 59);
+    const second = try twoDigits(bytes[10..12], 0, 59);
+    return .{
+        .kind = .utc,
+        .bytes = bytes,
+        .epoch_seconds = try epochSeconds(year, month, day, hour, minute, second),
+    };
+}
+
+fn parseGeneralizedTime(bytes: []const u8) Error!Time {
+    if (bytes.len != 15 or bytes[14] != 'Z') return error.InvalidTime;
+    const year_u16 = try fourDigits(bytes[0..4]);
+    const month = try twoDigits(bytes[4..6], 1, 12);
+    const day = try twoDigits(bytes[6..8], 1, 31);
+    const hour = try twoDigits(bytes[8..10], 0, 23);
+    const minute = try twoDigits(bytes[10..12], 0, 59);
+    const second = try twoDigits(bytes[12..14], 0, 59);
+    return .{
+        .kind = .generalized,
+        .bytes = bytes,
+        .epoch_seconds = try epochSeconds(@intCast(year_u16), month, day, hour, minute, second),
+    };
+}
+
+fn twoDigits(bytes: []const u8, min: u8, max: u8) Error!u8 {
+    if (bytes.len != 2) return error.InvalidTime;
+    if (!std.ascii.isDigit(bytes[0]) or !std.ascii.isDigit(bytes[1])) return error.InvalidTime;
+    const value = (bytes[0] - '0') * 10 + (bytes[1] - '0');
+    if (value < min or value > max) return error.InvalidTime;
+    return value;
+}
+
+fn fourDigits(bytes: []const u8) Error!u16 {
+    if (bytes.len != 4) return error.InvalidTime;
+    var value: u16 = 0;
+    for (bytes) |byte| {
+        if (!std.ascii.isDigit(byte)) return error.InvalidTime;
+        value = value * 10 + @as(u16, byte - '0');
+    }
+    return value;
+}
+
+fn epochSeconds(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8) Error!i64 {
+    const max_day = daysInMonth(year, month);
+    if (day > max_day) return error.InvalidTime;
+
+    var days: i64 = 0;
+    if (year >= 1970) {
+        var y: i32 = 1970;
+        while (y < year) : (y += 1) {
+            days += daysInYear(y);
+        }
+    } else {
+        var y: i32 = year;
+        while (y < 1970) : (y += 1) {
+            days -= daysInYear(y);
+        }
+    }
+
+    var m: u8 = 1;
+    while (m < month) : (m += 1) {
+        days += daysInMonth(year, m);
+    }
+    days += @as(i64, day) - 1;
+    return days * 86_400 + @as(i64, hour) * 3_600 + @as(i64, minute) * 60 + second;
+}
+
+fn daysInYear(year: i32) i64 {
+    return if (isLeapYear(year)) 366 else 365;
+}
+
+fn daysInMonth(year: i32, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn isLeapYear(year: i32) bool {
+    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+}
+
+fn emptyTime() Time {
+    return .{ .kind = .utc, .bytes = &.{}, .epoch_seconds = 0 };
+}
+
+const MinimalCrlWithRevoked = [_]u8{
+    0x30, 0x62,
+    0x30, 0x55,
+    0x02, 0x01,
+    0x01, 0x30,
+    0x05, 0x06,
+    0x03, 0x2B,
+    0x65, 0x70,
+    0x30, 0x00,
+    0x17, 0x0D,
+    '2',  '6',
+    '0',  '1',
+    '0',  '1',
+    '0',  '0',
+    '0',  '0',
+    '0',  '0',
+    'Z',  0x17,
+    0x0D, '2',
+    '6',  '0',
+    '2',  '0',
+    '1',  '0',
+    '0',  '0',
+    '0',  '0',
+    '0',  'Z',
+    0x30, 0x29,
+    0x30, 0x12,
+    0x02, 0x01,
+    0x05, 0x17,
+    0x0D, '2',
+    '6',  '0',
+    '1',  '0',
+    '2',  '0',
+    '0',  '0',
+    '0',  '0',
+    '0',  'Z',
+    0x30, 0x13,
+    0x02, 0x02,
+    0x00, 0x80,
+    0x17, 0x0D,
+    '2',  '6',
+    '0',  '1',
+    '0',  '3',
+    '0',  '0',
+    '0',  '0',
+    '0',  '0',
+    'Z',  0x30,
+    0x05, 0x06,
+    0x03, 0x2B,
+    0x65, 0x70,
+    0x03, 0x02,
+    0x00, 0x00,
+};
+
+const MinimalCrlWithoutRevoked = [_]u8{
+    0x30, 0x28,
+    0x30, 0x1B,
+    0x02, 0x01,
+    0x01, 0x30,
+    0x05, 0x06,
+    0x03, 0x2B,
+    0x65, 0x70,
+    0x30, 0x00,
+    0x17, 0x0D,
+    '2',  '6',
+    '0',  '1',
+    '0',  '1',
+    '0',  '0',
+    '0',  '0',
+    '0',  '0',
+    'Z',  0x30,
+    0x05, 0x06,
+    0x03, 0x2B,
+    0x65, 0x70,
+    0x03, 0x02,
+    0x00, 0x00,
+};
+
+test "crl parses revoked serials and checks revocation" {
+    const parsed = try parse(&MinimalCrlWithRevoked);
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x00 }, parsed.issuer_der);
+    try std.testing.expectEqualSlices(u8, "260101000000Z", parsed.this_update.bytes);
+    try std.testing.expect(parsed.next_update != null);
+    try std.testing.expectEqualSlices(u8, "260201000000Z", parsed.next_update.?.bytes);
+
+    try std.testing.expect(isRevoked(parsed, &[_]u8{0x05}));
+    try std.testing.expect(isRevoked(parsed, &[_]u8{ 0x00, 0x80 }));
+    try std.testing.expect(!isRevoked(parsed, &[_]u8{0x06}));
+
+    var serials = parsed.revokedSerials();
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x05}, (try serials.next()).?);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x80 }, (try serials.next()).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try serials.next());
+}
+
+test "crl accepts absent revokedCertificates" {
+    const parsed = try parse(&MinimalCrlWithoutRevoked);
+
+    try std.testing.expectEqual(@as(?Time, null), parsed.next_update);
+    try std.testing.expect(!isRevoked(parsed, &[_]u8{0x05}));
+
+    var serials = parsed.revokedSerials();
+    try std.testing.expectEqual(@as(?[]const u8, null), try serials.next());
+}
+
+test "crl rejects malformed input" {
+    try std.testing.expectError(error.EmptyInput, parse(&.{}));
+    try std.testing.expectError(error.Truncated, parse(&[_]u8{ 0x30, 0x00 }));
+
+    var bad_time = MinimalCrlWithRevoked;
+    bad_time[16] = x509.Tag.null_value;
+    try std.testing.expectError(error.InvalidTime, parse(&bad_time));
+
+    var bad_serial = MinimalCrlWithRevoked;
+    bad_serial[52] = 0x80;
+    try std.testing.expectError(error.InvalidInteger, parse(&bad_serial));
+
+    var trailing = MinimalCrlWithRevoked ++ [_]u8{0x00};
+    try std.testing.expectError(error.TrailingData, parse(&trailing));
+}
