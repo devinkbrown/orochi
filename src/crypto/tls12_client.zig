@@ -102,6 +102,13 @@ pub const Client = struct {
     selected_suite: ?tls12.CipherSuite = null,
     selected_alpn: ?[]u8 = null,
     leaf_key: ?LeafPublicKey = null,
+    /// Owned storage for the leaf RSA key's modulus/exponent. The parsed key
+    /// borrows the certificate chain DER, which is freed right after the
+    /// Certificate message — so an RSA leaf key would dangle by the time the
+    /// ServerKeyExchange signature is verified. Copy n/e here and re-point.
+    /// (ECDSA keys are value types and need no copy.)
+    leaf_rsa_n: [rsa_verify.max_bytes]u8 = undefined,
+    leaf_rsa_e: [16]u8 = undefined,
 
     master_secret: [tls12.master_secret_len]u8 = [_]u8{0} ** tls12.master_secret_len,
     keys: tls12.KeyMaterial = .{},
@@ -375,6 +382,18 @@ pub const Client = struct {
         }
         const leaf = try extractCertParts(chain[0]);
         self.leaf_key = try parsePublicKeyFromSpki(leaf.spki_der);
+        // The RSA variant borrows the SPKI bytes (in the chain freed above); copy
+        // n/e into owned storage so the key survives until ServerKeyExchange.
+        if (self.leaf_key) |lk| {
+            if (lk == .rsa) {
+                const n = lk.rsa.n;
+                const e = lk.rsa.e;
+                if (n.len > self.leaf_rsa_n.len or e.len > self.leaf_rsa_e.len) return error.BadCertificate;
+                @memcpy(self.leaf_rsa_n[0..n.len], n);
+                @memcpy(self.leaf_rsa_e[0..e.len], e);
+                self.leaf_key = .{ .rsa = .{ .n = self.leaf_rsa_n[0..n.len], .e = self.leaf_rsa_e[0..e.len] } };
+            }
+        }
     }
 
     fn verifyServerKeyExchange(self: *Client, body: []const u8) Error!void {
