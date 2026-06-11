@@ -212,6 +212,7 @@ pub const rendezvous_hash = @import("rendezvous_hash.zig");
 pub const reservoir_sample = @import("reservoir_sample.zig");
 pub const resolv_conf = @import("resolv_conf.zig");
 pub const route_report = @import("route_report.zig");
+pub const rsa_pkcs = @import("rsa_pkcs.zig");
 pub const rtcp_compound = @import("rtcp_compound.zig");
 pub const rtcp_translate = @import("rtcp_translate.zig");
 pub const rtcp_xr = @import("rtcp_xr.zig");
@@ -530,6 +531,7 @@ test {
     _ = reservoir_sample;
     _ = resolv_conf;
     _ = route_report;
+    _ = rsa_pkcs;
     _ = rtcp_compound;
     _ = rtcp_translate;
     _ = rtcp_xr;

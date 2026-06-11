@@ -184,6 +184,7 @@ const node_identity = @import("node_identity.zig");
 const secured_s2s_link = @import("secured_s2s_link.zig");
 const tls_conn = @import("tls_conn.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
+const rsa_sign = @import("../crypto/rsa_sign.zig");
 const reactor_wake = @import("reactor_wake.zig");
 const shard_mod = @import("shard.zig");
 const reactor_pool_mod = @import("reactor_pool.zig");
@@ -1109,13 +1110,17 @@ pub const Config = struct {
     s2s_port: u16 = 0,
     /// Optional implicit-TLS client listener port (0 = disabled). Accepts here
     /// are ordinary IRC clients whose bytes are wrapped in TLS 1.3 (no STARTTLS).
-    /// Requires both `tls_cert_chain` and `tls_signing_key`.
+    /// Requires `tls_cert_chain` plus an Ed25519 or RSA signing key.
     tls_port: u16 = 0,
     /// Leaf-first DER certificate chain presented on the TLS listener. Borrowed
     /// for the server's lifetime (loaded by main.zig via tls_certs.loadOrBootstrap).
     tls_cert_chain: []const []const u8 = &.{},
     /// Ed25519 key matching the leaf cert's SPKI; signs each TLS CertificateVerify.
     tls_signing_key: ?std.crypto.sign.Ed25519.KeyPair = null,
+    /// RSA key matching the leaf cert's SPKI; signs TLS 1.3 CertificateVerify
+    /// with rsa_pss_rsae_sha256, and TLS 1.2 ServerKeyExchange with
+    /// rsa_pkcs1_sha256 when the hardened 1.2 leg is enabled for an RSA leaf.
+    tls_rsa_signing_key: ?rsa_sign.PrivateKey = null,
     /// Enable TLS 1.3 NewSessionTicket issuance and PSK resumption on the live
     /// TLS listener. Default false keeps the listener's historical full-handshake
     /// behavior byte-identical.
@@ -1589,7 +1594,7 @@ pub const LinuxServer = struct {
         // Cert presence is the "TLS configured" signal (main.zig only supplies a
         // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
         // same convention the plaintext listener uses.
-        const tls_listener_fd: linux.fd_t = if (config.tls_cert_chain.len != 0 and config.tls_signing_key != null)
+        const tls_listener_fd: linux.fd_t = if (config.tls_cert_chain.len != 0 and (config.tls_signing_key != null or config.tls_rsa_signing_key != null))
             (if (reuse_port)
                 try reuseport.createReusePortListener(config.host, config.tls_port, config.backlog)
             else
@@ -1773,7 +1778,8 @@ pub const LinuxServer = struct {
     fn tls13Config(self: *LinuxServer) tls_server.Config {
         var cfg = tls_server.Config{
             .cert_chain = self.config.tls_cert_chain,
-            .signing_key = self.config.tls_signing_key.?,
+            .signing_key = self.config.tls_signing_key,
+            .rsa_signing_key = self.config.tls_rsa_signing_key,
             .request_client_cert = self.config.tls_request_client_cert,
         };
         if (self.config.tls_enable_resumption) {
@@ -2561,12 +2567,13 @@ pub const LinuxServer = struct {
             // Stand up the per-connection TLS engine; the IRC layer above sees
             // only decrypted plaintext once the handshake completes.
             const tls = try self.allocator.create(tls_conn.TlsConn);
-            if (self.config.tls12_signing_key) |ec_key| {
+            if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
                 // Hardened TLS 1.2 enabled: version-dispatch between the 1.3 and
                 // 1.2 engines on the first ClientHello.
                 tls.* = tls_conn.TlsConn.initDual(self.allocator, self.tls13Config(), .{
                     .cert_chain = self.config.tls12_cert_chain,
-                    .ecdsa_p256_signing_key = ec_key,
+                    .ecdsa_p256_signing_key = self.config.tls12_signing_key,
+                    .rsa_signing_key = self.config.tls_rsa_signing_key,
                 });
             } else {
                 tls.* = tls_conn.TlsConn.init(self.allocator, self.tls13Config()) catch {

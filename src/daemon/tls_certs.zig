@@ -1,11 +1,12 @@
 //! TLS certificate material loader for the daemon's TLS listener.
 //!
-//! Resolves the leaf certificate chain + Ed25519 signing key that the TLS server
+//! Resolves the leaf certificate chain + private signing key that the TLS server
 //! handshake needs, from one of two sources:
 //!   * **On-disk material** — when both `cert_path` and `key_path` are supplied,
 //!     the files are read and decoded. Each accepts either PEM (a
-//!     `-----BEGIN CERTIFICATE-----` / `-----BEGIN PRIVATE KEY-----` block) or
-//!     raw DER, detected by sniffing for the PEM armor.
+//!     `-----BEGIN CERTIFICATE-----`, `-----BEGIN PRIVATE KEY-----`, or
+//!     `-----BEGIN RSA PRIVATE KEY-----` block) or raw DER, detected by sniffing
+//!     for the PEM armor. Private keys may be Ed25519 PKCS#8 or RSA PKCS#1/PKCS#8.
 //!   * **Self-signed bootstrap** — when no paths are given and TLS is enabled,
 //!     a fresh Ed25519 keypair is generated (seeded from the OS CSPRNG) and a
 //!     short-lived self-signed leaf is minted with `dns_name` as its subject.
@@ -18,8 +19,10 @@ const std = @import("std");
 
 const pem = @import("../proto/pem.zig");
 const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
+const rsa_pkcs = @import("../proto/rsa_pkcs.zig");
 const x509_selfsign = @import("../proto/x509_selfsign.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
+const rsa_sign = @import("../crypto/rsa_sign.zig");
 const x509 = @import("../crypto/x509.zig");
 const random = @import("../crypto/random.zig");
 
@@ -32,6 +35,7 @@ const Ed25519 = std.crypto.sign.Ed25519;
 /// PEM armor markers used to distinguish PEM input from raw DER.
 const cert_pem_label = "CERTIFICATE";
 const key_pem_label = "PRIVATE KEY";
+const rsa_key_pem_label = "RSA PRIVATE KEY";
 const pem_begin_marker = "-----BEGIN";
 
 /// Upper bound on a single on-disk cert or key file. Generous for a leaf chain;
@@ -52,6 +56,7 @@ pub const Error = error{
     std.Io.Dir.ReadFileAllocError ||
     pem.Error ||
     ed25519_pkcs8.ParseError ||
+    rsa_pkcs.ParseError ||
     x509_selfsign.Error ||
     std.crypto.errors.IdentityElementError ||
     std.crypto.errors.NonCanonicalError ||
@@ -69,18 +74,34 @@ pub const Options = struct {
     dns_name: []const u8 = "localhost",
 };
 
-/// Resolved TLS material. Shape matches `crypto/tls_server.Config`:
-/// `cert_chain` is a leaf-first list of DER certificates, `signing_key` is the
-/// Ed25519 key that signs the TLS 1.3 CertificateVerify. The chain bytes are
-/// owned by this struct; the signing key is a value.
+/// On-disk/bootstrap key kind carried by `Loaded`.
+pub const KeyKind = enum {
+    ed25519,
+    ecdsa_p256,
+    rsa,
+};
+
+/// Resolved TLS material. `cert_chain` is a leaf-first list of DER
+/// certificates. Exactly one signing-key field is set according to `key_kind`;
+/// RSA key slices alias `rsa_key_storage`, which this value owns. The chain bytes
+/// are owned by this struct; call `deinit` after the server stops borrowing it.
 pub const Loaded = struct {
     cert_chain: [][]const u8,
-    signing_key: Ed25519.KeyPair,
+    key_kind: KeyKind,
+    signing_key: ?Ed25519.KeyPair = null,
+    rsa_signing_key: ?rsa_sign.PrivateKey = null,
+    rsa_key_storage: ?[]u8 = null,
 
     pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
         for (self.cert_chain) |der| allocator.free(der);
         allocator.free(self.cert_chain);
-        std.crypto.secureZero(u8, std.mem.asBytes(&self.signing_key.secret_key));
+        if (self.signing_key) |*kp| {
+            std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
+        }
+        if (self.rsa_key_storage) |storage| {
+            std.crypto.secureZero(u8, storage);
+            allocator.free(storage);
+        }
         self.* = undefined;
     }
 };
@@ -108,12 +129,18 @@ fn loadFromDisk(allocator: std.mem.Allocator, io: std.Io, cert_path: []const u8,
     const cert_der = try loadCertDer(allocator, io, cert_path);
     errdefer allocator.free(cert_der);
 
-    const seed = try loadKeySeed(allocator, io, key_path);
-    const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
+    var key = try loadPrivateKey(allocator, io, key_path);
+    errdefer key.deinit(allocator);
 
     const chain = try allocator.alloc([]const u8, 1);
     chain[0] = cert_der;
-    return .{ .cert_chain = chain, .signing_key = key_pair };
+    return .{
+        .cert_chain = chain,
+        .key_kind = key.key_kind,
+        .signing_key = key.signing_key,
+        .rsa_signing_key = key.rsa_signing_key,
+        .rsa_key_storage = key.takeRsaStorage(),
+    };
 }
 
 /// Read a certificate file (PEM or DER) and return owned DER bytes.
@@ -129,17 +156,62 @@ fn loadCertDer(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error
     return allocator.dupe(u8, der);
 }
 
-/// Read a private key file (PEM or DER PKCS#8) and return the 32-byte Ed25519 seed.
-fn loadKeySeed(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error![ed25519_pkcs8.seed_len]u8 {
+const LoadedKey = struct {
+    key_kind: KeyKind,
+    signing_key: ?Ed25519.KeyPair = null,
+    rsa_signing_key: ?rsa_sign.PrivateKey = null,
+    rsa_key_storage: ?[]u8 = null,
+
+    fn deinit(self: *LoadedKey, allocator: std.mem.Allocator) void {
+        if (self.signing_key) |*kp| {
+            std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
+        }
+        if (self.rsa_key_storage) |storage| {
+            std.crypto.secureZero(u8, storage);
+            allocator.free(storage);
+            self.rsa_key_storage = null;
+        }
+    }
+
+    fn takeRsaStorage(self: *LoadedKey) ?[]u8 {
+        const storage = self.rsa_key_storage;
+        self.rsa_key_storage = null;
+        return storage;
+    }
+};
+
+/// Read a private key file (PEM or DER) and return Ed25519 or RSA signing material.
+fn loadPrivateKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!LoadedKey {
     const raw = try readFileOwned(allocator, io, path);
     defer allocator.free(raw);
 
-    if (!isPem(raw)) return ed25519_pkcs8.parse(raw);
+    var der_buf: ?[]u8 = null;
+    defer if (der_buf) |buf| allocator.free(buf);
+    const der = if (!isPem(raw)) raw else blk: {
+        const buf = try allocator.alloc(u8, raw.len);
+        der_buf = buf;
+        const first = try pem.decodeFirst(raw, buf);
+        if (!std.mem.eql(u8, first.label, key_pem_label) and !std.mem.eql(u8, first.label, rsa_key_pem_label)) {
+            return error.UnsupportedAlgorithm;
+        }
+        break :blk first.der;
+    };
 
-    const der_buf = try allocator.alloc(u8, raw.len);
-    defer allocator.free(der_buf);
-    const der = try pem.decode(raw, key_pem_label, der_buf);
-    return ed25519_pkcs8.parse(der);
+    if (ed25519_pkcs8.parse(der)) |seed| {
+        var seed_copy = seed;
+        defer std.crypto.secureZero(u8, &seed_copy);
+        return .{
+            .key_kind = .ed25519,
+            .signing_key = try Ed25519.KeyPair.generateDeterministic(seed_copy),
+        };
+    } else |_| {
+        const rsa = try rsa_pkcs.parse(allocator, der);
+        return .{
+            .key_kind = .rsa,
+            .rsa_signing_key = rsa.key,
+            .rsa_key_storage = rsa.storage,
+        };
+    }
 }
 
 /// Generate a fresh Ed25519 keypair and mint a self-signed leaf for `dns_name`.
@@ -167,7 +239,7 @@ fn bootstrap(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) Err
     errdefer allocator.free(owned);
     const chain = try allocator.alloc([]const u8, 1);
     chain[0] = owned;
-    return .{ .cert_chain = chain, .signing_key = key_pair };
+    return .{ .cert_chain = chain, .key_kind = .ed25519, .signing_key = key_pair };
 }
 
 /// Resolved hardened-TLS-1.2 material: an ECDSA-P256 leaf chain + key. The 1.2
@@ -238,10 +310,11 @@ test "loadOrBootstrap: no paths mints a verifiable self-signed leaf for dns_name
 
     // Assert
     try testing.expectEqual(@as(usize, 1), loaded.cert_chain.len);
+    try testing.expectEqual(KeyKind.ed25519, loaded.key_kind);
     const cert = try x509.parse(loaded.cert_chain[0]);
     // The bootstrap leaf is self-signed: its embedded public key must match the
     // returned signing key, and its TBS signature must verify under that key.
-    try expectSelfSignedBy(loaded.cert_chain[0], loaded.signing_key);
+    try expectSelfSignedBy(loaded.cert_chain[0], loaded.signing_key.?);
     // When the certificate carries SAN entries, dns_name must be present; the
     // current minter encodes dns_name as the subject CN, so SAN may be empty.
     if (cert.san_dns_count != 0) {
@@ -264,10 +337,12 @@ test "loadOrBootstrap: bootstrap keypairs differ across calls" {
     defer b.deinit(allocator);
 
     // Assert: fresh OS entropy per call yields distinct public keys.
+    try testing.expectEqual(KeyKind.ed25519, a.key_kind);
+    try testing.expectEqual(KeyKind.ed25519, b.key_kind);
     try testing.expect(!std.mem.eql(
         u8,
-        &a.signing_key.public_key.toBytes(),
-        &b.signing_key.public_key.toBytes(),
+        &a.signing_key.?.public_key.toBytes(),
+        &b.signing_key.?.public_key.toBytes(),
     ));
 }
 
@@ -329,11 +404,12 @@ test "loadOrBootstrap: PEM round-trip from disk decodes cert + key" {
 
     // Assert: decoded chain equals the source DER and the key recovers the seed.
     try testing.expectEqual(@as(usize, 1), loaded.cert_chain.len);
+    try testing.expectEqual(KeyKind.ed25519, loaded.key_kind);
     try testing.expectEqualSlices(u8, cert_der, loaded.cert_chain[0]);
     try testing.expectEqualSlices(
         u8,
         &key_pair.public_key.toBytes(),
-        &loaded.signing_key.public_key.toBytes(),
+        &loaded.signing_key.?.public_key.toBytes(),
     );
 }
 
@@ -372,11 +448,12 @@ test "loadOrBootstrap: raw DER files (no PEM armor) load directly" {
     defer loaded.deinit(allocator);
 
     // Assert
+    try testing.expectEqual(KeyKind.ed25519, loaded.key_kind);
     try testing.expectEqualSlices(u8, cert_der, loaded.cert_chain[0]);
     try testing.expectEqualSlices(
         u8,
         &key_pair.public_key.toBytes(),
-        &loaded.signing_key.public_key.toBytes(),
+        &loaded.signing_key.?.public_key.toBytes(),
     );
 }
 
