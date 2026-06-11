@@ -226,6 +226,9 @@ pub const Client = struct {
     x25519_pair: kx.X25519Kx.KeyPair,
     p256_pair: ecdh_p256.KeyPair,
     legacy_session_id: [32]u8,
+    /// ClientHello random, generated once. RFC 8446 §4.1.2 requires the second
+    /// ClientHello (after a HelloRetryRequest) to carry the same random.
+    client_random: [32]u8,
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
     /// Owned storage for `selected_alpn`: the negotiated protocol is read from the
@@ -241,6 +244,15 @@ pub const Client = struct {
     leaf_rsa_n: [rsa_verify.max_bytes]u8 = undefined,
     leaf_rsa_e: [16]u8 = undefined,
     last_alert: ?tls_alert.Alert = null,
+
+    /// HelloRetryRequest state. `hrr_seen` guards against a second HRR (fatal per
+    /// RFC 8446). `cookie` (when present) is echoed in the second ClientHello;
+    /// it borrows `cookie_buf` (copied out of the consumed record). `retry_hello`
+    /// holds the second ClientHello bytes to send, owned until `feed` returns them.
+    hrr_seen: bool = false,
+    cookie: ?[]const u8 = null,
+    cookie_buf: [512]u8 = undefined,
+    retry_hello: ?[]u8 = null,
 
     /// Post-handshake records the client must send back (a KeyUpdate response
     /// when the peer requested one). Drained by the caller via `takePendingSend`.
@@ -299,6 +311,8 @@ pub const Client = struct {
         try osEntropy(&seed);
         var session_id: [32]u8 = undefined;
         try osEntropy(&session_id);
+        var random: [32]u8 = undefined;
+        try osEntropy(&random);
 
         const name = try allocator.dupe(u8, options.server_name);
         errdefer allocator.free(name);
@@ -316,6 +330,7 @@ pub const Client = struct {
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
             .p256_pair = try ecdh_p256.generate(),
             .legacy_session_id = session_id,
+            .client_random = random,
         };
     }
 
@@ -338,6 +353,7 @@ pub const Client = struct {
         self.recv_buf.deinit(self.allocator);
         self.hs_plain.deinit(self.allocator);
         self.post_handshake_send.deinit(self.allocator);
+        if (self.retry_hello) |r| self.allocator.free(r);
         self.allocator.free(self.server_name);
         self.allocator.free(self.trust_anchors);
         self.allocator.free(self.alpn_protocols);
@@ -359,8 +375,16 @@ pub const Client = struct {
         try self.recv_buf.appendSlice(self.allocator, received);
 
         if (self.state == .wait_server_hello) {
-            const progressed = try self.tryConsumeServerHello();
-            if (!progressed) return .need_more;
+            switch (try self.tryConsumeServerHello()) {
+                .need_more => return .need_more,
+                .retry => {
+                    // Send ClientHello2; keep waiting for the real ServerHello.
+                    const reply = self.retry_hello.?;
+                    self.retry_hello = null;
+                    return .{ .bytes_to_send = reply };
+                },
+                .proceed => {},
+            }
         }
 
         if (try self.tryConsumeServerFlight()) |reply| {
@@ -549,10 +573,8 @@ pub const Client = struct {
         defer body.deinit(self.allocator);
 
         try appendU16(self.allocator, &body, tls_record.legacy_record_version);
-        var random: [32]u8 = undefined;
-        try osEntropy(&random);
-        try body.appendSlice(self.allocator, &random);
-        secureZero(&random);
+        // RFC 8446 §4.1.2: a retried ClientHello reuses the same random.
+        try body.appendSlice(self.allocator, &self.client_random);
 
         try body.append(self.allocator, @intCast(self.legacy_session_id.len));
         try body.appendSlice(self.allocator, &self.legacy_session_id);
@@ -618,14 +640,25 @@ pub const Client = struct {
             try ext_builder.addTyped(.alpn, alpn_body);
         }
 
+        // Echo a HelloRetryRequest cookie in the retried ClientHello. The cookie
+        // extension body is opaque cookie<1..2^16-1>: a u16 length then the bytes.
+        if (self.cookie) |cookie| {
+            var cookie_ext: [514]u8 = undefined;
+            std.mem.writeInt(u16, cookie_ext[0..2], @intCast(cookie.len), .big);
+            @memcpy(cookie_ext[2..][0..cookie.len], cookie);
+            try ext_builder.addTyped(.cookie, cookie_ext[0 .. 2 + cookie.len]);
+        }
+
         const extensions = try ext_builder.finish();
         try body.appendSlice(self.allocator, extensions);
         try writeHandshake(self.allocator, out, .client_hello, body.items);
     }
 
-    fn tryConsumeServerHello(self: *Client) Error!bool {
+    const ServerHelloStep = enum { need_more, proceed, retry };
+
+    fn tryConsumeServerHello(self: *Client) Error!ServerHelloStep {
         while (true) {
-            const rec = completePlainRecord(self.recv_buf.items) orelse return false;
+            const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
             if (rec.content_type == .change_cipher_spec) {
                 consumePrefix(&self.recv_buf, rec.wire_len);
                 continue;
@@ -639,14 +672,105 @@ pub const Client = struct {
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);
             if (off != rec.fragment.len or msg.typ != .server_hello) return error.BadHandshake;
+
+            if (isHelloRetryRequest(msg.body)) {
+                // A second HelloRetryRequest in one connection is fatal.
+                if (self.hrr_seen) return error.BadHandshake;
+                const ch2 = try self.handleHelloRetryRequest(msg.body, msg.raw);
+                consumePrefix(&self.recv_buf, rec.wire_len);
+                self.retry_hello = ch2;
+                return .retry;
+            }
+
             var selected = try self.parseServerHello(msg.body);
             try self.appendTranscript(msg.raw);
             try self.deriveHandshakeKeys(selected.shared_secret);
             secureZero(&selected.shared_secret);
             consumePrefix(&self.recv_buf, rec.wire_len);
             self.state = .wait_encrypted_extensions;
-            return true;
+            return .proceed;
         }
+    }
+
+    /// Process a HelloRetryRequest (RFC 8446 §4.1.4): apply the cookie, rewrite
+    /// the transcript with the synthetic message_hash, and produce the second
+    /// ClientHello to send. Returns the plaintext handshake record (caller owns).
+    fn handleHelloRetryRequest(self: *Client, body: []const u8, raw: []const u8) Error![]u8 {
+        var c = Cursor.init(body);
+        if (try c.readU16() != tls_record.legacy_record_version) return error.ProtocolVersion;
+        _ = try c.take(32); // the HelloRetryRequest magic random
+        const sid = try c.take(try c.readU8());
+        if (!std.mem.eql(u8, sid, &self.legacy_session_id)) return error.BadHandshake;
+        const suite = try CipherSuite.fromWire(try c.readU16());
+        if (try c.readU8() != 0) return error.BadHandshake;
+        const ext_block = try c.take(try c.readU16());
+        try c.expectEmpty();
+
+        var selected_version = false;
+        var hrr_group: ?u16 = null;
+        var cookie_bytes: ?[]const u8 = null;
+        var it = tls_extension.Iterator.init(ext_block);
+        while (try it.next()) |ext| {
+            switch (ext.typed()) {
+                .supported_versions => {
+                    if (try tls_supported_versions.parseServer(ext.data) != tls_supported_versions.tls13) {
+                        return error.ProtocolVersion;
+                    }
+                    selected_version = true;
+                },
+                .key_share => {
+                    // In a HelloRetryRequest the key_share carries only the group.
+                    if (ext.data.len != 2) return error.BadHandshake;
+                    hrr_group = std.mem.readInt(u16, ext.data[0..2], .big);
+                },
+                .cookie => {
+                    if (ext.data.len < 2) return error.BadHandshake;
+                    const clen = std.mem.readInt(u16, ext.data[0..2], .big);
+                    if (ext.data.len != 2 + @as(usize, clen)) return error.BadHandshake;
+                    cookie_bytes = ext.data[2..];
+                },
+                else => {},
+            }
+        }
+        if (!selected_version) return error.MissingExtension;
+        self.selected_suite = suite; // selects the transcript hash below
+
+        // RFC 8446 §4.1.4: the requested group must be one we support AND did not
+        // already offer a key_share for. We always offer shares for both groups we
+        // support (x25519, secp256r1), so any group-change request is non-compliant.
+        if (hrr_group) |g| {
+            if (g == @intFromEnum(supported_groups.NamedGroup.x25519) or
+                g == @intFromEnum(supported_groups.NamedGroup.secp256r1))
+            {
+                return error.BadHandshake; // group already offered — illegal
+            }
+            return error.UnsupportedGroup; // group we cannot satisfy
+        }
+
+        if (cookie_bytes) |cb| {
+            if (cb.len == 0 or cb.len > self.cookie_buf.len) return error.BadHandshake;
+            @memcpy(self.cookie_buf[0..cb.len], cb);
+            self.cookie = self.cookie_buf[0..cb.len];
+        }
+
+        // Replace ClientHello1 in the transcript with the synthetic message_hash
+        // (handshake type 254): 0xFE || uint24(Hash.length) || Hash(ClientHello1).
+        var ch1_hash: [max_hash_len]u8 = undefined;
+        const hlen = self.transcriptHash(&ch1_hash);
+        self.transcript.clearRetainingCapacity();
+        try self.transcript.append(self.allocator, 0xFE);
+        try appendU24(self.allocator, &self.transcript, hlen);
+        try self.transcript.appendSlice(self.allocator, ch1_hash[0..hlen]);
+        try self.appendTranscript(raw); // fold in the HelloRetryRequest itself
+        self.hrr_seen = true;
+
+        // Build ClientHello2 (same random/session-id/key_shares, plus the cookie)
+        // and fold it into the transcript before sending.
+        var hs: std.ArrayList(u8) = .empty;
+        defer hs.deinit(self.allocator);
+        try self.writeClientHello(&hs);
+        try self.appendTranscript(hs.items);
+        return writePlainRecord(self.allocator, .handshake, hs.items);
     }
 
     fn tryConsumeServerFlight(self: *Client) Error!?[]u8 {
@@ -726,7 +850,9 @@ pub const Client = struct {
         var c = Cursor.init(body);
         if (try c.readU16() != tls_record.legacy_record_version) return error.ProtocolVersion;
         const random = try c.take(32);
-        if (std.mem.eql(u8, random, &hello_retry_request_random)) return error.HelloRetryRequestUnsupported;
+        // HelloRetryRequest is intercepted in tryConsumeServerHello; a magic
+        // random reaching here would be a logic error or a second HRR.
+        if (std.mem.eql(u8, random, &hello_retry_request_random)) return error.BadHandshake;
         const sid = try c.take(try c.readU8());
         if (!std.mem.eql(u8, sid, &self.legacy_session_id)) return error.BadHandshake;
         const suite = try CipherSuite.fromWire(try c.readU16());
@@ -1084,6 +1210,14 @@ const hello_retry_request_random = [_]u8{
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
     0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 };
+
+/// A ServerHello whose random equals the magic value is a HelloRetryRequest
+/// (RFC 8446 §4.1.3). `body` is the handshake message body (legacy_version then
+/// the 32-byte random).
+fn isHelloRetryRequest(body: []const u8) bool {
+    if (body.len < 2 + 32) return false;
+    return std.mem.eql(u8, body[2..34], &hello_retry_request_random);
+}
 
 fn osEntropy(buf: []u8) Error!void {
     switch (builtin.os.tag) {
@@ -1767,6 +1901,69 @@ test "applyToml toggles the tls debug_log flag and restores cleanly" {
     defer none.deinit(allocator);
     applyToml(&none);
     try std.testing.expectEqual(true, debug_log);
+}
+
+/// Build a HelloRetryRequest plaintext record carrying a cookie, for the given
+/// client session_id. Used only by the HRR test below.
+fn buildTestHrr(allocator: Allocator, session_id: []const u8, cookie: []const u8) ![]u8 {
+    var ext: std.ArrayList(u8) = .empty;
+    defer ext.deinit(allocator);
+    // supported_versions (server form): selected_version = TLS 1.3.
+    try appendU16(allocator, &ext, @intFromEnum(tls_extension.ExtensionType.supported_versions));
+    try appendU16(allocator, &ext, 2);
+    try appendU16(allocator, &ext, tls_supported_versions.tls13);
+    // cookie: opaque cookie<1..2^16-1> (u16 length + bytes).
+    try appendU16(allocator, &ext, @intFromEnum(tls_extension.ExtensionType.cookie));
+    try appendU16(allocator, &ext, @intCast(2 + cookie.len));
+    try appendU16(allocator, &ext, @intCast(cookie.len));
+    try ext.appendSlice(allocator, cookie);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, tls_record.legacy_record_version);
+    try body.appendSlice(allocator, &hello_retry_request_random);
+    try body.append(allocator, @intCast(session_id.len));
+    try body.appendSlice(allocator, session_id);
+    try appendU16(allocator, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+    try body.append(allocator, 0); // null compression
+    try appendU16(allocator, &body, @intCast(ext.items.len));
+    try body.appendSlice(allocator, ext.items);
+
+    var hs: std.ArrayList(u8) = .empty;
+    defer hs.deinit(allocator);
+    try writeHandshake(allocator, &hs, .server_hello, body.items);
+    return writePlainRecord(allocator, .handshake, hs.items);
+}
+
+test "HelloRetryRequest: client echoes the cookie, reuses its random, rejects a second HRR" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{} });
+    defer client.deinit();
+
+    const ch1 = try client.start();
+    defer allocator.free(ch1);
+    // ClientHello random sits at record(5) + handshake header(4) + legacy_version(2).
+    const ch1_random = ch1[11..43];
+
+    const cookie = "retry-cookie-1234";
+    const hrr = try buildTestHrr(allocator, &client.legacy_session_id, cookie);
+    defer allocator.free(hrr);
+
+    const ch2 = switch (try client.feed(hrr)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(ch2);
+
+    // ClientHello2 must carry the cookie and reuse ClientHello1's random.
+    try std.testing.expect(std.mem.indexOf(u8, ch2, cookie) != null);
+    try std.testing.expectEqualSlices(u8, ch1_random, ch2[11..43]);
+    try std.testing.expect(client.hrr_seen);
+
+    // A second HelloRetryRequest is fatal (RFC 8446 §4.1.4).
+    const hrr2 = try buildTestHrr(allocator, &client.legacy_session_id, cookie);
+    defer allocator.free(hrr2);
+    try std.testing.expectError(error.BadHandshake, client.feed(hrr2));
 }
 
 test {
