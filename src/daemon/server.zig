@@ -747,7 +747,9 @@ const Numeric = enum(u16) {
     RPL_NOWAWAY = 306,
     RPL_NOTOPIC = 331,
     RPL_TOPIC = 332,
+    RPL_TOPICWHOTIME = 333,
     RPL_CHANNELMODEIS = 324,
+    RPL_CREATIONTIME = 329,
     RPL_UMODEIS = 221,
     RPL_NAMREPLY = 353,
     RPL_ENDOFNAMES = 366,
@@ -3627,7 +3629,7 @@ pub const LinuxServer = struct {
         // Refresh the world's wall-clock so a channel created by this command
         // (JOIN/CREATE) gets a correct IRCX CREATION timestamp without the pure
         // world taking a clock dependency.
-        self.world.clock_unix = @divFloor(self.nowMs(), 1000);
+        self.world.clock_unix = @divFloor(platform.realtimeMillis(), 1000);
 
         // draft/multiline: a negotiating client's `BATCH +ref draft/multiline`
         // and its @batch-tagged PRIVMSG/NOTICE chunks are routed into the
@@ -4018,17 +4020,16 @@ pub const LinuxServer = struct {
                 return true;
             }
         }
-        if (!invited) {
-            // +b ban (isBannedCtx honors +e exceptions and extended bans) blocks the join.
-            if (self.world.isBannedCtx(channel, ban_ctx)) {
-                if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
-                return true;
-            }
-            // +i blocks unless the user holds an invite OR matches a +I invex mask.
-            if (self.world.channelHasFlag(channel, .invite_only) and !self.world.isInvexedCtx(channel, ban_ctx)) {
-                if (!quiet) try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
-                return true;
-            }
+        // +b ban (isBannedCtx honors +e exceptions and extended bans) blocks the
+        // join even when the user holds a pending invite.
+        if (self.world.isBannedCtx(channel, ban_ctx)) {
+            if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
+            return true;
+        }
+        // +i blocks unless the user holds an invite OR matches a +I invex mask.
+        if (!invited and self.world.channelHasFlag(channel, .invite_only) and !self.world.isInvexedCtx(channel, ban_ctx)) {
+            if (!quiet) try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
+            return true;
         }
         if (self.world.channelKey(channel)) |key| {
             if (supplied_key == null or !std.mem.eql(u8, supplied_key.?, key)) {
@@ -4130,6 +4131,7 @@ pub const LinuxServer = struct {
         var fwd_buf: [80]u8 = undefined;
         var join_target = channel;
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
+            const invited = self.world.hasInvite(channel, wid);
             // +f forward: when refused, redirect to the forward target (one hop).
             // Suppress the deny numeric while a forward is a candidate, then either
             // redirect quietly or, if the forward is unusable, emit the real deny.
@@ -4146,7 +4148,7 @@ pub const LinuxServer = struct {
             // +j join throttle: deny if the per-channel window is full. Opers and
             // invited users bypass. Checked after the hard gates so a denied join
             // does not consume a throttle slot.
-            if (!conn.session.isOper() and !self.world.hasInvite(channel, wid) and
+            if (!conn.session.isOper() and !invited and
                 !self.world.throttleAdmit(channel, self.nowMs()))
             {
                 try queueNumeric(conn, .ERR_THROTTLE, &.{channel}, "Cannot join channel (+j) - join rate exceeded, try again shortly");
@@ -4154,7 +4156,7 @@ pub const LinuxServer = struct {
             }
             // +l full: IRCX +d cloneable channels redirect the join to a clone;
             // otherwise it is a hard 471.
-            if (self.isChannelFull(channel)) {
+            if (!invited and self.isChannelFull(channel)) {
                 if (self.world.channelHasExtFlag(channel, .cloneable)) {
                     join_target = (try self.resolveCloneTarget(channel, &clone_buf)) orelse {
                         try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
@@ -4208,6 +4210,13 @@ pub const LinuxServer = struct {
         }
 
         try self.broadcastJoin(join_target, conn);
+        if (creating) {
+            var flags_buf: [16]u8 = undefined;
+            const flags = self.world.channelModeString(join_target, &flags_buf);
+            var line_buf: [default_reply_bytes]u8 = undefined;
+            const msg = try formatMessage(&line_buf, self.serverName(), "MODE", &.{ join_target, flags }, null);
+            try self.broadcastChannel(join_target, msg, null);
+        }
         try self.sendTopicReply(conn, join_target);
         // draft/no-implicit-names: a capable client suppresses the automatic
         // NAMES burst on JOIN (it can still request NAMES explicitly).
@@ -4277,13 +4286,21 @@ pub const LinuxServer = struct {
 
     pub fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"NAMES"}, "Not enough parameters");
+            var it = self.world.channelIterator();
+            while (it.next()) |ch| {
+                if (ch.secret or ch.hidden) continue;
+                try self.sendNames(conn, ch.name);
+            }
             return;
         }
 
         const channel = parsed.paramSlice()[0];
         if (!self.world.channelExists(channel)) {
-            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            if (world_model.isChannelName(channel)) {
+                try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
+            } else {
+                try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            }
             return;
         }
         try self.sendNames(conn, channel);
@@ -4426,6 +4443,11 @@ pub const LinuxServer = struct {
                 }
             }
             try queueNumeric(conn, .RPL_CHANNELMODEIS, parts[0..n], "");
+            if (self.world.channelCreatedUnix(channel)) |created| {
+                var created_buf: [32]u8 = undefined;
+                const created_text = std.fmt.bufPrint(&created_buf, "{d}", .{created}) catch "0";
+                try queueNumeric(conn, .RPL_CREATIONTIME, &.{ channel, created_text }, "");
+            }
             return;
         }
 
@@ -4474,6 +4496,9 @@ pub const LinuxServer = struct {
         var arg_index: usize = 2;
         var adding = true;
         var emitted_sign: u8 = 0;
+        var list_setter_buf: [256]u8 = undefined;
+        const list_setter = try clientPrefix(conn, &list_setter_buf);
+        const list_set_at = @divFloor(platform.realtimeMillis(), 1000);
 
         for (mode_str) |ch| {
             switch (ch) {
@@ -4609,7 +4634,7 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addBan(channel, mask) catch |e| {
+                        (self.world.addBan(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
                             continue;
                         })
@@ -4629,7 +4654,7 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addExempt(channel, mask) catch |e| {
+                        (self.world.addExempt(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
                             continue;
                         })
@@ -4646,7 +4671,7 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addInvex(channel, mask) catch |e| {
+                        (self.world.addInvex(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
                             continue;
                         })
@@ -4664,7 +4689,7 @@ pub const LinuxServer = struct {
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
                     const changed = if (adding)
-                        (self.world.addMute(channel, mask) catch |e| {
+                        (self.world.addMute(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
                             continue;
                         })
@@ -5228,18 +5253,21 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"INVITE"}, "Not enough parameters");
             return;
         };
+        const target_wid = self.world.findNick(args.nick) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{args.nick}, "No such nick");
+            return;
+        };
         if (!self.world.channelExists(args.channel)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
             return;
         }
         const inviter_modes = self.world.memberModes(args.channel, worldIdFromClient(id));
-        const target_wid = self.world.findNick(args.nick);
         const result = invite.checkInvitePreconditions(.{
             .on_channel = inviter_modes != null,
             .is_operator = if (inviter_modes) |m| m.isOperator() else false,
             .invite_only = self.world.channelHasFlag(args.channel, .invite_only),
             .free_invite = self.world.channelHasFlag(args.channel, .free_invite),
-            .target_on_channel = if (target_wid) |t| self.world.isMember(args.channel, t) else false,
+            .target_on_channel = self.world.isMember(args.channel, target_wid),
         });
         switch (result) {
             .allow => {},
@@ -5247,13 +5275,14 @@ pub const LinuxServer = struct {
             .deny_user_on_channel => return queueNumeric(conn, .ERR_USERONCHANNEL, &.{ args.nick, args.channel }, "is already on channel"),
             .deny_chan_op_privs_needed => return queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "You're not channel operator"),
         }
-        const target = target_wid orelse {
-            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{args.nick}, "No such nick");
-            return;
-        };
-
-        // Record the invite so the target can bypass +i / +b on JOIN.
-        self.world.addInvite(args.channel, target) catch {};
+        // Record a persistent invite only when a channel gate consumes it: +i,
+        // +l, or +j. INVITE delivery itself still succeeds for ordinary channels.
+        if (self.world.channelHasFlag(args.channel, .invite_only) or
+            self.world.channelLimit(args.channel) != null or
+            self.world.throttleOf(args.channel) != null)
+        {
+            self.world.addInvite(args.channel, target_wid) catch {};
+        }
 
         var num_buf: [default_reply_bytes]u8 = undefined;
         const inviting = invite.buildInvitingNumeric(&num_buf, self.serverName(), conn.session.displayName(), args.nick, args.channel) catch return;
@@ -5266,7 +5295,7 @@ pub const LinuxServer = struct {
         // deliver() expects a CRLF-terminated line; the builder omits it.
         var full_buf: [default_reply_bytes]u8 = undefined;
         const full = std.fmt.bufPrint(&full_buf, "{s}\r\n", .{target_line}) catch return;
-        try self.deliver(clientIdFromWorld(target), full);
+        try self.deliver(clientIdFromWorld(target_wid), full);
 
         // IRCv3 invite-notify: tell channel members who hold
         // the cap, except the inviter — `:inviter!u@h INVITE <target> :<channel>`.
@@ -7434,7 +7463,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
-        try self.world.setTopic(channel, topic);
+        try self.world.setTopic(channel, topic, self.serverName(), @divFloor(platform.realtimeMillis(), 1000));
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ self.serverName(), channel, topic }) catch return;
         try self.broadcastChannel(channel, line, null);
@@ -12367,7 +12396,9 @@ pub const LinuxServer = struct {
         // under UTF8ONLY, and broadcast the truncated form so every member sees
         // the same text.
         const text = utf8TruncateBytes(parsed.paramSlice()[1], self.config.topiclen);
-        try self.world.setTopic(channel, text);
+        var setter_buf: [256]u8 = undefined;
+        const setter = try clientPrefix(conn, &setter_buf);
+        try self.world.setTopic(channel, text, setter, @divFloor(platform.realtimeMillis(), 1000));
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
@@ -12400,8 +12431,11 @@ pub const LinuxServer = struct {
 
     fn sendTopicReply(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         if (conn.session.registered()) {
-            if (self.world.topic(channel)) |text| {
-                try queueNumeric(conn, .RPL_TOPIC, &.{channel}, text);
+            if (self.world.topicInfo(channel)) |topic| {
+                try queueNumeric(conn, .RPL_TOPIC, &.{channel}, topic.text);
+                var ts_buf: [32]u8 = undefined;
+                const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{topic.set_at}) catch "0";
+                try queueNumeric(conn, .RPL_TOPICWHOTIME, &.{ channel, topic.setter, ts }, "");
             } else {
                 try queueNumeric(conn, .RPL_NOTOPIC, &.{channel}, "No topic is set");
             }
@@ -12419,15 +12453,17 @@ pub const LinuxServer = struct {
         self: *LinuxServer,
         conn: *ConnState,
         channel: []const u8,
-        masks: ?[]const []const u8,
+        masks: ?[]const world_model.ListEntry,
         list_code: Numeric,
         end_code: Numeric,
         end_text: []const u8,
     ) !void {
         _ = self;
         if (masks) |entries| {
-            for (entries) |mask| {
-                try queueNumeric(conn, list_code, &.{ channel, mask }, "");
+            for (entries) |entry| {
+                var ts_buf: [32]u8 = undefined;
+                const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{entry.set_at}) catch "0";
+                try queueNumeric(conn, list_code, &.{ channel, entry.mask, entry.setter, ts }, "");
             }
         }
         try queueNumeric(conn, end_code, &.{channel}, end_text);
@@ -13186,6 +13222,12 @@ fn expectCodesInOrder(haystack: []const u8, codes: []const []const u8) !void {
     }
 }
 
+fn expectDigitAfter(haystack: []const u8, marker: []const u8) !void {
+    const pos = (std.mem.indexOf(u8, haystack, marker) orelse return error.TestExpectedEqual) + marker.len;
+    try std.testing.expect(pos < haystack.len);
+    try std.testing.expect(std.ascii.isDigit(haystack[pos]));
+}
+
 const LiveClient = struct {
     fd: linux.fd_t,
     buf: [default_reply_bytes]u8 = undefined,
@@ -13863,19 +13905,28 @@ test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
     try writeAllFd(fd_b, "JOIN #c sesame\r\n");
     try recvUntil(&b, " 474 B #c ", 200);
 
-    // INVITE lets the banned user back in (invite bypasses +b/+i).
+    // INVITE does not bypass +b: the invite is delivered, but JOIN is still denied.
     a.reset();
     try writeAllFd(fd_a, "INVITE B #c\r\n");
     try recvUntil(&a, " 341 A B #c", 200);
     b.reset();
     try writeAllFd(fd_b, "JOIN #c sesame\r\n");
-    try recvUntil(&b, " 366 B #c ", 200);
+    try recvUntil(&b, " 474 B #c ", 200);
 
     // Ban-list query: 367 entry + 368 end.
     a.reset();
     try writeAllFd(fd_a, "MODE #c b\r\n");
     try recvUntil(&a, " 367 A #c B!*@*", 200);
     try recvUntil(&a, " 368 A #c ", 200);
+
+    // Clear the ban and let B back in for the later shared-channel QUIT/WHOWAS
+    // assertions; invite bypass was already checked above.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #c -b B!*@*\r\n");
+    try recvUntil(&a, "MODE #c -b B!*@*", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #c sesame\r\n");
+    try recvUntil(&b, " 366 B #c ", 200);
 
     // KNOCK: A founds a fresh +i channel #i (B is not a member); B knocks ->
     // A (op) gets 710, B gets 711. B stays in #c for the WHOWAS step below.
@@ -13900,6 +13951,126 @@ test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
     try writeAllFd(fd_a, "WHOWAS B\r\n");
     try recvUntil(&a, " 314 A B ", 200);
     try recvUntil(&a, " 369 A B ", 200);
+}
+
+test "threaded server: JOIN INVITE NAMES MODE and TOPIC RFC parity regressions" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    // Fresh channels get +nt immediately, echoed to the creator and reflected in
+    // MODE query with a creation-time 329.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #nt\r\n");
+    try recvUntil(&a, "MODE #nt +nt", 200);
+    try recvUntil(&a, " 366 A #nt ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #nt\r\n");
+    try recvUntil(&a, " 324 A #nt +nt ", 200);
+    try recvUntil(&a, " 329 A #nt ", 200);
+    try expectDigitAfter(a.written(), " 329 A #nt ");
+
+    // Ban-list rows include setter mask and set-at timestamp.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #nt +b Bad!*@*\r\n");
+    try recvUntil(&a, "MODE #nt +b Bad!*@*", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #nt b\r\n");
+    try recvUntil(&a, " 367 A #nt Bad!*@* A!alice@localhost ", 200);
+    try expectDigitAfter(a.written(), " 367 A #nt Bad!*@* A!alice@localhost ");
+    try recvUntil(&a, " 368 A #nt ", 200);
+
+    // Topic queries emit both 332 and 333 with setter and Unix seconds.
+    a.reset();
+    try writeAllFd(fd_a, "TOPIC #nt :hello world\r\n");
+    try recvUntil(&a, "TOPIC #nt :hello world", 200);
+    a.reset();
+    try writeAllFd(fd_a, "TOPIC #nt\r\n");
+    try recvUntil(&a, " 332 A #nt :hello world", 200);
+    try recvUntil(&a, " 333 A #nt A!alice@localhost ", 200);
+    try expectDigitAfter(a.written(), " 333 A #nt A!alice@localhost ");
+
+    // Bare NAMES lists visible channels; a valid absent channel returns only 366.
+    a.reset();
+    try writeAllFd(fd_a, "NAMES\r\n");
+    try recvUntil(&a, " 353 A = #nt ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "NAMES #absent\r\n");
+    try recvUntil(&a, " 366 A #absent ", 200);
+    try a.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 403 A #absent ") == null);
+
+    // INVITE resolves the target nick first, even when the channel is absent.
+    a.reset();
+    try writeAllFd(fd_a, "INVITE Ghost #ghost\r\n");
+    try recvUntil(&a, " 401 A Ghost ", 200);
+    try a.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 403 A #ghost ") == null);
+
+    // INVITE is delivered but does not bypass +b.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #ban\r\n");
+    try recvUntil(&a, " 366 A #ban ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #ban +b B!*@*\r\n");
+    try recvUntil(&a, "MODE #ban +b B!*@*", 200);
+    a.reset();
+    try writeAllFd(fd_a, "INVITE B #ban\r\n");
+    try recvUntil(&a, " 341 A B #ban", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #ban\r\n");
+    try recvUntil(&b, " 474 B #ban ", 200);
+
+    // Invites on ordinary channels are not persisted for later +i joins.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #plain\r\n");
+    try recvUntil(&a, " 366 A #plain ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "INVITE B #plain\r\n");
+    try recvUntil(&a, " 341 A B #plain", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #plain +i\r\n");
+    try recvUntil(&a, "MODE #plain +i", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #plain\r\n");
+    try recvUntil(&b, " 473 B #plain ", 200);
+
+    // An invite on a +i/+l channel bypasses invite-only and full-channel gates.
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #limit\r\n");
+    try recvUntil(&a, " 366 A #limit ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #limit +il 1\r\n");
+    try recvUntil(&a, "MODE #limit +il 1", 200);
+    a.reset();
+    try writeAllFd(fd_a, "INVITE B #limit\r\n");
+    try recvUntil(&a, " 341 A B #limit", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #limit\r\n");
+    try recvUntil(&b, " 366 B #limit ", 200);
 }
 
 test "threaded server: IRCv3 server-time tag on PRIVMSG for cap holders" {
@@ -15583,10 +15754,10 @@ test "threaded server: MODE multi-flag batching in one command" {
     try recvUntil(&a, " 001 A ", 200);
     try writeAllFd(fd_a, "JOIN #m\r\n");
     try recvUntil(&a, " 366 A #m ", 200);
-    // Several flag modes set in one MODE command echo together.
+    // Several non-default flag modes set in one MODE command echo together.
     a.reset();
-    try writeAllFd(fd_a, "MODE #m +nt\r\n");
-    try recvUntil(&a, "MODE #m +nt", 200);
+    try writeAllFd(fd_a, "MODE #m +ims\r\n");
+    try recvUntil(&a, "MODE #m +ims", 200);
 }
 
 test "threaded server: +p private + +h hidden channel flags" {
@@ -15613,16 +15784,10 @@ test "threaded server: +p private + +h hidden channel flags" {
     a.reset();
     try writeAllFd(fd_a, "MODE #ph +ph\r\n");
     try recvUntil(&a, "MODE #ph +ph", 200);
-    // query reflects both flags.
+    // query reflects defaults plus both flags.
     a.reset();
     try writeAllFd(fd_a, "MODE #ph\r\n");
-    try recvUntil(&a, " 324 A #ph +ph", 200);
-    // +t topic-ops flag is echoed in RPL_CHANNELMODEIS too (item 31).
-    try writeAllFd(fd_a, "MODE #ph +t\r\n");
-    try recvUntil(&a, "MODE #ph +t", 200);
-    a.reset();
-    try writeAllFd(fd_a, "MODE #ph\r\n");
-    try recvUntil(&a, " 324 A #ph +t", 200);
+    try recvUntil(&a, " 324 A #ph +ntph", 200);
     // hidden channel is omitted from LIST.
     a.reset();
     try writeAllFd(fd_a, "LIST\r\n");

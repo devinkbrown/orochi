@@ -116,6 +116,8 @@ const Channel = struct {
     allocator: std.mem.Allocator,
     members: MemberMap,
     topic: ?[]u8 = null,
+    topic_setter: ?[]u8 = null,
+    topic_time: i64 = 0,
     /// Channel-level flag modes (i/m/n/t/s).
     modes: chanmode.ChannelModes = chanmode.ChannelModes.empty(),
     /// +k key — allocator-owned heap (safe across HashMap rehash; never a
@@ -123,15 +125,15 @@ const Channel = struct {
     key: ?[]u8 = null,
     /// +l member limit. Null = unlimited.
     limit: ?u32 = null,
-    /// +b ban masks (nick!user@host globs), allocator-owned.
-    bans: std.ArrayListUnmanaged([]u8) = .empty,
+    /// +b ban masks (nick!user@host globs), allocator-owned with setter metadata.
+    bans: std.ArrayListUnmanaged(ListEntry) = .empty,
     /// +e ban-exception masks: a match here overrides a +b ban on JOIN.
-    exempts: std.ArrayListUnmanaged([]u8) = .empty,
+    exempts: std.ArrayListUnmanaged(ListEntry) = .empty,
     /// +I invite-exception masks: a match here lets a user bypass +i on JOIN.
-    invex: std.ArrayListUnmanaged([]u8) = .empty,
+    invex: std.ArrayListUnmanaged(ListEntry) = .empty,
     /// +Z quiet (MUTE) masks: a match suppresses *speech* (not join), like a
     /// ban that only mutes. Honors +e exempts.
-    mutes: std.ArrayListUnmanaged([]u8) = .empty,
+    mutes: std.ArrayListUnmanaged(ListEntry) = .empty,
     /// +j join throttle: at most `throttle_joins` joins per `throttle_secs`
     /// window (0 = disabled). `throttle_times` is a bounded ring of recent
     /// successful join timestamps (ms) used to enforce the window.
@@ -160,21 +162,22 @@ const Channel = struct {
         return .{
             .allocator = allocator,
             .members = MemberMap.init(allocator),
-            .modes = chanmode.ChannelModes.empty(),
+            .modes = defaultChannelModes(),
         };
     }
 
     fn deinit(self: *Channel) void {
         if (self.topic) |topic| self.allocator.free(topic);
+        if (self.topic_setter) |setter| self.allocator.free(setter);
         if (self.key) |k| self.allocator.free(k);
         if (self.forward) |f| self.allocator.free(f);
-        for (self.bans.items) |b| self.allocator.free(b);
+        for (self.bans.items) |*b| b.deinit(self.allocator);
         self.bans.deinit(self.allocator);
-        for (self.exempts.items) |e| self.allocator.free(e);
+        for (self.exempts.items) |*e| e.deinit(self.allocator);
         self.exempts.deinit(self.allocator);
-        for (self.invex.items) |i| self.allocator.free(i);
+        for (self.invex.items) |*i| i.deinit(self.allocator);
         self.invex.deinit(self.allocator);
-        for (self.mutes.items) |m| self.allocator.free(m);
+        for (self.mutes.items) |*m| m.deinit(self.allocator);
         self.mutes.deinit(self.allocator);
         self.throttle_times.deinit(self.allocator);
         self.invites.deinit(self.allocator);
@@ -182,11 +185,48 @@ const Channel = struct {
         self.* = undefined;
     }
 
-    fn setTopic(self: *Channel, topic: []const u8) std.mem.Allocator.Error!void {
+    fn setTopic(self: *Channel, topic: []const u8, setter: []const u8, set_at: i64) std.mem.Allocator.Error!void {
         const owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(owned);
+        const owned_setter = try self.allocator.dupe(u8, setter);
         if (self.topic) |old| self.allocator.free(old);
+        if (self.topic_setter) |old| self.allocator.free(old);
         self.topic = owned;
+        self.topic_setter = owned_setter;
+        self.topic_time = set_at;
     }
+};
+
+fn defaultChannelModes() chanmode.ChannelModes {
+    var modes = chanmode.ChannelModes.empty();
+    modes.no_external = true;
+    modes.topic_ops = true;
+    return modes;
+}
+
+pub const ListEntry = struct {
+    mask: []u8,
+    setter: []u8,
+    set_at: i64,
+
+    fn init(allocator: std.mem.Allocator, mask: []const u8, setter: []const u8, set_at: i64) std.mem.Allocator.Error!ListEntry {
+        const owned_mask = try allocator.dupe(u8, mask);
+        errdefer allocator.free(owned_mask);
+        const owned_setter = try allocator.dupe(u8, setter);
+        return .{ .mask = owned_mask, .setter = owned_setter, .set_at = set_at };
+    }
+
+    fn deinit(self: *ListEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.mask);
+        allocator.free(self.setter);
+        self.* = undefined;
+    }
+};
+
+pub const TopicInfo = struct {
+    text: []const u8,
+    setter: []const u8,
+    set_at: i64,
 };
 
 /// Owned local nick/channel registry.
@@ -733,17 +773,17 @@ pub const World = struct {
     }
 
     /// Add a +b ban mask. Returns true if newly added (false if already present).
-    pub fn addBan(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+    pub fn addBan(self: *World, name: []const u8, mask: []const u8, setter: []const u8, set_at: i64) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
-        return self.listAddMask(&channel.bans, mask);
+        return self.listAddMask(&channel.bans, mask, setter, set_at);
     }
 
     /// Remove a +b ban mask. Returns true if it existed.
     pub fn removeBan(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
-        for (channel.bans.items, 0..) |b, idx| {
-            if (std.mem.eql(u8, b, mask)) {
-                self.allocator.free(b);
+        for (channel.bans.items, 0..) |*b, idx| {
+            if (std.mem.eql(u8, b.mask, mask)) {
+                b.deinit(self.allocator);
                 _ = channel.bans.orderedRemove(idx);
                 return true;
             }
@@ -752,27 +792,36 @@ pub const World = struct {
     }
 
     /// Ban masks for RPL_BANLIST, or null if no such channel.
-    pub fn bansOf(self: *World, name: []const u8) ?[]const []const u8 {
+    pub fn bansOf(self: *World, name: []const u8) ?[]const ListEntry {
         const channel = self.channels.getPtr(name) orelse return null;
         return channel.bans.items;
     }
 
-    fn listAddMask(self: *World, list: *std.ArrayListUnmanaged([]u8), mask: []const u8) WorldError!bool {
+    fn listAddMask(
+        self: *World,
+        list: *std.ArrayListUnmanaged(ListEntry),
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+    ) WorldError!bool {
         for (list.items) |m| {
-            if (std.mem.eql(u8, m, mask)) return false;
+            if (std.mem.eql(u8, m.mask, mask)) return false;
         }
         // Cap channel list modes to bound memory and resist ban-list flooding.
         if (list.items.len >= self.max_list_entries) return error.ListFull;
-        const owned = try self.allocator.dupe(u8, mask);
-        errdefer self.allocator.free(owned);
-        try list.append(self.allocator, owned);
+        const entry = try ListEntry.init(self.allocator, mask, setter, set_at);
+        errdefer {
+            var rollback = entry;
+            rollback.deinit(self.allocator);
+        }
+        try list.append(self.allocator, entry);
         return true;
     }
 
-    fn listRemoveMask(self: *World, list: *std.ArrayListUnmanaged([]u8), mask: []const u8) bool {
-        for (list.items, 0..) |m, idx| {
-            if (std.mem.eql(u8, m, mask)) {
-                self.allocator.free(m);
+    fn listRemoveMask(self: *World, list: *std.ArrayListUnmanaged(ListEntry), mask: []const u8) bool {
+        for (list.items, 0..) |*m, idx| {
+            if (std.mem.eql(u8, m.mask, mask)) {
+                m.deinit(self.allocator);
                 _ = list.orderedRemove(idx);
                 return true;
             }
@@ -780,9 +829,9 @@ pub const World = struct {
         return false;
     }
 
-    fn listMatches(list: []const []const u8, hostmask: []const u8) bool {
+    fn listMatches(list: []const ListEntry, hostmask: []const u8) bool {
         for (list) |m| {
-            if (listx.globMatch(m, hostmask)) return true;
+            if (listx.globMatch(m.mask, hostmask)) return true;
         }
         return false;
     }
@@ -796,27 +845,27 @@ pub const World = struct {
     /// prefix), preserving classic +b/+e/+I/+Z behavior; `$`-prefixed entries
     /// match account/realname/country/channel/negation. Malformed `$` entries
     /// degrade to a literal host glob so a bad mask never silently disables a ban.
-    fn listMatchesCtx(list: []const []const u8, ctx: extban.ClientContext) bool {
+    fn listMatchesCtx(list: []const ListEntry, ctx: extban.ClientContext) bool {
         for (list) |m| {
-            if (extban.parse(m)) |matcher| {
+            if (extban.parse(m.mask)) |matcher| {
                 if (matcher.matches(ctx)) return true;
             } else |_| {
-                if (listx.globMatch(m, ctx.host)) return true;
+                if (listx.globMatch(m.mask, ctx.host)) return true;
             }
         }
         return false;
     }
 
     /// +e ban-exception list operations.
-    pub fn addExempt(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+    pub fn addExempt(self: *World, name: []const u8, mask: []const u8, setter: []const u8, set_at: i64) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
-        return self.listAddMask(&channel.exempts, mask);
+        return self.listAddMask(&channel.exempts, mask, setter, set_at);
     }
     pub fn removeExempt(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
         return self.listRemoveMask(&channel.exempts, mask);
     }
-    pub fn exemptsOf(self: *World, name: []const u8) ?[]const []const u8 {
+    pub fn exemptsOf(self: *World, name: []const u8) ?[]const ListEntry {
         const channel = self.channels.getPtr(name) orelse return null;
         return channel.exempts.items;
     }
@@ -826,15 +875,15 @@ pub const World = struct {
     }
 
     /// +I invite-exception list operations.
-    pub fn addInvex(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+    pub fn addInvex(self: *World, name: []const u8, mask: []const u8, setter: []const u8, set_at: i64) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
-        return self.listAddMask(&channel.invex, mask);
+        return self.listAddMask(&channel.invex, mask, setter, set_at);
     }
     pub fn removeInvex(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
         return self.listRemoveMask(&channel.invex, mask);
     }
-    pub fn invexOf(self: *World, name: []const u8) ?[]const []const u8 {
+    pub fn invexOf(self: *World, name: []const u8) ?[]const ListEntry {
         const channel = self.channels.getPtr(name) orelse return null;
         return channel.invex.items;
     }
@@ -844,15 +893,15 @@ pub const World = struct {
     }
 
     /// +Z quiet (MUTE) list operations.
-    pub fn addMute(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
+    pub fn addMute(self: *World, name: []const u8, mask: []const u8, setter: []const u8, set_at: i64) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
-        return self.listAddMask(&channel.mutes, mask);
+        return self.listAddMask(&channel.mutes, mask, setter, set_at);
     }
     pub fn removeMute(self: *World, name: []const u8, mask: []const u8) WorldError!bool {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
         return self.listRemoveMask(&channel.mutes, mask);
     }
-    pub fn mutesOf(self: *World, name: []const u8) ?[]const []const u8 {
+    pub fn mutesOf(self: *World, name: []const u8) ?[]const ListEntry {
         const channel = self.channels.getPtr(name) orelse return null;
         return channel.mutes.items;
     }
@@ -1112,14 +1161,24 @@ pub const World = struct {
         return channel.members.keyIterator();
     }
 
-    pub fn setTopic(self: *World, name: []const u8, text: []const u8) WorldError!void {
+    pub fn setTopic(self: *World, name: []const u8, text: []const u8, setter: []const u8, set_at: i64) WorldError!void {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
-        try channel.setTopic(text);
+        try channel.setTopic(text, setter, set_at);
     }
 
     pub fn topic(self: *const World, name: []const u8) ?[]const u8 {
         const channel = self.channels.get(name) orelse return null;
         return channel.topic;
+    }
+
+    pub fn topicInfo(self: *const World, name: []const u8) ?TopicInfo {
+        const channel = self.channels.get(name) orelse return null;
+        const text = channel.topic orelse return null;
+        return .{
+            .text = text,
+            .setter = channel.topic_setter orelse "",
+            .set_at = channel.topic_time,
+        };
     }
 
     pub fn resolveMessageTarget(self: *World, target: []const u8) WorldError!MessageTarget {
@@ -1261,15 +1320,15 @@ test "channel list modes are capped at max_list_entries" {
     defer world.deinit();
     _ = try world.join("#c", testClient(1)); // creates the channel
 
-    try std.testing.expect(try world.addBan("#c", "a!*@*"));
-    try std.testing.expect(try world.addBan("#c", "b!*@*"));
-    try std.testing.expectError(error.ListFull, world.addBan("#c", "c!*@*"));
+    try std.testing.expect(try world.addBan("#c", "a!*@*", "setter", 1));
+    try std.testing.expect(try world.addBan("#c", "b!*@*", "setter", 2));
+    try std.testing.expectError(error.ListFull, world.addBan("#c", "c!*@*", "setter", 3));
     // Each list mode has its own independent cap.
-    try std.testing.expect(try world.addExempt("#c", "e1!*@*"));
-    try std.testing.expect(try world.addExempt("#c", "e2!*@*"));
-    try std.testing.expectError(error.ListFull, world.addExempt("#c", "e3!*@*"));
+    try std.testing.expect(try world.addExempt("#c", "e1!*@*", "setter", 1));
+    try std.testing.expect(try world.addExempt("#c", "e2!*@*", "setter", 2));
+    try std.testing.expectError(error.ListFull, world.addExempt("#c", "e3!*@*", "setter", 3));
     // A duplicate is a no-op (false), not a cap error.
-    try std.testing.expect(!try world.addBan("#c", "a!*@*"));
+    try std.testing.expect(!try world.addBan("#c", "a!*@*", "setter", 4));
 }
 
 test "isChannelName accepts #, &, and %#/%& but not bare names or ^" {
@@ -1448,10 +1507,16 @@ test "topics are owned and released" {
 
     const a = testClient(1);
     _ = try world.join("#x", a);
-    try world.setTopic("#x", "first topic");
+    try world.setTopic("#x", "first topic", "A!alice@localhost", 10);
     try std.testing.expectEqualStrings("first topic", world.topic("#x").?);
-    try world.setTopic("#x", "second topic");
+    var info = world.topicInfo("#x").?;
+    try std.testing.expectEqualStrings("A!alice@localhost", info.setter);
+    try std.testing.expectEqual(@as(i64, 10), info.set_at);
+    try world.setTopic("#x", "second topic", "B!bob@localhost", 20);
     try std.testing.expectEqualStrings("second topic", world.topic("#x").?);
+    info = world.topicInfo("#x").?;
+    try std.testing.expectEqualStrings("B!bob@localhost", info.setter);
+    try std.testing.expectEqual(@as(i64, 20), info.set_at);
 }
 
 test "first joiner founds the channel as operator; later joiners have no status" {
@@ -1512,8 +1577,8 @@ test "channel key, limit, bans, and invites with ownership" {
     try std.testing.expectEqual(@as(?u32, 42), world.channelLimit("#x"));
 
     // Bans: add (dedup), match (glob, case-insensitive), remove.
-    try std.testing.expect(try world.addBan("#x", "bad!*@*"));
-    try std.testing.expect(!(try world.addBan("#x", "bad!*@*"))); // dup
+    try std.testing.expect(try world.addBan("#x", "bad!*@*", "setter", 1));
+    try std.testing.expect(!(try world.addBan("#x", "bad!*@*", "setter", 1))); // dup
     try std.testing.expect(world.isBanned("#x", "BAD!user@host"));
     try std.testing.expect(!world.isBanned("#x", "good!user@host"));
     try std.testing.expectEqual(@as(usize, 1), world.bansOf("#x").?.len);
@@ -1521,15 +1586,15 @@ test "channel key, limit, bans, and invites with ownership" {
     try std.testing.expect(!world.isBanned("#x", "BAD!user@host"));
 
     // +e exemption overrides a +b ban; +I invite-exception list is independent.
-    try std.testing.expect(try world.addBan("#x", "bad!*@*"));
+    try std.testing.expect(try world.addBan("#x", "bad!*@*", "setter", 2));
     try std.testing.expect(world.isBanned("#x", "bad!u@h"));
-    try std.testing.expect(try world.addExempt("#x", "bad!vip@*"));
+    try std.testing.expect(try world.addExempt("#x", "bad!vip@*", "setter", 3));
     try std.testing.expect(!world.isBanned("#x", "bad!vip@h")); // exempt wins
     try std.testing.expect(world.isBanned("#x", "bad!other@h")); // still banned
     try std.testing.expectEqual(@as(usize, 1), world.exemptsOf("#x").?.len);
     try std.testing.expect(try world.removeExempt("#x", "bad!vip@*"));
     try std.testing.expect(world.isBanned("#x", "bad!vip@h")); // ban back in force
-    try std.testing.expect(try world.addInvex("#x", "friend!*@*"));
+    try std.testing.expect(try world.addInvex("#x", "friend!*@*", "setter", 4));
     try std.testing.expect(world.isInvexed("#x", "FRIEND!u@h"));
     try std.testing.expectEqual(@as(usize, 1), world.invexOf("#x").?.len);
 
@@ -1548,8 +1613,8 @@ test "renameChannel rekeys in place, preserving membership and bans" {
     defer world.deinit();
     const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
     _ = try world.join("#old", a);
-    try world.setTopic("#old", "hello");
-    try std.testing.expect(try world.addBan("#old", "bad!*@*"));
+    try world.setTopic("#old", "hello", "setter", 1);
+    try std.testing.expect(try world.addBan("#old", "bad!*@*", "setter", 1));
 
     // Rename moves everything to the new key.
     try std.testing.expect(try world.renameChannel("#old", "#new"));
@@ -1572,30 +1637,30 @@ test "extended bans match account, realname, channel, and negation" {
     _ = try world.join("#x", a);
 
     // Plain mask via the ctx path still globs the host prefix (back-compat).
-    try std.testing.expect(try world.addBan("#x", "bad!*@*"));
+    try std.testing.expect(try world.addBan("#x", "bad!*@*", "setter", 1));
     try std.testing.expect(world.isBannedCtx("#x", .{ .host = "bad!u@h" }));
     try std.testing.expect(!world.isBannedCtx("#x", .{ .host = "ok!u@h" }));
     try std.testing.expect(try world.removeBan("#x", "bad!*@*"));
 
     // $a: account ban.
-    try std.testing.expect(try world.addBan("#x", "$a:spammer"));
+    try std.testing.expect(try world.addBan("#x", "$a:spammer", "setter", 2));
     try std.testing.expect(world.isBannedCtx("#x", .{ .account = "spammer", .host = "x!y@z" }));
     try std.testing.expect(!world.isBannedCtx("#x", .{ .account = "good", .host = "x!y@z" }));
     // Unauthenticated client never matches an account ban.
     try std.testing.expect(!world.isBannedCtx("#x", .{ .host = "x!y@z" }));
 
     // $r: realname glob; $e exemption (also extban-aware) overrides.
-    try std.testing.expect(try world.addBan("#x", "$r:*bot*"));
+    try std.testing.expect(try world.addBan("#x", "$r:*bot*", "setter", 3));
     try std.testing.expect(world.isBannedCtx("#x", .{ .realname = "evil bot 9000", .host = "x!y@z" }));
-    try std.testing.expect(try world.addExempt("#x", "$a:trusted"));
+    try std.testing.expect(try world.addExempt("#x", "$a:trusted", "setter", 4));
     try std.testing.expect(!world.isBannedCtx("#x", .{ .account = "trusted", .realname = "evil bot", .host = "x!y@z" }));
 
     // $c: channel ban — banned when present in #secret.
-    try std.testing.expect(try world.addBan("#x", "$c:#secret"));
+    try std.testing.expect(try world.addBan("#x", "$c:#secret", "setter", 5));
     const chans = [_][]const u8{"#secret"};
     try std.testing.expect(world.isBannedCtx("#x", .{ .host = "n!u@h", .channels = &chans }));
     // $~a: negated account ban (matches everyone NOT logged in as alice).
-    try std.testing.expect(try world.addMute("#x", "$~a:alice"));
+    try std.testing.expect(try world.addMute("#x", "$~a:alice", "setter", 6));
     try std.testing.expect(!world.isMutedCtx("#x", .{ .account = "alice", .host = "x!y@z" }));
     try std.testing.expect(world.isMutedCtx("#x", .{ .account = "bob", .host = "x!y@z" }));
 }
@@ -1608,16 +1673,16 @@ test "channel flag modes set, query, and render" {
 
     try std.testing.expect(!world.channelHasFlag("#x", .moderated));
     try std.testing.expect(try world.setChannelFlag("#x", .moderated, true));
-    try std.testing.expect(try world.setChannelFlag("#x", .topic_ops, true));
+    try std.testing.expect(!(try world.setChannelFlag("#x", .topic_ops, true)));
     try std.testing.expect(world.channelHasFlag("#x", .moderated));
     // Idempotent set reports no change.
     try std.testing.expect(!(try world.setChannelFlag("#x", .moderated, true)));
 
     var buf: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("+mt", world.channelModeString("#x", &buf));
+    try std.testing.expectEqualStrings("+mnt", world.channelModeString("#x", &buf));
 
     try std.testing.expect(try world.setChannelFlag("#x", .moderated, false));
-    try std.testing.expectEqualStrings("+t", world.channelModeString("#x", &buf));
+    try std.testing.expectEqualStrings("+nt", world.channelModeString("#x", &buf));
     try std.testing.expectError(error.NoSuchChannel, world.setChannelFlag("#nope", .secret, true));
 }
 
@@ -1631,21 +1696,21 @@ test "+Z quiet (MUTE) list: add, match, exempt override, remove" {
     try std.testing.expect(!world.isMuted("#z", "loud!u@h"));
 
     // Add (dedup), glob + case-insensitive match.
-    try std.testing.expect(try world.addMute("#z", "loud!*@*"));
-    try std.testing.expect(!(try world.addMute("#z", "loud!*@*"))); // dup
+    try std.testing.expect(try world.addMute("#z", "loud!*@*", "setter", 1));
+    try std.testing.expect(!(try world.addMute("#z", "loud!*@*", "setter", 1))); // dup
     try std.testing.expect(world.isMuted("#z", "LOUD!user@host"));
     try std.testing.expect(!world.isMuted("#z", "quiet!user@host"));
     try std.testing.expectEqual(@as(usize, 1), world.mutesOf("#z").?.len);
 
     // A +e exempt overrides a +Z quiet, mirroring +b/+e semantics.
-    try std.testing.expect(try world.addExempt("#z", "loud!vip@*"));
+    try std.testing.expect(try world.addExempt("#z", "loud!vip@*", "setter", 2));
     try std.testing.expect(!world.isMuted("#z", "loud!vip@host")); // exempt wins
     try std.testing.expect(world.isMuted("#z", "loud!other@host")); // still muted
 
     // Remove returns to un-muted.
     try std.testing.expect(try world.removeMute("#z", "loud!*@*"));
     try std.testing.expect(!world.isMuted("#z", "loud!other@host"));
-    try std.testing.expectError(error.NoSuchChannel, world.addMute("#nope", "x!*@*"));
+    try std.testing.expectError(error.NoSuchChannel, world.addMute("#nope", "x!*@*", "setter", 1));
 }
 
 test "+j join throttle: token bucket admits up to N per window, then denies" {
