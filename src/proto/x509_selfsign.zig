@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const Error = error{
@@ -12,6 +13,7 @@ pub const Error = error{
     InvalidValidity,
     InvalidTime,
     InvalidDnsName,
+    InvalidIpAddress,
 };
 
 pub const Params = struct {
@@ -24,6 +26,27 @@ pub const Params = struct {
     /// the CN and match the hostname against the SAN, so a server cert MUST
     /// carry at least one. Empty keeps the legacy (extension-less) output.
     dns_names: []const []const u8 = &.{},
+    /// SubjectAltName iPAddress entries, encoded as raw IPv4 (4-byte) or IPv6
+    /// (16-byte) address octets.
+    ip_addresses: []const []const u8 = &.{},
+    /// Emit a critical BasicConstraints `cA:TRUE` so the cert can serve as its
+    /// own trust anchor (self-signed root). Off by default.
+    is_ca: bool = false,
+};
+
+pub const EcdsaP256Params = struct {
+    common_name: []const u8,
+    not_before: i64,
+    not_after: i64,
+    serial: []const u8,
+    key_pair: ecdsa_p256.KeyPair,
+    /// SubjectAltName dNSName entries. Standards TLS clients (RFC 6125) ignore
+    /// the CN and match the hostname against the SAN, so a server cert MUST
+    /// carry at least one. Empty keeps the legacy (extension-less) output.
+    dns_names: []const []const u8 = &.{},
+    /// SubjectAltName iPAddress entries, encoded as raw IPv4 (4-byte) or IPv6
+    /// (16-byte) address octets.
+    ip_addresses: []const []const u8 = &.{},
     /// Emit a critical BasicConstraints `cA:TRUE` so the cert can serve as its
     /// own trust anchor (self-signed root). Off by default.
     is_ca: bool = false,
@@ -43,6 +66,9 @@ const max_common_name_len = 64;
 const max_serial_len = 20;
 const max_dns_name_len = 253;
 const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 };
+const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
 const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 };
 const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 }; // 2.5.29.17
 const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 }; // 2.5.29.19
@@ -50,20 +76,31 @@ const tag_boolean: u8 = 0x01;
 const tag_octet_string: u8 = 0x04;
 const tag_context_3_constructed: u8 = 0xa3;
 const tag_san_dns_name: u8 = 0x82; // GeneralName [2] dNSName (context, primitive)
+const tag_san_ip_address: u8 = 0x87; // GeneralName [7] iPAddress (context, primitive)
+
+const SignatureAlgorithm = enum {
+    ed25519,
+    ecdsa_p256_sha256,
+};
+
+const SubjectPublicKey = union(enum) {
+    ed25519: [Ed25519.PublicKey.encoded_length]u8,
+    ecdsa_p256_sec1: [ecdsa_p256.sec1_uncompressed_length]u8,
+};
 
 pub fn buildSelfSigned(out: []u8, params: Params) ![]const u8 {
     if (@bitSizeOf(usize) != 64) return error.UnsupportedArchitecture;
     try validateParams(params);
 
-    var tbs_buf: [1024]u8 = undefined;
-    const tbs = try buildTbs(&tbs_buf, params);
+    var tbs_buf: [1400]u8 = undefined;
+    const tbs = try buildTbs(&tbs_buf, params, .ed25519, .{ .ed25519 = params.key_pair.public_key.toBytes() });
     const sig = try Ed25519.KeyPair.sign(params.key_pair, tbs, null);
     const sig_bytes = sig.toBytes();
 
-    var cert_body_buf: [1280]u8 = undefined;
+    var cert_body_buf: [1600]u8 = undefined;
     var cert_body = DerWriter.init(&cert_body_buf);
     try cert_body.write(tbs);
-    try writeAlgorithmIdentifier(&cert_body);
+    try writeSignatureAlgorithmIdentifier(&cert_body, .ed25519);
     try writeSignatureBitString(&cert_body, &sig_bytes);
 
     var cert = DerWriter.init(out);
@@ -71,7 +108,29 @@ pub fn buildSelfSigned(out: []u8, params: Params) ![]const u8 {
     return cert.bytes();
 }
 
-fn validateParams(params: Params) Error!void {
+pub fn buildSelfSignedEcdsaP256(out: []u8, params: EcdsaP256Params) ![]const u8 {
+    if (@bitSizeOf(usize) != 64) return error.UnsupportedArchitecture;
+    try validateParams(params);
+
+    var tbs_buf: [1400]u8 = undefined;
+    const public_sec1 = params.key_pair.public_key.toUncompressedSec1();
+    const tbs = try buildTbs(&tbs_buf, params, .ecdsa_p256_sha256, .{ .ecdsa_p256_sec1 = public_sec1 });
+    const sig = try ecdsa_p256.sign(tbs, params.key_pair);
+    var sig_der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = try ecdsa_p256.signatureToDer(sig, &sig_der_buf);
+
+    var cert_body_buf: [1600]u8 = undefined;
+    var cert_body = DerWriter.init(&cert_body_buf);
+    try cert_body.write(tbs);
+    try writeSignatureAlgorithmIdentifier(&cert_body, .ecdsa_p256_sha256);
+    try writeSignatureBitString(&cert_body, sig_der);
+
+    var cert = DerWriter.init(out);
+    try cert.tlv(tag_sequence, cert_body.bytes());
+    return cert.bytes();
+}
+
+fn validateParams(params: anytype) Error!void {
     if (params.common_name.len == 0) return error.InvalidCommonName;
     if (params.common_name.len > max_common_name_len) return error.CommonNameTooLong;
     for (params.common_name) |b| {
@@ -83,19 +142,22 @@ fn validateParams(params: Params) Error!void {
         if (name.len == 0 or name.len > max_dns_name_len) return error.InvalidDnsName;
         for (name) |b| if (b <= 0x20 or b >= 0x7f) return error.InvalidDnsName;
     }
+    for (params.ip_addresses) |ip| {
+        if (ip.len != 4 and ip.len != 16) return error.InvalidIpAddress;
+    }
 }
 
-fn buildTbs(out: []u8, params: Params) ![]const u8 {
-    var body_buf: [960]u8 = undefined;
+fn buildTbs(out: []u8, params: anytype, signature_algorithm: SignatureAlgorithm, public_key: SubjectPublicKey) ![]const u8 {
+    var body_buf: [1280]u8 = undefined;
     var body = DerWriter.init(&body_buf);
     try writeVersion(&body);
     try writeSerial(&body, params.serial);
-    try writeAlgorithmIdentifier(&body);
+    try writeSignatureAlgorithmIdentifier(&body, signature_algorithm);
     try writeName(&body, params.common_name);
     try writeValidity(&body, params.not_before, params.not_after);
     try writeName(&body, params.common_name);
-    try writeSubjectPublicKeyInfo(&body, params.key_pair.public_key.toBytes());
-    if (params.dns_names.len != 0 or params.is_ca) try writeExtensions(&body, params);
+    try writeSubjectPublicKeyInfo(&body, public_key);
+    if (params.dns_names.len != 0 or params.ip_addresses.len != 0 or params.is_ca) try writeExtensions(&body, params);
 
     var tbs = DerWriter.init(out);
     try tbs.tlv(tag_sequence, body.bytes());
@@ -104,7 +166,7 @@ fn buildTbs(out: []u8, params: Params) ![]const u8 {
 
 /// `[3] EXPLICIT SEQUENCE OF Extension` carrying SubjectAltName (dNSNames) and,
 /// optionally, a critical BasicConstraints cA:TRUE.
-fn writeExtensions(w: *DerWriter, params: Params) !void {
+fn writeExtensions(w: *DerWriter, params: anytype) !void {
     var seq_buf: [768]u8 = undefined;
     var seq = DerWriter.init(&seq_buf);
 
@@ -119,10 +181,11 @@ fn writeExtensions(w: *DerWriter, params: Params) !void {
         try writeExtension(&seq, &oid_basic_constraints, true, bc_seq.bytes());
     }
 
-    if (params.dns_names.len != 0) {
+    if (params.dns_names.len != 0 or params.ip_addresses.len != 0) {
         var names_buf: [600]u8 = undefined;
         var names = DerWriter.init(&names_buf);
         for (params.dns_names) |name| try names.tlv(tag_san_dns_name, name);
+        for (params.ip_addresses) |ip| try names.tlv(tag_san_ip_address, ip);
         var san_buf: [620]u8 = undefined;
         var san = DerWriter.init(&san_buf);
         try san.tlv(tag_sequence, names.bytes());
@@ -172,10 +235,21 @@ fn writeSerial(w: *DerWriter, serial: []const u8) !void {
     try w.tlv(tag_integer, buf[0..len]);
 }
 
-fn writeAlgorithmIdentifier(w: *DerWriter) !void {
-    var body_buf: [8]u8 = undefined;
+fn writeSignatureAlgorithmIdentifier(w: *DerWriter, algorithm: SignatureAlgorithm) !void {
+    var body_buf: [12]u8 = undefined;
     var body = DerWriter.init(&body_buf);
-    try body.tlv(tag_oid, &oid_ed25519);
+    switch (algorithm) {
+        .ed25519 => try body.tlv(tag_oid, &oid_ed25519),
+        .ecdsa_p256_sha256 => try body.tlv(tag_oid, &oid_ecdsa_sha256),
+    }
+    try w.tlv(tag_sequence, body.bytes());
+}
+
+fn writeEcPublicKeyAlgorithmIdentifier(w: *DerWriter) !void {
+    var body_buf: [24]u8 = undefined;
+    var body = DerWriter.init(&body_buf);
+    try body.tlv(tag_oid, &oid_ec_public_key);
+    try body.tlv(tag_oid, &oid_prime256v1);
     try w.tlv(tag_sequence, body.bytes());
 }
 
@@ -209,23 +283,35 @@ fn writeValidity(w: *DerWriter, not_before: i64, not_after: i64) !void {
     try w.tlv(tag_sequence, body.bytes());
 }
 
-fn writeSubjectPublicKeyInfo(w: *DerWriter, public_key: [Ed25519.PublicKey.encoded_length]u8) !void {
-    var body_buf: [48]u8 = undefined;
+fn writeSubjectPublicKeyInfo(w: *DerWriter, public_key: SubjectPublicKey) !void {
+    var body_buf: [104]u8 = undefined;
     var body = DerWriter.init(&body_buf);
-    try writeAlgorithmIdentifier(&body);
 
-    var bit_string: [1 + Ed25519.PublicKey.encoded_length]u8 = undefined;
-    bit_string[0] = 0;
-    @memcpy(bit_string[1..], &public_key);
-    try body.tlv(tag_bit_string, &bit_string);
+    switch (public_key) {
+        .ed25519 => |key| {
+            try writeSignatureAlgorithmIdentifier(&body, .ed25519);
+            var bit_string: [1 + Ed25519.PublicKey.encoded_length]u8 = undefined;
+            bit_string[0] = 0;
+            @memcpy(bit_string[1..], &key);
+            try body.tlv(tag_bit_string, &bit_string);
+        },
+        .ecdsa_p256_sec1 => |sec1| {
+            try writeEcPublicKeyAlgorithmIdentifier(&body);
+            var bit_string: [1 + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+            bit_string[0] = 0;
+            @memcpy(bit_string[1..], &sec1);
+            try body.tlv(tag_bit_string, &bit_string);
+        },
+    }
     try w.tlv(tag_sequence, body.bytes());
 }
 
-fn writeSignatureBitString(w: *DerWriter, signature: *const [Ed25519.Signature.encoded_length]u8) !void {
-    var bit_string: [1 + Ed25519.Signature.encoded_length]u8 = undefined;
+fn writeSignatureBitString(w: *DerWriter, signature: []const u8) !void {
+    var bit_string: [1 + ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+    if (signature.len > bit_string.len - 1) return error.NoSpaceLeft;
     bit_string[0] = 0;
-    @memcpy(bit_string[1..], signature);
-    try w.tlv(tag_bit_string, &bit_string);
+    @memcpy(bit_string[1..][0..signature.len], signature);
+    try w.tlv(tag_bit_string, bit_string[0 .. 1 + signature.len]);
 }
 
 const Asn1Time = struct {
@@ -500,6 +586,60 @@ test "buildSelfSigned emits SAN dnsNames + CA basic-constraints parseable by x50
     const sig_bits = try readTlv(outer.value, &body_cursor);
     const signature = Ed25519.Signature.fromBytes(sig_bits.value[1..][0..Ed25519.Signature.encoded_length].*);
     try signature.verify(tbs.full, params.key_pair.public_key);
+}
+
+test "buildSelfSignedEcdsaP256 emits P-256 SPKI and ECDSA-SHA256 signature" {
+    const x509 = @import("../crypto/x509.zig");
+    const kp = ecdsa_p256.KeyPair.generate(testing.io);
+    var out: [1024]u8 = undefined;
+    const der = try buildSelfSignedEcdsaP256(&out, .{
+        .common_name = "ecdsa.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_735_689_599,
+        .serial = &.{ 0x55, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"ecdsa.test"},
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+    });
+
+    const parsed = try x509.parse(der);
+    try testing.expect(parsed.basic_constraints_ca);
+    try testing.expectEqual(@as(usize, 1), parsed.san_dns_count);
+    try testing.expectEqualStrings("ecdsa.test", parsed.san_dns[0]);
+    try testing.expectEqual(@as(usize, 1), parsed.san_ip_count);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, parsed.san_ips[0].slice());
+    try testing.expectEqualSlices(u8, &oid_ecdsa_sha256, parsed.signature_algorithm_oid);
+
+    var cursor: usize = 0;
+    const outer = try readTlv(der, &cursor);
+    var body_cursor: usize = 0;
+    const tbs = try readTlv(outer.value, &body_cursor);
+    const sig_alg = try readTlv(outer.value, &body_cursor);
+    const sig_bits = try readTlv(outer.value, &body_cursor);
+    try testing.expectEqualSlices(u8, &.{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }, sig_alg.value);
+    try testing.expectEqual(@as(u8, 0), sig_bits.value[0]);
+    const signature = try ecdsa_p256.signatureFromDer(sig_bits.value[1..]);
+    try testing.expect(ecdsa_p256.verify(signature, tbs.full, kp.public_key));
+
+    cursor = 0;
+    _ = try readTlv(tbs.value, &cursor); // version
+    _ = try readTlv(tbs.value, &cursor); // serial
+    _ = try readTlv(tbs.value, &cursor); // signature
+    _ = try readTlv(tbs.value, &cursor); // issuer
+    _ = try readTlv(tbs.value, &cursor); // validity
+    _ = try readTlv(tbs.value, &cursor); // subject
+    const spki = try readTlv(tbs.value, &cursor);
+    cursor = 0;
+    const spki_alg = try readTlv(spki.value, &cursor);
+    const spki_bits = try readTlv(spki.value, &cursor);
+    cursor = 0;
+    const ec_oid = try readTlv(spki_alg.value, &cursor);
+    const curve_oid = try readTlv(spki_alg.value, &cursor);
+    try testing.expectEqualSlices(u8, &oid_ec_public_key, ec_oid.value);
+    try testing.expectEqualSlices(u8, &oid_prime256v1, curve_oid.value);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    try testing.expectEqualSlices(u8, &sec1, spki_bits.value[1..]);
 }
 
 test "buildSelfSigned rejects malformed SAN dnsNames" {

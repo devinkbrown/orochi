@@ -4,11 +4,11 @@
 //! application data through `encrypt()` / `decrypt()`.
 //!
 //! Scope (slice B of the TLS arc): TLS 1.3 only, X25519 key exchange, an
-//! Ed25519 leaf certificate (CertificateVerify signed with `ed25519`), and the
-//! AES-128-GCM / ChaCha20-Poly1305 suites. Interop is pinned by a loopback test
-//! against the in-repo standards client `tls_client.Client`. P-256 key exchange,
-//! RSA/ECDSA certs, HelloRetryRequest, and 0-RTT are intentionally out of scope
-//! here and rejected with a typed error.
+//! Ed25519 or ECDSA-P256 leaf certificate (CertificateVerify signed with the
+//! matching TLS 1.3 scheme), and the AES-128-GCM / ChaCha20-Poly1305 suites.
+//! Interop is pinned by loopback tests against the in-repo standards client
+//! `tls_client.Client`. RSA certs, HelloRetryRequest, and 0-RTT are intentionally
+//! out of scope here and rejected with a typed error.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const kx = @import("kx.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const hkdf = @import("hkdf_tls13.zig");
+const ecdsa_p256 = @import("ecdsa_p256.zig");
 const Sha256 = hkdf.Sha256;
 const Sha384 = hkdf.Sha384;
 /// Largest transcript-hash / traffic-secret length handled (SHA-384).
@@ -47,17 +48,24 @@ pub const Error = error{
     MissingExtension,
     FinishedMismatch,
     NoCertificate,
+    NoSigningKey,
 } || Allocator.Error || tls_record.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error ||
     tls_signature_scheme.Error;
 
 pub const Config = struct {
-    /// DER certificates, leaf first. The leaf SPKI must be the Ed25519 public
-    /// key matching `signing_key`.
+    /// DER certificates, leaf first. The leaf SPKI must match the configured
+    /// signing key used for CertificateVerify.
     cert_chain: []const []const u8,
     /// Ed25519 key pair whose public key is the leaf certificate's SPKI; signs
-    /// the CertificateVerify.
-    signing_key: Ed25519.KeyPair,
+    /// CertificateVerify with the `ed25519` scheme. This remains optional only
+    /// so ECDSA-only configs can omit it; existing `.signing_key = kp` callers
+    /// still coerce to `?Ed25519.KeyPair`.
+    signing_key: ?Ed25519.KeyPair = null,
+    /// ECDSA-P256 key pair whose public key is the leaf certificate's SPKI;
+    /// signs CertificateVerify with `ecdsa_secp256r1_sha256`. When set, this
+    /// takes precedence over `signing_key`.
+    ecdsa_p256_signing_key: ?ecdsa_p256.KeyPair = null,
     /// ALPN protocols the server is willing to select, in preference order.
     /// Empty disables ALPN negotiation.
     alpn_protocols: []const []const u8 = &.{},
@@ -68,6 +76,11 @@ pub const Config = struct {
     /// Certificate) still completes; `clientCertDer()` stays null. Default false
     /// is fully backward-compatible (no CertificateRequest).
     request_client_cert: bool = false,
+};
+
+pub const SigningKey = union(enum) {
+    ed25519: Ed25519.KeyPair,
+    ecdsa_p256: ecdsa_p256.KeyPair,
 };
 
 pub const FeedResult = union(enum) {
@@ -179,6 +192,7 @@ pub const Server = struct {
 
     pub fn init(allocator: Allocator, config: Config) Error!Server {
         if (config.cert_chain.len == 0) return error.NoCertificate;
+        if (activeSigningKey(config) == null) return error.NoSigningKey;
         var seed: [kx.X25519Kx.seed_len]u8 = undefined;
         try osEntropy(&seed);
         defer secureZero(&seed);
@@ -654,13 +668,25 @@ pub const Server = struct {
         const th_len = self.transcriptHash(&th);
         var in_buf: [cert_verify_input_max]u8 = undefined;
         const input = buildCertVerifyInput(&in_buf, certificate_verify_context, th[0..th_len]);
-        const sig = (self.config.signing_key.sign(input, null) catch return error.BadHandshake).toBytes();
 
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
-        try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
-        try appendU16(self.allocator, &body, @intCast(sig.len));
-        try body.appendSlice(self.allocator, &sig);
+        switch (activeSigningKey(self.config) orelse return error.NoSigningKey) {
+            .ed25519 => |key| {
+                const sig = (key.sign(input, null) catch return error.BadHandshake).toBytes();
+                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
+                try appendU16(self.allocator, &body, @intCast(sig.len));
+                try body.appendSlice(self.allocator, &sig);
+            },
+            .ecdsa_p256 => |key| {
+                const sig = ecdsa_p256.sign(input, key) catch return error.BadHandshake;
+                var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+                const der = ecdsa_p256.signatureToDer(sig, &der_buf) catch return error.BadHandshake;
+                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256));
+                try appendU16(self.allocator, &body, @intCast(der.len));
+                try body.appendSlice(self.allocator, der);
+            },
+        }
         try self.emit(out, .certificate_verify, body.items);
     }
 
@@ -778,6 +804,12 @@ pub const Server = struct {
         try self.transcript.appendSlice(self.allocator, bytes);
     }
 };
+
+fn activeSigningKey(config: Config) ?SigningKey {
+    if (config.ecdsa_p256_signing_key) |key| return .{ .ecdsa_p256 = key };
+    if (config.signing_key) |key| return .{ .ed25519 = key };
+    return null;
+}
 
 // --- record + handshake helpers (mirror tls_client.zig; kept local so the
 //     proven client stays untouched) -------------------------------------
@@ -1117,6 +1149,59 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("hello server", got_s);
+}
+
+test "loopback: tls_client completes a handshake against tls_server with ECDSA-P256 leaf" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x26, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .ecdsa_p256_signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    const s2c = try server.encrypt("ecdsa hello client");
+    defer alloc.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("ecdsa hello client", got_c);
+
+    const c2s = try client.encrypt("ecdsa hello server");
+    defer alloc.free(c2s);
+    const got_s = try server.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("ecdsa hello server", got_s);
 }
 
 test "loopback: handshake completes over TLS_AES_256_GCM_SHA384 (SHA-384 schedule)" {
