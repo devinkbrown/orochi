@@ -188,6 +188,9 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
 
         der: []const u8,
         tbs_der: []const u8,
+        /// DER INTEGER contents for TBSCertificate.serialNumber, including any
+        /// leading sign-padding byte required by DER for a positive serial.
+        serial_der: []const u8,
         spki_der: []const u8,
         spki_value: []const u8,
         not_before: Time,
@@ -222,6 +225,7 @@ pub fn ParsedCertificate(comptime max_dns_names: usize, comptime max_ip_addresse
             var cert = Self{
                 .der = der,
                 .tbs_der = &.{},
+                .serial_der = &.{},
                 .spki_der = &.{},
                 .spki_value = &.{},
                 .not_before = emptyTime(),
@@ -339,6 +343,7 @@ fn parseTbs(comptime CertType: type, cert: *CertType, parent: DerReader, tbs: Tl
 
     const serial = try tbs_reader.readExpected(Tag.integer);
     try validatePositiveInteger(serial.value);
+    cert.serial_der = serial.value;
 
     _ = try tbs_reader.readExpected(Tag.sequence); // TBSCertificate.signature
     _ = try tbs_reader.readExpected(Tag.sequence); // issuer

@@ -41,13 +41,15 @@
 //! past the slice.
 //!
 //! OUT OF SCOPE for this module (by design):
-//!   * Actual signature verification (ECDSA P-256 / Ed25519). The daemon's
-//!     `ecdsa_p256.zig` / `sign.zig` modules perform the cryptographic check;
-//!     this module only reconstructs the signed bytes via `buildSignedData`.
-//!   * Shipping or matching a CT log list / public keys. A future log-list
-//!     module would map a parsed `log_id` to a verification key.
+//!   * Shipping or matching a CT log list / public keys. The caller must map a
+//!     parsed `log_id` to the correct log SubjectPublicKeyInfo before calling
+//!     `verifySct`.
 //!   * DER decoding of the X.509 extension envelope (handled by `x509.zig`).
 const std = @import("std");
+const x509 = @import("x509.zig");
+const ecdsa_p256 = @import("ecdsa_p256.zig");
+
+const Ed25519 = std.crypto.sign.Ed25519;
 
 /// Width of a length prefix used throughout the SCT wire format.
 const len_prefix_len: usize = 2;
@@ -384,6 +386,31 @@ pub fn buildPrecertEntry(out: []u8, issuer_key_hash: [log_id_len]u8, tbs: []cons
     return out[0..total];
 }
 
+/// Verify an SCT's digitally-signed value against a CT log public key.
+///
+/// `signed_data` must be the exact `CertificateTimestamp` byte string returned
+/// by `buildSignedData` for the certificate or precertificate entry being
+/// checked. This function authenticates the SCT signature only; selecting the
+/// correct CT log key from `sct.log_id` and the public CT log list is the
+/// caller's responsibility.
+pub fn verifySct(sct: Sct, log_public_key_spki_der: []const u8, signed_data: []const u8) bool {
+    const key = parseLogPublicKeyFromSpki(log_public_key_spki_der) catch return false;
+    switch (key) {
+        .ecdsa_p256 => |pk| {
+            if (sct.sig_hash_alg != hash_sha256 or sct.sig_signature_alg != sig_ecdsa) return false;
+            const decoded = ecdsa_p256.signatureFromDer(sct.signature) catch return false;
+            return ecdsa_p256.verify(decoded, signed_data, pk);
+        },
+        .ed25519 => |pk| {
+            if (sct.sig_hash_alg != hash_intrinsic or sct.sig_signature_alg != sig_ed25519) return false;
+            if (sct.signature.len != Ed25519.Signature.encoded_length) return false;
+            const decoded = Ed25519.Signature.fromBytes(sct.signature[0..Ed25519.Signature.encoded_length].*);
+            decoded.verify(signed_data, pk) catch return false;
+            return true;
+        },
+    }
+}
+
 /// Write a big-endian 24-bit length into the first three bytes of `out`
 /// (caller guarantees `out.len >= 3` and `value <= 0xff_ffff`).
 fn writeU24(out: []u8, value: u24) void {
@@ -402,7 +429,63 @@ const testing = std.testing;
 /// i.e. the legacy pair that combines to the 0x0403 ecdsa_secp256r1_sha256
 /// SignatureScheme code.
 const hash_sha256: u8 = 4;
+const hash_intrinsic: u8 = 8;
 const sig_ecdsa: u8 = 3;
+const sig_ed25519: u8 = 7;
+
+const LogPublicKey = union(enum) {
+    ecdsa_p256: ecdsa_p256.PublicKey,
+    ed25519: Ed25519.PublicKey,
+};
+
+fn parseLogPublicKeyFromSpki(spki_der: []const u8) !LogPublicKey {
+    var top = x509.DerReader.init(spki_der);
+    const seq = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+    var spki = try top.child(seq);
+    const alg_seq = try spki.readExpected(x509.Tag.sequence);
+    const key_bits = try spki.readExpected(x509.Tag.bit_string);
+    try spki.expectEmpty();
+
+    var alg = try spki.child(alg_seq);
+    const oid = try alg.readExpected(x509.Tag.oid);
+    try validateOid(oid.value);
+    var params: ?[]const u8 = null;
+    if (alg.hasRemaining()) {
+        const p = try alg.readTlv();
+        if (p.tag == x509.Tag.oid) params = p.value;
+    }
+    try alg.expectEmpty();
+
+    if (key_bits.value.len == 0 or key_bits.value[0] != 0) return error.InvalidBitString;
+    const key_bytes = key_bits.value[1..];
+    if (std.mem.eql(u8, oid.value, &oid_ec_public_key)) {
+        const curve = params orelse return error.UnsupportedPublicKey;
+        if (!std.mem.eql(u8, curve, &oid_prime256v1)) return error.UnsupportedPublicKey;
+        return .{ .ecdsa_p256 = try ecdsa_p256.parsePublicKeySec1(key_bytes) };
+    }
+    if (std.mem.eql(u8, oid.value, &oid_ed25519)) {
+        if (key_bytes.len != Ed25519.PublicKey.encoded_length) return error.UnsupportedPublicKey;
+        return .{ .ed25519 = Ed25519.PublicKey.fromBytes(key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return error.UnsupportedPublicKey };
+    }
+    return error.UnsupportedPublicKey;
+}
+
+fn validateOid(value: []const u8) !void {
+    if (value.len == 0) return error.InvalidOid;
+    var at_arc_start = true;
+    var ended_arc = false;
+    for (value) |byte| {
+        if (at_arc_start and byte == 0x80) return error.InvalidOid;
+        ended_arc = (byte & 0x80) == 0;
+        at_arc_start = ended_arc;
+    }
+    if (!ended_arc) return error.InvalidOid;
+}
+
+const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
+const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
 
 /// Hand-build a `serialized_sct` body for one v1 SCT.
 fn buildOneSctBody(
@@ -776,6 +859,90 @@ test "buildPrecertEntry reports NoSpaceLeft when out is too small" {
 
     // Act / Assert
     try testing.expectError(error.NoSpaceLeft, buildPrecertEntry(&tiny, issuer_key_hash, &tbs));
+}
+
+test "verifySct accepts Ed25519 log signature over built signed data" {
+    const allocator = testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7C} ** Ed25519.KeyPair.seed_length);
+    const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
+    defer allocator.free(spki);
+
+    const cert_der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x09 };
+    var signed_buf: [128]u8 = undefined;
+    const signed = try buildSignedData(&signed_buf, .{
+        .timestamp = 0x0102_0304_0506_0708,
+        .entry_type = .x509_entry,
+        .signed_entry = &cert_der,
+        .extensions = &.{},
+    });
+    const sig = try kp.sign(signed, null);
+    const sig_bytes = sig.toBytes();
+    const sct = Sct{
+        .version = .v1,
+        .log_id = [_]u8{0xAA} ** log_id_len,
+        .timestamp = 0x0102_0304_0506_0708,
+        .extensions = &.{},
+        .sig_hash_alg = hash_intrinsic,
+        .sig_signature_alg = sig_ed25519,
+        .signature = &sig_bytes,
+    };
+
+    try testing.expect(verifySct(sct, spki, signed));
+    signed_buf[0] ^= 1;
+    try testing.expect(!verifySct(sct, spki, signed));
+}
+
+fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [Ed25519.PublicKey.encoded_length]u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendAlgId(allocator, &body, &oid_ed25519, false);
+    try appendDerBitString(allocator, &body, &public_key);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendAlgId(allocator: std.mem.Allocator, out: *std.ArrayList(u8), oid: []const u8, with_null: bool) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendDerTlv(allocator, &body, x509.Tag.oid, oid);
+    if (with_null) try appendDerTlv(allocator, &body, x509.Tag.null_value, "");
+    try appendDerSeq(allocator, out, body.items);
+}
+
+fn appendDerSeq(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    try appendDerTlv(allocator, out, x509.Tag.sequence, value);
+}
+
+fn appendDerBitString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 0);
+    try body.appendSlice(allocator, value);
+    try appendDerTlv(allocator, out, x509.Tag.bit_string, body.items);
+}
+
+fn appendDerTlv(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tag: u8, value: []const u8) !void {
+    try out.append(allocator, tag);
+    try appendDerLen(allocator, out, value.len);
+    try out.appendSlice(allocator, value);
+}
+
+fn appendDerLen(allocator: std.mem.Allocator, out: *std.ArrayList(u8), len: usize) !void {
+    if (len < 128) {
+        try out.append(allocator, @intCast(len));
+        return;
+    }
+    var tmp: [@sizeOf(usize)]u8 = undefined;
+    var n = len;
+    var count: usize = 0;
+    while (n != 0) : (n >>= 8) {
+        tmp[tmp.len - 1 - count] = @intCast(n & 0xff);
+        count += 1;
+    }
+    try out.append(allocator, 0x80 | @as(u8, @intCast(count)));
+    try out.appendSlice(allocator, tmp[tmp.len - count ..]);
 }
 
 test {

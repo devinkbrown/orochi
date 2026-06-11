@@ -7,6 +7,11 @@
 //! freshness or authenticity of the result.
 const std = @import("std");
 const x509 = @import("x509.zig");
+const ecdsa_p256 = @import("ecdsa_p256.zig");
+const rsa_verify = @import("rsa_verify.zig");
+
+const Ed25519 = std.crypto.sign.Ed25519;
+const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 
 pub const DefaultMaxResponses = 8;
 
@@ -72,6 +77,13 @@ pub fn ParsedResponse(comptime max_responses: usize) type {
         der: []const u8,
         response_status: ResponseStatus,
         basic_response_der: ?[]const u8,
+        /// DER TLV for BasicOCSPResponse.tbsResponseData; signed by
+        /// BasicOCSPResponse.signature.
+        tbs_response_data_der: []const u8,
+        /// AlgorithmIdentifier.algorithm from BasicOCSPResponse.signatureAlgorithm.
+        signature_algorithm_oid: []const u8,
+        /// Raw bytes from BasicOCSPResponse.signature BIT STRING.
+        signature_value: []const u8,
         responses: [max_responses]SingleResponse,
         response_count: usize,
 
@@ -96,6 +108,9 @@ pub fn parseBounded(comptime max_responses: usize, der: []const u8) Error!Parsed
         .der = der,
         .response_status = .successful,
         .basic_response_der = null,
+        .tbs_response_data_der = &.{},
+        .signature_algorithm_oid = &.{},
+        .signature_value = &.{},
         .responses = undefined,
         .response_count = 0,
     };
@@ -126,6 +141,48 @@ pub fn statusForSerial(parsed: anytype, serial: []const u8) ?CertStatus {
         if (serialsEqual(single.serial, serial)) return single.cert_status;
     }
     return null;
+}
+
+/// Verify a BasicOCSPResponse signed directly by the issuing CA.
+///
+/// This covers the common stapling case where `signature` authenticates
+/// `tbsResponseData` with the issuer certificate's SubjectPublicKeyInfo. OCSP
+/// delegated responders are deliberately out of scope here: this function does
+/// not validate responder certificates embedded in the BasicOCSPResponse, nor
+/// does it enforce id-kp-OCSPSigning EKU. A caller that accepts delegated OCSP
+/// responders must build and authorize that responder chain before trusting the
+/// response.
+pub fn verifyResponseSignature(parsed: anytype, issuer_spki_der: []const u8) bool {
+    if (parsed.basic_response_der == null) return false;
+    if (parsed.tbs_response_data_der.len == 0 or
+        parsed.signature_algorithm_oid.len == 0 or
+        parsed.signature_value.len == 0)
+    {
+        return false;
+    }
+    return verifyDerSignature(
+        parsed.signature_algorithm_oid,
+        issuer_spki_der,
+        parsed.tbs_response_data_der,
+        parsed.signature_value,
+    );
+}
+
+/// Verify an X.509-style DER signature whose key is carried in SPKI form.
+///
+/// This helper is shared by OCSP and CRL parsing code. It intentionally
+/// supports only the signature schemes used by the daemon's certificate path:
+/// SHA256-RSA PKCS#1 v1.5, RSA-PSS with SHA-256 and 32-byte salt, ECDSA
+/// P-256/SHA-256, ECDSA P-384/SHA-384, and Ed25519.
+pub fn verifyDerSignature(
+    signature_algorithm_oid: []const u8,
+    signer_spki_der: []const u8,
+    signed_data: []const u8,
+    signature: []const u8,
+) bool {
+    const key = parsePublicKeyFromSpki(signer_spki_der) catch return false;
+    verifyWithOid(key, signature_algorithm_oid, signed_data, signature) catch return false;
+    return true;
 }
 
 fn parseResponseStatus(tlv: x509.Tlv) Error!ResponseStatus {
@@ -168,10 +225,9 @@ fn parseBasicOcspResponse(
     var body = try top.child(basic);
     const tbs = try body.readExpected(x509.Tag.sequence);
 
-    // Signature verification is deliberately out of scope here, but the
-    // signatureAlgorithm/signature fields must still be structurally DER-valid.
-    _ = try body.readExpected(x509.Tag.sequence);
-    _ = try parseBitString(try body.readExpected(x509.Tag.bit_string));
+    parsed.tbs_response_data_der = tbs.raw;
+    parsed.signature_algorithm_oid = try parseAlgorithmIdentifier(body, try body.readExpected(x509.Tag.sequence));
+    parsed.signature_value = try parseSignatureBitString(try body.readExpected(x509.Tag.bit_string));
     if (body.hasRemaining()) {
         _ = try body.readExpected(x509.Tag.context_0_constructed); // certs
     }
@@ -320,6 +376,12 @@ fn parseBitString(tlv: x509.Tlv) Error![]const u8 {
     return tlv.value[1..];
 }
 
+fn parseSignatureBitString(tlv: x509.Tlv) Error![]const u8 {
+    const bytes = try parseBitString(tlv);
+    if (tlv.value[0] != 0) return error.InvalidBitString;
+    return bytes;
+}
+
 fn parseGeneralizedTime(tlv: x509.Tlv) Error![]const u8 {
     if (tlv.value.len != 15 or tlv.value[14] != 'Z') return error.InvalidGeneralizedTime;
     _ = try digits(tlv.value[0..4]);
@@ -377,6 +439,149 @@ fn unsignedSerial(serial: []const u8) []const u8 {
     if (serial.len > 1 and serial[0] == 0x00) return serial[1..];
     return serial;
 }
+
+const PublicKey = union(enum) {
+    rsa: rsa_verify.PublicKey,
+    ecdsa_p256: ecdsa_p256.PublicKey,
+    ecdsa_p384: EcdsaP384.PublicKey,
+    ed25519: Ed25519.PublicKey,
+};
+
+fn verifyWithOid(key: PublicKey, oid: []const u8, msg: []const u8, sig: []const u8) !void {
+    if (oidEq(oid, &oid_ecdsa_sha256)) {
+        const pk = switch (key) {
+            .ecdsa_p256 => |pk| pk,
+            else => return error.UnsupportedPublicKey,
+        };
+        const decoded = try ecdsa_p256.signatureFromDer(sig);
+        if (!ecdsa_p256.verify(decoded, msg, pk)) return error.BadSignature;
+        return;
+    }
+    if (oidEq(oid, &oid_ecdsa_sha384)) {
+        const pk = switch (key) {
+            .ecdsa_p384 => |pk| pk,
+            else => return error.UnsupportedPublicKey,
+        };
+        const decoded = EcdsaP384.Signature.fromDer(sig) catch return error.BadSignature;
+        decoded.verify(msg, pk) catch return error.BadSignature;
+        return;
+    }
+    if (oidEq(oid, &oid_sha256_rsa)) {
+        const pk = switch (key) {
+            .rsa => |pk| pk,
+            else => return error.UnsupportedPublicKey,
+        };
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(msg, &digest, .{});
+        if (!rsa_verify.verifyPkcs1v15(pk, .sha256, &digest, sig)) return error.BadSignature;
+        return;
+    }
+    if (oidEq(oid, &oid_rsassa_pss)) {
+        const pk = switch (key) {
+            .rsa => |pk| pk,
+            else => return error.UnsupportedPublicKey,
+        };
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(msg, &digest, .{});
+        if (!rsa_verify.verifyPss(pk, .sha256, &digest, sig, 32)) return error.BadSignature;
+        return;
+    }
+    if (oidEq(oid, &oid_ed25519)) {
+        const pk = switch (key) {
+            .ed25519 => |pk| pk,
+            else => return error.UnsupportedPublicKey,
+        };
+        if (sig.len != Ed25519.Signature.encoded_length) return error.BadSignature;
+        const decoded = Ed25519.Signature.fromBytes(sig[0..Ed25519.Signature.encoded_length].*);
+        decoded.verify(msg, pk) catch return error.BadSignature;
+        return;
+    }
+    return error.UnsupportedSignatureScheme;
+}
+
+fn parsePublicKeyFromSpki(spki_der: []const u8) !PublicKey {
+    var top = x509.DerReader.init(spki_der);
+    const seq = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+    var spki = try top.child(seq);
+    const alg_seq = try spki.readExpected(x509.Tag.sequence);
+    const key_bits = try spki.readExpected(x509.Tag.bit_string);
+    try spki.expectEmpty();
+    const alg = try parseSpkiAlgorithm(spki, alg_seq);
+    const key_bytes = try bitStringBytesZero(key_bits);
+    if (oidEq(alg.oid, &oid_rsa_encryption)) {
+        var r = x509.DerReader.init(key_bytes);
+        const rsa_seq = try r.readExpected(x509.Tag.sequence);
+        try r.expectEmpty();
+        var body = try r.child(rsa_seq);
+        const n = try positiveIntegerBytes(try body.readExpected(x509.Tag.integer));
+        const e = try positiveIntegerBytes(try body.readExpected(x509.Tag.integer));
+        try body.expectEmpty();
+        return .{ .rsa = .{ .n = n, .e = e } };
+    }
+    if (oidEq(alg.oid, &oid_ec_public_key)) {
+        const params = alg.params orelse return error.UnsupportedPublicKey;
+        if (oidEq(params, &oid_prime256v1)) {
+            return .{ .ecdsa_p256 = try ecdsa_p256.parsePublicKeySec1(key_bytes) };
+        }
+        if (oidEq(params, &oid_secp384r1)) {
+            return .{ .ecdsa_p384 = EcdsaP384.PublicKey.fromSec1(key_bytes) catch return error.UnsupportedPublicKey };
+        }
+        return error.UnsupportedPublicKey;
+    }
+    if (oidEq(alg.oid, &oid_ed25519)) {
+        if (key_bytes.len != Ed25519.PublicKey.encoded_length) return error.UnsupportedPublicKey;
+        return .{ .ed25519 = Ed25519.PublicKey.fromBytes(key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return error.UnsupportedPublicKey };
+    }
+    return error.UnsupportedPublicKey;
+}
+
+const SpkiAlgorithm = struct {
+    oid: []const u8,
+    params: ?[]const u8,
+};
+
+fn parseSpkiAlgorithm(parent: x509.DerReader, seq_tlv: x509.Tlv) !SpkiAlgorithm {
+    var r = try parent.child(seq_tlv);
+    const oid = try r.readExpected(x509.Tag.oid);
+    try validateOid(oid.value);
+    var params: ?[]const u8 = null;
+    if (r.hasRemaining()) {
+        const p = try r.readTlv();
+        if (p.tag == x509.Tag.oid) params = p.value;
+    }
+    try r.expectEmpty();
+    return .{ .oid = oid.value, .params = params };
+}
+
+fn bitStringBytesZero(tlv: x509.Tlv) ![]const u8 {
+    if (tlv.tag != x509.Tag.bit_string or tlv.value.len == 0) return error.InvalidBitString;
+    if (tlv.value[0] != 0) return error.InvalidBitString;
+    return tlv.value[1..];
+}
+
+fn positiveIntegerBytes(tlv: x509.Tlv) ![]const u8 {
+    if (tlv.tag != x509.Tag.integer or tlv.value.len == 0) return error.InvalidInteger;
+    if (tlv.value[0] & 0x80 != 0) return error.InvalidInteger;
+    var v = tlv.value;
+    if (v.len > 1 and v[0] == 0) v = v[1..];
+    if (v.len == 0) return error.InvalidInteger;
+    return v;
+}
+
+fn oidEq(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+const oid_rsa_encryption = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
+const oid_sha256_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B };
+const oid_rsassa_pss = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A };
+const oid_ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
+const oid_secp384r1 = [_]u8{ 0x2B, 0x81, 0x04, 0x00, 0x22 };
+const oid_ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
+const oid_ecdsa_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
+const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
 
 const ocsp_good_one_response = [_]u8{
     0x30, 0x81, 0xBD,
@@ -496,3 +701,146 @@ test "ocsp covers cert status tag bytes" {
     var malformed_reader = x509.DerReader.init(&[_]u8{ 0x80, 0x01, 0x00 });
     try std.testing.expectError(error.InvalidOcspResponse, parseCertStatus(malformed_reader, try malformed_reader.readTlv()));
 }
+
+test "ocsp verifyResponseSignature accepts direct issuer Ed25519 signature" {
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x5A} ** Ed25519.KeyPair.seed_length);
+    const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
+    defer allocator.free(spki);
+    const response = try testSignedOcspResponse(allocator, kp, &[_]u8{0x44}, .good);
+    defer allocator.free(response);
+
+    const parsed = try parse(response);
+    try std.testing.expect(verifyResponseSignature(parsed, spki));
+    try std.testing.expectEqual(CertStatus.good, statusForSerial(parsed, &[_]u8{0x44}).?);
+
+    var tampered = try allocator.dupe(u8, response);
+    defer allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 1;
+    const bad = try parse(tampered);
+    try std.testing.expect(!verifyResponseSignature(bad, spki));
+}
+
+fn testSignedOcspResponse(
+    allocator: std.mem.Allocator,
+    kp: Ed25519.KeyPair,
+    serial: []const u8,
+    status: CertStatus,
+) ![]u8 {
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(allocator);
+    try appendDerTlv(allocator, &tbs_body, Asn1Tag.context_2_primitive, &([_]u8{0xA5} ** 20));
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.generalized_time, "20260102030405Z");
+
+    var responses_body: std.ArrayList(u8) = .empty;
+    defer responses_body.deinit(allocator);
+    var single_body: std.ArrayList(u8) = .empty;
+    defer single_body.deinit(allocator);
+    var cert_id_body: std.ArrayList(u8) = .empty;
+    defer cert_id_body.deinit(allocator);
+    try appendAlgId(allocator, &cert_id_body, &oid_sha1, true);
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x11} ** 20));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &([_]u8{0x22} ** 20));
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.integer, serial);
+    try appendDerSeq(allocator, &single_body, cert_id_body.items);
+    switch (status) {
+        .good => try appendDerTlv(allocator, &single_body, Asn1Tag.context_0_primitive, ""),
+        .unknown => try appendDerTlv(allocator, &single_body, Asn1Tag.context_2_primitive, ""),
+        .revoked => {
+            var revoked_body: std.ArrayList(u8) = .empty;
+            defer revoked_body.deinit(allocator);
+            try appendDerTlv(allocator, &revoked_body, x509.Tag.generalized_time, "20260102030405Z");
+            try appendDerTlv(allocator, &single_body, x509.Tag.context_1_constructed, revoked_body.items);
+        },
+    }
+    try appendDerTlv(allocator, &single_body, x509.Tag.generalized_time, "20260102030405Z");
+    try appendDerSeq(allocator, &responses_body, single_body.items);
+    try appendDerSeq(allocator, &tbs_body, responses_body.items);
+
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(allocator);
+    try appendDerSeq(allocator, &tbs, tbs_body.items);
+    const sig = try kp.sign(tbs.items, null);
+    const sig_bytes = sig.toBytes();
+
+    var basic_body: std.ArrayList(u8) = .empty;
+    defer basic_body.deinit(allocator);
+    try basic_body.appendSlice(allocator, tbs.items);
+    try appendAlgId(allocator, &basic_body, &oid_ed25519, false);
+    try appendDerBitString(allocator, &basic_body, &sig_bytes);
+    var basic: std.ArrayList(u8) = .empty;
+    defer basic.deinit(allocator);
+    try appendDerSeq(allocator, &basic, basic_body.items);
+
+    var rb_body: std.ArrayList(u8) = .empty;
+    defer rb_body.deinit(allocator);
+    try appendDerTlv(allocator, &rb_body, x509.Tag.oid, &Oid.ocsp_basic);
+    try appendDerTlv(allocator, &rb_body, x509.Tag.octet_string, basic.items);
+    var rb: std.ArrayList(u8) = .empty;
+    defer rb.deinit(allocator);
+    try appendDerSeq(allocator, &rb, rb_body.items);
+
+    var outer_body: std.ArrayList(u8) = .empty;
+    defer outer_body.deinit(allocator);
+    try appendDerTlv(allocator, &outer_body, Asn1Tag.enumerated, &[_]u8{0});
+    try appendDerTlv(allocator, &outer_body, x509.Tag.context_0_constructed, rb.items);
+    var outer: std.ArrayList(u8) = .empty;
+    errdefer outer.deinit(allocator);
+    try appendDerSeq(allocator, &outer, outer_body.items);
+    return outer.toOwnedSlice(allocator);
+}
+
+fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [Ed25519.PublicKey.encoded_length]u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendAlgId(allocator, &body, &oid_ed25519, false);
+    try appendDerBitString(allocator, &body, &public_key);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendAlgId(allocator: std.mem.Allocator, out: *std.ArrayList(u8), oid: []const u8, with_null: bool) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendDerTlv(allocator, &body, x509.Tag.oid, oid);
+    if (with_null) try appendDerTlv(allocator, &body, x509.Tag.null_value, "");
+    try appendDerSeq(allocator, out, body.items);
+}
+
+fn appendDerSeq(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    try appendDerTlv(allocator, out, x509.Tag.sequence, value);
+}
+
+fn appendDerBitString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 0);
+    try body.appendSlice(allocator, value);
+    try appendDerTlv(allocator, out, x509.Tag.bit_string, body.items);
+}
+
+fn appendDerTlv(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tag: u8, value: []const u8) !void {
+    try out.append(allocator, tag);
+    try appendDerLen(allocator, out, value.len);
+    try out.appendSlice(allocator, value);
+}
+
+fn appendDerLen(allocator: std.mem.Allocator, out: *std.ArrayList(u8), len: usize) !void {
+    if (len < 128) {
+        try out.append(allocator, @intCast(len));
+        return;
+    }
+    var tmp: [@sizeOf(usize)]u8 = undefined;
+    var n = len;
+    var count: usize = 0;
+    while (n != 0) : (n >>= 8) {
+        tmp[tmp.len - 1 - count] = @intCast(n & 0xff);
+        count += 1;
+    }
+    try out.append(allocator, 0x80 | @as(u8, @intCast(count)));
+    try out.appendSlice(allocator, tmp[tmp.len - count ..]);
+}
+
+const oid_sha1 = [_]u8{ 0x2B, 0x0E, 0x03, 0x02, 0x1A };

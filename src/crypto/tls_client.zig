@@ -12,6 +12,7 @@ const tls_resumption = @import("tls_resumption.zig");
 const tls_record = @import("tls_record.zig");
 const x509 = @import("x509.zig");
 const x509_verify = @import("x509_verify.zig");
+const ocsp = @import("ocsp.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_verify = @import("rsa_verify.zig");
 const sign = @import("sign.zig");
@@ -66,6 +67,7 @@ pub const Error = error{
     BadSignature,
     BadState,
     CertificateNameMismatch,
+    CertificateRevoked,
     DecodeError,
     EmptyCertificateChain,
     FinishedMismatch,
@@ -88,7 +90,7 @@ pub const Error = error{
     tls_signature_scheme.Error || supported_groups.Error || tls_alpn.Error ||
     tls_alert.ParseError || rsa_verify.Error || sign.VerifyError ||
     tls_psk.Error || tls_session_ticket.ParseError || tls_session_ticket.EncodeError ||
-    tls_resumption.Error;
+    tls_resumption.Error || ocsp.Error;
 
 pub const Options = struct {
     server_name: []const u8,
@@ -819,6 +821,10 @@ pub const Client = struct {
             try ext_builder.addTyped(.alpn, alpn_body);
         }
 
+        // RFC 6066 / RFC 8446 OCSP stapling request:
+        // status_type=ocsp(1), empty responder_id_list, empty request_extensions.
+        try ext_builder.add(ext_status_request, &[_]u8{ 1, 0, 0, 0, 0 });
+
         // Echo a HelloRetryRequest cookie in the retried ClientHello. The cookie
         // extension body is opaque cookie<1..2^16-1>: a u16 length then the bytes.
         if (self.cookie) |cookie| {
@@ -1201,6 +1207,7 @@ pub const Client = struct {
 
         var chain_buf: [16][]const u8 = undefined;
         var count: usize = 0;
+        var leaf_ocsp_staple: ?[]const u8 = null;
         var certs = Cursor.init(list);
         while (certs.remaining() != 0) {
             if (count == chain_buf.len) return error.BadCertificate;
@@ -1208,7 +1215,11 @@ pub const Client = struct {
             const ext = try certs.take(try certs.readU16());
             if (ext.len != 0) {
                 var eit = tls_extension.Iterator.init(ext);
-                while (try eit.next()) |_| {}
+                while (try eit.next()) |entry_ext| {
+                    if (count == 0 and entry_ext.ext_type == ext_status_request) {
+                        leaf_ocsp_staple = try parseCertificateStatusOcsp(entry_ext.data);
+                    }
+                }
             }
             chain_buf[count] = der;
             count += 1;
@@ -1217,6 +1228,12 @@ pub const Client = struct {
         const chain = chain_buf[0..count];
         if (!self.skip_cert_verify_for_test) {
             try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name, self.verify_time);
+        }
+        if (leaf_ocsp_staple) |staple| {
+            const leaf = try x509.parse(chain[0]);
+            const issuer_der = if (chain.len > 1) chain[1] else chain[0];
+            const issuer_parts = try extractCertParts(issuer_der);
+            try verifyOcspStapleForLeaf(staple, issuer_parts.spki_der, leaf.serial_der);
         }
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         // The RSA variant borrows the SPKI bytes (in hs_plain); copy n/e into
@@ -1514,6 +1531,7 @@ const OpenedRecord = struct {
 };
 
 const ServerNameTypeHost: u8 = 0;
+const ext_status_request: u16 = 5;
 const hello_retry_request_random = [_]u8{
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
     0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
@@ -1696,6 +1714,38 @@ fn parseTicketEarlyDataLimit(extensions: []const u8) Error!u32 {
         }
     }
     return limit;
+}
+
+/// Parse a TLS 1.3 CertificateEntry status_request extension body.
+///
+/// The extension_data is a CertificateStatus:
+/// status_type(1) || ocsp_response_length(uint24) || OCSPResponse DER. Only
+/// status_type=ocsp(1) is accepted here.
+fn parseCertificateStatusOcsp(data: []const u8) Error![]const u8 {
+    if (data.len < 4) return error.BadCertificate;
+    if (data[0] != 1) return error.BadCertificate;
+    const len = readU24Bytes(data[1..4]);
+    if (data.len != 4 + len or len == 0) return error.BadCertificate;
+    return data[4..];
+}
+
+/// Authenticate a stapled OCSP response and enforce the leaf's serial status.
+///
+/// Absence is handled by the caller. A signed `good`, signed `unknown`, or a
+/// signed response with no matching SingleResponse soft-passes; a matching
+/// `revoked` SingleResponse fails closed.
+fn verifyOcspStapleForLeaf(staple_der: []const u8, issuer_spki_der: []const u8, leaf_serial: []const u8) Error!void {
+    const parsed = try ocsp.parse(staple_der);
+    if (!ocsp.verifyResponseSignature(parsed, issuer_spki_der)) return error.BadCertificate;
+    try enforceOcspStatusForSerial(parsed, leaf_serial);
+}
+
+fn enforceOcspStatusForSerial(parsed: anytype, leaf_serial: []const u8) Error!void {
+    const status = ocsp.statusForSerial(parsed, leaf_serial) orelse return;
+    switch (status) {
+        .revoked => return error.CertificateRevoked,
+        .good, .unknown => return,
+    }
 }
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeType, body: []const u8) Error!void {
@@ -2167,6 +2217,55 @@ test "ClientHello record carries SNI, TLS 1.3, suites, and key shares" {
         }
     }
     try std.testing.expect(offers_tls13);
+}
+
+test "ClientHello advertises OCSP status_request" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+
+    const record = try client.start();
+    defer allocator.free(record);
+    const fragment = record[tls_record.record_header_len..];
+    var off: usize = 0;
+    const ch = try parseHandshake(fragment, &off);
+    const ext_block = clientHelloExtensions(ch.body).?;
+    var ext_it = tls_extension.Iterator.init(ext_block);
+    var saw = false;
+    while (try ext_it.next()) |ext| {
+        if (ext.ext_type == ext_status_request) {
+            saw = true;
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0, 0 }, ext.data);
+        }
+    }
+    try std.testing.expect(saw);
+}
+
+test "OCSP staple status decision rejects revoked and soft-passes good or absent" {
+    var parsed = ocsp.Parsed{
+        .der = &.{},
+        .response_status = .successful,
+        .basic_response_der = null,
+        .tbs_response_data_der = &.{},
+        .signature_algorithm_oid = &.{},
+        .signature_value = &.{},
+        .responses = undefined,
+        .response_count = 1,
+    };
+    parsed.responses[0] = .{
+        .hash_algorithm_oid = &.{},
+        .issuer_name_hash = &.{},
+        .issuer_key_hash = &.{},
+        .serial = &[_]u8{0x10},
+        .cert_status = .revoked,
+        .this_update = "20260102030405Z",
+        .next_update = null,
+    };
+    try std.testing.expectError(error.CertificateRevoked, enforceOcspStatusForSerial(parsed, &[_]u8{0x10}));
+
+    parsed.responses[0].cert_status = .good;
+    try enforceOcspStatusForSerial(parsed, &[_]u8{0x10});
+    try enforceOcspStatusForSerial(parsed, &[_]u8{0x11});
 }
 
 test "DNS wildcard matching is single-label only" {

@@ -7,6 +7,7 @@
 //! trusting revocation results.
 const std = @import("std");
 const x509 = @import("x509.zig");
+const ocsp = @import("ocsp.zig");
 
 pub const Error = x509.Error;
 pub const Time = x509.Time;
@@ -102,6 +103,23 @@ pub fn isRevoked(parsed: CertificateRevocationList, serial: []const u8) bool {
         const candidate = revoked orelse return false;
         if (std.mem.eql(u8, candidate, serial)) return true;
     }
+}
+
+/// Verify the CertificateList signature with the issuer certificate's SPKI.
+///
+/// CRL issuer authorization and distribution-point policy are the caller's
+/// responsibility. This function authenticates only the RFC 5280
+/// `tbsCertList` bytes against `signatureValue`, using the same direct issuer
+/// signature schemes accepted for OCSP.
+pub fn verifySignature(parsed: CertificateRevocationList, issuer_spki_der: []const u8) bool {
+    if (!std.mem.eql(u8, parsed.tbs_signature_algorithm_oid, parsed.signature_algorithm_oid)) return false;
+    if (parsed.tbs_der.len == 0 or parsed.signature_value.len == 0) return false;
+    return ocsp.verifyDerSignature(
+        parsed.signature_algorithm_oid,
+        issuer_spki_der,
+        parsed.tbs_der,
+        parsed.signature_value,
+    );
 }
 
 fn parseTbs(parsed: *CertificateRevocationList, parent: x509.DerReader, tbs_tlv: x509.Tlv) Error!void {
@@ -454,3 +472,102 @@ test "crl rejects malformed input" {
     var trailing = MinimalCrlWithRevoked ++ [_]u8{0x00};
     try std.testing.expectError(error.TrailingData, parse(&trailing));
 }
+
+test "crl verifySignature accepts direct issuer Ed25519 signature" {
+    const allocator = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x6B} ** Ed25519.KeyPair.seed_length);
+    const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
+    defer allocator.free(spki);
+    const der = try testSignedCrl(allocator, kp);
+    defer allocator.free(der);
+
+    const parsed = try parse(der);
+    try std.testing.expect(verifySignature(parsed, spki));
+
+    var tampered = try allocator.dupe(u8, der);
+    defer allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 1;
+    const bad = try parse(tampered);
+    try std.testing.expect(!verifySignature(bad, spki));
+}
+
+fn testSignedCrl(allocator: std.mem.Allocator, kp: std.crypto.sign.Ed25519.KeyPair) ![]u8 {
+    var tbs_body: std.ArrayList(u8) = .empty;
+    defer tbs_body.deinit(allocator);
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.integer, &[_]u8{1});
+    try appendAlgId(allocator, &tbs_body, &oid_ed25519, false);
+    try appendDerSeq(allocator, &tbs_body, "");
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.utc_time, "260101000000Z");
+
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(allocator);
+    try appendDerSeq(allocator, &tbs, tbs_body.items);
+    const sig = try kp.sign(tbs.items, null);
+    const sig_bytes = sig.toBytes();
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, tbs.items);
+    try appendAlgId(allocator, &body, &oid_ed25519, false);
+    try appendDerBitString(allocator, &body, &sig_bytes);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+fn testEd25519Spki(allocator: std.mem.Allocator, public_key: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendAlgId(allocator, &body, &oid_ed25519, false);
+    try appendDerBitString(allocator, &body, &public_key);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendDerSeq(allocator, &out, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendAlgId(allocator: std.mem.Allocator, out: *std.ArrayList(u8), oid: []const u8, with_null: bool) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendDerTlv(allocator, &body, x509.Tag.oid, oid);
+    if (with_null) try appendDerTlv(allocator, &body, x509.Tag.null_value, "");
+    try appendDerSeq(allocator, out, body.items);
+}
+
+fn appendDerSeq(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    try appendDerTlv(allocator, out, x509.Tag.sequence, value);
+}
+
+fn appendDerBitString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 0);
+    try body.appendSlice(allocator, value);
+    try appendDerTlv(allocator, out, x509.Tag.bit_string, body.items);
+}
+
+fn appendDerTlv(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tag: u8, value: []const u8) !void {
+    try out.append(allocator, tag);
+    try appendDerLen(allocator, out, value.len);
+    try out.appendSlice(allocator, value);
+}
+
+fn appendDerLen(allocator: std.mem.Allocator, out: *std.ArrayList(u8), len: usize) !void {
+    if (len < 128) {
+        try out.append(allocator, @intCast(len));
+        return;
+    }
+    var tmp: [@sizeOf(usize)]u8 = undefined;
+    var n = len;
+    var count: usize = 0;
+    while (n != 0) : (n >>= 8) {
+        tmp[tmp.len - 1 - count] = @intCast(n & 0xff);
+        count += 1;
+    }
+    try out.append(allocator, 0x80 | @as(u8, @intCast(count)));
+    try out.appendSlice(allocator, tmp[tmp.len - count ..]);
+}
+
+const oid_ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
