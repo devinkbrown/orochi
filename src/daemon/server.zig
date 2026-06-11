@@ -802,6 +802,8 @@ const Numeric = enum(u16) {
     ERR_NOSUCHSERVER = 402,
     ERR_NOSUCHCHANNEL = 403,
     ERR_CANNOTSENDTOCHAN = 404,
+    ERR_NORECIPIENT = 411,
+    ERR_NOTEXTTOSEND = 412,
     ERR_CHANNELISFULL = 471,
     ERR_INVITEONLYCHAN = 473,
     ERR_BANNEDFROMCHAN = 474,
@@ -4757,6 +4759,9 @@ pub const LinuxServer = struct {
                         }
                         const changed = self.world.setChannelExtFlag(channel, flag, adding) catch continue;
                         if (changed) appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
+                    } else {
+                        var mode_buf: [1]u8 = .{ch};
+                        try queueNumeric(conn, .ERR_UNKNOWNMODE, &.{&mode_buf}, "is unknown mode char to me");
                     }
                 },
             }
@@ -5572,9 +5577,43 @@ pub const LinuxServer = struct {
     fn flushMonitorReplies(self: *LinuxServer, sink: *const monitor.MonitorReplySink) !void {
         for (sink.slice()) |reply| {
             const wid = clientIdFromMonitor(reply.client);
-            const trailing = if (reply.targets.len != 0) reply.targets else reply.text;
-            try self.deliverNumeric(wid, monitorNumeric(reply.numeric), &.{}, trailing);
+            switch (reply.numeric) {
+                .ERR_MONLISTFULL => {
+                    var limit_buf: [16]u8 = undefined;
+                    const limit = std.fmt.bufPrint(&limit_buf, "{d}", .{self.config.monitorlimit}) catch "0";
+                    try self.deliverNumeric(wid, monitorNumeric(reply.numeric), &.{ limit, reply.targets }, reply.text);
+                },
+                .RPL_MONONLINE => {
+                    var mask_buf: [default_reply_bytes]u8 = undefined;
+                    const targets = self.monitorOnlineMasks(reply.targets, &mask_buf) catch reply.targets;
+                    try self.deliverNumeric(wid, monitorNumeric(reply.numeric), &.{}, targets);
+                },
+                else => {
+                    const trailing = if (reply.targets.len != 0) reply.targets else reply.text;
+                    try self.deliverNumeric(wid, monitorNumeric(reply.numeric), &.{}, trailing);
+                },
+            }
         }
+    }
+
+    fn monitorOnlineMasks(self: *LinuxServer, targets: []const u8, out: []u8) ServerError![]const u8 {
+        var buf = Buf{ .storage = out };
+        var it = std.mem.splitScalar(u8, targets, ',');
+        var first = true;
+        while (it.next()) |target| {
+            if (target.len == 0) continue;
+            if (!first) try buf.appendByte(',');
+            first = false;
+            if (self.world.findNick(target)) |wid| {
+                if (self.connFor(clientIdFromWorld(wid))) |live| {
+                    var prefix_buf: [256]u8 = undefined;
+                    try buf.append(try clientPrefix(live, &prefix_buf));
+                    continue;
+                }
+            }
+            try buf.append(target);
+        }
+        return buf.written();
     }
 
     /// Notify MONITOR watchers that `nick` just came online (on registration).
@@ -5885,6 +5924,10 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleChathistory(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+        if (!conn.session.hasCap(.chathistory)) {
+            try self.failReply(conn, "CHATHISTORY", "NEED_REGISTRATION", "You must negotiate the draft/chathistory capability");
+            return;
+        }
         const trimmed = std.mem.trimEnd(u8, line, "\r\n");
         if (std.ascii.startsWithIgnoreCase(trimmed, "CHATHISTORY TARGETS")) {
             try self.handleChathistoryTargets(id, conn, trimmed);
@@ -11756,11 +11799,94 @@ pub const LinuxServer = struct {
         }
     }
 
+    const ChannelSpeechResult = enum { allow, deny, opmoderate };
+
+    fn channelSpeechGate(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        target: []const u8,
+        chan: []const u8,
+        text: []const u8,
+        is_notice: bool,
+        min_rank: u8,
+        allow_opmoderate: bool,
+    ) !ChannelSpeechResult {
+        if (!self.world.isMember(chan, worldIdFromClient(id)) and
+            self.world.channelHasFlag(chan, .no_external))
+        {
+            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
+            return .deny;
+        }
+
+        const opmod = allow_opmoderate and self.world.channelHasExtFlag(chan, .opmoderate);
+        var opmod_route = false;
+
+        const member_modes = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
+        if (self.world.channelHasFlag(chan, .moderated) and !member_modes.canSpeakModerated()) {
+            if (opmod) {
+                opmod_route = true;
+            } else {
+                if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
+                return .deny;
+            }
+        }
+
+        if (self.world.channelHasFlag(chan, .mod_reg) and conn.session.account() == null and !member_modes.canSpeakModerated()) {
+            if (opmod) {
+                opmod_route = true;
+            } else {
+                if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+M: identify to a registered account to speak)");
+                return .deny;
+            }
+        }
+
+        if (!conn.session.isOper()) {
+            var mask_buf: [256]u8 = undefined;
+            const mask = clientPrefix(conn, &mask_buf) catch "";
+            if (mask.len != 0) {
+                var chan_buf: [64][]const u8 = undefined;
+                const ban_ctx = banContextFor(self, conn, worldIdFromClient(id), mask, &chan_buf);
+                if (self.world.isBannedCtx(chan, ban_ctx)) {
+                    if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+b)");
+                    return .deny;
+                }
+                if (!member_modes.canSpeakModerated() and self.world.isMutedCtx(chan, ban_ctx)) {
+                    if (opmod) {
+                        opmod_route = true;
+                    } else {
+                        if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+Z: you are quieted)");
+                        return .deny;
+                    }
+                }
+            }
+        }
+
+        const sender_op = member_modes.isOperator() or conn.session.isOper();
+        if (!sender_op and self.world.channelHasFlag(chan, .no_ctcp) and isBlockableCtcp(text)) {
+            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+C: no CTCP)");
+            return .deny;
+        }
+        if (is_notice and !sender_op and self.world.channelHasFlag(chan, .no_notice)) {
+            return .deny;
+        }
+        if (min_rank > 0 and member_modes.rank() < 1) {
+            if (!is_notice) try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{target}, "You're not channel operator");
+            return .deny;
+        }
+
+        return if (opmod_route) .opmoderate else .allow;
+    }
+
     /// TAGMSG <target> — IRCv3 message-tags: relay the sender's client tags (no
     /// text body) to recipients that negotiated message-tags. A TAGMSG carrying
     /// no tags is a no-op. Delivered untagged-by-server (the client `@tags`
     /// segment is the whole tag set) — server-time-in-tags is a future merge.
     pub fn handleTagmsg(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.hasCap(.message_tags)) {
+            try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{"TAGMSG"}, "Unknown command");
+            return;
+        }
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) return;
         const tags = parsed.tags_raw orelse return; // nothing to relay
         const target = parsed.paramSlice()[0];
@@ -11778,8 +11904,11 @@ pub const LinuxServer = struct {
         const echo = conn.session.hasCap(.echo_message);
 
         if (world_model.isChannelName(target)) {
-            if (!self.world.channelExists(target)) return;
-            if (!self.world.isMember(target, worldIdFromClient(id))) return;
+            if (!self.world.channelExists(target)) {
+                try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
+                return;
+            }
+            if (try self.channelSpeechGate(id, conn, target, target, "", false, 0, false) != .allow) return;
             var members = self.world.memberIterator(target) orelse return;
             while (members.next()) |member| {
                 const mid = clientIdFromWorld(member.*);
@@ -11936,10 +12065,16 @@ pub const LinuxServer = struct {
         // NOTICE must never generate an automatic error reply (RFC 1459):
         // missing recipient/text is silently dropped to prevent bot reply loops.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
-        if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
+        if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             if (!is_notice) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{command}, "Not enough parameters");
+                var reason_buf: [64]u8 = undefined;
+                const reason = std.fmt.bufPrint(&reason_buf, "No recipient given ({s})", .{command}) catch "No recipient given";
+                try queueNumeric(conn, .ERR_NORECIPIENT, &.{}, reason);
             }
+            return;
+        }
+        if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
+            if (!is_notice) try queueNumeric(conn, .ERR_NOTEXTTOSEND, &.{}, "No text to send");
             return;
         }
         const text = parsed.paramSlice()[1];
@@ -11949,12 +12084,26 @@ pub const LinuxServer = struct {
         // at MAXTARGETS to bound fan-out / resist spam amplification.
         var targets = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
         var ntarget: u32 = 0;
+        var unique_targets: [64][]const u8 = undefined;
+        var unique_count: usize = 0;
         while (targets.next()) |target| {
             if (target.len == 0) continue;
+            var duplicate = false;
+            for (unique_targets[0..unique_count]) |seen| {
+                if (self.sameResolvedMessageTarget(seen, target)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
             ntarget += 1;
             if (ntarget > self.config.maxtargets) {
                 try queueNumeric(conn, .ERR_TOOMANYTARGETS, &.{target}, "Too many recipients");
                 break;
+            }
+            if (unique_count < unique_targets.len) {
+                unique_targets[unique_count] = target;
+                unique_count += 1;
             }
             try self.messageOne(id, conn, command, target, text, parsed.tags_raw);
         }
@@ -12018,6 +12167,13 @@ pub const LinuxServer = struct {
             }
         }
         return true;
+    }
+
+    fn sameResolvedMessageTarget(self: *LinuxServer, a: []const u8, b: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(a, b)) return true;
+        const an = self.world.findNick(a) orelse return false;
+        const bn = self.world.findNick(b) orelse return false;
+        return an.eql(bn);
     }
 
     /// Route one line from a draft/multiline-capable client into the per-conn
@@ -12148,87 +12304,14 @@ pub const LinuxServer = struct {
                 if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
-            // +n no-external-messages: a non-member may message the channel only
-            // when +n is unset (RFC 1459). Members always pass this gate.
-            if (!self.world.isMember(chan, worldIdFromClient(id)) and
-                self.world.channelHasFlag(chan, .no_external))
-            {
-                if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
-                return;
-            }
-            // +O opmoderate: instead of dropping a message blocked by +m/+M/+Z,
-            // deliver it to channel ops only (so they can see & act). When set,
-            // the moderation gates below route rather than reject.
-            const opmod = self.world.channelHasExtFlag(chan, .opmoderate);
-            var opmod_route = false;
-            // +m moderated: only voiced (+v) or any operator tier may speak.
-            if (self.world.channelHasFlag(chan, .moderated)) {
-                const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
-                if (!mm.canSpeakModerated()) {
-                    if (opmod) {
-                        opmod_route = true;
-                    } else {
-                        if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+m)");
-                        return;
-                    }
-                }
-            }
-            // +M moderate-unregistered: an unauthenticated member may speak only
-            // if voiced-or-higher (like +m, scoped to non-account users).
-            if (self.world.channelHasFlag(chan, .mod_reg) and conn.session.account() == null) {
-                const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
-                if (!mm.canSpeakModerated()) {
-                    if (opmod) {
-                        opmod_route = true;
-                    } else {
-                        if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+M: identify to a registered account to speak)");
-                        return;
-                    }
-                }
-            }
-            // +Z quiet (MUTE): a member whose mask matches a quiet entry (and is
-            // not +e exempt) may not speak unless voiced-or-higher / oper.
-            {
-                const qm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
-                if (!qm.canSpeakModerated() and !conn.session.isOper()) {
-                    var qmask_buf: [256]u8 = undefined;
-                    const qmask = clientPrefix(conn, &qmask_buf) catch "";
-                    var qchan_buf: [64][]const u8 = undefined;
-                    const quiet_ctx = banContextFor(self, conn, worldIdFromClient(id), qmask, &qchan_buf);
-                    if (qmask.len != 0 and self.world.isMutedCtx(chan, quiet_ctx)) {
-                        if (opmod) {
-                            opmod_route = true;
-                        } else {
-                            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+Z: you are quieted)");
-                            return;
-                        }
-                    }
-                }
-            }
+            const speech = try self.channelSpeechGate(id, conn, target, chan, text, is_notice, min_rank, true);
+            if (speech == .deny) return;
+            const opmod_route = speech == .opmoderate;
             // Fantasy bot: a speaker's PRIVMSG beginning with '!' may invoke the
             // weather/news bot. The message is still delivered to the channel
             // normally below; this only posts the server's answer as a NOTICE.
             if (!is_notice and text.len > 1 and text[0] == '!') {
                 self.handleFantasy(id, conn, chan, text);
-            }
-            // Op-bypass gates (+C no-ctcp, +T no-notice). Ops/voiced-or-higher and
-            // server opers are exempt; ACTION is never treated as blockable CTCP.
-            const sender_op = (self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty()).isOperator() or conn.session.isOper();
-            if (!sender_op and self.world.channelHasFlag(chan, .no_ctcp) and isBlockableCtcp(text)) {
-                if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+C: no CTCP)");
-                return;
-            }
-            if (is_notice and !sender_op and self.world.channelHasFlag(chan, .no_notice)) {
-                return; // +T: drop channel NOTICE from non-ops (NOTICE never auto-replies)
-            }
-            // STATUSMSG sender gate (chanop-or-voiced): only a
-            // member who is voiced-or-higher may send to a status-prefixed target.
-            if (min_rank > 0) {
-                const sm = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
-                if (sm.rank() < 1) {
-                    if (!is_notice) try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{target}, "You're not channel operator");
-                    return;
-                }
             }
             var time_buf: [40]u8 = undefined;
             const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
@@ -13226,6 +13309,16 @@ fn expectDigitAfter(haystack: []const u8, marker: []const u8) !void {
     const pos = (std.mem.indexOf(u8, haystack, marker) orelse return error.TestExpectedEqual) + marker.len;
     try std.testing.expect(pos < haystack.len);
     try std.testing.expect(std.ascii.isDigit(haystack[pos]));
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |found| {
+        count += 1;
+        pos = found + needle.len;
+    }
+    return count;
 }
 
 const LiveClient = struct {
@@ -14245,6 +14338,57 @@ test "threaded server: TAGMSG relays client tags to message-tags peers" {
     try std.testing.expect(std.mem.indexOf(u8, b.written(), ";+typing=active") != null);
 }
 
+test "threaded server: TAGMSG requires message-tags and channel speech permission" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :message-tags\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_c, "CAP REQ :message-tags\r\nNICK C\r\nUSER carol 0 * :Carol\r\nCAP END\r\n");
+    try recvUntil(&c, " 001 C ", 200);
+
+    try writeAllFd(fd_a, "JOIN #tg\r\n");
+    try recvUntil(&a, " 366 A #tg ", 200);
+    try writeAllFd(fd_b, "JOIN #tg\r\n");
+    try recvUntil(&b, " 366 B #tg ", 200);
+    try writeAllFd(fd_c, "JOIN #tg\r\n");
+    try recvUntil(&c, " 366 C #tg ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "@+typing=active TAGMSG #tg\r\n");
+    try recvUntil(&a, " 421 A TAGMSG :Unknown command", 200);
+
+    try writeAllFd(fd_a, "MODE #tg +m\r\n");
+    try recvUntil(&a, "MODE #tg +m", 200);
+    c.reset();
+    try writeAllFd(fd_c, "@+typing=active TAGMSG #tg\r\n");
+    try recvUntil(&c, " 404 C #tg :Cannot send to channel (+m)", 200);
+}
+
 test "threaded server: +e/+I list queries + +I join bypass" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -14466,6 +14610,28 @@ test "threaded server: PRIVMSG multi-target delivery" {
     try writeAllFd(fd_a, "PRIVMSG B,C :hi both\r\n");
     try recvUntil(b, ":A!alice@localhost PRIVMSG B :hi both\r\n", 200);
     try recvUntil(c, ":A!alice@localhost PRIVMSG C :hi both\r\n", 200);
+
+    // Duplicate resolved targets are delivered once and do not consume extra
+    // MAXTARGETS slots.
+    b.reset();
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG B,B,B,B,B :one copy\r\n");
+    try recvUntil(b, ":A!alice@localhost PRIVMSG B :one copy\r\n", 200);
+    waitMillis(100);
+    try b.readAvailable();
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "PRIVMSG B :one copy"));
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 407 ") == null);
+
+    try writeAllFd(fd_b, "JOIN #dup\r\n");
+    try recvUntil(b, " 366 B #dup ", 200);
+    try writeAllFd(fd_a, "JOIN #dup\r\n");
+    try recvUntil(a, " 366 A #dup ", 200);
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG #dup,#dup :chan copy\r\n");
+    try recvUntil(b, ":A!alice@localhost PRIVMSG #dup :chan copy\r\n", 200);
+    waitMillis(100);
+    try b.readAvailable();
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "PRIVMSG #dup :chan copy"));
 }
 
 test "threaded server: draft/multiline batch reassembles + splits to recipient" {
@@ -14715,6 +14881,22 @@ test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
     try writeAllFd(fd_a, "NOTICE\r\nPING :tok\r\n");
     try recvUntil(&a, "PONG :tok", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 461 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 411 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 412 ") == null);
+
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG\r\n");
+    try recvUntil(&a, " 411 A :No recipient given (PRIVMSG)", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG A\r\n");
+    try recvUntil(&a, " 412 A :No text to send", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "NOTICE A\r\nPING :tok2\r\n");
+    try recvUntil(&a, "PONG :tok2", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 411 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 412 ") == null);
 }
 
 test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
@@ -14761,12 +14943,36 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     a.reset();
     // Too few params → FAIL CHATHISTORY NEED_MORE_PARAMS, never silence.
     try writeAllFd(fd_a, "CHATHISTORY LATEST\r\n");
     try recvUntil(&a, "FAIL CHATHISTORY NEED_MORE_PARAMS", 200);
+}
+
+test "threaded server: CHATHISTORY requires negotiated capability" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY LATEST #h * 10\r\n");
+    try recvUntil(&a, "FAIL CHATHISTORY NEED_REGISTRATION :You must negotiate the draft/chathistory capability", 200);
 }
 
 test "threaded server: PRIVMSG beyond MAXTARGETS yields ERR_TOOMANYTARGETS" {
@@ -15570,7 +15776,7 @@ test "threaded server: EDIT updates own message history and rejects others" {
     try writeAllFd(fd_a, "CAP LS 302\r\n");
     try recvUntil(&a, "draft/message-editing", 200);
     a.reset();
-    try writeAllFd(fd_a, "CAP REQ :message-tags echo-message\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try writeAllFd(fd_a, "CAP REQ :message-tags echo-message draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&b, " 001 B ", 200);
@@ -15758,6 +15964,11 @@ test "threaded server: MODE multi-flag batching in one command" {
     a.reset();
     try writeAllFd(fd_a, "MODE #m +ims\r\n");
     try recvUntil(&a, "MODE #m +ims", 200);
+
+    // An unsupported mode letter yields 472 ERR_UNKNOWNMODE.
+    a.reset();
+    try writeAllFd(fd_a, "MODE #m +G\r\n");
+    try recvUntil(&a, " 472 A G :is unknown mode char to me", 200);
 }
 
 test "threaded server: +p private + +h hidden channel flags" {
@@ -15899,7 +16110,7 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     defer closeFd(fd_b);
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&b, " 001 B ", 200);
@@ -15944,7 +16155,7 @@ test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
     defer closeFd(fd_b);
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&b, " 001 B ", 200);
@@ -16163,7 +16374,7 @@ test "GRANT privilege resolution: class presets, explicit list, tombstone" {
 }
 
 test "threaded server: MONITOR online/offline/list end-to-end" {
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .monitorlimit = 1 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -16195,7 +16406,11 @@ test "threaded server: MONITOR online/offline/list end-to-end" {
     var b = LiveClient{ .fd = fd_b };
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 200);
-    try recvUntil(&a, " 730 A :B", 200);
+    try recvUntil(&a, " 730 A :B!bob@localhost", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "MONITOR + C\r\n");
+    try recvUntil(&a, " 734 A 1 C :Monitor list is full", 200);
 
     // MONITOR L -> 732 list + 733 end.
     a.reset();
