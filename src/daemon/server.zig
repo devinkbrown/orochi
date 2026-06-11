@@ -2407,9 +2407,7 @@ pub const LinuxServer = struct {
         // to the historical path (no pool, no fabric, no extra threads).
         if (self.reactors.len <= 1) {
             current_reactor = &self.reactors[0];
-            while (run.load(.acquire)) {
-                self.runOnce() catch return;
-            }
+            self.runLoopResilient(run);
             return;
         }
 
@@ -2424,9 +2422,7 @@ pub const LinuxServer = struct {
                 .{@errorName(err)},
             );
             current_reactor = &self.reactors[0];
-            while (run.load(.acquire)) {
-                self.runOnce() catch return;
-            }
+            self.runLoopResilient(run);
             return;
         };
 
@@ -2439,9 +2435,7 @@ pub const LinuxServer = struct {
             if (self.fabric) |*f| f.deinit();
             self.fabric = null;
             current_reactor = &self.reactors[0];
-            while (run.load(.acquire)) {
-                self.runOnce() catch return;
-            }
+            self.runLoopResilient(run);
             return;
         };
         // Block here until the run flag clears and every worker has exited, so the
@@ -2455,8 +2449,31 @@ pub const LinuxServer = struct {
     /// and connection slab; cross-shard work crosses via the fabric.
     fn reactorWorker(self: *LinuxServer, shard: u12, run: *reactor_pool_mod.RunFlag) void {
         current_reactor = &self.reactors[shard];
+        self.runLoopResilient(run);
+    }
+
+    /// Drive `runOnce` until the run flag clears. An error escaping runOnce is a
+    /// bug (per-client faults are firewalled below), but it must not silently
+    /// kill the reactor thread and take the shard's clients with it: log it and
+    /// keep serving. Only a persistent failure — the loop erroring on every
+    /// iteration with no successful completion in between — exits, since that
+    /// means the ring itself is broken and spinning would burn the core.
+    fn runLoopResilient(self: *LinuxServer, run: anytype) void {
+        var consecutive_failures: u32 = 0;
         while (run.load(.acquire)) {
-            self.runOnce() catch return;
+            if (self.runOnce()) |_| {
+                consecutive_failures = 0;
+            } else |err| {
+                consecutive_failures += 1;
+                std.debug.print(
+                    "orochi: reactor loop error {s} ({d} consecutive)\n",
+                    .{ @errorName(err), consecutive_failures },
+                );
+                if (consecutive_failures >= 64) {
+                    std.debug.print("orochi: reactor giving up after persistent errors\n", .{});
+                    return;
+                }
+            }
         }
     }
 
@@ -2963,7 +2980,17 @@ pub const LinuxServer = struct {
         if (id.shard == self.rx().shard_id) {
             const conn = self.rx().clients.get(id) orelse return error.ClientNotFound;
             if (conn.closing) return;
-            try appendToConn(conn, bytes);
+            // A full send buffer is the RECIPIENT's fault (it stopped reading):
+            // close that recipient (SendQ exceeded) and report success, so a
+            // channel fan-out keeps delivering to the remaining members instead
+            // of faulting the SENDER and black-holing the rest of the broadcast.
+            appendToConn(conn, bytes) catch |err| switch (err) {
+                error.OutputTooSmall => {
+                    conn.closing = true;
+                    return;
+                },
+                else => return err,
+            };
             try self.armSendIfNeeded(conn);
             return;
         }
@@ -3466,7 +3493,18 @@ pub const LinuxServer = struct {
     }
 
     fn processLiveLine(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
-        const parsed = try irc_line.parseLine(line);
+        // Parse errors are the CLIENT's fault and must never propagate past
+        // this frame: an escaped error reaches onCompletion's handler.err path
+        // and tears down the whole reactor — a one-line remote DoS for any
+        // unauthenticated peer. Blank lines are ignored per RFC 1459; every
+        // other malformed line closes only the offending connection.
+        const parsed = irc_line.parseLine(line) catch |err| switch (err) {
+            error.EmptyLine => return,
+            else => {
+                conn.closing = true;
+                return;
+            },
+        };
         const was_registered = conn.session.registered();
 
         if (!was_registered) {
@@ -3495,7 +3533,21 @@ pub const LinuxServer = struct {
                 return;
             }
             var sink = QueueSink{ .conn = conn };
-            try processLine(conn, line, &sink);
+            // Same per-client firewall as dispatchRegistered below: a full send
+            // buffer or oversize reply during preregistration closes only this
+            // connection instead of escaping to the reactor loop.
+            processLine(conn, line, &sink) catch |err| switch (err) {
+                error.OutputTooSmall,
+                error.TextTooLong,
+                error.NoSpaceLeft,
+                error.OversizeLine,
+                error.LineTooLong,
+                => {
+                    conn.closing = true;
+                    return;
+                },
+                else => return err,
+            };
             if (conn.session.registered()) {
                 try self.registerConnNick(id, conn);
                 // Warden: a network/node ban (Match × Scope × Action) is
@@ -3540,7 +3592,15 @@ pub const LinuxServer = struct {
 
         if (std.ascii.eqlIgnoreCase(parsed.command, "PING")) {
             var sink = QueueSink{ .conn = conn };
-            try processLine(conn, line, &sink);
+            processLine(conn, line, &sink) catch |err| switch (err) {
+                error.OutputTooSmall,
+                error.TextTooLong,
+                error.NoSpaceLeft,
+                error.OversizeLine,
+                error.LineTooLong,
+                => conn.closing = true,
+                else => return err,
+            };
             return;
         }
 
@@ -13232,6 +13292,43 @@ fn extractMsgid(bytes: []const u8) ?[]const u8 {
 fn waitMillis(ms: i64) void {
     const deadline = platform.monotonicMillis() + ms;
     while (platform.monotonicMillis() < deadline) {}
+}
+
+test "threaded server: malformed pre-auth lines never kill the reactor" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Attacker connection: a blank line (ParseError.EmptyLine), a NUL inside a
+    // line, and a tags-only line with no command. Before the firewall, the first
+    // of these escaped processLiveLine and exited the reactor loop — one line of
+    // garbage from an unauthenticated peer took down the whole daemon.
+    const fd_evil = connectLoopback(port) catch |err| switch (err) {
+        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(fd_evil);
+    try writeAllFd(fd_evil, "\r\n");
+    try writeAllFd(fd_evil, "PING a\x00b\r\n");
+    try writeAllFd(fd_evil, "@tag-only-no-command \r\n");
+
+    // The reactor must still be alive: a fresh client registers normally.
+    const fd_ok = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_ok);
+    var ok = LiveClient{ .fd = fd_ok };
+    try writeAllFd(fd_ok, "NICK survivor\r\nUSER s 0 * :Survivor\r\n");
+    try recvUntil(&ok, " 001 survivor ", 400);
 }
 
 test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
