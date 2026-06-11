@@ -240,6 +240,9 @@ pub const Client = struct {
     /// CertificateVerify signature is verified). Used only by the tls_server
     /// mTLS loopback tests, whose x509_selfsign leaves carry a CN but no SAN.
     skip_cert_verify_for_test: bool = false,
+    /// Test-only: offer secp256r1 as the sole key-exchange group, so the server's
+    /// P-256 fallback path can be exercised over the loopback.
+    force_p256_only_for_test: bool = false,
 
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
@@ -364,6 +367,11 @@ pub const Client = struct {
     /// still verified. Lets the mTLS loopback use CN-only self-signed leaves.
     pub fn skipServerCertVerifyForTest(self: *Client) void {
         self.skip_cert_verify_for_test = true;
+    }
+
+    /// Test-only: offer secp256r1 as the sole supported group + key share.
+    pub fn offerOnlyP256ForTest(self: *Client) void {
+        self.force_p256_only_for_test = true;
     }
 
     /// Raw (still-encrypted) record bytes received but not consumed by the
@@ -537,7 +545,10 @@ pub const Client = struct {
         try ext_builder.addTyped(.supported_versions, versions);
 
         var groups_buf: [16]u8 = undefined;
-        const groups = try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{ .x25519, .secp256r1 });
+        const groups = if (self.force_p256_only_for_test)
+            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{.secp256r1})
+        else
+            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{ .x25519, .secp256r1 });
         try ext_builder.addTyped(.supported_groups, groups);
 
         var sigs_buf: [16]u8 = undefined;
@@ -550,11 +561,16 @@ pub const Client = struct {
         });
         try ext_builder.addTyped(.signature_algorithms, sigs);
 
-        var keyshare_buf: [128]u8 = undefined;
-        const keyshares = try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-            .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
-            .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
-        });
+        var keyshare_buf: [256]u8 = undefined;
+        const keyshares = if (self.force_p256_only_for_test)
+            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
+            })
+        else
+            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
+                .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
+                .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
+            });
         try ext_builder.addTyped(.key_share, keyshares);
 
         if (self.alpn_protocols.len != 0) {

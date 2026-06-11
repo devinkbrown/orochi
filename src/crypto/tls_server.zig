@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const kx = @import("kx.zig");
+const ecdh_p256 = @import("ecdh_p256.zig");
 const hkdf = @import("hkdf_tls13.zig");
 const Sha256 = hkdf.Sha256;
 const tls_record = @import("tls_record.zig");
@@ -114,6 +115,10 @@ pub const Server = struct {
     state: State = .idle,
 
     x25519_pair: kx.X25519Kx.KeyPair,
+    p256_pair: ecdh_p256.KeyPair,
+    /// Group selected from the client's key_share. The server prefers X25519 and
+    /// falls back to secp256r1 when the client offered only that.
+    selected_group: tls_keyshare.NamedGroup = .x25519,
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
     legacy_session_id: [32]u8 = [_]u8{0} ** 32,
@@ -165,11 +170,13 @@ pub const Server = struct {
             .state = .wait_client_hello,
             .request_client_cert = config.request_client_cert,
             .x25519_pair = kx.X25519Kx.generateDeterministic(seed) catch return error.BadState,
+            .p256_pair = ecdh_p256.generate() catch return error.BadState,
         };
     }
 
     pub fn deinit(self: *Server) void {
         self.x25519_pair.wipe();
+        secureZero(&self.p256_pair.secret);
         secureZero(&self.early_secret);
         secureZero(&self.handshake_secret);
         secureZero(&self.master_secret);
@@ -484,7 +491,8 @@ pub const Server = struct {
         const ext_block = try c.take(try c.readU16());
 
         var offered_tls13 = false;
-        var client_share: ?[]const u8 = null;
+        var x25519_share: ?[]const u8 = null;
+        var p256_share: ?[]const u8 = null;
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
             switch (ext.typed()) {
@@ -495,8 +503,9 @@ pub const Server = struct {
                     var shares = tls_keyshare.parseClientShares(ext.data) catch continue;
                     while (shares.next() catch null) |entry| {
                         if (entry.group == .x25519 and entry.key_exchange.len == kx.X25519Kx.public_len) {
-                            client_share = entry.key_exchange;
-                            break;
+                            if (x25519_share == null) x25519_share = entry.key_exchange;
+                        } else if (entry.group == .secp256r1 and entry.key_exchange.len == ecdh_p256.public_length) {
+                            if (p256_share == null) p256_share = entry.key_exchange;
                         }
                     }
                 },
@@ -506,12 +515,21 @@ pub const Server = struct {
         }
 
         if (!offered_tls13) return error.ProtocolVersion;
-        const peer = client_share orelse return error.UnsupportedGroup;
-        var peer_pub: kx.PublicKey = undefined;
-        @memcpy(&peer_pub, peer);
-        var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
-        defer secret.wipe();
-        return secret.declassify();
+
+        // Prefer X25519; fall back to secp256r1 when it is the only group offered.
+        if (x25519_share) |peer| {
+            self.selected_group = .x25519;
+            var peer_pub: kx.PublicKey = undefined;
+            @memcpy(&peer_pub, peer);
+            var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
+            defer secret.wipe();
+            return secret.declassify();
+        }
+        if (p256_share) |peer| {
+            self.selected_group = .secp256r1;
+            return ecdh_p256.sharedSecret(self.p256_pair.secret, peer[0..ecdh_p256.public_length].*) catch return error.BadHandshake;
+        }
+        return error.UnsupportedGroup;
     }
 
     fn maybeSelectAlpn(self: *Server, data: []const u8) void {
@@ -547,8 +565,11 @@ pub const Server = struct {
         var ext_builder = try tls_extension.Builder.begin(&ext_storage);
         var ver_buf: [2]u8 = undefined;
         try ext_builder.addTyped(.supported_versions, try tls_supported_versions.buildServer(&ver_buf, tls_supported_versions.tls13));
-        var ks_buf: [64]u8 = undefined;
-        const ks = try tls_keyshare.buildServerShare(&ks_buf, .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key });
+        var ks_buf: [128]u8 = undefined;
+        const ks = switch (self.selected_group) {
+            .secp256r1 => try tls_keyshare.buildServerShare(&ks_buf, .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 }),
+            else => try tls_keyshare.buildServerShare(&ks_buf, .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key }),
+        };
         try ext_builder.addTyped(.key_share, ks);
         try body.appendSlice(self.allocator, try ext_builder.finish());
 
@@ -985,6 +1006,54 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("hello server", got_s);
+}
+
+test "loopback: handshake completes over secp256r1 key exchange" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x63} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x12, 0x34 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    client.offerOnlyP256ForTest();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    try std.testing.expectEqual(tls_keyshare.NamedGroup.secp256r1, server.selected_group);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    const s2c = try server.encrypt("p256 ok");
+    defer alloc.free(s2c);
+    const got = try client.decrypt(s2c);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("p256 ok", got);
 }
 
 test "loopback: client rejects an expired server certificate when a clock is supplied" {
