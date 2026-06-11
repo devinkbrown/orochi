@@ -1,0 +1,781 @@
+//! Socketless TLS 1.2 client handshake state machine.
+//!
+//! The caller owns transport I/O: call `start()` to obtain ClientHello bytes,
+//! feed peer bytes through `feed()`, write any returned flight, and use
+//! `encrypt()` / `decrypt()` once `handshakeDone()` is true. Policy is
+//! intentionally narrow: TLS 1.2, ECDHE over secp256r1, null compression, and
+//! the AEAD suites exposed by `tls12.zig`.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+const tls12 = @import("tls12.zig");
+const ecdh_p256 = @import("ecdh_p256.zig");
+const ecdsa_p256 = @import("ecdsa_p256.zig");
+const rsa_verify = @import("rsa_verify.zig");
+const x509 = @import("x509.zig");
+const x509_verify = @import("x509_verify.zig");
+
+const Allocator = std.mem.Allocator;
+
+const named_group_secp256r1: u16 = 0x0017;
+const sig_ecdsa_secp256r1_sha256: u16 = 0x0403;
+const sig_rsa_pkcs1_sha256: u16 = 0x0401;
+const sig_rsa_pkcs1_sha384: u16 = 0x0501;
+
+pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
+    ecdsa_p256.Sec1Error || rsa_verify.Error || x509.Error || x509_verify.Error ||
+    Allocator.Error || error{
+    BadCertificate,
+    BadHandshake,
+    BadSignature,
+    BadState,
+    CertificateNameMismatch,
+    EmptyCertificateChain,
+    FinishedMismatch,
+    NeedMore,
+    NoServerCertificate,
+    ProtocolVersion,
+    TlsAlert,
+    UnknownCa,
+    UnsupportedCipherSuite,
+    UnsupportedGroup,
+    UnsupportedPublicKey,
+    UnsupportedSignatureScheme,
+    EntropyUnavailable,
+};
+
+pub const Options = struct {
+    server_name: []const u8,
+    trust_anchors: []const []const u8,
+    alpn_protocols: []const []const u8 = &.{},
+    now_unix_seconds: ?i64 = null,
+};
+
+pub const FeedResult = union(enum) {
+    need_more,
+    bytes_to_send: []u8,
+};
+
+const State = enum {
+    idle,
+    wait_server_flight,
+    wait_server_ccs,
+    wait_server_finished,
+    connected,
+};
+
+const HandshakeMsg = struct {
+    typ: tls12.HandshakeType,
+    body: []const u8,
+    raw: []const u8,
+};
+
+const LeafPublicKey = union(enum) {
+    ecdsa_p256: ecdsa_p256.PublicKey,
+    rsa: rsa_verify.PublicKey,
+};
+
+const CertParts = struct {
+    tbs_der: []const u8,
+    signature_algorithm_oid: []const u8,
+    signature: []const u8,
+    issuer_der: []const u8,
+    subject_der: []const u8,
+    spki_der: []const u8,
+};
+
+pub const Client = struct {
+    allocator: Allocator,
+    server_name: []u8,
+    trust_anchors: []const []const u8,
+    alpn_protocols: []const []const u8,
+    now_unix_seconds: ?i64,
+
+    state: State = .idle,
+    recv_buf: std.ArrayList(u8) = .empty,
+    transcript: std.ArrayList(u8) = .empty,
+
+    key_pair: ecdh_p256.KeyPair,
+    client_random: [32]u8,
+    server_random: [32]u8 = [_]u8{0} ** 32,
+    selected_suite: ?tls12.CipherSuite = null,
+    selected_alpn: ?[]u8 = null,
+    leaf_key: ?LeafPublicKey = null,
+
+    master_secret: [tls12.master_secret_len]u8 = [_]u8{0} ** tls12.master_secret_len,
+    keys: tls12.KeyMaterial = .{},
+    app_read_seq: u64 = 0,
+    app_write_seq: u64 = 0,
+    hs_read_seq: u64 = 0,
+    hs_write_seq: u64 = 0,
+    force_chacha_only_for_test: bool = false,
+    force_aes128_only_for_test: bool = false,
+    skip_cert_verify_for_test: bool = false,
+
+    pub fn init(allocator: Allocator, options: Options) Error!Client {
+        var random: [32]u8 = undefined;
+        try osEntropy(&random);
+        const name = try allocator.dupe(u8, options.server_name);
+        errdefer allocator.free(name);
+        return .{
+            .allocator = allocator,
+            .server_name = name,
+            .trust_anchors = options.trust_anchors,
+            .alpn_protocols = options.alpn_protocols,
+            .now_unix_seconds = options.now_unix_seconds,
+            .key_pair = try ecdh_p256.generate(),
+            .client_random = random,
+        };
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.allocator.free(self.server_name);
+        if (self.selected_alpn) |p| self.allocator.free(p);
+        self.recv_buf.deinit(self.allocator);
+        self.transcript.deinit(self.allocator);
+        std.crypto.secureZero(u8, &self.key_pair.secret);
+        std.crypto.secureZero(u8, &self.master_secret);
+        self.keys.wipe();
+    }
+
+    pub fn start(self: *Client) Error![]u8 {
+        if (self.state != .idle) return error.BadState;
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try self.writeClientHelloBody(&body);
+
+        var hs: std.ArrayList(u8) = .empty;
+        defer hs.deinit(self.allocator);
+        try writeHandshake(self.allocator, &hs, .client_hello, body.items);
+        try self.transcript.appendSlice(self.allocator, hs.items);
+        self.state = .wait_server_flight;
+        return tls12.writePlainRecord(self.allocator, .handshake, hs.items);
+    }
+
+    pub fn feed(self: *Client, received: []const u8) Error!FeedResult {
+        if (self.state == .idle or self.state == .connected) return error.BadState;
+        try self.recv_buf.appendSlice(self.allocator, received);
+
+        while (true) {
+            const rec = (try tls12.completeRecord(self.recv_buf.items)) orelse return .need_more;
+            switch (self.state) {
+                .wait_server_flight => {
+                    if (rec.content_type == .alert) return error.TlsAlert;
+                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    var off: usize = 0;
+                    while (parseHandshakeMaybe(rec.fragment, &off)) |msg| {
+                        try self.handleServerHandshake(msg);
+                        if (self.state == .wait_server_ccs) {
+                            consumePrefix(&self.recv_buf, rec.wire_len);
+                            const reply = try self.buildClientFlight();
+                            return .{ .bytes_to_send = reply };
+                        }
+                    }
+                    if (off != rec.fragment.len) return .need_more;
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                },
+                .wait_server_ccs => {
+                    if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    self.state = .wait_server_finished;
+                },
+                .wait_server_finished => {
+                    const suite = self.selected_suite orelse return error.BadState;
+                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
+                    self.hs_read_seq += 1;
+                    defer self.allocator.free(opened.plaintext);
+                    if (opened.content_type != .handshake) return error.BadHandshake;
+                    var off: usize = 0;
+                    const msg = try parseHandshake(opened.plaintext, &off);
+                    if (off != opened.plaintext.len or msg.typ != .finished) return error.BadHandshake;
+                    const expected = try tls12.finishedVerifyData(suite, &self.master_secret, "server finished", self.transcript.items);
+                    if (!tls12.constantTimeEq(&expected, msg.body)) return error.FinishedMismatch;
+                    try self.transcript.appendSlice(self.allocator, msg.raw);
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    self.state = .connected;
+                    return .need_more;
+                },
+                else => return error.BadState,
+            }
+        }
+    }
+
+    pub fn handshakeDone(self: *const Client) bool {
+        return self.state == .connected;
+    }
+
+    pub fn pendingBytes(self: *const Client) []const u8 {
+        return self.recv_buf.items;
+    }
+
+    pub fn selectedAlpn(self: *const Client) ?[]const u8 {
+        return if (self.selected_alpn) |p| p else null;
+    }
+
+    pub fn offerOnlyChaChaForTest(self: *Client) void {
+        self.force_chacha_only_for_test = true;
+        self.force_aes128_only_for_test = false;
+    }
+
+    pub fn offerOnlyAes128ForTest(self: *Client) void {
+        self.force_aes128_only_for_test = true;
+        self.force_chacha_only_for_test = false;
+    }
+
+    pub fn skipServerCertVerifyForTest(self: *Client) void {
+        self.skip_cert_verify_for_test = true;
+    }
+
+    pub fn encrypt(self: *Client, appdata: []const u8) Error![]u8 {
+        if (self.state != .connected) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const out = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.app_write_seq, .application_data, appdata);
+        self.app_write_seq += 1;
+        return out;
+    }
+
+    pub fn decrypt(self: *Client, record: []const u8) Error![]u8 {
+        if (self.state != .connected) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, self.app_read_seq, record);
+        self.app_read_seq += 1;
+        errdefer self.allocator.free(opened.plaintext);
+        if (opened.content_type == .alert) return error.TlsAlert;
+        if (opened.content_type != .application_data) return error.BadHandshake;
+        return opened.plaintext;
+    }
+
+    fn writeClientHelloBody(self: *Client, out: *std.ArrayList(u8)) Error!void {
+        try appendU16(self.allocator, out, tls12.tls_version);
+        try out.appendSlice(self.allocator, &self.client_random);
+        try out.append(self.allocator, 0); // session_id
+
+        var suites: std.ArrayList(u8) = .empty;
+        defer suites.deinit(self.allocator);
+        if (self.force_chacha_only_for_test) {
+            try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_chacha20_poly1305_sha256));
+        } else if (self.force_aes128_only_for_test) {
+            try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_aes_128_gcm_sha256));
+        } else {
+            for (tls12.allowed_suites) |suite| try appendU16(self.allocator, &suites, @intFromEnum(suite));
+        }
+        try appendU16(self.allocator, out, @intCast(suites.items.len));
+        try out.appendSlice(self.allocator, suites.items);
+        try out.appendSlice(self.allocator, &.{ 1, 0 }); // null compression only
+
+        var exts: std.ArrayList(u8) = .empty;
+        defer exts.deinit(self.allocator);
+        try self.writeSniExtension(&exts);
+        try writeSupportedGroupsExtension(self.allocator, &exts);
+        try writeEcPointFormatsExtension(self.allocator, &exts);
+        try writeSignatureAlgorithmsExtension(self.allocator, &exts);
+        try self.writeAlpnExtension(&exts);
+        try appendU16(self.allocator, out, @intCast(exts.items.len));
+        try out.appendSlice(self.allocator, exts.items);
+    }
+
+    fn writeSniExtension(self: *Client, out: *std.ArrayList(u8)) Error!void {
+        if (self.server_name.len == 0) return;
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try appendU16(self.allocator, &body, @intCast(1 + 2 + self.server_name.len));
+        try body.append(self.allocator, 0);
+        try appendU16(self.allocator, &body, @intCast(self.server_name.len));
+        try body.appendSlice(self.allocator, self.server_name);
+        try writeExtension(self.allocator, out, 0x0000, body.items);
+    }
+
+    fn writeAlpnExtension(self: *Client, out: *std.ArrayList(u8)) Error!void {
+        if (self.alpn_protocols.len == 0) return;
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.allocator);
+        for (self.alpn_protocols) |proto| {
+            if (proto.len == 0 or proto.len > 255) return error.BadHandshake;
+            try list.append(self.allocator, @intCast(proto.len));
+            try list.appendSlice(self.allocator, proto);
+        }
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try appendU16(self.allocator, &body, @intCast(list.items.len));
+        try body.appendSlice(self.allocator, list.items);
+        try writeExtension(self.allocator, out, 0x0010, body.items);
+    }
+
+    fn handleServerHandshake(self: *Client, msg: HandshakeMsg) Error!void {
+        switch (msg.typ) {
+            .server_hello => {
+                try self.parseServerHello(msg.body);
+                try self.transcript.appendSlice(self.allocator, msg.raw);
+            },
+            .certificate => {
+                try self.parseCertificate(msg.body);
+                try self.transcript.appendSlice(self.allocator, msg.raw);
+            },
+            .server_key_exchange => {
+                try self.verifyServerKeyExchange(msg.body);
+                try self.transcript.appendSlice(self.allocator, msg.raw);
+            },
+            .server_hello_done => {
+                if (msg.body.len != 0) return error.BadHandshake;
+                try self.transcript.appendSlice(self.allocator, msg.raw);
+                self.state = .wait_server_ccs;
+            },
+            else => return error.BadHandshake,
+        }
+    }
+
+    fn parseServerHello(self: *Client, body: []const u8) Error!void {
+        var c = Cursor.init(body);
+        if (try c.readU16() != tls12.tls_version) return error.ProtocolVersion;
+        @memcpy(&self.server_random, try c.take(32));
+        const sid_len = try c.readU8();
+        _ = try c.take(sid_len);
+        const suite = try tls12.CipherSuite.fromWire(try c.readU16());
+        self.selected_suite = suite;
+        if (try c.readU8() != 0) return error.BadHandshake;
+        if (c.remaining() != 0) {
+            const ext_len = try c.readU16();
+            const ext_bytes = try c.take(ext_len);
+            try self.parseServerExtensions(ext_bytes);
+        }
+        try c.expectEmpty();
+    }
+
+    fn parseServerExtensions(self: *Client, bytes: []const u8) Error!void {
+        var c = Cursor.init(bytes);
+        while (c.remaining() != 0) {
+            const typ = try c.readU16();
+            const len = try c.readU16();
+            const body = try c.take(len);
+            if (typ == 0x0010) {
+                var a = Cursor.init(body);
+                const list = try a.take(try a.readU16());
+                var l = Cursor.init(list);
+                const proto = try l.take(try l.readU8());
+                try l.expectEmpty();
+                try a.expectEmpty();
+                const copy = try self.allocator.dupe(u8, proto);
+                errdefer self.allocator.free(copy);
+                if (self.selected_alpn) |old| self.allocator.free(old);
+                self.selected_alpn = copy;
+            } else if (typ == 0x002b) {
+                return error.ProtocolVersion; // supported_versions would select TLS 1.3.
+            }
+        }
+    }
+
+    fn parseCertificate(self: *Client, body: []const u8) Error!void {
+        const chain = try parseCertificateChain(self.allocator, body);
+        defer freeChain(self.allocator, chain);
+        if (chain.len == 0) return error.EmptyCertificateChain;
+        if (!self.skip_cert_verify_for_test) {
+            try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name, self.now_unix_seconds);
+        }
+        const leaf = try extractCertParts(chain[0]);
+        self.leaf_key = try parsePublicKeyFromSpki(leaf.spki_der);
+    }
+
+    fn verifyServerKeyExchange(self: *Client, body: []const u8) Error!void {
+        var c = Cursor.init(body);
+        const params_start: usize = 0;
+        const curve_type = try c.readU8();
+        if (curve_type != 3) return error.UnsupportedGroup;
+        if (try c.readU16() != named_group_secp256r1) return error.UnsupportedGroup;
+        const point_len = try c.readU8();
+        const point = try c.take(point_len);
+        if (point.len != ecdh_p256.public_length) return error.UnsupportedGroup;
+        const params_end = c.pos;
+        const scheme = try c.readU16();
+        const sig = try c.take(try c.readU16());
+        try c.expectEmpty();
+
+        var server_pub: [ecdh_p256.public_length]u8 = undefined;
+        @memcpy(&server_pub, point);
+        const shared = try ecdh_p256.sharedSecret(self.key_pair.secret, server_pub);
+        self.master_secret = try tls12.deriveMasterSecret(self.selected_suite orelse return error.BadState, &shared, &self.client_random, &self.server_random);
+        self.keys = try tls12.deriveKeyMaterial(self.selected_suite orelse return error.BadState, &self.master_secret, &self.client_random, &self.server_random);
+
+        var signed: std.ArrayList(u8) = .empty;
+        defer signed.deinit(self.allocator);
+        try signed.appendSlice(self.allocator, &self.client_random);
+        try signed.appendSlice(self.allocator, &self.server_random);
+        try signed.appendSlice(self.allocator, body[params_start..params_end]);
+        try verifySignature(self.leaf_key orelse return error.NoServerCertificate, scheme, signed.items, sig);
+    }
+
+    fn buildClientFlight(self: *Client) Error![]u8 {
+        var point_body: [1 + ecdh_p256.public_length]u8 = undefined;
+        point_body[0] = ecdh_p256.public_length;
+        @memcpy(point_body[1..], &self.key_pair.public_sec1);
+
+        var cke: std.ArrayList(u8) = .empty;
+        defer cke.deinit(self.allocator);
+        try writeHandshake(self.allocator, &cke, .client_key_exchange, &point_body);
+        try self.transcript.appendSlice(self.allocator, cke.items);
+
+        const suite = self.selected_suite orelse return error.BadState;
+        const verify = try tls12.finishedVerifyData(suite, &self.master_secret, "client finished", self.transcript.items);
+        var fin: std.ArrayList(u8) = .empty;
+        defer fin.deinit(self.allocator);
+        try writeHandshake(self.allocator, &fin, .finished, &verify);
+        try self.transcript.appendSlice(self.allocator, fin.items);
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const cke_rec = try tls12.writePlainRecord(self.allocator, .handshake, cke.items);
+        defer self.allocator.free(cke_rec);
+        try out.appendSlice(self.allocator, cke_rec);
+        const ccs = try tls12.writePlainRecord(self.allocator, .change_cipher_spec, &.{1});
+        defer self.allocator.free(ccs);
+        try out.appendSlice(self.allocator, ccs);
+        const fin_rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_write_seq, .handshake, fin.items);
+        self.hs_write_seq += 1;
+        defer self.allocator.free(fin_rec);
+        try out.appendSlice(self.allocator, fin_rec);
+        return out.toOwnedSlice(self.allocator);
+    }
+};
+
+fn writeSupportedGroupsExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
+    var body: [4]u8 = undefined;
+    std.mem.writeInt(u16, body[0..2], 2, .big);
+    std.mem.writeInt(u16, body[2..4], named_group_secp256r1, .big);
+    try writeExtension(allocator, out, 0x000a, &body);
+}
+
+fn writeEcPointFormatsExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
+    try writeExtension(allocator, out, 0x000b, &.{ 1, 0 });
+}
+
+fn writeSignatureAlgorithmsExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
+    var body: [10]u8 = undefined;
+    std.mem.writeInt(u16, body[0..2], 8, .big);
+    std.mem.writeInt(u16, body[2..4], sig_ecdsa_secp256r1_sha256, .big);
+    std.mem.writeInt(u16, body[4..6], sig_rsa_pkcs1_sha256, .big);
+    std.mem.writeInt(u16, body[6..8], sig_rsa_pkcs1_sha384, .big);
+    std.mem.writeInt(u16, body[8..10], 0x0503, .big);
+    try writeExtension(allocator, out, 0x000d, &body);
+}
+
+fn writeExtension(allocator: Allocator, out: *std.ArrayList(u8), typ: u16, body: []const u8) Error!void {
+    try appendU16(allocator, out, typ);
+    try appendU16(allocator, out, @intCast(body.len));
+    try out.appendSlice(allocator, body);
+}
+
+fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: tls12.HandshakeType, body: []const u8) Error!void {
+    try out.append(allocator, @intFromEnum(typ));
+    try appendU24(allocator, out, @intCast(body.len));
+    try out.appendSlice(allocator, body);
+}
+
+fn parseHandshake(bytes: []const u8, off: *usize) Error!HandshakeMsg {
+    return parseHandshakeMaybe(bytes, off) orelse error.NeedMore;
+}
+
+fn parseHandshakeMaybe(bytes: []const u8, off: *usize) ?HandshakeMsg {
+    if (bytes.len - off.* < 4) return null;
+    const start = off.*;
+    const typ: tls12.HandshakeType = @enumFromInt(bytes[start]);
+    const len = (@as(usize, bytes[start + 1]) << 16) | (@as(usize, bytes[start + 2]) << 8) | bytes[start + 3];
+    if (bytes.len - start < 4 + len) return null;
+    off.* = start + 4 + len;
+    return .{ .typ = typ, .body = bytes[start + 4 .. start + 4 + len], .raw = bytes[start .. start + 4 + len] };
+}
+
+fn parseCertificateChain(allocator: Allocator, body: []const u8) Error![][]u8 {
+    var c = Cursor.init(body);
+    const list = try c.take(try c.readU24());
+    try c.expectEmpty();
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |cert| allocator.free(cert);
+        out.deinit(allocator);
+    }
+    var certs = Cursor.init(list);
+    while (certs.remaining() != 0) {
+        const der = try certs.take(try certs.readU24());
+        try out.append(allocator, try allocator.dupe(u8, der));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeChain(allocator: Allocator, chain: [][]u8) void {
+    for (chain) |cert| allocator.free(cert);
+    allocator.free(chain);
+}
+
+fn verifySignature(key: LeafPublicKey, scheme: u16, msg: []const u8, sig: []const u8) Error!void {
+    switch (scheme) {
+        sig_ecdsa_secp256r1_sha256 => {
+            const pk = switch (key) {
+                .ecdsa_p256 => |pk| pk,
+                else => return error.UnsupportedPublicKey,
+            };
+            const decoded = try ecdsa_p256.signatureFromDer(sig);
+            if (!ecdsa_p256.verify(decoded, msg, pk)) return error.BadSignature;
+        },
+        sig_rsa_pkcs1_sha256 => {
+            const pk = switch (key) {
+                .rsa => |pk| pk,
+                else => return error.UnsupportedPublicKey,
+            };
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(msg, &digest, .{});
+            if (!rsa_verify.verifyPkcs1v15(pk, .sha256, &digest, sig)) return error.BadSignature;
+        },
+        sig_rsa_pkcs1_sha384 => {
+            const pk = switch (key) {
+                .rsa => |pk| pk,
+                else => return error.UnsupportedPublicKey,
+            };
+            var digest: [48]u8 = undefined;
+            std.crypto.hash.sha2.Sha384.hash(msg, &digest, .{});
+            if (!rsa_verify.verifyPkcs1v15(pk, .sha384, &digest, sig)) return error.BadSignature;
+        },
+        else => return error.UnsupportedSignatureScheme,
+    }
+}
+
+fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const u8, server_name: []const u8, now: ?i64) Error!void {
+    if (chain.len == 0) return error.EmptyCertificateChain;
+    if (anchors.len == 0) return error.UnknownCa;
+    const leaf = try x509.parse(chain[0]);
+    if (!dnsNameMatchesCert(server_name, leaf)) return error.CertificateNameMismatch;
+    if (now) |t| try x509_verify.validateParsedAt(leaf, t);
+    if (leaf.eku_present and !leaf.eku_server_auth) return error.BadCertificate;
+
+    var i: usize = 0;
+    while (i + 1 < chain.len) : (i += 1) {
+        try verifyIssuedBy(chain[i], chain[i + 1]);
+        const issuer = try x509.parse(chain[i + 1]);
+        if (!issuer.basic_constraints_ca) return error.BadCertificate;
+        if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
+        if (now) |t| try x509_verify.validateParsedAt(issuer, t);
+    }
+
+    const last = chain[chain.len - 1];
+    const last_parts = try extractCertParts(last);
+    for (anchors) |anchor_der| {
+        const anchor_parts = extractCertParts(anchor_der) catch continue;
+        if (!std.mem.eql(u8, last_parts.issuer_der, anchor_parts.subject_der) and
+            !std.mem.eql(u8, last_parts.subject_der, anchor_parts.subject_der)) continue;
+        verifyCertSignature(last_parts, anchor_der) catch continue;
+        return;
+    }
+    return error.UnknownCa;
+}
+
+fn verifyIssuedBy(child_der: []const u8, issuer_der: []const u8) Error!void {
+    const child = try extractCertParts(child_der);
+    const issuer = try extractCertParts(issuer_der);
+    if (!std.mem.eql(u8, child.issuer_der, issuer.subject_der)) return error.BadCertificate;
+    try verifyCertSignature(child, issuer_der);
+}
+
+fn verifyCertSignature(cert: CertParts, issuer_der: []const u8) Error!void {
+    const issuer = try extractCertParts(issuer_der);
+    const key = try parsePublicKeyFromSpki(issuer.spki_der);
+    if (oidEq(cert.signature_algorithm_oid, &oid_ecdsa_sha256)) {
+        try verifySignature(key, sig_ecdsa_secp256r1_sha256, cert.tbs_der, cert.signature);
+    } else if (oidEq(cert.signature_algorithm_oid, &oid_sha256_rsa)) {
+        try verifySignature(key, sig_rsa_pkcs1_sha256, cert.tbs_der, cert.signature);
+    } else {
+        return error.UnsupportedSignatureScheme;
+    }
+}
+
+fn dnsNameMatchesCert(server_name: []const u8, cert: x509.Certificate) bool {
+    var i: usize = 0;
+    while (i < cert.san_dns_count) : (i += 1) {
+        if (asciiEqlIgnoreCase(cert.san_dns[i], server_name)) return true;
+        if (wildcardMatches(cert.san_dns[i], server_name)) return true;
+    }
+    return false;
+}
+
+fn wildcardMatches(pattern: []const u8, name: []const u8) bool {
+    if (pattern.len < 3 or pattern[0] != '*' or pattern[1] != '.') return false;
+    const suffix = pattern[1..];
+    if (name.len <= suffix.len) return false;
+    if (!asciiEqlIgnoreCase(name[name.len - suffix.len ..], suffix)) return false;
+    return std.mem.indexOfScalar(u8, name[0 .. name.len - suffix.len], '.') == null;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    return true;
+}
+
+fn extractCertParts(der: []const u8) Error!CertParts {
+    _ = try x509_verify.linkInfo(der);
+    var top = x509.DerReader.init(der);
+    const cert_seq = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+    var body = try top.child(cert_seq);
+    const tbs = try body.readExpected(x509.Tag.sequence);
+    const sig_alg = try body.readExpected(x509.Tag.sequence);
+    const signature = try body.readExpected(x509.Tag.bit_string);
+    try body.expectEmpty();
+
+    var tbs_reader = try body.child(tbs);
+    if (tbs_reader.hasRemaining() and try tbs_reader.peekTag() == x509.Tag.context_0_constructed) _ = try tbs_reader.readTlv();
+    _ = try tbs_reader.readExpected(x509.Tag.integer);
+    _ = try tbs_reader.readExpected(x509.Tag.sequence);
+    const issuer = try tbs_reader.readExpected(x509.Tag.sequence);
+    _ = try tbs_reader.readExpected(x509.Tag.sequence);
+    const subject = try tbs_reader.readExpected(x509.Tag.sequence);
+    const spki = try tbs_reader.readExpected(x509.Tag.sequence);
+    return .{
+        .tbs_der = tbs.raw,
+        .signature_algorithm_oid = try algorithmOid(body, sig_alg),
+        .signature = try bitStringBytes(signature),
+        .issuer_der = issuer.raw,
+        .subject_der = subject.raw,
+        .spki_der = spki.raw,
+    };
+}
+
+fn parsePublicKeyFromSpki(spki_der: []const u8) Error!LeafPublicKey {
+    var top = x509.DerReader.init(spki_der);
+    const seq = try top.readExpected(x509.Tag.sequence);
+    try top.expectEmpty();
+    var spki = try top.child(seq);
+    const alg_seq = try spki.readExpected(x509.Tag.sequence);
+    const key_bits = try spki.readExpected(x509.Tag.bit_string);
+    try spki.expectEmpty();
+    const alg = try parseSpkiAlgorithm(spki, alg_seq);
+    const key_bytes = try bitStringBytes(key_bits);
+    if (oidEq(alg.oid, &oid_ec_public_key)) {
+        const params = alg.params orelse return error.UnsupportedPublicKey;
+        if (!oidEq(params, &oid_prime256v1)) return error.UnsupportedPublicKey;
+        return .{ .ecdsa_p256 = try ecdsa_p256.parsePublicKeySec1(key_bytes) };
+    }
+    if (oidEq(alg.oid, &oid_rsa_encryption)) {
+        var r = x509.DerReader.init(key_bytes);
+        const rsa_seq = try r.readExpected(x509.Tag.sequence);
+        try r.expectEmpty();
+        var body = try r.child(rsa_seq);
+        const n = try positiveIntegerBytes(try body.readExpected(x509.Tag.integer));
+        const e = try positiveIntegerBytes(try body.readExpected(x509.Tag.integer));
+        try body.expectEmpty();
+        return .{ .rsa = .{ .n = n, .e = e } };
+    }
+    return error.UnsupportedPublicKey;
+}
+
+const SpkiAlgorithm = struct { oid: []const u8, params: ?[]const u8 };
+
+fn parseSpkiAlgorithm(parent: x509.DerReader, seq_tlv: x509.Tlv) Error!SpkiAlgorithm {
+    var r = try parent.child(seq_tlv);
+    const oid = try r.readExpected(x509.Tag.oid);
+    var params: ?[]const u8 = null;
+    if (r.hasRemaining()) {
+        const p = try r.readTlv();
+        if (p.tag == x509.Tag.oid) params = p.value;
+    }
+    try r.expectEmpty();
+    return .{ .oid = oid.value, .params = params };
+}
+
+fn algorithmOid(parent: x509.DerReader, seq_tlv: x509.Tlv) Error![]const u8 {
+    var r = try parent.child(seq_tlv);
+    const oid = try r.readExpected(x509.Tag.oid);
+    if (r.hasRemaining()) _ = try r.readTlv();
+    try r.expectEmpty();
+    return oid.value;
+}
+
+fn bitStringBytes(tlv: x509.Tlv) Error![]const u8 {
+    if (tlv.value.len == 0 or tlv.value[0] != 0) return error.BadCertificate;
+    return tlv.value[1..];
+}
+
+fn positiveIntegerBytes(tlv: x509.Tlv) Error![]const u8 {
+    var bytes = tlv.value;
+    if (bytes.len == 0) return error.BadCertificate;
+    if (bytes.len > 1 and bytes[0] == 0) bytes = bytes[1..];
+    return bytes;
+}
+
+fn oidEq(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
+const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+const oid_sha256_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
+
+const Cursor = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn init(bytes: []const u8) Cursor {
+        return .{ .bytes = bytes };
+    }
+
+    fn remaining(self: Cursor) usize {
+        return self.bytes.len - self.pos;
+    }
+
+    fn take(self: *Cursor, n: usize) Error![]const u8 {
+        if (n > self.remaining()) return error.BadHandshake;
+        const out = self.bytes[self.pos .. self.pos + n];
+        self.pos += n;
+        return out;
+    }
+
+    fn readU8(self: *Cursor) Error!u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn readU16(self: *Cursor) Error!u16 {
+        const b = try self.take(2);
+        return (@as(u16, b[0]) << 8) | b[1];
+    }
+
+    fn readU24(self: *Cursor) Error!usize {
+        const b = try self.take(3);
+        return (@as(usize, b[0]) << 16) | (@as(usize, b[1]) << 8) | b[2];
+    }
+
+    fn expectEmpty(self: Cursor) Error!void {
+        if (self.remaining() != 0) return error.BadHandshake;
+    }
+};
+
+fn appendU16(allocator: Allocator, out: *std.ArrayList(u8), v: u16) Allocator.Error!void {
+    try out.append(allocator, @intCast(v >> 8));
+    try out.append(allocator, @intCast(v & 0xff));
+}
+
+fn appendU24(allocator: Allocator, out: *std.ArrayList(u8), v: u32) Allocator.Error!void {
+    try out.append(allocator, @intCast((v >> 16) & 0xff));
+    try out.append(allocator, @intCast((v >> 8) & 0xff));
+    try out.append(allocator, @intCast(v & 0xff));
+}
+
+fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
+    std.mem.copyForwards(u8, list.items[0 .. list.items.len - n], list.items[n..]);
+    list.shrinkRetainingCapacity(list.items.len - n);
+}
+
+fn osEntropy(buf: []u8) Error!void {
+    switch (builtin.os.tag) {
+        .linux => {
+            var filled: usize = 0;
+            while (filled < buf.len) {
+                const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
+                const signed: isize = @bitCast(rc);
+                if (signed < 0 or rc == 0) return error.EntropyUnavailable;
+                filled += rc;
+            }
+        },
+        else => return error.EntropyUnavailable,
+    }
+}
