@@ -4,11 +4,11 @@
 //! application data through `encrypt()` / `decrypt()`.
 //!
 //! Scope (slice B of the TLS arc): TLS 1.3 only, X25519 key exchange, an
-//! Ed25519 or ECDSA-P256 leaf certificate (CertificateVerify signed with the
-//! matching TLS 1.3 scheme), and the AES-128-GCM / ChaCha20-Poly1305 suites.
+//! Ed25519, ECDSA-P256, or RSA leaf certificate (CertificateVerify signed with
+//! the matching TLS 1.3 scheme), and the AES-128-GCM / ChaCha20-Poly1305 suites.
 //! Interop is pinned by loopback tests against the in-repo standards client
-//! `tls_client.Client`. RSA certs and HelloRetryRequest are intentionally out of
-//! scope here and rejected with a typed error.
+//! `tls_client.Client`. HelloRetryRequest is intentionally out of scope here and
+//! rejected with a typed error.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,6 +19,7 @@ const ecdh_p256 = @import("ecdh_p256.zig");
 const hkdf = @import("hkdf_tls13.zig");
 const tls_resumption = @import("tls_resumption.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
+const rsa_sign = @import("rsa_sign.zig");
 const Sha256 = hkdf.Sha256;
 const Sha384 = hkdf.Sha384;
 /// Largest transcript-hash / traffic-secret length handled (SHA-384).
@@ -70,6 +71,10 @@ pub const Config = struct {
     /// signs CertificateVerify with `ecdsa_secp256r1_sha256`. When set, this
     /// takes precedence over `signing_key`.
     ecdsa_p256_signing_key: ?ecdsa_p256.KeyPair = null,
+    /// RSA private key whose public key is the leaf certificate's SPKI; signs
+    /// CertificateVerify with `rsa_pss_rsae_sha256`. When set, this takes
+    /// precedence over the Ed25519 and ECDSA signing keys.
+    rsa_signing_key: ?rsa_sign.PrivateKey = null,
     /// ALPN protocols the server is willing to select, in preference order.
     /// Empty disables ALPN negotiation.
     alpn_protocols: []const []const u8 = &.{},
@@ -108,6 +113,7 @@ pub const Config = struct {
 pub const SigningKey = union(enum) {
     ed25519: Ed25519.KeyPair,
     ecdsa_p256: ecdsa_p256.KeyPair,
+    rsa: rsa_sign.PrivateKey,
 };
 
 pub const FeedResult = union(enum) {
@@ -912,6 +918,18 @@ pub const Server = struct {
                 try appendU16(self.allocator, &body, @intCast(der.len));
                 try body.appendSlice(self.allocator, der);
             },
+            .rsa => |key| {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(input, &digest, .{});
+                var salt: [32]u8 = undefined;
+                try osEntropy(&salt);
+                defer secureZero(&salt);
+                var sig_buf: [512]u8 = undefined;
+                const sig = rsa_sign.signPss(key, .sha256, &digest, &salt, &sig_buf) catch return error.BadHandshake;
+                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256));
+                try appendU16(self.allocator, &body, @intCast(sig.len));
+                try body.appendSlice(self.allocator, sig);
+            },
         }
         try self.emit(out, .certificate_verify, body.items);
     }
@@ -1183,6 +1201,7 @@ pub const Server = struct {
 };
 
 fn activeSigningKey(config: Config) ?SigningKey {
+    if (config.rsa_signing_key) |key| return .{ .rsa = key };
     if (config.ecdsa_p256_signing_key) |key| return .{ .ecdsa_p256 = key };
     if (config.signing_key) |key| return .{ .ed25519 = key };
     return null;
@@ -1528,6 +1547,34 @@ fn parseHandshakeMaybe(input: []const u8, offset: *usize) ?HandshakeMsg {
     const len = (@as(usize, input[1]) << 16) | (@as(usize, input[2]) << 8) | input[3];
     if (input.len < 4 + len) return null;
     return parseHandshake(input, offset) catch null;
+}
+
+fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+const rsa_test_n = hexToBytes("a0bd1304a87f0a69b8ef18eaa1da15522c221b1e9b1efaee23bea1faa7eaaefe1e09eba390ec9334aea9457530d40c6a6b89c039865e98dd9d7491ea57288debf370f796fe05904a589027272fc9bd803fcf9d228c5552da7ff4f2a25c1606b3a4794f4ffa5bd94ab2150026dbcd31c4f4a5755d449a7aaf41861ff069fa455563cb22de14114aff8085fc3d3c07bc929d761f6449c1a13975738c9876319599f88bd3676230802d76b7292ad0759dad8fc70ee18fded69e32216a7f52833f1138caa7f90307c236500c3aa1a6cd082097fc3e28609b8d33514f16d6687bed504aee82775a41e4b125eba9ca544dc375c29c19d20f10900301eea8e68be3b3d7");
+const rsa_test_e = hexToBytes("010001");
+const rsa_test_d = hexToBytes("12036e6cb0b76002de1b49770e01632f4ccbdbaf2fe2266be6ac97f97fb4f0bc80c04adc8f42bbf284fa6a52ca50913da1e4939abec0be2fe3d3eb0050993662716b410bf656c84754aa7f00c8bdba93735340805d2ab8b8cceb35ffd50310e833eff65ff7a630714b08c876125eea0b710153e84a6667865978fefe51da1ec7d7cfc1afb96c4223b187b49cb6305be1a2eccbb8d07ed016bc257908bec7daf322658bda2dc4abd3671ffa6919da8b86ecbefa2658c3c01bacee5c9cff02f1cbac3f05feb2d68c61ef9a5427f73edb1949f776350bd63475c3cb78c5605b094d5043756e894bf538e811903212b6990a75153e261a36630657f8b91dfdadf45d");
+const rsa_test_p = hexToBytes("e03b0d999233d320ae90bb8fa28ba36ad8c0bedeea9bc1218f65f1aac329e0c921a6aaf62a56719c6bd01c33ff119a657005eb500c33aa52e6d2fb6a55723f6fc2076fb8d30df12801dca523515992cad6ad628d180947e846fa3a3a3046c84c25266faf9079f44022bd4b5600d98a8ee4cbda9fddf01e9efb5d7eb62f7edb5d");
+const rsa_test_q = hexToBytes("b7832256daec3eb9c325d1cdd4b3e2036723d02daa96e029518640c40d87bde9df147bd8488031df85caa449ec42735cbfd1125f843027352d396e7e9024b76335a98148a553d31872f32275582897d1e8f2b1460f1a3bd0375fe8a884f2372e716d51a4b71043c9730d74a7263476362d502496c19f6a45a615517b4a7f4cc3");
+const rsa_test_dp = hexToBytes("1a1be62e7e8e9843d2efb95735370b3532bde6bbb017a8ba4ea731279007fd4b8e2688fb96dc6fe825c99aaf174126782f3e113345e87229ab04e00f769991f762615949ed114f86380948153fb0ad5dfef73b65706a0c3c689f544e5836b5b5e01184a9ada9f59dce2dba6aee386660d31545849de40abcba4a1da9fb07cb65");
+const rsa_test_dq = hexToBytes("90779aabf7b2adfabda763507fd790e10eec41b201aebf0fa80f61a335e79bd9a675d0bd46ee2cd503d5b09a457556ae388f95c03e274e666d90ddeca2fb54a7b49219a620092a90ffc56a66289de44f2aed0c23d435d9caa41d4be286aecc4432a555f5aeec0e016422bea7ebcab71915791724db8eed31a17afce76b9165d3");
+const rsa_test_qinv = hexToBytes("c4cae178938b60717e4d0484c144c548b275f87dd2723cfe1b6a5ba68305b154d1c86c894716bd9d5b4f974f51ad98942fa26005188896931a73206b778b946f96c6443f67bbb1861ce8a2e9d438befdb6cb1b7f413edc5b155b436660320f3cd26b0f65a9f586f957257b81e7c410856150abf4bb8f691beabecf7e428a2f8c");
+
+fn rsaTestPrivateKey() rsa_sign.PrivateKey {
+    return .{
+        .n = &rsa_test_n,
+        .e = &rsa_test_e,
+        .d = &rsa_test_d,
+        .p = &rsa_test_p,
+        .q = &rsa_test_q,
+        .dp = &rsa_test_dp,
+        .dq = &rsa_test_dq,
+        .qinv = &rsa_test_qinv,
+    };
 }
 
 test "loopback: tls_client completes a handshake against tls_server + app data both ways" {
@@ -2109,6 +2156,61 @@ test "loopback: tls_client completes a handshake against tls_server with ECDSA-P
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("ecdsa hello server", got_s);
+}
+
+test "loopback: tls_client completes a handshake against tls_server with RSA leaf" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const rsa_key = rsaTestPrivateKey();
+    var cert_buf: [2048]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedRsa(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x52, 0x13 },
+        .public_modulus = rsa_key.n,
+        .public_exponent = rsa_key.e,
+        .private_key = rsa_key,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .rsa_signing_key = rsa_key });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    const s2c = try server.encrypt("rsa hello client");
+    defer alloc.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("rsa hello client", got_c);
+
+    const c2s = try client.encrypt("rsa hello server");
+    defer alloc.free(c2s);
+    const got_s = try server.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("rsa hello server", got_s);
 }
 
 test "loopback: handshake completes over TLS_AES_256_GCM_SHA384 (SHA-384 schedule)" {
