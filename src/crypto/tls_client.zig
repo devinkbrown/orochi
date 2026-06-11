@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const hkdf_tls13 = @import("hkdf_tls13.zig");
+const tls_resumption = @import("tls_resumption.zig");
 const tls_record = @import("tls_record.zig");
 const x509 = @import("x509.zig");
 const x509_verify = @import("x509_verify.zig");
@@ -25,6 +26,8 @@ const supported_groups = @import("../proto/supported_groups.zig");
 const sni = @import("../proto/sni.zig");
 const tls_alert = @import("../proto/tls_alert.zig");
 const tls_finished = @import("../proto/tls_finished.zig");
+const tls_psk = @import("../proto/tls_psk.zig");
+const tls_session_ticket = @import("../proto/tls_session_ticket.zig");
 const tls_alpn = @import("../proto/tls_alpn.zig");
 const toml = @import("../proto/toml.zig");
 
@@ -83,7 +86,9 @@ pub const Error = error{
     ecdsa_p256.DerError || ecdsa_p256.Sec1Error || tls_extension.Error ||
     tls_keyshare.Error || tls_supported_versions.Error ||
     tls_signature_scheme.Error || supported_groups.Error || tls_alpn.Error ||
-    tls_alert.ParseError || rsa_verify.Error || sign.VerifyError;
+    tls_alert.ParseError || rsa_verify.Error || sign.VerifyError ||
+    tls_psk.Error || tls_session_ticket.ParseError || tls_session_ticket.EncodeError ||
+    tls_resumption.Error;
 
 pub const Options = struct {
     server_name: []const u8,
@@ -122,6 +127,7 @@ const State = enum {
 const HandshakeType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
+    new_session_ticket = 4,
     encrypted_extensions = 8,
     certificate = 11,
     certificate_request = 13,
@@ -213,6 +219,22 @@ const CertParts = struct {
     spki_der: []const u8,
 };
 
+const ResumeOffer = struct {
+    ticket: []u8,
+    ticket_age_add: u32,
+    ticket_lifetime: u32,
+    ticket_age_ms: u64,
+    suite: CipherSuite,
+    psk: [max_hash_len]u8,
+    psk_len: usize,
+
+    fn wipe(self: *ResumeOffer, allocator: Allocator) void {
+        allocator.free(self.ticket);
+        secureZero(&self.psk);
+        self.* = undefined;
+    }
+};
+
 pub const Client = struct {
     allocator: Allocator,
     server_name: []u8,
@@ -283,6 +305,15 @@ pub const Client = struct {
     /// SHA-384 key schedule is exercised end-to-end over the loopback.
     force_aes256_only_for_test: bool = false,
 
+    /// Optional PSK resumption offer loaded from a serialized session ticket.
+    resume_offer: ?ResumeOffer = null,
+    /// True when the server echoes `pre_shared_key(selected_identity = 0)` in
+    /// ServerHello and the certificate-auth flight is therefore omitted.
+    psk_accepted: bool = false,
+    /// Latest captured serialized session ticket. Ownership transfers through
+    /// `takeSessionTicket`.
+    captured_session_ticket: ?[]u8 = null,
+
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
     hs_plain: std.ArrayList(u8) = .empty,
@@ -292,6 +323,7 @@ pub const Client = struct {
     early_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    resumption_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
@@ -341,6 +373,7 @@ pub const Client = struct {
         secureZero(&self.early_secret);
         secureZero(&self.handshake_secret);
         secureZero(&self.master_secret);
+        secureZero(&self.resumption_master_secret);
         secureZero(&self.client_hs_secret);
         secureZero(&self.server_hs_secret);
         secureZero(&self.client_app_secret);
@@ -354,6 +387,8 @@ pub const Client = struct {
         self.hs_plain.deinit(self.allocator);
         self.post_handshake_send.deinit(self.allocator);
         if (self.retry_hello) |r| self.allocator.free(r);
+        if (self.resume_offer) |*offer| offer.wipe(self.allocator);
+        if (self.captured_session_ticket) |ticket| self.allocator.free(ticket);
         self.allocator.free(self.server_name);
         self.allocator.free(self.trust_anchors);
         self.allocator.free(self.alpn_protocols);
@@ -395,6 +430,40 @@ pub const Client = struct {
 
     pub fn handshakeDone(self: *const Client) bool {
         return self.state == .connected;
+    }
+
+    /// Load a serialized TLS 1.3 session ticket previously returned by
+    /// `takeSessionTicket`. `ticket_age_ms` is the caller's elapsed wall-clock
+    /// age for the ticket and is folded into `obfuscated_ticket_age`.
+    pub fn setSessionTicket(self: *Client, serialized: []const u8, ticket_age_ms: u64) Error!void {
+        const decoded = try tls_resumption.decodeStoredSession(serialized);
+        const suite = try CipherSuite.fromWire(decoded.suite);
+        if (decoded.psk.len != suite.hashLen()) return error.BadSession;
+        if (self.resume_offer) |*old| {
+            old.wipe(self.allocator);
+            self.resume_offer = null;
+        }
+        const ticket = try self.allocator.dupe(u8, decoded.ticket);
+        errdefer self.allocator.free(ticket);
+        var psk: [max_hash_len]u8 = [_]u8{0} ** max_hash_len;
+        @memcpy(psk[0..decoded.psk.len], decoded.psk);
+        self.resume_offer = .{
+            .ticket = ticket,
+            .ticket_age_add = decoded.ticket_age_add,
+            .ticket_lifetime = decoded.ticket_lifetime,
+            .ticket_age_ms = ticket_age_ms,
+            .suite = suite,
+            .psk = psk,
+            .psk_len = decoded.psk.len,
+        };
+    }
+
+    /// Take ownership of the newest captured resumable session ticket, if a
+    /// post-handshake NewSessionTicket has been received and parsed.
+    pub fn takeSessionTicket(self: *Client) ?[]u8 {
+        const ticket = self.captured_session_ticket orelse return null;
+        self.captured_session_ticket = null;
+        return ticket;
     }
 
     /// Test-only: configure a client certificate to present in response to a
@@ -537,9 +606,42 @@ pub const Client = struct {
                 if (request == @intFromEnum(KeyUpdateRequest.requested)) {
                     try self.sendKeyUpdate(.not_requested);
                 }
+            } else if (msg.typ == .new_session_ticket) {
+                try self.captureNewSessionTicket(msg.body);
             }
-            // Other post-handshake messages (e.g. NewSessionTicket) are ignored.
+            // Other post-handshake messages are ignored.
         }
+    }
+
+    fn captureNewSessionTicket(self: *Client, body: []const u8) Error!void {
+        const suite = self.selected_suite orelse return error.BadState;
+        const ticket = try tls_session_ticket.parse(body);
+        if (ticket.ticket.len == 0 or ticket.ticket_lifetime == 0) return;
+
+        var psk: [max_hash_len]u8 = undefined;
+        const psk_len = switch (self.hashAlg()) {
+            .sha256 => try self.deriveTicketPskT(Sha256, ticket.ticket_nonce, &psk),
+            .sha384 => try self.deriveTicketPskT(Sha384, ticket.ticket_nonce, &psk),
+        };
+        const serialized = try tls_resumption.encodeStoredSession(self.allocator, .{
+            .suite = @intFromEnum(suite),
+            .ticket_lifetime = ticket.ticket_lifetime,
+            .ticket_age_add = ticket.ticket_age_add,
+            .ticket = ticket.ticket,
+            .psk = psk[0..psk_len],
+        });
+        secureZero(psk[0..psk_len]);
+        if (self.captured_session_ticket) |old| self.allocator.free(old);
+        self.captured_session_ticket = serialized;
+    }
+
+    fn deriveTicketPskT(self: *Client, comptime KS: type, ticket_nonce: []const u8, out: *[max_hash_len]u8) Error!usize {
+        var sk: [KS.hash_len]u8 = undefined;
+        @memcpy(&sk, self.resumption_master_secret[0..KS.hash_len]);
+        var rms = KS.SecretBytes.init(sk);
+        defer rms.wipe();
+        try KS.hkdfExpandLabel(&rms, "resumption", ticket_nonce, out[0..KS.hash_len]);
+        return KS.hash_len;
     }
 
     /// Emit a KeyUpdate of our own (encrypted under the *current* send keys),
@@ -592,7 +694,7 @@ pub const Client = struct {
         try body.append(self.allocator, 1);
         try body.append(self.allocator, 0);
 
-        var ext_storage: [2048]u8 = undefined;
+        var ext_storage: [4096]u8 = undefined;
         var ext_builder = try tls_extension.Builder.begin(&ext_storage);
 
         var sni_buf: [512]u8 = undefined;
@@ -649,9 +751,76 @@ pub const Client = struct {
             try ext_builder.addTyped(.cookie, cookie_ext[0 .. 2 + cookie.len]);
         }
 
+        var binder_offset: ?usize = null;
+        var binder_len: usize = 0;
+        var binder_truncated_len: usize = 0;
+        if (self.resume_offer) |offer| {
+            // RFC 8446 §4.2.9: PSK resumption here always keeps a fresh ECDHE
+            // key_share, so advertise only psk_dhe_ke.
+            try ext_builder.addTyped(.psk_key_exchange_modes, &[_]u8{ 1, 1 });
+
+            const identity = tls_psk.PskIdentity{
+                .identity = offer.ticket,
+                .obfuscated_ticket_age = tls_session_ticket.obfuscatedAge(offer.ticket_age_ms, offer.ticket_age_add),
+            };
+            var zero_binder: [max_hash_len]u8 = [_]u8{0} ** max_hash_len;
+            const binders = [_][]const u8{zero_binder[0..offer.psk_len]};
+            const psk_ext_data_offset = ext_builder.len + tls_extension.header_len;
+            const psk_tmp_len = 2 + (try identity.wireLen()) + 2 + 1 + offer.psk_len;
+            const psk_tmp = try self.allocator.alloc(u8, psk_tmp_len);
+            defer self.allocator.free(psk_tmp);
+            const psk_body = try tls_psk.buildClientPsk(psk_tmp, &[_]tls_psk.PskIdentity{identity}, &binders);
+            const binder_list_offset = try tls_psk.binderListOffset(psk_body);
+            try ext_builder.addTyped(.pre_shared_key, psk_body);
+
+            const extensions_offset_in_body = body.items.len;
+            binder_truncated_len = 4 + extensions_offset_in_body + psk_ext_data_offset + binder_list_offset;
+            binder_offset = binder_truncated_len + 2 + 1;
+            binder_len = offer.psk_len;
+        }
+
         const extensions = try ext_builder.finish();
         try body.appendSlice(self.allocator, extensions);
+        const hs_start = out.items.len;
         try writeHandshake(self.allocator, out, .client_hello, body.items);
+        if (binder_offset) |rel| {
+            const hs = out.items[hs_start..];
+            if (rel + binder_len > hs.len or binder_truncated_len > hs.len) return error.BadHandshake;
+            var binder: [max_hash_len]u8 = undefined;
+            try self.computePskBinder(hs[0..binder_truncated_len], binder[0..binder_len]);
+            @memcpy(hs[rel..][0..binder_len], binder[0..binder_len]);
+            secureZero(binder[0..binder_len]);
+        }
+    }
+
+    fn computePskBinder(self: *Client, truncated_client_hello: []const u8, out: []u8) Error!void {
+        const offer = self.resume_offer orelse return error.BadState;
+        switch (offer.suite.hashAlg()) {
+            .sha256 => try self.computePskBinderT(Sha256, offer, truncated_client_hello, out),
+            .sha384 => try self.computePskBinderT(Sha384, offer, truncated_client_hello, out),
+        }
+    }
+
+    fn computePskBinderT(
+        self: *Client,
+        comptime KS: type,
+        offer: ResumeOffer,
+        truncated_client_hello: []const u8,
+        out: []u8,
+    ) Error!void {
+        if (offer.psk_len != KS.hash_len or out.len != KS.hash_len) return error.BadHandshake;
+        var early = KS.earlySecret(offer.psk[0..offer.psk_len]);
+        defer early.wipe();
+        var binder_key = try KS.deriveSecret(&early, "res binder", &KS.emptyTranscriptHash());
+        defer binder_key.wipe();
+
+        var transcript = std.ArrayList(u8).empty;
+        defer transcript.deinit(self.allocator);
+        try transcript.appendSlice(self.allocator, self.transcript.items);
+        try transcript.appendSlice(self.allocator, truncated_client_hello);
+        const th = KS.transcriptHash(transcript.items);
+        const verify = tls_finished.For(KS).verifyData(binder_key.declassify(), th);
+        @memcpy(out, &verify);
     }
 
     const ServerHelloStep = enum { need_more, proceed, retry };
@@ -810,7 +979,7 @@ pub const Client = struct {
                 if (msg.typ != .encrypted_extensions) return error.BadHandshake;
                 try self.parseEncryptedExtensions(msg.body);
                 try self.appendTranscript(msg.raw);
-                self.state = .wait_certificate;
+                self.state = if (self.psk_accepted) .wait_finished else .wait_certificate;
             },
             .wait_certificate => {
                 // An optional CertificateRequest precedes the server
@@ -862,6 +1031,7 @@ pub const Client = struct {
 
         var selected_version = false;
         var selected_share: ?tls_keyshare.Entry = null;
+        var selected_psk: ?u16 = null;
         var it = tls_extension.Iterator.init(extensions_block);
         while (try it.next()) |ext| {
             switch (ext.typed()) {
@@ -872,11 +1042,19 @@ pub const Client = struct {
                     selected_version = true;
                 },
                 .key_share => selected_share = try tls_keyshare.parseServerShare(ext.data),
+                .pre_shared_key => selected_psk = try tls_psk.parseServerPsk(ext.data),
                 else => {},
             }
         }
         if (!selected_version or selected_share == null) return error.MissingExtension;
         self.selected_suite = suite;
+        self.psk_accepted = false;
+        if (selected_psk) |idx| {
+            if (idx != 0) return error.BadHandshake;
+            const offer = self.resume_offer orelse return error.BadHandshake;
+            if (offer.suite != suite or offer.psk_len != suite.hashLen()) return error.BadHandshake;
+            self.psk_accepted = true;
+        }
         const share = selected_share.?;
         const shared = switch (share.group) {
             .x25519 => blk: {
@@ -1010,6 +1188,7 @@ pub const Client = struct {
         defer hs.deinit(self.allocator);
         try writeHandshake(self.allocator, &hs, .finished, verify_data);
         try self.appendTranscript(hs.items);
+        try self.deriveResumptionMasterSecret();
         const record = try sealRecordAlloc(self.allocator, suite, &self.client_hs_keys, self.hs_write_seq, .handshake, hs.items);
         defer self.allocator.free(record);
         self.hs_write_seq += 1;
@@ -1137,7 +1316,12 @@ pub const Client = struct {
     }
 
     fn deriveHandshakeKeysT(self: *Client, comptime KS: type, shared_secret: [32]u8) Error!void {
-        var early = KS.earlySecret("");
+        const psk = if (self.psk_accepted) blk: {
+            const offer = self.resume_offer orelse return error.BadHandshake;
+            if (offer.psk_len != KS.hash_len) return error.BadHandshake;
+            break :blk offer.psk[0..offer.psk_len];
+        } else "";
+        var early = KS.earlySecret(psk);
         defer early.wipe();
         self.early_secret[0..KS.hash_len].* = early.declassify();
 
@@ -1184,6 +1368,24 @@ pub const Client = struct {
         try deriveTrafficKeys(suite, self.server_app_secret[0..KS.hash_len], &self.server_app_keys);
         self.app_read_seq = 0;
         self.app_write_seq = 0;
+    }
+
+    fn deriveResumptionMasterSecret(self: *Client) Error!void {
+        switch (self.hashAlg()) {
+            .sha256 => try self.deriveResumptionMasterSecretT(Sha256),
+            .sha384 => try self.deriveResumptionMasterSecretT(Sha384),
+        }
+    }
+
+    fn deriveResumptionMasterSecretT(self: *Client, comptime KS: type) Error!void {
+        var sk: [KS.hash_len]u8 = undefined;
+        @memcpy(&sk, self.master_secret[0..KS.hash_len]);
+        var master = KS.SecretBytes.init(sk);
+        defer master.wipe();
+        const th = KS.transcriptHash(self.transcript.items);
+        var rms = try KS.deriveSecret(&master, "res master", &th);
+        defer rms.wipe();
+        self.resumption_master_secret[0..KS.hash_len].* = rms.declassify();
     }
 
     fn appendTranscript(self: *Client, bytes: []const u8) Error!void {
@@ -1902,8 +2104,21 @@ test "decryptApp skips post-handshake handshake records (NewSessionTicket)" {
     client.server_app_keys.key[0..Aes128Gcm.key_length].* = [_]u8{0x5A} ** Aes128Gcm.key_length;
     client.server_app_keys.iv = [_]u8{0xA5} ** 12;
 
-    // A NewSessionTicket arrives first (seq 0), then real application data (seq 1).
-    const ticket = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, "\x04\x00\x00\x00");
+    // A syntactically valid, zero-lifetime NewSessionTicket arrives first
+    // (seq 0), then real application data (seq 1). Zero lifetime means it is
+    // consumed as control but not persisted for resumption.
+    var ticket_body_buf: [32]u8 = undefined;
+    const ticket_body = try tls_session_ticket.encode(&ticket_body_buf, .{
+        .ticket_lifetime = 0,
+        .ticket_age_add = 0,
+        .ticket_nonce = "",
+        .ticket = &.{0xaa},
+        .extensions = "",
+    });
+    var ticket_hs: std.ArrayList(u8) = .empty;
+    defer ticket_hs.deinit(allocator);
+    try writeHandshake(allocator, &ticket_hs, .new_session_ticket, ticket_body);
+    const ticket = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, ticket_hs.items);
     defer allocator.free(ticket);
     const app = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &client.server_app_keys, 1, .application_data, "HTTP/1.1 200 OK");
     defer allocator.free(app);

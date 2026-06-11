@@ -37,6 +37,7 @@ pub const tls_client = @import("tls_client.zig");
 pub const tls_kat = @import("tls_kat.zig");
 pub const tls_props = @import("tls_props.zig");
 pub const tls_record = @import("tls_record.zig");
+pub const tls_resumption = @import("tls_resumption.zig");
 pub const tls_server = @import("tls_server.zig");
 pub const tls = @import("tls.zig");
 pub const totp = @import("totp.zig");
@@ -91,6 +92,7 @@ test {
     _ = tls_kat;
     _ = tls_props;
     _ = tls_record;
+    _ = tls_resumption;
     _ = tls_server;
     _ = tls;
     _ = totp;

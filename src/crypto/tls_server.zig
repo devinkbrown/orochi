@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const kx = @import("kx.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const hkdf = @import("hkdf_tls13.zig");
+const tls_resumption = @import("tls_resumption.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const Sha256 = hkdf.Sha256;
 const Sha384 = hkdf.Sha384;
@@ -31,6 +32,8 @@ const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
 const tls_finished = @import("../proto/tls_finished.zig");
 const tls_alpn = @import("../proto/tls_alpn.zig");
+const tls_psk = @import("../proto/tls_psk.zig");
+const tls_session_ticket = @import("../proto/tls_session_ticket.zig");
 const x509 = @import("x509.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -51,7 +54,8 @@ pub const Error = error{
     NoSigningKey,
 } || Allocator.Error || tls_record.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error ||
-    tls_signature_scheme.Error;
+    tls_signature_scheme.Error || tls_psk.Error || tls_session_ticket.EncodeError ||
+    tls_resumption.Error;
 
 pub const Config = struct {
     /// DER certificates, leaf first. The leaf SPKI must match the configured
@@ -76,6 +80,15 @@ pub const Config = struct {
     /// Certificate) still completes; `clientCertDer()` stays null. Default false
     /// is fully backward-compatible (no CertificateRequest).
     request_client_cert: bool = false,
+    /// Enable one post-handshake NewSessionTicket after the client Finished.
+    /// The default is false so existing full handshakes remain byte-for-byte
+    /// unchanged unless the caller opts into resumption.
+    enable_session_tickets: bool = false,
+    /// Optional reusable ticket key. When omitted, `Server.init` generates a
+    /// fresh per-server key; callers can retrieve it with `ticketKey()`.
+    ticket_key: ?tls_resumption.TicketKey = null,
+    /// Lifetime advertised in NewSessionTicket.
+    ticket_lifetime_seconds: u32 = 86_400,
 };
 
 pub const SigningKey = union(enum) {
@@ -92,6 +105,15 @@ const CipherSuite = enum(u16) {
     tls_aes_128_gcm_sha256 = 0x1301,
     tls_aes_256_gcm_sha384 = 0x1302,
     tls_chacha20_poly1305_sha256 = 0x1303,
+
+    fn fromWire(v: u16) Error!CipherSuite {
+        return switch (v) {
+            0x1301 => .tls_aes_128_gcm_sha256,
+            0x1302 => .tls_aes_256_gcm_sha384,
+            0x1303 => .tls_chacha20_poly1305_sha256,
+            else => error.UnsupportedCipherSuite,
+        };
+    }
 
     fn keyLen(self: CipherSuite) usize {
         return switch (self) {
@@ -113,6 +135,13 @@ const CipherSuite = enum(u16) {
         return switch (self) {
             .tls_aes_256_gcm_sha384 => .sha384,
             else => .sha256,
+        };
+    }
+
+    fn hashLen(self: CipherSuite) usize {
+        return switch (self.hashAlg()) {
+            .sha256 => Sha256.hash_len,
+            .sha384 => Sha384.hash_len,
         };
     }
 };
@@ -142,6 +171,7 @@ pub const Server = struct {
     allocator: Allocator,
     config: Config,
     state: State = .idle,
+    ticket_key: tls_resumption.TicketKey,
 
     x25519_pair: kx.X25519Kx.KeyPair,
     p256_pair: ecdh_p256.KeyPair,
@@ -150,6 +180,7 @@ pub const Server = struct {
     selected_group: tls_keyshare.NamedGroup = .x25519,
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
+    resumed: bool = false,
     legacy_session_id: [32]u8 = [_]u8{0} ** 32,
     session_id_len: usize = 0,
 
@@ -174,8 +205,11 @@ pub const Server = struct {
     // Stored at the maximum hash length (SHA-384); only the first
     // `selected_suite.hashAlg()` digest bytes are live for a given connection.
     early_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    accepted_psk: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    accepted_psk_len: usize = 0,
     handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    resumption_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_app_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
@@ -196,9 +230,16 @@ pub const Server = struct {
         var seed: [kx.X25519Kx.seed_len]u8 = undefined;
         try osEntropy(&seed);
         defer secureZero(&seed);
+        var ticket_key: tls_resumption.TicketKey = undefined;
+        if (config.ticket_key) |key| {
+            ticket_key = key;
+        } else {
+            try osEntropy(&ticket_key);
+        }
         return .{
             .allocator = allocator,
             .config = config,
+            .ticket_key = ticket_key,
             .state = .wait_client_hello,
             .request_client_cert = config.request_client_cert,
             .x25519_pair = kx.X25519Kx.generateDeterministic(seed) catch return error.BadState,
@@ -209,9 +250,12 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.x25519_pair.wipe();
         secureZero(&self.p256_pair.secret);
+        secureZero(&self.ticket_key);
         secureZero(&self.early_secret);
+        secureZero(&self.accepted_psk);
         secureZero(&self.handshake_secret);
         secureZero(&self.master_secret);
+        secureZero(&self.resumption_master_secret);
         secureZero(&self.client_hs_secret);
         secureZero(&self.server_hs_secret);
         secureZero(&self.client_app_secret);
@@ -242,6 +286,18 @@ pub const Server = struct {
         return self.selected_alpn;
     }
 
+    /// Return the per-server ticket key so a replacement `Server` can accept
+    /// tickets issued by this instance.
+    pub fn ticketKey(self: *const Server) tls_resumption.TicketKey {
+        return self.ticket_key;
+    }
+
+    /// True when the current handshake accepted a PSK ticket and used the
+    /// abbreviated TLS 1.3 resumption flight.
+    pub fn acceptedSessionTicket(self: *const Server) bool {
+        return self.resumed;
+    }
+
     pub fn feed(self: *Server, received: []const u8) Error!FeedResult {
         if (self.state == .idle or self.state == .connected) return error.BadState;
         try self.recv_buf.appendSlice(self.allocator, received);
@@ -257,11 +313,11 @@ pub const Server = struct {
             const msg = try parseHandshake(rec.fragment, &off);
             if (off != rec.fragment.len or msg.typ != .client_hello) return error.BadHandshake;
             try self.appendTranscript(msg.raw);
-            const reply = try self.buildServerFlight(msg.body);
+            const reply = try self.buildServerFlight(msg.body, msg.raw);
             consumePrefix(&self.recv_buf, rec.wire_len);
             // mTLS expects Certificate -> CertificateVerify -> Finished; otherwise
             // just the client Finished.
-            self.state = if (self.request_client_cert) .wait_client_cert else .wait_client_finished;
+            self.state = if (self.request_client_cert and !self.resumed) .wait_client_cert else .wait_client_finished;
             return .{ .bytes_to_send = reply };
         }
 
@@ -314,7 +370,9 @@ pub const Server = struct {
                 if (msg.typ != .finished) return error.BadHandshake;
                 if (!self.finishedVerify(&self.client_hs_secret, msg.body)) return error.FinishedMismatch;
                 try self.appendTranscript(msg.raw);
+                try self.deriveResumptionMasterSecret();
                 self.state = .connected;
+                if (self.config.enable_session_tickets) try self.queueNewSessionTicket();
             },
             else => return error.BadState,
         }
@@ -459,8 +517,8 @@ pub const Server = struct {
         }
     }
 
-    fn buildServerFlight(self: *Server, client_hello_body: []const u8) Error![]u8 {
-        const shared = try self.processClientHello(client_hello_body);
+    fn buildServerFlight(self: *Server, client_hello_body: []const u8, client_hello_raw: []const u8) Error![]u8 {
+        const shared = try self.processClientHello(client_hello_body, client_hello_raw);
 
         // ServerHello (plaintext handshake record).
         var sh_hs: std.ArrayList(u8) = .empty;
@@ -476,9 +534,11 @@ pub const Server = struct {
         var flight: std.ArrayList(u8) = .empty;
         defer flight.deinit(self.allocator);
         try self.writeEncryptedExtensions(&flight);
-        if (self.request_client_cert) try self.writeCertificateRequest(&flight);
-        try self.writeCertificate(&flight);
-        try self.writeCertificateVerify(&flight);
+        if (!self.resumed) {
+            if (self.request_client_cert) try self.writeCertificateRequest(&flight);
+            try self.writeCertificate(&flight);
+            try self.writeCertificateVerify(&flight);
+        }
         try self.writeServerFinished(&flight);
 
         // Application keys are derived over CH..server Finished (matches client).
@@ -499,7 +559,7 @@ pub const Server = struct {
         return out;
     }
 
-    fn processClientHello(self: *Server, body: []const u8) Error![32]u8 {
+    fn processClientHello(self: *Server, body: []const u8, raw: []const u8) Error![32]u8 {
         var c = Cursor.init(body);
         if (try c.readU16() != tls_record.legacy_record_version) return error.ProtocolVersion;
         _ = try c.take(32); // client random (unused by the server key schedule)
@@ -509,7 +569,7 @@ pub const Server = struct {
         self.session_id_len = sid.len;
 
         const suites_block = try c.take(try c.readU16());
-        self.selected_suite = pickSuite(suites_block) orelse return error.UnsupportedCipherSuite;
+        const full_suite = pickSuite(suites_block) orelse return error.UnsupportedCipherSuite;
 
         const comp = try c.take(try c.readU8());
         var null_comp = false;
@@ -523,6 +583,8 @@ pub const Server = struct {
         var offered_tls13 = false;
         var x25519_share: ?[]const u8 = null;
         var p256_share: ?[]const u8 = null;
+        var psk_modes_ok = false;
+        var psk_ext: ?[]const u8 = null;
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
             switch (ext.typed()) {
@@ -540,11 +602,27 @@ pub const Server = struct {
                     }
                 },
                 .alpn => self.maybeSelectAlpn(ext.data),
+                .psk_key_exchange_modes => psk_modes_ok = pskModesAllowDhe(ext.data),
+                .pre_shared_key => {
+                    if (it.remaining() != 0) return error.BadHandshake;
+                    psk_ext = ext.data;
+                },
                 else => {},
             }
         }
 
         if (!offered_tls13) return error.ProtocolVersion;
+        self.selected_suite = full_suite;
+        self.resumed = false;
+        self.accepted_psk_len = 0;
+        if (psk_ext) |ext| {
+            if (psk_modes_ok) {
+                if (try self.tryAcceptPsk(suites_block, raw, ext)) |suite| {
+                    self.selected_suite = suite;
+                    self.resumed = true;
+                }
+            }
+        }
 
         // Prefer X25519; fall back to secp256r1 when it is the only group offered.
         if (x25519_share) |peer| {
@@ -560,6 +638,54 @@ pub const Server = struct {
             return ecdh_p256.sharedSecret(self.p256_pair.secret, peer[0..ecdh_p256.public_length].*) catch return error.BadHandshake;
         }
         return error.UnsupportedGroup;
+    }
+
+    fn tryAcceptPsk(self: *Server, suites_block: []const u8, client_hello_raw: []const u8, psk_ext: []const u8) Error!?CipherSuite {
+        var parsed = tls_psk.parseClientPsk(psk_ext) catch return null;
+        const identity = (parsed.identities.next() catch return null) orelse return null;
+        const binder = (parsed.binders.next() catch return null) orelse return null;
+        if ((parsed.identities.next() catch return null) != null) return null;
+        if ((parsed.binders.next() catch return null) != null) return null;
+
+        const opened = tls_resumption.openTicket(self.allocator, self.ticket_key, identity.identity) catch return null;
+        defer self.allocator.free(opened.plain);
+        const suite = CipherSuite.fromWire(opened.opened.suite) catch return null;
+        if (!clientOfferedSuite(suites_block, suite)) return null;
+        if (opened.opened.psk.len != suite.hashLen()) return null;
+        if (binder.len != suite.hashLen()) return null;
+
+        const binder_list_offset = tls_psk.binderListOffset(psk_ext) catch return null;
+        const psk_body_offset = findPskExtensionBodyOffset(client_hello_raw) catch return null;
+        const truncated_len = psk_body_offset + binder_list_offset;
+        if (truncated_len > client_hello_raw.len) return null;
+        if (!self.verifyPskBinder(suite, opened.opened.psk, client_hello_raw[0..truncated_len], binder)) return null;
+
+        @memcpy(self.accepted_psk[0..opened.opened.psk.len], opened.opened.psk);
+        self.accepted_psk_len = opened.opened.psk.len;
+        return suite;
+    }
+
+    fn verifyPskBinder(self: *Server, suite: CipherSuite, psk: []const u8, truncated_client_hello: []const u8, binder: []const u8) bool {
+        _ = self;
+        return switch (suite.hashAlg()) {
+            .sha256 => verifyPskBinderT(Sha256, psk, truncated_client_hello, binder),
+            .sha384 => verifyPskBinderT(Sha384, psk, truncated_client_hello, binder),
+        };
+    }
+
+    fn verifyPskBinderT(comptime KS: type, psk: []const u8, truncated_client_hello: []const u8, binder: []const u8) bool {
+        if (psk.len != KS.hash_len or binder.len != KS.hash_len) return false;
+        var early = KS.earlySecret(psk);
+        defer early.wipe();
+        var binder_key = KS.deriveSecret(&early, "res binder", &KS.emptyTranscriptHash()) catch return false;
+        defer binder_key.wipe();
+        const th = KS.transcriptHash(truncated_client_hello);
+        const expected = tls_finished.For(KS).verifyData(binder_key.declassify(), th);
+        return switch (KS.hash_len) {
+            Sha256.hash_len => std.crypto.timing_safe.eql([Sha256.hash_len]u8, expected, binder[0..Sha256.hash_len].*),
+            Sha384.hash_len => std.crypto.timing_safe.eql([Sha384.hash_len]u8, expected, binder[0..Sha384.hash_len].*),
+            else => false,
+        };
     }
 
     fn maybeSelectAlpn(self: *Server, data: []const u8) void {
@@ -601,6 +727,10 @@ pub const Server = struct {
             else => try tls_keyshare.buildServerShare(&ks_buf, .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key }),
         };
         try ext_builder.addTyped(.key_share, ks);
+        if (self.resumed) {
+            var psk_buf: [2]u8 = undefined;
+            try ext_builder.addTyped(.pre_shared_key, try tls_psk.buildServerPsk(&psk_buf, 0));
+        }
         try body.appendSlice(self.allocator, try ext_builder.finish());
 
         try writeHandshake(self.allocator, out, .server_hello, body.items);
@@ -751,7 +881,11 @@ pub const Server = struct {
     }
 
     fn deriveHandshakeKeysT(self: *Server, comptime KS: type, shared_secret: [32]u8) Error!void {
-        var early = KS.earlySecret("");
+        const psk = if (self.resumed) blk: {
+            if (self.accepted_psk_len != KS.hash_len) return error.BadHandshake;
+            break :blk self.accepted_psk[0..self.accepted_psk_len];
+        } else "";
+        var early = KS.earlySecret(psk);
         defer early.wipe();
         self.early_secret[0..KS.hash_len].* = early.declassify();
 
@@ -800,6 +934,79 @@ pub const Server = struct {
         self.app_write_seq = 0;
     }
 
+    fn deriveResumptionMasterSecret(self: *Server) Error!void {
+        switch (self.hashAlg()) {
+            .sha256 => try self.deriveResumptionMasterSecretT(Sha256),
+            .sha384 => try self.deriveResumptionMasterSecretT(Sha384),
+        }
+    }
+
+    fn deriveResumptionMasterSecretT(self: *Server, comptime KS: type) Error!void {
+        var sk: [KS.hash_len]u8 = undefined;
+        @memcpy(&sk, self.master_secret[0..KS.hash_len]);
+        var master = KS.SecretBytes.init(sk);
+        defer master.wipe();
+        const th = KS.transcriptHash(self.transcript.items);
+        var rms = try KS.deriveSecret(&master, "res master", &th);
+        defer rms.wipe();
+        self.resumption_master_secret[0..KS.hash_len].* = rms.declassify();
+    }
+
+    fn queueNewSessionTicket(self: *Server) Error!void {
+        const suite = self.selected_suite orelse return error.BadState;
+        var ticket_nonce: [tls_resumption.ticket_nonce_len]u8 = undefined;
+        try osEntropy(&ticket_nonce);
+        var age_add_bytes: [4]u8 = undefined;
+        try osEntropy(&age_add_bytes);
+        const ticket_age_add = std.mem.readInt(u32, &age_add_bytes, .big);
+        var aead_nonce: [ChaCha20Poly1305.nonce_length]u8 = undefined;
+        try osEntropy(&aead_nonce);
+
+        var psk: [max_hash_len]u8 = undefined;
+        const psk_len = switch (self.hashAlg()) {
+            .sha256 => try self.deriveTicketPskT(Sha256, &ticket_nonce, &psk),
+            .sha384 => try self.deriveTicketPskT(Sha384, &ticket_nonce, &psk),
+        };
+        defer secureZero(psk[0..psk_len]);
+
+        const sealed = try tls_resumption.sealTicket(
+            self.allocator,
+            self.ticket_key,
+            aead_nonce,
+            @intFromEnum(suite),
+            psk[0..psk_len],
+            &ticket_nonce,
+            currentUnixMs(),
+        );
+        defer self.allocator.free(sealed);
+
+        var ticket_body_buf: [512]u8 = undefined;
+        const ticket_body = try tls_session_ticket.encode(&ticket_body_buf, .{
+            .ticket_lifetime = self.config.ticket_lifetime_seconds,
+            .ticket_age_add = ticket_age_add,
+            .ticket_nonce = &ticket_nonce,
+            .ticket = sealed,
+            .extensions = "",
+        });
+
+        var hs: std.ArrayList(u8) = .empty;
+        defer hs.deinit(self.allocator);
+        try writeHandshake(self.allocator, &hs, .new_session_ticket, ticket_body);
+        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, self.app_write_seq, .handshake, hs.items);
+        defer self.allocator.free(record);
+        self.app_write_seq += 1;
+        try self.post_handshake_send.appendSlice(self.allocator, record);
+    }
+
+    fn deriveTicketPskT(self: *Server, comptime KS: type, ticket_nonce: []const u8, out: *[max_hash_len]u8) Error!usize {
+        var sk: [KS.hash_len]u8 = undefined;
+        @memcpy(&sk, self.resumption_master_secret[0..KS.hash_len]);
+        var rms = KS.SecretBytes.init(sk);
+        defer rms.wipe();
+        try KS.hkdfExpandLabel(&rms, "resumption", ticket_nonce, out[0..KS.hash_len]);
+        return KS.hash_len;
+    }
+
     fn appendTranscript(self: *Server, bytes: []const u8) Error!void {
         try self.transcript.appendSlice(self.allocator, bytes);
     }
@@ -817,6 +1024,7 @@ fn activeSigningKey(config: Config) ?SigningKey {
 const HandshakeType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
+    new_session_ticket = 4,
     encrypted_extensions = 8,
     certificate_request = 13,
     certificate = 11,
@@ -883,6 +1091,61 @@ fn pickSuite(block: []const u8) ?CipherSuite {
     return null;
 }
 
+fn clientOfferedSuite(block: []const u8, suite: CipherSuite) bool {
+    if (block.len % 2 != 0) return false;
+    var i: usize = 0;
+    const wire: u16 = @intFromEnum(suite);
+    while (i + 1 < block.len) : (i += 2) {
+        if (std.mem.readInt(u16, block[i..][0..2], .big) == wire) return true;
+    }
+    return false;
+}
+
+fn pskModesAllowDhe(data: []const u8) bool {
+    if (data.len < 1) return false;
+    const len = data[0];
+    if (data.len != 1 + @as(usize, len)) return false;
+    for (data[1..]) |mode| {
+        if (mode == 1) return true; // psk_dhe_ke
+    }
+    return false;
+}
+
+fn findPskExtensionBodyOffset(client_hello_raw: []const u8) Error!usize {
+    if (client_hello_raw.len < 4 or client_hello_raw[0] != @intFromEnum(HandshakeType.client_hello)) {
+        return error.BadHandshake;
+    }
+    const body_len = (@as(usize, client_hello_raw[1]) << 16) |
+        (@as(usize, client_hello_raw[2]) << 8) |
+        client_hello_raw[3];
+    if (client_hello_raw.len != 4 + body_len) return error.BadHandshake;
+
+    var c = Cursor.init(client_hello_raw[4..]);
+    _ = try c.take(2);
+    _ = try c.take(32);
+    _ = try c.take(try c.readU8());
+    _ = try c.take(try c.readU16());
+    _ = try c.take(try c.readU8());
+    const ext_len = try c.readU16();
+    const ext_body_start = 4 + c.pos;
+    const ext_body = try c.take(ext_len);
+    if (c.remaining() != 0) return error.BadHandshake;
+
+    var pos: usize = 0;
+    while (pos < ext_body.len) {
+        if (ext_body.len - pos < tls_extension.header_len) return error.BadHandshake;
+        const typ = std.mem.readInt(u16, ext_body[pos..][0..2], .big);
+        const len = std.mem.readInt(u16, ext_body[pos + 2 ..][0..2], .big);
+        const data_start = pos + tls_extension.header_len;
+        if (ext_body.len - data_start < len) return error.BadHandshake;
+        if (typ == @intFromEnum(tls_extension.ExtensionType.pre_shared_key)) {
+            return ext_body_start + data_start;
+        }
+        pos = data_start + len;
+    }
+    return error.MissingExtension;
+}
+
 fn osEntropy(buf: []u8) Error!void {
     switch (builtin.os.tag) {
         .linux => {
@@ -900,6 +1163,13 @@ fn osEntropy(buf: []u8) Error!void {
 
 fn secureZero(buf: []u8) void {
     std.crypto.secureZero(u8, buf);
+}
+
+fn currentUnixMs() i64 {
+    // Zig 0.16's minimal std.time surface in this environment has no wall-clock
+    // syscall wrapper. The sealed ticket still carries the issued_time field;
+    // lifetime enforcement is left to the caller's ticket-retention policy.
+    return 0;
 }
 
 fn writePlainRecord(allocator: Allocator, typ: tls_record.ContentType, fragment: []const u8) Error![]u8 {
@@ -1149,6 +1419,126 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("hello server", got_s);
+}
+
+test "loopback: TLS 1.3 PSK-DHE session resumption and binder tamper fallback" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x91} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x91, 0x13 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .enable_session_tickets = true,
+    });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    const ticket_key = server.ticketKey();
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored);
+
+    var resumed_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+    });
+    defer resumed_server.deinit();
+    var resumed_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer resumed_client.deinit();
+    try resumed_client.setSessionTicket(stored, 0);
+
+    const rch = try resumed_client.start();
+    defer alloc.free(rch);
+    const rsflight = switch (try resumed_server.feed(rch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rsflight);
+    try std.testing.expect(resumed_server.acceptedSessionTicket());
+    const rcfin = switch (try resumed_client.feed(rsflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(rcfin);
+    try std.testing.expect(resumed_client.handshakeDone());
+    try std.testing.expect(resumed_client.leaf_key == null);
+    _ = try resumed_server.feed(rcfin);
+    try std.testing.expect(resumed_server.handshakeDone());
+
+    const s2c = try resumed_server.encrypt("resumed down");
+    defer alloc.free(s2c);
+    const got_c = try resumed_client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("resumed down", got_c);
+    const c2s = try resumed_client.encrypt("resumed up");
+    defer alloc.free(c2s);
+    const got_s = try resumed_server.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("resumed up", got_s);
+
+    var tamper_server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = kp,
+        .ticket_key = ticket_key,
+    });
+    defer tamper_server.deinit();
+    var tamper_client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer tamper_client.deinit();
+    try tamper_client.setSessionTicket(stored, 0);
+
+    const tch_orig = try tamper_client.start();
+    defer alloc.free(tch_orig);
+    const tch = try alloc.dupe(u8, tch_orig);
+    defer alloc.free(tch);
+    tch[tch.len - 1] ^= 0x01; // pre_shared_key is last; this flips a binder byte.
+    tamper_client.transcript.items[tamper_client.transcript.items.len - 1] ^= 0x01;
+    const tsflight = switch (try tamper_server.feed(tch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(tsflight);
+    try std.testing.expect(!tamper_server.acceptedSessionTicket());
+    const tcfin = switch (try tamper_client.feed(tsflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(tcfin);
+    _ = try tamper_server.feed(tcfin);
+    try std.testing.expect(tamper_server.handshakeDone());
+    try std.testing.expect(!tamper_server.acceptedSessionTicket());
 }
 
 test "loopback: tls_client completes a handshake against tls_server with ECDSA-P256 leaf" {
