@@ -269,13 +269,32 @@ pub const MemberMode = enum(u3) {
     founder,
 };
 
-/// Inline prefix list returned by MemberModes.allPrefixes().
+/// Network-operator status prefix, shown above founder for an IRC operator who
+/// holds the `oper_override` privilege. It is derived from oper status (not a
+/// grantable channel mode), so it is never stored in the per-member status —
+/// the render layer prepends it. Advertised in ISUPPORT PREFIX as `(Y…)*…`.
+pub const oper_prefix: u8 = '*';
+pub const oper_mode_letter: u8 = 'Y';
+
+/// Inline prefix list returned by MemberModes.allPrefixes(). Sized for the four
+/// grantable tiers (!.@+) plus a possible leading oper `*`.
 pub const PrefixList = struct {
-    bytes: [4]u8 = [_]u8{0} ** 4,
+    bytes: [5]u8 = [_]u8{0} ** 5,
     len: u8 = 0,
 
     pub fn asSlice(self: *const PrefixList) []const u8 {
         return self.bytes[0..self.len];
+    }
+
+    /// Prepend the network-operator `*` as the new highest prefix (no-op if the
+    /// member already shows it or the buffer is full).
+    pub fn prependOper(self: *PrefixList) void {
+        if (self.len >= self.bytes.len) return;
+        if (self.len > 0 and self.bytes[0] == oper_prefix) return;
+        var i: usize = self.len;
+        while (i > 0) : (i -= 1) self.bytes[i] = self.bytes[i - 1];
+        self.bytes[0] = oper_prefix;
+        self.len += 1;
     }
 };
 
@@ -322,9 +341,19 @@ pub const MemberModes = struct {
         return out;
     }
 
-    /// ISUPPORT PREFIX token: (Qqov)!.@+ — Orochi founder (!) above the
-    /// IRCX owner (.) / op (@) / voice (+) tiers.
-    pub const isupport_prefix = "(Qqov)!.@+";
+    /// ISUPPORT PREFIX token: (YQqov)*!.@+ — network-operator (*) above Orochi
+    /// founder (!), then the IRCX owner (.) / op (@) / voice (+) tiers. The `*`
+    /// tier is server-derived from the oper_override privilege (never set by
+    /// MODE); clients use it only to render the prefix in NAMES/WHO. This is the
+    /// single source of truth for the advertised PREFIX (the daemon's ISUPPORT
+    /// builder derives the 005 token from it — no duplicated copy elsewhere).
+    pub const isupport_prefix = "(YQqov)*!.@+";
+
+    /// ISUPPORT STATUSMSG symbols: the grantable status prefixes usable as
+    /// message targets (founder ! / owner . / op @ / voice +), highest first.
+    /// The derived oper `*` is intentionally excluded — it is not a message
+    /// target. Derived once here so PREFIX and STATUSMSG never drift apart.
+    pub const statusmsg_symbols = "!.@+";
 
     /// Operator authority: op or any higher tier (owner/founder).
     pub fn isOperator(self: MemberModes) bool {

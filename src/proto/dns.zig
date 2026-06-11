@@ -688,6 +688,275 @@ fn isExpired(now_ms: i64, expires_ms: i64) bool {
     return now_ms >= expires_ms;
 }
 
+// ===========================================================================
+// Live resolver — UDP transport + forward / reverse / forward-confirmed rDNS.
+//
+// The wire codec above is transport-free; this section adds a blocking UDP
+// resolver suitable for a dedicated resolver thread (the daemon never blocks
+// its io_uring loop on DNS). Reverse lookups feed the cloak/host pipeline, and
+// `resolveConfirmed` implements forward-confirmed reverse DNS (FCrDNS): a PTR
+// hostname is only trusted once it forward-resolves back to the same IP, which
+// defeats PTR spoofing (an attacker controlling only their own reverse zone
+// cannot forge a hostname that maps elsewhere).
+// ===========================================================================
+
+const builtin = @import("builtin");
+const linux = std.os.linux;
+const posix = std.posix;
+
+pub const max_nameservers: usize = 4;
+
+pub const ResolveError = error{
+    NoNameservers,
+    SocketUnavailable,
+    SendFailed,
+    Timeout,
+    IdMismatch,
+    ServerFailure,
+    NameError,
+    NoData,
+} || EncodeError || DecodeError;
+
+/// Resolver settings: the nameserver list (UDP) plus timeout/retry policy.
+pub const ResolverConfig = struct {
+    nameservers: [max_nameservers]Address = undefined,
+    nameserver_count: usize = 0,
+    port: u16 = 53,
+    timeout_ms: u32 = 2000,
+    attempts: u8 = 2,
+
+    pub fn addNameserver(self: *ResolverConfig, addr: Address) void {
+        if (self.nameserver_count >= max_nameservers) return;
+        self.nameservers[self.nameserver_count] = addr;
+        self.nameserver_count += 1;
+    }
+
+    pub fn nsSlice(self: *const ResolverConfig) []const Address {
+        return self.nameservers[0..self.nameserver_count];
+    }
+};
+
+/// Parse an IPv4 or IPv6 literal into an Address (null on malformed input).
+pub fn parseIpLiteral(text: []const u8) ?Address {
+    const net = std.Io.net;
+    if (net.IpAddress.parseIp4(text, 0)) |addr| {
+        return Address{ .ipv4 = addr.ip4.bytes };
+    } else |_| {}
+    if (net.IpAddress.parseIp6(text, 0)) |addr| {
+        return Address{ .ipv6 = addr.ip6.bytes };
+    } else |_| {}
+    return null;
+}
+
+/// Parse `nameserver` directives out of resolv.conf text into `cfg`. IPv4 and
+/// IPv6 literals are recognized; comments and other directives are ignored.
+/// Returns the total nameserver count now held by `cfg`.
+pub fn parseResolvConf(text: []const u8, cfg: *ResolverConfig) usize {
+    var it = std.mem.tokenizeAny(u8, text, "\r\n");
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        if (!std.mem.startsWith(u8, line, "nameserver")) continue;
+        const rest = std.mem.trim(u8, line["nameserver".len..], " \t");
+        if (rest.len == 0 or rest.len == line.len) continue; // need whitespace after keyword
+        // Strip an optional %zone / trailing comment token.
+        var field = rest;
+        if (std.mem.indexOfAny(u8, field, " \t#;%")) |cut| field = field[0..cut];
+        if (parseIpLiteral(field)) |addr| cfg.addNameserver(addr);
+    }
+    return cfg.nameserver_count;
+}
+
+/// Build a resolver config from /etc/resolv.conf, falling back to the public
+/// Cloudflare + Google resolvers when the file is missing or empty.
+pub fn systemResolverConfig() ResolverConfig {
+    var cfg = ResolverConfig{};
+    var buf: [8192]u8 = undefined;
+    if (readFileZ("/etc/resolv.conf", &buf)) |contents| {
+        _ = parseResolvConf(contents, &cfg);
+    }
+    if (cfg.nameserver_count == 0) {
+        cfg.addNameserver(.{ .ipv4 = .{ 1, 1, 1, 1 } });
+        cfg.addNameserver(.{ .ipv4 = .{ 8, 8, 8, 8 } });
+    }
+    return cfg;
+}
+
+/// Read a small file into `buf` via raw syscalls (no allocator / Io dependency),
+/// returning the populated slice or null on any error.
+fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const r = linux.read(fd, buf[total..].ptr, buf.len - total);
+        switch (posix.errno(r)) {
+            .SUCCESS => {
+                const got: usize = @intCast(r);
+                if (got == 0) break;
+                total += got;
+            },
+            .INTR => continue,
+            else => return null,
+        }
+    }
+    return buf[0..total];
+}
+
+fn addressEql(a: Address, b: Address) bool {
+    return switch (a) {
+        .ipv4 => |x| switch (b) {
+            .ipv4 => |y| std.mem.eql(u8, &x, &y),
+            else => false,
+        },
+        .ipv6 => |x| switch (b) {
+            .ipv6 => |y| std.mem.eql(u8, &x, &y),
+            else => false,
+        },
+    };
+}
+
+/// Pure FCrDNS decision: is `address` present in a PTR name's forward A/AAAA set?
+pub fn forwardConfirms(address: Address, forward_addrs: []const Address) bool {
+    for (forward_addrs) |a| {
+        if (addressEql(a, address)) return true;
+    }
+    return false;
+}
+
+/// Send one query to a single nameserver over a blocking, recv-timeout UDP
+/// socket and return the raw response bytes (a slice of `recv_buf`).
+fn queryServer(ns: Address, port: u16, query: []const u8, recv_buf: []u8, timeout_ms: u32) ResolveError![]const u8 {
+    // The blocking UDP transport is Linux-only (the daemon's target). Gated via
+    // a comptime os switch so only this prong is analyzed on Linux and the
+    // Windows cross-check compiles the inert `else`. std.os.linux.* always
+    // compiles; std.posix.* members are target-specific, hence the gate.
+    switch (builtin.os.tag) {
+        .linux => {
+            const family: u32 = switch (ns) {
+                .ipv4 => posix.AF.INET,
+                .ipv6 => posix.AF.INET6,
+            };
+            const rc = linux.socket(family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+            if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
+            const fd: linux.fd_t = @intCast(rc);
+            defer _ = linux.close(fd);
+
+            const tv = linux.timeval{ .sec = @intCast(timeout_ms / 1000), .usec = @intCast((timeout_ms % 1000) * 1000) };
+            _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+
+            switch (ns) {
+                .ipv4 => |b| {
+                    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(b) };
+                    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+                        return error.SendFailed;
+                },
+                .ipv6 => |b| {
+                    var sa = linux.sockaddr.in6{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = b, .scope_id = 0 };
+                    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
+                        return error.SendFailed;
+                },
+            }
+
+            const sent = linux.sendto(fd, query.ptr, query.len, 0, null, 0);
+            if (posix.errno(sent) != .SUCCESS) return error.SendFailed;
+
+            const got = linux.recvfrom(fd, recv_buf.ptr, recv_buf.len, 0, null, null);
+            if (posix.errno(got) != .SUCCESS) return error.Timeout;
+            return recv_buf[0..@intCast(got)];
+        },
+        else => return error.SocketUnavailable,
+    }
+}
+
+/// Query every configured nameserver (round-robin over `attempts`) until one
+/// returns a well-formed, id-matched, non-error answer.
+fn queryAll(
+    comptime maxq: usize,
+    comptime maxa: usize,
+    cfg: *const ResolverConfig,
+    name: []const u8,
+    qtype: RecordType,
+    id: u16,
+) ResolveError!Message(maxq, maxa) {
+    if (cfg.nameserver_count == 0) return error.NoNameservers;
+    var qbuf: [max_message_len]u8 = undefined;
+    const query = try encodeQuery(&qbuf, id, name, qtype);
+    var rbuf: [max_message_len]u8 = undefined;
+
+    var attempt: u8 = 0;
+    while (attempt < cfg.attempts) : (attempt += 1) {
+        for (cfg.nsSlice()) |ns| {
+            const resp = queryServer(ns, cfg.port, query, &rbuf, cfg.timeout_ms) catch continue;
+            const msg = parseMessage(maxq, maxa, resp) catch continue;
+            if (msg.header.id != id) continue;
+            switch (msg.header.rcode()) {
+                0 => return msg,
+                3 => return error.NameError, // NXDOMAIN — authoritative "no such name"
+                else => continue, // SERVFAIL/REFUSED — try the next server
+            }
+        }
+    }
+    return error.Timeout;
+}
+
+fn randomId() u16 {
+    var b: [2]u8 = undefined;
+    _ = linux.getrandom(&b, b.len, 0);
+    return std.mem.readInt(u16, &b, .little);
+}
+
+/// Forward-resolve `name` to A (or AAAA when `want_v6`) addresses into `out`.
+pub fn resolveForward(cfg: *const ResolverConfig, name: []const u8, want_v6: bool, out: []Address) ResolveError![]Address {
+    const qtype: RecordType = if (want_v6) .aaaa else .a;
+    const msg = try queryAll(1, max_cache_addrs, cfg, name, qtype, randomId());
+    var n: usize = 0;
+    for (msg.answerSlice()) |rr| {
+        if (n >= out.len) break;
+        switch (rr.data) {
+            .a => |b| {
+                out[n] = .{ .ipv4 = b };
+                n += 1;
+            },
+            .aaaa => |b| {
+                out[n] = .{ .ipv6 = b };
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    if (n == 0) return error.NoData;
+    return out[0..n];
+}
+
+/// Reverse-resolve `address` to its PTR hostname (no trailing dot) into `name_out`.
+pub fn resolveReverse(cfg: *const ResolverConfig, address: Address, name_out: []u8) ResolveError![]const u8 {
+    var qbuf: [max_domain_text_len]u8 = undefined;
+    const qname = try reverseName(&qbuf, address);
+    const msg = try queryAll(1, max_cache_addrs, cfg, qname, .ptr, randomId());
+    for (msg.answerSlice()) |rr| {
+        if (rr.rr_type != .ptr) continue;
+        const s = rr.data.ptr.slice();
+        if (s.len == 0 or s.len > name_out.len) continue;
+        @memcpy(name_out[0..s.len], s);
+        return name_out[0..s.len];
+    }
+    return error.NoData;
+}
+
+/// Forward-confirmed reverse DNS. PTR(address) → name, then confirm `name`
+/// forward-resolves back to `address`. Returns the trusted hostname, or null
+/// when there is no PTR, no confirmation, or any lookup fails — in which case
+/// the caller should fall back to the bare (cloaked) IP.
+pub fn resolveConfirmed(cfg: *const ResolverConfig, address: Address, name_out: []u8) ?[]const u8 {
+    const name = resolveReverse(cfg, address, name_out) catch return null;
+    var fwd: [max_cache_addrs]Address = undefined;
+    const addrs = resolveForward(cfg, name, address == .ipv6, &fwd) catch return null;
+    return if (forwardConfirms(address, addrs)) name else null;
+}
+
 test "encodes and parses A query and response round trip" {
     var buf: [max_message_len]u8 = undefined;
     const query = try encodeQuery(&buf, 0x1234, "example.com", .a);
@@ -827,4 +1096,51 @@ test "cache returns hits and expires forward and reverse entries" {
     try cache.putPtr(4000, addrs[0], "localhost", 1);
     try std.testing.expectEqualStrings("localhost", cache.getPtr(4999, addrs[0]).?);
     try std.testing.expect(cache.getPtr(5000, addrs[0]) == null);
+}
+
+test "parses IPv4 and IPv6 nameserver literals" {
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 1, 1, 1, 1 } }, parseIpLiteral("1.1.1.1").?);
+    const v6 = parseIpLiteral("2001:4860:4860::8888").?;
+    try std.testing.expect(v6 == .ipv6);
+    try std.testing.expectEqual(@as(u8, 0x20), v6.ipv6[0]);
+    try std.testing.expect(parseIpLiteral("not-an-ip") == null);
+    try std.testing.expect(parseIpLiteral("999.1.1.1") == null);
+}
+
+test "parseResolvConf extracts nameservers and ignores noise" {
+    var cfg = ResolverConfig{};
+    const text =
+        \\# generated
+        \\nameserver 8.8.8.8
+        \\options ndots:1
+        \\nameserver 2606:4700:4700::1111
+        \\;nameserver 9.9.9.9
+        \\nameserver 192.168.1.1 # router
+        \\search lan
+    ;
+    const n = parseResolvConf(text, &cfg);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 8, 8, 8, 8 } }, cfg.nameservers[0]);
+    try std.testing.expect(cfg.nameservers[1] == .ipv6);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 192, 168, 1, 1 } }, cfg.nameservers[2]);
+}
+
+test "ResolverConfig caps nameservers at max_nameservers" {
+    var cfg = ResolverConfig{};
+    var i: usize = 0;
+    while (i < max_nameservers + 3) : (i += 1) cfg.addNameserver(.{ .ipv4 = .{ 10, 0, 0, @intCast(i) } });
+    try std.testing.expectEqual(max_nameservers, cfg.nameserver_count);
+    try std.testing.expectEqual(max_nameservers, cfg.nsSlice().len);
+}
+
+test "forwardConfirms implements the FCrDNS match (anti-spoof)" {
+    const ip = Address{ .ipv4 = .{ 203, 0, 113, 7 } };
+    const matching = [_]Address{ .{ .ipv4 = .{ 198, 51, 100, 1 } }, ip };
+    const spoofed = [_]Address{.{ .ipv4 = .{ 198, 51, 100, 9 } }};
+    try std.testing.expect(forwardConfirms(ip, &matching)); // PTR name resolves back → trust
+    try std.testing.expect(!forwardConfirms(ip, &spoofed)); // forward set excludes IP → reject
+    try std.testing.expect(!forwardConfirms(ip, &[_]Address{})); // no data → reject
+    // Family mismatch never confirms.
+    const v6 = Address{ .ipv6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    try std.testing.expect(!forwardConfirms(v6, &matching));
 }

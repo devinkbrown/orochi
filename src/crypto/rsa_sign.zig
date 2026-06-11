@@ -613,6 +613,59 @@ test "blinded PKCS1 signing verifies across many random blinding bases and stays
     }
 }
 
+// Regression for the ReleaseFast mulAddWord inline-asm earlyclobber bug (see
+// rsa_verify.zig): with the broken constraint, every one of these signatures
+// came out garbage in optimized builds (gnutls TLS 1.3 clients then rejected
+// the RSA-PSS CertificateVerify with "Public key signature verification has
+// failed"), while Debug builds passed. Random salts keep the private op
+// (blinding + CRT) on fresh inputs each iteration; the explicit structural
+// decode asserts the exact RFC 8017 §9.1.1 EM layout that strict verifiers
+// (gnutls/nettle enforce salt_len == hash_len; openssl is lenient) require.
+test "signPss random salts: exactly k bytes with strict 32-byte-salt PSS structure" {
+    const priv = testPrivateKey();
+    const pub_key = rsa_verify.PublicKey{ .n = priv.n, .e = priv.e };
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const random = prng.random();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var digest: [32]u8 = undefined;
+        random.bytes(&digest);
+        var salt: [32]u8 = undefined;
+        random.bytes(&salt);
+
+        var sig: [rsa_verify.max_bytes]u8 = undefined;
+        const got = try signPss(priv, .sha256, &digest, &salt, &sig);
+
+        // Signature is the full modulus length (left-zero-padded big-endian I2OSP).
+        try testing.expectEqual(priv.n.len, got.len);
+        try testing.expectEqual(@as(usize, 256), got.len);
+        // Strict verify at the exact TLS 1.3 salt length (32 = SHA-256 len).
+        try testing.expect(rsa_verify.verifyPss(pub_key, .sha256, &digest, got, salt.len));
+        // A different claimed salt length must fail: the 0x01 separator sits at
+        // one exact offset, so this proves the embedded salt is exactly 32 bytes.
+        try testing.expect(!rsa_verify.verifyPss(pub_key, .sha256, &digest, got, salt.len - 1));
+        try testing.expect(!rsa_verify.verifyPss(pub_key, .sha256, &digest, got, salt.len + 1));
+
+        // Structural decode of EM = maskedDB || H || 0xbc (emBits = 2047,
+        // emLen = k = 256 for a 2048-bit modulus).
+        var em: [256]u8 = undefined;
+        try rsa_verify.modExp(got, priv.e, priv.n, &em);
+        try testing.expectEqual(@as(u8, 0xbc), em[255]);
+        try testing.expectEqual(@as(u8, 0), em[0] & 0x80); // top (8*emLen - emBits) bits clear
+        const db_len = 256 - 32 - 1; // 223
+        const h = em[db_len..][0..32];
+        var db: [db_len]u8 = undefined;
+        @memcpy(&db, em[0..db_len]);
+        rsa_verify.mgf1(.sha256, h, &db); // unmask: DB = maskedDB XOR MGF1(H)
+        db[0] &= 0x7f;
+        const ps_len = db_len - salt.len - 1; // 190
+        for (db[0..ps_len]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+        try testing.expectEqual(@as(u8, 0x01), db[ps_len]);
+        try testing.expectEqualSlices(u8, &salt, db[ps_len + 1 ..][0..salt.len]);
+    }
+}
+
 test "modular inverse returns rinv where r * rinv mod n is one" {
     const n = try Big.fromBytesBE(&rsa_n);
     const cases = [_][]const u8{

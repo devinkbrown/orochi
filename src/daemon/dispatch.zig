@@ -777,6 +777,10 @@ pub const ClientSession = struct {
         self.oper_priv = privileges;
         self.oper_class_store.set(class_name[0..@min(class_name.len, MAX_CLASS_BYTES)]) catch {};
         self.oper_title_store.set(title[0..@min(title.len, MAX_OPER_TITLE_BYTES)]) catch {};
+        // Network administrators carry the server-managed +a umode automatically:
+        // the server_admin privilege is what `isAdmin()` keys on, so the visible
+        // mode tracks it (set on elevation, cleared on logout below).
+        if (privileges.has(.server_admin)) self.umodes.add(.admin);
     }
 
     /// Drop operator status. Because oper is SASL-account-derived, ending the
@@ -788,6 +792,7 @@ pub const ClientSession = struct {
         self.oper_class_store = .{};
         self.oper_title_store = .{};
         self.event_mask = .{};
+        self.umodes.remove(.admin);
     }
 
     /// Whether the client is quarantined (Warden quarantine / SHUN): connected

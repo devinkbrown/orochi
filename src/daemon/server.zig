@@ -96,6 +96,7 @@ const s2s_link = @import("s2s_link.zig");
 const tracelog = @import("../substrate/trace.zig");
 const geoip = @import("../substrate/geoip.zig");
 const geo_services = @import("geo_services.zig");
+const rdns = @import("rdns.zig");
 const news_sources = @import("../proto/news_sources.zig");
 const build_info = @import("build_info");
 const stats_report = @import("stats_report.zig");
@@ -890,7 +891,9 @@ pub const ServerError = error{
 /// `protocol_inventory.setIsupportOverride` and free with `freeIsupportTokens`.
 pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     const base = protocol_inventory.isupport_tokens;
-    const out = try allocator.alloc([]const u8, base.len);
+    // +2: PREFIX and STATUSMSG are appended here, derived from the single source
+    // of truth in chanmode (never hardcoded in the proto token list).
+    const out = try allocator.alloc([]const u8, base.len + 2);
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "NETWORK=")) {
@@ -919,6 +922,10 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
             out[i] = tok; // static comptime data; borrowed, not freed
         }
     }
+    // PREFIX + STATUSMSG, derived from the single source of truth in chanmode so
+    // the advertised 005 tokens can never drift from the member-prefix model.
+    out[base.len] = try std.fmt.allocPrint(allocator, "PREFIX={s}", .{chanmode.MemberModes.isupport_prefix});
+    out[base.len + 1] = try std.fmt.allocPrint(allocator, "STATUSMSG={s}", .{chanmode.MemberModes.statusmsg_symbols});
     return out;
 }
 
@@ -1198,6 +1205,15 @@ pub const Config = struct {
     /// (real host shown). main derives this from `[server] cloak_secret`, or a
     /// random per-boot key when account/SASL features imply privacy is wanted.
     cloak_key: ?cloak.SecretKey = null,
+    /// Network-identifying suffix for cloaked hosts (`[cloak] suffix`). IP
+    /// cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname cloaks carry a
+    /// `<suffix>-<token>` leading label. Borrowed; outlives the server.
+    cloak_suffix: []const u8 = cloak.default_suffix,
+    /// Background forward-confirmed reverse-DNS resolver (owned by main). When
+    /// set, each non-loopback client IP is resolved off the hot path and its
+    /// confirmed hostname becomes the cloak base (so hosts show a cloaked
+    /// hostname rather than a cloaked IP). Null = reverse DNS disabled.
+    rdns: ?*rdns.Resolver = null,
     /// Config file path + resolver for live REHASH. When set (by main), REHASH
     /// re-reads and re-parses this file and swaps in the new oper registry. Null
     /// = REHASH acknowledges without reloading (e.g. defaults-only boot, tests).
@@ -1309,6 +1325,11 @@ pub const ConnState = struct {
     /// first reaches established (so the peer's NAMES/WHO is correct immediately,
     /// not only after future joins). See sendMembershipBurstTo / docs/planning/16.
     s2s_burst_done: bool = false,
+    /// True when THIS node opened the outbound S2S connection (we dialed the
+    /// peer). False on the responder side (the peer dialed us). Used by
+    /// `resolveS2sCollision` to deterministically collapse the duplicate link
+    /// that forms when both nodes auto-dial each other.
+    s2s_initiator: bool = false,
     /// Target address for an outbound S2S connect, kept here (the slot is stable)
     /// so it outlives the in-flight IORING_OP_CONNECT submission.
     s2s_connect_addr: posix.sockaddr.in = undefined,
@@ -2942,16 +2963,56 @@ pub const LinuxServer = struct {
             return;
         }
         conn.session.setRealHost(ip);
+        // Kick off forward-confirmed reverse DNS off the hot path; the result (if
+        // any) upgrades the cloak base from the IP to the hostname at
+        // registration time. The initial visible host below is always IP-based.
+        if (self.config.rdns) |res| {
+            if (conn.peer_addr) |addr| res.request(addr);
+        }
+        self.applyVisibleHost(conn);
+    }
+
+    /// (Re)compute a client's visible (cloaked) host. Prefers a forward-confirmed
+    /// reverse-DNS hostname when the resolver has one ready, else the raw IP; the
+    /// chosen base is then HMAC-cloaked (IP → hierarchical tokens, hostname →
+    /// domain-preserving) when a cloak key is configured. Called once at connect
+    /// (IP base) and again at registration completion (hostname base, if rDNS has
+    /// finished by then). Best-effort: never fails a connection.
+    fn applyVisibleHost(self: *LinuxServer, conn: *ConnState) void {
+        const addr = conn.peer_addr orelse return;
+        var ipbuf: [cloak.max_cloak_len]u8 = undefined;
+        const ip_text = addrText(addr, &ipbuf) orelse return;
+        // Loopback stays the conventional "localhost" (cloaking 127.x / ::1 is
+        // pointless); matches captureClientHost so the registration re-apply
+        // never overrides it with a cloaked 127.0.0.1.
+        if (std.mem.startsWith(u8, ip_text, "127.") or std.mem.eql(u8, ip_text, "0:0:0:0:0:0:0:1")) {
+            conn.session.setVisibleHost(default_host);
+            return;
+        }
+        var hostbuf: [cloak.max_cloak_len]u8 = undefined;
+        var base: []const u8 = ip_text;
+        if (self.config.rdns) |res| {
+            if (res.lookup(addr, &hostbuf)) |name| base = name;
+        }
         if (self.config.cloak_key) |key| {
             var cbuf: [cloak.max_cloak_len]u8 = undefined;
-            const cloaked = cloak.cloak(&cbuf, &key, ip, .{}) catch {
-                conn.session.setVisibleHost(ip);
+            const cloaked = cloak.cloak(&cbuf, &key, base, .{ .suffix = self.config.cloak_suffix }) catch {
+                conn.session.setVisibleHost(base);
                 return;
             };
             conn.session.setVisibleHost(cloaked);
         } else {
-            conn.session.setVisibleHost(ip);
+            conn.session.setVisibleHost(base);
         }
+    }
+
+    /// Format an address as its canonical text (IPv4 dotted-quad / IPv6) into
+    /// `buf`, returning the slice or null on overflow.
+    fn addrText(addr: dns.Address, buf: []u8) ?[]const u8 {
+        return switch (addr) {
+            .ipv4 => |b| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch null,
+            .ipv6 => |b| formatIp6(buf, b) catch null,
+        };
     }
 
     /// Drive a server-to-server peer connection: feed inbound bytes to its
@@ -3043,6 +3104,7 @@ pub const LinuxServer = struct {
             self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
+            if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
         }
         if (link.established()) self.accountPeerBytes(link.remoteName(), bytes.len, out.len);
         // Drain inbound cross-node user messages over the secured link.
@@ -3084,6 +3146,7 @@ pub const LinuxServer = struct {
             self.logMeshEvent(.peer_up, link.remoteName(), "link established");
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
+            if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
         }
         const out = link.outbound();
         if (out.len != 0) {
@@ -3844,6 +3907,10 @@ pub const LinuxServer = struct {
                 else => return err,
             };
             if (conn.session.registered()) {
+                // Upgrade the cloak base to the forward-confirmed reverse-DNS
+                // hostname if the background resolver has finished by now (it was
+                // kicked off at connect); otherwise this re-applies the IP cloak.
+                self.applyVisibleHost(conn);
                 try self.registerConnNick(id, conn);
                 // Complete the registration burst after the 001-005 numerics
                 // (emitted by the dispatch welcome): LUSERS (251-255) then the
@@ -4753,7 +4820,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
             return;
         };
-        if (!setter.isOperator()) {
+        if (!setter.isOperator() and !conn.session.hasPriv(.oper_override)) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
@@ -4824,7 +4891,7 @@ pub const LinuxServer = struct {
                     // rank is <= their own highest rank. So op manages op/voice,
                     // owner manages owner/op/voice, founder manages all — and an
                     // owner can NEVER strip a founder, nor an op an owner.
-                    if (setter.rank() < chanmode.rankOfMode(mode)) {
+                    if (setter.rank() < chanmode.rankOfMode(mode) and !conn.session.hasPriv(.oper_override)) {
                         try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Insufficient channel privilege for that mode");
                         continue;
                     }
@@ -5184,7 +5251,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{args.channel}, "You're not on that channel");
             return;
         };
-        if (!kicker.isOperator()) {
+        if (!kicker.isOperator() and !conn.session.hasPriv(.oper_override)) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "You're not channel operator");
             return;
         }
@@ -5564,8 +5631,8 @@ pub const LinuxServer = struct {
         }
         const inviter_modes = self.world.memberModes(args.channel, worldIdFromClient(id));
         const result = invite.checkInvitePreconditions(.{
-            .on_channel = inviter_modes != null,
-            .is_operator = if (inviter_modes) |m| m.isOperator() else false,
+            .on_channel = inviter_modes != null or conn.session.hasPriv(.oper_override),
+            .is_operator = (if (inviter_modes) |m| m.isOperator() else false) or conn.session.hasPriv(.oper_override),
             .invite_only = self.world.channelHasFlag(args.channel, .invite_only),
             .free_invite = self.world.channelHasFlag(args.channel, .free_invite),
             .target_on_channel = self.world.isMember(args.channel, target_wid),
@@ -7097,6 +7164,9 @@ pub const LinuxServer = struct {
         const peer = self.rx().clients.get(id).?;
         peer.token = try tokenFromId(id);
         peer.s2s_connect_addr = addr;
+        peer.s2s_initiator = true; // we dialed: this is the initiator side
+
+
 
         if (self.s2sSecured()) {
             // PQ-secured initiator: waits (await_prekey) for the responder's TOFU
@@ -7317,7 +7387,7 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
                 return;
             };
-            if (!setter.isOperator()) {
+            if (!setter.isOperator() and !conn.session.hasPriv(.oper_override)) {
                 try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
                 return;
             }
@@ -9137,18 +9207,12 @@ pub const LinuxServer = struct {
         var users: u64 = 0;
         var unknown: u64 = 0;
         var opers: u64 = 0;
-        var servers: u64 = 1; // this node
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
-            if (c.s2s) |link| {
-                if (link.established()) servers += 1;
-                continue;
-            }
-            if (c.s2s_secured) |link| {
-                if (link.established()) servers += 1;
-                continue;
-            }
+            // S2S peer links are counted as distinct servers below (deduped),
+            // never as users.
+            if (c.s2s != null or c.s2s_secured != null) continue;
             if (c.session.registered()) {
                 users += 1;
                 if (c.session.isOper()) opers += 1;
@@ -9156,6 +9220,9 @@ pub const LinuxServer = struct {
                 unknown += 1;
             }
         }
+        // Distinct peers + this node. Dedup collapses a transient duplicate link
+        // to the same peer so the count never double-reports a neighbour.
+        const servers: u64 = 1 + self.distinctPeerCount();
         const counts = lusers.Counts{
             .users = users,
             .invisible = 0,
@@ -11712,9 +11779,20 @@ pub const LinuxServer = struct {
         var line_buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Orochi IRC daemon"}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ self.serverName(), protocol_inventory.currentServerName() }, detail);
+        var seen: [32][]const u8 = undefined;
+        var seen_n: usize = 0;
         var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
+        outer: while (it.next()) |entry| {
             const rname = establishedPeerName(entry.value) orelse continue;
+            // One line per distinct peer: a transient duplicate link to the same
+            // server must not appear twice.
+            for (seen[0..seen_n]) |s| {
+                if (std.mem.eql(u8, s, rname)) continue :outer;
+            }
+            if (seen_n < seen.len) {
+                seen[seen_n] = rname;
+                seen_n += 1;
+            }
             var lbuf: [128]u8 = undefined;
             const ldetail = std.fmt.bufPrint(&lbuf, "1 {s}", .{"Suimyaku peer"}) catch continue;
             try queueNumeric(conn, .RPL_LINKS, &.{ rname, protocol_inventory.currentServerName() }, ldetail);
@@ -11734,6 +11812,56 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// Collapse the duplicate S2S link that forms when both nodes auto-dial each
+    /// other: each side ends up with two established links to the same peer (one
+    /// it dialed, one the peer dialed), so LINKS/LUSERS over-count and a link is
+    /// wasted. When `new_conn` reaches established, look for another established
+    /// link to the same `remote_name`; if found, keep the connection initiated by
+    /// the lexicographically-smaller server name and close the other. Both nodes
+    /// compute the same survivor, so exactly one physical link remains and the
+    /// mesh never fully splits. Returns true when `new_conn` itself was the loser
+    /// (so the caller stops driving it). Best-effort within this reactor.
+    fn resolveS2sCollision(self: *LinuxServer, new_conn: *ConnState, remote_name: []const u8) bool {
+        if (remote_name.len == 0) return false;
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const other = entry.value;
+            if (other == new_conn) continue;
+            const oname = establishedPeerName(other) orelse continue;
+            if (!std.mem.eql(u8, oname, remote_name)) continue;
+            // Only collapse a clean initiator+responder pair; if both somehow hold
+            // the same role, leave them (counting dedup still hides the dup) rather
+            // than risk closing the only usable link.
+            if (new_conn.s2s_initiator == other.s2s_initiator) return false;
+            const keep_initiator = std.mem.lessThan(u8, self.serverName(), remote_name);
+            const loser = if (new_conn.s2s_initiator == keep_initiator) other else new_conn;
+            loser.closing = true;
+            self.logMeshEvent(.peer_down, remote_name, "duplicate link collapsed");
+            return loser == new_conn;
+        }
+        return false;
+    }
+
+    /// Count distinct established S2S peers visible to this reactor (deduped by
+    /// remote server name), so a transient duplicate link to one peer is counted
+    /// once. Returns the peer count (servers = this node + peers).
+    fn distinctPeerCount(self: *LinuxServer) u64 {
+        var seen: [32][]const u8 = undefined;
+        var n: usize = 0;
+        var it = self.rx().clients.iterator();
+        outer: while (it.next()) |entry| {
+            const name = establishedPeerName(entry.value) orelse continue;
+            for (seen[0..n]) |s| {
+                if (std.mem.eql(u8, s, name)) continue :outer;
+            }
+            if (n < seen.len) {
+                seen[n] = name;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
     /// MAP — network topology: this server with each established S2S peer (both
     /// plaintext and secured) as a child node (RPL_MAP 015 / RPL_MAPEND 017).
     pub fn handleMap(self: *LinuxServer, conn: *ConnState) !void {
@@ -11743,9 +11871,18 @@ pub const LinuxServer = struct {
             self.countRegisteredUsers(),
         }) catch return;
         try queueNumeric(conn, .RPL_MAP, &.{}, detail);
+        var seen: [32][]const u8 = undefined;
+        var seen_n: usize = 0;
         var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
+        outer: while (it.next()) |entry| {
             const rname = establishedPeerName(entry.value) orelse continue;
+            for (seen[0..seen_n]) |s| {
+                if (std.mem.eql(u8, s, rname)) continue :outer;
+            }
+            if (seen_n < seen.len) {
+                seen[seen_n] = rname;
+                seen_n += 1;
+            }
             var pbuf: [160]u8 = undefined;
             const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{rname}) catch continue;
             try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
@@ -12806,8 +12943,9 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
             return;
         };
-        // +t: only channel operators (op or higher) may change the topic.
-        if (self.world.channelHasFlag(channel, .topic_ops) and !topic_setter.isOperator()) {
+        // +t: only channel operators (op or higher) may change the topic — unless
+        // the actor holds the oper_override privilege (network admin override).
+        if (self.world.channelHasFlag(channel, .topic_ops) and !topic_setter.isOperator() and !conn.session.hasPriv(.oper_override)) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
@@ -12897,6 +13035,23 @@ pub const LinuxServer = struct {
         return .regular;
     }
 
+    /// Whether a nick belongs to a registered local client that is an IRC
+    /// operator holding the oper_override privilege (the network-admin override).
+    /// Used to render the `*` status prefix in NAMES. Scans this shard's clients;
+    /// the daemon defaults to a single reactor, so this is complete for local
+    /// members (remote members carry their home server's status via the mesh).
+    fn isLocalOverrideOper(self: *LinuxServer, nick: []const u8) bool {
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            if (!c.session.registered()) continue;
+            if (!c.session.hasPriv(.oper_override)) continue;
+            if (std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
+        }
+        return false;
+    }
+
     fn sendNames(self: *LinuxServer, conn: *ConnState, channel: []const u8) !void {
         // Render NAMES via the names_reply module: each member carries its status
         // prefixes (all of them when the requester negotiated multi-prefix, else
@@ -12925,6 +13080,9 @@ pub const LinuxServer = struct {
                 if (!is_self and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
             }
             prefix_buf[count] = modes.allPrefixes();
+            // Network operators (oper_override) render with the `*` prefix above
+            // founder. Derived from live oper status, not a stored channel mode.
+            if (self.isLocalOverrideOper(nick)) prefix_buf[count].prependOper();
             members_buf[count] = .{
                 .prefixes = prefix_buf[count].asSlice(),
                 .nick = nick,
@@ -16004,7 +16162,16 @@ test "buildIsupportTokens replaces length tokens with configured values" {
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
     try std.testing.expectEqual(@as(usize, 10), hits);
-    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len, tokens.len);
+    // base tokens + the two derived ones (PREFIX, STATUSMSG) appended from chanmode.
+    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 2, tokens.len);
+    // PREFIX/STATUSMSG come from the single source of truth, not a hardcoded copy.
+    var saw_prefix = false;
+    var saw_statusmsg = false;
+    for (tokens) |tok| {
+        if (std.mem.eql(u8, tok, "PREFIX=" ++ chanmode.MemberModes.isupport_prefix)) saw_prefix = true;
+        if (std.mem.eql(u8, tok, "STATUSMSG=" ++ chanmode.MemberModes.statusmsg_symbols)) saw_statusmsg = true;
+    }
+    try std.testing.expect(saw_prefix and saw_statusmsg);
 }
 
 test "utf8TruncateBytes caps length without splitting a codepoint" {

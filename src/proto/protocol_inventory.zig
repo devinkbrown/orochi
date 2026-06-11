@@ -73,9 +73,12 @@ pub const isupport_tokens = [_][]const u8{
     "MONITOR=128",
     "SILENCE=32",
     "CASEMAPPING=ascii",
-    "PREFIX=(Qqov)!.@+",
+    // PREFIX and STATUSMSG are appended by the daemon's `buildIsupportTokens`,
+    // derived from the single source of truth in `daemon/chanmode.zig`
+    // (`MemberModes.isupport_prefix` / `statusmsg_symbols`). They are deliberately
+    // NOT hardcoded here so the member-prefix definition can never drift from the
+    // advertised 005 token. The boot override always supplies them in production.
     chanmodes_token,
-    "STATUSMSG=!.@+",
     "BOT=B",
     "EXTBAN=$,acgmrz",
     "WHOX",

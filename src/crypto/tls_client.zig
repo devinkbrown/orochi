@@ -206,6 +206,12 @@ const HandshakeMsg = struct {
     raw: []const u8,
 };
 
+/// Test-only client-certificate signing key (mutual TLS loopback tests).
+const ClientCertKey = union(enum) {
+    ed25519: sign.KeyPair,
+    ecdsa_p256: ecdsa_p256.KeyPair,
+};
+
 const LeafPublicKey = union(enum) {
     rsa: rsa_verify.PublicKey,
     ecdsa_p256: ecdsa_p256.PublicKey,
@@ -294,9 +300,9 @@ pub const Client = struct {
     /// Borrowed client leaf DER to present, or null to present an empty
     /// Certificate (decline). Only meaningful when the server requested a cert.
     client_cert_der: ?[]const u8 = null,
-    /// Ed25519 key pair matching `client_cert_der`'s SPKI, used to sign the
-    /// client CertificateVerify.
-    client_key_pair: ?sign.KeyPair = null,
+    /// Key pair matching `client_cert_der`'s SPKI, used to sign the client
+    /// CertificateVerify (Ed25519 or ECDSA P-256).
+    client_key_pair: ?ClientCertKey = null,
     /// When true, the server certificate's chain-to-trust-anchor and DNS-name
     /// checks are skipped (the leaf key is still parsed so the server
     /// CertificateVerify signature is verified). Used only by the tls_server
@@ -549,7 +555,14 @@ pub const Client = struct {
     /// client Certificate, preserving the production server-only-auth path.
     pub fn setClientCertForTest(self: *Client, der: []const u8, key_pair: sign.KeyPair) void {
         self.client_cert_der = der;
-        self.client_key_pair = key_pair;
+        self.client_key_pair = .{ .ed25519 = key_pair };
+    }
+
+    /// Test-only: like `setClientCertForTest` but for an ECDSA P-256 client
+    /// certificate; CertificateVerify is signed with ecdsa_secp256r1_sha256.
+    pub fn setClientCertEcdsaP256ForTest(self: *Client, der: []const u8, key_pair: ecdsa_p256.KeyPair) void {
+        self.client_cert_der = der;
+        self.client_key_pair = .{ .ecdsa_p256 = key_pair };
     }
 
     /// Test-only: respond to a server CertificateRequest with an empty
@@ -1074,6 +1087,7 @@ pub const Client = struct {
                 // the server Certificate; the request itself stays in the
                 // transcript. Only the test-only mTLS path acts on it later.
                 if (msg.typ == .certificate_request) {
+                    try validateCertificateRequest(msg.body);
                     self.cert_requested = true;
                     try self.appendTranscript(msg.raw);
                 } else {
@@ -1320,19 +1334,32 @@ pub const Client = struct {
     }
 
     /// Test-only: append an encrypted client CertificateVerify signed with the
-    /// configured Ed25519 key over the "client CertificateVerify" context.
+    /// configured key over the "client CertificateVerify" context, using the
+    /// scheme matching the key type.
     fn appendClientCertificateVerify(self: *Client, out: *std.ArrayList(u8), suite: CipherSuite) Error!void {
         const key_pair = self.client_key_pair orelse return error.BadState;
         var th: [max_hash_len]u8 = undefined;
         const th_len = self.transcriptHash(&th);
         var in_buf: [cert_verify_input_max]u8 = undefined;
         const input = buildCertVerifyInput(&in_buf, client_certificate_verify_context, th[0..th_len]);
-        const sig = key_pair.sign(input) catch return error.BadSignature;
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
-        try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
-        try appendU16(self.allocator, &body, @intCast(sig.len));
-        try body.appendSlice(self.allocator, &sig);
+        switch (key_pair) {
+            .ed25519 => |kp| {
+                const sig = kp.sign(input) catch return error.BadSignature;
+                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
+                try appendU16(self.allocator, &body, @intCast(sig.len));
+                try body.appendSlice(self.allocator, &sig);
+            },
+            .ecdsa_p256 => |kp| {
+                const sig = ecdsa_p256.sign(input, kp) catch return error.BadSignature;
+                var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+                const der = ecdsa_p256.signatureToDer(sig, &der_buf) catch return error.BadSignature;
+                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256));
+                try appendU16(self.allocator, &body, @intCast(der.len));
+                try body.appendSlice(self.allocator, der);
+            },
+        }
         try self.appendClientHandshakeRecord(out, suite, .certificate_verify, body.items);
     }
 
@@ -1848,6 +1875,35 @@ fn buildCertVerifyInput(out: *[cert_verify_input_max]u8, context: []const u8, tr
     const tail = 64 + context.len + 1;
     @memcpy(out[tail..][0..transcript_hash.len], transcript_hash);
     return out[0 .. tail + transcript_hash.len];
+}
+
+/// Strictly validate a TLS 1.3 CertificateRequest body (RFC 8446 §4.3.2):
+/// a 1-byte certificate_request_context (empty in the main handshake), then a
+/// 2-byte length-prefixed extensions vector that parses cleanly, spans the
+/// rest of the body exactly, and contains a well-formed, non-empty
+/// signature_algorithms extension (the only mandatory one). Real clients
+/// (gnutls/openssl) enforce all of this, so the loopback client must too —
+/// otherwise server-side encoding bugs survive the round-trip tests.
+fn validateCertificateRequest(body: []const u8) Error!void {
+    if (body.len < 1) return error.BadHandshake;
+    const ctx_len = body[0];
+    if (ctx_len != 0) return error.BadHandshake; // MUST be empty outside post-handshake auth
+    const block = body[1..];
+    const ext_body = tls_extension.unwrap(block) catch return error.BadHandshake;
+    if (2 + ext_body.len != block.len) return error.BadHandshake; // trailing garbage
+    var saw_signature_algorithms = false;
+    var it = tls_extension.Iterator.init(ext_body);
+    while (it.next() catch return error.BadHandshake) |ext| {
+        if (ext.typed() != .signature_algorithms) continue;
+        // signature_algorithms data: 2-byte list length + even-sized,
+        // non-empty list of u16 schemes spanning the data exactly.
+        if (ext.data.len < 4) return error.BadHandshake;
+        const list_len = std.mem.readInt(u16, ext.data[0..2], .big);
+        if (list_len == 0 or list_len % 2 != 0) return error.BadHandshake;
+        if (2 + @as(usize, list_len) != ext.data.len) return error.BadHandshake;
+        saw_signature_algorithms = true;
+    }
+    if (!saw_signature_algorithms) return error.BadHandshake;
 }
 
 fn verifySignatureScheme(key: LeafPublicKey, scheme: tls_signature_scheme.SignatureScheme, msg: []const u8, sig: []const u8) Error!void {
@@ -2486,6 +2542,50 @@ test "enforceNameConstraints applies permitted + excluded dNSName subtrees" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "validateCertificateRequest enforces RFC 8446 §4.3.2 framing" {
+    // Well-formed: empty context, exact extensions vector, one
+    // signature_algorithms extension listing ed25519 + ecdsa_secp256r1_sha256.
+    const good = [_]u8{
+        0x00, // empty certificate_request_context
+        0x00, 0x0a, // extensions total length (10)
+        0x00, 0x0d, 0x00, 0x06, // signature_algorithms, data length 6
+        0x00, 0x04, 0x08, 0x07, 0x04, 0x03, // list length 4: ed25519, ecdsa_p256
+    };
+    try validateCertificateRequest(&good);
+
+    // The historical server bug: a second (doubled) extensions-length prefix.
+    // Real clients reject this with "Invalid TLS extensions length field".
+    const doubled = [_]u8{
+        0x00,
+        0x00, 0x0c, // outer (spurious) extensions length
+        0x00, 0x0a, // inner extensions length — parsed as an extension type
+        0x00, 0x0d, 0x00, 0x06,
+        0x00, 0x04, 0x08, 0x07, 0x04, 0x03,
+    };
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&doubled));
+
+    // A non-empty context is illegal in the main handshake.
+    const nonempty_ctx = [_]u8{ 0x01, 0xaa, 0x00, 0x0a, 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x08, 0x07, 0x04, 0x03 };
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&nonempty_ctx));
+
+    // Missing the mandatory signature_algorithms extension.
+    const no_sigalgs = [_]u8{ 0x00, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x00 };
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&no_sigalgs));
+
+    // Extensions vector shorter than the remaining body (trailing garbage).
+    const trailing = good ++ [_]u8{0x00};
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&trailing));
+
+    // signature_algorithms list length disagreeing with the extension data.
+    const bad_list = [_]u8{
+        0x00,
+        0x00, 0x0a,
+        0x00, 0x0d, 0x00, 0x06,
+        0x00, 0x06, 0x08, 0x07, 0x04, 0x03, // claims 6 list bytes, has 4
+    };
+    try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&bad_list));
 }
 
 test "leaf RSA key survives the hs_plain consume (regression: copied, not borrowed)" {

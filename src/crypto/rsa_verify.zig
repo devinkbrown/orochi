@@ -57,6 +57,18 @@ inline fn mulAddWord(a: u64, b: u64, acc: u64, carry: u64) Wide {
         var hi: u64 = undefined;
         // rdx:rax = a*b; then add acc and carry into the low word, propagating
         // the carry into the high word with adc.
+        //
+        // The `hi` output MUST be earlyclobber ("=&"): `mulq` writes rdx with
+        // the first instruction, before `%[acc]` / `%[carry]` are read by the
+        // later `addq`s. Without "&", LLVM is free to allocate one of those
+        // "r" inputs into rdx (inputs are normally assumed to be consumed
+        // before any output is written), and under ReleaseFast inlining it
+        // did exactly that — every RSA signature came out garbage while Debug
+        // builds passed. Production symptom: TLS 1.3 clients (e.g. gnutls)
+        // failed the RSA-PSS CertificateVerify with "Public key signature
+        // verification has failed". (`lo` cannot be earlyclobber because the
+        // `a` input intentionally shares rax with it; rax is protected from
+        // the other inputs by that explicit pinning.)
         asm volatile (
             \\mulq %[b]
             \\addq %[acc], %%rax
@@ -64,7 +76,7 @@ inline fn mulAddWord(a: u64, b: u64, acc: u64, carry: u64) Wide {
             \\addq %[carry], %%rax
             \\adcq $0, %%rdx
             : [lo] "={rax}" (lo),
-              [hi] "={rdx}" (hi),
+              [hi] "=&{rdx}" (hi),
             : [a] "{rax}" (a),
               [b] "r" (b),
               [acc] "r" (acc),

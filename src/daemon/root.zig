@@ -169,6 +169,7 @@ pub const quote_index = @import("quote_index.zig");
 pub const raid_guard = @import("raid_guard.zig");
 pub const ratelimit = @import("ratelimit.zig");
 pub const rate_quota = @import("rate_quota.zig");
+pub const rdns = @import("rdns.zig");
 pub const reaction_leaderboard = @import("reaction_leaderboard.zig");
 pub const reaction_tally = @import("reaction_tally.zig");
 pub const reactor_fabric = @import("reactor_fabric.zig");
@@ -475,6 +476,7 @@ test {
     _ = raid_guard;
     _ = ratelimit;
     _ = rate_quota;
+    _ = rdns;
     _ = reaction_leaderboard;
     _ = reaction_tally;
     _ = reactor_fabric;

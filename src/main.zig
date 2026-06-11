@@ -230,11 +230,24 @@ pub fn main(init: std.process.Init) !void {
             std.crypto.hash.sha2.Sha256.hash(secret, &cloak_key_bytes, .{});
             srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
         }
+        // Network-identifying cloak suffix (`[cloak] suffix`); borrowed from
+        // the held config, which outlives the server.
+        if (h.parsed.cloak.suffix) |suffix| srv_cfg.cloak_suffix = suffix;
     }
     if (srv_cfg.cloak_key == null) {
         init.io.random(&cloak_key_bytes);
         srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
         std.debug.print("orochi: cloak key generated (per-boot; set [cloak] secret to persist)\n", .{});
+    }
+
+    // Background forward-confirmed reverse-DNS resolver: client IPs are resolved
+    // off the accept path so hosts present a cloaked hostname rather than a
+    // cloaked IP. Inert (no thread) when /etc/resolv.conf yields no nameservers.
+    var rdns_resolver = orochi.daemon.rdns.Resolver.init(allocator) catch null;
+    defer if (rdns_resolver) |*r| r.deinit();
+    if (rdns_resolver) |*r| {
+        r.start();
+        srv_cfg.rdns = r;
     }
 
     // Implicit-TLS client listener: when `[tls] enabled`, load the configured

@@ -65,6 +65,11 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // Honor -Doptimize for the module (and thus `zig build test`): release
+        // builds exercise codegen paths Debug never sees (the ReleaseFast
+        // RSA inline-asm earlyclobber regression in crypto/rsa_verify.zig was
+        // invisible to Debug-only test runs).
+        .optimize = optimize,
         .link_libc = needs_libc,
     });
 

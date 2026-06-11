@@ -23,6 +23,8 @@ pub const UserMode = enum(u4) {
     hide_oper, // H: hide operator status from WHOIS/WHO for non-opers
     media_tx_deny, // M: server-managed media transmit/publish deny
     media_presence_private, // P: suppress automatic media presence broadcasts
+    admin, // a: network administrator. Server-managed; derived from the
+    // server_admin oper privilege on auto-elevation, never client-settable.
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
@@ -153,6 +155,7 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .hide_oper, .letter = 'H', .name = "hide-oper" },
     .{ .mode = .media_tx_deny, .letter = 'M', .name = "media-tx-deny", .policy = .server_managed },
     .{ .mode = .media_presence_private, .letter = 'P', .name = "media-presence-private" },
+    .{ .mode = .admin, .letter = 'a', .name = "admin", .policy = .server_managed },
 };
 
 pub const DefaultCatalog = Catalog(&default_specs);
