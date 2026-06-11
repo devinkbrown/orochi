@@ -85,6 +85,7 @@ pub const dtls_record = @import("dtls_record.zig");
 pub const dtls_srtp = @import("dtls_srtp.zig");
 pub const ech = @import("ech.zig");
 pub const echo_message = @import("echo_message.zig");
+pub const ec_pkcs = @import("ec_pkcs.zig");
 pub const ed25519_pkcs8 = @import("ed25519_pkcs8.zig");
 pub const elist = @import("elist.zig");
 pub const email_validate = @import("email_validate.zig");
@@ -404,6 +405,7 @@ test {
     _ = dtls_srtp;
     _ = ech;
     _ = echo_message;
+    _ = ec_pkcs;
     _ = ed25519_pkcs8;
     _ = elist;
     _ = email_validate;

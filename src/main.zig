@@ -258,12 +258,18 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
                 srv_cfg.tls_signing_key = tls_loaded.?.signing_key;
                 srv_cfg.tls_rsa_signing_key = tls_loaded.?.rsa_signing_key;
+                srv_cfg.tls_ecdsa_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
                 srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;
                 srv_cfg.tls_early_data_max_size = h.tls.early_data_max_size;
                 std.debug.print("orochi: TLS listener enabled on port {d}\n", .{h.tls.port});
                 if (h.tls.enable_tls12) {
-                    if (tls_loaded.?.key_kind == .rsa) {
+                    if (tls_loaded.?.key_kind == .ecdsa_p256) {
+                        // The loaded ECDSA-P256 leaf serves the 1.2 leg natively.
+                        srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
+                        srv_cfg.tls12_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
+                        std.debug.print("orochi: hardened TLS 1.2 also accepted (ECDSA-P256 leaf)\n", .{});
+                    } else if (tls_loaded.?.key_kind == .rsa) {
                         srv_cfg.tls12_cert_chain = tls_loaded.?.cert_chain;
                         std.debug.print("orochi: hardened TLS 1.2 also accepted (RSA leg)\n", .{});
                     } else {

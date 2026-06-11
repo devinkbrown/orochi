@@ -20,6 +20,7 @@ const std = @import("std");
 const pem = @import("../proto/pem.zig");
 const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
 const rsa_pkcs = @import("../proto/rsa_pkcs.zig");
+const ec_pkcs = @import("../proto/ec_pkcs.zig");
 const x509_selfsign = @import("../proto/x509_selfsign.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const rsa_sign = @import("../crypto/rsa_sign.zig");
@@ -36,6 +37,7 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const cert_pem_label = "CERTIFICATE";
 const key_pem_label = "PRIVATE KEY";
 const rsa_key_pem_label = "RSA PRIVATE KEY";
+const ec_key_pem_label = "EC PRIVATE KEY";
 const pem_begin_marker = "-----BEGIN";
 
 /// Upper bound on a single on-disk cert or key file. Generous for a leaf chain;
@@ -52,11 +54,14 @@ pub const Error = error{
     IncompletePathPair,
     /// Neither on-disk paths nor `enabled` bootstrap were requested.
     NothingToLoad,
+    /// A PEM cert file contained no CERTIFICATE block.
+    NoCertificate,
 } ||
     std.Io.Dir.ReadFileAllocError ||
     pem.Error ||
     ed25519_pkcs8.ParseError ||
     rsa_pkcs.ParseError ||
+    ec_pkcs.ParseError ||
     x509_selfsign.Error ||
     std.crypto.errors.IdentityElementError ||
     std.crypto.errors.NonCanonicalError ||
@@ -89,6 +94,7 @@ pub const Loaded = struct {
     cert_chain: [][]const u8,
     key_kind: KeyKind,
     signing_key: ?Ed25519.KeyPair = null,
+    ecdsa_p256_signing_key: ?ecdsa_p256.KeyPair = null,
     rsa_signing_key: ?rsa_sign.PrivateKey = null,
     rsa_key_storage: ?[]u8 = null,
 
@@ -96,6 +102,9 @@ pub const Loaded = struct {
         for (self.cert_chain) |der| allocator.free(der);
         allocator.free(self.cert_chain);
         if (self.signing_key) |*kp| {
+            std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
+        }
+        if (self.ecdsa_p256_signing_key) |*kp| {
             std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
         }
         if (self.rsa_key_storage) |storage| {
@@ -126,44 +135,83 @@ pub fn loadOrBootstrap(allocator: std.mem.Allocator, io: std.Io, opts: Options) 
 
 /// Read and decode an on-disk certificate + private key pair.
 fn loadFromDisk(allocator: std.mem.Allocator, io: std.Io, cert_path: []const u8, key_path: []const u8) Error!Loaded {
-    const cert_der = try loadCertDer(allocator, io, cert_path);
-    errdefer allocator.free(cert_der);
+    const chain = try loadCertChain(allocator, io, cert_path);
+    errdefer {
+        for (chain) |der| allocator.free(der);
+        allocator.free(chain);
+    }
 
     var key = try loadPrivateKey(allocator, io, key_path);
     errdefer key.deinit(allocator);
 
-    const chain = try allocator.alloc([]const u8, 1);
-    chain[0] = cert_der;
     return .{
         .cert_chain = chain,
         .key_kind = key.key_kind,
         .signing_key = key.signing_key,
+        .ecdsa_p256_signing_key = key.ecdsa_p256_signing_key,
         .rsa_signing_key = key.rsa_signing_key,
         .rsa_key_storage = key.takeRsaStorage(),
     };
 }
 
-/// Read a certificate file (PEM or DER) and return owned DER bytes.
-fn loadCertDer(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error![]const u8 {
+/// Read a certificate file and return the full leaf-first chain as owned DER
+/// blocks. A PEM file with several `CERTIFICATE` blocks (e.g. a Let's Encrypt
+/// `fullchain.pem`: leaf + issuing intermediate) yields one DER per block, in
+/// file order; a single raw-DER file yields a one-element chain. Presenting the
+/// intermediate lets clients build a path to the trust anchor without having it
+/// cached. The caller owns the returned slice and every element.
+fn loadCertChain(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error![][]const u8 {
     const raw = try readFileOwned(allocator, io, path);
     defer allocator.free(raw);
 
-    if (!isPem(raw)) return allocator.dupe(u8, raw);
+    if (!isPem(raw)) {
+        const der = try allocator.dupe(u8, raw);
+        errdefer allocator.free(der);
+        const chain = try allocator.alloc([]const u8, 1);
+        chain[0] = der;
+        return chain;
+    }
 
-    const der_buf = try allocator.alloc(u8, raw.len);
-    defer allocator.free(der_buf);
-    const der = try pem.decode(raw, cert_pem_label, der_buf);
-    return allocator.dupe(u8, der);
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |der| allocator.free(der);
+        list.deinit(allocator);
+    }
+
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+    var off: usize = 0;
+    while (std.mem.indexOfPos(u8, raw, off, begin)) |b| {
+        const e = (std.mem.indexOfPos(u8, raw, b, end_marker) orelse break) + end_marker.len;
+        const block = raw[b..e];
+        const der_buf = try allocator.alloc(u8, block.len);
+        defer allocator.free(der_buf);
+        const der = try pem.decode(block, cert_pem_label, der_buf);
+        try list.append(allocator, try allocator.dupe(u8, der));
+        off = e;
+    }
+
+    if (list.items.len == 0) {
+        // No CERTIFICATE block despite PEM armor — surface a clear decode error.
+        var tiny: [1]u8 = undefined;
+        _ = pem.decode(raw, cert_pem_label, &tiny) catch |err| return err;
+        return error.NoCertificate;
+    }
+    return list.toOwnedSlice(allocator);
 }
 
 const LoadedKey = struct {
     key_kind: KeyKind,
     signing_key: ?Ed25519.KeyPair = null,
+    ecdsa_p256_signing_key: ?ecdsa_p256.KeyPair = null,
     rsa_signing_key: ?rsa_sign.PrivateKey = null,
     rsa_key_storage: ?[]u8 = null,
 
     fn deinit(self: *LoadedKey, allocator: std.mem.Allocator) void {
         if (self.signing_key) |*kp| {
+            std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
+        }
+        if (self.ecdsa_p256_signing_key) |*kp| {
             std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
         }
         if (self.rsa_key_storage) |storage| {
@@ -187,16 +235,24 @@ fn loadPrivateKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Er
 
     var der_buf: ?[]u8 = null;
     defer if (der_buf) |buf| allocator.free(buf);
+    // A SEC1 EC key carries its own PEM label; the PKCS#8 and PKCS#1 labels
+    // cover Ed25519/RSA and PKCS#8-wrapped EC. `is_sec1_ec` forces the EC path.
+    var is_sec1_ec = false;
     const der = if (!isPem(raw)) raw else blk: {
         const buf = try allocator.alloc(u8, raw.len);
         der_buf = buf;
         const first = try pem.decodeFirst(raw, buf);
-        if (!std.mem.eql(u8, first.label, key_pem_label) and !std.mem.eql(u8, first.label, rsa_key_pem_label)) {
+        if (std.mem.eql(u8, first.label, ec_key_pem_label)) {
+            is_sec1_ec = true;
+        } else if (!std.mem.eql(u8, first.label, key_pem_label) and !std.mem.eql(u8, first.label, rsa_key_pem_label)) {
             return error.UnsupportedAlgorithm;
         }
         break :blk first.der;
     };
 
+    if (is_sec1_ec) return loadEc(der);
+
+    // PKCS#8 / DER: probe Ed25519, then EC P-256, then RSA.
     if (ed25519_pkcs8.parse(der)) |seed| {
         var seed_copy = seed;
         defer std.crypto.secureZero(u8, &seed_copy);
@@ -204,14 +260,27 @@ fn loadPrivateKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Er
             .key_kind = .ed25519,
             .signing_key = try Ed25519.KeyPair.generateDeterministic(seed_copy),
         };
-    } else |_| {
-        const rsa = try rsa_pkcs.parse(allocator, der);
-        return .{
-            .key_kind = .rsa,
-            .rsa_signing_key = rsa.key,
-            .rsa_key_storage = rsa.storage,
-        };
-    }
+    } else |_| {}
+
+    if (ec_pkcs.parseScalar(der)) |_| {
+        return loadEc(der);
+    } else |_| {}
+
+    const rsa = try rsa_pkcs.parse(allocator, der);
+    return .{
+        .key_kind = .rsa,
+        .rsa_signing_key = rsa.key,
+        .rsa_key_storage = rsa.storage,
+    };
+}
+
+/// Decode an EC P-256 private key (SEC1 or PKCS#8 DER) into a signing keypair.
+fn loadEc(der: []const u8) Error!LoadedKey {
+    var scalar = try ec_pkcs.parseScalar(der);
+    defer std.crypto.secureZero(u8, &scalar);
+    const secret = ecdsa_p256.SecretKey.fromBytes(scalar) catch return error.UnsupportedAlgorithm;
+    const kp = ecdsa_p256.KeyPair.fromSecretKey(secret) catch return error.UnsupportedAlgorithm;
+    return .{ .key_kind = .ecdsa_p256, .ecdsa_p256_signing_key = kp };
 }
 
 /// Generate a fresh Ed25519 keypair and mint a self-signed leaf for `dns_name`.

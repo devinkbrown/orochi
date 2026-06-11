@@ -1129,6 +1129,10 @@ pub const Config = struct {
     /// with rsa_pss_rsae_sha256, and TLS 1.2 ServerKeyExchange with
     /// rsa_pkcs1_sha256 when the hardened 1.2 leg is enabled for an RSA leaf.
     tls_rsa_signing_key: ?rsa_sign.PrivateKey = null,
+    /// ECDSA P-256 key matching the leaf cert's SPKI; signs TLS 1.3
+    /// CertificateVerify with ecdsa_secp256r1_sha256 (and the 1.2 leg natively).
+    /// This is the common Let's Encrypt / ACME leaf type.
+    tls_ecdsa_signing_key: ?ecdsa_p256.KeyPair = null,
     /// Enable TLS 1.3 NewSessionTicket issuance and PSK resumption on the live
     /// TLS listener. Default false keeps the listener's historical full-handshake
     /// behavior byte-identical.
@@ -1602,7 +1606,7 @@ pub const LinuxServer = struct {
         // Cert presence is the "TLS configured" signal (main.zig only supplies a
         // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
         // same convention the plaintext listener uses.
-        const tls_listener_fd: linux.fd_t = if (config.tls_cert_chain.len != 0 and (config.tls_signing_key != null or config.tls_rsa_signing_key != null))
+        const tls_listener_fd: linux.fd_t = if (config.tls_cert_chain.len != 0 and (config.tls_signing_key != null or config.tls_rsa_signing_key != null or config.tls_ecdsa_signing_key != null))
             (if (reuse_port)
                 try reuseport.createReusePortListener(config.host, config.tls_port, config.backlog)
             else
@@ -1787,6 +1791,7 @@ pub const LinuxServer = struct {
         var cfg = tls_server.Config{
             .cert_chain = self.config.tls_cert_chain,
             .signing_key = self.config.tls_signing_key,
+            .ecdsa_p256_signing_key = self.config.tls_ecdsa_signing_key,
             .rsa_signing_key = self.config.tls_rsa_signing_key,
             .request_client_cert = self.config.tls_request_client_cert,
         };
