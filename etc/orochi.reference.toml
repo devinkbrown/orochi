@@ -169,6 +169,10 @@ dns_name = "irc.example.net"
 # Request a client certificate (mTLS) so SASL EXTERNAL can match the presented
 # fingerprint to an account.
 request_client_cert = false
+# Also accept hardened TLS 1.2 (ECDHE-AEAD over secp256r1) clients on this
+# listener via version-dispatch. Off by default to keep the TLS 1.3-only posture;
+# when on, the 1.2 leg presents a bootstrapped ECDSA-P256 leaf.
+enable_tls12 = false
 
 
 # --- [sts] — IRCv3 Strict Transport Security ---------------------------------

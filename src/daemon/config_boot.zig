@@ -116,6 +116,7 @@ pub const TlsBootConfig = struct {
     key_path: ?[]const u8 = null,
     dns_name: []const u8 = "localhost",
     request_client_cert: bool = false,
+    enable_tls12: bool = false,
 };
 
 /// Project the parsed `[tls]` section onto the neutral boot struct. Borrows
@@ -128,6 +129,7 @@ pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
         .key_path = cfg.tls.key_path,
         .dns_name = cfg.tls.dns_name,
         .request_client_cert = cfg.tls.request_client_cert,
+        .enable_tls12 = cfg.tls.enable_tls12,
     };
 }
 

@@ -12,7 +12,14 @@ cert_path = "/etc/orochi/tls/cert.pem"
 key_path = "/etc/orochi/tls/key.pem"
 dns_name = "irc.example.net"
 request_client_cert = false
+enable_tls12 = false
 ```
+
+Set `enable_tls12 = true` to also accept hardened TLS 1.2 (ECDHE-AEAD) clients on
+the same listener via version-dispatch; it is **off by default** to preserve the
+TLS 1.3-only posture. When enabled, the 1.2 leg presents a freshly bootstrapped
+ECDSA-P256 leaf (the 1.2 engine signs ServerKeyExchange with
+ecdsa_secp256r1_sha256), independent of the 1.3 leaf.
 
 When `[tls].enabled` is true, `main.zig` loads the configured cert/key or bootstraps a self-signed Ed25519 leaf using `dns_name`, then sets `server.Config.tls_port`, certificate chain, signing key, and client-cert request flag (`src/main.zig:222`, `src/main.zig:224`, `src/main.zig:231`, `src/main.zig:234`). The server binds the TLS listener only when cert material and a signing key are present (`src/daemon/server.zig:1499`).
 

@@ -19,6 +19,7 @@ const std = @import("std");
 const pem = @import("../proto/pem.zig");
 const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
 const x509_selfsign = @import("../proto/x509_selfsign.zig");
+const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const x509 = @import("../crypto/x509.zig");
 const random = @import("../crypto/random.zig");
 
@@ -167,6 +168,42 @@ fn bootstrap(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) Err
     const chain = try allocator.alloc([]const u8, 1);
     chain[0] = owned;
     return .{ .cert_chain = chain, .signing_key = key_pair };
+}
+
+/// Resolved hardened-TLS-1.2 material: an ECDSA-P256 leaf chain + key. The 1.2
+/// engine signs ServerKeyExchange with ecdsa_secp256r1_sha256, so its leg always
+/// uses an ECDSA-P256 cert regardless of the (possibly Ed25519) 1.3 cert.
+pub const Tls12 = struct {
+    cert_chain: [][]const u8,
+    key: ecdsa_p256.KeyPair,
+
+    pub fn deinit(self: *Tls12, allocator: std.mem.Allocator) void {
+        for (self.cert_chain) |der| allocator.free(der);
+        allocator.free(self.cert_chain);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.key));
+    }
+};
+
+/// Mint a fresh ECDSA-P256 keypair + self-signed leaf for the hardened TLS 1.2
+/// leg of the listener (`dns_name` as CN/SAN; self-anchoring CA).
+pub fn bootstrapTls12(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) !Tls12 {
+    const key = ecdsa_p256.KeyPair.generate(io);
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    var der_buf: [2048]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedEcdsaP256(&der_buf, .{
+        .common_name = dns_name,
+        .not_before = now - bootstrap_backdate_s,
+        .not_after = now + bootstrap_lifetime_s,
+        .serial = &bootstrap_serial,
+        .key_pair = key,
+        .dns_names = &.{dns_name},
+        .is_ca = true,
+    });
+    const owned = try allocator.dupe(u8, der);
+    errdefer allocator.free(owned);
+    const chain = try allocator.alloc([]const u8, 1);
+    chain[0] = owned;
+    return .{ .cert_chain = chain, .key = key };
 }
 
 /// Fixed nonzero serial for bootstrap leaves; uniqueness across boots is not

@@ -243,6 +243,8 @@ pub fn main(init: std.process.Init) !void {
     // (server.Config borrows them). No STARTTLS — this is a separate TLS port.
     var tls_loaded: ?orochi.daemon.tls_certs.Loaded = null;
     defer if (tls_loaded) |*t| t.deinit(allocator);
+    var tls12_loaded: ?orochi.daemon.tls_certs.Tls12 = null;
+    defer if (tls12_loaded) |*t| t.deinit(allocator);
     if (held) |h| {
         if (h.tls.enabled) {
             if (orochi.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
@@ -257,6 +259,16 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_signing_key = tls_loaded.?.signing_key;
                 srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
                 std.debug.print("orochi: TLS listener enabled on port {d}\n", .{h.tls.port});
+                if (h.tls.enable_tls12) {
+                    if (orochi.daemon.tls_certs.bootstrapTls12(allocator, init.io, h.tls.dns_name)) |t12| {
+                        tls12_loaded = t12;
+                        srv_cfg.tls12_cert_chain = tls12_loaded.?.cert_chain;
+                        srv_cfg.tls12_signing_key = tls12_loaded.?.key;
+                        std.debug.print("orochi: hardened TLS 1.2 also accepted (ECDSA-P256 leg)\n", .{});
+                    } else |err| {
+                        std.debug.print("orochi: TLS 1.2 bootstrap failed ({s}); 1.3-only\n", .{@errorName(err)});
+                    }
+                }
             } else |err| {
                 std.debug.print("orochi: TLS cert error ({s}); TLS disabled\n", .{@errorName(err)});
             }

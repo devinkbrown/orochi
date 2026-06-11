@@ -275,6 +275,12 @@ pub const Config = struct {
         /// Request a client certificate (mutual TLS) so SASL EXTERNAL can match
         /// the presented fingerprint to an account. Off by default.
         request_client_cert: bool = false,
+        /// Also accept hardened TLS 1.2 (ECDHE-AEAD) clients on the same listener,
+        /// via version-dispatch. Off by default to keep the modern TLS-1.3-only
+        /// posture; enabling it widens the accepted protocol surface. The 1.2 leg
+        /// always presents a freshly bootstrapped ECDSA-P256 leaf (the 1.2 engine
+        /// signs ServerKeyExchange with ecdsa_secp256r1_sha256).
+        enable_tls12: bool = false,
     };
 
     /// IRCv3 STS (Strict Transport Security) advertisement policy. When enabled,
