@@ -588,6 +588,8 @@ pub const World = struct {
             .tls_only => channel.modes.tls_only = on,
             .mod_reg => channel.modes.mod_reg = on,
             .news_wire => channel.modes.news_wire = on,
+            .oper_only => channel.modes.oper_only = on,
+            .admin_only => channel.modes.admin_only = on,
             else => return error.UnsupportedMode, // not a flag mode (b/e/I/k/l)
         }
         return before != on;
@@ -984,6 +986,8 @@ pub const World = struct {
             .{ .m = .tls_only, .c = 'S' },
             .{ .m = .mod_reg, .c = 'M' },
             .{ .m = .news_wire, .c = 'W' },
+            .{ .m = .oper_only, .c = 'O' },
+            .{ .m = .admin_only, .c = 'A' },
         };
         for (flags) |f| {
             if (channel.modes.containsFlag(f.m) and n < out.len) {

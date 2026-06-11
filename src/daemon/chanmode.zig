@@ -29,6 +29,8 @@ pub const ChannelMode = enum(u5) {
     tls_only, // S: join only permitted over a TLS session
     mod_reg, // M: mute unauthenticated members (speak needs an account or +v)
     news_wire, // W: enable the in-channel !news/!localnews fantasy bot
+    oper_only, // O: only server operators may join
+    admin_only, // A: only server administrators may join
 };
 
 /// Channel MODE operation direction.
@@ -108,6 +110,8 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .tls_only, .letter = 'S', .name = "tls-only", .kind = .flag_d },
     .{ .mode = .mod_reg, .letter = 'M', .name = "moderate-unregistered", .kind = .flag_d },
     .{ .mode = .news_wire, .letter = 'W', .name = "news-wire", .kind = .flag_d },
+    .{ .mode = .oper_only, .letter = 'O', .name = "oper-only", .kind = .flag_d },
+    .{ .mode = .admin_only, .letter = 'A', .name = "admin-only", .kind = .flag_d },
 };
 
 /// Caller-owned storage for one type-A channel mode list.
@@ -171,6 +175,8 @@ pub const ChannelModes = struct {
     tls_only: bool = false,
     mod_reg: bool = false,
     news_wire: bool = false,
+    oper_only: bool = false,
+    admin_only: bool = false,
 
     pub fn init(
         ban_storage: [][]const u8,
@@ -202,6 +208,8 @@ pub const ChannelModes = struct {
             .tls_only => self.tls_only,
             .mod_reg => self.mod_reg,
             .news_wire => self.news_wire,
+            .oper_only => self.oper_only,
+            .admin_only => self.admin_only,
             else => false,
         };
     }
@@ -238,6 +246,8 @@ pub const ChannelModes = struct {
             .tls_only => &self.tls_only,
             .mod_reg => &self.mod_reg,
             .news_wire => &self.news_wire,
+            .oper_only => &self.oper_only,
+            .admin_only => &self.admin_only,
             else => return false,
         };
         if (slot.* == enabled) return false;
@@ -473,6 +483,8 @@ pub fn letterOf(mode: ChannelMode) u8 {
         .tls_only => 'S',
         .mod_reg => 'M',
         .news_wire => 'W',
+        .oper_only => 'O',
+        .admin_only => 'A',
     };
 }
 
@@ -573,7 +585,7 @@ fn applyOne(modes: *ChannelModes, change: AppliedChange) ChanModeError!bool {
                 return true;
             },
         },
-        .invite_only, .moderated, .no_external, .topic_ops, .secret, .no_ctcp, .no_notice, .no_nick, .free_invite, .tls_only, .mod_reg, .news_wire => {
+        .invite_only, .moderated, .no_external, .topic_ops, .secret, .no_ctcp, .no_notice, .no_nick, .free_invite, .tls_only, .mod_reg, .news_wire, .oper_only, .admin_only => {
             return modes.setFlag(change.mode, change.op == .add);
         },
     }
@@ -806,4 +818,19 @@ test "member tier rank ordering gates privilege (founder>owner>op>voice)" {
     // An op (rank 2) cannot reach owner(3)/founder(4); an owner cannot reach founder.
     try std.testing.expect(MemberModes.fromModes(&.{.op}).rank() < rankOfMode(.owner));
     try std.testing.expect(MemberModes.fromModes(&.{.owner}).rank() < rankOfMode(.founder));
+}
+
+test "oper-only and admin-only channel modes round-trip" {
+    var modes = ChannelModes.empty();
+    var changes_buf: [MAX_SERIALIZED_MODES]AppliedChange = undefined;
+
+    const applied = try apply(&modes, "+OA", &.{}, &changes_buf);
+    try std.testing.expectEqual(@as(usize, 2), applied.len);
+    try std.testing.expect(modes.oper_only);
+    try std.testing.expect(modes.admin_only);
+
+    var mode_buf: [16]u8 = undefined;
+    var param_buf: [1][]const u8 = undefined;
+    const serialized = try writeModeString(&modes, &mode_buf, &param_buf);
+    try std.testing.expectEqualStrings("+OA", serialized.mode_string);
 }

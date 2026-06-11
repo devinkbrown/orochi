@@ -53,7 +53,7 @@ pub fn setServerName(name: ?[]const u8) void {
 }
 
 /// Channel-mode advertisement token (`CHANMODES=<A>,<B>,<C>,<D>`).
-pub const chanmodes_token = "CHANMODES=beIZ,k,lfj,imnstCTNMSgW";
+pub const chanmodes_token = "CHANMODES=beIZ,k,lfj,imnstCTNMSgWOA";
 
 /// The static RPL_ISUPPORT (005) tokens, in advertisement order. Dynamic
 /// per-connection tokens (if any are added later) are appended by the emitter.

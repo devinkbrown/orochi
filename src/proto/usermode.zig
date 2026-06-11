@@ -21,6 +21,8 @@ pub const UserMode = enum(u4) {
     hide_chans, // p: suppress own channel list in WHOIS (opers still see it)
     no_forward, // Q: never be forwarded to another channel on a blocked JOIN
     hide_oper, // H: hide operator status from WHOIS/WHO for non-opers
+    media_tx_deny, // M: server-managed media transmit/publish deny
+    media_presence_private, // P: suppress automatic media presence broadcasts
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
@@ -149,6 +151,8 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .hide_chans, .letter = 'p', .name = "hide-chans" },
     .{ .mode = .no_forward, .letter = 'Q', .name = "no-forward" },
     .{ .mode = .hide_oper, .letter = 'H', .name = "hide-oper" },
+    .{ .mode = .media_tx_deny, .letter = 'M', .name = "media-tx-deny", .policy = .server_managed },
+    .{ .mode = .media_presence_private, .letter = 'P', .name = "media-presence-private" },
 };
 
 pub const DefaultCatalog = Catalog(&default_specs);
@@ -369,6 +373,23 @@ test "no-forward umode (+Q) round-trips and is client-writable" {
     var modes = UmodeSet.empty();
     _ = try apply(&modes, changes, .client);
     try std.testing.expect(modes.contains(.no_forward));
+}
+
+test "media user modes expose server-managed transmit deny and client privacy" {
+    try std.testing.expectEqual(@as(?UserMode, .media_tx_deny), modeFromLetter('M'));
+    try std.testing.expectEqual(@as(?UserMode, .media_presence_private), modeFromLetter('P'));
+    try std.testing.expect(!DefaultCatalog.isClientWritable(.media_tx_deny));
+    try std.testing.expect(DefaultCatalog.isClientWritable(.media_presence_private));
+
+    var changes_buf: [MAX_MODE_CHANGES]ModeChange = undefined;
+    const client_changes = try parse("+MP", &changes_buf);
+    var modes = UmodeSet.empty();
+    try std.testing.expectError(error.ReadOnlyMode, apply(&modes, client_changes, .client));
+    try std.testing.expect(modes.isEmpty());
+
+    _ = try apply(&modes, client_changes, .server);
+    var out: [MAX_MODE_CHANGES + 1]u8 = undefined;
+    try std.testing.expectEqualStrings("+MP", try writeModeString(modes, &out));
 }
 
 test "unknown mode rejected" {

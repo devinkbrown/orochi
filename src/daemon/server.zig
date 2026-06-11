@@ -801,6 +801,7 @@ const Numeric = enum(u16) {
     ERR_INVITEONLYCHAN = 473,
     ERR_BANNEDFROMCHAN = 474,
     ERR_BADCHANNELKEY = 475,
+    ERR_OPERONLYCHAN = 520,
     ERR_NEEDREGGEDNICK = 477,
     ERR_UNAVAILRESOURCE = 437,
     ERR_UNKNOWNMODE = 472,
@@ -3914,6 +3915,17 @@ pub const LinuxServer = struct {
             return true;
         }
 
+        // +O oper-only / +A admin-only: server operator gates, checked with the
+        // other hard join denials and bypassed by no channel status.
+        if (self.world.channelHasFlag(channel, .oper_only) and !conn.session.isOper()) {
+            if (!quiet) try queueNumeric(conn, .ERR_OPERONLYCHAN, &.{channel}, "Cannot join channel (+O) - IRC operator required");
+            return true;
+        }
+        if (self.world.channelHasFlag(channel, .admin_only) and !conn.session.isAdmin()) {
+            if (!quiet) try queueNumeric(conn, .ERR_OPERONLYCHAN, &.{channel}, "Cannot join channel (+A) - server administrator required");
+            return true;
+        }
+
         // +a AUTHONLY (IRCX): only authenticated accounts may join, regardless of
         // invite. Enforced before all other gates.
         if (self.world.channelHasExtFlag(channel, .authonly) and conn.session.account() == null) {
@@ -4460,7 +4472,7 @@ pub const LinuxServer = struct {
                         targets.append(target_nick) catch break;
                     }
                 },
-                'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M', 'W' => {
+                'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M', 'W', 'O', 'A' => {
                     const mode: world_model.ChannelMode = switch (ch) {
                         'i' => .invite_only,
                         'm' => .moderated,
@@ -4474,8 +4486,14 @@ pub const LinuxServer = struct {
                         'S' => .tls_only,
                         'M' => .mod_reg,
                         'W' => .news_wire,
+                        'O' => .oper_only,
+                        'A' => .admin_only,
                         else => unreachable,
                     };
+                    if ((mode == .oper_only or mode == .admin_only) and !conn.session.isOper()) {
+                        try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "That channel mode is operator-only");
+                        continue;
+                    }
                     const changed = self.world.setChannelFlag(channel, mode, adding) catch continue;
                     if (changed) {
                         const want_sign: u8 = if (adding) '+' else '-';
@@ -4676,8 +4694,11 @@ pub const LinuxServer = struct {
     /// (ERR_USERSDONTMATCH 502 otherwise). Query form returns RPL_UMODEIS (221).
     /// Supports +i invisible and +B bot today (IRCv3 bot-mode).
     pub fn handleUserMode(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
-        _ = self;
         if (!std.mem.eql(u8, target, conn.session.displayName())) {
+            if (conn.session.isOper() and parsed.param_count >= 2) {
+                try self.handleOperUserMode(conn, parsed, target);
+                return;
+            }
             try queueNumeric(conn, .ERR_USERSDONTMATCH, &.{}, "Cannot change mode for other users");
             return;
         }
@@ -4717,6 +4738,45 @@ pub const LinuxServer = struct {
         const nick = conn.session.displayName();
         const msg = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "MODE", &.{ nick, applied.written() }, null);
         try appendToConn(conn, msg);
+    }
+
+    fn handleOperUserMode(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView, target: []const u8) !void {
+        const twid = self.world.findNick(target) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+            return;
+        };
+        const tid = clientIdFromWorld(twid);
+        const tconn = self.connFor(tid) orelse {
+            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+            return;
+        };
+        const mode_str = parsed.paramSlice()[1];
+        var applied_buf: [16]u8 = undefined;
+        var applied = Buf{ .storage = &applied_buf };
+        var adding = true;
+        var emitted_sign: u8 = 0;
+        for (mode_str) |ch| {
+            switch (ch) {
+                '+' => adding = true,
+                '-' => adding = false,
+                else => {
+                    const mode = usermode.modeFromLetter(ch) orelse continue;
+                    switch (mode) {
+                        .media_tx_deny, .media_presence_private => {},
+                        else => continue,
+                    }
+                    if (tconn.session.setUmode(mode, adding)) {
+                        appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
+                    }
+                },
+            }
+        }
+        if (applied.written().len == 0) return;
+
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const msg = try formatMessage(&line_buf, self.serverName(), "MODE", &.{ target, applied.written() }, null);
+        try appendToConn(conn, msg);
+        if (tconn != conn) try self.deliver(tid, msg);
     }
 
     /// KICK <channel> <user> [:reason]. Kicker must be op-or-higher and may not
@@ -6655,23 +6715,63 @@ pub const LinuxServer = struct {
             } else |_| {}
             return;
         }
-        // Set: synthesize an equivalent MODE line and delegate (reuses all gating,
-        // tier rules, and broadcast). Member-mode nicks become positional params,
-        // appended in the same order as their letters so handleMode aligns them.
+        var has_named_ext = false;
+        for (req.changes) |chg| {
+            if (modexDirectExtFlag(chg) != null) {
+                has_named_ext = true;
+                break;
+            }
+        }
+        var direct_applied_buf: [64]u8 = undefined;
+        var direct_applied = Buf{ .storage = &direct_applied_buf };
+        var direct_sign: u8 = 0;
+        if (has_named_ext) {
+            const setter = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
+                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+                return;
+            };
+            if (!setter.isOperator()) {
+                try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+                return;
+            }
+            for (req.changes) |chg| {
+                const flag = modexDirectExtFlag(chg) orelse continue;
+                if (chanmode_ext.requiresOper(flag) and !conn.session.isOper()) {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "That channel mode is operator-only");
+                    continue;
+                }
+                const on = chg.op == .add;
+                const changed = self.world.setChannelExtFlag(channel, flag, on) catch continue;
+                if (changed) appendModeLetter(&direct_applied, &direct_sign, chg.op.sign(), chg.letter.?);
+            }
+            if (direct_applied.written().len != 0) {
+                var prefix_buf: [256]u8 = undefined;
+                var line_buf: [default_reply_bytes]u8 = undefined;
+                const msg = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "MODE", &.{ channel, direct_applied.written() }, null);
+                try self.broadcastChannel(channel, msg, null);
+            }
+        }
+        // Set: synthesize equivalent MODE letters for the non-direct cases and
+        // delegate (reuses all gating, tier rules, and broadcast). Member-mode
+        // nicks become positional params, appended in the same order as their
+        // letters so handleMode aligns them.
         var synth = irc_line.LineView{ .raw = "", .command = "MODE" };
         synth.params[0] = channel;
         synth.param_count = 1;
         var ms_buf: [128]u8 = undefined;
         var ms = Buf{ .storage = &ms_buf };
         for (req.changes) |chg| {
+            if (modexDirectExtFlag(chg) != null) continue;
             if (chg.letter) |letter| {
                 ms.appendByte(chg.op.sign()) catch break;
                 ms.appendByte(letter) catch break;
             }
         }
+        if (ms.written().len == 0) return;
         synth.params[1] = ms.written();
         synth.param_count = 2;
         for (req.changes) |chg| {
+            if (modexDirectExtFlag(chg) != null) continue;
             if (chg.letter == null) continue;
             if (chg.param) |p| {
                 if (synth.param_count < synth.params.len) {
@@ -9774,6 +9874,10 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "OFFER")) {
+            if (conn.session.hasUmode(.media_tx_deny)) {
+                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
+                return;
+            }
             try self.mediaOffer(
                 id,
                 conn,
@@ -9948,6 +10052,10 @@ pub const LinuxServer = struct {
         const kname = media_room.kindName(kind);
 
         if (std.ascii.eqlIgnoreCase(sub, "JOIN")) {
+            if (conn.session.hasUmode(.media_tx_deny)) {
+                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
+                return;
+            }
             self.media_rooms.join(channel, nick, kind) catch {
                 try self.failReply(conn, "MEDIA", "JOIN_FAILED", "Could not join the call");
                 return;
@@ -9959,11 +10067,19 @@ pub const LinuxServer = struct {
             else
                 try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "You are not publishing that kind");
         } else if (std.ascii.eqlIgnoreCase(sub, "UNMUTE")) {
+            if (conn.session.hasUmode(.media_tx_deny)) {
+                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
+                return;
+            }
             if (self.media_rooms.setMuted(channel, nick, kind, false))
                 try self.broadcastMediaEvent(channel, "UNMUTE", nick, kname)
             else
                 try self.failReply(conn, "MEDIA", "NOT_IN_CALL", "You are not publishing that kind");
         } else if (std.ascii.eqlIgnoreCase(sub, "SPEAKING")) {
+            if (conn.session.hasUmode(.media_tx_deny)) {
+                try self.failReply(conn, "MEDIA", "TX_DENIED", "Media transmission is disabled for your session");
+                return;
+            }
             const on = parsed.param_count >= 4 and
                 (std.ascii.eqlIgnoreCase(parsed.paramSlice()[3], "on") or std.ascii.eqlIgnoreCase(parsed.paramSlice()[3], "1"));
             if (self.media_rooms.setSpeaking(channel, nick, kind, on))
@@ -9978,12 +10094,19 @@ pub const LinuxServer = struct {
     /// Broadcast a `:server NOTE MEDIA <#chan> <verb> <nick> [kind]` presence
     /// event to every member of `channel` (including the actor).
     fn broadcastMediaEvent(self: *LinuxServer, channel: []const u8, verb: []const u8, nick: []const u8, kind: []const u8) !void {
+        if (self.mediaPresencePrivate(nick)) return;
         var buf: [default_reply_bytes]u8 = undefined;
         const line = if (kind.len != 0)
             std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s} {s}\r\n", .{ self.serverName(), channel, verb, nick, kind }) catch return
         else
             std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s}\r\n", .{ self.serverName(), channel, verb, nick }) catch return;
         try self.broadcastChannel(channel, line, null);
+    }
+
+    fn mediaPresencePrivate(self: *LinuxServer, nick: []const u8) bool {
+        const wid = self.world.findNick(nick) orelse return false;
+        const c = self.connFor(clientIdFromWorld(wid)) orelse return false;
+        return c.session.hasUmode(.media_presence_private);
     }
 
     /// Remove a departing client from every media call it was in, broadcasting a
@@ -12270,6 +12393,14 @@ fn appendModeLetter(applied: *Buf, emitted_sign: *u8, sign: u8, letter: u8) void
     applied.appendByte(letter) catch return;
 }
 
+fn modexDirectExtFlag(change: ircx_modex.ModeChange) ?chanmode_ext.ExtChannelFlag {
+    const letter = change.letter orelse return null;
+    const flag = chanmode_ext.nameToFlag(change.mode_name) orelse return null;
+    if (letter == 'f') return flag;
+    if (chanmode.specFromLetter(letter) == null) return flag;
+    return null;
+}
+
 fn formatMessage(
     out_storage: []u8,
     prefix: []const u8,
@@ -12399,11 +12530,12 @@ fn banContextFor(
     chan_buf: [][]const u8,
 ) world_model.World.BanContext {
     const nchan = self.world.channelsOf(wid, chan_buf);
+    const country = self.metaValue(conn.session.displayName(), "country");
     return .{
         .account = conn.session.account(),
         .realname = conn.session.realname(),
         .host = host_mask,
-        .country = null, // no GeoIP source yet; $g: bans never match
+        .country = if (country.len == 0) null else country,
         .channels = chan_buf[0..nchan],
     };
 }
@@ -12521,6 +12653,17 @@ const test_oper_bindings = [_]oper_mod.OperBinding{
     .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
 };
 
+fn testMultiOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "oper")) and
+        std.mem.eql(u8, creds.password, "orochi");
+}
+var test_multi_oper_anchor: u8 = 0;
+const test_multi_oper_checker = sasl.PlainChecker{ .ptr = &test_multi_oper_anchor, .verifyFn = testMultiOperVerify };
+const test_multi_oper_bindings = [_]oper_mod.OperBinding{
+    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
+    .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
+};
+
 /// Config for the live oper tests: SASL PLAIN verifier + an oper binding for the
 /// "admin" account, so a client that SASL-authenticates as admin is elevated.
 fn operTestConfig(port: u16) Config {
@@ -12532,11 +12675,36 @@ fn operTestConfig(port: u16) Config {
     };
 }
 
+fn multiOperTestConfig(port: u16) Config {
+    return .{
+        .host = "127.0.0.1",
+        .port = port,
+        .num_shards = 1,
+        .sasl_checker = test_multi_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_multi_oper_bindings) catch unreachable,
+    };
+}
+
 /// Drive a live client through SASL PLAIN as the "admin" oper account. Call
 /// before NICK/USER so the client is elevated automatically at registration.
 fn saslAdminPrelude(fd: linux.fd_t) ServerError!void {
+    try saslPlainPrelude(fd, "admin", "orochi");
+}
+
+fn saslPlainPrelude(fd: linux.fd_t, account: []const u8, password: []const u8) ServerError!void {
+    var plain: [128]u8 = undefined;
+    if (account.len + password.len + 2 > plain.len) return error.OutputTooSmall;
+    var plain_len: usize = 0;
+    plain[plain_len] = 0;
+    plain_len += 1;
+    @memcpy(plain[plain_len .. plain_len + account.len], account);
+    plain_len += account.len;
+    plain[plain_len] = 0;
+    plain_len += 1;
+    @memcpy(plain[plain_len .. plain_len + password.len], password);
+    plain_len += password.len;
     var b64: [64]u8 = undefined;
-    const enc = std.base64.standard.Encoder.encode(&b64, "\x00admin\x00orochi");
+    const enc = std.base64.standard.Encoder.encode(&b64, plain[0..plain_len]);
     var line: [128]u8 = undefined;
     try writeAllFd(fd, "CAP REQ :sasl\r\n");
     try writeAllFd(fd, "AUTHENTICATE PLAIN\r\n");
@@ -14089,6 +14257,247 @@ test "threaded server: +x auditorium hides regular members in NAMES" {
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "C") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "!A") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "B") == null);
+}
+
+test "threaded server: MODEX NOFORMAT does not collide with channel forward +f" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #c\r\n");
+    try recvUntil(&a, " 366 A #c ", 200);
+    try writeAllFd(fd_b, "JOIN #c\r\n");
+    try recvUntil(&b, " 366 B #c ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "MODEX #c +NOFORMAT\r\n");
+    try recvUntil(&a, "MODE #c +f", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODEX #c\r\n");
+    try recvUntil(&a, "NOFORMAT", 200);
+
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #c :\x02bold\x02\r\n");
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #c :bold\r\n", 200);
+
+    try writeAllFd(fd_a, "JOIN #overflow\r\n");
+    try recvUntil(&a, " 366 A #overflow ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #c +f #overflow\r\n");
+    try recvUntil(&a, "MODE #c +f #overflow", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODEX #c\r\n");
+    try recvUntil(&a, "NOFORMAT", 200);
+}
+
+test "threaded server: country extban uses session country metadata" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try recvUntil(&c, " 001 C ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "METADATA * SET country DE\r\n");
+    try recvUntil(&b, " 762 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #geo\r\n");
+    try recvUntil(&a, " 366 A #geo ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #geo +b $g:DE\r\n");
+    try recvUntil(&a, "MODE #geo +b $g:DE", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #geo\r\n");
+    try recvUntil(&b, " 474 B #geo ", 200);
+
+    c.reset();
+    try writeAllFd(fd_c, "JOIN #geo\r\n");
+    try recvUntil(&c, " 366 C #geo ", 200);
+}
+
+test "threaded server: oper-only and admin-only channel join gates" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    const fd_d = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_d);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+    var d = LiveClient{ .fd = fd_d };
+
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_b, "oper", "orochi");
+    try saslPlainPrelude(fd_d, "admin", "orochi");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try writeAllFd(fd_d, "NICK D\r\nUSER dana 0 * :Dana\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&b, " 381 B ", 200);
+    try recvUntil(&c, " 001 C ", 200);
+    try recvUntil(&d, " 381 D ", 200);
+
+    try writeAllFd(fd_c, "JOIN #plain\r\n");
+    try recvUntil(&c, " 366 C #plain ", 200);
+    c.reset();
+    try writeAllFd(fd_c, "MODE #plain +O\r\n");
+    try recvUntil(&c, " 481 C ", 200);
+
+    try writeAllFd(fd_a, "JOIN #oa\r\n");
+    try recvUntil(&a, " 366 A #oa ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #oa +O\r\n");
+    try recvUntil(&a, "MODE #oa +O", 200);
+    c.reset();
+    try writeAllFd(fd_c, "JOIN #oa\r\n");
+    try recvUntil(&c, " 520 C #oa ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #oa\r\n");
+    try recvUntil(&b, " 366 B #oa ", 200);
+
+    try writeAllFd(fd_b, "PART #oa\r\n");
+    try recvUntil(&b, "PART #oa", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #oa -O+A\r\n");
+    try recvUntil(&a, "MODE #oa -O+A", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #oa\r\n");
+    try recvUntil(&b, " 520 B #oa ", 200);
+    d.reset();
+    try writeAllFd(fd_d, "JOIN #oa\r\n");
+    try recvUntil(&d, " 366 D #oa ", 200);
+}
+
+test "threaded server: media user modes block transmit and hide automatic presence" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #media\r\n");
+    try recvUntil(&a, " 366 A #media ", 200);
+    try writeAllFd(fd_b, "JOIN #media\r\n");
+    try recvUntil(&b, " 366 B #media ", 200);
+
+    b.reset();
+    try writeAllFd(fd_a, "MODE B +M\r\n");
+    try recvUntil(&b, "MODE B +M", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MEDIA JOIN #media voice\r\n");
+    try recvUntil(&b, "FAIL MEDIA TX_DENIED", 200);
+
+    b.reset();
+    try writeAllFd(fd_a, "MODE B -M\r\n");
+    try recvUntil(&b, "MODE B -M", 200);
+    try writeAllFd(fd_b, "MODE B +P\r\n");
+    try recvUntil(&b, "MODE B +P", 200);
+    a.reset();
+    try writeAllFd(fd_b, "MEDIA JOIN #media voice\r\n");
+    try writeAllFd(fd_a, "PING :media-private\r\n");
+    try recvUntil(&a, "PONG :media-private", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "NOTE MEDIA #media JOIN B voice") == null);
+
+    a.reset();
+    try writeAllFd(fd_a, "MEDIA ROSTER #media\r\n");
+    try recvUntil(&a, "NOTE MEDIA #media ROSTER B voice", 200);
+
+    b.reset();
+    try writeAllFd(fd_a, "MODE B +M\r\n");
+    try recvUntil(&b, "MODE B +M", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MEDIA SPEAKING #media voice on\r\n");
+    try recvUntil(&b, "FAIL MEDIA TX_DENIED", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE B\r\n");
+    try recvUntil(&b, " 221 B :+", 200);
+    try std.testing.expect(std.mem.indexOfScalar(u8, b.written(), 'M') != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, b.written(), 'P') != null);
 }
 
 test "threaded server: oper DEBUG dumps the flight recorder" {

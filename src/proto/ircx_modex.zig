@@ -552,6 +552,7 @@ test "name to letter mapping follows IRCX table" {
     try std.testing.expectEqual(@as(?u8, 'o'), try nameToLetter("HOST"));
     try std.testing.expectEqual(@as(?u8, 'v'), try nameToLetter("VOICE"));
     try std.testing.expectEqual(@as(?u8, 't'), try nameToLetter("TOPICOP"));
+    try std.testing.expectEqual(@as(?u8, 'f'), try nameToLetter("NOFORMAT"));
     try std.testing.expectEqual(@as(?u8, 'Q'), try nameToLetter("FOUNDER"));
     try std.testing.expectEqual(@as(?u8, null), try nameToLetter("PUBLIC"));
 }
