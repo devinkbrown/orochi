@@ -10,7 +10,7 @@
 //!     a fresh Ed25519 keypair is generated (seeded from the OS CSPRNG) and a
 //!     short-lived self-signed leaf is minted with `dns_name` as its subject.
 //!
-//! The returned `Loaded` shape mirrors `crypto/tls_handshake.Config`
+//! The returned `Loaded` shape mirrors `crypto/tls_server.Config`
 //! (`cert_chain` + an Ed25519 `signing_key`); the live listener is wired by
 //! `main.zig`, which owns the handshake. The cert chain bytes are caller-owned —
 //! call `Loaded.deinit` to release them.
@@ -68,7 +68,7 @@ pub const Options = struct {
     dns_name: []const u8 = "localhost",
 };
 
-/// Resolved TLS material. Shape matches `crypto/tls_handshake.Config`:
+/// Resolved TLS material. Shape matches `crypto/tls_server.Config`:
 /// `cert_chain` is a leaf-first list of DER certificates, `signing_key` is the
 /// Ed25519 key that signs the TLS 1.3 CertificateVerify. The chain bytes are
 /// owned by this struct; the signing key is a value.

@@ -31,7 +31,6 @@ pub const shamir = @import("shamir.zig");
 pub const sign_kat = @import("sign_kat.zig");
 pub const sign = @import("sign.zig");
 pub const tls_client = @import("tls_client.zig");
-pub const tls_handshake = @import("tls_handshake.zig");
 pub const tls_kat = @import("tls_kat.zig");
 pub const tls_props = @import("tls_props.zig");
 pub const tls_record = @import("tls_record.zig");
@@ -83,7 +82,6 @@ test {
     _ = sign_kat;
     _ = sign;
     _ = tls_client;
-    _ = tls_handshake;
     _ = tls_kat;
     _ = tls_props;
     _ = tls_record;
