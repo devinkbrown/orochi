@@ -180,7 +180,10 @@ pub const S2sLink = struct {
         return self.peer.registryCount();
     }
 
-    /// Announce a local member's presence/departure in `channel` to the peer.
+    pub const MemberIdentity = s2s_peer.MemberIdentity;
+
+    /// Announce a local member's presence/departure in `channel` to the peer,
+    /// carrying the member's real username/realname/visible-host identity.
     /// Outbound frames accumulate in `out`. Best-effort: only meaningful once the
     /// link is established.
     pub fn sendMembership(
@@ -190,8 +193,9 @@ pub const S2sLink = struct {
         status: u4,
         hlc: u64,
         present: bool,
+        ident: MemberIdentity,
     ) !void {
-        try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present);
+        try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present, ident);
     }
 
     /// Remote members the peer has announced for `channel` (borrowed roster).
@@ -299,10 +303,15 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
     defer b.deinit();
 
-    // Establish, then A announces alice (op) on #chat; pump to B.
+    // Establish, then A announces alice (op) on #chat with her real identity;
+    // pump to B.
     try a.start(10);
     var now: u64 = 11;
-    try a.sendMembership("#chat", "alice", 0b0010, 100, true); // op bit
+    try a.sendMembership("#chat", "alice", 0b0010, 100, true, .{
+        .username = "alice",
+        .realname = "Alice Liddell",
+        .host = "cloak-1a2b.users.orochi",
+    }); // op bit
     var rounds: usize = 0;
     while (rounds < 32) : (rounds += 1) {
         const a_out = a.outbound();
@@ -319,15 +328,29 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
         now += 1;
     }
 
-    // B now sees alice on #chat as a remote member homed on node 1, with op status.
+    // B now sees alice on #chat as a remote member homed on node 1, with op
+    // status AND her propagated real identity (no mesh@server placeholder).
     const members = b.channelMembers("#chat");
     try std.testing.expectEqual(@as(usize, 1), members.len);
     try std.testing.expectEqualStrings("alice", members[0].nick);
     try std.testing.expectEqual(@as(u64, 1), members[0].node);
     try std.testing.expectEqual(@as(u4, 0b0010), members[0].status);
+    try std.testing.expectEqualStrings("alice", members[0].username);
+    try std.testing.expectEqualStrings("Alice Liddell", members[0].realname);
+    try std.testing.expectEqualStrings("cloak-1a2b.users.orochi", members[0].host);
+
+    // The queued live-IRC delta carries the identity too (for the JOIN line).
+    const deltas = try b.takeMembershipChanges();
+    defer {
+        for (deltas) |*d| d.deinit(allocator);
+        allocator.free(deltas);
+    }
+    try std.testing.expectEqual(@as(usize, 1), deltas.len);
+    try std.testing.expectEqualStrings("alice", deltas[0].username);
+    try std.testing.expectEqualStrings("cloak-1a2b.users.orochi", deltas[0].host);
 
     // A part removes her on B too.
-    try a.sendMembership("#chat", "alice", 0, 101, false);
+    try a.sendMembership("#chat", "alice", 0, 101, false, .{});
     rounds = 0;
     while (rounds < 16) : (rounds += 1) {
         const a_out = a.outbound();

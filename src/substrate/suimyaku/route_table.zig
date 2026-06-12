@@ -110,23 +110,46 @@ const ChannelState = struct {
     }
 };
 
-/// One remote channel member's identity, for projecting NAMES/WHO. `nick` is
-/// owned by the route table; `status` reuses the MemberStatus bit layout
-/// (founder/owner/op/voice) so prefixes render; `hlc` drives last-writer-wins.
+/// One remote channel member's identity, for projecting NAMES/WHO. `nick`,
+/// `username`, `realname`, and `host` are owned by the route table; `status`
+/// reuses the MemberStatus bit layout (founder/owner/op/voice) so prefixes
+/// render; `hlc` drives last-writer-wins. Identity strings may be empty when
+/// the origin did not propagate them (consumers substitute placeholders).
 pub const Member = struct {
     nick: []u8,
+    /// The member's username (USER ident) on its home node ("" = unknown).
+    username: []u8,
+    /// The member's realname/GECOS ("" = unknown).
+    realname: []u8,
+    /// The member's VISIBLE (cloaked) host ("" = unknown).
+    host: []u8,
     node: NodeId,
     status: u4,
     hlc: u64,
+
+    fn freeStrings(self: *const Member, allocator: std.mem.Allocator) void {
+        allocator.free(self.nick);
+        allocator.free(self.username);
+        allocator.free(self.realname);
+        allocator.free(self.host);
+    }
+};
+
+/// A remote member's propagated identity, as `applyMembership` accepts it
+/// (borrowed; duped into owned `Member` strings on store).
+pub const MemberIdentity = struct {
+    username: []const u8 = "",
+    realname: []const u8 = "",
+    host: []const u8 = "",
 };
 
 /// Per-channel member roster (flat list — channels are bounded, and a flat list
-/// keeps ownership trivial: one owned nick per entry).
+/// keeps ownership trivial: owned nick + identity strings per entry).
 const MemberList = struct {
     entries: std.ArrayListUnmanaged(Member) = .empty,
 
     fn deinit(self: *MemberList, allocator: std.mem.Allocator) void {
-        for (self.entries.items) |m| allocator.free(m.nick);
+        for (self.entries.items) |m| m.freeStrings(allocator);
         self.entries.deinit(allocator);
     }
 
@@ -288,6 +311,8 @@ pub const RouteTable = struct {
     /// Apply a MEMBERSHIP event for a remote member, last-writer-wins by `hlc`.
     /// `present` true = join/status upsert; false = part. Stale events (hlc <= the
     /// stored one for this nick) are ignored, so out-of-order gossip converges.
+    /// `ident` carries the member's propagated username/realname/visible-host;
+    /// on a newer event the stored identity is replaced (LWW, like the status).
     pub fn applyMembership(
         self: *Self,
         chan: []const u8,
@@ -296,6 +321,7 @@ pub const RouteTable = struct {
         status: u4,
         hlc: u64,
         present: bool,
+        ident: MemberIdentity,
     ) Error!ApplyResult {
         try self.validateName(chan);
         try self.validateName(nick);
@@ -308,12 +334,15 @@ pub const RouteTable = struct {
             if (hlc <= cur.hlc) return .{ .outcome = .unchanged, .prev_status = prev }; // stale
             if (present) {
                 const changed = cur.status != status or cur.node != node;
+                try replaceOwned(self.allocator, &cur.username, ident.username);
+                try replaceOwned(self.allocator, &cur.realname, ident.realname);
+                try replaceOwned(self.allocator, &cur.host, ident.host);
                 cur.node = node;
                 cur.status = status;
                 cur.hlc = hlc;
                 return .{ .outcome = if (changed) .status_changed else .unchanged, .prev_status = prev };
             } else {
-                self.allocator.free(cur.nick);
+                cur.freeStrings(self.allocator);
                 _ = list.entries.swapRemove(idx);
                 self.pruneIfEmpty(chan);
                 return .{ .outcome = .parted, .prev_status = prev };
@@ -323,7 +352,21 @@ pub const RouteTable = struct {
         if (list.entries.items.len >= self.cfg.max_nicks) return error.RouteTableFull;
         const owned = try self.allocator.dupe(u8, nick);
         errdefer self.allocator.free(owned);
-        try list.entries.append(self.allocator, .{ .nick = owned, .node = node, .status = status, .hlc = hlc });
+        const owned_user = try self.allocator.dupe(u8, ident.username);
+        errdefer self.allocator.free(owned_user);
+        const owned_real = try self.allocator.dupe(u8, ident.realname);
+        errdefer self.allocator.free(owned_real);
+        const owned_host = try self.allocator.dupe(u8, ident.host);
+        errdefer self.allocator.free(owned_host);
+        try list.entries.append(self.allocator, .{
+            .nick = owned,
+            .username = owned_user,
+            .realname = owned_real,
+            .host = owned_host,
+            .node = node,
+            .status = status,
+            .hlc = hlc,
+        });
         return .{ .outcome = .joined };
     }
 
@@ -383,7 +426,7 @@ pub const RouteTable = struct {
             var i: usize = 0;
             while (i < list.entries.items.len) {
                 if (list.entries.items[i].node == node) {
-                    self.allocator.free(list.entries.items[i].nick);
+                    list.entries.items[i].freeStrings(self.allocator);
                     _ = list.entries.swapRemove(i);
                 } else i += 1;
             }
@@ -443,6 +486,16 @@ pub const RouteTable = struct {
 
 fn validateNode(node: NodeId) Error!void {
     if (node == 0) return error.InvalidNode;
+}
+
+/// Replace an owned string with a copy of `incoming` (no-op when equal). The
+/// new copy is allocated BEFORE the old one is freed, so an allocation failure
+/// leaves the previous owned value intact (never a dangling slot).
+fn replaceOwned(allocator: std.mem.Allocator, slot: *[]u8, incoming: []const u8) std.mem.Allocator.Error!void {
+    if (std.mem.eql(u8, slot.*, incoming)) return;
+    const fresh = try allocator.dupe(u8, incoming);
+    allocator.free(slot.*);
+    slot.* = fresh;
 }
 
 fn containsNode(nodes: []const NodeId, node: NodeId) bool {
@@ -543,13 +596,13 @@ test "applyMembership tracks remote channel members with last-writer-wins" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#chat", "alice", 10, 0b0100, 1, true); // op
-    _ = try table.applyMembership("#chat", "bob", 20, 0b0000, 1, true);
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0100, 1, true, .{}); // op
+    _ = try table.applyMembership("#chat", "bob", 20, 0b0000, 1, true, .{});
     try std.testing.expectEqual(@as(usize, 2), table.channelMembers("#chat").len);
 
     // A stale event (lower hlc) is ignored; a newer one updates status.
-    _ = try table.applyMembership("#chat", "alice", 10, 0b0000, 0, true);
-    _ = try table.applyMembership("#chat", "alice", 10, 0b0010, 5, true); // now voice
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0000, 0, true, .{});
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0010, 5, true, .{}); // now voice
     var alice_status: ?u4 = null;
     for (table.channelMembers("#chat")) |m| {
         if (std.mem.eql(u8, m.nick, "alice")) alice_status = m.status;
@@ -557,12 +610,45 @@ test "applyMembership tracks remote channel members with last-writer-wins" {
     try std.testing.expectEqual(@as(u4, 0b0010), alice_status.?);
 }
 
+test "applyMembership stores and LWW-updates the propagated identity" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{
+        .username = "alice",
+        .realname = "Alice Liddell",
+        .host = "cloak-1a2b.users",
+    });
+    var alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("alice", alice.username);
+    try std.testing.expectEqualStrings("Alice Liddell", alice.realname);
+    try std.testing.expectEqualStrings("cloak-1a2b.users", alice.host);
+
+    // A stale event must NOT clobber the stored identity.
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{ .username = "stale" });
+    alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("alice", alice.username);
+
+    // A newer event replaces it (e.g. a vhost change re-announced).
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 9, true, .{
+        .username = "alice",
+        .realname = "Alice Liddell",
+        .host = "vanity.example",
+    });
+    alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("vanity.example", alice.host);
+
+    // Part frees the identity strings (leak-checked by testing.allocator).
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 10, false, .{});
+    try std.testing.expect(table.findMember("alice") == null);
+}
+
 test "findMember locates a roster member case-insensitively with its node" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#chat", "Alice", 10, 0b0100, 1, true);
-    _ = try table.applyMembership("#ops", "bob", 20, 0, 1, true);
+    _ = try table.applyMembership("#chat", "Alice", 10, 0b0100, 1, true, .{});
+    _ = try table.applyMembership("#ops", "bob", 20, 0, 1, true, .{});
 
     const alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("Alice", alice.nick);
@@ -578,12 +664,12 @@ test "applyMembership part removes a member and prunes an empty channel" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#x", "alice", 10, 0, 1, true);
+    _ = try table.applyMembership("#x", "alice", 10, 0, 1, true, .{});
     // Stale part (hlc <= current) does not remove.
-    _ = try table.applyMembership("#x", "alice", 10, 0, 1, false);
+    _ = try table.applyMembership("#x", "alice", 10, 0, 1, false, .{});
     try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#x").len);
     // Newer part removes; the now-empty channel is pruned.
-    _ = try table.applyMembership("#x", "alice", 10, 0, 2, false);
+    _ = try table.applyMembership("#x", "alice", 10, 0, 2, false, .{});
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
 }
 
@@ -591,8 +677,8 @@ test "removeNode evicts that node's remote members (netsplit hygiene)" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true);
-    _ = try table.applyMembership("#chat", "bob", 20, 0, 1, true);
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{});
+    _ = try table.applyMembership("#chat", "bob", 20, 0, 1, true, .{});
     table.removeNode(10);
     const members = table.channelMembers("#chat");
     try std.testing.expectEqual(@as(usize, 1), members.len);
