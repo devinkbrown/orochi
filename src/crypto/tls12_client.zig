@@ -202,6 +202,12 @@ pub const Client = struct {
                     if (!tls12.constantTimeEq(&expected, msg.body)) return error.FinishedMismatch;
                     try self.transcript.appendSlice(self.allocator, msg.raw);
                     consumePrefix(&self.recv_buf, rec.wire_len);
+                    // TLS 1.2 uses ONE record sequence per direction per epoch:
+                    // application data continues the counter past the encrypted
+                    // Finished (it does not reset to 0). Carry the handshake
+                    // counters into the app counters so we agree with the peer.
+                    self.app_read_seq = self.hs_read_seq;
+                    self.app_write_seq = self.hs_write_seq;
                     self.state = .connected;
                     return .need_more;
                 },

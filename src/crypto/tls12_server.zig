@@ -182,6 +182,14 @@ pub const Server = struct {
                     try self.transcript.appendSlice(self.allocator, msg.raw);
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     const reply = try self.buildServerFinishedFlight();
+                    // TLS 1.2 keeps ONE record sequence per direction per epoch:
+                    // the encrypted Finished is seq 0 and application data continues
+                    // from there (first app record is seq 1), it does NOT reset.
+                    // Carry the handshake counters into the app counters so we agree
+                    // with standards-compliant peers (OpenSSL, browsers); resetting
+                    // to 0 only ever interoperated with our own client.
+                    self.app_read_seq = self.hs_read_seq;
+                    self.app_write_seq = self.hs_write_seq;
                     self.state = .connected;
                     return .{ .bytes_to_send = reply };
                 },
@@ -747,8 +755,11 @@ test "TLS 1.2 exportResume/resumeConnected carries a live session across Server 
     defer fresh.deinit();
     try std.testing.expectError(error.BadState, fresh.exportResume());
     const st = try server.exportResume();
-    try std.testing.expectEqual(@as(u64, 1), st.app_read_seq);
-    try std.testing.expectEqual(@as(u64, 1), st.app_write_seq);
+    // One app record each way after the handshake. App sequences continue past
+    // the encrypted Finished (which was seq 0), so each is now at 2: 1 (carried
+    // from the handshake) + 1 (the single app record exchanged above).
+    try std.testing.expectEqual(@as(u64, 2), st.app_read_seq);
+    try std.testing.expectEqual(@as(u64, 2), st.app_write_seq);
 
     var successor = try Server.resumeConnected(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key }, st);
     defer successor.deinit();
