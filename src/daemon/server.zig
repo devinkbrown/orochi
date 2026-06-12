@@ -9728,7 +9728,23 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
         const nick = conn.session.displayName();
-        const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, "+o" }, null);
+        // Announce the operator modes just granted: +o plus every server-managed
+        // umode setOperGrant applied (e.g. +a for a server_admin). Letters come
+        // from the umode catalog, not hardcoded, so the announcement always
+        // matches what the session actually holds.
+        var modes_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
+        var ml: usize = 0;
+        modes_buf[ml] = '+';
+        ml += 1;
+        modes_buf[ml] = 'o'; // the IRC operator mode (derived from is_oper)
+        ml += 1;
+        for (usermode.default_specs) |spec| {
+            if (spec.policy == .server_managed and conn.session.hasUmode(spec.mode)) {
+                modes_buf[ml] = spec.letter;
+                ml += 1;
+            }
+        }
+        const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, modes_buf[0..ml] }, null);
         try appendToConn(conn, msg);
     }
 
