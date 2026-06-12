@@ -1508,7 +1508,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     const host_line = std.fmt.bufPrint(&host_buf, "Your host is {s}, running Orochi", .{replies.server_name}) catch "Your host is this server, running Orochi";
     try replies.numeric(session, .RPL_YOURHOST, &.{}, host_line);
     try replies.numeric(session, .RPL_CREATED, &.{}, "This server is running Orochi");
-    try replies.numeric(session, .RPL_MYINFO, &.{ replies.server_name, "orochi-0.1", "io", "ov" }, "are supported by this server");
+    try replies.numeric(session, .RPL_MYINFO, &.{ replies.server_name, "orochi-" ++ @import("build_info").git_commit, "io", "ov" }, "are supported by this server");
     try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
 }
 
