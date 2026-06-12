@@ -372,6 +372,16 @@ pub const RouteTable = struct {
         self.removeNodeMembers(node);
     }
 
+    /// Alias used by daemon peer-drop cleanup: remove every route/member whose
+    /// origin is `node`.
+    pub fn removeByNode(self: *Self, node: NodeId) void {
+        self.removeNode(node);
+    }
+
+    pub fn clearOrigin(self: *Self, node: NodeId) void {
+        self.removeByNode(node);
+    }
+
     /// Drop every remote member homed on a departed node (netsplit hygiene), and
     /// remove any channel left with no remaining members.
     fn removeNodeMembers(self: *Self, node: NodeId) void {
@@ -505,7 +515,7 @@ test "node removal purges its nicks" {
     try table.updateOnMembershipChange("#zig", 20, .join);
     try table.updateOnMembershipChange("#empty-after-purge", 10, .join);
 
-    table.removeNode(10);
+    table.removeByNode(10);
 
     try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("alice"));
     try std.testing.expectEqual(@as(?NodeId, 20), table.nickNode("bob"));

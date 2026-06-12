@@ -1567,7 +1567,7 @@ pub const LinuxServer = struct {
     geoip_asn_bytes: ?[]u8 = null,
     geoip_asn_tried: bool = false,
     /// Last time the periodic membership anti-entropy re-burst ran (ms). Gates
-    /// `resyncMembershipToPeers` so it fires on a coarse cadence, not every tick.
+    /// `resyncMeshStateToPeers` so it fires on a coarse cadence, not every tick.
     last_membership_resync_ms: i64 = 0,
     /// Web-stats publishing throttle + running peak client count.
     stats_last_write_ms: i64 = 0,
@@ -2198,23 +2198,23 @@ pub const LinuxServer = struct {
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
         self.sweepMeshAutoConnect(false);
-        // Membership anti-entropy: periodically re-burst this node's local channel
-        // members to every established peer so anything missed during a split or a
-        // reconnect race (e.g. a user who joined while the link was down)
-        // converges within the cadence instead of staying out of sync forever.
+        // Mesh anti-entropy: periodically re-burst this node's local channel
+        // state to every established peer so anything missed during a split or a
+        // reconnect race converges within the cadence instead of staying out of
+        // sync forever.
         const now = self.nowMs();
         if (now - self.last_membership_resync_ms >= membership_resync_interval_ms) {
             self.last_membership_resync_ms = now;
-            self.resyncMembershipToPeers();
+            self.resyncMeshStateToPeers();
         }
         self.maybeWriteStats();
     }
 
-    /// Re-send the local membership roster to every established S2S peer. The
-    /// CRDT is HLC-keyed so re-affirming present members is idempotent; this only
-    /// fills gaps (a member the peer never learned about). Mirrors the one-shot
+    /// Re-send local mesh state to every established S2S peer. Membership is
+    /// HLC-keyed so re-affirming present members is idempotent; this fills gaps
+    /// (a member the peer never learned about). Mirrors the one-shot
     /// link-establish burst (`sendMembershipBurstTo`) on a periodic cadence.
-    fn resyncMembershipToPeers(self: *LinuxServer) void {
+    fn resyncMeshStateToPeers(self: *LinuxServer) void {
         for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             const is_peer = slot.value.s2s_secured != null or slot.value.s2s != null;
@@ -2226,7 +2226,19 @@ pub const LinuxServer = struct {
             else
                 false;
             if (!established) continue;
-            self.sendMembershipBurstTo(&slot.value);
+            self.sendMeshStateBurstTo(&slot.value);
+        }
+    }
+
+    fn clearDroppedPeerRouteOrigin(self: *LinuxServer, dropped_node: u64) void {
+        if (dropped_node == 0) return;
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (link.inner) |inner| inner.peer.routes.clearOrigin(dropped_node);
+            } else if (slot.value.s2s) |link| {
+                link.peer.routes.clearOrigin(dropped_node);
+            }
         }
     }
 
@@ -3203,7 +3215,7 @@ pub const LinuxServer = struct {
         }
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
-            self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
+            self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst to the new peer
             self.rebroadcastLocalOpers(); // propagate this node's opers to the new peer
         }
     }
@@ -3257,7 +3269,7 @@ pub const LinuxServer = struct {
         self.drainMembershipChanges(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
-            self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
+            self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst to the new peer
         }
     }
 
@@ -3728,11 +3740,13 @@ pub const LinuxServer = struct {
         if (self.rx().clients.get(id)) |conn| {
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
+                const dropped_node = link.peerShortId();
                 if (link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
                     _ = self.peer_health.remove(link.remoteName());
                 }
                 self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
+                if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
@@ -3743,11 +3757,13 @@ pub const LinuxServer = struct {
                 return;
             }
             if (conn.s2s) |link| {
+                const dropped_node = link.remoteNodeId();
                 if (link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
                     _ = self.peer_health.remove(link.remoteName());
                 }
                 self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
+                if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s = null;
@@ -4296,9 +4312,16 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Burst the full local channel-member roster to ONE freshly-established peer
-    /// link (the conn's s2s/s2s_secured), so the peer's NAMES/WHO is correct
-    /// immediately rather than only after subsequent joins. Best-effort. (#65)
+    /// Burst all currently wired local mesh state to ONE peer link. This wrapper
+    /// is shared by the one-shot link-establish burst and the periodic
+    /// anti-entropy cadence so new state families have one re-sync hook.
+    fn sendMeshStateBurstTo(self: *LinuxServer, conn: *ConnState) void {
+        self.sendMembershipBurstTo(conn);
+    }
+
+    /// Burst the full local channel-member roster to ONE peer link (the conn's
+    /// s2s/s2s_secured), so the peer's NAMES/WHO is correct immediately rather
+    /// than only after subsequent joins. Best-effort. (#65)
     fn sendMembershipBurstTo(self: *LinuxServer, conn: *ConnState) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         var cit = self.world.channelIterator();
