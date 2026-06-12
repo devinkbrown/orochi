@@ -212,6 +212,40 @@ pub const S2sLink = struct {
         try self.peer.sendChannelProp(self.sink(), channel, key, value, owner, hlc, present);
     }
 
+    /// Announce a local channel topic change to the peer.
+    pub fn sendTopic(
+        self: *S2sLink,
+        channel: []const u8,
+        topic: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        try self.peer.sendTopic(self.sink(), channel, topic, setter, set_at, hlc, present);
+    }
+
+    /// Announce a local user's nick change to the peer.
+    pub fn sendNickChange(
+        self: *S2sLink,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        ident: s2s_peer.MemberIdentity,
+        hlc: u64,
+    ) !void {
+        try self.peer.sendNickChange(self.sink(), old_nick, new_nick, ident, hlc);
+    }
+
+    /// Drain remote channel topic changes the daemon should apply + emit.
+    pub fn takeTopicChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.TopicDelta {
+        return self.peer.takeTopicChanges();
+    }
+
+    /// Drain remote user nick changes the daemon should surface as NICK lines.
+    pub fn takeNickChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.NickDelta {
+        return self.peer.takeNickChanges();
+    }
+
     /// Remote members the peer has announced for `channel` (borrowed roster).
     pub fn channelMembers(self: *const S2sLink, channel: []const u8) []const s2s_peer.MemberInfo {
         return self.peer.channelMembers(channel);
@@ -515,6 +549,113 @@ test "CHANNEL_PROP payload round-trips across the link into takeChannelPropChang
     try std.testing.expectEqualStrings("alice", changes[0].owner);
     try std.testing.expect(!changes[1].present);
     try std.testing.expectEqualStrings("SUBJECT", changes[1].key);
+}
+
+test "TOPIC payload round-trips across the link into takeTopicChanges" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    try a.start(10);
+    try a.sendTopic("#chat", "welcome to the mesh", "alice!u@h", 1700, 100, true);
+
+    var now: u64 = 11;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const changes = try b.takeTopicChanges();
+    defer {
+        for (changes) |*ch| ch.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expect(changes[0].present);
+    try std.testing.expectEqualStrings("#chat", changes[0].channel);
+    try std.testing.expectEqualStrings("welcome to the mesh", changes[0].topic);
+    try std.testing.expectEqualStrings("alice!u@h", changes[0].setter);
+    try std.testing.expectEqual(@as(i64, 1700), changes[0].set_at);
+
+    // A staler topic (lower hlc) is dropped by the route-table LWW.
+    try a.sendTopic("#chat", "old", "bob", 1600, 50, true);
+    rounds = 0;
+    while (rounds < 16) : (rounds += 1) {
+        const a_out = a.outbound();
+        if (a_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        a.clearOutbound();
+        try b.feed(a_copy, now, 7);
+        now += 1;
+    }
+    const stale = try b.takeTopicChanges();
+    defer allocator.free(stale);
+    try std.testing.expectEqual(@as(usize, 0), stale.len);
+}
+
+test "NICKCHANGE renames a remote member and yields a delta" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    try a.start(10);
+    // Announce the member first so b's roster knows it, then rename.
+    try a.sendMembership("#chat", "Guest1", 0, 100, true, .{ .username = "guest", .realname = "G", .host = "old.host" });
+    try a.sendNickChange("Guest1", "kain", .{ .username = "kain", .realname = "Devin", .host = "cloak.host" }, 200);
+
+    var now: u64 = 11;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const changes = try b.takeNickChanges();
+    defer {
+        for (changes) |*d| d.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("Guest1", changes[0].old_nick);
+    try std.testing.expectEqualStrings("kain", changes[0].new_nick);
+    try std.testing.expectEqualStrings("kain", changes[0].username);
+    try std.testing.expectEqualStrings("cloak.host", changes[0].host);
+
+    // The roster now resolves the new nick and no longer the old one.
+    try std.testing.expect(b.findRemoteMember("kain") != null);
+    try std.testing.expect(b.findRemoteMember("Guest1") == null);
 }
 
 test "OPER_GRANT payload round-trips across the link into takeOperGrants" {

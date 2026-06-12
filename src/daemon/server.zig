@@ -3233,6 +3233,10 @@ pub const LinuxServer = struct {
         self.drainChannelListChanges(link);
         // Apply remote IRCX channel PROP changes and surface non-secret updates.
         self.drainChannelPropChanges(link);
+        // Apply/surface remote channel topic changes in real time.
+        self.drainTopicChanges(link);
+        // Surface remote user nick changes to shared-channel local members.
+        self.drainNickChanges(link);
         // Drain inbound cross-mesh oper grants. Each is verified against the
         // peer's authenticated Ed25519 key from the Tsumugi handshake before it
         // can confer operator authority locally — an unverifiable grant is
@@ -3306,6 +3310,10 @@ pub const LinuxServer = struct {
         self.drainChannelListChanges(link);
         // Apply remote IRCX channel PROP changes and surface non-secret updates.
         self.drainChannelPropChanges(link);
+        // Apply/surface remote channel topic changes in real time.
+        self.drainTopicChanges(link);
+        // Surface remote user nick changes to shared-channel local members.
+        self.drainNickChanges(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
@@ -4362,6 +4370,7 @@ pub const LinuxServer = struct {
         self.sendMembershipBurstTo(conn); // roster + channel list-modes (+b/+e/+I)
         self.sendChannelModeFlagsBurstTo(conn);
         self.sendChannelPropBurstTo(conn);
+        self.sendTopicBurstTo(conn);
     }
 
     const ChannelModeFlagSpec = struct {
@@ -4462,10 +4471,17 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn nextChannelPropHlc(self: *LinuxServer) u64 {
+    /// Monotonic-ish hybrid logical clock for LWW mesh facts: wall-clock millis in
+    /// the high bits, a per-node sequence in the low 16 so two writes in the same
+    /// millisecond still order. Shared by PROP and TOPIC propagation.
+    fn nextMeshHlc(self: *LinuxServer) u64 {
         self.msg_seq +%= 1;
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         return (now << 16) | (self.msg_seq & 0xffff);
+    }
+
+    fn nextChannelPropHlc(self: *LinuxServer) u64 {
+        return self.nextMeshHlc();
     }
 
     fn writeChannelPropClockKey(out: []u8, channel: []const u8, key: []const u8) ?[]const u8 {
@@ -4900,6 +4916,146 @@ pub const LinuxServer = struct {
             ch.deinit(self.allocator);
         }
         self.allocator.free(changes);
+    }
+
+    /// Drain remote channel topic changes, apply each to the local world (so
+    /// TOPIC queries reflect it), and surface a live `TOPIC` line to local
+    /// members. The route-table LWW already gated stale/re-burst events.
+    fn drainTopicChanges(self: *LinuxServer, link: anytype) void {
+        const changes = link.takeTopicChanges() catch return;
+        const remote = link.remoteName();
+        for (changes) |*ch| {
+            self.applyRemoteTopic(ch);
+            self.emitRemoteTopic(ch, remote);
+            ch.deinit(self.allocator);
+        }
+        self.allocator.free(changes);
+    }
+
+    fn applyRemoteTopic(self: *LinuxServer, ch: anytype) void {
+        if (!self.world.channelExists(ch.channel)) return;
+        if (ch.present) {
+            self.world.setTopic(ch.channel, ch.topic, ch.setter, ch.set_at) catch {};
+        } else {
+            self.world.setTopic(ch.channel, "", ch.setter, ch.set_at) catch {};
+        }
+    }
+
+    fn emitRemoteTopic(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        // Only locally-known channels have local members to notify.
+        if (!self.world.channelExists(ch.channel)) return;
+        const prefix = if (ch.setter.len != 0) ch.setter else if (remote_name.len != 0) remote_name else self.serverName();
+        var buf: [900]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s} TOPIC {s} :{s}\r\n", .{ prefix, ch.channel, ch.topic }) catch return;
+        self.broadcastChannel(ch.channel, line, null) catch {};
+    }
+
+    /// Drain remote user nick changes: the route table already renamed the user
+    /// in its rosters, so here we only surface a live `:old!u@h NICK new` line to
+    /// each local client sharing a channel with the renamed user (deduped).
+    fn drainNickChanges(self: *LinuxServer, link: anytype) void {
+        const changes = link.takeNickChanges() catch return;
+        const remote = link.remoteName();
+        for (changes) |*d| {
+            self.emitRemoteNick(d, remote, link);
+            d.deinit(self.allocator);
+        }
+        self.allocator.free(changes);
+    }
+
+    fn emitRemoteNick(self: *LinuxServer, d: anytype, remote_name: []const u8, link: anytype) void {
+        const user = if (d.username.len != 0) d.username else world_projection.remote_user_placeholder;
+        const host = if (d.host.len != 0) d.host else if (remote_name.len != 0) remote_name else default_host;
+        var buf: [900]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} NICK {s}\r\n", .{ d.old_nick, user, host, d.new_nick }) catch return;
+
+        // Deliver once per local client that shares any channel with the renamed
+        // remote user (now stored under new_nick in the peer's rosters).
+        var seen = std.AutoHashMap(u64, void).init(self.allocator);
+        defer seen.deinit();
+        var it = self.world.channels.iterator();
+        while (it.next()) |entry| {
+            const channel = entry.key_ptr.*;
+            var present = false;
+            for (link.channelMembers(channel)) |m| {
+                if (std.ascii.eqlIgnoreCase(m.nick, d.new_nick)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) continue;
+            var members = self.world.memberIterator(channel) orelse continue;
+            while (members.next()) |member| {
+                const mid = clientIdFromWorld(member.*);
+                const key = @as(u64, @bitCast(mid));
+                if (seen.contains(key)) continue;
+                seen.put(key, {}) catch {};
+                self.deliver(mid, line) catch {};
+            }
+        }
+    }
+
+    /// Announce a local channel topic change to every established mesh peer so
+    /// their members see the new topic in real time.
+    fn announceTopic(self: *LinuxServer, channel: []const u8, topic: []const u8, setter: []const u8, set_at: i64, present: bool) void {
+        const hlc = self.nextMeshHlc();
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    /// Announce a local user's nick change to every established mesh peer so their
+    /// rosters rename the user and their members see a live NICK line.
+    fn announceNickChange(self: *LinuxServer, old_nick: []const u8, new_nick: []const u8, ident: s2s_link.S2sLink.MemberIdentity) void {
+        const hlc = self.nextMeshHlc();
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.sendNickChange(old_nick, new_nick, ident, hlc) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                link.sendNickChange(old_nick, new_nick, ident, hlc) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    /// Burst every local channel's current topic to ONE freshly-established peer
+    /// so a relink converges immediately instead of waiting for the next TOPIC.
+    fn sendTopicBurstTo(self: *LinuxServer, conn: *ConnState) void {
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            const info = self.world.topicInfo(cv.name) orelse continue;
+            if (info.text.len == 0) continue;
+            const hlc = self.nextMeshHlc();
+            if (conn.s2s_secured) |link| {
+                link.sendTopic(cv.name, info.text, info.setter, info.set_at, hlc, true) catch continue;
+            } else if (conn.s2s) |link| {
+                link.sendTopic(cv.name, info.text, info.setter, info.set_at, hlc, true) catch continue;
+            }
+        }
+        if (conn.s2s_secured) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        } else if (conn.s2s) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        }
     }
 
     fn flushS2sOutbound(self: *LinuxServer, conn: *ConnState, out: []const u8) !void {
@@ -10616,6 +10772,10 @@ pub const LinuxServer = struct {
         try self.deliver(id, msg);
         try self.notifyCommonChannels(id, msg, null, id, null);
 
+        // Propagate the nick change across the mesh so remote members rename the
+        // user and see a live NICK line (identity is nick-independent).
+        self.announceNickChange(old, newnick, membershipIdentityOf(conn));
+
         // MONITOR: old nick went away, new nick appeared.
         self.monitorTransition(old, newnick) catch {};
 
@@ -14093,12 +14253,15 @@ pub const LinuxServer = struct {
         const text = utf8TruncateBytes(parsed.paramSlice()[1], self.config.topiclen);
         var setter_buf: [256]u8 = undefined;
         const setter = try clientPrefix(conn, &setter_buf);
-        try self.world.setTopic(channel, text, setter, @divFloor(platform.realtimeMillis(), 1000));
+        const set_at = @divFloor(platform.realtimeMillis(), 1000);
+        try self.world.setTopic(channel, text, setter, set_at);
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "TOPIC", &.{channel}, text);
         try self.broadcastChannel(channel, msg, null);
+        // Propagate the topic across the mesh so remote members see it live.
+        self.announceTopic(channel, text, setter, set_at, text.len != 0);
     }
 
     /// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint:

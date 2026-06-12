@@ -35,6 +35,8 @@ const membership_event = @import("../../proto/membership_event.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_prop_event = @import("../../proto/channel_prop_event.zig");
+const topic_event = @import("../../proto/topic_event.zig");
+const nick_event = @import("../../proto/nick_event.zig");
 const partition_detector = @import("partition_detector.zig");
 
 pub const ByteSink = struct {
@@ -139,6 +141,12 @@ pub const S2sPeer = struct {
     /// Remote IRCX channel PROP events awaiting daemon-side LWW apply into the
     /// local prop store. The daemon owns prop clocks and client emission policy.
     prop_changes: std.ArrayListUnmanaged(ChannelPropDelta) = .empty,
+    /// Remote channel topic changes that altered LWW state, awaiting the daemon
+    /// to apply them to its local world and emit a live `TOPIC` line.
+    topic_changes: std.ArrayListUnmanaged(TopicDelta) = .empty,
+    /// Remote user nick changes, awaiting the daemon to rename the user in its
+    /// world and surface a live `:old!u@h NICK new` line to shared-channel members.
+    nick_changes: std.ArrayListUnmanaged(NickDelta) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -203,6 +211,10 @@ pub const S2sPeer = struct {
         self.channel_list_changes.deinit(self.allocator);
         for (self.prop_changes.items) |*d| d.deinit(self.allocator);
         self.prop_changes.deinit(self.allocator);
+        for (self.topic_changes.items) |*d| d.deinit(self.allocator);
+        self.topic_changes.deinit(self.allocator);
+        for (self.nick_changes.items) |*d| d.deinit(self.allocator);
+        self.nick_changes.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -342,6 +354,8 @@ pub const S2sPeer = struct {
             .MEMBERSHIP => try self.recvMembership(frame.payload),
             .CHANNEL_MODE_FLAGS => try self.recvChannelModeFlags(frame.payload),
             .CHANNEL_LIST => try self.recvChannelList(frame.payload),
+            .TOPIC => try self.recvTopic(frame.payload),
+            .NICKCHANGE => try self.recvNickChange(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
@@ -494,6 +508,52 @@ pub const S2sPeer = struct {
     /// delta's strings (call `deinit` per entry, then free the slice).
     pub fn takeChannelPropChanges(self: *S2sPeer) ![]ChannelPropDelta {
         return self.prop_changes.toOwnedSlice(self.allocator);
+    }
+
+    /// A remote channel's topic changed (LWW winner). Strings are heap-owned.
+    pub const TopicDelta = struct {
+        channel: []u8,
+        topic: []u8,
+        setter: []u8,
+        set_at: i64,
+        present: bool,
+
+        pub fn deinit(self: *TopicDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.channel);
+            allocator.free(self.topic);
+            allocator.free(self.setter);
+            self.* = undefined;
+        }
+    };
+
+    /// A remote user changed nick (with refreshed identity). Strings heap-owned.
+    pub const NickDelta = struct {
+        old_nick: []u8,
+        new_nick: []u8,
+        username: []u8,
+        realname: []u8,
+        host: []u8,
+
+        pub fn deinit(self: *NickDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.old_nick);
+            allocator.free(self.new_nick);
+            allocator.free(self.username);
+            allocator.free(self.realname);
+            allocator.free(self.host);
+            self.* = undefined;
+        }
+    };
+
+    /// Drain remote channel topic changes. Caller owns the slice + each delta's
+    /// strings (call `deinit` per entry, then free the slice).
+    pub fn takeTopicChanges(self: *S2sPeer) ![]TopicDelta {
+        return self.topic_changes.toOwnedSlice(self.allocator);
+    }
+
+    /// Drain remote user nick changes. Caller owns the slice + each delta's
+    /// strings (call `deinit` per entry, then free the slice).
+    pub fn takeNickChanges(self: *S2sPeer) ![]NickDelta {
+        return self.nick_changes.toOwnedSlice(self.allocator);
     }
 
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
@@ -728,6 +788,135 @@ pub const S2sPeer = struct {
         var buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32]u8 = undefined;
         const wire = try channel_prop_event.encode(ev, &buf);
         try emitFrame(self.allocator, sink, .CHANNEL_PROP, wire);
+    }
+
+    /// Apply an inbound TOPIC event to the route table (LWW by hlc). Malformed or
+    /// stale payloads are dropped; a real change is queued so the daemon can apply
+    /// it to its world and emit a live `TOPIC` line.
+    fn recvTopic(self: *S2sPeer, payload: []const u8) !void {
+        const ev = topic_event.decode(payload) catch return;
+        const outcome = self.routes.applyTopic(ev.channel, ev.origin_node, ev.hlc) catch return;
+        if (outcome == .unchanged) return;
+
+        const ch = self.allocator.dupe(u8, ev.channel) catch return;
+        const topic = self.allocator.dupe(u8, ev.topic) catch {
+            self.allocator.free(ch);
+            return;
+        };
+        const setter = self.allocator.dupe(u8, ev.setter) catch {
+            self.allocator.free(ch);
+            self.allocator.free(topic);
+            return;
+        };
+        self.topic_changes.append(self.allocator, .{
+            .channel = ch,
+            .topic = topic,
+            .setter = setter,
+            .set_at = ev.set_at,
+            .present = ev.present,
+        }) catch {
+            self.allocator.free(ch);
+            self.allocator.free(topic);
+            self.allocator.free(setter);
+        };
+    }
+
+    /// Emit a TOPIC event to the peer announcing a local channel topic change.
+    pub fn sendTopic(
+        self: *S2sPeer,
+        sink: ByteSink,
+        channel: []const u8,
+        topic: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        const ev = topic_event.TopicEvent{
+            .present = present,
+            .origin_node = self.local_node_id,
+            .hlc = hlc,
+            .set_at = set_at,
+            .channel = channel,
+            .topic = topic,
+            .setter = setter,
+        };
+        var buf: [topic_event.max_channel_len + topic_event.max_topic_len + topic_event.max_setter_len + 40]u8 = undefined;
+        const wire = try topic_event.encode(ev, &buf);
+        try emitFrame(self.allocator, sink, .TOPIC, wire);
+    }
+
+    /// Apply an inbound NICKCHANGE event: rename the user in the route table +
+    /// rosters, then queue a delta so the daemon can emit the live `NICK` line.
+    /// Malformed payloads and no-op renames are dropped.
+    fn recvNickChange(self: *S2sPeer, payload: []const u8) !void {
+        const ev = nick_event.decode(payload) catch return;
+        const renamed = self.routes.renameNick(ev.old_nick, ev.new_nick, ev.origin_node, .{
+            .username = ev.username,
+            .realname = ev.realname,
+            .host = ev.host,
+        }) catch return;
+        if (!renamed) return;
+
+        const old_nick = self.allocator.dupe(u8, ev.old_nick) catch return;
+        const new_nick = self.allocator.dupe(u8, ev.new_nick) catch {
+            self.allocator.free(old_nick);
+            return;
+        };
+        const username = self.allocator.dupe(u8, ev.username) catch {
+            self.allocator.free(old_nick);
+            self.allocator.free(new_nick);
+            return;
+        };
+        const realname = self.allocator.dupe(u8, ev.realname) catch {
+            self.allocator.free(old_nick);
+            self.allocator.free(new_nick);
+            self.allocator.free(username);
+            return;
+        };
+        const host = self.allocator.dupe(u8, ev.host) catch {
+            self.allocator.free(old_nick);
+            self.allocator.free(new_nick);
+            self.allocator.free(username);
+            self.allocator.free(realname);
+            return;
+        };
+        self.nick_changes.append(self.allocator, .{
+            .old_nick = old_nick,
+            .new_nick = new_nick,
+            .username = username,
+            .realname = realname,
+            .host = host,
+        }) catch {
+            self.allocator.free(old_nick);
+            self.allocator.free(new_nick);
+            self.allocator.free(username);
+            self.allocator.free(realname);
+            self.allocator.free(host);
+        };
+    }
+
+    /// Emit a NICKCHANGE event to the peer for a local user's nick change.
+    pub fn sendNickChange(
+        self: *S2sPeer,
+        sink: ByteSink,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        ident: MemberIdentity,
+        hlc: u64,
+    ) !void {
+        const ev = nick_event.NickEvent{
+            .origin_node = self.local_node_id,
+            .hlc = hlc,
+            .old_nick = old_nick,
+            .new_nick = new_nick,
+            .username = ident.username,
+            .realname = ident.realname,
+            .host = ident.host,
+        };
+        var buf: [nick_event.max_nick_len * 2 + nick_event.max_user_len + nick_event.max_real_len + nick_event.max_host_len + 32]u8 = undefined;
+        const wire = try nick_event.encode(ev, &buf);
+        try emitFrame(self.allocator, sink, .NICKCHANGE, wire);
     }
 
     /// Remote members the peer has announced for `channel` (borrowed roster).

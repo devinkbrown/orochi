@@ -41,6 +41,10 @@ pub const FrameType = enum(u8) {
     CHANNEL_LIST = 0x0C,
     /// IRCX channel PROP convergence event (channel/key/value/owner LWW by hlc).
     CHANNEL_PROP = 0x0D,
+    /// Channel topic-text fact (channel/topic/setter/set_at), LWW by payload HLC.
+    TOPIC = 0x0E,
+    /// Remote user nick change (old/new nick + identity) for live `NICK` lines.
+    NICKCHANGE = 0x0F,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -61,6 +65,8 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.CHANNEL_MODE_FLAGS) => .CHANNEL_MODE_FLAGS,
             @intFromEnum(FrameType.CHANNEL_LIST) => .CHANNEL_LIST,
             @intFromEnum(FrameType.CHANNEL_PROP) => .CHANNEL_PROP,
+            @intFromEnum(FrameType.TOPIC) => .TOPIC,
+            @intFromEnum(FrameType.NICKCHANGE) => .NICKCHANGE,
             else => null,
         };
     }
@@ -180,6 +186,8 @@ const all_frame_types = [_]FrameType{
     .CHANNEL_MODE_FLAGS,
     .CHANNEL_LIST,
     .CHANNEL_PROP,
+    .TOPIC,
+    .NICKCHANGE,
 };
 
 test "encode/decode round-trip each type" {

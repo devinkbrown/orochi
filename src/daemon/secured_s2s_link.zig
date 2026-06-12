@@ -197,6 +197,46 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
+    /// Announce a local channel topic change over the secured CRDT link.
+    pub fn sendTopic(
+        self: *SecuredLink,
+        channel: []const u8,
+        topic: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        hlc: u64,
+        present: bool,
+    ) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendTopic(channel, topic, setter, set_at, hlc, present);
+        try self.drainInner();
+    }
+
+    /// Announce a local user's nick change over the secured CRDT link.
+    pub fn sendNickChange(
+        self: *SecuredLink,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        ident: s2s_peer.MemberIdentity,
+        hlc: u64,
+    ) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendNickChange(old_nick, new_nick, ident, hlc);
+        try self.drainInner();
+    }
+
+    /// Drain remote channel topic changes for the daemon to apply + emit.
+    pub fn takeTopicChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.TopicDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeTopicChanges();
+    }
+
+    /// Drain remote user nick changes for the daemon to surface as NICK lines.
+    pub fn takeNickChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.NickDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeNickChanges();
+    }
+
     /// Forward a cross-node user message over the secured CRDT link.
     pub fn sendMessage(self: *SecuredLink, msg: s2s_link.RelayMessage) anyerror!void {
         const link = self.inner orelse return;

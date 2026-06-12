@@ -200,6 +200,14 @@ pub const ChannelModeFlags = struct {
     hlc: u64,
 };
 
+/// LWW clock for a channel's topic. The topic TEXT lives in the daemon's world;
+/// the route table only orders writes so a stale/re-burst TOPIC never clobbers a
+/// newer one. `hlc` is the sole ordering key.
+pub const TopicClock = struct {
+    origin_node: NodeId,
+    hlc: u64,
+};
+
 pub const RouteTable = struct {
     const Self = @This();
 
@@ -218,6 +226,9 @@ pub const RouteTable = struct {
     /// channel name -> LWW list-mode facts (+b/+e/+I). Tombstones are retained so
     /// stale add frames cannot resurrect a mask after a newer remove.
     channel_lists: std.StringHashMap(ChannelListState),
+    /// channel name -> LWW clock for the channel topic (text lives in the daemon
+    /// world; this only orders writes so a re-burst never clobbers a newer topic).
+    channel_topics: std.StringHashMap(TopicClock),
     nick_count: usize = 0,
     channel_count: usize = 0,
     list_channel_count: usize = 0,
@@ -232,6 +243,7 @@ pub const RouteTable = struct {
             .channel_members = std.StringHashMap(MemberList).init(allocator),
             .channel_mode_flags = std.StringHashMap(ChannelModeFlags).init(allocator),
             .channel_lists = std.StringHashMap(ChannelListState).init(allocator),
+            .channel_topics = std.StringHashMap(TopicClock).init(allocator),
         };
     }
 
@@ -242,6 +254,7 @@ pub const RouteTable = struct {
         self.channel_members.deinit();
         self.channel_mode_flags.deinit();
         self.channel_lists.deinit();
+        self.channel_topics.deinit();
         self.* = undefined;
     }
 
@@ -274,6 +287,10 @@ pub const RouteTable = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.channel_lists.clearRetainingCapacity();
+
+        var topics = self.channel_topics.iterator();
+        while (topics.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.channel_topics.clearRetainingCapacity();
 
         self.nick_count = 0;
         self.channel_count = 0;
@@ -550,6 +567,79 @@ pub const RouteTable = struct {
 
     pub fn channelModeFlags(self: *const Self, chan: []const u8) ?ChannelModeFlags {
         return self.channel_mode_flags.get(chan);
+    }
+
+    pub const ApplyTopicOutcome = enum { changed, unchanged };
+
+    /// Apply a TOPIC event for a remote channel, last-writer-wins by `hlc`. Stale
+    /// events (hlc <= stored) are ignored. The topic TEXT mutation happens in the
+    /// daemon's world after draining a `changed` outcome.
+    pub fn applyTopic(self: *Self, chan: []const u8, node: NodeId, hlc: u64) Error!ApplyTopicOutcome {
+        try self.validateName(chan);
+        try validateNode(node);
+
+        if (self.channel_topics.getPtr(chan)) |cur| {
+            if (hlc <= cur.hlc) return .unchanged;
+            cur.origin_node = node;
+            cur.hlc = hlc;
+            return .changed;
+        }
+
+        if (self.channel_topics.count() >= self.cfg.max_channels) return error.RouteTableFull;
+        const owned = try self.allocator.dupe(u8, chan);
+        errdefer self.allocator.free(owned);
+        try self.channel_topics.putNoClobber(owned, .{ .origin_node = node, .hlc = hlc });
+        return .changed;
+    }
+
+    /// Rename a remote user across the nick→node map and every channel roster it
+    /// appears in, refreshing its propagated identity. Returns true if `old_nick`
+    /// existed anywhere (so the daemon should surface a live NICK line). ASCII
+    /// case-sensitive match (nicks are stored verbatim). Best-effort on OOM: a
+    /// failed roster rename leaves that roster untouched but still reports the
+    /// rename if the nick→node entry moved.
+    pub fn renameNick(
+        self: *Self,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        node: NodeId,
+        ident: MemberIdentity,
+    ) Error!bool {
+        try self.validateName(new_nick);
+        var existed = false;
+
+        // nick_to_node: move old -> new (preserving the node mapping).
+        if (self.nick_to_node.fetchRemove(old_nick)) |kv| {
+            self.allocator.free(kv.key);
+            const owned = self.allocator.dupe(u8, new_nick) catch {
+                // Couldn't re-key; drop the stale mapping rather than corrupt it.
+                return error.OutOfMemory;
+            };
+            errdefer self.allocator.free(owned);
+            // If new_nick already maps (collision), overwrite the owned key it has.
+            if (self.nick_to_node.fetchRemove(new_nick)) |old_new| self.allocator.free(old_new.key);
+            try self.nick_to_node.putNoClobber(owned, node);
+            existed = true;
+        }
+
+        // Every channel roster: rename the matching member + refresh identity.
+        var it = self.channel_members.iterator();
+        while (it.next()) |entry| {
+            const list = entry.value_ptr;
+            const idx = list.find(old_nick) orelse continue;
+            const m = &list.entries.items[idx];
+            const new_owned = self.allocator.dupe(u8, new_nick) catch continue;
+            self.allocator.free(m.nick);
+            m.nick = new_owned;
+            m.node = node;
+            // Identity refresh is best-effort: a failed realloc keeps the old copy.
+            replaceOwned(self.allocator, &m.username, ident.username) catch {};
+            replaceOwned(self.allocator, &m.realname, ident.realname) catch {};
+            replaceOwned(self.allocator, &m.host, ident.host) catch {};
+            existed = true;
+        }
+
+        return existed;
     }
 
     fn ensureMemberList(self: *Self, chan: []const u8) Error!*MemberList {
