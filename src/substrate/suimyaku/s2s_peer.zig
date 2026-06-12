@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
 pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const NodeId = gossip_round.NodeId;
 pub const MemberInfo = route_table.Member;
+pub const MemberIdentity = route_table.MemberIdentity;
 pub const RelayMessage = message_relay.RelayMessage;
 pub const InboundMessage = message_relay.Owned;
 pub const RelayVerb = message_relay.Verb;
@@ -396,13 +397,17 @@ pub const S2sPeer = struct {
     }
 
     /// A remote channel membership transition the daemon should reflect as a live
-    /// IRC line. `channel`/`nick` are heap-owned; the daemon frees them via
-    /// `deinit` after emitting the JOIN/PART.
+    /// IRC line. All strings are heap-owned; the daemon frees them via `deinit`
+    /// after emitting the JOIN/PART. `username`/`realname`/`host` carry the
+    /// member's propagated identity ("" = unknown; render the placeholder).
     pub const MembershipDelta = struct {
         pub const Kind = enum { joined, parted, status };
 
         channel: []u8,
         nick: []u8,
+        username: []u8,
+        realname: []u8,
+        host: []u8,
         kind: Kind,
         /// New status bits (for joined/status); the member's prefix modes.
         status: u4,
@@ -412,6 +417,9 @@ pub const S2sPeer = struct {
         pub fn deinit(self: *MembershipDelta, allocator: std.mem.Allocator) void {
             allocator.free(self.channel);
             allocator.free(self.nick);
+            allocator.free(self.username);
+            allocator.free(self.realname);
+            allocator.free(self.host);
             self.* = undefined;
         }
     };
@@ -493,28 +501,48 @@ pub const S2sPeer = struct {
     /// status-change is queued so the daemon can emit the matching live IRC line.
     fn recvMembership(self: *S2sPeer, payload: []const u8) !void {
         const ev = membership_event.decode(payload) catch return;
-        const res = self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present) catch return;
+        const res = self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
+            .username = ev.username,
+            .realname = ev.realname,
+            .host = ev.host,
+        }) catch return;
         const kind: MembershipDelta.Kind = switch (res.outcome) {
             .joined => .joined,
             .parted => .parted,
             .status_changed => .status,
             .unchanged => return,
         };
-        const ch = self.allocator.dupe(u8, ev.channel) catch return;
-        const nk = self.allocator.dupe(u8, ev.nick) catch {
-            self.allocator.free(ch);
-            return;
-        };
-        self.membership_changes.append(self.allocator, .{
+        self.queueMembershipDelta(&ev, kind, res.prev_status) catch return; // best-effort
+    }
+
+    /// Dupe an event's strings into an owned `MembershipDelta` and queue it.
+    /// Any allocation failure unwinds the partial copies (errdefer chain).
+    fn queueMembershipDelta(
+        self: *S2sPeer,
+        ev: *const membership_event.MembershipEvent,
+        kind: MembershipDelta.Kind,
+        prev_status: u4,
+    ) !void {
+        const ch = try self.allocator.dupe(u8, ev.channel);
+        errdefer self.allocator.free(ch);
+        const nk = try self.allocator.dupe(u8, ev.nick);
+        errdefer self.allocator.free(nk);
+        const un = try self.allocator.dupe(u8, ev.username);
+        errdefer self.allocator.free(un);
+        const rn = try self.allocator.dupe(u8, ev.realname);
+        errdefer self.allocator.free(rn);
+        const ho = try self.allocator.dupe(u8, ev.host);
+        errdefer self.allocator.free(ho);
+        try self.membership_changes.append(self.allocator, .{
             .channel = ch,
             .nick = nk,
+            .username = un,
+            .realname = rn,
+            .host = ho,
             .kind = kind,
             .status = ev.status,
-            .prev_status = res.prev_status,
-        }) catch {
-            self.allocator.free(ch);
-            self.allocator.free(nk);
-        };
+            .prev_status = prev_status,
+        });
     }
 
     /// Apply an inbound CHANNEL_MODE_FLAGS event to the route table (LWW by hlc).
@@ -565,7 +593,9 @@ pub const S2sPeer = struct {
     }
 
     /// Emit a MEMBERSHIP event to the peer announcing a local member's presence
-    /// (or departure) in `channel`. Best-effort; only meaningful once established.
+    /// (or departure) in `channel`, carrying the member's real identity
+    /// (username/realname/visible host) so the peer renders `user@host` instead
+    /// of a placeholder. Best-effort; only meaningful once established.
     pub fn sendMembership(
         self: *S2sPeer,
         sink: ByteSink,
@@ -574,6 +604,7 @@ pub const S2sPeer = struct {
         status: u4,
         hlc: u64,
         present: bool,
+        ident: MemberIdentity,
     ) !void {
         const ev = membership_event.MembershipEvent{
             .present = present,
@@ -582,8 +613,11 @@ pub const S2sPeer = struct {
             .hlc = hlc,
             .channel = channel,
             .nick = nick,
+            .username = truncated(ident.username, membership_event.max_username_len),
+            .realname = truncated(ident.realname, membership_event.max_realname_len),
+            .host = truncated(ident.host, membership_event.max_host_len),
         };
-        var buf: [membership_event.max_channel_len + membership_event.max_nick_len + 32]u8 = undefined;
+        var buf: [membership_event.max_encoded_len]u8 = undefined;
         const wire = try membership_event.encode(ev, &buf);
         try emitFrame(self.allocator, sink, .MEMBERSHIP, wire);
     }
@@ -983,6 +1017,12 @@ fn decodeMemberState(value: u8) !gossip_round.MemberState {
 fn containsNode(nodes: []const NodeId, node: NodeId) bool {
     for (nodes) |candidate| if (candidate == node) return true;
     return false;
+}
+
+/// Clamp an identity string to its wire limit (an over-long local value is
+/// propagated truncated rather than failing the whole announcement).
+fn truncated(s: []const u8, max: usize) []const u8 {
+    return if (s.len > max) s[0..max] else s;
 }
 
 fn i64Ms(ms: u64) !i64 {

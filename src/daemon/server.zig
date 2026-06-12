@@ -3894,7 +3894,7 @@ pub const LinuxServer = struct {
                 // Tell mesh peers this member is gone so their remote roster drops
                 // it and they emit a PART to their own local members (otherwise a
                 // disconnect leaves a ghost on the far side of the mesh).
-                if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false);
+                if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false, .{});
             }
         }
     }
@@ -4324,11 +4324,15 @@ pub const LinuxServer = struct {
             if (remote_members.len == 0) continue;
 
             var ghosts: [32]netsplit_batch.Ghost = undefined;
-            var prefixes: [32][160]u8 = undefined;
+            var prefixes: [32][420]u8 = undefined;
             var n: usize = 0;
             for (remote_members) |m| {
                 if (n >= ghosts.len) break;
-                const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!*@{s}", .{ m.nick, remote_name }) catch continue;
+                // QUIT with the member's propagated real user@host when known,
+                // matching how the user was rendered while present.
+                const user: []const u8 = if (m.username.len != 0) m.username else "*";
+                const host: []const u8 = if (m.host.len != 0) m.host else remote_name;
+                const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!{s}@{s}", .{ m.nick, user, host }) catch continue;
                 ghosts[n] = .{ .prefix = prefix, .nick = m.nick };
                 n += 1;
             }
@@ -4410,10 +4414,11 @@ pub const LinuxServer = struct {
                 if (mconn.s2s != null or mconn.s2s_secured != null) continue; // skip peer links
                 const nick = mconn.session.displayName();
                 const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
+                const ident = membershipIdentityOf(mconn);
                 if (conn.s2s_secured) |link| {
-                    link.sendMembership(cv.name, nick, status, hlc, true) catch continue;
+                    link.sendMembership(cv.name, nick, status, hlc, true, ident) catch continue;
                 } else if (conn.s2s) |link| {
-                    link.sendMembership(cv.name, nick, status, hlc, true) catch continue;
+                    link.sendMembership(cv.name, nick, status, hlc, true, ident) catch continue;
                 }
             }
             if (self.world.bansOf(cv.name)) |entries| {
@@ -4598,18 +4603,18 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool) void {
+    fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool, ident: s2s_link.S2sLink.MemberIdentity) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             if (slot.value.s2s_secured) |link| {
                 if (!link.established()) continue;
-                link.sendMembership(channel, nick, status, hlc, present) catch continue;
+                link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
                 self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
                 link.clearOutbound();
             } else if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
-                link.sendMembership(channel, nick, status, hlc, present) catch continue;
+                link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
                 self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
                 link.clearOutbound();
             }
@@ -4685,29 +4690,44 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// The LOCAL member identity (real username, realname, VISIBLE/cloaked host)
+    /// to propagate alongside a membership announcement, so remote peers render
+    /// the real `user@host` instead of the `mesh@<server>` placeholder.
+    fn membershipIdentityOf(conn: *const ConnState) s2s_link.S2sLink.MemberIdentity {
+        return .{
+            .username = conn.session.username(),
+            .realname = conn.session.realname(),
+            .host = hostOf(conn),
+        };
+    }
+
     /// Surface a remote (mesh) channel membership change to LOCAL members of
     /// `channel` as live IRC lines, so clients already sitting in the channel see
     /// remote users join/leave/gain-status in real time — not only on a fresh
-    /// NAMES. Remote users render with user "mesh" and host = the origin peer's
-    /// server name, matching the NAMES projection (`addRemoteMembers`).
-    ///   - joined: `:nick JOIN #chan`, then a MODE granting any join-time prefix.
+    /// NAMES. Remote users render with their PROPAGATED real `user@host`
+    /// (username + cloaked/visible host from the MEMBERSHIP event), matching the
+    /// NAMES projection (`addRemoteMembers`); only an identity-less event falls
+    /// back to the `mesh@<origin server>` placeholder.
+    ///   - joined: `:nick!user@host JOIN #chan`, then a MODE for any join prefix.
     ///   - status: a MODE diff (added/removed prefix modes vs `prev_status`).
-    ///   - parted: `:nick PART #chan`.
+    ///   - parted: `:nick!user@host PART #chan`.
     /// Best-effort: a channel with no local members has no one to notify.
     fn emitRemoteMembership(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
-        const host = if (remote_name.len != 0) remote_name else default_host;
-        var buf: [600]u8 = undefined;
+        const server_host = if (remote_name.len != 0) remote_name else default_host;
+        const user = if (ch.username.len != 0) ch.username else world_projection.remote_user_placeholder;
+        const host = if (ch.host.len != 0) ch.host else server_host;
+        var buf: [900]u8 = undefined;
         switch (ch.kind) {
             .joined => {
-                const line = std.fmt.bufPrint(&buf, ":{s}!mesh@{s} JOIN :{s}\r\n", .{ ch.nick, host, ch.channel }) catch return;
+                const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} JOIN :{s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch return;
-                if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, host, 0, ch.status);
+                if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, 0, ch.status);
             },
             .parted => {
-                const line = std.fmt.bufPrint(&buf, ":{s}!mesh@{s} PART {s}\r\n", .{ ch.nick, host, ch.channel }) catch return;
+                const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} PART {s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch {};
             },
-            .status => self.emitRemoteModeDiff(ch.channel, ch.nick, host, ch.prev_status, ch.status),
+            .status => self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status),
         }
     }
 
@@ -4889,8 +4909,10 @@ pub const LinuxServer = struct {
     }
 
     /// Append a peer's remote channel members into the NAMES buffer (deduped,
-    /// auditorium-filtered; host = origin server name). Returns the new count.
-    /// `members` is a borrowed roster from either link type.
+    /// auditorium-filtered). Returns the new count. `members` is a borrowed
+    /// roster from either link type. Each member renders with its PROPAGATED
+    /// real username + visible (cloaked) host; only a roster entry whose origin
+    /// never supplied identity falls back to the `mesh@<server>` placeholder.
     fn addRemoteMembers(
         self: *LinuxServer,
         members_buf: []names_reply.Member,
@@ -4914,8 +4936,8 @@ pub const LinuxServer = struct {
             members_buf[count] = .{
                 .prefixes = prefix_buf[count].asSlice(),
                 .nick = rm.nick,
-                .user = "mesh",
-                .host = if (remote_name.len != 0) remote_name else default_host,
+                .user = if (rm.username.len != 0) rm.username else world_projection.remote_user_placeholder,
+                .host = if (rm.host.len != 0) rm.host else if (remote_name.len != 0) remote_name else default_host,
             };
             count += 1;
         }
@@ -5238,7 +5260,7 @@ pub const LinuxServer = struct {
         // Propagate this membership to mesh peers (status = the joiner's modes,
         // e.g. founder on a freshly created/cloned channel).
         const jmodes = self.world.memberModes(join_target, wid) orelse world_model.MemberModes.empty();
-        self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true);
+        self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true, membershipIdentityOf(conn));
     }
 
     pub fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -5289,7 +5311,7 @@ pub const LinuxServer = struct {
         const parted_nick = conn.session.displayName();
         try self.world.part(channel, wid);
         // Tell mesh peers this member left.
-        self.announceMembership(channel, parted_nick, 0, false);
+        self.announceMembership(channel, parted_nick, 0, false, .{});
     }
 
     pub fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -5573,7 +5595,8 @@ pub const LinuxServer = struct {
                         // the periodic re-burst). Local target only — a remote member's
                         // status is owned by its home node.
                         const nm = self.world.memberModes(channel, target) orelse world_model.MemberModes.empty();
-                        self.announceMembership(channel, target_nick, @truncate(nm.bits), true);
+                        const tident = if (self.connFor(clientIdFromWorld(target))) |tc| membershipIdentityOf(tc) else s2s_link.S2sLink.MemberIdentity{};
+                        self.announceMembership(channel, target_nick, @truncate(nm.bits), true, tident);
                     }
                 },
                 'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M', 'W', 'O', 'A' => {
@@ -6297,13 +6320,18 @@ pub const LinuxServer = struct {
     }
 
     /// A remote (mesh) WHOIS subject resolved from S2S peer rosters: the nick
-    /// as the roster spells it plus its origin server — the owning node's
-    /// registry name when known, falling back to the direct peer's name for an
-    /// unmapped multi-hop node. Channel rosters are the only mesh-wide nick
-    /// replication today, so a remote user in no channels stays unfindable
-    /// (full per-nick origin tracking would need a nick→origin gossip table).
+    /// as the roster spells it, its PROPAGATED identity (username/realname/
+    /// visible host — "" when the origin never supplied it), plus its origin
+    /// server — the owning node's registry name when known, falling back to the
+    /// direct peer's name for an unmapped multi-hop node. Channel rosters are
+    /// the only mesh-wide nick replication today, so a remote user in no
+    /// channels stays unfindable (full per-nick origin tracking would need a
+    /// nick→origin gossip table).
     const RemoteWhois = struct {
         nick: []const u8,
+        username: []const u8,
+        realname: []const u8,
+        host: []const u8,
         server: []const u8,
         server_info: ?[]const u8,
     };
@@ -6332,21 +6360,33 @@ pub const LinuxServer = struct {
         // remote user's actual home server; an unmapped multi-hop node falls
         // back to the direct peer's name.
         if (link.nodeName(member.node)) |name| {
-            return .{ .nick = member.nick, .server = name, .server_info = link.nodeDescription(member.node) };
+            return .{
+                .nick = member.nick,
+                .username = member.username,
+                .realname = member.realname,
+                .host = member.host,
+                .server = name,
+                .server_info = link.nodeDescription(member.node),
+            };
         }
         const direct = link.remoteName();
         return .{
             .nick = member.nick,
+            .username = member.username,
+            .realname = member.realname,
+            .host = member.host,
             .server = if (direct.len != 0) direct else default_host,
             .server_info = null,
         };
     }
 
     /// Emit the minimal WHOIS sequence for a remote mesh member: 311 with the
-    /// NAMES-projection identity (placeholder user, origin server as host),
-    /// 312 with the actual home server, RPL_WHOISOPERATOR (313) when a live
-    /// propagated oper grant covers the nick, and 318. Idle/away/671/276 need
-    /// per-user state remote nodes don't replicate, so they are omitted.
+    /// member's PROPAGATED identity (real username, realname, and cloaked/
+    /// visible host — falling back to the placeholder/origin-server forms only
+    /// when the origin never supplied identity), 312 with the actual home
+    /// server, RPL_WHOISOPERATOR (313) when a live propagated oper grant covers
+    /// the nick, and 318. Idle/away/671/276 need per-user state remote nodes
+    /// don't replicate, so they are omitted.
     fn sendRemoteWhois(
         self: *LinuxServer,
         conn: *ConnState,
@@ -6366,9 +6406,9 @@ pub const LinuxServer = struct {
         }
         const subject = whois.WhoisSubject{
             .nick = remote.nick,
-            .user = world_projection.remote_user_placeholder,
-            .host = remote.server,
-            .realname = "Remote mesh user",
+            .user = if (remote.username.len != 0) remote.username else world_projection.remote_user_placeholder,
+            .host = if (remote.host.len != 0) remote.host else remote.server,
+            .realname = if (remote.realname.len != 0) remote.realname else "Remote mesh user",
             .server = remote.server,
             .server_info = remote.server_info,
             .is_oper = is_oper,
@@ -18929,11 +18969,16 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     try std.testing.expect(learned);
 
     // Remote WHOIS via the mesh projection: the fake peer announces a channel
-    // member on its side of the link; once the MEMBERSHIP frame lands, the
-    // server answers WHOIS for that nick from the converged roster — 311 with
-    // the placeholder identity (user "mesh", host = origin) and 312 naming the
-    // member's actual home server (remote.test), not the local server.
-    try peer.sendMembership("#mesh", "Zed", 0b0100, now + 1, true);
+    // member (with its real propagated identity) on its side of the link; once
+    // the MEMBERSHIP frame lands, the server answers WHOIS for that nick from
+    // the converged roster — 311 with the PROPAGATED username + cloaked host
+    // (not the mesh@<server> placeholder) and 312 naming the member's actual
+    // home server (remote.test), not the local server.
+    try peer.sendMembership("#mesh", "Zed", 0b0100, now + 1, true, .{
+        .username = "zed",
+        .realname = "Zed Remote",
+        .host = "cloak-zed.users.test",
+    });
     if (peer.outbound().len != 0) {
         try writeAllFd(peer_fd, peer.outbound());
         peer.clearOutbound();
@@ -18949,7 +18994,8 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         if (std.mem.indexOf(u8, a.written(), " 311 A Zed ") != null) {
             recvUntil(&a, " 318 A Zed", 200) catch {};
             const got = a.written();
-            if (std.mem.indexOf(u8, got, " 311 A Zed mesh remote.test ") != null and
+            if (std.mem.indexOf(u8, got, " 311 A Zed zed cloak-zed.users.test ") != null and
+                std.mem.indexOf(u8, got, ":Zed Remote") != null and
                 std.mem.indexOf(u8, got, " 312 A Zed remote.test ") != null) whois_seen = true;
         }
     }

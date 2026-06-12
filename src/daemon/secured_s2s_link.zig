@@ -164,10 +164,11 @@ pub const SecuredLink = struct {
     }
 
     /// Announce a local member to the peer over the secured CRDT link (no-op until
-    /// established). Outbound bytes accumulate in `out`.
-    pub fn sendMembership(self: *SecuredLink, channel: []const u8, nick: []const u8, status: u4, hlc: u64, present: bool) anyerror!void {
+    /// established), carrying the member's real username/realname/visible-host.
+    /// Outbound bytes accumulate in `out`.
+    pub fn sendMembership(self: *SecuredLink, channel: []const u8, nick: []const u8, status: u4, hlc: u64, present: bool, ident: s2s_peer.MemberIdentity) anyerror!void {
         const link = self.inner orelse return;
-        try link.sendMembership(channel, nick, status, hlc, present);
+        try link.sendMembership(channel, nick, status, hlc, present, ident);
         try self.drainInner();
     }
 
