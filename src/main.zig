@@ -180,22 +180,44 @@ pub fn main(init: std.process.Init) !void {
     // runtime-limits holder rather than a config handle.
     orochi.proto.protocol_inventory.setRuntimeLimits(.{ .nicklen = srv_cfg.nicklen });
 
-    // PQ-secured S2S: if the config supplies node.secret_key, derive this node's
-    // Tsumugi identity and enable the secured handshake (TOFU) on S2S links. The
-    // identity outlives the server (the server borrows a pointer to it). Without a
-    // key, S2S stays plaintext (backward compatible).
+    // PQ-secured S2S is ON BY DEFAULT: an explicit `[node] secret_key` takes
+    // precedence (and never touches the keyfile); otherwise the daemon loads — or
+    // generates + persists (0600) — the seed from `orochi-node.key` next to the
+    // config (CWD without one), so the secured Tsumugi mesh needs no manual key.
+    // The identity outlives the server (it borrows a pointer); only a keyfile or
+    // identity error leaves S2S plaintext.
     var node_id_holder: ?orochi.daemon.node_identity.NodeIdentity = null;
     defer if (node_id_holder) |*n| n.deinit();
-    if (held) |h| {
-        if (h.parsed.node.secret_key) |sk| {
-            if (orochi.daemon.node_identity.fromConfig(sk, h.parsed.mesh.realm)) |ident| {
-                node_id_holder = ident;
-                srv_cfg.node_identity = &node_id_holder.?;
-                if (h.parsed.mesh.mesh_pass) |mp| srv_cfg.mesh_pass = mp;
-                std.debug.print("orochi: PQ-secured S2S enabled (node identity configured)\n", .{});
-            } else |err| {
-                std.debug.print("orochi: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
+    const mesh_realm: []const u8 = if (held) |h| h.parsed.mesh.realm else "local";
+    const configured_key: ?[]const u8 = if (held) |h| h.parsed.node.secret_key else null;
+    if (configured_key) |sk| {
+        if (orochi.daemon.node_identity.fromConfig(sk, mesh_realm)) |ident| {
+            node_id_holder = ident;
+            std.debug.print("orochi: PQ-secured S2S enabled (node identity configured)\n", .{});
+        } else |err| {
+            std.debug.print("orochi: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
+        }
+    } else auto: {
+        const key_path = orochi.daemon.node_keyfile.derivePath(allocator, srv_cfg.config_path) catch break :auto;
+        defer allocator.free(key_path);
+        const loaded_key = orochi.daemon.node_keyfile.loadOrCreate(allocator, init.io, std.Io.Dir.cwd(), key_path) catch |err| {
+            std.debug.print("orochi: node keyfile error in {s} ({s}); S2S stays plaintext\n", .{ key_path, @errorName(err) });
+            break :auto;
+        };
+        if (orochi.daemon.node_identity.fromSeed(loaded_key.seed, mesh_realm)) |ident| {
+            node_id_holder = ident;
+            switch (loaded_key.source) {
+                .loaded => std.debug.print("orochi: node identity loaded from {s}\n", .{key_path}),
+                .generated => std.debug.print("orochi: node identity generated + persisted to {s}\n", .{key_path}),
             }
+        } else |err| {
+            std.debug.print("orochi: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
+        }
+    }
+    if (node_id_holder != null) {
+        srv_cfg.node_identity = &node_id_holder.?;
+        if (held) |h| {
+            if (h.parsed.mesh.mesh_pass) |mp| srv_cfg.mesh_pass = mp;
         }
     }
 
