@@ -194,6 +194,20 @@ pub const S2sLink = struct {
         try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present);
     }
 
+    /// Announce a local IRCX channel PROP set/delete to the peer.
+    /// Outbound frames accumulate in `out`.
+    pub fn sendChannelProp(
+        self: *S2sLink,
+        channel: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        try self.peer.sendChannelProp(self.sink(), channel, key, value, owner, hlc, present);
+    }
+
     /// Remote members the peer has announced for `channel` (borrowed roster).
     pub fn channelMembers(self: *const S2sLink, channel: []const u8) []const s2s_peer.MemberInfo {
         return self.peer.channelMembers(channel);
@@ -217,6 +231,12 @@ pub const S2sLink = struct {
     /// surface to local members. Caller owns the slice + each delta's strings.
     pub fn takeMembershipChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.MembershipDelta {
         return self.peer.takeMembershipChanges();
+    }
+
+    /// Drain remote channel PROP changes for daemon-side LWW apply. Caller owns
+    /// the slice + each delta's strings.
+    pub fn takeChannelPropChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.ChannelPropDelta {
+        return self.peer.takeChannelPropChanges();
     }
 
     /// Forward a signed cross-mesh operator grant to the peer (best-effort; only
@@ -339,6 +359,53 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
         now += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#chat").len);
+}
+
+test "CHANNEL_PROP payload round-trips across the link into takeChannelPropChanges" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    try a.start(10);
+    try a.sendChannelProp("#chat", "TOPIC", "hello mesh", "alice", 100, true);
+    try a.sendChannelProp("#chat", "SUBJECT", "", "alice", 101, false);
+
+    var now: u64 = 11;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const changes = try b.takeChannelPropChanges();
+    defer {
+        for (changes) |*ch| ch.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), changes.len);
+    try std.testing.expect(changes[0].present);
+    try std.testing.expectEqual(@as(u64, 100), changes[0].hlc);
+    try std.testing.expectEqualStrings("#chat", changes[0].channel);
+    try std.testing.expectEqualStrings("TOPIC", changes[0].key);
+    try std.testing.expectEqualStrings("hello mesh", changes[0].value);
+    try std.testing.expectEqualStrings("alice", changes[0].owner);
+    try std.testing.expect(!changes[1].present);
+    try std.testing.expectEqualStrings("SUBJECT", changes[1].key);
 }
 
 test "OPER_GRANT payload round-trips across the link into takeOperGrants" {

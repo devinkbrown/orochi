@@ -31,6 +31,7 @@ const handshake_version: u8 = 1;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
+const channel_prop_event = @import("../../proto/channel_prop_event.zig");
 const partition_detector = @import("partition_detector.zig");
 
 pub const ByteSink = struct {
@@ -126,6 +127,9 @@ pub const S2sPeer = struct {
     /// as live `:nick JOIN/PART #chan` lines to local members. Re-affirmations
     /// (anti-entropy re-bursts) never enqueue here, so no duplicate JOINs.
     membership_changes: std.ArrayListUnmanaged(MembershipDelta) = .empty,
+    /// Remote IRCX channel PROP events awaiting daemon-side LWW apply into the
+    /// local prop store. The daemon owns prop clocks and client emission policy.
+    prop_changes: std.ArrayListUnmanaged(ChannelPropDelta) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -184,6 +188,8 @@ pub const S2sPeer = struct {
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
         self.membership_changes.deinit(self.allocator);
+        for (self.prop_changes.items) |*d| d.deinit(self.allocator);
+        self.prop_changes.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -323,6 +329,7 @@ pub const S2sPeer = struct {
             .MEMBERSHIP => try self.recvMembership(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
+            .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
         }
     }
 
@@ -401,6 +408,30 @@ pub const S2sPeer = struct {
         return self.membership_changes.toOwnedSlice(self.allocator);
     }
 
+    /// A remote IRCX channel PROP mutation. Strings are heap-owned by the delta.
+    pub const ChannelPropDelta = struct {
+        channel: []u8,
+        key: []u8,
+        value: []u8,
+        owner: []u8,
+        hlc: u64,
+        present: bool,
+
+        pub fn deinit(self: *ChannelPropDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.channel);
+            allocator.free(self.key);
+            allocator.free(self.value);
+            allocator.free(self.owner);
+            self.* = undefined;
+        }
+    };
+
+    /// Drain queued remote channel PROP changes. Caller owns the slice and each
+    /// delta's strings (call `deinit` per entry, then free the slice).
+    pub fn takeChannelPropChanges(self: *S2sPeer) ![]ChannelPropDelta {
+        return self.prop_changes.toOwnedSlice(self.allocator);
+    }
+
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
     /// malformed payload is dropped, never fatal to the link. A real add/remove/
     /// status-change is queued so the daemon can emit the matching live IRC line.
@@ -452,6 +483,67 @@ pub const S2sPeer = struct {
         var buf: [membership_event.max_channel_len + membership_event.max_nick_len + 32]u8 = undefined;
         const wire = try membership_event.encode(ev, &buf);
         try emitFrame(self.allocator, sink, .MEMBERSHIP, wire);
+    }
+
+    /// Queue an inbound CHANNEL_PROP event for daemon-side LWW apply. Malformed
+    /// payloads and allocation failures are dropped without faulting the link.
+    fn recvChannelProp(self: *S2sPeer, payload: []const u8) !void {
+        const ev = channel_prop_event.decode(payload) catch return;
+        const ch = self.allocator.dupe(u8, ev.channel) catch return;
+        const key = self.allocator.dupe(u8, ev.key) catch {
+            self.allocator.free(ch);
+            return;
+        };
+        const value = self.allocator.dupe(u8, ev.value) catch {
+            self.allocator.free(ch);
+            self.allocator.free(key);
+            return;
+        };
+        const owner = self.allocator.dupe(u8, ev.owner) catch {
+            self.allocator.free(ch);
+            self.allocator.free(key);
+            self.allocator.free(value);
+            return;
+        };
+
+        self.prop_changes.append(self.allocator, .{
+            .channel = ch,
+            .key = key,
+            .value = value,
+            .owner = owner,
+            .hlc = ev.hlc,
+            .present = ev.present,
+        }) catch {
+            self.allocator.free(ch);
+            self.allocator.free(key);
+            self.allocator.free(value);
+            self.allocator.free(owner);
+        };
+    }
+
+    /// Emit a CHANNEL_PROP event to the peer announcing a local IRCX channel
+    /// property set/delete. Best-effort; only meaningful once established.
+    pub fn sendChannelProp(
+        self: *S2sPeer,
+        sink: ByteSink,
+        channel: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        const ev = channel_prop_event.ChannelPropEvent{
+            .present = present,
+            .hlc = hlc,
+            .channel = channel,
+            .key = key,
+            .value = value,
+            .owner = owner,
+        };
+        var buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32]u8 = undefined;
+        const wire = try channel_prop_event.encode(ev, &buf);
+        try emitFrame(self.allocator, sink, .CHANNEL_PROP, wire);
     }
 
     /// Remote members the peer has announced for `channel` (borrowed roster).
