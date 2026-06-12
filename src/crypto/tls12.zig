@@ -436,10 +436,18 @@ pub fn openRecordAlloc(
     if (cipher_len > max_plaintext_len) return error.PlaintextTooLong;
     const ciphertext = parsed.fragment[explicit_len .. explicit_len + cipher_len];
     const tag = parsed.fragment[explicit_len + cipher_len ..];
-    const nonce = makeNonce(suite, keys.iv, seq);
-    if (explicit_len != 0) {
-        if (std.mem.readInt(u64, parsed.fragment[0..8], .big) != seq) return error.BadRecord;
-    }
+    // AES-GCM (RFC 5288): the 8-byte explicit nonce is chosen by the SENDER and
+    // need not equal the record sequence number — the receiver MUST take it from
+    // the wire (salt ‖ explicit). Reconstructing it from `seq` and demanding they
+    // match rejected every client (OpenSSL, browsers) that picks a different
+    // explicit nonce. ChaCha20-Poly1305 (RFC 7905) carries no explicit nonce, so
+    // it is still derived from `seq` ⊕ iv. The AAD/anti-replay still bind `seq`.
+    const nonce = if (explicit_len != 0) blk: {
+        var n: [12]u8 = undefined;
+        @memcpy(n[0..4], keys.iv[0..4]);
+        @memcpy(n[4..12], parsed.fragment[0..8]);
+        break :blk n;
+    } else makeNonce(suite, keys.iv, seq);
     var aad = makeAad(seq, parsed.content_type, @intCast(cipher_len));
     const plaintext = try allocator.alloc(u8, cipher_len);
     errdefer allocator.free(plaintext);
