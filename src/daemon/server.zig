@@ -3949,7 +3949,16 @@ pub const LinuxServer = struct {
             conn.session.tls_cipher = conn.tls.?.cipherName();
         }
         if (outcome.handshake_bytes.len != 0) {
-            appendToConn(conn, outcome.handshake_bytes) catch {
+            // `handshake_bytes` are ALREADY-FORMED TLS records (the handshake
+            // flight / post-handshake KeyUpdate) produced by the TLS engine, so
+            // they go straight to the wire — NEVER through the app-data encrypt
+            // seam. This matters for TLS 1.2: the server's CCS+Finished is built
+            // in the same onInbound that flips the connection to "established", so
+            // a plain appendToConn would see handshakeDone()=true and wrongly
+            // re-encrypt the flight as application_data (clients abort with
+            // "unexpected message"). TLS 1.3 sends its Finished pre-established so
+            // it never tripped this.
+            rawAppendToConn(conn, outcome.handshake_bytes) catch {
                 conn.closing = true;
                 return;
             };
