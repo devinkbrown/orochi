@@ -77,6 +77,46 @@ pub fn writeNetjoin(
     return writer.written();
 }
 
+/// Write un-batched QUIT lines (no `@batch` tag, no BATCH open/close) for one
+/// recipient that did NOT negotiate the `batch` cap. Same QUIT events a netsplit
+/// batch carries, just without the IRCv3 framing such a client can't parse.
+pub fn writeQuitsPlain(
+    out: []u8,
+    local_server: []const u8,
+    remote_server: []const u8,
+    ghosts: []const Ghost,
+) Error![]const u8 {
+    var writer = FixedWriter.init(out);
+    for (ghosts) |ghost| {
+        try writer.append(":");
+        try writer.append(ghost.prefix);
+        try writer.append(" QUIT :");
+        try writer.append(local_server);
+        try writer.appendByte(' ');
+        try writer.append(remote_server);
+        try writer.append("\r\n");
+    }
+    return writer.written();
+}
+
+/// Write un-batched JOIN lines for a channel for one recipient that did NOT
+/// negotiate the `batch` cap. Same JOIN events a netjoin batch carries.
+pub fn writeJoinsPlain(
+    out: []u8,
+    channel: []const u8,
+    ghosts: []const Ghost,
+) Error![]const u8 {
+    var writer = FixedWriter.init(out);
+    for (ghosts) |ghost| {
+        try writer.append(":");
+        try writer.append(ghost.prefix);
+        try writer.append(" JOIN ");
+        try writer.append(channel);
+        try writer.append("\r\n");
+    }
+    return writer.written();
+}
+
 const FixedWriter = struct {
     out: []u8,
     cursor: usize = 0,
@@ -185,6 +225,25 @@ test "netjoin batch wraps two ghost joins" {
             "@batch=ref :bob!b@leaf JOIN #room\r\n" ++
             ":a BATCH -ref\r\n",
         written,
+    );
+}
+
+test "plain quit/join lines carry no batch framing" {
+    const ghosts = [_]Ghost{
+        .{ .prefix = "alice!a@leaf", .nick = "alice" },
+        .{ .prefix = "bob!b@leaf", .nick = "bob" },
+    };
+    var out: [256]u8 = undefined;
+
+    try std.testing.expectEqualStrings(
+        ":alice!a@leaf QUIT :a b\r\n" ++
+            ":bob!b@leaf QUIT :a b\r\n",
+        try writeQuitsPlain(&out, "a", "b", &ghosts),
+    );
+    try std.testing.expectEqualStrings(
+        ":alice!a@leaf JOIN #room\r\n" ++
+            ":bob!b@leaf JOIN #room\r\n",
+        try writeJoinsPlain(&out, "#room", &ghosts),
     );
 }
 

@@ -717,6 +717,12 @@ const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
 /// Cadence for the periodic membership anti-entropy re-burst to S2S peers. Coarse
 /// (relative to the 2s sweep) so it converges split-window gaps without churn.
 const membership_resync_interval_ms: i64 = 30_000;
+/// Max members per netsplit/netjoin IRCv3 BATCH chunk; a larger channel splits
+/// across multiple batches so members past a fixed cap are never silently lost.
+const mesh_batch_chunk: usize = 32;
+/// Scratch size for one rendered netsplit/netjoin batch — fits `mesh_batch_chunk`
+/// members at the 420-byte max prefix plus the BATCH framing.
+const mesh_batch_buf_len: usize = 20480;
 /// Distinct accept token for the implicit-TLS client listener (:6697), so
 /// handleAccept can tell it apart from the plaintext + S2S listeners.
 const tls_listener_token: RingFdToken = .{ .slot = 3, .gen = 0 };
@@ -4387,6 +4393,24 @@ pub const LinuxServer = struct {
     /// QUITs for the remote members that link had announced (instead of letting
     /// them silently vanish from NAMES). Must run BEFORE the link is deinit'd
     /// (it reads the link's remote roster). Best-effort. (#64)
+    /// Deliver a peer-transition event to a channel's LOCAL members: the IRCv3
+    /// BATCH form to members that negotiated the `batch` cap, and the equivalent
+    /// un-batched lines to those that did not — a non-`batch` client must never
+    /// receive `@batch=` framing or BATCH open/close it can't parse. Peer links
+    /// are skipped. Routes via the shard-aware sink (local append or cross-shard
+    /// handoff).
+    fn deliverChannelBatchGated(self: *LinuxServer, channel: []const u8, batched: []const u8, plain: []const u8) void {
+        var members = self.world.memberIterator(channel) orelse return;
+        while (members.next()) |member| {
+            const mid = clientIdFromWorld(member.*);
+            const mc = self.connFor(mid) orelse continue;
+            if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
+            const bytes = if (mc.session.hasCap(.batch)) batched else plain;
+            if (bytes.len == 0) continue;
+            self.enqueueDelivery(mid, bytes) catch continue;
+        }
+    }
+
     fn netsplitOnPeerDrop(self: *LinuxServer, conn: *ConnState) void {
         const remote_name = if (conn.s2s_secured) |l| l.remoteName() else if (conn.s2s) |l| l.remoteName() else return;
         var cit = self.world.channelIterator();
@@ -4399,34 +4423,33 @@ pub const LinuxServer = struct {
                 &.{};
             if (remote_members.len == 0) continue;
 
-            var ghosts: [32]netsplit_batch.Ghost = undefined;
-            var prefixes: [32][420]u8 = undefined;
-            var n: usize = 0;
-            for (remote_members) |m| {
-                if (n >= ghosts.len) break;
-                // QUIT with the member's propagated real user@host when known,
-                // matching how the user was rendered while present.
-                const user: []const u8 = if (m.username.len != 0) m.username else "*";
-                const host: []const u8 = if (m.host.len != 0) m.host else remote_name;
-                const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!{s}@{s}", .{ m.nick, user, host }) catch continue;
-                ghosts[n] = .{ .prefix = prefix, .nick = m.nick };
-                n += 1;
-            }
-            if (n == 0) continue;
+            // Chunk so an arbitrarily large channel never silently drops members
+            // past a fixed cap; each chunk is one netsplit BATCH.
+            var off: usize = 0;
+            while (off < remote_members.len) {
+                const chunk_end = @min(off + mesh_batch_chunk, remote_members.len);
+                var ghosts: [mesh_batch_chunk]netsplit_batch.Ghost = undefined;
+                var prefixes: [mesh_batch_chunk][420]u8 = undefined;
+                var n: usize = 0;
+                for (remote_members[off..chunk_end]) |m| {
+                    // QUIT with the member's propagated real user@host when known,
+                    // matching how the user was rendered while present.
+                    const user: []const u8 = if (m.username.len != 0) m.username else "*";
+                    const host: []const u8 = if (m.host.len != 0) m.host else remote_name;
+                    const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!{s}@{s}", .{ m.nick, user, host }) catch continue;
+                    ghosts[n] = .{ .prefix = prefix, .nick = m.nick };
+                    n += 1;
+                }
+                off = chunk_end;
+                if (n == 0) continue;
 
-            var ref_buf: [16]u8 = undefined;
-            const ref = netsplit_batch.makeBatchRef(&ref_buf, @intCast(@max(@as(i64, 0), self.nowMs())));
-            var batch_buf: [8192]u8 = undefined;
-            const batch = netsplit_batch.writeNetsplit(&batch_buf, ref, self.serverName(), remote_name, ghosts[0..n]) catch continue;
-
-            var members = self.world.memberIterator(cv.name) orelse continue;
-            while (members.next()) |member| {
-                const mid = clientIdFromWorld(member.*);
-                const mc = self.connFor(mid) orelse continue;
-                if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
-                // Route via the shard-aware sink: local append or cross-shard
-                // handoff (the batch is chunked to the pool's per-buffer max).
-                self.enqueueDelivery(mid, batch) catch continue;
+                var ref_buf: [16]u8 = undefined;
+                const ref = netsplit_batch.makeBatchRef(&ref_buf, @intCast(@max(@as(i64, 0), self.nowMs())));
+                var batch_buf: [mesh_batch_buf_len]u8 = undefined;
+                var plain_buf: [mesh_batch_buf_len]u8 = undefined;
+                const batched = netsplit_batch.writeNetsplit(&batch_buf, ref, self.serverName(), remote_name, ghosts[0..n]) catch continue;
+                const plain = netsplit_batch.writeQuitsPlain(&plain_buf, self.serverName(), remote_name, ghosts[0..n]) catch continue;
+                self.deliverChannelBatchGated(cv.name, batched, plain);
             }
         }
     }
@@ -4878,15 +4901,73 @@ pub const LinuxServer = struct {
     }
 
     /// Drain a link's remote membership changes and surface each as live IRC.
-    /// Frees the drained slice + each delta's owned strings.
+    /// A run of consecutive joins to the SAME channel — as a link-up membership
+    /// burst delivers them — is wrapped in one IRCv3 `netjoin` BATCH (cap-gated)
+    /// so rejoining users collapse client-side instead of arriving as a flood of
+    /// bare JOINs; everything else stays an individual live line. Frees the
+    /// drained slice + each delta's owned strings.
     fn drainMembershipChanges(self: *LinuxServer, link: anytype) void {
         const changes = link.takeMembershipChanges() catch return;
+        defer self.allocator.free(changes);
         const remote = link.remoteName();
-        for (changes) |*ch| {
-            self.emitRemoteMembership(ch, remote);
-            ch.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < changes.len) {
+            if (changes[i].kind == .joined) {
+                const chan = changes[i].channel;
+                var j = i;
+                while (j < changes.len and changes[j].kind == .joined and
+                    std.mem.eql(u8, changes[j].channel, chan)) : (j += 1)
+                {}
+                if (j - i >= 2) {
+                    self.emitNetjoinRun(chan, remote, changes[i..j]);
+                } else {
+                    self.emitRemoteMembership(&changes[i], remote);
+                }
+                for (changes[i..j]) |*ch| ch.deinit(self.allocator);
+                i = j;
+            } else {
+                self.emitRemoteMembership(&changes[i], remote);
+                changes[i].deinit(self.allocator);
+                i += 1;
+            }
         }
-        self.allocator.free(changes);
+    }
+
+    /// Emit a run of remote joins to one channel as a cap-gated IRCv3 `netjoin`
+    /// BATCH (the mirror of `netsplitOnPeerDrop`), chunked so a large rejoin
+    /// never drops members. Prefix modes (op/voice/…) follow the batch as MODE
+    /// lines, matching the single-join path in `emitRemoteMembership`.
+    fn emitNetjoinRun(self: *LinuxServer, channel: []const u8, remote_name: []const u8, run: anytype) void {
+        const server_host = if (remote_name.len != 0) remote_name else default_host;
+        var off: usize = 0;
+        while (off < run.len) {
+            const chunk_end = @min(off + mesh_batch_chunk, run.len);
+            var ghosts: [mesh_batch_chunk]netsplit_batch.Ghost = undefined;
+            var prefixes: [mesh_batch_chunk][420]u8 = undefined;
+            var n: usize = 0;
+            for (run[off..chunk_end]) |*ch| {
+                const user = if (ch.username.len != 0) ch.username else world_projection.remote_user_placeholder;
+                const host = if (ch.host.len != 0) ch.host else server_host;
+                const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!{s}@{s}", .{ ch.nick, user, host }) catch continue;
+                ghosts[n] = .{ .prefix = prefix, .nick = ch.nick };
+                n += 1;
+            }
+            off = chunk_end;
+            if (n == 0) continue;
+
+            var ref_buf: [16]u8 = undefined;
+            const ref = netsplit_batch.makeBatchRef(&ref_buf, @intCast(@max(@as(i64, 0), self.nowMs())));
+            var batch_buf: [mesh_batch_buf_len]u8 = undefined;
+            var plain_buf: [mesh_batch_buf_len]u8 = undefined;
+            const batched = netsplit_batch.writeNetjoin(&batch_buf, ref, self.serverName(), remote_name, channel, ghosts[0..n]) catch continue;
+            const plain = netsplit_batch.writeJoinsPlain(&plain_buf, channel, ghosts[0..n]) catch continue;
+            self.deliverChannelBatchGated(channel, batched, plain);
+        }
+        // Prefix modes for the joined members, after the batch (display-only;
+        // world roster was already updated on receive).
+        for (run) |*ch| {
+            if (ch.status != 0) self.emitRemoteModeDiff(channel, ch.nick, server_host, 0, ch.status);
+        }
     }
 
     /// Drain a link's remote aggregate channel MODE flag changes, apply each to
