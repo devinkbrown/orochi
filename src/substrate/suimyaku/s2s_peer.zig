@@ -31,6 +31,7 @@ const handshake_version: u8 = 1;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
+const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const partition_detector = @import("partition_detector.zig");
 
 pub const ByteSink = struct {
@@ -126,6 +127,9 @@ pub const S2sPeer = struct {
     /// as live `:nick JOIN/PART #chan` lines to local members. Re-affirmations
     /// (anti-entropy re-bursts) never enqueue here, so no duplicate JOINs.
     membership_changes: std.ArrayListUnmanaged(MembershipDelta) = .empty,
+    /// Remote aggregate channel MODE flag changes that won the LWW route-table
+    /// state, awaiting the daemon to apply them to the local world and emit MODE.
+    channel_mode_flag_changes: std.ArrayListUnmanaged(ChannelModeFlagsDelta) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -184,6 +188,8 @@ pub const S2sPeer = struct {
         self.inbound_grants.deinit(self.allocator);
         for (self.membership_changes.items) |*d| d.deinit(self.allocator);
         self.membership_changes.deinit(self.allocator);
+        for (self.channel_mode_flag_changes.items) |*d| d.deinit(self.allocator);
+        self.channel_mode_flag_changes.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -321,6 +327,7 @@ pub const S2sPeer = struct {
             .PONG => self.pong_rx_count += 1,
             .QUIT => self.closeRemote(),
             .MEMBERSHIP => try self.recvMembership(frame.payload),
+            .CHANNEL_MODE_FLAGS => try self.recvChannelModeFlags(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
         }
@@ -401,6 +408,24 @@ pub const S2sPeer = struct {
         return self.membership_changes.toOwnedSlice(self.allocator);
     }
 
+    /// A remote channel's aggregate boolean MODE flags changed. `channel` is
+    /// heap-owned; the daemon frees it via `deinit` after applying/emitting.
+    pub const ChannelModeFlagsDelta = struct {
+        channel: []u8,
+        flags: u16,
+
+        pub fn deinit(self: *ChannelModeFlagsDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.channel);
+            self.* = undefined;
+        }
+    };
+
+    /// Drain queued remote channel MODE flag changes. Caller owns the slice and
+    /// each delta's channel string (call `deinit` per entry, then free slice).
+    pub fn takeChannelModeFlagChanges(self: *S2sPeer) ![]ChannelModeFlagsDelta {
+        return self.channel_mode_flag_changes.toOwnedSlice(self.allocator);
+    }
+
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
     /// malformed payload is dropped, never fatal to the link. A real add/remove/
     /// status-change is queued so the daemon can emit the matching live IRC line.
@@ -430,6 +455,20 @@ pub const S2sPeer = struct {
         };
     }
 
+    /// Apply an inbound CHANNEL_MODE_FLAGS event to the route table (LWW by hlc).
+    /// Malformed/stale/no-op payloads are dropped; only a real aggregate change is
+    /// queued for the daemon to apply to its local world.
+    fn recvChannelModeFlags(self: *S2sPeer, payload: []const u8) !void {
+        const ev = channel_mode_flags_event.decode(payload) catch return;
+        const outcome = self.routes.applyChannelModeFlags(ev.channel, ev.origin_node, ev.flags, ev.hlc) catch return;
+        if (outcome == .unchanged) return;
+        const ch = self.allocator.dupe(u8, ev.channel) catch return;
+        self.channel_mode_flag_changes.append(self.allocator, .{
+            .channel = ch,
+            .flags = ev.flags,
+        }) catch self.allocator.free(ch);
+    }
+
     /// Emit a MEMBERSHIP event to the peer announcing a local member's presence
     /// (or departure) in `channel`. Best-effort; only meaningful once established.
     pub fn sendMembership(
@@ -454,9 +493,33 @@ pub const S2sPeer = struct {
         try emitFrame(self.allocator, sink, .MEMBERSHIP, wire);
     }
 
+    /// Emit a CHANNEL_MODE_FLAGS aggregate to the peer. Best-effort; only
+    /// meaningful once established.
+    pub fn sendChannelModeFlags(
+        self: *S2sPeer,
+        sink: ByteSink,
+        channel: []const u8,
+        flags: u16,
+        hlc: u64,
+    ) !void {
+        const ev = channel_mode_flags_event.ChannelModeFlagsEvent{
+            .flags = flags,
+            .origin_node = self.local_node_id,
+            .hlc = hlc,
+            .channel = channel,
+        };
+        var buf: [channel_mode_flags_event.max_channel_len + 32]u8 = undefined;
+        const wire = try channel_mode_flags_event.encode(ev, &buf);
+        try emitFrame(self.allocator, sink, .CHANNEL_MODE_FLAGS, wire);
+    }
+
     /// Remote members the peer has announced for `channel` (borrowed roster).
     pub fn channelMembers(self: *const S2sPeer, channel: []const u8) []const route_table.Member {
         return self.routes.channelMembers(channel);
+    }
+
+    pub fn channelModeFlags(self: *const S2sPeer, channel: []const u8) ?route_table.ChannelModeFlags {
+        return self.routes.channelModeFlags(channel);
     }
 
     fn recvHandshake(self: *S2sPeer, payload: []const u8, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {

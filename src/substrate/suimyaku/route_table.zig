@@ -138,6 +138,13 @@ const MemberList = struct {
     }
 };
 
+/// One remote channel MODE-flag aggregate, tracked last-writer-wins by HLC.
+pub const ChannelModeFlags = struct {
+    flags: u16,
+    origin_node: NodeId,
+    hlc: u64,
+};
+
 pub const RouteTable = struct {
     const Self = @This();
 
@@ -149,6 +156,10 @@ pub const RouteTable = struct {
     /// MEMBERSHIP propagation (see docs/planning/16). Independent of `channels`
     /// (which is node-level routing) so identity churn never disturbs routing.
     channel_members: std.StringHashMap(MemberList),
+    /// channel name -> last remote aggregate boolean MODE flags, populated by
+    /// CHANNEL_MODE_FLAGS propagation. This is independent of route fanout and
+    /// rosters; it is only an LWW cache that drives daemon-side world updates.
+    channel_mode_flags: std.StringHashMap(ChannelModeFlags),
     nick_count: usize = 0,
     channel_count: usize = 0,
 
@@ -160,6 +171,7 @@ pub const RouteTable = struct {
             .nick_to_node = std.StringHashMap(NodeId).init(allocator),
             .channels = std.StringHashMap(ChannelState).init(allocator),
             .channel_members = std.StringHashMap(MemberList).init(allocator),
+            .channel_mode_flags = std.StringHashMap(ChannelModeFlags).init(allocator),
         };
     }
 
@@ -168,6 +180,7 @@ pub const RouteTable = struct {
         self.nick_to_node.deinit();
         self.channels.deinit();
         self.channel_members.deinit();
+        self.channel_mode_flags.deinit();
         self.* = undefined;
     }
 
@@ -189,6 +202,10 @@ pub const RouteTable = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.channel_members.clearRetainingCapacity();
+
+        var mode_flags = self.channel_mode_flags.iterator();
+        while (mode_flags.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.channel_mode_flags.clearRetainingCapacity();
 
         self.nick_count = 0;
         self.channel_count = 0;
@@ -347,6 +364,45 @@ pub const RouteTable = struct {
             }
         }
         return null;
+    }
+
+    pub const ApplyChannelModeFlagsOutcome = enum { changed, unchanged };
+
+    /// Apply a CHANNEL_MODE_FLAGS event for a remote channel, last-writer-wins by
+    /// `hlc`. Stale events (hlc <= stored) are ignored. The daemon handles the
+    /// actual local world mutation after draining a changed aggregate.
+    pub fn applyChannelModeFlags(
+        self: *Self,
+        chan: []const u8,
+        node: NodeId,
+        flags: u16,
+        hlc: u64,
+    ) Error!ApplyChannelModeFlagsOutcome {
+        try self.validateName(chan);
+        try validateNode(node);
+
+        if (self.channel_mode_flags.getPtr(chan)) |cur| {
+            if (hlc <= cur.hlc) return .unchanged;
+            const changed = cur.flags != flags;
+            cur.flags = flags;
+            cur.origin_node = node;
+            cur.hlc = hlc;
+            return if (changed) .changed else .unchanged;
+        }
+
+        if (self.channel_mode_flags.count() >= self.cfg.max_channels) return error.RouteTableFull;
+        const owned = try self.allocator.dupe(u8, chan);
+        errdefer self.allocator.free(owned);
+        try self.channel_mode_flags.putNoClobber(owned, .{
+            .flags = flags,
+            .origin_node = node,
+            .hlc = hlc,
+        });
+        return .changed;
+    }
+
+    pub fn channelModeFlags(self: *const Self, chan: []const u8) ?ChannelModeFlags {
+        return self.channel_mode_flags.get(chan);
     }
 
     fn ensureMemberList(self: *Self, chan: []const u8) Error!*MemberList {
@@ -610,6 +666,21 @@ test "removeNode evicts that node's remote members (netsplit hygiene)" {
 
     table.removeNode(20); // last member gone -> channel pruned
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#chat").len);
+}
+
+test "applyChannelModeFlags tracks aggregate flags with last-writer-wins" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    try std.testing.expectEqual(RouteTable.ApplyChannelModeFlagsOutcome.changed, try table.applyChannelModeFlags("#chat", 10, 0b0011, 5));
+    try std.testing.expectEqual(RouteTable.ApplyChannelModeFlagsOutcome.unchanged, try table.applyChannelModeFlags("#chat", 10, 0b0101, 4));
+    try std.testing.expectEqual(@as(u16, 0b0011), table.channelModeFlags("#chat").?.flags);
+
+    try std.testing.expectEqual(RouteTable.ApplyChannelModeFlagsOutcome.changed, try table.applyChannelModeFlags("#chat", 20, 0b0101, 6));
+    const got = table.channelModeFlags("#chat").?;
+    try std.testing.expectEqual(@as(u16, 0b0101), got.flags);
+    try std.testing.expectEqual(@as(NodeId, 20), got.origin_node);
+    try std.testing.expectEqual(@as(u64, 6), got.hlc);
 }
 
 test "Config.applyToml overlays mesh.routing route-table keys" {
