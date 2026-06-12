@@ -3645,6 +3645,28 @@ pub const LinuxServer = struct {
         try self.enqueueDelivery(id, bytes);
     }
 
+    /// Mirror one already-rendered direct PRIVMSG/NOTICE line to the other
+    /// attached local sessions of `account` that explicitly opted in. This helper
+    /// is called only from the user-target DM path, never from mirrored delivery,
+    /// so sibling copies cannot recursively fan out.
+    fn deliverSessionSyncSiblings(
+        self: *LinuxServer,
+        account: []const u8,
+        tags: MsgTags,
+        bytes: []const u8,
+        skip_a: client_model.ClientId,
+        skip_b: ?client_model.ClientId,
+    ) void {
+        const skip_a_flat = monitorIdFromClient(skip_a);
+        const skip_b_flat = if (skip_b) |id| monitorIdFromClient(id) else null;
+        for (self.sessions.sessions(account)) |s| {
+            const sibling_id = clientIdFromMonitor(s.client);
+            const sibling = self.connFor(sibling_id) orelse continue;
+            if (!allowsSessionSyncSibling(s, sibling, skip_a_flat, skip_b_flat)) continue;
+            self.deliverTagged(sibling_id, tags, bytes) catch continue;
+        }
+    }
+
     fn broadcastChannelTagged(
         self: *LinuxServer,
         channel: []const u8,
@@ -12403,10 +12425,10 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
+            self.media_plane.remove(channel, nick);
+            self.native_media.unregister(channel, nick);
+            self.bridgeUnregister(channel, nick);
             if (self.media_rooms.leaveAll(channel, nick)) {
-                self.media_plane.remove(channel, nick);
-                self.native_media.unregister(channel, nick);
-                self.bridgeUnregister(channel, nick);
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
                 if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel); // call ended
             } else try self.noticeTo(conn, "MEDIA: you are not in this call");
@@ -12488,10 +12510,10 @@ pub const LinuxServer = struct {
         var it = self.world.channels.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
+            self.media_plane.remove(entry.key_ptr.*, nick);
+            self.native_media.unregister(entry.key_ptr.*, nick);
+            self.bridgeUnregister(entry.key_ptr.*, nick);
             if (self.media_rooms.leaveAll(entry.key_ptr.*, nick)) {
-                self.media_plane.remove(entry.key_ptr.*, nick);
-                self.native_media.unregister(entry.key_ptr.*, nick);
-                self.bridgeUnregister(entry.key_ptr.*, nick);
                 self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
                 if (self.media_rooms.room(entry.key_ptr.*) == null) _ = self.transcript.clearChannel(entry.key_ptr.*);
             }
@@ -14419,8 +14441,17 @@ pub const LinuxServer = struct {
         }
         var time_buf: [40]u8 = undefined;
         const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
-        try self.deliverTagged(clientIdFromWorld(recipient), dtags, msg);
+        const recipient_id = clientIdFromWorld(recipient);
+        try self.deliverTagged(recipient_id, dtags, msg);
+        const recipient_account = if (self.connFor(recipient_id)) |rconn| rconn.session.account() else null;
+        if (recipient_account) |acct| {
+            self.deliverSessionSyncSiblings(acct, dtags, msg, recipient_id, id);
+        }
         if (echo) try self.deliverTagged(id, dtags, msg);
+        if (conn.session.account()) |sender_account| {
+            const same_account = if (recipient_account) |acct| std.mem.eql(u8, sender_account, acct) else false;
+            if (!same_account) self.deliverSessionSyncSiblings(sender_account, dtags, msg, id, recipient_id);
+        }
         if (!is_notice) {
             var dm_key_buf: [320]u8 = undefined;
             if (dmHistoryKey(conn.session.displayName(), target, &dm_key_buf)) |store_target| {
@@ -14791,6 +14822,22 @@ fn monitorIdFromClient(id: client_model.ClientId) u64 {
 
 fn clientIdFromMonitor(id: u64) client_model.ClientId {
     return @bitCast(id);
+}
+
+fn allowsSessionSyncSibling(
+    session: sessions_mod.Session,
+    conn: *const ConnState,
+    skip_a_flat: u64,
+    skip_b_flat: ?u64,
+) bool {
+    if (!session.attached) return false;
+    if (session.client == skip_a_flat) return false;
+    if (skip_b_flat) |skip| {
+        if (session.client == skip) return false;
+    }
+    if (conn.closing) return false;
+    if (conn.s2s != null or conn.s2s_secured != null) return false;
+    return conn.session.hasCap(.orochi_session_sync);
 }
 
 /// Map a MonitorStore numeric to the live server's numeric enum.
@@ -15472,6 +15519,10 @@ fn saslAdminPrelude(fd: linux.fd_t) ServerError!void {
 }
 
 fn saslPlainPrelude(fd: linux.fd_t, account: []const u8, password: []const u8) ServerError!void {
+    try saslPlainPreludeWithCaps(fd, account, password, "");
+}
+
+fn saslPlainPreludeWithCaps(fd: linux.fd_t, account: []const u8, password: []const u8, extra_caps: []const u8) ServerError!void {
     var plain: [128]u8 = undefined;
     if (account.len + password.len + 2 > plain.len) return error.OutputTooSmall;
     var plain_len: usize = 0;
@@ -15486,7 +15537,11 @@ fn saslPlainPrelude(fd: linux.fd_t, account: []const u8, password: []const u8) S
     var b64: [64]u8 = undefined;
     const enc = std.base64.standard.Encoder.encode(&b64, plain[0..plain_len]);
     var line: [128]u8 = undefined;
-    try writeAllFd(fd, "CAP REQ :sasl\r\n");
+    if (extra_caps.len == 0) {
+        try writeAllFd(fd, "CAP REQ :sasl\r\n");
+    } else {
+        try writeAllFd(fd, std.fmt.bufPrint(&line, "CAP REQ :sasl {s}\r\n", .{extra_caps}) catch return error.OutputTooSmall);
+    }
     try writeAllFd(fd, "AUTHENTICATE PLAIN\r\n");
     try writeAllFd(fd, std.fmt.bufPrint(&line, "AUTHENTICATE {s}\r\n", .{enc}) catch return error.OutputTooSmall);
     try writeAllFd(fd, "CAP END\r\n");
@@ -15673,6 +15728,85 @@ test "processLine rejects malformed input without writing" {
 
     try std.testing.expectError(error.EmbeddedLineBreak, processLine(&conn, "PING :abc\nWHOIS kain", &sink));
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+}
+
+test "session-sync unit: two sessions same account both session-sync get the DM" {
+    const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const sender_id = client_model.ClientId{ .shard = 0, .slot = 9, .gen = 1 };
+    const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    var sibling = ConnState.init(-1);
+    sibling.session.addCap(.orochi_session_sync);
+    const session = sessions_mod.Session{
+        .client = monitorIdFromClient(sibling_id),
+        .token = [_]u8{0} ** 16,
+        .signon_ms = 0,
+    };
+
+    try std.testing.expect(allowsSessionSyncSibling(
+        session,
+        &sibling,
+        monitorIdFromClient(target_id),
+        monitorIdFromClient(sender_id),
+    ));
+}
+
+test "session-sync unit: a session without the cap does not get the DM" {
+    const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    var sibling = ConnState.init(-1);
+    const session = sessions_mod.Session{
+        .client = monitorIdFromClient(sibling_id),
+        .token = [_]u8{0} ** 16,
+        .signon_ms = 0,
+    };
+
+    try std.testing.expect(!allowsSessionSyncSibling(
+        session,
+        &sibling,
+        monitorIdFromClient(target_id),
+        null,
+    ));
+}
+
+test "session-sync unit: sender other session gets outgoing DM echo" {
+    const sender_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const recipient_id = client_model.ClientId{ .shard = 0, .slot = 8, .gen = 1 };
+    const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    var sibling = ConnState.init(-1);
+    sibling.session.addCap(.orochi_session_sync);
+    const session = sessions_mod.Session{
+        .client = monitorIdFromClient(sibling_id),
+        .token = [_]u8{0} ** 16,
+        .signon_ms = 0,
+    };
+
+    try std.testing.expect(allowsSessionSyncSibling(
+        session,
+        &sibling,
+        monitorIdFromClient(sender_id),
+        monitorIdFromClient(recipient_id),
+    ));
+}
+
+test "session-sync unit: single-session account has no sibling copies" {
+    const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    var store = sessions_mod.SessionStore.init(std.testing.allocator);
+    defer store.deinit();
+    _ = try store.attach("alice", monitorIdFromClient(target_id), [_]u8{1} ** 16, 0);
+
+    var target_conn = ConnState.init(-1);
+    target_conn.session.addCap(.orochi_session_sync);
+    var copies: usize = 0;
+    for (store.sessions("alice")) |session| {
+        if (allowsSessionSyncSibling(
+            session,
+            &target_conn,
+            monitorIdFromClient(target_id),
+            null,
+        )) copies += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), copies);
 }
 
 /// Blocking read with a bounded poll budget (so a misbehaving server fails the
@@ -16918,6 +17052,174 @@ test "threaded server: PRIVMSG multi-target delivery" {
     waitMillis(100);
     try b.readAvailable();
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "PRIVMSG #dup :chan copy"));
+}
+
+test "threaded server: session-sync fans out inbound direct messages to account siblings" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_s = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_s);
+    const fd_a1 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a1);
+    const fd_a2 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a2);
+    var s = LiveClient{ .fd = fd_s };
+    var a1 = LiveClient{ .fd = fd_a1 };
+    var a2 = LiveClient{ .fd = fd_a2 };
+
+    try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
+    try saslPlainPreludeWithCaps(fd_a1, "admin", "orochi", "orochi/session-sync");
+    try writeAllFd(fd_a1, "NICK A1\r\nUSER a1 0 * :Admin One\r\n");
+    try saslPlainPreludeWithCaps(fd_a2, "admin", "orochi", "orochi/session-sync");
+    try writeAllFd(fd_a2, "NICK A2\r\nUSER a2 0 * :Admin Two\r\n");
+    try recvUntil(&s, " 001 S ", 200);
+    try recvUntil(&a1, " 001 A1 ", 200);
+    try recvUntil(&a2, " 001 A2 ", 200);
+
+    a1.reset();
+    a2.reset();
+    try writeAllFd(fd_s, "PRIVMSG A1 :hello devices\r\n");
+    try recvUntil(&a1, ":S!sender@localhost PRIVMSG A1 :hello devices\r\n", 200);
+    try recvUntil(&a2, ":S!sender@localhost PRIVMSG A1 :hello devices\r\n", 200);
+    waitMillis(100);
+    try a2.readAvailable();
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(a2.written(), "PRIVMSG A1 :hello devices"));
+}
+
+test "threaded server: session-sync does not fan out to sibling without cap" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_s = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_s);
+    const fd_a1 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a1);
+    const fd_a2 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a2);
+    var s = LiveClient{ .fd = fd_s };
+    var a1 = LiveClient{ .fd = fd_a1 };
+    var a2 = LiveClient{ .fd = fd_a2 };
+
+    try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
+    try saslPlainPreludeWithCaps(fd_a1, "admin", "orochi", "orochi/session-sync");
+    try writeAllFd(fd_a1, "NICK A1\r\nUSER a1 0 * :Admin One\r\n");
+    try saslPlainPrelude(fd_a2, "admin", "orochi");
+    try writeAllFd(fd_a2, "NICK A2\r\nUSER a2 0 * :Admin Two\r\n");
+    try recvUntil(&s, " 001 S ", 200);
+    try recvUntil(&a1, " 001 A1 ", 200);
+    try recvUntil(&a2, " 001 A2 ", 200);
+
+    a1.reset();
+    a2.reset();
+    try writeAllFd(fd_s, "PRIVMSG A1 :cap gated\r\n");
+    try recvUntil(&a1, ":S!sender@localhost PRIVMSG A1 :cap gated\r\n", 200);
+    waitMillis(100);
+    try a2.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, a2.written(), "PRIVMSG A1 :cap gated") == null);
+}
+
+test "threaded server: session-sync mirrors outgoing direct messages to sender siblings" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a1 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a1);
+    const fd_a2 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a2);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a1 = LiveClient{ .fd = fd_a1 };
+    var a2 = LiveClient{ .fd = fd_a2 };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslPlainPrelude(fd_a1, "admin", "orochi");
+    try writeAllFd(fd_a1, "NICK A1\r\nUSER a1 0 * :Admin One\r\n");
+    try saslPlainPreludeWithCaps(fd_a2, "admin", "orochi", "orochi/session-sync");
+    try writeAllFd(fd_a2, "NICK A2\r\nUSER a2 0 * :Admin Two\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a1, " 001 A1 ", 200);
+    try recvUntil(&a2, " 001 A2 ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    a2.reset();
+    b.reset();
+    try writeAllFd(fd_a1, "PRIVMSG B :sent copy\r\n");
+    try recvUntil(&b, ":A1!a1@localhost PRIVMSG B :sent copy\r\n", 200);
+    try recvUntil(&a2, ":A1!a1@localhost PRIVMSG B :sent copy\r\n", 200);
+}
+
+test "threaded server: session-sync single-session account keeps direct message single" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_s = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_s);
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var s = LiveClient{ .fd = fd_s };
+    var a = LiveClient{ .fd = fd_a };
+
+    try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
+    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "orochi/session-sync");
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :Admin\r\n");
+    try recvUntil(&s, " 001 S ", 200);
+    try recvUntil(&a, " 001 A ", 200);
+
+    a.reset();
+    try writeAllFd(fd_s, "PRIVMSG A :single copy\r\n");
+    try recvUntil(&a, ":S!sender@localhost PRIVMSG A :single copy\r\n", 200);
+    waitMillis(100);
+    try a.readAvailable();
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(a.written(), "PRIVMSG A :single copy"));
 }
 
 test "threaded server: draft/multiline batch reassembles + splits to recipient" {

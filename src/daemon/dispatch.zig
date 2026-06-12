@@ -233,6 +233,7 @@ pub const CapId = enum(u6) {
     account_notify,
     invite_notify,
     account_tag,
+    orochi_session_sync,
     orochi_bouncer,
     chghost,
     no_implicit_names,
@@ -302,6 +303,9 @@ const cap_specs = [_]CapSpec{
     .{ .id = .extended_join, .name = "extended-join" },
     .{ .id = .invite_notify, .name = "invite-notify" },
     .{ .id = .account_tag, .name = "account-tag" },
+    // orochi/session-sync: opt-in sibling-device mirroring for direct
+    // PRIVMSG/NOTICE delivery and outgoing DM self-view.
+    .{ .id = .orochi_session_sync, .name = "orochi/session-sync" },
     // orochi/bouncer: opt-in to automatic rewind (replay of missed channel
     // history on (re)join, bounded by the client's read marker). Multi-session
     // reclaim (SESSION RESUME) works without it; this only enables auto-replay.
