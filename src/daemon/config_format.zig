@@ -542,6 +542,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("tls.key_path"), &cfg.tls.key_path);
     try setStr(allocator, resolver, doc.getString("tls.dns_name"), &cfg.tls.dns_name);
     if (doc.getBool("tls.request_client_cert")) |b| cfg.tls.request_client_cert = b;
+    if (doc.getBool("tls.enable_tls12")) |b| cfg.tls.enable_tls12 = b;
+    if (doc.getBool("tls.enable_resumption")) |b| cfg.tls.enable_resumption = b;
+    cfg.tls.early_data_max_size = @intCast(try uintField(doc, "tls.early_data_max_size", cfg.tls.early_data_max_size, 0, std.math.maxInt(u32)));
 
     // [sts]
     if (doc.getBool("sts.enabled")) |b| cfg.sts.enabled = b;
@@ -889,6 +892,9 @@ test "parseToml: [tls] section projects onto Config" {
         \\cert_path = "/etc/orochi/leaf.pem"
         \\key_path = "/etc/orochi/leaf.key"
         \\dns_name = "irc.example.test"
+        \\enable_tls12 = true
+        \\enable_resumption = true
+        \\early_data_max_size = 16384
         \\
     ;
 
@@ -902,6 +908,11 @@ test "parseToml: [tls] section projects onto Config" {
     try testing.expectEqualStrings("/etc/orochi/leaf.pem", cfg.tls.cert_path.?);
     try testing.expectEqualStrings("/etc/orochi/leaf.key", cfg.tls.key_path.?);
     try testing.expectEqualStrings("irc.example.test", cfg.tls.dns_name);
+    // These three keys were declared in the schema but never parsed — a TLS 1.2
+    // opt-in (and resumption/0-RTT) was silently ignored. Guard the wiring.
+    try testing.expect(cfg.tls.enable_tls12);
+    try testing.expect(cfg.tls.enable_resumption);
+    try testing.expectEqual(@as(u32, 16384), cfg.tls.early_data_max_size);
 }
 
 test "parseToml: [tls] omitted keeps secure defaults" {
