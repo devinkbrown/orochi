@@ -5,6 +5,7 @@
 //! released on removal/deinit.
 const std = @import("std");
 const toml = @import("../../proto/toml.zig");
+const channel_list_event = @import("../../proto/channel_list_event.zig");
 
 pub const NodeId = u64;
 
@@ -120,6 +121,37 @@ pub const Member = struct {
     hlc: u64,
 };
 
+pub const ChannelListKind = channel_list_event.ListKind;
+
+pub const ChannelListEntry = struct {
+    kind: ChannelListKind,
+    mask: []u8,
+    setter: []u8,
+    set_at: i64,
+    origin_node: NodeId,
+    hlc: u64,
+    present: bool,
+};
+
+const ChannelListState = struct {
+    entries: std.ArrayListUnmanaged(ChannelListEntry) = .empty,
+
+    fn deinit(self: *ChannelListState, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*entry| {
+            allocator.free(entry.mask);
+            allocator.free(entry.setter);
+        }
+        self.entries.deinit(allocator);
+    }
+
+    fn find(self: *const ChannelListState, kind: ChannelListKind, mask: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, i| {
+            if (entry.kind == kind and std.mem.eql(u8, entry.mask, mask)) return i;
+        }
+        return null;
+    }
+};
+
 /// Per-channel member roster (flat list — channels are bounded, and a flat list
 /// keeps ownership trivial: one owned nick per entry).
 const MemberList = struct {
@@ -149,8 +181,12 @@ pub const RouteTable = struct {
     /// MEMBERSHIP propagation (see docs/planning/16). Independent of `channels`
     /// (which is node-level routing) so identity churn never disturbs routing.
     channel_members: std.StringHashMap(MemberList),
+    /// channel name -> LWW list-mode facts (+b/+e/+I). Tombstones are retained so
+    /// stale add frames cannot resurrect a mask after a newer remove.
+    channel_lists: std.StringHashMap(ChannelListState),
     nick_count: usize = 0,
     channel_count: usize = 0,
+    list_channel_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Error!Self {
         try cfg.validate();
@@ -160,6 +196,7 @@ pub const RouteTable = struct {
             .nick_to_node = std.StringHashMap(NodeId).init(allocator),
             .channels = std.StringHashMap(ChannelState).init(allocator),
             .channel_members = std.StringHashMap(MemberList).init(allocator),
+            .channel_lists = std.StringHashMap(ChannelListState).init(allocator),
         };
     }
 
@@ -168,6 +205,7 @@ pub const RouteTable = struct {
         self.nick_to_node.deinit();
         self.channels.deinit();
         self.channel_members.deinit();
+        self.channel_lists.deinit();
         self.* = undefined;
     }
 
@@ -190,8 +228,16 @@ pub const RouteTable = struct {
         }
         self.channel_members.clearRetainingCapacity();
 
+        var lists = self.channel_lists.iterator();
+        while (lists.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.channel_lists.clearRetainingCapacity();
+
         self.nick_count = 0;
         self.channel_count = 0;
+        self.list_channel_count = 0;
     }
 
     pub fn setNickLocation(self: *Self, nick: []const u8, node: NodeId) Error!void {
@@ -285,6 +331,12 @@ pub const RouteTable = struct {
         prev_status: u4 = 0,
     };
 
+    pub const ApplyListOutcome = enum { added, removed, unchanged };
+
+    pub const ApplyListResult = struct {
+        outcome: ApplyListOutcome,
+    };
+
     /// Apply a MEMBERSHIP event for a remote member, last-writer-wins by `hlc`.
     /// `present` true = join/status upsert; false = part. Stale events (hlc <= the
     /// stored one for this nick) are ignored, so out-of-order gossip converges.
@@ -334,6 +386,58 @@ pub const RouteTable = struct {
         return list.entries.items;
     }
 
+    /// Apply a CHANNEL_LIST event for +b/+e/+I state, last-writer-wins by `hlc`
+    /// for the tuple (channel, kind, mask). Newer tombstones are retained so an
+    /// older add frame cannot resurrect a removed mask.
+    pub fn applyChannelList(
+        self: *Self,
+        chan: []const u8,
+        kind: ChannelListKind,
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        origin_node: NodeId,
+        hlc: u64,
+        present: bool,
+    ) Error!ApplyListResult {
+        try self.validateName(chan);
+        try validateNode(origin_node);
+        if (mask.len == 0 or mask.len > channel_list_event.max_mask_len) return error.InvalidName;
+        if (setter.len > channel_list_event.max_setter_len) return error.InvalidName;
+
+        const list = try self.ensureChannelList(chan);
+        if (list.find(kind, mask)) |idx| {
+            const cur = &list.entries.items[idx];
+            if (hlc <= cur.hlc) return .{ .outcome = .unchanged };
+
+            const was_present = cur.present;
+            const owned_setter = try self.allocator.dupe(u8, setter);
+            self.allocator.free(cur.setter);
+            cur.setter = owned_setter;
+            cur.set_at = set_at;
+            cur.origin_node = origin_node;
+            cur.hlc = hlc;
+            cur.present = present;
+            return .{ .outcome = if (present == was_present) .unchanged else if (present) .added else .removed };
+        }
+
+        if (list.entries.items.len >= self.cfg.max_nicks) return error.RouteTableFull;
+        const owned_mask = try self.allocator.dupe(u8, mask);
+        errdefer self.allocator.free(owned_mask);
+        const owned_setter = try self.allocator.dupe(u8, setter);
+        errdefer self.allocator.free(owned_setter);
+        try list.entries.append(self.allocator, .{
+            .kind = kind,
+            .mask = owned_mask,
+            .setter = owned_setter,
+            .set_at = set_at,
+            .origin_node = origin_node,
+            .hlc = hlc,
+            .present = present,
+        });
+        return .{ .outcome = if (present) .added else .unchanged };
+    }
+
     /// Scan every channel roster for `nick` (ASCII case-insensitive, matching
     /// the daemon's nick comparison) and return the first match by value. The
     /// returned `nick` slice is borrowed from the table — valid until the next
@@ -355,6 +459,16 @@ pub const RouteTable = struct {
         errdefer self.allocator.free(owned);
         try self.channel_members.putNoClobber(owned, .{});
         return self.channel_members.getPtr(chan).?;
+    }
+
+    fn ensureChannelList(self: *Self, chan: []const u8) Error!*ChannelListState {
+        if (self.channel_lists.getPtr(chan)) |list| return list;
+        if (self.list_channel_count == self.cfg.max_channels) return error.RouteTableFull;
+        const owned = try self.allocator.dupe(u8, chan);
+        errdefer self.allocator.free(owned);
+        try self.channel_lists.putNoClobber(owned, .{});
+        self.list_channel_count += 1;
+        return self.channel_lists.getPtr(chan).?;
     }
 
     fn pruneIfEmpty(self: *Self, chan: []const u8) void {
@@ -585,6 +699,30 @@ test "applyMembership part removes a member and prunes an empty channel" {
     // Newer part removes; the now-empty channel is pruned.
     _ = try table.applyMembership("#x", "alice", 10, 0, 2, false);
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
+}
+
+test "applyChannelList tracks list masks with last-writer-wins tombstones" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    var res = try table.applyChannelList("#ops", .ban, "*!*@bad", "oper!u@h", 10, 2, 100, true);
+    try std.testing.expectEqual(RouteTable.ApplyListOutcome.added, res.outcome);
+
+    // Stale remove is ignored.
+    res = try table.applyChannelList("#ops", .ban, "*!*@bad", "oper!u@h", 11, 2, 99, false);
+    try std.testing.expectEqual(RouteTable.ApplyListOutcome.unchanged, res.outcome);
+
+    // Newer remove becomes a tombstone.
+    res = try table.applyChannelList("#ops", .ban, "*!*@bad", "oper!u@h", 12, 2, 101, false);
+    try std.testing.expectEqual(RouteTable.ApplyListOutcome.removed, res.outcome);
+
+    // Older add cannot resurrect.
+    res = try table.applyChannelList("#ops", .ban, "*!*@bad", "oper!u@h", 13, 2, 100, true);
+    try std.testing.expectEqual(RouteTable.ApplyListOutcome.unchanged, res.outcome);
+
+    // Newer add can.
+    res = try table.applyChannelList("#ops", .ban, "*!*@bad", "oper2!u@h", 14, 2, 102, true);
+    try std.testing.expectEqual(RouteTable.ApplyListOutcome.added, res.outcome);
 }
 
 test "removeNode evicts that node's remote members (netsplit hygiene)" {

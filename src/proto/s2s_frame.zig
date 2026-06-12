@@ -36,6 +36,8 @@ pub const FrameType = enum(u8) {
     /// Signed cross-mesh operator authorization grant (oper_cred_share bytes),
     /// verified against the sending peer's identity on receipt.
     OPER_GRANT = 0x0A,
+    /// Channel list-mode fact (+b/+e/+I), LWW by payload HLC.
+    CHANNEL_LIST = 0x0B,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -53,6 +55,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.MEMBERSHIP) => .MEMBERSHIP,
             @intFromEnum(FrameType.MESSAGE) => .MESSAGE,
             @intFromEnum(FrameType.OPER_GRANT) => .OPER_GRANT,
+            @intFromEnum(FrameType.CHANNEL_LIST) => .CHANNEL_LIST,
             else => null,
         };
     }
@@ -169,6 +172,7 @@ const all_frame_types = [_]FrameType{
     .MEMBERSHIP,
     .MESSAGE,
     .OPER_GRANT,
+    .CHANNEL_LIST,
 };
 
 test "encode/decode round-trip each type" {

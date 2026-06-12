@@ -44,6 +44,7 @@ pub const certfp = @import("certfp.zig");
 pub const chan_forward = @import("chan_forward.zig");
 pub const chan_log = @import("chan_log.zig");
 pub const chanmode_ext = @import("chanmode_ext.zig");
+pub const channel_list_event = @import("channel_list_event.zig");
 pub const channel_rename = @import("channel_rename.zig");
 pub const chanserv_cmd = @import("chanserv_cmd.zig");
 pub const chathistory = @import("chathistory.zig");
@@ -364,6 +365,7 @@ test {
     _ = chan_forward;
     _ = chan_log;
     _ = chanmode_ext;
+    _ = channel_list_event;
     _ = channel_rename;
     _ = chanserv_cmd;
     _ = chathistory;
