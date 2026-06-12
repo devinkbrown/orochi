@@ -219,6 +219,18 @@ pub const S2sLink = struct {
         return self.peer.takeMembershipChanges();
     }
 
+    /// Announce aggregate local boolean MODE flags for `channel` to the peer.
+    /// Outbound frames accumulate in `out`.
+    pub fn sendChannelModeFlags(self: *S2sLink, channel: []const u8, flags: u16, hlc: u64) !void {
+        try self.peer.sendChannelModeFlags(self.sink(), channel, flags, hlc);
+    }
+
+    /// Drain remote channel MODE flag changes the daemon should apply and
+    /// surface to local members.
+    pub fn takeChannelModeFlagChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.ChannelModeFlagsDelta {
+        return self.peer.takeChannelModeFlagChanges();
+    }
+
     /// Forward a signed cross-mesh operator grant to the peer (best-effort; only
     /// meaningful once established). `signed` is opaque `oper_cred_share` bytes.
     pub fn sendOperGrant(self: *S2sLink, signed: []const u8) !void {
@@ -339,6 +351,60 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
         now += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#chat").len);
+}
+
+test "CHANNEL_MODE_FLAGS propagates aggregate flag state across the link" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    try a.start(10);
+    var now: u64 = 11;
+    try a.sendChannelModeFlags("#chat", 0b1011, 100);
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const changes = try b.takeChannelModeFlagChanges();
+    defer {
+        for (changes) |*ch| ch.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("#chat", changes[0].channel);
+    try std.testing.expectEqual(@as(u16, 0b1011), changes[0].flags);
+
+    try a.sendChannelModeFlags("#chat", 0b0101, 99); // stale
+    rounds = 0;
+    while (rounds < 16) : (rounds += 1) {
+        const a_out = a.outbound();
+        if (a_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        a.clearOutbound();
+        try b.feed(a_copy, now, 7);
+        now += 1;
+    }
+    const stale = try b.takeChannelModeFlagChanges();
+    defer allocator.free(stale);
+    try std.testing.expectEqual(@as(usize, 0), stale.len);
 }
 
 test "OPER_GRANT payload round-trips across the link into takeOperGrants" {

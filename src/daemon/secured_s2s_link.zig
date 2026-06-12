@@ -171,6 +171,15 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
+    /// Announce aggregate local boolean MODE flags for `channel` over the
+    /// secured CRDT link (no-op until established). Outbound bytes accumulate in
+    /// `out`.
+    pub fn sendChannelModeFlags(self: *SecuredLink, channel: []const u8, flags: u16, hlc: u64) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendChannelModeFlags(channel, flags, hlc);
+        try self.drainInner();
+    }
+
     /// Forward a cross-node user message over the secured CRDT link.
     pub fn sendMessage(self: *SecuredLink, msg: s2s_link.RelayMessage) anyerror!void {
         const link = self.inner orelse return;
@@ -190,6 +199,13 @@ pub const SecuredLink = struct {
     pub fn takeMembershipChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.MembershipDelta {
         const link = self.inner orelse return &.{};
         return link.takeMembershipChanges();
+    }
+
+    /// Drain remote channel MODE flag changes for the daemon to apply and
+    /// surface to local members. Caller owns the slice + each delta's string.
+    pub fn takeChannelModeFlagChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelModeFlagsDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeChannelModeFlagChanges();
     }
 
     /// Forward a signed cross-mesh operator grant to the peer over the secured

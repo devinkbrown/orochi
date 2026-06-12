@@ -3188,6 +3188,8 @@ pub const LinuxServer = struct {
         } else |_| {}
         // Surface remote channel JOIN/PART to local members in real time.
         self.drainMembershipChanges(link);
+        // Apply/surface remote aggregate channel MODE flag changes in real time.
+        self.drainChannelModeFlagChanges(link);
         // Drain inbound cross-mesh oper grants. Each is verified against the
         // peer's authenticated Ed25519 key from the Tsumugi handshake before it
         // can confer operator authority locally — an unverifiable grant is
@@ -3204,6 +3206,7 @@ pub const LinuxServer = struct {
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
+            self.sendChannelModeFlagsBurstTo(conn);
             self.rebroadcastLocalOpers(); // propagate this node's opers to the new peer
         }
     }
@@ -3255,9 +3258,12 @@ pub const LinuxServer = struct {
         } else |_| {}
         // Surface remote channel JOIN/PART to local members in real time.
         self.drainMembershipChanges(link);
+        // Apply/surface remote aggregate channel MODE flag changes in real time.
+        self.drainChannelModeFlagChanges(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
+            self.sendChannelModeFlagsBurstTo(conn);
         }
     }
 
@@ -4296,6 +4302,43 @@ pub const LinuxServer = struct {
         }
     }
 
+    const ChannelModeFlagSpec = struct {
+        mode: world_model.ChannelMode,
+        letter: u8,
+        bit: u16,
+    };
+
+    const channel_mode_flag_specs = [_]ChannelModeFlagSpec{
+        .{ .mode = .invite_only, .letter = 'i', .bit = 1 << 0 },
+        .{ .mode = .moderated, .letter = 'm', .bit = 1 << 1 },
+        .{ .mode = .no_external, .letter = 'n', .bit = 1 << 2 },
+        .{ .mode = .topic_ops, .letter = 't', .bit = 1 << 3 },
+        .{ .mode = .secret, .letter = 's', .bit = 1 << 4 },
+        .{ .mode = .no_ctcp, .letter = 'C', .bit = 1 << 5 },
+        .{ .mode = .no_notice, .letter = 'T', .bit = 1 << 6 },
+        .{ .mode = .no_nick, .letter = 'N', .bit = 1 << 7 },
+        .{ .mode = .free_invite, .letter = 'g', .bit = 1 << 8 },
+        .{ .mode = .tls_only, .letter = 'S', .bit = 1 << 9 },
+        .{ .mode = .mod_reg, .letter = 'M', .bit = 1 << 10 },
+        .{ .mode = .news_wire, .letter = 'W', .bit = 1 << 11 },
+        .{ .mode = .oper_only, .letter = 'O', .bit = 1 << 12 },
+        .{ .mode = .admin_only, .letter = 'A', .bit = 1 << 13 },
+    };
+
+    fn channelModeFlagBits(self: *LinuxServer, channel: []const u8) u16 {
+        var flags: u16 = 0;
+        for (channel_mode_flag_specs) |spec| {
+            if (self.world.channelHasFlag(channel, spec.mode)) flags |= spec.bit;
+        }
+        return flags;
+    }
+
+    fn setChannelModeFlagBits(self: *LinuxServer, channel: []const u8, flags: u16) void {
+        for (channel_mode_flag_specs) |spec| {
+            _ = self.world.setChannelFlag(channel, spec.mode, (flags & spec.bit) != 0) catch {};
+        }
+    }
+
     /// Burst the full local channel-member roster to ONE freshly-established peer
     /// link (the conn's s2s/s2s_secured), so the peer's NAMES/WHO is correct
     /// immediately rather than only after subsequent joins. Best-effort. (#65)
@@ -4325,6 +4368,28 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Burst aggregate local channel MODE flags to ONE freshly-established peer
+    /// so a relink converges immediately instead of waiting for the next MODE.
+    fn sendChannelModeFlagsBurstTo(self: *LinuxServer, conn: *ConnState) void {
+        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            const flags = self.channelModeFlagBits(cv.name);
+            if (conn.s2s_secured) |link| {
+                link.sendChannelModeFlags(cv.name, flags, hlc) catch continue;
+            } else if (conn.s2s) |link| {
+                link.sendChannelModeFlags(cv.name, flags, hlc) catch continue;
+            }
+        }
+        if (conn.s2s_secured) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        } else if (conn.s2s) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        }
+    }
+
     fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         for (self.rx().clients.slots.items) |*slot| {
@@ -4337,6 +4402,24 @@ pub const LinuxServer = struct {
             } else if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
                 link.sendMembership(channel, nick, status, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    fn announceChannelModeFlags(self: *LinuxServer, channel: []const u8, flags: u16) void {
+        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.sendChannelModeFlags(channel, flags, hlc) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                link.sendChannelModeFlags(channel, flags, hlc) catch continue;
                 self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
                 link.clearOutbound();
             }
@@ -4405,6 +4488,32 @@ pub const LinuxServer = struct {
         self.broadcastChannel(channel, line, null) catch {};
     }
 
+    fn emitRemoteChannelModeFlags(self: *LinuxServer, channel: []const u8, remote_name: []const u8, prev: u16, now: u16) void {
+        const added = now & ~prev;
+        const removed = prev & ~now;
+        if (added == 0 and removed == 0) return;
+
+        var modes_buf: [32]u8 = undefined;
+        var ml: usize = 0;
+        for ([_]struct { sign: u8, mask: u16 }{ .{ .sign = '+', .mask = added }, .{ .sign = '-', .mask = removed } }) |grp| {
+            if (grp.mask == 0) continue;
+            if (ml < modes_buf.len) {
+                modes_buf[ml] = grp.sign;
+                ml += 1;
+            }
+            for (channel_mode_flag_specs) |spec| {
+                if ((grp.mask & spec.bit) != 0 and ml < modes_buf.len) {
+                    modes_buf[ml] = spec.letter;
+                    ml += 1;
+                }
+            }
+        }
+        const host = if (remote_name.len != 0) remote_name else default_host;
+        var line_buf: [600]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, ":{s} MODE {s} {s}\r\n", .{ host, channel, modes_buf[0..ml] }) catch return;
+        self.broadcastChannel(channel, line, null) catch {};
+    }
+
     /// Drain a link's remote membership changes and surface each as live IRC.
     /// Frees the drained slice + each delta's owned strings.
     fn drainMembershipChanges(self: *LinuxServer, link: anytype) void {
@@ -4412,6 +4521,23 @@ pub const LinuxServer = struct {
         const remote = link.remoteName();
         for (changes) |*ch| {
             self.emitRemoteMembership(ch, remote);
+            ch.deinit(self.allocator);
+        }
+        self.allocator.free(changes);
+    }
+
+    /// Drain a link's remote aggregate channel MODE flag changes, apply each to
+    /// the local world, and surface the actual local delta as a MODE line.
+    fn drainChannelModeFlagChanges(self: *LinuxServer, link: anytype) void {
+        const changes = link.takeChannelModeFlagChanges() catch return;
+        const remote = link.remoteName();
+        for (changes) |*ch| {
+            if (self.world.channelExists(ch.channel)) {
+                const prev = self.channelModeFlagBits(ch.channel);
+                self.setChannelModeFlagBits(ch.channel, ch.flags);
+                const now = self.channelModeFlagBits(ch.channel);
+                self.emitRemoteChannelModeFlags(ch.channel, remote, prev, now);
+            }
             ch.deinit(self.allocator);
         }
         self.allocator.free(changes);
@@ -5042,6 +5168,7 @@ pub const LinuxServer = struct {
         var list_setter_buf: [256]u8 = undefined;
         const list_setter = try clientPrefix(conn, &list_setter_buf);
         const list_set_at = @divFloor(platform.realtimeMillis(), 1000);
+        var channel_flags_changed = false;
 
         for (mode_str) |ch| {
             switch (ch) {
@@ -5093,6 +5220,7 @@ pub const LinuxServer = struct {
                         continue;
                     };
                     if (changed) {
+                        channel_flags_changed = true;
                         const want_sign: u8 = if (adding) '+' else '-';
                         if (emitted_sign != want_sign) {
                             applied.appendByte(want_sign) catch break;
@@ -5314,6 +5442,7 @@ pub const LinuxServer = struct {
             }
         }
 
+        if (channel_flags_changed) self.announceChannelModeFlags(channel, self.channelModeFlagBits(channel));
         if (applied.written().len == 0) return;
 
         var prefix_buf: [256]u8 = undefined;
@@ -7671,8 +7800,6 @@ pub const LinuxServer = struct {
         peer.token = try tokenFromId(id);
         peer.s2s_connect_addr = addr;
         peer.s2s_initiator = true; // we dialed: this is the initiator side
-
-
 
         if (self.s2sSecured()) {
             // PQ-secured initiator: waits (await_prekey) for the responder's TOFU
