@@ -344,7 +344,9 @@ fn isMultilineOpen(parsed: *const irc_line.LineView) bool {
         std.mem.eql(u8, parsed.params[1], multiline.draft_multiline_batch);
 }
 
-const server_version = "orochi-0.1";
+// The IRC version token (RPL_MYINFO 004 / RPL_VERSION 351 / INFO) is the build's
+// git commit so `/version` traces straight back to the exact source revision.
+const server_version = "orochi-" ++ build_info.git_commit;
 /// Personalized default MOTD, expanded per connection by `motd_template`
 /// (operators override the whole thing via `[motd] text`). Conditional blocks
 /// begin right after the prior line so an inactive branch leaves no blank line.
@@ -2418,7 +2420,7 @@ pub const LinuxServer = struct {
         const snapshot = stats_report.Snapshot{
             .server_name = self.serverName(),
             .network = protocol_inventory.currentNetworkName(),
-            .version = "orochi-0.1",
+            .version = server_version,
             .generated_unix = @divTrunc(platform.realtimeMillis(), 1000),
             .uptime_secs = @intCast(@max(@as(i64, 0), @divTrunc(now - self.start_ms, 1000))),
             .clients = clients,
@@ -13054,7 +13056,7 @@ pub const LinuxServer = struct {
         const uptime_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(now - self.start_ms, 1000)));
         const online_since: i64 = @divTrunc(platform.realtimeMillis(), 1000) - @as(i64, @intCast(uptime_secs));
         const about = server_about.AboutInfo{
-            .version = server_version ++ " (" ++ build_info.git_commit ++ ")",
+            .version = server_version,
             .zig_version = builtin.zig_version_string,
             .target = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
             .optimize = @tagName(builtin.mode),
