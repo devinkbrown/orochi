@@ -412,6 +412,12 @@ pub fn main(init: std.process.Init) !void {
     // (inherited socket fds + restored sessions) now that the ring exists.
     if (comptime builtin.os.tag == .linux) srv.adoptInheritedSessions();
 
+    // SIGUSR2 → connection-preserving Helix UPGRADE: lets a shell-driven deploy
+    // (`systemctl kill -s USR2 orochi`, after staging the new binary) hot-swap
+    // the running image while keeping every live client session attached,
+    // instead of dropping them with a hard `systemctl restart`.
+    orochi.daemon.server.installUpgradeSignalHandler();
+
     std.debug.print(
         "orochi: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",
         .{try srv.boundPort()},

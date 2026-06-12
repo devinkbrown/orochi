@@ -727,6 +727,37 @@ const wake_token: RingFdToken = .{ .slot = 4, .gen = 0 };
 /// Distinct accept token for the secure-WebSocket (wss) browser listener, so
 /// handleAccept can tell it apart from the plaintext/S2S/TLS listeners.
 const ws_listener_token: RingFdToken = .{ .slot = 5, .gen = 0 };
+
+/// Set by the SIGUSR2 handler; polled by reactor 0's housekeeping tick to fire a
+/// connection-preserving Helix UPGRADE out of signal context. A process-global
+/// atomic (NOT a server field) because an async-signal-safe handler may only
+/// touch lock-free process-global state, never the server instance. The flag is
+/// inert until `installUpgradeSignalHandler` is called at boot, so tests (which
+/// never install it) never trip the poll.
+var upgrade_signal_requested = std.atomic.Value(bool).init(false);
+
+/// SIGUSR2 handler — async-signal-safe: records the request and returns. The
+/// re-exec runs later on reactor 0's loop (`onTimerTick`), so a shell-driven
+/// deploy (`systemctl kill -s USR2 orochi`) hot-upgrades the daemon while
+/// preserving every live client session, instead of dropping them all with a
+/// hard `systemctl restart`.
+fn onUpgradeSignal(_: posix.SIG) callconv(.c) void {
+    upgrade_signal_requested.store(true, .seq_cst);
+}
+
+/// Install the SIGUSR2 → UPGRADE handler. Linux-only (UPGRADE itself is); a
+/// no-op elsewhere. Call once at boot. SA_RESTART keeps the signal from
+/// EINTR-storming the reactors' blocking syscalls — the upgrade is observed on
+/// the next ≤2s housekeeping tick, which is ample for a deploy.
+pub fn installUpgradeSignalHandler() void {
+    if (comptime builtin.os.tag != .linux) return;
+    const act = posix.Sigaction{
+        .handler = .{ .handler = onUpgradeSignal },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.RESTART,
+    };
+    posix.sigaction(posix.SIG.USR2, &act, null);
+}
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
@@ -2232,6 +2263,17 @@ pub const LinuxServer = struct {
     /// Fired when the periodic timer elapses: run the timeout sweep and re-arm.
     fn onTimerTick(self: *LinuxServer) void {
         self.rx().timer_armed = false;
+        // SIGUSR2 → connection-preserving Helix UPGRADE. Polled here (out of
+        // signal context) and gated to reactor 0 — the reactor that owns the
+        // listener + every client connection the upgrade carries. `swap`
+        // atomically consumes the request so a single signal fires exactly one
+        // upgrade. On success `performUpgrade` execve's and never returns; a
+        // failure is logged and the daemon keeps serving.
+        if (self.rx() == &self.reactors[0] and upgrade_signal_requested.swap(false, .seq_cst)) {
+            self.performUpgrade(null) catch |e| {
+                std.debug.print("orochi: SIGUSR2 UPGRADE failed: {s}\n", .{@errorName(e)});
+            };
+        }
         self.sweepTimeouts();
         self.sweepTempModes();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
@@ -7899,12 +7941,39 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
             return;
         }
+        return self.performUpgrade(conn);
+    }
+
+    /// Emit one UPGRADE progress line: a NOTICE to the requesting oper when the
+    /// upgrade was issued by `/UPGRADE`, or a server-log line when it was
+    /// triggered by SIGUSR2 (no requesting client). Best-effort — a failed
+    /// notice never aborts an in-flight upgrade.
+    fn upgradeNotice(self: *LinuxServer, requester: ?*ConnState, msg: []const u8) void {
+        if (requester) |c| {
+            self.noticeTo(c, msg) catch {};
+        } else {
+            std.debug.print("orochi: {s}\n", .{msg});
+        }
+    }
+
+    /// Core Helix UPGRADE: serialize every carried session into a sealed memfd
+    /// arena, then re-exec the on-disk binary preserving the listener + client
+    /// sockets. `requester` is the oper connection that ran `/UPGRADE` (excluded
+    /// from carry-over and sent progress NOTICEs), or `null` for a
+    /// SIGUSR2-triggered upgrade — a shell-driven deploy
+    /// (`systemctl kill -s USR2 orochi`) that has no requesting client, so every
+    /// registered session is carried and status is logged. The oper privilege
+    /// check lives in the `handleUpgrade` wrapper; a signal-triggered upgrade is
+    /// implicitly privileged (it came from the service manager / root).
+    fn performUpgrade(self: *LinuxServer, requester: ?*ConnState) !void {
         if (comptime builtin.os.tag != .linux) {
-            try self.noticeTo(conn, "UPGRADE is Linux-only");
+            self.upgradeNotice(requester, "UPGRADE is Linux-only");
             return;
         }
+        const requester_fd: ?linux.fd_t = if (requester) |c| c.fd else null;
         var nbuf: [128]u8 = undefined;
-        const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{conn.session.displayName()}) catch "UPGRADE";
+        const requested_by = if (requester) |c| c.session.displayName() else "SIGUSR2";
+        const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{requested_by}) catch "UPGRADE";
         try self.publishOperEvent(.oper_action, .critical, note);
 
         // Serialize every registered session into encoded snapshot pieces.
@@ -7944,8 +8013,11 @@ pub const LinuxServer = struct {
             }
             if (!e.value.session.registered()) continue;
             // Don't carry the requesting oper's own connection: it issued UPGRADE
-            // and its buffered reply would be lost across the swap; let it reconnect.
-            if (e.value.fd == conn.fd) continue;
+            // and its buffered reply would be lost across the swap; let it
+            // reconnect. A signal-triggered upgrade has no requester — carry all.
+            if (requester_fd) |rfd| {
+                if (e.value.fd == rfd) continue;
+            }
             // wss browser clients are not carried yet (the TLS+WebSocket adapter
             // stack has no resume path); their sockets close at execve and the
             // browser reconnects against the still-bound listener.
@@ -8018,14 +8090,14 @@ pub const LinuxServer = struct {
             .fds = &.{},
         }) catch |e| {
             var eb: [96]u8 = undefined;
-            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE: state seal failed ({s}); listener-only", .{@errorName(e)}) catch "UPGRADE: listener-only");
-            return self.upgradeListenerOnly(conn);
+            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE: state seal failed ({s}); listener-only", .{@errorName(e)}) catch "UPGRADE: listener-only");
+            return self.upgradeListenerOnly(requester);
         };
         defer prepared.deinit();
 
-        const arena = prepared.runtime.arena orelse return self.upgradeListenerOnly(conn);
+        const arena = prepared.runtime.arena orelse return self.upgradeListenerOnly(requester);
         var sbuf: [160]u8 = undefined;
-        try self.noticeTo(conn, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} mesh re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, s2s_hints }) catch "UPGRADE: re-exec");
+        self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} mesh re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, s2s_hints }) catch "UPGRADE: re-exec");
 
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
@@ -8037,14 +8109,14 @@ pub const LinuxServer = struct {
         var plan = helix_live.buildArenaListenerExecPlan(self.allocator, exe_target, arena.fd, self.rx().listener_fd, self.config.config_path) catch |e| {
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
-            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer plan.deinit(self.allocator);
         plan.commit(self.allocator) catch |e| {
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
-            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
     }
@@ -8254,20 +8326,20 @@ pub const LinuxServer = struct {
 
     /// Listener-only upgrade fallback: re-exec preserving just the listening
     /// socket (no state arena). Caller has already done the oper/linux checks.
-    fn upgradeListenerOnly(self: *LinuxServer, conn: *ConnState) !void {
+    fn upgradeListenerOnly(self: *LinuxServer, requester: ?*ConnState) !void {
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
         const exe_target = self.config.exe_path orelse "/proc/self/exe";
         var plan = helix_live.buildListenerExecPlan(self.allocator, exe_target, self.rx().listener_fd, self.config.config_path) catch |e| {
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
-            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer plan.deinit(self.allocator);
         plan.commit(self.allocator) catch |e| {
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
-            try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
+            self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
     }
@@ -19260,6 +19332,20 @@ test "parseHostPort: host:port split, bad port rejected, IPv6 brackets" {
     try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("[]:6900"));
     try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("[::1]6900"));
     try std.testing.expectEqual(@as(?HostPort, null), parseHostPort("[::1]"));
+}
+
+test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {
+    // Deterministic, execve-safe: drive the handler directly (it only stores the
+    // flag) and consume it the same way `onTimerTick` does — never installs a
+    // process signal handler and never runs a reactor, so there is no path to an
+    // actual re-exec inside the test binary.
+    upgrade_signal_requested.store(false, .seq_cst);
+    onUpgradeSignal(posix.SIG.USR2);
+    try std.testing.expect(upgrade_signal_requested.load(.seq_cst));
+    // First consume observes the request and clears it.
+    try std.testing.expect(upgrade_signal_requested.swap(false, .seq_cst));
+    // A second consume sees nothing — exactly one upgrade per signal.
+    try std.testing.expect(!upgrade_signal_requested.swap(false, .seq_cst));
 }
 
 test "threaded server: [mesh].connect auto-links two nodes without an oper" {
