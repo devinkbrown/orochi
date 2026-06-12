@@ -68,7 +68,11 @@ pub fn main(init: std.process.Init) !void {
 
     var args = try std.process.Args.iterateAllocator(init.minimal.args, allocator);
     defer args.deinit(); // no-op on POSIX, frees the arg buffer on Windows/WASI
-    _ = args.skip(); // argv[0]
+    // argv[0] is the launch path. UPGRADE re-execs THIS path (not /proc/self/exe,
+    // which would re-run the old in-memory image), so a swapped-in new binary is
+    // what actually boots across a hot upgrade.
+    if (args.next()) |exe| srv_cfg.exe_path = exe;
+    var config_path_arg: ?[]const u8 = null;
     if (args.next()) |first| {
         // `orochi --supervisor` is the Helix in-process-upgrade successor mode:
         // a fresh image execve'd by an UPGRADE handoff. If the handoff env fds are
@@ -94,7 +98,10 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 std.debug.print("orochi: --supervisor is Linux-only\n", .{});
             }
-            // Fall through to a normal boot (config defaults; no config path arg).
+            // The successor carries its config path as the arg after --supervisor,
+            // so it boots with the SAME config (ports/certs/opers/cloak) as the
+            // predecessor — not the built-in defaults.
+            config_path_arg = args.next();
         } else
         // `orochi acme-issue ...` runs an out-of-band ACME issuance and exits.
         // Linux-only (raw socket syscalls); comptime-gated so non-linux targets
@@ -118,8 +125,15 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
         } else {
-            const path = first;
-            const resolver = orochi.daemon.config_format.Resolver{
+            config_path_arg = first;
+        }
+    }
+
+    // Load the config file — normal boot uses argv[1]; the UPGRADE successor uses
+    // the path carried after --supervisor. One path for both so a hot-upgraded
+    // process comes up on the real ports/certs/opers, not the defaults.
+    if (config_path_arg) |path| {
+        const resolver = orochi.daemon.config_format.Resolver{
             .ctx = @ptrCast(&resolver_ctx),
             .env = envLookup,
             .file = fileLookup,
@@ -128,20 +142,24 @@ pub fn main(init: std.process.Init) !void {
             defer allocator.free(text); // string fields are duped by the parser
             if (orochi.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                 held = loaded;
+                // Preserve the Helix handoff fields set above: `srv_cfg = loaded.config`
+                // replaces the whole struct, and these are not config-file keys.
+                const carried_exe = srv_cfg.exe_path;
+                const carried_resume = srv_cfg.resume_arena_fd;
+                const carried_listen = srv_cfg.inherited_listener_fd;
                 srv_cfg = loaded.config;
-                // Carry the requested reactor-shard count onto the live config
-                // ([limits].num_shards lifts via the boot projection).
+                srv_cfg.exe_path = carried_exe;
+                srv_cfg.resume_arena_fd = carried_resume;
+                srv_cfg.inherited_listener_fd = carried_listen;
                 srv_cfg.num_shards = loaded.num_shards;
-                // Enable live REHASH: the server re-reads this same file/resolver.
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;
                 std.debug.print("orochi: loaded config from {s}\n", .{path});
             } else |err| {
                 std.debug.print("orochi: config error in {s} ({s}); using defaults\n", .{ path, @errorName(err) });
             }
-            } else |err| {
-                std.debug.print("orochi: cannot read config {s} ({s}); using defaults\n", .{ path, @errorName(err) });
-            }
+        } else |err| {
+            std.debug.print("orochi: cannot read config {s} ({s}); using defaults\n", .{ path, @errorName(err) });
         }
     }
 

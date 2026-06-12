@@ -1219,6 +1219,11 @@ pub const Config = struct {
     /// = REHASH acknowledges without reloading (e.g. defaults-only boot, tests).
     config_path: ?[]const u8 = null,
     config_resolver: config_format.Resolver = .{},
+    /// On-disk path of the running binary (argv[0], absolute), captured by main.
+    /// `UPGRADE` re-execs THIS path — not `/proc/self/exe`, which would re-run the
+    /// old in-memory image even after the file is replaced — so a swapped-in new
+    /// binary is what actually boots. Null falls back to `/proc/self/exe`.
+    exe_path: ?[]const u8 = null,
 };
 
 /// Per-connection daemon state used by both the pure command core and the
@@ -6961,7 +6966,11 @@ pub const LinuxServer = struct {
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
         _ = linux.fcntl(arena.fd, posix.F.SETFD, 0);
-        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, "/proc/self/exe", arena.fd, self.rx().listener_fd) catch |e| {
+        // Exec the on-disk launch path (the swapped-in new binary) when known,
+        // not /proc/self/exe (which re-runs the current, old image). Carry the
+        // config path so the successor boots with the real config.
+        const exe_target = self.config.exe_path orelse "/proc/self/exe";
+        var plan = helix_live.buildArenaListenerExecPlan(self.allocator, exe_target, arena.fd, self.rx().listener_fd, self.config.config_path) catch |e| {
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
@@ -7050,7 +7059,8 @@ pub const LinuxServer = struct {
     /// socket (no state arena). Caller has already done the oper/linux checks.
     fn upgradeListenerOnly(self: *LinuxServer, conn: *ConnState) !void {
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
-        var plan = helix_live.buildListenerExecPlan(self.allocator, "/proc/self/exe", self.rx().listener_fd) catch |e| {
+        const exe_target = self.config.exe_path orelse "/proc/self/exe";
+        var plan = helix_live.buildListenerExecPlan(self.allocator, exe_target, self.rx().listener_fd, self.config.config_path) catch |e| {
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             try self.noticeTo(conn, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");

@@ -223,13 +223,19 @@ pub fn buildListenerExecPlan(
     allocator: std.mem.Allocator,
     binary_path: []const u8,
     listen_fd: handoff.Fd,
+    config_path: ?[]const u8,
 ) anyerror!ExecPlan {
-    var argv = try allocator.alloc([:0]const u8, 2);
+    const argc: usize = if (config_path != null) 3 else 2;
+    var argv = try allocator.alloc([:0]const u8, argc);
     errdefer allocator.free(argv);
     argv[0] = try allocator.dupeZ(u8, binary_path);
     errdefer allocator.free(argv[0]);
     argv[1] = try allocator.dupeZ(u8, "--supervisor");
     errdefer allocator.free(argv[1]);
+    if (config_path) |cp| {
+        argv[2] = try allocator.dupeZ(u8, cp);
+        errdefer allocator.free(argv[2]);
+    }
 
     var envp = try allocator.alloc([:0]const u8, 1);
     errdefer allocator.free(envp);
@@ -247,13 +253,22 @@ pub fn buildArenaListenerExecPlan(
     binary_path: []const u8,
     arena_fd: handoff.Fd,
     listen_fd: handoff.Fd,
+    config_path: ?[]const u8,
 ) anyerror!ExecPlan {
-    var argv = try allocator.alloc([:0]const u8, 2);
+    // argv = [binary, --supervisor, (config_path)?]. The config path is passed
+    // through so the successor boots with the SAME config (ports, certs, opers,
+    // cloak) rather than the built-in defaults.
+    const argc: usize = if (config_path != null) 3 else 2;
+    var argv = try allocator.alloc([:0]const u8, argc);
     errdefer allocator.free(argv);
     argv[0] = try allocator.dupeZ(u8, binary_path);
     errdefer allocator.free(argv[0]);
     argv[1] = try allocator.dupeZ(u8, "--supervisor");
     errdefer allocator.free(argv[1]);
+    if (config_path) |cp| {
+        argv[2] = try allocator.dupeZ(u8, cp);
+        errdefer allocator.free(argv[2]);
+    }
 
     var envp = try allocator.alloc([:0]const u8, 2);
     errdefer allocator.free(envp);
@@ -440,7 +455,7 @@ test "ExecPlan.commit execve's the target (fork + /bin/true)" {
     const allocator = std.testing.allocator;
 
     // Build a plan pointing at /bin/true so the child execs and exits 0.
-    var plan = try buildListenerExecPlan(allocator, "/bin/true", 0);
+    var plan = try buildListenerExecPlan(allocator, "/bin/true", 0, null);
     defer plan.deinit(allocator);
 
     const pid_rc = linux.fork();
@@ -460,7 +475,7 @@ test "ExecPlan.commit execve's the target (fork + /bin/true)" {
 
 test "arena+listener exec plan carries both fds, no control" {
     const allocator = std.testing.allocator;
-    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, 6);
+    var plan = try buildArenaListenerExecPlan(allocator, "/proc/self/exe", 5, 6, null);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), plan.envp.len);
     try std.testing.expectEqualStrings("OROCHI_HELIX_ARENA_FD=5", plan.envp[0]);
@@ -470,7 +485,7 @@ test "arena+listener exec plan carries both fds, no control" {
 
 test "listener-only exec plan carries just the listen fd" {
     const allocator = std.testing.allocator;
-    var plan = try buildListenerExecPlan(allocator, "/proc/self/exe", 7);
+    var plan = try buildListenerExecPlan(allocator, "/proc/self/exe", 7, null);
     defer plan.deinit(allocator);
     try std.testing.expectEqualStrings("/proc/self/exe", plan.argv[0]);
     try std.testing.expectEqualStrings("--supervisor", plan.argv[1]);
