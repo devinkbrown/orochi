@@ -1487,6 +1487,21 @@ const Reactor = struct {
 /// the same pointer in the single-reactor configuration, so the fallback is exact.
 threadlocal var current_reactor: ?*Reactor = null;
 
+const ChannelPropClock = struct {
+    channel: []u8,
+    key: []u8,
+    owner: []u8,
+    hlc: u64,
+    present: bool,
+
+    fn deinit(self: *ChannelPropClock, allocator: std.mem.Allocator) void {
+        allocator.free(self.channel);
+        allocator.free(self.key);
+        allocator.free(self.owner);
+        self.* = undefined;
+    }
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -1589,6 +1604,9 @@ pub const LinuxServer = struct {
     /// of a small set of recently-active channels. Bounded; oldest slot evicted.
     fantasy_cooldown: [fantasy_cooldown_slots]FantasyCooldown = [_]FantasyCooldown{.{}} ** fantasy_cooldown_slots,
     props: ircx_prop_store.DefaultStore,
+    /// Mesh LWW clocks for IRCX channel PROP facts. Current values live in
+    /// `props`; this table retains delete tombstones for relink convergence.
+    channel_prop_clocks: std.StringHashMapUnmanaged(ChannelPropClock) = .empty,
     access: ircx_access_store.AccessStore,
     /// Per-channel AKICK (registered auto-kick) list — masks matched on JOIN.
     chan_akick: svc_akick.AkickStore,
@@ -2024,6 +2042,14 @@ pub const LinuxServer = struct {
         self.warden.deinit();
         self.metadata.deinit();
         self.props.deinit();
+        {
+            var it = self.channel_prop_clocks.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.channel_prop_clocks.deinit(self.allocator);
+        }
         self.access.deinit();
         self.chan_akick.deinit();
         self.chan_resv.deinit();
@@ -3205,6 +3231,8 @@ pub const LinuxServer = struct {
         self.drainChannelModeFlagChanges(link);
         // Apply/surface remote channel list-mode (+b/+e/+I) changes in real time.
         self.drainChannelListChanges(link);
+        // Apply remote IRCX channel PROP changes and surface non-secret updates.
+        self.drainChannelPropChanges(link);
         // Drain inbound cross-mesh oper grants. Each is verified against the
         // peer's authenticated Ed25519 key from the Tsumugi handshake before it
         // can confer operator authority locally — an unverifiable grant is
@@ -3220,7 +3248,7 @@ pub const LinuxServer = struct {
         }
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
-            self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags) to the new peer
+            self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
             self.rebroadcastLocalOpers(); // propagate this node's opers to the new peer
         }
     }
@@ -3276,9 +3304,11 @@ pub const LinuxServer = struct {
         self.drainChannelModeFlagChanges(link);
         // Apply/surface remote channel list-mode (+b/+e/+I) changes in real time.
         self.drainChannelListChanges(link);
+        // Apply remote IRCX channel PROP changes and surface non-secret updates.
+        self.drainChannelPropChanges(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
-            self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags) to the new peer
+            self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
         }
     }
 
@@ -4325,8 +4355,9 @@ pub const LinuxServer = struct {
     /// is shared by the one-shot link-establish burst and the periodic
     /// anti-entropy cadence so new state families have one re-sync hook.
     fn sendMeshStateBurstTo(self: *LinuxServer, conn: *ConnState) void {
-        self.sendMembershipBurstTo(conn);
+        self.sendMembershipBurstTo(conn); // roster + channel list-modes (+b/+e/+I)
         self.sendChannelModeFlagsBurstTo(conn);
+        self.sendChannelPropBurstTo(conn);
     }
 
     const ChannelModeFlagSpec = struct {
@@ -4426,6 +4457,128 @@ pub const LinuxServer = struct {
         }
     }
 
+    fn nextChannelPropHlc(self: *LinuxServer) u64 {
+        self.msg_seq +%= 1;
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        return (now << 16) | (self.msg_seq & 0xffff);
+    }
+
+    fn writeChannelPropClockKey(out: []u8, channel: []const u8, key: []const u8) ?[]const u8 {
+        const need = channel.len + 1 + key.len;
+        if (out.len < need) return null;
+        for (channel, 0..) |byte, i| out[i] = std.ascii.toLower(byte);
+        out[channel.len] = 0x1f;
+        for (key, 0..) |byte, i| out[channel.len + 1 + i] = std.ascii.toLower(byte);
+        return out[0..need];
+    }
+
+    fn channelPropClock(self: *LinuxServer, channel: []const u8, key: []const u8) ?*ChannelPropClock {
+        var key_buf: [ircx_prop_store.default_max_entity_id + 1 + ircx_prop_store.default_max_key]u8 = undefined;
+        const map_key = writeChannelPropClockKey(&key_buf, channel, key) orelse return null;
+        return self.channel_prop_clocks.getPtr(map_key);
+    }
+
+    fn allocChannelPropClockKey(self: *LinuxServer, channel: []const u8, key: []const u8) ![]u8 {
+        const out = try self.allocator.alloc(u8, channel.len + 1 + key.len);
+        errdefer self.allocator.free(out);
+        const written = writeChannelPropClockKey(out, channel, key) orelse return error.OutOfMemory;
+        return out[0..written.len];
+    }
+
+    fn recordChannelPropClock(
+        self: *LinuxServer,
+        channel: []const u8,
+        key: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+    ) bool {
+        if (self.channelPropClock(channel, key)) |entry| {
+            if (hlc <= entry.hlc) return false;
+            const owner_copy = self.allocator.dupe(u8, owner) catch return false;
+            self.allocator.free(entry.owner);
+            entry.owner = owner_copy;
+            entry.hlc = hlc;
+            entry.present = present;
+            return true;
+        }
+
+        const map_key = self.allocChannelPropClockKey(channel, key) catch return false;
+        const channel_copy = self.allocator.dupe(u8, channel) catch {
+            self.allocator.free(map_key);
+            return false;
+        };
+        const key_copy = self.allocator.dupe(u8, key) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(channel_copy);
+            return false;
+        };
+        const owner_copy = self.allocator.dupe(u8, owner) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(channel_copy);
+            self.allocator.free(key_copy);
+            return false;
+        };
+
+        self.channel_prop_clocks.putNoClobber(self.allocator, map_key, .{
+            .channel = channel_copy,
+            .key = key_copy,
+            .owner = owner_copy,
+            .hlc = hlc,
+            .present = present,
+        }) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(channel_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            return false;
+        };
+        return true;
+    }
+
+    fn sendChannelPropBurstTo(self: *LinuxServer, conn: *ConnState) void {
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            const entity = ircx_prop_store.Entity{ .kind = .channel, .id = cv.name };
+            var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+            const rows = self.props.listProps(entity, &views) catch views[0..0];
+            for (rows) |entry| {
+                if (self.channelPropClock(entry.entity.id, entry.key) == null) {
+                    _ = self.recordChannelPropClock(entry.entity.id, entry.key, entry.owner, self.nextChannelPropHlc(), true);
+                }
+            }
+        }
+
+        var it = self.channel_prop_clocks.iterator();
+        while (it.next()) |entry| {
+            const clock = entry.value_ptr;
+            var present = clock.present;
+            var value: []const u8 = "";
+            var owner: []const u8 = clock.owner;
+            if (clock.present) {
+                const entity = ircx_prop_store.Entity{ .kind = .channel, .id = clock.channel };
+                if (self.props.getProp(entity, clock.key)) |ev| {
+                    value = ev.value;
+                    owner = ev.owner;
+                } else |_| {
+                    present = false;
+                }
+            }
+            if (conn.s2s_secured) |link| {
+                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present) catch continue;
+            } else if (conn.s2s) |link| {
+                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present) catch continue;
+            }
+        }
+        if (conn.s2s_secured) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        } else if (conn.s2s) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        }
+    }
+
     fn sendChannelListToConn(
         self: *LinuxServer,
         conn: *ConnState,
@@ -4501,6 +4654,31 @@ pub const LinuxServer = struct {
             } else if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
                 link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    fn announceChannelProp(
+        self: *LinuxServer,
+        channel: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+    ) void {
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
                 self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
                 link.clearOutbound();
             }
@@ -4618,6 +4796,47 @@ pub const LinuxServer = struct {
                 self.setChannelModeFlagBits(ch.channel, ch.flags);
                 const now = self.channelModeFlagBits(ch.channel);
                 self.emitRemoteChannelModeFlags(ch.channel, remote, prev, now);
+            }
+            ch.deinit(self.allocator);
+        }
+        self.allocator.free(changes);
+    }
+
+    fn applyRemoteChannelProp(self: *LinuxServer, ch: anytype) bool {
+        if (self.channelPropClock(ch.channel, ch.key)) |entry| {
+            if (ch.hlc <= entry.hlc) return false;
+        }
+
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = ch.channel };
+        const owner = if (ch.owner.len != 0) ch.owner else "remote";
+        if (ch.present) {
+            _ = self.props.setProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
+        } else {
+            self.props.deleteProp(entity, ch.key) catch {};
+        }
+        return self.recordChannelPropClock(ch.channel, ch.key, owner, ch.hlc, ch.present);
+    }
+
+    fn emitRemoteChannelProp(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = ch.channel };
+        if (propIsSecret(entity, ch.key)) return;
+        const host = if (remote_name.len != 0) remote_name else self.serverName();
+        var buf: [900]u8 = undefined;
+        const line = if (ch.present)
+            std.fmt.bufPrint(&buf, ":{s} PROP {s} {s} :{s}\r\n", .{ host, ch.channel, ch.key, ch.value }) catch return
+        else
+            std.fmt.bufPrint(&buf, ":{s} PROP {s} {s} :\r\n", .{ host, ch.channel, ch.key }) catch return;
+        self.broadcastChannel(ch.channel, line, null) catch {};
+    }
+
+    /// Drain a link's remote IRCX channel PROP changes, apply them LWW to the
+    /// local store, and emit non-secret live PROP lines to local channel members.
+    fn drainChannelPropChanges(self: *LinuxServer, link: anytype) void {
+        const changes = link.takeChannelPropChanges() catch return;
+        const remote = link.remoteName();
+        for (changes) |*ch| {
+            if (self.applyRemoteChannelProp(ch)) {
+                self.emitRemoteChannelProp(ch, remote);
             }
             ch.deinit(self.allocator);
         }
@@ -9587,6 +9806,12 @@ pub const LinuxServer = struct {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Cannot set that property");
                     return;
                 };
+                if (m.entity.kind == .channel) {
+                    const hlc = self.nextChannelPropHlc();
+                    if (self.recordChannelPropClock(ev.entity.id, ev.key, ev.owner, hlc, true)) {
+                        self.announceChannelProp(ev.entity.id, ev.key, ev.value, ev.owner, hlc, true);
+                    }
+                }
                 try propEmitEntry(conn, ev);
                 try propEmitEnd(conn, m.entity);
             },
@@ -9596,6 +9821,13 @@ pub const LinuxServer = struct {
                     return;
                 }
                 self.props.deleteProp(k.entity, k.key) catch {};
+                if (k.entity.kind == .channel) {
+                    const hlc = self.nextChannelPropHlc();
+                    const owner = conn.session.displayName();
+                    if (self.recordChannelPropClock(k.entity.id, k.key, owner, hlc, false)) {
+                        self.announceChannelProp(k.entity.id, k.key, "", owner, hlc, false);
+                    }
+                }
                 try propEmitEnd(conn, k.entity);
             },
         }

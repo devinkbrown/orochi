@@ -180,6 +180,22 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
+    /// Announce a local IRCX channel PROP set/delete over the secured CRDT link.
+    /// Outbound bytes accumulate in `out`.
+    pub fn sendChannelProp(
+        self: *SecuredLink,
+        channel: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+    ) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendChannelProp(channel, key, value, owner, hlc, present);
+        try self.drainInner();
+    }
+
     /// Forward a cross-node user message over the secured CRDT link.
     pub fn sendMessage(self: *SecuredLink, msg: s2s_link.RelayMessage) anyerror!void {
         const link = self.inner orelse return;
@@ -229,6 +245,12 @@ pub const SecuredLink = struct {
     pub fn takeChannelListChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelListDelta {
         const link = self.inner orelse return &.{};
         return link.takeChannelListChanges();
+    }
+
+    /// Drain remote channel PROP changes for daemon-side LWW apply.
+    pub fn takeChannelPropChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelPropDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeChannelPropChanges();
     }
 
     /// Forward a signed cross-mesh operator grant to the peer over the secured

@@ -39,6 +39,8 @@ pub const FrameType = enum(u8) {
     CHANNEL_MODE_FLAGS = 0x0B,
     /// Channel list-mode fact (+b/+e/+I), LWW by payload HLC.
     CHANNEL_LIST = 0x0C,
+    /// IRCX channel PROP convergence event (channel/key/value/owner LWW by hlc).
+    CHANNEL_PROP = 0x0D,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -58,6 +60,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.OPER_GRANT) => .OPER_GRANT,
             @intFromEnum(FrameType.CHANNEL_MODE_FLAGS) => .CHANNEL_MODE_FLAGS,
             @intFromEnum(FrameType.CHANNEL_LIST) => .CHANNEL_LIST,
+            @intFromEnum(FrameType.CHANNEL_PROP) => .CHANNEL_PROP,
             else => null,
         };
     }
@@ -176,6 +179,7 @@ const all_frame_types = [_]FrameType{
     .OPER_GRANT,
     .CHANNEL_MODE_FLAGS,
     .CHANNEL_LIST,
+    .CHANNEL_PROP,
 };
 
 test "encode/decode round-trip each type" {

@@ -46,6 +46,7 @@ pub const chan_log = @import("chan_log.zig");
 pub const chanmode_ext = @import("chanmode_ext.zig");
 pub const channel_list_event = @import("channel_list_event.zig");
 pub const channel_rename = @import("channel_rename.zig");
+pub const channel_prop_event = @import("channel_prop_event.zig");
 pub const chanserv_cmd = @import("chanserv_cmd.zig");
 pub const chathistory = @import("chathistory.zig");
 pub const chathistory_cmd = @import("chathistory_cmd.zig");
@@ -367,6 +368,7 @@ test {
     _ = chanmode_ext;
     _ = channel_list_event;
     _ = channel_rename;
+    _ = channel_prop_event;
     _ = chanserv_cmd;
     _ = chathistory;
     _ = chathistory_cmd;
