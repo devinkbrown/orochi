@@ -1327,6 +1327,11 @@ pub const ConnState = struct {
     /// Wall-clock ms of the last inbound activity (recv with data). Updated on
     /// every received chunk; the idle/ping sweep measures silence against it.
     last_activity_ms: i64 = 0,
+    /// Monotonic ms of the last user-visible MESSAGE (PRIVMSG) this client sent.
+    /// Drives the WHOIS idle time (RPL_WHOISIDLE 317), which by convention counts
+    /// silence since the last message — NOT since the last PING/PONG or query, so
+    /// it is intentionally separate from `last_activity_ms`. Seeded at signon.
+    last_message_ms: i64 = 0,
     /// True after the sweep sent an unsolicited server PING and is awaiting any
     /// inbound byte (PONG or otherwise) before the ping-timeout grace elapses.
     awaiting_pong: bool = false,
@@ -2799,6 +2804,7 @@ pub const LinuxServer = struct {
         conn.token = try tokenFromId(id);
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
+        conn.last_message_ms = conn.connected_at_ms;
 
         if (is_s2s and self.s2sSecured()) {
             // PQ-secured peer: stand up a SecuredLink (responder). Its TOFU prekey
@@ -6445,6 +6451,16 @@ pub const LinuxServer = struct {
             .realname = tconn.session.realname(),
             .account = tconn.session.account(),
             .away = tconn.session.awayMessage(),
+            // RPL_WHOISIDLE (317): seconds since the target's last PRIVMSG, and the
+            // wall-clock signon time. `connected_at_ms`/`last_message_ms` are on the
+            // monotonic clock, so derive the unix signon from realtime minus the
+            // connection's monotonic age.
+            .idle_secs = @intCast(@max(@as(i64, 0), @divTrunc(self.nowMs() - tconn.last_message_ms, 1000))),
+            .signon_ts = blk: {
+                const age_ms = @max(@as(i64, 0), self.nowMs() - tconn.connected_at_ms);
+                const signon_unix_ms = platform.realtimeMillis() - age_ms;
+                break :blk @intCast(@max(@as(i64, 0), @divTrunc(signon_unix_ms, 1000)));
+            },
             .geo = geo_text,
             // RPL_WHOISSERVER (312) trailing: this node's configured description
             // (`[network] description`), mirroring the per-server description a
@@ -8126,6 +8142,7 @@ pub const LinuxServer = struct {
         };
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
+        conn.last_message_ms = conn.connected_at_ms;
         conn.session.restore(snap);
         self.injectSessionState(conn);
         // TLS client: rebuild the live engine BEFORE anything else can touch the
@@ -13882,6 +13899,9 @@ pub const LinuxServer = struct {
         }
         const text = parsed.paramSlice()[1];
         if (!try self.messageContentGates(id, conn, command, parsed.paramSlice()[0], text, is_notice)) return;
+        // Reset the WHOIS idle clock on a real PRIVMSG (NOTICE never resets idle,
+        // by convention — so bots/services don't keep a user looking "active").
+        if (!is_notice) conn.last_message_ms = self.nowMs();
 
         // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target, capped
         // at MAXTARGETS to bound fan-out / resist spam amplification.
