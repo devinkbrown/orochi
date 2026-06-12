@@ -278,6 +278,7 @@ pub const Client = struct {
         try writeSupportedGroupsExtension(self.allocator, &exts);
         try writeEcPointFormatsExtension(self.allocator, &exts);
         try writeSignatureAlgorithmsExtension(self.allocator, &exts);
+        try writeSupportedVersionsExtension(self.allocator, &exts);
         try self.writeAlpnExtension(&exts);
         try appendU16(self.allocator, out, @intCast(exts.items.len));
         try out.appendSlice(self.allocator, exts.items);
@@ -466,6 +467,19 @@ fn writeSupportedGroupsExtension(allocator: Allocator, out: *std.ArrayList(u8)) 
 
 fn writeEcPointFormatsExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
     try writeExtension(allocator, out, 0x000b, &.{ 1, 0 });
+}
+
+/// supported_versions offering ONLY TLS 1.2 (0x0303). Standards-compliant 1.2
+/// clients send this even though they could omit it, so we include it for wire
+/// realism — and it exercises the server's acceptance of the extension (a 1.2
+/// server must accept a 1.2-only supported_versions, not reject the extension
+/// wholesale).
+fn writeSupportedVersionsExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {
+    // body = list_len(u8) + ProtocolVersion(2).
+    var body: [3]u8 = undefined;
+    body[0] = 2;
+    std.mem.writeInt(u16, body[1..3], tls12.tls_version, .big);
+    try writeExtension(allocator, out, 0x002b, &body);
 }
 
 fn writeSignatureAlgorithmsExtension(allocator: Allocator, out: *std.ArrayList(u8)) Error!void {

@@ -294,7 +294,23 @@ pub const Server = struct {
                     try g.expectEmpty();
                 },
                 0x0010 => try self.selectAlpn(body),
-                0x002b => return error.ProtocolVersion,
+                0x002b => {
+                    // supported_versions: real TLS 1.2 clients (OpenSSL, browsers)
+                    // include this even when offering 1.2, since they also support
+                    // 1.3. The version dispatcher already routed a 1.3-capable
+                    // ClientHello (one listing 0x0304) to the 1.3 engine, so here we
+                    // only require the list to actually offer TLS 1.2 (0x0303) and
+                    // refuse a client that omits it. Rejecting the extension outright
+                    // broke every standards-compliant 1.2 client.
+                    var sv = Cursor.init(body);
+                    const list = try sv.take(try sv.readU8());
+                    var v = Cursor.init(list);
+                    var offers_12 = false;
+                    while (v.remaining() >= 2) {
+                        if (try v.readU16() == tls12.tls_version) offers_12 = true;
+                    }
+                    if (!offers_12) return error.ProtocolVersion;
+                },
                 else => {},
             }
         }
