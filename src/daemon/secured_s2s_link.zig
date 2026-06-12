@@ -41,6 +41,9 @@ pub const Options = struct {
     cfg: hs.Config,
     rng: std.Io,
     server_name: []const u8,
+    /// Human description of THIS node, gossiped to the peer in the CRDT handshake
+    /// so remote WHOIS (312) names the right per-server description. Empty = none.
+    description: []const u8 = "",
     local_epoch_ms: u64 = 1000,
     channel_name: []const u8 = "#suimyaku",
     /// Optional trust pin: require the peer's node id to equal this. Null = TOFU.
@@ -58,6 +61,7 @@ pub const SecuredLink = struct {
     rng: std.Io,
     expected_remote: ?[20]u8,
     server_name: []const u8,
+    description: []const u8,
     local_epoch_ms: u64,
     channel_name: []const u8,
 
@@ -80,6 +84,7 @@ pub const SecuredLink = struct {
             .rng = opts.rng,
             .expected_remote = opts.expected_remote,
             .server_name = opts.server_name,
+            .description = opts.description,
             .local_epoch_ms = opts.local_epoch_ms,
             .channel_name = opts.channel_name,
             .phase = if (opts.role == .responder) .ake else .await_prekey,
@@ -178,6 +183,13 @@ pub const SecuredLink = struct {
     pub fn takeInbound(self: *SecuredLink) anyerror![]s2s_peer.InboundMessage {
         const link = self.inner orelse return &.{};
         return link.takeInbound();
+    }
+
+    /// Drain remote channel membership changes (JOIN/PART) for the daemon to
+    /// surface to local members. Caller owns the slice + each delta's strings.
+    pub fn takeMembershipChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.MembershipDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeMembershipChanges();
     }
 
     /// Forward a signed cross-mesh operator grant to the peer over the secured
@@ -287,6 +299,7 @@ pub const SecuredLink = struct {
             .remote_node_id = peer_short,
             .local_epoch_ms = self.local_epoch_ms,
             .server_name = self.server_name,
+            .description = self.description,
             .channel_name = self.channel_name,
             .now_ms = now_ms,
         });

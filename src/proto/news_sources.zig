@@ -1,15 +1,14 @@
-//! Working news/weather data sources, ported verbatim from ophion's `m_bot.py`
-//! (the proven, no-API-key feeds it shipped). This module is *data only*: the
-//! source URLs and their metadata. Fetching, caching, and parsing live
-//! elsewhere (`geo_fetch.zig` builds requests / parses bodies; `geo_services`
-//! does the background I/O).
+//! Working news/weather data sources — a curated set of proven, no-API-key
+//! feeds. This module is *data only*: the source URLs and their metadata.
+//! Fetching, caching, and parsing live elsewhere (`geo_fetch.zig` builds
+//! requests / parses bodies; `geo_services` does the background I/O).
 //!
 //! Weather uses wttr.in (see `geo_fetch.weather_host`); news uses the RSS feeds
 //! below. Keeping the source list in one typed table lets `!news`/`!localnews`
-//! resolve a feed by key or by the user's GeoIP country, exactly as ophion did.
+//! resolve a feed by key or by the user's GeoIP country.
 const std = @import("std");
 
-/// A general news feed with editorial leaning + topic tags (ophion `SOURCES`).
+/// A general news feed with editorial leaning + topic tags.
 pub const Source = struct {
     key: []const u8,
     name: []const u8,
@@ -18,24 +17,23 @@ pub const Source = struct {
     topics: []const []const u8,
 };
 
-/// A country's default headline feed (ophion `COUNTRY_FEEDS`), keyed by ISO
-/// 3166-1 alpha-2 code.
+/// A country's default headline feed, keyed by ISO 3166-1 alpha-2 code.
 pub const CountryFeed = struct {
     cc: []const u8,
     name: []const u8,
     url: []const u8,
 };
 
-/// Countries that read weather in imperial units (ophion `_IMPERIAL_COUNTRIES`).
-/// Note: `weather_units.forCountry` carries a broader list; this mirrors what
-/// ophion's bot used for `!weather` unit selection.
+/// Countries that read weather in imperial units. Note:
+/// `weather_units.forCountry` carries a broader list; this is the compact set
+/// used for `!weather` unit selection.
 pub const imperial_countries = [_][]const u8{ "US", "LR", "MM" };
 
-/// Default general source when the user names none (ophion defaulted to a
-/// center wire; BBC World is a safe, reliable pick).
+/// Default general source when the user names none (a center wire; BBC World is
+/// a safe, reliable pick).
 pub const default_source_key = "bbc";
 
-/// General news sources (ophion `SOURCES`), verbatim URLs.
+/// General news sources, verbatim URLs.
 pub const sources = [_]Source{
     .{ .key = "abc", .name = "ABC News", .url = "https://feeds.abcnews.com/abcnews/topstories", .leaning = "center", .topics = &.{ "world", "us", "politics" } },
     .{ .key = "bbc", .name = "BBC World", .url = "https://feeds.bbci.co.uk/news/rss.xml", .leaning = "center", .topics = &.{ "world", "uk" } },
@@ -55,9 +53,21 @@ pub const sources = [_]Source{
     .{ .key = "cnbc", .name = "CNBC", .url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", .leaning = "center", .topics = &.{ "business", "finance" } },
     .{ .key = "espn", .name = "ESPN", .url = "https://www.espn.com/espn/rss/news", .leaning = "center", .topics = &.{"sports"} },
     .{ .key = "cbssports", .name = "CBS Sports", .url = "https://www.cbssports.com/rss/headlines/", .leaning = "center", .topics = &.{"sports"} },
+    .{ .key = "cbs", .name = "CBS News", .url = "https://www.cbsnews.com/latest/rss/world", .leaning = "center", .topics = &.{ "world", "us" } },
+    .{ .key = "sky", .name = "Sky News", .url = "https://feeds.skynews.com/feeds/rss/world.xml", .leaning = "center", .topics = &.{ "world", "uk" } },
+    .{ .key = "wapo", .name = "Washington Post", .url = "https://feeds.washingtonpost.com/rss/world", .leaning = "center-left", .topics = &.{ "world", "us", "politics" } },
+    .{ .key = "dw", .name = "Deutsche Welle", .url = "https://rss.dw.com/rdf/rss-en-all", .leaning = "center", .topics = &.{ "world", "europe" } },
+    .{ .key = "cnn", .name = "CNN", .url = "https://rss.cnn.com/rss/edition.rss", .leaning = "center-left", .topics = &.{ "world", "us" } },
 };
 
-/// Per-country default headline feeds (ophion `COUNTRY_FEEDS`), verbatim URLs.
+/// Pick a pseudo-random general source from `sources` for `seed` (e.g. a clock
+/// tick mixed with the client). Used by the MOTD to vary the headline wire each
+/// connect instead of always serving the default source.
+pub fn randomSource(seed: u64) Source {
+    return sources[seed % sources.len];
+}
+
+/// Per-country default headline feeds, verbatim URLs.
 pub const country_feeds = [_]CountryFeed{
     .{ .cc = "US", .name = "NPR News", .url = "https://feeds.npr.org/1001/rss.xml" },
     .{ .cc = "GB", .name = "BBC News", .url = "https://feeds.bbci.co.uk/news/rss.xml" },
@@ -127,7 +137,7 @@ pub fn countryFeed(cc: []const u8) ?CountryFeed {
     return null;
 }
 
-/// Whether a country reads weather in imperial units (ophion's set).
+/// Whether a country reads weather in imperial units (the compact set).
 pub fn usesImperial(cc: []const u8) bool {
     for (imperial_countries) |c| {
         if (std.ascii.eqlIgnoreCase(c, cc)) return true;
@@ -155,7 +165,7 @@ test "countryFeed maps ISO codes to feeds" {
     try std.testing.expect(countryFeed("ZZ") == null);
 }
 
-test "usesImperial matches ophion's imperial set" {
+test "usesImperial matches the imperial set" {
     try std.testing.expect(usesImperial("US"));
     try std.testing.expect(usesImperial("lr"));
     try std.testing.expect(!usesImperial("GB"));

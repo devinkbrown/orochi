@@ -213,10 +213,10 @@ pub fn writeLocalUsersWith(
 
     var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_LOCALUSERS, ctx);
-    try b.appendByte(' ');
-    try b.appendUnsigned(counts.local_clients);
-    try b.appendByte(' ');
-    try b.appendUnsigned(counts.local_max);
+    // The optional leading `<u> <m>` params are deliberately omitted: clients
+    // (e.g. WeeChat) render them verbatim before the human text, producing an
+    // ugly "6 6 Current local users 6, max 6". The trailing message already
+    // carries both numbers; this keeps the spec-allowed compact form.
     try b.appendBytes(" :Current local users ");
     try b.appendUnsigned(counts.local_clients);
     try b.appendBytes(", max ");
@@ -241,10 +241,7 @@ pub fn writeGlobalUsersWith(
 
     var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_GLOBALUSERS, ctx);
-    try b.appendByte(' ');
-    try b.appendUnsigned(counts.global_clients);
-    try b.appendByte(' ');
-    try b.appendUnsigned(counts.global_max);
+    // Omit the optional leading `<u> <m>` params (see writeLocalUsersWith).
     try b.appendBytes(" :Current global users ");
     try b.appendUnsigned(counts.global_clients);
     try b.appendBytes(", max ");
@@ -429,11 +426,11 @@ test "full LUSERS sequence uses RFC2812 reply text" {
         sink.slice()[4],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 265 alice 13 21 :Current local users 13, max 21\r\n",
+        ":irc.local 265 alice :Current local users 13, max 21\r\n",
         sink.slice()[5],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 266 alice 49 88 :Current global users 49, max 88\r\n",
+        ":irc.local 266 alice :Current global users 49, max 88\r\n",
         sink.slice()[6],
     );
 }
@@ -509,11 +506,11 @@ test "u64 bounds render without overflow" {
         sink.slice()[0],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 265 alice 18446744073709551615 18446744073709551615 :Current local users 18446744073709551615, max 18446744073709551615\r\n",
+        ":irc.local 265 alice :Current local users 18446744073709551615, max 18446744073709551615\r\n",
         sink.slice()[5],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 266 alice 18446744073709551615 18446744073709551615 :Current global users 18446744073709551615, max 18446744073709551615\r\n",
+        ":irc.local 266 alice :Current global users 18446744073709551615, max 18446744073709551615\r\n",
         sink.slice()[6],
     );
 }

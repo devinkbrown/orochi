@@ -3,7 +3,7 @@
 Orochi is a pure-Zig (0.16) clean-room IRC daemon — a bespoke successor to the
 C `ophion` daemon, not a clone. It speaks IRCv3 + IRCX, runs a custom Suimyaku
 CRDT mesh with forward-secret Tsumugi server links, and ships its own pure-Zig
-TLS (opssl), media codecs (OPVOX/OPVIS), and in-place upgrade (Helix).
+TLS (Yoroi), media codecs (OPVOX/OPVIS), and in-place upgrade (Helix).
 
 This tree is generated from, and cites, the live source. Where the code diverges
 from convention or from the design notes in `planning/`, the docs flag it.
@@ -13,7 +13,7 @@ from convention or from the design notes in `planning/`, the docs flag it.
 - [Reactor & threading](architecture/01-reactor-threading.md) — io_uring + sharded workers
 - [World, dispatch & modules](architecture/02-world-dispatch-modules.md) — the SerpentRegistry command system
 - [Mesh & S2S](architecture/mesh-s2s.md) — Suimyaku CRDT, links, partition detection, oper-grant sharing
-- [Cryptography](architecture/crypto.md) — Tsumugi handshake, opssl, signing, sealed tokens
+- [Cryptography](architecture/crypto.md) — Tsumugi handshake, Yoroi, signing, sealed tokens
 - [Media](architecture/03-media.md) — SFU, transport stack, codecs, WASM shims
 - [Upgrade & WASM host](architecture/04-upgrade-wasm.md) — Helix in-place upgrade, OroWasm plugins
 

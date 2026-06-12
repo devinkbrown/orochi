@@ -4,7 +4,7 @@
 //! never touches the reactor io_uring); reactor threads only ever read/write the
 //! mutex-guarded cache. A request that misses or finds a stale entry enqueues a
 //! refresh job and returns "not ready" so the caller can say *"fetching… try
-//! again"* — exactly ophion's m_bot behaviour, but in-process.
+//! again"* — the classic fantasy-bot behaviour, but in-process.
 //!
 //!   * Weather: wttr.in (plain HTTP, no key); cached metric reading re-localized
 //!     per the requesting user's country at serve time.
@@ -31,8 +31,8 @@ const job_capacity = 128;
 const State = enum { empty, pending, ready };
 
 pub const Options = struct {
-    weather_ttl_ms: i64 = 10 * 60 * 1000, // ophion weather_cache_ttl 600s
-    news_ttl_ms: i64 = 5 * 60 * 1000, // ophion news_cache_ttl 300s
+    weather_ttl_ms: i64 = 10 * 60 * 1000, // weather cache TTL 600s
+    news_ttl_ms: i64 = 5 * 60 * 1000, // news cache TTL 300s
     weather_enabled: bool = true,
     news_enabled: bool = true,
     /// Skip TLS cert verification for news feeds (public read-only data). Lets

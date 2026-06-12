@@ -19,6 +19,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     var out = base;
     if (cfg.network.name.len != 0) out.network_name = cfg.network.name;
     if (cfg.network.server_name) |v| out.server_name = v;
+    if (cfg.network.description) |v| {
+        if (v.len != 0) out.server_description = v;
+    }
     if (cfg.motd.text) |t| out.motd_text_raw = t;
     if (cfg.admin.location.len != 0) out.admin_location = cfg.admin.location;
     if (cfg.admin.email.len != 0) out.admin_email = cfg.admin.email;
@@ -55,6 +58,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
     if (cfg.stats.interval_ms != 0) out.stats_interval_ms = cfg.stats.interval_ms;
     if (cfg.geoip.database.len != 0) out.geoip_db_path = cfg.geoip.database;
+    if (cfg.geoip.asn_database.len != 0) out.geoip_asn_db_path = cfg.geoip.asn_database;
     out.backlog = cfg.limits.backlog;
     out.max_clients = cfg.limits.max_clients;
     out.topiclen = cfg.limits.topiclen;

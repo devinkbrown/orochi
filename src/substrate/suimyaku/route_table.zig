@@ -272,6 +272,19 @@ pub const RouteTable = struct {
         self.channel_count -= 1;
     }
 
+    /// Outcome of `applyMembership`, so the caller can emit the matching live IRC
+    /// surface (a remote `JOIN`/`PART` to local channel members). `unchanged`
+    /// covers stale events and re-affirmations of an existing member (so the
+    /// periodic anti-entropy re-burst never produces a duplicate JOIN).
+    pub const ApplyOutcome = enum { joined, parted, status_changed, unchanged };
+
+    /// Outcome plus the member's previous status bits, so the caller can emit a
+    /// precise MODE diff (which prefixes were added/removed) for a status change.
+    pub const ApplyResult = struct {
+        outcome: ApplyOutcome,
+        prev_status: u4 = 0,
+    };
+
     /// Apply a MEMBERSHIP event for a remote member, last-writer-wins by `hlc`.
     /// `present` true = join/status upsert; false = part. Stale events (hlc <= the
     /// stored one for this nick) are ignored, so out-of-order gossip converges.
@@ -283,7 +296,7 @@ pub const RouteTable = struct {
         status: u4,
         hlc: u64,
         present: bool,
-    ) Error!void {
+    ) Error!ApplyResult {
         try self.validateName(chan);
         try self.validateName(nick);
         try validateNode(node);
@@ -291,23 +304,27 @@ pub const RouteTable = struct {
         const list = try self.ensureMemberList(chan);
         if (list.find(nick)) |idx| {
             const cur = &list.entries.items[idx];
-            if (hlc <= cur.hlc) return; // stale; LWW keeps the newer event
+            const prev = cur.status;
+            if (hlc <= cur.hlc) return .{ .outcome = .unchanged, .prev_status = prev }; // stale
             if (present) {
+                const changed = cur.status != status or cur.node != node;
                 cur.node = node;
                 cur.status = status;
                 cur.hlc = hlc;
+                return .{ .outcome = if (changed) .status_changed else .unchanged, .prev_status = prev };
             } else {
                 self.allocator.free(cur.nick);
                 _ = list.entries.swapRemove(idx);
                 self.pruneIfEmpty(chan);
+                return .{ .outcome = .parted, .prev_status = prev };
             }
-            return;
         }
-        if (!present) return; // part for an unknown member: nothing to do
+        if (!present) return .{ .outcome = .unchanged }; // part for an unknown member
         if (list.entries.items.len >= self.cfg.max_nicks) return error.RouteTableFull;
         const owned = try self.allocator.dupe(u8, nick);
         errdefer self.allocator.free(owned);
         try list.entries.append(self.allocator, .{ .nick = owned, .node = node, .status = status, .hlc = hlc });
+        return .{ .outcome = .joined };
     }
 
     /// Borrowed roster of remote members for `chan` (empty if none). Valid until
@@ -526,13 +543,13 @@ test "applyMembership tracks remote channel members with last-writer-wins" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    try table.applyMembership("#chat", "alice", 10, 0b0100, 1, true); // op
-    try table.applyMembership("#chat", "bob", 20, 0b0000, 1, true);
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0100, 1, true); // op
+    _ = try table.applyMembership("#chat", "bob", 20, 0b0000, 1, true);
     try std.testing.expectEqual(@as(usize, 2), table.channelMembers("#chat").len);
 
     // A stale event (lower hlc) is ignored; a newer one updates status.
-    try table.applyMembership("#chat", "alice", 10, 0b0000, 0, true);
-    try table.applyMembership("#chat", "alice", 10, 0b0010, 5, true); // now voice
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0000, 0, true);
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0010, 5, true); // now voice
     var alice_status: ?u4 = null;
     for (table.channelMembers("#chat")) |m| {
         if (std.mem.eql(u8, m.nick, "alice")) alice_status = m.status;
@@ -544,8 +561,8 @@ test "findMember locates a roster member case-insensitively with its node" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    try table.applyMembership("#chat", "Alice", 10, 0b0100, 1, true);
-    try table.applyMembership("#ops", "bob", 20, 0, 1, true);
+    _ = try table.applyMembership("#chat", "Alice", 10, 0b0100, 1, true);
+    _ = try table.applyMembership("#ops", "bob", 20, 0, 1, true);
 
     const alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("Alice", alice.nick);
@@ -561,12 +578,12 @@ test "applyMembership part removes a member and prunes an empty channel" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    try table.applyMembership("#x", "alice", 10, 0, 1, true);
+    _ = try table.applyMembership("#x", "alice", 10, 0, 1, true);
     // Stale part (hlc <= current) does not remove.
-    try table.applyMembership("#x", "alice", 10, 0, 1, false);
+    _ = try table.applyMembership("#x", "alice", 10, 0, 1, false);
     try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#x").len);
     // Newer part removes; the now-empty channel is pruned.
-    try table.applyMembership("#x", "alice", 10, 0, 2, false);
+    _ = try table.applyMembership("#x", "alice", 10, 0, 2, false);
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
 }
 
@@ -574,8 +591,8 @@ test "removeNode evicts that node's remote members (netsplit hygiene)" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    try table.applyMembership("#chat", "alice", 10, 0, 1, true);
-    try table.applyMembership("#chat", "bob", 20, 0, 1, true);
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true);
+    _ = try table.applyMembership("#chat", "bob", 20, 0, 1, true);
     table.removeNode(10);
     const members = table.channelMembers("#chat");
     try std.testing.expectEqual(@as(usize, 1), members.len);

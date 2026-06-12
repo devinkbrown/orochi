@@ -711,6 +711,9 @@ const listener_token: RingFdToken = .{ .slot = 0, .gen = 0 };
 const s2s_listener_token: RingFdToken = .{ .slot = 1, .gen = 0 };
 /// Reserved token for the periodic timeout sweep timer (single in-flight timer).
 const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
+/// Cadence for the periodic membership anti-entropy re-burst to S2S peers. Coarse
+/// (relative to the 2s sweep) so it converges split-window gaps without churn.
+const membership_resync_interval_ms: i64 = 30_000;
 /// Distinct accept token for the implicit-TLS client listener (:6697), so
 /// handleAccept can tell it apart from the plaintext + S2S listeners.
 const tls_listener_token: RingFdToken = .{ .slot = 3, .gen = 0 };
@@ -975,6 +978,11 @@ pub const Config = struct {
     /// replies/identities don't collide. Configurable via `[network] server_name`;
     /// defaults to the build-time `server_name` constant.
     server_name: []const u8 = server_name,
+    /// Human description of THIS node, shown in VERSION, the WHOIS RPL_WHOISSERVER
+    /// (312) trailing for local users, and advertised to S2S peers so remote
+    /// WHOIS names the right per-server description. Configurable via
+    /// `[network] description`; defaults to the generic daemon tagline.
+    server_description: []const u8 = "Orochi — pure-Zig mesh IRC daemon",
     /// MOTD text served by the MOTD command, split on newlines. Empty = the
     /// built-in default MOTD. Configurable via `[motd] text` (supports @file:).
     motd_text_raw: []const u8 = "",
@@ -1054,6 +1062,9 @@ pub const Config = struct {
     /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
     /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
     geoip_db_path: []const u8 = "",
+    /// Optional path to a separate ASN database (.mmdb) for WHOIS AS-number/org
+    /// (city DBs don't carry ASN). Empty = no ASN. Loaded lazily. Borrowed.
+    geoip_asn_db_path: []const u8 = "",
     /// Directory to publish web stats into (stats.json + index.html), e.g. an
     /// nginx `root`. Empty = disabled. Written periodically via Config.crypto_io.
     stats_web_dir: []const u8 = "",
@@ -1551,6 +1562,13 @@ pub const LinuxServer = struct {
     geoip_db: ?geoip.Database = null,
     geoip_bytes: ?[]u8 = null,
     geoip_tried: bool = false,
+    /// Lazily-loaded ASN database (from Config.geoip_asn_db_path) for WHOIS.
+    geoip_asn_db: ?geoip.Database = null,
+    geoip_asn_bytes: ?[]u8 = null,
+    geoip_asn_tried: bool = false,
+    /// Last time the periodic membership anti-entropy re-burst ran (ms). Gates
+    /// `resyncMembershipToPeers` so it fires on a coarse cadence, not every tick.
+    last_membership_resync_ms: i64 = 0,
     /// Web-stats publishing throttle + running peak client count.
     stats_last_write_ms: i64 = 0,
     stats_peak_clients: u64 = 0,
@@ -2036,6 +2054,7 @@ pub const LinuxServer = struct {
             self.seen.deinit(self.allocator);
         }
         if (self.geoip_bytes) |b| self.allocator.free(b);
+        if (self.geoip_asn_bytes) |b| self.allocator.free(b);
         self.account_verifies.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
@@ -2179,7 +2198,36 @@ pub const LinuxServer = struct {
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
         self.sweepMeshAutoConnect(false);
+        // Membership anti-entropy: periodically re-burst this node's local channel
+        // members to every established peer so anything missed during a split or a
+        // reconnect race (e.g. a user who joined while the link was down)
+        // converges within the cadence instead of staying out of sync forever.
+        const now = self.nowMs();
+        if (now - self.last_membership_resync_ms >= membership_resync_interval_ms) {
+            self.last_membership_resync_ms = now;
+            self.resyncMembershipToPeers();
+        }
         self.maybeWriteStats();
+    }
+
+    /// Re-send the local membership roster to every established S2S peer. The
+    /// CRDT is HLC-keyed so re-affirming present members is idempotent; this only
+    /// fills gaps (a member the peer never learned about). Mirrors the one-shot
+    /// link-establish burst (`sendMembershipBurstTo`) on a periodic cadence.
+    fn resyncMembershipToPeers(self: *LinuxServer) void {
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            const is_peer = slot.value.s2s_secured != null or slot.value.s2s != null;
+            if (!is_peer) continue;
+            const established = if (slot.value.s2s_secured) |l|
+                l.established()
+            else if (slot.value.s2s) |l|
+                l.established()
+            else
+                false;
+            if (!established) continue;
+            self.sendMembershipBurstTo(&slot.value);
+        }
     }
 
     /// Publish server/channel stats to the configured web directory (stats.json
@@ -3099,6 +3147,7 @@ pub const LinuxServer = struct {
             },
             .rng = self.config.crypto_io.?,
             .server_name = self.serverName(),
+            .description = self.config.server_description,
             .local_epoch_ms = wall,
         });
         return link;
@@ -3137,6 +3186,8 @@ pub const LinuxServer = struct {
             }
             self.allocator.free(inbound);
         } else |_| {}
+        // Surface remote channel JOIN/PART to local members in real time.
+        self.drainMembershipChanges(link);
         // Drain inbound cross-mesh oper grants. Each is verified against the
         // peer's authenticated Ed25519 key from the Tsumugi handshake before it
         // can confer operator authority locally — an unverifiable grant is
@@ -3202,6 +3253,8 @@ pub const LinuxServer = struct {
             }
             self.allocator.free(inbound);
         } else |_| {}
+        // Surface remote channel JOIN/PART to local members in real time.
+        self.drainMembershipChanges(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
@@ -3777,10 +3830,16 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "QUIT", &.{}, reason);
 
+        const nick = conn.session.displayName();
+        const announce = !std.mem.eql(u8, nick, "*");
         var it = self.world.channels.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.members.contains(worldIdFromClient(id))) {
                 try self.broadcastChannel(entry.key_ptr.*, msg, id);
+                // Tell mesh peers this member is gone so their remote roster drops
+                // it and they emit a PART to their own local members (otherwise a
+                // disconnect leaves a ghost on the far side of the mesh).
+                if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false);
             }
         }
     }
@@ -4284,6 +4343,80 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Surface a remote (mesh) channel membership change to LOCAL members of
+    /// `channel` as live IRC lines, so clients already sitting in the channel see
+    /// remote users join/leave/gain-status in real time — not only on a fresh
+    /// NAMES. Remote users render with user "mesh" and host = the origin peer's
+    /// server name, matching the NAMES projection (`addRemoteMembers`).
+    ///   - joined: `:nick JOIN #chan`, then a MODE granting any join-time prefix.
+    ///   - status: a MODE diff (added/removed prefix modes vs `prev_status`).
+    ///   - parted: `:nick PART #chan`.
+    /// Best-effort: a channel with no local members has no one to notify.
+    fn emitRemoteMembership(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        const host = if (remote_name.len != 0) remote_name else default_host;
+        var buf: [600]u8 = undefined;
+        switch (ch.kind) {
+            .joined => {
+                const line = std.fmt.bufPrint(&buf, ":{s}!mesh@{s} JOIN :{s}\r\n", .{ ch.nick, host, ch.channel }) catch return;
+                self.broadcastChannel(ch.channel, line, null) catch return;
+                if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, host, 0, ch.status);
+            },
+            .parted => {
+                const line = std.fmt.bufPrint(&buf, ":{s}!mesh@{s} PART {s}\r\n", .{ ch.nick, host, ch.channel }) catch return;
+                self.broadcastChannel(ch.channel, line, null) catch {};
+            },
+            .status => self.emitRemoteModeDiff(ch.channel, ch.nick, host, ch.prev_status, ch.status),
+        }
+    }
+
+    /// Emit a `MODE #chan +/-<letters> <nick> …` to local channel members for a
+    /// remote member whose prefix modes changed from `prev` to `now`. Combines
+    /// the additions and removals into one line (each member mode repeats the
+    /// nick as its parameter).
+    fn emitRemoteModeDiff(self: *LinuxServer, channel: []const u8, nick: []const u8, host: []const u8, prev: u4, now: u4) void {
+        const added = now & ~prev;
+        const removed = prev & ~now;
+        if (added == 0 and removed == 0) return;
+        var modes_buf: [16]u8 = undefined;
+        var params_buf: [320]u8 = undefined;
+        var ml: usize = 0;
+        var pl: usize = 0;
+        const order = [_]chanmode.MemberMode{ .founder, .owner, .op, .voice };
+        inline for ([_]struct { sign: u8, mask: u4 }{ .{ .sign = '+', .mask = @truncate(added) }, .{ .sign = '-', .mask = @truncate(removed) } }) |grp| {
+            if (grp.mask != 0) {
+                if (ml < modes_buf.len) {
+                    modes_buf[ml] = grp.sign;
+                    ml += 1;
+                }
+                for (order) |m| {
+                    if ((world_model.MemberModes{ .bits = @as(u8, grp.mask) }).contains(m)) {
+                        if (ml < modes_buf.len) {
+                            modes_buf[ml] = chanmode.memberModeLetter(m);
+                            ml += 1;
+                        }
+                        const seg = std.fmt.bufPrint(params_buf[pl..], " {s}", .{nick}) catch break;
+                        pl += seg.len;
+                    }
+                }
+            }
+        }
+        var line_buf: [600]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, ":{s} MODE {s} {s}{s}\r\n", .{ host, channel, modes_buf[0..ml], params_buf[0..pl] }) catch return;
+        self.broadcastChannel(channel, line, null) catch {};
+    }
+
+    /// Drain a link's remote membership changes and surface each as live IRC.
+    /// Frees the drained slice + each delta's owned strings.
+    fn drainMembershipChanges(self: *LinuxServer, link: anytype) void {
+        const changes = link.takeMembershipChanges() catch return;
+        const remote = link.remoteName();
+        for (changes) |*ch| {
+            self.emitRemoteMembership(ch, remote);
+            ch.deinit(self.allocator);
+        }
+        self.allocator.free(changes);
+    }
+
     fn flushS2sOutbound(self: *LinuxServer, conn: *ConnState, out: []const u8) !void {
         if (out.len == 0) return;
         try appendToConn(conn, out);
@@ -4506,7 +4639,7 @@ pub const LinuxServer = struct {
         const fwd = self.world.forwardOf(channel) orelse return null;
         if (std.ascii.eqlIgnoreCase(fwd, channel)) return null;
         if (!world_model.isChannelName(fwd)) return null;
-        // +D disforward (ophion MODE_DISFORWARD): a channel that refuses to be a
+        // +D disforward (MODE_DISFORWARD): a channel that refuses to be a
         // forward destination is skipped — the original blocked-JOIN deny fires.
         if (self.world.channelHasExtFlag(fwd, .disforward)) return null;
         if (fwd.len > out.len) return null;
@@ -4968,6 +5101,12 @@ pub const LinuxServer = struct {
                         applied.appendByte(ch) catch break;
                         targets.appendByte(' ') catch break;
                         targets.append(target_nick) catch break;
+                        // Propagate the member's new prefix status to mesh peers so
+                        // remote rosters + clients converge immediately (not only via
+                        // the periodic re-burst). Local target only — a remote member's
+                        // status is owned by its home node.
+                        const nm = self.world.memberModes(channel, target) orelse world_model.MemberModes.empty();
+                        self.announceMembership(channel, target_nick, @truncate(nm.bits), true);
                     }
                 },
                 'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M', 'W', 'O', 'A' => {
@@ -5132,7 +5271,7 @@ pub const LinuxServer = struct {
                         const target = parsed.paramSlice()[arg_index];
                         arg_index += 1;
                         if (!chan_forward.validForwardTarget(target, channel)) continue;
-                        // Target-side permission (ophion check_forward): the target
+                        // Target-side permission (forward-target check): the target
                         // must exist, and unless it is +F (freetarget) the setter
                         // must hold ops there — so you can't dump users into an
                         // arbitrary channel you don't run.
@@ -5615,15 +5754,24 @@ pub const LinuxServer = struct {
         var geo_text: ?[]const u8 = null;
         if (conn.session.isOper() or conn == tconn) {
             if (parseGeoIp(tconn.session.realHost())) |gip| {
+                // City DB → city + region + country; the separate ASN DB → AS + org.
+                var city: ?[]const u8 = null;
+                var region: ?[]const u8 = null;
+                var country: ?[]const u8 = null;
                 if (self.ensureGeoip()) |db| {
-                    if (db.lookupInfo(gip) catch null) |gi| {
-                        const country = gi.country_iso orelse "??";
-                        geo_text = if (gi.asn) |asn|
-                            std.fmt.bufPrint(&geo_buf, "is in {s}, AS{d} {s}", .{ country, asn, gi.asn_org orelse gi.org orelse "" }) catch null
-                        else
-                            std.fmt.bufPrint(&geo_buf, "is in {s}", .{country}) catch null;
+                    if (db.lookupInfo(gip) catch null) |gi| country = gi.country_iso;
+                    city = db.lookupName(gip, "city", "en") catch null;
+                    region = db.lookupString(gip, &.{ "subdivisions", "0", "names", "en" }) catch null;
+                }
+                var asn: ?u32 = null;
+                var asn_org: ?[]const u8 = null;
+                if (self.ensureGeoipAsn()) |adb| {
+                    if (adb.lookupInfo(gip) catch null) |ai| {
+                        asn = ai.asn;
+                        asn_org = ai.asn_org orelse ai.org orelse ai.isp;
                     }
                 }
+                geo_text = buildGeoWhois(&geo_buf, city, region, country, asn, asn_org);
             }
         }
 
@@ -5635,6 +5783,10 @@ pub const LinuxServer = struct {
             .account = tconn.session.account(),
             .away = tconn.session.awayMessage(),
             .geo = geo_text,
+            // RPL_WHOISSERVER (312) trailing: this node's configured description
+            // (`[network] description`), mirroring the per-server description a
+            // remote node gossips for its own users.
+            .server_info = if (self.config.server_description.len > 0) self.config.server_description else null,
             // +H hide-oper: suppress operator status unless the requester is an
             // oper (or the user themselves).
             .is_oper = tconn.session.isOper() and !operHidden(tconn, conn),
@@ -8485,6 +8637,24 @@ pub const LinuxServer = struct {
         return db;
     }
 
+    /// Lazily load the separate ASN database (Config.geoip_asn_db_path) for the
+    /// WHOIS AS-number/org line. Same load-once contract as `ensureGeoip`.
+    fn ensureGeoipAsn(self: *LinuxServer) ?geoip.Database {
+        if (self.geoip_asn_db) |db| return db;
+        if (self.geoip_asn_tried) return null;
+        self.geoip_asn_tried = true;
+        if (self.config.geoip_asn_db_path.len == 0) return null;
+        const io = self.config.crypto_io orelse return null;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.config.geoip_asn_db_path, self.allocator, .limited(256 << 20)) catch return null;
+        const db = geoip.Database.init(bytes) catch {
+            self.allocator.free(bytes);
+            return null;
+        };
+        self.geoip_asn_bytes = bytes;
+        self.geoip_asn_db = db;
+        return db;
+    }
+
     /// On registration, record the client's `location` (city or country) and
     /// `country` (ISO) metadata from GeoIP, falling back to the configured
     /// default location. This gives `!weather` a per-user location with no
@@ -9597,37 +9767,104 @@ pub const LinuxServer = struct {
     /// MOTD (375/372/376).
     /// Read + localize the configured weather source into `out` for the MOTD
     /// `{weather}` placeholder; empty on disabled/missing/unreadable source.
-    fn motdWeatherLine(self: *LinuxServer, io: std.Io, out: []u8) []const u8 {
-        if (!self.config.weather_enabled or self.config.weather_source.len == 0) return "";
-        const content = std.Io.Dir.cwd().readFileAlloc(io, self.config.weather_source, self.allocator, .limited(4096)) catch return "";
-        defer self.allocator.free(content);
-        const f = weather_units.parseForecast(content);
-        const country = if (self.config.weather_country.len != 0) self.config.weather_country else f.country;
-        const loc = if (self.config.weather_location.len != 0) self.config.weather_location else f.location;
+    /// Build the MOTD `{weather}` line for the connecting client. A configured
+    /// `[weather] source` file (refreshed by an external updater) takes
+    /// precedence; otherwise the line is served from the live geo cache,
+    /// personalized to the user's `location` metadata, the configured default
+    /// location, or — last resort — their GeoIP country, and localized to their
+    /// `country`. Empty when nothing resolves (the `{if:weather}` block hides it).
+    fn motdWeatherLine(self: *LinuxServer, conn: *ConnState, io: std.Io, out: []u8) []const u8 {
+        // 1) File-based source (external updater) wins when configured.
+        if (self.config.weather_enabled and self.config.weather_source.len != 0) {
+            const content = std.Io.Dir.cwd().readFileAlloc(io, self.config.weather_source, self.allocator, .limited(4096)) catch return "";
+            defer self.allocator.free(content);
+            const f = weather_units.parseForecast(content);
+            const country = if (self.config.weather_country.len != 0) self.config.weather_country else f.country;
+            const loc = if (self.config.weather_location.len != 0) self.config.weather_location else f.location;
+            const sys = weather_units.resolveSystem(self.config.weather_units, country);
+            return weather_units.renderLine(out, loc, f.reading, sys);
+        }
+        // 2) Live geo cache, personalized to the connecting user.
+        if (!self.config.geo_enabled) return "";
+        const nick = conn.session.displayName();
+        const country = self.metaValue(nick, "country");
+        var location = self.metaValue(nick, "location");
+        if (location.len == 0) location = self.config.weather_location;
+        if (location.len == 0) location = country; // GeoIP country geolocates on the source
+        if (location.len == 0) return "";
         const sys = weather_units.resolveSystem(self.config.weather_units, country);
-        return weather_units.renderLine(out, loc, f.reading, sys);
+        var loc_out: [64]u8 = undefined;
+        var desc_out: [48]u8 = undefined;
+        if (self.geo.getWeather(location, &loc_out, &desc_out)) |view| {
+            return weather_units.renderLine(out, view.location, view.reading, sys);
+        }
+        return "";
     }
 
-    /// Read the configured news source into `out` (first `news_count` non-empty
-    /// headlines joined with " | ") for the MOTD `{news}` placeholder.
-    fn motdNewsLine(self: *LinuxServer, io: std.Io, out: []u8) []const u8 {
-        if (!self.config.news_enabled or self.config.news_source.len == 0) return "";
-        const content = std.Io.Dir.cwd().readFileAlloc(io, self.config.news_source, self.allocator, .limited(8192)) catch return "";
-        defer self.allocator.free(content);
-        var n: u32 = 0;
+    /// Build the MOTD `{news}` line for the connecting client (first two
+    /// headlines joined with " | "). A configured `[news] source` file wins;
+    /// otherwise headlines come from the live geo cache, keyed by the user's
+    /// GeoIP country feed when one exists, else the default wire. Empty hides the
+    /// `{if:news}` block.
+    fn motdNewsLine(self: *LinuxServer, conn: *ConnState, io: std.Io, out: []u8) []const u8 {
+        // 1) File-based source (external updater) wins when configured.
+        if (self.config.news_enabled and self.config.news_source.len != 0) {
+            const content = std.Io.Dir.cwd().readFileAlloc(io, self.config.news_source, self.allocator, .limited(8192)) catch return "";
+            defer self.allocator.free(content);
+            var n: u32 = 0;
+            var w: usize = 0;
+            var it = std.mem.splitScalar(u8, content, '\n');
+            while (it.next()) |raw| {
+                if (n >= self.config.news_count) break;
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len == 0 or line[0] == '#') continue;
+                const sep: []const u8 = if (n == 0) "" else " | ";
+                if (w + sep.len + line.len > out.len) break;
+                @memcpy(out[w..][0..sep.len], sep);
+                w += sep.len;
+                @memcpy(out[w..][0..line.len], line);
+                w += line.len;
+                n += 1;
+            }
+            return out[0..w];
+        }
+        // 2) Live geo cache. Prefer the user's localized country feed; otherwise
+        //    a RANDOM verified general source, varied per connect for variety.
+        if (!self.config.geo_enabled) return "";
+        const nick = conn.session.displayName();
+        const cc = self.metaValue(nick, "country");
+        var nbuf: [512]u8 = undefined;
+        var lines: [5][]const u8 = undefined;
+        var keybuf: [80]u8 = undefined;
+        if (cc.len >= 2 and news_sources.countryFeed(cc[0..2]) != null) {
+            const key = std.fmt.bufPrint(&keybuf, "cc:{s}", .{cc[0..2]}) catch return "";
+            if (self.geo.getNews(key, &nbuf, &lines)) |got| return motdJoinHeadlines(got, out);
+        }
+        // Random general source, seeded by the clock mixed with the nick so each
+        // connect varies. A cold pick enqueues a background fetch (warming the
+        // pool); we try several and use the first warm one.
+        const seed = self.nowU64() ^ std.hash.Wyhash.hash(0, nick);
+        var attempt: usize = 0;
+        while (attempt < 6) : (attempt += 1) {
+            const src = news_sources.randomSource(seed +% attempt *% 0x9E3779B97F4A7C15);
+            const key = std.fmt.bufPrint(&keybuf, "src:{s}", .{src.key}) catch return "";
+            if (self.geo.getNews(key, &nbuf, &lines)) |got| return motdJoinHeadlines(got, out);
+        }
+        return "";
+    }
+
+    /// Join up to two cached headlines with " | " into `out` for the MOTD `{news}`
+    /// placeholder. Returns the written slice (borrows `out`).
+    fn motdJoinHeadlines(got: [][]const u8, out: []u8) []const u8 {
         var w: usize = 0;
-        var it = std.mem.splitScalar(u8, content, '\n');
-        while (it.next()) |raw| {
-            if (n >= self.config.news_count) break;
-            const line = std.mem.trim(u8, raw, " \t\r");
-            if (line.len == 0 or line[0] == '#') continue;
-            const sep: []const u8 = if (n == 0) "" else " | ";
-            if (w + sep.len + line.len > out.len) break;
+        const take = @min(got.len, 2);
+        for (got[0..take], 0..) |headline, idx| {
+            const sep: []const u8 = if (idx == 0) "" else " | ";
+            if (w + sep.len + headline.len > out.len) break;
             @memcpy(out[w..][0..sep.len], sep);
             w += sep.len;
-            @memcpy(out[w..][0..line.len], line);
-            w += line.len;
-            n += 1;
+            @memcpy(out[w..][0..headline.len], headline);
+            w += headline.len;
         }
         return out[0..w];
     }
@@ -9652,8 +9889,11 @@ pub const LinuxServer = struct {
         var weather_line: []const u8 = "";
         var news_line: []const u8 = "";
         if (self.config.crypto_io) |io| {
-            weather_line = self.motdWeatherLine(io, &weather_buf);
-            news_line = self.motdNewsLine(io, &news_buf);
+            // Ensure the background fetcher is running so the geo cache fills
+            // (idempotent; the MOTD reads cache only, never blocks on network).
+            if (self.config.geo_enabled) self.geo.start();
+            weather_line = self.motdWeatherLine(conn, io, &weather_buf);
+            news_line = self.motdNewsLine(conn, io, &news_buf);
         }
 
         const vars = motd_template.Vars{
@@ -9727,7 +9967,7 @@ pub const LinuxServer = struct {
             .build = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ build_info.git_commit,
             .branding = @tagName(builtin.mode),
             .reply_server = self.serverName(),
-            .description = "Orochi — pure-Zig mesh IRC daemon",
+            .description = self.config.server_description,
         };
         const line = serverinfo.writeVersionReply(&out_buf, .{ .server_name = self.serverName(), .requester = conn.session.displayName() }, info) catch return;
         try appendToConn(conn, line);
@@ -13160,7 +13400,7 @@ pub const LinuxServer = struct {
             }
             var time_buf: [40]u8 = undefined;
             const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
-            // +f noformat (IRCX NOFORMAT; ophion chm_nocolour): strip mIRC
+            // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
             // colour/formatting from the message body for every recipient.
             var nf_text_buf: [1024]u8 = undefined;
             var nf_msg_buf: [default_reply_bytes]u8 = undefined;
@@ -14052,6 +14292,64 @@ fn isBlockableCtcp(text: []const u8) bool {
     const action = "ACTION";
     if (body.len >= action.len and std.ascii.eqlIgnoreCase(body[0..action.len], action)) return false;
     return true;
+}
+
+/// Compose the RPL_WHOISSPECIAL geo/ASN phrase from the resolved parts:
+/// `is connecting from <city>, <region>, <country> · AS<asn> <org>`. Omits any
+/// missing piece; returns null when neither a location nor an ASN resolved.
+fn buildGeoWhois(
+    buf: []u8,
+    city: ?[]const u8,
+    region: ?[]const u8,
+    country: ?[]const u8,
+    asn: ?u32,
+    asn_org: ?[]const u8,
+) ?[]const u8 {
+    const Appender = struct {
+        buf: []u8,
+        w: usize = 0,
+        fn put(self: *@This(), s: []const u8) void {
+            const n = @min(s.len, self.buf.len - self.w);
+            @memcpy(self.buf[self.w..][0..n], s[0..n]);
+            self.w += n;
+        }
+    };
+    const ne = struct {
+        fn f(o: ?[]const u8) []const u8 {
+            return o orelse "";
+        }
+    }.f;
+    const parts = [_][]const u8{ ne(city), ne(region), ne(country) };
+    var has_loc = false;
+    for (parts) |p| {
+        if (p.len != 0) has_loc = true;
+    }
+    if (!has_loc and asn == null) return null;
+
+    var a = Appender{ .buf = buf };
+    a.put("is connecting from ");
+    if (has_loc) {
+        var sep = false;
+        for (parts) |p| {
+            if (p.len == 0) continue;
+            if (sep) a.put(", ");
+            a.put(p);
+            sep = true;
+        }
+    } else {
+        a.put("an unknown location");
+    }
+    if (asn) |n| {
+        a.put(" · AS");
+        var nb: [12]u8 = undefined;
+        a.put(std.fmt.bufPrint(&nb, "{d}", .{n}) catch "?");
+        const org = ne(asn_org);
+        if (org.len != 0) {
+            a.put(" ");
+            a.put(org);
+        }
+    }
+    return buf[0..a.w];
 }
 
 /// The host to show for `conn`: its visible (cloaked/vhost) host, falling back

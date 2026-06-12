@@ -63,6 +63,9 @@ pub const Config = struct {
         name: []const u8 = "Orochi",
         /// This server's own name (source prefix + S2S identity). Unique per node.
         server_name: ?[]const u8 = null,
+        /// Human description of THIS node, shown in VERSION and WHOIS 312 and
+        /// gossiped to mesh peers (per-server description). Null = generic tagline.
+        description: ?[]const u8 = null,
     };
 
     /// Message of the Day. `text` is served by the MOTD command (split on
@@ -249,6 +252,9 @@ pub const Config = struct {
     pub const Geoip = struct {
         /// Path to a MaxMind GeoIP database (.mmdb). Empty = GeoIP disabled.
         database: []const u8 = "",
+        /// Optional separate ASN database (.mmdb) for the WHOIS AS-number/org
+        /// line (city DBs don't carry ASN). Empty = no ASN in WHOIS.
+        asn_database: []const u8 = "",
     };
 
     pub const Sasl = struct {
@@ -332,6 +338,8 @@ pub const Config = struct {
         errdefer allocator.free(stats_dir);
         const geoip_db = try allocator.dupe(u8, "");
         errdefer allocator.free(geoip_db);
+        const geoip_asn_db = try allocator.dupe(u8, "");
+        errdefer allocator.free(geoip_asn_db);
         return .{
             .network = .{ .name = try allocator.dupe(u8, "Orochi") },
             .admin = .{
@@ -342,7 +350,7 @@ pub const Config = struct {
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
             .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
             .stats = .{ .dir = stats_dir },
-            .geoip = .{ .database = geoip_db },
+            .geoip = .{ .database = geoip_db, .asn_database = geoip_asn_db },
         };
     }
 
@@ -351,6 +359,7 @@ pub const Config = struct {
         if (self.node.secret_key) |value| allocator.free(value);
         allocator.free(self.network.name);
         if (self.network.server_name) |v| allocator.free(v);
+        if (self.network.description) |v| allocator.free(v);
         if (self.motd.text) |value| allocator.free(value);
         allocator.free(self.admin.location);
         allocator.free(self.admin.email);
@@ -385,6 +394,7 @@ pub const Config = struct {
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
         allocator.free(self.geoip.database);
+        allocator.free(self.geoip.asn_database);
         if (self.cloak.secret) |value| allocator.free(value);
         if (self.cloak.suffix) |value| allocator.free(value);
         allocator.free(self.tls.dns_name);
@@ -415,6 +425,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [network]
     try setStr(allocator, resolver, doc.getString("network.name"), &cfg.network.name);
     try setOpt(allocator, resolver, doc.getString("network.server_name"), &cfg.network.server_name);
+    try setOpt(allocator, resolver, doc.getString("network.description"), &cfg.network.description);
 
     // [motd] — `text` may use `@file:path` to load from disk.
     try setOpt(allocator, resolver, doc.getString("motd.text"), &cfg.motd.text);
@@ -512,6 +523,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getString("stats.interval")) |s| cfg.stats.interval_ms = @intCast(try durationMs(s));
 
     try setStr(allocator, resolver, doc.getString("geoip.database"), &cfg.geoip.database);
+    try setStr(allocator, resolver, doc.getString("geoip.asn_database"), &cfg.geoip.asn_database);
     cfg.media.stun_port = try portField(doc, "media.stun_port", cfg.media.stun_port);
 
     // [sasl]

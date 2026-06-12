@@ -121,6 +121,11 @@ pub const S2sPeer = struct {
     /// Inbound signed oper-grant payloads (raw oper_cred_share bytes) decoded
     /// from OPER_GRANT frames, awaiting the daemon to verify + ingest them.
     inbound_grants: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Remote channel membership changes (a peer's user joined/parted a channel)
+    /// that actually altered the route table, awaiting the daemon to surface them
+    /// as live `:nick JOIN/PART #chan` lines to local members. Re-affirmations
+    /// (anti-entropy re-bursts) never enqueue here, so no duplicate JOINs.
+    membership_changes: std.ArrayListUnmanaged(MembershipDelta) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -177,6 +182,8 @@ pub const S2sPeer = struct {
         self.inbound.deinit(self.allocator);
         for (self.inbound_grants.items) |g| self.allocator.free(g);
         self.inbound_grants.deinit(self.allocator);
+        for (self.membership_changes.items) |*d| d.deinit(self.allocator);
+        self.membership_changes.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -367,11 +374,60 @@ pub const S2sPeer = struct {
         return self.inbound.toOwnedSlice(self.allocator);
     }
 
+    /// A remote channel membership transition the daemon should reflect as a live
+    /// IRC line. `channel`/`nick` are heap-owned; the daemon frees them via
+    /// `deinit` after emitting the JOIN/PART.
+    pub const MembershipDelta = struct {
+        pub const Kind = enum { joined, parted, status };
+
+        channel: []u8,
+        nick: []u8,
+        kind: Kind,
+        /// New status bits (for joined/status); the member's prefix modes.
+        status: u4,
+        /// Previous status bits (for a `status` change), to diff the MODE.
+        prev_status: u4,
+
+        pub fn deinit(self: *MembershipDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.channel);
+            allocator.free(self.nick);
+            self.* = undefined;
+        }
+    };
+
+    /// Drain the queued remote membership changes. Caller owns the slice and each
+    /// delta's strings (call `deinit` per entry, then free the slice).
+    pub fn takeMembershipChanges(self: *S2sPeer) ![]MembershipDelta {
+        return self.membership_changes.toOwnedSlice(self.allocator);
+    }
+
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
-    /// malformed payload is dropped, never fatal to the link.
+    /// malformed payload is dropped, never fatal to the link. A real add/remove/
+    /// status-change is queued so the daemon can emit the matching live IRC line.
     fn recvMembership(self: *S2sPeer, payload: []const u8) !void {
         const ev = membership_event.decode(payload) catch return;
-        self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present) catch {};
+        const res = self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present) catch return;
+        const kind: MembershipDelta.Kind = switch (res.outcome) {
+            .joined => .joined,
+            .parted => .parted,
+            .status_changed => .status,
+            .unchanged => return,
+        };
+        const ch = self.allocator.dupe(u8, ev.channel) catch return;
+        const nk = self.allocator.dupe(u8, ev.nick) catch {
+            self.allocator.free(ch);
+            return;
+        };
+        self.membership_changes.append(self.allocator, .{
+            .channel = ch,
+            .nick = nk,
+            .kind = kind,
+            .status = ev.status,
+            .prev_status = res.prev_status,
+        }) catch {
+            self.allocator.free(ch);
+            self.allocator.free(nk);
+        };
     }
 
     /// Emit a MEMBERSHIP event to the peer announcing a local member's presence

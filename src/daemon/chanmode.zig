@@ -671,6 +671,17 @@ fn memberBit(mode: MemberMode) u8 {
     return @as(u8, 1) << @as(u3, @intCast(@intFromEnum(mode)));
 }
 
+/// The channel-mode letter that grants `mode` (the `(YQqov)` set, minus the
+/// derived oper `Y`). Used to render a MODE line for a member's prefix.
+pub fn memberModeLetter(mode: MemberMode) u8 {
+    return switch (mode) {
+        .founder => 'Q',
+        .owner => 'q',
+        .op => 'o',
+        .voice => 'v',
+    };
+}
+
 fn validParamByte(ch: u8) bool {
     return switch (ch) {
         0, ' ', '\t', '\r', '\n' => false,

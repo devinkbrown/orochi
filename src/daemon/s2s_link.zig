@@ -213,6 +213,12 @@ pub const S2sLink = struct {
         return self.peer.takeInbound();
     }
 
+    /// Drain remote channel membership changes (JOIN/PART) the daemon should
+    /// surface to local members. Caller owns the slice + each delta's strings.
+    pub fn takeMembershipChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.MembershipDelta {
+        return self.peer.takeMembershipChanges();
+    }
+
     /// Forward a signed cross-mesh operator grant to the peer (best-effort; only
     /// meaningful once established). `signed` is opaque `oper_cred_share` bytes.
     pub fn sendOperGrant(self: *S2sLink, signed: []const u8) !void {

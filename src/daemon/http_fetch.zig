@@ -16,6 +16,7 @@ const posix = std.posix;
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 const tls_client = @import("../crypto/tls_client.zig");
+const tls12_client = @import("../crypto/tls12_client.zig");
 const http1 = @import("../proto/http1_client.zig");
 const net = std.Io.net;
 
@@ -29,7 +30,7 @@ pub const Error = error{
     ConnectionClosed,
     RecvTimeout,
     ResponseTooLarge,
-} || std.mem.Allocator.Error || tls_client.Error;
+} || std.mem.Allocator.Error || tls_client.Error || tls12_client.Error;
 
 const max_tls_record = 16 * 1024 + 512;
 
@@ -95,15 +96,106 @@ pub fn get(
     opts: Options,
 ) Error![]u8 {
     const addr = try resolveHostA(host, port, opts.recv_timeout_ms);
-    const fd = try connectAddr(addr, opts.connect_timeout_ms);
-    defer closeFd(fd);
-    setRecvTimeout(fd, opts.recv_timeout_ms);
 
     if (!tls) {
+        const fd = try connectAddr(addr, opts.connect_timeout_ms);
+        defer closeFd(fd);
+        setRecvTimeout(fd, opts.recv_timeout_ms);
         try writeAll(fd, request_bytes);
         return try readHttp(allocator, fd, opts.max_response_bytes);
     }
-    return try getTls(allocator, fd, host, request_bytes, opts);
+
+    // Try TLS 1.3 first (the preferred client). Many RSS/CDN hosts still serve
+    // TLS 1.2 only (or trip the 1.3 client), so on any handshake/transport
+    // failure fall back to the hardened TLS 1.2 client on a *fresh* connection
+    // (the failed handshake consumed the first socket). `ResponseTooLarge` means
+    // 1.3 actually worked — don't retry that.
+    {
+        const fd = try connectAddr(addr, opts.connect_timeout_ms);
+        defer closeFd(fd);
+        setRecvTimeout(fd, opts.recv_timeout_ms);
+        if (getTls(allocator, fd, host, request_bytes, opts)) |resp| {
+            return resp;
+        } else |err| switch (err) {
+            error.ResponseTooLarge => return err,
+            else => {},
+        }
+    }
+    const fd2 = try connectAddr(addr, opts.connect_timeout_ms);
+    defer closeFd(fd2);
+    setRecvTimeout(fd2, opts.recv_timeout_ms);
+    return try getTls12(allocator, fd2, host, request_bytes, opts);
+}
+
+/// TLS 1.2 variant of `getTls` (hardened `tls12_client`). Used as the fallback
+/// when the TLS 1.3 handshake fails — broadens outbound reach to TLS-1.2-only
+/// hosts. Mirrors `getTls` but uses the 1.2 client's `decrypt` (no KeyUpdate).
+fn getTls12(
+    allocator: std.mem.Allocator,
+    fd: linux.fd_t,
+    host: []const u8,
+    request_bytes: []const u8,
+    opts: Options,
+) Error![]u8 {
+    var tc = try tls12_client.Client.init(allocator, .{
+        .server_name = host,
+        .trust_anchors = opts.trust_anchors,
+        .alpn_protocols = &.{"http/1.1"},
+        .now_unix_seconds = wallClockSeconds(),
+    });
+    defer tc.deinit();
+    if (opts.insecure_skip_verify) tc.skipServerCertVerifyForTest();
+
+    {
+        const hello = try tc.start();
+        defer allocator.free(hello);
+        try writeAll(fd, hello);
+    }
+    var read_buf: [max_tls_record]u8 = undefined;
+    while (!tc.handshakeDone()) {
+        const n = try readSome(fd, &read_buf);
+        switch (try tc.feed(read_buf[0..n])) {
+            .need_more => {},
+            .bytes_to_send => |out| {
+                defer allocator.free(out);
+                try writeAll(fd, out);
+            },
+        }
+    }
+    {
+        const record = try tc.encrypt(request_bytes);
+        defer allocator.free(record);
+        try writeAll(fd, record);
+    }
+
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
+    try pending.appendSlice(allocator, tc.pendingBytes());
+    var plaintext: std.ArrayList(u8) = .empty;
+    defer plaintext.deinit(allocator);
+
+    read_loop: while (true) {
+        while (frameRecordLen(pending.items)) |rec_len| {
+            const rec = pending.items[0..rec_len];
+            const pt = tc.decrypt(rec) catch |err| switch (err) {
+                error.TlsAlert => break :read_loop, // close_notify ends the stream
+                else => return err,
+            };
+            defer allocator.free(pt);
+            if (plaintext.items.len + pt.len > opts.max_response_bytes) return error.ResponseTooLarge;
+            try plaintext.appendSlice(allocator, pt);
+            consumePrefix(&pending, rec_len);
+            if (http1.isComplete(plaintext.items)) break :read_loop;
+        }
+        if (http1.isComplete(plaintext.items)) break;
+        const n = readSome(fd, &read_buf) catch |err| switch (err) {
+            error.ConnectionClosed => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        try pending.appendSlice(allocator, read_buf[0..n]);
+    }
+    return plaintext.toOwnedSlice(allocator);
 }
 
 fn getTls(
