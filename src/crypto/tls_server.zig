@@ -164,6 +164,16 @@ const CipherSuite = enum(u16) {
             .sha384 => Sha384.hash_len,
         };
     }
+
+    /// IANA registry name of the suite (static string, e.g.
+    /// "TLS_AES_128_GCM_SHA256") — surfaced to users in WHOIS 671.
+    fn name(self: CipherSuite) []const u8 {
+        return switch (self) {
+            .tls_aes_128_gcm_sha256 => "TLS_AES_128_GCM_SHA256",
+            .tls_aes_256_gcm_sha384 => "TLS_AES_256_GCM_SHA384",
+            .tls_chacha20_poly1305_sha256 => "TLS_CHACHA20_POLY1305_SHA256",
+        };
+    }
 };
 
 const State = enum {
@@ -318,6 +328,14 @@ pub const Server = struct {
 
     pub fn selectedAlpn(self: *const Server) ?[]const u8 {
         return self.selected_alpn;
+    }
+
+    /// IANA name of the negotiated cipher suite ("TLS_AES_128_GCM_SHA256"),
+    /// or null before the ServerHello selects one. The returned string is
+    /// static — safe to retain for the connection's lifetime.
+    pub fn cipherName(self: *const Server) ?[]const u8 {
+        const suite = self.selected_suite orelse return null;
+        return suite.name();
     }
 
     /// Return the per-server ticket key so a replacement `Server` can accept
@@ -1698,6 +1716,9 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
     defer client.deinit();
 
+    // No suite negotiated before the ClientHello is processed.
+    try std.testing.expectEqual(@as(?[]const u8, null), server.cipherName());
+
     const ch = try client.start();
     defer alloc.free(ch);
     const sflight = switch (try server.feed(ch)) {
@@ -1715,6 +1736,11 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
 
     _ = try server.feed(cfin);
     try std.testing.expect(server.handshakeDone());
+
+    // The negotiated suite renders as its IANA name for WHOIS 671. The server
+    // prefers AES-128-GCM whenever the client offers it (pickSuite).
+    const negotiated = server.cipherName() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("TLS_AES_128_GCM_SHA256", negotiated);
 
     // Server -> client application data.
     const s2c = try server.encrypt("hello client");

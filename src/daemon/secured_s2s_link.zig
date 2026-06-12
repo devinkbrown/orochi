@@ -142,6 +142,22 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.routeNickNode(nick) else null;
     }
 
+    /// Find `nick` in this peer's converged remote channel rosters (ASCII
+    /// case-insensitive). Borrowed; valid until the next membership mutation.
+    pub fn findRemoteMember(self: *const SecuredLink, nick: []const u8) ?s2s_peer.MemberInfo {
+        return if (self.inner) |l| l.findRemoteMember(nick) else null;
+    }
+
+    /// Server name registered for `node` (handshake or gossiped registry).
+    pub fn nodeName(self: *const SecuredLink, node: u64) ?[]const u8 {
+        return if (self.inner) |l| l.nodeName(node) else null;
+    }
+
+    /// Server description registered for `node`, or null when unknown/empty.
+    pub fn nodeDescription(self: *const SecuredLink, node: u64) ?[]const u8 {
+        return if (self.inner) |l| l.nodeDescription(node) else null;
+    }
+
     /// Announce a local member to the peer over the secured CRDT link (no-op until
     /// established). Outbound bytes accumulate in `out`.
     pub fn sendMembership(self: *SecuredLink, channel: []const u8, nick: []const u8, status: u4, hlc: u64, present: bool) anyerror!void {

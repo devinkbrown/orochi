@@ -104,6 +104,10 @@ pub const WhoisSubject = struct {
     certfp: ?[]const u8 = null,
     /// RPL_WHOISSECURE (671) when the target is connected over TLS.
     is_secure: bool = false,
+    /// Negotiated TLS cipher suite name (e.g. "TLS_AES_128_GCM_SHA256"),
+    /// appended to the 671 trailing as "... secure connection (<cipher>)".
+    /// Only rendered when `is_secure` is set; null keeps the plain wording.
+    secure_cipher: ?[]const u8 = null,
     /// RPL_WHOISACTUALLY (338): the target's real host/IP, shown only to opers
     /// (or the user themselves). Null suppresses the line.
     actual_host: ?[]const u8 = null,
@@ -198,7 +202,7 @@ pub fn writeWhoisWith(
         try writeWhoisCertfpLine(params, sink, server_name, requester_nick, subject.nick, fp);
     }
     if (subject.is_secure) {
-        try writeWhoisSecureLine(params, sink, server_name, requester_nick, subject.nick);
+        try writeWhoisSecureLine(params, sink, server_name, requester_nick, subject.nick, subject.secure_cipher);
     }
     if (subject.geo) |geo_text| {
         try writeWhoisGeoLine(params, sink, server_name, requester_nick, subject.nick, geo_text);
@@ -587,12 +591,20 @@ fn writeWhoisSecureLine(
     server_name: []const u8,
     requester_nick: []const u8,
     subject_nick: []const u8,
+    cipher: ?[]const u8,
 ) WhoisError!void {
     var b = try sink.beginLine();
     b.max_line_bytes = params.max_line_bytes;
     try b.numericPrefix(whois_secure_code, server_name, requester_nick);
     try b.spaceParam(subject_nick);
     try b.spaceTrailing("is using a secure connection");
+    if (cipher) |c| {
+        if (c.len > 0) {
+            try b.appendBytes(" (");
+            try b.appendBytes(c);
+            try b.appendBytes(")");
+        }
+    }
     try b.crlf();
     try sink.commitLine(&b);
 }
@@ -837,6 +849,44 @@ test "secure connection emits RPL_WHOISSECURE 671 before end" {
     }
     try std.testing.expect(found_671);
     try std.testing.expect(idx_671 < idx_end); // before End of /WHOIS
+}
+
+test "secure connection with negotiated cipher renders it in the 671 trailing" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.is_secure = true;
+    subject.secure_cipher = "TLS_AES_128_GCM_SHA256";
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    var found_671 = false;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 671 ") != null) {
+            found_671 = true;
+            try std.testing.expectEqualStrings(
+                ":irc.example 671 dan alice :is using a secure connection (TLS_AES_128_GCM_SHA256)\r\n",
+                line.bytes,
+            );
+        }
+    }
+    try std.testing.expect(found_671);
+}
+
+test "secure cipher without is_secure stays suppressed" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.is_secure = false;
+    subject.secure_cipher = "TLS_AES_128_GCM_SHA256";
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    for (sink.slice()) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line.bytes, " 671 ") == null);
+    }
 }
 
 test "actual_host emits RPL_WHOISACTUALLY 338 after the server line" {

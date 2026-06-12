@@ -317,6 +317,21 @@ pub const RouteTable = struct {
         return list.entries.items;
     }
 
+    /// Scan every channel roster for `nick` (ASCII case-insensitive, matching
+    /// the daemon's nick comparison) and return the first match by value. The
+    /// returned `nick` slice is borrowed from the table — valid until the next
+    /// `applyMembership`/eviction. Channel membership is the only mesh-wide
+    /// nick replication, so a remote user in no channels is not findable here.
+    pub fn findMember(self: *const Self, nick: []const u8) ?Member {
+        var it = self.channel_members.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.entries.items) |m| {
+                if (std.ascii.eqlIgnoreCase(m.nick, nick)) return m;
+            }
+        }
+        return null;
+    }
+
     fn ensureMemberList(self: *Self, chan: []const u8) Error!*MemberList {
         if (self.channel_members.getPtr(chan)) |list| return list;
         const owned = try self.allocator.dupe(u8, chan);
@@ -523,6 +538,23 @@ test "applyMembership tracks remote channel members with last-writer-wins" {
         if (std.mem.eql(u8, m.nick, "alice")) alice_status = m.status;
     }
     try std.testing.expectEqual(@as(u4, 0b0010), alice_status.?);
+}
+
+test "findMember locates a roster member case-insensitively with its node" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    try table.applyMembership("#chat", "Alice", 10, 0b0100, 1, true);
+    try table.applyMembership("#ops", "bob", 20, 0, 1, true);
+
+    const alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Alice", alice.nick);
+    try std.testing.expectEqual(@as(NodeId, 10), alice.node);
+
+    const bob = table.findMember("BOB") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(NodeId, 20), bob.node);
+
+    try std.testing.expect(table.findMember("carol") == null);
 }
 
 test "applyMembership part removes a member and prunes an empty channel" {

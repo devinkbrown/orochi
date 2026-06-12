@@ -130,6 +130,17 @@ pub const TlsConn = struct {
         };
     }
 
+    /// IANA name of the negotiated cipher suite (e.g. "TLS_AES_128_GCM_SHA256"),
+    /// or null until the chosen engine has selected one. The returned string is
+    /// static — safe to hold for the connection's lifetime (WHOIS 671).
+    pub fn cipherName(self: *const TlsConn) ?[]const u8 {
+        return switch (self.engine) {
+            .undecided => null,
+            .tls13 => |*s| s.cipherName(),
+            .tls12 => |*s| s.cipherName(),
+        };
+    }
+
     /// The verified client leaf DER (mTLS), or null. mTLS client auth is a
     /// TLS 1.3-only path here; the hardened 1.2 engine never requests a cert.
     pub fn clientCertDer(self: *const TlsConn) ?[]const u8 {

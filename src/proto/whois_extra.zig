@@ -70,6 +70,51 @@ pub fn writeWhoisSecureWith(
     );
 }
 
+/// Append `RPL_WHOISSECURE` (671) carrying the negotiated cipher suite name,
+/// e.g. `:is using a secure connection (TLS_AES_128_GCM_SHA256)`.
+pub fn writeWhoisSecureCipher(
+    allocator: std.mem.Allocator,
+    sink: *std.ArrayList(u8),
+    server_name: []const u8,
+    requester_nick: []const u8,
+    target_nick: []const u8,
+    cipher: []const u8,
+) WhoisExtraError!void {
+    return writeWhoisSecureCipherWith(.{}, allocator, sink, server_name, requester_nick, target_nick, cipher);
+}
+
+/// Append `RPL_WHOISSECURE` (671) with a cipher name, caller-selected limits.
+pub fn writeWhoisSecureCipherWith(
+    comptime params: Params,
+    allocator: std.mem.Allocator,
+    sink: *std.ArrayList(u8),
+    server_name: []const u8,
+    requester_nick: []const u8,
+    target_nick: []const u8,
+    cipher: []const u8,
+) WhoisExtraError!void {
+    try validateEnvelopeWith(params, server_name, requester_nick, target_nick);
+    try validateParamWith(params, cipher);
+
+    var trailing_buf: [160]u8 = undefined;
+    const trailing = std.fmt.bufPrint(
+        &trailing_buf,
+        "is using a secure connection ({s})",
+        .{cipher},
+    ) catch return error.MessageTooLong;
+
+    try appendNumericLineRaw(
+        params,
+        allocator,
+        sink,
+        rpl_whoissecure_code,
+        server_name,
+        requester_nick,
+        &.{target_nick},
+        trailing,
+    );
+}
+
 /// Append `RPL_WHOISCERTFP` (276).
 pub fn writeWhoisCertfp(
     allocator: std.mem.Allocator,
@@ -382,6 +427,18 @@ test "builds WHOIS secure 671" {
 
     try std.testing.expectEqualStrings(
         ":irc.example 671 dan alice :is using a secure connection\r\n",
+        out.items,
+    );
+}
+
+test "builds WHOIS secure 671 with negotiated cipher" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+
+    try writeWhoisSecureCipher(std.testing.allocator, &out, "irc.example", "dan", "alice", "TLS_AES_128_GCM_SHA256");
+
+    try std.testing.expectEqualStrings(
+        ":irc.example 671 dan alice :is using a secure connection (TLS_AES_128_GCM_SHA256)\r\n",
         out.items,
     );
 }

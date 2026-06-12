@@ -261,6 +261,26 @@ pub const S2sPeer = struct {
         return self.routes.nickNode(nick);
     }
 
+    /// Find `nick` in this peer's converged remote channel rosters (ASCII
+    /// case-insensitive). The returned member's `nick` slice is borrowed from
+    /// the route table — valid until the next membership mutation.
+    pub fn findRemoteMember(self: *const S2sPeer, nick: []const u8) ?MemberInfo {
+        return self.routes.findMember(nick);
+    }
+
+    /// Server name registered for `node` (handshake or gossiped registry), or
+    /// null when the node is unknown. Borrowed from the registry entry.
+    pub fn nodeName(self: *const S2sPeer, node: NodeId) ?[]const u8 {
+        const entry = self.registry.get(node) orelse return null;
+        return entry.name;
+    }
+
+    /// Server description registered for `node`, or null when unknown/empty.
+    pub fn nodeDescription(self: *const S2sPeer, node: NodeId) ?[]const u8 {
+        const entry = self.registry.get(node) orelse return null;
+        return if (entry.description.len != 0) entry.description else null;
+    }
+
     /// Copy this peer's known-server registry into `out` as (node_id, uplink)
     /// topology entries for partition analysis, returning the count written. The
     /// gossiped registry encodes the mesh as a tree via each node's uplink.

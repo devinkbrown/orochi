@@ -32,6 +32,7 @@ const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
+const world_projection = @import("world_projection.zig");
 const sasl = @import("../proto/sasl.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const certfp = @import("../proto/certfp.zig");
@@ -860,6 +861,19 @@ fn formatNumericCode(code: Numeric, buf: []u8) []const u8 {
     buf[1] = @as(u8, '0') + @as(u8, @intCast((value / 10) % 10));
     buf[2] = @as(u8, '0') + @as(u8, @intCast(value % 10));
     return buf[0..3];
+}
+
+/// WHOIS operator flags for a REMOTE user derived from a propagated cross-mesh
+/// oper grant's privilege bits: `oper_override` renders "is an IRC operator",
+/// `server_admin` upgrades the wording to Network Administrator. Zero bits
+/// (a revocation tombstone) grants nothing.
+const RemoteOperStatus = struct { is_oper: bool, is_admin: bool };
+
+fn remoteGrantWhoisStatus(privilege_bits: u64) RemoteOperStatus {
+    if (privilege_bits == 0) return .{ .is_oper = false, .is_admin = false };
+    const privs = oper_mod.OperPrivileges.fromBits(privilege_bits);
+    const admin = privs.has(.server_admin);
+    return .{ .is_oper = admin or privs.has(.oper_override), .is_admin = admin };
 }
 
 pub const ServerError = error{
@@ -3789,6 +3803,12 @@ pub const LinuxServer = struct {
                 conn.session.tls_certfp = conn.certfp_buf[0..];
             }
         }
+        // Capture the negotiated cipher suite once the handshake completes, so
+        // WHOIS 671 can show it. cipherName() returns a static string — no
+        // per-connection backing or lifetime concern.
+        if (conn.session.tls_cipher == null and conn.tls.?.handshakeDone()) {
+            conn.session.tls_cipher = conn.tls.?.cipherName();
+        }
         if (outcome.handshake_bytes.len != 0) {
             appendToConn(conn, outcome.handshake_bytes) catch {
                 conn.closing = true;
@@ -5559,6 +5579,13 @@ pub const LinuxServer = struct {
         const target_wid = self.world.findNick(target_nick);
         const target_conn: ?*ConnState = if (target_wid) |w| self.connFor(clientIdFromWorld(w)) else null;
         if (target_wid == null or target_conn == null) {
+            // Not a local client: try the mesh projection before giving up. A
+            // remote member announced by an established S2S peer gets a minimal
+            // WHOIS (311/312/313/318) built from converged mesh state.
+            if (self.findRemoteWhois(target_nick)) |remote| {
+                self.sendRemoteWhois(conn, &sink, remote) catch return;
+                return;
+            }
             whois.writeNoSuchNick(&sink, self.serverName(), conn.session.displayName(), target_nick) catch return;
             for (sink.slice()) |line| try appendToConn(conn, line.bytes);
             return;
@@ -5620,8 +5647,11 @@ pub const LinuxServer = struct {
             // RPL_WHOISCERTFP (276): surface the TLS client-cert fingerprint of a
             // mutual-TLS user (the same value SASL EXTERNAL matches to an account).
             .certfp = tconn.session.tls_certfp,
-            // RPL_WHOISSECURE (671): the target is connected over TLS.
+            // RPL_WHOISSECURE (671): the target is connected over TLS, with the
+            // negotiated cipher suite name when the handshake recorded one
+            // (local connections only; remote users carry no local TLS state).
             .is_secure = tconn.is_tls,
+            .secure_cipher = tconn.session.tls_cipher,
             // RPL_WHOISACTUALLY (338): real host/IP, shown only to opers or self.
             .actual_host = if (conn.session.isOper() or conn == tconn) blk: {
                 const rh = tconn.session.realHost();
@@ -5636,6 +5666,89 @@ pub const LinuxServer = struct {
             },
         };
         whois.writeWhois(&sink, self.serverName(), conn.session.displayName(), subject) catch return;
+        for (sink.slice()) |line| try appendToConn(conn, line.bytes);
+    }
+
+    /// A remote (mesh) WHOIS subject resolved from S2S peer rosters: the nick
+    /// as the roster spells it plus its origin server — the owning node's
+    /// registry name when known, falling back to the direct peer's name for an
+    /// unmapped multi-hop node. Channel rosters are the only mesh-wide nick
+    /// replication today, so a remote user in no channels stays unfindable
+    /// (full per-nick origin tracking would need a nick→origin gossip table).
+    const RemoteWhois = struct {
+        nick: []const u8,
+        server: []const u8,
+        server_info: ?[]const u8,
+    };
+
+    /// Resolve `nick` as a remote mesh member via any established S2S peer
+    /// (secured or plaintext). Borrowed slices; valid within this handler turn.
+    fn findRemoteWhois(self: *LinuxServer, nick: []const u8) ?RemoteWhois {
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                if (remoteWhoisFromLink(link, nick)) |rw| return rw;
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                if (remoteWhoisFromLink(link, nick)) |rw| return rw;
+            }
+        }
+        return null;
+    }
+
+    /// Per-link roster probe (duck-typed over S2sLink / SecuredLink — both
+    /// expose findRemoteMember + nodeName + nodeDescription + remoteName).
+    fn remoteWhoisFromLink(link: anytype, nick: []const u8) ?RemoteWhois {
+        const member = link.findRemoteMember(nick) orelse return null;
+        // RPL_WHOISSERVER (312): the owning node's registry entry names the
+        // remote user's actual home server; an unmapped multi-hop node falls
+        // back to the direct peer's name.
+        if (link.nodeName(member.node)) |name| {
+            return .{ .nick = member.nick, .server = name, .server_info = link.nodeDescription(member.node) };
+        }
+        const direct = link.remoteName();
+        return .{
+            .nick = member.nick,
+            .server = if (direct.len != 0) direct else default_host,
+            .server_info = null,
+        };
+    }
+
+    /// Emit the minimal WHOIS sequence for a remote mesh member: 311 with the
+    /// NAMES-projection identity (placeholder user, origin server as host),
+    /// 312 with the actual home server, RPL_WHOISOPERATOR (313) when a live
+    /// propagated oper grant covers the nick, and 318. Idle/away/671/276 need
+    /// per-user state remote nodes don't replicate, so they are omitted.
+    fn sendRemoteWhois(
+        self: *LinuxServer,
+        conn: *ConnState,
+        sink: *whois.WhoisLineSink,
+        remote: RemoteWhois,
+    ) !void {
+        var is_oper = false;
+        var is_admin = false;
+        var oper_title: ?[]const u8 = null;
+        // Cross-mesh oper grants are keyed by account and matched to the nick
+        // (same convention as isOverrideOper / the `*` status prefix).
+        if (self.oper_grants.lookup(remote.nick, self.nowU64())) |g| {
+            const status = remoteGrantWhoisStatus(g.privilege_bits);
+            is_oper = status.is_oper;
+            is_admin = status.is_admin;
+            if (is_oper and g.title.len > 0) oper_title = g.title;
+        }
+        const subject = whois.WhoisSubject{
+            .nick = remote.nick,
+            .user = world_projection.remote_user_placeholder,
+            .host = remote.server,
+            .realname = "Remote mesh user",
+            .server = remote.server,
+            .server_info = remote.server_info,
+            .is_oper = is_oper,
+            .is_admin = is_admin,
+            .oper_title = oper_title,
+        };
+        whois.writeWhois(sink, self.serverName(), conn.session.displayName(), subject) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
     }
 
@@ -14289,6 +14402,33 @@ const LiveClient = struct {
     }
 };
 
+test "remoteGrantWhoisStatus maps grant privilege bits to WHOIS 313 flags" {
+    // No grant bits (revocation tombstone): no operator line at all.
+    const none = remoteGrantWhoisStatus(0);
+    try std.testing.expect(!none.is_oper and !none.is_admin);
+
+    // oper_override alone: "is an IRC operator".
+    const override_bits = oper_mod.OperPrivileges.initMany(&.{.oper_override}).toBits();
+    const oper_only = remoteGrantWhoisStatus(override_bits);
+    try std.testing.expect(oper_only.is_oper);
+    try std.testing.expect(!oper_only.is_admin);
+
+    // server_admin upgrades the wording to Network Administrator.
+    const admin_bits = oper_mod.OperPrivileges.initMany(&.{ .oper_override, .server_admin }).toBits();
+    const admin = remoteGrantWhoisStatus(admin_bits);
+    try std.testing.expect(admin.is_oper);
+    try std.testing.expect(admin.is_admin);
+
+    // server_admin without oper_override still renders the operator line.
+    const admin_only = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.server_admin}).toBits());
+    try std.testing.expect(admin_only.is_oper);
+    try std.testing.expect(admin_only.is_admin);
+
+    // Unrelated privileges (no override/admin) stay silent in WHOIS.
+    const plain = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits());
+    try std.testing.expect(!plain.is_oper and !plain.is_admin);
+}
+
 test "processLine answers PING with bare PONG token" {
     const allocator = std.testing.allocator;
     _ = allocator;
@@ -18003,6 +18143,34 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         if (std.mem.indexOf(u8, a.written(), "remote.test") != null) learned = true;
     }
     try std.testing.expect(learned);
+
+    // Remote WHOIS via the mesh projection: the fake peer announces a channel
+    // member on its side of the link; once the MEMBERSHIP frame lands, the
+    // server answers WHOIS for that nick from the converged roster — 311 with
+    // the placeholder identity (user "mesh", host = origin) and 312 naming the
+    // member's actual home server (remote.test), not the local server.
+    try peer.sendMembership("#mesh", "Zed", 0b0100, now + 1, true);
+    if (peer.outbound().len != 0) {
+        try writeAllFd(peer_fd, peer.outbound());
+        peer.clearOutbound();
+    }
+    var whois_seen = false;
+    probes = 0;
+    while (probes < 60 and !whois_seen) : (probes += 1) {
+        a.reset();
+        try writeAllFd(fd_a, "WHOIS Zed\r\n");
+        // " A Zed" arrives on BOTH outcomes (401 A Zed / 311 A Zed), so a miss
+        // cycles quickly instead of riding out the full recvUntil budget.
+        recvUntil(&a, " A Zed", 200) catch {};
+        if (std.mem.indexOf(u8, a.written(), " 311 A Zed ") != null) {
+            recvUntil(&a, " 318 A Zed", 200) catch {};
+            const got = a.written();
+            if (std.mem.indexOf(u8, got, " 311 A Zed mesh remote.test ") != null and
+                std.mem.indexOf(u8, got, " 312 A Zed remote.test ") != null) whois_seen = true;
+        }
+    }
+    try std.testing.expect(whois_seen);
+
     a.reset();
     try writeAllFd(fd_a, "SQUIT remote.test\r\n");
     try recvUntil(&a, "SQUIT complete", 200);
@@ -18107,6 +18275,35 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
         if (std.mem.indexOf(u8, c.written(), "node2.test") != null) linked = true;
     }
     try std.testing.expect(linked);
+
+    // Remote WHOIS via the mesh projection: D joins a channel on node 2; once
+    // the membership gossip lands, node 1 answers WHOIS D from the converged
+    // roster — 311 with the placeholder identity (user "mesh", host = origin)
+    // and 312 naming D's actual home server, not the local one.
+    const fd_d = connectLoopback(node2.boundPort() catch 0) catch return error.SkipZigTest;
+    defer closeFd(fd_d);
+    var d = LiveClient{ .fd = fd_d };
+    try writeAllFd(fd_d, "NICK D\r\nUSER dave 0 * :Dave\r\n");
+    try recvUntil(&d, " 001 D ", 200);
+    try writeAllFd(fd_d, "JOIN #mesh\r\n");
+    try recvUntil(&d, "JOIN", 200);
+
+    var whois_seen = false;
+    probes = 0;
+    while (probes < 120 and !whois_seen) : (probes += 1) {
+        c.reset();
+        try writeAllFd(fd_c, "WHOIS D\r\n");
+        // " C D " arrives on BOTH outcomes (401 C D / 311 C D), so a miss
+        // cycles quickly instead of riding out the full recvUntil budget.
+        recvUntil(&c, " C D ", 200) catch {};
+        if (std.mem.indexOf(u8, c.written(), " 311 C D ") != null) {
+            recvUntil(&c, " 318 C D ", 200) catch {};
+            const got = c.written();
+            if (std.mem.indexOf(u8, got, " 311 C D mesh node2.test ") != null and
+                std.mem.indexOf(u8, got, " 312 C D node2.test ") != null) whois_seen = true;
+        }
+    }
+    try std.testing.expect(whois_seen);
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {

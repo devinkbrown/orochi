@@ -149,6 +149,22 @@ pub const S2sLink = struct {
         return self.peer.routeNickNode(nick);
     }
 
+    /// Find `nick` in this peer's converged remote channel rosters (ASCII
+    /// case-insensitive). Borrowed; valid until the next membership mutation.
+    pub fn findRemoteMember(self: *const S2sLink, nick: []const u8) ?s2s_peer.MemberInfo {
+        return self.peer.findRemoteMember(nick);
+    }
+
+    /// Server name registered for `node` (handshake or gossiped registry).
+    pub fn nodeName(self: *const S2sLink, node: NodeId) ?[]const u8 {
+        return self.peer.nodeName(node);
+    }
+
+    /// Server description registered for `node`, or null when unknown/empty.
+    pub fn nodeDescription(self: *const S2sLink, node: NodeId) ?[]const u8 {
+        return self.peer.nodeDescription(node);
+    }
+
     /// The remote server's name once the handshake has been processed (empty
     /// before establishment).
     pub fn remoteName(self: *const S2sLink) []const u8 {

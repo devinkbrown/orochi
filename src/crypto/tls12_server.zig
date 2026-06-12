@@ -127,6 +127,13 @@ pub const Server = struct {
         return if (self.selected_alpn) |p| p else null;
     }
 
+    /// IANA name of the negotiated cipher suite, or null before the ClientHello
+    /// selects one. The returned string is static.
+    pub fn cipherName(self: *const Server) ?[]const u8 {
+        const suite = self.selected_suite orelse return null;
+        return suite.name();
+    }
+
     pub fn feed(self: *Server, received: []const u8) Error!FeedResult {
         if (self.state == .connected) return error.BadState;
         try self.recv_buf.appendSlice(self.allocator, received);

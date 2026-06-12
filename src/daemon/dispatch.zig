@@ -671,6 +671,11 @@ pub const ClientSession = struct {
     /// Hex-encoded TLS client-certificate fingerprint, set at accept when the
     /// connection presents a client cert. Drives SASL EXTERNAL; null = no cert.
     tls_certfp: ?[]const u8 = null,
+    /// IANA name of the negotiated TLS cipher suite (e.g.
+    /// "TLS_AES_128_GCM_SHA256"), captured when the handshake completes. Points
+    /// at a static string table, so no per-connection backing is needed; null on
+    /// plaintext connections. Surfaced in the WHOIS 671 (RPL_WHOISSECURE) text.
+    tls_cipher: ?[]const u8 = null,
     /// Server nonce for SCRAM challenges. Borrowed for the router's lifetime; the
     /// live server points this at `sasl_server_nonce_buf` via setSaslServerNonce.
     sasl_server_nonce: []const u8 = "",
