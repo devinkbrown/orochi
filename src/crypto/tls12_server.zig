@@ -351,6 +351,12 @@ pub const Server = struct {
         try sh_body.append(self.allocator, 0);
         var exts: std.ArrayList(u8) = .empty;
         defer exts.deinit(self.allocator);
+        // renegotiation_info (RFC 5746): an initial handshake carries an EMPTY
+        // renegotiated_connection (a single 0x00 length byte). Clients that
+        // enforce secure renegotiation — OpenSSL and browsers do by default —
+        // abort with "unsafe legacy renegotiation" if the server omits this, so
+        // it must always be present even though we never renegotiate.
+        try writeExtension(self.allocator, &exts, 0xff01, &.{0x00});
         if (self.selected_alpn) |proto| {
             var alpn_body: [3 + 255]u8 = undefined;
             std.mem.writeInt(u16, alpn_body[0..2], @intCast(1 + proto.len), .big);
@@ -646,6 +652,10 @@ fn runLoopback(comptime suite_kind: LoopbackSuite) !void {
         .need_more => return error.BadHandshake,
     };
     defer allocator.free(sf);
+    // RFC 5746: the ServerHello flight MUST carry an empty renegotiation_info
+    // (ff 01 00 01 00); clients that enforce secure renegotiation abort without
+    // it. Guard the wire so this can't silently regress.
+    try std.testing.expect(std.mem.indexOf(u8, sf, &[_]u8{ 0xff, 0x01, 0x00, 0x01, 0x00 }) != null);
     const cf = switch (try client.feed(sf)) {
         .bytes_to_send => |b| b,
         .need_more => return error.BadHandshake,
