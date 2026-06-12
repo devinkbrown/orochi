@@ -723,6 +723,9 @@ const mesh_batch_chunk: usize = 32;
 /// Scratch size for one rendered netsplit/netjoin batch — fits `mesh_batch_chunk`
 /// members at the 420-byte max prefix plus the BATCH framing.
 const mesh_batch_buf_len: usize = 20480;
+/// Monotonic seed for netsplit/netjoin BATCH reference tags so every emitted
+/// batch gets a distinct ref even when several render in the same millisecond.
+var mesh_batch_ref_seq: std.atomic.Value(u64) = .init(0);
 /// Distinct accept token for the implicit-TLS client listener (:6697), so
 /// handleAccept can tell it apart from the plaintext + S2S listeners.
 const tls_listener_token: RingFdToken = .{ .slot = 3, .gen = 0 };
@@ -3662,6 +3665,12 @@ pub const LinuxServer = struct {
         for (self.sessions.sessions(account)) |s| {
             const sibling_id = clientIdFromMonitor(s.client);
             const sibling = self.connFor(sibling_id) orelse continue;
+            // Defense in depth: only mirror to a sibling STILL authenticated to
+            // this account. A stale SessionStore entry (e.g. left behind by an
+            // account switch) must never leak this account's DMs to a connection
+            // no longer logged into it.
+            const cur = sibling.session.account() orelse continue;
+            if (!std.mem.eql(u8, cur, account)) continue;
             if (!allowsSessionSyncSibling(s, sibling, skip_a_flat, skip_b_flat)) continue;
             self.deliverTagged(sibling_id, tags, bytes) catch continue;
         }
@@ -4427,7 +4436,10 @@ pub const LinuxServer = struct {
             const mid = clientIdFromWorld(member.*);
             const mc = self.connFor(mid) orelse continue;
             if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
-            const bytes = if (mc.session.hasCap(.batch)) batched else plain;
+            // Cap clients get the batched form; clients without `batch` — and cap
+            // clients whose batch failed to render (empty) — fall back to the
+            // un-batched lines so nobody is silently dropped.
+            const bytes = if (mc.session.hasCap(.batch) and batched.len != 0) batched else plain;
             if (bytes.len == 0) continue;
             self.enqueueDelivery(mid, bytes) catch continue;
         }
@@ -4465,8 +4477,8 @@ pub const LinuxServer = struct {
                 off = chunk_end;
                 if (n == 0) continue;
 
-                var ref_buf: [16]u8 = undefined;
-                const ref = netsplit_batch.makeBatchRef(&ref_buf, @intCast(@max(@as(i64, 0), self.nowMs())));
+                var ref_buf: [18]u8 = undefined;
+                const ref = netsplit_batch.makeBatchRef(&ref_buf, mesh_batch_ref_seq.fetchAdd(1, .monotonic));
                 var batch_buf: [mesh_batch_buf_len]u8 = undefined;
                 var plain_buf: [mesh_batch_buf_len]u8 = undefined;
                 const batched = netsplit_batch.writeNetsplit(&batch_buf, ref, self.serverName(), remote_name, ghosts[0..n]) catch continue;
@@ -4977,8 +4989,8 @@ pub const LinuxServer = struct {
             off = chunk_end;
             if (n == 0) continue;
 
-            var ref_buf: [16]u8 = undefined;
-            const ref = netsplit_batch.makeBatchRef(&ref_buf, @intCast(@max(@as(i64, 0), self.nowMs())));
+            var ref_buf: [18]u8 = undefined;
+            const ref = netsplit_batch.makeBatchRef(&ref_buf, mesh_batch_ref_seq.fetchAdd(1, .monotonic));
             var batch_buf: [mesh_batch_buf_len]u8 = undefined;
             var plain_buf: [mesh_batch_buf_len]u8 = undefined;
             const batched = netsplit_batch.writeNetjoin(&batch_buf, ref, self.serverName(), remote_name, channel, ghosts[0..n]) catch continue;
@@ -11516,6 +11528,13 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
             return;
         };
+        // Re-IDENTIFY to a different account: drop the previous account's session
+        // binding first (mirrors handleLogout), so a stale SessionStore entry can
+        // never keep this connection in the old account's delivery/fan-out set.
+        if (conn.session.account()) |old| {
+            if (!std.ascii.eqlIgnoreCase(old, account))
+                _ = self.sessions.remove(old, monitorIdFromClient(idFromToken(conn.token)));
+        }
         loginSession(conn, account);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
