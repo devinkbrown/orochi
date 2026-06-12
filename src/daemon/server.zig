@@ -8041,14 +8041,19 @@ pub const LinuxServer = struct {
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
             // Capture channel memberships + member modes so the successor re-joins.
+            // Use a separate write index: a channel whose member modes can't be
+            // read is skipped entirely, never leaving an undefined slot inside the
+            // serialized range (which would encode garbage into the snapshot).
             var chan_names: [64][]const u8 = undefined;
             const nch = self.world.channelsOf(worldIdFromClient(e.id), &chan_names);
             var chans: [64]session_snapshot.ChannelMembership = undefined;
-            for (chan_names[0..nch], 0..) |cname, ci| {
+            var chan_n: usize = 0;
+            for (chan_names[0..nch]) |cname| {
                 const m = self.world.memberModes(cname, worldIdFromClient(e.id)) orelse continue;
-                chans[ci] = .{ .name = cname, .modes = m.bits };
+                chans[chan_n] = .{ .name = cname, .modes = m.bits };
+                chan_n += 1;
             }
-            snap.channels = chans[0..nch];
+            snap.channels = chans[0..chan_n];
             const blob = session_snapshot.encode(self.allocator, snap) catch {
                 if (tls_blob) |tb| self.allocator.free(tb);
                 continue;
