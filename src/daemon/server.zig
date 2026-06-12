@@ -3136,6 +3136,21 @@ pub const LinuxServer = struct {
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMembershipBurstTo(conn); // #65: roster burst to the new peer
+            self.rebroadcastLocalOpers(); // propagate this node's opers to the new peer
+        }
+    }
+
+    /// Re-mint + broadcast every locally-opered session's grant, so a freshly
+    /// established secured peer learns this node's current operators without
+    /// waiting for them to re-elevate. Grants ride only the secured mesh.
+    fn rebroadcastLocalOpers(self: *LinuxServer) void {
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value;
+            if (c.s2s != null or c.s2s_secured != null) continue;
+            if (!c.session.registered() or !c.session.isOper()) continue;
+            const account = c.session.account() orelse continue;
+            self.mintOperGrant(account, c.session.oper_priv, c.session.operClass(), c.session.operTitle());
         }
     }
 
@@ -4265,7 +4280,6 @@ pub const LinuxServer = struct {
         remote_name: []const u8,
         members: anytype,
     ) usize {
-        _ = self;
         var count = count_in;
         for (members) |rm| {
             if (count >= members_buf.len) break;
@@ -4273,6 +4287,9 @@ pub const LinuxServer = struct {
             const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
             if (is_auditorium and !auditorium.visibleTo(viewer_rank, auditoriumRank(modes))) continue;
             prefix_buf[count] = modes.allPrefixes();
+            // Remote network operators (oper_override via a propagated grant)
+            // render with the `*` prefix too, so admin status is uniform mesh-wide.
+            if (self.isOverrideOper(rm.nick)) prefix_buf[count].prependOper();
             members_buf[count] = .{
                 .prefixes = prefix_buf[count].asSlice(),
                 .nick = rm.nick,
@@ -13061,19 +13078,23 @@ pub const LinuxServer = struct {
         return .regular;
     }
 
-    /// Whether a nick belongs to a registered local client that is an IRC
-    /// operator holding the oper_override privilege (the network-admin override).
-    /// Used to render the `*` status prefix in NAMES. Scans this shard's clients;
-    /// the daemon defaults to a single reactor, so this is complete for local
-    /// members (remote members carry their home server's status via the mesh).
-    fn isLocalOverrideOper(self: *LinuxServer, nick: []const u8) bool {
+    /// Whether `nick` is an IRC operator holding oper_override (the network-admin
+    /// override) — rendered as the `*` status prefix and in WHOIS. Covers both a
+    /// local session AND a cross-mesh oper grant propagated from a peer node
+    /// (keyed by account; matched to the nick), so a remote server's admins also
+    /// render with `*`. The grant path requires the secured Tsumugi mesh, over
+    /// which signed grants travel.
+    fn isOverrideOper(self: *LinuxServer, nick: []const u8) bool {
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             if (c.s2s != null or c.s2s_secured != null) continue;
             if (!c.session.registered()) continue;
-            if (!c.session.hasPriv(.oper_override)) continue;
-            if (std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
+            if (c.session.hasPriv(.oper_override) and std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
+        }
+        // Propagated cross-mesh grant (account == nick) carrying oper_override.
+        if (self.oper_grants.lookup(nick, self.nowU64())) |g| {
+            if (g.privilege_bits != 0 and oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override)) return true;
         }
         return false;
     }
@@ -13108,7 +13129,7 @@ pub const LinuxServer = struct {
             prefix_buf[count] = modes.allPrefixes();
             // Network operators (oper_override) render with the `*` prefix above
             // founder. Derived from live oper status, not a stored channel mode.
-            if (self.isLocalOverrideOper(nick)) prefix_buf[count].prependOper();
+            if (self.isOverrideOper(nick)) prefix_buf[count].prependOper();
             members_buf[count] = .{
                 .prefixes = prefix_buf[count].asSlice(),
                 .nick = nick,
