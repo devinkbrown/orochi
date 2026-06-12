@@ -1364,6 +1364,11 @@ pub const ConnState = struct {
     /// `resolveS2sCollision` to deterministically collapse the duplicate link
     /// that forms when both nodes auto-dial each other.
     s2s_initiator: bool = false,
+    /// True when this S2S link is being torn down by `resolveS2sCollision` as a
+    /// duplicate (the same peer is still reachable via the surviving link). Its
+    /// `closeConn` must NOT emit a netsplit — the members never actually left, so
+    /// a netsplit QUIT would spuriously churn the channel.
+    s2s_dedup: bool = false,
     /// Target address for an outbound S2S connect, kept here (the slot is stable)
     /// so it outlives the in-flight IORING_OP_CONNECT submission.
     s2s_connect_addr: posix.sockaddr.in = undefined,
@@ -3792,7 +3797,9 @@ pub const LinuxServer = struct {
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
                     _ = self.peer_health.remove(link.remoteName());
                 }
-                self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
+                // A collision-collapsed duplicate keeps the peer reachable via the
+                // surviving link, so its members never left — no netsplit.
+                if (!conn.s2s_dedup) self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
                 link.deinit();
                 self.allocator.destroy(link);
@@ -3809,7 +3816,9 @@ pub const LinuxServer = struct {
                     self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
                     _ = self.peer_health.remove(link.remoteName());
                 }
-                self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
+                // A collision-collapsed duplicate keeps the peer reachable via the
+                // surviving link, so its members never left — no netsplit.
+                if (!conn.s2s_dedup) self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
                 link.deinit();
                 self.allocator.destroy(link);
@@ -8392,6 +8401,12 @@ pub const LinuxServer = struct {
                     if (peer.token.slot == tok.slot and peer.token.gen == tok.gen and !peer.closing) continue;
                 }
                 dial.token = null; // dial's connection is gone — eligible again
+            }
+            // Already linked to this peer via the surviving (possibly inbound)
+            // link? Don't dial a duplicate — that just loops collapse→redial.
+            if (self.meshPeerLinkedByHost(dial.host)) {
+                dial.token = null;
+                continue;
             }
             if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) continue;
             dial.last_attempt_ms = now;
@@ -13108,6 +13123,22 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// Whether an established S2S peer link to `host` already exists in EITHER
+    /// direction (we dialed it, or it dialed us). The auto-connect sweep consults
+    /// this so it never re-dials a peer that is already reachable via the inbound
+    /// link the collision rule chose to keep — which otherwise loops establish →
+    /// duplicate-collapse → redial forever. The dial host is matched against the
+    /// handshake-learned peer server name (ASCII case-insensitive), the same
+    /// identity LINKS/MAP report.
+    fn meshPeerLinkedByHost(self: *LinuxServer, host: []const u8) bool {
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const name = establishedPeerName(entry.value) orelse continue;
+            if (std.ascii.eqlIgnoreCase(name, host)) return true;
+        }
+        return false;
+    }
+
     /// Collapse the duplicate S2S link that forms when both nodes auto-dial each
     /// other: each side ends up with two established links to the same peer (one
     /// it dialed, one the peer dialed), so LINKS/LUSERS over-count and a link is
@@ -13131,6 +13162,7 @@ pub const LinuxServer = struct {
             if (new_conn.s2s_initiator == other.s2s_initiator) return false;
             const keep_initiator = std.mem.lessThan(u8, self.serverName(), remote_name);
             const loser = if (new_conn.s2s_initiator == keep_initiator) other else new_conn;
+            loser.s2s_dedup = true; // collapsed duplicate: suppress its netsplit on close
             loser.closing = true;
             self.logMeshEvent(.peer_down, remote_name, "duplicate link collapsed");
             return loser == new_conn;
