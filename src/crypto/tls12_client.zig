@@ -118,6 +118,7 @@ pub const Client = struct {
     hs_write_seq: u64 = 0,
     force_chacha_only_for_test: bool = false,
     force_aes128_only_for_test: bool = false,
+    force_aes256_only_for_test: bool = false,
     skip_cert_verify_for_test: bool = false,
 
     pub fn init(allocator: Allocator, options: Options) Error!Client {
@@ -229,6 +230,13 @@ pub const Client = struct {
     pub fn offerOnlyAes128ForTest(self: *Client) void {
         self.force_aes128_only_for_test = true;
         self.force_chacha_only_for_test = false;
+        self.force_aes256_only_for_test = false;
+    }
+
+    pub fn offerOnlyAes256ForTest(self: *Client) void {
+        self.force_aes256_only_for_test = true;
+        self.force_aes128_only_for_test = false;
+        self.force_chacha_only_for_test = false;
     }
 
     pub fn skipServerCertVerifyForTest(self: *Client) void {
@@ -265,6 +273,8 @@ pub const Client = struct {
             try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_chacha20_poly1305_sha256));
         } else if (self.force_aes128_only_for_test) {
             try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_aes_128_gcm_sha256));
+        } else if (self.force_aes256_only_for_test) {
+            try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_aes_256_gcm_sha384));
         } else {
             for (tls12.allowed_suites) |suite| try appendU16(self.allocator, &suites, @intFromEnum(suite));
         }

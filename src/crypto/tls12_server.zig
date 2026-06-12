@@ -611,7 +611,9 @@ fn makeFixture(allocator: Allocator) !Fixture {
     return .{ .storage = buf, .cert = buf[0..cert.len], .key = key };
 }
 
-fn runLoopback(comptime chacha: bool) !void {
+const LoopbackSuite = enum { aes128, aes256, chacha };
+
+fn runLoopback(comptime suite_kind: LoopbackSuite) !void {
     const allocator = std.testing.allocator;
     const fixture = try makeFixture(allocator);
     defer fixture.deinit(allocator);
@@ -631,7 +633,11 @@ fn runLoopback(comptime chacha: bool) !void {
         .now_unix_seconds = 1_735_689_600,
     });
     defer client.deinit();
-    if (chacha) client.offerOnlyChaChaForTest() else client.offerOnlyAes128ForTest();
+    switch (suite_kind) {
+        .aes128 => client.offerOnlyAes128ForTest(),
+        .aes256 => client.offerOnlyAes256ForTest(),
+        .chacha => client.offerOnlyChaChaForTest(),
+    }
 
     const ch = try client.start();
     defer allocator.free(ch);
@@ -671,7 +677,13 @@ fn runLoopback(comptime chacha: bool) !void {
 }
 
 test "TLS 1.2 loopback ECDHE ECDSA AES-128-GCM" {
-    try runLoopback(false);
+    try runLoopback(.aes128);
+}
+
+test "TLS 1.2 loopback ECDHE ECDSA AES-256-GCM-SHA384" {
+    // Real clients (OpenSSL, browsers) list AES-256-GCM-SHA384 first, so this is
+    // the suite the server actually negotiates in the wild — exercise it.
+    try runLoopback(.aes256);
 }
 
 test "TLS 1.2 exportResume/resumeConnected carries a live session across Server instances" {
@@ -746,7 +758,7 @@ test "TLS 1.2 exportResume/resumeConnected carries a live session across Server 
 }
 
 test "TLS 1.2 loopback ECDHE ECDSA ChaCha20-Poly1305" {
-    try runLoopback(true);
+    try runLoopback(.chacha);
 }
 
 test "TLS 1.2 loopback ECDHE RSA AES-128-GCM" {

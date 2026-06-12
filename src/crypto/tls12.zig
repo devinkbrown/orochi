@@ -332,7 +332,14 @@ pub fn completeRecord(buf: []const u8) Error!?Record {
     if (buf.len < record_header_len) return null;
     const ct = ContentType.fromWire(buf[0]) orelse return error.BadRecord;
     const version = std.mem.readInt(u16, buf[1..3], .big);
-    if (version != tls_version) return error.BadRecord;
+    // The record-layer ProtocolVersion is a legacy field (RFC 5246 §E.1): real
+    // clients send the initial ClientHello record as TLS 1.0 (0x0301) for maximum
+    // backward compatibility, then TLS 1.2 (0x0303) afterward. Servers MUST NOT
+    // reject a record for its legacy version — the negotiated version comes from
+    // the handshake, not this byte. Accept the TLS 1.x family (0x0301–0x0303) and
+    // refuse only an obviously wrong major (e.g. SSLv2/3 or TLS 1.3 record
+    // framing), which keeps the surface tight without breaking standard clients.
+    if (version != 0x0301 and version != 0x0302 and version != tls_version) return error.BadRecord;
     const len = std.mem.readInt(u16, buf[3..5], .big);
     if (len > max_ciphertext_len) return error.CiphertextTooLong;
     const total = record_header_len + @as(usize, len);
@@ -494,6 +501,26 @@ pub fn constantTimeEq(a: []const u8, b: []const u8) bool {
     var diff: u8 = 0;
     for (a, b) |x, y| diff |= x ^ y;
     return diff == 0;
+}
+
+test "completeRecord accepts the legacy ClientHello record version" {
+    // Real clients (OpenSSL, browsers) frame the initial ClientHello record with
+    // legacy version TLS 1.0 (0x0301). The server must accept it — rejecting it
+    // dropped every standards-compliant TLS 1.2 handshake.
+    const legacy = [_]u8{ 22, 0x03, 0x01, 0x00, 0x01, 0xff };
+    const got = (try completeRecord(&legacy)).?;
+    try std.testing.expectEqual(ContentType.handshake, got.content_type);
+    try std.testing.expectEqual(@as(usize, 6), got.wire_len);
+
+    // TLS 1.1 (0x0302) and 1.2 (0x0303) are also accepted.
+    const v11 = [_]u8{ 22, 0x03, 0x02, 0x00, 0x01, 0xff };
+    _ = (try completeRecord(&v11)).?;
+    const v12 = [_]u8{ 22, 0x03, 0x03, 0x00, 0x01, 0xff };
+    _ = (try completeRecord(&v12)).?;
+
+    // A non-TLS major (SSLv2-style 0x0200) is still rejected.
+    const bad = [_]u8{ 22, 0x02, 0x00, 0x00, 0x01, 0xff };
+    try std.testing.expectError(error.BadRecord, completeRecord(&bad));
 }
 
 test "TLS 1.2 SHA-256 PRF RFC vector" {
