@@ -17,6 +17,8 @@ pub const account_capsule = @import("account_capsule.zig");
 pub const listener_capsule = @import("listener_capsule.zig");
 pub const session_capsule = @import("session_capsule.zig");
 pub const session_snapshot = @import("session_snapshot.zig");
+pub const tls_snapshot = @import("tls_snapshot.zig");
+pub const mesh_redial = @import("mesh_redial.zig");
 pub const session_migrate = @import("session_migrate.zig");
 pub const migration_relay = @import("migration_relay.zig");
 // S2S migration support modules (fsm + signed token + journal + policy + metrics).

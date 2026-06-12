@@ -119,7 +119,10 @@ const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
 const helix_live = @import("helix/live.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
+const tls_snapshot = @import("helix/tls_snapshot.zig");
+const mesh_redial = @import("helix/mesh_redial.zig");
 const tls_server = @import("../crypto/tls_server.zig");
+const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const http_fetch = @import("http_fetch.zig");
 
@@ -6906,11 +6909,19 @@ pub const LinuxServer = struct {
     }
 
     /// `UPGRADE` — oper-only hot in-place binary upgrade (Helix). Serializes every
-    /// registered session into a sealed memfd arena, then re-execs
-    /// `/proc/self/exe --supervisor` preserving both the listening socket and the
-    /// arena, so the port stays bound and the successor recovers session state.
-    /// Client socket-fd re-attach (so connections survive, not just state) is the
-    /// next increment; for now clients reconnect to the new image.
+    /// registered session into a sealed memfd arena, then re-execs the on-disk
+    /// binary `--supervisor` preserving the listening socket, the arena, and every
+    /// carried client socket (FD_CLOEXEC cleared), so the port stays bound and the
+    /// successor re-attaches the live connections. TLS clients additionally carry
+    /// their live engine state (suite + traffic secrets + record seqs + buffered
+    /// bytes) so the encrypted stream survives the swap; a TLS conn whose state
+    /// cannot be exported is NOT carried (it reconnects — fail-safe). S2S links
+    /// are never carried (the secured stream can't re-enter mid-connection):
+    /// hand-dialed initiator links seal a re-dial hint the successor dials at
+    /// boot, and config-managed [mesh].connect peers re-dial via the mesh boot
+    /// pass, keeping the netsplit window to one connect+handshake round-trip.
+    /// wss browser clients are not carried yet (no WS adapter resume); they
+    /// reconnect against the still-bound listener.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
@@ -6932,12 +6943,57 @@ pub const LinuxServer = struct {
         }
         var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
         defer pieces.deinit(self.allocator);
+        var tls_carried: usize = 0;
+        var s2s_hints: usize = 0;
         var it = self.rx().clients.iterator();
         while (it.next()) |e| {
+            // S2S peer links are not carried: the secured Tsumugi link's post-AKE
+            // stream cannot be re-entered mid-connection, so the socket keeps
+            // CLOEXEC (the peer sees the drop the instant we exec and can react).
+            // For links THIS node dialed by hand (oper CONNECT), seal a re-dial
+            // hint so the successor reconnects immediately at boot; config-managed
+            // [mesh].connect dials are skipped — the successor's mesh boot pass
+            // re-dials those itself in its first loop iteration.
+            if (e.value.s2s != null or e.value.s2s_secured != null) {
+                if (e.value.s2s_initiator and !self.dialManaged(e.value.token)) {
+                    const hint = mesh_redial.encode(.{
+                        .addr4 = @bitCast(e.value.s2s_connect_addr.addr),
+                        .port = std.mem.bigToNative(u16, e.value.s2s_connect_addr.port),
+                    });
+                    const hb = self.allocator.dupe(u8, &hint) catch continue;
+                    blobs.append(self.allocator, hb) catch {
+                        self.allocator.free(hb);
+                        continue;
+                    };
+                    pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = hb }) catch continue;
+                    s2s_hints += 1;
+                }
+                continue;
+            }
             if (!e.value.session.registered()) continue;
             // Don't carry the requesting oper's own connection: it issued UPGRADE
             // and its buffered reply would be lost across the swap; let it reconnect.
             if (e.value.fd == conn.fd) continue;
+            // wss browser clients are not carried yet (the TLS+WebSocket adapter
+            // stack has no resume path); their sockets close at execve and the
+            // browser reconnects against the still-bound listener.
+            if (e.value.ws != null) continue;
+            // TLS client: export the live engine state FIRST — if it cannot be
+            // exported the connection is not carried at all (its fd keeps
+            // CLOEXEC, closes at exec, and the client reconnects). A TLS socket
+            // must never be handed to the successor without its crypto state.
+            var tls_blob: ?[]u8 = null;
+            if (e.value.tls) |t| {
+                const rs = t.exportResume() catch continue;
+                tls_blob = tls_snapshot.encode(self.allocator, .{
+                    .fd = e.value.fd,
+                    .state = rs,
+                    // Wire bytes encrypted but not yet flushed: carried verbatim so
+                    // the client's record sequence has no hole after the swap.
+                    .pending_out = e.value.send_buf[e.value.send_offset..e.value.send_len],
+                    .certfp = if (e.value.session.tls_certfp) |fp| fp else &.{},
+                }) catch continue;
+            }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
             // Capture channel memberships + member modes so the successor re-joins.
@@ -6949,12 +7005,31 @@ pub const LinuxServer = struct {
                 chans[ci] = .{ .name = cname, .modes = m.bits };
             }
             snap.channels = chans[0..nch];
-            const blob = session_snapshot.encode(self.allocator, snap) catch continue;
+            const blob = session_snapshot.encode(self.allocator, snap) catch {
+                if (tls_blob) |tb| self.allocator.free(tb);
+                continue;
+            };
+            // Queue the TLS piece BEFORE the session piece: an orphaned TLS
+            // capsule is ignored by the successor, but a TLS client whose session
+            // piece landed without its TLS piece would be adopted as plaintext —
+            // never allow that ordering.
+            if (tls_blob) |tb| {
+                blobs.append(self.allocator, tb) catch {
+                    self.allocator.free(tb);
+                    self.allocator.free(blob);
+                    continue;
+                };
+                pieces.append(self.allocator, .{ .kind = .tls_session, .bytes = tb }) catch {
+                    self.allocator.free(blob);
+                    continue;
+                };
+            }
             blobs.append(self.allocator, blob) catch {
                 self.allocator.free(blob);
                 continue;
             };
-            pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch {};
+            pieces.append(self.allocator, .{ .kind = .clients, .bytes = blob }) catch continue;
+            if (tls_blob != null) tls_carried += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
             _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
         }
@@ -6977,8 +7052,8 @@ pub const LinuxServer = struct {
         defer prepared.deinit();
 
         const arena = prepared.runtime.arena orelse return self.upgradeListenerOnly(conn);
-        var sbuf: [96]u8 = undefined;
-        try self.noticeTo(conn, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} session(s) sealed; re-exec preserving listener", .{prepared.capsule_count}) catch "UPGRADE: re-exec");
+        var sbuf: [160]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} mesh re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, s2s_hints }) catch "UPGRADE: re-exec");
 
         // Preserve the listener + arena across execve (clear FD_CLOEXEC).
         _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, 0);
@@ -7004,11 +7079,17 @@ pub const LinuxServer = struct {
 
     /// Successor side of UPGRADE: read the inherited state arena and re-attach
     /// every carried-over client connection (inherited socket fd + restored
-    /// session) into the client table + io_uring recv. Called once after boot.
-    /// Best-effort: a client that can't be re-attached is dropped, not fatal.
+    /// session, plus its live TLS engine when one was carried) into the client
+    /// table + io_uring recv, then immediately re-dial any carried mesh peers.
+    /// Called once after boot. Best-effort: a client that can't be re-attached
+    /// is dropped, not fatal — the successor must never crash on bad state.
     pub fn adoptInheritedSessions(self: *LinuxServer) void {
         if (comptime builtin.os.tag != .linux) return;
         const arena_fd = self.config.resume_arena_fd orelse return;
+        // Boot-time only (before the reactor loop): bind this thread to reactor
+        // 0, the reactor that owns the inherited listener and every connection
+        // adopted below.
+        current_reactor = &self.reactors[0];
         const caps = helix_live.readArena(self.allocator, arena_fd) catch |e| {
             std.debug.print("orochi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
             return;
@@ -7017,22 +7098,73 @@ pub const LinuxServer = struct {
             for (caps) |*c| c.deinit(self.allocator);
             self.allocator.free(caps);
         }
-        var adopted: usize = 0;
+
+        // Pass 1: index the carried TLS engine states by socket fd (the join key
+        // back to the matching client snapshot). Undecodable capsules are skipped
+        // — the matching client is then dropped below rather than mis-adopted.
+        var tls_snaps: std.ArrayList(tls_snapshot.Snapshot) = .empty;
+        defer tls_snaps.deinit(self.allocator);
         for (caps) |c| {
+            if (c.header.kind != .tls_session) continue;
+            if (c.fields.len == 0) continue;
+            const ts = tls_snapshot.decode(c.fields[0].bytes) catch continue;
+            tls_snaps.append(self.allocator, ts) catch continue;
+        }
+
+        // Pass 2: adopt the carried clients.
+        var adopted: usize = 0;
+        var adopted_tls: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .clients) continue;
             if (c.fields.len == 0) continue;
             const snap = session_snapshot.decode(c.fields[0].bytes) catch continue;
             if (snap.fd < 0) continue;
-            if (self.adoptInheritedClient(snap)) adopted += 1;
+            var tls_state: ?tls_snapshot.Snapshot = null;
+            for (tls_snaps.items) |ts| {
+                if (ts.fd == snap.fd) {
+                    tls_state = ts;
+                    break;
+                }
+            }
+            if (self.adoptInheritedClient(snap, tls_state)) {
+                adopted += 1;
+                if (tls_state != null) adopted_tls += 1;
+            }
         }
+
+        // Pass 3: re-dial carried mesh peers NOW (not on the sweep timer), so a
+        // hand-opened S2S link is re-established within one connect+handshake
+        // round-trip of the swap. Config-managed [mesh].connect peers are not in
+        // the arena — the mesh boot pass dials those in the first loop iteration.
+        var redialed: usize = 0;
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            if (c.fields.len == 0) continue;
+            const peer = mesh_redial.decode(c.fields[0].bytes) catch continue;
+            const addr = posix.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, peer.port),
+                .addr = @bitCast(peer.addr4),
+            };
+            _ = self.initiateS2sConnectToAddr(addr) catch |e| {
+                std.debug.print("orochi: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(e)});
+                continue;
+            };
+            redialed += 1;
+        }
+
         // The arena is fully consumed; close the inherited memfd.
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
-        std.debug.print("orochi: UPGRADE resume — re-attached {d} client connection(s)\n", .{adopted});
+        std.debug.print(
+            "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS), {d} mesh re-dial(s)\n",
+            .{ adopted, adopted_tls, redialed },
+        );
     }
 
     /// Re-attach one carried-over client: take ownership of its inherited socket
-    /// fd, restore its session, and arm recv. Returns true on success.
-    fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot) bool {
+    /// fd, restore its session (and live TLS engine when carried), and arm recv.
+    /// Returns true on success; ANY failure closes the fd and frees the slot.
+    fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot) bool {
         if (self.rx().clients.len() >= self.config.max_clients) {
             closeFd(snap.fd);
             return false;
@@ -7051,6 +7183,16 @@ pub const LinuxServer = struct {
         conn.last_activity_ms = conn.connected_at_ms;
         conn.session.restore(snap);
         self.injectSessionState(conn);
+        // TLS client: rebuild the live engine BEFORE anything else can touch the
+        // socket. Any failure drops this client cleanly (fd closed, slot freed) —
+        // a TLS connection must never be adopted as plaintext.
+        if (tls_state) |ts| {
+            if (!self.adoptTlsState(conn, ts)) {
+                _ = self.rx().clients.free(id);
+                closeFd(snap.fd);
+                return false;
+            }
+        }
         // Re-populate the world nick registry so the carried client stays
         // addressable (WHOIS, PRIVMSG target). A fresh successor world has no
         // collisions; ignore NickInUse defensively. Channel membership carry-over
@@ -7065,11 +7207,76 @@ pub const LinuxServer = struct {
         }
         self.rx().ring.submitRecv(conn.token, conn.fd, &conn.recv_buf) catch {
             self.world.removeClient(worldIdFromClient(id));
+            if (conn.tls) |t| {
+                t.deinit();
+                self.allocator.destroy(t);
+                conn.tls = null;
+            }
             _ = self.rx().clients.free(id);
             closeFd(snap.fd);
             return false;
         };
+        // Restore exec hygiene: the fd survived ONE execve on purpose; re-arm
+        // CLOEXEC so it never leaks into any other child. The next UPGRADE
+        // clears it again for exactly the connections it carries.
+        _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
         return true;
+    }
+
+    /// Rebuild a carried client's live TLS engine from its snapshot. On success
+    /// the conn owns a resumed TlsConn and any unflushed predecessor ciphertext
+    /// is re-queued verbatim. Returns false on ANY failure — the caller drops
+    /// the client (fail-safe: a TLS socket never falls back to plaintext).
+    fn adoptTlsState(self: *LinuxServer, conn: *ConnState, ts: tls_snapshot.Snapshot) bool {
+        const t = self.allocator.create(tls_conn.TlsConn) catch return false;
+        // Mirror the accept path's engine-config gate: the hardened 1.2 leg is
+        // only offered when its cert material is configured. A carried 1.2
+        // connection with no 1.2 config fails resume and is dropped.
+        const cfg12: ?tls12_server.Config = if (self.config.tls12_cert_chain.len != 0 and
+            (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null))
+            .{
+                .cert_chain = self.config.tls12_cert_chain,
+                .ecdsa_p256_signing_key = self.config.tls12_signing_key,
+                .rsa_signing_key = self.config.tls_rsa_signing_key,
+            }
+        else
+            null;
+        t.* = tls_conn.TlsConn.resumeFrom(self.allocator, self.tls13Config(), cfg12, ts.state) catch {
+            self.allocator.destroy(t);
+            return false;
+        };
+        conn.tls = t;
+        conn.is_tls = true;
+        // Re-bind the mTLS client-cert fingerprint (SASL EXTERNAL identity).
+        if (ts.certfp.len == certfp.fingerprint_len) {
+            @memcpy(&conn.certfp_buf, ts.certfp);
+            conn.session.tls_certfp = conn.certfp_buf[0..];
+        }
+        // Wire bytes the predecessor encrypted but never flushed: re-queue them
+        // verbatim (already TLS records — bypass the encrypt seam). If they don't
+        // fit, the client's record stream would hole; drop the client instead.
+        if (ts.pending_out.len != 0) {
+            rawAppendToConn(conn, ts.pending_out) catch {
+                t.deinit();
+                self.allocator.destroy(t);
+                conn.tls = null;
+                conn.is_tls = false;
+                return false;
+            };
+            self.armSendIfNeeded(conn) catch {};
+        }
+        return true;
+    }
+
+    /// True when `token` is the live connection of a config-managed
+    /// `[mesh].connect` dial. Those links are NOT sealed as re-dial hints — the
+    /// successor's mesh boot pass re-dials every configured peer itself.
+    fn dialManaged(self: *LinuxServer, token: RingFdToken) bool {
+        for (self.mesh_dials) |dial| {
+            const t = dial.token orelse continue;
+            if (t.slot == token.slot and t.gen == token.gen) return true;
+        }
+        return false;
     }
 
     /// Listener-only upgrade fallback: re-exec preserving just the listening
@@ -7182,8 +7389,15 @@ pub const LinuxServer = struct {
     /// calling reactor (same ownership as an inbound accept). Returns the new
     /// connection's token so callers can track the dial.
     fn initiateS2sConnect(self: *LinuxServer, host: []const u8, port: u16) !RingFdToken {
-        if (self.rx().clients.len() >= self.config.max_clients) return error.SocketUnavailable;
         const addr = try sockaddrForHost(host, port, 2_000);
+        return self.initiateS2sConnectToAddr(addr);
+    }
+
+    /// Open an outbound S2S link to an already-resolved peer address. Shared by
+    /// the oper CONNECT path (via `initiateS2sConnect`) and the post-UPGRADE
+    /// re-dial of carried mesh links (the predecessor sealed the sockaddr).
+    fn initiateS2sConnectToAddr(self: *LinuxServer, addr: posix.sockaddr.in) !RingFdToken {
+        if (self.rx().clients.len() >= self.config.max_clients) return error.SocketUnavailable;
         const fd = try socketTcp();
         errdefer closeFd(fd);
         const id = try self.rx().clients.alloc(ConnState.init(fd));
@@ -17883,6 +18097,258 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
     var c = LiveClient{ .fd = fd_c };
     try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
     try recvUntil(&c, " 001 C ", 200);
+
+    var linked = false;
+    var probes: usize = 0;
+    while (probes < 120 and !linked) : (probes += 1) {
+        c.reset();
+        try writeAllFd(fd_c, "LINKS\r\n");
+        recvUntil(&c, " 365 ", 80) catch {};
+        if (std.mem.indexOf(u8, c.written(), "node2.test") != null) linked = true;
+    }
+    try std.testing.expect(linked);
+}
+
+test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    // adoptInheritedSessions binds this thread's reactor; unbind on exit so
+    // later direct-runOnce tests never see a stale pointer.
+    defer current_reactor = null;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x61, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{der};
+
+    // The "predecessor" leg: a real TLS 1.3 handshake driven purely in memory,
+    // exactly the state a live pre-upgrade connection would hold.
+    var pre_conn = try tls_conn.TlsConn.init(alloc, .{ .cert_chain = &chain, .signing_key = kp });
+    defer pre_conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &chain });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh = try pre_conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try pre_conn.onInbound(cfin);
+    try std.testing.expect(pre_conn.handshakeDone());
+    // Advance both directions so the carried seqs are non-zero.
+    const warm = try client.encrypt("warmup");
+    defer alloc.free(warm);
+    const warm_out = try pre_conn.onInbound(warm);
+    try std.testing.expectEqualStrings("warmup", warm_out.plaintext);
+    const warm_reply = try pre_conn.write("warm-ack");
+    const warm_plain = try client.decrypt(warm_reply);
+    defer alloc.free(warm_plain);
+    // A record the predecessor encrypted but never flushed — carried as
+    // pending_out so the client's record sequence stays unbroken.
+    const pend = try pre_conn.write(":upgrade.test NOTICE TLSY :carried-across\r\n");
+    const pend_copy = try alloc.dupe(u8, pend);
+    defer alloc.free(pend_copy);
+    const rs = try pre_conn.exportResume();
+
+    // The carried socket: one end is "the client connection", the other stays
+    // with the test as the remote peer.
+    var sp: [2]i32 = undefined;
+    const sp_rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp);
+    if (linux.errno(sp_rc) != .SUCCESS) return error.SkipZigTest;
+    defer closeFd(sp[1]); // sp[0] ownership transfers to the server on adopt
+
+    // Seal the arena exactly like handleUpgrade does (TLS piece + session piece).
+    const tls_blob = try tls_snapshot.encode(alloc, .{
+        .fd = sp[0],
+        .state = rs,
+        .pending_out = pend_copy,
+    });
+    defer alloc.free(tls_blob);
+    const sess_blob = try session_snapshot.encode(alloc, .{ .nick = "TLSY", .realname = "Carried", .fd = sp[0] });
+    defer alloc.free(sess_blob);
+    const arena_pieces = [_]helix_live.StatePiece{
+        .{ .kind = .tls_session, .bytes = tls_blob },
+        .{ .kind = .clients, .bytes = sess_blob },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-tls-adopt",
+        .pieces = arena_pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+    // The "successor": a fresh server adopting the arena before its loop runs.
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = kp,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.config.resume_arena_fd = arena_dup;
+    server.adoptInheritedSessions();
+    // adopt binds this thread to the server's reactor; unbind so later
+    // main-thread calls (and the teardown defers) resolve per-instance.
+    current_reactor = null;
+    const plain_port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(plain_port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // The client end keeps speaking TLS across the swap: first the carried
+    // pending record arrives, then a PING round-trips through the resumed
+    // engine (read seq, write seq, and keys all survived).
+    const ping = try client.encrypt("PING :across-upgrade\r\n");
+    defer alloc.free(ping);
+    try writeAllFd(sp[1], ping);
+
+    var cipher: std.ArrayList(u8) = .empty;
+    defer cipher.deinit(alloc);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(alloc);
+    var rbuf: [4096]u8 = undefined;
+    var guard: usize = 0;
+    while (std.mem.indexOf(u8, plain.items, "PONG :across-upgrade") == null) : (guard += 1) {
+        if (guard > 64) return error.TestUnexpectedResult;
+        const n = try readFd(sp[1], &rbuf);
+        if (n == 0) return error.TestUnexpectedResult;
+        try cipher.appendSlice(alloc, rbuf[0..n]);
+        // Drain every complete TLS record (5-byte header + big-endian length).
+        while (cipher.items.len >= 5) {
+            const body_len = std.mem.readInt(u16, cipher.items[3..5], .big);
+            const wire_len = 5 + @as(usize, body_len);
+            if (cipher.items.len < wire_len) break;
+            const pt = try client.decrypt(cipher.items[0..wire_len]);
+            defer alloc.free(pt);
+            try plain.appendSlice(alloc, pt);
+            std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - wire_len], cipher.items[wire_len..]);
+            cipher.shrinkRetainingCapacity(cipher.items.len - wire_len);
+        }
+    }
+    // The predecessor's unflushed record arrived FIRST (no sequence hole) ...
+    try expectContains(plain.items, ":upgrade.test NOTICE TLSY :carried-across");
+    // ... and fresh traffic flows both ways on the resumed engine.
+    try expectContains(plain.items, "PONG :across-upgrade");
+    const before = std.mem.indexOf(u8, plain.items, "carried-across").?;
+    const after = std.mem.indexOf(u8, plain.items, "PONG :across-upgrade").?;
+    try std.testing.expect(before < after);
+}
+
+test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    // s2s_port = 0 means "S2S disabled", so probe a free ephemeral port first
+    // and hand THAT to node 2 (small TOCTOU window; fine for a test).
+    const probe_fd = createListener("127.0.0.1", 0, 1) catch return error.SkipZigTest;
+    const s2s_port = socketPort(probe_fd) catch {
+        closeFd(probe_fd);
+        return error.SkipZigTest;
+    };
+    closeFd(probe_fd);
+
+    // The surviving peer: a node whose S2S listener stays up across our swap.
+    var node2 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_port,
+        .node_id = 2,
+        .server_name = "node2.test",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    defer {
+        run2.store(false, .release);
+        if (connectLoopback(node2.boundPort() catch 0)) |wfd| closeFd(wfd) else |_| {}
+        thr2.join();
+    }
+
+    // The predecessor sealed a re-dial hint for the hand-opened link (this peer
+    // is NOT in [mesh].connect — the hint is the only way it comes back).
+    const hint = mesh_redial.encode(.{ .addr4 = .{ 127, 0, 0, 1 }, .port = s2s_port });
+    const arena_pieces = [_]helix_live.StatePiece{
+        .{ .kind = .mesh_checkpoint, .bytes = &hint },
+    };
+    var prepared = try helix_live.prepare(alloc, .{
+        .epoch = 1,
+        .now_ms = 1,
+        .timeout_ms = 1000,
+        .arena_name = "orochi-test-redial",
+        .pieces = arena_pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const dup_rc = linux.dup(prepared.runtime.arena.?.fd);
+    if (linux.errno(dup_rc) != .SUCCESS) return error.SkipZigTest;
+    const arena_dup: linux.fd_t = @intCast(dup_rc);
+
+    // The successor: no [mesh].connect, no oper — the carried hint alone must
+    // re-establish the link as soon as the loop starts.
+    var node1 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = 0,
+        .node_id = 1,
+        .server_name = "node1.test",
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+    node1.config.resume_arena_fd = arena_dup;
+    node1.adoptInheritedSessions();
+    // adopt binds this thread to node1's reactor; unbind so the main-thread
+    // teardown pokes (node2.boundPort etc.) resolve against the right server.
+    current_reactor = null;
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+    var run1 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    defer {
+        run1.store(false, .release);
+        if (connectLoopback(port1)) |wfd| closeFd(wfd) else |_| {}
+        thr1.join();
+    }
+
+    // Observable readiness: a plain client polls LINKS on node 1 until node 2's
+    // handshake-learned name shows — the re-dialed S2S link is live.
+    const fd_c = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var c = LiveClient{ .fd = fd_c };
+    try writeAllFd(fd_c, "NICK R\r\nUSER rita 0 * :Rita\r\n");
+    try recvUntil(&c, " 001 R ", 200);
 
     var linked = false;
     var probes: usize = 0;

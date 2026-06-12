@@ -183,6 +183,57 @@ pub const TlsConn = struct {
         return .{ .handshake_bytes = self.send_buf.items, .plaintext = self.plain_buf.items };
     }
 
+    /// Adapter-level resume state for a Helix live upgrade: the chosen engine's
+    /// connected-state snapshot plus any buffered partial inbound record. The
+    /// `pending_recv` slice borrows this TlsConn's internal buffer — serialize it
+    /// before driving the connection again.
+    pub const ResumeState = struct {
+        engine: EngineState,
+        /// Bytes of a partially received TLS record buffered at export time.
+        pending_recv: []const u8 = &.{},
+
+        pub const EngineState = union(Version) {
+            tls12: tls12_server.Server.ResumeState,
+            tls13: tls_server.Server.ResumeState,
+        };
+    };
+
+    /// Capture this connection's live TLS state for a Helix upgrade handoff.
+    /// Only valid once the handshake completed (`error.BadState` otherwise —
+    /// mid-handshake connections are not resumable and must reconnect).
+    pub fn exportResume(self: *const TlsConn) Error!ResumeState {
+        if (!self.handshakeDone()) return error.BadState;
+        return switch (self.engine) {
+            .tls13 => |*s| .{ .engine = .{ .tls13 = try s.exportResume() }, .pending_recv = self.recv_buf.items },
+            .tls12 => |*s| .{ .engine = .{ .tls12 = try s.exportResume() }, .pending_recv = self.recv_buf.items },
+            .undecided => error.BadState,
+        };
+    }
+
+    /// Successor side of a Helix upgrade: rebuild a CONNECTED adapter from an
+    /// exported `ResumeState`. The matching engine config must be supplied (a
+    /// 1.2-engine state with no `cfg12` fails with `error.ProtocolVersion`).
+    /// Any carried partial inbound record is re-buffered so the byte stream
+    /// continues exactly where the predecessor stopped.
+    pub fn resumeFrom(allocator: Allocator, cfg13: tls_server.Config, cfg12: ?tls12_server.Config, st: ResumeState) Error!TlsConn {
+        var self = TlsConn{
+            .allocator = allocator,
+            .engine = .undecided,
+            .cfg13 = cfg13,
+            .cfg12 = cfg12,
+        };
+        errdefer self.deinit();
+        switch (st.engine) {
+            .tls13 => |s13| self.engine = .{ .tls13 = try tls_server.Server.resumeConnected(allocator, cfg13, s13) },
+            .tls12 => |s12| {
+                const c12 = cfg12 orelse return error.ProtocolVersion;
+                self.engine = .{ .tls12 = try tls12_server.Server.resumeConnected(allocator, c12, s12) };
+            },
+        }
+        try self.recv_buf.appendSlice(allocator, st.pending_recv);
+        return self;
+    }
+
     /// Encrypt `plaintext` into one or more application_data records.
     pub fn write(self: *TlsConn, plaintext: []const u8) Error![]const u8 {
         if (!self.handshakeDone()) return error.BadState;
@@ -501,6 +552,90 @@ test "shared ticket key and replay guard resume across TlsConn instances" {
         .tls13 => |*s| s.earlyDataAccepted(),
         else => true,
     });
+}
+
+test "exportResume/resumeFrom carries a live TLS 1.3 conn, including a buffered partial record" {
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const cfg13 = tls_server.Config{ .cert_chain = &.{der}, .signing_key = kp };
+
+    var conn = try TlsConn.init(alloc, cfg13);
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    // Export before the handshake completes is rejected (fail-safe: such a
+    // connection is dropped from the upgrade carry set, never mis-carried).
+    try std.testing.expectError(error.BadState, conn.exportResume());
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+
+    // Advance both directions, then leave HALF of a client record buffered so
+    // the export carries a non-empty pending_recv.
+    const pre = try client.encrypt("before upgrade");
+    defer alloc.free(pre);
+    const pre_out = try conn.onInbound(pre);
+    try std.testing.expectEqualStrings("before upgrade", pre_out.plaintext);
+    const ack = try conn.write("ack");
+    const ack_plain = try client.decrypt(ack);
+    defer alloc.free(ack_plain);
+    try std.testing.expectEqualStrings("ack", ack_plain);
+
+    const split_rec = try client.encrypt("split across upgrade");
+    defer alloc.free(split_rec);
+    const half = split_rec.len / 2;
+    const part = try conn.onInbound(split_rec[0..half]);
+    try std.testing.expectEqual(@as(usize, 0), part.plaintext.len);
+
+    const st = try conn.exportResume();
+    try std.testing.expectEqual(Version.tls13, std.meta.activeTag(st.engine));
+    try std.testing.expect(st.pending_recv.len != 0);
+
+    // Successor adapter: the second half of the record completes and decrypts.
+    var conn2 = try TlsConn.resumeFrom(alloc, cfg13, null, st);
+    defer conn2.deinit();
+    try std.testing.expect(conn2.handshakeDone());
+    const rest = try conn2.onInbound(split_rec[half..]);
+    try std.testing.expectEqualStrings("split across upgrade", rest.plaintext);
+
+    // Both directions keep flowing on the resumed adapter.
+    const cipher = try conn2.write("hello from successor");
+    const got = try client.decrypt(cipher);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("hello from successor", got);
+    const more = try client.encrypt("more after upgrade");
+    defer alloc.free(more);
+    const more_out = try conn2.onInbound(more);
+    try std.testing.expectEqualStrings("more after upgrade", more_out.plaintext);
+}
+
+test "resumeFrom rejects a TLS 1.2 engine state when no 1.2 config is supplied" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x72} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const st = TlsConn.ResumeState{ .engine = .{ .tls12 = .{
+        .suite = 0xc02b,
+        .keys = .{},
+        .app_read_seq = 0,
+        .app_write_seq = 0,
+    } } };
+    try std.testing.expectError(
+        error.ProtocolVersion,
+        TlsConn.resumeFrom(alloc, .{ .cert_chain = &.{der}, .signing_key = kp }, null, st),
+    );
 }
 
 test "onInbound reassembles a handshake record split across two calls" {

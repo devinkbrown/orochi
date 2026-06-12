@@ -202,6 +202,45 @@ pub const Server = struct {
         return opened.plaintext;
     }
 
+    /// Everything a successor process needs to keep driving an ESTABLISHED
+    /// hardened TLS 1.2 connection: the negotiated suite, the derived directional
+    /// AEAD key material, and the live record sequence numbers. There is no
+    /// post-handshake re-keying in this profile, so the master secret and
+    /// handshake transcript are deliberately NOT carried.
+    pub const ResumeState = struct {
+        suite: u16,
+        keys: tls12.KeyMaterial,
+        app_read_seq: u64,
+        app_write_seq: u64,
+    };
+
+    /// Capture the connected-state snapshot for a Helix live upgrade. Only valid
+    /// once the handshake completed; the key material in the returned struct is
+    /// sensitive and must be handled accordingly by the caller.
+    pub fn exportResume(self: *const Server) Error!ResumeState {
+        if (self.state != .connected) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        return .{
+            .suite = @intFromEnum(suite),
+            .keys = self.keys,
+            .app_read_seq = self.app_read_seq,
+            .app_write_seq = self.app_write_seq,
+        };
+    }
+
+    /// Successor side of a Helix live upgrade: rebuild a CONNECTED server from an
+    /// exported `ResumeState`. The handshake machinery is never re-entered.
+    pub fn resumeConnected(allocator: Allocator, config: Config, st: ResumeState) Error!Server {
+        var self = try Server.init(allocator, config);
+        errdefer self.deinit();
+        self.selected_suite = tls12.CipherSuite.fromWire(st.suite) catch return error.UnsupportedCipherSuite;
+        self.keys = st.keys;
+        self.app_read_seq = st.app_read_seq;
+        self.app_write_seq = st.app_write_seq;
+        self.state = .connected;
+        return self;
+    }
+
     fn parseClientHello(self: *Server, body: []const u8) Error!void {
         var c = Cursor.init(body);
         if (try c.readU16() != tls12.tls_version) return error.ProtocolVersion;
@@ -610,6 +649,77 @@ fn runLoopback(comptime chacha: bool) !void {
 
 test "TLS 1.2 loopback ECDHE ECDSA AES-128-GCM" {
     try runLoopback(false);
+}
+
+test "TLS 1.2 exportResume/resumeConnected carries a live session across Server instances" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone());
+
+    // Advance both directions so the carried seqs are non-zero.
+    const pre_c = try client.encrypt("pre c2s");
+    defer allocator.free(pre_c);
+    const pre_cp = try server.decrypt(pre_c);
+    defer allocator.free(pre_cp);
+    const pre_s = try server.encrypt("pre s2c");
+    defer allocator.free(pre_s);
+    const pre_sp = try client.decrypt(pre_s);
+    defer allocator.free(pre_sp);
+
+    // Export is rejected mid-handshake and works once connected.
+    var fresh = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer fresh.deinit();
+    try std.testing.expectError(error.BadState, fresh.exportResume());
+    const st = try server.exportResume();
+    try std.testing.expectEqual(@as(u64, 1), st.app_read_seq);
+    try std.testing.expectEqual(@as(u64, 1), st.app_write_seq);
+
+    var successor = try Server.resumeConnected(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key }, st);
+    defer successor.deinit();
+    try std.testing.expect(successor.handshakeDone());
+
+    const c2s = try client.encrypt("post c2s");
+    defer allocator.free(c2s);
+    const got_s = try successor.decrypt(c2s);
+    defer allocator.free(got_s);
+    try std.testing.expectEqualSlices(u8, "post c2s", got_s);
+
+    const s2c = try successor.encrypt("post s2c");
+    defer allocator.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer allocator.free(got_c);
+    try std.testing.expectEqualSlices(u8, "post s2c", got_c);
 }
 
 test "TLS 1.2 loopback ECDHE ECDSA ChaCha20-Poly1305" {

@@ -542,6 +542,54 @@ pub const Server = struct {
         return self.buildKeyUpdateRecord(request);
     }
 
+    /// Everything a successor process needs to keep decrypting/encrypting an
+    /// ESTABLISHED TLS 1.3 connection: the negotiated suite, both application
+    /// traffic secrets (so post-resume KeyUpdates still derive correctly), and
+    /// the live record sequence numbers. Handshake-phase state (transcript,
+    /// ephemeral key shares, handshake secrets) is deliberately NOT carried —
+    /// it is dead once the handshake completes.
+    pub const ResumeState = struct {
+        suite: u16,
+        client_app_secret: [max_hash_len]u8,
+        server_app_secret: [max_hash_len]u8,
+        app_read_seq: u64,
+        app_write_seq: u64,
+    };
+
+    /// Capture the connected-state snapshot for a Helix live upgrade. Only valid
+    /// once the handshake completed; the secrets in the returned struct are key
+    /// material — the caller must treat the bytes as sensitive.
+    pub fn exportResume(self: *const Server) Error!ResumeState {
+        if (self.state != .connected) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        return .{
+            .suite = @intFromEnum(suite),
+            .client_app_secret = self.client_app_secret,
+            .server_app_secret = self.server_app_secret,
+            .app_read_seq = self.app_read_seq,
+            .app_write_seq = self.app_write_seq,
+        };
+    }
+
+    /// Successor side of a Helix live upgrade: rebuild a CONNECTED server from an
+    /// exported `ResumeState`. Traffic keys are re-derived from the carried
+    /// application secrets, so the record stream continues seamlessly (including
+    /// later KeyUpdates). The handshake machinery is never re-entered.
+    pub fn resumeConnected(allocator: Allocator, config: Config, st: ResumeState) Error!Server {
+        var self = try Server.init(allocator, config);
+        errdefer self.deinit();
+        const suite = try CipherSuite.fromWire(st.suite);
+        self.selected_suite = suite;
+        self.client_app_secret = st.client_app_secret;
+        self.server_app_secret = st.server_app_secret;
+        try deriveTrafficKeys(suite, self.client_app_secret[0..suite.hashLen()], &self.client_app_keys);
+        try deriveTrafficKeys(suite, self.server_app_secret[0..suite.hashLen()], &self.server_app_keys);
+        self.app_read_seq = st.app_read_seq;
+        self.app_write_seq = st.app_write_seq;
+        self.state = .connected;
+        return self;
+    }
+
     /// Process a decrypted post-handshake handshake fragment. A KeyUpdate rotates
     /// the client→server application keys and, when update_requested, queues our
     /// own KeyUpdate(update_not_requested) reply and rotates the server→client
@@ -1681,6 +1729,91 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     const got_s = try server.decrypt(c2s);
     defer alloc.free(got_s);
     try std.testing.expectEqualStrings("hello server", got_s);
+}
+
+test "loopback: exportResume/resumeConnected carries a live session across Server instances" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x44} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x44, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+
+    // Advance both sequence directions before the export so the carried seqs
+    // are non-zero (the interesting case for a mid-life upgrade).
+    const pre_s2c = try server.encrypt("pre-upgrade s2c");
+    defer alloc.free(pre_s2c);
+    const pre_got = try client.decrypt(pre_s2c);
+    defer alloc.free(pre_got);
+    const pre_c2s = try client.encrypt("pre-upgrade c2s");
+    defer alloc.free(pre_c2s);
+    const pre_got_s = try server.decrypt(pre_c2s);
+    defer alloc.free(pre_got_s);
+
+    // Export is rejected before connect (fresh server) and works when live.
+    var fresh = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer fresh.deinit();
+    try std.testing.expectError(error.BadState, fresh.exportResume());
+    const st = try server.exportResume();
+    try std.testing.expectEqual(@as(u64, 1), st.app_read_seq);
+    try std.testing.expectEqual(@as(u64, 1), st.app_write_seq);
+
+    // The successor instance continues the SAME record stream both ways.
+    var successor = try Server.resumeConnected(alloc, .{ .cert_chain = &.{der}, .signing_key = kp }, st);
+    defer successor.deinit();
+    try std.testing.expect(successor.handshakeDone());
+
+    const c2s = try client.encrypt("post-upgrade c2s");
+    defer alloc.free(c2s);
+    const got_s = try successor.decrypt(c2s);
+    defer alloc.free(got_s);
+    try std.testing.expectEqualStrings("post-upgrade c2s", got_s);
+
+    const s2c = try successor.encrypt("post-upgrade s2c");
+    defer alloc.free(s2c);
+    const got_c = try client.decrypt(s2c);
+    defer alloc.free(got_c);
+    try std.testing.expectEqualStrings("post-upgrade s2c", got_c);
+
+    // A KeyUpdate initiated by the resumed successor still works: the carried
+    // application secrets (not just the derived keys) survived the handoff.
+    const ku = try successor.initiateKeyUpdate(false);
+    defer alloc.free(ku);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ku));
+    const rotated = try successor.encrypt("after keyupdate");
+    defer alloc.free(rotated);
+    const got_rot = try client.decrypt(rotated);
+    defer alloc.free(got_rot);
+    try std.testing.expectEqualStrings("after keyupdate", got_rot);
 }
 
 test "loopback: TLS 1.3 PSK-DHE session resumption and binder tamper fallback" {

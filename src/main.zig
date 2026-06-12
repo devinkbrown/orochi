@@ -76,8 +76,8 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |first| {
         // `orochi --supervisor` is the Helix in-process-upgrade successor mode:
         // a fresh image execve'd by an UPGRADE handoff. If the handoff env fds are
-        // present we resume from them; otherwise it boots normally. (Full client-fd
-        // re-attach is the remaining hardening step — see docs/planning/17.)
+        // present we resume from them (listener + client fds + sessions + live TLS
+        // state + mesh re-dial hints); otherwise it boots normally.
         if (std.mem.eql(u8, first, "--supervisor")) {
             if (comptime builtin.os.tag == .linux) {
                 if (orochi.daemon.helix.live.resumeFromEnv()) |r| {
