@@ -112,6 +112,7 @@ const clone_limit_mod = @import("clone_limit.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
 const channel_rename = @import("../proto/channel_rename.zig");
+const channel_list_event = @import("../proto/channel_list_event.zig");
 const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
 const media_room = @import("media_room.zig");
@@ -3202,6 +3203,8 @@ pub const LinuxServer = struct {
         self.drainMembershipChanges(link);
         // Apply/surface remote aggregate channel MODE flag changes in real time.
         self.drainChannelModeFlagChanges(link);
+        // Apply/surface remote channel list-mode (+b/+e/+I) changes in real time.
+        self.drainChannelListChanges(link);
         // Drain inbound cross-mesh oper grants. Each is verified against the
         // peer's authenticated Ed25519 key from the Tsumugi handshake before it
         // can confer operator authority locally — an unverifiable grant is
@@ -3271,6 +3274,8 @@ pub const LinuxServer = struct {
         self.drainMembershipChanges(link);
         // Apply/surface remote aggregate channel MODE flag changes in real time.
         self.drainChannelModeFlagChanges(link);
+        // Apply/surface remote channel list-mode (+b/+e/+I) changes in real time.
+        self.drainChannelListChanges(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags) to the new peer
@@ -4380,6 +4385,15 @@ pub const LinuxServer = struct {
                     link.sendMembership(cv.name, nick, status, hlc, true) catch continue;
                 }
             }
+            if (self.world.bansOf(cv.name)) |entries| {
+                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .ban, entry.mask, entry.setter, entry.set_at, hlc, true);
+            }
+            if (self.world.exemptsOf(cv.name)) |entries| {
+                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .exempt, entry.mask, entry.setter, entry.set_at, hlc, true);
+            }
+            if (self.world.invexOf(cv.name)) |entries| {
+                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .invex, entry.mask, entry.setter, entry.set_at, hlc, true);
+            }
         }
         if (conn.s2s_secured) |link| {
             self.flushS2sOutbound(conn, link.outbound()) catch {};
@@ -4409,6 +4423,25 @@ pub const LinuxServer = struct {
         } else if (conn.s2s) |link| {
             self.flushS2sOutbound(conn, link.outbound()) catch {};
             link.clearOutbound();
+        }
+    }
+
+    fn sendChannelListToConn(
+        self: *LinuxServer,
+        conn: *ConnState,
+        channel: []const u8,
+        kind: channel_list_event.ListKind,
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        hlc: u64,
+        present: bool,
+    ) void {
+        _ = self;
+        if (conn.s2s_secured) |link| {
+            link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch return;
+        } else if (conn.s2s) |link| {
+            link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch return;
         }
     }
 
@@ -4442,6 +4475,32 @@ pub const LinuxServer = struct {
             } else if (slot.value.s2s) |link| {
                 if (!link.established()) continue;
                 link.sendChannelModeFlags(channel, flags, hlc) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    fn announceChannelList(
+        self: *LinuxServer,
+        channel: []const u8,
+        kind: channel_list_event.ListKind,
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        present: bool,
+    ) void {
+        const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
+                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
+                link.clearOutbound();
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
                 self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
                 link.clearOutbound();
             }
@@ -4560,6 +4619,45 @@ pub const LinuxServer = struct {
                 const now = self.channelModeFlagBits(ch.channel);
                 self.emitRemoteChannelModeFlags(ch.channel, remote, prev, now);
             }
+            ch.deinit(self.allocator);
+        }
+        self.allocator.free(changes);
+    }
+
+    fn applyRemoteChannelList(self: *LinuxServer, ch: anytype) bool {
+        if (ch.present) {
+            self.world.ensureRemoteListChannel(ch.channel) catch return false;
+            return switch (ch.kind) {
+                .ban => self.world.addBan(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
+                .exempt => self.world.addExempt(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
+                .invex => self.world.addInvex(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
+            };
+        }
+        return switch (ch.kind) {
+            .ban => self.world.removeBan(ch.channel, ch.mask) catch false,
+            .exempt => self.world.removeExempt(ch.channel, ch.mask) catch false,
+            .invex => self.world.removeInvex(ch.channel, ch.mask) catch false,
+        };
+    }
+
+    fn emitRemoteChannelList(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        const prefix = if (ch.setter.len != 0) ch.setter else if (remote_name.len != 0) remote_name else self.serverName();
+        var line_buf: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &line_buf,
+            ":{s} MODE {s} {c}{c} {s}\r\n",
+            .{ prefix, ch.channel, if (ch.present) @as(u8, '+') else @as(u8, '-'), ch.kind.letter(), ch.mask },
+        ) catch return;
+        self.broadcastChannel(ch.channel, line, null) catch {};
+    }
+
+    /// Drain remote +b/+e/+I list-mode changes, apply them to local world state,
+    /// and surface real changes as MODE lines to local channel members.
+    fn drainChannelListChanges(self: *LinuxServer, link: anytype) void {
+        const changes = link.takeChannelListChanges() catch return;
+        const remote = link.remoteName();
+        for (changes) |*ch| {
+            if (self.applyRemoteChannelList(ch)) self.emitRemoteChannelList(ch, remote);
             ch.deinit(self.allocator);
         }
         self.allocator.free(changes);
@@ -5342,6 +5440,7 @@ pub const LinuxServer = struct {
                     if (changed) {
                         const sign: u8 = if (adding) '+' else '-';
                         appendParamMode(&applied, &targets, &emitted_sign, sign, 'b', mask);
+                        self.announceChannelList(channel, .ban, mask, list_setter, list_set_at, adding);
                     }
                 },
                 'e' => {
@@ -5359,7 +5458,10 @@ pub const LinuxServer = struct {
                         })
                     else
                         (self.world.removeExempt(channel, mask) catch continue);
-                    if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'e', mask);
+                    if (changed) {
+                        appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'e', mask);
+                        self.announceChannelList(channel, .exempt, mask, list_setter, list_set_at, adding);
+                    }
                 },
                 'I' => {
                     // No argument => RPL_INVITELIST query (346/347).
@@ -5376,7 +5478,10 @@ pub const LinuxServer = struct {
                         })
                     else
                         (self.world.removeInvex(channel, mask) catch continue);
-                    if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'I', mask);
+                    if (changed) {
+                        appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'I', mask);
+                        self.announceChannelList(channel, .invex, mask, list_setter, list_set_at, adding);
+                    }
                 },
                 'Z' => {
                     // +Z quiet (MUTE) list — like +b but only suppresses speech.

@@ -231,6 +231,26 @@ pub const S2sLink = struct {
         return self.peer.takeChannelModeFlagChanges();
     }
 
+    /// Announce a local channel list-mode (+b/+e/+I) change to the peer.
+    pub fn sendChannelList(
+        self: *S2sLink,
+        channel: []const u8,
+        kind: s2s_peer.S2sPeer.ChannelListDelta.Kind,
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        try self.peer.sendChannelList(self.sink(), channel, kind, mask, setter, set_at, hlc, present);
+    }
+
+    /// Drain remote channel list-mode changes (+b/+e/+I) the daemon should apply
+    /// to local world state and surface as MODE lines.
+    pub fn takeChannelListChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.ChannelListDelta {
+        return self.peer.takeChannelListChanges();
+    }
+
     /// Forward a signed cross-mesh operator grant to the peer (best-effort; only
     /// meaningful once established). `signed` is opaque `oper_cred_share` bytes.
     pub fn sendOperGrant(self: *S2sLink, signed: []const u8) !void {

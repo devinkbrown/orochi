@@ -32,6 +32,7 @@ const handshake_version: u8 = 1;
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
+const channel_list_event = @import("../../proto/channel_list_event.zig");
 const partition_detector = @import("partition_detector.zig");
 
 pub const ByteSink = struct {
@@ -130,6 +131,9 @@ pub const S2sPeer = struct {
     /// Remote aggregate channel MODE flag changes that won the LWW route-table
     /// state, awaiting the daemon to apply them to the local world and emit MODE.
     channel_mode_flag_changes: std.ArrayListUnmanaged(ChannelModeFlagsDelta) = .empty,
+    /// Remote channel list-mode changes (+b/+e/+I) that altered LWW state,
+    /// awaiting the daemon to apply them to its local world and emit MODE lines.
+    channel_list_changes: std.ArrayListUnmanaged(ChannelListDelta) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -190,6 +194,8 @@ pub const S2sPeer = struct {
         self.membership_changes.deinit(self.allocator);
         for (self.channel_mode_flag_changes.items) |*d| d.deinit(self.allocator);
         self.channel_mode_flag_changes.deinit(self.allocator);
+        for (self.channel_list_changes.items) |*d| d.deinit(self.allocator);
+        self.channel_list_changes.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -328,6 +334,7 @@ pub const S2sPeer = struct {
             .QUIT => self.closeRemote(),
             .MEMBERSHIP => try self.recvMembership(frame.payload),
             .CHANNEL_MODE_FLAGS => try self.recvChannelModeFlags(frame.payload),
+            .CHANNEL_LIST => try self.recvChannelList(frame.payload),
             .MESSAGE => try self.recvMessage(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
         }
@@ -420,10 +427,34 @@ pub const S2sPeer = struct {
         }
     };
 
+    pub const ChannelListDelta = struct {
+        pub const Kind = route_table.ChannelListKind;
+
+        channel: []u8,
+        mask: []u8,
+        setter: []u8,
+        set_at: i64,
+        kind: Kind,
+        present: bool,
+
+        pub fn deinit(self: *ChannelListDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.channel);
+            allocator.free(self.mask);
+            allocator.free(self.setter);
+            self.* = undefined;
+        }
+    };
+
     /// Drain queued remote channel MODE flag changes. Caller owns the slice and
     /// each delta's channel string (call `deinit` per entry, then free slice).
     pub fn takeChannelModeFlagChanges(self: *S2sPeer) ![]ChannelModeFlagsDelta {
         return self.channel_mode_flag_changes.toOwnedSlice(self.allocator);
+    }
+
+    /// Drain remote channel list-mode changes (+b/+e/+I). Caller owns the slice
+    /// and each delta's strings.
+    pub fn takeChannelListChanges(self: *S2sPeer) ![]ChannelListDelta {
+        return self.channel_list_changes.toOwnedSlice(self.allocator);
     }
 
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
@@ -469,6 +500,39 @@ pub const S2sPeer = struct {
         }) catch self.allocator.free(ch);
     }
 
+    /// Apply an inbound CHANNEL_LIST event to the route table (LWW by hlc), then
+    /// queue add/remove transitions for the daemon. Malformed or stale payloads
+    /// are dropped and never fault the link.
+    fn recvChannelList(self: *S2sPeer, payload: []const u8) !void {
+        const ev = channel_list_event.decode(payload) catch return;
+        const res = self.routes.applyChannelList(ev.channel, ev.kind, ev.mask, ev.setter, ev.set_at, ev.origin_node, ev.hlc, ev.present) catch return;
+        if (res.outcome == .unchanged) return;
+
+        const ch = self.allocator.dupe(u8, ev.channel) catch return;
+        const mask = self.allocator.dupe(u8, ev.mask) catch {
+            self.allocator.free(ch);
+            return;
+        };
+        const setter = self.allocator.dupe(u8, ev.setter) catch {
+            self.allocator.free(ch);
+            self.allocator.free(mask);
+            return;
+        };
+
+        self.channel_list_changes.append(self.allocator, .{
+            .channel = ch,
+            .mask = mask,
+            .setter = setter,
+            .set_at = ev.set_at,
+            .kind = ev.kind,
+            .present = ev.present,
+        }) catch {
+            self.allocator.free(ch);
+            self.allocator.free(mask);
+            self.allocator.free(setter);
+        };
+    }
+
     /// Emit a MEMBERSHIP event to the peer announcing a local member's presence
     /// (or departure) in `channel`. Best-effort; only meaningful once established.
     pub fn sendMembership(
@@ -511,6 +575,33 @@ pub const S2sPeer = struct {
         var buf: [channel_mode_flags_event.max_channel_len + 32]u8 = undefined;
         const wire = try channel_mode_flags_event.encode(ev, &buf);
         try emitFrame(self.allocator, sink, .CHANNEL_MODE_FLAGS, wire);
+    }
+
+    /// Emit a CHANNEL_LIST event to announce local +b/+e/+I state.
+    pub fn sendChannelList(
+        self: *S2sPeer,
+        sink: ByteSink,
+        channel: []const u8,
+        kind: route_table.ChannelListKind,
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        hlc: u64,
+        present: bool,
+    ) !void {
+        const ev = channel_list_event.ChannelListEvent{
+            .present = present,
+            .kind = kind,
+            .origin_node = self.local_node_id,
+            .hlc = hlc,
+            .set_at = set_at,
+            .channel = channel,
+            .mask = mask,
+            .setter = setter,
+        };
+        var buf: [channel_list_event.max_channel_len + channel_list_event.max_mask_len + channel_list_event.max_setter_len + 40]u8 = undefined;
+        const wire = try channel_list_event.encode(ev, &buf);
+        try emitFrame(self.allocator, sink, .CHANNEL_LIST, wire);
     }
 
     /// Remote members the peer has announced for `channel` (borrowed roster).

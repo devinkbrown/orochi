@@ -37,6 +37,8 @@ pub const FrameType = enum(u8) {
     /// verified against the sending peer's identity on receipt.
     OPER_GRANT = 0x0A,
     CHANNEL_MODE_FLAGS = 0x0B,
+    /// Channel list-mode fact (+b/+e/+I), LWW by payload HLC.
+    CHANNEL_LIST = 0x0C,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -55,6 +57,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.MESSAGE) => .MESSAGE,
             @intFromEnum(FrameType.OPER_GRANT) => .OPER_GRANT,
             @intFromEnum(FrameType.CHANNEL_MODE_FLAGS) => .CHANNEL_MODE_FLAGS,
+            @intFromEnum(FrameType.CHANNEL_LIST) => .CHANNEL_LIST,
             else => null,
         };
     }
@@ -172,6 +175,7 @@ const all_frame_types = [_]FrameType{
     .MESSAGE,
     .OPER_GRANT,
     .CHANNEL_MODE_FLAGS,
+    .CHANNEL_LIST,
 };
 
 test "encode/decode round-trip each type" {

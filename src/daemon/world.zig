@@ -1099,6 +1099,13 @@ pub const World = struct {
         return self.channels.count();
     }
 
+    /// Materialize an empty channel so remote mesh-owned list state (+b/+e/+I)
+    /// can be stored before any local user joins it. Joining later still grants
+    /// founder status because the member set is empty.
+    pub fn ensureRemoteListChannel(self: *World, name: []const u8) WorldError!void {
+        _ = try self.ensureChannel(name);
+    }
+
     /// Read-only view of a channel for LIST.
     pub const ChannelView = struct {
         name: []const u8,

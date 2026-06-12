@@ -208,6 +208,29 @@ pub const SecuredLink = struct {
         return link.takeChannelModeFlagChanges();
     }
 
+    /// Announce a local channel list-mode (+b/+e/+I) change over the secured
+    /// link. Outbound bytes accumulate in `out`.
+    pub fn sendChannelList(
+        self: *SecuredLink,
+        channel: []const u8,
+        kind: s2s_peer.S2sPeer.ChannelListDelta.Kind,
+        mask: []const u8,
+        setter: []const u8,
+        set_at: i64,
+        hlc: u64,
+        present: bool,
+    ) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present);
+        try self.drainInner();
+    }
+
+    /// Drain remote channel list-mode changes decoded by the inner link.
+    pub fn takeChannelListChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelListDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeChannelListChanges();
+    }
+
     /// Forward a signed cross-mesh operator grant to the peer over the secured
     /// CRDT link (no-op until established). Outbound bytes accumulate in `out`.
     pub fn sendOperGrant(self: *SecuredLink, signed: []const u8) anyerror!void {
