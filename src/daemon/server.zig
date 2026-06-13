@@ -2866,6 +2866,7 @@ pub const LinuxServer = struct {
         conn.last_message_ms = conn.connected_at_ms;
 
         if (is_s2s and self.s2sSecured()) {
+            self.captureClientHost(conn);
             // PQ-secured peer: stand up a SecuredLink (responder). Its TOFU prekey
             // preamble is already queued; send it and wait for the initiator's M1.
             const link = try self.newSecuredLink(.responder);
@@ -2887,6 +2888,7 @@ pub const LinuxServer = struct {
             return;
         }
         if (is_s2s) {
+            self.captureClientHost(conn);
             // Server-to-server peer: stand up an S2sLink and wait for its inbound
             // handshake (the connecting side opens it; we respond on recv).
             const link = try self.allocator.create(s2s_link.S2sLink);
@@ -3944,18 +3946,18 @@ pub const LinuxServer = struct {
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
                 const dropped_node = link.peerShortId();
-                if (link.remoteName().len != 0) {
+                if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
                     _ = self.peer_health.remove(link.remoteName());
                 }
                 // A collision-collapsed duplicate keeps the peer reachable via the
                 // surviving link, so its members never left — no netsplit.
                 if (!conn.s2s_dedup) self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
-                if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
+                if (!conn.s2s_dedup) if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
-                self.updatePartitionTransitions(); // detect a split this drop caused
+                if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true);
@@ -3963,18 +3965,18 @@ pub const LinuxServer = struct {
             }
             if (conn.s2s) |link| {
                 const dropped_node = link.remoteNodeId();
-                if (link.remoteName().len != 0) {
+                if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
                     _ = self.peer_health.remove(link.remoteName());
                 }
                 // A collision-collapsed duplicate keeps the peer reachable via the
                 // surviving link, so its members never left — no netsplit.
                 if (!conn.s2s_dedup) self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
-                if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
+                if (!conn.s2s_dedup) if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s = null;
-                self.updatePartitionTransitions(); // detect a split this drop caused
+                if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
                 self.stats.onClose(true);
@@ -8773,13 +8775,18 @@ pub const LinuxServer = struct {
             }
             // Already linked to this peer via the surviving (possibly inbound)
             // link? Don't dial a duplicate — that just loops collapse→redial.
-            if (self.meshPeerLinkedByHost(dial.host)) {
+            if (self.meshPeerLinkedByDial(dial)) {
                 dial.token = null;
                 continue;
             }
             if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) continue;
             dial.last_attempt_ms = now;
-            if (self.initiateS2sConnect(dial.host, dial.port)) |tok| {
+            const addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
+                std.debug.print("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                continue;
+            };
+            dial.addr = addr;
+            if (self.initiateS2sConnectToAddr(addr)) |tok| {
                 dial.token = tok;
                 std.debug.print("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
             } else |err| {
@@ -13502,18 +13509,23 @@ pub const LinuxServer = struct {
         return null;
     }
 
-    /// Whether an established S2S peer link to `host` already exists in EITHER
-    /// direction (we dialed it, or it dialed us). The auto-connect sweep consults
-    /// this so it never re-dials a peer that is already reachable via the inbound
-    /// link the collision rule chose to keep — which otherwise loops establish →
-    /// duplicate-collapse → redial forever. The dial host is matched against the
-    /// handshake-learned peer server name (ASCII case-insensitive), the same
-    /// identity LINKS/MAP report.
-    fn meshPeerLinkedByHost(self: *LinuxServer, host: []const u8) bool {
-        var it = self.rx().clients.iterator();
+    /// Whether an established S2S peer link for this configured dial already exists
+    /// in either direction. The survivor after reciprocal auto-dial may be inbound,
+    /// so the configured dial token can disappear even though the peer is still up.
+    /// Match by server name when the dial host is a DNS name equal to the peer's
+    /// advertised name, and by the last resolved dial IP when the config used an IP
+    /// literal or different DNS label.
+    fn meshPeerLinkedByDial(self: *LinuxServer, dial: *const MeshDial) bool {
+        const dial_addr = dial.addr;
+        var it = self.reactors[0].clients.iterator();
         while (it.next()) |entry| {
-            const name = establishedPeerName(entry.value) orelse continue;
-            if (std.ascii.eqlIgnoreCase(name, host)) return true;
+            const conn = entry.value;
+            const name = establishedPeerName(conn) orelse continue;
+            if (std.ascii.eqlIgnoreCase(name, dial.host)) return true;
+            if (dial_addr) |addr| {
+                if (conn.s2s_initiator and sameSockaddrIn(conn.s2s_connect_addr, addr)) return true;
+                if (!conn.s2s_initiator and samePeerIp(conn.peer_addr, addr)) return true;
+            }
         }
         return false;
     }
@@ -15565,7 +15577,7 @@ pub fn parseHostPort(spec: []const u8) ?HostPort {
 /// link is down. The boot pass dials immediately; afterwards the sweep timer
 /// re-dials at most this often per peer (no duplicate dial while one is in
 /// flight or established — see `MeshDial.token`).
-const mesh_redial_interval_ms: i64 = 10_000;
+const mesh_redial_interval_ms: i64 = if (builtin.is_test) 250 else 10_000;
 
 /// One [mesh].connect auto-dial slot. Owned (and only touched) by reactor 0,
 /// the reactor that owns every outbound ConnState the dial creates.
@@ -15579,10 +15591,26 @@ const MeshDial = struct {
     /// while a connect is in flight or the link is up. Cleared when that slot
     /// is gone (generation mismatch), which is the re-dial signal.
     token: ?RingFdToken = null,
+    /// Last resolved target address for this dial. Used to recognize an inbound
+    /// survivor after reciprocal auto-dial collision closes our outbound token.
+    addr: ?posix.sockaddr.in = null,
     /// Monotonic ms of the last dial attempt (rate cap for re-dials). 0 =
     /// never dialed (the forced boot pass always fires regardless).
     last_attempt_ms: i64 = 0,
 };
+
+fn sameSockaddrIn(a: posix.sockaddr.in, b: posix.sockaddr.in) bool {
+    return a.addr == b.addr and a.port == b.port;
+}
+
+fn samePeerIp(peer_addr: ?dns.Address, dial_addr: posix.sockaddr.in) bool {
+    const peer = peer_addr orelse return false;
+    const dial_ip: [4]u8 = @bitCast(dial_addr.addr);
+    return switch (peer) {
+        .ipv4 => |b| std.mem.eql(u8, &b, &dial_ip),
+        .ipv6 => false,
+    };
+}
 
 fn sockaddrIn(host: []const u8, port: u16) ServerError!posix.sockaddr.in {
     const parsed = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidAddress;
@@ -20026,6 +20054,143 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
         }
     }
     try std.testing.expect(whois_seen);
+}
+
+fn reserveTwoLoopbackPorts() ServerError!struct { u16, u16 } {
+    const fd1 = try createListener("127.0.0.1", 0, 8);
+    defer closeFd(fd1);
+    const fd2 = try createListener("127.0.0.1", 0, 8);
+    defer closeFd(fd2);
+    return .{ try socketPort(fd1), try socketPort(fd2) };
+}
+
+fn testSleepMs(ms: isize) void {
+    var ts = linux.timespec{
+        .sec = @divFloor(ms, 1000),
+        .nsec = @mod(ms, 1000) * @as(isize, std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&ts, null);
+}
+
+fn expectMeshPeerVisible(client: *LiveClient, peer_name: []const u8, max_probes: usize) !void {
+    var probes: usize = 0;
+    while (probes < max_probes) : (probes += 1) {
+        client.reset();
+        try writeAllFd(client.fd, "LINKS\r\nLUSERS\r\n");
+        const deadline = platform.monotonicMillis() + 250;
+        while (platform.monotonicMillis() < deadline) {
+            var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 20) catch return error.Unexpected;
+            if (ready != 0 and (fds[0].revents & linux.POLL.IN) != 0) try client.readAvailable();
+            const got_now = client.written();
+            if (std.mem.indexOf(u8, got_now, " 365 ") != null and
+                std.mem.indexOf(u8, got_now, " 255 ") != null) break;
+        }
+        const got = client.written();
+        if (std.mem.indexOf(u8, got, peer_name) != null and
+            std.mem.indexOf(u8, got, " on 2 servers") != null) return;
+        testSleepMs(25);
+    }
+    return error.TestTimeout;
+}
+
+fn countMeshLogDetail(server: *const LinuxServer, detail: []const u8) usize {
+    var n: usize = 0;
+    var it = server.mesh_log.iterator();
+    while (it.next()) |ev| {
+        if (std.mem.eql(u8, ev.detail, detail)) n += 1;
+    }
+    return n;
+}
+
+fn runReciprocalMeshDurabilityTest(num_shards: u16) !void {
+    const alloc = std.testing.allocator;
+    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    const s2s_port1 = s2s_ports[0];
+    const s2s_port2 = s2s_ports[1];
+
+    var spec1_buf: [32]u8 = undefined;
+    var spec2_buf: [32]u8 = undefined;
+    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_port1});
+    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_port2});
+    const node1_peers = [_][]const u8{node2_spec};
+    const node2_peers = [_][]const u8{node1_spec};
+
+    var node1 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_port1,
+        .node_id = 1,
+        .server_name = "node1.test",
+        .mesh_connect = &node1_peers,
+        .num_shards = num_shards,
+        .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+
+    var node2 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_port2,
+        .node_id = 2,
+        .server_name = "node2.test",
+        .mesh_connect = &node2_peers,
+        .num_shards = num_shards,
+        .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+    const port2 = node2.boundPort() catch return error.SkipZigTest;
+
+    var run1 = std.atomic.Value(bool).init(true);
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    defer {
+        node1.requestStop(&run1);
+        node2.requestStop(&run2);
+        thr1.join();
+        thr2.join();
+    }
+
+    const fd1 = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd1);
+    const fd2 = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd2);
+    var c1 = LiveClient{ .fd = fd1 };
+    var c2 = LiveClient{ .fd = fd2 };
+    try writeAllFd(fd1, "NICK C1\r\nUSER c1 0 * :Client One\r\n");
+    try writeAllFd(fd2, "NICK C2\r\nUSER c2 0 * :Client Two\r\n");
+    try recvUntil(&c1, " 001 C1 ", 200);
+    try recvUntil(&c2, " 001 C2 ", 200);
+
+    try expectMeshPeerVisible(&c1, "node2.test", 160);
+    try expectMeshPeerVisible(&c2, "node1.test", 160);
+    const node1_collapses = countMeshLogDetail(&node1, "duplicate link collapsed");
+    const node2_collapses = countMeshLogDetail(&node2, "duplicate link collapsed");
+
+    // Hold through several accelerated auto-connect sweeps. A reciprocal mesh
+    // used to establish, hit the next redial/collision pass, and then disappear.
+    var checks: usize = 0;
+    while (checks < 12) : (checks += 1) {
+        testSleepMs(150);
+        try expectMeshPeerVisible(&c1, "node2.test", 8);
+        try expectMeshPeerVisible(&c2, "node1.test", 8);
+    }
+    try std.testing.expectEqual(node1_collapses, countMeshLogDetail(&node1, "duplicate link collapsed"));
+    try std.testing.expectEqual(node2_collapses, countMeshLogDetail(&node2, "duplicate link collapsed"));
+}
+
+test "threaded server: reciprocal [mesh].connect survives redial sweeps" {
+    try runReciprocalMeshDurabilityTest(1);
+    try runReciprocalMeshDurabilityTest(2);
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
