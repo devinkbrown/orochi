@@ -389,10 +389,11 @@ pub fn main(init: std.process.Init) !void {
     // reactor 0). The earlier "reactor spin" that forced a revert was actually
     // the http_fetch EOF busy-loop (fixed in readSome), not the pool itself;
     // re-enable a moderate pool by default. Tunable via [server] num_shards.
-    if (srv_cfg.num_shards <= 1) {
-        const cpus = std.Thread.getCpuCount() catch 1;
-        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
-    }
+    // Single-reactor default (opt-in pool via [server] num_shards>1). Re-verified
+    // live: even with the spin fixed + S2S on reactor 0, num_shards>1 still drops
+    // the S2S link after the initial burst (2 servers -> 1, no re-establish). Real
+    // multi-reactor S2S-maintenance bug; keep single-reactor until root-caused.
+    if (srv_cfg.num_shards == 0) srv_cfg.num_shards = 1;
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
