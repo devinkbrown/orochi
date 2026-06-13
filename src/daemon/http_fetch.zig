@@ -459,7 +459,15 @@ fn readSome(fd: linux.fd_t, buf: []u8) Error!usize {
     while (true) {
         const rc = linux.read(fd, buf.ptr, buf.len);
         switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                // read()==0 is EOF (peer FIN). Surface it as ConnectionClosed so
+                // every caller terminates — notably the TLS handshake loop, which
+                // otherwise feeds empty -> need_more -> reads EOF again forever,
+                // pegging a core and leaking the socket in CLOSE-WAIT.
+                if (n == 0) return error.ConnectionClosed;
+                return n;
+            },
             .INTR => continue,
             .AGAIN => return error.RecvTimeout,
             else => return error.ConnectionClosed,
