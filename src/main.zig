@@ -385,10 +385,11 @@ pub fn main(init: std.process.Init) !void {
     // Multithreading: default to a moderate sharded reactor pool. S2S accepts
     // are pinned to reactor 0, so client SO_REUSEPORT load-balancing can be on by
     // default without placing mesh peer ConnStates on arbitrary shards.
-    if (srv_cfg.num_shards <= 1) {
-        const cpus = std.Thread.getCpuCount() catch 1;
-        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
-    }
+    // Default OFF (opt-in via [server] num_shards>1). Even with S2S accept pinned
+    // to reactor 0, the live pool still showed a reactor busy-spin + mesh
+    // instability under load; keep single-reactor (stable: 2-server mesh, idle
+    // CPU ~0) as the default until that is root-caused.
+    if (srv_cfg.num_shards == 0) srv_cfg.num_shards = 1;
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
