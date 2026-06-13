@@ -370,6 +370,59 @@ fn queryOneServer(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![4]u8 
     return error.HostNotFound;
 }
 
+/// Like `resolveHostA` but queries AAAA records, returning an IPv6 address.
+/// Used by the mesh dial path so a v6-only peer resolves; the query travels over
+/// the (IPv4) system resolvers exactly like the A path.
+pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
+    if (net.IpAddress.parse(host, port)) |addr| switch (addr) {
+        .ip6 => return addr,
+        .ip4 => {}, // an IPv4 literal is not an AAAA answer — fall through to DNS
+    } else |_| {}
+
+    var conf_buf: [4096]u8 = undefined;
+    const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
+    const conf = resolv_conf.parse(text);
+    const servers = conf.nameserverSlice();
+    if (servers.len == 0) return error.NoNameservers;
+
+    var id_seed: [2]u8 = undefined;
+    osEntropy(&id_seed);
+    const query_id = std.mem.readInt(u16, &id_seed, .big);
+    var query_buf: [dns.max_message_len]u8 = undefined;
+    const query = dns.encodeQuery(&query_buf, query_id, host, .aaaa) catch return error.HostNotFound;
+
+    for (servers) |srv| {
+        const ns_v4 = switch (srv) {
+            .ipv4 => |b| b,
+            .ipv6 => continue,
+        };
+        if (queryOneServer6(ns_v4, query, timeout_ms)) |ipv6| {
+            return .{ .ip6 = .{ .bytes = ipv6, .port = port } };
+        } else |_| {}
+    }
+    return error.HostNotFound;
+}
+
+fn queryOneServer6(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![16]u8 {
+    const fd = try udpSocket();
+    defer closeFd(fd);
+    setRecvTimeout(fd, timeout_ms);
+    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, 53), .addr = @bitCast(ns_v4) };
+    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
+    if (posix.errno(linux.write(fd, query.ptr, query.len)) != .SUCCESS) return error.ConnectFailed;
+
+    var resp: [dns.max_message_len]u8 = undefined;
+    const rc = linux.read(fd, &resp, resp.len);
+    if (posix.errno(rc) != .SUCCESS) return error.HostNotFound;
+    const n: usize = @intCast(rc);
+    const msg = dns.parseMessage(1, dns.max_cache_addrs, resp[0..n]) catch return error.HostNotFound;
+    for (msg.answerSlice()) |rr| switch (rr.data) {
+        .aaaa => |ipv6| return ipv6,
+        else => {},
+    };
+    return error.HostNotFound;
+}
+
 // ---- raw socket helpers (mirror acme_runner / server idiom) ------------------
 
 fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!linux.fd_t {

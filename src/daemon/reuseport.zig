@@ -44,8 +44,15 @@ pub fn createReusePortListener(host: []const u8, port: u16, backlog: u31) ReuseP
     // fast rebind after restart.
     try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes));
     try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&yes));
+    // Dual-stack: a single AF_INET6 socket accepts both IPv6 and IPv4 (the
+    // latter as IPv4-mapped ::ffff:a.b.c.d). Disable V6ONLY explicitly so the
+    // behavior never depends on the net.ipv6.bindv6only sysctl. IPv4-mapped
+    // peers are normalized back to real IPv4 in captureClientHost, so cloaking,
+    // bans, reputation, and clone limits see the address family they expect.
+    var v6only: u32 = 0;
+    try setsockopt(fd, linux.IPPROTO.IPV6, linux.IPV6.V6ONLY, std.mem.asBytes(&v6only));
 
-    var addr = try sockaddrIn(host, port);
+    var addr = try sockaddrIn6(host, port);
     try bindSocket(fd, &addr);
     try listenSocket(fd, backlog);
     return fd;
@@ -61,7 +68,7 @@ pub fn hasReusePort(fd: linux.fd_t) bool {
 }
 
 fn socketTcp() ReusePortError!linux.fd_t {
-    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    const rc = linux.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     switch (posix.errno(rc)) {
         .SUCCESS => return @intCast(rc),
         .ACCES, .PERM => return error.PermissionDenied,
@@ -70,17 +77,31 @@ fn socketTcp() ReusePortError!linux.fd_t {
     }
 }
 
-fn sockaddrIn(host: []const u8, port: u16) ReusePortError!posix.sockaddr.in {
-    const parsed = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidAddress;
+/// Build an IPv6 bind address. A wildcard host ("0.0.0.0", "::", or empty) binds
+/// in6addr_any so the dual-stack socket accepts every interface and both
+/// families. An IPv6 literal binds directly; an IPv4 literal binds as its
+/// IPv4-mapped form (::ffff:a.b.c.d). Anything else is rejected.
+fn sockaddrIn6(host: []const u8, port: u16) ReusePortError!posix.sockaddr.in6 {
+    var addr: [16]u8 = [_]u8{0} ** 16; // in6addr_any (dual-stack wildcard)
+    if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
+        if (std.Io.net.Ip6Address.parse(host, port)) |a6| {
+            addr = a6.bytes;
+        } else |_| {
+            const a4 = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidAddress;
+            addr = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ a4.bytes;
+        }
+    }
     return .{
-        .port = std.mem.nativeToBig(u16, parsed.port),
-        .addr = @bitCast(parsed.bytes),
+        .port = std.mem.nativeToBig(u16, port),
+        .flowinfo = 0,
+        .addr = addr,
+        .scope_id = 0,
     };
 }
 
-fn bindSocket(fd: linux.fd_t, addr: *const posix.sockaddr.in) ReusePortError!void {
+fn bindSocket(fd: linux.fd_t, addr: *const posix.sockaddr.in6) ReusePortError!void {
     const ptr: *const posix.sockaddr = @ptrCast(addr);
-    const rc = linux.bind(fd, ptr, @sizeOf(posix.sockaddr.in));
+    const rc = linux.bind(fd, ptr, @sizeOf(posix.sockaddr.in6));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
         .ACCES, .PERM => return error.PermissionDenied,

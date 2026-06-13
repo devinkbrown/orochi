@@ -1428,7 +1428,7 @@ pub const ConnState = struct {
     s2s_dedup: bool = false,
     /// Target address for an outbound S2S connect, kept here (the slot is stable)
     /// so it outlives the in-flight IORING_OP_CONNECT submission.
-    s2s_connect_addr: posix.sockaddr.in = undefined,
+    s2s_connect_addr: posix.sockaddr.in6 = undefined,
     /// Non-null while this client has an open inbound draft/multiline batch.
     /// Heap-owned; freed when the batch closes/aborts or the connection ends.
     multiline: ?*MultilineState = null,
@@ -3167,6 +3167,15 @@ pub const LinuxServer = struct {
             },
             posix.AF.INET6 => blk: {
                 const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+                // A dual-stack listener reports IPv4 peers as IPv4-mapped IPv6
+                // (::ffff:a.b.c.d). Unwrap those to real IPv4 so host display,
+                // cloaking, bans, reputation, and clone limits treat them as the
+                // v4 address they actually are — not a synthetic v6 host.
+                if (isV4Mapped(in6.addr)) {
+                    const b: [4]u8 = in6.addr[12..16].*;
+                    conn.peer_addr = .{ .ipv4 = b };
+                    break :blk std.fmt.bufPrint(&ipbuf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch return;
+                }
                 conn.peer_addr = .{ .ipv6 = in6.addr };
                 break :blk formatIp6(&ipbuf, in6.addr) catch return;
             },
@@ -8290,7 +8299,7 @@ pub const LinuxServer = struct {
             if (e.value.s2s != null or e.value.s2s_secured != null) {
                 if (e.value.s2s_initiator and !self.dialManaged(e.value.token)) {
                     const hint = mesh_redial.encode(.{
-                        .addr4 = @bitCast(e.value.s2s_connect_addr.addr),
+                        .addr = e.value.s2s_connect_addr.addr,
                         .port = std.mem.bigToNative(u16, e.value.s2s_connect_addr.port),
                     });
                     const hb = self.allocator.dupe(u8, &hint) catch continue;
@@ -8492,9 +8501,11 @@ pub const LinuxServer = struct {
             if (c.header.kind != .mesh_checkpoint) continue;
             if (c.fields.len == 0) continue;
             const peer = mesh_redial.decode(c.fields[0].bytes) catch continue;
-            const addr = posix.sockaddr.in{
+            const addr = posix.sockaddr.in6{
                 .port = std.mem.nativeToBig(u16, peer.port),
-                .addr = @bitCast(peer.addr4),
+                .flowinfo = 0,
+                .addr = peer.addr,
+                .scope_id = 0,
             };
             _ = self.initiateS2sConnectToAddr(addr) catch |e| {
                 std.debug.print("orochi: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(e)});
@@ -8748,9 +8759,11 @@ pub const LinuxServer = struct {
     /// Open an outbound S2S link to an already-resolved peer address. Shared by
     /// the oper CONNECT path (via `initiateS2sConnect`) and the post-UPGRADE
     /// re-dial of carried mesh links (the predecessor sealed the sockaddr).
-    fn initiateS2sConnectToAddr(self: *LinuxServer, addr: posix.sockaddr.in) !RingFdToken {
+    fn initiateS2sConnectToAddr(self: *LinuxServer, addr: posix.sockaddr.in6) !RingFdToken {
         if (self.rx().clients.len() >= self.config.max_clients) return error.SocketUnavailable;
-        const fd = try socketTcp();
+        // Dual-stack outbound socket: connects to a real IPv6 peer directly and
+        // to an IPv4 peer via its IPv4-mapped form (::ffff:a.b.c.d).
+        const fd = try socketTcp6();
         errdefer closeFd(fd);
         const id = try self.rx().clients.alloc(ConnState.init(fd));
         errdefer _ = self.rx().clients.free(id);
@@ -8769,7 +8782,7 @@ pub const LinuxServer = struct {
             }
             peer.s2s_secured = link;
             errdefer peer.s2s_secured = null;
-            try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
+            try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in6));
             return peer.token;
         }
 
@@ -8786,7 +8799,7 @@ pub const LinuxServer = struct {
         peer.s2s = link;
         errdefer peer.s2s = null;
 
-        try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in));
+        try self.rx().ring.submitConnect(peer.token, peer.fd, @ptrCast(&peer.s2s_connect_addr), @sizeOf(posix.sockaddr.in6));
         return peer.token;
     }
 
@@ -15584,6 +15597,12 @@ fn hostOf(conn: *const ConnState) []const u8 {
 
 /// Format raw IPv6 bytes as eight colon-separated hex groups (matching the
 /// cloak module's IPv6 rendering style).
+/// True for an IPv4-mapped IPv6 address (::ffff:a.b.c.d) — the form a dual-stack
+/// AF_INET6 listener reports for an IPv4 peer.
+fn isV4Mapped(address: [16]u8) bool {
+    return std.mem.eql(u8, address[0..10], &([_]u8{0} ** 10)) and address[10] == 0xff and address[11] == 0xff;
+}
+
 fn formatIp6(out: []u8, address: [16]u8) ![]const u8 {
     var groups: [8]u16 = undefined;
     for (&groups, 0..) |*g, i| g.* = std.mem.readInt(u16, address[i * 2 ..][0..2], .big);
@@ -15594,14 +15613,21 @@ fn formatIp6(out: []u8, address: [16]u8) ![]const u8 {
 }
 
 fn createListener(host: []const u8, port: u16, backlog: u31) ServerError!linux.fd_t {
-    const fd = try socketTcp();
+    // Dual-stack: a single AF_INET6 socket accepts both IPv6 and IPv4 peers (the
+    // latter as IPv4-mapped ::ffff:a.b.c.d, normalized in captureClientHost).
+    // V6ONLY is disabled explicitly so this never depends on the host's
+    // net.ipv6.bindv6only sysctl. Used by the S2S listener and the single-shard
+    // TLS/WS listeners; the SO_REUSEPORT client listeners live in reuseport.zig.
+    const fd = try socketTcp6();
     errdefer closeFd(fd);
 
     var yes: u32 = 1;
     try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes));
+    var v6only: u32 = 0;
+    try setsockopt(fd, linux.IPPROTO.IPV6, linux.IPV6.V6ONLY, std.mem.asBytes(&v6only));
 
-    var addr = try sockaddrIn(host, port);
-    try bindSocket(fd, &addr);
+    var addr = try sockaddrIn6(host, port);
+    try bindSocket6(fd, &addr);
     try listenSocket(fd, backlog);
     return fd;
 }
@@ -15654,22 +15680,23 @@ const MeshDial = struct {
     token: ?RingFdToken = null,
     /// Last resolved target address for this dial. Used to recognize an inbound
     /// survivor after reciprocal auto-dial collision closes our outbound token.
-    addr: ?posix.sockaddr.in = null,
+    /// Dual-stack: IPv4 peers are held in IPv4-mapped form (::ffff:a.b.c.d).
+    addr: ?posix.sockaddr.in6 = null,
     /// Monotonic ms of the last dial attempt (rate cap for re-dials). 0 =
     /// never dialed (the forced boot pass always fires regardless).
     last_attempt_ms: i64 = 0,
 };
 
-fn sameSockaddrIn(a: posix.sockaddr.in, b: posix.sockaddr.in) bool {
-    return a.addr == b.addr and a.port == b.port;
+fn sameSockaddrIn(a: posix.sockaddr.in6, b: posix.sockaddr.in6) bool {
+    return std.mem.eql(u8, &a.addr, &b.addr) and a.port == b.port;
 }
 
-fn samePeerIp(peer_addr: ?dns.Address, dial_addr: posix.sockaddr.in) bool {
+fn samePeerIp(peer_addr: ?dns.Address, dial_addr: posix.sockaddr.in6) bool {
     const peer = peer_addr orelse return false;
-    const dial_ip: [4]u8 = @bitCast(dial_addr.addr);
     return switch (peer) {
-        .ipv4 => |b| std.mem.eql(u8, &b, &dial_ip),
-        .ipv6 => false,
+        // A v4 peer matches an IPv4-mapped dial address on its embedded v4 bytes.
+        .ipv4 => |b| isV4Mapped(dial_addr.addr) and std.mem.eql(u8, &b, dial_addr.addr[12..16]),
+        .ipv6 => |b| std.mem.eql(u8, &b, &dial_addr.addr),
     };
 }
 
@@ -15681,21 +15708,37 @@ fn sockaddrIn(host: []const u8, port: u16) ServerError!posix.sockaddr.in {
     };
 }
 
-/// `sockaddrIn` with hostname support: IPv4 literals parse directly; anything
-/// else goes through a blocking DNS A-record lookup (bounded by `timeout_ms`
-/// per nameserver), so `[mesh].connect = ["ircx.us:6900"]` and oper
-/// `CONNECT ircx.us 6900` both dial by name. IPv6 results are rejected — the
-/// S2S dial path is sockaddr_in (IPv4) end to end.
-fn sockaddrForHost(host: []const u8, port: u16, timeout_ms: u31) ServerError!posix.sockaddr.in {
-    if (sockaddrIn(host, port)) |addr| return addr else |_| {}
-    const resolved = http_fetch.resolveHostA(host, port, timeout_ms) catch return error.InvalidAddress;
-    switch (resolved) {
-        .ip4 => |a4| return .{
-            .port = std.mem.nativeToBig(u16, a4.port),
-            .addr = @bitCast(a4.bytes),
-        },
-        .ip6 => return error.InvalidAddress,
+/// Resolve a mesh peer "host" to a dual-stack `sockaddr.in6`. IPv4/IPv6 literals
+/// parse directly (IPv4 as IPv4-mapped ::ffff:a.b.c.d); a hostname goes through a
+/// blocking DNS lookup (bounded by `timeout_ms` per nameserver) — an A record
+/// first (dialed IPv4-mapped), falling back to AAAA so a v6-only peer such as
+/// `[mesh].connect = ["node.example:6900"]` or oper `CONNECT node.example 6900`
+/// still resolves. The outbound socket is AF_INET6, so both families dial.
+fn sockaddrForHost(host: []const u8, port: u16, timeout_ms: u31) ServerError!posix.sockaddr.in6 {
+    if (sockaddrIn6(host, port)) |addr| return addr else |_| {}
+    if (http_fetch.resolveHostA(host, port, timeout_ms)) |resolved| {
+        switch (resolved) {
+            .ip4 => |a4| return sockaddrIn6FromV4(a4.bytes, port),
+            .ip6 => |a6| return sockaddrIn6FromV6(a6.bytes, port),
+        }
+    } else |_| {}
+    const resolved6 = http_fetch.resolveHostAAAA(host, port, timeout_ms) catch return error.InvalidAddress;
+    switch (resolved6) {
+        .ip4 => |a4| return sockaddrIn6FromV4(a4.bytes, port),
+        .ip6 => |a6| return sockaddrIn6FromV6(a6.bytes, port),
     }
+}
+
+fn sockaddrIn6FromV6(addr: [16]u8, port: u16) posix.sockaddr.in6 {
+    return .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = addr, .scope_id = 0 };
+}
+
+fn sockaddrIn6FromV4(addr4: [4]u8, port: u16) posix.sockaddr.in6 {
+    var a: [16]u8 = [_]u8{0} ** 16;
+    a[10] = 0xff;
+    a[11] = 0xff;
+    @memcpy(a[12..16], &addr4);
+    return sockaddrIn6FromV6(a, port);
 }
 
 fn socketTcp() ServerError!linux.fd_t {
@@ -15708,9 +15751,51 @@ fn socketTcp() ServerError!linux.fd_t {
     }
 }
 
+fn socketTcp6() ServerError!linux.fd_t {
+    const rc = linux.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .ACCES, .PERM => return error.PermissionDenied,
+        .MFILE, .NFILE, .NOBUFS, .NOMEM => return error.SocketUnavailable,
+        else => return error.Unexpected,
+    }
+}
+
 fn bindSocket(fd: linux.fd_t, addr: *const posix.sockaddr.in) ServerError!void {
     const ptr: *const posix.sockaddr = @ptrCast(addr);
     const rc = linux.bind(fd, ptr, @sizeOf(posix.sockaddr.in));
+    switch (posix.errno(rc)) {
+        .SUCCESS => return,
+        .ACCES, .PERM => return error.PermissionDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.Unexpected,
+    }
+}
+
+/// Build a dual-stack IPv6 bind address. A wildcard host ("0.0.0.0", "::", or
+/// empty) binds in6addr_any; an IPv6 literal binds directly; an IPv4 literal
+/// binds as its IPv4-mapped form (::ffff:a.b.c.d). Anything else is rejected.
+fn sockaddrIn6(host: []const u8, port: u16) ServerError!posix.sockaddr.in6 {
+    var addr: [16]u8 = [_]u8{0} ** 16; // in6addr_any (dual-stack wildcard)
+    if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
+        if (std.Io.net.Ip6Address.parse(host, port)) |a6| {
+            addr = a6.bytes;
+        } else |_| {
+            const a4 = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidAddress;
+            addr = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ a4.bytes;
+        }
+    }
+    return .{
+        .port = std.mem.nativeToBig(u16, port),
+        .flowinfo = 0,
+        .addr = addr,
+        .scope_id = 0,
+    };
+}
+
+fn bindSocket6(fd: linux.fd_t, addr: *const posix.sockaddr.in6) ServerError!void {
+    const ptr: *const posix.sockaddr = @ptrCast(addr);
+    const rc = linux.bind(fd, ptr, @sizeOf(posix.sockaddr.in6));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
         .ACCES, .PERM => return error.PermissionDenied,
@@ -20569,7 +20654,7 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
 
     // The predecessor sealed a re-dial hint for the hand-opened link (this peer
     // is NOT in [mesh].connect — the hint is the only way it comes back).
-    const hint = mesh_redial.encode(.{ .addr4 = .{ 127, 0, 0, 1 }, .port = s2s_port });
+    const hint = mesh_redial.encode(.{ .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = s2s_port });
     const arena_pieces = [_]helix_live.StatePiece{
         .{ .kind = .mesh_checkpoint, .bytes = &hint },
     };
