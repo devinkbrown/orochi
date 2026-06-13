@@ -1769,8 +1769,8 @@ pub const LinuxServer = struct {
         return current_reactor orelse &self.reactors[0];
     }
 
-    /// Clamp the configured shard count to `[1, max_shards]`. A zero (unset) or
-    /// out-of-range request collapses to a single reactor — the safe default.
+    /// Clamp the configured shard count to `[1, max_shards]`; callers choose the
+    /// default before init, while direct tests that leave it unset get one shard.
     fn clampShards(config: Config) u12 {
         const requested: usize = if (config.num_shards == 0) 1 else config.num_shards;
         const capped = @min(requested, shard_mod.max_shards);
@@ -1787,11 +1787,12 @@ pub const LinuxServer = struct {
 
     /// Build one shard's `Reactor`: its own ring, connection table (reserved to
     /// `max_clients`), wake eventfd, and listeners stamped with `shard_id`. When
-    /// `reuse_port` is set every listener is a `SO_REUSEPORT` socket so N reactors
-    /// can share the same `(host, port)` and the kernel load-balances accepts;
-    /// the single-reactor path keeps the plain `createListener` sockets (and the
-    /// inherited-fd upgrade handoff) for byte-identical behavior. On any partial
-    /// failure every fd/resource already created for this shard is released.
+    /// `reuse_port` is set the CLIENT listeners use `SO_REUSEPORT` so N reactors
+    /// can load-balance accepts; S2S is reactor-0-only because mesh dial/collision
+    /// state is owned by reactor 0. The single-reactor path keeps the plain
+    /// `createListener` sockets (and the inherited-fd upgrade handoff) for
+    /// byte-identical behavior. On any partial failure every fd/resource already
+    /// created for this shard is released.
     fn initReactor(allocator: std.mem.Allocator, config: Config, shard_id: u12, reuse_port: bool) !Reactor {
         const listener_fd = if (!reuse_port and config.inherited_listener_fd != null) blk: {
             const fd = config.inherited_listener_fd.?;
@@ -1803,11 +1804,11 @@ pub const LinuxServer = struct {
             try createListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
 
-        const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0)
-            (if (reuse_port)
-                try reuseport.createReusePortListener(config.host, config.s2s_port, config.backlog)
-            else
-                try createListener(config.host, config.s2s_port, config.backlog))
+        // S2S peers must be accepted on reactor 0: the mesh dial table,
+        // collision resolver, and link-establish side effects are reactor-0
+        // state. In sharded mode no other reactor even binds this port.
+        const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0 and (!reuse_port or shard_id == 0))
+            try createListener(config.host, config.s2s_port, config.backlog)
         else
             -1;
         errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
@@ -2171,7 +2172,7 @@ pub const LinuxServer = struct {
             try self.rx().ring.submitAccept(listener_token, self.rx().listener_fd);
             self.rx().accept_armed = true;
         }
-        if (self.rx().s2s_listener_fd >= 0 and !self.rx().s2s_accept_armed) {
+        if (self.rx() == &self.reactors[0] and self.rx().s2s_listener_fd >= 0 and !self.rx().s2s_accept_armed) {
             try self.rx().ring.submitAccept(s2s_listener_token, self.rx().s2s_listener_fd);
             self.rx().s2s_accept_armed = true;
         }
@@ -2689,8 +2690,8 @@ pub const LinuxServer = struct {
     }
 
     pub fn s2sBoundPort(self: *LinuxServer) !u16 {
-        if (self.rx().s2s_listener_fd < 0) return error.Unsupported;
-        return socketPort(self.rx().s2s_listener_fd);
+        if (self.reactors[0].s2s_listener_fd < 0) return error.Unsupported;
+        return socketPort(self.reactors[0].s2s_listener_fd);
     }
 
     pub fn tlsBoundPort(self: *LinuxServer) !u16 {
@@ -19681,7 +19682,7 @@ test "threaded server: MONITOR online/offline/list end-to-end" {
 
 test "threaded server: live S2S listener completes a peer handshake" {
     // Non-default mesh identity exercises the config-driven SID/node id path.
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .node_id = 42 }) catch |err| switch (err) {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .s2s_port = 0, .node_id = 42, .num_shards = 2 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
@@ -19690,8 +19691,7 @@ test "threaded server: live S2S listener completes a peer handshake" {
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
     defer {
-        run.store(false, .release);
-        if (connectLoopback(server.boundPort() catch 0)) |wfd| closeFd(wfd) else |_| {}
+        server.requestStop(&run);
         thr.join();
     }
 
@@ -19939,6 +19939,7 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
         .s2s_port = 0,
         .node_id = 2,
         .server_name = "node2.test",
+        .num_shards = 2,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -19948,8 +19949,7 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
     var run2 = std.atomic.Value(bool).init(true);
     var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
     defer {
-        run2.store(false, .release);
-        if (connectLoopback(node2.boundPort() catch 0)) |wfd| closeFd(wfd) else |_| {}
+        node2.requestStop(&run2);
         thr2.join();
     }
 
@@ -19965,6 +19965,7 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
         .node_id = 1,
         .server_name = "node1.test",
         .mesh_connect = &peers,
+        .num_shards = 2,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -19974,8 +19975,7 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
     var run1 = std.atomic.Value(bool).init(true);
     var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
     defer {
-        run1.store(false, .release);
-        if (connectLoopback(port1)) |wfd| closeFd(wfd) else |_| {}
+        node1.requestStop(&run1);
         thr1.join();
     }
 

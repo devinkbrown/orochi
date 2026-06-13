@@ -382,14 +382,13 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Multithreading: a sharded reactor pool (SO_REUSEPORT) is OPT-IN via an
-    // explicit `[server] num_shards > 1` in the config. It is NOT defaulted on:
-    // S2S peer-link ESTABLISHMENT (inbound accept landing on a non-reactor-0
-    // shard, plus dial/collision resolve which assume reactor 0) is not yet
-    // multi-reactor-safe and a >1 default split the live mesh. The cross-shard
-    // data-plane fanout + EBR per-thread readers + cross-shard admin commands
-    // ARE hardened; finish the S2S-accept-on-reactor-0 work before defaulting on.
-    if (srv_cfg.num_shards == 0) srv_cfg.num_shards = 1;
+    // Multithreading: default to a moderate sharded reactor pool. S2S accepts
+    // are pinned to reactor 0, so client SO_REUSEPORT load-balancing can be on by
+    // default without placing mesh peer ConnStates on arbitrary shards.
+    if (srv_cfg.num_shards <= 1) {
+        const cpus = std.Thread.getCpuCount() catch 1;
+        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
+    }
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
