@@ -20113,7 +20113,7 @@ fn countMeshLogDetail(server: *const LinuxServer, detail: []const u8) usize {
     return n;
 }
 
-fn runReciprocalMeshDurabilityTest(num_shards: u16) !void {
+fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
     const alloc = std.testing.allocator;
     const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
     const s2s_port1 = s2s_ports[0];
@@ -20133,7 +20133,7 @@ fn runReciprocalMeshDurabilityTest(num_shards: u16) !void {
         .node_id = 1,
         .server_name = "node1.test",
         .mesh_connect = &node1_peers,
-        .num_shards = num_shards,
+        .num_shards = shards1,
         .sweep_interval_ms = 100,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
@@ -20148,7 +20148,7 @@ fn runReciprocalMeshDurabilityTest(num_shards: u16) !void {
         .node_id = 2,
         .server_name = "node2.test",
         .mesh_connect = &node2_peers,
-        .num_shards = num_shards,
+        .num_shards = shards2,
         .sweep_interval_ms = 100,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
@@ -20199,8 +20199,14 @@ fn runReciprocalMeshDurabilityTest(num_shards: u16) !void {
 }
 
 test "threaded server: reciprocal [mesh].connect survives redial sweeps" {
-    try runReciprocalMeshDurabilityTest(1);
-    try runReciprocalMeshDurabilityTest(2);
+    try runReciprocalMeshDurabilityTest(1, 1);
+    try runReciprocalMeshDurabilityTest(2, 2);
+    // Asymmetric: mirrors the live topology (eshmaki 8 cores -> 4 shards,
+    // ircx.us 1 core -> 1 shard). This is the case that was reported to
+    // oscillate live; the oscillation was the USR2 CLOEXEC strand (d06b8f4),
+    // not a runtime flap. Lock in that the asymmetric mesh holds.
+    try runReciprocalMeshDurabilityTest(4, 1);
+    try runReciprocalMeshDurabilityTest(1, 4);
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
