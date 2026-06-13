@@ -384,10 +384,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Sharded reactor pool across cores (SO_REUSEPORT clients; S2S pinned to
     // reactor 0). Tunable via [server] num_shards.
-    if (srv_cfg.num_shards <= 1) {
-        const cpus = std.Thread.getCpuCount() catch 1;
-        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
-    }
+    // Single-reactor default (opt-in pool via [server] num_shards>1). The
+    // reciprocal-dial flap fix holds the loopback symmetric repro, but the LIVE
+    // asymmetric topology (4-shard <-> 1-shard, real net/DNS) still oscillates
+    // 1<->2 servers; keep single-reactor until that case converges (task #134).
+    if (srv_cfg.num_shards == 0) srv_cfg.num_shards = 1;
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
