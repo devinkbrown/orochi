@@ -4466,6 +4466,12 @@ pub const LinuxServer = struct {
                 var prefixes: [mesh_batch_chunk][420]u8 = undefined;
                 var n: usize = 0;
                 for (remote_members[off..chunk_end]) |m| {
+                    // Never QUIT a nick that is still homed locally: a live local
+                    // user cannot split away with a peer link. Such roster entries
+                    // are membership echoes (e.g. the peer's MODE-status announce
+                    // for one of OUR members), and a fabricated QUIT permanently
+                    // removes the user from local clients' nicklists. (#64)
+                    if (self.nickIsLiveLocal(m.nick)) continue;
                     // QUIT with the member's propagated real user@host when known,
                     // matching how the user was rendered while present.
                     const user: []const u8 = if (m.username.len != 0) m.username else "*";
@@ -4842,6 +4848,18 @@ pub const LinuxServer = struct {
         };
     }
 
+    /// True when `nick` belongs to a live, locally-connected (non-peer) client.
+    /// A peer link's remote roster can contain echoes of OUR OWN members (a peer
+    /// announcing a status grant for a user homed here attributes that nick to
+    /// the link); fabricating JOIN/PART/netsplit-QUIT display lines for such a
+    /// nick desyncs every client-side nicklist from the server roster — the
+    /// user never actually left.
+    fn nickIsLiveLocal(self: *LinuxServer, nick: []const u8) bool {
+        const wid = self.world.findNick(nick) orelse return false;
+        const conn = self.connFor(clientIdFromWorld(wid)) orelse return false;
+        return conn.s2s == null and conn.s2s_secured == null;
+    }
+
     /// Surface a remote (mesh) channel membership change to LOCAL members of
     /// `channel` as live IRC lines, so clients already sitting in the channel see
     /// remote users join/leave/gain-status in real time — not only on a fresh
@@ -4860,11 +4878,22 @@ pub const LinuxServer = struct {
         var buf: [900]u8 = undefined;
         switch (ch.kind) {
             .joined => {
+                // Membership echo for a nick homed HERE (a peer announcing
+                // status for our own member): local clients never lost this
+                // user, so re-JOINing would duplicate them — surface only the
+                // status diff.
+                if (self.nickIsLiveLocal(ch.nick)) {
+                    if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status);
+                    return;
+                }
                 const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} JOIN :{s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch return;
                 if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, 0, ch.status);
             },
             .parted => {
+                // Echo artifact: the user is still connected here — a fabricated
+                // PART would desync client nicklists from the server roster.
+                if (self.nickIsLiveLocal(ch.nick)) return;
                 const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} PART {s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch {};
             },
@@ -4980,6 +5009,9 @@ pub const LinuxServer = struct {
             var prefixes: [mesh_batch_chunk][420]u8 = undefined;
             var n: usize = 0;
             for (run[off..chunk_end]) |*ch| {
+                // Skip membership echoes of locally-homed users — they never
+                // split, so local clients never lost their JOIN. (#64)
+                if (self.nickIsLiveLocal(ch.nick)) continue;
                 const user = if (ch.username.len != 0) ch.username else world_projection.remote_user_placeholder;
                 const host = if (ch.host.len != 0) ch.host else server_host;
                 const prefix = std.fmt.bufPrint(&prefixes[n], "{s}!{s}@{s}", .{ ch.nick, user, host }) catch continue;
