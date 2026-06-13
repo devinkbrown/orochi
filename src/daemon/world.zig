@@ -1208,6 +1208,20 @@ pub const World = struct {
         return self.channels.count();
     }
 
+    /// Count of locally-owned registered nicks. The `nicks`/RCU map holds only
+    /// LOCAL clients (remote mesh users are projected per-channel, never
+    /// registered here), so this is the node-wide local user count. It reads
+    /// through the lock-free RCU registry with a per-thread reader participant,
+    /// so it is safe to call from ANY reactor shard — unlike iterating a single
+    /// reactor's connection set, which only sees that shard's clients. Used by
+    /// LUSERS/MAP so their counts are consistent regardless of which shard the
+    /// querying client landed on under multithreading.
+    pub fn localNickCount(self: *World) usize {
+        const r = self.ensureRcuNicks() catch return self.nicks.count();
+        const p = rcuReaderParticipant(&r.domain, r.generation) catch return self.nicks.count();
+        return r.nicks.count(p);
+    }
+
     /// Materialize an empty channel so remote mesh-owned list state (+b/+e/+I)
     /// can be stored before any local user joins it. Joining later still grants
     /// founder status because the member set is empty.

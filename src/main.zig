@@ -383,17 +383,23 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Sharded reactor pool across cores (SO_REUSEPORT clients; S2S pinned to
-    // reactor 0). Single-reactor DEFAULT; opt in with [server] num_shards>1.
+    // reactor 0). Default on: one reactor per core, capped at 4. Override via
+    // [server] num_shards (set >1 to pin an exact count).
     //
-    // Default-on was attempted and reverted: the loopback repro (incl.
-    // asymmetric 4<->1, runReciprocalMeshDurabilityTest) holds, and the USR2
-    // CLOEXEC strand is fixed (d06b8f4), but the LIVE asymmetric topology
-    // (eshmaki 4-shard <-> ircx.us 1-shard, real WAN/PQ-handshake timing) still
-    // flaps: the 4-shard node oscillates its peer view 1<->2 while the 1-shard
-    // node sees it steadily — a genuine multi-reactor concurrency bug that the
-    // loopback harness does NOT reproduce. Keep single-reactor until it does
-    // (task #134).
-    if (srv_cfg.num_shards == 0) srv_cfg.num_shards = 1;
+    // The "flap" that kept this off was THREE bugs, now all fixed: (1) the
+    // reciprocal-dial collision/redial loop; (2) accepted sockets not being
+    // CLOEXEC, so every USR2 deploy stranded the mesh (d06b8f4); and (3) — the
+    // one that actually presented as a live "flap" — LUSERS/MAP counted peers
+    // and users from the QUERYING shard's own connection set. S2S links live
+    // only on reactor 0, so a LUSERS answered by shards 1..N reported "1 server"
+    // (and a fraction of the users); a reconnecting probe (SO_REUSEPORT spreads
+    // it across shards) sampled that as 1<->2 oscillation. The mesh link was
+    // stable the whole time. Fixed: servers come from a reactor-0-published
+    // atomic, users from the shared world nick registry.
+    if (srv_cfg.num_shards <= 1) {
+        const cpus = std.Thread.getCpuCount() catch 1;
+        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
+    }
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {

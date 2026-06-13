@@ -1725,6 +1725,15 @@ pub const LinuxServer = struct {
     /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
     /// keyed by remote server name, surfaced in the MESH peer table.
     peer_health: link_health_mod.Registry = .{},
+    /// Distinct established S2S peer count, PUBLISHED by reactor 0 (which owns
+    /// the S2S listener + every peer link) for cross-shard reads. Under
+    /// multithreading, a client's LUSERS/MAP runs on whatever shard accepted it,
+    /// but peer links live only on reactor 0 — iterating another shard's client
+    /// set would both miss the peers (reporting "1 server") and race reactor 0's
+    /// slotmap. Reactor 0 recomputes this each timer tick from its own clients
+    /// and stores it here; any shard reads it atomically. Single-reactor mode
+    /// publishes from the one reactor, so behaviour is unchanged.
+    net_peer_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Orochi media SFU control plane): who is in each call.
@@ -2304,6 +2313,11 @@ pub const LinuxServer = struct {
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
         self.sweepMeshAutoConnect(false);
+        // Publish the distinct-peer count for cross-shard LUSERS reads. Reactor 0
+        // owns the peer links, so it is the only reactor that can compute this;
+        // other shards read the published atomic. Converges within one tick of a
+        // peer establishing/dropping.
+        if (self.rx() == &self.reactors[0]) self.publishPeerCount();
         // Mesh anti-entropy: periodically re-burst this node's local channel
         // state to every established peer so anything missed during a split or a
         // reconnect race converges within the cadence instead of staying out of
@@ -10796,14 +10810,9 @@ pub const LinuxServer = struct {
     /// still in registration). Shared by LUSERS and MAP so their user totals
     /// agree and never include peer links or half-open sockets.
     fn countRegisteredUsers(self: *LinuxServer) u64 {
-        var n: u64 = 0;
-        var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
-            const c = entry.value;
-            if (c.s2s != null or c.s2s_secured != null) continue;
-            if (c.session.registered()) n += 1;
-        }
-        return n;
+        // Shared world nick registry (local clients only, consistent across
+        // shards) — not this reactor's connection slice. See world.localNickCount.
+        return @intCast(self.world.localNickCount());
     }
 
     pub fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
@@ -10811,17 +10820,22 @@ pub const LinuxServer = struct {
         // registration) vs established S2S peers (counted as servers, never
         // users). Previously every connection — S2S links and half-registered
         // sockets included — was lumped into `users`, and `unknown` was always 0.
-        var users: u64 = 0;
+        // Local registered users come from the shared world (the nick registry
+        // holds only local clients and is consistent across reactor shards) —
+        // iterating `self.rx().clients` would only see THIS shard's clients and
+        // report a fraction of the node's users under multithreading.
+        const users: u64 = @intCast(self.world.localNickCount());
+        // opers/unknown remain best-effort per-shard: both are almost always 0
+        // (their 252/253 lines only emit when >0), and there is no shared source
+        // for half-registered sockets. A more exact cross-shard tally is not
+        // worth the lifecycle bookkeeping for these rarely-nonzero fields.
         var unknown: u64 = 0;
         var opers: u64 = 0;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
-            // S2S peer links are counted as distinct servers below (deduped),
-            // never as users.
             if (c.s2s != null or c.s2s_secured != null) continue;
             if (c.session.registered()) {
-                users += 1;
                 if (c.session.isOper()) opers += 1;
             } else {
                 unknown += 1;
@@ -13574,7 +13588,17 @@ pub const LinuxServer = struct {
     /// Count distinct established S2S peers visible to this reactor (deduped by
     /// remote server name), so a transient duplicate link to one peer is counted
     /// once. Returns the peer count (servers = this node + peers).
+    /// Distinct established peers, read from the cross-shard published count.
+    /// Safe on any reactor (LUSERS may run on any shard); reactor 0 keeps it
+    /// fresh via `publishPeerCount`.
     fn distinctPeerCount(self: *LinuxServer) u64 {
+        return self.net_peer_count.load(.acquire);
+    }
+
+    /// Recompute the distinct established-peer count from THIS reactor's client
+    /// set. Only correct on reactor 0 (the reactor that owns the S2S links) and
+    /// must only be called there — it iterates `self.rx().clients`.
+    fn distinctPeerCountLocal(self: *LinuxServer) u64 {
         var seen: [32][]const u8 = undefined;
         var n: usize = 0;
         var it = self.rx().clients.iterator();
@@ -13589,6 +13613,12 @@ pub const LinuxServer = struct {
             }
         }
         return n;
+    }
+
+    /// Publish reactor 0's authoritative distinct-peer count for cross-shard
+    /// LUSERS reads. MUST be called on reactor 0 only.
+    fn publishPeerCount(self: *LinuxServer) void {
+        self.net_peer_count.store(@intCast(self.distinctPeerCountLocal()), .release);
     }
 
     /// MAP — network topology: this server with each established S2S peer (both
@@ -20196,6 +20226,126 @@ fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
     }
     try std.testing.expectEqual(node1_collapses, countMeshLogDetail(&node1, "duplicate link collapsed"));
     try std.testing.expectEqual(node2_collapses, countMeshLogDetail(&node2, "duplicate link collapsed"));
+}
+
+/// Parse the user count out of a LUSERS 251 line ("There are N users ...").
+fn parseLusersUserCount(buf: []const u8) ?u64 {
+    const marker = "There are ";
+    const at = std.mem.indexOf(u8, buf, marker) orelse return null;
+    var i = at + marker.len;
+    var n: u64 = 0;
+    var any = false;
+    while (i < buf.len and buf[i] >= '0' and buf[i] <= '9') : (i += 1) {
+        n = n * 10 + (buf[i] - '0');
+        any = true;
+    }
+    return if (any) n else null;
+}
+
+// The live "flap" was per-shard LUSERS inconsistency, not a link flap: a 4-shard
+// node's S2S peer lives only on reactor 0 and its users spread across shards via
+// SO_REUSEPORT, so LUSERS answered by shards 1..3 reported "1 server" and a
+// fraction of the users. A reconnecting probe sampled that as 1<->2 oscillation.
+// Open many connections (spread across shards) and assert EVERY one agrees on
+// the server count (2) and the user count. Asymmetric 4<->1 mirrors the live
+// topology (eshmaki 8 cores, ircx.us 1 core).
+fn runLusersCrossShardConsistencyTest(shards1: u16, shards2: u16) !void {
+    const alloc = std.testing.allocator;
+    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    var spec1_buf: [32]u8 = undefined;
+    var spec2_buf: [32]u8 = undefined;
+    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
+    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const node1_peers = [_][]const u8{node2_spec};
+    const node2_peers = [_][]const u8{node1_spec};
+
+    var node1 = Server.init(alloc, .{
+        .host = "127.0.0.1",       .port = 0,
+        .s2s_port = s2s_ports[0],  .node_id = 1,
+        .server_name = "node1.test", .mesh_connect = &node1_peers,
+        .num_shards = shards1,     .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+    var node2 = Server.init(alloc, .{
+        .host = "127.0.0.1",       .port = 0,
+        .s2s_port = s2s_ports[1],  .node_id = 2,
+        .server_name = "node2.test", .mesh_connect = &node2_peers,
+        .num_shards = shards2,     .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+
+    var run1 = std.atomic.Value(bool).init(true);
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    defer {
+        node1.requestStop(&run1);
+        node2.requestStop(&run2);
+        thr1.join();
+        thr2.join();
+    }
+
+    // Establish the mesh first (probe connection), so reactor 0 has published a
+    // peer count of 1 before we fan out.
+    const probe_fd = connectLoopback(port1) catch return error.SkipZigTest;
+    var probe = LiveClient{ .fd = probe_fd };
+    try writeAllFd(probe_fd, "NICK P\r\nUSER p 0 * :Probe\r\n");
+    try recvUntil(&probe, " 001 P ", 200);
+    try expectMeshPeerVisible(&probe, "node2.test", 200);
+    closeFd(probe_fd);
+
+    // Fan out: many connections spread across node1's shards by SO_REUSEPORT.
+    const N = 16;
+    var fds: [N]linux.fd_t = undefined;
+    var clients: [N]LiveClient = undefined;
+    var opened: usize = 0;
+    defer for (fds[0..opened]) |fd| closeFd(fd);
+    for (0..N) |i| {
+        const fd = connectLoopback(port1) catch return error.SkipZigTest;
+        fds[i] = fd;
+        clients[i] = LiveClient{ .fd = fd };
+        opened += 1;
+        var rb: [48]u8 = undefined;
+        const reg = try std.fmt.bufPrint(&rb, "NICK U{d}\r\nUSER u{d} 0 * :User\r\n", .{ i, i });
+        try writeAllFd(fd, reg);
+    }
+    for (0..N) |i| {
+        var nb: [16]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&nb, " 001 U{d} ", .{i});
+        try recvUntil(&clients[i], needle, 200);
+    }
+
+    // Every connection's LUSERS must agree: same server count (2) and same user
+    // count, regardless of which shard answered it.
+    var first_users: ?u64 = null;
+    for (0..N) |i| {
+        clients[i].reset();
+        try writeAllFd(fds[i], "LUSERS\r\n");
+        try recvUntil(&clients[i], " 255 ", 200);
+        const out = clients[i].written();
+        if (std.mem.indexOf(u8, out, "2 servers") == null) {
+            std.debug.print("conn {d} LUSERS missing '2 servers': {s}\n", .{ i, out });
+            return error.TestUnexpectedResult;
+        }
+        const uc = parseLusersUserCount(out) orelse return error.TestUnexpectedResult;
+        // At least the N fanned-out users are registered network-wide.
+        try std.testing.expect(uc >= N);
+        if (first_users) |fu| {
+            try std.testing.expectEqual(fu, uc);
+        } else first_users = uc;
+    }
+}
+
+test "threaded server: LUSERS counts are consistent across shards" {
+    try runLusersCrossShardConsistencyTest(4, 1);
+    try runLusersCrossShardConsistencyTest(1, 4);
 }
 
 test "threaded server: reciprocal [mesh].connect survives redial sweeps" {
