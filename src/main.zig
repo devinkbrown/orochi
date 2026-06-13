@@ -383,21 +383,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Sharded reactor pool across cores (SO_REUSEPORT clients; S2S pinned to
-    // reactor 0). Default on: one reactor per core up to 4. Override via
-    // [server] num_shards (set 1 to force single-reactor).
+    // reactor 0). Single-reactor DEFAULT; opt in with [server] num_shards>1.
     //
-    // History: enabling this used to "flap" the live mesh (link drops ~10s after
-    // boot, never recovers). Two distinct bugs fed that signal — (1) the
-    // reciprocal-dial collision/redial loop (fixed: non-destructive s2s_dedup
-    // close + reactor-0-authoritative liveness scan + dial-addr redial
-    // suppression), and (2) accepted sockets were not CLOEXEC, so every USR2
-    // deploy stranded the mesh regardless of reactor count (fixed in d06b8f4).
-    // Because every multithreading test was deployed via USR2, (2) masked
-    // whether (1) was actually fixed. With both closed, default the pool on.
-    if (srv_cfg.num_shards <= 1) {
-        const cpus = std.Thread.getCpuCount() catch 1;
-        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
-    }
+    // Default-on was attempted and reverted: the loopback repro (incl.
+    // asymmetric 4<->1, runReciprocalMeshDurabilityTest) holds, and the USR2
+    // CLOEXEC strand is fixed (d06b8f4), but the LIVE asymmetric topology
+    // (eshmaki 4-shard <-> ircx.us 1-shard, real WAN/PQ-handshake timing) still
+    // flaps: the 4-shard node oscillates its peer view 1<->2 while the 1-shard
+    // node sees it steadily — a genuine multi-reactor concurrency bug that the
+    // loopback harness does NOT reproduce. Keep single-reactor until it does
+    // (task #134).
+    if (srv_cfg.num_shards == 0) srv_cfg.num_shards = 1;
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
