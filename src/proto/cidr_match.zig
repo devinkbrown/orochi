@@ -152,12 +152,13 @@ pub fn matchHostmask(mask: []const u8, host: []const u8) bool {
     return mask_index == mask.len;
 }
 
-/// Matches a ban mask as CIDR when it contains a slash, otherwise as a hostmask glob.
+/// Matches a ban mask as CIDR when it parses as CIDR, otherwise as a hostmask glob.
 pub fn matchBan(mask: []const u8, ip: ?u128, host: []const u8) bool {
     if (std.mem.indexOfScalar(u8, mask, '/') != null) {
-        const cidr = Cidr.parse(mask) catch return false;
-        const addr = ip orelse return false;
-        return cidr.contains(addr);
+        if (Cidr.parse(mask)) |cidr| {
+            const addr = ip orelse return false;
+            return cidr.contains(addr);
+        } else |_| {}
     }
     return matchHostmask(mask, host);
 }

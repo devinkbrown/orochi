@@ -13,6 +13,7 @@
 //! module is transport-agnostic and deterministic, so it slots into the DST
 //! harness now.
 const std = @import("std");
+const random = @import("random.zig");
 
 const ratchet = @import("ratchet.zig");
 const hpke = @import("hpke.zig");
@@ -71,8 +72,11 @@ pub const Channel = struct {
         allocator: std.mem.Allocator,
         own_pair: X25519.KeyPair,
         responder_pub: PublicKey,
-        eph_seed: [X25519.seed_length]u8,
     ) !struct { channel: Channel, enc: hpke.Enc } {
+        var eph_seed: [X25519.seed_length]u8 = undefined;
+        try random.fillOsEntropy(&eph_seed);
+        defer std.crypto.secureZero(u8, eph_seed[0..]);
+
         const encapsulation = try hpke.encapDeterministic(responder_pub, eph_seed);
         const root = ratchet.RootKey.init(encapsulation.shared_secret);
         var r = try ratchet.Ratchet.initAlice(allocator, root, own_pair, responder_pub, ratchetMaxSkip());
@@ -156,7 +160,7 @@ test "1:1 channel: HPKE bootstrap + ratchet round-trip both directions" {
     const alice_pair = try pairFromSeed(0x11);
     const bob_pair = try pairFromSeed(0x22);
 
-    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key, [_]u8{0x33} ** X25519.seed_length);
+    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key);
     var alice = setup.channel;
     defer alice.deinit();
     var bob = try Channel.respond(allocator, bob_pair, setup.enc);
@@ -181,7 +185,7 @@ test "1:1 channel: tampered ciphertext is rejected" {
     const allocator = testing.allocator;
     const alice_pair = try pairFromSeed(0x44);
     const bob_pair = try pairFromSeed(0x55);
-    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key, [_]u8{0x66} ** X25519.seed_length);
+    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key);
     var alice = setup.channel;
     defer alice.deinit();
     var bob = try Channel.respond(allocator, bob_pair, setup.enc);
@@ -197,7 +201,7 @@ test "1:1 channel: out-of-order delivery within the skip window" {
     const allocator = testing.allocator;
     const alice_pair = try pairFromSeed(0x77);
     const bob_pair = try pairFromSeed(0x88);
-    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key, [_]u8{0x99} ** X25519.seed_length);
+    const setup = try Channel.initiate(allocator, alice_pair, bob_pair.public_key);
     var alice = setup.channel;
     defer alice.deinit();
     var bob = try Channel.respond(allocator, bob_pair, setup.enc);

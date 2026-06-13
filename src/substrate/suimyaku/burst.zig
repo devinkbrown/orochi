@@ -377,17 +377,16 @@ const Reader = struct {
     }
 
     fn readVarint(self: *Reader) !usize {
-        var shift: u6 = 0;
         var value: u64 = 0;
         var i: usize = 0;
         while (i < 10) : (i += 1) {
             const byte = try self.readByte();
+            const shift = @as(u6, @intCast(i * 7));
             value |= @as(u64, byte & 0x7f) << shift;
             if ((byte & 0x80) == 0) {
                 if (value > std.math.maxInt(usize)) return error.Oversize;
                 return @intCast(value);
             }
-            shift += 7;
         }
         return error.VarintTooLong;
     }

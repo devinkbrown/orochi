@@ -44,6 +44,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             kind: MediaKind,
             stream_id: u32,
             addr: TransportAddress,
+            addr_bound: bool = false,
             live: bool = false,
             /// Media frames/bytes received from this publisher and forwarded.
             rx_packets: u64 = 0,
@@ -77,6 +78,12 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             return null;
         }
 
+        pub fn streamIdFor(self: *Self, id_bytes: []const u8) ?u32 {
+            const id = ParticipantId.init(id_bytes) catch return null;
+            if (self.findById(id)) |e| return e.stream_id;
+            return null;
+        }
+
         /// Register (or update) a participant: join the forwarding session and
         /// record its publishing `stream_id` and current `TransportAddress`.
         /// Re-registering the same id updates its address/stream/kind in place.
@@ -97,6 +104,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
                 e.kind = kind;
                 e.stream_id = stream_id;
                 e.addr = addr;
+                e.addr_bound = addr.ip_len != 0 and addr.port != 0;
                 return;
             }
 
@@ -107,6 +115,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
                 .kind = kind,
                 .stream_id = stream_id,
                 .addr = addr,
+                .addr_bound = addr.ip_len != 0 and addr.port != 0,
                 .live = true,
             };
             self.len += 1;
@@ -191,7 +200,9 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             const view = opcodec_frame.decode(datagram) catch return 0;
             for (self.entries[0..self.len]) |*e| {
                 if (e.live and e.stream_id == view.stream_id) {
+                    if (e.addr_bound and !e.addr.eql(from)) return 0;
                     e.addr = from;
+                    e.addr_bound = true;
                     break;
                 }
             }

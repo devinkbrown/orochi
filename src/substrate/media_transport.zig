@@ -65,6 +65,7 @@ const ufrag_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123
 /// The IP is always 16 fully-initialized bytes (IPv4 lives in the first 4),
 /// so byte-array hashing is well-defined.
 const AddrKey = [18]u8;
+const UfragKey = [ufrag_len]u8;
 
 fn addrKey(a: TransportAddress) AddrKey {
     var k: AddrKey = undefined;
@@ -73,12 +74,19 @@ fn addrKey(a: TransportAddress) AddrKey {
     return k;
 }
 
+fn ufragKey(ufrag: []const u8) ?UfragKey {
+    if (ufrag.len != ufrag_len) return null;
+    var key: UfragKey = undefined;
+    @memcpy(key[0..], ufrag);
+    return key;
+}
+
 pub const MediaTransport = struct {
     allocator: std.mem.Allocator,
     /// Composite "channel\x00participant" -> Endpoint.
     endpoints: std.StringHashMapUnmanaged(Endpoint) = .empty,
     /// Server ufrag -> composite key, for STUN binding demultiplexing.
-    by_ufrag: std.StringHashMapUnmanaged([]const u8) = .empty,
+    by_ufrag: std.AutoHashMapUnmanaged(UfragKey, []const u8) = .empty,
     /// Bound peer address -> composite key, for routing inbound RTP by source.
     by_addr: std.AutoHashMapUnmanaged(AddrKey, []const u8) = .empty,
     /// Learned RTP SSRC -> composite key, for resolving NACK media sources.
@@ -145,14 +153,14 @@ pub const MediaTransport = struct {
             };
         } else {
             // Rotating creds: tear down the prior incarnation's indexes + buffer.
-            _ = self.by_ufrag.remove(gop.value_ptr.ufragSlice());
+            _ = self.by_ufrag.remove(gop.value_ptr.ufrag);
             if (gop.value_ptr.remote) |a| _ = self.by_addr.remove(addrKey(a));
             if (gop.value_ptr.ssrc != 0) _ = self.by_ssrc.remove(gop.value_ptr.ssrc);
             gop.value_ptr.rtx.deinit();
         }
         gop.value_ptr.* = ep;
-        // Index the (stable) stored ufrag slice back to the owned key.
-        self.by_ufrag.put(self.allocator, gop.value_ptr.ufragSlice(), gop.key_ptr.*) catch {};
+        // Index the ufrag by value back to the owned key.
+        self.by_ufrag.put(self.allocator, gop.value_ptr.ufrag, gop.key_ptr.*) catch {};
         return gop.value_ptr;
     }
 
@@ -175,7 +183,7 @@ pub const MediaTransport = struct {
     /// Resolve a participant endpoint from the server ufrag carried in a STUN
     /// binding's USERNAME (`<server-ufrag>:<peer-ufrag>`).
     pub fn byServerUfrag(self: *MediaTransport, server_ufrag: []const u8) ?*Endpoint {
-        const key = self.by_ufrag.get(server_ufrag) orelse return null;
+        const key = self.by_ufrag.get(ufragKey(server_ufrag) orelse return null) orelse return null;
         return self.endpoints.getPtr(key);
     }
 
@@ -266,7 +274,7 @@ pub const MediaTransport = struct {
         const colon = std.mem.indexOfScalar(u8, user, ':') orelse user.len;
         const server_ufrag = user[0..colon];
 
-        const owned_key = self.by_ufrag.get(server_ufrag) orelse return null;
+        const owned_key = self.by_ufrag.get(ufragKey(server_ufrag) orelse return null) orelse return null;
         const ep = self.endpoints.getPtr(owned_key) orelse return null;
         // Short-term credential check (RFC 8445 §7.3): the peer keys its request
         // with the server's advertised password.
@@ -399,7 +407,7 @@ pub const MediaTransport = struct {
         const k = compositeKey(&kb, channel, participant) orelse return;
         if (self.endpoints.fetchRemove(k)) |kv| {
             var ep = kv.value;
-            _ = self.by_ufrag.remove(ep.ufragSlice());
+            _ = self.by_ufrag.remove(ep.ufrag);
             if (ep.remote) |addr| _ = self.by_addr.remove(addrKey(addr));
             if (ep.ssrc != 0) _ = self.by_ssrc.remove(ep.ssrc);
             ep.rtx.deinit();

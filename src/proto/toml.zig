@@ -616,8 +616,10 @@ const Parser = struct {
                 break;
             }
             var value = try self.parseValue();
-            errdefer value.deinit(self.allocator);
-            try items.append(self.allocator, value);
+            items.append(self.allocator, value) catch |err| {
+                value.deinit(self.allocator);
+                return err;
+            };
             self.skipBlank();
             const sep = self.peek() orelse return error.UnexpectedEof;
             if (sep == ',') {

@@ -214,11 +214,11 @@ pub fn decodeChunked(allocator: std.mem.Allocator, input: []const u8, limits: Li
             };
         }
 
-        if (body.items.len + size > limits.max_body_bytes) return Error.Oversized;
-        if (pos + size > input.len) return Error.Truncated;
+        if (size > limits.max_body_bytes - body.items.len) return Error.Oversized;
+        if (size > input.len - pos) return Error.Truncated;
         try body.appendSlice(allocator, input[pos .. pos + size]);
         pos += size;
-        if (pos + 2 > input.len) return Error.Truncated;
+        if (input.len - pos < 2) return Error.Truncated;
         if (!std.mem.eql(u8, input[pos .. pos + 2], "\r\n")) return Error.Malformed;
         pos += 2;
     }

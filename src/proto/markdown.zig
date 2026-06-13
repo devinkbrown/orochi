@@ -103,6 +103,7 @@ pub const Link = struct {
 
 const ListKind = enum { unordered, ordered };
 const RenderMode = enum { irc, plain };
+const max_recursion_depth: usize = 24;
 
 const ItemMarker = struct {
     kind: ListKind,
@@ -124,21 +125,21 @@ pub fn parse(allocator: Allocator, md: []const u8) Allocator.Error!Ast {
         start = end + 1;
     }
 
-    const nodes = try parseLines(allocator, lines.items);
+    const nodes = try parseLines(allocator, lines.items, 0);
     return .{ .allocator = allocator, .nodes = nodes };
 }
 
 pub fn renderIrc(allocator: Allocator, ast: Ast) Allocator.Error![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    try renderBlocks(allocator, &out, ast.nodes, .irc);
+    try renderBlocks(allocator, &out, ast.nodes, .irc, 0);
     return out.toOwnedSlice(allocator);
 }
 
 pub fn renderPlain(allocator: Allocator, ast: Ast) Allocator.Error![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    try renderBlocks(allocator, &out, ast.nodes, .plain);
+    try renderBlocks(allocator, &out, ast.nodes, .plain, 0);
     return out.toOwnedSlice(allocator);
 }
 
@@ -154,7 +155,7 @@ pub fn toPlain(allocator: Allocator, md: []const u8) Allocator.Error![]u8 {
     return renderPlain(allocator, ast);
 }
 
-fn parseLines(allocator: Allocator, lines: []const []const u8) Allocator.Error![]Node {
+fn parseLines(allocator: Allocator, lines: []const []const u8, depth: usize) Allocator.Error![]Node {
     var nodes = std.ArrayListUnmanaged(Node).empty;
     errdefer {
         for (nodes.items) |node| node.deinit(allocator);
@@ -173,7 +174,7 @@ fn parseLines(allocator: Allocator, lines: []const []const u8) Allocator.Error![
             continue;
         }
 
-        if (try parseHeading(allocator, lines[index])) |node| {
+        if (try parseHeading(allocator, lines[index], depth)) |node| {
             index += 1;
             try nodes.append(allocator, node);
             continue;
@@ -186,18 +187,18 @@ fn parseLines(allocator: Allocator, lines: []const []const u8) Allocator.Error![
         }
 
         if (startsBlockquote(lines[index])) {
-            const node = try parseBlockquote(allocator, lines, &index);
+            const node = try parseBlockquote(allocator, lines, &index, depth);
             try nodes.append(allocator, node);
             continue;
         }
 
         if (listMarker(lines[index])) |marker| {
-            const node = try parseList(allocator, lines, &index, marker.kind, marker.indent);
+            const node = try parseList(allocator, lines, &index, marker.kind, marker.indent, depth);
             try nodes.append(allocator, node);
             continue;
         }
 
-        const node = try parseParagraph(allocator, lines, &index);
+        const node = try parseParagraph(allocator, lines, &index, depth);
         try nodes.append(allocator, node);
     }
 
@@ -225,7 +226,7 @@ fn parseFence(allocator: Allocator, lines: []const []const u8, index: *usize) Al
     return Node{ .code_block = try body.toOwnedSlice(allocator) };
 }
 
-fn parseHeading(allocator: Allocator, line: []const u8) Allocator.Error!?Node {
+fn parseHeading(allocator: Allocator, line: []const u8, depth: usize) Allocator.Error!?Node {
     const trimmed_left = trimLeft(line);
     var level: usize = 0;
     while (level < trimmed_left.len and trimmed_left[level] == '#') : (level += 1) {}
@@ -235,11 +236,11 @@ fn parseHeading(allocator: Allocator, line: []const u8) Allocator.Error!?Node {
     const content = if (level < trimmed_left.len) trimBoth(trimmed_left[level + 1 ..]) else "";
     return Node{ .heading = .{
         .level = @intCast(level),
-        .text = try parseInlines(allocator, content),
+        .text = try parseInlines(allocator, content, depth),
     } };
 }
 
-fn parseBlockquote(allocator: Allocator, lines: []const []const u8, index: *usize) Allocator.Error!Node {
+fn parseBlockquote(allocator: Allocator, lines: []const []const u8, index: *usize, depth: usize) Allocator.Error!Node {
     var source = std.ArrayListUnmanaged(u8).empty;
     errdefer source.deinit(allocator);
 
@@ -253,7 +254,8 @@ fn parseBlockquote(allocator: Allocator, lines: []const []const u8, index: *usiz
     const text = try source.toOwnedSlice(allocator);
     defer allocator.free(text);
 
-    return Node{ .blockquote = try parseOwnedSubdocument(allocator, text) };
+    if (depth >= max_recursion_depth) return try literalParagraph(allocator, text);
+    return Node{ .blockquote = try parseOwnedSubdocument(allocator, text, depth + 1) };
 }
 
 fn parseList(
@@ -262,6 +264,7 @@ fn parseList(
     index: *usize,
     kind: ListKind,
     base_indent: usize,
+    depth: usize,
 ) Allocator.Error!Node {
     var items = std.ArrayListUnmanaged(ListItem).empty;
     errdefer {
@@ -298,7 +301,10 @@ fn parseList(
 
         const text = try source.toOwnedSlice(allocator);
         defer allocator.free(text);
-        const blocks = try parseOwnedSubdocument(allocator, text);
+        const blocks = if (depth >= max_recursion_depth)
+            try literalParagraphSlice(allocator, text)
+        else
+            try parseOwnedSubdocument(allocator, text, depth + 1);
         try items.append(allocator, .{ .blocks = blocks });
     }
 
@@ -309,7 +315,7 @@ fn parseList(
     };
 }
 
-fn parseParagraph(allocator: Allocator, lines: []const []const u8, index: *usize) Allocator.Error!Node {
+fn parseParagraph(allocator: Allocator, lines: []const []const u8, index: *usize, depth: usize) Allocator.Error!Node {
     var text = std.ArrayListUnmanaged(u8).empty;
     errdefer text.deinit(allocator);
 
@@ -328,15 +334,49 @@ fn parseParagraph(allocator: Allocator, lines: []const []const u8, index: *usize
 
     const raw = try text.toOwnedSlice(allocator);
     defer allocator.free(raw);
-    return Node{ .paragraph = try parseInlines(allocator, raw) };
+    return Node{ .paragraph = try parseInlines(allocator, raw, depth) };
 }
 
-fn parseOwnedSubdocument(allocator: Allocator, text: []const u8) Allocator.Error![]Node {
-    const ast = try parse(allocator, text);
-    return ast.nodes;
+fn parseOwnedSubdocument(allocator: Allocator, text: []const u8, depth: usize) Allocator.Error![]Node {
+    var lines = std.ArrayListUnmanaged([]const u8).empty;
+    defer lines.deinit(allocator);
+
+    var start: usize = 0;
+    while (start <= text.len) {
+        const end = findByte(text, start, '\n') orelse text.len;
+        try lines.append(allocator, text[start..end]);
+        if (end == text.len) break;
+        start = end + 1;
+    }
+
+    return parseLines(allocator, lines.items, depth);
 }
 
-fn parseInlines(allocator: Allocator, text: []const u8) Allocator.Error![]Inline {
+fn literalParagraphSlice(allocator: Allocator, text: []const u8) Allocator.Error![]Node {
+    const inlines = try literalInlineSlice(allocator, text);
+    errdefer deinitInlineSlice(allocator, inlines);
+
+    const nodes = try allocator.alloc(Node, 1);
+    nodes[0] = .{ .paragraph = inlines };
+    return nodes;
+}
+
+fn literalParagraph(allocator: Allocator, text: []const u8) Allocator.Error!Node {
+    return Node{ .paragraph = try literalInlineSlice(allocator, text) };
+}
+
+fn literalInlineSlice(allocator: Allocator, text: []const u8) Allocator.Error![]Inline {
+    const copy = try allocator.dupe(u8, text);
+    errdefer allocator.free(copy);
+
+    const inlines = try allocator.alloc(Inline, 1);
+    inlines[0] = .{ .text = copy };
+    return inlines;
+}
+
+fn parseInlines(allocator: Allocator, text: []const u8, depth: usize) Allocator.Error![]Inline {
+    if (depth >= max_recursion_depth) return literalInlineSlice(allocator, text);
+
     var out = std.ArrayListUnmanaged(Inline).empty;
     errdefer {
         for (out.items) |inline_node| inline_node.deinit(allocator);
@@ -352,12 +392,12 @@ fn parseInlines(allocator: Allocator, text: []const u8) Allocator.Error![]Inline
         }
 
         if (try parseCodeInline(allocator, text, &index, &out)) continue;
-        if (try parseDelimitedInline(allocator, text, &index, &out, "**", .bold)) continue;
-        if (try parseDelimitedInline(allocator, text, &index, &out, "__", .bold)) continue;
-        if (try parseDelimitedInline(allocator, text, &index, &out, "~~", .strike)) continue;
-        if (try parseDelimitedInline(allocator, text, &index, &out, "*", .italic)) continue;
-        if (try parseDelimitedInline(allocator, text, &index, &out, "_", .italic)) continue;
-        if (try parseLinkInline(allocator, text, &index, &out)) continue;
+        if (try parseDelimitedInline(allocator, text, &index, &out, "**", .bold, depth)) continue;
+        if (try parseDelimitedInline(allocator, text, &index, &out, "__", .bold, depth)) continue;
+        if (try parseDelimitedInline(allocator, text, &index, &out, "~~", .strike, depth)) continue;
+        if (try parseDelimitedInline(allocator, text, &index, &out, "*", .italic, depth)) continue;
+        if (try parseDelimitedInline(allocator, text, &index, &out, "_", .italic, depth)) continue;
+        if (try parseLinkInline(allocator, text, &index, &out, depth)) continue;
         if (try parseAutolinkInline(allocator, text, &index, &out)) continue;
 
         const end = nextInlineSpecial(text, index + 1);
@@ -390,10 +430,11 @@ fn parseDelimitedInline(
     out: *std.ArrayListUnmanaged(Inline),
     marker: []const u8,
     comptime tag: std.meta.Tag(Inline),
+    depth: usize,
 ) Allocator.Error!bool {
     if (!startsWithAt(text, index.*, marker)) return false;
     const close = findSlice(text, index.* + marker.len, marker) orelse return false;
-    const inner = try parseInlines(allocator, text[index.* + marker.len .. close]);
+    const inner = try parseInlines(allocator, text[index.* + marker.len .. close], depth + 1);
     errdefer deinitInlineSlice(allocator, inner);
 
     switch (tag) {
@@ -411,13 +452,14 @@ fn parseLinkInline(
     text: []const u8,
     index: *usize,
     out: *std.ArrayListUnmanaged(Inline),
+    depth: usize,
 ) Allocator.Error!bool {
     if (text[index.*] != '[') return false;
     const close_text = findByte(text, index.* + 1, ']') orelse return false;
     if (close_text + 1 >= text.len or text[close_text + 1] != '(') return false;
     const close_url = findByte(text, close_text + 2, ')') orelse return false;
 
-    const label = try parseInlines(allocator, text[index.* + 1 .. close_text]);
+    const label = try parseInlines(allocator, text[index.* + 1 .. close_text], depth + 1);
     errdefer deinitInlineSlice(allocator, label);
     const url = try allocator.dupe(u8, text[close_text + 2 .. close_url]);
     errdefer allocator.free(url);
@@ -449,8 +491,9 @@ fn renderBlocks(
     out: *std.ArrayListUnmanaged(u8),
     nodes: []const Node,
     mode: RenderMode,
+    depth: usize,
 ) Allocator.Error!void {
-    try renderBlocksWithSeparator(allocator, out, nodes, mode, "\n\n");
+    try renderBlocksWithSeparator(allocator, out, nodes, mode, "\n\n", depth);
 }
 
 fn renderBlocksWithSeparator(
@@ -459,10 +502,15 @@ fn renderBlocksWithSeparator(
     nodes: []const Node,
     mode: RenderMode,
     separator: []const u8,
+    depth: usize,
 ) Allocator.Error!void {
     for (nodes, 0..) |node, i| {
         if (i > 0) try out.appendSlice(allocator, separator);
-        try renderNode(allocator, out, node, mode);
+        if (depth >= max_recursion_depth) {
+            try renderNodeLiteralShallow(allocator, out, node, mode);
+        } else {
+            try renderNode(allocator, out, node, mode, depth);
+        }
     }
 }
 
@@ -471,20 +519,21 @@ fn renderNode(
     out: *std.ArrayListUnmanaged(u8),
     node: Node,
     mode: RenderMode,
+    depth: usize,
 ) Allocator.Error!void {
     switch (node) {
         .heading => |heading| {
             if (mode == .irc) try out.append(allocator, Control.bold);
-            try renderInlineSlice(allocator, out, heading.text, mode);
+            try renderInlineSlice(allocator, out, heading.text, mode, depth);
             if (mode == .irc) try out.append(allocator, Control.bold);
         },
-        .paragraph => |inlines| try renderInlineSlice(allocator, out, inlines, mode),
-        .unordered_list => |items| try renderList(allocator, out, items, mode, .unordered),
-        .ordered_list => |items| try renderList(allocator, out, items, mode, .ordered),
+        .paragraph => |inlines| try renderInlineSlice(allocator, out, inlines, mode, depth),
+        .unordered_list => |items| try renderList(allocator, out, items, mode, .unordered, depth),
+        .ordered_list => |items| try renderList(allocator, out, items, mode, .ordered, depth),
         .blockquote => |nodes| {
             var inner = std.ArrayListUnmanaged(u8).empty;
             defer inner.deinit(allocator);
-            try renderBlocksWithSeparator(allocator, &inner, nodes, mode, "\n");
+            try renderBlocksWithSeparator(allocator, &inner, nodes, mode, "\n", depth + 1);
             try appendPrefixedLines(allocator, out, "> ", inner.items);
         },
         .code_block => |text| try renderCodeBlock(allocator, out, text, mode),
@@ -497,18 +546,21 @@ fn renderInlineSlice(
     out: *std.ArrayListUnmanaged(u8),
     inlines: []const Inline,
     mode: RenderMode,
+    depth: usize,
 ) Allocator.Error!void {
+    if (depth >= max_recursion_depth) return renderInlineLiteralShallow(allocator, out, inlines);
+
     for (inlines) |inline_node| {
         switch (inline_node) {
             .text => |text| try out.appendSlice(allocator, text),
             .bold => |inner| {
                 if (mode == .irc) try out.append(allocator, Control.bold);
-                try renderInlineSlice(allocator, out, inner, mode);
+                try renderInlineSlice(allocator, out, inner, mode, depth + 1);
                 if (mode == .irc) try out.append(allocator, Control.bold);
             },
             .italic => |inner| {
                 if (mode == .irc) try out.append(allocator, Control.italic);
-                try renderInlineSlice(allocator, out, inner, mode);
+                try renderInlineSlice(allocator, out, inner, mode, depth + 1);
                 if (mode == .irc) try out.append(allocator, Control.italic);
             },
             .code => |text| {
@@ -518,11 +570,11 @@ fn renderInlineSlice(
             },
             .strike => |inner| {
                 if (mode == .irc) try out.append(allocator, Control.strike);
-                try renderInlineSlice(allocator, out, inner, mode);
+                try renderInlineSlice(allocator, out, inner, mode, depth + 1);
                 if (mode == .irc) try out.append(allocator, Control.strike);
             },
             .link => |link| {
-                try renderInlineSlice(allocator, out, link.text, mode);
+                try renderInlineSlice(allocator, out, link.text, mode, depth + 1);
                 try out.appendSlice(allocator, " (");
                 try out.appendSlice(allocator, link.url);
                 try out.append(allocator, ')');
@@ -533,18 +585,113 @@ fn renderInlineSlice(
     }
 }
 
+fn renderNodeLiteralShallow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    node: Node,
+    mode: RenderMode,
+) Allocator.Error!void {
+    _ = mode;
+    switch (node) {
+        .heading => |heading| try renderInlineLiteralShallow(allocator, out, heading.text),
+        .paragraph => |inlines| try renderInlineLiteralShallow(allocator, out, inlines),
+        .unordered_list => |items| try renderListLiteralShallow(allocator, out, items, .unordered),
+        .ordered_list => |items| try renderListLiteralShallow(allocator, out, items, .ordered),
+        .blockquote => |nodes| {
+            try out.appendSlice(allocator, "> ");
+            if (nodes.len > 0) try renderFlatNodeContent(allocator, out, nodes[0]);
+        },
+        .code_block => |text| try out.appendSlice(allocator, text),
+        .thematic_break => try out.appendSlice(allocator, "----------"),
+    }
+}
+
+fn renderListLiteralShallow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    items: []const ListItem,
+    kind: ListKind,
+) Allocator.Error!void {
+    for (items, 0..) |item, item_index| {
+        if (item_index > 0) try out.append(allocator, '\n');
+        var marker_buf: [32]u8 = undefined;
+        const marker = switch (kind) {
+            .unordered => "- ",
+            .ordered => std.fmt.bufPrint(&marker_buf, "{d}. ", .{item_index + 1}) catch unreachable,
+        };
+        try out.appendSlice(allocator, marker);
+        if (item.blocks.len > 0) try renderFlatNodeContent(allocator, out, item.blocks[0]);
+    }
+}
+
+fn renderFlatNodeContent(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    node: Node,
+) Allocator.Error!void {
+    switch (node) {
+        .heading => |heading| try renderInlineLiteralShallow(allocator, out, heading.text),
+        .paragraph => |inlines| try renderInlineLiteralShallow(allocator, out, inlines),
+        .code_block => |text| try out.appendSlice(allocator, text),
+        .thematic_break => try out.appendSlice(allocator, "----------"),
+        .unordered_list, .ordered_list, .blockquote => {},
+    }
+}
+
+fn renderInlineLiteralShallow(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    inlines: []const Inline,
+) Allocator.Error!void {
+    for (inlines) |inline_node| {
+        switch (inline_node) {
+            .text => |text| try out.appendSlice(allocator, text),
+            .bold => |inner| try renderFlatInlineContent(allocator, out, inner),
+            .italic => |inner| try renderFlatInlineContent(allocator, out, inner),
+            .code => |text| try out.appendSlice(allocator, text),
+            .strike => |inner| try renderFlatInlineContent(allocator, out, inner),
+            .link => |link| {
+                try renderFlatInlineContent(allocator, out, link.text);
+                try out.appendSlice(allocator, " (");
+                try out.appendSlice(allocator, link.url);
+                try out.append(allocator, ')');
+            },
+            .autolink => |url| try out.appendSlice(allocator, url),
+            .hard_break => try out.append(allocator, '\n'),
+        }
+    }
+}
+
+fn renderFlatInlineContent(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    inlines: []const Inline,
+) Allocator.Error!void {
+    for (inlines) |inline_node| {
+        switch (inline_node) {
+            .text => |text| try out.appendSlice(allocator, text),
+            .code => |text| try out.appendSlice(allocator, text),
+            .autolink => |url| try out.appendSlice(allocator, url),
+            .hard_break => try out.append(allocator, '\n'),
+            .link => |link| try out.appendSlice(allocator, link.url),
+            .bold, .italic, .strike => {},
+        }
+    }
+}
+
 fn renderList(
     allocator: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     items: []const ListItem,
     mode: RenderMode,
     kind: ListKind,
+    depth: usize,
 ) Allocator.Error!void {
     for (items, 0..) |item, item_index| {
         if (item_index > 0) try out.append(allocator, '\n');
         var inner = std.ArrayListUnmanaged(u8).empty;
         defer inner.deinit(allocator);
-        try renderBlocksWithSeparator(allocator, &inner, item.blocks, mode, "\n");
+        try renderBlocksWithSeparator(allocator, &inner, item.blocks, mode, "\n", depth + 1);
 
         var marker_buf: [32]u8 = undefined;
         const marker = switch (kind) {

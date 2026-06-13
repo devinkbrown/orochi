@@ -91,9 +91,11 @@ pub const StringError = error{
 
 /// Encode a string literal into `out`.  Huffman bit = 0.
 /// Returns number of bytes written.
-pub fn encodeString(out: []u8, s: []const u8) usize {
+pub fn encodeString(out: []u8, s: []const u8) error{NoSpaceLeft}!usize {
     var tmp: [11]u8 = undefined;
     const len_bytes = encodeInt(&tmp, 7, 0x00, s.len);
+    if (len_bytes > out.len) return error.NoSpaceLeft;
+    if (s.len > out.len - len_bytes) return error.NoSpaceLeft;
     @memcpy(out[0..len_bytes], tmp[0..len_bytes]);
     @memcpy(out[len_bytes..][0..s.len], s);
     return len_bytes + s.len;
@@ -262,6 +264,7 @@ pub const Header = struct {
 
 pub const EncodeError = error{
     OutOfMemory,
+    NoSpaceLeft,
 };
 
 /// Encode a slice of headers into QPACK-encoded field section bytes.
@@ -297,7 +300,7 @@ pub fn encodeFieldSection(allocator: Allocator, headers: []const Header) EncodeE
             const n = encodeInt(&tmp, 4, 0x50, name_idx);
             try buf.appendSlice(allocator, tmp[0..n]);
             // value string
-            const vs = encodeString(tmp[n..], h.value);
+            const vs = try encodeString(tmp[n..], h.value);
             try buf.appendSlice(allocator, tmp[n .. n + vs]);
             continue;
         }
@@ -308,7 +311,7 @@ pub fn encodeFieldSection(allocator: Allocator, headers: []const Header) EncodeE
             const n = encodeInt(&tmp, 3, 0x20, h.name.len);
             try buf.appendSlice(allocator, tmp[0..n]);
             try buf.appendSlice(allocator, h.name);
-            const vs = encodeString(tmp[0..], h.value);
+            const vs = try encodeString(tmp[0..], h.value);
             try buf.appendSlice(allocator, tmp[0..vs]);
         }
     }
@@ -490,7 +493,7 @@ test "prefix integer: high bits preserved" {
 test "string literal: round-trip" {
     var buf: [64]u8 = undefined;
     const s = "hello";
-    const n = encodeString(&buf, s);
+    const n = try encodeString(&buf, s);
     const r = try decodeString(buf[0..n]);
     try testing.expectEqualStrings(s, r.str);
     try testing.expectEqual(n, r.consumed);
@@ -498,7 +501,7 @@ test "string literal: round-trip" {
 
 test "string literal: empty string" {
     var buf: [4]u8 = undefined;
-    const n = encodeString(&buf, "");
+    const n = try encodeString(&buf, "");
     const r = try decodeString(buf[0..n]);
     try testing.expectEqualStrings("", r.str);
 }
@@ -506,7 +509,7 @@ test "string literal: empty string" {
 test "string literal: long string" {
     var buf: [512]u8 = undefined;
     const s = "x" ** 200;
-    const n = encodeString(&buf, s);
+    const n = try encodeString(&buf, s);
     const r = try decodeString(buf[0..n]);
     try testing.expectEqualStrings(s, r.str);
 }
@@ -514,7 +517,7 @@ test "string literal: long string" {
 test "string literal: truncation" {
     var buf: [8]u8 = undefined;
     const s = "hello";
-    const n = encodeString(&buf, s);
+    const n = try encodeString(&buf, s);
     // Truncate to just the length prefix
     const result = decodeString(buf[0..1]);
     try testing.expectError(StringError.Truncated, result);

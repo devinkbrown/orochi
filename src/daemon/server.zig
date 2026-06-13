@@ -1510,6 +1510,7 @@ const Reactor = struct {
     ws_accept_armed: bool = false,
     /// Whether the periodic timeout-sweep timer is currently in flight.
     timer_armed: bool = false,
+    timer_spec: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
 
     /// This reactor's cross-reactor wake eventfd (null if eventfd is unavailable),
     /// its in-flight poll-arm flag, and a monotonic count of observed wakes. Lets
@@ -2264,8 +2265,8 @@ pub const LinuxServer = struct {
     fn armTimer(self: *LinuxServer) !void {
         if (self.rx().timer_armed) return;
         const ns = self.config.sweep_interval_ms * std.time.ns_per_ms;
-        const ts: linux.kernel_timespec = .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) };
-        try self.rx().ring.submitTimeout(timer_token, &ts);
+        self.rx().timer_spec = .{ .sec = @intCast(@divFloor(ns, std.time.ns_per_s)), .nsec = @intCast(@mod(ns, std.time.ns_per_s)) };
+        try self.rx().ring.submitTimeout(timer_token, &self.rx().timer_spec);
         self.rx().timer_armed = true;
     }
 
@@ -2479,10 +2480,10 @@ pub const LinuxServer = struct {
             .channels = self.world.channelCount(),
             .servers = 1,
             .max_clients = self.stats_peak_clients,
-            .connections_total = self.stats.connections_total,
-            .messages_total = self.stats.messages_in_total,
-            .bytes_in = self.stats.bytes_in_total,
-            .bytes_out = self.stats.bytes_out_total,
+            .connections_total = self.stats.connections_total.load(.monotonic),
+            .messages_total = self.stats.messages_in_total.load(.monotonic),
+            .bytes_in = self.stats.bytes_in_total.load(.monotonic),
+            .bytes_out = self.stats.bytes_out_total.load(.monotonic),
             .history = hist_buf[0..hc],
             .top_channels = tops[0..ntop],
             .top_countries = top_countries[0..nctry],
@@ -3432,13 +3433,34 @@ pub const LinuxServer = struct {
             } else if (conn.s2s) |link| {
                 self.driveS2s(conn, link, chunk);
             } else if (conn.tls != null) {
-                try self.driveTls(id, conn, chunk);
+                self.driveTls(id, conn, chunk) catch |err| switch (err) {
+                    error.LineTooLong => {
+                        conn.close_reason = "Line too long";
+                        try self.closeConn(event.token, conn.close_reason);
+                        return;
+                    },
+                    else => return err,
+                };
             } else if (conn.ws != null) {
                 // Plain-ws testing mode only (the production ws listener always
                 // carries TLS, so its bytes route through driveTls above).
-                try self.driveWs(id, conn, chunk);
+                self.driveWs(id, conn, chunk) catch |err| switch (err) {
+                    error.LineTooLong => {
+                        conn.close_reason = "Line too long";
+                        try self.closeConn(event.token, conn.close_reason);
+                        return;
+                    },
+                    else => return err,
+                };
             } else {
-                try self.feedBytes(id, conn, chunk);
+                self.feedBytes(id, conn, chunk) catch |err| switch (err) {
+                    error.LineTooLong => {
+                        conn.close_reason = "Line too long";
+                        try self.closeConn(event.token, conn.close_reason);
+                        return;
+                    },
+                    else => return err,
+                };
             }
             try self.armSendIfNeeded(conn);
             if (!conn.closing) {
@@ -3801,40 +3823,56 @@ pub const LinuxServer = struct {
     fn deliverRelay(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
         // Global mesh-wide dedup (handles cross-path duplicates in a cyclic mesh).
         if (self.relay_seen.observe(msg.origin_node, msg.hlc)) return;
+        var safe_tag_buf: [256]u8 = undefined;
+        const safe_tags = clientOnlyTags(msg.tags, &safe_tag_buf);
+        const clean_msg = s2s_link.RelayMessage{
+            .verb = msg.verb,
+            .target = msg.target,
+            .source_nick = msg.source_nick,
+            .source_prefix = msg.source_prefix,
+            .account = msg.account,
+            .tags = safe_tags,
+            .text = msg.text,
+            .origin_node = msg.origin_node,
+            .hlc = msg.hlc,
+        };
         const verb = switch (msg.verb) {
             .privmsg => "PRIVMSG",
             .notice => "NOTICE",
             .tagmsg => "TAGMSG",
         };
         var line_buf: [default_reply_bytes]u8 = undefined;
-        const line = if (msg.verb == .tagmsg)
-            (if (msg.tags.len > 0)
-                std.fmt.bufPrint(&line_buf, "@{s} :{s} TAGMSG {s}\r\n", .{ msg.tags, msg.source_prefix, msg.target }) catch return
-            else
-                std.fmt.bufPrint(&line_buf, ":{s} TAGMSG {s}\r\n", .{ msg.source_prefix, msg.target }) catch return)
-        else if (msg.tags.len > 0)
-            std.fmt.bufPrint(&line_buf, "@{s} :{s} {s} {s} :{s}\r\n", .{ msg.tags, msg.source_prefix, verb, msg.target, msg.text }) catch return
+        const line = if (clean_msg.verb == .tagmsg)
+            std.fmt.bufPrint(&line_buf, ":{s} TAGMSG {s}\r\n", .{ clean_msg.source_prefix, clean_msg.target }) catch return
         else
-            std.fmt.bufPrint(&line_buf, ":{s} {s} {s} :{s}\r\n", .{ msg.source_prefix, verb, msg.target, msg.text }) catch return;
+            std.fmt.bufPrint(&line_buf, ":{s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, clean_msg.target, clean_msg.text }) catch return;
+        var time_buf: [40]u8 = undefined;
+        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+        const relay_tags = MsgTags{
+            .time_value = serverTimeValue(&time_buf),
+            .account = if (clean_msg.account.len != 0) clean_msg.account else null,
+            .client_tags = clean_msg.tags,
+            .msgid = self.msgid_gen.next(&msgid_buf),
+        };
 
-        if (world_model.isChannelName(msg.target)) {
-            if (self.world.memberIterator(msg.target)) |*it| {
+        if (world_model.isChannelName(clean_msg.target)) {
+            if (self.world.memberIterator(clean_msg.target)) |*it| {
                 var members = it.*;
                 while (members.next()) |member| {
-                    self.deliver(clientIdFromWorld(member.*), line) catch {};
+                    self.deliverTagged(clientIdFromWorld(member.*), relay_tags, line) catch {};
                 }
             }
-        } else if (self.world.findNick(msg.target)) |wid| {
-            self.deliver(clientIdFromWorld(wid), line) catch {};
+        } else if (self.world.findNick(clean_msg.target)) |wid| {
+            self.deliverTagged(clientIdFromWorld(wid), relay_tags, line) catch {};
         }
         // Multi-hop re-forward, scoped via route_table (global seen-set already
         // deduped, so re-forwarding the source link is harmless).
-        const scope: RelayScope = if (world_model.isChannelName(msg.target))
-            .{ .channel = msg.target }
+        const scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
+            .{ .channel = clean_msg.target }
         else
-            .{ .nick = msg.target };
-        if (self.relayToPeers(msg, scope) == 0 and !world_model.isChannelName(msg.target)) {
-            _ = self.relayToPeers(msg, .all); // unknown nick route → widen for multi-hop
+            .{ .nick = clean_msg.target };
+        if (self.relayToPeers(clean_msg, scope) == 0 and !world_model.isChannelName(clean_msg.target)) {
+            _ = self.relayToPeers(clean_msg, .all); // unknown nick route → widen for multi-hop
         }
     }
 
@@ -5994,6 +6032,7 @@ pub const LinuxServer = struct {
                     }
                     const changed = self.world.setChannelFlag(channel, mode, adding) catch continue;
                     if (changed) {
+                        channel_flags_changed = true;
                         const want_sign: u8 = if (adding) '+' else '-';
                         if (emitted_sign != want_sign) {
                             applied.appendByte(want_sign) catch break;
@@ -8131,6 +8170,9 @@ pub const LinuxServer = struct {
         }
         var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
         defer pieces.deinit(self.allocator);
+        const carried_fds = try self.allocator.alloc(linux.fd_t, self.rx().clients.slots.items.len);
+        defer self.allocator.free(carried_fds);
+        var carried_fd_count: usize = 0;
         var tls_carried: usize = 0;
         var s2s_hints: usize = 0;
         var it = self.rx().clients.iterator();
@@ -8228,6 +8270,8 @@ pub const LinuxServer = struct {
             if (tls_blob != null) tls_carried += 1;
             // Preserve the client socket across execve so the successor re-attaches it.
             _ = linux.fcntl(e.value.fd, posix.F.SETFD, 0);
+            carried_fds[carried_fd_count] = e.value.fd;
+            carried_fd_count += 1;
         }
 
         // Seal the state arena. On failure, fall back to a listener-only upgrade
@@ -8241,13 +8285,17 @@ pub const LinuxServer = struct {
             .pieces = pieces.items,
             .fds = &.{},
         }) catch |e| {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
             var eb: [96]u8 = undefined;
             self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE: state seal failed ({s}); listener-only", .{@errorName(e)}) catch "UPGRADE: listener-only");
             return self.upgradeListenerOnly(requester);
         };
         defer prepared.deinit();
 
-        const arena = prepared.runtime.arena orelse return self.upgradeListenerOnly(requester);
+        const arena = prepared.runtime.arena orelse {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
+            return self.upgradeListenerOnly(requester);
+        };
         var sbuf: [160]u8 = undefined;
         self.upgradeNotice(requester, std.fmt.bufPrint(&sbuf, "UPGRADE: {d} capsule(s) sealed ({d} TLS, {d} mesh re-dial hint(s)); re-exec preserving listener", .{ prepared.capsule_count, tls_carried, s2s_hints }) catch "UPGRADE: re-exec");
 
@@ -8259,14 +8307,18 @@ pub const LinuxServer = struct {
         // config path so the successor boots with the real config.
         const exe_target = self.config.exe_path orelse "/proc/self/exe";
         var plan = helix_live.buildArenaListenerExecPlan(self.allocator, exe_target, arena.fd, self.rx().listener_fd, self.config.config_path) catch |e| {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            _ = linux.fcntl(arena.fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (plan): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
         };
         defer plan.deinit(self.allocator);
         plan.commit(self.allocator) catch |e| {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
             _ = linux.fcntl(self.rx().listener_fd, posix.F.SETFD, posix.FD_CLOEXEC);
+            _ = linux.fcntl(arena.fd, posix.F.SETFD, posix.FD_CLOEXEC);
             var eb: [96]u8 = undefined;
             self.upgradeNotice(requester, std.fmt.bufPrint(&eb, "UPGRADE failed (execve): {s}", .{@errorName(e)}) catch "UPGRADE failed");
             return;
@@ -9642,7 +9694,7 @@ pub const LinuxServer = struct {
         // Relay across the mesh so remote members of the channel see the reply,
         // attributed to this (the replying) server. Deduped via relay_seen.
         if (self.hasEstablishedPeer()) {
-            const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+            const hlc = self.nextMeshHlc();
             _ = self.relay_seen.observe(self.config.node_id, hlc);
             const relay_msg = s2s_link.RelayMessage{
                 .verb = .notice,
@@ -14417,15 +14469,16 @@ pub const LinuxServer = struct {
             {
                 var pbuf: [320]u8 = undefined;
                 if (clientPrefix(conn, &pbuf)) |prefix| {
-                    const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+                    const hlc = self.nextMeshHlc();
                     _ = self.relay_seen.observe(self.config.node_id, hlc); // drop an echo back
+                    var relay_tag_buf: [256]u8 = undefined;
                     _ = self.relayToPeers(.{
                         .verb = if (is_notice) .notice else .privmsg,
                         .target = chan,
                         .source_nick = conn.session.displayName(),
                         .source_prefix = prefix,
                         .account = conn.session.account() orelse "",
-                        .tags = client_tags orelse "",
+                        .tags = clientOnlyTags(client_tags orelse "", &relay_tag_buf),
                         .text = eff_text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
@@ -14444,15 +14497,16 @@ pub const LinuxServer = struct {
             if (self.hasEstablishedPeer()) {
                 var pbuf2: [320]u8 = undefined;
                 if (clientPrefix(conn, &pbuf2)) |prefix| {
-                    const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+                    const hlc = self.nextMeshHlc();
                     _ = self.relay_seen.observe(self.config.node_id, hlc);
+                    var relay_tag_buf: [256]u8 = undefined;
                     const relay_msg = s2s_link.RelayMessage{
                         .verb = if (is_notice) .notice else .privmsg,
                         .target = target,
                         .source_nick = conn.session.displayName(),
                         .source_prefix = prefix,
                         .account = conn.session.account() orelse "",
-                        .tags = client_tags orelse "",
+                        .tags = clientOnlyTags(client_tags orelse "", &relay_tag_buf),
                         .text = text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
@@ -14938,6 +14992,26 @@ const Buf = struct {
         return self.storage[0..self.len];
     }
 };
+
+fn clientOnlyTags(raw: []const u8, out: []u8) []const u8 {
+    var b = Buf{ .storage = out };
+    var any = false;
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |tag| {
+        if (tag.len == 0 or tag[0] != '+') continue;
+        const sep_len: usize = if (any) 1 else 0;
+        const extra = tag.len + sep_len;
+        if (b.len + extra > b.storage.len) break;
+        if (any) b.appendByte(';') catch break;
+        b.append(tag) catch break;
+        any = true;
+    }
+    return b.written();
+}
+
+fn restoreCloexec(fds: []const linux.fd_t) void {
+    for (fds) |fd| _ = linux.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
+}
 
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     // WebSocket clients: once upgraded, outbound IRC bytes are cut on CRLF

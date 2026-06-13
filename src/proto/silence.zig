@@ -129,9 +129,10 @@ pub const Store = struct {
         }
 
         const owner_copy = try self.allocator.dupe(u8, owner);
-        errdefer self.allocator.free(owner_copy);
-
-        const gop = try self.owners.getOrPut(owner);
+        const gop = self.owners.getOrPut(owner) catch |err| {
+            self.allocator.free(owner_copy);
+            return err;
+        };
         if (gop.found_existing) {
             self.allocator.free(owner_copy);
             return gop.value_ptr.add(self.allocator, self.params.max_masks_per_owner, mask);

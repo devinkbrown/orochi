@@ -382,6 +382,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Multithreading: run a sharded reactor pool (SO_REUSEPORT) across cores
+    // unless the config pins a specific shard count. Default to a moderate slice
+    // of the host's CPUs so the daemon scales past a single core.
+    if (srv_cfg.num_shards <= 1) {
+        const cpus = std.Thread.getCpuCount() catch 1;
+        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
+    }
+
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
         // io_uring unavailable (old kernel / sandbox): fall back to the DST boot banner.
@@ -422,10 +430,8 @@ pub fn main(init: std.process.Init) !void {
         "orochi: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",
         .{try srv.boundPort()},
     );
-    while (true) {
-        srv.runOnce() catch |err| {
-            std.debug.print("orochi: runOnce error: {s}\n", .{@errorName(err)});
-            return err;
-        };
-    }
+    // Sharded multi-reactor run loop (one worker thread per shard, joined here).
+    // runThreaded transparently runs a single in-line reactor when num_shards==1.
+    var run = std.atomic.Value(bool).init(true);
+    srv.runThreaded(&run);
 }

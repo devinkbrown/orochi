@@ -53,7 +53,7 @@ pub const IdentityIterator = struct {
 
         const identity_len = mem.readInt(u16, self.body[self.pos..][0..2], .big);
         self.pos += 2;
-        if (self.body.len - self.pos < identity_len + 4) return error.BufferTooShort;
+        if (self.body.len - self.pos < @as(usize, identity_len) + 4) return error.BufferTooShort;
 
         const identity = self.body[self.pos .. self.pos + identity_len];
         self.pos += identity_len;

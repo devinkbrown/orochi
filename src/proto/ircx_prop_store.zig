@@ -389,6 +389,7 @@ pub fn PropStore(comptime params: Params) type {
             var prop_key_buf: [params.max_key]u8 = undefined;
             const prop_key = try writePropKey(&prop_key_buf, key, params.max_key);
             const entry = state.props.getPtr(prop_key) orelse return error.PropMissing;
+            if (isSecretChannelProp(entity, entry.key)) return error.PropMissing;
             return view(state, entry);
         }
 
@@ -422,11 +423,12 @@ pub fn PropStore(comptime params: Params) type {
             var entity_key_buf: [max_entity_key]u8 = undefined;
             const entity_key = try writeEntityKey(&entity_key_buf, entity, params.max_entity_id);
             const state = self.entities.getPtr(entity_key) orelse return out[0..0];
-            if (state.prop_count > out.len) return error.OutputTooSmall;
 
             var count: usize = 0;
             var it = state.props.iterator();
             while (it.next()) |entry| {
+                if (isSecretChannelProp(entity, entry.value_ptr.key)) continue;
+                if (count >= out.len) return error.OutputTooSmall;
                 out[count] = view(state, entry.value_ptr);
                 count += 1;
             }
@@ -587,6 +589,12 @@ fn validateValueFor(entity: Entity, key: []const u8, value: []const u8, access: 
         }
     }
     try validateValue(value, limit);
+}
+
+fn isSecretChannelProp(entity: Entity, key: []const u8) bool {
+    if (entity.kind != .channel) return false;
+    const info = channelPropInfo(key) orelse return false;
+    return info.secret;
 }
 
 fn validateValue(value: []const u8, max_value: usize) PropError!void {

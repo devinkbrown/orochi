@@ -244,6 +244,7 @@ pub const Big = struct {
 /// byte length, left-zero-padded.
 pub fn modExp(base_be: []const u8, exp_be: []const u8, mod_be: []const u8, out: []u8) Error!void {
     const n = try Big.fromBytesBE(mod_be);
+    if (n.len > max_limbs / 2) return error.TooLarge;
     const e = try Big.fromBytesBE(exp_be);
     var b = try Big.fromBytesBE(base_be);
     b = b.mod(&n);
@@ -304,7 +305,7 @@ fn hashOf(alg: HashAlg, msg: []const u8, out: []u8) void {
 /// pre-computed hash of the signed message. Returns true iff valid.
 pub fn verifyPkcs1v15(pub_key: PublicKey, alg: HashAlg, digest: []const u8, signature: []const u8) bool {
     const k = pub_key.n.len;
-    if (k > max_bytes or k == 0) return false;
+    if (k == 0 or k > max_bytes / 2) return false;
     if (signature.len != k) return false;
     if (digest.len != alg.digestLen()) return false;
 
@@ -348,7 +349,7 @@ pub fn mgf1(alg: HashAlg, seed: []const u8, mask: []u8) void {
 /// `mhash` is the pre-computed hash; `salt_len` is the expected salt length.
 pub fn verifyPss(pub_key: PublicKey, alg: HashAlg, mhash: []const u8, signature: []const u8, salt_len: usize) bool {
     const k = pub_key.n.len;
-    if (k > max_bytes or k == 0) return false;
+    if (k == 0 or k > max_bytes / 2) return false;
     if (signature.len != k) return false;
     const h_len = alg.digestLen();
     if (mhash.len != h_len) return false;

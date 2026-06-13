@@ -109,18 +109,33 @@ pub const HostsTable = struct {
         var buf: [max_name_len]u8 = undefined;
         const lowered = lowerName(&buf, name) orelse return;
 
-        const fwd = try self.forward.getOrPut(self.allocator, lowered);
-        if (!fwd.found_existing) {
-            fwd.key_ptr.* = try self.allocator.dupe(u8, lowered);
-            fwd.value_ptr.* = address;
+        if (!self.forward.contains(lowered)) {
+            const owned = try self.allocator.dupe(u8, lowered);
+            const fwd = self.forward.getOrPut(self.allocator, owned) catch |err| {
+                self.allocator.free(owned);
+                return err;
+            };
+            if (fwd.found_existing) {
+                self.allocator.free(owned);
+            } else {
+                fwd.value_ptr.* = address;
+            }
         }
 
         if (!is_canonical) return;
 
         const key = addressKey(address);
-        const rev = try self.reverse.getOrPut(self.allocator, key);
-        if (!rev.found_existing) {
-            rev.value_ptr.* = try self.allocator.dupe(u8, lowered);
+        if (!self.reverse.contains(key)) {
+            const owned = try self.allocator.dupe(u8, lowered);
+            const rev = self.reverse.getOrPut(self.allocator, key) catch |err| {
+                self.allocator.free(owned);
+                return err;
+            };
+            if (rev.found_existing) {
+                self.allocator.free(owned);
+            } else {
+                rev.value_ptr.* = owned;
+            }
         }
     }
 };

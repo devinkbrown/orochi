@@ -367,11 +367,12 @@ pub const Server = struct {
         try self.recv_buf.appendSlice(self.allocator, received);
 
         if (self.state == .wait_client_hello) {
-            const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
-            if (rec.content_type == .change_cipher_spec) {
+            while (true) {
+                const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
+                if (rec.content_type != .change_cipher_spec) break;
                 consumePrefix(&self.recv_buf, rec.wire_len);
-                return self.feed(&.{});
             }
+            const rec = completePlainRecord(self.recv_buf.items) orelse return .need_more;
             if (rec.content_type != .handshake) return error.BadRecord;
             var off: usize = 0;
             const msg = try parseHandshake(rec.fragment, &off);

@@ -81,7 +81,12 @@ pub const FormatError = error{
     InvalidUtf8,
     MapKeysOutOfOrder,
     DuplicateMapKey,
+    NestingTooDeep,
+    TooManyValues,
 };
+
+pub const max_decode_depth = 128;
+pub const max_decode_values = 1_000_000;
 
 /// Canonical CoilPack encoder.
 pub const Encoder = struct {
@@ -141,18 +146,23 @@ pub const Encoder = struct {
 pub const Decoder = struct {
     input: []const u8,
     pos: usize = 0,
+    values_seen: usize = 0,
 
     /// Parses one complete CoilPack value from `input` into an owned value tree.
     pub fn decode(allocator: std.mem.Allocator, input: []const u8) !Value {
         var decoder = Decoder{ .input = input };
-        var value = try decoder.readValue(allocator);
+        var value = try decoder.readValue(allocator, 0);
         errdefer value.deinit(allocator);
 
         if (decoder.pos != input.len) return FormatError.TrailingBytes;
         return value;
     }
 
-    fn readValue(self: *Decoder, allocator: std.mem.Allocator) anyerror!Value {
+    fn readValue(self: *Decoder, allocator: std.mem.Allocator, depth: usize) anyerror!Value {
+        if (depth > max_decode_depth) return FormatError.NestingTooDeep;
+        if (self.values_seen == max_decode_values) return FormatError.TooManyValues;
+        self.values_seen += 1;
+
         const tag_byte = try self.readByte();
         const tag: Tag = switch (tag_byte) {
             @intFromEnum(Tag.nil) => .nil,
@@ -180,12 +190,12 @@ pub const Decoder = struct {
                 if (!isValidUtf8(string)) return FormatError.InvalidUtf8;
                 break :blk .{ .string = string };
             },
-            .array => try self.readArray(allocator),
-            .map => try self.readMap(allocator),
+            .array => try self.readArray(allocator, depth + 1),
+            .map => try self.readMap(allocator, depth + 1),
         };
     }
 
-    fn readArray(self: *Decoder, allocator: std.mem.Allocator) anyerror!Value {
+    fn readArray(self: *Decoder, allocator: std.mem.Allocator, depth: usize) anyerror!Value {
         const count = try self.readVarintAsUsize();
         var items: std.ArrayList(Value) = .empty;
         errdefer {
@@ -195,7 +205,7 @@ pub const Decoder = struct {
 
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            var item = try self.readValue(allocator);
+            var item = try self.readValue(allocator, depth);
             errdefer item.deinit(allocator);
             try items.append(allocator, item);
         }
@@ -203,7 +213,7 @@ pub const Decoder = struct {
         return .{ .array = try items.toOwnedSlice(allocator) };
     }
 
-    fn readMap(self: *Decoder, allocator: std.mem.Allocator) anyerror!Value {
+    fn readMap(self: *Decoder, allocator: std.mem.Allocator, depth: usize) anyerror!Value {
         const count = try self.readVarintAsUsize();
         var entries: std.ArrayList(MapEntry) = .empty;
         errdefer {
@@ -229,7 +239,7 @@ pub const Decoder = struct {
 
             const key = try allocator.dupe(u8, key_view);
             errdefer allocator.free(key);
-            var value = try self.readValue(allocator);
+            var value = try self.readValue(allocator, depth);
             errdefer value.deinit(allocator);
 
             try entries.append(allocator, .{

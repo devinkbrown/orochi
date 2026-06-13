@@ -107,6 +107,14 @@ fn takeBytes16(bytes: []const u8, i: *usize, max_len: usize) Error![]const u8 {
     return out;
 }
 
+fn validateLineField(bytes: []const u8, reject_space: bool) Error!void {
+    for (bytes) |byte| {
+        if (byte < 0x20 or byte == 0x7f or (reject_space and byte == ' ')) {
+            return error.NameTooLong;
+        }
+    }
+}
+
 /// Decode from `bytes`; the returned string fields borrow `bytes`.
 pub fn decode(bytes: []const u8) Error!MembershipEvent {
     if (bytes.len < fixed_prefix + 2) return error.Truncated;
@@ -128,6 +136,12 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     const host = try takeBytes16(bytes, &i, max_host_len);
 
     if (i != bytes.len) return error.TrailingBytes;
+    if (channel.len == 0 or nick.len == 0) return error.NameTooLong;
+    try validateLineField(channel, true);
+    try validateLineField(nick, true);
+    try validateLineField(username, false);
+    try validateLineField(realname, false);
+    try validateLineField(host, false);
     return .{
         .present = present,
         .status = @intCast(status_raw),

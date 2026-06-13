@@ -107,6 +107,19 @@ const Pending = struct {
 /// truncated to the first N — ample for host/reverse lookups.
 const max_answers = 8;
 
+fn hasMatchingAnswer(
+    comptime max_questions: usize,
+    comptime max_response_answers: usize,
+    msg: *const dns.Message(max_questions, max_response_answers),
+    name: []const u8,
+    qtype: dns.RecordType,
+) bool {
+    for (msg.answerSlice()) |rr| {
+        if (dns.rrMatchesQuestion(rr, name, qtype)) return true;
+    }
+    return false;
+}
+
 pub const Resolver = struct {
     const Self = @This();
 
@@ -199,9 +212,22 @@ pub const Resolver = struct {
         const msg = dns.parseMessage(1, max_answers, datagram) catch return null;
         if (!msg.header.isResponse()) return null;
 
+        const pending = self.pending.get(msg.header.id) orelse return null;
+        const want: dns.RecordType = switch (pending.query) {
+            .ptr => .ptr,
+            .a => .a,
+            .aaaa => .aaaa,
+        };
+        var qname_buf: [dns.max_domain_text_len]u8 = undefined;
+        const qname = switch (pending.query) {
+            .ptr => dns.reverseName(&qname_buf, pending.address) catch return null,
+            .a, .aaaa => pending.name_buf[0..pending.name_len],
+        };
+        if (!dns.responseMatchesQuestion(1, max_answers, &msg, qname, want)) return null;
+        if (msg.header.rcode() == 0 and msg.answer_count != 0 and !hasMatchingAnswer(1, max_answers, &msg, qname, want)) return null;
+
         const removed = self.pending.fetchRemove(msg.header.id) orelse return null;
         const p = removed.value;
-
         var r = Resolved{ .caller = p.caller, .query = p.query, .kind = .failure };
 
         if (msg.header.rcode() != 0) {
@@ -212,7 +238,7 @@ pub const Resolver = struct {
         switch (p.query) {
             .ptr => {
                 for (msg.answerSlice()) |rr| {
-                    if (rr.rr_type != .ptr) continue;
+                    if (!dns.rrMatchesQuestion(rr, qname, .ptr)) continue;
                     const host = rr.data.ptr.slice();
                     r.kind = .ptr;
                     r.name_len = @min(host.len, r.name_buf.len);
@@ -223,10 +249,10 @@ pub const Resolver = struct {
                 r.kind = .nxdomain;
             },
             .a, .aaaa => {
-                const want: dns.RecordType = if (p.query == .a) .a else .aaaa;
+                const want_rt: dns.RecordType = if (p.query == .a) .a else .aaaa;
                 var n: usize = 0;
                 for (msg.answerSlice()) |rr| {
-                    if (rr.rr_type != want or n >= r.addrs.len) continue;
+                    if (!dns.rrMatchesQuestion(rr, qname, want_rt) or n >= r.addrs.len) continue;
                     r.addrs[n] = switch (rr.data) {
                         .a => |b| .{ .ipv4 = b },
                         .aaaa => |b| .{ .ipv6 = b },

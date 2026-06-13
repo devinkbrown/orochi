@@ -415,11 +415,14 @@ const KvMap = struct {
             return;
         }
 
-        gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        const owned_key = self.allocator.dupe(u8, key) catch |err| {
+            _ = self.map.remove(key);
+            return err;
+        };
+        gop.key_ptr.* = owned_key;
         errdefer {
-            const owned_key = gop.key_ptr.*;
-            _ = self.map.remove(owned_key);
-            self.allocator.free(owned_key);
+            _ = self.map.remove(gop.key_ptr.*);
+            self.allocator.free(gop.key_ptr.*);
         }
         gop.value_ptr.* = try self.allocator.dupe(u8, value);
     }
@@ -461,18 +464,19 @@ const ChangeFeed = struct {
     fn push(self: *ChangeFeed, mutation: Mutation) !void {
         if (self.entries.len == 0) return;
 
-        const index = if (self.count < self.entries.len) blk: {
-            const write_index = (self.start + self.count) % self.entries.len;
-            self.count += 1;
-            break :blk write_index;
-        } else blk: {
-            const write_index = self.start;
-            if (self.entries[write_index]) |*old| old.deinit(self.allocator);
-            self.start = (self.start + 1) % self.entries.len;
-            break :blk write_index;
-        };
+        const owned = try OwnedMutation.from(self.allocator, mutation);
 
-        self.entries[index] = try OwnedMutation.from(self.allocator, mutation);
+        if (self.count < self.entries.len) {
+            const index = (self.start + self.count) % self.entries.len;
+            self.entries[index] = owned;
+            self.count += 1;
+        } else {
+            const index = self.start;
+            if (self.entries[index]) |*old| old.deinit(self.allocator);
+            self.entries[index] = null;
+            self.entries[index] = owned;
+            self.start = (self.start + 1) % self.entries.len;
+        }
     }
 
     fn at(self: *const ChangeFeed, index: usize) ?Mutation {

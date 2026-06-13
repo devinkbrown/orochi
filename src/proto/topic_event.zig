@@ -66,6 +66,12 @@ pub fn encode(ev: TopicEvent, out: []u8) Error![]const u8 {
     return out[0..i];
 }
 
+fn validateNoLineBreak(bytes: []const u8) Error!void {
+    for (bytes) |byte| {
+        if (byte == 0 or byte == '\r' or byte == '\n') return error.FieldTooLong;
+    }
+}
+
 pub fn decode(bytes: []const u8) Error!TopicEvent {
     if (bytes.len < fixed_prefix + 2) return error.Truncated;
 
@@ -101,6 +107,8 @@ pub fn decode(bytes: []const u8) Error!TopicEvent {
     i += setter_len;
 
     if (i != bytes.len) return error.TrailingBytes;
+    try validateNoLineBreak(topic);
+    try validateNoLineBreak(setter);
     return .{
         .present = present,
         .origin_node = origin_node,

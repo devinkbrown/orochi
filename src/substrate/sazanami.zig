@@ -233,7 +233,7 @@ pub const Membership = struct {
             // Suspicion of ourselves: refute by bumping our incarnation above
             // the rumor. This is the SAZANAMI self-refutation path.
             if (incarnation >= self.self_incarnation) {
-                self.self_incarnation = incarnation + 1;
+                self.self_incarnation = if (incarnation == std.math.maxInt(Incarnation)) incarnation else incarnation + 1;
                 return true;
             }
             return false;
@@ -292,7 +292,7 @@ pub const Membership = struct {
         if (node == self.self_id) {
             // We are obviously not dead. Refute hard.
             if (incarnation >= self.self_incarnation) {
-                self.self_incarnation = incarnation + 1;
+                self.self_incarnation = if (incarnation == std.math.maxInt(Incarnation)) incarnation else incarnation + 1;
                 return true;
             }
             return false;

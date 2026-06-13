@@ -255,7 +255,12 @@ pub fn validateSubjectWith(comptime params: Params, subject: WhoisSubject) Whois
     try validateRealnameWith(params, subject.realname);
     if (subject.account) |account| try validateAccountWith(params, account);
     if (subject.server) |server_name| try validateServerNameWith(params, server_name);
+    if (subject.oper_title) |title| try validateRenderedTrailingText(title, error.InvalidRealname);
     if (subject.away) |away_message| try validateAwayMessageWith(params, away_message);
+    if (subject.certfp) |fp| try validateRenderedTrailingText(fp, error.InvalidRealname);
+    if (subject.secure_cipher) |cipher| try validateRenderedTrailingText(cipher, error.InvalidRealname);
+    if (subject.actual_host) |host| try validateRenderedParam(host, error.InvalidHost);
+    if (subject.geo) |geo_text| try validateRenderedTrailingText(geo_text, error.InvalidRealname);
     for (subject.channels) |membership| {
         try validateChannelMembershipWith(params, membership);
     }
@@ -691,8 +696,20 @@ fn validParamByte(ch: u8) bool {
     return ch != ':';
 }
 
+fn validateRenderedParam(value: []const u8, err: WhoisError) WhoisError!void {
+    for (value) |ch| {
+        if (!validParamByte(ch)) return err;
+    }
+}
+
 fn validTrailingByte(ch: u8) bool {
     return ch >= 0x20 and ch != 0x7f;
+}
+
+fn validateRenderedTrailingText(value: []const u8, err: WhoisError) WhoisError!void {
+    for (value) |ch| {
+        if (!validTrailingByte(ch)) return err;
+    }
 }
 
 fn isChannelPrefix(ch: u8) bool {

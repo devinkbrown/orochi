@@ -244,6 +244,7 @@ pub fn parseFecHeader(data: []const u8) !FecHeader {
         data[7];
     const length_recovery: u16 = (@as(u16, data[8]) << 8) | data[9];
     const protection_length: u16 = (@as(u16, data[10]) << 8) | data[11];
+    if (FEC_OVERHEAD + @as(usize, protection_length) > data.len) return error.TruncatedInput;
     const mask: u16 = (@as(u16, data[12]) << 8) | data[13];
     return FecHeader{
         .e = e,
@@ -408,16 +409,13 @@ pub fn recoverPacket(
 
     // XOR-fold received packets out of the FEC repair data to get the missing
     // packet's fields.
-    const prot_len = hdr.protection_length;
+    const prot_len: usize = hdr.protection_length;
+    if (fec_data.len < FEC_OVERHEAD + prot_len) return error.TruncatedInput;
     var recovered_payload = try allocator.alloc(u8, prot_len);
     errdefer allocator.free(recovered_payload);
 
     // Start with the FEC repair payload bytes
     const fec_repair = fec_data[FEC_OVERHEAD .. FEC_OVERHEAD + prot_len];
-    if (fec_data.len < FEC_OVERHEAD + prot_len) {
-        allocator.free(recovered_payload);
-        return error.TruncatedInput;
-    }
     @memcpy(recovered_payload[0..prot_len], fec_repair);
 
     // XOR out all received packets

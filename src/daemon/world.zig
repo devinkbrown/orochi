@@ -250,11 +250,13 @@ pub const World = struct {
     /// read path being validated ahead of the live flip (see
     /// docs/planning/24-multithreading.md, world.zig adoption map).
     rcu_nicks: ?*RcuNickState = null,
+    rcu_nick_writes_since_advance: usize = 0,
     /// Lazily-activated RCU mirror of channel existence + per-channel membership
     /// (lock-free reads for `channelExists`/`isMember`). Null until the first
     /// channel is created; once active, `ensureChannel`/`removeChannel`/`join`/
     /// `part`/`removeClient` keep it in sync. Case-insensitive end-to-end.
     rcu_channels: ?*RcuChannelState = null,
+    rcu_channel_writes_since_advance: usize = 0,
     /// Guards all of the maps above for the multi-reactor model: lookups take the
     /// read lock, mutations (join/part/nick/mode/rename/remove) the write lock.
     /// Every mutation — and its allocation — happens under the exclusive lock, so
@@ -344,7 +346,7 @@ pub const World = struct {
         errdefer self.allocator.destroy(r);
         r.domain = ebr.Domain.init(self.allocator);
         errdefer r.domain.deinit();
-        r.participant = r.domain.register();
+        r.participant = r.domain.register() catch return error.OutOfMemory;
         errdefer r.participant.unregister();
         r.nicks = try world_rcu.NickRegistry.init(self.allocator, &r.domain);
         self.rcu_nicks = r;
@@ -358,13 +360,29 @@ pub const World = struct {
         errdefer self.allocator.destroy(c);
         c.domain = ebr.Domain.init(self.allocator);
         errdefer c.domain.deinit();
-        c.participant = c.domain.register();
+        c.participant = c.domain.register() catch return error.OutOfMemory;
         errdefer c.participant.unregister();
         c.names = try world_rcu.ChannelRegistry(u32).init(self.allocator, &c.domain);
         errdefer c.names.deinit();
         c.members = .empty;
         self.rcu_channels = c;
         return c;
+    }
+
+    fn noteRcuNickWrite(self: *World, r: *RcuNickState) void {
+        if (self.rcu_nick_writes_since_advance < rcuAdvanceWriteInterval)
+            self.rcu_nick_writes_since_advance += 1;
+        if (self.rcu_nick_writes_since_advance < rcuAdvanceWriteInterval) return;
+        if (advanceRcuDomainIfIdle(&r.domain))
+            self.rcu_nick_writes_since_advance = 0;
+    }
+
+    fn noteRcuChannelWrite(self: *World, c: *RcuChannelState) void {
+        if (self.rcu_channel_writes_since_advance < rcuAdvanceWriteInterval)
+            self.rcu_channel_writes_since_advance += 1;
+        if (self.rcu_channel_writes_since_advance < rcuAdvanceWriteInterval) return;
+        if (advanceRcuDomainIfIdle(&c.domain))
+            self.rcu_channel_writes_since_advance = 0;
     }
 
     /// Get (creating if absent) the per-channel RCU membership set for `name`.
@@ -469,7 +487,11 @@ pub const World = struct {
 
         // Authoritative nick->id lives in the RCU registry (case-insensitive).
         try r.nicks.set(r.participant, nick, @bitCast(client));
-        errdefer r.nicks.remove(r.participant, nick) catch {};
+        self.noteRcuNickWrite(r);
+        errdefer {
+            r.nicks.remove(r.participant, nick) catch {};
+            self.noteRcuNickWrite(r);
+        }
 
         try self.nicks.put(owned, client);
         errdefer _ = self.nicks.remove(owned);
@@ -482,7 +504,10 @@ pub const World = struct {
         if (self.client_nicks.fetchRemove(client)) |removed| {
             // Remove from the authoritative RCU map using the nick string before
             // it is freed below.
-            if (self.rcu_nicks) |r| r.nicks.remove(r.participant, removed.value) catch {};
+            if (self.rcu_nicks) |r| {
+                r.nicks.remove(r.participant, removed.value) catch {};
+                self.noteRcuNickWrite(r);
+            }
             _ = self.nicks.remove(removed.value);
             self.allocator.free(removed.value);
         }
@@ -520,7 +545,7 @@ pub const World = struct {
         // The first member to join a freshly-created channel is its FOUNDER
         // (Orochi founder tier +Q, prefix ! — above IRCX owner); later
         // joiners start with no status modes.
-        const founding = channel.members.count() == 0;
+        const founding = channel.members.count() == 0 and !channel.ext_modes.has(.registered);
         const member = try channel.members.getOrPut(client);
         if (!member.found_existing) {
             member.value_ptr.* = if (founding)
@@ -531,6 +556,7 @@ pub const World = struct {
             if (self.rcu_channels) |c| {
                 const set = try self.rcuMembershipSet(c, name);
                 try set.add(c.participant, @bitCast(client));
+                self.noteRcuChannelWrite(c);
             }
         }
         return !member.found_existing;
@@ -548,6 +574,7 @@ pub const World = struct {
             if (self.rcu_channels) |c| {
                 const set = try self.rcuMembershipSet(c, name);
                 try set.add(c.participant, @bitCast(client));
+                self.noteRcuChannelWrite(c);
             }
         }
     }
@@ -639,8 +666,9 @@ pub const World = struct {
     /// any prior key is freed.
     pub fn setChannelKey(self: *World, name: []const u8, key: ?[]const u8) WorldError!void {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        const owned = if (key) |k| try self.allocator.dupe(u8, k) else null;
         if (channel.key) |old| self.allocator.free(old);
-        channel.key = if (key) |k| try self.allocator.dupe(u8, k) else null;
+        channel.key = owned;
     }
 
     pub fn channelKey(self: *World, name: []const u8) ?[]const u8 {
@@ -737,8 +765,12 @@ pub const World = struct {
             var nb: [foldBufLen]u8 = undefined;
             const of = foldName(old, &ob);
             const nf = foldName(new, &nb);
-            if (!std.mem.eql(u8, of, nf)) c.names.remove(c.participant, old) catch {};
+            if (!std.mem.eql(u8, of, nf)) {
+                c.names.remove(c.participant, old) catch {};
+                self.noteRcuChannelWrite(c);
+            }
             c.names.set(c.participant, new, oid) catch {};
+            self.noteRcuChannelWrite(c);
         }
         return true;
     }
@@ -915,8 +947,9 @@ pub const World = struct {
     /// +f forward target. `target == null` clears it. Owns a duped copy.
     pub fn setForward(self: *World, name: []const u8, target: ?[]const u8) WorldError!void {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
+        const owned = if (target) |t| try self.allocator.dupe(u8, t) else null;
         if (channel.forward) |old| self.allocator.free(old);
-        channel.forward = if (target) |t| try self.allocator.dupe(u8, t) else null;
+        channel.forward = owned;
     }
     /// The +f forward target for `name`, or null when unset / no such channel.
     pub fn forwardOf(self: *World, name: []const u8) ?[]const u8 {
@@ -1062,7 +1095,10 @@ pub const World = struct {
         // Mirror the removal into the lock-free set (best-effort: the
         // authoritative store is `channel.members`).
         if (self.rcu_channels) |c| {
-            if (rcuMembershipGet(c, name)) |set| set.remove(c.participant, @bitCast(client)) catch {};
+            if (rcuMembershipGet(c, name)) |set| {
+                set.remove(c.participant, @bitCast(client)) catch {};
+                self.noteRcuChannelWrite(c);
+            }
         }
         // A registered (+r) channel persists across empty: its config, topic,
         // and modes survive when the last member leaves. Unregistered channels
@@ -1212,8 +1248,10 @@ pub const World = struct {
                     // Mirror the membership removal for channels that survive;
                     // removed channels have their whole set dropped below.
                     if (self.rcu_channels) |c| {
-                        if (rcuMembershipGet(c, entry.key_ptr.*)) |set|
+                        if (rcuMembershipGet(c, entry.key_ptr.*)) |set| {
                             set.remove(c.participant, @bitCast(client)) catch {};
+                            self.noteRcuChannelWrite(c);
+                        }
                     }
                 }
                 // Registered (+r) channels persist across empty; only reclaim
@@ -1237,22 +1275,27 @@ pub const World = struct {
         const entry = try self.channels.getOrPut(name);
         if (entry.found_existing) return entry.value_ptr;
 
-        const owned_name = try self.allocator.dupe(u8, name);
+        var owned_name: ?[]u8 = null;
         errdefer {
-            self.allocator.free(owned_name);
+            if (owned_name) |owned| self.allocator.free(owned);
             self.channels.removeByPtr(entry.key_ptr);
         }
+        owned_name = try self.allocator.dupe(u8, name);
         const oid = self.next_oid;
 
         // Activate + populate the RCU existence mirror BEFORE finalising the map
         // entry, so a mirror-alloc failure rolls back cleanly (errdefer above).
         const c = try self.ensureRcuChannels();
         try c.names.set(c.participant, name, oid);
-        errdefer c.names.remove(c.participant, name) catch {};
+        self.noteRcuChannelWrite(c);
+        errdefer {
+            c.names.remove(c.participant, name) catch {};
+            self.noteRcuChannelWrite(c);
+        }
         // Pre-create the (empty) membership set so isMember/joins are mirrored.
         _ = try self.rcuMembershipSet(c, name);
 
-        entry.key_ptr.* = owned_name;
+        entry.key_ptr.* = owned_name.?;
         entry.value_ptr.* = Channel.init(self.allocator);
         entry.value_ptr.oid = oid;
         entry.value_ptr.created_unix = self.clock_unix;
@@ -1268,6 +1311,7 @@ pub const World = struct {
             // Tear down the RCU mirrors for this channel (existence + members).
             if (self.rcu_channels) |c| {
                 c.names.remove(c.participant, owned_name) catch {};
+                self.noteRcuChannelWrite(c);
                 self.rcuDropMembership(c, owned_name);
             }
             self.allocator.free(owned_name);
@@ -1279,6 +1323,28 @@ pub const World = struct {
 /// names are far shorter in practice; longer names truncate-fold (still
 /// deterministic, only an academic edge case for absurd lengths).
 const foldBufLen = 256;
+const rcuAdvanceWriteInterval: usize = 64;
+const rcuAdvancePasses: usize = 3;
+
+fn advanceRcuDomainIfIdle(domain: *ebr.Domain) bool {
+    if (!rcuDomainIdle(domain)) return false;
+    var advanced = false;
+    var pass: usize = 0;
+    while (pass < rcuAdvancePasses) : (pass += 1) {
+        if (!rcuDomainIdle(domain)) return advanced;
+        advanced = domain.advance() or advanced;
+    }
+    return advanced;
+}
+
+fn rcuDomainIdle(domain: *ebr.Domain) bool {
+    const n = domain.participant_count.load(.acquire);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (domain.participants[i].active.load(.acquire)) return false;
+    }
+    return true;
+}
 
 /// ASCII-lowercase `name` into `buf`, returning the folded slice. Used to key
 /// the per-channel membership-set map case-insensitively, mirroring the

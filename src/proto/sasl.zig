@@ -141,6 +141,8 @@ pub const Dispatcher = struct {
     tls_certfp: ?[]const u8 = null,
     server_nonce: []const u8,
     state: State = .idle,
+    authcid_buf: [MAX_SCRAM_USERNAME]u8 = undefined,
+    authcid_len: usize = 0,
 
     const State = union(enum) {
         idle,
@@ -249,11 +251,21 @@ pub const Dispatcher = struct {
                     self.state = .idle;
                     return if (err == error.OutputTooSmall) err else .{ .failure = .ERR_SASLFAIL };
                 };
-                const authcid = scram.username();
+                const authcid = self.copyAuthcid(scram.username()) orelse {
+                    self.state = .idle;
+                    return .{ .failure = .ERR_SASLFAIL };
+                };
                 self.state = .idle;
                 return .{ .success = .{ .identity = .{ .authcid = authcid }, .final_data = final_data } };
             },
         }
+    }
+
+    fn copyAuthcid(self: *Dispatcher, authcid: []const u8) ?[]const u8 {
+        if (authcid.len == 0 or authcid.len > self.authcid_buf.len) return null;
+        @memcpy(self.authcid_buf[0..authcid.len], authcid);
+        self.authcid_len = authcid.len;
+        return self.authcid_buf[0..self.authcid_len];
     }
 };
 

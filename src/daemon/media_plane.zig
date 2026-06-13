@@ -35,16 +35,17 @@ fn isRtcp(b1: u8) bool {
     return b1 >= 192 and b1 <= 223;
 }
 
-/// Fill `buf` with OS entropy (getrandom), falling back to a constant only if
-/// the syscall fails (never expected on a running daemon).
-fn osEntropy(buf: []u8) void {
+/// Fill `buf` with OS entropy (getrandom).
+fn osEntropy(buf: []u8) !void {
     var filled: usize = 0;
     while (filled < buf.len) {
         const rc = linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-        if (posix.errno(rc) != .SUCCESS) {
-            for (buf[filled..]) |*b| b.* = 0x55;
-            return;
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.EntropyUnavailable,
         }
+        if (rc == 0) return error.EntropyUnavailable;
         filled += @intCast(rc);
     }
 }
@@ -86,7 +87,7 @@ pub const MediaPlane = struct {
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
-        osEntropy(&seed);
+        osEntropy(&seed) catch @panic("media CSPRNG entropy unavailable");
         return .{
             .allocator = allocator,
             .transport = MediaTransport.init(allocator),

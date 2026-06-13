@@ -343,12 +343,20 @@ pub fn Deframer(comptime max_frame_size: usize) type {
         pub const max_frame = max_frame_size;
         /// Header (2) + extended length (8) + mask key (4) on top of the payload.
         const max_overhead = 14;
+        const PendingEvent = union(enum) {
+            data: struct { len: usize, fin: bool },
+            ping: usize,
+            pong: void,
+            close: usize,
+        };
 
         /// Reassembly buffer for wire bytes of the (possibly partial) next frame.
         buf: [max_frame_size + max_overhead]u8 = undefined,
         len: usize = 0,
         /// Unmask destination; `data`/`ping`/`close` payload slices point here.
         payload_buf: [max_frame_size]u8 = undefined,
+        pending: ?PendingEvent = null,
+        pending_error: ?DeframeError = null,
         /// True while a fragmented DATA message is open (a non-FIN text/binary
         /// frame was seen and its closing FIN continuation has not arrived yet).
         fragmented: bool = false,
@@ -357,15 +365,38 @@ pub fn Deframer(comptime max_frame_size: usize) type {
         /// size exceeds capacity (oversize *declared* lengths are rejected earlier
         /// by `next` as `PayloadTooLarge`, straight from the frame header).
         pub fn feed(self: *Self, bytes: []const u8) error{BufferFull}!void {
-            if (self.len + bytes.len > self.buf.len) return error.BufferFull;
-            @memcpy(self.buf[self.len..][0..bytes.len], bytes);
-            self.len += bytes.len;
+            var rest = bytes;
+            while (rest.len != 0) {
+                const spare = self.buf.len - self.len;
+                if (rest.len <= spare) {
+                    @memcpy(self.buf[self.len..][0..rest.len], rest);
+                    self.len += rest.len;
+                    return;
+                }
+
+                if (spare != 0) {
+                    @memcpy(self.buf[self.len..], rest[0..spare]);
+                    self.len += spare;
+                    rest = rest[spare..];
+                }
+
+                if (!self.drainBufferedFrame()) return error.BufferFull;
+                if (self.pending_error != null) return;
+            }
         }
 
         /// Pop the next complete frame as a semantic event, or null when more
         /// wire bytes are needed. Any error is fatal to the stream: the caller
         /// must close the connection (RFC 6455 §10.7).
         pub fn next(self: *Self) DeframeError!?DeframeEvent {
+            if (self.pending_error) |err| {
+                self.pending_error = null;
+                return err;
+            }
+            if (self.pending) |pending| {
+                self.pending = null;
+                return self.eventFromPending(pending);
+            }
             if (self.len == 0) return null;
             const res = decodeFrame(
                 max_frame_size,
@@ -382,7 +413,55 @@ pub fn Deframer(comptime max_frame_size: usize) type {
             std.mem.copyForwards(u8, self.buf[0..rem], self.buf[res.consumed..self.len]);
             self.len = rem;
 
-            const frame = res.frame;
+            return try self.eventFromFrame(res.frame);
+        }
+
+        fn drainBufferedFrame(self: *Self) bool {
+            if (self.pending != null or self.pending_error != null) return false;
+            const res = decodeFrame(
+                max_frame_size,
+                .client_to_server,
+                self.buf[0..self.len],
+                &self.payload_buf,
+            ) catch |err| switch (err) {
+                error.Truncated => return false,
+                else => {
+                    self.pending_error = err;
+                    self.len = 0;
+                    return true;
+                },
+            };
+
+            self.queuePending(res.frame) catch |err| {
+                self.pending_error = err;
+                self.len = 0;
+                return true;
+            };
+            const rem = self.len - res.consumed;
+            std.mem.copyForwards(u8, self.buf[0..rem], self.buf[res.consumed..self.len]);
+            self.len = rem;
+            return true;
+        }
+
+        fn queuePending(self: *Self, frame: Frame) DeframeError!void {
+            switch (frame.opcode) {
+                .text, .binary => {
+                    if (self.fragmented) return error.NestedFragmentation;
+                    self.fragmented = !frame.fin;
+                    self.pending = .{ .data = .{ .len = frame.payload.len, .fin = frame.fin } };
+                },
+                .continuation => {
+                    if (!self.fragmented) return error.UnexpectedContinuation;
+                    if (frame.fin) self.fragmented = false;
+                    self.pending = .{ .data = .{ .len = frame.payload.len, .fin = frame.fin } };
+                },
+                .ping => self.pending = .{ .ping = frame.payload.len },
+                .pong => self.pending = .pong,
+                .close => self.pending = .{ .close = frame.payload.len },
+            }
+        }
+
+        fn eventFromFrame(self: *Self, frame: Frame) DeframeError!DeframeEvent {
             switch (frame.opcode) {
                 .text, .binary => {
                     if (self.fragmented) return error.NestedFragmentation;
@@ -398,6 +477,15 @@ pub fn Deframer(comptime max_frame_size: usize) type {
                 .pong => return .pong,
                 .close => return .{ .close = frame.payload },
             }
+        }
+
+        fn eventFromPending(self: *Self, pending: PendingEvent) DeframeEvent {
+            return switch (pending) {
+                .data => |data| .{ .data = .{ .payload = self.payload_buf[0..data.len], .fin = data.fin } },
+                .ping => |len| .{ .ping = self.payload_buf[0..len] },
+                .pong => .pong,
+                .close => |len| .{ .close = self.payload_buf[0..len] },
+            };
         }
     };
 }

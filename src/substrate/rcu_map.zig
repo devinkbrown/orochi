@@ -287,9 +287,9 @@ test "single-thread put/get/remove/overwrite/count under read handles" {
         map.deinit();
     }
 
-    const w = domain.register();
+    const w = domain.register() catch unreachable;
     defer w.unregister();
-    const r = domain.register();
+    const r = domain.register() catch unreachable;
     defer r.unregister();
 
     // Empty.
@@ -374,9 +374,9 @@ test "snapshot stability: held handle keeps the old version across writes" {
         map.deinit();
     }
 
-    const w = domain.register();
+    const w = domain.register() catch unreachable;
     defer w.unregister();
-    const r = domain.register();
+    const r = domain.register() catch unreachable;
     defer r.unregister();
 
     try map.put(w, 1, 10);
@@ -487,8 +487,8 @@ test "threaded: readers never observe garbage while writers churn, no leak" {
 
     var reader_parts: [reader_count]*ebr.Participant = undefined;
     var writer_parts: [writer_count]*ebr.Participant = undefined;
-    for (0..reader_count) |i| reader_parts[i] = domain.register();
-    for (0..writer_count) |i| writer_parts[i] = domain.register();
+    for (0..reader_count) |i| reader_parts[i] = domain.register() catch unreachable;
+    for (0..writer_count) |i| writer_parts[i] = domain.register() catch unreachable;
 
     const shared = Shared{
         .map = &map,

@@ -95,7 +95,8 @@ pub const Encoder = struct {
         try config.validate();
         if (symbol_count == 0) return error.InvalidLayout;
         if (symbol_count % config.generation_size != 0) return error.InvalidLayout;
-        if (source.len != symbol_count * config.symbol_size) return error.InvalidLayout;
+        const expected_len = std.math.mul(usize, symbol_count, config.symbol_size) catch return error.InvalidLayout;
+        if (source.len != expected_len) return error.InvalidLayout;
 
         return .{
             .source = source,

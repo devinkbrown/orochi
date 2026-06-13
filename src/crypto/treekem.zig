@@ -7,6 +7,7 @@
 //! retained members to converge on the same root secret while omitted members
 //! cannot decrypt the new epoch.
 const std = @import("std");
+const random = @import("random.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -176,7 +177,7 @@ pub const MemberView = struct {
             .remove => "op-remove",
             else => return error.KeyChangedWithoutSecret,
         };
-        const next_key = try operationKeyPair(self.member_id, commit.epoch, label);
+        const next_key = try operationKeyPair(self.member_id, commit.epoch, label, self.root_secret);
         if (!equalPublic(current.public_key, next_key.public_key)) return error.KeyChangedWithoutSecret;
 
         self.key_pair.wipe();
@@ -238,8 +239,9 @@ pub const Group = struct {
     pub fn update(self: *Group, member_id: MemberId) (std.mem.Allocator.Error || Error)!Commit {
         const idx = self.findMemberIndex(member_id) orelse return error.UnknownMember;
         self.epoch += 1;
+        const previous_root = self.root_secret;
         self.members.items[idx].key_pair.wipe();
-        self.members.items[idx].key_pair = try operationKeyPair(member_id, self.epoch, "op-update");
+        self.members.items[idx].key_pair = try operationKeyPair(member_id, self.epoch, "op-update", previous_root);
         self.root_secret = try deriveRoot(self.members.items);
         return self.makeCommit(.update, member_id);
     }
@@ -267,8 +269,9 @@ pub const Group = struct {
 
         self.epoch += 1;
         const sender_id = self.members.items[0].id;
+        const previous_root = self.root_secret;
         self.members.items[0].key_pair.wipe();
-        self.members.items[0].key_pair = try operationKeyPair(sender_id, self.epoch, "op-remove");
+        self.members.items[0].key_pair = try operationKeyPair(sender_id, self.epoch, "op-remove", previous_root);
         self.root_secret = try deriveRoot(self.members.items);
         return self.makeCommit(.remove, sender_id);
     }
@@ -284,14 +287,13 @@ pub const Group = struct {
         var envelopes: std.ArrayList(Envelope) = .empty;
         errdefer envelopes.deinit(self.allocator);
 
-        for (self.members.items, 0..) |member, i| {
+        for (self.members.items) |member| {
             try envelopes.append(self.allocator, try sealRootFor(
                 self.root_secret,
                 self.epoch,
                 operation,
                 member.id,
                 member.key_pair.public_key,
-                i,
             ));
         }
 
@@ -379,9 +381,9 @@ fn sealRootFor(
     operation: Operation,
     member_id: MemberId,
     recipient_public: PublicKey,
-    envelope_index: usize,
 ) Error!Envelope {
-    const eph = try envelopeKeyPair(epoch, operation, member_id, envelope_index);
+    var eph = try envelopeKeyPair();
+    defer eph.wipe();
     var dh = X25519.scalarmult(eph.secret_key, recipient_public) catch return error.InvalidPublicKey;
     defer secureZero(&dh);
 
@@ -421,20 +423,20 @@ fn envelopeMask(
     return hkdfExpand(&dh, "envelope", &ctx);
 }
 
-fn operationKeyPair(member_id: MemberId, epoch: u64, label: []const u8) Error!KeyPair {
-    var material: [16]u8 = undefined;
+fn operationKeyPair(member_id: MemberId, epoch: u64, label: []const u8, previous_root: Secret) Error!KeyPair {
+    var material: [16 + secret_len]u8 = undefined;
     std.mem.writeInt(u64, material[0..8], member_id, .big);
     std.mem.writeInt(u64, material[8..16], epoch, .big);
+    @memcpy(material[16..], &previous_root);
     return keyPairFromMaterial(label, &material);
 }
 
-fn envelopeKeyPair(epoch: u64, operation: Operation, member_id: MemberId, index: usize) Error!KeyPair {
-    var material: [25]u8 = undefined;
-    std.mem.writeInt(u64, material[0..8], epoch, .big);
-    material[8] = @intFromEnum(operation);
-    std.mem.writeInt(u64, material[9..17], member_id, .big);
-    std.mem.writeInt(u64, material[17..25], @intCast(index), .big);
-    return keyPairFromMaterial("envelope-key", &material);
+fn envelopeKeyPair() Error!KeyPair {
+    var seed: MemberSeed = undefined;
+    random.fillOsEntropy(&seed) catch return error.InvalidPublicKey;
+    defer secureZero(&seed);
+    const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.InvalidPublicKey;
+    return .{ .public_key = kp.public_key, .secret_key = kp.secret_key };
 }
 
 fn keyPairFromMaterial(label: []const u8, material: []const u8) Error!KeyPair {
@@ -641,7 +643,7 @@ test "remove evicts a member and retained members converge" {
     try testing.expect(!std.mem.eql(u8, &group.root_secret, &three.root_secret));
 }
 
-test "deterministic fixed seeds reproduce roots and commits" {
+test "deterministic fixed seeds reproduce roots and public commit metadata" {
     const allocator = testing.allocator;
     const seeds = [_]MemberSeed{ fixedSeed(0xc1), fixedSeed(0xc2), fixedSeed(0xc3) };
 
@@ -660,11 +662,16 @@ test "deterministic fixed seeds reproduce roots and commits" {
     try testing.expectEqualSlices(u8, &left.root_secret, &right.root_secret);
     try testing.expectEqualSlices(u8, &left_commit.tree_hash, &right_commit.tree_hash);
     try testing.expectEqual(left_commit.envelopes.len, right_commit.envelopes.len);
+    var saw_randomized_envelope = false;
     for (left_commit.envelopes, right_commit.envelopes) |a, b| {
         try testing.expectEqual(a.member_id, b.member_id);
-        try testing.expectEqualSlices(u8, &a.ephemeral_public, &b.ephemeral_public);
-        try testing.expectEqualSlices(u8, &a.ciphertext, &b.ciphertext);
+        if (!std.mem.eql(u8, &a.ephemeral_public, &b.ephemeral_public) or
+            !std.mem.eql(u8, &a.ciphertext, &b.ciphertext))
+        {
+            saw_randomized_envelope = true;
+        }
     }
+    try testing.expect(saw_randomized_envelope);
 }
 
 test "applyToml overrides treekem_max_members and enforces the new cap" {

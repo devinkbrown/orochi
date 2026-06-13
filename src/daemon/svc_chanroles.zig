@@ -701,25 +701,36 @@ pub const ChanRoleStore = struct {
         defer self.allocator.free(prefix);
 
         var removed: usize = 0;
+        var role_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer role_keys.deinit(self.allocator);
+        var assignment_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer assignment_keys.deinit(self.allocator);
 
         var role_it = self.roles.iterator();
         while (role_it.next()) |entry| {
             if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
-                const key = entry.key_ptr.*;
-                self.roles.removeByPtr(entry.key_ptr);
-                self.allocator.free(key);
-                removed += 1;
+                try role_keys.append(self.allocator, entry.key_ptr.*);
             }
         }
 
         var assignment_it = self.assignments.iterator();
         while (assignment_it.next()) |entry| {
             if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
-                const key = entry.key_ptr.*;
-                const value = entry.value_ptr.*;
-                self.assignments.removeByPtr(entry.key_ptr);
-                self.allocator.free(key);
-                self.allocator.free(value);
+                try assignment_keys.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (role_keys.items) |key| {
+            if (self.roles.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
+                removed += 1;
+            }
+        }
+
+        for (assignment_keys.items) |key| {
+            if (self.assignments.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
                 removed += 1;
             }
         }
@@ -752,15 +763,15 @@ pub const ChanRoleStore = struct {
 
     fn makeKey(self: *Self, channel: []const u8, name: []const u8) ![]u8 {
         const key = try self.allocator.alloc(u8, channel.len + 1 + name.len);
-        @memcpy(key[0..channel.len], channel);
+        for (channel, 0..) |byte, index| key[index] = std.ascii.toLower(byte);
         key[channel.len] = key_sep;
-        @memcpy(key[channel.len + 1 ..], name);
+        for (name, 0..) |byte, index| key[channel.len + 1 + index] = std.ascii.toLower(byte);
         return key;
     }
 
     fn makePrefix(self: *Self, channel: []const u8) ![]u8 {
         const prefix = try self.allocator.alloc(u8, channel.len + 1);
-        @memcpy(prefix[0..channel.len], channel);
+        for (channel, 0..) |byte, index| prefix[index] = std.ascii.toLower(byte);
         prefix[channel.len] = key_sep;
         return prefix;
     }
@@ -770,14 +781,20 @@ pub const ChanRoleStore = struct {
         defer self.allocator.free(prefix);
 
         var removed: usize = 0;
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer keys.deinit(self.allocator);
+
         var it = self.assignments.iterator();
         while (it.next()) |entry| {
-            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix) and std.mem.eql(u8, entry.value_ptr.*, role)) {
-                const key = entry.key_ptr.*;
-                const value = entry.value_ptr.*;
-                self.assignments.removeByPtr(entry.key_ptr);
-                self.allocator.free(key);
-                self.allocator.free(value);
+            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix) and std.ascii.eqlIgnoreCase(entry.value_ptr.*, role)) {
+                keys.append(self.allocator, entry.key_ptr.*) catch return 0;
+            }
+        }
+
+        for (keys.items) |key| {
+            if (self.assignments.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
                 removed += 1;
             }
         }

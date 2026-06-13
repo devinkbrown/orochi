@@ -199,12 +199,12 @@ fn decodeChunkedInPlace(region: []u8) !usize {
             return write_pos;
         }
 
-        if (read_pos + size > region.len) return Error.Truncated;
+        if (size > region.len - read_pos) return Error.Truncated;
         // Move chunk data toward the front; overlapping copy goes forward only.
         std.mem.copyForwards(u8, region[write_pos .. write_pos + size], region[read_pos .. read_pos + size]);
         write_pos += size;
         read_pos += size;
-        if (read_pos + 2 > region.len) return Error.Truncated;
+        if (region.len - read_pos < 2) return Error.Truncated;
         if (!std.mem.eql(u8, region[read_pos .. read_pos + 2], "\r\n")) return Error.Malformed;
         read_pos += 2;
     }
@@ -225,8 +225,10 @@ fn chunkedComplete(region: []const u8) bool {
                 if (blank) return true;
             }
         }
-        if (pos + size + 2 > region.len) return false;
-        pos += size + 2;
+        if (size > region.len - pos) return false;
+        pos += size;
+        if (region.len - pos < 2) return false;
+        pos += 2;
     }
 }
 

@@ -423,14 +423,13 @@ pub const Client = struct {
         try self.appendTranscript(handshake.items);
         self.state = .wait_server_hello;
         const ch_record = try writePlainRecord(self.allocator, .handshake, handshake.items);
-        errdefer self.allocator.free(ch_record);
         if (self.early_data == null) return ch_record;
+        defer self.allocator.free(ch_record);
 
         try self.deriveClientEarlyTrafficKeys();
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, ch_record);
-        self.allocator.free(ch_record);
 
         const early = self.early_data.?;
         const early_record = try sealRecordAlloc(

@@ -32,6 +32,7 @@
 //! Target: 64-bit only (x86_64 / aarch64).
 
 const std = @import("std");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const cpv = @import("../../proto/coilpack_value.zig");
 const signed_object = @import("../../proto/signed_object.zig");
@@ -53,7 +54,7 @@ comptime {
 pub const frame_magic: u8 = 'M';
 
 /// Frame format version. Bump when the on-wire layout changes incompatibly.
-pub const frame_version: u8 = 1;
+pub const frame_version: u8 = 2;
 
 /// Fixed frame header byte count: magic + version + fsm_state + u32 token_len.
 pub const frame_header_len: usize = 1 + 1 + 1 + 4;
@@ -67,6 +68,7 @@ const endian: std.builtin.Endian = .little;
 pub const KeyPair = signed_object.KeyPair;
 pub const PublicKey = signed_object.PublicKey;
 pub const Signature = signed_object.Signature;
+pub const CapsuleHash = [Sha256.digest_length]u8;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -220,6 +222,8 @@ pub const Token = struct {
     fsm_state: FsmState,
     /// Monotonic epoch; lets policy reject stale re-offers of the same nonce.
     epoch: u64,
+    /// SHA-256 over the canonical capsule payload this token authorizes.
+    capsule_hash: CapsuleHash,
     /// Ed25519 signature over the canonical token bytes.
     signature: Signature,
     /// Public key of the origin that signed it.
@@ -234,9 +238,16 @@ pub const Token = struct {
     /// Canonical CoilPack value over the *signed* fields (everything except the
     /// signature itself). Stable regardless of map ordering, so the signature is
     /// reproducible. Caller-supplied account is borrowed into the value.
-    fn canonicalValue(account: []const u8, nonce: u64, fsm_state: FsmState, epoch: u64) [4]cpv.MapEntry {
+    fn canonicalValue(
+        account: []const u8,
+        nonce: u64,
+        fsm_state: FsmState,
+        epoch: u64,
+        capsule_hash: []const u8,
+    ) [5]cpv.MapEntry {
         return .{
             .{ .key = "account", .value = .{ .string = account } },
+            .{ .key = "capsule_hash", .value = .{ .bytes = capsule_hash } },
             .{ .key = "epoch", .value = .{ .unsigned = epoch } },
             .{ .key = "fsm", .value = .{ .unsigned = fsm_state.tag() } },
             .{ .key = "nonce", .value = .{ .unsigned = nonce } },
@@ -252,8 +263,9 @@ pub const Token = struct {
         nonce: u64,
         fsm_state: FsmState,
         epoch: u64,
+        capsule_hash: CapsuleHash,
     ) Error!Token {
-        var entries = canonicalValue(account, nonce, fsm_state, epoch);
+        var entries = canonicalValue(account, nonce, fsm_state, epoch, capsule_hash[0..]);
         var obj = signed_object.sign(allocator, .{ .map = entries[0..] }, kp) catch |err| {
             return narrowSignError(err);
         };
@@ -265,6 +277,7 @@ pub const Token = struct {
             .nonce = nonce,
             .fsm_state = fsm_state,
             .epoch = epoch,
+            .capsule_hash = capsule_hash,
             .signature = obj.signature,
             .signer = obj.signer,
         };
@@ -273,7 +286,7 @@ pub const Token = struct {
     /// Verify this token's signature against `expected_signer` by recomputing
     /// the canonical bytes from its fields. Returns `false` on any mismatch.
     pub fn verify(self: Token, allocator: std.mem.Allocator, expected_signer: PublicKey) bool {
-        var entries = canonicalValue(self.account, self.nonce, self.fsm_state, self.epoch);
+        var entries = canonicalValue(self.account, self.nonce, self.fsm_state, self.epoch, self.capsule_hash[0..]);
         const canonical = cpv.Encoder.encode(allocator, .{ .map = entries[0..] }) catch return false;
         defer allocator.free(canonical);
 
@@ -299,6 +312,7 @@ pub const Token = struct {
     pub fn encode(self: Token, allocator: std.mem.Allocator) Error![]u8 {
         var entries = [_]cpv.MapEntry{
             .{ .key = "account", .value = .{ .string = self.account } },
+            .{ .key = "capsule_hash", .value = .{ .bytes = self.capsule_hash[0..] } },
             .{ .key = "epoch", .value = .{ .unsigned = self.epoch } },
             .{ .key = "fsm", .value = .{ .unsigned = self.fsm_state.tag() } },
             .{ .key = "nonce", .value = .{ .unsigned = self.nonce } },
@@ -318,11 +332,13 @@ pub const Token = struct {
         const epoch = mapUnsigned(value.map, "epoch") orelse return error.MalformedToken;
         const fsm_raw = mapUnsigned(value.map, "fsm") orelse return error.MalformedToken;
         const nonce = mapUnsigned(value.map, "nonce") orelse return error.MalformedToken;
+        const capsule_hash_src = mapBytes(value.map, "capsule_hash") orelse return error.MalformedToken;
         const sig_src = mapBytes(value.map, "sig") orelse return error.MalformedToken;
         const signer_src = mapBytes(value.map, "signer") orelse return error.MalformedToken;
 
         if (fsm_raw > std.math.maxInt(u8)) return error.MalformedToken;
         const fsm_state = FsmState.fromTag(@intCast(fsm_raw)) orelse return error.MalformedToken;
+        if (capsule_hash_src.len != Sha256.digest_length) return error.MalformedToken;
         if (sig_src.len != @typeInfo(Signature).array.len) return error.MalformedToken;
         if (signer_src.len != @typeInfo(PublicKey).array.len) return error.MalformedToken;
 
@@ -333,12 +349,15 @@ pub const Token = struct {
         @memcpy(signature[0..], sig_src);
         var signer: PublicKey = undefined;
         @memcpy(signer[0..], signer_src);
+        var capsule_hash: CapsuleHash = undefined;
+        @memcpy(capsule_hash[0..], capsule_hash_src);
 
         return .{
             .account = owned_account,
             .nonce = nonce,
             .fsm_state = fsm_state,
             .epoch = epoch,
+            .capsule_hash = capsule_hash,
             .signature = signature,
             .signer = signer,
         };
@@ -650,29 +669,34 @@ pub const MigrationOrigin = struct {
         if (!try self.policy.admit(self.allocator, account, epoch)) return error.Replay;
         if (!try self.journal.record(self.allocator, nonce)) return error.Replay;
 
-        var token = try Token.mint(self.allocator, self.keypair, account, nonce, .offered, epoch);
+        const capsule_hash = try capsulePayloadHash(self.allocator, account, snapshot);
+
+        var token = try Token.mint(self.allocator, self.keypair, account, nonce, .offered, epoch, capsule_hash);
         errdefer token.deinit(self.allocator);
-
-        // The capsule borrows the token's owned fields by value-copying the
-        // struct; we keep an independent owned token to return, so re-mint a
-        // matching token copy for the capsule rather than aliasing the slice.
-        var capsule_token = try Token.mint(self.allocator, self.keypair, account, nonce, .offered, epoch);
-        errdefer capsule_token.deinit(self.allocator);
-
-        const owned_account = try self.allocator.dupe(u8, account);
-        errdefer self.allocator.free(owned_account);
 
         // The capsule's snapshot must be owned independently of the caller's, so
         // re-encode/decode through CoilPack to deep-copy it.
         const snap_bytes = try snapshot.encode(self.allocator);
         defer self.allocator.free(snap_bytes);
-        var capsule_snapshot = try Snapshot.decode(self.allocator, snap_bytes);
-        errdefer capsule_snapshot.deinit(self.allocator);
 
-        var capsule = Capsule{
-            .token = capsule_token,
-            .account = owned_account,
-            .snapshot = capsule_snapshot,
+        var capsule = blk: {
+            // The capsule borrows the token's owned fields by value-copying the
+            // struct; we keep an independent owned token to return, so re-mint a
+            // matching token copy for the capsule rather than aliasing the slice.
+            var capsule_token = try Token.mint(self.allocator, self.keypair, account, nonce, .offered, epoch, capsule_hash);
+            errdefer capsule_token.deinit(self.allocator);
+
+            const owned_account = try self.allocator.dupe(u8, account);
+            errdefer self.allocator.free(owned_account);
+
+            var capsule_snapshot = try Snapshot.decode(self.allocator, snap_bytes);
+            errdefer capsule_snapshot.deinit(self.allocator);
+
+            break :blk Capsule{
+                .token = capsule_token,
+                .account = owned_account,
+                .snapshot = capsule_snapshot,
+            };
         };
         defer capsule.deinit(self.allocator);
 
@@ -741,6 +765,11 @@ pub const MigrationTarget = struct {
         if (!std.mem.eql(u8, frame.token.account, frame.capsule.account)) {
             self.metrics.rejected_signature += 1;
             return error.AccountMismatch;
+        }
+        const capsule_hash = try capsulePayloadHash(self.allocator, frame.capsule.account, frame.capsule.snapshot);
+        if (!std.crypto.timing_safe.eql(CapsuleHash, frame.token.capsule_hash, capsule_hash)) {
+            self.metrics.rejected_signature += 1;
+            return error.BadSignature;
         }
 
         // Stale-epoch rejection (policy), then replay rejection (journal).
@@ -816,9 +845,26 @@ fn cloneToken(allocator: std.mem.Allocator, token: Token) Error!Token {
         .nonce = token.nonce,
         .fsm_state = token.fsm_state,
         .epoch = token.epoch,
+        .capsule_hash = token.capsule_hash,
         .signature = token.signature,
         .signer = token.signer,
     };
+}
+
+fn capsulePayloadHash(allocator: std.mem.Allocator, account: []const u8, snapshot: Snapshot) Error!CapsuleHash {
+    const snapshot_bytes = try snapshot.encode(allocator);
+    defer allocator.free(snapshot_bytes);
+
+    var entries = [_]cpv.MapEntry{
+        .{ .key = "account", .value = .{ .string = account } },
+        .{ .key = "snapshot", .value = .{ .bytes = snapshot_bytes } },
+    };
+    const canonical = try canonicalEncode(allocator, .{ .map = entries[0..] });
+    defer allocator.free(canonical);
+
+    var digest: CapsuleHash = undefined;
+    Sha256.hash(canonical, &digest, .{});
+    return digest;
 }
 
 // ---------------------------------------------------------------------------

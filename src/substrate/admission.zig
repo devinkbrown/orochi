@@ -186,10 +186,9 @@ pub fn verifyChain(root_pubkey: PublicKeyBytes, chain: []const SignedGrant, now_
 ///
 /// This validates grant signatures, chain linkage, validity windows, revocation
 /// state, exact scope match, final subject, and the requested capability bits.
-/// Call `verifyChain` with a trusted root when the caller needs to bind the
-/// first issuer to an external trust anchor.
 pub fn authorize(
     chain: []const SignedGrant,
+    trusted_root: PublicKeyBytes,
     subject: PublicKeyBytes,
     scope: []const u8,
     needed_caps: Caps,
@@ -197,7 +196,7 @@ pub fn authorize(
     revocations: *const RevocationSet,
 ) bool {
     if (chain.len == 0) return false;
-    verifyChain(chain[0].grant.issuer_pubkey, chain, now_ms) catch return false;
+    verifyChain(trusted_root, chain, now_ms) catch return false;
 
     var effective_caps: Caps = ~@as(Caps, 0);
     for (chain) |signed| {
@@ -302,7 +301,7 @@ test "issue verify authorize accept" {
 
     try verifyGrant(signed.grant, signed.signature);
     try verifyChain(issuer.public_key.toBytes(), &.{signed}, 1_500);
-    try std.testing.expect(authorize(&.{signed}, subject.public_key.toBytes(), "#orochi", read, 1_500, &revocations));
+    try std.testing.expect(authorize(&.{signed}, issuer.public_key.toBytes(), subject.public_key.toBytes(), "#orochi", read, 1_500, &revocations));
 }
 
 test "expired grant is rejected" {
@@ -315,7 +314,7 @@ test "expired grant is rejected" {
     const signed = try issueGrant(makeGrant(issuer, subject, "#ops", capBit(0), 10), issuer);
 
     try std.testing.expectError(error.Expired, verifyChain(issuer.public_key.toBytes(), &.{signed}, 2_001));
-    try std.testing.expect(!authorize(&.{signed}, subject.public_key.toBytes(), "#ops", capBit(0), 2_001, &revocations));
+    try std.testing.expect(!authorize(&.{signed}, issuer.public_key.toBytes(), subject.public_key.toBytes(), "#ops", capBit(0), 2_001, &revocations));
 }
 
 test "wrong scope is rejected" {
@@ -327,7 +326,7 @@ test "wrong scope is rejected" {
     const subject = try testKey(6);
     const signed = try issueGrant(makeGrant(issuer, subject, "#ops", capBit(0), 11), issuer);
 
-    try std.testing.expect(!authorize(&.{signed}, subject.public_key.toBytes(), "#dev", capBit(0), 1_500, &revocations));
+    try std.testing.expect(!authorize(&.{signed}, issuer.public_key.toBytes(), subject.public_key.toBytes(), "#dev", capBit(0), 1_500, &revocations));
 }
 
 test "missing capability is rejected" {
@@ -341,7 +340,7 @@ test "missing capability is rejected" {
     const write = capBit(1);
     const signed = try issueGrant(makeGrant(issuer, subject, "#ops", read, 12), issuer);
 
-    try std.testing.expect(!authorize(&.{signed}, subject.public_key.toBytes(), "#ops", write, 1_500, &revocations));
+    try std.testing.expect(!authorize(&.{signed}, issuer.public_key.toBytes(), subject.public_key.toBytes(), "#ops", write, 1_500, &revocations));
 }
 
 test "revoked grant id is rejected" {
@@ -354,7 +353,7 @@ test "revoked grant id is rejected" {
     const signed = try issueGrant(makeGrant(issuer, subject, "#ops", capBit(0), 13), issuer);
     try revocations.revoke(signed.grant.grant_id);
 
-    try std.testing.expect(!authorize(&.{signed}, subject.public_key.toBytes(), "#ops", capBit(0), 1_500, &revocations));
+    try std.testing.expect(!authorize(&.{signed}, issuer.public_key.toBytes(), subject.public_key.toBytes(), "#ops", capBit(0), 1_500, &revocations));
 }
 
 test "tampered body or signature is rejected" {
@@ -387,8 +386,8 @@ test "three node delegation chain authorizes final subject" {
     const chain = [_]SignedGrant{ ab, bc };
 
     try verifyChain(a.public_key.toBytes(), &chain, 1_500);
-    try std.testing.expect(authorize(&chain, c.public_key.toBytes(), "#mesh", read, 1_500, &revocations));
-    try std.testing.expect(!authorize(&chain, c.public_key.toBytes(), "#mesh", write, 1_500, &revocations));
+    try std.testing.expect(authorize(&chain, a.public_key.toBytes(), c.public_key.toBytes(), "#mesh", read, 1_500, &revocations));
+    try std.testing.expect(!authorize(&chain, a.public_key.toBytes(), c.public_key.toBytes(), "#mesh", write, 1_500, &revocations));
 }
 
 test "delegation that widens capabilities is rejected" {

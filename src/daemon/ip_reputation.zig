@@ -147,25 +147,17 @@ pub const IpReputation = struct {
     /// Returns the number of entries removed.
     pub fn sweep(self: *IpReputation, now_ms: u64) usize {
         var removed: usize = 0;
+        var doomed = std.ArrayListUnmanaged(Key).empty;
+        defer doomed.deinit(self.allocator);
+
         var it = self.entries.iterator();
-        // Collect-then-remove is avoided by removing via iterator-safe pattern:
-        // we cannot remove during iteration, so gather keys first.
-        // Bounded by current count; uses a small fixed scan with re-iteration.
         while (it.next()) |kv| {
             const mag = @abs(decayed(kv.value_ptr.*, now_ms, self.config.half_life_ms));
             if (mag <= self.config.negligible) {
-                kv.value_ptr.*.score = sweep_sentinel;
-            }
-        }
-        // Second pass: remove the sentinel-marked entries.
-        var again = self.entries.iterator();
-        var doomed = std.ArrayListUnmanaged(Key).empty;
-        defer doomed.deinit(self.allocator);
-        while (again.next()) |kv| {
-            if (kv.value_ptr.*.score == sweep_sentinel) {
                 doomed.append(self.allocator, kv.key_ptr.*) catch break;
             }
         }
+
         for (doomed.items) |k| {
             if (self.entries.remove(k)) removed += 1;
         }
@@ -184,11 +176,6 @@ pub const IpReputation = struct {
         return next;
     }
 };
-
-/// A NaN-free magic value used only to mark entries for removal within `sweep`.
-/// Real scores can never equal it because it is a specific large negative
-/// number well outside any plausible accumulated reward.
-const sweep_sentinel: f64 = -1.7976931348623157e+300;
 
 /// Decay `entry`'s stored score forward to `now_ms` using the half-life model.
 fn decayed(entry: Entry, now_ms: u64, half_life_ms: u64) f64 {

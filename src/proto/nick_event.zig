@@ -75,6 +75,19 @@ fn takeBytes16(bytes: []const u8, i: *usize, max: usize) Error![]const u8 {
     return out;
 }
 
+fn validateNick(bytes: []const u8) Error!void {
+    if (bytes.len == 0) return error.FieldTooLong;
+    for (bytes) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == ' ') return error.FieldTooLong;
+    }
+}
+
+fn validateLineIdentity(bytes: []const u8) Error!void {
+    for (bytes) |byte| {
+        if (byte == 0 or byte == '\r' or byte == '\n') return error.FieldTooLong;
+    }
+}
+
 pub fn decode(bytes: []const u8) Error!NickEvent {
     if (bytes.len < fixed_prefix) return error.Truncated;
 
@@ -91,6 +104,10 @@ pub fn decode(bytes: []const u8) Error!NickEvent {
     const host = try takeBytes16(bytes, &i, max_host_len);
 
     if (i != bytes.len) return error.TrailingBytes;
+    try validateNick(old_nick);
+    try validateNick(new_nick);
+    try validateLineIdentity(username);
+    try validateLineIdentity(host);
     return .{
         .origin_node = origin_node,
         .hlc = hlc,

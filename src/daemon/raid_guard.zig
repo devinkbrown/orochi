@@ -60,9 +60,11 @@ pub const RaidGuard = struct {
         var state = ChannelState{
             .name = try self.allocator.dupe(u8, channel),
         };
-        errdefer state.deinit(self.allocator);
 
-        try self.channels.append(self.allocator, state);
+        self.channels.append(self.allocator, state) catch |err| {
+            state.deinit(self.allocator);
+            return err;
+        };
         errdefer {
             var removed = self.channels.orderedRemove(self.channels.items.len - 1);
             removed.deinit(self.allocator);

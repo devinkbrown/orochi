@@ -150,6 +150,9 @@ pub const MediaRooms = struct {
         var kb: [256]u8 = undefined;
         const k = breakoutKey(&kb, channel, pid) orelse return;
         const trimmed = name[0..@min(name.len, self.config.max_breakout_bytes)];
+        const owned_value = try self.allocator.dupe(u8, trimmed);
+        var value_stored = false;
+        errdefer if (!value_stored) self.allocator.free(owned_value);
         const gop = try self.breakouts.getOrPut(k);
         if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, k) catch |e| {
@@ -159,7 +162,8 @@ pub const MediaRooms = struct {
         } else {
             self.allocator.free(gop.value_ptr.*);
         }
-        gop.value_ptr.* = try self.allocator.dupe(u8, trimmed);
+        gop.value_ptr.* = owned_value;
+        value_stored = true;
     }
 
     /// The breakout `pid` is in within `channel` (default "main").

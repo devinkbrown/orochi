@@ -49,6 +49,8 @@ pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     accounts: std.StringHashMap(SessionList),
+    session_snapshots: std.ArrayListUnmanaged([]Session) = .empty,
+    match_accounts: std.ArrayListUnmanaged([]u8) = .empty,
     lock: rwlock.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) SessionStore {
@@ -70,6 +72,10 @@ pub const SessionStore = struct {
                 entry.value_ptr.deinit(self.allocator);
             }
             self.accounts.deinit();
+            for (self.session_snapshots.items) |snapshot| self.allocator.free(snapshot);
+            self.session_snapshots.deinit(self.allocator);
+            for (self.match_accounts.items) |account| self.allocator.free(account);
+            self.match_accounts.deinit(self.allocator);
         }
         self.* = undefined;
     }
@@ -151,28 +157,41 @@ pub const SessionStore = struct {
         return 0;
     }
 
-    /// Borrowed session list for `account` (empty if none). Valid until the next
-    /// mutation touching this account.
+    /// Snapshot of the session list for `account` (empty if none).
     pub fn sessions(self: *const SessionStore, account: []const u8) []const Session {
-        @constCast(&self.lock).lockShared();
-        defer @constCast(&self.lock).unlockShared();
+        const self_mut = @constCast(self);
+        self_mut.lock.lockExclusive();
+        defer self_mut.lock.unlockExclusive();
 
-        const list = self.accounts.getPtr(account) orelse return &.{};
-        return list.items.items;
+        const list = self_mut.accounts.getPtr(account) orelse return &.{};
+        const snapshot = self_mut.allocator.dupe(Session, list.items.items) catch return &.{};
+        self_mut.session_snapshots.append(self_mut.allocator, snapshot) catch {
+            self_mut.allocator.free(snapshot);
+            return &.{};
+        };
+        return snapshot;
     }
 
     pub const Match = struct { account: []const u8, client: ClientId };
 
     /// Find the session bearing `token` (for reclaim). The returned `account`
-    /// borrows the store's key storage.
+    /// is a store-retained copy of the account name.
     pub fn findByToken(self: *const SessionStore, token: Token) ?Match {
-        @constCast(&self.lock).lockShared();
-        defer @constCast(&self.lock).unlockShared();
+        const self_mut = @constCast(self);
+        self_mut.lock.lockExclusive();
+        defer self_mut.lock.unlockExclusive();
 
-        var it = self.accounts.iterator();
+        var it = self_mut.accounts.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items.items) |s| {
-                if (std.mem.eql(u8, &s.token, &token)) return .{ .account = entry.key_ptr.*, .client = s.client };
+                if (std.crypto.timing_safe.eql(Token, s.token, token)) {
+                    const account = self_mut.allocator.dupe(u8, entry.key_ptr.*) catch return null;
+                    self_mut.match_accounts.append(self_mut.allocator, account) catch {
+                        self_mut.allocator.free(account);
+                        return null;
+                    };
+                    return .{ .account = account, .client = s.client };
+                }
             }
         }
         return null;
@@ -187,7 +206,7 @@ pub const SessionStore = struct {
 
         const list = self.accounts.getPtr(account) orelse return null;
         for (list.items.items) |s| {
-            if (std.mem.eql(u8, &s.token, &token)) return s.client;
+            if (std.crypto.timing_safe.eql(Token, s.token, token)) return s.client;
         }
         return null;
     }

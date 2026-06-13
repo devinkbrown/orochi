@@ -68,6 +68,7 @@ pub const ScramStore = struct {
     allocator: std.mem.Allocator,
     /// Maps canonical account name -> SCRAM material. Keys and salt bytes owned.
     entries: std.StringHashMapUnmanaged(Entry),
+    lookup_salts: std.ArrayListUnmanaged([]u8) = .empty,
     lock: rwlock.RwLock = .{},
     /// Optional durable backfill source consulted by `resolve` on a miss.
     loader: ?Loader = null,
@@ -95,6 +96,11 @@ pub const ScramStore = struct {
                 secureZero(&entry.value_ptr.server_key);
             }
             self.entries.deinit(self.allocator);
+            for (self.lookup_salts.items) |salt| {
+                secureZero(salt);
+                self.allocator.free(salt);
+            }
+            self.lookup_salts.deinit(self.allocator);
         }
         self.* = undefined;
     }
@@ -290,16 +296,21 @@ pub const ScramStore = struct {
     }
 
     /// Look up SCRAM credentials for `account`, returning a `ScramRecord` whose
-    /// `salt` slice borrows store-owned memory. The record stays valid until the
-    /// entry is overwritten or the store is torn down. Returns null for an
-    /// unknown account.
+    /// `salt` slice is retained by the store until teardown. Returns null for an
+    /// unknown account or allocation failure.
     pub fn lookup(self: *const ScramStore, account: []const u8) ?sasl.ScramRecord {
-        @constCast(&self.lock).lockShared();
-        defer @constCast(&self.lock).unlockShared();
+        const self_mut = @constCast(self);
+        self_mut.lock.lockExclusive();
+        defer self_mut.lock.unlockExclusive();
 
-        const entry = self.entries.get(account) orelse return null;
+        const entry = self_mut.entries.get(account) orelse return null;
+        const salt = self_mut.allocator.dupe(u8, entry.salt) catch return null;
+        self_mut.lookup_salts.append(self_mut.allocator, salt) catch {
+            self_mut.allocator.free(salt);
+            return null;
+        };
         return .{
-            .salt = entry.salt,
+            .salt = salt,
             .iterations = entry.iterations,
             .stored_key = entry.stored_key,
             .server_key = entry.server_key,

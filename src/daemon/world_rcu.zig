@@ -489,7 +489,7 @@ test "NickRegistry: set/lookup/remove, case-insensitive, overwrite, miss" {
     const a = testing.allocator;
     var domain = ebr.Domain.init(a);
     defer domain.deinit();
-    const p = domain.register();
+    const p = domain.register() catch unreachable;
     defer p.unregister();
 
     var reg = try NickRegistry.init(a, &domain);
@@ -536,7 +536,7 @@ test "ChannelRegistry(*Dummy): set/lookup/remove with pointer value" {
     const a = testing.allocator;
     var domain = ebr.Domain.init(a);
     defer domain.deinit();
-    const p = domain.register();
+    const p = domain.register() catch unreachable;
     defer p.unregister();
 
     var d1 = Dummy{ .tag = 11 };
@@ -576,7 +576,7 @@ test "MembershipSet: add/contains/remove/iterate/count" {
     const a = testing.allocator;
     var domain = ebr.Domain.init(a);
     defer domain.deinit();
-    const p = domain.register();
+    const p = domain.register() catch unreachable;
     defer p.unregister();
 
     var set = try MembershipSet.init(a, &domain);
@@ -616,9 +616,9 @@ test "snapshot stability: held guard sees pre-mutation state" {
     const a = testing.allocator;
     var domain = ebr.Domain.init(a);
     defer domain.deinit();
-    const reader = domain.register();
+    const reader = domain.register() catch unreachable;
     defer reader.unregister();
-    const writer = domain.register();
+    const writer = domain.register() catch unreachable;
     defer writer.unregister();
 
     var set = try MembershipSet.init(a, &domain);
@@ -702,13 +702,13 @@ test "THREADED: concurrent readers vs writer, no UAF, no leak, correct final" {
         for (0..spawned) |i| threads[i].join();
     }
     for (0..reader_count) |i| {
-        reader_parts[i] = domain.register();
+        reader_parts[i] = domain.register() catch unreachable;
         threads[i] = std.Thread.spawn(.{}, Shared.readerLoop, .{ shared, reader_parts[i] }) catch return error.SkipZigTest;
         spawned += 1;
     }
 
     // Writer runs on this thread, its own participant, bounded round count.
-    const writer = domain.register();
+    const writer = domain.register() catch unreachable;
     const rounds: usize = 40_000;
     var r: usize = 0;
     while (r < rounds) : (r += 1) {

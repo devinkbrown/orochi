@@ -224,6 +224,7 @@ pub fn Art(comptime V: type) type {
             const old_node = slot.*.?;
             const old_leaf = old_node.leaf;
             const shared = commonPrefixLen(old_leaf.key[depth..], key[depth..]);
+            const branch_depth = depth + shared;
             const prefix = try allocator.dupe(u8, key[depth .. depth + shared]);
             errdefer allocator.free(prefix);
 
@@ -231,7 +232,15 @@ pub fn Art(comptime V: type) type {
             errdefer allocator.destroy(branch);
             branch.* = .{ .n4 = .{ .prefix = prefix } };
 
-            const branch_depth = depth + shared;
+            var new_key = if (branch_depth == key.len) try allocator.dupe(u8, key) else null;
+            errdefer {
+                if (new_key) |k| allocator.free(k);
+            }
+            var new_leaf = if (branch_depth == key.len) null else try createLeaf(allocator, key, value);
+            errdefer {
+                if (new_leaf) |leaf| destroyNode(allocator, leaf);
+            }
+
             if (branch_depth == old_leaf.key.len) {
                 branch.n4.key = old_leaf.key;
                 branch.n4.value = old_leaf.value;
@@ -242,13 +251,13 @@ pub fn Art(comptime V: type) type {
             }
 
             if (branch_depth == key.len) {
-                branch.n4.key = try allocator.dupe(u8, key);
+                branch.n4.key = new_key.?;
+                new_key = null;
                 branch.n4.value = value;
                 branch.n4.has_value = true;
             } else {
-                const new_leaf = try createLeaf(allocator, key, value);
-                errdefer destroyNode(allocator, new_leaf);
-                insertSmall(4, &branch.n4, key[branch_depth], new_leaf);
+                insertSmall(4, &branch.n4, key[branch_depth], new_leaf.?);
+                new_leaf = null;
             }
 
             slot.* = branch;
@@ -271,6 +280,15 @@ pub fn Art(comptime V: type) type {
             errdefer allocator.free(parent_prefix);
             const old_suffix = try allocator.dupe(u8, old_prefix[common + 1 ..]);
             errdefer allocator.free(old_suffix);
+            const branch_depth = depth + common;
+            var new_key = if (branch_depth == key.len) try allocator.dupe(u8, key) else null;
+            errdefer {
+                if (new_key) |k| allocator.free(k);
+            }
+            var new_leaf = if (branch_depth == key.len) null else try createLeaf(allocator, key, value);
+            errdefer {
+                if (new_leaf) |leaf| destroyNode(allocator, leaf);
+            }
 
             const parent = try allocator.create(Node);
             errdefer allocator.destroy(parent);
@@ -280,15 +298,14 @@ pub fn Art(comptime V: type) type {
             nodePrefix(old_node).* = old_suffix;
             insertSmall(4, &parent.n4, old_edge, old_node);
 
-            const branch_depth = depth + common;
             if (branch_depth == key.len) {
-                parent.n4.key = try allocator.dupe(u8, key);
+                parent.n4.key = new_key.?;
+                new_key = null;
                 parent.n4.value = value;
                 parent.n4.has_value = true;
             } else {
-                const new_leaf = try createLeaf(allocator, key, value);
-                errdefer destroyNode(allocator, new_leaf);
-                insertSmall(4, &parent.n4, key[branch_depth], new_leaf);
+                insertSmall(4, &parent.n4, key[branch_depth], new_leaf.?);
+                new_leaf = null;
             }
 
             slot.* = parent;

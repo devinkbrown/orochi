@@ -201,7 +201,7 @@ pub fn buildV2(out: []u8, header: Header) BuildError![]u8 {
 }
 
 fn parseV2Tcp4(payload: []const u8, consumed: usize) ParseError!Parsed {
-    if (payload.len != 12) return error.InvalidFamily;
+    if (payload.len < 12) return error.InvalidFamily;
     var header = Header{ .family = .tcp4 };
     @memcpy(header.src_ip[0..4], payload[0..4]);
     @memcpy(header.dst_ip[0..4], payload[4..8]);
@@ -211,7 +211,7 @@ fn parseV2Tcp4(payload: []const u8, consumed: usize) ParseError!Parsed {
 }
 
 fn parseV2Tcp6(payload: []const u8, consumed: usize) ParseError!Parsed {
-    if (payload.len != 36) return error.InvalidFamily;
+    if (payload.len < 36) return error.InvalidFamily;
     var header = Header{ .family = .tcp6 };
     @memcpy(header.src_ip[0..16], payload[0..16]);
     @memcpy(header.dst_ip[0..16], payload[16..32]);

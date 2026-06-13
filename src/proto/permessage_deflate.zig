@@ -50,6 +50,11 @@ pub const extension_token = "permessage-deflate";
 /// independent DEFLATE stream, matching how `compressMessage` operates.
 pub const response_value = "permessage-deflate; server_no_context_takeover; client_no_context_takeover";
 
+/// Conservative fallback when a caller has not supplied its negotiated message
+/// cap. Call `decompressMessageBounded` with the connection's actual limit when
+/// one is available.
+pub const default_max_decompressed_message_bytes: usize = 16 * 1024 * 1024;
+
 /// Parse a client `Sec-WebSocket-Extensions` offer and, if it contains a
 /// `permessage-deflate` extension, return the server response header value.
 ///
@@ -103,7 +108,20 @@ pub fn compressMessage(allocator: std.mem.Allocator, payload: []const u8) ![]u8 
 ///
 /// Caller owns the returned slice and must free it with `allocator`.
 pub fn decompressMessage(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    return decompressMessageBounded(allocator, payload, default_max_decompressed_message_bytes);
+}
+
+/// Append `0x00 0x00 0xff 0xff` to `payload` then raw-INFLATE it, per RFC 7692.
+/// Decompression is capped to the negotiated message limit.
+///
+/// Caller owns the returned slice and must free it with `allocator`.
+pub fn decompressMessageBounded(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    max_decompressed_bytes: usize,
+) ![]u8 {
     // Rebuild the full DEFLATE stream by re-appending the stripped tail.
+    if (payload.len > std.math.maxInt(usize) - tail.len) return error.MessageTooLarge;
     const framed = try allocator.alloc(u8, payload.len + tail.len);
     defer allocator.free(framed);
     @memcpy(framed[0..payload.len], payload);
@@ -116,7 +134,17 @@ pub fn decompressMessage(allocator: std.mem.Allocator, payload: []const u8) ![]u
     defer allocator.free(window);
 
     var decomp = flate.Decompress.init(&in, .raw, window);
-    return decomp.reader.allocRemaining(allocator, .unlimited);
+    if (max_decompressed_bytes == std.math.maxInt(usize)) {
+        return decomp.reader.allocRemaining(allocator, .unlimited);
+    }
+    const limit = max_decompressed_bytes + 1;
+    const decoded = decomp.reader.allocRemaining(allocator, .limited(limit)) catch |err| switch (err) {
+        error.StreamTooLong => return error.MessageTooLarge,
+        else => |e| return e,
+    };
+    errdefer allocator.free(decoded);
+    if (decoded.len > max_decompressed_bytes) return error.MessageTooLarge;
+    return decoded;
 }
 
 test "compress then decompress round-trips the original payload" {

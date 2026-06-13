@@ -159,7 +159,8 @@ pub const Mixer = struct {
             if (p.id == id) {
                 // Apply gain and store.
                 for (samples, 0..) |s, i| {
-                    p.frame[i] = s * p.gain;
+                    const mixed = s * p.gain;
+                    p.frame[i] = if (std.math.isFinite(mixed)) mixed else 0.0;
                 }
                 p.active = frameEnergy(p.frame) >= self.energy_threshold;
                 return;

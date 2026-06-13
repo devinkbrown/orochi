@@ -83,7 +83,14 @@ pub fn assemble(
     for (body_lines) |line| {
         try assembler.append(line, out);
     }
-    return assembler.finish(close_line, out);
+    var msg = try assembler.finish(close_line, out);
+    const needed = checkedAdd(msg.value.len, msg.target.len) orelse return error.OutputTooSmall;
+    if (needed > out.len) return error.OutputTooSmall;
+    const target_start = msg.value.len;
+    const target_len = msg.target.len;
+    @memcpy(out[target_start..][0..target_len], msg.target);
+    msg.target = out[target_start..][0..target_len];
+    return msg;
 }
 
 /// Stateful allocation-free multiline batch assembler.

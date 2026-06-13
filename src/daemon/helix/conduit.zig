@@ -185,6 +185,9 @@ pub fn recv(allocator: Allocator, socket_fd: handoff.Fd) Error!Received {
     if (handoff.fdBatchCount(head.fd_count) != head.batches) return error.Protocol;
 
     var fd_offset: usize = 0;
+    errdefer for (fds[0..fd_offset]) |fd| {
+        _ = linux.close(fd);
+    };
     var payload_offset: usize = 0;
     var batch_index: usize = 0;
     while (batch_index < head.batches) : (batch_index += 1) {

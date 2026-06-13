@@ -70,7 +70,6 @@ pub const Reassembler = struct {
     received: []bool = &.{},
     received_count: usize = 0,
     total_len: usize = 0,
-    completed: ?[]u8 = null,
 
     const Self = @This();
 
@@ -90,9 +89,8 @@ pub const Reassembler = struct {
         return .{ .allocator = allocator };
     }
 
-    pub fn push(self: *Self, datagram: []const u8) Error!?[]const u8 {
-        self.releaseCompleted();
-
+    /// Returns an owned completed payload when the frame is complete; caller frees it.
+    pub fn push(self: *Self, datagram: []const u8) Error!?[]u8 {
         const h = try parse(datagram);
         if (h.frag_count == 0) return error.Mismatch;
         if (h.frag_index >= h.frag_count) return error.Mismatch;
@@ -126,12 +124,10 @@ pub const Reassembler = struct {
         }
 
         self.resetInFlight();
-        self.completed = out;
         return out;
     }
 
     pub fn reset(self: *Self) void {
-        self.releaseCompleted();
         self.resetInFlight();
     }
 
@@ -167,13 +163,6 @@ pub const Reassembler = struct {
         self.received = &.{};
         self.received_count = 0;
         self.total_len = 0;
-    }
-
-    fn releaseCompleted(self: *Self) void {
-        if (self.completed) |payload| {
-            self.allocator.free(payload);
-            self.completed = null;
-        }
     }
 
     fn parse(datagram: []const u8) Error!Header {
@@ -224,6 +213,7 @@ test "fragment then reassemble out of order" {
     try std.testing.expect(try r.push(datagrams[3]) == null);
 
     const rebuilt = try r.push(datagrams[1]) orelse return error.Incomplete;
+    defer std.testing.allocator.free(rebuilt);
     try std.testing.expectEqualSlices(u8, &payload, rebuilt);
 }
 

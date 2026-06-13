@@ -28,6 +28,7 @@ pub const CertfpBindStore = struct {
     allocator: std.mem.Allocator,
     /// fingerprint (lowercase hex) -> owned account name.
     entries: std.StringHashMapUnmanaged([]u8),
+    lookup_accounts: std.ArrayListUnmanaged([]u8) = .empty,
     lock: rwlock.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) CertfpBindStore {
@@ -45,6 +46,8 @@ pub const CertfpBindStore = struct {
                 self.allocator.free(e.value_ptr.*);
             }
             self.entries.deinit(self.allocator);
+            for (self.lookup_accounts.items) |account| self.allocator.free(account);
+            self.lookup_accounts.deinit(self.allocator);
         }
         self.* = undefined;
     }
@@ -71,13 +74,20 @@ pub const CertfpBindStore = struct {
         try self.entries.put(self.allocator, key, val);
     }
 
-    /// The account owning `fingerprint`, or null. Borrowed (store-owned).
+    /// The account owning `fingerprint`, or null. Retained by this store.
     pub fn accountForFingerprint(self: *const CertfpBindStore, fingerprint: []const u8) ?[]const u8 {
-        @constCast(&self.lock).lockShared();
-        defer @constCast(&self.lock).unlockShared();
+        const self_mut = @constCast(self);
+        self_mut.lock.lockExclusive();
+        defer self_mut.lock.unlockExclusive();
 
         if (fingerprint.len != certfp.fingerprint_len) return null;
-        return self.entries.get(fingerprint);
+        const account = self_mut.entries.get(fingerprint) orelse return null;
+        const copy = self_mut.allocator.dupe(u8, account) catch return null;
+        self_mut.lookup_accounts.append(self_mut.allocator, copy) catch {
+            self_mut.allocator.free(copy);
+            return null;
+        };
+        return copy;
     }
 
     /// Remove a binding; returns whether one was present.

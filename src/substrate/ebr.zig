@@ -90,11 +90,15 @@ const testing = std.testing;
 pub const cache_line_bytes: usize = 64;
 
 /// Maximum number of concurrently registered participants. Registration beyond
-/// this asserts. 256 is ample for Orochi's sharded reactor + worker pool.
+/// this fails. 256 is ample for Orochi's sharded reactor + worker pool.
 pub const max_participants: usize = 256;
 
 /// Number of epochs in the rotation. The classic scheme uses 3.
 pub const epoch_count: usize = 3;
+
+pub const RegisterError = error{
+    TooManyParticipants,
+};
 
 /// A type-erased retired node awaiting reclamation.
 const Retired = struct {
@@ -263,9 +267,16 @@ pub const Domain = struct {
     }
 
     /// Claim a free participant slot. One per reader thread.
-    pub fn register(self: *Domain) *Participant {
-        const idx = self.participant_count.fetchAdd(1, .acq_rel);
-        std.debug.assert(idx < max_participants); // overflow
+    pub fn register(self: *Domain) RegisterError!*Participant {
+        var idx = self.participant_count.load(.acquire);
+        while (true) {
+            if (idx >= max_participants) return error.TooManyParticipants;
+            if (self.participant_count.cmpxchgWeak(idx, idx + 1, .acq_rel, .acquire)) |next| {
+                idx = next;
+                continue;
+            }
+            break;
+        }
         const p = &self.participants[idx];
         p.* = .{};
         p.domain = self;
@@ -414,7 +425,7 @@ test "single-thread: deferred free happens only after enough epoch advances" {
 
     var domain = Domain.init(std.testing.allocator);
     defer domain.deinit();
-    const p = domain.register();
+    const p = try domain.register();
     defer p.unregister();
 
     // Retire a node in epoch 0.
@@ -444,7 +455,7 @@ test "single-thread: deferred free happens only after enough epoch advances" {
 test "pin and unpin toggle active flag" {
     var domain = Domain.init(std.testing.allocator);
     defer domain.deinit();
-    const p = domain.register();
+    const p = try domain.register();
     defer p.unregister();
 
     try testing.expect(!p.active.load(.monotonic));
@@ -458,9 +469,9 @@ test "pin and unpin toggle active flag" {
 test "advance is blocked while a participant is pinned in an older epoch" {
     var domain = Domain.init(std.testing.allocator);
     defer domain.deinit();
-    const reader = domain.register();
+    const reader = try domain.register();
     defer reader.unregister();
-    const writer = domain.register();
+    const writer = try domain.register();
     defer writer.unregister();
 
     // Reader pins at epoch 0.
@@ -485,9 +496,9 @@ test "premature free is impossible while a reader holds a retired pointer" {
     var domain = Domain.init(std.testing.allocator);
     defer domain.deinit();
 
-    const reader = domain.register();
+    const reader = try domain.register();
     defer reader.unregister();
-    const writer = domain.register();
+    const writer = try domain.register();
     defer writer.unregister();
 
     // Reader pins at epoch 0 and captures a pointer to a node.
@@ -527,7 +538,7 @@ test "deinit asserts quiescence after draining" {
     const alloc = tracking.allocator();
 
     var domain = Domain.init(std.testing.allocator);
-    const p = domain.register();
+    const p = try domain.register();
 
     const node = try alloc.create(TestNode);
     node.* = .{ .value = 7 };
@@ -601,7 +612,7 @@ test "threaded stress: readers never observe poisoned memory, no leaks" {
     seed.* = .{ .value = 0 };
     published.store(seed, .release);
 
-    const writer_part = domain.register();
+    const writer_part = try domain.register();
 
     const shared = Shared{
         .domain = &domain,
@@ -620,7 +631,7 @@ test "threaded stress: readers never observe poisoned memory, no leaks" {
     }
 
     for (0..reader_count) |i| {
-        reader_parts[i] = domain.register();
+        reader_parts[i] = try domain.register();
         threads[i] = std.Thread.spawn(.{}, Shared.readerLoop, .{ shared, reader_parts[i] }) catch return error.SkipZigTest;
         spawned += 1;
     }

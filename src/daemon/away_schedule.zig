@@ -41,7 +41,6 @@ pub const AwaySchedule = struct {
         if (msg.len > max_msg_bytes) return error.MessageTooLong;
 
         const owned_msg = try self.allocator.dupe(u8, msg);
-        errdefer self.allocator.free(owned_msg);
         var msg_owned = false;
         errdefer if (!msg_owned) self.allocator.free(owned_msg);
 

@@ -66,6 +66,7 @@ pub const ContentFilter = struct {
         const owned = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(owned);
         try self.patterns.append(self.allocator, owned);
+        errdefer _ = self.patterns.orderedRemove(self.patterns.items.len - 1);
         try self.rebuild();
         return true;
     }

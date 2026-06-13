@@ -17,7 +17,9 @@ pub const TokenStoreError = std.mem.Allocator.Error || error{
     InvalidKeyAuthorization,
 };
 
-pub const ResponseError = error{
+pub const TokenGetError = std.mem.Allocator.Error;
+
+pub const ResponseError = std.mem.Allocator.Error || error{
     NoSpaceLeft,
 };
 
@@ -80,19 +82,23 @@ pub const TokenStore = struct {
         return false;
     }
 
-    pub fn get(self: *Self, token: []const u8) ?[]const u8 {
+    pub fn get(self: *Self, token: []const u8) TokenGetError!?[]u8 {
         validateToken(token) catch return null;
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        return self.tokens.get(token);
+        const value = self.tokens.get(token) orelse return null;
+        return try self.allocator.dupe(u8, value);
     }
 };
 
 pub fn handleRequest(store: *TokenStore, request_bytes: []const u8, out: []u8) ResponseError![]const u8 {
-    const body = if (parseChallengeToken(request_bytes)) |token|
-        store.get(token) orelse not_found_body
-    else
-        not_found_body;
+    var owned_body: ?[]u8 = null;
+    defer if (owned_body) |body| store.allocator.free(body);
+
+    const body: []const u8 = if (parseChallengeToken(request_bytes)) |token| blk: {
+        owned_body = try store.get(token);
+        break :blk if (owned_body) |body| body else not_found_body;
+    } else not_found_body;
 
     const status = if (body.ptr == not_found_body.ptr and body.len == not_found_body.len)
         "404 Not Found"
@@ -175,7 +181,9 @@ test "TokenStore put stores owned key authorization" {
     mutable_value[0] = 'x';
 
     // Assert
-    try testing.expectEqualStrings("key", store.get("token-1").?);
+    const stored = (try store.get("token-1")).?;
+    defer store.allocator.free(stored);
+    try testing.expectEqualStrings("key", stored);
 }
 
 test "TokenStore put replaces existing value" {
@@ -188,7 +196,9 @@ test "TokenStore put replaces existing value" {
     try store.put("token_1", "new.auth");
 
     // Assert
-    try testing.expectEqualStrings("new.auth", store.get("token_1").?);
+    const stored = (try store.get("token_1")).?;
+    defer store.allocator.free(stored);
+    try testing.expectEqualStrings("new.auth", stored);
 }
 
 test "TokenStore remove clears owned entry" {
@@ -202,7 +212,7 @@ test "TokenStore remove clears owned entry" {
 
     // Assert
     try testing.expect(removed);
-    try testing.expect(store.get("token") == null);
+    try testing.expect((try store.get("token")) == null);
     try testing.expect(!store.remove("token"));
 }
 

@@ -430,17 +430,14 @@ pub const Cache = struct {
         var value = HostCacheEntry{ .addrs_len = addrs.len, .expires_ms = expiresAt(now_ms, ttl_seconds) };
         for (addrs, 0..) |addr, i| value.addrs[i] = addr;
 
-        const gop = try self.hosts.getOrPut(host);
+        const owned_key = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(owned_key);
+
+        const gop = try self.hosts.getOrPut(owned_key);
         if (gop.found_existing) {
+            self.allocator.free(owned_key);
             gop.value_ptr.* = value;
             return;
-        }
-
-        gop.key_ptr.* = try self.allocator.dupe(u8, host);
-        errdefer {
-            const owned_key = gop.key_ptr.*;
-            _ = self.hosts.remove(owned_key);
-            self.allocator.free(owned_key);
         }
         gop.value_ptr.* = value;
     }
@@ -715,6 +712,7 @@ pub const ResolveError = error{
     ServerFailure,
     NameError,
     NoData,
+    RandomSourceFailed,
 } || EncodeError || DecodeError;
 
 /// Resolver settings: the nameserver list (UDP) plus timeout/retry policy.
@@ -818,6 +816,51 @@ fn addressEql(a: Address, b: Address) bool {
     };
 }
 
+fn trimRootDot(name: []const u8) []const u8 {
+    if (name.len > 1 and name[name.len - 1] == '.') return name[0 .. name.len - 1];
+    return name;
+}
+
+pub fn namesEqual(a: []const u8, b: []const u8) bool {
+    const left = trimRootDot(a);
+    const right = trimRootDot(b);
+    if (left.len != right.len) return false;
+    for (left, right) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+pub fn responseMatchesQuestion(
+    comptime max_questions: usize,
+    comptime max_answers: usize,
+    msg: *const Message(max_questions, max_answers),
+    name: []const u8,
+    qtype: RecordType,
+) bool {
+    if (!msg.header.isResponse()) return false;
+    if (msg.question_count != 1) return false;
+    const q = msg.questions[0];
+    return q.qclass == class_in and q.qtype == qtype and namesEqual(q.name.slice(), name);
+}
+
+pub fn rrMatchesQuestion(rr: ResourceRecord, name: []const u8, qtype: RecordType) bool {
+    return rr.class == class_in and rr.rr_type == qtype and namesEqual(rr.name.slice(), name);
+}
+
+fn responseAnswersInBailiwick(
+    comptime max_questions: usize,
+    comptime max_answers: usize,
+    msg: *const Message(max_questions, max_answers),
+    name: []const u8,
+    qtype: RecordType,
+) bool {
+    for (msg.answerSlice()) |rr| {
+        if (!rrMatchesQuestion(rr, name, qtype)) return false;
+    }
+    return true;
+}
+
 /// Pure FCrDNS decision: is `address` present in a PTR name's forward A/AAAA set?
 pub fn forwardConfirms(address: Address, forward_addrs: []const Address) bool {
     for (forward_addrs) |a| {
@@ -892,8 +935,12 @@ fn queryAll(
             const resp = queryServer(ns, cfg.port, query, &rbuf, cfg.timeout_ms) catch continue;
             const msg = parseMessage(maxq, maxa, resp) catch continue;
             if (msg.header.id != id) continue;
+            if (!responseMatchesQuestion(maxq, maxa, &msg, name, qtype)) continue;
             switch (msg.header.rcode()) {
-                0 => return msg,
+                0 => {
+                    if (!responseAnswersInBailiwick(maxq, maxa, &msg, name, qtype)) continue;
+                    return msg;
+                },
                 3 => return error.NameError, // NXDOMAIN — authoritative "no such name"
                 else => continue, // SERVFAIL/REFUSED — try the next server
             }
@@ -902,16 +949,28 @@ fn queryAll(
     return error.Timeout;
 }
 
-fn randomId() u16 {
+fn randomId() ResolveError!u16 {
     var b: [2]u8 = undefined;
-    _ = linux.getrandom(&b, b.len, 0);
+    var filled: usize = 0;
+    while (filled < b.len) {
+        const rc = linux.getrandom(b[filled..].ptr, b.len - filled, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                const got: usize = rc;
+                if (got == 0) return error.RandomSourceFailed;
+                filled += got;
+            },
+            .INTR => continue,
+            else => return error.RandomSourceFailed,
+        }
+    }
     return std.mem.readInt(u16, &b, .little);
 }
 
 /// Forward-resolve `name` to A (or AAAA when `want_v6`) addresses into `out`.
 pub fn resolveForward(cfg: *const ResolverConfig, name: []const u8, want_v6: bool, out: []Address) ResolveError![]Address {
     const qtype: RecordType = if (want_v6) .aaaa else .a;
-    const msg = try queryAll(1, max_cache_addrs, cfg, name, qtype, randomId());
+    const msg = try queryAll(1, max_cache_addrs, cfg, name, qtype, try randomId());
     var n: usize = 0;
     for (msg.answerSlice()) |rr| {
         if (n >= out.len) break;
@@ -935,7 +994,7 @@ pub fn resolveForward(cfg: *const ResolverConfig, name: []const u8, want_v6: boo
 pub fn resolveReverse(cfg: *const ResolverConfig, address: Address, name_out: []u8) ResolveError![]const u8 {
     var qbuf: [max_domain_text_len]u8 = undefined;
     const qname = try reverseName(&qbuf, address);
-    const msg = try queryAll(1, max_cache_addrs, cfg, qname, .ptr, randomId());
+    const msg = try queryAll(1, max_cache_addrs, cfg, qname, .ptr, try randomId());
     for (msg.answerSlice()) |rr| {
         if (rr.rr_type != .ptr) continue;
         const s = rr.data.ptr.slice();

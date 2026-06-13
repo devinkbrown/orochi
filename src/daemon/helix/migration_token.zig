@@ -44,8 +44,8 @@ pub fn encodeClaims(allocator: std.mem.Allocator, claims: Claims) EncodeError![]
     return bytes.toOwnedSlice(allocator);
 }
 
-pub fn sign(key: []const u8, claims: Claims) [tag_len]u8 {
-    std.debug.assert(claims.account.len <= max_account_len);
+pub fn sign(key: []const u8, claims: Claims) EncodeError![tag_len]u8 {
+    if (claims.account.len > max_account_len) return error.AccountTooLong;
 
     var canonical: [max_canonical_len]u8 = undefined;
     const msg = writeCanonical(&canonical, claims);
@@ -174,7 +174,8 @@ test "sign and verify roundtrip" {
     var token: std.ArrayList(u8) = .empty;
     defer token.deinit(allocator);
     try token.appendSlice(allocator, canonical);
-    try token.appendSlice(allocator, &sign(key, claims));
+    const tag = try sign(key, claims);
+    try token.appendSlice(allocator, &tag);
 
     const decoded = try verify(key, token.items, claims.issued_ms);
     try std.testing.expectEqualStrings(claims.account, decoded.account);
@@ -196,7 +197,8 @@ test "tampered byte is rejected with BadTag" {
     var token: std.ArrayList(u8) = .empty;
     defer token.deinit(allocator);
     try token.appendSlice(allocator, canonical);
-    try token.appendSlice(allocator, &sign(key, claims));
+    const tag = try sign(key, claims);
+    try token.appendSlice(allocator, &tag);
 
     token.items[3] ^= 0xff;
     try std.testing.expectError(error.BadTag, verify(key, token.items, claims.issued_ms));
@@ -213,7 +215,8 @@ test "expired token is rejected after tag validation" {
     var token: std.ArrayList(u8) = .empty;
     defer token.deinit(allocator);
     try token.appendSlice(allocator, canonical);
-    try token.appendSlice(allocator, &sign(key, claims));
+    const tag = try sign(key, claims);
+    try token.appendSlice(allocator, &tag);
 
     try std.testing.expectError(error.Expired, verify(key, token.items, claims.expires_ms + 1));
 }
@@ -229,7 +232,8 @@ test "truncated tokens are rejected" {
     var token: std.ArrayList(u8) = .empty;
     defer token.deinit(allocator);
     try token.appendSlice(allocator, canonical);
-    try token.appendSlice(allocator, &sign(key, claims));
+    const tag = try sign(key, claims);
+    try token.appendSlice(allocator, &tag);
 
     try std.testing.expectError(error.Truncated, verify(key, token.items[0..0], claims.issued_ms));
     try std.testing.expectError(error.Truncated, verify(key, token.items[0..1], claims.issued_ms));
@@ -264,4 +268,5 @@ test "account length above limit is rejected by encoder" {
     claims.account = long_account;
 
     try std.testing.expectError(error.AccountTooLong, encodeClaims(allocator, claims));
+    try std.testing.expectError(error.AccountTooLong, sign("migration-key", claims));
 }

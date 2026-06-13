@@ -1,8 +1,8 @@
 //! Allocation-free runtime counters for the daemon hot path.
 //!
 //! The hot path (accept/recv/send/line dispatch) must never allocate or take a
-//! lock to record a metric, so this is a plain struct of plain integers bumped
-//! inline. Rendering — Prometheus exposition text or an oper STATS dump — is a
+//! lock to record a metric, so counters are atomic values bumped inline.
+//! Rendering — Prometheus exposition text or an oper STATS dump — is a
 //! cold path that snapshots the counters into a caller-provided buffer.
 //!
 //! These complement the structured `qlog`/`trace` flight recorder (which keeps
@@ -10,59 +10,62 @@
 const std = @import("std");
 
 /// Monotonic counters (only ever increase) plus two gauges (active connections,
-/// established S2S links) which move both ways. Copyable; the server embeds one.
+/// established S2S links) which move both ways. The server embeds one.
 pub const Stats = struct {
+    const AtomicU64 = std.atomic.Value(u64);
+    const AtomicI64 = std.atomic.Value(i64);
+
     // --- counters (monotonic) ---
-    connections_total: u64 = 0,
-    s2s_accepts_total: u64 = 0,
-    messages_in_total: u64 = 0,
-    bytes_in_total: u64 = 0,
-    bytes_out_total: u64 = 0,
-    errors_total: u64 = 0,
-    quits_total: u64 = 0,
+    connections_total: AtomicU64 = .init(0),
+    s2s_accepts_total: AtomicU64 = .init(0),
+    messages_in_total: AtomicU64 = .init(0),
+    bytes_in_total: AtomicU64 = .init(0),
+    bytes_out_total: AtomicU64 = .init(0),
+    errors_total: AtomicU64 = .init(0),
+    quits_total: AtomicU64 = .init(0),
 
     // --- gauges (up/down) ---
-    connections_active: i64 = 0,
-    s2s_links_active: i64 = 0,
+    connections_active: AtomicI64 = .init(0),
+    s2s_links_active: AtomicI64 = .init(0),
 
     pub fn onAccept(self: *Stats) void {
-        self.connections_total += 1;
-        self.connections_active += 1;
+        _ = self.connections_total.fetchAdd(1, .monotonic);
+        _ = self.connections_active.fetchAdd(1, .monotonic);
     }
 
     pub fn onS2sAccept(self: *Stats) void {
-        self.s2s_accepts_total += 1;
-        self.s2s_links_active += 1;
+        _ = self.s2s_accepts_total.fetchAdd(1, .monotonic);
+        _ = self.s2s_links_active.fetchAdd(1, .monotonic);
     }
 
     /// A connection closed. `was_s2s` decrements the S2S gauge instead of the
     /// client gauge so the two never cross-count.
     pub fn onClose(self: *Stats, was_s2s: bool) void {
         if (was_s2s) {
-            if (self.s2s_links_active > 0) self.s2s_links_active -= 1;
+            decrementPositive(&self.s2s_links_active);
         } else {
-            if (self.connections_active > 0) self.connections_active -= 1;
+            decrementPositive(&self.connections_active);
         }
     }
 
     pub fn onBytesIn(self: *Stats, n: usize) void {
-        self.bytes_in_total +%= n;
+        _ = self.bytes_in_total.fetchAdd(@as(u64, @intCast(n)), .monotonic);
     }
 
     pub fn onBytesOut(self: *Stats, n: usize) void {
-        self.bytes_out_total +%= n;
+        _ = self.bytes_out_total.fetchAdd(@as(u64, @intCast(n)), .monotonic);
     }
 
     pub fn onLine(self: *Stats) void {
-        self.messages_in_total += 1;
+        _ = self.messages_in_total.fetchAdd(1, .monotonic);
     }
 
     pub fn onError(self: *Stats) void {
-        self.errors_total += 1;
+        _ = self.errors_total.fetchAdd(1, .monotonic);
     }
 
     pub fn onQuit(self: *Stats) void {
-        self.quits_total += 1;
+        _ = self.quits_total.fetchAdd(1, .monotonic);
     }
 
     /// One metric's identity for rendering: Prometheus name, HELP text, type, and
@@ -78,16 +81,27 @@ pub const Stats = struct {
 
     fn rows(self: *const Stats) [9]Row {
         return .{
-            .{ .prom = "orochi_connections_total", .irc = "conns", .help = "Total client connections accepted", .kind = .counter, .value = self.connections_total },
-            .{ .prom = "orochi_connections_active", .irc = "conns_active", .help = "Currently open client connections", .kind = .gauge, .value = self.connections_active },
-            .{ .prom = "orochi_s2s_accepts_total", .irc = "s2s", .help = "Total server-to-server peers accepted", .kind = .counter, .value = self.s2s_accepts_total },
-            .{ .prom = "orochi_s2s_links_active", .irc = "s2s_active", .help = "Currently established S2S links", .kind = .gauge, .value = self.s2s_links_active },
-            .{ .prom = "orochi_messages_in_total", .irc = "msgs_in", .help = "Total complete protocol lines received", .kind = .counter, .value = self.messages_in_total },
-            .{ .prom = "orochi_bytes_in_total", .irc = "bytes_in", .help = "Total bytes received from clients", .kind = .counter, .value = self.bytes_in_total },
-            .{ .prom = "orochi_bytes_out_total", .irc = "bytes_out", .help = "Total bytes queued to clients", .kind = .counter, .value = self.bytes_out_total },
-            .{ .prom = "orochi_quits_total", .irc = "quits", .help = "Total client disconnects", .kind = .counter, .value = self.quits_total },
-            .{ .prom = "orochi_errors_total", .irc = "errors", .help = "Total recoverable hot-path errors", .kind = .counter, .value = self.errors_total },
+            .{ .prom = "orochi_connections_total", .irc = "conns", .help = "Total client connections accepted", .kind = .counter, .value = self.connections_total.load(.acquire) },
+            .{ .prom = "orochi_connections_active", .irc = "conns_active", .help = "Currently open client connections", .kind = .gauge, .value = self.connections_active.load(.acquire) },
+            .{ .prom = "orochi_s2s_accepts_total", .irc = "s2s", .help = "Total server-to-server peers accepted", .kind = .counter, .value = self.s2s_accepts_total.load(.acquire) },
+            .{ .prom = "orochi_s2s_links_active", .irc = "s2s_active", .help = "Currently established S2S links", .kind = .gauge, .value = self.s2s_links_active.load(.acquire) },
+            .{ .prom = "orochi_messages_in_total", .irc = "msgs_in", .help = "Total complete protocol lines received", .kind = .counter, .value = self.messages_in_total.load(.acquire) },
+            .{ .prom = "orochi_bytes_in_total", .irc = "bytes_in", .help = "Total bytes received from clients", .kind = .counter, .value = self.bytes_in_total.load(.acquire) },
+            .{ .prom = "orochi_bytes_out_total", .irc = "bytes_out", .help = "Total bytes queued to clients", .kind = .counter, .value = self.bytes_out_total.load(.acquire) },
+            .{ .prom = "orochi_quits_total", .irc = "quits", .help = "Total client disconnects", .kind = .counter, .value = self.quits_total.load(.acquire) },
+            .{ .prom = "orochi_errors_total", .irc = "errors", .help = "Total recoverable hot-path errors", .kind = .counter, .value = self.errors_total.load(.acquire) },
         };
+    }
+
+    fn decrementPositive(counter: *AtomicI64) void {
+        var current = counter.load(.monotonic);
+        while (current > 0) {
+            if (counter.cmpxchgWeak(current, current - 1, .monotonic, .monotonic)) |next| {
+                current = next;
+            } else {
+                return;
+            }
+        }
     }
 
     /// Append Prometheus exposition text (HELP/TYPE/sample per metric) to `out`.
@@ -127,27 +141,27 @@ test "counters and gauges move as expected" {
     s.onBytesIn(100);
     s.onLine();
     s.onClose(false);
-    try testing.expectEqual(@as(u64, 2), s.connections_total);
-    try testing.expectEqual(@as(i64, 1), s.connections_active);
-    try testing.expectEqual(@as(u64, 100), s.bytes_in_total);
-    try testing.expectEqual(@as(u64, 1), s.messages_in_total);
+    try testing.expectEqual(@as(u64, 2), s.connections_total.load(.acquire));
+    try testing.expectEqual(@as(i64, 1), s.connections_active.load(.acquire));
+    try testing.expectEqual(@as(u64, 100), s.bytes_in_total.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), s.messages_in_total.load(.acquire));
 }
 
 test "gauges never go negative on extra closes" {
     var s = Stats{};
     s.onClose(false);
     s.onClose(true);
-    try testing.expectEqual(@as(i64, 0), s.connections_active);
-    try testing.expectEqual(@as(i64, 0), s.s2s_links_active);
+    try testing.expectEqual(@as(i64, 0), s.connections_active.load(.acquire));
+    try testing.expectEqual(@as(i64, 0), s.s2s_links_active.load(.acquire));
 }
 
 test "s2s accept/close uses the s2s gauge only" {
     var s = Stats{};
     s.onS2sAccept();
-    try testing.expectEqual(@as(i64, 1), s.s2s_links_active);
-    try testing.expectEqual(@as(i64, 0), s.connections_active);
+    try testing.expectEqual(@as(i64, 1), s.s2s_links_active.load(.acquire));
+    try testing.expectEqual(@as(i64, 0), s.connections_active.load(.acquire));
     s.onClose(true);
-    try testing.expectEqual(@as(i64, 0), s.s2s_links_active);
+    try testing.expectEqual(@as(i64, 0), s.s2s_links_active.load(.acquire));
 }
 
 test "prometheus export carries HELP, TYPE, and samples" {

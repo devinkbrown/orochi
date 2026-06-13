@@ -157,6 +157,24 @@ pub const NativeMediaTransport = struct {
         return gop.value_ptr;
     }
 
+    fn removeStreamEntriesForChannel(self: *NativeMediaTransport, channel_key: []const u8) void {
+        while (true) {
+            var doomed: ?u32 = null;
+            var it = self.stream_index.iterator();
+            while (it.next()) |e| {
+                if (std.mem.eql(u8, e.value_ptr.*, channel_key)) {
+                    doomed = e.key_ptr.*;
+                    break;
+                }
+            }
+            if (doomed) |sid| {
+                _ = self.stream_index.remove(sid);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Register/update a native participant in `channel` (MEDIA OFFER). `addr`
     /// may be a placeholder; the pump learns the real return path from the
     /// participant's first datagram. `stream_id` is what the publisher stamps
@@ -171,8 +189,15 @@ pub const NativeMediaTransport = struct {
     ) !void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.stream_index.get(stream_id)) |owner| {
+            if (!std.mem.eql(u8, owner, channel)) return error.StreamInUse;
+        }
         const link = try self.linkForChannel(channel);
+        const old_stream_id = link.streamIdFor(id);
         try link.register(id, kind, stream_id, addr);
+        if (old_stream_id) |old| {
+            if (old != stream_id) _ = self.stream_index.remove(old);
+        }
         // Index stream_id -> channel key (borrow the map's stable key pointer).
         const key = self.channels.getKey(channel).?;
         try self.stream_index.put(self.allocator, stream_id, key);
@@ -184,22 +209,14 @@ pub const NativeMediaTransport = struct {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const link = self.channels.getPtr(channel) orelse return;
+        if (link.streamIdFor(id)) |sid| _ = self.stream_index.remove(sid);
         link.unregister(id);
         if (link.count() != 0) return;
 
         // Last participant gone: tear the channel down. Clear stream-index
         // entries that borrow this channel's key BEFORE freeing the key.
         const key = self.channels.getKey(channel).?;
-        var it = self.stream_index.iterator();
-        var doomed: [max_call_participants]u32 = undefined;
-        var dn: usize = 0;
-        while (it.next()) |e| {
-            if (e.value_ptr.*.ptr == key.ptr and dn < doomed.len) {
-                doomed[dn] = e.key_ptr.*;
-                dn += 1;
-            }
-        }
-        for (doomed[0..dn]) |sid| _ = self.stream_index.remove(sid);
+        self.removeStreamEntriesForChannel(key);
         _ = self.channels.remove(channel);
         self.allocator.free(key);
     }
