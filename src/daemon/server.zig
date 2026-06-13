@@ -1734,6 +1734,14 @@ pub const LinuxServer = struct {
     /// and stores it here; any shard reads it atomically. Single-reactor mode
     /// publishes from the one reactor, so behaviour is unchanged.
     net_peer_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Published distinct peer NAMES (for cross-shard MAP), written by reactor 0
+    /// in lockstep with net_peer_count. Fixed buffers -> always memory-safe to
+    /// read from any shard; names are written BEFORE the release-store of
+    /// net_peer_count, so a reader that acquire-loads the count sees the matching
+    /// names. The peer set rarely changes and the write is idempotent, so a
+    /// concurrent overwrite is at worst a momentary cosmetic mix in MAP.
+    mesh_peer_names: [32][64]u8 = [_][64]u8{[_]u8{0} ** 64} ** 32,
+    mesh_peer_name_lens: [32]u8 = [_]u8{0} ** 32,
     /// Koshi content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Orochi media SFU control plane): who is in each call.
@@ -1813,14 +1821,18 @@ pub const LinuxServer = struct {
     /// byte-identical behavior. On any partial failure every fd/resource already
     /// created for this shard is released.
     fn initReactor(allocator: std.mem.Allocator, config: Config, shard_id: u12, reuse_port: bool) !Reactor {
-        const listener_fd = if (!reuse_port and config.inherited_listener_fd != null) blk: {
+        // The plaintext listener is ALWAYS SO_REUSEPORT — even single-reactor — so
+        // a later 1-shard -> N-shard UPGRADE can bind sibling per-shard listeners
+        // on the same port (REUSEPORT requires every socket on the port to set
+        // it; a single-reactor predecessor that bound a plain socket used to make
+        // the multishard successor fail AddressInUse and fall back to boot-only).
+        // Shard 0 adopts the inherited fd across UPGRADE for a seamless handoff
+        // (no bind gap, no leak); sibling shards and fresh boots create their own.
+        const listener_fd = if (shard_id == 0 and config.inherited_listener_fd != null) blk: {
             const fd = config.inherited_listener_fd.?;
             std.debug.print("orochi: adopting inherited listener fd {d}\n", .{fd});
             break :blk fd;
-        } else if (reuse_port)
-            try reuseport.createReusePortListener(config.host, config.port, config.backlog)
-        else
-            try createListener(config.host, config.port, config.backlog);
+        } else try reuseport.createReusePortListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
 
         // S2S peers must be accepted on reactor 0: the mesh dial table,
@@ -13598,7 +13610,12 @@ pub const LinuxServer = struct {
     /// Recompute the distinct established-peer count from THIS reactor's client
     /// set. Only correct on reactor 0 (the reactor that owns the S2S links) and
     /// must only be called there — it iterates `self.rx().clients`.
-    fn distinctPeerCountLocal(self: *LinuxServer) u64 {
+    /// Publish reactor 0's authoritative distinct established-peer set (count +
+    /// names) for cross-shard LUSERS/MAP reads. MUST be called on reactor 0 only
+    /// — it iterates `self.rx().clients`, valid only there. Names are written
+    /// before the release-store of the count so cross-shard readers observe a
+    /// consistent (count, names) pair.
+    fn publishPeerCount(self: *LinuxServer) void {
         var seen: [32][]const u8 = undefined;
         var n: usize = 0;
         var it = self.rx().clients.iterator();
@@ -13612,13 +13629,23 @@ pub const LinuxServer = struct {
                 n += 1;
             }
         }
-        return n;
+        for (seen[0..n], 0..) |nm, i| {
+            const len = @min(nm.len, self.mesh_peer_names[i].len);
+            @memcpy(self.mesh_peer_names[i][0..len], nm[0..len]);
+            self.mesh_peer_name_lens[i] = @intCast(len);
+        }
+        self.net_peer_count.store(@intCast(n), .release);
     }
 
-    /// Publish reactor 0's authoritative distinct-peer count for cross-shard
-    /// LUSERS reads. MUST be called on reactor 0 only.
-    fn publishPeerCount(self: *LinuxServer) void {
-        self.net_peer_count.store(@intCast(self.distinctPeerCountLocal()), .release);
+    /// Copy the published peer names into `out` (cross-shard safe). Returns the
+    /// count written, capped at `out.len` and the snapshot capacity.
+    fn readPeerNames(self: *LinuxServer, out: [][]const u8) usize {
+        const n = @min(@as(usize, @intCast(self.net_peer_count.load(.acquire))), @min(out.len, self.mesh_peer_names.len));
+        for (0..n) |i| {
+            const len = self.mesh_peer_name_lens[i];
+            out[i] = self.mesh_peer_names[i][0..len];
+        }
+        return n;
     }
 
     /// MAP — network topology: this server with each established S2S peer (both
@@ -13630,18 +13657,12 @@ pub const LinuxServer = struct {
             self.countRegisteredUsers(),
         }) catch return;
         try queueNumeric(conn, .RPL_MAP, &.{}, detail);
-        var seen: [32][]const u8 = undefined;
-        var seen_n: usize = 0;
-        var it = self.rx().clients.iterator();
-        outer: while (it.next()) |entry| {
-            const rname = establishedPeerName(entry.value) orelse continue;
-            for (seen[0..seen_n]) |s| {
-                if (std.mem.eql(u8, s, rname)) continue :outer;
-            }
-            if (seen_n < seen.len) {
-                seen[seen_n] = rname;
-                seen_n += 1;
-            }
+        // Peer names come from the reactor-0-published snapshot, not this shard's
+        // own connection set — otherwise MAP run on a non-zero shard (the peer
+        // links live only on reactor 0) would list no peers.
+        var names: [32][]const u8 = undefined;
+        const np = self.readPeerNames(&names);
+        for (names[0..np]) |rname| {
             var pbuf: [160]u8 = undefined;
             const pdetail = std.fmt.bufPrint(&pbuf, "  `- {s}", .{rname}) catch continue;
             try queueNumeric(conn, .RPL_MAP, &.{}, pdetail);
