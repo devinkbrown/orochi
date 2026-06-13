@@ -27,6 +27,11 @@ pub const DeliverBuf = struct {
 pub const DeliverMsg = struct {
     to: ClientId,
     buf: *DeliverBuf,
+    /// Set by cross-shard administrative closes (KILL/CLOSE): the owning
+    /// reactor appends this buffer, arms send, then marks the connection closing
+    /// so the normal send-drain path tears it down.
+    close_after: bool = false,
+    close_reason: []const u8 = "Client quit",
 };
 
 pub fn DeliverPool(comptime slots: usize) type {

@@ -8,17 +8,20 @@ const ebr = @import("../substrate/ebr.zig");
 const world_rcu = @import("world_rcu.zig");
 
 /// Lazily-created RCU mirror of the nick registry (the lock-free read path).
-/// Heap-allocated so the EBR domain has a stable address: the registered
-/// `participant` and the registry's borrowed `&domain` must stay valid after the
-/// owning `World` is moved (World.init returns by value). Activated lazily and,
-/// once live, drives EVERY nick read (`findNick`) and collision check — the read
+/// Heap-allocated so the EBR domain has a stable address: registered writer and
+/// per-thread reader participants plus the registry's borrowed `&domain` must
+/// stay valid after the owning `World` is moved (World.init returns by value).
+/// Activated lazily and, once live, drives EVERY nick read (`findNick`) and collision check — the read
 /// hot path is lock-free at the registry level and case-insensitive (RFC1459-ish
 /// ASCII casemapping; "Alice" and "alice" are the same nick). `client_nicks`
 /// remains the authoritative id->nick reverse index; the RCU registry is
 /// authoritative for nick->id.
 const RcuNickState = struct {
     domain: ebr.Domain,
-    participant: *ebr.Participant,
+    generation: usize,
+    /// Writer-side participant used for CoW publish/retire. Readers must never
+    /// share it; they use a per-thread participant from `rcuReaderParticipant`.
+    writer_participant: *ebr.Participant,
     nicks: world_rcu.NickRegistry,
 };
 
@@ -29,14 +32,64 @@ const RcuNickState = struct {
 /// pointer into the rehash-prone `channels` map).
 const RcuChannelState = struct {
     domain: ebr.Domain,
-    participant: *ebr.Participant,
+    generation: usize,
+    /// Writer-side participant used for CoW publish/retire. Readers must never
+    /// share it; they use a per-thread participant from `rcuReaderParticipant`.
+    writer_participant: *ebr.Participant,
     /// channel name -> OID witness (existence set).
     names: world_rcu.ChannelRegistry(u32),
     /// One membership set per live channel, keyed by case-folded channel name.
     /// The MembershipSet values are heap-allocated for stable addresses (the
-    /// AutoHashMap may rehash). All share the one EBR `domain`/`participant`.
+    /// AutoHashMap may rehash). All share the same EBR `domain`; writers use
+    /// `writer_participant`, and readers use per-thread participants.
     members: std.StringHashMapUnmanaged(*world_rcu.MembershipSet) = .empty,
 };
+
+const rcu_tls_slot_count: usize = ebr.max_participants;
+
+const RcuTlsEntry = struct {
+    domain: ?*ebr.Domain = null,
+    generation: usize = 0,
+    participant: ?*ebr.Participant = null,
+};
+
+threadlocal var rcu_tls_entries: [rcu_tls_slot_count]RcuTlsEntry = [_]RcuTlsEntry{.{}} ** rcu_tls_slot_count;
+var rcu_generation = std.atomic.Value(usize).init(1);
+
+fn nextRcuGeneration() usize {
+    return rcu_generation.fetchAdd(1, .monotonic);
+}
+
+fn rcuReaderParticipant(domain: *ebr.Domain, generation: usize) ebr.RegisterError!*ebr.Participant {
+    var free_slot: ?usize = null;
+    for (&rcu_tls_entries, 0..) |*entry, i| {
+        if (entry.participant) |p| {
+            if (entry.domain == domain and entry.generation == generation) return p;
+        } else if (free_slot == null) {
+            free_slot = i;
+        }
+    }
+
+    const idx = free_slot orelse return error.TooManyParticipants;
+    const p = try domain.register();
+    rcu_tls_entries[idx] = .{
+        .domain = domain,
+        .generation = generation,
+        .participant = p,
+    };
+    return p;
+}
+
+fn rcuForgetThreadParticipants(domain: *ebr.Domain, generation: usize) void {
+    for (&rcu_tls_entries) |*entry| {
+        if (entry.participant) |p| {
+            if (entry.domain == domain and entry.generation == generation) {
+                p.unregister();
+                entry.* = .{};
+            }
+        }
+    }
+}
 
 /// Opaque client handle value used by the local server world.
 pub const ClientId = packed struct {
@@ -312,7 +365,8 @@ pub const World = struct {
             // (now-quiescent) domain and free the heap state.
             r.nicks.deinit();
             r.domain.drainAll();
-            r.participant.unregister();
+            r.writer_participant.unregister();
+            rcuForgetThreadParticipants(&r.domain, r.generation);
             r.domain.deinit();
             self.allocator.destroy(r);
         }
@@ -331,7 +385,8 @@ pub const World = struct {
             c.members.deinit(self.allocator);
             c.names.deinit();
             c.domain.drainAll();
-            c.participant.unregister();
+            c.writer_participant.unregister();
+            rcuForgetThreadParticipants(&c.domain, c.generation);
             c.domain.deinit();
             self.allocator.destroy(c);
         }
@@ -346,8 +401,9 @@ pub const World = struct {
         errdefer self.allocator.destroy(r);
         r.domain = ebr.Domain.init(self.allocator);
         errdefer r.domain.deinit();
-        r.participant = r.domain.register() catch return error.OutOfMemory;
-        errdefer r.participant.unregister();
+        r.generation = nextRcuGeneration();
+        r.writer_participant = r.domain.register() catch return error.OutOfMemory;
+        errdefer r.writer_participant.unregister();
         r.nicks = try world_rcu.NickRegistry.init(self.allocator, &r.domain);
         self.rcu_nicks = r;
         return r;
@@ -360,8 +416,9 @@ pub const World = struct {
         errdefer self.allocator.destroy(c);
         c.domain = ebr.Domain.init(self.allocator);
         errdefer c.domain.deinit();
-        c.participant = c.domain.register() catch return error.OutOfMemory;
-        errdefer c.participant.unregister();
+        c.generation = nextRcuGeneration();
+        c.writer_participant = c.domain.register() catch return error.OutOfMemory;
+        errdefer c.writer_participant.unregister();
         c.names = try world_rcu.ChannelRegistry(u32).init(self.allocator, &c.domain);
         errdefer c.names.deinit();
         c.members = .empty;
@@ -466,7 +523,7 @@ pub const World = struct {
         const r = try self.ensureRcuNicks();
 
         // Case-insensitive collision check against the authoritative RCU map.
-        if (r.nicks.lookup(r.participant, nick)) |existing| {
+        if (r.nicks.lookup(r.writer_participant, nick)) |existing| {
             if ((@as(ClientId, @bitCast(existing))).eql(client)) {
                 // Same owner: a pure case change ("Alice" -> "ALICE") still
                 // updates the stored display form below; otherwise no-op.
@@ -486,10 +543,10 @@ pub const World = struct {
         errdefer self.allocator.free(owned);
 
         // Authoritative nick->id lives in the RCU registry (case-insensitive).
-        try r.nicks.set(r.participant, nick, @bitCast(client));
+        try r.nicks.set(r.writer_participant, nick, @bitCast(client));
         self.noteRcuNickWrite(r);
         errdefer {
-            r.nicks.remove(r.participant, nick) catch {};
+            r.nicks.remove(r.writer_participant, nick) catch {};
             self.noteRcuNickWrite(r);
         }
 
@@ -505,7 +562,7 @@ pub const World = struct {
             // Remove from the authoritative RCU map using the nick string before
             // it is freed below.
             if (self.rcu_nicks) |r| {
-                r.nicks.remove(r.participant, removed.value) catch {};
+                r.nicks.remove(r.writer_participant, removed.value) catch {};
                 self.noteRcuNickWrite(r);
             }
             _ = self.nicks.remove(removed.value);
@@ -517,6 +574,15 @@ pub const World = struct {
         return self.client_nicks.get(client);
     }
 
+    fn findNickFallback(self: *const World, nick: []const u8) ?ClientId {
+        if (self.nicks.get(nick)) |id| return id;
+        var it = self.nicks.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, nick)) return entry.value_ptr.*;
+        }
+        return null;
+    }
+
     /// Look up the owner of `nick` (CASE-INSENSITIVE). Reads from the lock-free
     /// RCU registry when active (the common case after any nick registers);
     /// falls back to the case-sensitive `nicks` map only when the mirror has
@@ -524,10 +590,11 @@ pub const World = struct {
     /// through it even from `*const World`.
     pub fn findNick(self: *const World, nick: []const u8) ?ClientId {
         if (self.rcu_nicks) |r| {
-            if (r.nicks.lookup(r.participant, nick)) |id| return @as(ClientId, @bitCast(id));
+            const p = rcuReaderParticipant(&r.domain, r.generation) catch return self.findNickFallback(nick);
+            if (r.nicks.lookup(p, nick)) |id| return @as(ClientId, @bitCast(id));
             return null;
         }
-        return self.nicks.get(nick);
+        return self.findNickFallback(nick);
     }
 
     /// Lock-free nick lookup via the RCU mirror (activates it on first use).
@@ -535,7 +602,8 @@ pub const World = struct {
     /// the same registry once active.
     pub fn findNickRcu(self: *World, nick: []const u8) !?ClientId {
         const r = try self.ensureRcuNicks();
-        if (r.nicks.lookup(r.participant, nick)) |id| return @as(ClientId, @bitCast(id));
+        const p = try rcuReaderParticipant(&r.domain, r.generation);
+        if (r.nicks.lookup(p, nick)) |id| return @as(ClientId, @bitCast(id));
         return null;
     }
 
@@ -555,7 +623,7 @@ pub const World = struct {
             // Mirror the new membership into the lock-free set.
             if (self.rcu_channels) |c| {
                 const set = try self.rcuMembershipSet(c, name);
-                try set.add(c.participant, @bitCast(client));
+                try set.add(c.writer_participant, @bitCast(client));
                 self.noteRcuChannelWrite(c);
             }
         }
@@ -573,7 +641,7 @@ pub const World = struct {
         if (was_new) {
             if (self.rcu_channels) |c| {
                 const set = try self.rcuMembershipSet(c, name);
-                try set.add(c.participant, @bitCast(client));
+                try set.add(c.writer_participant, @bitCast(client));
                 self.noteRcuChannelWrite(c);
             }
         }
@@ -766,10 +834,10 @@ pub const World = struct {
             const of = foldName(old, &ob);
             const nf = foldName(new, &nb);
             if (!std.mem.eql(u8, of, nf)) {
-                c.names.remove(c.participant, old) catch {};
+                c.names.remove(c.writer_participant, old) catch {};
                 self.noteRcuChannelWrite(c);
             }
-            c.names.set(c.participant, new, oid) catch {};
+            c.names.set(c.writer_participant, new, oid) catch {};
             self.noteRcuChannelWrite(c);
         }
         return true;
@@ -1096,7 +1164,7 @@ pub const World = struct {
         // authoritative store is `channel.members`).
         if (self.rcu_channels) |c| {
             if (rcuMembershipGet(c, name)) |set| {
-                set.remove(c.participant, @bitCast(client)) catch {};
+                set.remove(c.writer_participant, @bitCast(client)) catch {};
                 self.noteRcuChannelWrite(c);
             }
         }
@@ -1113,8 +1181,12 @@ pub const World = struct {
     /// authoritative member map otherwise.
     pub fn isMember(self: *World, name: []const u8, client: ClientId) bool {
         if (self.rcu_channels) |c| {
+            const p = rcuReaderParticipant(&c.domain, c.generation) catch {
+                const channel = self.channels.getPtr(name) orelse return false;
+                return channel.members.contains(client);
+            };
             if (rcuMembershipGet(c, name)) |set|
-                return set.contains(c.participant, @bitCast(client));
+                return set.contains(p, @bitCast(client));
             return false;
         }
         const channel = self.channels.getPtr(name) orelse return false;
@@ -1126,7 +1198,8 @@ pub const World = struct {
     /// otherwise. `rcu_channels` is a pointer so this works through `*const`.
     pub fn channelExists(self: *const World, name: []const u8) bool {
         if (self.rcu_channels) |c| {
-            return c.names.lookup(c.participant, name) != null;
+            const p = rcuReaderParticipant(&c.domain, c.generation) catch return self.channels.contains(name);
+            return c.names.lookup(p, name) != null;
         }
         return self.channels.contains(name);
     }
@@ -1249,7 +1322,7 @@ pub const World = struct {
                     // removed channels have their whole set dropped below.
                     if (self.rcu_channels) |c| {
                         if (rcuMembershipGet(c, entry.key_ptr.*)) |set| {
-                            set.remove(c.participant, @bitCast(client)) catch {};
+                            set.remove(c.writer_participant, @bitCast(client)) catch {};
                             self.noteRcuChannelWrite(c);
                         }
                     }
@@ -1286,10 +1359,10 @@ pub const World = struct {
         // Activate + populate the RCU existence mirror BEFORE finalising the map
         // entry, so a mirror-alloc failure rolls back cleanly (errdefer above).
         const c = try self.ensureRcuChannels();
-        try c.names.set(c.participant, name, oid);
+        try c.names.set(c.writer_participant, name, oid);
         self.noteRcuChannelWrite(c);
         errdefer {
-            c.names.remove(c.participant, name) catch {};
+            c.names.remove(c.writer_participant, name) catch {};
             self.noteRcuChannelWrite(c);
         }
         // Pre-create the (empty) membership set so isMember/joins are mirrored.
@@ -1310,7 +1383,7 @@ pub const World = struct {
             self.channels.removeByPtr(entry.key_ptr);
             // Tear down the RCU mirrors for this channel (existence + members).
             if (self.rcu_channels) |c| {
-                c.names.remove(c.participant, owned_name) catch {};
+                c.names.remove(c.writer_participant, owned_name) catch {};
                 self.noteRcuChannelWrite(c);
                 self.rcuDropMembership(c, owned_name);
             }

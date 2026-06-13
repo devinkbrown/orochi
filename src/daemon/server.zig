@@ -2257,6 +2257,10 @@ pub const LinuxServer = struct {
                 if (conn.closing) continue;
                 appendToConn(conn, bytes) catch continue;
                 self.armSendIfNeeded(conn) catch {};
+                if (msg.close_after) {
+                    conn.close_reason = msg.close_reason;
+                    conn.closing = true;
+                }
             }
         }
     }
@@ -3510,6 +3514,14 @@ pub const LinuxServer = struct {
     /// a cross-shard handoff cannot see the target's liveness, so it best-effort
     /// enqueues and the owning reactor drops the bytes if the slot is gone.
     fn enqueueDelivery(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) !void {
+        return self.enqueueDeliveryMaybeClose(id, bytes, false, "Client quit");
+    }
+
+    fn enqueueDeliveryThenClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_reason: []const u8) !void {
+        return self.enqueueDeliveryMaybeClose(id, bytes, true, close_reason);
+    }
+
+    fn enqueueDeliveryMaybeClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_after: bool, close_reason: []const u8) !void {
         // Local fast path (always taken in single-reactor mode, where shard_id==0
         // and every id carries shard 0).
         if (id.shard == self.rx().shard_id) {
@@ -3527,6 +3539,10 @@ pub const LinuxServer = struct {
                 else => return err,
             };
             try self.armSendIfNeeded(conn);
+            if (close_after) {
+                conn.close_reason = close_reason;
+                conn.closing = true;
+            }
             return;
         }
         // Cross-shard: hand off through the fabric. Absent a fabric (should not
@@ -3550,8 +3566,9 @@ pub const LinuxServer = struct {
             // Likewise retry a full inbox briefly, then drop to avoid a stall.
             var pushed = false;
             var psp: usize = 0;
+            const is_last = close_after and end == bytes.len;
             while (psp < 4096) : (psp += 1) {
-                if (fabric.sendTo(id.shard, .{ .to = id, .buf = buf })) {
+                if (fabric.sendTo(id.shard, .{ .to = id, .buf = buf, .close_after = is_last, .close_reason = close_reason })) {
                     pushed = true;
                     break;
                 }
@@ -3605,6 +3622,10 @@ pub const LinuxServer = struct {
     fn connFor(self: *LinuxServer, id: client_model.ClientId) ?*ConnState {
         if (id.shard >= self.reactors.len) return null;
         return self.reactors[id.shard].clients.get(id);
+    }
+
+    fn slotClientId(reactor: *const Reactor, slot_index: usize, gen: u32) client_model.ClientId {
+        return .{ .shard = reactor.shard_id, .slot = @intCast(slot_index), .gen = gen };
     }
 
     /// Deliver `bytes` (a complete `:prefix ...` line), prepending the IRCv3
@@ -3771,23 +3792,25 @@ pub const LinuxServer = struct {
     /// scope when a targeted route is not yet known).
     fn relayToPeers(self: *LinuxServer, msg: s2s_link.RelayMessage, scope: RelayScope) usize {
         var sent: usize = 0;
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            const c = &slot.value;
-            if (c.s2s_secured) |link| {
-                if (!link.established()) continue;
-                if (!relayWanted(link, scope)) continue;
-                link.sendMessage(msg) catch continue;
-                self.flushS2sOutbound(c, link.outbound()) catch continue;
-                link.clearOutbound();
-                sent += 1;
-            } else if (c.s2s) |link| {
-                if (!link.established()) continue;
-                if (!relayWanted(link, scope)) continue;
-                link.sendMessage(msg) catch continue;
-                self.flushS2sOutbound(c, link.outbound()) catch continue;
-                link.clearOutbound();
-                sent += 1;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    if (!relayWanted(link, scope)) continue;
+                    link.sendMessage(msg) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                    sent += 1;
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    if (!relayWanted(link, scope)) continue;
+                    link.sendMessage(msg) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                    sent += 1;
+                }
             }
         }
         return sent;
@@ -3806,12 +3829,14 @@ pub const LinuxServer = struct {
     /// True if any S2S peer link (secured or plaintext) is established — used to
     /// decide whether an unknown-local nick might be reachable across the mesh.
     fn hasEstablishedPeer(self: *LinuxServer) bool {
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |l| {
-                if (l.established()) return true;
-            } else if (slot.value.s2s) |l| {
-                if (l.established()) return true;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |l| {
+                    if (l.established()) return true;
+                } else if (slot.value.s2s) |l| {
+                    if (l.established()) return true;
+                }
             }
         }
         return false;
@@ -4588,7 +4613,7 @@ pub const LinuxServer = struct {
         while (cit.next()) |cv| {
             var members = self.world.memberIterator(cv.name) orelse continue;
             while (members.next()) |member| {
-                const mconn = self.rx().clients.get(clientIdFromWorld(member.*)) orelse continue;
+                const mconn = self.connFor(clientIdFromWorld(member.*)) orelse continue;
                 if (mconn.s2s != null or mconn.s2s_secured != null) continue; // skip peer links
                 const nick = mconn.session.displayName();
                 const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
@@ -4790,36 +4815,42 @@ pub const LinuxServer = struct {
 
     fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool, ident: s2s_link.S2sLink.MemberIdentity) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
             }
         }
     }
 
     fn announceChannelModeFlags(self: *LinuxServer, channel: []const u8, flags: u16) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                link.sendChannelModeFlags(channel, flags, hlc) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                link.sendChannelModeFlags(channel, flags, hlc) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendChannelModeFlags(channel, flags, hlc) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendChannelModeFlags(channel, flags, hlc) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
             }
         }
     }
@@ -4834,18 +4865,21 @@ pub const LinuxServer = struct {
         present: bool,
     ) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendChannelList(channel, kind, mask, setter, set_at, hlc, present) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
             }
         }
     }
@@ -4859,18 +4893,21 @@ pub const LinuxServer = struct {
         hlc: u64,
         present: bool,
     ) void {
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
             }
         }
     }
@@ -5252,18 +5289,21 @@ pub const LinuxServer = struct {
     /// their members see the new topic in real time.
     fn announceTopic(self: *LinuxServer, channel: []const u8, topic: []const u8, setter: []const u8, set_at: i64, present: bool) void {
         const hlc = self.nextMeshHlc();
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendTopic(channel, topic, setter, set_at, hlc, present) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
             }
         }
     }
@@ -5272,18 +5312,21 @@ pub const LinuxServer = struct {
     /// rosters rename the user and their members see a live NICK line.
     fn announceNickChange(self: *LinuxServer, old_nick: []const u8, new_nick: []const u8, ident: s2s_link.S2sLink.MemberIdentity) void {
         const hlc = self.nextMeshHlc();
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                link.sendNickChange(old_nick, new_nick, ident, hlc) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                link.sendNickChange(old_nick, new_nick, ident, hlc) catch continue;
-                self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-                link.clearOutbound();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendNickChange(old_nick, new_nick, ident, hlc) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendNickChange(old_nick, new_nick, ident, hlc) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
             }
         }
     }
@@ -5315,6 +5358,13 @@ pub const LinuxServer = struct {
         if (out.len == 0) return;
         try appendToConn(conn, out);
         try self.armSendIfNeeded(conn);
+    }
+
+    fn flushS2sOutboundTo(self: *LinuxServer, id: client_model.ClientId, out: []const u8) !void {
+        if (out.len == 0) return;
+        // The S2S link state is serialized by the world write lock; the actual
+        // socket send buffer remains owned by `id.shard` via enqueueDelivery.
+        try self.enqueueDelivery(id, out);
     }
 
     /// Append a peer's remote channel members into the NAMES buffer (deduped,
@@ -5756,7 +5806,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
-        const tconn = self.rx().clients.get(clientIdFromWorld(twid)) orelse {
+        const tconn = self.connFor(clientIdFromWorld(twid)) orelse {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
@@ -5790,10 +5840,12 @@ pub const LinuxServer = struct {
     /// whose real IP equals `ip`. Silencing itself is authoritative via `gags`.
     fn mirrorGagFlag(self: *LinuxServer, ip: []const u8, on: bool) void {
         if (ip.len == 0) return;
-        var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
-            const c = entry.value;
-            if (std.ascii.eqlIgnoreCase(c.session.realHost(), ip)) c.gagged = on;
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const c = entry.value;
+                if (std.ascii.eqlIgnoreCase(c.session.realHost(), ip)) c.gagged = on;
+            }
         }
     }
 
@@ -6759,14 +6811,16 @@ pub const LinuxServer = struct {
     /// Resolve `nick` as a remote mesh member via any established S2S peer
     /// (secured or plaintext). Borrowed slices; valid within this handler turn.
     fn findRemoteWhois(self: *LinuxServer, nick: []const u8) ?RemoteWhois {
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (!link.established()) continue;
-                if (remoteWhoisFromLink(link, nick)) |rw| return rw;
-            } else if (slot.value.s2s) |link| {
-                if (!link.established()) continue;
-                if (remoteWhoisFromLink(link, nick)) |rw| return rw;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    if (remoteWhoisFromLink(link, nick)) |rw| return rw;
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    if (remoteWhoisFromLink(link, nick)) |rw| return rw;
+                }
             }
         }
         return null;
@@ -6949,21 +7003,28 @@ pub const LinuxServer = struct {
     pub fn handleClose(self: *LinuxServer, conn: *ConnState) !void {
         // Operator gate enforced by the registry (access=.oper).
         var closed: usize = 0;
-        var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
-            const c = entry.value;
-            if (c.closing) continue;
-            if (c.s2s != null or c.s2s_secured != null) continue;
-            if (c.session.registered()) continue;
-            emitServerLine(c, "ERROR :Closing unregistered connection");
-            c.close_reason = "Closed by operator";
-            c.closing = true;
-            self.armSendIfNeeded(c) catch {};
-            closed += 1;
+        const line = "ERROR :Closing unregistered connection\r\n";
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const c = entry.value;
+                if (c.closing) continue;
+                if (c.s2s != null or c.s2s_secured != null) continue;
+                if (c.session.registered()) continue;
+                if (entry.id.shard == self.rx().shard_id) {
+                    emitServerLine(c, "ERROR :Closing unregistered connection");
+                    c.close_reason = "Closed by operator";
+                    c.closing = true;
+                    self.armSendIfNeeded(c) catch {};
+                } else {
+                    self.enqueueDeliveryThenClose(entry.id, line, "Closed by operator") catch continue;
+                }
+                closed += 1;
+            }
         }
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :CLOSE: {d} unregistered connection(s) closed\r\n", .{ self.serverName(), conn.session.displayName(), closed }) catch return;
-        try appendToConn(conn, line);
+        const notice = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :CLOSE: {d} unregistered connection(s) closed\r\n", .{ self.serverName(), conn.session.displayName(), closed }) catch return;
+        try appendToConn(conn, notice);
     }
 
     pub fn handleKill(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -6978,7 +7039,8 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
-        const tconn = self.rx().clients.get(clientIdFromWorld(target_wid)) orelse {
+        const target_id = clientIdFromWorld(target_wid);
+        const tconn = self.connFor(target_id) orelse {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
             return;
         };
@@ -6987,11 +7049,11 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const killer = conn.session.displayName();
         const kill_line = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "KILL", &.{target_nick}, reason);
-        try self.deliver(clientIdFromWorld(target_wid), kill_line);
+        try self.deliver(target_id, kill_line);
 
         var err_buf: [default_reply_bytes]u8 = undefined;
         const err_line = std.fmt.bufPrint(&err_buf, "ERROR :Closing Link: {s} (Killed ({s} ({s})))\r\n", .{ target_nick, killer, reason }) catch return error.OutputTooSmall;
-        try self.deliver(clientIdFromWorld(target_wid), err_line);
+        try self.enqueueDeliveryThenClose(target_id, err_line, "Killed");
 
         // Oper-visible KILL event through the Event Spine (kill category).
         var kev_buf: [512]u8 = undefined;
@@ -7000,8 +7062,10 @@ pub const LinuxServer = struct {
 
         // Graceful close: the send-drain path fires QUIT to channels and frees
         // the slot once the buffer flushes (mirrors a self-QUIT).
-        tconn.closing = true;
-        try self.armSendIfNeeded(tconn);
+        if (target_id.shard == self.rx().shard_id) {
+            tconn.closing = true;
+            try self.armSendIfNeeded(tconn);
+        }
     }
 
     /// WHOWAS <nick> [count] — historical identities from the ring, most-recent
@@ -9357,7 +9421,7 @@ pub const LinuxServer = struct {
             return null;
         };
         const tid = clientIdFromWorld(twid);
-        const tconn = self.rx().clients.get(tid) orelse {
+        const tconn = self.connFor(tid) orelse {
             queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick") catch {};
             return null;
         };
@@ -11277,13 +11341,16 @@ pub const LinuxServer = struct {
     /// plaintext S2S path is deliberately skipped: a grant only carries authority
     /// over a link whose peer identity the Tsumugi handshake authenticated.
     fn broadcastOperGrant(self: *LinuxServer, signed: []const u8) void {
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied) continue;
-            const link = slot.value.s2s_secured orelse continue;
-            if (!link.established()) continue;
-            link.sendOperGrant(signed) catch continue;
-            self.flushS2sOutbound(&slot.value, link.outbound()) catch continue;
-            link.clearOutbound();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established()) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                link.sendOperGrant(signed) catch continue;
+                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
         }
     }
 
