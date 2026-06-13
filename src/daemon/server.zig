@@ -667,7 +667,17 @@ const ringlane = struct {
 
         pub fn submitAccept(self: *Ring, token: FdToken, listener_fd: linux.fd_t) !void {
             _ = self.features;
-            _ = try self.inner.accept(try encodeUserData(.accept, token), listener_fd, null, null, 0);
+            // Accept with SOCK_CLOEXEC so every accepted socket defaults to
+            // close-on-exec. Helix UPGRADE re-execs the daemon in place; the
+            // design (see performUpgrade) carries select client sockets by
+            // explicitly CLEARING CLOEXEC on them, and relies on every other
+            // accepted socket — S2S mesh peers, the requesting oper, wss
+            // browser clients, TLS clients whose engine can't be exported —
+            // closing at execve so the far end sees the drop and reconnects.
+            // Without this flag those sockets leak across execve as orphans:
+            // a re-exec'd meshed node strands its peer link (the peer keeps a
+            // zombie ESTAB socket and dedups away every re-dial → split-brain).
+            _ = try self.inner.accept(try encodeUserData(.accept, token), listener_fd, null, null, posix.SOCK.CLOEXEC);
         }
 
         pub fn submitRecv(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []u8) !void {
