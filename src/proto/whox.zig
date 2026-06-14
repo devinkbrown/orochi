@@ -448,6 +448,44 @@ test "build subset preserves requested order" {
     );
 }
 
+test "ip and oper-level fields emit caller supplied visible values" {
+    const allocator = std.testing.allocator;
+    const request = try parse("%ino");
+    const line = try buildReply(allocator, .{
+        .server_name = "irc.example.test",
+        .requester = "dan",
+        .request = request,
+        .member = sampleMember(),
+    });
+    defer allocator.free(line);
+
+    try std.testing.expectEqualStrings(
+        ":irc.example.test 354 dan 192.0.2.7 Alice netadmin\r\n",
+        line,
+    );
+}
+
+test "ip and oper-level fields emit masked caller supplied values" {
+    const allocator = std.testing.allocator;
+    const request = try parse("%io");
+    var member = sampleMember();
+    member.ip = "255.255.255.255";
+    member.oper_level = "0";
+
+    const line = try buildReply(allocator, .{
+        .server_name = "irc.example.test",
+        .requester = "dan",
+        .request = request,
+        .member = member,
+    });
+    defer allocator.free(line);
+
+    try std.testing.expectEqualStrings(
+        ":irc.example.test 354 dan 255.255.255.255 0\r\n",
+        line,
+    );
+}
+
 test "reject malformed selectors" {
     try std.testing.expectError(error.InvalidSelector, parse(""));
     try std.testing.expectError(error.InvalidSelector, parse("cuh"));

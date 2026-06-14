@@ -6904,6 +6904,21 @@ pub const LinuxServer = struct {
             @intCast(@max(0, @divTrunc(self.nowMs() - c.last_activity_ms, 1000)))
         else
             0;
+        const visible_ip: []const u8 = if (mconn) |c| blk: {
+            if (conn.session.isOper() or conn == c) {
+                const real = c.session.realHost();
+                break :blk if (real.len > 0) real else "0";
+            }
+            break :blk "255.255.255.255";
+        } else "0";
+        const visible_oper_level: []const u8 = if (mconn) |c| blk: {
+            if (!c.session.isOper() or operHidden(c, conn)) break :blk "0";
+            if (!conn.session.isOper() and conn != c) break :blk "0";
+            const class = c.session.operClass();
+            if (class.len > 0) break :blk class;
+            const title = c.session.operTitle();
+            break :blk if (title.len > 0) title else "1";
+        } else "0";
         const ctx = whox.ReplyContext{
             .server_name = self.serverName(),
             .requester = requester,
@@ -6911,12 +6926,14 @@ pub const LinuxServer = struct {
             .member = .{
                 .channel = channel,
                 .user = username,
+                .ip = visible_ip,
                 .host = if (mconn) |c| hostOf(c) else default_host,
                 .server = self.serverName(),
                 .nick = nick,
                 .flags = flags_buf[0..fl],
                 .idle_seconds = idle,
                 .account = if (mconn) |c| (c.session.account() orelse "0") else "0",
+                .oper_level = visible_oper_level,
                 .realname = if (mconn) |c| c.session.realname() else nick,
             },
         };
@@ -6959,6 +6976,8 @@ pub const LinuxServer = struct {
                         .host = if (mconn) |c| hostOf(c) else default_host,
                         .server = self.serverName(),
                         .realname = if (mconn) |c| c.session.realname() else nick,
+                        .away = if (mconn) |c| c.session.awayMessage() != null else false,
+                        .oper = if (mconn) |c| c.session.isOper() and !operHidden(c, conn) else false,
                         .account = if (mconn) |c| c.session.account() else null,
                     },
                     .member = .{ .channel = target, .channel_prefix = if (hp != 0) hp else null },
@@ -6981,6 +7000,8 @@ pub const LinuxServer = struct {
                         .host = if (mconn) |c| hostOf(c) else default_host,
                         .server = self.serverName(),
                         .realname = if (mconn) |c| c.session.realname() else target,
+                        .away = if (mconn) |c| c.session.awayMessage() != null else false,
+                        .oper = if (mconn) |c| c.session.isOper() and !operHidden(c, conn) else false,
                         .account = if (mconn) |c| c.session.account() else null,
                     },
                 };
@@ -6995,11 +7016,19 @@ pub const LinuxServer = struct {
     }
 
     /// LIST [<filters>] — RPL_LISTSTART/RPL_LIST/RPL_LISTEND. Secret (+s)
-    /// channels are hidden. Filters that fail to parse fall back to listing all.
+    /// channels are hidden. Malformed filters return a numeric instead of
+    /// falling back to listing every channel. C/T filters remain matched against
+    /// zero ages until ChannelView tracks creation/topic timestamps.
     pub fn handleList(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        const request = list.parseList(parsed.paramSlice()) catch list.Request{};
+        const request = list.parseList(parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LIST"}, "Invalid LIST filter");
+            return;
+        };
         // ELIST extended filters (>N/<N/C/T/mask); empty set matches everything.
-        var filters = elist.parseParams(self.allocator, parsed.paramSlice()) catch elist.FilterSet{};
+        var filters = elist.parseParams(self.allocator, parsed.paramSlice()) catch {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LIST"}, "Invalid LIST filter");
+            return;
+        };
         defer filters.deinit(self.allocator);
         const Adapter = struct {
             it: world_model.World.ChannelViewIterator,
