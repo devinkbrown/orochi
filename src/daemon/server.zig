@@ -3971,7 +3971,9 @@ pub const LinuxServer = struct {
     ) void {
         const skip_a_flat = monitorIdFromClient(skip_a);
         const skip_b_flat = if (skip_b) |id| monitorIdFromClient(id) else null;
-        for (self.sessions.sessions(account)) |s| {
+        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        for (account_sessions) |s| {
             const sibling_id = clientIdFromMonitor(s.client);
             const sibling = self.connFor(sibling_id) orelse continue;
             // Defense in depth: only mirror to a sibling STILL authenticated to
@@ -13004,7 +13006,9 @@ pub const LinuxServer = struct {
     fn trackSession(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
         const account = conn.session.account() orelse return;
         const cid = monitorIdFromClient(id);
-        for (self.sessions.sessions(account)) |s| {
+        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        for (account_sessions) |s| {
             if (s.client == cid) return; // already tracked
         }
         const signon: i64 = @intCast(@max(@as(i64, 0), self.nowMs()));
@@ -13026,7 +13030,9 @@ pub const LinuxServer = struct {
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
-            for (self.sessions.sessions(account)) |s| {
+            var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+            const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+            for (account_sessions) |s| {
                 if (s.client != cid) continue;
                 const hex = std.fmt.bytesToHex(s.token, .lower);
                 const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION TOKEN :{s}\r\n", .{ self.serverName(), hex }) catch return;
@@ -13046,7 +13052,9 @@ pub const LinuxServer = struct {
         }
         // LIST (default): never reveal tokens here.
         var idx: usize = 0;
-        for (self.sessions.sessions(account)) |s| {
+        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        for (account_sessions) |s| {
             idx += 1;
             const current: []const u8 = if (s.client == cid) "*" else "-";
             const state: []const u8 = if (s.attached) "attached" else "detached";
@@ -13132,7 +13140,9 @@ pub const LinuxServer = struct {
         // Does this node hold a detached session for the account (other than the
         // caller's own live session)?
         var ghost: ?sessions_mod.ClientId = null;
-        for (self.sessions.sessions(account)) |s| {
+        var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+        const account_sessions = self.sessions.sessionsInto(account, &session_buf);
+        for (account_sessions) |s| {
             if (s.client != cid) {
                 ghost = s.client;
                 break;
@@ -17188,7 +17198,9 @@ test "session-sync unit: single-session account has no sibling copies" {
     var target_conn = ConnState.init(-1);
     target_conn.session.addCap(.orochi_session_sync);
     var copies: usize = 0;
-    for (store.sessions("alice")) |session| {
+    var session_buf: [sessions_mod.snapshot_capacity]sessions_mod.Session = undefined;
+    const account_sessions = store.sessionsInto("alice", &session_buf);
+    for (account_sessions) |session| {
         if (allowsSessionSyncSibling(
             session,
             &target_conn,

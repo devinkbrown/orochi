@@ -13,12 +13,13 @@ const rwlock = @import("../substrate/rwlock.zig");
 
 pub const ClientId = u64;
 pub const Token = [16]u8;
+pub const snapshot_capacity: usize = 64;
 
 pub const Error = std.mem.Allocator.Error || error{ TooManyAccounts, TooManySessions };
 
 pub const Config = struct {
     max_accounts: usize = 65536,
-    max_sessions_per_account: usize = 64,
+    max_sessions_per_account: usize = snapshot_capacity,
 };
 
 pub const Session = struct {
@@ -49,8 +50,6 @@ pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     accounts: std.StringHashMap(SessionList),
-    session_snapshots: std.ArrayListUnmanaged([]Session) = .empty,
-    match_accounts: std.ArrayListUnmanaged([]u8) = .empty,
     lock: rwlock.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) SessionStore {
@@ -72,10 +71,6 @@ pub const SessionStore = struct {
                 entry.value_ptr.deinit(self.allocator);
             }
             self.accounts.deinit();
-            for (self.session_snapshots.items) |snapshot| self.allocator.free(snapshot);
-            self.session_snapshots.deinit(self.allocator);
-            for (self.match_accounts.items) |account| self.allocator.free(account);
-            self.match_accounts.deinit(self.allocator);
         }
         self.* = undefined;
     }
@@ -157,40 +152,33 @@ pub const SessionStore = struct {
         return 0;
     }
 
-    /// Snapshot of the session list for `account` (empty if none).
-    pub fn sessions(self: *const SessionStore, account: []const u8) []const Session {
-        const self_mut = @constCast(self);
-        self_mut.lock.lockExclusive();
-        defer self_mut.lock.unlockExclusive();
+    /// Copy a snapshot of the session list for `account` into caller-owned
+    /// storage (empty if none). The returned slice borrows `out`, not the store.
+    pub fn sessionsInto(self: *const SessionStore, account: []const u8, out: []Session) []const Session {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
 
-        const list = self_mut.accounts.getPtr(account) orelse return &.{};
-        const snapshot = self_mut.allocator.dupe(Session, list.items.items) catch return &.{};
-        self_mut.session_snapshots.append(self_mut.allocator, snapshot) catch {
-            self_mut.allocator.free(snapshot);
-            return &.{};
-        };
-        return snapshot;
+        const list = self.accounts.getPtr(account) orelse return out[0..0];
+        const n = @min(list.items.items.len, out.len);
+        @memcpy(out[0..n], list.items.items[0..n]);
+        return out[0..n];
     }
 
     pub const Match = struct { account: []const u8, client: ClientId };
 
     /// Find the session bearing `token` (for reclaim). The returned `account`
-    /// is a store-retained copy of the account name.
-    pub fn findByToken(self: *const SessionStore, token: Token) ?Match {
-        const self_mut = @constCast(self);
-        self_mut.lock.lockExclusive();
-        defer self_mut.lock.unlockExclusive();
+    /// borrows `account_out`, not the store.
+    pub fn findByTokenInto(self: *const SessionStore, token: Token, account_out: []u8) ?Match {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
 
-        var it = self_mut.accounts.iterator();
+        var it = self.accounts.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items.items) |s| {
                 if (std.crypto.timing_safe.eql(Token, s.token, token)) {
-                    const account = self_mut.allocator.dupe(u8, entry.key_ptr.*) catch return null;
-                    self_mut.match_accounts.append(self_mut.allocator, account) catch {
-                        self_mut.allocator.free(account);
-                        return null;
-                    };
-                    return .{ .account = account, .client = s.client };
+                    if (entry.key_ptr.*.len > account_out.len) return null;
+                    @memcpy(account_out[0..entry.key_ptr.*.len], entry.key_ptr.*);
+                    return .{ .account = account_out[0..entry.key_ptr.*.len], .client = s.client };
                 }
             }
         }
@@ -241,43 +229,48 @@ fn tok(b: u8) Token {
 test "attach lists a multi-device account; idempotent re-attach" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
+    var out: [64]Session = undefined;
     _ = try s.attach("alice", 1, tok(1), 100);
     _ = try s.attach("alice", 2, tok(2), 200);
-    try testing.expectEqual(@as(usize, 2), s.sessions("alice").len);
+    try testing.expectEqual(@as(usize, 2), s.sessionsInto("alice", &out).len);
     // Re-attaching the same client refreshes, not duplicates.
     _ = try s.attach("alice", 1, tok(9), 300);
-    try testing.expectEqual(@as(usize, 2), s.sessions("alice").len);
+    try testing.expectEqual(@as(usize, 2), s.sessionsInto("alice", &out).len);
 }
 
 test "markDetached retains the session; remove prunes; empty account drops" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
+    var out: [64]Session = undefined;
     _ = try s.attach("bob", 7, tok(7), 1);
     try testing.expect(s.markDetached("bob", 7));
-    try testing.expectEqual(@as(usize, 1), s.sessions("bob").len); // retained
-    try testing.expect(!s.sessions("bob")[0].attached);
+    const retained = s.sessionsInto("bob", &out);
+    try testing.expectEqual(@as(usize, 1), retained.len); // retained
+    try testing.expect(!retained[0].attached);
     try testing.expect(s.remove("bob", 7));
-    try testing.expectEqual(@as(usize, 0), s.sessions("bob").len); // account pruned
+    try testing.expectEqual(@as(usize, 0), s.sessionsInto("bob", &out).len); // account pruned
 }
 
-test "findByToken locates a session for reclaim" {
+test "findByTokenInto locates a session for reclaim" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
+    var account_buf: [64]u8 = undefined;
     _ = try s.attach("alice", 1, tok(0xAB), 1);
     _ = try s.attach("carol", 2, tok(0xCD), 1);
-    const m = s.findByToken(tok(0xCD)).?;
+    const m = s.findByTokenInto(tok(0xCD), &account_buf).?;
     try testing.expectEqualStrings("carol", m.account);
     try testing.expectEqual(@as(ClientId, 2), m.client);
-    try testing.expect(s.findByToken(tok(0xEE)) == null);
+    try testing.expect(s.findByTokenInto(tok(0xEE), &account_buf) == null);
 }
 
 test "removeClient drops a client without knowing its account" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
+    var out: [64]Session = undefined;
     _ = try s.attach("alice", 1, tok(1), 1);
     _ = try s.attach("alice", 2, tok(2), 1);
     try testing.expectEqual(@as(usize, 1), s.removeClient(1));
-    try testing.expectEqual(@as(usize, 1), s.sessions("alice").len);
+    try testing.expectEqual(@as(usize, 1), s.sessionsInto("alice", &out).len);
     try testing.expectEqual(@as(usize, 0), s.removeClient(999)); // unknown
 }
 
@@ -292,12 +285,13 @@ test "per-account session cap is enforced for attached sessions" {
 test "at cap, attach evicts the oldest detached ghost instead of failing" {
     var s = SessionStore.initWithConfig(testing.allocator, .{ .max_sessions_per_account = 2 });
     defer s.deinit();
+    var out: [2]Session = undefined;
     _ = try s.attach("alice", 1, tok(1), 10); // older
     _ = try s.attach("alice", 2, tok(2), 20);
     try testing.expect(s.markDetached("alice", 1)); // client 1 is the ghost
     // New live session evicts the detached ghost (client 1), not client 2.
     _ = try s.attach("alice", 3, tok(3), 30);
-    try testing.expectEqual(@as(usize, 2), s.sessions("alice").len);
+    try testing.expectEqual(@as(usize, 2), s.sessionsInto("alice", &out).len);
     try testing.expect(s.findTokenInAccount("alice", tok(1)) == null); // evicted
     try testing.expectEqual(@as(ClientId, 2), s.findTokenInAccount("alice", tok(2)).?);
     try testing.expectEqual(@as(ClientId, 3), s.findTokenInAccount("alice", tok(3)).?);
@@ -311,6 +305,23 @@ test "findTokenInAccount is scoped to the account" {
     try testing.expectEqual(@as(ClientId, 1), s.findTokenInAccount("alice", tok(0xAB)).?);
     // bob's token must not resolve under alice.
     try testing.expect(s.findTokenInAccount("alice", tok(0xCD)) == null);
+}
+
+test "sessionsInto and findByTokenInto do not retain snapshots" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("alice", 1, tok(1), 1);
+
+    var out: [64]Session = undefined;
+    var account_buf: [64]u8 = undefined;
+    for (0..10_000) |_| {
+        const list = s.sessionsInto("alice", &out);
+        try testing.expectEqual(@as(usize, 1), list.len);
+        try testing.expectEqual(@as(ClientId, 1), list[0].client);
+        const found = s.findByTokenInto(tok(1), &account_buf).?;
+        try testing.expectEqualStrings("alice", found.account);
+        try testing.expectEqual(@as(ClientId, 1), found.client);
+    }
 }
 
 const SessionMtCtx = struct {
@@ -377,12 +388,14 @@ const SessionMtCtx = struct {
     fn reader(ctx: *SessionMtCtx) void {
         var i: usize = 0;
         while (i < ctx.iters * 4) : (i += 1) {
-            const seed_sessions = ctx.store.sessions("seed");
+            var out: [64]Session = undefined;
+            var account_buf: [64]u8 = undefined;
+            const seed_sessions = ctx.store.sessionsInto("seed", &out);
             if (seed_sessions.len != 1 or seed_sessions[0].client != 1) {
                 _ = ctx.failures.fetchAdd(1, .monotonic);
                 return;
             }
-            const found = ctx.store.findByToken(tok(1)) orelse {
+            const found = ctx.store.findByTokenInto(tok(1), &account_buf) orelse {
                 _ = ctx.failures.fetchAdd(1, .monotonic);
                 return;
             };
@@ -426,11 +439,13 @@ test "SessionStore concurrent writers and readers preserve sessions" {
     for (threads[0..spawned]) |t| t.join();
 
     try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
-    try testing.expectEqual(@as(usize, 1), s.sessions("seed").len);
+    var seed_out: [64]Session = undefined;
+    try testing.expectEqual(@as(usize, 1), s.sessionsInto("seed", &seed_out).len);
     var acct_buf: [16]u8 = undefined;
     for (0..writers) |w| {
         const acct = SessionMtCtx.account(&acct_buf, w);
-        const list = s.sessions(acct);
+        var out: [64]Session = undefined;
+        const list = s.sessionsInto(acct, &out);
         try testing.expectEqual(@as(usize, iters), list.len);
         for (list) |session| try testing.expect(session.attached);
     }
