@@ -6890,6 +6890,12 @@ pub const LinuxServer = struct {
         try line.append(targets.written());
         try line.append("\r\n");
         try self.broadcastChannel(channel, line.written(), null);
+        // draft/event-playback: record the channel mode change as a MODE event
+        // (`:setter MODE #chan <applied> <params>`) for event-playback replay.
+        var mode_ev_buf: [default_reply_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&mode_ev_buf, "{s} {s}{s}", .{ channel, applied.written(), targets.written() })) |mbody| {
+            self.recordHistoryEvent(channel, conn, "MODE", mbody);
+        } else |_| {}
     }
 
     /// MODE <nick> [modes] — user modes. A client may only view/change its own
@@ -22879,7 +22885,7 @@ test "threaded server: draft/event-playback replays TOPIC events only to capable
     try recvUntil(&a, "BATCH -1", 200);
 }
 
-test "threaded server: event-playback replays JOIN and KICK events" {
+test "threaded server: event-playback replays JOIN, MODE, and KICK events" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -22910,15 +22916,19 @@ test "threaded server: event-playback replays JOIN and KICK events" {
     try writeAllFd(fd_b, "JOIN #jk\r\n");
     try recvUntil(&b, " 366 B #jk ", 200);
     a.reset();
+    try writeAllFd(fd_a, "MODE #jk +m\r\n");
+    try recvUntil(&a, "MODE #jk +m", 200);
     try writeAllFd(fd_a, "KICK #jk B :rude\r\n");
     try recvUntil(&a, "KICK #jk B :rude", 200);
 
-    // A replays: the JOIN (no-trailing body) and KICK (multi-param body) events
-    // render verbatim through the generalized event renderer.
+    // A replays: JOIN (no-trailing body), MODE (modestring body), and KICK
+    // (multi-param body) events all render verbatim through the generalized
+    // event renderer, oldest-first.
     a.reset();
     try writeAllFd(fd_a, "CHATHISTORY LATEST #jk * 10\r\n");
     try recvUntil(&a, "BATCH +1 chathistory #jk", 200);
     try recvUntil(&a, ":B!bob@localhost JOIN #jk", 200);
+    try recvUntil(&a, ":A!alice@localhost MODE #jk +m", 200);
     try recvUntil(&a, ":A!alice@localhost KICK #jk B :rude", 200);
     try recvUntil(&a, "BATCH -1", 200);
 }
