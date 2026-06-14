@@ -390,8 +390,13 @@ const irc_line = struct {
         EmbeddedLineBreak,
         MissingCommand,
         MalformedPrefix,
+        MalformedTags,
         TooManyParams,
     };
+
+    pub const max_client_tags_raw_len: usize = 4094;
+    pub const max_client_tag_count: usize = 32;
+    const max_client_tag_key_len: usize = 96;
 
     pub const LineView = struct {
         raw: []const u8,
@@ -425,7 +430,11 @@ const irc_line = struct {
 
         if (body[cursor] == '@') {
             const tag_end = findSpace(body, cursor) orelse return error.MissingCommand;
-            if (tag_end > cursor + 1) view.tags_raw = body[cursor + 1 .. tag_end];
+            if (tag_end > cursor + 1) {
+                const tags = body[cursor + 1 .. tag_end];
+                try validateTagSegment(tags);
+                view.tags_raw = tags;
+            }
             cursor = skipSpaces(body, tag_end);
             if (cursor >= body.len) return error.MissingCommand;
         }
@@ -457,6 +466,44 @@ const irc_line = struct {
         }
 
         return view;
+    }
+
+    fn validateTagSegment(raw: []const u8) ParseError!void {
+        if (raw.len > max_client_tags_raw_len) return error.MalformedTags;
+
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, raw, ';');
+        while (it.next()) |tag| {
+            if (tag.len == 0) return error.MalformedTags;
+            count += 1;
+            if (count > max_client_tag_count) return error.MalformedTags;
+
+            const eq = std.mem.indexOfScalar(u8, tag, '=') orelse tag.len;
+            const key = tag[0..eq];
+            if (!validTagKey(key)) return error.MalformedTags;
+
+            if (eq < tag.len) {
+                for (tag[eq + 1 ..]) |ch| {
+                    switch (ch) {
+                        0, '\r', '\n', ' ', ';' => return error.MalformedTags,
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+
+    fn validTagKey(key: []const u8) bool {
+        if (key.len == 0 or key.len > max_client_tag_key_len) return false;
+        const start: usize = if (key[0] == '+') 1 else 0;
+        if (start == key.len) return false;
+        for (key[start..]) |ch| {
+            switch (ch) {
+                'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '/' => {},
+                else => return false,
+            }
+        }
+        return true;
     }
 
     fn stripLineEnding(input: []const u8) []const u8 {
@@ -14405,7 +14452,10 @@ pub const LinuxServer = struct {
             return;
         }
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) return;
-        const tags = parsed.tags_raw orelse return; // nothing to relay
+        const raw_tags = parsed.tags_raw orelse return; // nothing to relay
+        var tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+        const tags = clientOnlyTags(raw_tags, &tag_buf);
+        if (tags.len == 0) return;
         const target = parsed.paramSlice()[0];
 
         // Stamp a server-minted msgid into the relayed tag segment (so a relayed
@@ -14805,6 +14855,11 @@ pub const LinuxServer = struct {
         // reply (prevents NOTICE/error ping-pong between bots and servers). All
         // delivery-failure numerics below are suppressed for NOTICE.
         const is_notice = std.ascii.eqlIgnoreCase(command, "NOTICE");
+        var clean_tag_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+        const clean_client_tags: ?[]const u8 = if (client_tags) |raw| blk: {
+            const clean = clientOnlyTags(raw, &clean_tag_buf);
+            break :blk if (clean.len == 0) null else clean;
+        } else null;
 
         // STATUSMSG: a leading prefix (!/./@/+) before a channel name restricts
         // delivery to members of that rank or higher. `chan` is the bare channel
@@ -14834,7 +14889,7 @@ pub const LinuxServer = struct {
                 self.handleFantasy(id, conn, chan, text);
             }
             var time_buf: [40]u8 = undefined;
-            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
+            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id };
             // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
             // colour/formatting from the message body for every recipient.
             var nf_text_buf: [1024]u8 = undefined;
@@ -14881,7 +14936,7 @@ pub const LinuxServer = struct {
                         .source_nick = conn.session.displayName(),
                         .source_prefix = prefix,
                         .account = conn.session.account() orelse "",
-                        .tags = clientOnlyTags(client_tags orelse "", &relay_tag_buf),
+                        .tags = clientOnlyTags(clean_client_tags orelse "", &relay_tag_buf),
                         .text = eff_text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
@@ -14909,7 +14964,7 @@ pub const LinuxServer = struct {
                         .source_nick = conn.session.displayName(),
                         .source_prefix = prefix,
                         .account = conn.session.account() orelse "",
-                        .tags = clientOnlyTags(client_tags orelse "", &relay_tag_buf),
+                        .tags = clientOnlyTags(clean_client_tags orelse "", &relay_tag_buf),
                         .text = text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
@@ -14921,7 +14976,7 @@ pub const LinuxServer = struct {
                     }
                     if (echo) {
                         var et_buf: [40]u8 = undefined;
-                        const etags = MsgTags{ .time_value = serverTimeValue(&et_buf), .account = conn.session.account(), .client_tags = client_tags };
+                        const etags = MsgTags{ .time_value = serverTimeValue(&et_buf), .account = conn.session.account(), .client_tags = clean_client_tags };
                         self.deliverTagged(id, etags, msg) catch {};
                     }
                     return;
@@ -14930,12 +14985,22 @@ pub const LinuxServer = struct {
             if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
             return;
         };
+        const recipient_id = clientIdFromWorld(recipient);
+        const recipient_conn = self.connFor(recipient_id);
         // +R regonly-pm: the recipient rejects PMs/notices from unauthenticated
         // senders. Logged-in senders and opers always pass.
         if (conn.session.account() == null and !conn.session.isOper()) {
-            if (self.connFor(clientIdFromWorld(recipient))) |rconn| {
+            if (recipient_conn) |rconn| {
                 if (rconn.session.umodes.contains(.regonly_pm)) {
                     if (!is_notice) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{target}, "Cannot message this user (+R: identify to a registered account)");
+                    return;
+                }
+            }
+        }
+        if (!is_notice and isBlockableCtcp(text)) {
+            if (recipient_conn) |rconn| {
+                if (rconn.session.umodes.contains(.no_ctcp)) {
+                    try self.failReply(conn, command, "CTCP_BLOCKED", "Cannot message this user (+C: no CTCP)");
                     return;
                 }
             }
@@ -14948,10 +15013,9 @@ pub const LinuxServer = struct {
             if (self.silence.isSilenced(target, sender_mask)) return;
         }
         var time_buf: [40]u8 = undefined;
-        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = client_tags, .msgid = message_id };
-        const recipient_id = clientIdFromWorld(recipient);
+        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id };
         try self.deliverTagged(recipient_id, dtags, msg);
-        const recipient_account = if (self.connFor(recipient_id)) |rconn| rconn.session.account() else null;
+        const recipient_account = if (recipient_conn) |rconn| rconn.session.account() else null;
         if (recipient_account) |acct| {
             // Pass the DM target nick so SAME-NICK siblings (the same identity
             // signed in to this nick from another client) receive the message
@@ -14974,12 +15038,40 @@ pub const LinuxServer = struct {
         // RFC 1459: a PRIVMSG (not NOTICE) to an away user returns RPL_AWAY so
         // the sender sees the auto-reply. NOTICE never auto-responds.
         if (std.ascii.eqlIgnoreCase(command, "PRIVMSG")) {
-            if (self.connFor(clientIdFromWorld(recipient))) |rconn| {
+            if (recipient_conn) |rconn| {
+                try self.autoReplyCtcp(conn, rconn, text);
                 if (rconn.session.awayMessage()) |reason| {
                     try queueNumeric(conn, .RPL_AWAY, &.{target}, reason);
                 }
             }
         }
+    }
+
+    fn autoReplyCtcp(self: *LinuxServer, sender: *ConnState, recipient: *ConnState, text: []const u8) !void {
+        const ctcp = @import("../proto/ctcp.zig");
+        const view = ctcp.parseFirst(.privmsg, text) catch return;
+        const req = view orelse return;
+        if (req.id == .action) return;
+
+        var ping_arg_buf: [256]u8 = undefined;
+        var time_buf: [40]u8 = undefined;
+        const reply_arg: ?[]const u8 = switch (req.id) {
+            .version => server_version,
+            .ping => req.dequoteArg(&ping_arg_buf) catch return,
+            .time => serverTimeValue(&time_buf),
+            .clientinfo => "ACTION CLIENTINFO PING SOURCE TIME VERSION",
+            .source => "https://github.com/devinkbrown/orochi",
+            else => return,
+        };
+        const command_name = ctcp.commandName(req.id) orelse return;
+
+        var payload_buf: [512]u8 = undefined;
+        const payload = ctcp.buildPayload(command_name, reply_arg, &payload_buf) catch return;
+        var prefix_buf: [256]u8 = undefined;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = try formatMessage(&line_buf, try clientPrefix(recipient, &prefix_buf), "NOTICE", &.{sender.session.displayName()}, payload);
+        try appendToConn(sender, line);
+        _ = self;
     }
 
     pub fn handleTopic(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -15409,14 +15501,29 @@ const Buf = struct {
 fn clientOnlyTags(raw: []const u8, out: []u8) []const u8 {
     var b = Buf{ .storage = out };
     var any = false;
+    var seen_keys: [irc_line.max_client_tag_count][]const u8 = undefined;
+    var seen_count: usize = 0;
     var it = std.mem.splitScalar(u8, raw, ';');
     while (it.next()) |tag| {
         if (tag.len == 0 or tag[0] != '+') continue;
+        const key_end = std.mem.indexOfScalar(u8, tag, '=') orelse tag.len;
+        const key = tag[0..key_end];
+        var duplicate = false;
+        for (seen_keys[0..seen_count]) |seen| {
+            if (std.mem.eql(u8, seen, key)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (seen_count == seen_keys.len) break;
         const sep_len: usize = if (any) 1 else 0;
         const extra = tag.len + sep_len;
         if (b.len + extra > b.storage.len) break;
         if (any) b.appendByte(';') catch break;
         b.append(tag) catch break;
+        seen_keys[seen_count] = key;
+        seen_count += 1;
         any = true;
     }
     return b.written();
@@ -17421,6 +17528,85 @@ test "threaded server: TAGMSG relays client tags to message-tags peers" {
     try std.testing.expect(std.mem.indexOf(u8, b.written(), ";+typing=active") != null);
 }
 
+test "threaded server: TAGMSG strips forged server tags and duplicate client tags" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :message-tags\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #t2\r\n");
+    try recvUntil(&a, " 366 A #t2 ", 200);
+    try writeAllFd(fd_b, "JOIN #t2\r\n");
+    try recvUntil(&b, " 366 B #t2 ", 200);
+
+    b.reset();
+    try writeAllFd(fd_a, "@+typing=active;time=forged;+typing=ignored TAGMSG #t2\r\n");
+    try recvUntil(&b, ":A!alice@localhost TAGMSG #t2\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), ";+typing=active ") != null or
+        std.mem.indexOf(u8, b.written(), ";+typing=active :") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "time=forged") == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "+typing="));
+}
+
+test "threaded server: malformed and oversized message tags close only sender" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_bad = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_bad);
+    try writeAllFd(fd_bad, "@+ok=1;;+bad=2 PING :x\r\n");
+
+    const fd_big = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_big);
+    var line_buf: [4300]u8 = undefined;
+    var out = Buf{ .storage = &line_buf };
+    try out.append("@+");
+    var i: usize = 0;
+    while (i < 4100) : (i += 1) try out.appendByte('a');
+    try out.append(" PING :x\r\n");
+    try writeAllFd(fd_big, out.written());
+
+    const fd_ok = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_ok);
+    var ok = LiveClient{ .fd = fd_ok };
+    try writeAllFd(fd_ok, "NICK Safe\r\nUSER safe 0 * :Safe\r\n");
+    try recvUntil(&ok, " 001 Safe ", 400);
+}
+
 test "threaded server: TAGMSG requires message-tags and channel speech permission" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -17715,6 +17901,83 @@ test "threaded server: PRIVMSG multi-target delivery" {
     waitMillis(100);
     try b.readAvailable();
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "PRIVMSG #dup :chan copy"));
+}
+
+test "threaded server: ctcp VERSION direct PRIVMSG gets NOTICE reply" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :\x01VERSION\x01\r\n");
+    try recvUntil(&b, ":A!alice@localhost PRIVMSG B :\x01VERSION\x01\r\n", 200);
+    try recvUntil(&a, ":B!bob@localhost NOTICE A :\x01VERSION orochi-", 200);
+}
+
+test "threaded server: user +C blocks direct CTCP except ACTION" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "MODE B +C\r\n");
+    try recvUntil(&b, "MODE B +C", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :\x01VERSION\x01\r\n");
+    try recvUntil(&a, "FAIL PRIVMSG CTCP_BLOCKED :Cannot message this user (+C: no CTCP)", 200);
+    try b.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "\x01VERSION\x01") == null);
+
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :\x01ACTION waves\x01\r\n");
+    try recvUntil(&b, ":A!alice@localhost PRIVMSG B :\x01ACTION waves\x01\r\n", 200);
 }
 
 test "threaded server: session-sync fans out inbound direct messages to account siblings" {
