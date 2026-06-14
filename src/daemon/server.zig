@@ -1615,9 +1615,89 @@ const ChannelPropClock = struct {
     }
 };
 
+const RuntimeFeatureConfig = struct {
+    config: Config,
+    owned_disabled_features: ?[][]const u8 = null,
+};
+
+fn disabledFeaturePresent(features: []const []const u8, needle: []const u8) bool {
+    for (features) |feature| {
+        if (std.ascii.eqlIgnoreCase(feature, needle)) return true;
+    }
+    return false;
+}
+
+fn runtimeDisabledFeatures(allocator: std.mem.Allocator, config: Config) !RuntimeFeatureConfig {
+    if (config.account_services != null or disabledFeaturePresent(config.disabled_features, "accounts")) {
+        return .{ .config = config };
+    }
+
+    var out = config;
+    const merged = try allocator.alloc([]const u8, config.disabled_features.len + 1);
+    @memcpy(merged[0..config.disabled_features.len], config.disabled_features);
+    merged[config.disabled_features.len] = "accounts";
+    out.disabled_features = merged;
+    return .{ .config = out, .owned_disabled_features = merged };
+}
+
+fn appendSaslInfoMech(out: []u8, len: *usize, name: []const u8) error{OutputTooSmall}!void {
+    if (len.* != 0) {
+        if (len.* >= out.len) return error.OutputTooSmall;
+        out[len.*] = ',';
+        len.* += 1;
+    }
+    if (name.len > out.len - len.*) return error.OutputTooSmall;
+    @memcpy(out[len.* .. len.* + name.len], name);
+    len.* += name.len;
+}
+
+fn channelAccessLevel(level: chanserv_cmd.AccessLevel) ?services_mod.AccessLevel {
+    return switch (level) {
+        .founder => .founder,
+        .op => .op,
+        .voice => .voice,
+        .akick => null,
+    };
+}
+
+fn channelAccessLevelName(level: services_mod.AccessLevel) []const u8 {
+    return switch (level) {
+        .founder => "FOUNDER",
+        .admin => "ADMIN",
+        .op => "OP",
+        .voice => "VOICE",
+    };
+}
+
+fn joinChannelAkickReason(tokens: []const []const u8, scratch: []u8) ![]const u8 {
+    if (tokens.len == 0) return "Auto-kicked";
+    var len: usize = 0;
+    for (tokens, 0..) |token, i| {
+        if (i != 0) {
+            if (len >= scratch.len) return error.OutputTooSmall;
+            scratch[len] = ' ';
+            len += 1;
+        }
+        if (token.len > scratch.len - len) return error.OutputTooSmall;
+        @memcpy(scratch[len .. len + token.len], token);
+        len += token.len;
+    }
+    return scratch[0..len];
+}
+
+fn akickLiveFailCode(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Duplicate => "AKICK_EXISTS",
+        error.InvalidMask => "INVALID_PARAMS",
+        error.ListFull => "LIST_FULL",
+        else => "TEMPORARILY_UNAVAILABLE",
+    };
+}
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    owned_disabled_features: ?[][]const u8 = null,
     /// Process-wide TLS 1.3 resumption key. Generated once at daemon init when
     /// resumption is enabled, then copied into every per-connection TLS config so
     /// a ticket issued on one reactor can resume on another.
@@ -1948,9 +2028,12 @@ pub const LinuxServer = struct {
 
     /// Create, bind, and listen on a TCP socket, then initialize the Ringlane
     /// ring used for accept/recv/send completions.
-    pub fn init(allocator: std.mem.Allocator, config: Config) !LinuxServer {
+    pub fn init(allocator: std.mem.Allocator, raw_config: Config) !LinuxServer {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
+        const runtime_features = try runtimeDisabledFeatures(allocator, raw_config);
+        errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
+        const config = runtime_features.config;
         const shard_count = clampShards(config);
         // For >1 shard EVERY listener (shard 0 included) must be SO_REUSEPORT or
         // the kernel rejects the second bind on the shared port. The single-shard
@@ -2009,6 +2092,7 @@ pub const LinuxServer = struct {
         return .{
             .allocator = allocator,
             .config = config,
+            .owned_disabled_features = runtime_features.owned_disabled_features,
             .wasm = wasm_bridge.Bridge.init(allocator),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .tls_ticket_key = tls_ticket_key,
@@ -2171,6 +2255,10 @@ pub const LinuxServer = struct {
     }
 
     pub fn deinit(self: *LinuxServer) void {
+        if (self.owned_disabled_features) |owned| {
+            self.allocator.free(owned);
+            self.owned_disabled_features = null;
+        }
         self.driveDeinit();
         self.geo.stop();
         self.allocator.destroy(self.geo);
@@ -12407,10 +12495,14 @@ pub const LinuxServer = struct {
     /// `SASLINFO` — report the SASL mechanisms this server accepts and the
     /// caller's current authentication state. Read-only; available to anyone.
     pub fn handleSaslInfo(self: *LinuxServer, conn: *ConnState) !void {
-        const mechs = if (self.config.sasl_checker != null)
-            (if (self.config.sasl_scram256 != null) "PLAIN,SCRAM-SHA-256" else "PLAIN")
-        else
-            "(none configured)";
+        var mech_buf: [64]u8 = undefined;
+        var mech_len: usize = 0;
+        if (self.config.sasl_checker != null) {
+            appendSaslInfoMech(&mech_buf, &mech_len, "PLAIN") catch return;
+            if (self.config.sasl_scram256 != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-256") catch return;
+        }
+        if (self.config.sasl_external != null) appendSaslInfoMech(&mech_buf, &mech_len, "EXTERNAL") catch return;
+        const mechs = if (mech_len == 0) "(none configured)" else mech_buf[0..mech_len];
         var buf: [default_reply_bytes]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :SASL mechanisms: {s}\r\n", .{ self.serverName(), conn.session.displayName(), mechs }) catch return;
         try appendToConn(conn, m);
@@ -12628,6 +12720,103 @@ pub const LinuxServer = struct {
                     try channelNotice(conn, "CHANNEL SET {s} is not available yet", .{@tagName(r.field)});
                 }
             },
+            .access => |r| {
+                if (r.action == .list and r.account == null) {
+                    var entries_buf: [64]services_mod.AccessInfo = undefined;
+                    const entries = svc.channelAccessList(r.channel, account, &entries_buf) catch |err| {
+                        try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel access list failed");
+                        return;
+                    };
+                    for (entries) |access| {
+                        try channelNotice(conn, "ACCESS {s} {s} {s}", .{ access.channel.asSlice(), access.account.asSlice(), channelAccessLevelName(access.level) });
+                    }
+                    try channelNotice(conn, "End of ACCESS list for {s}", .{r.channel});
+                    return;
+                }
+
+                const target = r.account orelse {
+                    try self.failReply(conn, "CHANNEL", "NEED_MORE_PARAMS", "Usage: CHANNEL ACCESS <#channel> <ADD|DEL|LIST> <account> <FOUNDER|OP|VOICE>");
+                    return;
+                };
+                const level = channelAccessLevel(r.level orelse .voice) orelse {
+                    try self.failReply(conn, "CHANNEL", "INVALID_PARAMS", "ACCESS level AKICK belongs under CHANNEL AKICK");
+                    return;
+                };
+                const action: services_mod.AccessAction = switch (r.action) {
+                    .add => .grant,
+                    .del => .revoke,
+                    .list => .query,
+                };
+                const result = svc.channelAccess(r.channel, account, target, action, level, &scratch) catch |err| {
+                    try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel access operation failed");
+                    return;
+                };
+                switch (result) {
+                    .access => |access| try channelNotice(conn, "ACCESS {s} {s} {s}", .{ access.channel.asSlice(), access.account.asSlice(), channelAccessLevelName(access.level) }),
+                    .access_revoked => |access| try channelNotice(conn, "ACCESS removed {s} {s} {s}", .{ access.channel.asSlice(), access.account.asSlice(), channelAccessLevelName(access.level) }),
+                    else => try channelNotice(conn, "ACCESS updated {s}", .{r.channel}),
+                }
+            },
+            .akick => |r| {
+                switch (r.action) {
+                    .list => {
+                        if (r.mask) |mask| {
+                            const result = svc.channelAkick(r.channel, account, mask, .query, "", &scratch) catch |err| {
+                                try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel AKICK query failed");
+                                return;
+                            };
+                            if (result == .akick) {
+                                const ak = result.akick;
+                                try channelNotice(conn, "AKICK {s} {s} :{s}", .{ ak.channel.asSlice(), ak.mask.asSlice(), ak.reason.asSlice() });
+                            }
+                        } else {
+                            var entries_buf: [64]services_mod.AkickInfo = undefined;
+                            const entries = svc.channelAkickList(r.channel, account, &entries_buf) catch |err| {
+                                try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel AKICK list failed");
+                                return;
+                            };
+                            for (entries) |ak| {
+                                try channelNotice(conn, "AKICK {s} {s} :{s}", .{ ak.channel.asSlice(), ak.mask.asSlice(), ak.reason.asSlice() });
+                            }
+                            try channelNotice(conn, "End of AKICK list for {s}", .{r.channel});
+                        }
+                    },
+                    .add => {
+                        const mask = r.mask orelse {
+                            try self.failReply(conn, "CHANNEL", "NEED_MORE_PARAMS", "Usage: CHANNEL AKICK <#channel> ADD <mask> [reason...]");
+                            return;
+                        };
+                        const reason = try joinChannelAkickReason(r.reason, &scratch);
+                        const result = svc.channelAkick(r.channel, account, mask, .add, reason, &scratch) catch |err| {
+                            try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel AKICK add failed");
+                            return;
+                        };
+                        if (result == .akick) {
+                            const ak = result.akick;
+                            self.chan_akick.add(ak.channel.asSlice(), ak.mask.asSlice(), ak.reason.asSlice(), account, self.nowMs(), null) catch |err| {
+                                try self.failReply(conn, "CHANNEL", akickLiveFailCode(err), "Channel AKICK live mirror failed");
+                                return;
+                            };
+                            try channelNotice(conn, "AKICK added on {s}: {s}", .{ ak.channel.asSlice(), ak.mask.asSlice() });
+                        }
+                    },
+                    .del => {
+                        const mask = r.mask orelse {
+                            try self.failReply(conn, "CHANNEL", "NEED_MORE_PARAMS", "Usage: CHANNEL AKICK <#channel> DEL <mask>");
+                            return;
+                        };
+                        const result = svc.channelAkick(r.channel, account, mask, .remove, "", &scratch) catch |err| {
+                            try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel AKICK delete failed");
+                            return;
+                        };
+                        if (result == .akick_removed) {
+                            const ak = result.akick_removed;
+                            _ = self.chan_akick.remove(ak.channel.asSlice(), ak.mask.asSlice());
+                            try channelNotice(conn, "AKICK removed on {s}: {s}", .{ ak.channel.asSlice(), ak.mask.asSlice() });
+                        }
+                    },
+                }
+            },
             else => {
                 try channelNotice(conn, "{s} is not available yet", .{chanserv_cmd.fmtUsage(req.subcommand())});
             },
@@ -12656,6 +12845,7 @@ pub const LinuxServer = struct {
             error.NotFound => "CHANNEL_UNKNOWN",
             error.Forbidden => "ACCESS_DENIED",
             error.InvalidChannel, error.InvalidName => "BAD_CHANNEL_NAME",
+            error.InvalidValue => "INVALID_PARAMS",
             else => "TEMPORARILY_UNAVAILABLE",
         };
     }
@@ -16466,6 +16656,12 @@ const test_oper_bindings = [_]oper_mod.OperBinding{
     .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
 };
 
+fn testExternalVerify(_: *anyopaque, _: []const u8, authzid: []const u8) ?[]const u8 {
+    return if (std.mem.eql(u8, authzid, "admin")) "admin" else null;
+}
+var test_external_anchor: u8 = 0;
+const test_external_lookup = sasl_mechrouter.ExternalLookup{ .ptr = &test_external_anchor, .verifyFn = testExternalVerify };
+
 fn testMultiOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
     return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "oper")) and
         std.mem.eql(u8, creds.password, "orochi");
@@ -17136,6 +17332,159 @@ test "threaded server: CERTLIST and CERTDEL use authenticated account bindings" 
     client.reset();
     try writeAllFd(fd, "CERTLIST\r\n");
     try recvUntil(&client, "CERTLIST: no certificate fingerprints bound", 200);
+}
+
+test "threaded server: SASLINFO advertises EXTERNAL when configured" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .sasl_external = test_external_lookup }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+
+    try writeAllFd(fd, "NICK SaslInfo\r\nUSER saslinfo 0 * :Sasl Info\r\n");
+    try recvUntil(&client, " 001 SaslInfo ", 200);
+
+    client.reset();
+    try writeAllFd(fd, "SASLINFO\r\n");
+    try recvUntil(&client, "SASL mechanisms: EXTERNAL", 200);
+}
+
+test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-channel-access.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+    _ = try services.registerAccount("carol", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    const fd_bob = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_bob);
+    var admin = LiveClient{ .fd = fd_admin };
+    var bob = LiveClient{ .fd = fd_bob };
+
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Founder\r\nUSER founder 0 * :Founder\r\n");
+    try writeAllFd(fd_bob, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&admin, " 381 Founder ", 200);
+    try recvUntil(&bob, " 001 Bob ", 200);
+
+    bob.reset();
+    try writeAllFd(fd_bob, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&bob, "You are now identified as bob", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL REGISTER #c\r\n");
+    try recvUntil(&admin, "Channel #c registered to admin", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL ACCESS #c ADD bob OP\r\n");
+    try recvUntil(&admin, "ACCESS #c bob OP", 200);
+
+    bob.reset();
+    try writeAllFd(fd_bob, "CHANNEL ACCESS #c ADD carol OP\r\n");
+    try recvUntil(&bob, "FAIL CHANNEL ACCESS_DENIED", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL ACCESS #c LIST\r\n");
+    try recvUntil(&admin, "ACCESS #c bob OP", 200);
+}
+
+test "threaded server: CHANNEL AKICK add mirrors to live join gate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-channel-akick.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    const fd_bad = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_bad);
+    var admin = LiveClient{ .fd = fd_admin };
+    var bad = LiveClient{ .fd = fd_bad };
+
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Founder\r\nUSER founder 0 * :Founder\r\n");
+    try writeAllFd(fd_bad, "NICK Bad\r\nUSER bad 0 * :Bad User\r\n");
+    try recvUntil(&admin, " 381 Founder ", 200);
+    try recvUntil(&bad, " 001 Bad ", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL REGISTER #c\r\n");
+    try recvUntil(&admin, "Channel #c registered to admin", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL AKICK #c ADD *!bad@localhost no bad\r\n");
+    try recvUntil(&admin, "AKICK added on #c: *!bad@localhost", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL AKICK #c LIST\r\n");
+    try recvUntil(&admin, "AKICK #c *!bad@localhost :no bad", 200);
+
+    bad.reset();
+    try writeAllFd(fd_bad, "JOIN #c\r\n");
+    try recvUntil(&bad, " 474 Bad #c :no bad", 200);
 }
 
 test "threaded server: ACCOUNT oper lifecycle command controls account auth" {

@@ -4,6 +4,7 @@
 const registry = @import("../registry.zig");
 const Core = @import("../module_core.zig").Core;
 const I = registry.CommandInvocation;
+const accounts_feature = "accounts";
 
 fn register(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
@@ -66,24 +67,49 @@ fn certDel(c: *anyopaque, _: I) anyerror!void {
     try x.server.handleCertDel(x.conn, x.parsed);
 }
 
+pub const REGISTER_spec = registry.CommandSpec{ .name = "REGISTER", .feature = accounts_feature, .handler = register };
+pub const VERIFY_spec = registry.CommandSpec{ .name = "VERIFY", .feature = accounts_feature, .handler = verify };
+pub const IDENTIFY_spec = registry.CommandSpec{ .name = "IDENTIFY", .feature = accounts_feature, .handler = identify };
+pub const LOGOUT_spec = registry.CommandSpec{ .name = "LOGOUT", .feature = accounts_feature, .handler = logout };
+pub const DROP_spec = registry.CommandSpec{ .name = "DROP", .feature = accounts_feature, .handler = drop };
+pub const ACCOUNTINFO_spec = registry.CommandSpec{ .name = "ACCOUNTINFO", .feature = accounts_feature, .handler = accountInfo };
+pub const ACCOUNT_spec = registry.CommandSpec{ .name = "ACCOUNT", .access = .oper, .feature = accounts_feature, .handler = account, .summary = "administer account lifecycle flags" };
+pub const SASLINFO_spec = registry.CommandSpec{ .name = "SASLINFO", .handler = saslInfo };
+pub const ACCOUNTSET_spec = registry.CommandSpec{ .name = "ACCOUNTSET", .feature = accounts_feature, .handler = accountSet };
+pub const GHOST_spec = registry.CommandSpec{ .name = "GHOST", .feature = accounts_feature, .handler = ghost };
+pub const CHANNEL_spec = registry.CommandSpec{ .name = "CHANNEL", .feature = accounts_feature, .handler = channel };
+pub const CS_spec = registry.CommandSpec{ .name = "CS", .feature = accounts_feature, .handler = channel };
+pub const SESSION_spec = registry.CommandSpec{ .name = "SESSION", .feature = accounts_feature, .handler = session };
+pub const CERTADD_spec = registry.CommandSpec{ .name = "CERTADD", .feature = accounts_feature, .handler = certAdd };
+pub const CERTLIST_spec = registry.CommandSpec{ .name = "CERTLIST", .feature = accounts_feature, .handler = certList };
+pub const CERTDEL_spec = registry.CommandSpec{ .name = "CERTDEL", .feature = accounts_feature, .handler = certDel };
+
 pub const module = registry.Module{
     .id = "accounts",
     .commands = &.{
-        .{ .name = "REGISTER", .handler = register },
-        .{ .name = "VERIFY", .handler = verify },
-        .{ .name = "IDENTIFY", .handler = identify },
-        .{ .name = "LOGOUT", .handler = logout },
-        .{ .name = "DROP", .handler = drop },
-        .{ .name = "ACCOUNTINFO", .handler = accountInfo },
-        .{ .name = "ACCOUNT", .access = .oper, .handler = account, .summary = "administer account lifecycle flags" },
-        .{ .name = "SASLINFO", .handler = saslInfo },
-        .{ .name = "ACCOUNTSET", .handler = accountSet },
-        .{ .name = "GHOST", .handler = ghost },
-        .{ .name = "CHANNEL", .handler = channel },
-        .{ .name = "CS", .handler = channel },
-        .{ .name = "SESSION", .handler = session },
-        .{ .name = "CERTADD", .handler = certAdd },
-        .{ .name = "CERTLIST", .handler = certList },
-        .{ .name = "CERTDEL", .handler = certDel },
+        REGISTER_spec,
+        VERIFY_spec,
+        IDENTIFY_spec,
+        LOGOUT_spec,
+        DROP_spec,
+        ACCOUNTINFO_spec,
+        ACCOUNT_spec,
+        SASLINFO_spec,
+        ACCOUNTSET_spec,
+        GHOST_spec,
+        CHANNEL_spec,
+        CS_spec,
+        SESSION_spec,
+        CERTADD_spec,
+        CERTLIST_spec,
+        CERTDEL_spec,
     },
 };
+
+test "accounts commands are feature gated except SASLINFO" {
+    const caps = registry.DispatchCaps{ .registered = true, .oper = true, .disabled_features = &.{"accounts"} };
+
+    try @import("std").testing.expect(!registry.commandAvailable(REGISTER_spec, caps));
+    try @import("std").testing.expect(!registry.commandAvailable(CHANNEL_spec, caps));
+    try @import("std").testing.expect(registry.commandAvailable(SASLINFO_spec, caps));
+}

@@ -648,6 +648,32 @@ pub const Services = struct {
         }
     }
 
+    pub fn channelAccessList(
+        self: *Services,
+        channel: []const u8,
+        actor: []const u8,
+        out: []AccessInfo,
+    ) ServiceError![]AccessInfo {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const record = try self.loadChannel(channel);
+        try self.requireAccess(record, actor, .admin);
+        var prefix_buf: [key_max]u8 = undefined;
+        const prefix = try prefixedKey(access_prefix, record.name.asSlice(), "", &prefix_buf);
+        var count: usize = 0;
+        var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const access = try decodeAccess(entry.value_ptr.*);
+            if (!sameBytes(generation_len, &access.generation, &record.generation)) continue;
+            if (count >= out.len) return error.BufferTooSmall;
+            out[count] = access.info();
+            count += 1;
+        }
+        return out[0..count];
+    }
+
     fn channelAccessUnlocked(
         self: *Services,
         channel: []const u8,
@@ -705,6 +731,32 @@ pub const Services = struct {
                 return self.channelAkickUnlocked(channel, actor, mask, action, reason, scratch);
             },
         }
+    }
+
+    pub fn channelAkickList(
+        self: *Services,
+        channel: []const u8,
+        actor: []const u8,
+        out: []AkickInfo,
+    ) ServiceError![]AkickInfo {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const record = try self.loadChannel(channel);
+        try self.requireAccess(record, actor, .admin);
+        var prefix_buf: [key_max]u8 = undefined;
+        const prefix = try prefixedKey(akick_prefix, record.name.asSlice(), "", &prefix_buf);
+        var count: usize = 0;
+        var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const akick = try decodeAkick(entry.value_ptr.*);
+            if (!sameBytes(generation_len, &akick.generation, &record.generation)) continue;
+            if (count >= out.len) return error.BufferTooSmall;
+            out[count] = akick.info();
+            count += 1;
+        }
+        return out[0..count];
     }
 
     fn channelAkickUnlocked(
