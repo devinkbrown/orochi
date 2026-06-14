@@ -41,15 +41,24 @@ PREFIX=(Qqov)~.@+, channel props, Event-Spine model, +h HIDDEN, extbans.
 
 ## IRCX — gaps (priority order)
 
-1. **PROP entity providers** — per the IRCX draft, PROP should expose entity
-   property providers (account / member_of / onjoin / onpart / opkey / ownerkey /
-   user_profile) on `ircx_prop_store`. Partial; enumerate + fill the missing ones.
-2. **LISTX filter completeness** — verify all IRCX LISTX filter tokens
-   (`<mask>`, `T>`/`T<` topic-age, `N>`/`N<` member-count, `C`reated) are honored.
-3. **ACCESS level coverage** — confirm OWNER/HOST/VOICE/GRANT/DENY + DELETE/CLEAR
-   verbs and the IRCX access numerics are complete vs. the Exchange chatsvc ref.
+1. **PROP entity providers** — DONE. Computed providers: channel
+   NAME/OID/CREATION/MEMBERCOUNT/MEMBERLIMIT and user MEMBER_OF + ACCOUNT (the
+   account provider was the last genuine gap, added 2026-06-14 in `userBuiltinGet`).
+   onjoin/onpart/opkey(HOSTKEY)/ownerkey(OWNERKEY) exist as stored props with
+   proper access tiers. `user_profile` deferred (no canonical data source).
+2. **LISTX filter completeness** — DONE (2026-06-14). The handler now feeds the
+   matcher real channel data for every filter — `<mask>`, name/topic/subject/
+   language masks, `C`/`T` age thresholds (wall-clock ms), member-count, and
+   `R=` registered — plus an `816 RPL_LISTXTRUNC` cap. Engine (`listx.zig`) was
+   already complete; the gap was handler wiring.
+3. **ACCESS level coverage** — DONE/confirmed. `handleAccess` supports list/add/
+   delete/clear over FOUNDER/OWNER/HOST/VOICE/GRANT/DENY with tiered auth
+   (`accessCanManage`), numerics 801-805 + 913-916, and JOIN-time DENY (474) /
+   GRANT auto-status enforcement (`matchHostmask`). No gap found.
 4. **IRCX numeric conformance sweep** — re-verify the IRCX numeric set against the
-   recovered Exchange/OfficeIRC reference for any missing replies.
+   recovered Exchange/OfficeIRC reference for any missing replies. (Still open: a
+   research sweep against the chatsvc RE, distinct from the now-complete ACCESS
+   numeric set above.)
 
 Out of scope: IRCX AUTH packages (GateKeeper/Passport/ANON) — legacy auth, replaced
 by SASL.
