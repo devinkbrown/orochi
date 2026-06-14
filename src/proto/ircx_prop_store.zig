@@ -515,12 +515,12 @@ pub fn parseParamsBounded(comptime params: Params, params_slice: []const []const
 
     if (params_slice.len == 1) return .{ .list = entity };
 
-    if (std.mem.eql(u8, params_slice[1], "CLEAR")) {
+    if (std.ascii.eqlIgnoreCase(params_slice[1], "CLEAR")) {
         if (params_slice.len != 2) return error.TooManyParams;
         return .{ .delete = .{ .entity = entity, .key = "" } };
     }
 
-    if (std.mem.eql(u8, params_slice[1], "GET")) {
+    if (std.ascii.eqlIgnoreCase(params_slice[1], "GET")) {
         if (params_slice.len < 3) return error.NeedMoreParams;
         if (params_slice.len > 3) return error.TooManyParams;
         const keys = params_slice[2];
@@ -528,7 +528,7 @@ pub fn parseParamsBounded(comptime params: Params, params_slice: []const []const
         return .{ .get = .{ .entity = entity, .keys = keys } };
     }
 
-    if (std.mem.eql(u8, params_slice[1], "SET")) {
+    if (std.ascii.eqlIgnoreCase(params_slice[1], "SET")) {
         if (params_slice.len < 3) return error.NeedMoreParams;
         const key = params_slice[2];
         try validateKeyWithLimit(key, params.max_key);
