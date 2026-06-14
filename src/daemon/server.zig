@@ -901,6 +901,11 @@ const Numeric = enum(u16) {
     RPL_TESTMASK = 727,
     RPL_ACCEPTLIST = 281,
     RPL_ENDOFACCEPT = 282,
+    // Caller-id (+g / ACCEPT) DM gating: 716 to the blocked sender, 717 optional
+    // target-notify to the sender, 718 one-shot notice to the +g recipient.
+    ERR_CANTSENDTOUSER = 716,
+    RPL_TARGNOTIFY = 717,
+    RPL_UMODEGMSG = 718,
     RPL_KNOCK = 710,
     RPL_KNOCKDLVR = 711,
     ERR_CHANOPEN = 713,
@@ -15571,6 +15576,36 @@ pub const LinuxServer = struct {
                 }
             }
         }
+        // +g callerid: a recipient in +g mode only receives DMs from senders on
+        // its ACCEPT list. Unaccepted senders are dropped: the sender gets 716
+        // (ERR_CANTSENDTOUSER) and the recipient is notified once with 718
+        // (RPL_UMODEGMSG). Opers and same-account siblings bypass the gate, and a
+        // client can always message its own nick.
+        if (recipient_conn) |rconn| {
+            if (rconn.session.umodes.contains(.callerid)) {
+                const sender_nick = conn.session.displayName();
+                const self_msg = recipient_id.eql(id);
+                const accepted = self.accepts.contains(target, sender_nick) catch false;
+                const sender_account = conn.session.account();
+                const same_account = if (sender_account) |sa|
+                    if (rconn.session.account()) |ra| std.mem.eql(u8, sa, ra) else false
+                else
+                    false;
+                const bypass = self_msg or accepted or conn.session.isOper() or same_account;
+                if (!bypass) {
+                    if (!is_notice) {
+                        try queueNumeric(conn, .ERR_CANTSENDTOUSER, &.{target}, "is in +g mode (must be accepted)");
+                        try queueNumeric(conn, .RPL_TARGNOTIFY, &.{target}, "has been informed that you messaged them");
+                    }
+                    try queueNumeric(rconn, .RPL_UMODEGMSG, &.{ sender_nick, "G" }, "is messaging you, and you have umode +g set. Use ACCEPT to allow");
+                    // 718 is queued onto the recipient's connection (not the one
+                    // being processed), so its send buffer must be armed explicitly
+                    // or the bytes never reach the socket this reactor cycle.
+                    try self.armSendIfNeeded(rconn);
+                    return;
+                }
+            }
+        }
         // SILENCE: if the recipient has silenced a mask matching the sender, drop
         // the message silently (no error to the sender — ircu/charybdis behavior).
         {
@@ -21556,6 +21591,60 @@ test "threaded server: ACCEPT add + list" {
     try writeAllFd(fd_a, "ACCEPT\r\n");
     try recvUntil(&a, " 281 A bob", 200);
     try recvUntil(&a, " 282 A ", 200);
+}
+
+test "threaded server: +g callerid gates DM until sender is accepted" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Two distinct clients: A (sender), B (recipient). Neither is an oper or
+    // shares an account, so the +g gate is the only thing that can block A.
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    // B enables caller-id (+g): only accepted senders may DM it.
+    try writeAllFd(fd_b, "MODE B +g\r\n");
+    try recvUntil(&b, "MODE B +g", 200);
+
+    // A (not on B's accept list) DMs B → A gets 716, B gets 718, and the DM
+    // body never reaches B.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :blocked-by-callerid\r\n");
+    try recvUntil(&a, " 716 A B :is in +g mode", 200);
+    try recvUntil(&b, " 718 B A ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "blocked-by-callerid") == null);
+
+    // B accepts A; confirm the add landed (ACCEPT list shows A) before resending
+    // so the PRIVMSG cannot race ahead of the accept-list mutation.
+    b.reset();
+    try writeAllFd(fd_b, "ACCEPT +A\r\nACCEPT\r\n");
+    try recvUntil(&b, " 281 B A", 200);
+    try recvUntil(&b, " 282 B ", 200);
+
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :now-delivered\r\n");
+    try recvUntil(&b, "PRIVMSG B :now-delivered", 200);
 }
 
 test "threaded server: METADATA set then get" {

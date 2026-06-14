@@ -221,6 +221,13 @@ pub const Numeric = enum(u16) {
     ERR_INVALIDKEY = 525,
     ERR_NOCOMICDATA = 531,
 
+    // Caller-id (usermode +g / ACCEPT). When a +g recipient has not accepted the
+    // sender, the DM is dropped: the sender gets 716 (and optionally 717), and
+    // the recipient is notified once with 718.
+    ERR_CANTSENDTOUSER = 716,
+    RPL_TARGNOTIFY = 717,
+    RPL_UMODEGMSG = 718,
+
     RPL_LOGGEDIN = 900,
     RPL_LOGGEDOUT = 901,
     ERR_NICKLOCKED = 902,
