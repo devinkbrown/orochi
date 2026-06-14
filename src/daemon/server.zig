@@ -11047,15 +11047,30 @@ pub const LinuxServer = struct {
         return null;
     }
 
-    /// Computed IRCX built-in property for a `user` entity. MEMBER_OF (aka
-    /// MEMBEROF) lists the channels the target user is in, space-separated, with
-    /// the same visibility filter as WHOIS: secret/private channels are omitted
-    /// unless the requester is the target, an operator, or a member. GET-only,
-    /// like the channel built-ins (computed, not stored).
+    /// Computed IRCX built-in properties for a `user` entity. GET-only (computed,
+    /// not stored), consulted ahead of the generic store:
+    ///   - MEMBER_OF (aka MEMBEROF): the channels the target is in, space-
+    ///     separated, with the WHOIS visibility filter (secret/private channels
+    ///     omitted unless the requester is the target, an operator, or a member).
+    ///   - ACCOUNT: the target's logged-in services account. Public (mirrors
+    ///     WHOIS 330 / `account-tag`), so no visibility gate. Local target only —
+    ///     a remote (mesh) user has no local ConnState, so the provider declines.
     fn userBuiltinGet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, buf: []u8, requester_id: client_model.ClientId, conn: *const ConnState) ?[]const u8 {
         if (entity.kind != .user) return null;
-        if (!std.ascii.eqlIgnoreCase(key, "MEMBER_OF") and !std.ascii.eqlIgnoreCase(key, "MEMBEROF")) return null;
+        const is_member_of = std.ascii.eqlIgnoreCase(key, "MEMBER_OF") or std.ascii.eqlIgnoreCase(key, "MEMBEROF");
+        const is_account = std.ascii.eqlIgnoreCase(key, "ACCOUNT");
+        if (!is_member_of and !is_account) return null;
         const target_wid = self.world.findNick(entity.id) orelse return null;
+
+        if (is_account) {
+            const target_cid = client_model.ClientId{ .shard = target_wid.shard, .slot = target_wid.slot, .gen = target_wid.gen };
+            const tconn = self.connFor(target_cid) orelse return null;
+            const acct = tconn.session.account() orelse return null;
+            if (acct.len == 0 or acct.len > buf.len) return null;
+            @memcpy(buf[0..acct.len], acct);
+            return buf[0..acct.len];
+        }
+
         const requester_wid = worldIdFromClient(requester_id);
         const sees_all = conn.session.isOper() or requester_wid.eql(target_wid);
         var names: [64][]const u8 = undefined;
@@ -21780,6 +21795,59 @@ test "threaded server: PROP user MEMBER_OF lists visible channels (WHOIS filter)
     try recvUntil(&a, " 818 A A MEMBER_OF :", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "#mpub") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "#msec") != null);
+}
+
+test "threaded server: PROP user ACCOUNT provider returns the target's login" {
+    // Proves the computed USER ACCOUNT provider returns the target's real
+    // services account (public, like WHOIS 330), ahead of the generic store.
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A logs into the "admin" services account via SASL.
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 900 ", 200); // RPL_LOGGEDIN — A is now account "admin"
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+
+    // B (unauthenticated) opts into IRCX and asks for A's account.
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "PROP A GET ACCOUNT\r\n");
+    try recvUntil(&b, " 818 B A ACCOUNT :admin", 200);
+    try recvUntil(&b, " 819 B A ", 200);
+
+    // An unauthenticated target yields no ACCOUNT value (provider declines).
+    b.reset();
+    try writeAllFd(fd_b, "PROP B GET ACCOUNT\r\n");
+    try recvUntil(&b, " 819 B B ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "ACCOUNT :") == null);
 }
 
 test "threaded server: HOSTKEY PROP grants op on keyed join without client disclosure" {
