@@ -1,6 +1,6 @@
 # Orochi Modes
 
-This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOA` from `src/proto/protocol_inventory.zig:36`; the advertised status-prefix token is `PREFIX=(Qqov)!.@+` from `src/proto/protocol_inventory.zig:56` and `src/daemon/chanmode.zig:310`.
+This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVU` from `src/proto/protocol_inventory.zig` (`chanmodes_token`); the advertised status-prefix token is `PREFIX=(YQqov)*!.@+` from `src/daemon/chanmode.zig` (`MemberModes.isupport_prefix`) — the `Y`/`*` network-operator tier sits above founder. (`V` = NOCOMICDATA and `U` = OPMODERATE are live IRCX flag modes; see below.)
 
 ## User Modes
 
