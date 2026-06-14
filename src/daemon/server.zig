@@ -7550,10 +7550,35 @@ pub const LinuxServer = struct {
 
     /// Notify MONITOR watchers that `nick` just came online (on registration).
     fn monitorOnline(self: *LinuxServer, nick: []const u8) !void {
+        const watcher_count = self.monitor.watcherCount(nick);
         var replies_buf: [64]monitor.MonitorReply = undefined;
-        var storage: [default_reply_bytes]u8 = undefined;
-        var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
-        self.monitor.setOnline(nick, &sink) catch return;
+        var allocated_replies: ?[]monitor.MonitorReply = null;
+        defer if (allocated_replies) |buf| self.allocator.free(buf);
+        const replies = if (watcher_count <= replies_buf.len) replies_buf[0..] else blk: {
+            const buf = try self.allocator.alloc(monitor.MonitorReply, watcher_count);
+            allocated_replies = buf;
+            break :blk buf;
+        };
+
+        var storage_buf: [default_reply_bytes]u8 = undefined;
+        var allocated_storage: ?[]u8 = null;
+        defer if (allocated_storage) |buf| self.allocator.free(buf);
+        const storage_len = @max(default_reply_bytes, watcher_count * @max(nick.len, @as(usize, 1)));
+        const storage = if (storage_len <= storage_buf.len) storage_buf[0..] else blk: {
+            const buf = try self.allocator.alloc(u8, storage_len);
+            allocated_storage = buf;
+            break :blk buf;
+        };
+
+        var sink = monitor.MonitorReplySink{ .replies = replies, .storage = storage };
+        self.monitor.setOnline(nick, &sink) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooManyReplies, error.OutputTooSmall => {
+                try self.flushMonitorReplies(&sink);
+                return;
+            },
+            else => return,
+        };
         try self.flushMonitorReplies(&sink);
     }
 
@@ -10883,6 +10908,10 @@ pub const LinuxServer = struct {
     /// METADATA <target> <GET|LIST|SET|CLEAR> [key [:value]] — IRCv3 metadata-2.
     /// Per-target key/value store; RPL_KEYVALUE (761) + RPL_METADATAEND (762).
     pub fn handleMetadata(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.hasCap(.metadata_2)) {
+            try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{"METADATA"}, "Unknown command");
+            return;
+        }
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"METADATA"}, "Not enough parameters");
             return;
@@ -10899,7 +10928,7 @@ pub const LinuxServer = struct {
             while (i < parsed.param_count) : (i += 1) {
                 const key = parsed.paramSlice()[i];
                 if (self.metadata.get(store_target, key)) |ev| {
-                    try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, ev.value);
+                    try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, ev.ircv3VisibilityToken() }, ev.value);
                 } else |_| {
                     try queueNumeric(conn, .ERR_KEYNOTSET, &.{ target, key }, "key not set");
                 }
@@ -10907,7 +10936,7 @@ pub const LinuxServer = struct {
         } else if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
             var views: [64]metadata_store.EntryView = undefined;
             const all = self.metadata.list(store_target, &views) catch views[0..0];
-            for (all) |ev| try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, ev.key, "*" }, ev.value);
+            for (all) |ev| try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, ev.key, ev.ircv3VisibilityToken() }, ev.value);
         } else if (std.ascii.eqlIgnoreCase(sub, "SET")) {
             if (parsed.param_count < 3) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"METADATA"}, "Not enough parameters");
@@ -10922,15 +10951,25 @@ pub const LinuxServer = struct {
             }
             const key = parsed.paramSlice()[2];
             if (parsed.param_count >= 4 and parsed.paramSlice()[3].len != 0) {
-                const value = parsed.paramSlice()[3];
-                _ = self.metadata.set(store_target, key, value) catch {
+                var visibility: metadata_store.Visibility = .public;
+                var value_index: usize = 3;
+                if (parsed.param_count >= 5) {
+                    visibility = metadata_store.Visibility.fromToken(parsed.paramSlice()[3]) orelse {
+                        try queueNumeric(conn, .ERR_KEYINVALID, &.{ target, key }, "invalid visibility");
+                        return;
+                    };
+                    value_index = 4;
+                }
+                const value = parsed.paramSlice()[value_index];
+                const ev = self.metadata.setWithVisibility(store_target, key, value, visibility) catch {
                     try queueNumeric(conn, .ERR_KEYINVALID, &.{ target, key }, "invalid key");
                     return;
                 };
-                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, value);
+                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, ev.ircv3VisibilityToken() }, value);
             } else {
+                const visibility = if (self.metadata.get(store_target, key)) |ev| ev.ircv3VisibilityToken() else |_| metadata_store.Visibility.public.token();
                 self.metadata.delete(store_target, key) catch {};
-                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, "");
+                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, visibility }, "");
             }
         } else if (std.ascii.eqlIgnoreCase(sub, "CLEAR")) {
             if (!self.metadataCanWrite(id, conn, target)) {
@@ -10945,8 +10984,9 @@ pub const LinuxServer = struct {
                 if (ev.key.len > key_buf.len) continue;
                 @memcpy(key_buf[0..ev.key.len], ev.key);
                 const key = key_buf[0..ev.key.len];
+                const visibility = ev.ircv3VisibilityToken();
                 self.metadata.delete(store_target, key) catch {};
-                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, "*" }, "");
+                try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, visibility }, "");
             }
         }
         try queueNumeric(conn, .RPL_METADATAEND, &.{}, "end of metadata");
@@ -11538,7 +11578,7 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
         const msg = try formatMessage(&msg_buf, prefix, "SETNAME", &.{}, newname);
-        try self.deliver(id, msg); // echo to self
+        if (conn.session.hasCap(.setname)) try self.deliver(id, msg); // echo to self
         try self.notifyCommonChannels(id, msg, .setname, id, conn.session.displayName());
     }
 
@@ -14303,8 +14343,16 @@ pub const LinuxServer = struct {
         // NOT already share a channel (those are in `seen`) and negotiated the
         // cap. Keeps the no-duplicate guarantee against the channel fan-out.
         if (monitor_nick) |nick| {
-            var watchers: [128]monitor.ClientId = undefined;
-            const n = self.monitor.watchersOf(nick, &watchers);
+            const watcher_count = self.monitor.watcherCount(nick);
+            var watchers_buf: [128]monitor.ClientId = undefined;
+            var allocated_watchers: ?[]monitor.ClientId = null;
+            defer if (allocated_watchers) |buf| self.allocator.free(buf);
+            const watchers = if (watcher_count <= watchers_buf.len) watchers_buf[0..watcher_count] else blk: {
+                const buf = try self.allocator.alloc(monitor.ClientId, watcher_count);
+                allocated_watchers = buf;
+                break :blk buf;
+            };
+            const n = self.monitor.watchersOf(nick, watchers);
             for (watchers[0..n]) |w| {
                 const wid = clientIdFromMonitor(w);
                 if (wid.eql(except)) continue;
@@ -16580,7 +16628,7 @@ test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
     var b = LiveClient{ .fd = fd_b };
 
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
-    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_b, "CAP REQ :draft/metadata-2\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&b, " 001 B ", 200);
 
@@ -16936,7 +16984,7 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
-    try saslAdminPrelude(fd_a); // A authenticates as the admin oper account
+    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "setname"); // A authenticates as the admin oper account
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
@@ -17013,6 +17061,34 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     try recvUntil(&b, "KILL B :spam\r\n", 200);
     // Oper A (subscribed) also sees the KILL as an Event Spine notice.
     try recvUntil(&a, "NOTE EVENT KILL ", 200);
+}
+
+test "threaded server: SETNAME self echo requires setname cap" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "SETNAME :No Echo\r\nPING :setname-gate\r\n");
+    try recvUntil(&a, "PONG :setname-gate", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "SETNAME :No Echo\r\n") == null);
 }
 
 test "threaded server: channel-mode enforcement +k/+l/+b/+i end-to-end" {
@@ -19639,15 +19715,15 @@ test "threaded server: METADATA set then get" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/metadata-2\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     a.reset();
-    try writeAllFd(fd_a, "METADATA * SET url :http://x\r\n");
-    try recvUntil(&a, " 761 A * url ", 200);
+    try writeAllFd(fd_a, "METADATA * SET url secret :http://x\r\n");
+    try recvUntil(&a, " 761 A * url secret :http://x", 200);
     try recvUntil(&a, " 762 A ", 200);
     a.reset();
     try writeAllFd(fd_a, "METADATA * GET url\r\n");
-    try recvUntil(&a, " 761 A * url * :http://x", 200);
+    try recvUntil(&a, " 761 A * url secret :http://x", 200);
     // Writing another user's metadata is denied (ERR_KEYNOPERMISSION 769).
     a.reset();
     try writeAllFd(fd_a, "METADATA Bob SET url :http://y\r\n");
@@ -19657,11 +19733,35 @@ test "threaded server: METADATA set then get" {
     const fd_b = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_b);
     var b = LiveClient{ .fd = fd_b };
-    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_b, "CAP REQ :draft/metadata-2\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try recvUntil(&b, " 001 B ", 200);
     b.reset();
     try writeAllFd(fd_b, "METADATA * GET url\r\n");
     try recvUntil(&b, " 766 B * url ", 200);
+}
+
+test "threaded server: METADATA requires draft metadata cap" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "METADATA * GET url\r\n");
+    try recvUntil(&a, " 421 A METADATA :Unknown command", 200);
 }
 
 test "threaded server: METADATA clear removes writable keys" {
@@ -19681,7 +19781,7 @@ test "threaded server: METADATA clear removes writable keys" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/metadata-2\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
 
     a.reset();
@@ -20373,6 +20473,59 @@ test "threaded server: MONITOR online/offline/list end-to-end" {
     try writeAllFd(fd_b, "QUIT :bye\r\n");
     try recvUntil(&a, " 731 A :B", 200);
     closeFd(fd_b);
+}
+
+test "threaded server: MONITOR online fanout flushes beyond fixed sink size" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const watcher_count = 65;
+    var fds: [watcher_count]linux.fd_t = undefined;
+    var clients: [watcher_count]LiveClient = undefined;
+    var connected: usize = 0;
+    defer for (fds[0..connected]) |fd| closeFd(fd);
+
+    for (0..watcher_count) |i| {
+        fds[i] = connectLoopback(port) catch return error.SkipZigTest;
+        connected += 1;
+        clients[i] = LiveClient{ .fd = fds[i] };
+        var reg_buf: [80]u8 = undefined;
+        const reg = std.fmt.bufPrint(&reg_buf, "NICK W{d}\r\nUSER w{d} 0 * :Watcher {d}\r\n", .{ i, i, i }) catch unreachable;
+        try writeAllFd(fds[i], reg);
+    }
+    for (0..watcher_count) |i| {
+        var need: [16]u8 = undefined;
+        const needle = std.fmt.bufPrint(&need, " 001 W{d} ", .{i}) catch unreachable;
+        try recvUntil(&clients[i], needle, 400);
+        clients[i].reset();
+        try writeAllFd(fds[i], "MONITOR + Target\r\n");
+        try recvUntil(&clients[i], " 731 W", 400);
+        clients[i].reset();
+    }
+
+    const fd_target = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_target);
+    var target = LiveClient{ .fd = fd_target };
+    try writeAllFd(fd_target, "NICK Target\r\nUSER target 0 * :Target\r\n");
+    try recvUntil(&target, " 001 Target ", 400);
+
+    for (0..watcher_count) |i| {
+        var need: [64]u8 = undefined;
+        const needle = std.fmt.bufPrint(&need, " 730 W{d} :Target!target@localhost", .{i}) catch unreachable;
+        try recvUntil(&clients[i], needle, 400);
+    }
 }
 
 test "threaded server: live S2S listener completes a peer handshake" {

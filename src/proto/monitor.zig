@@ -271,6 +271,12 @@ pub const MonitorStore = struct {
         return n;
     }
 
+    pub fn watcherCount(self: *MonitorStore, nick: []const u8) usize {
+        const key = NickKey.init(nick, true) catch return 0;
+        const watchers = self.reverse.getPtr(key) orelse return 0;
+        return watchers.count();
+    }
+
     pub fn isMonitoring(self: *MonitorStore, client: ClientId, target: []const u8) MonitorError!bool {
         const normalized = try NickKey.init(target, true);
         const state = self.clients.getPtr(client) orelse return false;
@@ -543,6 +549,34 @@ test "watchersOf lists the clients monitoring a nick (case-insensitive)" {
     }
     try std.testing.expect(saw1 and saw3);
     try std.testing.expectEqual(@as(usize, 0), store.watchersOf("nobody", &out));
+}
+
+test "watchersOf can return more than the old fixed fanout buffer" {
+    var store = MonitorStore.init(std.testing.allocator, 8);
+    defer store.deinit();
+    var replies: [1]MonitorReply = undefined;
+    var storage: [64]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+
+    const watcher_count = 129;
+    var client: ClientId = 1;
+    while (client <= watcher_count) : (client += 1) {
+        sink.count = 0;
+        sink.used = 0;
+        try store.addTargets(client, "Alice", &sink);
+    }
+
+    try std.testing.expectEqual(@as(usize, watcher_count), store.watcherCount("ALICE"));
+    var out: [watcher_count]ClientId = undefined;
+    const n = store.watchersOf("alice", &out);
+    try std.testing.expectEqual(@as(usize, watcher_count), n);
+
+    var saw = [_]bool{false} ** watcher_count;
+    for (out[0..n]) |watcher| {
+        try std.testing.expect(watcher >= 1 and watcher <= watcher_count);
+        saw[@intCast(watcher - 1)] = true;
+    }
+    for (saw) |present| try std.testing.expect(present);
 }
 
 test "offline transition notifies watchers" {

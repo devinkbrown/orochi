@@ -322,6 +322,20 @@ test "extended-monitor sink reports too many recipients" {
     try expectRecipient(sink.slice()[0], 1);
 }
 
+test "extended-monitor selects more than the old fixed daemon watcher buffer" {
+    const count = 129;
+    var watchers: [count]Watcher = undefined;
+    for (&watchers, 0..) |*watcher, i| {
+        watcher.* = .{ .client = @intCast(i + 1), .monitors_target = true, .has_cap = true };
+    }
+    var storage: [count]Recipient = undefined;
+    var sink = Sink{ .recipients = &storage };
+
+    try selectRecipients("alice", &watchers, &sink);
+    try std.testing.expectEqual(@as(usize, count), sink.slice().len);
+    for (sink.slice(), 0..) |recipient, i| try expectRecipient(recipient, @intCast(i + 1));
+}
+
 test "generic notification builder emits passthrough line" {
     var buf: [128]u8 = undefined;
     const line = try buildNotificationLine(&buf, .{
