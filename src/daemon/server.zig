@@ -8097,19 +8097,29 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// `VERIFY <code>` — confirm a pending account email verification issued at
-    /// REGISTER time. Backed by account_verify.
+    /// `VERIFY [account] <code>` — confirm a pending account email verification
+    /// issued at REGISTER time. The one-argument form keeps legacy behaviour by
+    /// using the caller's logged-in account.
     pub fn handleVerify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        const account = conn.session.account() orelse {
-            try self.failReply(conn, "VERIFY", "ACCOUNT_REQUIRED", "Log in before verifying");
-            return;
-        };
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
-            try self.noticeTo(conn, "Usage: VERIFY <code>");
+            try self.noticeTo(conn, "Usage: VERIFY [account] <code>");
             return;
         }
+        const params = parsed.paramSlice();
+        var account: []const u8 = undefined;
+        var code: []const u8 = undefined;
+        if (parsed.param_count >= 2 and params[1].len != 0) {
+            account = params[0];
+            code = params[1];
+        } else {
+            account = conn.session.account() orelse {
+                try self.failReply(conn, "VERIFY", "ACCOUNT_REQUIRED", "Log in before verifying");
+                return;
+            };
+            code = params[0];
+        }
         const now_u: u64 = @intCast(@max(0, self.nowMs()));
-        switch (self.account_verifies.confirm(account, parsed.paramSlice()[0], now_u)) {
+        switch (self.account_verifies.confirm(account, code, now_u)) {
             .verified => try self.noticeTo(conn, "VERIFY: your account email is now verified"),
             .expired => try self.failReply(conn, "VERIFY", "EXPIRED", "Verification code expired; re-register or request a new one"),
             .no_pending => try self.noticeTo(conn, "VERIFY: nothing to verify for your account"),
@@ -11938,7 +11948,8 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "REGISTER", "NEED_MORE_PARAMS", "Usage: REGISTER <account> <email|*> <password>");
             return;
         }
-        const account = parsed.paramSlice()[0];
+        const requested_account = parsed.paramSlice()[0];
+        const account = if (std.mem.eql(u8, requested_account, "*")) conn.session.displayName() else requested_account;
         const password = parsed.paramSlice()[2];
         var scratch: [1024]u8 = undefined;
         _ = svc.registerAccount(account, password, &scratch) catch |err| {
@@ -12263,7 +12274,11 @@ pub const LinuxServer = struct {
             return;
         };
         var scratch: [512]u8 = undefined;
-        _ = svc.setAccount(account, p[1], field, &scratch) catch {
+        _ = svc.setAccount(account, p[1], field, &scratch) catch |err| {
+            if (err == error.Forbidden) {
+                try self.failReply(conn, "ACCOUNTSET", "PRIVILEGED_FLAGS", "Lifecycle flags require service_admin");
+                return;
+            }
             try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
             return;
         };
@@ -12282,7 +12297,11 @@ pub const LinuxServer = struct {
             return;
         }
         const target = parsed.paramSlice()[0];
-        _ = svc.ghostAccount(target, parsed.paramSlice()[1], target) catch {
+        const account = conn.session.account() orelse {
+            try self.failReply(conn, "GHOST", "ACCOUNT_REQUIRED", "Log in before ghosting a nick");
+            return;
+        };
+        _ = svc.ghostAccount(account, parsed.paramSlice()[1], target) catch {
             try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
             return;
         };
@@ -16739,6 +16758,163 @@ test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
     admin.reset();
     try writeAllFd(fd_admin, "ACCOUNT NOEXPIRE bob off\r\n");
     try recvUntil(&admin, "noexpire=false", 200);
+}
+
+test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects lifecycle flags" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-accountset-register-star.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+
+    try writeAllFd(fd, "NICK StarNick\r\nUSER star 0 * :Star Nick\r\n");
+    try recvUntil(&client, " 001 StarNick ", 200);
+
+    client.reset();
+    try writeAllFd(fd, "REGISTER * * correcthorse\r\n");
+    try recvUntil(&client, "REGISTER SUCCESS StarNick", 200);
+
+    client.reset();
+    try writeAllFd(fd, "ACCOUNTSET StarNick correcthorse flags 1\r\n");
+    try recvUntil(&client, "FAIL ACCOUNTSET PRIVILEGED_FLAGS", 200);
+
+    client.reset();
+    try writeAllFd(fd, "ACCOUNTSET StarNick correcthorse flags 4\r\n");
+    try recvUntil(&client, "FAIL ACCOUNTSET PRIVILEGED_FLAGS", 200);
+
+    client.reset();
+    try writeAllFd(fd, "ACCOUNTSET StarNick correcthorse flags 8\r\n");
+    try recvUntil(&client, "Account StarNick updated (flags)", 200);
+
+    const info = try services.accountInfo("starnick");
+    try std.testing.expectEqual(@as(u32, 8), info.account_info.flags);
+    try std.testing.expectError(error.InvalidName, services.accountInfo("*"));
+}
+
+test "threaded server: VERIFY accepts account argument and legacy code form" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-verify-account-arg.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const now_u: u64 = @intCast(@max(0, server.nowMs()));
+    var alice_bytes = [_]u8{0x11} ** 16;
+    const alice_token = try server.account_verifies.issue("alice", "alice@example.test", &alice_bytes, now_u);
+    var alice_verify_buf: [128]u8 = undefined;
+    const alice_verify = try std.fmt.bufPrint(&alice_verify_buf, "VERIFY alice {s}\r\n", .{alice_token});
+
+    var bob_bytes = [_]u8{0x22} ** 16;
+    const bob_token = try server.account_verifies.issue("bob", "bob@example.test", &bob_bytes, now_u);
+    var bob_verify_buf: [128]u8 = undefined;
+    const bob_verify = try std.fmt.bufPrint(&bob_verify_buf, "VERIFY {s}\r\n", .{bob_token});
+
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var alice = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK Verifier\r\nUSER verifier 0 * :Verifier\r\n");
+    try recvUntil(&alice, " 001 Verifier ", 200);
+    alice.reset();
+    try writeAllFd(fd_a, alice_verify);
+    try recvUntil(&alice, "VERIFY: your account email is now verified", 200);
+
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var bob = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&bob, " 001 Bob ", 200);
+    bob.reset();
+    try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&bob, "You are now identified as bob", 200);
+    bob.reset();
+    try writeAllFd(fd_b, bob_verify);
+    try recvUntil(&bob, "VERIFY: your account email is now verified", 200);
+}
+
+test "threaded server: GHOST authenticates caller account for non-account nick" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-ghost-caller-account.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_victim = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_victim);
+    const fd_alice = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_alice);
+    var victim = LiveClient{ .fd = fd_victim };
+    var alice = LiveClient{ .fd = fd_alice };
+
+    try writeAllFd(fd_victim, "NICK AwayNick\r\nUSER away 0 * :Away Nick\r\n");
+    try writeAllFd(fd_alice, "NICK Alice\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&victim, " 001 AwayNick ", 200);
+    try recvUntil(&alice, " 001 Alice ", 200);
+
+    alice.reset();
+    try writeAllFd(fd_alice, "IDENTIFY alice correcthorse\r\n");
+    try recvUntil(&alice, "You are now identified as alice", 200);
+
+    victim.reset();
+    alice.reset();
+    try writeAllFd(fd_alice, "GHOST AwayNick correcthorse\r\n");
+    try recvUntil(&alice, "Ghost session for AwayNick removed", 200);
+    try recvUntil(&victim, "ERROR :Ghosted by Alice", 200);
 }
 
 test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {

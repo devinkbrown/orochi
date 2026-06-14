@@ -146,6 +146,7 @@ pub const ChannelRef = struct { name: ChannelName };
 pub const account_flag_suspended: u32 = 1 << 0;
 pub const account_flag_forbidden: u32 = 1 << 1;
 pub const account_flag_noexpire: u32 = 1 << 2;
+pub const account_flags_privileged: u32 = account_flag_suspended | account_flag_forbidden | account_flag_noexpire;
 
 pub const AccountInfo = struct {
     name: AccountName,
@@ -502,7 +503,11 @@ pub const Services = struct {
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         switch (field) {
             .email => |email| record.email = try validateEmail(email),
-            .flags => |flags| record.flags = flags,
+            .flags => |flags| {
+                const preserved = record.flags & account_flags_privileged;
+                if ((flags & account_flags_privileged) != preserved) return error.Forbidden;
+                record.flags = preserved | (flags & ~account_flags_privileged);
+            },
         }
         const encoded = try encodeAccount(record, scratch);
         try self.store.family(.accounts).put(record.name.asSlice(), encoded);
@@ -1365,6 +1370,49 @@ test "account lifecycle flags round-trip and persist" {
         try std.testing.expect(!reserved.registered);
         try std.testing.expect(reserved.forbidden());
     }
+}
+
+test "setAccount refuses password-holder lifecycle flag changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-accountset-lifecycle-denied.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    try std.testing.expectError(error.Forbidden, services.setAccount("alice", "correct horse battery staple", .{ .flags = account_flag_suspended }, &scratch));
+    try std.testing.expectError(error.Forbidden, services.setAccount("alice", "correct horse battery staple", .{ .flags = account_flag_noexpire }, &scratch));
+
+    const display_pref: u32 = 1 << 8;
+    const changed = try services.setAccount("alice", "correct horse battery staple", .{ .flags = display_pref }, &scratch);
+    try std.testing.expectEqual(display_pref, changed.set_account.flags);
+
+    var admin = try services.setAccountNoExpire("alice", true, &scratch);
+    try std.testing.expect(admin.noexpire());
+    try std.testing.expectError(error.Forbidden, services.setAccount("alice", "correct horse battery staple", .{ .flags = display_pref }, &scratch));
+
+    const with_pref = try services.setAccount("alice", "correct horse battery staple", .{ .flags = display_pref | account_flag_noexpire }, &scratch);
+    try std.testing.expectEqual(display_pref | account_flag_noexpire, with_pref.set_account.flags);
+    admin = try services.adminAccountInfo("alice");
+    try std.testing.expect(admin.noexpire());
+}
+
+test "ghostAccount authenticates account separately from target nick" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-ghost-nick.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    const ghosted = try services.ghostAccount("alice", "correct horse battery staple", "AwayNick");
+    try std.testing.expectEqualStrings("alice", ghosted.ghosted.account.asSlice());
+    try std.testing.expectEqualStrings("AwayNick", ghosted.ghosted.nick.asSlice());
+    try std.testing.expectError(error.NotFound, services.ghostAccount("AwayNick", "correct horse battery staple", "AwayNick"));
 }
 
 test "scram credentials persist across store reopen via loader" {
