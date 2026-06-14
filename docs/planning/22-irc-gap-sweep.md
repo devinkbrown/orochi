@@ -103,27 +103,21 @@ residual in `server.zig:2264`.
 
 ## 3. CHANNEL MODES
 
-ISUPPORT advertises `CHANMODES=beIZ,k,lfj,imnstCTNMSg` (dispatch.zig:1048).
-Implementation: `chanmode.zig` `default_specs` (line 92) — `ChannelMode` enum is
-`u4` and is **completely full (16/16)**.
+ISUPPORT advertises `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOA`
+(`src/proto/protocol_inventory.zig:56`). Implementation is split between the
+generic channel-mode catalog and live server/world handlers.
 
-Group A (list): `b` ban, `e` exempt, `I` invex — **PRESENT**.
-- **`Z`** — MISSING — advertised in group A but **not in default_specs**. False advertising. (Conventionally `Z` = "all members secure" status; needs a real backing or removal from ISUPPORT.)
+Group A (list): `b` ban, `e` exempt, `I` invex, `Z` quiet/mute — **PRESENT**.
 
 Group B (param always): `k` key — **PRESENT**.
 
-Group C (param when set): `l` limit — **PRESENT**.
-- **`f`** (flood/forward) — MISSING — advertised, not implemented. (`f` in `chanmode_ext.zig` is the unrelated IRCX MODEX NOFORMAT flag.)
-- **`j`** (join throttle) — MISSING — advertised, not implemented.
+Group C (param when set): `l` limit, `f` forward, `j` join throttle —
+**PRESENT**.
 
-Group D (flag): `i m n s t C T N M S g` — all **PRESENT** (chanmode.zig:98-108).
+Group D (flag): `i m n s t C T N M S g W O A` — all **PRESENT**.
 
-**Blocker:** the `u4 ChannelMode` enum is at capacity, so `Z`/`f`/`j` cannot be
-added without the parameterized-mode rework (matches MEMORY note
-`project_orochi_gap_closing`). **Action:** either widen to `u5` + add real
-`f`/`j`/`Z` handlers, or correct ISUPPORT to `beI,k,l,imnstCTNMSg` to stop
-false-advertising. Common modes also missing: `R` (regonly-join — note `R` exists
-as a *umode*), `c` (no-color/strip), `O`/`A` (oper/admin-only) — all MISSING.
+Previous false-advertising notes for `Z`/`f`/`j`/`O`/`A` are resolved in current
+source: the advertised token and live handlers now agree.
 
 ---
 
@@ -197,21 +191,20 @@ no-implicit-names, batch, bot, extended-monitor, channel-rename (draft),
 orochi/bouncer, draft/chathistory, draft/message-redaction, draft/read-marker,
 draft/typing, draft/react, draft/reply.
 
-**MISSING caps (backing command/data often already exists):**
-1. **cap-notify + CAP NEW/DEL** — MISSING — no `cap_notify` advertised though
-   `proto/cap_notify.zig` exists. Foundational for dynamic caps. HIGH value.
-2. **labeled-response** — MISSING — `proto/labeled_response.zig` + `labeled_batch.zig` exist but cap unadvertised and `label` tag not echoed. HIGH value (pairs with present `batch`).
-3. **sts** — MISSING — `proto/sts.zig`/`sts_policy.zig`/`cap_sts_preload.zig` exist; cap unadvertised. Fits implicit-TLS posture.
-4. **standard-replies** — MISSING (cap) — FAIL/WARN/NOTE are *emitted* (server.zig:7537) but the cap token is not advertised. Trivial.
-5. **draft/account-registration** — MISSING (cap) — REGISTER/VERIFY commands live (`accounts.zig`) but cap + `account-registration` ISUPPORT token unadvertised. Clients won't surface registration. Cheap.
-6. **draft/metadata-2** — MISSING (cap) — METADATA command + 761/762 numerics live (server.zig:5730) but cap/notify unadvertised. Cheap.
-7. **draft/multiline** — MISSING — `proto/multiline.zig`/`multiline_assembler.zig` exist; not wired to a cap. Lower priority.
-8. **utf8only** — PARTIAL — enforced + advertised via **ISUPPORT `UTF8ONLY`** (server.zig:7937), but **not** as the IRCv3 cap. Acceptable (ISUPPORT is the ratified surface).
-9. **soju.im/* (bouncer-networks etc.)** — MISSING — `orochi/bouncer` is the native analogue; soju compat not provided. Optional.
-10. **draft/event-playback** — MISSING — chathistory present; event-playback not. Optional.
-11. **sasl EXTERNAL/SCRAM mechanisms** — PARTIAL — `proto/sasl_external*`, `sasl_scram*` exist but `cap_specs` advertises `sasl=PLAIN` only and `handleAuthenticate` only routes PLAIN. Medium value (EXTERNAL/certfp).
+**Closed since this sweep:** `cap-notify`, `labeled-response`, config-gated
+`sts`, `standard-replies`, `draft/account-registration`, `draft/metadata-2`,
+`draft/multiline`, and `sasl=PLAIN,EXTERNAL,SCRAM-SHA-256` are all advertised
+from the live `src/daemon/dispatch.zig` cap table.
 
-CapId enum is `u6` (64 slots), 25 used — ample headroom.
+**Remaining caps / optional compat:**
+1. **utf8only** — enforced + advertised via **ISUPPORT `UTF8ONLY`**, but not as
+   a separate IRCv3 cap. Acceptable (ISUPPORT is the ratified surface).
+2. **soju.im/* (bouncer-networks etc.)** — MISSING — `orochi/bouncer` is the
+   native analogue; soju compat not provided. Optional.
+3. **draft/event-playback** — MISSING — chathistory present; event-playback not.
+   Optional.
+
+CapId enum is `u6` (64 slots), 36 used — ample headroom.
 
 ---
 
@@ -251,27 +244,27 @@ Ordered by client value; grouped into parallel waves (items in a wave are
 independent and can be fanned out to separate workers).
 
 ### Wave 1 — cheap high-value cap/ISUPPORT truthfulness (no new state)
-1. **Advertise `draft/account-registration` cap + ISUPPORT token** — commands already live. (accounts.zig; dispatch.zig cap table)
-2. **Advertise `draft/metadata-2` cap + notify** — command + numerics already live. (messaging.zig/server.zig:5730)
-3. **Advertise `standard-replies` cap** — FAIL/WARN/NOTE already emitted. (dispatch.zig cap table)
-4. **Fix CHANMODES false-advertising** — drop `Z`/`f`/`j` from ISUPPORT *or* implement; pick one. (dispatch.zig:1048 vs chanmode.zig)
+1. **Advertise `draft/account-registration` cap + ISUPPORT token** — DONE.
+2. **Advertise `draft/metadata-2` cap + notify** — DONE.
+3. **Advertise `standard-replies` cap** — DONE.
+4. **Fix CHANMODES false-advertising** — DONE; live token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOA`.
 5. **Reconcile CHANTYPES vs isChannelName** — advertise `&` (and decide on `%`) or stop accepting them. (dispatch.zig:1048 vs world.zig:860)
 
 ### Wave 2 — foundational caps (unlock later features)
-6. **cap-notify + CAP NEW/DEL** — `proto/cap_notify.zig` exists; wire it. (dispatch.zig CapSession)
-7. **labeled-response + `label` tag echo** — `proto/labeled_response.zig`/`labeled_batch.zig` exist; pairs with `batch`. (dispatch.zig + server reply path)
-8. **STS policy cap** — `proto/sts*.zig` exist; advertise per implicit-TLS stance.
+6. **cap-notify** — DONE for the static cap set; CAP NEW/DEL do not fire because the set is static.
+7. **labeled-response + `label` tag echo** — DONE.
+8. **STS policy cap** — DONE; advertised only when an STS policy is configured and live.
 
 ### Wave 3 — moderation / matching depth
 9. **`$m` mute/quiet action-extban** — highest-value extban; matcher extensible. (extban.zig:144)
 10. **`$z` secure-TLS extban** — (extban.zig)
-11. **Channel modes `+f` flood, `+j` join-throttle** — needs `ChannelMode` widened from `u4` to `u5` first (enum is full). (chanmode.zig:13 — parameterized-mode rework)
+11. **Channel modes `+f` forward, `+j` join-throttle** — DONE.
 12. **`+o` user mode entry** — add to `usermode.zig` so RPL_UMODEIS reflects oper. (usermode.zig:11; 6 free slots)
 
 ### Wave 4 — SASL + multiline + numerics hygiene
-13. **SASL EXTERNAL (certfp)** — `proto/sasl_external*` exist; route + advertise `sasl=PLAIN,EXTERNAL`. (dispatch.zig:962)
-14. **SASL SCRAM-SHA-256** — `proto/sasl_scram*` exist; route + advertise.
-15. **draft/multiline** — `proto/multiline*` exist; wire to batch + cap.
+13. **SASL EXTERNAL (certfp)** — DONE; advertised in `sasl=PLAIN,EXTERNAL,SCRAM-SHA-256`.
+14. **SASL SCRAM-SHA-256** — DONE; advertised in the same cap value.
+15. **draft/multiline** — DONE.
 16. **Consolidate the three numeric enums** — fold 600-799 into `proto/numeric.zig` to remove drift risk. (maintainability, not conformance)
 
 ### Wave 5 — IRCX completeness (lower client value)
@@ -279,8 +272,8 @@ independent and can be fanned out to separate workers).
 18. **IRCX 9xx numeric conformance sweep** vs recovered Exchange/OfficeIRC ref. (server.zig 9xx; ircx.zig:422)
 
 ### Biggest gaps (one-line)
-- **CHANMODES `Z`/`f`/`j` and EXTBAN `$g` semantics are advertised but not (correctly) implemented** — active interop lies; fix first (Wave 1/3).
-- **cap-notify, labeled-response, STS not advertised** despite proto support — Wave 2.
-- **REGISTER/VERIFY + METADATA work but their caps are hidden** — clients can't discover them (Wave 1).
-- **SASL stuck at PLAIN** despite EXTERNAL/SCRAM proto code — Wave 4.
+- **CHANMODES `Z`/`f`/`j`/`W`/`O`/`A` are now advertised consistently with live handlers** — previous false-advertising item is closed.
+- **cap-notify, labeled-response, STS are now advertised from the live CAP table** — previous Wave 2 item is closed.
+- **REGISTER/VERIFY + METADATA caps are now discoverable** — previous Wave 1 item is closed.
+- **SASL now advertises PLAIN, EXTERNAL, and SCRAM-SHA-256** — previous Wave 4 item is closed.
 - **CHANTYPES parser/ISUPPORT mismatch** (`&`/`%` accepted, only `#` advertised) — Wave 1.

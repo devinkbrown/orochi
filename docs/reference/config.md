@@ -119,8 +119,8 @@ Source: struct at `src/daemon/config_format.zig:75`, parsing at `src/daemon/conf
 |---|---|---:|---|---|
 | `host` | string | `"127.0.0.1"` | any string accepted by bind helpers | Bind address for runtime listeners (`src/daemon/config_boot.zig:25`). |
 | `irc` | port integer | `0` before validation | required, `1..65535` | Plain IRC listener port. Current parser requires this even for TLS-first deployments. |
-| `ws` | port integer | `0` | `0..65535` | Parsed but not yet wired: `mapToServerConfig` does not overlay it (`src/daemon/config_format.zig:339`, `src/daemon/config_boot.zig:24`). |
-| `webtransport` | port integer | `0` | `0..65535` | Parsed but not yet wired: `mapToServerConfig` does not overlay it (`src/daemon/config_format.zig:340`, `src/daemon/config_boot.zig:24`). |
+| `ws` | port integer | `0` | `0..65535` | Secure-WebSocket browser listener intent. `mapToServerConfig` overlays it into `ws_enabled`/`ws_port`; the listener stands up when TLS certificates are loaded, or with testing-only `ws_plain` (`src/daemon/config_format.zig:462`, `src/daemon/config_boot.zig:45`, `src/main.zig:350`, `src/daemon/server.zig:1862`). |
+| `webtransport` | port integer | `0` | `0..65535` | Parser/proto-only: parsed by config format, but `mapToServerConfig` does not overlay it and no listener binds from it yet (`src/daemon/config_format.zig:464`, `src/daemon/config_boot.zig:42`). |
 | `s2s` | port integer | `0` | `0..65535` | Server-to-server mesh listener; `0` disables it (`src/daemon/config_boot.zig:26`, `src/daemon/server.zig:1046`). |
 | `media` | port integer | `0` | `0..65535` | UDP media transport plane port; `0` means ephemeral (`src/daemon/config_boot.zig:27`, `src/daemon/server.zig:963`). |
 | `native_media` | port integer | `0` | `0..65535` | Native OPVOX/OPVIS media UDP port; `0` means ephemeral (`src/daemon/config_boot.zig:28`, `src/daemon/server.zig:971`). |
@@ -146,7 +146,7 @@ Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/con
 |---|---|---:|---|---|
 | `backlog` | integer | `128` | `1..32767` | Listener backlog (`src/daemon/config_boot.zig:35`). |
 | `max_clients` | integer | `1024` | `1..32767` | Reserved connection table size and accept cap (`src/daemon/server.zig:983`). |
-| `num_shards` | integer | `1` | `1..4096` | Requested worker reactor shards (`src/daemon/config_boot.zig:199`). Current server clamps runtime to single-reactor until the threaded reactor array lands (`src/daemon/server.zig:987`). |
+| `num_shards` | integer | `1` | `1..4096` | Requested worker reactor shards (`src/daemon/config_boot.zig:234`). `main.zig` passes the configured value through; if it is left at `1`, boot chooses a CPU-based default capped at 4. `Server.init` allocates the reactor array from the shard count, and `runThreaded` starts one worker per reactor when more than one reactor exists (`src/main.zig:154`, `src/main.zig:399`, `src/daemon/server.zig:1802`, `src/daemon/server.zig:2795`). |
 | `handshake_timeout` | duration string | `"30s"` | positive `ms/s/m/h` duration | Registration timeout, mapped to `registration_timeout_ms` (`src/daemon/config_boot.zig:47`). |
 | `ping_interval` | duration string | `"2m"` | positive `ms/s/m/h` duration | Idle interval before server PING (`src/daemon/config_boot.zig:48`). |
 | `ping_timeout` | duration string | `"1m"` | positive `ms/s/m/h` duration | Grace after PING before disconnect (`src/daemon/config_boot.zig:49`). |
@@ -309,8 +309,7 @@ These keys are accepted by `parseToml` but do not currently change live daemon b
 
 | Key | Parse source | Current status |
 |---|---|---|
-| `listen.ws` | `src/daemon/config_format.zig:339` | No `mapToServerConfig` overlay and no listener binding from this config yet. |
-| `listen.webtransport` | `src/daemon/config_format.zig:340` | No `mapToServerConfig` overlay and no listener binding from this config yet. |
+| `listen.webtransport` | `src/daemon/config_format.zig:464` | Parser/proto-only: no `mapToServerConfig` overlay and no listener binding from this config yet. |
 | `mesh.trust_roots` | `src/daemon/config_format.zig:349` | Parsed and tested; current secured S2S boot uses node secret key, realm, and mesh pass. |
 | `media.enabled` | `src/daemon/config_format.zig:389` | Parsed; current mapped media fields are ports, advertised host, and STUN. |
 | `media.max_upload_bytes` | `src/daemon/config_format.zig:390` | Parsed; not mapped into current server config. |

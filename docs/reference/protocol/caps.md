@@ -1,57 +1,57 @@
 # Orochi IRCv3 Capabilities
 
-This reference documents the capability registry in `src/proto/cap.zig` only. The registry advertises client capabilities whose `kind` is `.client` and `advertised` is true (`src/proto/cap.zig:103`, `src/proto/cap.zig:140`, `src/proto/cap.zig:164`). CAP LS 302 appends `=<value>` only when a `value_302` exists and the client requested 302 (`src/proto/cap.zig:150`, `src/proto/cap.zig:465`).
+This reference documents the live capability registry in `src/daemon/dispatch.zig`. `src/proto/cap.zig` is not the live CAP registry. The live registry is `CapId` plus `cap_specs`; CAP LS emits those specs and appends `=<value>` for CAP LS 302 only when the spec/session supplies one (`src/daemon/dispatch.zig:223`, `src/daemon/dispatch.zig:293`, `src/daemon/dispatch.zig:504`).
 
 ## CAP LS 302 Table
 
 | Capability | CAP LS 302 Value | Notes | Evidence |
 | --- | --- | --- | --- |
-| `server-time` | none | Enables server-time tags; tag gate maps `time` / `server-time` to this cap. | `src/proto/cap.zig:372`, `src/proto/cap.zig:354` |
-| `message-tags` | none | Negotiable generic message tags. | `src/proto/cap.zig:373` |
-| `account-tag` | none | Enables account tags; tag gate maps `account` to this cap. | `src/proto/cap.zig:374`, `src/proto/cap.zig:358` |
-| `batch` | none | Enables BATCH; tag gate maps `batch` tag to this cap. | `src/proto/cap.zig:375`, `src/proto/cap.zig:359` |
-| `echo-message` | none | Echo sent messages to sender. | `src/proto/cap.zig:376` |
-| `cap-notify` | none | Capability notification support. | `src/proto/cap.zig:377` |
-| `sts` | `duration=604800` | Strict Transport Security value advertised only under CAP LS 302. | `src/proto/cap.zig:378`, `src/proto/cap.zig:499` |
-| `bot` | none | Bot mode/cap; tag gate maps `bot` to this cap. | `src/proto/cap.zig:379`, `src/proto/cap.zig:360` |
-| `multiline` | none | Draft multiline cap in this registry; tag gate maps `draft/multiline-concat` to this cap. | `src/proto/cap.zig:380`, `src/proto/cap.zig:363` |
-| `chathistory` | none | Chat history capability. | `src/proto/cap.zig:381` |
-| `account-notify` | none | Account change notifications. | `src/proto/cap.zig:382` |
-| `away-notify` | none | Away state notifications. | `src/proto/cap.zig:383` |
-| `setname` | none | SETNAME support. | `src/proto/cap.zig:384` |
-| `chghost` | none | CHGHOST support. | `src/proto/cap.zig:385` |
-| `extended-monitor` | none | Extended MONITOR support. | `src/proto/cap.zig:386` |
-| `labeled-response` | none | Labeled response support; tag gate maps `label` to this cap. | `src/proto/cap.zig:387`, `src/proto/cap.zig:361` |
-| `sasl` | `PLAIN,EXTERNAL` | Authentication mechanisms advertised by this registry under CAP LS 302. | `src/proto/cap.zig:388`, `src/proto/cap.zig:500` |
-| `msgid` | none | Message ID support; tag gate maps `msgid` to this cap. | `src/proto/cap.zig:389`, `src/proto/cap.zig:362` |
-| `account-extban` | none | Account extban support. | `src/proto/cap.zig:390` |
-| `tls` | none | TLS capability token. | `src/proto/cap.zig:391` |
-| `utf8-only` | none | UTF-8-only network behavior. | `src/proto/cap.zig:392` |
-| `no-implicit-names` | none | Suppress automatic NAMES behavior for capable clients. | `src/proto/cap.zig:393` |
-| `event-playback` | none | Event playback capability. | `src/proto/cap.zig:394` |
-| `read-marker` | none | Read marker support. | `src/proto/cap.zig:395` |
-| `channel-rename` | none | Channel rename support. | `src/proto/cap.zig:396` |
-| `file-upload` | none | File upload capability token. | `src/proto/cap.zig:397` |
-| `search` | none | Search capability token. | `src/proto/cap.zig:398` |
-| `reply` | none | Reply metadata capability. | `src/proto/cap.zig:399` |
-| `react` | none | Reaction metadata capability. | `src/proto/cap.zig:400` |
-| `message-editing` | none | Message editing capability. | `src/proto/cap.zig:401` |
-| `message-redaction` | none | Message redaction capability. | `src/proto/cap.zig:402` |
-| `typing` | none | Typing indicator capability. | `src/proto/cap.zig:403` |
-| `orochi/prop-notify` | none | Orochi vendor cap for property notifications. | `src/proto/cap.zig:404`, `src/proto/cap.zig:405` |
-| `orochi/session-sync` | none | Orochi vendor cap for session synchronization. | `src/proto/cap.zig:405`, `src/proto/cap.zig:406` |
-| `orochi/bouncer` | none | Orochi vendor cap for bouncer-style behavior. | `src/proto/cap.zig:406`, `src/proto/cap.zig:407` |
-| `orochi/suimyaku-media` | none | Orochi vendor cap for Suimyaku media. | `src/proto/cap.zig:407`, `src/proto/cap.zig:408` |
+| `server-time` | none | Enables server-time tags. | `src/daemon/dispatch.zig:293` |
+| `message-tags` | none | Negotiable generic message tags. | `src/daemon/dispatch.zig:294` |
+| `echo-message` | none | Echo sent messages to sender. | `src/daemon/dispatch.zig:295` |
+| `sasl` | `PLAIN,EXTERNAL,SCRAM-SHA-256` | Live `AUTHENTICATE` routes PLAIN, EXTERNAL, and SCRAM-SHA-256 through the mech router; unconfigured checkers fail closed. | `src/daemon/dispatch.zig:298`, `src/daemon/dispatch.zig:1367` |
+| `multi-prefix` | none | Multi-prefix NAMES/WHOIS behavior. | `src/daemon/dispatch.zig:299` |
+| `userhost-in-names` | none | Adds userhost detail to NAMES for capable clients. | `src/daemon/dispatch.zig:300` |
+| `away-notify` | none | Away state notifications. | `src/daemon/dispatch.zig:301` |
+| `setname` | none | SETNAME support. | `src/daemon/dispatch.zig:302` |
+| `extended-join` | none | Extended JOIN support. | `src/daemon/dispatch.zig:303` |
+| `invite-notify` | none | Invite notifications. | `src/daemon/dispatch.zig:304` |
+| `account-tag` | none | Enables account tags. | `src/daemon/dispatch.zig:305` |
+| `orochi/session-sync` | none | Orochi vendor cap for sibling-device direct-message mirroring. | `src/daemon/dispatch.zig:308` |
+| `orochi/bouncer` | none | Orochi vendor cap for automatic history rewind on join/rejoin. | `src/daemon/dispatch.zig:312` |
+| `chghost` | none | Receive CHGHOST lines for common-user host changes. | `src/daemon/dispatch.zig:316` |
+| `no-implicit-names` | none | Suppress automatic NAMES burst on JOIN for capable clients. | `src/daemon/dispatch.zig:319` |
+| `draft/chathistory` | none | CHATHISTORY command and chathistory BATCH replies. | `src/daemon/dispatch.zig:331` |
+| `draft/message-redaction` | none | REDACT command. | `src/daemon/dispatch.zig:332` |
+| `draft/message-editing` | none | EDIT command. | `src/daemon/dispatch.zig:333` |
+| `draft/read-marker` | none | MARKREAD command. | `src/daemon/dispatch.zig:334` |
+| `draft/typing` | none | Client-only typing tags relayed through TAGMSG. | `src/daemon/dispatch.zig:335` |
+| `draft/react` | none | Client-only reaction tags relayed through TAGMSG. | `src/daemon/dispatch.zig:336` |
+| `draft/reply` | none | Client-only reply tags relayed through TAGMSG. | `src/daemon/dispatch.zig:337` |
+| `batch` | none | Server emits BATCH for features such as chathistory and netsplit. | `src/daemon/dispatch.zig:338` |
+| `bot` | none | Bot mode/cap; user `+B` is surfaced in WHOIS. | `src/daemon/dispatch.zig:339` |
+| `draft/channel-rename` | none | Receive RENAME for common channel renames. | `src/daemon/dispatch.zig:342` |
+| `extended-monitor` | none | Extended MONITOR state notifications. | `src/daemon/dispatch.zig:345` |
+| `account-notify` | none | ACCOUNT lines on common-user login/logout. | `src/daemon/dispatch.zig:349` |
+| `draft/account-registration` | none | REGISTER/VERIFY account registration discovery. | `src/daemon/dispatch.zig:352` |
+| `draft/metadata-2` | none | METADATA GET/SET/LIST/CLEAR and 761/762/766 numerics. | `src/daemon/dispatch.zig:354` |
+| `standard-replies` | none | FAIL/WARN/NOTE support. | `src/daemon/dispatch.zig:356` |
+| `cap-notify` | none | Static cap set support; CAP NEW/DEL do not fire for the static set. | `src/daemon/dispatch.zig:357` |
+| `labeled-response` | none | Echoes `@label` on responses and frames multiline replies with labeled-response BATCH. | `src/daemon/dispatch.zig:362`, `src/daemon/dispatch.zig:1125` |
+| `draft/pre-away` | none | AWAY may be sent during registration. | `src/daemon/dispatch.zig:368` |
+| `draft/channel-context` | none | Relays client-only channel-context tags. | `src/daemon/dispatch.zig:371` |
+| `draft/multiline` | `max-bytes=4096,max-lines=24` | Accepts inbound multiline BATCH chunks and reassembles them within enforced limits. | `src/daemon/dispatch.zig:375` |
+| `sts` | runtime policy value | Config-gated; omitted unless a live STS policy is enabled for the session. | `src/daemon/dispatch.zig:383`, `src/daemon/dispatch.zig:504` |
 
 ## Negotiation Behavior
 
 | Operation | Behavior | Evidence |
 | --- | --- | --- |
-| `CAP LS [302]` | Enters negotiating state, remembers 302 support, and emits advertised client caps, chunking to `MAX_CAP_REPLY_BODY` if needed. | `src/proto/cap.zig:271`, `src/proto/cap.zig:293`, `src/proto/cap.zig:150`, `src/proto/cap.zig:171` |
-| `CAP REQ` | Parses requested tokens; unknown, server-kind, or unadvertised cap NAKs the whole raw list without partial mutation. | `src/proto/cap.zig:315`, `src/proto/cap.zig:323`, `src/proto/cap.zig:432` |
-| `CAP LIST` | Emits currently negotiated cap names. | `src/proto/cap.zig:305`, `src/proto/cap.zig:448` |
-| `CAP END` | Marks negotiation complete and releases registration hold. | `src/proto/cap.zig:286`, `src/proto/cap.zig:343`, `src/proto/cap.zig:260` |
+| `CAP LS [302]` | Enters negotiating state, remembers 302 support, and emits live cap specs, chunking to `MAX_CAP_REPLY_BODY` if needed. | `src/daemon/dispatch.zig:468`, `src/daemon/dispatch.zig:504` |
+| `CAP REQ` | Parses requested tokens; unknown or unavailable caps NAK the request without partial mutation. | `src/daemon/dispatch.zig:531`, `src/daemon/dispatch.zig:577` |
+| `CAP LIST` | Emits currently negotiated cap names. | `src/daemon/dispatch.zig:564` |
+| `CAP END` | Marks negotiation complete and releases registration hold. | `src/daemon/dispatch.zig:552` |
 
 ## Vendor Caps
 
-The current `src/proto/cap.zig` vendor namespace is `orochi/*`: `orochi/prop-notify`, `orochi/session-sync`, `orochi/bouncer`, and `orochi/suimyaku-media` (`src/proto/cap.zig:405`). No `ocean/*` capability appears in this source file; do not document an Ocean vendor cap unless one is added to the registry.
+The live `src/daemon/dispatch.zig` vendor namespace is `orochi/*`: `orochi/session-sync` and `orochi/bouncer` (`src/daemon/dispatch.zig:308`, `src/daemon/dispatch.zig:312`). No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.

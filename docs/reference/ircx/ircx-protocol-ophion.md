@@ -1,6 +1,11 @@
 # IRCX
 > IRCX adds opt-in extended IRC commands, channel modes, properties, access lists, events, and media policy integration.
 
+> Historical reference only: this page describes the legacy Ophion C implementation
+> (`modules/m_ircx_*.c`). It is not the Orochi Zig implementation source of truth.
+> For Orochi, verify current behavior in `src/daemon/modules/ircx.zig`,
+> `src/daemon/server.zig`, and the relevant `src/proto/ircx_*.zig` files.
+
 ## Overview
 
 Ophion's IRCX support is implemented by `modules/m_ircx_*.c`. The base module registers the `IRCX` server capability, `IRCX` and `ISIRCX` client commands, and ISUPPORT tokens `IRCX`, `MAXCODEPAGE`, and `MAXLANGUAGE`.

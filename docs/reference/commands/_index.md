@@ -49,7 +49,7 @@ Registry commands default to registered-client access unless the command table s
 | `HELP` | Return built-in help text. | [queries.md](queries.md#help) |
 | `HELPOP` | Alias of `HELP`. | [queries.md](queries.md#helpop) |
 | `AUTOJOIN` | Manage account autojoin list. | [queries.md](queries.md#autojoin) |
-| `GROUP` | Account grouping placeholder. | [queries.md](queries.md#group) |
+| `GROUP` | Account grouping query/management handler. | [queries.md](queries.md#group) |
 | `WELCOME` | Replay welcome text. | [queries.md](queries.md#welcome) |
 | `SUMMON` | Disabled command; returns 445. | [queries.md](queries.md#summon) |
 | `VERSION` | Show server version. | [informational.md](informational.md#version) |
@@ -116,6 +116,8 @@ Registry commands default to registered-client access unless the command table s
 | `CS` | Alias of `CHANNEL`. | [accounts-services.md](accounts-services.md#cs) |
 | `SESSION` | List, token, or resume account sessions. | [accounts-services.md](accounts-services.md#session) |
 | `CERTADD` | Bind TLS client certificate fingerprint. | [accounts-services.md](accounts-services.md#certadd) |
+| `CERTLIST` | List bound TLS client certificate fingerprints. | [accounts-services.md](accounts-services.md#certlist) |
+| `CERTDEL` | Remove a bound TLS client certificate fingerprint. | [accounts-services.md](accounts-services.md#certdel) |
 | `TEGAMI` | Offline account messages. | [accounts-services.md](accounts-services.md#tegami) |
 | `VHOST` | Vhost wardrobe, requests, offers, and oper set. | [accounts-services.md](accounts-services.md#vhost) |
 | `PRIVS` | Show oper class and privileges. | [accounts-services.md](accounts-services.md#privs) |

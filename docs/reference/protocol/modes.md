@@ -1,6 +1,6 @@
 # Orochi Modes
 
-This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgW` from `src/proto/protocol_inventory.zig:36`; the advertised status-prefix token is `PREFIX=(Qqov)!.@+` from `src/proto/protocol_inventory.zig:56` and `src/daemon/chanmode.zig:310`.
+This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOA` from `src/proto/protocol_inventory.zig:36`; the advertised status-prefix token is `PREFIX=(Qqov)!.@+` from `src/proto/protocol_inventory.zig:56` and `src/daemon/chanmode.zig:310`.
 
 ## User Modes
 
@@ -43,7 +43,7 @@ Rank gating: a member may only set/clear a tier whose rank is less than or equal
 | A list modes | `b`, `e`, `I`, `Z` | Always take a mask parameter for add/remove; no parameter queries the list. | `src/proto/protocol_inventory.zig:36`, `src/daemon/server.zig:4378`, `src/daemon/server.zig:4432` |
 | B parameter modes | `k` | Always has a parameter in the generic catalog; live server uses a key on set and emits `*` on unset echo. | `src/proto/protocol_inventory.zig:36`, `src/daemon/chanmode.zig:96`, `src/daemon/server.zig:4353` |
 | C parameter-on-set modes | `l`, `f`, `j` | `+l` takes numeric limit; `+f` takes forward channel; `+j` takes `joins:seconds`; unset is bare. | `src/proto/protocol_inventory.zig:36`, `src/daemon/server.zig:4365`, `src/daemon/server.zig:4450`, `src/daemon/server.zig:4468` |
-| D flags | `i`, `m`, `n`, `s`, `t`, `C`, `T`, `N`, `M`, `S`, `g` | No parameter. | `src/proto/protocol_inventory.zig:36`, `src/daemon/chanmode.zig:98`, `src/daemon/server.zig:4320` |
+| D flags | `i`, `m`, `n`, `s`, `t`, `C`, `T`, `N`, `M`, `S`, `g`, `W`, `O`, `A` | No parameter. | `src/proto/protocol_inventory.zig:36`, `src/daemon/chanmode.zig:98`, `src/daemon/server.zig:4320` |
 
 ## Channel List Modes
 
@@ -81,8 +81,10 @@ List modes are capped by `World.max_list_entries`; exceeding the cap returns `ER
 | `S` | tls-only | none | Channel op or higher. | JOIN only over TLS; non-TLS gets `ERR_SECUREONLYCHAN`. | `src/daemon/chanmode.zig:107`, `src/daemon/server.zig:3770` |
 | `M` | moderate-unregistered | none | Channel op or higher. | Unauthenticated members need voice/operator tier to speak. | `src/daemon/chanmode.zig:108`, `src/daemon/server.zig:10989` |
 | `W` | news-wire | none | Channel op or higher. | Enables the in-channel `!news`/`!localnews` bot in this channel; silent without it. | `src/daemon/chanmode.zig:109`, `src/daemon/server.zig:11155` |
+| `O` | oper-only | none | Channel op or higher. | JOIN requires IRC operator status. | `src/daemon/chanmode.zig:110`, `src/daemon/server.zig:5718` |
+| `A` | admin-only | none | Channel op or higher. | JOIN requires server administrator privileges. | `src/daemon/chanmode.zig:111`, `src/daemon/server.zig:5722` |
 
-The generic `chanmode.zig` catalog includes only `b e I k l i m n t s C T N g S M` (`src/daemon/chanmode.zig:92`). The live server also implements `Z`, `j`, `f`, `p`, `h`, and IRCX extended flags in `server.zig` / `world.zig`.
+The generic `chanmode.zig` catalog includes `b e I k l i m n t s C T N g S M W O A` (`src/daemon/chanmode.zig:92`). The live server also implements `Z`, `j`, `f`, `p`, `h`, and IRCX extended flags in `server.zig` / `world.zig`.
 
 ## IRCX Extended Channel Flags
 
