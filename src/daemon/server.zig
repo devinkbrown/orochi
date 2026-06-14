@@ -6242,6 +6242,32 @@ pub const LinuxServer = struct {
             }
         }
 
+        // IRCX ACCESS GRANT: a stored channel ACCESS entry matching the joiner and
+        // resolving to a status tier auto-applies that member status on join — the
+        // IRCX analog of services auto-op/-voice, and the positive counterpart to
+        // the ACCESS DENY join gate. DENY is enforced earlier in joinDenied and so
+        // never reaches here, leaving the joiner's highest non-DENY tier. Additive
+        // (a founder-by-creation keeps founder); `catch null`/`catch ""` fail open
+        // exactly as the DENY path does.
+        {
+            var amask_buf: [256]u8 = undefined;
+            const amask = clientPrefix(conn, &amask_buf) catch "";
+            if (amask.len != 0) {
+                if (self.access.matchHostmask(join_target, amask) catch null) |entry| {
+                    const granted: ?chanmode.MemberMode = switch (entry.level) {
+                        .founder => .founder,
+                        .owner => .owner,
+                        // HOST is the IRCX channel-operator tier; GRANT is IRCX
+                        // "operator access" — both map to +o.
+                        .host, .grant => .op,
+                        .voice => .voice,
+                        .deny => null,
+                    };
+                    if (granted) |mm| _ = self.world.setMemberMode(join_target, wid, mm, true) catch {};
+                }
+            }
+        }
+
         try self.broadcastJoin(join_target, conn);
         if (creating) {
             var flags_buf: [16]u8 = undefined;
@@ -21453,6 +21479,62 @@ test "threaded server: IRCX ACCESS DENY blocks the matching join" {
     c.reset();
     try writeAllFd(fd_c, "JOIN #d\r\n");
     try recvUntil(&c, " 366 C #d ", 200);
+}
+
+test "threaded server: IRCX ACCESS GRANT auto-applies member status on join" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+
+    // A founds #g (opts into IRCX for ACCESS); B has username "bob", C "carol".
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A ", 200);
+    try writeAllFd(fd_a, "JOIN #g\r\n");
+    try recvUntil(&a, " 366 A #g ", 200);
+
+    // Founder grants VOICE to anyone whose user is "bob".
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #g ADD VOICE *!bob@*\r\n");
+    try recvUntil(&a, " 801 A #g VOICE ", 200);
+
+    // B (user bob) joins and is auto-voiced: its own end-of-NAMES burst lists it
+    // with the '+' voice prefix.
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #g\r\n");
+    try recvUntil(&b, " 366 B #g ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "+B") != null);
+
+    // C (user carol) matches no ACCESS entry and joins as a plain member (no '+C').
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&c, " 001 C ", 200);
+    c.reset();
+    try writeAllFd(fd_c, "JOIN #g\r\n");
+    try recvUntil(&c, " 366 C #g ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "+C") == null);
 }
 
 test "threaded server: EVENT subscription managed by opers" {
