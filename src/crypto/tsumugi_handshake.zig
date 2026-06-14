@@ -65,6 +65,7 @@ pub const Error = error{
     DowngradeAttempt,
     NoCommonBands,
     MeshPassTooLarge,
+    MeshPassMismatch,
 } || Allocator.Error || xwing.Error || sign.SignError || sign.VerifyError || hash.HkdfError;
 
 pub const Config = struct {
@@ -312,6 +313,15 @@ pub const Responder = struct {
         const sig_digest = digest2(m1.prefix, body.signed, "");
         if (!try sign.verifyCtx(m1_sig_domain, &sig_digest, body.sig, body.node_key)) return error.BadSignature;
 
+        // Shared-secret gate. Only enforced when this responder is configured
+        // with a MeshPass; an empty local secret fails OPEN so an upgraded node
+        // can still link with a not-yet-configured peer (no mesh-flap on rollout).
+        // The compare runs only after the M1 signature is verified, so an
+        // unauthenticated peer can never probe the secret.
+        if (self.cfg.mesh_pass.len != 0 and
+            !constantTimeEqlBytes(body.mesh_pass, self.cfg.mesh_pass))
+            return error.MeshPassMismatch;
+
         self.state = .m1_recv;
         var enc2 = try xwing.encapsulate(body.prekey.public_key, rng);
         defer enc2.wipe();
@@ -371,7 +381,7 @@ pub const Responder = struct {
 const Role = enum { initiator, responder };
 const ParsedM1 = struct { version: u16, prekey_id: u64, ct: xwing.Ciphertext, prefix: []const u8, enc: []const u8, tag: [ChaCha.tag_length]u8 };
 const ParsedM2 = struct { ct: xwing.Ciphertext, prefix: []const u8, enc: []const u8, tag: [ChaCha.tag_length]u8 };
-const M1Body = struct { signed: []const u8, node_id: NodeId, node_key: sign.PublicKey, prekey: SignedPrekey, requested_bands: u128, requested_features: u128, sig: sign.Signature };
+const M1Body = struct { signed: []const u8, node_id: NodeId, node_key: sign.PublicKey, prekey: SignedPrekey, requested_bands: u128, requested_features: u128, mesh_pass: []const u8, sig: sign.Signature };
 const M2Body = struct { signed: []const u8, node_id: NodeId, node_key: sign.PublicKey, accepted_bands: u128, accepted_features: u128, sig: sign.Signature };
 
 fn nodeIdFromKey(pk: sign.PublicKey) NodeId {
@@ -642,11 +652,11 @@ fn decodeM1Payload(bytes: []const u8) Error!M1Body {
     _ = try r.readU64();
     const pass_len = try r.readU16();
     if (pass_len > max_meshpass_len) return error.MeshPassTooLarge;
-    _ = try r.take(pass_len);
+    const mesh_pass = try r.take(pass_len);
     const signed = bytes[0..r.pos];
     const sig = (try r.take(sign.signature_len))[0..sign.signature_len].*;
     if (r.pos != bytes.len) return error.InvalidMessage;
-    return .{ .signed = signed, .node_id = node_id, .node_key = node_key, .prekey = prekey, .requested_bands = requested_bands, .requested_features = requested_features, .sig = sig };
+    return .{ .signed = signed, .node_id = node_id, .node_key = node_key, .prekey = prekey, .requested_bands = requested_bands, .requested_features = requested_features, .mesh_pass = mesh_pass, .sig = sig };
 }
 
 fn decodeM2Payload(bytes: []const u8) Error!M2Body {
@@ -674,6 +684,16 @@ fn secureZero(buf: []u8) void {
 
 fn contains(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+/// Length-checked constant-time byte compare for the MeshPass shared secret.
+/// The length branch is unavoidable for variable-length secrets; the per-byte
+/// loop runs in time independent of where a mismatch occurs.
+fn constantTimeEqlBytes(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= (x ^ y);
+    return diff == 0;
 }
 
 fn makeFixture(allocator: Allocator) !struct {
@@ -753,6 +773,66 @@ test "two parties complete Tsumugi handshake and derive crossed keys" {
     try std.testing.expectEqualSlices(u8, &est_i.recv_key.declassify(), &est_r.send_key.declassify());
     try std.testing.expectEqualSlices(u8, &fx.r_pre.node_id, &est_i.peer_node_id);
     try std.testing.expectEqualSlices(u8, &fx.i_pre.node_id, &est_r.peer_node_id);
+}
+
+// Drive a fresh Initiator->Responder M1 exchange with the given MeshPass on
+// each side, returning the responder's recv() result (M2 wire or an error).
+// Frees the M1 and any returned M2 itself so callers only assert.
+fn meshPassHandshakeResult(
+    allocator: Allocator,
+    fx: anytype,
+    initiator_pass: []const u8,
+    responder_pass: []const u8,
+    seed: u64,
+) Error!void {
+    var rng = DeterministicIo{ .s = seed };
+    var cfg_i = fx.cfg_i;
+    cfg_i.mesh_pass = initiator_pass;
+    var cfg_r = fx.cfg_r;
+    cfg_r.mesh_pass = responder_pass;
+
+    var initr = Initiator.init(allocator, &fx.i_node, fx.i_pre, &fx.i_kem.secret_key, fx.r_pre, cfg_i);
+    defer initr.deinit();
+    var respr = Responder.init(allocator, &fx.r_node, fx.r_pre, &fx.r_kem.secret_key, cfg_r);
+    defer respr.deinit();
+
+    const m1 = try initr.start(rng.io());
+    defer allocator.free(m1);
+    const m2 = try respr.recv(m1, rng.io());
+    allocator.free(m2);
+}
+
+test "matching MeshPass on both nodes completes the handshake" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    try meshPassHandshakeResult(std.testing.allocator, &fx, "shared mesh secret", "shared mesh secret", 0x1111);
+}
+
+test "mismatched MeshPass is rejected after the M1 signature verifies" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    try std.testing.expectError(
+        error.MeshPassMismatch,
+        meshPassHandshakeResult(std.testing.allocator, &fx, "node-a secret", "node-b secret", 0x2222),
+    );
+}
+
+test "unconfigured responder MeshPass fails open and accepts a configured peer" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    // Backward-compat rollout: an upgraded node presenting a secret must still
+    // link with a peer that has not yet set [mesh].mesh_pass.
+    try meshPassHandshakeResult(std.testing.allocator, &fx, "node-a secret", "", 0x3333);
+}
+
+test "configured responder rejects a peer that presents no MeshPass" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    // Fail closed: a responder that requires a secret must not accept an empty one.
+    try std.testing.expectError(
+        error.MeshPassMismatch,
+        meshPassHandshakeResult(std.testing.allocator, &fx, "", "responder secret", 0x4444),
+    );
 }
 
 test "signed prekey encode/decode round-trips, verifies, and rejects truncation" {
