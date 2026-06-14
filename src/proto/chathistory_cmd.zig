@@ -231,6 +231,9 @@ pub const Message = struct {
     msgid: []const u8,
     sender: []const u8,
     text: []const u8,
+    /// IRC command to replay this entry as. Defaults to PRIVMSG; draft/
+    /// event-playback entries (e.g. TOPIC) carry their own command.
+    command: []const u8 = "PRIVMSG",
 };
 
 pub const BuildError = error{
@@ -295,7 +298,9 @@ pub const ResponseBuilder = struct {
         try self.writer.append(message.msgid);
         try self.writer.append(" :");
         try self.writer.append(message.sender);
-        try self.writer.append(" PRIVMSG ");
+        try self.writer.append(" ");
+        try self.writer.append(message.command);
+        try self.writer.append(" ");
         try self.writer.append(target);
         try self.writer.append(" :");
         try self.writer.append(message.text);

@@ -260,6 +260,7 @@ pub const CapId = enum(u6) {
     channel_context,
     multiline,
     sts,
+    event_playback,
 };
 
 const CapSet = struct {
@@ -333,6 +334,7 @@ const cap_specs = [_]CapSpec{
     .{ .id = .message_redaction, .name = "draft/message-redaction" },
     .{ .id = .message_editing, .name = "draft/message-editing" },
     .{ .id = .read_marker, .name = "draft/read-marker" },
+    .{ .id = .event_playback, .name = "draft/event-playback" },
     .{ .id = .typing, .name = "draft/typing" },
     .{ .id = .react, .name = "draft/react" },
     .{ .id = .reply, .name = "draft/reply" },

@@ -8145,6 +8145,19 @@ pub const LinuxServer = struct {
         _ = self.history.append(store_target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts }) catch {};
     }
 
+    /// Record a draft/event-playback EVENT (a non-message channel action such as
+    /// TOPIC) into the CHATHISTORY ring. Replays as `command` and is delivered
+    /// only to clients that negotiated `event-playback`. A fresh msgid is minted
+    /// (events carry no client msgid). `store_target` is the channel.
+    fn recordHistoryEvent(self: *LinuxServer, store_target: []const u8, conn: *ConnState, command: []const u8, text: []const u8) void {
+        const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+        var prefix_buf: [256]u8 = undefined;
+        const sender = clientPrefix(conn, &prefix_buf) catch return;
+        var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+        const msgid = self.msgid_gen.next(&msgid_buf);
+        _ = self.history.append(store_target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts, .command = command }) catch {};
+    }
+
     fn latestActivityInWindow(
         self: *LinuxServer,
         store_target: []const u8,
@@ -8207,11 +8220,13 @@ pub const LinuxServer = struct {
         var buf: [64]lotus.Message = undefined;
         const found = self.history.after(channel, marker_ms, buf.len, buf[0..]) catch return;
         if (found.len == 0) return;
+        const want_events = conn.session.hasCap(.event_playback);
         var cmsgs: [64]chathistory_cmd.Message = undefined;
         var cn: usize = 0;
         for (found) |m| {
             if (m.tombstone) continue;
-            cmsgs[cn] = .{ .timestamp_ms = m.timestamp, .msgid = m.msgid, .sender = m.sender, .text = m.text };
+            if (!want_events and historyEntryIsEvent(m.command)) continue;
+            cmsgs[cn] = .{ .timestamp_ms = m.timestamp, .msgid = m.msgid, .sender = m.sender, .text = m.text, .command = m.command };
             cn += 1;
         }
         if (cn == 0) return;
@@ -8404,16 +8419,26 @@ pub const LinuxServer = struct {
             },
         }
 
+        // draft/event-playback: event entries (TOPIC, …) replay only to clients
+        // that negotiated `event-playback`; everyone else gets messages only.
+        const want_events = conn.session.hasCap(.event_playback);
         var cmsgs: [64]chathistory_cmd.Message = undefined;
         var cn: usize = 0;
         for (found) |m| {
             if (m.tombstone) continue;
-            cmsgs[cn] = .{ .timestamp_ms = m.timestamp, .msgid = m.msgid, .sender = m.sender, .text = m.text };
+            if (!want_events and historyEntryIsEvent(m.command)) continue;
+            cmsgs[cn] = .{ .timestamp_ms = m.timestamp, .msgid = m.msgid, .sender = m.sender, .text = m.text, .command = m.command };
             cn += 1;
         }
         var out_buf: [default_reply_bytes * 4]u8 = undefined;
         const batch = chathistory_cmd.writeBatch(&out_buf, "1", target, cmsgs[0..cn]) catch return;
         try appendToConn(conn, batch);
+    }
+
+    /// A CHATHISTORY entry is a draft/event-playback EVENT (rather than an
+    /// ordinary message) when its replay command is neither PRIVMSG nor NOTICE.
+    fn historyEntryIsEvent(command: []const u8) bool {
+        return !std.mem.eql(u8, command, "PRIVMSG") and !std.mem.eql(u8, command, "NOTICE");
     }
 
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
@@ -15897,6 +15922,9 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "TOPIC", &.{channel}, text);
         try self.broadcastChannel(channel, msg, null);
+        // draft/event-playback: record the topic change in channel history so it
+        // replays as a TOPIC event to event-playback clients.
+        self.recordHistoryEvent(channel, conn, "TOPIC", text);
         // Propagate the topic across the mesh so remote members see it live.
         self.announceTopic(channel, text, setter, set_at, text.len != 0);
     }
@@ -22756,6 +22784,67 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-one", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
     try recvUntil(&a, "BATCH -1", 200);
+}
+
+test "threaded server: draft/event-playback replays TOPIC events only to capable clients" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A negotiates chathistory + event-playback; B only chathistory.
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory draft/event-playback\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :draft/chathistory\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    // A founds #ep (so it may set the topic); B joins.
+    try writeAllFd(fd_a, "JOIN #ep\r\n");
+    try recvUntil(&a, " 366 A #ep ", 200);
+    try writeAllFd(fd_b, "JOIN #ep\r\n");
+    try recvUntil(&b, " 366 B #ep ", 200);
+
+    // A message (recorded as PRIVMSG) and a topic change (recorded as a TOPIC event).
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #ep :hello-there\r\n");
+    try recvUntil(&a, "PRIVMSG #ep :hello-there", 200);
+    try writeAllFd(fd_a, "TOPIC #ep :the-topic\r\n");
+    try recvUntil(&a, "TOPIC #ep :the-topic", 200);
+
+    // A (event-playback) replays BOTH the message and the TOPIC event.
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY LATEST #ep * 10\r\n");
+    try recvUntil(&a, "BATCH +1 chathistory #ep", 200);
+    try recvUntil(&a, "PRIVMSG #ep :hello-there", 200);
+    try recvUntil(&a, "TOPIC #ep :the-topic", 200);
+    try recvUntil(&a, "BATCH -1", 200);
+
+    // Drain B's LIVE copy of the topic (B is a member; it has no echo-message so
+    // it never saw its own PRIVMSG) before the negative assertion, so it inspects
+    // only the replayed batch and not the pending live broadcast in B's socket.
+    try recvUntil(&b, "TOPIC #ep :the-topic", 200);
+
+    // B (no event-playback) replays the message only — the TOPIC event is filtered.
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST #ep * 10\r\n");
+    try recvUntil(&b, "BATCH +1 chathistory #ep", 200);
+    try recvUntil(&b, "PRIVMSG #ep :hello-there", 200);
+    try recvUntil(&b, "BATCH -1", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "TOPIC #ep :the-topic") == null);
 }
 
 test "threaded server: CHATHISTORY DM history follows accounts over reused nicks" {

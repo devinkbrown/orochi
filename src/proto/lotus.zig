@@ -16,6 +16,11 @@ pub const InputMessage = struct {
     sender: []const u8,
     text: []const u8,
     timestamp: u64,
+    /// IRC command this history entry replays as. "PRIVMSG"/"NOTICE" are ordinary
+    /// messages; anything else (e.g. "TOPIC") is a draft/event-playback event,
+    /// replayed only to clients that negotiated `event-playback`. Must be a
+    /// static-lifetime string — it is stored by reference, never duped/freed.
+    command: []const u8 = "PRIVMSG",
 };
 
 pub const Message = struct {
@@ -24,6 +29,7 @@ pub const Message = struct {
     text: []const u8,
     timestamp: u64,
     tombstone: bool,
+    command: []const u8 = "PRIVMSG",
 };
 
 pub const AppendResult = struct {
@@ -263,6 +269,9 @@ const StoredMessage = struct {
     text: []u8,
     timestamp: u64,
     tombstone: bool,
+    /// Replay command. Stored by reference (static-lifetime literal); not duped
+    /// or freed, so it is excluded from init's dup list and deinit's free list.
+    command: []const u8 = "PRIVMSG",
 
     fn init(allocator: std.mem.Allocator, msg: InputMessage) std.mem.Allocator.Error!StoredMessage {
         var stored = StoredMessage{
@@ -271,6 +280,7 @@ const StoredMessage = struct {
             .text = &.{},
             .timestamp = msg.timestamp,
             .tombstone = false,
+            .command = msg.command,
         };
         errdefer stored.deinit(allocator);
 
@@ -290,6 +300,7 @@ const StoredMessage = struct {
             .text = &.{},
             .timestamp = 0,
             .tombstone = false,
+            .command = "PRIVMSG",
         };
     }
 
@@ -300,6 +311,7 @@ const StoredMessage = struct {
             .text = self.text,
             .timestamp = self.timestamp,
             .tombstone = self.tombstone,
+            .command = self.command,
         };
     }
 };
