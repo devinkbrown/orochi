@@ -302,6 +302,10 @@ fn buildTagPrefix(session: *const dispatch.ClientSession, tags: LinuxServer.MsgT
             any = true;
         }
     }
+    if (tags.is_bot and session.hasCap(.message_tags)) {
+        b.append(if (any) ";bot" else "@bot") catch return "";
+        any = true;
+    }
     // Relay the sender's CLIENT-ONLY (`+`) tags to message-tags recipients,
     // merged into the single @-segment. Server-supplied tags in the sender's
     // segment (no `+`) are NOT relayed, so a client can't spoof server-time etc.
@@ -3905,6 +3909,9 @@ pub const LinuxServer = struct {
         /// Server-minted `msgid` value (no `msgid=` key), shared by every
         /// recipient of this message. Null for events that carry no msgid.
         msgid: ?[]const u8 = null,
+        /// Sender has user mode +B. Emitted as IRCv3 valueless `bot` server tag
+        /// only to recipients that negotiated message-tags.
+        is_bot: bool = false,
     };
 
     /// Deliver `bytes` with an IRCv3 message-tag segment assembled for THIS
@@ -15363,7 +15370,7 @@ pub const LinuxServer = struct {
                 self.handleFantasy(id, conn, chan, text);
             }
             var time_buf: [40]u8 = undefined;
-            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id };
+            const ctags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
             // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
             // colour/formatting from the message body for every recipient.
             var nf_text_buf: [1024]u8 = undefined;
@@ -15450,7 +15457,7 @@ pub const LinuxServer = struct {
                     }
                     if (echo) {
                         var et_buf: [40]u8 = undefined;
-                        const etags = MsgTags{ .time_value = serverTimeValue(&et_buf), .account = conn.session.account(), .client_tags = clean_client_tags };
+                        const etags = MsgTags{ .time_value = serverTimeValue(&et_buf), .account = conn.session.account(), .client_tags = clean_client_tags, .is_bot = conn.session.isBot() };
                         self.deliverTagged(id, etags, msg) catch {};
                     }
                     return;
@@ -15487,7 +15494,7 @@ pub const LinuxServer = struct {
             if (self.silence.isSilenced(target, sender_mask)) return;
         }
         var time_buf: [40]u8 = undefined;
-        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id };
+        const dtags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
         try self.deliverTagged(recipient_id, dtags, msg);
         const recipient_account = if (recipient_conn) |rconn| rconn.session.account() else null;
         if (recipient_account) |acct| {
@@ -16379,14 +16386,18 @@ test "banContextFor carries TLS state for secure extbans" {
     try std.testing.expect(banContextFor(&server, &conn, wid, "n!u@h", &chan_buf).secure);
 }
 
-/// Whether `text` is a CTCP request that `+C` should block — i.e. wrapped in
-/// \x01 and NOT a CTCP ACTION (/me stays allowed).
+/// Whether `text` contains a CTCP request that `+C` should block. CTCP ACTION
+/// (/me) stays allowed, but only when the parsed command token is exactly ACTION.
 fn isBlockableCtcp(text: []const u8) bool {
-    if (text.len < 2 or text[0] != 0x01 or text[text.len - 1] != 0x01) return false;
-    const body = text[1 .. text.len - 1];
-    const action = "ACTION";
-    if (body.len >= action.len and std.ascii.eqlIgnoreCase(body[0..action.len], action)) return false;
-    return true;
+    const ctcp = @import("../proto/ctcp.zig");
+    var cursor: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, cursor, ctcp.delimiter)) |start| {
+        const end = std.mem.indexOfScalarPos(u8, text, start + 1, ctcp.delimiter) orelse return false;
+        const view = (ctcp.parseFirst(.privmsg, text[start .. end + 1]) catch return true) orelse return true;
+        if (view.id != .action) return true;
+        cursor = end + 1;
+    }
+    return false;
 }
 
 /// Compose the RPL_WHOISSPECIAL geo/ASN phrase from the resolved parts:
@@ -18523,6 +18534,70 @@ test "buildTagPrefix stamps msgid only for message-tags recipients" {
     );
 }
 
+test "buildTagPrefix stamps bot only for message-tags recipients" {
+    var buf: [256]u8 = undefined;
+    const tags = LinuxServer.MsgTags{ .time_value = "", .account = null, .is_bot = true };
+
+    var none = dispatch.ClientSession.init();
+    try std.testing.expectEqualStrings("", buildTagPrefix(&none, tags, &buf));
+
+    var mt = dispatch.ClientSession.init();
+    mt.addCap(.message_tags);
+    try std.testing.expectEqualStrings("@bot ", buildTagPrefix(&mt, tags, &buf));
+}
+
+test "threaded server: bot tag is delivered only to message-tags recipients" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+
+    try writeAllFd(fd_a, "CAP REQ :message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&c, " 001 C ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bot 0 * :Bot\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "MODE B +B\r\n");
+    try recvUntil(&b, "MODE B +B", 200);
+
+    try writeAllFd(fd_a, "JOIN #bot\r\n");
+    try recvUntil(&a, " 366 A #bot ", 200);
+    try writeAllFd(fd_c, "JOIN #bot\r\n");
+    try recvUntil(&c, " 366 C #bot ", 200);
+    try writeAllFd(fd_b, "JOIN #bot\r\n");
+    try recvUntil(&b, " 366 B #bot ", 200);
+
+    a.reset();
+    c.reset();
+    try writeAllFd(fd_b, "PRIVMSG #bot :hello\r\n");
+    try recvUntil(&a, ":B!bot@localhost PRIVMSG #bot :hello\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), ";bot ") != null);
+    try recvUntil(&c, ":B!bot@localhost PRIVMSG #bot :hello\r\n", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), ";bot ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "@bot ") == null);
+}
+
 test "threaded server: TAGMSG relays client tags to message-tags peers" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -19012,9 +19087,69 @@ test "threaded server: user +C blocks direct CTCP except ACTION" {
     try b.readAvailable();
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "\x01VERSION\x01") == null);
 
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :\x01ACTIONGRAB x\x01\r\n");
+    try recvUntil(&a, "FAIL PRIVMSG CTCP_BLOCKED :Cannot message this user (+C: no CTCP)", 200);
+    try b.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "\x01ACTIONGRAB x\x01") == null);
+
     b.reset();
     try writeAllFd(fd_a, "PRIVMSG B :\x01ACTION waves\x01\r\n");
     try recvUntil(&b, ":A!alice@localhost PRIVMSG B :\x01ACTION waves\x01\r\n", 200);
+}
+
+test "threaded server: channel +C blocks embedded CTCP except exact ACTION" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "JOIN #ctcp\r\n");
+    try recvUntil(&a, " 366 A #ctcp ", 200);
+    try writeAllFd(fd_b, "JOIN #ctcp\r\n");
+    try recvUntil(&b, " 366 B #ctcp ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #ctcp +C\r\n");
+    try recvUntil(&a, "MODE #ctcp +C", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_b, "PRIVMSG #ctcp :hi \x01VERSION\x01\r\n");
+    try recvUntil(&b, " 404 B #ctcp :Cannot send to channel (+C: no CTCP)", 200);
+    waitMillis(100);
+    try a.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "\x01VERSION\x01") == null);
+
+    b.reset();
+    try writeAllFd(fd_b, "PRIVMSG #ctcp :\x01ACTIONGRAB x\x01\r\n");
+    try recvUntil(&b, " 404 B #ctcp :Cannot send to channel (+C: no CTCP)", 200);
+
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #ctcp :\x01ACTION waves\x01\r\n");
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #ctcp :\x01ACTION waves\x01\r\n", 200);
 }
 
 test "threaded server: session-sync fans out inbound direct messages to account siblings" {
