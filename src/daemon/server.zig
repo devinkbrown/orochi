@@ -11268,6 +11268,7 @@ pub const LinuxServer = struct {
                 var time_buf: [40]u8 = undefined;
                 const tags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
                 try self.broadcastChannelMinRank(chan, tags, line, null, if (speech == .opmoderate) 2 else min_rank);
+                if (speech == .opmoderate) self.publishModerationHeld(chan, conn, message);
             } else {
                 try self.broadcastChannel(chan, line, null);
             }
@@ -14339,6 +14340,20 @@ pub const LinuxServer = struct {
         self.publishOperEvent(.server_link, .notice, msg) catch {};
     }
 
+    /// Surface an opmoderate (+U) held message to the Event Spine as a POLICY
+    /// event, so opers subscribed to POLICY get a structured moderation feed in
+    /// addition to the channel ops who already receive the raw routed message.
+    /// This is the `mode_rearchitecture.md` "held → structured signal" intent for
+    /// the network-oper monitoring audience (channel-op raw delivery is unchanged).
+    /// Best-effort; reaches opers on the publishing reactor, the same caveat as
+    /// every other publishOperEvent caller.
+    fn publishModerationHeld(self: *LinuxServer, channel: []const u8, conn: *ConnState, text: []const u8) void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const held = if (text.len > 200) text[0..200] else text;
+        const msg = std.fmt.bufPrint(&buf, "{s} held message from {s}: {s}", .{ channel, conn.session.displayName(), held }) catch return;
+        self.publishOperEvent(.policy, .notice, msg) catch {};
+    }
+
     /// REHASH — oper-only configuration reload. Re-reads and re-parses the
     /// configured file and swaps in a freshly-built oper registry (account→class
     /// bindings). Existing sessions keep their current oper state; new SASL logins
@@ -15565,6 +15580,7 @@ pub const LinuxServer = struct {
                 // to ops-and-above only (rank >= 2); no sender error, no echo, no
                 // history, no cross-node relay — ops locally see what was attempted.
                 try self.broadcastChannelMinRank(chan, ctags, eff_msg, id, 2);
+                self.publishModerationHeld(chan, conn, eff_text);
                 return;
             }
             if (min_rank == 0) {
@@ -21292,6 +21308,56 @@ test "threaded server: +U OPMODERATE routes a muted member's message to ops only
     try writeAllFd(fd_a, "PRIVMSG #o :op-says-hi\r\n");
     try recvUntil(&c, "PRIVMSG #o :op-says-hi", 200);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "muted-attempt") == null);
+}
+
+test "threaded server: +U OPMODERATE held message surfaces a POLICY event to opers" {
+    // operTestConfig defaults to one shard, so the muted member and the oper
+    // share a reactor (publishOperEvent reaches same-reactor subscribers — a
+    // pre-existing limitation under num_shards>1, out of scope here).
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A is a network oper (auto-subscribed to POLICY on SASL elevation) and the
+    // founder/op of #o, which it makes +m (moderated) + +U (opmoderate).
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&a, " 381 A ", 200);
+    try writeAllFd(fd_a, "JOIN #o\r\n");
+    try recvUntil(&a, " 366 A #o ", 200);
+    try writeAllFd(fd_a, "MODE #o +m\r\n");
+    try recvUntil(&a, "MODE #o +m", 200);
+    try writeAllFd(fd_a, "MODE #o +U\r\n");
+    try recvUntil(&a, "MODE #o +U", 200);
+
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "JOIN #o\r\n");
+    try recvUntil(&b, " 366 B #o ", 200);
+
+    // B (muted) speaks: besides the raw routed copy, A receives a structured
+    // POLICY event naming the channel, sender, and held text.
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #o :held-here\r\n");
+    try recvUntil(&a, "NOTE EVENT POLICY :#o held message from B: held-here", 200);
 }
 
 test "threaded server: DATA STATUSMSG target reaches ops only" {
