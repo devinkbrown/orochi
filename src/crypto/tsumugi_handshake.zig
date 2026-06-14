@@ -641,6 +641,7 @@ fn decodeM1Payload(bytes: []const u8) Error!M1Body {
     const requested_features = try r.readU128();
     _ = try r.readU64();
     const pass_len = try r.readU16();
+    if (pass_len > max_meshpass_len) return error.MeshPassTooLarge;
     _ = try r.take(pass_len);
     const signed = bytes[0..r.pos];
     const sig = (try r.take(sign.signature_len))[0..sign.signature_len].*;
@@ -825,4 +826,28 @@ test "applyToml overrides tsumugi_max_meshpass_len and restores cleanly" {
     defer zero.deinit(allocator);
     applyToml(&zero);
     try std.testing.expectEqual(default_max_meshpass_len, max_meshpass_len);
+}
+
+test "responder M1 decode rejects oversized MeshPass and accepts capped pass" {
+    const saved = max_meshpass_len;
+    defer max_meshpass_len = saved;
+    max_meshpass_len = 4;
+
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+
+    var ok_cfg = fx.cfg_i;
+    ok_cfg.mesh_pass = "pass";
+    var ok_initr = Initiator.init(std.testing.allocator, &fx.i_node, fx.i_pre, &fx.i_kem.secret_key, fx.r_pre, ok_cfg);
+    const ok_payload = try ok_initr.buildM1Payload("test-prefix");
+    defer std.testing.allocator.free(ok_payload);
+    const ok_body = try decodeM1Payload(ok_payload);
+    try std.testing.expectEqualSlices(u8, &fx.i_pre.node_id, &ok_body.node_id);
+
+    var oversized_cfg = fx.cfg_i;
+    oversized_cfg.mesh_pass = "pass!";
+    var oversized_initr = Initiator.init(std.testing.allocator, &fx.i_node, fx.i_pre, &fx.i_kem.secret_key, fx.r_pre, oversized_cfg);
+    const oversized_payload = try oversized_initr.buildM1Payload("test-prefix");
+    defer std.testing.allocator.free(oversized_payload);
+    try std.testing.expectError(error.MeshPassTooLarge, decodeM1Payload(oversized_payload));
 }
