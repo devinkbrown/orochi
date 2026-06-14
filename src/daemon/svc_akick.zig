@@ -386,6 +386,21 @@ test "add/list: hostmask entry stored and matchable" {
     try testing.expect(store.matchOnJoin("#chan", "good!ok@example.com", null, 2000) == null);
 }
 
+test "matchOnJoin: hostmask mirror matches mixed-case joining prefix" {
+    var store = AkickStore.init(testing.allocator);
+    defer store.deinit();
+
+    try store.add("#c", "Bad!*@*", "no bad", "admin", 1000, null);
+
+    const hit_tilde = store.matchOnJoin("#c", "Bad!~bad@host", null, 2000);
+    try testing.expect(hit_tilde != null);
+    try testing.expectEqualStrings("no bad", hit_tilde.?.reason);
+
+    const hit_plain = store.matchOnJoin("#c", "Bad!bad@host", null, 2000);
+    try testing.expect(hit_plain != null);
+    try testing.expectEqualStrings("no bad", hit_plain.?.reason);
+}
+
 test "channel name is matched case-insensitively" {
     var store = AkickStore.init(testing.allocator);
     defer store.deinit();
