@@ -5403,6 +5403,8 @@ pub const LinuxServer = struct {
         if (self.world.channelHasFlag(channel, .moderated) and !modes.canSpeakModerated()) return true;
         // +M mod_reg: an unauthenticated member without voice+ cannot speak.
         if (self.world.channelHasFlag(channel, .mod_reg) and account.len == 0 and !modes.canSpeakModerated()) return true;
+        // +a authonly: an unauthenticated remote sender cannot speak (mirrors the join gate).
+        if (self.world.channelHasExtFlag(channel, .authonly) and account.len == 0) return true;
 
         // +b bans / +Z quiet: build an extban context from the remote actor's
         // propagated prefix (nick!user@host) + account; an op member overrides a
