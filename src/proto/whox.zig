@@ -6,6 +6,7 @@ const std = @import("std");
 const numeric = @import("numeric.zig");
 
 pub const MAX_TOKEN_BYTES: usize = 32;
+pub const MAX_SELECTOR_FIELDS: usize = 16;
 
 const whospcrpl_code = numeric.Numeric.RPL_WHOSPCRPL;
 
@@ -34,23 +35,8 @@ pub const Field = enum(u8) {
     realname = 'r',
 };
 
-pub const canonical_fields = [_]Field{
-    .token,
-    .channel,
-    .user,
-    .ip,
-    .host,
-    .server,
-    .nick,
-    .flags,
-    .distance,
-    .idle,
-    .account,
-    .oper_level,
-    .realname,
-};
-
-/// Bitset-style selector parsed from the WHOX field list.
+/// Selector parsed from the WHOX field list. Boolean fields provide cheap
+/// membership tests; `order` preserves caller-requested wire order.
 pub const FieldSet = struct {
     token: bool = false,
     channel: bool = false,
@@ -65,6 +51,8 @@ pub const FieldSet = struct {
     account: bool = false,
     oper_level: bool = false,
     realname: bool = false,
+    order: [MAX_SELECTOR_FIELDS]Field = undefined,
+    count: usize = 0,
 
     pub fn contains(self: FieldSet, field: Field) bool {
         return switch (field) {
@@ -84,7 +72,12 @@ pub const FieldSet = struct {
         };
     }
 
+    pub fn slice(self: *const FieldSet) []const Field {
+        return self.order[0..self.count];
+    }
+
     fn set(self: *FieldSet, field: Field) WhoxError!void {
+        if (self.count >= self.order.len) return error.InvalidSelector;
         switch (field) {
             .token => {
                 if (self.token) return error.DuplicateField;
@@ -139,6 +132,8 @@ pub const FieldSet = struct {
                 self.realname = true;
             },
         }
+        self.order[self.count] = field;
+        self.count += 1;
     }
 };
 
@@ -203,15 +198,12 @@ pub fn writeReply(
     var b = LineBuilder.init(allocator, out);
     try b.numericPrefix(whospcrpl_code, ctx.server_name, ctx.requester);
 
-    var emitted = false;
-    inline for (canonical_fields) |field| {
-        if (ctx.request.fields.contains(field)) {
-            emitted = true;
-            try appendField(&b, field, ctx.request.token, ctx.member);
-        }
-    }
+    const fields = ctx.request.fields.slice();
+    if (fields.len == 0) return error.InvalidSelector;
 
-    if (!emitted) return error.InvalidSelector;
+    for (fields, 0..) |field, index| {
+        try appendField(&b, field, ctx.request.token, ctx.member, index + 1 == fields.len);
+    }
     try b.crlf();
 }
 
@@ -229,6 +221,7 @@ fn appendField(
     field: Field,
     token: ?[]const u8,
     member: MemberValues,
+    last: bool,
 ) WhoxError!void {
     switch (field) {
         .token => try b.spaceParam(token orelse "0"),
@@ -243,7 +236,7 @@ fn appendField(
         .idle => try b.spaceUnsigned(member.idle_seconds),
         .account => try b.spaceParam(member.account),
         .oper_level => try b.spaceParam(member.oper_level),
-        .realname => try b.spaceTrailing(member.realname),
+        .realname => if (last) try b.spaceTrailing(member.realname) else try b.spaceParam(member.realname),
     }
 }
 
@@ -402,9 +395,9 @@ test "parse selector without token" {
     try std.testing.expect(request.token == null);
 }
 
-test "build full canonical 354 line" {
+test "build full requested-order 354 line" {
     const allocator = std.testing.allocator;
-    const request = try parse("%rfoalducsihnt,42");
+    const request = try parse("%tcuihsnfdlaor,42");
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
 
@@ -434,6 +427,23 @@ test "build subset 354 line" {
 
     try std.testing.expectEqualStrings(
         ":irc.example.test 354 dan 99 Alice H*@\r\n",
+        line,
+    );
+}
+
+test "build subset preserves requested order" {
+    const allocator = std.testing.allocator;
+    const request = try parse("%fnt,99");
+    const line = try buildReply(allocator, .{
+        .server_name = "irc.example.test",
+        .requester = "dan",
+        .request = request,
+        .member = sampleMember(),
+    });
+    defer allocator.free(line);
+
+    try std.testing.expectEqualStrings(
+        ":irc.example.test 354 dan H*@ Alice 99\r\n",
         line,
     );
 }

@@ -6671,7 +6671,9 @@ pub const LinuxServer = struct {
         var count: usize = 0;
         for (parsed.paramSlice()) |nick| {
             if (count >= online_buf.len) break;
-            if (self.world.findNick(nick) != null) {
+            if (self.world.findNick(nick)) |wid| {
+                const mconn = self.connFor(clientIdFromWorld(wid));
+                if (mconn != null and self.userHiddenByInvisible(conn, wid, mconn.?)) continue;
                 online_buf[count] = nick;
                 count += 1;
             }
@@ -6693,7 +6695,7 @@ pub const LinuxServer = struct {
             // Reflect live per-client oper (`*`) and away (`-`/`+`) state from the
             // target's session, as RPL_USERHOST requires.
             const mconn = self.connFor(clientIdFromWorld(wid));
-            const is_oper = if (mconn) |mc| mc.session.isOper() else false;
+            const is_oper = if (mconn) |mc| mc.session.isOper() and !operHidden(mc, conn) else false;
             const is_away = if (mconn) |mc| mc.session.awayMessage() != null else false;
             const vhost = if (mconn) |mc| hostOf(mc) else default_host;
             targets[count] = .{ .nick = nick, .is_oper = is_oper, .is_away = is_away, .user = usernameOf(self, wid), .host = vhost };
@@ -6714,18 +6716,20 @@ pub const LinuxServer = struct {
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
                 const mconn = self.connFor(clientIdFromWorld(member.*));
+                if (mconn != null and self.userHiddenByInvisible(conn, member.*, mconn.?)) continue;
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
                 try self.emitWhoxRow(conn, req, requester, target, nick, usernameOf(self, member.*), mconn, hp);
             }
         } else if (self.world.findNick(target)) |wid| {
             // Nick target: a single 354 row, no channel context (channel "*").
             const mconn = self.connFor(clientIdFromWorld(wid));
-            try self.emitWhoxRow(conn, req, requester, "*", target, usernameOf(self, wid), mconn, 0);
+            if (mconn != null and !self.userHiddenByInvisible(conn, wid, mconn.?)) {
+                try self.emitWhoxRow(conn, req, requester, "*", target, usernameOf(self, wid), mconn, 0);
+            }
         }
         var endbuf: [default_reply_bytes]u8 = undefined;
         const end = who.writeEndOfWho(&endbuf, self.serverName(), requester, target) catch return;
         try appendToConn(conn, end);
-        try appendToConn(conn, "\r\n");
     }
 
     /// +H hide-oper: whether `target`'s operator status must be hidden from
@@ -6733,6 +6737,28 @@ pub const LinuxServer = struct {
     /// nor the target themselves.
     fn operHidden(target: *ConnState, viewer: *ConnState) bool {
         return target.session.umodes.contains(.hide_oper) and !viewer.session.isOper() and viewer != target;
+    }
+
+    fn sharesAnyChannelWith(self: *LinuxServer, left: world_model.ClientId, right: world_model.ClientId) bool {
+        if (left.eql(right)) return true;
+        var chan_names: [64][]const u8 = undefined;
+        const nchan = self.world.channelsOf(left, &chan_names);
+        for (chan_names[0..nchan]) |channel| {
+            if (self.world.isMember(channel, right)) return true;
+        }
+        return false;
+    }
+
+    fn userHiddenByInvisible(self: *LinuxServer, viewer: *ConnState, target_wid: world_model.ClientId, target: *ConnState) bool {
+        if (!target.session.umodes.contains(.invisible)) return false;
+        if (viewer == target or viewer.session.isOper()) return false;
+        const viewer_wid = self.world.findNick(viewer.session.displayName()) orelse return true;
+        return !self.sharesAnyChannelWith(viewer_wid, target_wid);
+    }
+
+    fn channelHiddenFromWhois(self: *LinuxServer, channel: []const u8, viewer_wid: world_model.ClientId) bool {
+        if (!self.world.channelHasFlag(channel, .secret) and !self.world.isPrivate(channel)) return false;
+        return !self.world.isMember(channel, viewer_wid);
     }
 
     /// Emit one RPL_WHOSPCRPL (354) row. Flags are `<H|G>[*][<prefix>]`: away,
@@ -6807,6 +6833,7 @@ pub const LinuxServer = struct {
             while (it.next()) |member| {
                 const nick = self.world.nickOf(member.*) orelse continue;
                 const mconn = self.connFor(clientIdFromWorld(member.*));
+                if (mconn != null and self.userHiddenByInvisible(conn, member.*, mconn.?)) continue;
                 const hp = (self.world.memberModes(target, member.*) orelse world_model.MemberModes.empty()).highestPrefix();
                 const ctx = who.ReplyContext{
                     .server_name = self.serverName(),
@@ -6824,32 +6851,33 @@ pub const LinuxServer = struct {
                 };
                 const line = who.writeWhoReply(&buf, ctx) catch continue;
                 try appendToConn(conn, line);
-                try appendToConn(conn, "\r\n");
             }
         } else if (self.world.findNick(target)) |wid| {
             const mconn = self.connFor(clientIdFromWorld(wid));
-            const ctx = who.ReplyContext{
-                .server_name = self.serverName(),
-                .requester = requester,
-                .target = target,
-                .client = .{
-                    .nick = target,
-                    .user = usernameOf(self, wid),
-                    .host = if (mconn) |c| hostOf(c) else default_host,
-                    .server = self.serverName(),
-                    .realname = if (mconn) |c| c.session.realname() else target,
-                    .account = if (mconn) |c| c.session.account() else null,
-                },
-            };
-            if (who.writeWhoReply(&buf, ctx)) |line| {
-                try appendToConn(conn, line);
-                try appendToConn(conn, "\r\n");
-            } else |_| {}
+            if (mconn != null and self.userHiddenByInvisible(conn, wid, mconn.?)) {
+                // Hidden by +i: complete the query with 315 and no 352 row.
+            } else {
+                const ctx = who.ReplyContext{
+                    .server_name = self.serverName(),
+                    .requester = requester,
+                    .target = target,
+                    .client = .{
+                        .nick = target,
+                        .user = usernameOf(self, wid),
+                        .host = if (mconn) |c| hostOf(c) else default_host,
+                        .server = self.serverName(),
+                        .realname = if (mconn) |c| c.session.realname() else target,
+                        .account = if (mconn) |c| c.session.account() else null,
+                    },
+                };
+                if (who.writeWhoReply(&buf, ctx)) |line| {
+                    try appendToConn(conn, line);
+                } else |_| {}
+            }
         }
 
         const end = who.writeEndOfWho(&buf, self.serverName(), requester, target) catch return;
         try appendToConn(conn, end);
-        try appendToConn(conn, "\r\n");
     }
 
     /// LIST [<filters>] — RPL_LISTSTART/RPL_LIST/RPL_LISTEND. Secret (+s)
@@ -6938,15 +6966,19 @@ pub const LinuxServer = struct {
         const nchan = self.world.channelsOf(target_wid.?, &chan_names);
         var memberships: [32]whois.ChannelMembership = undefined;
         var prefix_store: [32][1]u8 = undefined;
-        for (chan_names[0..nchan], 0..) |cn, i| {
+        const requester_wid = self.world.findNick(conn.session.displayName()) orelse world_model.ClientId.invalid;
+        var visible_nchan: usize = 0;
+        for (chan_names[0..nchan]) |cn| {
+            if (self.channelHiddenFromWhois(cn, requester_wid)) continue;
             const modes = self.world.memberModes(cn, target_wid.?) orelse world_model.MemberModes.empty();
             const hp = modes.highestPrefix();
             var pfx: []const u8 = "";
             if (hp != 0) {
-                prefix_store[i][0] = hp;
-                pfx = prefix_store[i][0..1];
+                prefix_store[visible_nchan][0] = hp;
+                pfx = prefix_store[visible_nchan][0..1];
             }
-            memberships[i] = .{ .prefix = pfx, .channel = cn };
+            memberships[visible_nchan] = .{ .prefix = pfx, .channel = cn };
+            visible_nchan += 1;
         }
 
         const tconn = target_conn.?;
@@ -7027,7 +7059,7 @@ pub const LinuxServer = struct {
             .channels = blk: {
                 const hide = tconn.session.umodes.contains(.hide_chans) and
                     !conn.session.isOper() and conn != tconn;
-                break :blk memberships[0..if (hide) 0 else nchan];
+                break :blk memberships[0..if (hide) 0 else visible_nchan];
             },
         };
         whois.writeWhois(&sink, self.serverName(), conn.session.displayName(), subject) catch return;
@@ -7319,9 +7351,14 @@ pub const LinuxServer = struct {
             return;
         }
         const target = parsed.paramSlice()[0];
+        const requested_count = if (parsed.param_count >= 2)
+            std.fmt.parseInt(usize, parsed.paramSlice()[1], 10) catch 16
+        else
+            16;
+        const max_results = @min(requested_count, 16);
 
         var records: [16]whowas.Record = undefined;
-        const found = self.whowas.query(target, records.len, &records) catch records[0..0];
+        const found = self.whowas.query(target, max_results, &records) catch records[0..0];
         const n = found.len;
 
         var entries: [16]whowas_reply.HistoryEntry = undefined;
@@ -11051,12 +11088,14 @@ pub const LinuxServer = struct {
         // worth the lifecycle bookkeeping for these rarely-nonzero fields.
         var unknown: u64 = 0;
         var opers: u64 = 0;
+        var invisible: u64 = 0;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             if (c.s2s != null or c.s2s_secured != null) continue;
             if (c.session.registered()) {
                 if (c.session.isOper()) opers += 1;
+                if (c.session.umodes.contains(.invisible)) invisible += 1;
             } else {
                 unknown += 1;
             }
@@ -11066,7 +11105,7 @@ pub const LinuxServer = struct {
         const servers: u64 = 1 + self.distinctPeerCount();
         const counts = lusers.Counts{
             .users = users,
-            .invisible = 0,
+            .invisible = invisible,
             .servers = servers,
             .opers = opers,
             .unknown = unknown,
@@ -16212,6 +16251,10 @@ fn expectDigitAfter(haystack: []const u8, marker: []const u8) !void {
     try std.testing.expect(std.ascii.isDigit(haystack[pos]));
 }
 
+fn expectNoEmptyIrcLine(haystack: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, "\r\n\r\n") == null);
+}
+
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
@@ -19680,6 +19723,172 @@ test "threaded server: WHOX field-selected reply" {
     try recvUntil(&a, " 315 A #w ", 200);
 }
 
+test "threaded server: WHO and WHOX emit no blank lines" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "JOIN #who\r\n");
+    try recvUntil(&a, " 366 A #who ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "WHO #who\r\n");
+    try recvUntil(&a, " 352 A #who ", 200);
+    try recvUntil(&a, " 315 A #who ", 200);
+    try expectNoEmptyIrcLine(a.written());
+
+    a.reset();
+    try writeAllFd(fd_a, "WHO #who %cn\r\n");
+    try recvUntil(&a, " 354 A #who A", 200);
+    try recvUntil(&a, " 315 A #who ", 200);
+    try expectNoEmptyIrcLine(a.written());
+}
+
+test "threaded server: invisible users are hidden from WHO and ISON without common channel" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE A +i\r\n");
+    try recvUntil(&a, "MODE A +i", 200);
+
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "WHO A\r\n");
+    try recvUntil(&b, " 315 B A ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 352 B ") == null);
+
+    b.reset();
+    try writeAllFd(fd_b, "ISON A\r\n");
+    try recvUntil(&b, " 303 B :", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 303 B :A") == null);
+}
+
+test "threaded server: WHOIS hides secret and private channels from non-members" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "JOIN #secret\r\n");
+    try recvUntil(&a, " 366 A #secret ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #secret +s\r\n");
+    try recvUntil(&a, "MODE #secret +s", 200);
+    try writeAllFd(fd_a, "JOIN #private\r\n");
+    try recvUntil(&a, " 366 A #private ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #private +p\r\n");
+    try recvUntil(&a, "MODE #private +p", 200);
+
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "WHOIS A\r\n");
+    try recvUntil(&b, " 318 B A ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "#secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "#private") == null);
+}
+
+test "threaded server: WHOWAS count parameter bounds returned history" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "NICK C\r\n");
+    try recvUntil(&b, "NICK C", 200);
+    b.reset();
+    try writeAllFd(fd_b, "NICK B\r\n");
+    try recvUntil(&b, "NICK B", 200);
+    b.reset();
+    try writeAllFd(fd_b, "NICK D\r\n");
+    try recvUntil(&b, "NICK D", 200);
+    b.reset();
+    try writeAllFd(fd_b, "NICK B\r\n");
+    try recvUntil(&b, "NICK B", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "WHOWAS B 1\r\n");
+    try recvUntil(&a, " 369 A B ", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(a.written(), " 314 A B "));
+}
+
 test "threaded server: MODE multi-flag batching in one command" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -20678,20 +20887,28 @@ fn runLusersCrossShardConsistencyTest(shards1: u16, shards2: u16) !void {
     const node2_peers = [_][]const u8{node1_spec};
 
     var node1 = Server.init(alloc, .{
-        .host = "127.0.0.1",       .port = 0,
-        .s2s_port = s2s_ports[0],  .node_id = 1,
-        .server_name = "node1.test", .mesh_connect = &node1_peers,
-        .num_shards = shards1,     .sweep_interval_ms = 100,
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .node_id = 1,
+        .server_name = "node1.test",
+        .mesh_connect = &node1_peers,
+        .num_shards = shards1,
+        .sweep_interval_ms = 100,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
     };
     defer node1.deinit();
     var node2 = Server.init(alloc, .{
-        .host = "127.0.0.1",       .port = 0,
-        .s2s_port = s2s_ports[1],  .node_id = 2,
-        .server_name = "node2.test", .mesh_connect = &node2_peers,
-        .num_shards = shards2,     .sweep_interval_ms = 100,
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[1],
+        .node_id = 2,
+        .server_name = "node2.test",
+        .mesh_connect = &node2_peers,
+        .num_shards = shards2,
+        .sweep_interval_ms = 100,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
@@ -20796,20 +21013,28 @@ test "threaded server: inbound relay re-enforces local +n / +t against a remote 
     const node2_peers = [_][]const u8{node1_spec};
 
     var node1 = Server.init(alloc, .{
-        .host = "127.0.0.1",       .port = 0,
-        .s2s_port = s2s_ports[0],  .node_id = 1,
-        .server_name = "node1.test", .mesh_connect = &node1_peers,
-        .num_shards = 1,           .sweep_interval_ms = 100,
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .node_id = 1,
+        .server_name = "node1.test",
+        .mesh_connect = &node1_peers,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
     };
     defer node1.deinit();
     var node2 = Server.init(alloc, .{
-        .host = "127.0.0.1",       .port = 0,
-        .s2s_port = s2s_ports[1],  .node_id = 2,
-        .server_name = "node2.test", .mesh_connect = &node2_peers,
-        .num_shards = 1,           .sweep_interval_ms = 100,
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[1],
+        .node_id = 2,
+        .server_name = "node2.test",
+        .mesh_connect = &node2_peers,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
         else => return err,
