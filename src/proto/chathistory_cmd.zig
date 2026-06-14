@@ -9,6 +9,7 @@ pub const max_msgid_len: usize = 128;
 pub const max_batch_ref_len: usize = 64;
 pub const max_sender_len: usize = 256;
 pub const max_line_body: usize = 8191;
+pub const targets_batch_type = "draft/chathistory-targets";
 
 pub const FailCode = enum {
     INVALID_PARAMS,
@@ -74,6 +75,38 @@ pub const Request = union(enum) {
     between: Range,
     around: Around,
 };
+
+pub const LatestMode = enum {
+    unbounded,
+    before_bound,
+};
+
+pub const RangeDirection = enum {
+    forward,
+    reverse,
+};
+
+pub fn requestTarget(request: Request) []const u8 {
+    return switch (request) {
+        .latest => |r| r.target,
+        .before => |r| r.target,
+        .after => |r| r.target,
+        .between => |r| r.target,
+        .around => |r| r.target,
+    };
+}
+
+pub fn latestMode(latest: Latest) LatestMode {
+    return if (latest.lower_bound == null) .unbounded else .before_bound;
+}
+
+pub fn rangeDirection(start: u64, end: u64) RangeDirection {
+    return if (start <= end) .forward else .reverse;
+}
+
+pub fn channelHistoryTargetAllowed(channel_exists: bool, is_member: bool, is_visible: bool) bool {
+    return channel_exists and (is_member or is_visible);
+}
 
 pub fn parse(line: []const u8) ParseError!Request {
     return parseWithOptions(line, .{});
@@ -463,6 +496,50 @@ test "parse before after between and around" {
     const around_two = try parse("CHATHISTORY AROUND #channel msgid=1234 timestamp=2015-06-26T19:43:53.410Z 11");
     try std.testing.expectEqualStrings("1234", around_two.around.center.msgid);
     try std.testing.expectEqual(@as(u64, 1435347833410), around_two.around.second.?.timestamp);
+}
+
+test "request target helper covers all chathistory subcommands" {
+    const latest = try parse("CHATHISTORY LATEST #channel * 50");
+    try std.testing.expectEqualStrings("#channel", requestTarget(latest));
+
+    const before = try parse("CHATHISTORY BEFORE #before timestamp=2015-06-26T19:40:31.230Z 20");
+    try std.testing.expectEqualStrings("#before", requestTarget(before));
+
+    const after = try parse("CHATHISTORY AFTER #after msgid=1234 20");
+    try std.testing.expectEqualStrings("#after", requestTarget(after));
+
+    const between = try parse(
+        "CHATHISTORY BETWEEN #between timestamp=2015-06-26T19:40:31.230Z timestamp=2015-06-26T19:43:53.410Z 20",
+    );
+    try std.testing.expectEqualStrings("#between", requestTarget(between));
+
+    const around = try parse("CHATHISTORY AROUND #around msgid=1234 11");
+    try std.testing.expectEqualStrings("#around", requestTarget(around));
+}
+
+test "channel history target policy denies non-member hidden channels" {
+    try std.testing.expect(channelHistoryTargetAllowed(true, true, false));
+    try std.testing.expect(channelHistoryTargetAllowed(true, false, true));
+    try std.testing.expect(!channelHistoryTargetAllowed(true, false, false));
+    try std.testing.expect(!channelHistoryTargetAllowed(false, false, true));
+}
+
+test "latest mode honors selector bound" {
+    const latest_star = try parse("CHATHISTORY LATEST #channel * 50");
+    try std.testing.expectEqual(LatestMode.unbounded, latestMode(latest_star.latest));
+
+    const latest_ts = try parse("CHATHISTORY LATEST #channel timestamp=2015-06-26T19:40:31.230Z 10");
+    try std.testing.expectEqual(LatestMode.before_bound, latestMode(latest_ts.latest));
+}
+
+test "between range direction preserves requested order" {
+    try std.testing.expectEqual(RangeDirection.forward, rangeDirection(1, 2));
+    try std.testing.expectEqual(RangeDirection.forward, rangeDirection(2, 2));
+    try std.testing.expectEqual(RangeDirection.reverse, rangeDirection(3, 2));
+}
+
+test "targets batch type uses the draft token" {
+    try std.testing.expectEqualStrings("draft/chathistory-targets", targets_batch_type);
 }
 
 test "reject malformed and oversized requests" {
