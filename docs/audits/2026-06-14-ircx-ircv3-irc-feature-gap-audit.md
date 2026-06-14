@@ -5,9 +5,9 @@ Branch scanned: `integ`
 
 Scope: read-only source audit of `/home/kain/orochi` using 30 delegated audit scopes plus local grep review, combined with the earlier unwired/incomplete surface audit from the same date. No daemon source was changed for this report.
 
-## Repair Run Status — landed on `main` @ `<pending>` (full suite 6609/6612 pass, 0 fail, 3 skip)
+## Repair Run Status — landed on `main` @ `73f00ab` (full suite 6609/6612 pass, 0 fail, 3 skip)
 
-PROP computed USER `ACCOUNT` provider (this commit): doc 21's IRCX gap #1 (PROP entity providers) — `member_of` was already done; `onjoin`/`onpart`/`ownerkey`/`hostkey` exist as stored props; `user_profile` stays deferred (no canonical source). The one genuine missing *computed* provider was USER `ACCOUNT`: `PROP <nick> ACCOUNT` fell through to the (empty) generic store instead of returning the target's real login. Added it to `userBuiltinGet` alongside MEMBER_OF — returns the target's services account, consulted ahead of the store. Public (mirrors WHOIS 330 / `account-tag`), so no visibility gate; local target only — a remote mesh user has no local `ConnState`, so the provider declines (falls through) rather than guessing. Gated by a live test (authenticated A → `ACCOUNT :admin`; unauthenticated B → no value). Full suite green.
+PROP computed USER `ACCOUNT` provider (`73f00ab`): doc 21's IRCX gap #1 (PROP entity providers) — `member_of` was already done; `onjoin`/`onpart`/`ownerkey`/`hostkey` exist as stored props; `user_profile` stays deferred (no canonical source). The one genuine missing *computed* provider was USER `ACCOUNT`: `PROP <nick> ACCOUNT` fell through to the (empty) generic store instead of returning the target's real login. Added it to `userBuiltinGet` alongside MEMBER_OF — returns the target's services account, consulted ahead of the store. Public (mirrors WHOIS 330 / `account-tag`), so no visibility gate; local target only — a remote mesh user has no local `ConnState`, so the provider declines (falls through) rather than guessing. Gated by a live test (authenticated A → `ACCOUNT :admin`; unauthenticated B → no value). Full suite green.
 
 ## Repair Run Status — landed on `main` @ `4344bd4` (full suite 6608/6611 pass, 0 fail, 3 skip)
 
