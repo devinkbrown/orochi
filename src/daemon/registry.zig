@@ -11,6 +11,7 @@
 //! capable phases carry a mutable `approved: bool` an early hook can flip to
 //! `false`, while still honoring stop-on-veto ordering semantics.
 const std = @import("std");
+const ircx_gate = @import("../proto/ircx_gate.zig");
 
 /// Command handler used by registry dispatch.
 pub const CommandHandler = *const fn (ctx: *anyopaque, invocation: CommandInvocation) anyerror!void;
@@ -57,6 +58,7 @@ pub const Access = enum {
 pub const DispatchCaps = struct {
     registered: bool,
     oper: bool,
+    ircx: bool = false,
     /// Feature toggles that are turned OFF by config. A command whose
     /// `feature` tag appears here is treated as unavailable (`.disabled`).
     disabled_features: []const []const u8 = &.{},
@@ -66,6 +68,7 @@ pub const DispatchCaps = struct {
 pub const DeniedReason = enum {
     needs_registered,
     needs_oper,
+    needs_ircx,
 };
 
 /// Outcome of command lookup, feature/access gating, and arity validation.
@@ -561,6 +564,9 @@ pub fn Registry(comptime mods: []const Module) type {
             // Config feature gate: a command tied to a disabled feature is
             // unavailable to everyone (reported as `.disabled`).
             if (featureDisabled(entry.spec.feature, client_caps)) return .disabled;
+            if (ircx_gate.gate(client_caps.ircx, entry.spec.name) == .NeedIrcx) {
+                return .{ .denied = .needs_ircx };
+            }
             if (!accessSatisfied(entry.spec.access, client_caps)) {
                 return .{ .denied = if (entry.spec.access == .oper) .needs_oper else .needs_registered };
             }

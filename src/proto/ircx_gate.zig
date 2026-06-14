@@ -34,11 +34,15 @@ pub const BuildError = error{
 
 const gated_commands = [_][]const u8{
     "CREATE",
+    "DATA",
+    "REQUEST",
+    "REPLY",
     "PROP",
     "ACCESS",
     "EVENT",
     "MODEX",
     "WHISPER",
+    "LISTX",
     "AUTH",
 };
 
@@ -198,7 +202,6 @@ test "non-ircx commands are always allowed" {
         "PRIVMSG",
         "JOIN",
         "AUTHENTICATE",
-        "LISTX",
     });
     defer allocator.free(commands);
 

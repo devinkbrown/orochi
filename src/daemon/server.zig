@@ -4462,6 +4462,7 @@ pub const LinuxServer = struct {
             const caps = mod_registry.DispatchCaps{
                 .registered = conn.session.registered(),
                 .oper = conn.session.isOper(),
+                .ircx = conn.ircx,
                 .disabled_features = self.config.disabled_features,
             };
             switch (try module_manifest.Live.dispatchGated(&core, parsed.command, parsed.paramSlice(), caps)) {
@@ -4474,6 +4475,7 @@ pub const LinuxServer = struct {
                     switch (reason) {
                         .needs_oper => try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: operator privileges required"),
                         .needs_registered => try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered"),
+                        .needs_ircx => try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{parsed.command}, "IRCX command requires ISIRCX"),
                     }
                     return;
                 },
@@ -10773,8 +10775,17 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_BADTAG, &.{tag}, "Invalid DATA tag");
             return;
         }
+        var chan = target;
+        var min_rank: u8 = 0;
+        if (target.len >= 2) {
+            const r = statusPrefixRank(target[0]);
+            if (r > 0 and world_model.isChannelName(target[1..])) {
+                min_rank = r;
+                chan = target[1..];
+            }
+        }
         // Reserved-prefix authorization (case-insensitive 3-letter prefix).
-        const is_chan = world_model.isChannelName(target);
+        const is_chan = world_model.isChannelName(chan);
         if (tag.len >= 3) {
             const p = tag[0..3];
             if (std.ascii.eqlIgnoreCase(p, "SYS") or std.ascii.eqlIgnoreCase(p, "ADM")) {
@@ -10784,7 +10795,7 @@ pub const LinuxServer = struct {
                 }
             } else if (std.ascii.eqlIgnoreCase(p, "OWN") or std.ascii.eqlIgnoreCase(p, "HST")) {
                 const ok = is_chan and blk: {
-                    const mm = self.world.memberModes(target, worldIdFromClient(id)) orelse break :blk false;
+                    const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse break :blk false;
                     break :blk mm.isOperator();
                 };
                 if (!ok and !conn.session.isOper()) {
@@ -10797,11 +10808,19 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const line = formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), parsed.command, &.{ target, tag }, message) catch return;
         if (is_chan) {
-            if (!self.world.channelExists(target) or !self.world.isMember(target, worldIdFromClient(id))) {
+            if (!self.world.channelExists(chan) or !self.world.isMember(chan, worldIdFromClient(id))) {
                 try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{target}, "You're not on that channel");
                 return;
             }
-            try self.broadcastChannel(target, line, null);
+            const speech = try self.channelSpeechGate(id, conn, target, chan, message, false, min_rank, true);
+            if (speech == .deny) return;
+            if (speech == .opmoderate or min_rank > 0) {
+                var time_buf: [40]u8 = undefined;
+                const tags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
+                try self.broadcastChannelMinRank(chan, tags, line, null, if (speech == .opmoderate) 2 else min_rank);
+            } else {
+                try self.broadcastChannel(chan, line, null);
+            }
         } else {
             const rwid = self.world.findNick(target) orelse {
                 try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
@@ -17068,6 +17087,10 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&a, " 381 A ", 200); // A auto-elevated on SASL login
     try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try recvUntil(&b, " 800 B 1 0 ", 200);
 
     // B marks away -> 306; A PRIVMSGs B -> A sees RPL_AWAY (301).
     b.reset();
@@ -19062,6 +19085,8 @@ test "threaded server: WHISPER delivers to channel co-member only" {
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(a, " 001 A ", 200);
     try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(a, " 800 A 1 0 ", 200);
     try writeAllFd(fd_a, "JOIN #w\r\n");
     try writeAllFd(fd_b, "JOIN #w\r\n");
     try recvUntil(a, " 366 A #w ", 200);
@@ -19170,6 +19195,8 @@ test "threaded server: MODEX NOFORMAT does not collide with channel forward +f" 
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
     try writeAllFd(fd_a, "JOIN #c\r\n");
     try recvUntil(&a, " 366 A #c ", 200);
     try writeAllFd(fd_b, "JOIN #c\r\n");
@@ -19447,6 +19474,144 @@ test "threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800" {
     try recvUntil(&a, " 800 A 1 0 ", 200);
 }
 
+test "threaded server: IRCX opt-in gates DATA then permits typed channel delivery" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #dx\r\n");
+    try writeAllFd(fd_b, "JOIN #dx\r\n");
+    try recvUntil(&a, " 366 A #dx ", 200);
+    try recvUntil(&b, " 366 B #dx ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "DATA #dx TAG :legacy\r\n");
+    try recvUntil(&a, " 421 A DATA :IRCX command requires ISIRCX", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    b.reset();
+    try writeAllFd(fd_a, "DATA #dx TAG :typed\r\n");
+    try recvUntil(&b, ":A!alice@localhost DATA #dx TAG :typed\r\n", 200);
+}
+
+test "threaded server: DATA respects moderated channel speech gate" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #dm\r\n");
+    try writeAllFd(fd_b, "JOIN #dm\r\n");
+    try recvUntil(&a, " 366 A #dm ", 200);
+    try recvUntil(&b, " 366 B #dm ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #dm +m\r\n");
+    try recvUntil(&a, "MODE #dm +m", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "DATA #dm TAG :blocked\r\n");
+    try recvUntil(&b, " 404 B #dm :Cannot send to channel (+m)", 200);
+}
+
+test "threaded server: DATA STATUSMSG target reaches ops only" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try recvUntil(&c, " 001 C ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try writeAllFd(fd_c, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+    try recvUntil(&c, " 800 C 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #ds\r\n");
+    try writeAllFd(fd_b, "JOIN #ds\r\n");
+    try writeAllFd(fd_c, "JOIN #ds\r\n");
+    try recvUntil(&a, " 366 A #ds ", 200);
+    try recvUntil(&b, " 366 B #ds ", 200);
+    try recvUntil(&c, " 366 C #ds ", 200);
+    try writeAllFd(fd_a, "MODE #ds +o B\r\n");
+    try recvUntil(&b, "MODE #ds +o B", 200);
+
+    b.reset();
+    c.reset();
+    try writeAllFd(fd_a, "DATA @#ds TAG :ops\r\n");
+    try recvUntil(&b, ":A!alice@localhost DATA @#ds TAG :ops\r\n", 200);
+    try c.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "DATA @#ds TAG :ops") == null);
+
+    c.reset();
+    try writeAllFd(fd_c, "DATA @#ds TAG :sneaky\r\n");
+    try recvUntil(&c, " 482 C @#ds ", 200);
+}
+
 test "threaded server: PROP set/get gated by channel-op" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -19476,6 +19641,10 @@ test "threaded server: PROP set/get gated by channel-op" {
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(a, " 001 A ", 200);
     try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(a, " 800 A 1 0 ", 200);
+    try recvUntil(b, " 800 B 1 0 ", 200);
     try writeAllFd(fd_a, "JOIN #p\r\n");
     try recvUntil(a, " 366 A #p ", 200);
     // Founder A sets a channel property and reads it back (818 + 819).
@@ -19531,6 +19700,10 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(a, " 001 A ", 200);
     try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(a, " 800 A 1 0 ", 200);
+    try recvUntil(b, " 800 B 1 0 ", 200);
     try writeAllFd(fd_a, "JOIN #a\r\n");
     try recvUntil(a, " 366 A #a ", 200);
     // Founder A grants VOICE access, lists it, then deletes it (801/803-805/802).
@@ -19586,6 +19759,8 @@ test "threaded server: EVENT subscription managed by opers" {
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&a, " 381 A ", 200); // A auto-elevated on SASL login
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
 
     // A non-oper (no SASL oper binding) cannot use EVENT (ERR_NOPRIVILEGES 481).
     const fd_b = connectLoopback(port) catch return error.SkipZigTest;
@@ -19593,6 +19768,8 @@ test "threaded server: EVENT subscription managed by opers" {
     var b = LiveClient{ .fd = fd_b };
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&b, " 800 B 1 0 ", 200);
     try writeAllFd(fd_b, "EVENT LIST\r\n");
     try recvUntil(&b, " 481 ", 200);
 
@@ -20100,6 +20277,8 @@ test "threaded server: CREATE makes founder channel" {
     var a = LiveClient{ .fd = fd_a };
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
     a.reset();
     try writeAllFd(fd_a, "CREATE #cr\r\n");
     try recvUntil(&a, " 366 A #cr ", 200);
