@@ -143,7 +143,29 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 - Replies: Server notice confirming fingerprint binding.
 - Errors: `FAIL CERTADD TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `NO_CLIENT_CERT`, `CERT_ADD_FAILED`.
 - Example: `CERTADD`
-- Sources: `src/daemon/modules/accounts.zig:72`, `src/daemon/server.zig:8623`
+- Sources: `src/daemon/modules/accounts.zig:85`, `src/daemon/server.zig:12157`
+
+## CERTLIST
+
+- Syntax: `CERTLIST`
+- Description: Lists TLS client-certificate fingerprints bound to the logged-in account for SASL EXTERNAL.
+- Privileges: Registered client logged in to an account.
+- Parameters: None.
+- Replies: Server notices, one `CERTLIST <fingerprint>` per bound fingerprint, or a no-fingerprints notice.
+- Errors: `FAIL CERTLIST TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `CERT_LIST_FAILED`.
+- Example: `CERTLIST`
+- Sources: `src/daemon/modules/accounts.zig:86`, `src/daemon/server.zig:12167`
+
+## CERTDEL
+
+- Syntax: `CERTDEL <fingerprint>`
+- Description: Removes a TLS client-certificate fingerprint binding from the logged-in account.
+- Privileges: Registered client logged in to an account.
+- Parameters: Certificate fingerprint.
+- Replies: Server notice confirming removal.
+- Errors: `FAIL CERTDEL TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `NEED_MORE_PARAMS`, `CERT_NOT_OWNED`, `CERT_NOT_FOUND`, `CERT_DEL_FAILED`.
+- Example: `CERTDEL SHA256:...`
+- Sources: `src/daemon/modules/accounts.zig:87`, `src/daemon/server.zig:12183`
 
 ## TEGAMI
 

@@ -1,6 +1,11 @@
 # m_ircx_auth — IRCX AUTH command — multi-step SASL driver for non-CAP clients
 > Source-verified module reference for `m_ircx_auth`.
 
+> Historical reference only: this page describes the legacy Ophion C module
+> `modules/m_ircx_auth.c`. It is not the Orochi Zig implementation source of
+> truth. Orochi's live authentication path is IRCv3 CAP/AUTHENTICATE in
+> `src/daemon/dispatch.zig`.
+
 ## Overview
 `m_ircx_auth` is a C module implemented in `modules/m_ircx_auth.c`. IRCX AUTH command — multi-step SASL driver for non-CAP clients.
 

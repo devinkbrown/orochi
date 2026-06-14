@@ -21,19 +21,20 @@ sandbox (WASM); state moves between binary versions through typed, versioned cap
   struct literal carries `id/requires/conflicts/commands/hooks/caps/chanmodes/usermodes/
   numerics/isupport`; `Registry(mods)` validates at comptime (duplicate id/command/cap/mode/
   numeric, missing dep, conflict) and generates immutable command/hook/cap/mode/numeric/
-  isupport tables + `dispatch()` + priority-ordered `callHook()`. 4 tests pass. **It is not
-  yet wired into the live server.**
-- `src/daemon/server.zig` (9.6k lines) — `dispatchRegistered()` is a ~190-line
-  `eqlIgnoreCase` if-chain over ~90 commands, each an `LinuxServer` method
-  (`handleJoin`, `handleWhois`, …). This is the spine to modularize.
+  isupport tables + `dispatch()` + priority-ordered `callHook()`. 4 tests pass.
+  The registry is now wired into the live server: `dispatchRegistered()` consults
+  `module_manifest.Live.dispatchGated` before the non-command fallbacks.
+- `src/daemon/server.zig` — `dispatchRegistered()` now routes registered commands
+  through the live SerpentRegistry module manifest, with smaller fallback branches
+  for multiline, WASM plugins, and lower pre-registration dispatch.
 - `src/daemon/event_spine.zig` — typed event bus (Event Spine, already live).
 - `src/proto/coilpack*.zig` — canonical signature-stable wire format (capsule substrate).
 - `build.zig` builds OPVOX/OPVIS to **freestanding wasm32** already; the team owns the
   `wasm32-freestanding` toolchain. The daemon does **not** yet host/execute WASM.
 
-The module system is therefore ~60% latent: the registry exists, the seam to the live
-dispatch does not. This doc specifies the seam, the typed capability/hook layer, the
-lifecycle, Helix Upgrade, and the WASM boundary.
+The module system is therefore no longer merely latent: the registry exists and
+the live dispatch seam is wired. This doc remains useful for the typed
+capability/hook layer, lifecycle, Helix Upgrade, and WASM boundary.
 
 ---
 

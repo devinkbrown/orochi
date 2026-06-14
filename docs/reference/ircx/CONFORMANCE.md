@@ -18,10 +18,10 @@ alignment decision; fill residual 9xx error set.
 ## Discovery & session
 | Feature | Status | Notes |
 | --- | --- | --- |
-| `IRCX` (enable) → 800 RPL_IRCX | ❌ | gateway missing; implement first |
-| `ISIRCX` / `MODE ISIRCX` (query) → 800 | ❌ | discovery; implement first |
-| 800 `<state> <version> <pkgs> <maxmsg> <opts>` | ❌ | no 800 builder yet |
-| session IRCX opt-in bit | ❌ | add `ircx` to ConnState; gate via ircx_gate |
+| `IRCX` (enable) → 800 RPL_IRCX | ✅ | live gateway and reply path |
+| `ISIRCX` / `MODE ISIRCX` (query) → 800 | ✅ | live discovery path |
+| 800 `<state> <version> <pkgs> <maxmsg> <opts>` | ✅ | live `RPL_IRCX` builder/emitter |
+| session IRCX opt-in bit | ✅ | live per-session IRCX state gates IRCX behavior |
 
 ## Commands
 | Cmd | Status | Notes |
@@ -30,10 +30,10 @@ alignment decision; fill residual 9xx error set.
 | ACCESS (801–805, OWNER/HOST/VOICE/GRANT/DENY) | ✅ | live, channel-op gated; OWNER needs owner/founder |
 | PROP (818/819) | ✅ | live; secret-key read filter; denial 913 |
 | EVENT (806–810, types CHANNEL/MEMBER/…) | 🟡 | wired ADD/DEL/LIST over Event-Spine categories; numerics+types not draft-aligned (decide: conform vs document divergence) |
-| LISTX (811–817 + query terms) | ❌ | listx.zig builder exists but NOT dispatched — wire it |
+| LISTX (811–817 + query terms) | ✅ | live dispatch and filter builder |
 | CREATE (returns OID) | 🟡 | live as create-or-join founder; no OID returned |
 | WHISPER (+w/923) | ✅ | live, member-gated |
-| DATA / REQUEST / REPLY (tag messaging) | ❌ | not implemented; SYS/ADM/OWN/HST prefix gating |
+| DATA / REQUEST / REPLY (tag messaging) | ✅ | live tag messaging with SYS/ADM/OWN/HST prefix gating |
 | KNOCK | ✅ | live (713/711) |
 
 ## Channel modes (stored vs enforced)
@@ -41,11 +41,11 @@ alignment decision; fill residual 9xx error set.
 | --- | --- | --- | --- |
 | PUBLIC/PRIVATE +p / HIDDEN +h / SECRET +s | ✅ | 🟡 | +s/+p affect NAMES/LIST visibility; verify PRIVATE/HIDDEN query rules |
 | MODERATED +m / NOEXTERN +n / TOPICOP +t / INVITE +i | ✅ | ✅ | base enforcement live |
-| KNOCK +u | 🟡 | ❌ | flag stored (chanmode_ext); KNOCK cmd live but +u gating? |
-| NOFORMAT +f | ✅ | ❌ | stored; no display-format effect (client-side mostly) |
+| KNOCK +u | ✅ | ✅ | KNOCK accepted when `+i` or `+u`; otherwise open-channel rejection applies |
+| NOFORMAT +f | ✅ | ✅ | settable/rendered; channel delivery strips formatting |
 | NOWHISPER +w | ✅ | ✅ | enforced in WHISPER |
 | AUDITORIUM +x | ✅ | ✅ | enforced NAMES/JOIN/PART |
-| AUTHONLY +a | ✅ | ❌ | **must block unauthenticated JOIN** — implement |
+| AUTHONLY +a | ✅ | ✅ | blocks unauthenticated JOIN with numeric 477 |
 | CLONEABLE +d / CLONE +E | ✅ | ❌ | auto-clone-on-full + clone-takeover protection — implement |
 | REGISTERED +r / SERVICE +z | ✅ | ❌ | oper/services-set; semantics TBD |
 
@@ -60,7 +60,7 @@ alignment decision; fill residual 9xx error set.
 | Draft umode | Orochi | Notes |
 | --- | --- | --- |
 | +q OWNER (`.` prefix) | ✅ (as member mode) | Orochi models owner as a *channel member* mode (+q owner `.`), plus founder +Q `~` above it — cleaner than a umode. Deliberate divergence. |
-| +z GAG (sysop-only; server drops user's msgs) | ❌ | add as an oper tool (silently drop a user's PRIVMSG/NOTICE) |
+| +z GAG (sysop-only; server drops user's msgs) | ✅ | oper-set; silently drops gagged user's PRIVMSG/NOTICE |
 | (Orochi-native) +o oper | ✅ | RPL_UMODEIS reflects +o (item 90) |
 | (Orochi-native) +i invisible / +B bot / +r registered / +Z secure-tls / +D deaf / +g callerid / +T no-ctcp / +x cloaked | ✅ | richer than the draft; our design |
 
@@ -69,7 +69,7 @@ alignment decision; fill residual 9xx error set.
 | --- | --- | --- |
 | AUDITORIUM +x visibility/relay | ✅ | NAMES + JOIN + PART relay gating |
 | Clone takeover protection (CREATE clone removes same-name) | ❌ | with CLONEABLE/CLONE |
-| AUTHONLY +a blocks unauth JOIN | ❌ | implement |
+| AUTHONLY +a blocks unauth JOIN | ✅ | live JOIN gate returns 477 |
 | KNOCK notify owner/host on +i reject | 🟡 | KNOCK cmd live; tie to +i/+u |
 | NOFORMAT +f raw display | ❌ | largely client-side; mark relay tag |
 | Backward compat (RFC1459 clients unaffected) | ✅ | IRCX is opt-in; base IRC always works |
@@ -83,10 +83,10 @@ alignment decision; fill residual 9xx error set.
 925 NOTSUPPORTED, 926 CHANNELEXIST, 927 ALREADYONCHANNEL.
 
 ## Implementation order (this conformance pass)
-1. **IRCX/ISIRCX gateway + 800 RPL_IRCX** (the entry point). ← starting now
-2. **LISTX** dispatch (builder exists).
-3. **AUTHONLY +a** JOIN enforcement; **KNOCK +u** gating.
-4. **DATA/REQUEST/REPLY** tag messaging + reserved-prefix gating.
+1. **IRCX/ISIRCX gateway + 800 RPL_IRCX** — DONE.
+2. **LISTX** dispatch — DONE.
+3. **AUTHONLY +a** JOIN enforcement; **KNOCK +u** gating — DONE.
+4. **DATA/REQUEST/REPLY** tag messaging + reserved-prefix gating — DONE.
 5. **CLONEABLE/CLONE** auto-clone + takeover protection.
 6. EVENT numeric/type alignment decision; OID decision; UTF8 IRCX prefixes.
 7. Fill the IRCX error-numeric set.

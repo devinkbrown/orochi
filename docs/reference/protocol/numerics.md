@@ -10,6 +10,8 @@ This reference documents current source only. Orochi is a pure-Zig 0.16 clean-ro
 | `src/daemon/dispatch.zig` | Pre-registration command dispatch, welcome burst, CAP/SASL registration numerics. | `Numeric` enum at `src/daemon/dispatch.zig:141`; welcome burst at `src/daemon/dispatch.zig:1493`. |
 | `src/proto/numeric.zig` | Shared protocol numeric catalog and compile-time duplicate guard. | `Numeric` enum at `src/proto/numeric.zig:9`; derived table at `src/proto/numeric.zig:235`; duplicate check at `src/proto/numeric.zig:238`. |
 
+Current enum sizes are 113 daemon-local live handler codes, 15 pre-registration dispatch codes, and 215 shared protocol catalog codes. The shared catalog is intentionally broader than the set currently emitted by handlers.
+
 ## Connection Registration
 
 | Value | Name | When Emitted | Message Text | Evidence |
@@ -145,4 +147,4 @@ The shared standard-replies catalog currently contains these code tokens: `ACCOU
 
 The daemon-local enum includes IRCX residual 9xx numerics that are intentionally inert until a handler emits them: `ERR_BADCOMMAND` 900, `ERR_BADLEVEL` 903, `ERR_BADPROPERTY` 905, `ERR_RESOURCE` 907, `ERR_SECURITY` 908, `ERR_UNKNOWNPACKAGE` 912, `ERR_DUPACCESS` 914, `ERR_MISACCESS` 915, `ERR_TOOMANYACCESSES` 916, `ERR_NOSUCHOBJECT` 924, `ERR_NOTSUPPORTED` 925, `ERR_CHANNELEXIST` 926, and `ERR_ALREADYONCHANNEL` 927 (`src/daemon/server.zig:799`).
 
-The shared protocol enum is broader than the live daemon emission set. It catalogs additional 0xx, 2xx, 3xx, 4xx, 5xx, 6xx, and SASL/account numerics including `RPL_SAVENICK`, TRACE/STATS variants, WHOIS/WHOWAS variants, LIST/MOTD/ADMIN/TIME/USERS variants, `ERR_INPUTTOOLONG`, `ERR_UNKNOWNMODE`, `ERR_UMODEUNKNOWNFLAG`, `ERR_DISABLED`, `ERR_INVALIDKEY`, and `RPL_SASLMECHS` (`src/proto/numeric.zig:21`, `src/proto/numeric.zig:23`, `src/proto/numeric.zig:75`, `src/proto/numeric.zig:148`, `src/proto/numeric.zig:224`). Do not treat a catalog entry as live behavior unless a handler citation above or a future handler emission exists.
+The shared protocol enum is broader than the live daemon emission set. It catalogs additional 0xx, 2xx, 3xx, 4xx, 5xx, 6xx, and SASL/account numerics including `RPL_SAVENICK`, TRACE/STATS variants, WHOIS/WHOWAS variants, LIST/MOTD/ADMIN/TIME/USERS variants, `ERR_UNKNOWNMODE`, `ERR_UMODEUNKNOWNFLAG`, `ERR_DISABLED`, `ERR_INVALIDKEY`, `RPL_WHOISSECURE`, and `RPL_SASLMECHS` (`src/proto/numeric.zig:21`, `src/proto/numeric.zig:23`, `src/proto/numeric.zig:72`, `src/proto/numeric.zig:148`, `src/proto/numeric.zig:224`). Correct shared-catalog names for the historically conflicting 4xx slots are `ERR_NEEDREGGEDNICK` 477, `ERR_ISCHANSERVICE` 484, and `ERR_BANNEDNICK` 485 (`src/proto/numeric.zig:200`, `src/proto/numeric.zig:207`, `src/proto/numeric.zig:208`). Do not treat a catalog entry as live behavior unless a handler citation above or a future handler emission exists.
