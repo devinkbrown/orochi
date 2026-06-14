@@ -32,6 +32,12 @@ pub const DeliverMsg = struct {
     /// so the normal send-drain path tears it down.
     close_after: bool = false,
     close_reason: []const u8 = "Client quit",
+    /// Cross-shard oper-event fan-out: when non-null, `to` is ignored and the
+    /// owning reactor delivers `buf` to every one of ITS OWN clients subscribed to
+    /// this Event-Spine category (raw `u6` to avoid importing event_spine into the
+    /// handle layer; the server casts to/from `EventCategory`). Keeps cross-reactor
+    /// client iteration on each reactor's own thread.
+    broadcast_category: ?u6 = null,
 };
 
 pub fn DeliverPool(comptime slots: usize) type {

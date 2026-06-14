@@ -2468,6 +2468,21 @@ pub const LinuxServer = struct {
             for (msgs[0..n]) |msg| {
                 defer fabric.release(msg.buf);
                 const bytes = fabric.bytes(msg.buf);
+                // Cross-shard oper-event fan-out: deliver to every one of THIS
+                // reactor's clients subscribed to the carried category (safe — we
+                // only touch our own shard's client table, on our own thread).
+                if (msg.broadcast_category) |cat_raw| {
+                    const category: event_spine.EventCategory = @enumFromInt(cat_raw);
+                    var it = self.rx().clients.iterator();
+                    while (it.next()) |entry| {
+                        const c = entry.value;
+                        if (c.closing) continue;
+                        if (!c.session.subscribesTo(category)) continue;
+                        appendToConn(c, bytes) catch continue;
+                        self.armSendIfNeeded(c) catch {};
+                    }
+                    continue;
+                }
                 const conn = self.rx().clients.get(msg.to) orelse continue;
                 if (conn.closing) continue;
                 if (msg.close_after and bytes.len == 0) {
@@ -14326,6 +14341,33 @@ pub const LinuxServer = struct {
             const line = if (entry.value.session.hasCap(.message_tags)) tagged else plain;
             try self.deliver(entry.id, line);
         }
+        // Cross-shard fan-out: opers on OTHER reactors are not in this reactor's
+        // client table, so hand the PLAIN form to each other shard's inbox and that
+        // reactor delivers it to its own category-subscribers on its own thread.
+        // (Off-reactor message-tags opers receive the plain form — always valid
+        // IRCv3; same-reactor opers already got the cap-correct line above.) The
+        // fabric is null for a single-shard daemon, so this is a no-op there.
+        if (self.fabric) |*fabric| {
+            const my_shard = self.rx().shard_id;
+            const total: u12 = @intCast(fabric.numShards());
+            var shard: u12 = 0;
+            while (shard < total) : (shard += 1) {
+                if (shard == my_shard) continue;
+                const buf = fabric.acquire(plain) orelse continue;
+                const fan = reactor_fabric.DeliverMsg{
+                    .to = client_model.ClientId.invalid,
+                    .buf = buf,
+                    .broadcast_category = @intFromEnum(category),
+                };
+                if (fabric.sendTo(shard, fan)) {
+                    // Wake the target via its OWN wake eventfd — the reactor loop
+                    // watches Reactor.wake (its wake-poll completion runs
+                    // drainFabric), not the fabric's wake fds. Same path the normal
+                    // cross-shard delivery uses.
+                    if (self.reactors[shard].wake) |*w| w.wake();
+                } else fabric.release(buf);
+            }
+        }
     }
 
     /// Mirror a mesh peer link/unlink into the Event Spine as a SERVER_LINK oper
@@ -18222,6 +18264,70 @@ test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
             // arrive — proving local AND cross-shard delivery in one assertion.
             try recvUntil(&clients[i], expected, 400);
         }
+    }
+}
+
+test "threaded server: oper EVENT delivery + cross-shard fan-out under num_shards=2" {
+    // Exercises the multi-reactor oper-event path: several SASL-admin opers (all
+    // auto-subscribed on elevation), one broadcasts, and EVERY oper must receive
+    // it. publishOperEvent delivers locally AND fans the event to other shards'
+    // inboxes; each reactor delivers to its own subscribers on its own thread.
+    // NOTE: this sandbox's SO_REUSEPORT routes all loopback accepts to one shard,
+    // so the cross-shard RECEIVE side is mechanism-verified by instrumentation
+    // rather than guaranteed exercised here; what this test does guarantee is that
+    // the fan-out code path runs without breaking local delivery, and that an oper
+    // reliably receives its own and a sibling's announce under sharding.
+    var cfg = operTestConfig(0);
+    cfg.num_shards = 2;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        server.requestStop(&run);
+        thr.join();
+    }
+
+    const n_opers = 4;
+    var fds: [n_opers]linux.fd_t = undefined;
+    var clients: [n_opers]LiveClient = undefined;
+    var connected: usize = 0;
+    defer for (fds[0..connected]) |fd| closeFd(fd);
+    for (0..n_opers) |i| {
+        fds[i] = connectLoopback(port) catch |err| switch (err) {
+            error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+            else => return err,
+        };
+        connected += 1;
+        clients[i] = LiveClient{ .fd = fds[i] };
+        try saslAdminPrelude(fds[i]);
+        var reg_buf: [48]u8 = undefined;
+        const reg = try std.fmt.bufPrint(&reg_buf, "NICK O{d}\r\nUSER u{d} 0 * :O{d}\r\n", .{ i, i, i });
+        try writeAllFd(fds[i], reg);
+    }
+    for (0..n_opers) |i| {
+        var need_buf: [16]u8 = undefined;
+        const need = try std.fmt.bufPrint(&need_buf, " 381 O{d} ", .{i});
+        try recvUntil(&clients[i], need, 400);
+    }
+
+    // O0 opts into IRCX (EVENT is IRCX-gated) and broadcasts.
+    try writeAllFd(fds[0], "IRCX\r\n");
+    try recvUntil(&clients[0], " 800 O0 ", 300);
+    for (0..n_opers) |i| clients[i].reset();
+    try writeAllFd(fds[0], "EVENT BROADCAST :crossshard\r\n");
+
+    // Every oper receives the announce. The line is
+    // `NOTE EVENT ANNOUNCE :<sender-mask>: <message>`, so match the category line
+    // and the message text separately (the mask sits between them).
+    for (0..n_opers) |i| {
+        try recvUntil(&clients[i], "NOTE EVENT ANNOUNCE :", 500);
+        try recvUntil(&clients[i], "crossshard", 500);
     }
 }
 
