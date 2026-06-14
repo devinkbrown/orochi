@@ -3897,6 +3897,20 @@ pub const LinuxServer = struct {
         };
     }
 
+    fn relayDirectMessagePolicyBlocks(
+        self: *LinuxServer,
+        target: []const u8,
+        recipient_id: client_model.ClientId,
+        source_prefix: []const u8,
+        account: []const u8,
+    ) bool {
+        if (self.connFor(recipient_id)) |rconn| {
+            if (account.len == 0 and rconn.session.umodes.contains(.regonly_pm)) return true;
+        }
+        if (self.silence.isSilenced(target, source_prefix)) return true;
+        return false;
+    }
+
     /// True if any S2S peer link (secured or plaintext) is established — used to
     /// decide whether an unknown-local nick might be reachable across the mesh.
     fn hasEstablishedPeer(self: *LinuxServer) bool {
@@ -3977,7 +3991,14 @@ pub const LinuxServer = struct {
                 }
             }
         } else if (self.world.findNick(clean_msg.target)) |wid| {
-            self.deliverTagged(clientIdFromWorld(wid), relay_tags, line) catch {};
+            const recipient_id = clientIdFromWorld(wid);
+            if (!self.relayDirectMessagePolicyBlocks(clean_msg.target, recipient_id, clean_msg.source_prefix, clean_msg.account)) {
+                self.deliverTagged(recipient_id, relay_tags, line) catch {};
+                const recipient_account = if (self.connFor(recipient_id)) |rconn| rconn.session.account() else null;
+                if (recipient_account) |acct| {
+                    self.deliverSessionSyncSiblingsNick(acct, relay_tags, line, recipient_id, null, clean_msg.target);
+                }
+            }
         }
         // Multi-hop re-forward, scoped via route_table (global seen-set already
         // deduped, so re-forwarding the source link is harmless).
@@ -4713,6 +4734,7 @@ pub const LinuxServer = struct {
         .{ .mode = .oper_only, .letter = 'O', .bit = 1 << 12 },
         .{ .mode = .admin_only, .letter = 'A', .bit = 1 << 13 },
     };
+    const local_channel_policy_flag_mask: u16 = (1 << 2) | (1 << 3) | (1 << 12) | (1 << 13);
 
     fn channelModeFlagBits(self: *LinuxServer, channel: []const u8) u16 {
         var flags: u16 = 0;
@@ -4723,8 +4745,13 @@ pub const LinuxServer = struct {
     }
 
     fn setChannelModeFlagBits(self: *LinuxServer, channel: []const u8, flags: u16) void {
+        const current = self.channelModeFlagBits(channel);
+        const applied = (flags & ~local_channel_policy_flag_mask) | (current & local_channel_policy_flag_mask);
+        if (((flags ^ current) & local_channel_policy_flag_mask) != 0) {
+            self.traceLog(.info, .s2s, "remote channel mode aggregate ignored local policy flags");
+        }
         for (channel_mode_flag_specs) |spec| {
-            _ = self.world.setChannelFlag(channel, spec.mode, (flags & spec.bit) != 0) catch {};
+            _ = self.world.setChannelFlag(channel, spec.mode, (applied & spec.bit) != 0) catch {};
         }
     }
 
@@ -9086,22 +9113,27 @@ pub const LinuxServer = struct {
             return;
         }
         const target = parsed.paramSlice()[0];
-        // Find the matching peer first, then close it (don't free a slot mid-iter).
-        var victim: ?RingFdToken = null;
-        var it = self.rx().clients.iterator();
-        while (it.next()) |entry| {
-            const link = entry.value.s2s orelse continue;
-            if (std.ascii.eqlIgnoreCase(link.remoteName(), target)) {
-                victim = entry.value.token;
-                break;
-            }
-        }
-        if (victim) |tok| {
+        if (self.findSquitVictim(target)) |tok| {
             try self.closeConn(tok, "SQUIT");
             try self.noticeTo(conn, "SQUIT complete");
         } else {
             try queueNumeric(conn, .ERR_NOSUCHSERVER, &.{target}, "No such server");
         }
+    }
+
+    fn peerRemoteName(conn: *const ConnState) ?[]const u8 {
+        if (conn.s2s_secured) |link| return link.remoteName();
+        if (conn.s2s) |link| return link.remoteName();
+        return null;
+    }
+
+    fn findSquitVictim(self: *LinuxServer, target: []const u8) ?RingFdToken {
+        var it = self.rx().clients.iterator();
+        while (it.next()) |entry| {
+            const remote = peerRemoteName(entry.value) orelse continue;
+            if (std.ascii.eqlIgnoreCase(remote, target)) return entry.value.token;
+        }
+        return null;
     }
 
     /// Send a server NOTICE to a single connection.
@@ -16265,6 +16297,17 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
+fn addTestLocalClient(server: *Server, nick: []const u8, account: ?[]const u8) !client_model.ClientId {
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.token = try tokenFromId(id);
+    try conn.session.setNick(nick);
+    if (account) |acct| conn.session.loginAs(acct);
+    try server.world.registerNick(nick, worldIdFromClient(id));
+    if (account != null) server.trackSession(id, conn);
+    return id;
+}
+
 const LiveClient = struct {
     fd: linux.fd_t,
     buf: [default_reply_bytes]u8 = undefined,
@@ -16470,6 +16513,89 @@ test "session-sync unit: single-session account has no sibling copies" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), copies);
+}
+
+test "relay direct messages honor local +R SILENCE and recipient session-sync" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+    const sibling_id = try addTestLocalClient(&server, "Sibling", "targetacct");
+    const target = server.connFor(target_id).?;
+    const sibling = server.connFor(sibling_id).?;
+    _ = target.session.setUmode(.regonly_pm, true);
+    sibling.session.addCap(.orochi_session_sync);
+
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "Target",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@host",
+        .account = "",
+        .tags = "",
+        .text = "blocked by +R",
+        .origin_node = 99,
+        .hlc = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
+
+    _ = target.session.setUmode(.regonly_pm, false);
+    _ = try server.silence.add("Target", "Remote!*@host");
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "Target",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@host",
+        .account = "remoteacct",
+        .tags = "",
+        .text = "blocked by silence",
+        .origin_node = 99,
+        .hlc = 2,
+    });
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), sibling.send_len);
+
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "Target",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@elsewhere",
+        .account = "remoteacct",
+        .tags = "",
+        .text = "delivered",
+        .origin_node = 99,
+        .hlc = 3,
+    });
+    try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
+    try expectContains(sibling.send_buf[0..sibling.send_len], ":Remote!r@elsewhere PRIVMSG Target :delivered\r\n");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sibling.send_buf[0..sibling.send_len], "PRIVMSG Target :delivered"));
+}
+
+test "remote aggregate channel mode flags cannot clear local +nt policy" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const founder_id = try addTestLocalClient(&server, "Founder", null);
+    _ = try server.world.join("#policy", worldIdFromClient(founder_id));
+    try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
+    try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
+
+    server.setChannelModeFlagBits("#policy", 0);
+    try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
+    try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
+    try std.testing.expect(!server.world.channelHasFlag("#policy", .moderated));
+
+    server.setChannelModeFlagBits("#policy", 1 << 1);
+    try std.testing.expect(server.world.channelHasFlag("#policy", .no_external));
+    try std.testing.expect(server.world.channelHasFlag("#policy", .topic_ops));
+    try std.testing.expect(server.world.channelHasFlag("#policy", .moderated));
 }
 
 /// Blocking read with a bounded poll budget (so a misbehaving server fails the
@@ -20444,6 +20570,42 @@ test "threaded server: live S2S listener completes a peer handshake" {
     try writeAllFd(fd_c, "LINKS\r\n");
     try recvUntil(&c, " 365 ", 200);
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "peer.test") != null);
+}
+
+test "squit lookup finds secured peer entries" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const inner = try alloc.create(s2s_link.S2sLink);
+    try inner.init(.{
+        .allocator = alloc,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "local.test",
+    });
+    inner.peer.remote_name = try alloc.dupe(u8, "secured.test");
+
+    const secured = try alloc.create(secured_s2s_link.SecuredLink);
+    secured.* = undefined;
+    secured.allocator = alloc;
+    secured.session = null;
+    secured.inner = inner;
+    secured.inbuf = .empty;
+    secured.out = .empty;
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer = server.rx().clients.get(peer_id).?;
+    peer.token = try tokenFromId(peer_id);
+    peer.s2s_secured = secured;
+
+    const found = server.findSquitVictim("SECURED.TEST") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(peer.token.slot, found.slot);
+    try std.testing.expectEqual(peer.token.gen, found.gen);
 }
 
 test "threaded server: oper CONNECT opens an outbound S2S link" {
