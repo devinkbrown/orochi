@@ -121,6 +121,11 @@ pub const mode_table = [_]ModeSpec{
     // dc69cfb), so the MODEX query row no longer risks advertise-without-enforce.
     .{ .name = "OPMODERATE", .letter = 'U', .kind = .channel },
     .{ .name = "NOCOMICDATA", .letter = 'V', .kind = .channel },
+    // FREETARGET (+F): let anyone set this channel as a `+f` forward target.
+    // DISFORWARD (+D): refuse to be a forward destination. Both enforced live on
+    // the forward path, so the MODEX rows carry no advertise-without-enforce risk.
+    .{ .name = "FREETARGET", .letter = 'F', .kind = .channel },
+    .{ .name = "DISFORWARD", .letter = 'D', .kind = .channel },
     .{ .name = "FOUNDER", .letter = 'Q', .kind = .member, .status_prefix = '~' },
     .{ .name = "OWNER", .letter = 'q', .kind = .member, .status_prefix = '.' },
     .{ .name = "HOST", .letter = 'o', .kind = .member, .status_prefix = '@' },

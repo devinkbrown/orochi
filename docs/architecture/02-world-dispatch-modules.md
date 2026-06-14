@@ -104,7 +104,7 @@ ISUPPORT comes from `src/proto/protocol_inventory.zig`, not from module declarat
 | Token/source | Evidence |
 | --- | --- |
 | Default network name `Orochi` | `src/proto/protocol_inventory.zig:16` |
-| `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVU` | `src/proto/protocol_inventory.zig` (`chanmodes_token`) |
+| `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVUFD` | `src/proto/protocol_inventory.zig` (`chanmodes_token`) |
 | Static token array | `src/proto/protocol_inventory.zig:40` |
 | Runtime ISUPPORT override | `src/proto/protocol_inventory.zig:65`, `src/proto/protocol_inventory.zig:73`, `src/proto/protocol_inventory.zig:78` |
 | Welcome burst emits current ISUPPORT | `src/daemon/dispatch.zig:1497` |

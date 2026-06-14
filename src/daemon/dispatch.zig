@@ -2108,7 +2108,7 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     try std.testing.expectEqualStrings("beIZ", class_a);
     try std.testing.expectEqualStrings("k", class_b);
     try std.testing.expectEqualStrings("lfj", class_c);
-    try std.testing.expectEqualStrings("imnstCTNMSgWOAVU", class_d);
+    try std.testing.expectEqualStrings("imnstCTNMSgWOAVUFD", class_d);
 
     // Letters backed by the compact chanmode.ChannelMode enum must resolve in the
     // catalog with the matching protocol class.
@@ -2123,17 +2123,20 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
 
     // f, j, Z are enforced in the world layer (forward / throttle / quiet); V is
     // the IRCX ext flag NOCOMICDATA (enforced via chanmode_ext + the DATA handler);
-    // U is the IRCX ext flag OPMODERATE (enforced via the channel speech gate).
-    // All are intentionally NOT in the compact enum (and U is distinct from the
-    // enum's 'O' oper-only), but are still real, handled modes. Their absence from
-    // the enum must be deliberate, not an oversight.
-    for ("fjZVU") |letter| {
+    // U is the IRCX ext flag OPMODERATE (enforced via the channel speech gate);
+    // F is FREETARGET and D is DISFORWARD (both enforced on the +f forward path:
+    // F at the forward-target set check, D at the forward-apply check). All are
+    // intentionally NOT in the compact enum (and U is distinct from the enum's
+    // 'O' oper-only), but are still real, handled modes. Their absence from the
+    // enum must be deliberate, not an oversight.
+    for ("fjZVUFD") |letter| {
         try std.testing.expect(chanmode.specFromLetter(letter) == null);
     }
 
     // The advertisement must not leak any letter the handler does not enforce.
-    // The full enforced set across both layers (V = NOCOMICDATA, U = OPMODERATE).
-    const enforced = "beIZklfjimnstCTNMSgWOAVU";
+    // The full enforced set across both layers (V = NOCOMICDATA, U = OPMODERATE,
+    // F = FREETARGET, D = DISFORWARD).
+    const enforced = "beIZklfjimnstCTNMSgWOAVUFD";
     for (class_a) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_b) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_c) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
