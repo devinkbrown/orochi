@@ -5,7 +5,10 @@ Branch scanned: `integ`
 
 Scope: read-only source audit of `/home/kain/orochi` using 30 delegated audit scopes plus local grep review, combined with the earlier unwired/incomplete surface audit from the same date. No daemon source was changed for this report.
 
-## Repair Run Status — landed on `main` @ `f2aea06` (full suite 6597/6601 pass, 0 fail, 4 skip)
+## Repair Run Status — landed on `main` @ `8160991` (full suite 6599/6603 pass, 0 fail, 4 skip)
+
+Planning-doc gap sweep (`8160991`): worked the IRCX/IRC items in `planning/14-ircx-remainder.md`, `21-protocol-gaps.md`, `22-irc-gap-sweep.md`. MOST listed "big items" are ALREADY DONE (the docs are stale): channel OID + `created_unix` + `World.next_oid` (world.zig:212/295/1406); CLONEABLE `+d` / CLONE `+E` auto-clone-on-full (server.zig:6100-6209); SASL EXTERNAL + SCRAM-SHA-256 advertised + routed (dispatch.zig:301/1456); `$m` mute + `$z` secure extbans (extban.zig); LISTX/ELIST filter tokens (`elist.zig`); metadata-2 cap-gate; KNOCK `+u`. LANDED two genuine gaps: `$o` oper-status extban (the one standard extban missing from `NodeKind`; mostly for `+e`/`+I` since opers already bypass `+b`); IRCX PROP user `MEMBER_OF` provider (computed `userBuiltinGet`, WHOIS-filtered channel list). DEFERRED (genuinely big, not false-advertisable as a stub): `draft/event-playback` — the cap is defined in `cap.zig` but unadvertised/unwired; doing it right means extending the CHATHISTORY/Lotus store (entries are `{msgid,sender,text,timestamp}` with NO command-type field, so events can't be distinguished from messages), recording channel events (JOIN/PART/MODE/TOPIC) at their sites, and cap-gated replay rendering — a history-subsystem sub-project. PROP `user_profile` provider also deferred (no clear canonical data source — needs a decision on what it maps to).
+
 
 Major item LANDED (`f2aea06`): cross-reactor `publishOperEvent` fan-out — oper events (SERVER_LINK, the opmoderate POLICY feed, KILL, ANNOUNCE) now reach opers on every shard, not just the publishing reactor. See the detailed entry below (with the correction of a phantom "multi-shard send-flush bug" that was actually a wrong test needle).
 
