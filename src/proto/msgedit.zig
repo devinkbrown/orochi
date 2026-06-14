@@ -363,7 +363,7 @@ fn isReplyTag(key: []const u8) bool {
     return std.mem.eql(u8, key, "+draft/reply") or std.mem.eql(u8, key, "+reply");
 }
 
-fn isTypingTag(key: []const u8) bool {
+pub fn isTypingTag(key: []const u8) bool {
     return std.mem.eql(u8, key, "+draft/typing") or std.mem.eql(u8, key, "+typing");
 }
 

@@ -11360,6 +11360,10 @@ pub const LinuxServer = struct {
     /// the message in the CHATHISTORY ring (filtered from future replay) and
     /// broadcasts the redaction to the channel. Requires channel-operator.
     pub fn handleRedact(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.hasCap(.message_redaction)) {
+            try self.failReply(conn, "REDACT", "NEED_REGISTRATION", "You must negotiate the draft/message-redaction capability");
+            return;
+        }
         if (parsed.param_count < 2) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"REDACT"}, "Not enough parameters");
             return;
@@ -11379,7 +11383,13 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
-        self.history.redact(channel, msgid) catch {};
+        self.history.redact(channel, msgid) catch |err| switch (err) {
+            error.NotFound, error.InvalidTarget => {
+                try self.failReply(conn, "REDACT", "UNKNOWN_MSGID", "Unknown message id");
+                return;
+            },
+            else => return err,
+        };
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "REDACT", &.{ channel, msgid }, reason);
@@ -11390,6 +11400,10 @@ pub const LinuxServer = struct {
     /// sender may edit a message; channel operators cannot edit other users'
     /// messages. The history ring is updated so CHATHISTORY replays the new text.
     pub fn handleEdit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+        if (!conn.session.hasCap(.message_editing)) {
+            try self.failReply(conn, "EDIT", "NEED_REGISTRATION", "You must negotiate the draft/message-editing capability");
+            return;
+        }
         const edit = msgedit.parseEditCommand(line) catch |err| {
             const reason: []const u8 = switch (err) {
                 error.MissingTarget, error.MissingMsgid, error.MissingEditBody => "Missing EDIT parameters",
@@ -14157,7 +14171,12 @@ pub const LinuxServer = struct {
 
     /// Emit an IRCv3 `FAIL <command> <code> :<reason>` standard reply.
     fn failReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
-        _ = self;
+        if (!conn.session.hasCap(.standard_replies)) {
+            var notice_buf: [default_reply_bytes]u8 = undefined;
+            const notice = std.fmt.bufPrint(&notice_buf, "FAIL {s} {s}: {s}", .{ command, code, reason }) catch return;
+            try self.noticeTo(conn, notice);
+            return;
+        }
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "FAIL {s} {s} :{s}\r\n", .{ command, code, reason }) catch return;
         try appendToConn(conn, line);
@@ -14966,9 +14985,21 @@ pub const LinuxServer = struct {
                 try self.deliver(mid, msg);
             }
             // #33: typing and reaction tags also feed the ACTIVITY stream.
-            if (findTagValue(tags, "+typing")) |tv| self.pushTypingActivity(id, conn, target, tv) catch {};
+            var tag_it = std.mem.splitScalar(u8, tags, ';');
+            while (tag_it.next()) |pair| {
+                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+                    if (msgedit.isTypingTag(pair)) self.pushTypingActivity(id, conn, target, pair[0..0]) catch {};
+                    continue;
+                };
+                if (msgedit.isTypingTag(pair[0..eq])) {
+                    self.pushTypingActivity(id, conn, target, pair[eq + 1 ..]) catch {};
+                    break;
+                }
+            }
             if (findTagValue(tags, "+draft/react")) |rv| {
-                self.pushReactionActivity(id, conn, target, rv, findTagValue(tags, "+draft/reply")) catch {};
+                self.pushReactionActivity(id, conn, target, rv, findTagValue(tags, "+draft/reply"), .add) catch {};
+            } else if (findTagValue(tags, "+draft/unreact")) |rv| {
+                self.pushReactionActivity(id, conn, target, rv, findTagValue(tags, "+draft/reply"), .remove) catch {};
             }
             return;
         }
@@ -15031,16 +15062,17 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Push a reaction ActivityEvent (`:reactor ACTIVITY <#chan> react <msgid>
-    /// <reaction>`) to subscribers. Requires a `+draft/reply` target msgid; an
-    /// empty/oversized reaction is dropped.
-    fn pushReactionActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, react_value: []const u8, reply_target: ?[]const u8) !void {
+    /// Push a reaction ActivityEvent (`:reactor ACTIVITY <#chan> react|unreact
+    /// <msgid> <reaction>`) to subscribers. Requires a `+draft/reply` target
+    /// msgid; an empty/oversized reaction is dropped.
+    fn pushReactionActivity(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, react_value: []const u8, reply_target: ?[]const u8, op: activity.ReactionOp) !void {
         const subs = self.activity_subs.subscribers(channel);
         if (subs.len == 0) return;
-        const r = activity.Reaction.fromTags(react_value, reply_target) catch return;
+        const r = activity.Reaction.fromTagsWithOp(react_value, reply_target, op) catch return;
+        const verb: []const u8 = if (r.op == .add) "react" else "unreact";
         var prefix_buf: [256]u8 = undefined;
         var line_buf: [default_reply_bytes]u8 = undefined;
-        const line = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "ACTIVITY", &.{ channel, "react", r.target_msgid, r.reaction }, null);
+        const line = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "ACTIVITY", &.{ channel, verb, r.target_msgid, r.reaction }, null);
         for (subs) |sid| {
             const cid = clientIdFromMonitor(sid);
             if (cid.eql(id)) continue;
@@ -17437,7 +17469,7 @@ test "threaded server: CERTLIST and CERTDEL use authenticated account bindings" 
     defer closeFd(fd);
     var client = LiveClient{ .fd = fd };
 
-    try writeAllFd(fd, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd, "CAP REQ :standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&client, " 001 A ", 200);
     try writeAllFd(fd, "REGISTER alice * correcthorse\r\n");
     try recvUntil(&client, "REGISTER SUCCESS alice", 200);
@@ -17532,10 +17564,10 @@ test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
     var admin = LiveClient{ .fd = fd_admin };
     var bob = LiveClient{ .fd = fd_bob };
 
-    try saslAdminPrelude(fd_admin);
+    try saslPlainPreludeWithCaps(fd_admin, "admin", "orochi", "standard-replies");
     try writeAllFd(fd_admin, "NICK Founder\r\nUSER founder 0 * :Founder\r\n");
-    try writeAllFd(fd_bob, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&admin, " 381 Founder ", 200);
+    try writeAllFd(fd_bob, "CAP REQ :standard-replies\r\nNICK Bob\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try recvUntil(&bob, " 001 Bob ", 200);
 
     bob.reset();
@@ -17664,8 +17696,8 @@ test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
 
     try saslAdminPrelude(fd_admin);
     try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
-    try writeAllFd(fd_user, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&admin, " 381 Oper ", 200);
+    try writeAllFd(fd_user, "CAP REQ :standard-replies\r\nNICK Bob\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try recvUntil(&user, " 001 Bob ", 200);
 
     admin.reset();
@@ -17742,7 +17774,7 @@ test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects li
     defer closeFd(fd);
     var client = LiveClient{ .fd = fd };
 
-    try writeAllFd(fd, "NICK StarNick\r\nUSER star 0 * :Star Nick\r\n");
+    try writeAllFd(fd, "CAP REQ :standard-replies\r\nNICK StarNick\r\nUSER star 0 * :Star Nick\r\nCAP END\r\n");
     try recvUntil(&client, " 001 StarNick ", 200);
 
     client.reset();
@@ -17857,8 +17889,8 @@ test "threaded server: GHOST rejects caller account for non-account nick" {
     var alice = LiveClient{ .fd = fd_alice };
 
     try writeAllFd(fd_victim, "NICK AwayNick\r\nUSER away 0 * :Away Nick\r\n");
-    try writeAllFd(fd_alice, "NICK Alice\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&victim, " 001 AwayNick ", 200);
+    try writeAllFd(fd_alice, "CAP REQ :standard-replies\r\nNICK Alice\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&alice, " 001 Alice ", 200);
 
     alice.reset();
@@ -19082,7 +19114,7 @@ test "threaded server: user +C blocks direct CTCP except ACTION" {
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
 
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 200);
@@ -20135,7 +20167,7 @@ test "threaded server: utf8only advertised and invalid PRIVMSG rejected" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     // ISUPPORT advertises the UTF8ONLY token.
     try recvUntil(&a, "UTF8ONLY", 200);
@@ -20162,7 +20194,7 @@ test "threaded server: malformed CHATHISTORY yields a FAIL standard reply" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "CAP REQ :draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     a.reset();
     // Too few params → FAIL CHATHISTORY NEED_MORE_PARAMS, never silence.
@@ -20187,7 +20219,7 @@ test "threaded server: CHATHISTORY requires negotiated capability" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     a.reset();
     try writeAllFd(fd_a, "CHATHISTORY LATEST #h * 10\r\n");
@@ -20665,8 +20697,8 @@ test "threaded server: media user modes block transmit and hide automatic presen
 
     try saslPlainPrelude(fd_a, "admin", "orochi");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
-    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 381 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :standard-replies\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try recvUntil(&b, " 001 B ", 200);
     try writeAllFd(fd_a, "JOIN #media\r\n");
     try recvUntil(&a, " 366 A #media ", 200);
@@ -21297,17 +21329,33 @@ test "threaded server: REDACT broadcast + KLINE oper event" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try saslAdminPrelude(fd_a);
+    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "draft/message-redaction standard-replies message-tags echo-message");
     try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
     try writeAllFd(fd_a, "JOIN #r\r\n");
     try recvUntil(&a, " 366 A #r ", 200);
 
-    // REDACT broadcasts to the channel (A is founder/op, sees its own).
+    // REDACT broadcasts only for a real message id in the history ring.
     a.reset();
-    try writeAllFd(fd_a, "REDACT #r 7 :gone\r\n");
-    try recvUntil(&a, "REDACT #r 7 :gone", 200);
+    try writeAllFd(fd_a, "PRIVMSG #r :before-redact\r\n");
+    try recvUntil(&a, "PRIVMSG #r :before-redact", 200);
+    const msgid = extractMsgid(a.written()) orelse return error.TestUnexpectedResult;
+    var msgid_buf: [msgid_mod.id_len]u8 = undefined;
+    try std.testing.expect(msgid.len <= msgid_buf.len);
+    @memcpy(msgid_buf[0..msgid.len], msgid);
+    const saved_msgid = msgid_buf[0..msgid.len];
+
+    var redact_line: [256]u8 = undefined;
+    const real_redact = std.fmt.bufPrint(&redact_line, "REDACT #r {s} :gone\r\n", .{saved_msgid}) catch unreachable;
+    a.reset();
+    try writeAllFd(fd_a, real_redact);
+    try recvUntil(&a, "REDACT #r ", 200);
+    try recvUntil(&a, " :gone", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "REDACT #r bogus-msgid :gone\r\n");
+    try recvUntil(&a, "FAIL REDACT UNKNOWN_MSGID", 200);
 
     // KLINE emits an oper-action Event Spine notice (A is subscribed).
     a.reset();
@@ -21356,9 +21404,9 @@ test "threaded server: EDIT updates own message history and rejects others" {
     try writeAllFd(fd_a, "CAP LS 302\r\n");
     try recvUntil(&a, "draft/message-editing", 200);
     a.reset();
-    try writeAllFd(fd_a, "CAP REQ :message-tags echo-message draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
-    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_a, "CAP REQ :message-tags echo-message draft/chathistory draft/message-editing\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "CAP REQ :draft/message-editing standard-replies\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
     try recvUntil(&b, " 001 B ", 200);
     try writeAllFd(fd_a, "JOIN #edit\r\n");
     try recvUntil(&a, " 366 A #edit ", 200);
@@ -21883,8 +21931,8 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
     try writeAllFd(fd_a, "CAP REQ :draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
-    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 200);
     try writeAllFd(fd_a, "JOIN #h\r\n");
     try recvUntil(&a, " 366 A #h ", 200);
@@ -21986,9 +22034,9 @@ test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
     defer closeFd(fd_b);
     var a = LiveClient{ .fd = fd_a };
     var b = LiveClient{ .fd = fd_b };
-    try writeAllFd(fd_a, "CAP REQ :draft/chathistory\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
-    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 200);
     try writeAllFd(fd_a, "JOIN #t1\r\n");
     try recvUntil(&a, " 366 A #t1 ", 200);
