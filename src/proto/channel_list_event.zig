@@ -22,12 +22,16 @@ pub const ListKind = enum(u8) {
     ban = 0,
     exempt = 1,
     invex = 2,
+    // +Z quiet (mute) list. Additive tag: pre-quiet peers reject unknown kinds
+    // (decode -> error.BadKind), so this stays forward-compatible on the wire.
+    quiet = 3,
 
     pub fn letter(self: ListKind) u8 {
         return switch (self) {
             .ban => 'b',
             .exempt => 'e',
             .invex => 'I',
+            .quiet => 'Z',
         };
     }
 
@@ -36,6 +40,7 @@ pub const ListKind = enum(u8) {
             @intFromEnum(ListKind.ban) => .ban,
             @intFromEnum(ListKind.exempt) => .exempt,
             @intFromEnum(ListKind.invex) => .invex,
+            @intFromEnum(ListKind.quiet) => .quiet,
             else => null,
         };
     }
@@ -186,6 +191,50 @@ test "channel list event round-trips remove invex" {
     try testing.expect(!got.present);
     try testing.expectEqual(ListKind.invex, got.kind);
     try testing.expectEqualStrings("friend!*@*", got.mask);
+}
+
+test "channel list event round-trips quiet" {
+    const ev = ChannelListEvent{
+        .present = true,
+        .kind = .quiet,
+        .origin_node = 3,
+        .hlc = 1234,
+        .set_at = 1_781_000_000,
+        .channel = "#muted",
+        .mask = "loud!*@*",
+        .setter = "Op!u@h",
+    };
+    var buf: [256]u8 = undefined;
+    const wire = try encode(ev, &buf);
+    try testing.expectEqual(try encodedLen(ev), wire.len);
+    // Wire tag is the additive value 3, and renders as the +Z mode letter.
+    try testing.expectEqual(@as(u8, 3), wire[1]);
+    try testing.expectEqual(@as(u8, 'Z'), ListKind.quiet.letter());
+
+    const got = try decode(wire);
+    try testing.expect(got.present);
+    try testing.expectEqual(ListKind.quiet, got.kind);
+    try testing.expectEqual(@as(u64, 3), got.origin_node);
+    try testing.expectEqual(@as(u64, 1234), got.hlc);
+    try testing.expectEqual(@as(i64, 1_781_000_000), got.set_at);
+    try testing.expectEqualStrings("#muted", got.channel);
+    try testing.expectEqualStrings("loud!*@*", got.mask);
+    try testing.expectEqualStrings("Op!u@h", got.setter);
+
+    // Round-trip the remove path too.
+    var buf2: [256]u8 = undefined;
+    const gone = try decode(try encode(.{
+        .present = false,
+        .kind = .quiet,
+        .origin_node = 3,
+        .hlc = 1235,
+        .set_at = 1_781_000_001,
+        .channel = "#muted",
+        .mask = "loud!*@*",
+        .setter = "Op!u@h",
+    }, &buf2));
+    try testing.expect(!gone.present);
+    try testing.expectEqual(ListKind.quiet, gone.kind);
 }
 
 test "channel list event rejects malformed input" {

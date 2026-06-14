@@ -4989,6 +4989,9 @@ pub const LinuxServer = struct {
             if (self.world.invexOf(cv.name)) |entries| {
                 for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .invex, entry.mask, entry.setter, entry.set_at, hlc, true);
             }
+            if (self.world.mutesOf(cv.name)) |entries| {
+                for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .quiet, entry.mask, entry.setter, entry.set_at, hlc, true);
+            }
         }
         if (conn.s2s_secured) |link| {
             self.flushS2sOutbound(conn, link.outbound()) catch {};
@@ -5625,12 +5628,14 @@ pub const LinuxServer = struct {
                 .ban => self.world.addBan(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
                 .exempt => self.world.addExempt(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
                 .invex => self.world.addInvex(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
+                .quiet => self.world.addMute(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
             };
         }
         return switch (ch.kind) {
             .ban => self.world.removeBan(ch.channel, ch.mask) catch false,
             .exempt => self.world.removeExempt(ch.channel, ch.mask) catch false,
             .invex => self.world.removeInvex(ch.channel, ch.mask) catch false,
+            .quiet => self.world.removeMute(ch.channel, ch.mask) catch false,
         };
     }
 
@@ -6678,7 +6683,10 @@ pub const LinuxServer = struct {
                         })
                     else
                         (self.world.removeMute(channel, mask) catch continue);
-                    if (changed) appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'Z', mask);
+                    if (changed) {
+                        appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'Z', mask);
+                        self.announceChannelList(channel, .quiet, mask, list_setter, list_set_at, adding);
+                    }
                 },
                 'j' => {
                     // +j join throttle: param "joins:seconds" on set, bare on unset.
