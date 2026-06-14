@@ -4534,6 +4534,25 @@ pub const LinuxServer = struct {
                 try self.handleAway(id, conn, &parsed);
                 return;
             }
+            // draft/account-registration: pre-registration REGISTER is not
+            // supported (account creation requires a completed connection so the
+            // current nick/account identity is established). Reply with the draft
+            // standard-replies FAIL instead of letting REGISTER fall through to
+            // generic dispatch, which would emit 421 ERR_UNKNOWNCOMMAND for an
+            // unregistered client. This is also why the cap is not advertised
+            // before-connect.
+            if (std.ascii.eqlIgnoreCase(parsed.command, "REGISTER")) {
+                self.failReply(conn, "REGISTER", "COMPLETE_CONNECTION_REQUIRED", "Complete connection registration first") catch |err| switch (err) {
+                    error.OutputTooSmall,
+                    error.TextTooLong,
+                    error.NoSpaceLeft,
+                    error.OversizeLine,
+                    error.LineTooLong,
+                    => conn.closing = true,
+                    else => return err,
+                };
+                return;
+            }
             var sink = QueueSink{ .conn = conn };
             // Same per-client firewall as dispatchRegistered below: a full send
             // buffer or oversize reply during preregistration closes only this
@@ -17807,6 +17826,44 @@ test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects li
     const info = try services.accountInfo("starnick");
     try std.testing.expectEqual(@as(u32, 8), info.account_info.flags);
     try std.testing.expectError(error.InvalidName, services.accountInfo("*"));
+}
+
+test "threaded server: pre-registration REGISTER fails and CAP LS 302 advertises custom-account-name" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch |err| switch (err) {
+        error.PermissionDenied, error.SocketUnavailable, error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+
+    // CAP LS 302 must list the cap with its `custom-account-name` value, signalling
+    // that REGISTER may name an account distinct from the current nick.
+    try writeAllFd(fd, "CAP LS 302\r\n");
+    try recvUntil(&client, "draft/account-registration=custom-account-name", 200);
+
+    // Negotiate standard-replies so the pre-registration REGISTER produces the
+    // draft FAIL line (not the NOTICE fallback) — then issue REGISTER before
+    // NICK/USER. It must FAIL with COMPLETE_CONNECTION_REQUIRED, never 421.
+    client.reset();
+    try writeAllFd(fd, "CAP REQ :standard-replies\r\n");
+    try writeAllFd(fd, "REGISTER newacct * pw\r\n");
+    try recvUntil(&client, "FAIL REGISTER COMPLETE_CONNECTION_REQUIRED", 200);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), " 421 ") == null);
 }
 
 test "threaded server: VERIFY accepts account argument and legacy code form" {

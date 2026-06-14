@@ -349,8 +349,12 @@ const cap_specs = [_]CapSpec{
     // login/logout sites.
     .{ .id = .account_notify, .name = "account-notify" },
     // account-registration: REGISTER/VERIFY are live; advertising lets compliant
-    // clients surface nick/account registration.
-    .{ .id = .account_registration, .name = "draft/account-registration" },
+    // clients surface nick/account registration. The `custom-account-name` value
+    // signals that REGISTER may name an account distinct from the current nick
+    // (`REGISTER <account> ...`), which this server supports. We deliberately do
+    // NOT advertise before-connect, because pre-registration REGISTER is not
+    // supported (it replies FAIL REGISTER COMPLETE_CONNECTION_REQUIRED).
+    .{ .id = .account_registration, .name = "draft/account-registration", .value_302 = "custom-account-name" },
     // metadata-2: METADATA GET/SET/LIST/CLEAR + RPL_KEYVALUE(761)/762/766 are live.
     .{ .id = .metadata_2, .name = "draft/metadata-2" },
     // standard-replies: FAIL/WARN/NOTE are emitted across the command surface.
