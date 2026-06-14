@@ -116,7 +116,7 @@ fn nethealth(c: *anyopaque, _: I) anyerror!void {
 pub const module = registry.Module{
     .id = "oper.security",
     .commands = &.{
-        // OPER is how a client *becomes* an operator; STATS and USERIP are not
+        // OPER is how a client *becomes* an operator; STATS is not
         // operator-gated here. The rest require operator authority, enforced
         // declaratively by the registry (access=.oper).
         .{ .name = "OPER", .handler = oper },
@@ -142,7 +142,7 @@ pub const module = registry.Module{
         .{ .name = "STATS", .handler = stats },
         .{ .name = "TESTLINE", .access = .oper, .handler = testline },
         .{ .name = "TESTMASK", .access = .oper, .handler = testmask },
-        .{ .name = "USERIP", .handler = userip },
+        .{ .name = "USERIP", .access = .oper, .handler = userip },
         .{ .name = "DEBUG", .access = .oper, .handler = debug },
         .{ .name = "MESH", .access = .oper, .handler = mesh, .summary = "mesh peer/link health (NETSTAT)" },
         .{ .name = "NETSTAT", .access = .oper, .handler = mesh, .summary = "alias of MESH" },

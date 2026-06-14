@@ -381,6 +381,37 @@ test "num_shards lifts onto the boot config and defaults to 1" {
     try testing.expectEqual(@as(u16, 1), dflt.num_shards);
 }
 
+test "oper groups project configured privileges and titles" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[[oper_groups]]
+        \\name = "observer"
+        \\privileges = ["audit_read"]
+        \\[[oper_groups]]
+        \\name = "admin"
+        \\inherits = "observer"
+        \\privileges = ["server_rehash"]
+        \\[[opers]]
+        \\account = "alice"
+        \\class = "admin"
+        \\title = "Network Guardian"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+
+    const registry = loaded.config.oper_registry.?;
+    const grant = try registry.elevateAuthenticated(.{ .name = "alice" });
+    try testing.expect(grant.privileges.has(.server_rehash));
+    try testing.expect(grant.privileges.has(.audit_read));
+    try testing.expect(!grant.privileges.has(.server_admin));
+    try testing.expectEqualStrings("Network Guardian", grant.title);
+}
+
 test "minimal config: unspecified optional fields keep defaults" {
     const allocator = testing.allocator;
     const text =
