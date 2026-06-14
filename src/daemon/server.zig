@@ -1160,6 +1160,8 @@ pub const Config = struct {
     /// whose `feature` tag appears here is rejected at dispatch as unavailable.
     /// Borrowed; outlives the server (owned by main/config). Empty = all on.
     disabled_features: []const []const u8 = &.{},
+    /// Whether media transports and media-tagged registry commands are enabled.
+    media_enabled: bool = false,
     /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
     /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
     geoip_db_path: []const u8 = "",
@@ -2080,36 +2082,71 @@ pub const LinuxServer = struct {
         self.driveLifecycle(.ready);
         // Restore runtime operator grants persisted by a previous run.
         self.loadGrants();
-        // Optional STUN-based reflexive-candidate discovery at boot (before the
-        // pump thread starts). Configured as an IPv4 literal + port.
-        if (self.config.media_stun_port != 0) {
-            if (parseIp4(self.config.media_stun_host)) |ip4| {
-                self.media_plane.stun_server = media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port) catch null;
+        if (self.config.media_enabled) {
+            // Optional STUN-based reflexive-candidate discovery at boot (before the
+            // pump thread starts). Configured as an IPv4 literal + port.
+            if (self.config.media_stun_port != 0) {
+                if (parseIp4(self.config.media_stun_host)) |ip4| {
+                    self.media_plane.stun_server = media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port) catch null;
+                }
             }
-        }
-        // Bring the native media transport online (our own OPVOX/OPVIS codec
-        // leg). Independent of the WebRTC plane below; a bind failure logs and
-        // the daemon keeps serving IRC.
-        self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
-            std.debug.print("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
-        };
-        if (self.native_media.port != 0) {
-            std.debug.print("orochi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
-            // Bridge native frames to any opt-in WebRTC members of each channel.
-            self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
-        }
 
-        // Bring the media transport plane online (bind UDP + pump thread). Media
-        // is optional: a bind failure logs and the daemon keeps serving IRC.
-        self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
-            std.debug.print("orochi: media plane disabled ({s})\n", .{@errorName(e)});
-            return;
+            // Bring the native media transport online (our own OPVOX/OPVIS codec
+            // leg). Independent of the WebRTC plane below; a bind failure logs and
+            // the daemon keeps serving IRC.
+            self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
+                std.debug.print("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
+            };
+            if (self.native_media.port != 0) {
+                std.debug.print("orochi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
+                // Bridge native frames to any opt-in WebRTC members of each channel.
+                self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
+            }
+
+            // Bring the media transport plane online (bind UDP + pump thread). Media
+            // is optional: a bind failure logs and the daemon keeps serving IRC.
+            self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
+                std.debug.print("orochi: media plane disabled ({s})\n", .{@errorName(e)});
+                return;
+            };
+            var host_buf: [16]u8 = undefined;
+            const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
+            std.debug.print("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
+            // Bridge WebRTC RTP frames to any native members of each channel.
+            self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
+        }
+    }
+
+    test "server start gates media transports on media_enabled" {
+        if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+        const allocator = std.testing.allocator;
+
+        var media_off = LinuxServer.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .media_enabled = false,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
         };
-        var host_buf: [16]u8 = undefined;
-        const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
-        std.debug.print("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
-        // Bridge WebRTC RTP frames to any native members of each channel.
-        self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
+        defer media_off.deinit();
+        media_off.start();
+        try std.testing.expectEqual(@as(u16, 0), media_off.media_plane.port);
+        try std.testing.expectEqual(@as(u16, 0), media_off.native_media.port);
+
+        var media_on = LinuxServer.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .media_enabled = true,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer media_on.deinit();
+        media_on.start();
+        if (media_on.media_plane.port == 0 or media_on.native_media.port == 0) return error.SkipZigTest;
+        try std.testing.expect(media_on.media_plane.port != 0);
+        try std.testing.expect(media_on.native_media.port != 0);
     }
 
     /// Build the TLS 1.3 config for one accepted client. Certificate material is
