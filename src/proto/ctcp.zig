@@ -441,6 +441,16 @@ test "parses ACTION from PRIVMSG body" {
     try std.testing.expectEqualStrings("waves hello", view.argOrEmpty());
 }
 
+test "parses embedded spans and keeps ACTIONGRAB distinct from ACTION" {
+    const embedded = (try parseFirst(.privmsg, "hi \x01VERSION\x01 there")).?;
+    try std.testing.expectEqual(CommandId.version, embedded.id);
+    try std.testing.expectEqualStrings("\x01VERSION\x01", embedded.raw);
+
+    const actiongrab = (try parseFirst(.privmsg, "\x01ACTIONGRAB x\x01")).?;
+    try std.testing.expectEqual(CommandId.unknown, actiongrab.id);
+    try std.testing.expectEqualStrings("ACTIONGRAB", actiongrab.command);
+}
+
 test "parses VERSION reply from NOTICE body" {
     const view = (try parseFirst(.notice, "prefix \x01VERSION Orochi 0.1\x01 suffix")).?;
     try std.testing.expect(view.isReply());
