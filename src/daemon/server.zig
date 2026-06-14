@@ -3516,6 +3516,7 @@ pub const LinuxServer = struct {
         if (!was and link.established()) {
             self.traceLog(.info, .s2s, "s2s secured link established");
             self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
+            self.publishServerLink(link.remoteName(), true);
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
@@ -3585,6 +3586,7 @@ pub const LinuxServer = struct {
         };
         if (!was and link.established()) {
             self.logMeshEvent(.peer_up, link.remoteName(), "link established");
+            self.publishServerLink(link.remoteName(), true);
             self.markPeerHealth(link.remoteName(), .established);
             self.updatePartitionTransitions();
             if (self.resolveS2sCollision(conn, link.remoteName())) return; // this link lost the dedup
@@ -4275,6 +4277,7 @@ pub const LinuxServer = struct {
                 const dropped_node = link.peerShortId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
+                    self.publishServerLink(link.remoteName(), false);
                     _ = self.peer_health.remove(link.remoteName());
                 }
                 // A collision-collapsed duplicate keeps the peer reachable via the
@@ -4294,6 +4297,7 @@ pub const LinuxServer = struct {
                 const dropped_node = link.remoteNodeId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
+                    self.publishServerLink(link.remoteName(), false);
                     _ = self.peer_health.remove(link.remoteName());
                 }
                 // A collision-collapsed duplicate keeps the peer reachable via the
@@ -14278,6 +14282,18 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Mirror a mesh peer link/unlink into the Event Spine as a SERVER_LINK oper
+    /// event, alongside the existing `logMeshEvent` entry, so opers subscribed to
+    /// SERVER_LINK see peers appear and disappear in real time. Local oper notice
+    /// only — no S2S wire change. Reaches opers on the publishing reactor (reactor
+    /// 0 owns the peer links), consistent with every other publishOperEvent caller.
+    fn publishServerLink(self: *LinuxServer, remote: []const u8, up: bool) void {
+        if (remote.len == 0) return;
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{s} {s}", .{ remote, if (up) "linked" else "delinked" }) catch return;
+        self.publishOperEvent(.server_link, .notice, msg) catch {};
+    }
+
     /// REHASH — oper-only configuration reload. Re-reads and re-parses the
     /// configured file and swaps in a freshly-built oper registry (account→class
     /// bindings). Existing sessions keep their current oper state; new SASL logins
@@ -22852,6 +22868,12 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     }
     try std.testing.expect(peer.established());
     try std.testing.expect(peer.knownServers() >= 2);
+
+    // SERVER_LINK Event Spine mirror: the oper A (auto-subscribed to every
+    // category on elevation) receives a NOTE EVENT SERVER_LINK when the peer link
+    // comes up, alongside the mesh_event_log entry. The peer named itself
+    // "remote.test", so that is the link subject. Asserted before the reset below.
+    try recvUntil(&a, "NOTE EVENT SERVER_LINK :remote.test linked", 400);
 
     // Deterministic readiness gate (no timing race): LINKS is idempotent and only
     // lists ESTABLISHED, handshake-NAMED peers. Poll it until 'remote.test'
