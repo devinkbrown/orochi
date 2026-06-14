@@ -379,6 +379,14 @@ pub fn PropStore(comptime params: Params) type {
         }
 
         pub fn getProp(self: *const Self, entity: Entity, key: []const u8) PropError!EntryView {
+            return self.getPropInternal(entity, key, false);
+        }
+
+        pub fn getPropRaw(self: *const Self, entity: Entity, key: []const u8) PropError!EntryView {
+            return self.getPropInternal(entity, key, true);
+        }
+
+        fn getPropInternal(self: *const Self, entity: Entity, key: []const u8, include_secret: bool) PropError!EntryView {
             try validateEntity(entity, params.max_entity_id);
             try validateKeyWithLimit(key, params.max_key);
 
@@ -389,7 +397,7 @@ pub fn PropStore(comptime params: Params) type {
             var prop_key_buf: [params.max_key]u8 = undefined;
             const prop_key = try writePropKey(&prop_key_buf, key, params.max_key);
             const entry = state.props.getPtr(prop_key) orelse return error.PropMissing;
-            if (isSecretChannelProp(entity, entry.key)) return error.PropMissing;
+            if (!include_secret and isSecretChannelProp(entity, entry.key)) return error.PropMissing;
             return view(state, entry);
         }
 
@@ -415,6 +423,18 @@ pub fn PropStore(comptime params: Params) type {
                 empty_state.deinit(self.allocator);
                 self.entity_count -= 1;
             }
+        }
+
+        pub fn clearEntity(self: *Self, entity: Entity) PropError!void {
+            try validateEntity(entity, params.max_entity_id);
+
+            var entity_key_buf: [max_entity_key]u8 = undefined;
+            const entity_key = try writeEntityKey(&entity_key_buf, entity, params.max_entity_id);
+            const removed_entity = self.entities.fetchRemove(entity_key) orelse return;
+            self.allocator.free(removed_entity.key);
+            var state = removed_entity.value;
+            state.deinit(self.allocator);
+            if (self.entity_count > 0) self.entity_count -= 1;
         }
 
         pub fn listProps(self: *const Self, entity: Entity, out: []EntryView) PropError![]EntryView {
@@ -488,12 +508,43 @@ pub fn parseLineBounded(comptime params: Params, line: []const u8) PropError!Req
 
 pub fn parseParamsBounded(comptime params: Params, params_slice: []const []const u8, had_trailing: bool) PropError!Request {
     if (params_slice.len == 0) return error.NeedMoreParams;
-    if (params_slice.len > 3) return error.TooManyParams;
+    if (params_slice.len > 4) return error.TooManyParams;
 
     const entity = try Entity.fromId(params_slice[0]);
     try validateEntity(entity, params.max_entity_id);
 
     if (params_slice.len == 1) return .{ .list = entity };
+
+    if (std.mem.eql(u8, params_slice[1], "CLEAR")) {
+        if (params_slice.len != 2) return error.TooManyParams;
+        return .{ .delete = .{ .entity = entity, .key = "" } };
+    }
+
+    if (std.mem.eql(u8, params_slice[1], "GET")) {
+        if (params_slice.len < 3) return error.NeedMoreParams;
+        if (params_slice.len > 3) return error.TooManyParams;
+        const keys = params_slice[2];
+        try validateKeyList(keys, params.max_key, params.max_request_keys);
+        return .{ .get = .{ .entity = entity, .keys = keys } };
+    }
+
+    if (std.mem.eql(u8, params_slice[1], "SET")) {
+        if (params_slice.len < 3) return error.NeedMoreParams;
+        const key = params_slice[2];
+        try validateKeyWithLimit(key, params.max_key);
+        if (std.mem.indexOfScalar(u8, key, ',') != null) return error.InvalidKey;
+        if (params_slice.len == 3) return .{ .delete = .{ .entity = entity, .key = key } };
+
+        const value = params_slice[3];
+        if (had_trailing and value.len == 0) {
+            return .{ .delete = .{ .entity = entity, .key = key } };
+        }
+
+        try validateValue(value, params.max_value);
+        return .{ .set = .{ .entity = entity, .key = key, .value = value } };
+    }
+
+    if (params_slice.len > 3) return error.TooManyParams;
 
     const key = params_slice[1];
     try validateKeyList(key, params.max_key, params.max_request_keys);
@@ -715,6 +766,42 @@ test "parse each PROP request form" {
     try std.testing.expectError(error.InvalidCommand, parseLine("PRIVMSG #chan :no"));
     try std.testing.expectError(error.NeedMoreParams, parseLine("PROP"));
     try std.testing.expectError(error.TooManyParams, parseLine("PROP #c A B C"));
+}
+
+test "parse IRCX PROP verb request forms" {
+    const clear = try parseLine("PROP #chan CLEAR");
+    try std.testing.expectEqual(Request.delete, @as(std.meta.Tag(Request), clear));
+    try std.testing.expectEqualStrings("#chan", clear.delete.entity.id);
+    try std.testing.expectEqualStrings("", clear.delete.key);
+
+    const get = try parseLine("PROP #chan GET TOPIC,NAME");
+    try std.testing.expectEqual(Request.get, @as(std.meta.Tag(Request), get));
+    try std.testing.expectEqualStrings("TOPIC,NAME", get.get.keys);
+
+    const set = try parseLine("PROP #chan SET TOPIC :hello world");
+    try std.testing.expectEqual(Request.set, @as(std.meta.Tag(Request), set));
+    try std.testing.expectEqualStrings("TOPIC", set.set.key);
+    try std.testing.expectEqualStrings("hello world", set.set.value);
+
+    const del = try parseLine("PROP #chan SET TOPIC :");
+    try std.testing.expectEqual(Request.delete, @as(std.meta.Tag(Request), del));
+    try std.testing.expectEqualStrings("TOPIC", del.delete.key);
+
+    try std.testing.expectError(error.NeedMoreParams, parseLine("PROP #chan GET"));
+    try std.testing.expectError(error.TooManyParams, parseLine("PROP #chan CLEAR TOPIC"));
+}
+
+test "secret channel props stay hidden except raw internal lookup" {
+    var store = DefaultStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const entity = try Entity.fromId("#keys");
+    _ = try store.setProp(entity, "HOSTKEY", "s3cret", .{ .id = "owner", .access = .owner });
+
+    try std.testing.expectError(error.PropMissing, store.getProp(entity, "HOSTKEY"));
+    const raw = try store.getPropRaw(entity, "HOSTKEY");
+    try std.testing.expectEqualStrings("HOSTKEY", raw.key);
+    try std.testing.expectEqualStrings("s3cret", raw.value);
 }
 
 test "limits and built-in channel property metadata are enforced" {

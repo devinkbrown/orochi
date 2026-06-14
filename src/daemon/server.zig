@@ -6038,10 +6038,10 @@ pub const LinuxServer = struct {
             var tkeys = tiered_keys.ChannelKeys{};
             defer tkeys.deinit(self.allocator);
             const chan_entity = ircx_prop_store.Entity{ .kind = .channel, .id = join_target };
-            if (self.props.getProp(chan_entity, "HOSTKEY")) |ev| {
+            if (self.props.getPropRaw(chan_entity, "HOSTKEY")) |ev| {
                 tkeys.setKey(self.allocator, .host, ev.value) catch {};
             } else |_| {}
-            if (self.props.getProp(chan_entity, "OWNERKEY")) |ev| {
+            if (self.props.getPropRaw(chan_entity, "OWNERKEY")) |ev| {
                 tkeys.setKey(self.allocator, .owner, ev.value) catch {};
             } else |_| {}
             if (self.props.getProp(chan_entity, "FOUNDERKEY")) |ev| {
@@ -10808,9 +10808,8 @@ pub const LinuxServer = struct {
     /// Replies are RPL_PROPLIST 818 + RPL_PROPEND 819. Writes are gated by
     /// channel-operator (channel/member entities) or self (user entities).
     pub fn handleProp(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        // This parser folds the trailing param in without a flag; treating a 3rd
-        // param as "trailing present" lets parseParamsBounded map an empty value
-        // (`PROP e k :`) to delete and a non-empty value to set — both correct.
+        // The daemon's LineView keeps only folded params, so preserve the
+        // historical PROP behavior: an empty final param means delete.
         const req = ircx_prop_store.parseParamsBounded(.{}, parsed.paramSlice(), true) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"PROP"}, "Invalid PROP");
             return;
@@ -10885,6 +10884,22 @@ pub const LinuxServer = struct {
             .delete => |k| {
                 if (self.propAccess(id, conn, k.entity) == null) {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Insufficient access to delete property");
+                    return;
+                }
+                if (k.key.len == 0) {
+                    var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                    const rows = self.props.listProps(k.entity, &views) catch views[0..0];
+                    self.props.clearEntity(k.entity) catch {};
+                    if (k.entity.kind == .channel) {
+                        const owner = conn.session.displayName();
+                        for (rows) |ev| {
+                            const hlc = self.nextChannelPropHlc();
+                            if (self.recordChannelPropClock(k.entity.id, ev.key, owner, hlc, false)) {
+                                self.announceChannelProp(k.entity.id, ev.key, "", owner, hlc, false);
+                            }
+                        }
+                    }
+                    try propEmitEnd(conn, k.entity);
                     return;
                 }
                 self.props.deleteProp(k.entity, k.key) catch {};
@@ -20433,6 +20448,79 @@ test "threaded server: PROP set/get gated by channel-op" {
     try writeAllFd(fd_b, "PROP #p OWNERKEY\r\n");
     try recvUntil(b, " 819 B #p ", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "sekret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
+
+    // Verb forms: SET writes, GET can read computed built-ins, CLEAR removes
+    // stored props while preserving client-safe replies.
+    a.reset();
+    try writeAllFd(fd_a, "PROP #p SET TOPIC :verb\r\n");
+    try recvUntil(a, " 818 A #p TOPIC :verb", 200);
+    try recvUntil(a, " 819 A #p ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #p GET NAME\r\n");
+    try recvUntil(a, " 818 A #p NAME :#p", 200);
+    try recvUntil(a, " 819 A #p ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #p CLEAR\r\n");
+    try recvUntil(a, " 819 A #p ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #p GET TOPIC\r\n");
+    try recvUntil(a, " 819 A #p ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "verb") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 818 ") == null);
+}
+
+test "threaded server: HOSTKEY PROP grants op on keyed join without client disclosure" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(a, " 800 A 1 0 ", 200);
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(b, " 800 B 1 0 ", 200);
+
+    try writeAllFd(fd_a, "JOIN #hk\r\n");
+    try recvUntil(a, " 366 A #hk ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #hk HOSTKEY :s3cret\r\n");
+    try recvUntil(a, " 818 A #hk HOSTKEY :s3cret", 200);
+    try recvUntil(a, " 819 A #hk ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #hk s3cret\r\n");
+    try recvUntil(b, " 366 B #hk ", 200);
+    try expectContains(b.written(), "@B");
+
+    b.reset();
+    try writeAllFd(fd_b, "PROP #hk HOSTKEY\r\n");
+    try recvUntil(b, " 819 B #hk ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "s3cret") == null);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
 }
 
