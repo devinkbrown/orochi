@@ -17560,12 +17560,6 @@ test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
 }
 
 test "threaded server: CHANNEL AKICK add mirrors to live join gate" {
-    // QUARANTINED: the CHANNEL AKICK command (ADD/LIST storage via the services
-    // backend) works, but the mirror into the in-memory chan_akick join-gate does
-    // not yet deny the masked user's JOIN (a subtle mask/case detail in svc_akick
-    // entry matching — the dual-store trap). TODO(services): fix chan_akick
-    // enforcement matching and re-enable this test.
-    if (platform.monotonicMillis() >= 0) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
