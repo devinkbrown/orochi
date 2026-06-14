@@ -5991,6 +5991,31 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Registered-channel AKICK join gate. A non-oper joiner whose mask (or
+    /// account) matches an active AKICK entry is refused entry with 474. This is
+    /// consulted on BOTH join paths: from `joinDenied` for a live channel, and
+    /// from the create path in `joinOne` — a registered channel's AKICK must bite
+    /// even when no live channel exists yet (otherwise the masked user could
+    /// re-create the empty channel and walk straight in). Opers bypass.
+    /// `precomputed_mask` reuses the caller's `nick!user@host` when available.
+    fn akickDenied(
+        self: *LinuxServer,
+        conn: *ConnState,
+        channel: []const u8,
+        precomputed_mask: ?[]const u8,
+        quiet: bool,
+    ) !bool {
+        if (conn.session.isOper()) return false;
+        if (self.chan_akick.count(channel) == 0) return false;
+        var mask_buf: [256]u8 = undefined;
+        const mask = precomputed_mask orelse (clientPrefix(conn, &mask_buf) catch return false);
+        if (self.chan_akick.matchOnJoin(channel, mask, conn.session.account(), self.nowMs())) |ak| {
+            if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, ak.reason);
+            return true;
+        }
+        return false;
+    }
+
     /// Channel-mode gate for JOIN. Returns true (and emits the numeric) when the
     /// join must be refused: +b ban (474), +i invite-only (473), +k bad key
     /// (475), +l full (471). A pending INVITE bypasses ban and invite-only.
@@ -6053,12 +6078,7 @@ pub const LinuxServer = struct {
         const ban_ctx = banContextFor(self, conn, wid, mask, &chan_buf);
         // Registered-channel AKICK: a mask/account match is auto-denied entry
         // (services-style; overrides an invite). Opers bypass.
-        if (!conn.session.isOper()) {
-            if (self.chan_akick.matchOnJoin(channel, mask, conn.session.account(), self.nowMs())) |ak| {
-                if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, ak.reason);
-                return true;
-            }
-        }
+        if (try self.akickDenied(conn, channel, mask, quiet)) return true;
         // IRCX ACCESS DENY: a stored channel ACCESS entry whose mask matches the
         // joiner and whose effective (highest-precedence) level is DENY blocks the
         // join — the IRCX equivalent of a +b ban, managed via the ACCESS command.
@@ -6238,6 +6258,10 @@ pub const LinuxServer = struct {
         // already set up by cloneChannel, so it is never "creating" here.)
         const creating = !self.world.channelExists(join_target);
         if (creating) {
+            // Registered-channel AKICK must bite even when re-creating an empty
+            // registered channel: joinDenied's gate only runs for live channels,
+            // so a masked user could otherwise re-create the channel and enter.
+            if (try self.akickDenied(conn, join_target, null, false)) return;
             self.props.clearChannel(join_target);
             _ = self.access.clear(.{ .channel = join_target }) catch {};
         }
@@ -9988,86 +10012,6 @@ pub const LinuxServer = struct {
             if (lv == .owner) return mm.contains(.owner) or mm.contains(.founder);
         }
         return mm.isOperator();
-    }
-
-    /// ACCESS <channel> <ADD|DELETE|LIST|CLEAR> [LEVEL [mask [timeout] [:reason]]] —
-    /// IRCX per-channel access list (OWNER/HOST/VOICE/GRANT/DENY). Replies are
-    /// RPL_ACCESS{ADD 801,DELETE 802,START 803,ENTRY 804,END 805}. All operations
-    /// require channel-operator (or oper).
-    /// AKICK <#channel> <ADD|DEL|LIST> [mask] [:reason] — registered-channel
-    /// auto-kick list. ADD/DEL require channel-op (or oper); a matching mask is
-    /// denied entry on JOIN (see the join gate). Real server command, no
-    /// pseudo-client: replies are server NOTICEs + standard numerics.
-    pub fn handleAkick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        const p = parsed.paramSlice();
-        if (p.len < 2) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "Usage: AKICK <#channel> <ADD|DEL|LIST> [mask] [:reason]");
-            return;
-        }
-        const channel = p[0];
-        if (!self.world.channelExists(channel)) {
-            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
-            return;
-        }
-        const sub = p[1];
-        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
-        const may_manage = conn.session.isOper() or mm.isOperator();
-        const nick = conn.session.displayName();
-
-        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
-            if (!may_manage) {
-                try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
-                return;
-            }
-            for (self.chan_akick.list(channel)) |e| {
-                var lb: [512]u8 = undefined;
-                const line = std.fmt.bufPrint(&lb, ":{s} NOTICE {s} :AKICK {s} {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, channel, e.mask, e.reason }) catch continue;
-                try appendToConn(conn, line);
-            }
-            var eb: [128]u8 = undefined;
-            const endl = std.fmt.bufPrint(&eb, ":{s} NOTICE {s} :End of AKICK list for {s}\r\n", .{ protocol_inventory.currentServerName(), nick, channel }) catch return;
-            try appendToConn(conn, endl);
-            return;
-        }
-
-        if (!may_manage) {
-            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
-            return;
-        }
-
-        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
-            if (p.len < 3) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "Usage: AKICK <#channel> ADD <mask> [:reason]");
-                return;
-            }
-            const reason = if (p.len >= 4) p[3] else "Auto-kicked";
-            self.chan_akick.add(channel, p[2], reason, nick, self.nowMs(), null) catch |err| {
-                const msg = switch (err) {
-                    error.Duplicate => "AKICK mask already present",
-                    error.InvalidMask => "Invalid AKICK mask",
-                    error.ListFull => "AKICK list is full",
-                    else => "AKICK add failed",
-                };
-                var nb: [256]u8 = undefined;
-                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, msg }) catch return;
-                try appendToConn(conn, nl);
-                return;
-            };
-            var nb: [320]u8 = undefined;
-            const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :AKICK added on {s}: {s}\r\n", .{ protocol_inventory.currentServerName(), nick, channel, p[2] }) catch return;
-            try appendToConn(conn, nl);
-        } else if (std.ascii.eqlIgnoreCase(sub, "DEL")) {
-            if (p.len < 3) {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "Usage: AKICK <#channel> DEL <mask>");
-                return;
-            }
-            const removed = self.chan_akick.remove(channel, p[2]) == .removed;
-            var nb: [320]u8 = undefined;
-            const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ protocol_inventory.currentServerName(), nick, if (removed) "AKICK removed" else "AKICK mask not found" }) catch return;
-            try appendToConn(conn, nl);
-        } else {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"AKICK"}, "AKICK subcommand must be ADD, DEL, or LIST");
-        }
     }
 
     /// Enforce the Warden registry against a freshly registered client. The
@@ -17944,11 +17888,7 @@ test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
 }
 
 test "threaded server: CHANNEL AKICK add mirrors to live join gate" {
-    // STILL QUARANTINED: CHANNEL AKICK command storage works, but the mirror into the
-    // in-memory chan_akick join gate still does not deny the masked user's JOIN (the
-    // svc_akick entry-match fix was incomplete). TODO(services): finish chan_akick
-    // enforcement matching and re-enable.
-    if (platform.monotonicMillis() >= 0) return error.SkipZigTest;
+    // UN-QUARANTINED (empirical check): verifying the actual enforcement behavior.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

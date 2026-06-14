@@ -34,7 +34,7 @@ Registry commands default to registered-client access unless the command table s
 | `KNOCK` | Request entry to a channel. | [channels.md](channels.md#knock) |
 | `CREATE` | IRCX create-or-join channel. | [channels.md](channels.md#create) |
 | `RENAME` | Rename a channel. | [channels.md](channels.md#rename) |
-| `AKICK` | Registered-channel auto-kick list. | [channels.md](channels.md#akick) |
+| `CHANNEL AKICK` | Registered-channel auto-kick list (services-managed). | [channels.md](channels.md#akick) |
 | `CLEAR` | Mass-kick below a keep rank. | [channels.md](channels.md#clear) |
 | `TEMPMODE` | Schedule or cancel temporary channel modes. | [channels.md](channels.md#tempmode) |
 | `SEEN` | Show an account's last-seen/login history. | [accounts-services.md](accounts-services.md#seen) |

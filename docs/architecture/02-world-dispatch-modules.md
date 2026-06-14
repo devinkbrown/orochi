@@ -84,7 +84,7 @@ The server currently fires the `client_registered` hook after welcome. Evidence:
 | `feature.misc` | VHOST, PRIVS, FILTER, MEDIA, TEGAMI, ACTIVITY, GEOIP, SUMMON, PONG | `src/daemon/modules/feature_misc.zig:46`, `src/daemon/modules/feature_misc.zig:49` |
 | `diag.introspect` | MODULES, MODLIST, COMMANDS | `src/daemon/modules/introspect.zig:95`, `src/daemon/modules/introspect.zig:99` |
 | `ops.upgrade` | UPGRADE | `src/daemon/modules/upgrade.zig:18`, `src/daemon/modules/upgrade.zig:22` |
-| `services.ext` | AKICK, RESV, UNRESV, FORCEOP, FORCEDEOP, FORCEJOIN, FORCEPART, FORCETOPIC, CLEAR, TEMPMODE, CLONES, SEEN | `src/daemon/modules/services_ext.zig:41`, `src/daemon/modules/services_ext.zig:47` |
+| `services.ext` | RESV, UNRESV, FORCEOP, FORCEDEOP, FORCEJOIN, FORCEPART, FORCETOPIC, CLEAR, TEMPMODE, CLONES, SEEN | `src/daemon/modules/services_ext.zig:41` |
 
 The `MEDIA` command is feature-gated by the registry feature tag `"media"`; disabled feature tags come from `Config.disabled_features`. Evidence: `src/daemon/modules/feature_misc.zig:52`, `src/daemon/server.zig:951`, `src/daemon/server.zig:3448`.
 

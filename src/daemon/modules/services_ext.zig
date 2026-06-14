@@ -9,10 +9,6 @@ const registry = @import("../registry.zig");
 const Core = @import("../module_core.zig").Core;
 const I = registry.CommandInvocation;
 
-fn akick(c: *anyopaque, _: I) anyerror!void {
-    const x = Core.from(c);
-    try x.server.handleAkick(x.id, x.conn, x.parsed);
-}
 fn resv(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleResv(x.conn, x.parsed);
@@ -44,7 +40,9 @@ pub const module = registry.Module{
     .commands = &.{
         // Channel-scoped commands keep their finer-grained channel-operator
         // checks inside the handler; the registry enforces the coarse gate.
-        .{ .name = "AKICK", .min_params = 2, .access = .registered, .handler = akick },
+        // AKICK is managed solely via `CHANNEL AKICK` (services-backed, persistent,
+        // join-gate-enforced); the old in-memory-only top-level AKICK was removed
+        // to avoid a divergent second store.
         .{ .name = "RESV", .min_params = 1, .access = .oper, .handler = resv },
         .{ .name = "UNRESV", .min_params = 1, .access = .oper, .handler = resv },
         .{ .name = "FORCEOP", .min_params = 2, .access = .oper, .handler = forceAction },

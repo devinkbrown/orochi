@@ -114,14 +114,14 @@ The channel command module registers the base membership and moderation commands
 
 ## AKICK
 
-- Syntax: `AKICK <#channel> <ADD|DEL|LIST> [mask] [:reason]`
-- Description: Real server command for registered-channel auto-kick lists. Matching masks are denied at join.
-- Privileges: Registered client; channel operator or oper required inside handler.
+- Syntax: `CHANNEL AKICK <#channel> <ADD|DEL|LIST> [mask] [reason...]`
+- Description: Registered-channel auto-kick list, managed via the services `CHANNEL` command. Entries are persisted to the services store and mirrored into the in-memory join gate; a matching mask (or `account:<name>` mask) is denied entry at JOIN — even when re-creating an empty registered channel. There is no longer a separate top-level `AKICK` command; the old in-memory-only variant was removed to avoid a divergent second store.
+- Privileges: Logged-in services account with AKICK-management access (founder/admin) on the registered channel.
 - Parameters: Channel, subcommand, optional mask/reason.
 - Replies: Server `NOTICE` list/add/delete responses.
-- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_CHANOPRIVSNEEDED 482`.
-- Example: `AKICK #zig ADD *!*@bad.example :spam`
-- Sources: `src/daemon/modules/services_ext.zig:47`, `src/daemon/server.zig:6718`
+- Errors: `FAIL CHANNEL` standard replies (`ACCOUNT_REQUIRED`, `NEED_MORE_PARAMS`, services access/lookup failures).
+- Example: `CHANNEL AKICK #zig ADD *!*@bad.example spam`
+- Sources: `src/daemon/server.zig` (`handleChannel` AKICK arm), join gate `akickDenied` in `joinOne`/`joinDenied`
 
 ## CLEAR
 
