@@ -5,7 +5,10 @@ Branch scanned: `integ`
 
 Scope: read-only source audit of `/home/kain/orochi` using 30 delegated audit scopes plus local grep review, combined with the earlier unwired/incomplete surface audit from the same date. No daemon source was changed for this report.
 
-## Repair Run Status — landed on `main` @ `c20f94b` (full suite 6594/6598 pass, 0 fail, 4 skip)
+## Repair Run Status — landed on `main` @ `dc69cfb` (full suite 6595/6599 pass, 0 fail, 4 skip)
+
+Mode-letter fix #2 (`dc69cfb`): channel ext flag **OPMODERATE reassigned `O`→`U`** (the sibling collision flagged after NOCOMICDATA). `O` is the enum-backed oper-only channel mode (only-opers-may-join, `ERR_OPERONLYCHAN` 520); raw `MODE +O` resolved to the enum first, so opmoderate was **unreachable/dead** — its speech-gate routing existed but the flag could never be set (also absent from CHANMODES/MODEX; audit §"MODEX" item 229). Reassigned to `U` per `mode_rearchitecture.md`, leaving `O` as oper-only; advertised `U` in CHANMODES; consistency test updated. The previously-dead enforcement is now exercised by a test: in a `+m`+`U` channel a muted member's PRIVMSG is delivered to ops only (rank≥2), not rejected. FOLLOW-UP (deferred): `mode_rearchitecture.md` wants held messages surfaced via an Event-Spine `chan.moderation.held` signal rather than the current raw op delivery — a semantic refinement, not a letter issue. The mode-letter space is now collision-free for the live ext flags ([[feedback_orochi_mode_letter_collisions]]).
+
 
 Mode-letter fix (`c20f94b`): channel ext flag **NOCOMICDATA reassigned `Y`→`V`** — `Y` is the network-operator member-status PREFIX letter (`PREFIX=(YQqov)*!.@+`, `chanmode.oper_mode_letter='Y'`), so it was double-claimed across PREFIX and a channel mode (ambiguous MODE parse). New letter `V` (free, unreserved) applied across all six in-sync definition sites (chanmode_ext mode_specs+render_specs, svc_template, ircx_modex, ircx_modex_cmd) and **now advertised in CHANMODES** (was settable/rendered but unadvertised). The dormant enforcement is now wired: a `+V` channel refuses comic-chat `DATA` from non-op members with `ERR_NOCOMICDATA` (531, previously no live caller); ops/founder/network-opers bypass. NOTE: the sibling collision OPMODERATE on `O` (also double-claimed — `mode_rearchitecture.md` wants `U`) is left for a deliberate follow-up.
 
