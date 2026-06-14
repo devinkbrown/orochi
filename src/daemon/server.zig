@@ -19872,16 +19872,16 @@ test "threaded server: WHOWAS count parameter bounds returned history" {
     try recvUntil(&b, " 001 B ", 200);
     b.reset();
     try writeAllFd(fd_b, "NICK C\r\n");
-    try recvUntil(&b, "NICK C", 200);
+    try recvUntil(&b, "NICK :C", 200);
     b.reset();
     try writeAllFd(fd_b, "NICK B\r\n");
-    try recvUntil(&b, "NICK B", 200);
+    try recvUntil(&b, "NICK :B", 200);
     b.reset();
     try writeAllFd(fd_b, "NICK D\r\n");
-    try recvUntil(&b, "NICK D", 200);
+    try recvUntil(&b, "NICK :D", 200);
     b.reset();
     try writeAllFd(fd_b, "NICK B\r\n");
-    try recvUntil(&b, "NICK B", 200);
+    try recvUntil(&b, "NICK :B", 200);
 
     a.reset();
     try writeAllFd(fd_a, "WHOWAS B 1\r\n");
