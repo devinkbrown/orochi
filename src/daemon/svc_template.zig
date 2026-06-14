@@ -91,7 +91,7 @@ pub const flag_specs = [_]FlagSpec{
     .{ .flag = .auditorium, .letter = 'x', .name = "AUDITORIUM" },
     .{ .flag = .nowhisper, .letter = 'w', .name = "NOWHISPER" },
     .{ .flag = .nocomicdata, .letter = 'V', .name = "NOCOMICDATA" },
-    .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
+    .{ .flag = .opmoderate, .letter = 'U', .name = "OPMODERATE" },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
     .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
 };

@@ -15560,7 +15560,7 @@ pub const LinuxServer = struct {
                 } else |_| {}
             }
             if (opmod_route) {
-                // +O opmoderate: the sender was muted (+m/+M/+Z) but the channel
+                // +U opmoderate: the sender was muted (+m/+M/+Z) but the channel
                 // routes blocked messages to ops instead of dropping them. Deliver
                 // to ops-and-above only (rank >= 2); no sender error, no echo, no
                 // history, no cross-node relay — ops locally see what was attempted.
@@ -21231,6 +21231,67 @@ test "threaded server: +V NOCOMICDATA refuses non-op DATA with 531" {
     b.reset();
     try writeAllFd(fd_a, "DATA #v TAG :fromop\r\n");
     try recvUntil(&b, "DATA #v TAG :fromop", 200);
+}
+
+test "threaded server: +U OPMODERATE routes a muted member's message to ops only" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+
+    // A founds #o (founder/op) and makes it +m (moderated) + +U (opmoderate);
+    // B and C join as plain, non-voiced members. Serialized so the modes commit
+    // before anyone speaks.
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "JOIN #o\r\n");
+    try recvUntil(&a, " 366 A #o ", 200);
+    try writeAllFd(fd_a, "MODE #o +m\r\n");
+    try recvUntil(&a, "MODE #o +m", 200);
+    try writeAllFd(fd_a, "MODE #o +U\r\n");
+    try recvUntil(&a, "MODE #o +U", 200);
+
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "JOIN #o\r\n");
+    try recvUntil(&b, " 366 B #o ", 200);
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&c, " 001 C ", 200);
+    try writeAllFd(fd_c, "JOIN #o\r\n");
+    try recvUntil(&c, " 366 C #o ", 200);
+
+    // B (muted under +m) speaks: instead of a 404, the message is routed to ops
+    // only — A (op) receives it, with no error back to B.
+    a.reset();
+    c.reset();
+    try writeAllFd(fd_b, "PRIVMSG #o :muted-attempt\r\n");
+    try recvUntil(&a, "PRIVMSG #o :muted-attempt", 200);
+
+    // A (op, may speak) sends a normal message that reaches every member. C
+    // receiving THIS but never the earlier routed-to-ops line proves the muted
+    // attempt was withheld from non-ops (deterministic ordering, no flaky sleep).
+    try writeAllFd(fd_a, "PRIVMSG #o :op-says-hi\r\n");
+    try recvUntil(&c, "PRIVMSG #o :op-says-hi", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "muted-attempt") == null);
 }
 
 test "threaded server: DATA STATUSMSG target reaches ops only" {

@@ -63,7 +63,7 @@ pub const mode_specs = [_]ModeSpec{
     .{ .flag = .auditorium, .letter = 'x', .name = "AUDITORIUM" },
     .{ .flag = .nowhisper, .letter = 'w', .name = "NOWHISPER" },
     .{ .flag = .nocomicdata, .letter = 'V', .name = "NOCOMICDATA" },
-    .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
+    .{ .flag = .opmoderate, .letter = 'U', .name = "OPMODERATE" },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
     .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
 };
@@ -72,7 +72,7 @@ const render_specs = [_]ModeSpec{
     .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
     .{ .flag = .clone, .letter = 'E', .name = "CLONE", .requires_oper = true },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
-    .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
+    .{ .flag = .opmoderate, .letter = 'U', .name = "OPMODERATE" },
     .{ .flag = .nocomicdata, .letter = 'V', .name = "NOCOMICDATA" },
     .{ .flag = .authonly, .letter = 'a', .name = "AUTHONLY" },
     .{ .flag = .cloneable, .letter = 'd', .name = "CLONEABLE" },
