@@ -116,6 +116,10 @@ pub const mode_table = [_]ModeSpec{
     .{ .name = "SERVICE", .letter = 'z', .kind = .channel, .requires_oper = true },
     .{ .name = "AUDITORIUM", .letter = 'x', .kind = .channel },
     .{ .name = "NOWHISPER", .letter = 'w', .kind = .channel },
+    // OPMODERATE (+U): redirect blocked-by-+m speech to channel ops rather than
+    // rejecting it. Enforced live (the `U` ext flag, reassigned from `O` in
+    // dc69cfb), so the MODEX query row no longer risks advertise-without-enforce.
+    .{ .name = "OPMODERATE", .letter = 'U', .kind = .channel },
     .{ .name = "NOCOMICDATA", .letter = 'V', .kind = .channel },
     .{ .name = "FOUNDER", .letter = 'Q', .kind = .member, .status_prefix = '~' },
     .{ .name = "OWNER", .letter = 'q', .kind = .member, .status_prefix = '.' },
