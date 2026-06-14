@@ -98,6 +98,13 @@ pub fn Matcher(comptime max_nodes: usize) type {
             return nodeKind(self.nodes[self.root]);
         }
 
+        /// Semantic kind after unwrapping root negation chains. Callers use this
+        /// to keep `$m` quiet extbans out of join-denial paths even when negated.
+        pub fn rootMatchKind(self: *const Self) NodeKind {
+            if (self.node_count == 0) return .hostmask;
+            return self.matchKind(self.root);
+        }
+
         /// Pattern stored at the root node when it is a leaf matcher.
         pub fn rootPattern(self: *const Self) ?[]const u8 {
             return switch (self.nodes[self.root]) {
@@ -186,6 +193,14 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 .secure => ctx.secure,
                 .mute => |pattern| patternMatch(pattern, ctx.host),
                 .negation => |child| !self.matchNode(child, ctx),
+            };
+        }
+
+        fn matchKind(self: *const Self, index: usize) NodeKind {
+            if (index >= self.node_count) return .hostmask;
+            return switch (self.nodes[index]) {
+                .negation => |child| self.matchKind(child),
+                else => nodeKind(self.nodes[index]),
             };
         }
     };
@@ -334,8 +349,13 @@ test "matches secure-connection extban" {
 
 test "matches mute extban against host like a plain hostmask" {
     const mute = try parse("$m:*.spam.example");
+    try std.testing.expectEqual(NodeKind.mute, mute.rootMatchKind());
     try std.testing.expect(mute.matches(.{ .host = "node.spam.example" }));
     try std.testing.expect(!mute.matches(.{ .host = "node.good.example" }));
+
+    const negated_mute = try parse("$~m:*.trusted.example");
+    try std.testing.expectEqual(NodeKind.negation, negated_mute.rootKind());
+    try std.testing.expectEqual(NodeKind.mute, negated_mute.rootMatchKind());
 }
 
 test "matches positive and negative account extbans" {

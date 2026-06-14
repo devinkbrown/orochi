@@ -965,16 +965,25 @@ pub const World = struct {
     /// evaluation. Re-exported from the extban parser so callers build one place.
     pub const BanContext = extban.ClientContext;
 
+    const ExtbanMutePolicy = enum { include, exclude, only };
+
     /// Like `listMatches`, but each entry may be an extended ban. Plain masks
     /// fall through to a host glob against `ctx.host` (the full nick!user@host
     /// prefix), preserving classic +b/+e/+I/+Z behavior; `$`-prefixed entries
     /// match account/realname/country/channel/negation. Malformed `$` entries
     /// degrade to a literal host glob so a bad mask never silently disables a ban.
-    fn listMatchesCtx(list: []const ListEntry, ctx: extban.ClientContext) bool {
+    fn listMatchesCtx(list: []const ListEntry, ctx: extban.ClientContext, mute_policy: ExtbanMutePolicy) bool {
         for (list) |m| {
             if (extban.parse(m.mask)) |matcher| {
+                const is_mute = matcher.rootMatchKind() == .mute;
+                switch (mute_policy) {
+                    .include => {},
+                    .exclude => if (is_mute) continue,
+                    .only => if (!is_mute) continue,
+                }
                 if (matcher.matches(ctx)) return true;
             } else |_| {
+                if (mute_policy == .only) continue;
                 if (listx.globMatch(m.mask, ctx.host)) return true;
             }
         }
@@ -1105,21 +1114,22 @@ pub const World = struct {
     /// overrides the ban.
     pub fn isBannedCtx(self: *World, name: []const u8, ctx: extban.ClientContext) bool {
         const channel = self.channels.getPtr(name) orelse return false;
-        if (listMatchesCtx(channel.exempts.items, ctx)) return false;
-        return listMatchesCtx(channel.bans.items, ctx);
+        if (listMatchesCtx(channel.exempts.items, ctx, .exclude)) return false;
+        return listMatchesCtx(channel.bans.items, ctx, .exclude);
     }
 
     /// Extended-ban-aware +Z quiet check (mirrors `isMuted`).
     pub fn isMutedCtx(self: *World, name: []const u8, ctx: extban.ClientContext) bool {
         const channel = self.channels.getPtr(name) orelse return false;
-        if (listMatchesCtx(channel.exempts.items, ctx)) return false;
-        return listMatchesCtx(channel.mutes.items, ctx);
+        if (listMatchesCtx(channel.exempts.items, ctx, .include)) return false;
+        return listMatchesCtx(channel.mutes.items, ctx, .include) or
+            listMatchesCtx(channel.bans.items, ctx, .only);
     }
 
     /// Extended-ban-aware +I invite-exception check (mirrors `isInvexed`).
     pub fn isInvexedCtx(self: *World, name: []const u8, ctx: extban.ClientContext) bool {
         const channel = self.channels.getPtr(name) orelse return false;
-        return listMatchesCtx(channel.invex.items, ctx);
+        return listMatchesCtx(channel.invex.items, ctx, .include);
     }
 
     /// Record an INVITE so the target may bypass +i.
@@ -1874,6 +1884,33 @@ test "extended bans match account, realname, channel, and negation" {
     try std.testing.expect(try world.addMute("#x", "$~a:alice", "setter", 6));
     try std.testing.expect(!world.isMutedCtx("#x", .{ .account = "alice", .host = "x!y@z" }));
     try std.testing.expect(world.isMutedCtx("#x", .{ .account = "bob", .host = "x!y@z" }));
+}
+
+test "$m extban in +b is a speech mute, not a join ban" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.join("#m", testClient(1));
+
+    try std.testing.expect(try world.addBan("#m", "$m:muted!*@*", "setter", 1));
+
+    const target = World.BanContext{ .host = "muted!user@example.test" };
+    try std.testing.expect(!world.isBannedCtx("#m", target));
+    try std.testing.expect(world.isMutedCtx("#m", target));
+
+    const other = World.BanContext{ .host = "speaker!user@example.test" };
+    try std.testing.expect(!world.isBannedCtx("#m", other));
+    try std.testing.expect(!world.isMutedCtx("#m", other));
+}
+
+test "$z extban honors secure client context" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.join("#tls", testClient(1));
+
+    try std.testing.expect(try world.addBan("#tls", "$z", "setter", 1));
+
+    try std.testing.expect(!world.isBannedCtx("#tls", .{ .host = "plain!u@h", .secure = false }));
+    try std.testing.expect(world.isBannedCtx("#tls", .{ .host = "secure!u@h", .secure = true }));
 }
 
 test "channel flag modes set, query, and render" {
