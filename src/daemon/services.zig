@@ -15,6 +15,7 @@ const account_max = 32;
 const channel_max = 64;
 const nick_max = 64;
 const email_max = 96;
+const mlock_max = 128;
 const mask_max = 160;
 const reason_max = 128;
 const key_max = 256;
@@ -44,11 +45,17 @@ pub const Config = struct {
 };
 
 const account_version = "A1";
+const account_version_v2 = "A2";
 const channel_version = "C1";
+const channel_version_v2 = "C2";
 const access_version = "X1";
 const akick_version = "K1";
+const verify_version = "V1";
+const ward_version = "W1";
 const access_prefix = "chanaccess:";
 const akick_prefix = "chanakick:";
+const verify_prefix = "acctverify:";
+const ward_prefix = "ward:";
 const missing_account_salt: [salt_len]u8 = .{
     0x6d, 0x69, 0x7a, 0x75, 0x63, 0x68, 0x69, 0x2d,
     0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73,
@@ -122,6 +129,7 @@ pub const AccountName = InlineText(account_max);
 pub const ChannelName = InlineText(channel_max);
 pub const NickName = InlineText(nick_max);
 pub const Email = InlineText(email_max);
+pub const Mlock = InlineText(mlock_max);
 pub const Mask = InlineText(mask_max);
 pub const Reason = InlineText(reason_max);
 
@@ -137,7 +145,7 @@ pub const AccessLevel = enum(u8) {
 };
 
 pub const AccountSetField = union(enum) { email: []const u8, flags: u32 };
-pub const ChannelSetField = union(enum) { flags: u32 };
+pub const ChannelSetField = union(enum) { flags: u32, mlock: []const u8 };
 pub const AccessAction = enum { query, grant, revoke };
 pub const AkickAction = enum { add, remove, query };
 pub const AccountRef = struct { name: AccountName };
@@ -151,12 +159,14 @@ pub const account_flags_privileged: u32 = account_flag_suspended | account_flag_
 pub const AccountInfo = struct {
     name: AccountName,
     email: Email = Email.empty(),
+    email_verified: bool = false,
     flags: u32 = 0,
 };
 
 pub const AccountAdminInfo = struct {
     name: AccountName,
     email: Email = Email.empty(),
+    email_verified: bool = false,
     flags: u32 = 0,
     registered: bool = false,
 
@@ -177,6 +187,7 @@ pub const ChannelInfo = struct {
     name: ChannelName,
     founder: AccountName,
     flags: u32 = 0,
+    mlock: Mlock = Mlock.empty(),
 };
 
 pub const GhostInfo = struct {
@@ -195,6 +206,38 @@ pub const AkickInfo = struct {
     mask: Mask,
     setter: AccountName,
     reason: Reason = Reason.empty(),
+};
+
+pub const EmailVerifyResult = enum {
+    verified,
+    expired,
+    no_pending,
+    bad_token,
+};
+
+pub const ReplayWard = struct {
+    match: []const u8,
+    pattern: []const u8,
+    scope: []const u8,
+    action: []const u8,
+    reason: []const u8,
+    setter: []const u8,
+    created_ms: i64,
+    expires_ms: i64,
+};
+
+pub const LiveReplaySummary = struct {
+    channels: usize = 0,
+    mlocks: usize = 0,
+    akicks: usize = 0,
+    wards: usize = 0,
+};
+
+pub const LiveReplaySink = struct {
+    ptr: *anyopaque,
+    channel: *const fn (ctx: *anyopaque, channel: []const u8, mlock: []const u8) ServiceError!void,
+    akick: ?*const fn (ctx: *anyopaque, channel: []const u8, mask: []const u8, reason: []const u8, setter: []const u8) ServiceError!void = null,
+    ward: ?*const fn (ctx: *anyopaque, ward: ReplayWard) ServiceError!void = null,
 };
 
 pub const CommandResult = union(enum) {
@@ -219,14 +262,15 @@ const AccountRecord = struct {
     salt: [salt_len]u8,
     hash: [hash_len]u8,
     email: Email = Email.empty(),
+    email_verified: bool = false,
     flags: u32 = 0,
 
     fn info(self: AccountRecord) AccountInfo {
-        return .{ .name = self.name, .email = self.email, .flags = self.flags };
+        return .{ .name = self.name, .email = self.email, .email_verified = self.email_verified, .flags = self.flags };
     }
 
     fn adminInfo(self: AccountRecord) AccountAdminInfo {
-        return .{ .name = self.name, .email = self.email, .flags = self.flags, .registered = true };
+        return .{ .name = self.name, .email = self.email, .email_verified = self.email_verified, .flags = self.flags, .registered = true };
     }
 };
 
@@ -235,9 +279,10 @@ const ChannelRecord = struct {
     founder: AccountName,
     generation: [generation_len]u8,
     flags: u32 = 0,
+    mlock: Mlock = Mlock.empty(),
 
     fn info(self: ChannelRecord) ChannelInfo {
-        return .{ .name = self.name, .founder = self.founder, .flags = self.flags };
+        return .{ .name = self.name, .founder = self.founder, .flags = self.flags, .mlock = self.mlock };
     }
 };
 
@@ -415,6 +460,17 @@ pub const Services = struct {
     }
 
     pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
+        return self.registerAccountWithEmail(name, password, null, false, scratch);
+    }
+
+    pub fn registerAccountWithEmail(
+        self: *Services,
+        name: []const u8,
+        password: []const u8,
+        email: ?[]const u8,
+        email_verified: bool,
+        scratch: []u8,
+    ) ServiceError!CommandResult {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
@@ -433,6 +489,8 @@ pub const Services = struct {
             .name = AccountName.init(key.asSlice()) catch return error.InvalidName,
             .salt = salt,
             .hash = hash,
+            .email = if (email) |value| try validateEmail(value) else Email.empty(),
+            .email_verified = email_verified and email != null,
         };
         const encoded = try encodeAccount(record, scratch);
         try self.store.family(.accounts).put(key.asSlice(), encoded);
@@ -452,6 +510,59 @@ pub const Services = struct {
             self.persistScram(scram, record.name.asSlice());
         }
         return .{ .registered_account = .{ .name = record.name } };
+    }
+
+    pub fn setAccountEmailPending(
+        self: *Services,
+        name: []const u8,
+        email: []const u8,
+        token: []const u8,
+        issued_ms: u64,
+        scratch: []u8,
+    ) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var record = try self.loadAccount(name);
+        record.email = try validateEmail(email);
+        record.email_verified = false;
+        try self.saveAccount(record, scratch);
+
+        var key_buf: [verify_key_max]u8 = undefined;
+        const key = verifyKey(&key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        var value_buf: [verify_value_max]u8 = undefined;
+        const value = try encodeVerify(record.name.asSlice(), record.email.asSlice(), token, issued_ms, &value_buf);
+        try self.store.family(.props).put(key, value);
+    }
+
+    pub fn confirmAccountEmail(
+        self: *Services,
+        name: []const u8,
+        token: []const u8,
+        now_ms: u64,
+        scratch: []u8,
+    ) ServiceError!EmailVerifyResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try accountKey(name);
+        var verify_key_buf: [verify_key_max]u8 = undefined;
+        const verify_key_text = verifyKey(&verify_key_buf, key.asSlice()) orelse return error.BufferTooSmall;
+        const encoded = self.store.family(.props).get(verify_key_text) orelse return .no_pending;
+        const pending = try decodeVerify(encoded);
+        if (!std.ascii.eqlIgnoreCase(pending.account, key.asSlice())) return .no_pending;
+        if (now_ms >= pending.issued_ms and now_ms - pending.issued_ms >= default_verify_ttl_ms) {
+            try self.store.family(.props).delete(verify_key_text);
+            return .expired;
+        }
+        if (!tokenMatches(pending.token, token)) return .bad_token;
+
+        var record = try self.loadAccount(key.asSlice());
+        record.email = try validateEmail(pending.email);
+        record.email_verified = true;
+        try self.saveAccount(record, scratch);
+        try self.store.family(.props).delete(verify_key_text);
+        return .verified;
     }
 
     pub fn identifyAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
@@ -502,7 +613,10 @@ pub const Services = struct {
         var record = try self.loadAccount(name);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         switch (field) {
-            .email => |email| record.email = try validateEmail(email),
+            .email => |email| {
+                record.email = try validateEmail(email);
+                record.email_verified = false;
+            },
             .flags => |flags| {
                 const preserved = record.flags & account_flags_privileged;
                 if ((flags & account_flags_privileged) != preserved) return error.Forbidden;
@@ -816,6 +930,7 @@ pub const Services = struct {
         try self.requireAccess(record, actor, .admin);
         switch (field) {
             .flags => |flags| record.flags = flags,
+            .mlock => |spec| record.mlock = try validateMlock(spec),
         }
         const encoded = try encodeChannel(record, scratch);
         try self.store.family(.chanregs).put(record.name.asSlice(), encoded);
@@ -828,6 +943,75 @@ pub const Services = struct {
 
         const record = try self.loadChannel(channel);
         return .{ .channel_info = record.info() };
+    }
+
+    pub fn channelAccessLevelFor(self: *Services, channel: []const u8, account: []const u8) ServiceError!?AccessLevel {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const record = try self.loadChannel(channel);
+        const key = try accountKey(account);
+        if (std.mem.eql(u8, key.asSlice(), record.founder.asSlice())) return .founder;
+        const access = self.loadAccess(record, key.asSlice()) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return access.level;
+    }
+
+    pub fn persistWard(self: *Services, ward: ReplayWard, scratch: []u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try wardKey(ward.match, ward.pattern, scratch);
+        var value_buf: [ward_value_max]u8 = undefined;
+        const value = try encodeWard(ward, &value_buf);
+        try self.store.family(.bans).put(key, value);
+    }
+
+    pub fn deleteWard(self: *Services, match: []const u8, pattern: []const u8, scratch: []u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try wardKey(match, pattern, scratch);
+        try self.store.family(.bans).delete(key);
+    }
+
+    pub fn replayLiveState(self: *Services, sink: LiveReplaySink) ServiceError!LiveReplaySummary {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var summary = LiveReplaySummary{};
+        {
+            var it = self.store.maps[@intFromEnum(store_mod.Family.chanregs)].map.iterator();
+            while (it.next()) |entry| {
+                const record = decodeChannel(entry.value_ptr.*) catch continue;
+                try sink.channel(sink.ptr, record.name.asSlice(), record.mlock.asSlice());
+                summary.channels += 1;
+                if (record.mlock.asSlice().len != 0) summary.mlocks += 1;
+            }
+        }
+        if (sink.akick) |on_akick| {
+            var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+            while (it.next()) |entry| {
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, akick_prefix)) continue;
+                const akick = decodeAkick(entry.value_ptr.*) catch continue;
+                const channel = self.loadChannel(akick.channel.asSlice()) catch continue;
+                if (!sameBytes(generation_len, &akick.generation, &channel.generation)) continue;
+                try on_akick(sink.ptr, akick.channel.asSlice(), akick.mask.asSlice(), akick.reason.asSlice(), akick.setter.asSlice());
+                summary.akicks += 1;
+            }
+        }
+        if (sink.ward) |on_ward| {
+            var it = self.store.maps[@intFromEnum(store_mod.Family.bans)].map.iterator();
+            while (it.next()) |entry| {
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, ward_prefix)) continue;
+                const ward = decodeWard(entry.value_ptr.*) catch continue;
+                try on_ward(sink.ptr, ward);
+                summary.wards += 1;
+            }
+        }
+        return summary;
     }
 
     fn addCertfpListEntry(self: *Services, account: []const u8, fingerprint: []const u8) ServiceError!void {
@@ -978,6 +1162,12 @@ fn validateEmail(input: []const u8) ServiceError!Email {
     return Email.init(input) catch error.InvalidValue;
 }
 
+fn validateMlock(input: []const u8) ServiceError!Mlock {
+    if (input.len == 0) return Mlock.empty();
+    if (input.len > mlock_max or hasCtlOrSep(input)) return error.InvalidValue;
+    return Mlock.init(input) catch error.InvalidValue;
+}
+
 fn validateReason(input: []const u8) ServiceError!Reason {
     if (input.len > reason_max or hasCtlOrSep(input)) return error.InvalidValue;
     return Reason.init(input) catch error.InvalidValue;
@@ -1003,6 +1193,11 @@ const certfp_account_key_max = certfp_account_key_prefix.len + account_max;
 const certfp_list_value_max = 16 * 64 + 15;
 const forbidden_account_key_prefix = "acctforbid:";
 const forbidden_account_key_max = forbidden_account_key_prefix.len + account_max;
+const verify_key_max = verify_prefix.len + account_max;
+const verify_value_max = verify_version.len + 1 + account_max + 1 + email_max + 1 + 128 + 1 + 20;
+const default_verify_ttl_ms: u64 = 15 * 60 * 1000;
+const ward_key_max = ward_prefix.len + 16 + 1 + 256;
+const ward_value_max = ward_version.len + 1 + 16 + 1 + 256 + 1 + 16 + 1 + 16 + 1 + 20 + 1 + 20 + 1 + 64 + 1 + 512;
 
 /// Build the props-family key for a certfp binding, or null if it would not fit.
 fn certfpKey(buf: []u8, fingerprint: []const u8) ?[]const u8 {
@@ -1015,6 +1210,10 @@ fn certfpAccountKey(buf: []u8, account: []const u8) ?[]const u8 {
 
 fn forbiddenAccountKey(buf: []u8, account: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, forbidden_account_key_prefix ++ "{s}", .{account}) catch null;
+}
+
+fn verifyKey(buf: []u8, account: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, verify_prefix ++ "{s}", .{account}) catch null;
 }
 
 /// Durable-store key prefix for persisted SCRAM credential tuples (props family).
@@ -1095,19 +1294,23 @@ fn encodeAccount(record: AccountRecord, scratch: []u8) ServiceError![]const u8 {
     var hash_hex = std.fmt.bytesToHex(record.hash, .lower);
     return std.fmt.bufPrint(
         scratch,
-        "{s}|{s}|{s}|{s}|{}|{s}",
-        .{ account_version, record.name.asSlice(), &salt_hex, &hash_hex, record.flags, record.email.asSlice() },
+        "{s}|{s}|{s}|{s}|{}|{s}|{}",
+        .{ account_version_v2, record.name.asSlice(), &salt_hex, &hash_hex, record.flags, record.email.asSlice(), record.email_verified },
     ) catch error.BufferTooSmall;
 }
 
 fn decodeAccount(value: []const u8) ServiceError!AccountRecord {
     var it = std.mem.splitScalar(u8, value, '|');
-    if (!std.mem.eql(u8, it.next() orelse return error.InvalidRecord, account_version)) return error.InvalidRecord;
+    const version = it.next() orelse return error.InvalidRecord;
+    const is_v1 = std.mem.eql(u8, version, account_version);
+    const is_v2 = std.mem.eql(u8, version, account_version_v2);
+    if (!is_v1 and !is_v2) return error.InvalidRecord;
     const name = try accountKey(it.next() orelse return error.InvalidRecord);
     const salt_hex = it.next() orelse return error.InvalidRecord;
     const hash_hex = it.next() orelse return error.InvalidRecord;
     const flags_text = it.next() orelse return error.InvalidRecord;
     const email_text = it.next() orelse "";
+    const verified_text = if (is_v2) it.next() orelse return error.InvalidRecord else "false";
     if (it.next() != null) return error.InvalidRecord;
     if (salt_hex.len != salt_hex_len or hash_hex.len != hash_hex_len) return error.InvalidRecord;
 
@@ -1117,6 +1320,7 @@ fn decodeAccount(value: []const u8) ServiceError!AccountRecord {
         .hash = undefined,
         .flags = std.fmt.parseInt(u32, flags_text, 10) catch return error.InvalidRecord,
         .email = try validateEmail(email_text),
+        .email_verified = std.mem.eql(u8, verified_text, "true"),
     };
     _ = std.fmt.hexToBytes(&record.salt, salt_hex) catch return error.InvalidRecord;
     _ = std.fmt.hexToBytes(&record.hash, hash_hex) catch return error.InvalidRecord;
@@ -1127,24 +1331,29 @@ fn encodeChannel(record: ChannelRecord, scratch: []u8) ServiceError![]const u8 {
     var gen_hex = std.fmt.bytesToHex(record.generation, .lower);
     return std.fmt.bufPrint(
         scratch,
-        "{s}|{s}|{s}|{s}|{}",
-        .{ channel_version, record.name.asSlice(), record.founder.asSlice(), &gen_hex, record.flags },
+        "{s}|{s}|{s}|{s}|{}|{s}",
+        .{ channel_version_v2, record.name.asSlice(), record.founder.asSlice(), &gen_hex, record.flags, record.mlock.asSlice() },
     ) catch error.BufferTooSmall;
 }
 
 fn decodeChannel(value: []const u8) ServiceError!ChannelRecord {
     var it = std.mem.splitScalar(u8, value, '|');
-    if (!std.mem.eql(u8, it.next() orelse return error.InvalidRecord, channel_version)) return error.InvalidRecord;
+    const version = it.next() orelse return error.InvalidRecord;
+    const is_v1 = std.mem.eql(u8, version, channel_version);
+    const is_v2 = std.mem.eql(u8, version, channel_version_v2);
+    if (!is_v1 and !is_v2) return error.InvalidRecord;
     const name = try channelKey(it.next() orelse return error.InvalidRecord);
     const founder = try accountKey(it.next() orelse return error.InvalidRecord);
     const gen_hex = it.next() orelse return error.InvalidRecord;
     const flags_text = it.next() orelse return error.InvalidRecord;
+    const mlock_text = if (is_v2) it.next() orelse return error.InvalidRecord else "";
     if (it.next() != null or gen_hex.len != generation_hex_len) return error.InvalidRecord;
     var record = ChannelRecord{
         .name = name,
         .founder = founder,
         .generation = undefined,
         .flags = std.fmt.parseInt(u32, flags_text, 10) catch return error.InvalidRecord,
+        .mlock = try validateMlock(mlock_text),
     };
     _ = std.fmt.hexToBytes(&record.generation, gen_hex) catch return error.InvalidRecord;
     return record;
@@ -1204,6 +1413,113 @@ fn decodeAkick(value: []const u8) ServiceError!AkickRecord {
     };
     _ = std.fmt.hexToBytes(&record.generation, gen_hex) catch return error.InvalidRecord;
     return record;
+}
+
+const PendingVerify = struct {
+    account: []const u8,
+    email: []const u8,
+    token: []const u8,
+    issued_ms: u64,
+};
+
+fn encodeVerify(account: []const u8, email: []const u8, token: []const u8, issued_ms: u64, out: []u8) ServiceError![]const u8 {
+    if (hasCtlOrSep(token) or token.len == 0 or token.len > 128) return error.InvalidValue;
+    return std.fmt.bufPrint(out, "{s}|{s}|{s}|{s}|{d}", .{ verify_version, account, email, token, issued_ms }) catch error.BufferTooSmall;
+}
+
+fn decodeVerify(value: []const u8) ServiceError!PendingVerify {
+    var it = std.mem.splitScalar(u8, value, '|');
+    if (!std.mem.eql(u8, it.next() orelse return error.InvalidRecord, verify_version)) return error.InvalidRecord;
+    const account = it.next() orelse return error.InvalidRecord;
+    const email = it.next() orelse return error.InvalidRecord;
+    const token = it.next() orelse return error.InvalidRecord;
+    const issued_text = it.next() orelse return error.InvalidRecord;
+    if (it.next() != null) return error.InvalidRecord;
+    _ = try accountKey(account);
+    _ = try validateEmail(email);
+    if (hasCtlOrSep(token) or token.len == 0 or token.len > 128) return error.InvalidRecord;
+    return .{
+        .account = account,
+        .email = email,
+        .token = token,
+        .issued_ms = std.fmt.parseInt(u64, issued_text, 10) catch return error.InvalidRecord,
+    };
+}
+
+fn tokenMatches(expected: []const u8, actual: []const u8) bool {
+    if (expected.len != actual.len) return false;
+    return std.crypto.timing_safe.compare(u8, expected, actual, .big) == .eq;
+}
+
+fn validateWardField(value: []const u8, max_len: usize) ServiceError!void {
+    if (value.len == 0 or value.len > max_len) return error.InvalidValue;
+    if (hasCtlOrSep(value)) return error.InvalidValue;
+}
+
+fn validateWardOptionalField(value: []const u8, max_len: usize) ServiceError!void {
+    if (value.len > max_len) return error.InvalidValue;
+    if (hasCtlOrSep(value)) return error.InvalidValue;
+}
+
+fn wardKey(match: []const u8, pattern: []const u8, out: []u8) ServiceError![]const u8 {
+    try validateWardField(match, 16);
+    try validateWardField(pattern, 256);
+    if (ward_prefix.len + match.len + 1 + pattern.len > @min(out.len, ward_key_max)) return error.BufferTooSmall;
+    return std.fmt.bufPrint(out, ward_prefix ++ "{s}:{s}", .{ match, pattern }) catch error.BufferTooSmall;
+}
+
+fn encodeWard(ward: ReplayWard, out: []u8) ServiceError![]const u8 {
+    try validateWardField(ward.match, 16);
+    try validateWardField(ward.pattern, 256);
+    try validateWardField(ward.scope, 16);
+    try validateWardField(ward.action, 16);
+    try validateWardOptionalField(ward.setter, 64);
+    try validateWardOptionalField(ward.reason, 512);
+    return std.fmt.bufPrint(
+        out,
+        "{s}|{s}|{s}|{s}|{s}|{d}|{d}|{s}|{s}",
+        .{
+            ward_version,
+            ward.match,
+            ward.pattern,
+            ward.scope,
+            ward.action,
+            ward.created_ms,
+            ward.expires_ms,
+            ward.setter,
+            ward.reason,
+        },
+    ) catch error.BufferTooSmall;
+}
+
+fn decodeWard(value: []const u8) ServiceError!ReplayWard {
+    var it = std.mem.splitScalar(u8, value, '|');
+    if (!std.mem.eql(u8, it.next() orelse return error.InvalidRecord, ward_version)) return error.InvalidRecord;
+    const match = it.next() orelse return error.InvalidRecord;
+    const pattern = it.next() orelse return error.InvalidRecord;
+    const scope = it.next() orelse return error.InvalidRecord;
+    const action = it.next() orelse return error.InvalidRecord;
+    const created = it.next() orelse return error.InvalidRecord;
+    const expires = it.next() orelse return error.InvalidRecord;
+    const setter = it.next() orelse "";
+    const reason = it.next() orelse "";
+    if (it.next() != null) return error.InvalidRecord;
+    try validateWardField(match, 16);
+    try validateWardField(pattern, 256);
+    try validateWardField(scope, 16);
+    try validateWardField(action, 16);
+    try validateWardOptionalField(setter, 64);
+    try validateWardOptionalField(reason, 512);
+    return .{
+        .match = match,
+        .pattern = pattern,
+        .scope = scope,
+        .action = action,
+        .created_ms = std.fmt.parseInt(i64, created, 10) catch return error.InvalidRecord,
+        .expires_ms = std.fmt.parseInt(i64, expires, 10) catch return error.InvalidRecord,
+        .setter = setter,
+        .reason = reason,
+    };
 }
 
 fn levelFromInt(value: u8) ?AccessLevel {
@@ -1317,6 +1633,41 @@ test "account persists across store reopen" {
         const result = try services.accountInfo("ALICE");
         try std.testing.expectEqualStrings("alice@example.test", result.account_info.email.asSlice());
         _ = try services.identifyAccount("alice", "correct horse battery staple");
+    }
+}
+
+test "account email verification persists across store reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-email-verify.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var scratch: [record_max]u8 = undefined;
+
+        _ = try services.registerAccountWithEmail("Alice", "correct horse battery staple", "alice@example.test", false, &scratch);
+        var info = try services.accountInfo("alice");
+        try std.testing.expectEqualStrings("alice@example.test", info.account_info.email.asSlice());
+        try std.testing.expect(!info.account_info.email_verified);
+
+        try services.setAccountEmailPending("alice", "alice@example.test", "abc123", 10, &scratch);
+    }
+    {
+        var store = try openTestStore(tmp, "services-email-verify.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var scratch: [record_max]u8 = undefined;
+
+        try std.testing.expectEqual(EmailVerifyResult.bad_token, try services.confirmAccountEmail("ALICE", "wrong", 11, &scratch));
+        var info = try services.accountInfo("alice");
+        try std.testing.expect(!info.account_info.email_verified);
+
+        try std.testing.expectEqual(EmailVerifyResult.verified, try services.confirmAccountEmail("ALICE", "abc123", 12, &scratch));
+        info = try services.accountInfo("alice");
+        try std.testing.expectEqualStrings("alice@example.test", info.account_info.email.asSlice());
+        try std.testing.expect(info.account_info.email_verified);
+        try std.testing.expectEqual(EmailVerifyResult.no_pending, try services.confirmAccountEmail("ALICE", "abc123", 13, &scratch));
     }
 }
 
@@ -1517,6 +1868,109 @@ test "channel register and access grant" {
 
     const queried = try services.channelAccess("#orochi", "bob", "bob", .query, .voice, &scratch);
     try std.testing.expectEqual(AccessLevel.op, queried.access.level);
+}
+
+test "channel mlock access akick and ward replay from durable services" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-live-replay.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var scratch: [record_max]u8 = undefined;
+
+        _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+        _ = try services.registerAccount("bob", "another correct battery staple", &scratch);
+        _ = try services.registerChannel("#Orochi", "alice", &scratch);
+        _ = try services.setChannel("#orochi", "alice", .{ .mlock = "+nt-k" }, &scratch);
+        _ = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
+        _ = try services.channelAkick("#orochi", "alice", "Bad!*@*", .add, "go away", &scratch);
+        try services.persistWard(.{
+            .match = "mask",
+            .pattern = "Bad!*@*",
+            .scope = "node",
+            .action = "expel",
+            .reason = "spam",
+            .setter = "alice",
+            .created_ms = 111,
+            .expires_ms = 222,
+        }, &scratch);
+    }
+
+    {
+        var store = try openTestStore(tmp, "services-live-replay.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+
+        const info = try services.channelInfo("#orochi");
+        try std.testing.expectEqualStrings("+nt-k", info.channel_info.mlock.asSlice());
+        try std.testing.expectEqual(AccessLevel.op, (try services.channelAccessLevelFor("#orochi", "bob")).?);
+
+        const ReplayRecorder = struct {
+            channel: [channel_max]u8 = [_]u8{0} ** channel_max,
+            channel_len: usize = 0,
+            mlock: [mlock_max]u8 = [_]u8{0} ** mlock_max,
+            mlock_len: usize = 0,
+            akick_channel: [channel_max]u8 = [_]u8{0} ** channel_max,
+            akick_channel_len: usize = 0,
+            akick_mask: [mask_max]u8 = [_]u8{0} ** mask_max,
+            akick_mask_len: usize = 0,
+            akick_reason: [reason_max]u8 = [_]u8{0} ** reason_max,
+            akick_reason_len: usize = 0,
+            ward_match: [16]u8 = [_]u8{0} ** 16,
+            ward_match_len: usize = 0,
+            ward_pattern: [mask_max]u8 = [_]u8{0} ** mask_max,
+            ward_pattern_len: usize = 0,
+            ward_reason: [reason_max]u8 = [_]u8{0} ** reason_max,
+            ward_reason_len: usize = 0,
+
+            fn copyInto(dst: []u8, len: *usize, value: []const u8) ServiceError!void {
+                if (value.len > dst.len) return error.BufferTooSmall;
+                @memcpy(dst[0..value.len], value);
+                len.* = value.len;
+            }
+
+            fn onChannel(ctx: *anyopaque, channel: []const u8, mlock: []const u8) ServiceError!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                try copyInto(&self.channel, &self.channel_len, channel);
+                try copyInto(&self.mlock, &self.mlock_len, mlock);
+            }
+
+            fn onAkick(ctx: *anyopaque, channel: []const u8, mask: []const u8, reason: []const u8, _: []const u8) ServiceError!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                try copyInto(&self.akick_channel, &self.akick_channel_len, channel);
+                try copyInto(&self.akick_mask, &self.akick_mask_len, mask);
+                try copyInto(&self.akick_reason, &self.akick_reason_len, reason);
+            }
+
+            fn onWard(ctx: *anyopaque, ward: ReplayWard) ServiceError!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                try copyInto(&self.ward_match, &self.ward_match_len, ward.match);
+                try copyInto(&self.ward_pattern, &self.ward_pattern_len, ward.pattern);
+                try copyInto(&self.ward_reason, &self.ward_reason_len, ward.reason);
+            }
+        };
+        var recorder = ReplayRecorder{};
+        const summary = try services.replayLiveState(.{
+            .ptr = &recorder,
+            .channel = ReplayRecorder.onChannel,
+            .akick = ReplayRecorder.onAkick,
+            .ward = ReplayRecorder.onWard,
+        });
+        try std.testing.expectEqual(@as(usize, 1), summary.channels);
+        try std.testing.expectEqual(@as(usize, 1), summary.mlocks);
+        try std.testing.expectEqual(@as(usize, 1), summary.akicks);
+        try std.testing.expectEqual(@as(usize, 1), summary.wards);
+        try std.testing.expectEqualStrings("#orochi", recorder.channel[0..recorder.channel_len]);
+        try std.testing.expectEqualStrings("+nt-k", recorder.mlock[0..recorder.mlock_len]);
+        try std.testing.expectEqualStrings("#orochi", recorder.akick_channel[0..recorder.akick_channel_len]);
+        try std.testing.expectEqualStrings("Bad!*@*", recorder.akick_mask[0..recorder.akick_mask_len]);
+        try std.testing.expectEqualStrings("go away", recorder.akick_reason[0..recorder.akick_reason_len]);
+        try std.testing.expectEqualStrings("mask", recorder.ward_match[0..recorder.ward_match_len]);
+        try std.testing.expectEqualStrings("Bad!*@*", recorder.ward_pattern[0..recorder.ward_pattern_len]);
+        try std.testing.expectEqualStrings("spam", recorder.ward_reason[0..recorder.ward_reason_len]);
+    }
 }
 
 test "non-admin channel mutations are forbidden" {

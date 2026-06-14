@@ -8,7 +8,7 @@ const sasl = @import("sasl.zig");
 const scram256 = @import("sasl_scram_server.zig");
 const scram512 = @import("sasl_scram512_server.zig");
 
-pub const SUPPORTED_MECHANISMS = "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512";
+pub const SUPPORTED_MECHANISMS = "PLAIN EXTERNAL SCRAM-SHA-256";
 pub const MAX_AUTHENTICATE_CHUNK: usize = 400;
 pub const MAX_RAW_MESSAGE: usize = sasl.MAX_SCRAM_MESSAGE;
 pub const MAX_B64_MESSAGE: usize = std.base64.standard.Encoder.calcSize(MAX_RAW_MESSAGE);
@@ -469,7 +469,7 @@ test "unknown mechanism rejects" {
 
 test "mechanism list string advertises supported mechanisms" {
     try std.testing.expectEqualStrings(
-        "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512",
+        "PLAIN EXTERNAL SCRAM-SHA-256",
         Router.mechanismList(),
     );
     try std.testing.expectEqualStrings(SUPPORTED_MECHANISMS, Router.mechanismList());

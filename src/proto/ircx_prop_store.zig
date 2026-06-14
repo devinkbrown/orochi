@@ -70,15 +70,20 @@ pub const Entity = struct {
 
     pub fn fromId(id: []const u8) PropError!Entity {
         if (id.len == 0) return error.InvalidEntity;
-        const kind: EntityKind = switch (id[0]) {
-            '#', '&', '+', '%' => .channel,
-            else => if (std.mem.indexOfScalar(u8, id, ':') != null) .member else .user,
-        };
+        const kind: EntityKind = if (isChannelEntityId(id)) .channel else if (std.mem.indexOfScalar(u8, id, ':') != null) .member else .user;
         const entity = Entity{ .kind = kind, .id = id };
         try validateEntity(entity, default_max_entity_id);
         return entity;
     }
 };
+
+fn isChannelEntityId(id: []const u8) bool {
+    return switch (id[0]) {
+        '#', '&' => true,
+        '%' => id.len >= 2 and (id[1] == '#' or id[1] == '&'),
+        else => false,
+    };
+}
 
 pub const AccessLevel = enum(u8) {
     user = 0,

@@ -19,14 +19,17 @@ pub const module = registry.Module{
     .id = "ops.upgrade",
     .category = .core,
     .commands = &.{
-        .{ .name = "UPGRADE", .handler = upgrade },
+        .{ .name = "UPGRADE", .access = .oper, .handler = upgrade },
     },
 };
 
 test "upgrade module declares UPGRADE" {
     var saw = false;
     for (module.commands) |c| {
-        if (std.ascii.eqlIgnoreCase(c.name, "UPGRADE")) saw = true;
+        if (std.ascii.eqlIgnoreCase(c.name, "UPGRADE")) {
+            saw = true;
+            try std.testing.expectEqual(registry.Access.oper, c.access);
+        }
     }
     try std.testing.expect(saw);
 }

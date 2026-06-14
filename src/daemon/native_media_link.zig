@@ -351,6 +351,19 @@ test "inboundFrom learns the publisher's address and still forwards to others" {
     try testing.expect(out[0].eql(learned));
 }
 
+test "inboundFrom rejects a bound stream_id from a different source address" {
+    var link = NativeMediaLink(8).init();
+    const floor = opcodec_frame.MEDIA_BAND_FLOOR;
+    try link.register("alice", .voice, 100, mkAddr(0, 0));
+    try link.register("bob", .voice, 200, mkAddr(2, 9000));
+
+    var fbuf: [64]u8 = undefined;
+    var out: [8]TransportAddress = undefined;
+    const learned = mkAddr(7, 1234);
+    try testing.expectEqual(@as(usize, 1), link.inboundFrom(frame(100, floor, 1, false, &fbuf), learned, &out));
+    try testing.expectEqual(@as(usize, 0), link.inboundFrom(frame(100, floor, 2, false, &fbuf), mkAddr(8, 1234), &out));
+}
+
 test "stats meter received frames against the publisher" {
     var link = NativeMediaLink(8).init();
     const floor = opcodec_frame.MEDIA_BAND_FLOOR;

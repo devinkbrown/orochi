@@ -25,12 +25,16 @@ pub const BuildError = error{
 pub const Package = enum {
     anon,
     plain,
+    external,
+    scram_sha_256,
     gatekeeper,
     gatekeeper_passport,
 
     pub fn parse(raw: []const u8) ?Package {
         if (std.ascii.eqlIgnoreCase(raw, "ANON")) return .anon;
         if (std.ascii.eqlIgnoreCase(raw, "PLAIN")) return .plain;
+        if (std.ascii.eqlIgnoreCase(raw, "EXTERNAL")) return .external;
+        if (std.ascii.eqlIgnoreCase(raw, "SCRAM-SHA-256")) return .scram_sha_256;
         if (std.ascii.eqlIgnoreCase(raw, "GateKeeper")) return .gatekeeper;
         if (std.ascii.eqlIgnoreCase(raw, "GateKeeperPassport")) return .gatekeeper_passport;
         return null;
@@ -40,6 +44,8 @@ pub const Package = enum {
         return switch (self) {
             .anon => "ANON",
             .plain => "PLAIN",
+            .external => "EXTERNAL",
+            .scram_sha_256 => "SCRAM-SHA-256",
             .gatekeeper => "GateKeeper",
             .gatekeeper_passport => "GateKeeperPassport",
         };

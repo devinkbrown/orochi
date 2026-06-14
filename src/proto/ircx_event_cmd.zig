@@ -22,7 +22,9 @@ pub const BuildError = error{
 
 pub const Operation = enum {
     add,
+    change,
     del,
+    clear,
     list,
 };
 
@@ -69,8 +71,10 @@ pub fn parseParams(params: []const []const u8) ParseError!Request {
 
 pub fn parseOperation(token: []const u8) ParseError!Operation {
     if (std.ascii.eqlIgnoreCase(token, "ADD")) return .add;
-    if (std.ascii.eqlIgnoreCase(token, "DEL")) return .del;
-    if (std.ascii.eqlIgnoreCase(token, "LIST")) return .list;
+    if (std.ascii.eqlIgnoreCase(token, "CHANGE")) return .change;
+    if (std.ascii.eqlIgnoreCase(token, "DEL") or std.ascii.eqlIgnoreCase(token, "DELETE")) return .del;
+    if (std.ascii.eqlIgnoreCase(token, "CLEAR")) return .clear;
+    if (std.ascii.eqlIgnoreCase(token, "LIST") or std.ascii.eqlIgnoreCase(token, "STATUS")) return .list;
     return error.InvalidSubcommand;
 }
 
@@ -106,7 +110,9 @@ pub fn draftAlias(token: []const u8) ?EventCategory {
 pub fn applyRequest(current: CategoryMask, request: Request) CategoryMask {
     return switch (request.operation) {
         .add => current.include(request.mask),
+        .change => request.mask,
         .del => current.exclude(request.mask),
+        .clear => CategoryMask.empty(),
         .list => current,
     };
 }

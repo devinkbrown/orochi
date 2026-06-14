@@ -42,6 +42,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
+    if (cfg.listen.webtransport != 0) out.webtransport_port = cfg.listen.webtransport;
+    out.proxy_protocol_enabled = cfg.listen.proxy_protocol;
+    if (cfg.listen.trusted_proxies.len != 0) out.trusted_proxies = cfg.listen.trusted_proxies;
     if (cfg.listen.ws != 0) {
         // Secure-WebSocket browser listener intent. The live listener only
         // stands up once main.zig has loaded the TLS certificate (or in the
@@ -55,6 +58,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.media_host.len != 0) out.media_host = cfg.listen.media_host;
     out.media_enabled = cfg.media.enabled;
     if (!out.media_enabled) out.disabled_features = &.{"media"};
+    out.media_max_upload_bytes = cfg.media.max_upload_bytes;
+    out.media_max_frame_bytes = cfg.media.max_frame_bytes;
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
@@ -87,6 +92,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.session_max_accounts = cfg.sessions.max_accounts;
     out.session_max_per_account = cfg.sessions.max_per_account;
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
+    if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
+    out.sasl_enabled = cfg.sasl.enabled or !cfg.sasl.enabled_explicit;
+    if (cfg.sasl.realm) |realm| out.sasl_realm = realm;
     // [mesh].connect — peers this node auto-dials at boot (strings borrow cfg).
     if (cfg.mesh.connect.len != 0) out.mesh_connect = cfg.mesh.connect;
     return out;
@@ -255,10 +263,21 @@ test "config text overlays the server config" {
         \\host = "10.0.0.5"
         \\irc = 6700
         \\s2s = 7700
+        \\webtransport = 4433
+        \\proxy_protocol = true
+        \\trusted_proxies = ["127.0.0.1"]
         \\[limits]
         \\max_clients = 2048
         \\[mesh]
+        \\trust_roots = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
         \\connect = ["ircx.us:6900"]
+        \\[media]
+        \\enabled = true
+        \\max_upload_bytes = 12345
+        \\max_frame_bytes = 1200
+        \\[sasl]
+        \\enabled = false
+        \\realm = "ircxnet"
         \\
     ;
     const base = server.Config{ .port = 6680 };
@@ -268,10 +287,20 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u16, 6700), loaded.config.port);
     try testing.expectEqualStrings("10.0.0.5", loaded.config.host);
     try testing.expectEqual(@as(u16, 7700), loaded.config.s2s_port);
+    try testing.expectEqual(@as(u16, 4433), loaded.config.webtransport_port);
+    try testing.expect(loaded.config.proxy_protocol_enabled);
+    try testing.expectEqual(@as(usize, 1), loaded.config.trusted_proxies.len);
+    try testing.expectEqualStrings("127.0.0.1", loaded.config.trusted_proxies[0]);
     try testing.expectEqual(@as(u64, 42), loaded.config.node_id);
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
+    try testing.expectEqual(@as(usize, 1), loaded.config.mesh_trust_roots.len);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_connect.len);
     try testing.expectEqualStrings("ircx.us:6900", loaded.config.mesh_connect[0]);
+    try testing.expect(loaded.config.media_enabled);
+    try testing.expectEqual(@as(u64, 12345), loaded.config.media_max_upload_bytes);
+    try testing.expectEqual(@as(u64, 1200), loaded.config.media_max_frame_bytes);
+    try testing.expect(!loaded.config.sasl_enabled);
+    try testing.expectEqualStrings("ircxnet", loaded.config.sasl_realm);
 }
 
 test "media listen overlays media port and candidate host" {

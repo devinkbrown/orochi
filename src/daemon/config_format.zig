@@ -137,6 +137,11 @@ pub const Config = struct {
         /// production page, so this defaults OFF.
         ws_plain: bool = false,
         webtransport: u16 = 0,
+        /// Accept HAProxy PROXY protocol v1/v2 headers from trusted proxies
+        /// before IRC/TLS/WebSocket framing. Requires `trusted_proxies`.
+        proxy_protocol: bool = false,
+        /// Source IPs allowed to supply PROXY headers.
+        trusted_proxies: []const []const u8 = &.{},
         s2s: u16 = 0,
         /// UDP port for the media (SFU) transport plane; 0 = ephemeral.
         media: u16 = 0,
@@ -264,6 +269,10 @@ pub const Config = struct {
 
     pub const Sasl = struct {
         enabled: bool = false,
+        /// True when `[sasl].enabled` was present. This preserves older configs
+        /// where `account_db` alone implied SASL while letting explicit false be
+        /// a real off switch.
+        enabled_explicit: bool = false,
         realm: ?[]const u8 = null,
         /// Path (relative to the daemon cwd) of the WAL-backed account store. When
         /// set, the daemon opens it and verifies SASL credentials against it.
@@ -377,6 +386,7 @@ pub const Config = struct {
         if (self.geo.news_cache_dir) |v| allocator.free(v);
         if (self.oper.grants_path) |v| allocator.free(v);
         allocator.free(self.listen.host);
+        freeStringList(allocator, self.listen.trusted_proxies);
         allocator.free(self.listen.media_host);
         for (self.opers) |oper| {
             allocator.free(oper.account);
@@ -467,6 +477,11 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.listen.ws = try portField(doc, "listen.ws", cfg.listen.ws);
     if (doc.getBool("listen.ws_plain")) |b| cfg.listen.ws_plain = b;
     cfg.listen.webtransport = try portField(doc, "listen.webtransport", cfg.listen.webtransport);
+    if (doc.getBool("listen.proxy_protocol")) |b| cfg.listen.proxy_protocol = b;
+    if (doc.getArray("listen.trusted_proxies")) |arr| {
+        freeStringList(allocator, cfg.listen.trusted_proxies);
+        cfg.listen.trusted_proxies = try ownStringArray(allocator, resolver, arr);
+    }
     cfg.listen.s2s = try portField(doc, "listen.s2s", cfg.listen.s2s);
     cfg.listen.media = try portField(doc, "listen.media", cfg.listen.media);
     cfg.listen.native_media = try portField(doc, "listen.native_media", cfg.listen.native_media);
@@ -533,7 +548,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.media.stun_port = try portField(doc, "media.stun_port", cfg.media.stun_port);
 
     // [sasl]
-    if (doc.getBool("sasl.enabled")) |b| cfg.sasl.enabled = b;
+    if (doc.getBool("sasl.enabled")) |b| {
+        cfg.sasl.enabled = b;
+        cfg.sasl.enabled_explicit = true;
+    }
     try setOpt(allocator, resolver, doc.getString("sasl.realm"), &cfg.sasl.realm);
     try setOpt(allocator, resolver, doc.getString("sasl.account_db"), &cfg.sasl.account_db);
 
@@ -784,6 +802,42 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
     try testing.expectEqualStrings("netadmin", cfg.opers[0].class);
     try testing.expectEqualStrings("helper", cfg.opers[1].account);
     try testing.expectEqualStrings("", cfg.opers[1].class);
+}
+
+test "parseToml: listen proxy protocol and SASL enabled gate project" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\proxy_protocol = true
+        \\trusted_proxies = ["127.0.0.1", "::1"]
+        \\[sasl]
+        \\enabled = false
+        \\realm = "ircxnet"
+        \\account_db = "accounts.oro"
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.listen.proxy_protocol);
+    try testing.expectEqual(@as(usize, 2), cfg.listen.trusted_proxies.len);
+    try testing.expectEqualStrings("127.0.0.1", cfg.listen.trusted_proxies[0]);
+    try testing.expect(!cfg.sasl.enabled);
+    try testing.expect(cfg.sasl.enabled_explicit);
+    try testing.expectEqualStrings("ircxnet", cfg.sasl.realm.?);
+    try testing.expectEqualStrings("accounts.oro", cfg.sasl.account_db.?);
+
+    var omitted = try parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\
+    , .{});
+    defer omitted.deinit(allocator);
+    try testing.expect(!omitted.sasl.enabled_explicit);
 }
 
 test "parseToml: [mesh].require_secured projects onto Config and defaults false" {

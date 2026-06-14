@@ -104,12 +104,11 @@ pub const Level = enum {
 
     pub fn precedence(self: Level) u8 {
         return switch (self) {
-            .deny => 50,
-            .grant => 40,
-            .founder => 35,
-            .owner => 30,
-            .host => 20,
-            .voice => 10,
+            .deny => 70,
+            .founder => 60,
+            .owner => 50,
+            .host, .grant => 40,
+            .voice => 30,
         };
     }
 };
@@ -500,13 +499,18 @@ fn validateContextWith(comptime limits: Params, ctx: ReplyContext) AccessError!v
 fn validateChannelWith(comptime limits: Params, channel: []const u8) AccessError!void {
     if (channel.len == 0 or channel.len > limits.max_channel_bytes) return error.InvalidChannel;
     try validateSafeText(channel, error.InvalidChannel);
-    switch (channel[0]) {
-        '#', '&', '%', '+' => {},
-        else => return error.InvalidChannel,
-    }
+    if (!validChannelNamePrefix(channel)) return error.InvalidChannel;
     for (channel) |byte| {
         if (byte == ' ' or byte == ',' or byte == 7) return error.InvalidChannel;
     }
+}
+
+fn validChannelNamePrefix(channel: []const u8) bool {
+    return switch (channel[0]) {
+        '#', '&' => true,
+        '%' => channel.len >= 2 and (channel[1] == '#' or channel[1] == '&'),
+        else => false,
+    };
 }
 
 fn validateMaskWith(comptime limits: Params, mask: []const u8) AccessError!void {

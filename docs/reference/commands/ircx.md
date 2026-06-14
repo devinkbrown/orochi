@@ -8,7 +8,7 @@ The IRCX module registers discovery, typed messaging, property, access, event, m
 - Description: Enables IRCX mode on the session and reports IRCX support. It also works before registration through the special pre-registration path.
 - Privileges: Registered client or pre-registration client.
 - Parameters: None.
-- Replies: `RPL_IRCX 800` with state, version, SASL package list, max message size, and option list.
+- Replies: `RPL_IRCX 800` with state, version, live SASL package list (`PLAIN,SCRAM-SHA-256,EXTERNAL`), max message size, and option list.
 - Errors: None specific.
 - Example: `IRCX`
 - Sources: `src/daemon/server.zig:3331`, `src/daemon/modules/ircx.zig:48`, `src/daemon/server.zig:7698`
@@ -107,7 +107,7 @@ The IRCX module registers discovery, typed messaging, property, access, event, m
 - Description: IRCX named-mode front-end. With no changes, lists active named modes. With changes, translates names to mode letters and delegates to the normal `MODE` engine.
 - Privileges: Registered client; actual mutations inherit `MODE` gates.
 - Parameters: Channel and optional named mode changes.
-- Replies: `RPL_MODEXLIST 820`, `RPL_MODEXEND 821`, or normal `MODE` replies/broadcasts.
+- Replies: `RPL_MODEXLIST 806`, `RPL_MODEXEND 807`, or normal `MODE` replies/broadcasts.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, plus delegated `MODE` errors.
 - Example: `MODEX #zig +AUTHONLY`
 - Sources: `src/daemon/modules/ircx.zig:57`, `src/daemon/server.zig:6470`

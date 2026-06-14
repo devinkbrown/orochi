@@ -71,7 +71,7 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## SASLINFO
 
 - Syntax: `SASLINFO`
-- Description: Shows configured SASL mechanisms and whether the caller is currently logged in.
+- Description: Shows configured SASL mechanisms and whether the caller is currently logged in. Live mechanism listings are limited to wired mechanisms: `PLAIN`, `SCRAM-SHA-256`, and `EXTERNAL` when their backends are configured.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: Server notices.

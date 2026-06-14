@@ -21,6 +21,9 @@ pub const InputMessage = struct {
     /// replayed only to clients that negotiated `event-playback`. Must be a
     /// static-lifetime string — it is stored by reference, never duped/freed.
     command: []const u8 = "PRIVMSG",
+    /// Sanitized client-only tag segment for TAGMSG history replay, without the
+    /// leading '@'. Null for entries that do not carry client tags.
+    client_tags: ?[]const u8 = null,
 };
 
 pub const Message = struct {
@@ -30,6 +33,7 @@ pub const Message = struct {
     timestamp: u64,
     tombstone: bool,
     command: []const u8 = "PRIVMSG",
+    client_tags: ?[]const u8 = null,
 };
 
 pub const AppendResult = struct {
@@ -272,6 +276,7 @@ const StoredMessage = struct {
     /// Replay command. Stored by reference (static-lifetime literal); not duped
     /// or freed, so it is excluded from init's dup list and deinit's free list.
     command: []const u8 = "PRIVMSG",
+    client_tags: ?[]u8 = null,
 
     fn init(allocator: std.mem.Allocator, msg: InputMessage) std.mem.Allocator.Error!StoredMessage {
         var stored = StoredMessage{
@@ -281,12 +286,14 @@ const StoredMessage = struct {
             .timestamp = msg.timestamp,
             .tombstone = false,
             .command = msg.command,
+            .client_tags = null,
         };
         errdefer stored.deinit(allocator);
 
         stored.msgid = try allocator.dupe(u8, msg.msgid);
         stored.sender = try allocator.dupe(u8, msg.sender);
         stored.text = try allocator.dupe(u8, msg.text);
+        if (msg.client_tags) |tags| stored.client_tags = try allocator.dupe(u8, tags);
         return stored;
     }
 
@@ -294,6 +301,7 @@ const StoredMessage = struct {
         allocator.free(self.msgid);
         allocator.free(self.sender);
         allocator.free(self.text);
+        if (self.client_tags) |tags| allocator.free(tags);
         self.* = .{
             .msgid = &.{},
             .sender = &.{},
@@ -301,6 +309,7 @@ const StoredMessage = struct {
             .timestamp = 0,
             .tombstone = false,
             .command = "PRIVMSG",
+            .client_tags = null,
         };
     }
 
@@ -312,6 +321,7 @@ const StoredMessage = struct {
             .timestamp = self.timestamp,
             .tombstone = self.tombstone,
             .command = self.command,
+            .client_tags = self.client_tags,
         };
     }
 };
@@ -482,6 +492,27 @@ test "edit replaces message text" {
     const got = try store.latest("kain", 1, &out);
     try std.testing.expectEqual(@as(usize, 1), got.len);
     try expectMsg(got[0], "m1", 1, "after");
+}
+
+test "client tags are retained for TAGMSG entries" {
+    const Store = Lotus(.{ .max_targets = 1, .max_per_target = 2, .max_text = 32 });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.append("#lotus", .{
+        .msgid = "m1",
+        .sender = "alice",
+        .text = "",
+        .timestamp = 1,
+        .command = "TAGMSG",
+        .client_tags = "+typing=active;+draft/reply=m0;+draft/react=ok",
+    });
+
+    var out: [1]Message = undefined;
+    const got = try store.latest("#lotus", 1, &out);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqualStrings("TAGMSG", got[0].command);
+    try std.testing.expectEqualStrings("+typing=active;+draft/reply=m0;+draft/react=ok", got[0].client_tags.?);
 }
 
 test "ownership remains leak free across fills evictions edits and deinit" {

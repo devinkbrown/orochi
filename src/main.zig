@@ -29,6 +29,12 @@ fn fileLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) 
     return std.Io.Dir.cwd().readFileAlloc(rc.io, path, allocator, .limited(1 << 20));
 }
 
+fn validateTlsChain(chain: []const []const u8) anyerror!void {
+    if (chain.len == 0) return error.EmptyCertificateChain;
+    const now_unix: i64 = @divTrunc(orochi.substrate.platform.realtimeMillis(), 1000);
+    try orochi.crypto.x509_verify.verifySimpleChainAt(chain, now_unix);
+}
+
 /// Services → live-world bridge: a channel registration marks the live channel
 /// REGISTERED (+r), materializing it if empty so the reservation persists.
 fn svcCreateChannel(ctx: *anyopaque, channel: []const u8) orochi.daemon.services.ServiceError!void {
@@ -224,6 +230,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (srv_cfg.webtransport_port != 0) {
+        std.debug.print("orochi: [listen] webtransport={d} parsed but no WebTransport listener is implemented; ignoring\n", .{srv_cfg.webtransport_port});
+    }
+
     // SASL account backend: when `[sasl] account_db` is configured, open the
     // WAL-backed account store and verify SASL PLAIN credentials against it. The
     // store/services/checker live for the server's lifetime (the checker fat
@@ -242,7 +252,11 @@ pub fn main(init: std.process.Init) !void {
     var certfp_binds = orochi.daemon.certfp_bind.CertfpBindStore.init(allocator);
     defer certfp_binds.deinit();
     if (held) |h| {
-        if (h.parsed.sasl.account_db) |db| {
+        if (!srv_cfg.sasl_enabled) {
+            if (h.parsed.sasl.account_db != null) {
+                std.debug.print("orochi: SASL account store configured but [sasl].enabled=false; SASL disabled\n", .{});
+            }
+        } else if (h.parsed.sasl.account_db) |db| {
             if (orochi.daemon.services.OroStore.open(allocator, init.io, std.Io.Dir.cwd(), db)) |store| {
                 account_store = store;
                 account_services = orochi.daemon.services.Services.init(&account_store.?, null);
@@ -308,7 +322,13 @@ pub fn main(init: std.process.Init) !void {
                 .cert_path = h.tls.cert_path,
                 .key_path = h.tls.key_path,
                 .dns_name = h.tls.dns_name,
-            })) |loaded| {
+            })) |loaded| tls_material: {
+                validateTlsChain(loaded.cert_chain) catch |err| {
+                    var rejected = loaded;
+                    rejected.deinit(allocator);
+                    std.debug.print("orochi: TLS certificate validation failed ({s}); TLS disabled\n", .{@errorName(err)});
+                    break :tls_material;
+                };
                 tls_loaded = loaded;
                 srv_cfg.tls_port = h.tls.port;
                 srv_cfg.tls_cert_chain = tls_loaded.?.cert_chain;
@@ -428,6 +448,7 @@ pub fn main(init: std.process.Init) !void {
             .create_channel = svcCreateChannel,
             .drop_channel = svcDropChannel,
         };
+        srv.replayServicesLiveState(&account_services);
     }
 
     // Helix UPGRADE successor: re-attach the carried-over client connections

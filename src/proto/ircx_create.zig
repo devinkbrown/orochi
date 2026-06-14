@@ -15,7 +15,7 @@ pub const DEFAULT_MAX_SERVER_NAME_BYTES: usize = 255;
 pub const DEFAULT_MAX_CHANNEL_BYTES: usize = 200;
 pub const DEFAULT_MAX_MODE_BYTES: usize = 64;
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 256;
-pub const DEFAULT_CHANNEL_PREFIXES: []const u8 = "#+&!";
+pub const DEFAULT_CHANNEL_PREFIXES: []const u8 = "#&%";
 
 pub const IrcxCreateError = error{
     MissingChannel,
@@ -140,7 +140,7 @@ pub fn validateChannel(channel: []const u8) IrcxCreateError!void {
 pub fn validateChannelWith(comptime params: Params, channel: []const u8) IrcxCreateError!void {
     if (channel.len < 2) return error.InvalidChannel;
     if (channel.len > params.max_channel_bytes) return error.ChannelTooLong;
-    if (!validChannelPrefix(params, channel[0])) return error.InvalidChannel;
+    if (!validChannelNamePrefixWith(params, channel)) return error.InvalidChannel;
     for (channel) |ch| {
         if (!validChannelByte(ch)) return error.InvalidChannel;
     }
@@ -378,6 +378,12 @@ fn validChannelPrefix(comptime params: Params, prefix: u8) bool {
         if (prefix == candidate) return true;
     }
     return false;
+}
+
+fn validChannelNamePrefixWith(comptime params: Params, channel: []const u8) bool {
+    if (channel.len == 0 or !validChannelPrefix(params, channel[0])) return false;
+    if (channel[0] == '%') return channel.len >= 2 and (channel[1] == '#' or channel[1] == '&');
+    return true;
 }
 
 fn validChannelByte(ch: u8) bool {

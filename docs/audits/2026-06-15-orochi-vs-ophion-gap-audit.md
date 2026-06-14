@@ -12,7 +12,8 @@ documents deleted in the same cleanup:
 
 ## Scope
 
-- Orochi source: `main` at `72ad029`.
+- Orochi source: audit baseline `main` at `72ad029`; repaired through the
+  2026-06-15 implementation pass on `main`.
 - Ophion reference: `/home/kain/ophion` at `15040367`.
 - Method: read source first, use older docs only as historical hints, and keep
   only gaps that still exist in the current source.
@@ -44,6 +45,50 @@ These were frequent stale-document claims but are live now:
 4. IRCX AUTH/SACCESS/PROP/EVENT/MODEX/LISTX parity.
 5. Runtime config, PROXY, TLS reload/verification, metrics/admin, and media
    hardening.
+
+## Repair Status After 2026-06-15 Implementation Pass
+
+Closed in the repair pass:
+
+- Direct-owned S2S state frames now reject mismatched origins, count rejected
+  frames, and log the drained audit signal in both secured and plaintext S2S
+  loops. Peer pinning and `[mesh].trust_roots` are wired into secured S2S.
+- Mesh channel state now carries parameter modes (`+k`, `+l`, `+j`, `+f`),
+  private/hidden state, and IRCX extended flags, with split-recovery burst,
+  MLOCK-preserving inbound apply, and server/link regression coverage.
+- S2S message relay now preserves `STATUSMSG` minimum rank and reuses local
+  channel/direct-message policy gates for inbound relay delivery.
+- `LIST C/T`, CHATHISTORY `BATCH` gating, TAGMSG typing/reaction replay,
+  edit/redact recipient capability filters, extended-monitor event caps,
+  metadata visibility reads, MARKREAD-on-JOIN, standalone typing delivery, SASL
+  mechanism honesty, and extban store-time validation are wired and tested.
+- IRCX live surfaces now cover `MODE <nick> ISIRCX`, `AUTH`, `SACCESS` /
+  `ACCESS *`, channel `ACCESS` join overrides, prefixed channel handling,
+  MODEX `806/807`, EVENT aliases, CREATE existing-channel rejection/basic modes,
+  and LISTX prefix parity.
+- Services now persist account email verification state, replay registered
+  channels into live `+r`, replay MLOCK/AKICK/WARD, apply services access
+  automode, kick current AKICK matches, add WARD compatibility aliases, and gate
+  sensitive oper commands by named privileges.
+- Runtime config now wires PROXY trusted accept handling, `mesh.trust_roots`,
+  `media.max_upload_bytes`, `media.max_frame_bytes`, `sasl.enabled`,
+  `sasl.realm`, TLS chain validation, native-media sender binding coverage, and
+  atomic stats-file export. `listen.webtransport` is parsed and explicitly
+  logged as not implemented.
+
+Still open or intentionally partial:
+
+- Full signed envelopes for routed/multi-hop message frames remain open; the
+  current pass closes direct-owned state origin rejection and audit visibility.
+- `SESSION RESUME` is still reclaim-oriented, not full Ophion-class live session
+  migration with caps/channels/marks/history cursors over mesh.
+- Server-level IRCX SACCESS/ACCESS state is process-local. Account/user/member
+  PROP persistence/propagation, full EVENT hook/numeric parity, and complete
+  DATA/REQUEST/REPLY/WHISPER mesh semantics remain partial.
+- `RPL_LISTXPICS 813`, complete CREATE/clone template parity, ACME renewal/hot
+  cert reload, live HTTP `/metrics`/admin, datagram-level media authentication,
+  and packaged deployment/systemd smoke assets remain future work or deliberate
+  scope decisions.
 
 ## Mesh And S2S
 

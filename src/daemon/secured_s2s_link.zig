@@ -26,6 +26,7 @@ pub const Role = tsumugi_session.Role;
 
 /// Bound on a single buffered handshake message (prekey ~1.3KB, M1/M2 a few KB).
 const max_handshake_msg: u32 = 64 * 1024;
+pub const max_expected_remotes: usize = 16;
 
 /// Named errors this adapter raises (it also surfaces handshake, allocation, and
 /// inner-link errors; the methods use `anyerror` to carry the union).
@@ -48,6 +49,12 @@ pub const Options = struct {
     channel_name: []const u8 = "#suimyaku",
     /// Optional trust pin: require the peer's node id to equal this. Null = TOFU.
     expected_remote: ?[20]u8 = null,
+    /// Optional trust pins: require the peer's node id to match one entry. Empty
+    /// keeps TOFU. Copied into the link at init.
+    expected_remotes: []const [20]u8 = &.{},
+    /// Optional node-signing-key allowlist. Empty keeps TOFU. Borrowed; caller
+    /// must keep it alive for the link lifetime.
+    trusted_node_keys: []const [32]u8 = &.{},
 };
 
 const Phase = enum { await_prekey, ake, established };
@@ -59,7 +66,9 @@ pub const SecuredLink = struct {
     local_prekey: hs.SignedPrekey,
     cfg: hs.Config,
     rng: std.Io,
-    expected_remote: ?[20]u8,
+    expected_remotes: [max_expected_remotes][20]u8 = undefined,
+    expected_remote_count: usize = 0,
+    trusted_node_keys: []const [32]u8 = &.{},
     server_name: []const u8,
     description: []const u8,
     local_epoch_ms: u64,
@@ -75,6 +84,17 @@ pub const SecuredLink = struct {
     /// Initialize. The responder immediately queues its prekey preamble and stands
     /// up its session; the initiator waits for the responder's preamble.
     pub fn init(opts: Options) anyerror!SecuredLink {
+        var expected: [max_expected_remotes][20]u8 = undefined;
+        var expected_count: usize = 0;
+        if (opts.expected_remote) |pin| {
+            expected[expected_count] = pin;
+            expected_count += 1;
+        }
+        for (opts.expected_remotes) |pin| {
+            if (expected_count == expected.len) break;
+            expected[expected_count] = pin;
+            expected_count += 1;
+        }
         var self = SecuredLink{
             .allocator = opts.allocator,
             .role = opts.role,
@@ -82,7 +102,9 @@ pub const SecuredLink = struct {
             .local_prekey = opts.local_prekey,
             .cfg = opts.cfg,
             .rng = opts.rng,
-            .expected_remote = opts.expected_remote,
+            .expected_remotes = expected,
+            .expected_remote_count = expected_count,
+            .trusted_node_keys = opts.trusted_node_keys,
             .server_name = opts.server_name,
             .description = opts.description,
             .local_epoch_ms = opts.local_epoch_ms,
@@ -128,12 +150,24 @@ pub const SecuredLink = struct {
     pub fn peerShortId(self: *const SecuredLink) ?u64 {
         return if (self.session) |s| s.peerShortId() else null;
     }
+    pub fn peerNodeId(self: *const SecuredLink) ?[20]u8 {
+        return if (self.session) |s| s.peerNodeId() else null;
+    }
 
     /// The peer's authenticated raw Ed25519 signing public key (null before the
     /// AKE establishes). Verifies peer-signed cross-mesh operator grants.
     pub fn peerNodeKey(self: *const SecuredLink) ?[32]u8 {
         return if (self.session) |s| s.peerNodeKey() else null;
     }
+
+    fn trustRootAllows(self: *const SecuredLink, key: [32]u8) bool {
+        if (self.trusted_node_keys.len == 0) return true;
+        for (self.trusted_node_keys) |trusted| {
+            if (std.mem.eql(u8, trusted[0..], key[0..])) return true;
+        }
+        return false;
+    }
+
     pub fn channelMembers(self: *const SecuredLink, channel: []const u8) []const s2s_peer.MemberInfo {
         return if (self.inner) |l| l.channelMembers(channel) else &.{};
     }
@@ -178,6 +212,14 @@ pub const SecuredLink = struct {
     pub fn sendChannelModeFlags(self: *SecuredLink, channel: []const u8, flags: u16, hlc: u64) anyerror!void {
         const link = self.inner orelse return;
         try link.sendChannelModeFlags(channel, flags, hlc);
+        try self.drainInner();
+    }
+
+    /// Announce a full local parameter/IRCX channel-state snapshot over the
+    /// secured CRDT link. Outbound bytes accumulate in `out`.
+    pub fn sendChannelModeState(self: *SecuredLink, ev: s2s_link.ChannelModeStateEvent) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendChannelModeState(ev);
         try self.drainInner();
     }
 
@@ -263,6 +305,18 @@ pub const SecuredLink = struct {
     pub fn takeChannelModeFlagChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelModeFlagsDelta {
         const link = self.inner orelse return &.{};
         return link.takeChannelModeFlagChanges();
+    }
+
+    /// Drain remote parameter/IRCX channel-state snapshots for daemon-side apply.
+    pub fn takeChannelModeStateChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelModeStateDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeChannelModeStateChanges();
+    }
+
+    /// Drain remote direct-owned frames rejected for origin/peer mismatch.
+    pub fn takeRejectedOriginFrames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeRejectedOriginFrames();
     }
 
     /// Announce a local channel list-mode (+b/+e/+I) change over the secured
@@ -364,9 +418,8 @@ pub const SecuredLink = struct {
                 // Initiator: verify + adopt the responder's announced prekey (TOFU).
                 const remote_prekey = hs.decodeSignedPrekey(msg) catch return error.PrekeyRejected;
                 remote_prekey.verify(self.cfg.now_ms) catch return error.PrekeyRejected;
-                if (self.expected_remote) |want| {
-                    if (!std.mem.eql(u8, &want, &remote_prekey.node_id)) return error.UnexpectedRemote;
-                }
+                if (!self.allowsExpectedRemote(remote_prekey.node_id)) return error.UnexpectedRemote;
+                if (!self.trustRootAllows(remote_prekey.node_key)) return error.PrekeyRejected;
                 self.session = tsumugi_session.Session.initInitiator(
                     self.allocator,
                     &self.identity.sign_kp,
@@ -385,13 +438,29 @@ pub const SecuredLink = struct {
                     defer self.allocator.free(reply);
                     try self.writeFramed(reply);
                 }
-                if (self.session.?.isEstablished()) try self.beginCrdt(now_ms);
+                if (self.session.?.isEstablished()) {
+                    if (self.session.?.peerNodeId()) |peer| {
+                        if (!self.allowsExpectedRemote(peer)) return error.UnexpectedRemote;
+                    }
+                    try self.beginCrdt(now_ms);
+                }
             },
             .established => unreachable,
         }
     }
 
+    fn allowsExpectedRemote(self: *const SecuredLink, node_id: [20]u8) bool {
+        if (self.expected_remote_count == 0) return true;
+        for (self.expected_remotes[0..self.expected_remote_count]) |pin| {
+            if (std.mem.eql(u8, &pin, &node_id)) return true;
+        }
+        return false;
+    }
+
     fn beginCrdt(self: *SecuredLink, now_ms: u64) anyerror!void {
+        if (self.peerNodeKey()) |key| {
+            if (!self.trustRootAllows(key)) return error.PrekeyRejected;
+        }
         const peer_short = self.session.?.peerShortId().?;
         const link = try self.allocator.create(s2s_link.S2sLink);
         errdefer self.allocator.destroy(link);

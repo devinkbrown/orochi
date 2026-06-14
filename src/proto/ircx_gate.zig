@@ -44,6 +44,7 @@ const gated_commands = [_][]const u8{
     "WHISPER",
     "LISTX",
     "AUTH",
+    "SACCESS",
 };
 
 /// Return whether `name` is one of the IRCX commands guarded by this module.

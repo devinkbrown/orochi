@@ -189,14 +189,27 @@ pub const SessionStore = struct {
     /// caller's own account — a token never reaches across accounts). Returns the
     /// matched client id, or null if no session in `account` bears the token.
     pub fn findTokenInAccount(self: *const SessionStore, account: []const u8, token: Token) ?ClientId {
+        return if (self.findTokenSessionInAccount(account, token)) |s| s.client else null;
+    }
+
+    /// Look up a session by token *within* `account`, returning a copied snapshot
+    /// so callers can distinguish attached live sessions from detached ghosts.
+    pub fn findTokenSessionInAccount(self: *const SessionStore, account: []const u8, token: Token) ?Session {
         @constCast(&self.lock).lockShared();
         defer @constCast(&self.lock).unlockShared();
 
         const list = self.accounts.getPtr(account) orelse return null;
         for (list.items.items) |s| {
-            if (std.crypto.timing_safe.eql(Token, s.token, token)) return s.client;
+            if (std.crypto.timing_safe.eql(Token, s.token, token)) return s;
         }
         return null;
+    }
+
+    /// Reclaim lookup that intentionally ignores still-attached sessions. A live
+    /// sibling token must not be consumable by another connection of the account.
+    pub fn findDetachedTokenInAccount(self: *const SessionStore, account: []const u8, token: Token) ?ClientId {
+        const s = self.findTokenSessionInAccount(account, token) orelse return null;
+        return if (s.attached) null else s.client;
     }
 
     fn ensureAccount(self: *SessionStore, account: []const u8) Error!*SessionList {
@@ -305,6 +318,20 @@ test "findTokenInAccount is scoped to the account" {
     try testing.expectEqual(@as(ClientId, 1), s.findTokenInAccount("alice", tok(0xAB)).?);
     // bob's token must not resolve under alice.
     try testing.expect(s.findTokenInAccount("alice", tok(0xCD)) == null);
+}
+
+test "findDetachedTokenInAccount rejects attached sibling tokens" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(0xAB), 1);
+    _ = try s.attach("alice", 2, tok(0xCD), 2);
+    try testing.expect(s.findDetachedTokenInAccount("alice", tok(0xCD)) == null);
+
+    try testing.expect(s.markDetached("alice", 2));
+    try testing.expectEqual(@as(ClientId, 2), s.findDetachedTokenInAccount("alice", tok(0xCD)).?);
+    const snap = s.findTokenSessionInAccount("alice", tok(0xCD)).?;
+    try testing.expect(!snap.attached);
 }
 
 test "sessionsInto and findByTokenInto do not retain snapshots" {

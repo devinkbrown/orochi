@@ -17,6 +17,9 @@ pub const Verb = enum(u8) {
 pub const RelayMessage = struct {
     verb: Verb,
     target: []const u8,
+    /// STATUSMSG delivery floor for channel targets (0 = every member, 1 = +,
+    /// 2 = @, 3 = owner, 4 = founder). The target stays the bare channel name.
+    min_rank: u8 = 0,
     source_nick: []const u8,
     source_prefix: []const u8,
     account: []const u8 = "",
@@ -53,6 +56,7 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     var entries = [_]cpv.MapEntry{
         .{ .key = "account", .value = .{ .string = msg.account } },
         .{ .key = "hlc", .value = .{ .unsigned = msg.hlc } },
+        .{ .key = "min_rank", .value = .{ .unsigned = msg.min_rank } },
         .{ .key = "origin_node", .value = .{ .unsigned = msg.origin_node } },
         .{ .key = "source_nick", .value = .{ .string = msg.source_nick } },
         .{ .key = "source_prefix", .value = .{ .string = msg.source_prefix } },
@@ -81,6 +85,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     var account_opt: ?[]const u8 = null;
     var tags_opt: ?[]const u8 = null;
     var text_opt: ?[]const u8 = null;
+    var min_rank: u8 = 0;
     var origin_node_opt: ?u64 = null;
     var hlc_opt: ?u64 = null;
 
@@ -89,6 +94,8 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
             account_opt = try readString(entry.value);
         } else if (std.mem.eql(u8, entry.key, "hlc")) {
             hlc_opt = try readU64(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "min_rank")) {
+            min_rank = try readRank(entry.value);
         } else if (std.mem.eql(u8, entry.key, "origin_node")) {
             origin_node_opt = try readU64(entry.value);
         } else if (std.mem.eql(u8, entry.key, "source_nick")) {
@@ -136,6 +143,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
         .account = account_owned,
         .tags = tags_owned,
         .text = text_owned,
+        .min_rank = min_rank,
         .origin_node = origin_node_opt orelse return DecodeError.MissingField,
         .hlc = hlc_opt orelse return DecodeError.MissingField,
     } };
@@ -214,6 +222,12 @@ fn readVerb(value: cpv.Value) DecodeError!Verb {
     };
 }
 
+fn readRank(value: cpv.Value) DecodeError!u8 {
+    const raw = try readU64(value);
+    if (raw > 4) return DecodeError.InvalidFieldType;
+    return @intCast(raw);
+}
+
 fn expectRoundTrip(msg: RelayMessage) !void {
     const allocator = std.testing.allocator;
     const wire = try encode(allocator, msg);
@@ -229,6 +243,7 @@ fn expectRoundTrip(msg: RelayMessage) !void {
     try std.testing.expectEqualStrings(msg.account, owned.msg.account);
     try std.testing.expectEqualStrings(msg.tags, owned.msg.tags);
     try std.testing.expectEqualStrings(msg.text, owned.msg.text);
+    try std.testing.expectEqual(msg.min_rank, owned.msg.min_rank);
     try std.testing.expectEqual(msg.origin_node, owned.msg.origin_node);
     try std.testing.expectEqual(msg.hlc, owned.msg.hlc);
 }
@@ -242,6 +257,7 @@ test "relay messages round-trip for each verb" {
         .account = "alice",
         .tags = "+draft/reply=42",
         .text = "hello mesh",
+        .min_rank = 2,
         .origin_node = 7,
         .hlc = 101,
     });

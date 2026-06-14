@@ -66,6 +66,11 @@ fn nodeIdFromKey(pk: sign.PublicKey) [20]u8 {
     return full[0..20].*;
 }
 
+/// Derive Orochi's canonical 20-byte node id from an Ed25519 public key.
+pub fn nodeIdFromPublicKey(pk: sign.PublicKey) [20]u8 {
+    return nodeIdFromKey(pk);
+}
+
 fn kemSeed(seed: [32]u8) [32]u8 {
     var h = Blake3.init(.{});
     h.update("MZ-KEM");

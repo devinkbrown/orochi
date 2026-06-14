@@ -29,6 +29,14 @@ fn access(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleAccess(x.id, x.conn, x.parsed);
 }
+fn saccess(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleSaccess(x.conn, x.parsed);
+}
+fn auth(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleIrcxAuth(x.id, x.conn, x.parsed);
+}
 fn event(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleEvent(x.conn, x.parsed);
@@ -53,6 +61,8 @@ pub const module = registry.Module{
         .{ .name = "WHISPER", .handler = whisper },
         .{ .name = "PROP", .handler = prop },
         .{ .name = "ACCESS", .handler = access },
+        .{ .name = "SACCESS", .access = .oper, .handler = saccess },
+        .{ .name = "AUTH", .handler = auth },
         .{ .name = "EVENT", .handler = event },
         .{ .name = "MODEX", .handler = modex },
         .{ .name = "LISTX", .handler = listx },

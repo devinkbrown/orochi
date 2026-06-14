@@ -279,7 +279,7 @@ pub fn parseFilterWith(comptime params: Params, token: []const u8) ListxError!Fi
         };
     }
 
-    if (token[0] == '#') {
+    if (validChannelNamePrefix(token)) {
         try validateMaskWith(params, token);
         return .{ .criterion = .{ .channel_mask = token } };
     }
@@ -458,9 +458,18 @@ fn validateContextWith(comptime params: Params, ctx: ReplyContext) ListxError!vo
 
 fn validateChannelWith(comptime params: Params, channel: ChannelInfo) ListxError!void {
     try validateParamBounded(channel.name, params.max_channel_bytes, error.InvalidChannelName);
-    if (channel.name[0] != '#') return error.InvalidChannelName;
+    if (!validChannelNamePrefix(channel.name)) return error.InvalidChannelName;
     if (channel.topic.len > params.max_topic_bytes) return error.InvalidTopic;
     try validateTrailingBytes(channel.topic, error.InvalidTopic);
+}
+
+fn validChannelNamePrefix(name: []const u8) bool {
+    if (name.len == 0) return false;
+    return switch (name[0]) {
+        '#', '&' => true,
+        '%' => name.len >= 2 and (name[1] == '#' or name[1] == '&'),
+        else => false,
+    };
 }
 
 fn validateParamBounded(param: []const u8, max_len: usize, err: ListxError) ListxError!void {

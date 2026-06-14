@@ -19,6 +19,8 @@ const std = @import("std");
 
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
+const s2s_frame = @import("../proto/s2s_frame.zig");
+const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
@@ -28,6 +30,7 @@ const peer_link = @import("../substrate/suimyaku/peer_link.zig");
 
 pub const NodeId = s2s_peer.NodeId;
 pub const ChannelCrdt = s2s_peer.ChannelCrdt;
+pub const ChannelModeStateEvent = s2s_peer.ChannelModeStateEvent;
 
 /// Caller-supplied identity/config for one S2S link. The sovereign node_id is the
 /// single mesh identity (no legacy server-id): it keys the registry and is the
@@ -277,10 +280,27 @@ pub const S2sLink = struct {
         try self.peer.sendChannelModeFlags(self.sink(), channel, flags, hlc);
     }
 
+    /// Announce a full local parameter/IRCX channel-state snapshot to the peer.
+    /// Outbound frames accumulate in `out`.
+    pub fn sendChannelModeState(self: *S2sLink, ev: ChannelModeStateEvent) !void {
+        try self.peer.sendChannelModeState(self.sink(), ev);
+    }
+
     /// Drain remote channel MODE flag changes the daemon should apply and
     /// surface to local members.
     pub fn takeChannelModeFlagChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.ChannelModeFlagsDelta {
         return self.peer.takeChannelModeFlagChanges();
+    }
+
+    /// Drain remote parameter/IRCX channel-state snapshots the daemon should
+    /// apply and surface to local members.
+    pub fn takeChannelModeStateChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.ChannelModeStateDelta {
+        return self.peer.takeChannelModeStateChanges();
+    }
+
+    /// Drain remote direct-owned frames rejected for origin/peer mismatch.
+    pub fn takeRejectedOriginFrames(self: *S2sLink) u64 {
+        return self.peer.takeRejectedOriginFrames();
     }
 
     /// Announce a local channel list-mode (+b/+e/+I) change to the peer.
@@ -549,6 +569,81 @@ test "CHANNEL_PROP payload round-trips across the link into takeChannelPropChang
     try std.testing.expectEqualStrings("alice", changes[0].owner);
     try std.testing.expect(!changes[1].present);
     try std.testing.expectEqualStrings("SUBJECT", changes[1].key);
+}
+
+test "CHANNEL_MODE_STATE propagates parameter and IRCX state across the link" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    try a.start(10);
+    try a.sendChannelModeState(.{
+        .origin_node = 0,
+        .hlc = 100,
+        .channel = "#chat",
+        .private = true,
+        .hidden = true,
+        .ext_bits = 1 << 9, // noformat
+        .key = "sekret",
+        .limit = 50,
+        .throttle_joins = 3,
+        .throttle_secs = 20,
+        .forward = "#overflow",
+    });
+
+    var now: u64 = 11;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const changes = try b.takeChannelModeStateChanges();
+    defer {
+        for (changes) |*ch| ch.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("#chat", changes[0].channel);
+    try std.testing.expect(changes[0].private);
+    try std.testing.expect(changes[0].hidden);
+    try std.testing.expectEqual(@as(u32, 1 << 9), changes[0].ext_bits);
+    try std.testing.expectEqualStrings("sekret", changes[0].key.?);
+    try std.testing.expectEqual(@as(?u32, 50), changes[0].limit);
+    try std.testing.expectEqual(@as(u16, 3), changes[0].throttle_joins);
+    try std.testing.expectEqual(@as(u32, 20), changes[0].throttle_secs);
+    try std.testing.expectEqualStrings("#overflow", changes[0].forward.?);
+
+    const forged_ev = channel_mode_state_event.ChannelModeStateEvent{
+        .origin_node = 99,
+        .hlc = 101,
+        .channel = "#chat",
+        .key = "forged",
+    };
+    var payload_buf: [256]u8 = undefined;
+    const payload = try channel_mode_state_event.encode(forged_ev, &payload_buf);
+    var frame_buf: [512]u8 = undefined;
+    const frame = try s2s_frame.encode(.CHANNEL_MODE_STATE, payload, frame_buf[0..try s2s_frame.encodedLen(payload.len)]);
+    try b.feed(frame, now, 7);
+    const forged = try b.takeChannelModeStateChanges();
+    defer allocator.free(forged);
+    try std.testing.expectEqual(@as(usize, 0), forged.len);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
 }
 
 test "TOPIC payload round-trips across the link into takeTopicChanges" {

@@ -4,6 +4,7 @@
 //! module only parses borrowed command parameters and emits replies into
 //! caller-owned buffers; storage and permission checks live above it.
 const std = @import("std");
+const listx = @import("listx.zig");
 const numeric = @import("numeric.zig");
 const limits_config = @import("limits_config.zig");
 
@@ -37,9 +38,12 @@ pub const SaccessError = error{
     InvalidServerName,
     InvalidRequester,
     TooManyParameters,
+    TooManyEntries,
     LineTooLong,
     OutputTooSmall,
 };
+
+pub const StoreError = SaccessError || std.mem.Allocator.Error;
 
 /// Compile-time limits used by parsers and line builders.
 pub const Params = struct {
@@ -119,6 +123,139 @@ pub const ReplyContext = struct {
     requester: []const u8,
 };
 
+const StoredEntry = struct {
+    entry_type: EntryType,
+    mask: []u8,
+    duration: ?u64 = null,
+    reason: ?[]u8 = null,
+
+    fn view(self: *const StoredEntry) Entry {
+        return .{
+            .entry_type = self.entry_type,
+            .mask = self.mask,
+            .duration = self.duration,
+            .reason = self.reason,
+        };
+    }
+
+    fn deinit(self: StoredEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.mask);
+        if (self.reason) |reason| allocator.free(reason);
+    }
+};
+
+pub const ServerAccessStore = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(StoredEntry) = .empty,
+    max_entries: usize = 256,
+
+    pub fn init(allocator: std.mem.Allocator) ServerAccessStore {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn initWith(allocator: std.mem.Allocator, max_entries: usize) ServerAccessStore {
+        return .{ .allocator = allocator, .max_entries = max_entries };
+    }
+
+    pub fn deinit(self: *ServerAccessStore) void {
+        for (self.entries.items) |entry| entry.deinit(self.allocator);
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn add(self: *ServerAccessStore, entry: Entry) StoreError!void {
+        try validateEntryWith(.{}, entry);
+
+        if (self.findIndex(entry.entry_type, entry.mask)) |idx| {
+            const reason_copy = if (entry.reason) |reason| try self.allocator.dupe(u8, reason) else null;
+            errdefer if (reason_copy) |reason| self.allocator.free(reason);
+            if (self.entries.items[idx].reason) |old| self.allocator.free(old);
+            self.entries.items[idx].reason = reason_copy;
+            self.entries.items[idx].duration = entry.duration;
+            return;
+        }
+
+        if (self.entries.items.len >= self.max_entries) return error.TooManyEntries;
+
+        const mask_copy = try self.allocator.dupe(u8, entry.mask);
+        errdefer self.allocator.free(mask_copy);
+        const reason_copy = if (entry.reason) |reason| try self.allocator.dupe(u8, reason) else null;
+        errdefer if (reason_copy) |reason| self.allocator.free(reason);
+
+        try self.entries.append(self.allocator, .{
+            .entry_type = entry.entry_type,
+            .mask = mask_copy,
+            .duration = entry.duration,
+            .reason = reason_copy,
+        });
+    }
+
+    pub fn remove(self: *ServerAccessStore, entry_type: EntryType, mask: []const u8) SaccessError!bool {
+        try validateMaskWith(.{}, entry_type, mask);
+        const idx = self.findIndex(entry_type, mask) orelse return false;
+        const removed = self.entries.swapRemove(idx);
+        removed.deinit(self.allocator);
+        return true;
+    }
+
+    pub fn clear(self: *ServerAccessStore, entry_type: ?EntryType) usize {
+        var removed_count: usize = 0;
+        var idx: usize = 0;
+        while (idx < self.entries.items.len) {
+            if (entry_type == null or self.entries.items[idx].entry_type == entry_type.?) {
+                const removed = self.entries.swapRemove(idx);
+                removed.deinit(self.allocator);
+                removed_count += 1;
+            } else {
+                idx += 1;
+            }
+        }
+        return removed_count;
+    }
+
+    pub fn list(self: *const ServerAccessStore, entry_type: ?EntryType, out: []Entry) SaccessError![]const Entry {
+        var count: usize = 0;
+        for (self.entries.items) |*entry| {
+            if (entry_type != null and entry.entry_type != entry_type.?) continue;
+            if (count >= out.len) return error.OutputTooSmall;
+            out[count] = entry.view();
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    pub fn matchHostmask(self: *const ServerAccessStore, entry_type: EntryType, hostmask: []const u8) ?Entry {
+        for (self.entries.items) |*entry| {
+            if (entry.entry_type != entry_type) continue;
+            if (listx.globMatch(entry.mask, hostmask)) return entry.view();
+        }
+        return null;
+    }
+
+    pub fn matchNick(self: *const ServerAccessStore, nick: []const u8) ?Entry {
+        for (self.entries.items) |*entry| {
+            if (entry.entry_type != .nonick) continue;
+            if (listx.globMatch(entry.mask, nick)) return entry.view();
+        }
+        return null;
+    }
+
+    pub fn matchChannel(self: *const ServerAccessStore, channel: []const u8) ?Entry {
+        for (self.entries.items) |*entry| {
+            if (entry.entry_type != .nochannel) continue;
+            if (listx.globMatch(entry.mask, channel)) return entry.view();
+        }
+        return null;
+    }
+
+    fn findIndex(self: *const ServerAccessStore, entry_type: EntryType, mask: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, idx| {
+            if (entry.entry_type == entry_type and std.ascii.eqlIgnoreCase(entry.mask, mask)) return idx;
+        }
+        return null;
+    }
+};
+
 const Subcommand = enum {
     add,
     delete,
@@ -127,7 +264,7 @@ const Subcommand = enum {
 
     fn parse(raw: []const u8) ?Subcommand {
         if (std.ascii.eqlIgnoreCase(raw, "ADD")) return .add;
-        if (std.ascii.eqlIgnoreCase(raw, "DELETE")) return .delete;
+        if (std.ascii.eqlIgnoreCase(raw, "DEL") or std.ascii.eqlIgnoreCase(raw, "DELETE")) return .delete;
         if (std.ascii.eqlIgnoreCase(raw, "LIST")) return .list;
         if (std.ascii.eqlIgnoreCase(raw, "CLEAR")) return .clear;
         return null;
@@ -359,7 +496,7 @@ fn validateMaskWith(comptime limits: Params, entry_type: EntryType, mask: []cons
 
     switch (entry_type) {
         .nochannel => {
-            if (mask[0] != '#') return error.InvalidMask;
+            if (!validChannelMaskPrefix(mask)) return error.InvalidMask;
         },
         .nonick => {
             if (mask[0] == '#') return error.InvalidMask;
@@ -369,6 +506,14 @@ fn validateMaskWith(comptime limits: Params, entry_type: EntryType, mask: []cons
         },
         .deny, .gag, .grant => {},
     }
+}
+
+fn validChannelMaskPrefix(mask: []const u8) bool {
+    return switch (mask[0]) {
+        '#', '&' => true,
+        '%' => mask.len >= 2 and (mask[1] == '#' or mask[1] == '&'),
+        else => false,
+    };
 }
 
 fn validateReasonWith(comptime limits: Params, reason: []const u8) SaccessError!void {

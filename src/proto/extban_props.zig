@@ -22,6 +22,7 @@ fn expectParseError(err: extban.ParseError) !void {
         error.MissingType,
         error.MissingDelimiter,
         error.EmptyPattern,
+        error.UnexpectedPattern,
         error.UnknownType,
         error.TooDeep,
         => {},

@@ -15,7 +15,7 @@ const media_transport = @import("media_transport.zig");
 
 pub const TransportAddress = ice.TransportAddress;
 pub const MediaTransport = media_transport.MediaTransport;
-pub const max_datagram: usize = 1500;
+pub const max_datagram: usize = 64 * 1024;
 
 /// 127.0.0.1 in network byte order, for loopback binds/tests.
 pub const loopback_be: u32 = nativeToBigU32(0x7f00_0001);

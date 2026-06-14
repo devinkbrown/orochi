@@ -45,6 +45,8 @@ pub const FrameType = enum(u8) {
     TOPIC = 0x0E,
     /// Remote user nick change (old/new nick + identity) for live `NICK` lines.
     NICKCHANGE = 0x0F,
+    /// Parameter/IRCX channel state snapshot (+k/+l/+j/+f/private/hidden/ext).
+    CHANNEL_MODE_STATE = 0x10,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -67,6 +69,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.CHANNEL_PROP) => .CHANNEL_PROP,
             @intFromEnum(FrameType.TOPIC) => .TOPIC,
             @intFromEnum(FrameType.NICKCHANGE) => .NICKCHANGE,
+            @intFromEnum(FrameType.CHANNEL_MODE_STATE) => .CHANNEL_MODE_STATE,
             else => null,
         };
     }
@@ -188,6 +191,7 @@ const all_frame_types = [_]FrameType{
     .CHANNEL_PROP,
     .TOPIC,
     .NICKCHANGE,
+    .CHANNEL_MODE_STATE,
 };
 
 test "encode/decode round-trip each type" {

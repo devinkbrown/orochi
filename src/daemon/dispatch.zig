@@ -1099,12 +1099,24 @@ fn writeSaslCapValue(session: *const ClientSession, out: []u8) ?[]const u8 {
     return if (len == 0) null else out[0..len];
 }
 
+fn writeSaslMechanismList(session: *const ClientSession, out: []u8) ?[]const u8 {
+    var len: usize = 0;
+    appendSaslMechanismSep(out, &len, session.sasl_plain != null, "PLAIN", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_external != null and session.tls_certfp != null, "EXTERNAL", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256", ' ') catch return null;
+    return if (len == 0) null else out[0..len];
+}
+
 fn appendSaslMechanism(out: []u8, len: *usize, enabled: bool, name: []const u8) error{OutputTooSmall}!void {
+    return appendSaslMechanismSep(out, len, enabled, name, ',');
+}
+
+fn appendSaslMechanismSep(out: []u8, len: *usize, enabled: bool, name: []const u8, sep: u8) error{OutputTooSmall}!void {
     if (!enabled) return;
     const comma_len: usize = if (len.* == 0) 0 else 1;
     if (len.* + comma_len + name.len > out.len) return error.OutputTooSmall;
     if (len.* != 0) {
-        out[len.*] = ',';
+        out[len.*] = sep;
         len.* += 1;
     }
     @memcpy(out[len.* .. len.* + name.len], name);
@@ -1607,10 +1619,12 @@ fn saslAlready(ctx: DispatchCtx) DispatchError!void {
 }
 
 fn saslUnsupportedMechanism(ctx: DispatchCtx) DispatchError!void {
+    var mech_buf: [64]u8 = undefined;
+    const mechanisms = writeSaslMechanismList(ctx.session, &mech_buf) orelse "";
     try ctx.replies.numeric(
         ctx.session,
         .RPL_SASLMECHS,
-        &.{sasl_mechrouter.Router.mechanismList()},
+        &.{mechanisms},
         "are available SASL mechanisms",
     );
     try saslFail(ctx, "Unsupported SASL mechanism");
@@ -2073,7 +2087,8 @@ test "sasl unsupported mechanism emits 908 then 904" {
 
     try dispatchText(&session, &replies, "AUTHENTICATE NOT-A-MECH");
     try expectCodesInOrder(replies.written(), &.{ " 908 ", " 904 " });
-    try expectContains(replies.written(), "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512");
+    try expectContains(replies.written(), "PLAIN");
+    try expectNotContains(replies.written(), "SCRAM-SHA-512");
 }
 
 test "sasl reauth after registration emits 907" {

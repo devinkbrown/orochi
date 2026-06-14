@@ -18,6 +18,7 @@ pub const ParseError = error{
     MissingType,
     MissingDelimiter,
     EmptyPattern,
+    UnexpectedPattern,
     UnknownType,
     TooDeep,
 };
@@ -158,21 +159,23 @@ pub fn Matcher(comptime max_nodes: usize) type {
         fn parseTyped(self: *Self, typed: []const u8) ParseError!usize {
             if (typed.len == 0) return error.MissingType;
 
-            // `$z` (secure connection) takes no pattern: bare `$z` is valid, and a
-            // trailing `:pattern` is accepted but ignored (the pattern carries no
-            // matching meaning for this type).
+            // `$z` (secure connection) takes no pattern: bare `$z` is valid.
+            // Patterned `$z:<fp>` is rejected until certificate-fingerprint
+            // semantics are implemented, so a stored mask cannot imply a check
+            // Orochi does not actually perform.
             if (typed[0] == 'z') {
                 if (typed.len == 1) return self.appendNode(.{ .secure = "" });
                 if (typed[1] != ':') return error.MissingDelimiter;
-                return self.appendNode(.{ .secure = typed[2..] });
+                return error.UnexpectedPattern;
             }
 
-            // `$o` (oper status) also takes no pattern: bare `$o` is valid, a
-            // trailing `:pattern` is accepted but ignored.
+            // `$o` (oper status) also takes no pattern: bare `$o` is valid.
+            // Patterned `$o:<token>` is rejected until class/token semantics are
+            // represented in ClientContext.
             if (typed[0] == 'o') {
                 if (typed.len == 1) return self.appendNode(.{ .oper = "" });
                 if (typed[1] != ':') return error.MissingDelimiter;
-                return self.appendNode(.{ .oper = typed[2..] });
+                return error.UnexpectedPattern;
             }
 
             if (typed.len < 2 or typed[1] != ':') return error.MissingDelimiter;
@@ -346,12 +349,12 @@ test "parses each extended ban type" {
     const secure = try parse("$z");
     try std.testing.expectEqual(NodeKind.secure, secure.rootKind());
 
-    const secure_with_pattern = try parse("$z:ignored");
-    try std.testing.expectEqual(NodeKind.secure, secure_with_pattern.rootKind());
-
     const mute = try parse("$m:*!*@spam.example");
     try std.testing.expectEqual(NodeKind.mute, mute.rootKind());
     try std.testing.expectEqualStrings("*!*@spam.example", mute.rootPattern().?);
+
+    const oper = try parse("$o");
+    try std.testing.expectEqual(NodeKind.oper, oper.rootKind());
 }
 
 test "matches secure-connection extban" {
@@ -435,6 +438,8 @@ test "rejects malformed masks" {
     try std.testing.expectError(error.UnknownType, parse("$x:value"));
     try std.testing.expectError(error.InvalidByte, parse("$a:bad\nvalue"));
     try std.testing.expectError(error.EmptyPattern, parse("$~"));
+    try std.testing.expectError(error.UnexpectedPattern, parse("$z:certfp"));
+    try std.testing.expectError(error.UnexpectedPattern, parse("$o:admin"));
 }
 
 test "plain hostmask fallthrough uses host glob" {

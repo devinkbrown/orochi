@@ -44,6 +44,18 @@ fn ward(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleWard(x.conn, x.parsed);
 }
+fn kline(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleWardAlias(x.conn, x.parsed, .kline);
+}
+fn dline(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleWardAlias(x.conn, x.parsed, .dline);
+}
+fn xline(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleWardAlias(x.conn, x.parsed, .xline);
+}
 fn shun(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleShun(x.conn, x.parsed, true);
@@ -129,6 +141,9 @@ pub const module = registry.Module{
         .{ .name = "DRAIN", .access = .oper, .handler = drain },
         .{ .name = "UNREJECT", .access = .oper, .handler = unreject },
         .{ .name = "WARD", .access = .oper, .handler = ward },
+        .{ .name = "KLINE", .access = .oper, .handler = kline },
+        .{ .name = "DLINE", .access = .oper, .handler = dline },
+        .{ .name = "XLINE", .access = .oper, .handler = xline },
         .{ .name = "SHUN", .access = .oper, .handler = shun },
         .{ .name = "UNSHUN", .access = .oper, .handler = unshun },
         .{ .name = "GLOBAL", .access = .oper, .handler = global },

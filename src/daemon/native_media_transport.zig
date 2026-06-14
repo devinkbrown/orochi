@@ -26,6 +26,7 @@ pub const MediaKind = native_media_link.MediaKind;
 pub const Selection = native_media_link.Selection;
 pub const loopback_be = media_socket.loopback_be;
 pub const any_be = media_socket.any_be;
+pub const max_datagram = media_socket.max_datagram;
 
 /// Max participants per native call (forward fan-out bound).
 pub const max_call_participants = 64;
@@ -51,6 +52,10 @@ pub const NativeMediaTransport = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started); advertised to native clients.
     port: u16 = 0,
+    /// Runtime cap for accepted opcodec datagrams.
+    max_frame_bytes: usize = media_socket.max_datagram,
+    /// Runtime cap reserved for upload-bearing media operations.
+    max_upload_bytes: u64 = 16 * 1024 * 1024,
     /// Optional cross-leg sink: after forwarding a native frame to native peers,
     /// the pump hands it here to also reach the channel's WebRTC members
     /// (rewrapped to RTP). Null = native-only call (no bridging).
@@ -112,6 +117,7 @@ pub const NativeMediaTransport = struct {
             const sock = &(self.socket orelse return);
             const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
             // Require opcodec framing so the port is not an open UDP reflector.
+            if (got.data.len > self.max_frame_bytes) continue;
             if (got.data.len < opcodec_frame.MIN_FRAME_WIRE_BYTES) continue;
             const view = opcodec_frame.decode(got.data) catch continue;
 

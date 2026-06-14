@@ -116,6 +116,7 @@ pub const WorldError = std.mem.Allocator.Error || error{
     NotOnChannel,
     NoSuchNick,
     UnsupportedMode,
+    InvalidMask,
     /// A channel list mode (+b/+e/+I/+Z) is at its `max_list_entries` cap.
     ListFull,
 };
@@ -929,6 +930,7 @@ pub const World = struct {
         setter: []const u8,
         set_at: i64,
     ) WorldError!bool {
+        try validateListMask(mask);
         for (list.items) |m| {
             if (std.mem.eql(u8, m.mask, mask)) return false;
         }
@@ -954,6 +956,12 @@ pub const World = struct {
         return false;
     }
 
+    fn validateListMask(mask: []const u8) WorldError!void {
+        if (mask.len != 0 and mask[0] == '$') {
+            _ = extban.parse(mask) catch return error.InvalidMask;
+        }
+    }
+
     fn listMatches(list: []const ListEntry, hostmask: []const u8) bool {
         for (list) |m| {
             if (listx.globMatch(m.mask, hostmask)) return true;
@@ -971,7 +979,8 @@ pub const World = struct {
     /// fall through to a host glob against `ctx.host` (the full nick!user@host
     /// prefix), preserving classic +b/+e/+I/+Z behavior; `$`-prefixed entries
     /// match account/realname/country/channel/negation. Malformed `$` entries
-    /// degrade to a literal host glob so a bad mask never silently disables a ban.
+    /// are rejected when stored; any legacy malformed `$` state is ignored rather
+    /// than downgraded to a host glob.
     fn listMatchesCtx(list: []const ListEntry, ctx: extban.ClientContext, mute_policy: ExtbanMutePolicy) bool {
         for (list) |m| {
             if (extban.parse(m.mask)) |matcher| {
@@ -983,6 +992,7 @@ pub const World = struct {
                 }
                 if (matcher.matches(ctx)) return true;
             } else |_| {
+                if (m.mask.len != 0 and m.mask[0] == '$') continue;
                 if (mute_policy == .only) continue;
                 if (listx.globMatch(m.mask, ctx.host)) return true;
             }
@@ -1920,6 +1930,18 @@ test "$z extban honors secure client context" {
 
     try std.testing.expect(!world.isBannedCtx("#tls", .{ .host = "plain!u@h", .secure = false }));
     try std.testing.expect(world.isBannedCtx("#tls", .{ .host = "secure!u@h", .secure = true }));
+}
+
+test "malformed extended bans are rejected before storage" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.join("#x", testClient(1));
+
+    try std.testing.expectError(error.InvalidMask, world.addBan("#x", "$x:value", "setter", 1));
+    try std.testing.expectError(error.InvalidMask, world.addBan("#x", "$z:certfp", "setter", 2));
+    try std.testing.expectError(error.InvalidMask, world.addExempt("#x", "$o:admin", "setter", 3));
+    try std.testing.expectEqual(@as(usize, 0), world.bansOf("#x").?.len);
+    try std.testing.expectEqual(@as(usize, 0), world.exemptsOf("#x").?.len);
 }
 
 test "channel flag modes set, query, and render" {

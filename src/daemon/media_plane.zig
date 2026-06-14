@@ -21,6 +21,7 @@ pub const MediaSocket = media_socket.MediaSocket;
 pub const TransportAddress = media_transport.TransportAddress;
 pub const loopback_be = media_socket.loopback_be;
 pub const any_be = media_socket.any_be;
+pub const max_datagram = media_socket.max_datagram;
 
 /// Blocking acquire on the tryLock-only `std.atomic.Mutex`. Contention is
 /// near-zero (rare allocate/remove vs. low-rate STUN handshakes), so yielding.
@@ -77,6 +78,10 @@ pub const MediaPlane = struct {
     stun_server: ?TransportAddress = null,
     /// The discovered server-reflexive address (null if discovery is off/failed).
     discovered: ?TransportAddress = null,
+    /// Runtime cap for accepted RTP/RTCP datagrams.
+    max_frame_bytes: usize = media_socket.max_datagram,
+    /// Runtime cap reserved for upload-bearing media operations.
+    max_upload_bytes: u64 = 16 * 1024 * 1024,
     /// CSPRNG for ICE credential generation, seeded from the OS at init.
     /// Accessed only under `mutex` (in allocate).
     csprng: std.Random.DefaultCsprng,
@@ -151,6 +156,7 @@ pub const MediaPlane = struct {
             const sock = &(self.socket orelse return);
             const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
             if (got.data.len == 0) continue;
+            if (got.data.len > self.max_frame_bytes) continue;
             if (MediaSocket.isStun(got.data[0])) {
                 lockSpin(&self.mutex);
                 const resp = self.transport.handleStunBinding(self.allocator, got.data, got.from) catch null;

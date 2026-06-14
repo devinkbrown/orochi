@@ -26,6 +26,7 @@ pub const MemberIdentity = route_table.MemberIdentity;
 pub const RelayMessage = message_relay.RelayMessage;
 pub const InboundMessage = message_relay.Owned;
 pub const RelayVerb = message_relay.Verb;
+pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
 
 const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 const handshake_version: u8 = 1;
@@ -34,6 +35,7 @@ const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
+const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
 const channel_prop_event = @import("../../proto/channel_prop_event.zig");
 const topic_event = @import("../../proto/topic_event.zig");
 const nick_event = @import("../../proto/nick_event.zig");
@@ -135,6 +137,13 @@ pub const S2sPeer = struct {
     /// Remote aggregate channel MODE flag changes that won the LWW route-table
     /// state, awaiting the daemon to apply them to the local world and emit MODE.
     channel_mode_flag_changes: std.ArrayListUnmanaged(ChannelModeFlagsDelta) = .empty,
+    /// Remote parameter/IRCX channel-state snapshots that won a per-channel LWW
+    /// clock, awaiting daemon-side application and MODE emission.
+    channel_mode_state_changes: std.ArrayListUnmanaged(ChannelModeStateDelta) = .empty,
+    channel_mode_state_clocks: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Direct-owned state frames rejected because their claimed origin did not
+    /// match the authenticated peer. Drained by the daemon for audit logging.
+    rejected_origin_frames: u64 = 0,
     /// Remote channel list-mode changes (+b/+e/+I) that altered LWW state,
     /// awaiting the daemon to apply them to its local world and emit MODE lines.
     channel_list_changes: std.ArrayListUnmanaged(ChannelListDelta) = .empty,
@@ -207,6 +216,11 @@ pub const S2sPeer = struct {
         self.membership_changes.deinit(self.allocator);
         for (self.channel_mode_flag_changes.items) |*d| d.deinit(self.allocator);
         self.channel_mode_flag_changes.deinit(self.allocator);
+        for (self.channel_mode_state_changes.items) |*d| d.deinit(self.allocator);
+        self.channel_mode_state_changes.deinit(self.allocator);
+        var state_clocks = self.channel_mode_state_clocks.iterator();
+        while (state_clocks.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.channel_mode_state_clocks.deinit(self.allocator);
         for (self.channel_list_changes.items) |*d| d.deinit(self.allocator);
         self.channel_list_changes.deinit(self.allocator);
         for (self.prop_changes.items) |*d| d.deinit(self.allocator);
@@ -359,6 +373,7 @@ pub const S2sPeer = struct {
             .MESSAGE => try self.recvMessage(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
+            .CHANNEL_MODE_STATE => try self.recvChannelModeState(frame.payload),
         }
     }
 
@@ -456,6 +471,25 @@ pub const S2sPeer = struct {
         }
     };
 
+    pub const ChannelModeStateDelta = struct {
+        channel: []u8,
+        private: bool,
+        hidden: bool,
+        ext_bits: u32,
+        key: ?[]u8,
+        limit: ?u32,
+        throttle_joins: u16,
+        throttle_secs: u32,
+        forward: ?[]u8,
+
+        pub fn deinit(self: *ChannelModeStateDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.channel);
+            if (self.key) |key| allocator.free(key);
+            if (self.forward) |forward| allocator.free(forward);
+            self.* = undefined;
+        }
+    };
+
     pub const ChannelListDelta = struct {
         pub const Kind = route_table.ChannelListKind;
 
@@ -496,6 +530,12 @@ pub const S2sPeer = struct {
     /// each delta's channel string (call `deinit` per entry, then free slice).
     pub fn takeChannelModeFlagChanges(self: *S2sPeer) ![]ChannelModeFlagsDelta {
         return self.channel_mode_flag_changes.toOwnedSlice(self.allocator);
+    }
+
+    /// Drain remote channel parameter/IRCX state changes. Caller owns the slice
+    /// and each delta's strings.
+    pub fn takeChannelModeStateChanges(self: *S2sPeer) ![]ChannelModeStateDelta {
+        return self.channel_mode_state_changes.toOwnedSlice(self.allocator);
     }
 
     /// Drain remote channel list-mode changes (+b/+e/+I). Caller owns the slice
@@ -556,11 +596,39 @@ pub const S2sPeer = struct {
         return self.nick_changes.toOwnedSlice(self.allocator);
     }
 
+    /// Drain origin-mismatch rejections for daemon-side audit logging.
+    pub fn takeRejectedOriginFrames(self: *S2sPeer) u64 {
+        const n = self.rejected_origin_frames;
+        self.rejected_origin_frames = 0;
+        return n;
+    }
+
+    fn acceptsDirectOrigin(self: *S2sPeer, origin_node: NodeId) bool {
+        if (self.remote_node_id != 0 and origin_node == self.remote_node_id) return true;
+        self.rejected_origin_frames +|= 1;
+        return false;
+    }
+
+    fn noteChannelModeStateClock(self: *S2sPeer, channel: []const u8, hlc: u64) bool {
+        if (self.channel_mode_state_clocks.getPtr(channel)) |cur| {
+            if (hlc <= cur.*) return false;
+            cur.* = hlc;
+            return true;
+        }
+        const owned = self.allocator.dupe(u8, channel) catch return false;
+        self.channel_mode_state_clocks.put(self.allocator, owned, hlc) catch {
+            self.allocator.free(owned);
+            return false;
+        };
+        return true;
+    }
+
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
     /// malformed payload is dropped, never fatal to the link. A real add/remove/
     /// status-change is queued so the daemon can emit the matching live IRC line.
     fn recvMembership(self: *S2sPeer, payload: []const u8) !void {
         const ev = membership_event.decode(payload) catch return;
+        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const res = self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
             .username = ev.username,
             .realname = ev.realname,
@@ -610,6 +678,7 @@ pub const S2sPeer = struct {
     /// queued for the daemon to apply to its local world.
     fn recvChannelModeFlags(self: *S2sPeer, payload: []const u8) !void {
         const ev = channel_mode_flags_event.decode(payload) catch return;
+        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const outcome = self.routes.applyChannelModeFlags(ev.channel, ev.origin_node, ev.flags, ev.hlc) catch return;
         if (outcome == .unchanged) return;
         const ch = self.allocator.dupe(u8, ev.channel) catch return;
@@ -624,6 +693,7 @@ pub const S2sPeer = struct {
     /// are dropped and never fault the link.
     fn recvChannelList(self: *S2sPeer, payload: []const u8) !void {
         const ev = channel_list_event.decode(payload) catch return;
+        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const res = self.routes.applyChannelList(ev.channel, ev.kind, ev.mask, ev.setter, ev.set_at, ev.origin_node, ev.hlc, ev.present) catch return;
         if (res.outcome == .unchanged) return;
 
@@ -733,6 +803,7 @@ pub const S2sPeer = struct {
     /// payloads and allocation failures are dropped without faulting the link.
     fn recvChannelProp(self: *S2sPeer, payload: []const u8) !void {
         const ev = channel_prop_event.decode(payload) catch return;
+        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const ch = self.allocator.dupe(u8, ev.channel) catch return;
         const key = self.allocator.dupe(u8, ev.key) catch {
             self.allocator.free(ch);
@@ -779,6 +850,7 @@ pub const S2sPeer = struct {
     ) !void {
         const ev = channel_prop_event.ChannelPropEvent{
             .present = present,
+            .origin_node = self.local_node_id,
             .hlc = hlc,
             .channel = channel,
             .key = key,
@@ -790,11 +862,53 @@ pub const S2sPeer = struct {
         try emitFrame(self.allocator, sink, .CHANNEL_PROP, wire);
     }
 
+    /// Queue a remote parameter/IRCX channel-state snapshot for daemon apply.
+    /// Only the authenticated direct peer may assert direct-owned state frames.
+    fn recvChannelModeState(self: *S2sPeer, payload: []const u8) !void {
+        const ev = channel_mode_state_event.decode(payload) catch return;
+        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
+        if (!self.noteChannelModeStateClock(ev.channel, ev.hlc)) return;
+
+        const ch = self.allocator.dupe(u8, ev.channel) catch return;
+        errdefer self.allocator.free(ch);
+        const key = if (ev.key) |k| try self.allocator.dupe(u8, k) else null;
+        errdefer if (key) |k| self.allocator.free(k);
+        const forward = if (ev.forward) |f| try self.allocator.dupe(u8, f) else null;
+        errdefer if (forward) |f| self.allocator.free(f);
+
+        try self.channel_mode_state_changes.append(self.allocator, .{
+            .channel = ch,
+            .private = ev.private,
+            .hidden = ev.hidden,
+            .ext_bits = ev.ext_bits,
+            .key = key,
+            .limit = ev.limit,
+            .throttle_joins = ev.throttle_joins,
+            .throttle_secs = ev.throttle_secs,
+            .forward = forward,
+        });
+    }
+
+    /// Emit a full parameter/IRCX channel-state snapshot. The caller supplies the
+    /// state; this peer stamps its authenticated local origin into the envelope.
+    pub fn sendChannelModeState(
+        self: *S2sPeer,
+        sink: ByteSink,
+        ev: channel_mode_state_event.ChannelModeStateEvent,
+    ) !void {
+        var out_ev = ev;
+        out_ev.origin_node = self.local_node_id;
+        var buf: [channel_mode_state_event.max_channel_len + channel_mode_state_event.max_key_len + channel_mode_state_event.max_forward_len + 80]u8 = undefined;
+        const wire = try channel_mode_state_event.encode(out_ev, &buf);
+        try emitFrame(self.allocator, sink, .CHANNEL_MODE_STATE, wire);
+    }
+
     /// Apply an inbound TOPIC event to the route table (LWW by hlc). Malformed or
     /// stale payloads are dropped; a real change is queued so the daemon can apply
     /// it to its world and emit a live `TOPIC` line.
     fn recvTopic(self: *S2sPeer, payload: []const u8) !void {
         const ev = topic_event.decode(payload) catch return;
+        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const outcome = self.routes.applyTopic(ev.channel, ev.origin_node, ev.hlc) catch return;
         if (outcome == .unchanged) return;
 
@@ -851,6 +965,7 @@ pub const S2sPeer = struct {
     /// Malformed payloads and no-op renames are dropped.
     fn recvNickChange(self: *S2sPeer, payload: []const u8) !void {
         const ev = nick_event.decode(payload) catch return;
+        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const renamed = self.routes.renameNick(ev.old_nick, ev.new_nick, ev.origin_node, .{
             .username = ev.username,
             .realname = ev.realname,

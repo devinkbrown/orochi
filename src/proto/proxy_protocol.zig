@@ -8,6 +8,10 @@ const std = @import("std");
 pub const v2_signature = [_]u8{ 0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a };
 pub const v2_header_len: usize = 16;
 pub const v1_max_line_len: usize = 108;
+/// Maximum PROXY header accepted on the daemon accept path. This comfortably
+/// covers v1/v2 TCP addresses and small TLVs while preventing proxy-fed preamble
+/// buffering from becoming an unbounded allocation path.
+pub const max_header_bytes: usize = 512;
 
 pub const Family = enum {
     unknown,
@@ -69,6 +73,17 @@ pub fn parse(input: []const u8) ParseError!Parsed {
         return parseV2(input);
     }
     return error.InvalidSignature;
+}
+
+/// Return the full length of a complete v2 header (fixed header + payload/TLVs)
+/// once enough bytes are available to read the length field.
+pub fn v2TotalLength(input: []const u8) ParseError!usize {
+    if (input.len < v2_header_len) {
+        if (input.len <= v2_signature.len and std.mem.eql(u8, input[0..], v2_signature[0..input.len])) return error.Truncated;
+        return error.InvalidSignature;
+    }
+    if (!std.mem.eql(u8, input[0..v2_signature.len], &v2_signature)) return error.InvalidSignature;
+    return v2_header_len + @as(usize, readU16(input[14..16]));
 }
 
 pub fn parseV1(input: []const u8) ParseError!Parsed {
@@ -365,6 +380,7 @@ test "v2 TCP4 round-trip" {
 
     const parsed = try parseV2(built);
     try std.testing.expectEqual(built.len, parsed.consumed);
+    try std.testing.expectEqual(built.len, try v2TotalLength(built[0..16]));
     try expectHeaderEqual(expected, parsed.header);
     try expectHeaderEqual(expected, (try parse(built)).header);
 }
@@ -422,6 +438,7 @@ test "bad signatures and truncation are rejected" {
     bad_v2[13] = 0x11;
     writeU16(bad_v2[14..16], 0);
     try std.testing.expectError(error.InvalidSignature, parseV2(&bad_v2));
+    try std.testing.expectError(error.InvalidSignature, v2TotalLength(&bad_v2));
 
     var truncated_v2: [16]u8 = undefined;
     @memcpy(truncated_v2[0..12], &v2_signature);
@@ -429,6 +446,7 @@ test "bad signatures and truncation are rejected" {
     truncated_v2[13] = 0x11;
     writeU16(truncated_v2[14..16], 12);
     try std.testing.expectError(error.Truncated, parseV2(&truncated_v2));
+    try std.testing.expectEqual(@as(usize, 28), try v2TotalLength(&truncated_v2));
 }
 
 test "v1 UNKNOWN is accepted and deterministic" {

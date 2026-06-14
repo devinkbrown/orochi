@@ -11,7 +11,7 @@ pub const max_key_len = 64;
 pub const max_value_len = 512;
 pub const max_owner_len = 128;
 
-const fixed_prefix = 1 + 8;
+const fixed_prefix = 1 + 8 + 8;
 
 pub const Error = error{
     Truncated,
@@ -21,6 +21,7 @@ pub const Error = error{
 
 pub const ChannelPropEvent = struct {
     present: bool,
+    origin_node: u64,
     hlc: u64,
     channel: []const u8,
     key: []const u8,
@@ -46,6 +47,8 @@ pub fn encode(ev: ChannelPropEvent, out: []u8) Error![]const u8 {
     var i: usize = 0;
     out[i] = @intFromBool(ev.present);
     i += 1;
+    std.mem.writeInt(u64, out[i..][0..8], ev.origin_node, .little);
+    i += 8;
     std.mem.writeInt(u64, out[i..][0..8], ev.hlc, .little);
     i += 8;
     i = writeField(out, i, ev.channel);
@@ -69,6 +72,8 @@ pub fn decode(bytes: []const u8) Error!ChannelPropEvent {
     var i: usize = 0;
     const present = bytes[i] != 0;
     i += 1;
+    const origin_node = std.mem.readInt(u64, bytes[i..][0..8], .little);
+    i += 8;
     const hlc = std.mem.readInt(u64, bytes[i..][0..8], .little);
     i += 8;
 
@@ -80,6 +85,7 @@ pub fn decode(bytes: []const u8) Error!ChannelPropEvent {
 
     return .{
         .present = present,
+        .origin_node = origin_node,
         .hlc = hlc,
         .channel = channel,
         .key = key,
@@ -104,6 +110,7 @@ const testing = std.testing;
 test "channel prop event set round-trips" {
     const ev = ChannelPropEvent{
         .present = true,
+        .origin_node = 7,
         .hlc = 12345,
         .channel = "#chat",
         .key = "TOPIC",
@@ -116,6 +123,7 @@ test "channel prop event set round-trips" {
 
     const got = try decode(wire);
     try testing.expect(got.present);
+    try testing.expectEqual(@as(u64, 7), got.origin_node);
     try testing.expectEqual(@as(u64, 12345), got.hlc);
     try testing.expectEqualStrings("#chat", got.channel);
     try testing.expectEqualStrings("TOPIC", got.key);
@@ -124,7 +132,7 @@ test "channel prop event set round-trips" {
 }
 
 test "channel prop delete round-trips" {
-    const ev = ChannelPropEvent{ .present = false, .hlc = 9, .channel = "#chat", .key = "TOPIC", .value = "", .owner = "alice" };
+    const ev = ChannelPropEvent{ .present = false, .origin_node = 7, .hlc = 9, .channel = "#chat", .key = "TOPIC", .value = "", .owner = "alice" };
     var buf: [256]u8 = undefined;
     const wire = try encode(ev, &buf);
     const got = try decode(wire);
@@ -133,7 +141,7 @@ test "channel prop delete round-trips" {
 }
 
 test "channel prop codec rejects truncated and trailing input" {
-    const ev = ChannelPropEvent{ .present = true, .hlc = 1, .channel = "#c", .key = "K", .value = "V", .owner = "o" };
+    const ev = ChannelPropEvent{ .present = true, .origin_node = 7, .hlc = 1, .channel = "#c", .key = "K", .value = "V", .owner = "o" };
     var buf: [256]u8 = undefined;
     const wire = try encode(ev, &buf);
     try testing.expectError(error.Truncated, decode(wire[0 .. wire.len - 1]));
@@ -146,6 +154,6 @@ test "channel prop codec rejects truncated and trailing input" {
 
 test "channel prop codec rejects oversized fields" {
     const big = "x" ** (max_value_len + 1);
-    const ev = ChannelPropEvent{ .present = true, .hlc = 1, .channel = "#c", .key = "K", .value = big, .owner = "o" };
+    const ev = ChannelPropEvent{ .present = true, .origin_node = 7, .hlc = 1, .channel = "#c", .key = "K", .value = big, .owner = "o" };
     try testing.expectError(error.FieldTooLong, encodedLen(ev));
 }

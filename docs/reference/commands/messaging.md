@@ -24,6 +24,12 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 - Example: `NOTICE suzu :heads up`
 - Sources: `src/daemon/modules/messaging.zig:48`, `src/daemon/server.zig:10740`, `src/daemon/server.zig:10941`
 
+## CTCP And DCC
+
+- CTCP payloads are parsed for normal message policy, automatic replies, and `+C` no-CTCP enforcement.
+- DCC is intentionally parser-only in Orochi: the server does not provide DCC proxy, filehost, or relay behavior, and clients must not assume a server-mediated DCC surface.
+- Sources: `src/proto/ctcp.zig`, `src/daemon/server.zig`
+
 ## TAGMSG
 
 - Syntax: `TAGMSG <target>`
