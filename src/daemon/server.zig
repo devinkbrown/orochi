@@ -6336,6 +6336,15 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "PART", &.{channel}, reason);
 
+        // draft/event-playback: record the part as a PART event (`:parter PART
+        // #chan [:reason]`) in channel history for event-playback replay.
+        var part_ev_buf: [600]u8 = undefined;
+        const part_body = if (reason) |r|
+            (std.fmt.bufPrint(&part_ev_buf, "{s} :{s}", .{ channel, r }) catch channel)
+        else
+            channel;
+        self.recordHistoryEvent(channel, conn, "PART", part_body);
+
         // +x AUDITORIUM: a regular member's PART is only relayed to ops/voiced (and
         // the parter itself), mirroring the JOIN relay gating.
         const wid = worldIdFromClient(id);
@@ -15923,8 +15932,12 @@ pub const LinuxServer = struct {
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "TOPIC", &.{channel}, text);
         try self.broadcastChannel(channel, msg, null);
         // draft/event-playback: record the topic change in channel history so it
-        // replays as a TOPIC event to event-playback clients.
-        self.recordHistoryEvent(channel, conn, "TOPIC", text);
+        // replays as a TOPIC event (`:setter TOPIC #chan :topic`) to event-playback
+        // clients. The event body is the full post-command text (target + trailing).
+        var topic_ev_buf: [640]u8 = undefined;
+        if (std.fmt.bufPrint(&topic_ev_buf, "{s} :{s}", .{ channel, text })) |body| {
+            self.recordHistoryEvent(channel, conn, "TOPIC", body);
+        } else |_| {}
         // Propagate the topic across the mesh so remote members see it live.
         self.announceTopic(channel, text, setter, set_at, text.len != 0);
     }
@@ -22845,6 +22858,16 @@ test "threaded server: draft/event-playback replays TOPIC events only to capable
     try recvUntil(&b, "PRIVMSG #ep :hello-there", 200);
     try recvUntil(&b, "BATCH -1", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "TOPIC #ep :the-topic") == null);
+
+    // A second event type: B parts with a reason (a PART event). A (event-playback)
+    // replays it verbatim via the generalized event renderer (`:sender CMD body`).
+    a.reset();
+    try writeAllFd(fd_b, "PART #ep :goodbye-all\r\n");
+    try recvUntil(&a, "PART #ep :goodbye-all", 200);
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY LATEST #ep * 10\r\n");
+    try recvUntil(&a, ":B!bob@localhost PART #ep :goodbye-all", 200);
+    try recvUntil(&a, "BATCH -1", 200);
 }
 
 test "threaded server: CHATHISTORY DM history follows accounts over reused nicks" {

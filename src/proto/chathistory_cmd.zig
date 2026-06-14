@@ -300,12 +300,27 @@ pub const ResponseBuilder = struct {
         try self.writer.append(message.sender);
         try self.writer.append(" ");
         try self.writer.append(message.command);
-        try self.writer.append(" ");
-        try self.writer.append(target);
-        try self.writer.append(" :");
-        try self.writer.append(message.text);
+        if (isEventCommand(message.command)) {
+            // draft/event-playback entry: `text` is the full post-command body
+            // (target + params, e.g. "#chan +o nick" or "#chan :a new topic"),
+            // so the line renders verbatim as `:sender <CMD> <body>`.
+            try self.writer.append(" ");
+            try self.writer.append(message.text);
+        } else {
+            // Ordinary message: `:sender PRIVMSG <target> :<body>`.
+            try self.writer.append(" ");
+            try self.writer.append(target);
+            try self.writer.append(" :");
+            try self.writer.append(message.text);
+        }
         try self.writer.crlf();
         try self.checkLineLen(start);
+    }
+
+    /// A history entry is a draft/event-playback EVENT (rather than an ordinary
+    /// message) when its replay command is neither PRIVMSG nor NOTICE.
+    fn isEventCommand(command: []const u8) bool {
+        return !std.mem.eql(u8, command, "PRIVMSG") and !std.mem.eql(u8, command, "NOTICE");
     }
 
     fn writeClose(self: *ResponseBuilder, ref: []const u8) BuildError!void {
