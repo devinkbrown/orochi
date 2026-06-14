@@ -153,7 +153,10 @@ const Numeric = enum(u16) {
     RPL_LOGGEDIN = 900,
     RPL_SASLSUCCESS = 903,
     ERR_SASLFAIL = 904,
+    ERR_SASLTOOLONG = 905,
     ERR_SASLABORTED = 906,
+    ERR_SASLALREADY = 907,
+    RPL_SASLMECHS = 908,
 };
 
 fn formatCode(numeric: Numeric, buf: []u8) []const u8 {
@@ -411,6 +414,7 @@ pub const StsPolicy = struct {
 
 const CapReplyKind = enum {
     ls,
+    list,
     ack,
     nak,
 };
@@ -460,18 +464,23 @@ const CapSession = struct {
         self: *CapSession,
         subcommand: []const u8,
         params: []const []const u8,
+        sasl_value: ?[]const u8,
         sink: *CapReplySink,
     ) DispatchError!CapHandleResult {
         if (std.ascii.eqlIgnoreCase(subcommand, "LS")) {
             self.state = .negotiating;
             self.cap_302 = self.cap_302 or (params.len != 0 and std.mem.eql(u8, params[0], "302"));
-            try emitCapLs(self.cap_302, self.sts.value(), sink);
+            try emitCapLs(self.cap_302, self.sts.value(), sasl_value, sink);
+            return .ok;
+        }
+        if (std.ascii.eqlIgnoreCase(subcommand, "LIST")) {
+            try emitCapList(self.negotiated, sink);
             return .ok;
         }
         if (std.ascii.eqlIgnoreCase(subcommand, "REQ")) {
             if (params.len == 0) return .missing_parameter;
             self.state = .negotiating;
-            if (applyCapRequest(&self.negotiated, params[0])) {
+            if (applyCapRequest(&self.negotiated, params[0], self.sts.value(), sasl_value)) {
                 try sink.append(.ack, false, params[0]);
             } else {
                 try sink.append(.nak, false, params[0]);
@@ -501,7 +510,7 @@ fn capBit(id: CapId) u64 {
 /// flagged as a continuation (gets the trailing `*` parameter); the final chunk
 /// closes the list. A space is left for the `:<server> CAP <nick> LS * :` framing
 /// so each emitted line stays under the 512-byte wire limit.
-fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sink: *CapReplySink) DispatchError!void {
+fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sasl_value: ?[]const u8, sink: *CapReplySink) DispatchError!void {
     const seg_max: usize = 400;
     var seg: [seg_max]u8 = undefined;
     var len: usize = 0;
@@ -511,12 +520,13 @@ fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sink: *CapReplySink) Dispatc
         // no policy -> the cap never reaches CAP LS.
         const policy_value: ?[]const u8 = if (spec.requires_policy) sts_value else null;
         if (spec.requires_policy and policy_value == null) continue;
+        if (spec.id == .sasl and sasl_value == null) continue;
 
         // 302 clients see values; bare LS suppresses them. A policy-gated cap's
         // value is the policy itself, surfaced regardless of 302 since its
         // presence is already the operator's explicit, actionable signal.
         const static_value = if (cap_302) spec.value_302 else null;
-        const value = policy_value orelse static_value;
+        const value = policy_value orelse if (spec.id == .sasl and cap_302) sasl_value else static_value;
         const value_len: usize = if (value) |v| 1 + v.len else 0;
         const space_len: usize = if (len == 0) 0 else 1;
         if (len + space_len + spec.name.len + value_len > seg.len) {
@@ -542,7 +552,31 @@ fn emitCapLs(cap_302: bool, sts_value: ?[]const u8, sink: *CapReplySink) Dispatc
     try sink.append(.ls, false, seg[0..len]);
 }
 
-fn applyCapRequest(negotiated: *CapSet, raw_list: []const u8) bool {
+fn emitCapList(negotiated: CapSet, sink: *CapReplySink) DispatchError!void {
+    const seg_max: usize = 400;
+    var seg: [seg_max]u8 = undefined;
+    var len: usize = 0;
+    for (cap_specs) |spec| {
+        if (!negotiated.contains(spec.id)) continue;
+
+        const space_len: usize = if (len == 0) 0 else 1;
+        if (len != 0 and len + space_len + spec.name.len > seg.len) {
+            try sink.append(.list, true, seg[0..len]);
+            len = 0;
+        }
+        if (len != 0) {
+            seg[len] = ' ';
+            len += 1;
+        }
+        @memcpy(seg[len .. len + spec.name.len], spec.name);
+        len += spec.name.len;
+    }
+    try sink.append(.list, false, seg[0..len]);
+}
+
+fn applyCapRequest(negotiated: *CapSet, raw_list_in: []const u8, sts_value: ?[]const u8, sasl_value: ?[]const u8) bool {
+    var raw_list = std.mem.trim(u8, raw_list_in, " ");
+    if (raw_list.len != 0 and raw_list[0] == ':') raw_list = raw_list[1..];
     var cursor: usize = 0;
     var saw_token = false;
     var changes = negotiated.*;
@@ -558,7 +592,18 @@ fn applyCapRequest(negotiated: *CapSet, raw_list: []const u8) bool {
         if (remove) token = token[1..];
         if (token.len == 0) return false;
 
-        const spec = findCap(token) orelse return false;
+        const eq_index = std.mem.indexOfScalar(u8, token, '=');
+        const name = if (eq_index) |index| token[0..index] else token;
+        const requested_value = if (eq_index) |index| token[index + 1 ..] else null;
+        if (name.len == 0) return false;
+
+        const spec = findCap(name) orelse return false;
+        if (!remove and !capRequestable(spec, sts_value, sasl_value)) return false;
+        if (requested_value) |value| {
+            if (value.len == 0) return false;
+            const offered = capRequestValue(spec, sts_value, sasl_value) orelse return false;
+            if (!capValueAllowed(offered, value)) return false;
+        }
         if (remove) {
             changes.remove(spec.id);
         } else {
@@ -570,6 +615,28 @@ fn applyCapRequest(negotiated: *CapSet, raw_list: []const u8) bool {
     if (!saw_token) return false;
     negotiated.* = changes;
     return true;
+}
+
+fn capRequestable(spec: CapSpec, sts_value: ?[]const u8, sasl_value: ?[]const u8) bool {
+    if (spec.requires_policy) return sts_value != null;
+    if (spec.id == .sasl) return sasl_value != null;
+    return true;
+}
+
+fn capRequestValue(spec: CapSpec, sts_value: ?[]const u8, sasl_value: ?[]const u8) ?[]const u8 {
+    if (spec.requires_policy) return sts_value;
+    if (spec.id == .sasl) return sasl_value;
+    return spec.value_302;
+}
+
+fn capValueAllowed(offered: []const u8, requested: []const u8) bool {
+    if (std.mem.eql(u8, offered, requested)) return true;
+
+    var parts = std.mem.splitScalar(u8, offered, ',');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, requested)) return true;
+    }
+    return false;
 }
 
 fn findCap(name: []const u8) ?CapSpec {
@@ -1014,6 +1081,26 @@ pub const ClientSession = struct {
     }
 };
 
+fn writeSaslCapValue(session: *const ClientSession, out: []u8) ?[]const u8 {
+    var len: usize = 0;
+    appendSaslMechanism(out, &len, session.sasl_plain != null, "PLAIN") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_external != null and session.tls_certfp != null, "EXTERNAL") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256") catch return null;
+    return if (len == 0) null else out[0..len];
+}
+
+fn appendSaslMechanism(out: []u8, len: *usize, enabled: bool, name: []const u8) error{OutputTooSmall}!void {
+    if (!enabled) return;
+    const comma_len: usize = if (len.* == 0) 0 else 1;
+    if (len.* + comma_len + name.len > out.len) return error.OutputTooSmall;
+    if (len.* != 0) {
+        out[len.*] = ',';
+        len.* += 1;
+    }
+    @memcpy(out[len.* .. len.* + name.len], name);
+    len.* += name.len;
+}
+
 /// Caller-owned reply collector.
 pub const ReplyCtx = struct {
     storage: []u8,
@@ -1323,7 +1410,9 @@ fn handleCap(ctx: DispatchCtx) DispatchError!void {
     };
 
     const params = ctx.params();
-    switch (try ctx.session.cap.handle(params[0], params[1..], &sink)) {
+    var sasl_value_buf: [64]u8 = undefined;
+    const sasl_value = writeSaslCapValue(ctx.session, &sasl_value_buf);
+    switch (try ctx.session.cap.handle(params[0], params[1..], sasl_value, &sink)) {
         .ok => {},
         .invalid_command => {
             try ctx.replies.numeric(ctx.session, .ERR_INVALIDCAPCMD, &.{params[0]}, "Invalid CAP command");
@@ -1341,8 +1430,11 @@ fn handleCap(ctx: DispatchCtx) DispatchError!void {
 
 fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
     if (ctx.session.registered()) {
-        try ctx.replies.numeric(ctx.session, .ERR_ALREADYREGISTRED, &.{}, "You may not reregister");
-        return;
+        return saslAlready(ctx);
+    }
+
+    if (ctx.session.logged_in or ctx.session.client.registration.sasl == .succeeded) {
+        return saslAlready(ctx);
     }
 
     if (!ctx.session.cap.negotiated.contains(.sasl)) {
@@ -1383,7 +1475,11 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                 try ctx.replies.message(null, "AUTHENTICATE", &.{challenge}, null);
                 return;
             },
-            .fail => return saslFail(ctx, "Unsupported SASL mechanism"),
+            .fail => |failure| return switch (failure) {
+                .unknown_mechanism => saslUnsupportedMechanism(ctx),
+                .too_long => saslTooLong(ctx),
+                else => saslFail(ctx, "Unsupported SASL mechanism"),
+            },
             // start() only ever yields continue_/fail.
             .success => return saslFail(ctx, "SASL authentication failed"),
         }
@@ -1406,6 +1502,7 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             ctx.session.sasl_pending = null;
             return switch (failure) {
                 .aborted => saslAbort(ctx),
+                .too_long => saslTooLong(ctx),
                 else => saslFail(ctx, "SASL authentication failed"),
             };
         },
@@ -1477,6 +1574,15 @@ fn saslFail(ctx: DispatchCtx, message: []const u8) DispatchError!void {
     try ctx.replies.numeric(ctx.session, .ERR_SASLFAIL, &.{}, message);
 }
 
+fn saslTooLong(ctx: DispatchCtx) DispatchError!void {
+    ctx.session.sasl_pending = null;
+    ctx.session.sasl_router = null;
+    ctx.session.logged_in = false;
+    ctx.session.account_store.len = 0;
+    ctx.session.client.registration.sasl = .failed;
+    try ctx.replies.numeric(ctx.session, .ERR_SASLTOOLONG, &.{}, "SASL message too long");
+}
+
 fn saslAbort(ctx: DispatchCtx) DispatchError!void {
     ctx.session.sasl_pending = null;
     ctx.session.sasl_router = null;
@@ -1484,6 +1590,20 @@ fn saslAbort(ctx: DispatchCtx) DispatchError!void {
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
     try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
+}
+
+fn saslAlready(ctx: DispatchCtx) DispatchError!void {
+    try ctx.replies.numeric(ctx.session, .ERR_SASLALREADY, &.{}, "You have already authenticated using SASL");
+}
+
+fn saslUnsupportedMechanism(ctx: DispatchCtx) DispatchError!void {
+    try ctx.replies.numeric(
+        ctx.session,
+        .RPL_SASLMECHS,
+        &.{sasl_mechrouter.Router.mechanismList()},
+        "are available SASL mechanisms",
+    );
+    try saslFail(ctx, "Unsupported SASL mechanism");
 }
 
 fn handlePing(ctx: DispatchCtx) DispatchError!void {
@@ -1541,6 +1661,7 @@ fn emitCapReplies(
     for (cap_replies) |reply| {
         const verb = switch (reply.kind) {
             .ls => "LS",
+            .list => "LIST",
             .ack => "ACK",
             .nak => "NAK",
         };
@@ -1725,6 +1846,65 @@ test "enabled sts policy advertises a well-formed value" {
     try expectNotContains(replies.written(), "sts=");
 }
 
+test "CAP LS gates sasl on configured session mechanisms" {
+    var session = ClientSession.init();
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectNotContains(replies.written(), "sasl");
+    replies.clear();
+
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+    try dispatchText(&session, &replies, "CAP LS 302");
+    try expectContains(replies.written(), "sasl=PLAIN");
+}
+
+test "CAP REQ accepts bare and value-bearing tokens" {
+    var session = ClientSession.init();
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP REQ :server-time sasl=PLAIN");
+    try expectContains(replies.written(), " CAP * ACK :server-time sasl=PLAIN\r\n");
+    try std.testing.expect(session.cap.negotiated.contains(.server_time));
+    try std.testing.expect(session.cap.negotiated.contains(.sasl));
+}
+
+test "CAP REQ accepts SASL EXTERNAL value when available" {
+    var session = ClientSession.init();
+    var anchor: u8 = 0;
+    session.sasl_external = .{ .ptr = &anchor, .verifyFn = TestExternalChecker.verify };
+    session.tls_certfp = "DEADBEEF";
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP REQ :sasl=EXTERNAL");
+    try expectContains(replies.written(), " CAP * ACK :sasl=EXTERNAL\r\n");
+    try std.testing.expect(session.cap.negotiated.contains(.sasl));
+}
+
+test "CAP LIST reports negotiated capabilities after ACK" {
+    var session = ClientSession.init();
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP REQ :sasl=PLAIN");
+    try expectContains(replies.written(), " CAP * ACK :sasl=PLAIN\r\n");
+
+    replies.clear();
+    try dispatchText(&session, &replies, "CAP LIST");
+    try expectContains(replies.written(), " CAP * LIST :sasl\r\n");
+}
+
 test "NICK rejects nicks longer than the configured NICKLEN" {
     protocol_inventory.setRuntimeLimits(.{ .nicklen = 8 });
     defer protocol_inventory.setRuntimeLimits(.{}); // restore default for other tests
@@ -1849,6 +2029,56 @@ test "sasl PLAIN rejects bad credentials and stays logged out" {
     try dispatchText(&session, &replies, line);
     try std.testing.expect(session.account() == null);
     try expectContains(replies.written(), " 904 ");
+}
+
+test "sasl too-long authenticate chunk emits 905" {
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE PLAIN");
+    replies.clear();
+
+    var chunk: [sasl_mechrouter.MAX_AUTHENTICATE_CHUNK + 1]u8 = undefined;
+    @memset(chunk[0..], 'A');
+    var linebuf: [512]u8 = undefined;
+    const line = try std.fmt.bufPrint(&linebuf, "AUTHENTICATE {s}", .{chunk[0..]});
+    try dispatchText(&session, &replies, line);
+    try expectContains(replies.written(), " 905 ");
+    try expectNotContains(replies.written(), " 904 ");
+}
+
+test "sasl unsupported mechanism emits 908 then 904" {
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    var anchor: u8 = 0;
+    session.sasl_plain = .{ .ptr = &anchor, .verifyFn = TestPlainChecker.verify };
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE NOT-A-MECH");
+    try expectCodesInOrder(replies.written(), &.{ " 908 ", " 904 " });
+    try expectContains(replies.written(), "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512");
+}
+
+test "sasl reauth after registration emits 907" {
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    session.loginAs("alice");
+    session.client.registration.sasl = .succeeded;
+    session.registration.registered = true;
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE PLAIN");
+    try expectContains(replies.written(), " 907 ");
+    try expectNotContains(replies.written(), " 462 ");
 }
 
 test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
