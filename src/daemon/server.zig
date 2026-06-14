@@ -4166,6 +4166,20 @@ pub const LinuxServer = struct {
             .msgid = self.msgid_gen.next(&msgid_buf),
         };
 
+        // Origin spoof guard: a relayed message must never be RENDERED locally as a
+        // nick that is live & local on THIS node. A genuinely-local nick's traffic
+        // originates here (handlePrivmsg), never via a peer, and nick collisions are
+        // resolved by rename-to-UID — so a peer asserting a local nick's prefix is a
+        // spoof. Still re-forward for multi-hop; just never deliver the spoofed line.
+        if (self.nickIsLiveLocal(clean_msg.source_nick)) {
+            const spoof_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
+                .{ .channel = clean_msg.target }
+            else
+                .{ .nick = clean_msg.target };
+            _ = self.relayToPeers(clean_msg, spoof_scope);
+            return;
+        }
+
         if (world_model.isChannelName(clean_msg.target)) {
             // Receiver-side defense-in-depth: re-enforce THIS node's channel
             // policy (+n/+m/+M/+b/+Z) against the REMOTE sender before delivering
