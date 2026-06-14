@@ -287,9 +287,10 @@ pub const RenderOptions = struct {
     server_name: []const u8,
     event: Event,
     max_line_len: usize = 8191,
+    include_tags: bool = true,
 };
 
-/// Build `@event-* :server NOTE EVENT <CATEGORY> :message\r\n` into `out`.
+/// Build `[ @event-* ] :server NOTE EVENT <CATEGORY> :message\r\n` into `out`.
 pub fn renderOperNote(options: RenderOptions, out: []u8) RenderError![]const u8 {
     try validateServerName(options.server_name);
     try validateEvent(options.event);
@@ -299,13 +300,16 @@ pub fn renderOperNote(options: RenderOptions, out: []u8) RenderError![]const u8 
     if (out.len < needed) return error.OutputTooSmall;
 
     var writer = SliceWriter{ .buf = out };
-    try writer.append("@event-category=");
-    try writer.append(options.event.category.token());
-    try writer.append(";event-severity=");
-    try writer.append(options.event.severity.token());
-    try writer.append(";event-timestamp-ms=");
-    try writer.appendInt(options.event.timestamp_ms);
-    try writer.append(" :");
+    if (options.include_tags) {
+        try writer.append("@event-category=");
+        try writer.append(options.event.category.token());
+        try writer.append(";event-severity=");
+        try writer.append(options.event.severity.token());
+        try writer.append(";event-timestamp-ms=");
+        try writer.appendInt(options.event.timestamp_ms);
+        try writer.append(" ");
+    }
+    try writer.append(":");
     try writer.append(options.server_name);
     try writer.append(" NOTE EVENT ");
     try writer.append(options.event.category.code());
@@ -317,13 +321,16 @@ pub fn renderOperNote(options: RenderOptions, out: []u8) RenderError![]const u8 
 
 fn renderedLen(options: RenderOptions) RenderError!usize {
     var total: usize = 0;
-    try addLen(&total, "@event-category=".len);
-    try addLen(&total, options.event.category.token().len);
-    try addLen(&total, ";event-severity=".len);
-    try addLen(&total, options.event.severity.token().len);
-    try addLen(&total, ";event-timestamp-ms=".len);
-    try addLen(&total, decimalLen(@intCast(options.event.timestamp_ms)));
-    try addLen(&total, " :".len);
+    if (options.include_tags) {
+        try addLen(&total, "@event-category=".len);
+        try addLen(&total, options.event.category.token().len);
+        try addLen(&total, ";event-severity=".len);
+        try addLen(&total, options.event.severity.token().len);
+        try addLen(&total, ";event-timestamp-ms=".len);
+        try addLen(&total, decimalLen(@intCast(options.event.timestamp_ms)));
+        try addLen(&total, " ".len);
+    }
+    try addLen(&total, ":".len);
     try addLen(&total, options.server_name.len);
     try addLen(&total, " NOTE EVENT ".len);
     try addLen(&total, options.event.category.code().len);
@@ -467,6 +474,25 @@ test "render output is structured NOTE event line with tags" {
 
     try std.testing.expectEqualStrings(
         "@event-category=server_link;event-severity=notice;event-timestamp-ms=17000042 :orochi.local NOTE EVENT SERVER_LINK :mesh link established\r\n",
+        line,
+    );
+}
+
+test "render output can omit message-tags prefix" {
+    var out: [256]u8 = undefined;
+    const line = try renderOperNote(.{
+        .server_name = "orochi.local",
+        .event = .{
+            .category = .announce,
+            .severity = .notice,
+            .timestamp_ms = 17000042,
+            .message = "oper announcement",
+        },
+        .include_tags = false,
+    }, &out);
+
+    try std.testing.expectEqualStrings(
+        ":orochi.local NOTE EVENT ANNOUNCE :oper announcement\r\n",
         line,
     );
 }
