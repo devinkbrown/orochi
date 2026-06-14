@@ -205,32 +205,35 @@ pub fn loadFromText(
     }
 
     // Build the SASL-only operator registry from `[[opers]]` blocks.
-    const bindings = try allocator.alloc(oper_mod.OperBinding, parsed.opers.len);
-    errdefer allocator.free(bindings);
-    for (parsed.opers, 0..) |o, i| {
-        const privileges = blk: {
-            if (o.class.len != 0 and groups.get(o.class) != null) {
-                const ep = groups.effectivePrivileges(o.class);
-                if (ep.count() > 0) break :blk ep; // empty group => fall back to full
-            }
-            break :blk oper_mod.OperPrivileges.full;
-        };
-        bindings[i] = .{
+    var bindings: std.ArrayList(oper_mod.OperBinding) = .empty;
+    errdefer bindings.deinit(allocator);
+    for (parsed.opers) |o| {
+        if (o.class.len == 0 or groups.get(o.class) == null) {
+            std.debug.print("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
+            continue;
+        }
+        const privileges = groups.effectivePrivileges(o.class);
+        if (privileges.count() == 0) {
+            std.debug.print("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
+            continue;
+        }
+        try bindings.append(allocator, .{
             .account_name = o.account,
-            .class_name = if (o.class.len != 0) o.class else "operator",
+            .class_name = o.class,
             .privileges = privileges,
             .title = o.title,
-        };
+        });
     }
+    const oper_bindings = try bindings.toOwnedSlice(allocator);
 
     var config = mapToServerConfig(parsed, base);
-    if (bindings.len != 0) {
-        config.oper_registry = try oper_mod.OperRegistry.init(bindings);
+    if (oper_bindings.len != 0) {
+        config.oper_registry = try oper_mod.OperRegistry.init(oper_bindings);
     }
     return .{
         .config = config,
         .parsed = parsed,
-        .oper_bindings = bindings,
+        .oper_bindings = oper_bindings,
         .tls = mapTlsBootConfig(parsed),
         .sts = mapStsBootConfig(parsed),
         .num_shards = parsed.limits.num_shards,
