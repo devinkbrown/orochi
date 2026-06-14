@@ -53,6 +53,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.listen.media != 0) out.media_port = cfg.listen.media;
     if (cfg.listen.native_media != 0) out.native_media_port = cfg.listen.native_media;
     if (cfg.listen.media_host.len != 0) out.media_host = cfg.listen.media_host;
+    out.media_enabled = cfg.media.enabled;
+    if (!out.media_enabled) out.disabled_features = &.{"media"};
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
@@ -284,6 +286,37 @@ test "media listen overlays media port and candidate host" {
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u16, 7820), loaded.config.media_port);
     try testing.expectEqualStrings("203.0.113.5", loaded.config.media_host);
+}
+
+test "media enabled maps to server gate and disabled feature" {
+    const allocator = testing.allocator;
+
+    var disabled = try loadFromText(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[media]
+        \\enabled = false
+        \\
+    , .{ .port = 6680 }, .{});
+    defer disabled.deinit(allocator);
+    try testing.expect(!disabled.config.media_enabled);
+    try testing.expectEqual(@as(usize, 1), disabled.config.disabled_features.len);
+    try testing.expectEqualStrings("media", disabled.config.disabled_features[0]);
+
+    var enabled = try loadFromText(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[media]
+        \\enabled = true
+        \\
+    , .{ .port = 6680 }, .{});
+    defer enabled.deinit(allocator);
+    try testing.expect(enabled.config.media_enabled);
+    try testing.expectEqual(@as(usize, 0), enabled.config.disabled_features.len);
 }
 
 test "media stun server overlays discovery config" {
