@@ -209,6 +209,11 @@ realm = "local"
 # Hostnames resolve via DNS (A record); IPv6 hosts are bracketed ("[::1]:6900").
 # Requires [listen].s2s on the remote node. Empty/absent = no auto-connect.
 # connect = ["ircx.us:6900"]
+# Refuse plaintext S2S entirely: reject inbound plaintext peers and never dial
+# plaintext outbound. Only the Tsumugi-secured path is allowed; if secured S2S
+# is not configured (no [node].secret_key / key file), ALL S2S is dropped rather
+# than falling back to clear. Default false keeps the plaintext fallback.
+# require_secured = true
 
 
 # --- [limits] — capacity, timeouts, and advertised protocol limits -----------

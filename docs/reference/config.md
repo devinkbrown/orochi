@@ -135,8 +135,9 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | `realm` | string | `"local"` | any string | Realm fed into node identity derivation for secured S2S (`src/main.zig:149`). |
 | `trust_roots` | array of strings | `[]` | strings | Parsed and tested, but not consumed by current boot mapping (`src/daemon/config_format.zig:349`, `src/daemon/config_format.zig:637`). |
 | `mesh_pass` | string or null | unset | any string | Shared passphrase carried into S2S handshake config when node identity is configured (`src/main.zig:152`, `src/daemon/server.zig:1074`). |
+| `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 
-Plaintext S2S is used when no node identity is configured; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`).
+Plaintext S2S is used when no node identity is configured and `require_secured` is false; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`).
 
 ## `[limits]`
 

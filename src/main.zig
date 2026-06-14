@@ -188,6 +188,10 @@ pub fn main(init: std.process.Init) !void {
     var node_id_holder: ?orochi.daemon.node_identity.NodeIdentity = null;
     defer if (node_id_holder) |*n| n.deinit();
     const mesh_realm: []const u8 = if (held) |h| h.parsed.mesh.realm else "local";
+    // Apply [mesh].require_secured before the node-identity setup below, so the
+    // policy holds even when secured S2S is NOT configured (the case it most
+    // matters for — it then drops all S2S instead of falling back to plaintext).
+    if (held) |h| srv_cfg.require_secured = h.parsed.mesh.require_secured;
     const configured_key: ?[]const u8 = if (held) |h| h.parsed.node.secret_key else null;
     if (configured_key) |sk| {
         if (orochi.daemon.node_identity.fromConfig(sk, mesh_realm)) |ident| {

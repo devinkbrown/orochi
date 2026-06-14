@@ -1329,6 +1329,12 @@ pub const Config = struct {
     node_identity: ?*const node_identity.NodeIdentity = null,
     crypto_io: ?std.Io = null,
     mesh_pass: []const u8 = "",
+    /// `[mesh].require_secured` — when true, refuse plaintext S2S entirely: reject
+    /// inbound plaintext peers and never dial plaintext outbound links. Only the
+    /// Tsumugi-secured path is permitted; if secured S2S is not configured/available
+    /// (`!s2sSecured()`), all S2S is dropped rather than silently falling back to
+    /// clear. Default false preserves the backward-compatible plaintext fallback.
+    require_secured: bool = false,
     /// `[mesh].connect` — peers ("host:port"; IPv6 hosts bracketed) this node
     /// dials automatically at boot and re-dials while the link is down, so the
     /// S2S mesh stays up without an oper CONNECT. Strings are borrowed (owned
@@ -3090,6 +3096,16 @@ pub const LinuxServer = struct {
         // Refuse past the reserved cap: alloc beyond capacity would realloc the
         // slot array and move ConnState buffers out from under in-flight I/O.
         if (self.rx().clients.len() >= self.config.max_clients) {
+            closeFd(fd);
+            return;
+        }
+
+        // [mesh].require_secured: refuse plaintext S2S peers. A plaintext link is
+        // only ever stood up when secured S2S is unavailable, so a require_secured
+        // operator drops the peer rather than relaying in clear. (Secured peers go
+        // through the Tsumugi path below and are unaffected.)
+        if (is_s2s and self.config.require_secured and !self.s2sSecured()) {
+            self.traceLog(.info, .s2s, "refused plaintext S2S peer ([mesh].require_secured)");
             closeFd(fd);
             return;
         }
@@ -9563,6 +9579,13 @@ pub const LinuxServer = struct {
     /// re-dial of carried mesh links (the predecessor sealed the sockaddr).
     fn initiateS2sConnectToAddr(self: *LinuxServer, addr: posix.sockaddr.in6) !RingFdToken {
         if (self.rx().clients.len() >= self.config.max_clients) return error.SocketUnavailable;
+        // [mesh].require_secured: never dial a plaintext outbound link. When secured
+        // S2S is unavailable, refuse the dial rather than connecting in clear (the
+        // secured path below is unaffected). Gated before any socket/slot alloc.
+        if (self.config.require_secured and !self.s2sSecured()) {
+            self.traceLog(.info, .s2s, "skipped plaintext S2S dial ([mesh].require_secured)");
+            return error.SecuredS2sRequired;
+        }
         // Dual-stack outbound socket: connects to a real IPv6 peer directly and
         // to an IPv4 peer via its IPv4-mapped form (::ffff:a.b.c.d).
         const fd = try socketTcp6();

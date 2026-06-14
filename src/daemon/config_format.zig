@@ -174,6 +174,11 @@ pub const Config = struct {
         /// link is down), each a "host:port" string (IPv6 hosts bracketed,
         /// e.g. "[::1]:6900"). Empty = no auto-connect.
         connect: []const []const u8 = &.{},
+        /// When true, refuse plaintext S2S entirely (reject inbound plaintext
+        /// peers, never dial plaintext outbound). Only the Tsumugi-secured path
+        /// is permitted; if secured S2S is unavailable, all S2S is dropped rather
+        /// than falling back to clear. Default false keeps the plaintext fallback.
+        require_secured: bool = false,
     };
 
     pub const Limits = struct {
@@ -478,6 +483,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         freeStringList(allocator, cfg.mesh.connect);
         cfg.mesh.connect = try ownStringArray(allocator, resolver, arr);
     }
+    if (doc.getBool("mesh.require_secured")) |b| cfg.mesh.require_secured = b;
 
     // [limits]
     cfg.limits.backlog = @intCast(try uintField(doc, "limits.backlog", cfg.limits.backlog, 1, 32767));
@@ -778,6 +784,41 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
     try testing.expectEqualStrings("netadmin", cfg.opers[0].class);
     try testing.expectEqualStrings("helper", cfg.opers[1].account);
     try testing.expectEqualStrings("", cfg.opers[1].class);
+}
+
+test "parseToml: [mesh].require_secured projects onto Config and defaults false" {
+    const allocator = testing.allocator;
+    // Explicit true.
+    {
+        const text =
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[mesh]
+            \\realm = "ircxnet"
+            \\require_secured = true
+            \\
+        ;
+        var cfg = try parseToml(allocator, text, .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.mesh.require_secured);
+    }
+    // Omitted → backward-compatible default (plaintext fallback allowed).
+    {
+        const text =
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[mesh]
+            \\realm = "ircxnet"
+            \\
+        ;
+        var cfg = try parseToml(allocator, text, .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(!cfg.mesh.require_secured);
+    }
 }
 
 test "parseToml: env: indirection resolves through the Resolver" {
