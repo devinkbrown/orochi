@@ -5,7 +5,10 @@ Branch scanned: `integ`
 
 Scope: read-only source audit of `/home/kain/orochi` using 30 delegated audit scopes plus local grep review, combined with the earlier unwired/incomplete surface audit from the same date. No daemon source was changed for this report.
 
-## Repair Run Status — landed on `main` @ `f131f9c` (full suite 6601/6605 pass, 0 fail, 4 skip)
+## Repair Run Status — landed on `main` @ `e213f35` (full suite 6602/6606 pass, 0 fail, 4 skip)
+
+draft/event-playback COMPLETE (`e213f35`): added the two cross-channel event types — NICK (recorded with the OLD prefix into every channel the user is in) and QUIT (recorded into each of the leaver's channels in `broadcastQuit`'s loop) — via a `recordHistoryEventSender` explicit-sender variant. event-playback now records the FULL IRC event set: TOPIC, PART, JOIN, KICK, MODE, NICK, QUIT — all cap-gated, replayed verbatim. The feature is done.
+
 
 draft/event-playback EXTENDED to full channel-event coverage (`fdccd85`, `8e822f2`, `f131f9c`): the event renderer was generalized to `:sender CMD <body>` (body = full post-command text), so any event line replays verbatim. Recorded event types now: TOPIC, PART, JOIN, KICK, MODE — each via `recordHistoryEvent` at its broadcast site, cap-gated to `draft/event-playback` clients (others get messages only). MODE captures the applied modestring + params at the single channel-mode broadcast point. NICK is cross-channel and intentionally excluded from per-channel history. This is the complete client-facing event-playback feature.
 
