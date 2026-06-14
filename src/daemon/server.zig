@@ -9297,6 +9297,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT is for operators");
             return;
         }
+        if (!self.requirePriv(conn, .event_subscribe)) return;
         const params = parsed.paramSlice();
         if (params.len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
@@ -9333,12 +9334,17 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Invalid EVENT subcommand");
             return;
         }
+        var parsed_mask = event_spine.CategoryMask.empty();
+        for (params[1..]) |token| {
+            const cat = eventCategoryFromToken(token) orelse {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Unknown EVENT category");
+                return;
+            };
+            parsed_mask.add(cat);
+        }
         if (!is_list) {
             var mask = conn.session.event_mask;
-            for (params[1..]) |token| {
-                const cat = eventCategoryFromToken(token) orelse continue;
-                if (is_add) mask.add(cat) else mask.remove(cat);
-            }
+            mask = if (is_add) mask.include(parsed_mask) else mask.exclude(parsed_mask);
             conn.session.setEventMask(mask);
         }
         // Render the current subscription set as `EVENT LIST <CATEGORY>` lines.
@@ -19482,6 +19488,42 @@ test "threaded server: EVENT subscription managed by opers" {
     try recvUntil(&a, "EVENT LIST :End of event list", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT LIST CONNECT") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT LIST KILL") == null);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT ADD NO_SUCH_CATEGORY\r\n");
+    try recvUntil(&a, " 461 A EVENT :Unknown EVENT category", 200);
+}
+
+test "threaded server: EVENT requires event_subscribe privilege" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+    try saslPlainPrelude(fd, "oper", "orochi");
+    try writeAllFd(fd, "NICK O\r\nUSER oper 0 * :Limited Oper\r\n");
+    try recvUntil(&client, " 001 O ", 200);
+    try recvUntil(&client, " 381 O ", 200);
+
+    client.reset();
+    try writeAllFd(fd, "EVENT LIST\r\n");
+    try recvUntil(&client, " 481 O :Permission denied: requires the 'event_subscribe' operator privilege", 200);
+
+    client.reset();
+    try writeAllFd(fd, "EVENT OBSERVE *\r\n");
+    try recvUntil(&client, " 481 O :Permission denied: requires the 'event_subscribe' operator privilege", 200);
 }
 
 test "threaded server: REDACT broadcast + KLINE oper event" {
