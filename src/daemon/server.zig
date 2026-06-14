@@ -14274,11 +14274,18 @@ pub const LinuxServer = struct {
             .timestamp_ms = platform.realtimeMillis(),
             .message = message,
         };
-        var line_buf: [default_reply_bytes]u8 = undefined;
-        const line = event_spine.renderOperNote(.{ .server_name = self.serverName(), .event = event }, &line_buf) catch return;
+        // Render two forms: the IRCv3 `@event-*` message-tags variant for clients
+        // that negotiated `message-tags`, and a plain variant for everyone else.
+        // A client without message-tags must never be handed a tag-prefixed line.
+        var tagged_buf: [default_reply_bytes]u8 = undefined;
+        var plain_buf: [default_reply_bytes]u8 = undefined;
+        const tagged = event_spine.renderOperNote(.{ .server_name = self.serverName(), .event = event, .include_tags = true }, &tagged_buf) catch return;
+        const plain = event_spine.renderOperNote(.{ .server_name = self.serverName(), .event = event, .include_tags = false }, &plain_buf) catch return;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            if (entry.value.session.subscribesTo(category)) try self.deliver(entry.id, line);
+            if (!entry.value.session.subscribesTo(category)) continue;
+            const line = if (entry.value.session.hasCap(.message_tags)) tagged else plain;
+            try self.deliver(entry.id, line);
         }
     }
 
@@ -18311,6 +18318,9 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     try writeAllFd(fd_a, "EVENT BROADCAST :hello opers\r\n");
     try recvUntil(&a, "NOTE EVENT ANNOUNCE :", 200);
     try recvUntil(&a, "hello opers", 200);
+    // A negotiated `setname`, not `message-tags`, so its event note must arrive
+    // WITHOUT the @event-* tag prefix (the cap-gated plain-delivery branch).
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "@event-category") == null);
     // REHASH now permitted (382).
     a.reset();
     try writeAllFd(fd_a, "REHASH\r\n");
@@ -21496,6 +21506,52 @@ test "threaded server: EVENT subscription managed by opers" {
     a.reset();
     try writeAllFd(fd_a, "EVENT ADD NO_SUCH_CATEGORY\r\n");
     try recvUntil(&a, " 461 A EVENT :Unknown EVENT category", 200);
+}
+
+test "threaded server: oper EVENT notes carry @event-* tags with message-tags cap" {
+    // Mirrors the proven AWAY/SETNAME EVENT-broadcast setup (operTestConfig, an
+    // admin oper plus a filler user, both IRCX-opted-in), but A negotiates
+    // `message-tags` so its own announce copy must carry the @event-* tag prefix.
+    // The plain (no-tags) branch is asserted in that sibling test (oper has
+    // `setname`, not message-tags).
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "message-tags");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    // EVENT is an IRCX command, gated behind the IRCX opt-in (421 otherwise).
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+
+    // A broadcasts an oper announce; with message-tags negotiated, A's own copy
+    // carries the @event-* tag prefix.
+    a.reset();
+    try writeAllFd(fd_a, "EVENT BROADCAST :tagtest\r\n");
+    try recvUntil(&a, "NOTE EVENT ANNOUNCE", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "tagtest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "@event-category=announce") != null);
 }
 
 test "threaded server: EVENT requires event_subscribe privilege" {
