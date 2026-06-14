@@ -27,6 +27,9 @@ pub const Candidate = struct {
     /// True when the client is connected over a secure (TLS) transport; matched
     /// by the `$z` secure-connection extban.
     secure: bool = false,
+    /// True when the client holds IRC operator status; matched by the `$o`
+    /// oper-status extban.
+    is_oper: bool = false,
 };
 
 /// Parse through extban.zig and immediately evaluate the parsed mask.
@@ -61,6 +64,7 @@ fn evaluateNode(parsed: anytype, index: usize, candidate: Candidate) bool {
         .channel => |pattern| matchAnyChannel(pattern, candidate.channels),
         .secure => candidate.secure,
         .mute => |pattern| matchMask(pattern, candidate),
+        .oper => candidate.is_oper,
         .negation => |child| !evaluateNode(parsed, child, candidate),
     };
 }
@@ -151,6 +155,18 @@ test "evaluates secure-connection extban" {
     try std.testing.expect(evaluate(parsed, .{ .secure = true }));
     try std.testing.expect(!evaluate(parsed, .{ .secure = false }));
     try std.testing.expect(!evaluate(parsed, .{}));
+}
+
+test "evaluates oper-status extban" {
+    const parsed = try extban.parse("$o");
+
+    try std.testing.expect(evaluate(parsed, .{ .is_oper = true }));
+    try std.testing.expect(!evaluate(parsed, .{ .is_oper = false }));
+    try std.testing.expect(!evaluate(parsed, .{}));
+    // A negated `$~o` exempts/excludes opers.
+    const neg = try extban.parse("$~o");
+    try std.testing.expect(!evaluate(neg, .{ .is_oper = true }));
+    try std.testing.expect(evaluate(neg, .{ .is_oper = false }));
 }
 
 test "evaluates mute extban over hostmask" {

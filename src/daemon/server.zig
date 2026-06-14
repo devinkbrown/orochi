@@ -11014,6 +11014,34 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// Computed IRCX built-in property for a `user` entity. MEMBER_OF (aka
+    /// MEMBEROF) lists the channels the target user is in, space-separated, with
+    /// the same visibility filter as WHOIS: secret/private channels are omitted
+    /// unless the requester is the target, an operator, or a member. GET-only,
+    /// like the channel built-ins (computed, not stored).
+    fn userBuiltinGet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, buf: []u8, requester_id: client_model.ClientId, conn: *const ConnState) ?[]const u8 {
+        if (entity.kind != .user) return null;
+        if (!std.ascii.eqlIgnoreCase(key, "MEMBER_OF") and !std.ascii.eqlIgnoreCase(key, "MEMBEROF")) return null;
+        const target_wid = self.world.findNick(entity.id) orelse return null;
+        const requester_wid = worldIdFromClient(requester_id);
+        const sees_all = conn.session.isOper() or requester_wid.eql(target_wid);
+        var names: [64][]const u8 = undefined;
+        const n = self.world.channelsOf(target_wid, &names);
+        var w: usize = 0;
+        for (names[0..n]) |cn| {
+            if (!sees_all and self.channelHiddenFromWhois(cn, requester_wid)) continue;
+            const need = cn.len + @as(usize, if (w == 0) 0 else 1);
+            if (w + need > buf.len) break;
+            if (w != 0) {
+                buf[w] = ' ';
+                w += 1;
+            }
+            @memcpy(buf[w .. w + cn.len], cn);
+            w += cn.len;
+        }
+        return buf[0..w];
+    }
+
     /// Computed/linked IRCX channel built-in property writes. MEMBERKEY <-> +k
     /// channel key; MEMBERLIMIT <-> +l limit. Returns true if the key is a linked
     /// built-in (and was applied), false to fall through to the generic store.
@@ -11111,6 +11139,13 @@ pub const LinuxServer = struct {
                     // reflect live channel state, ahead of the generic store.
                     var bbuf: [64]u8 = undefined;
                     if (self.channelBuiltinGet(q.entity, key, &bbuf)) |val| {
+                        try propEmitBuiltin(conn, q.entity, key, val);
+                        continue;
+                    }
+                    // Computed user built-ins (MEMBER_OF) need a wider buffer for
+                    // the channel list and the requester context for visibility.
+                    var ubuf: [400]u8 = undefined;
+                    if (self.userBuiltinGet(q.entity, key, &ubuf, id, conn)) |val| {
                         try propEmitBuiltin(conn, q.entity, key, val);
                         continue;
                     }
@@ -16630,6 +16665,7 @@ fn banContextFor(
         .country = if (country.len == 0) null else country,
         .channels = chan_buf[0..nchan],
         .secure = conn.is_tls,
+        .is_oper = conn.session.isOper(),
     };
 }
 
@@ -21600,6 +21636,60 @@ test "threaded server: PROP set/get gated by channel-op" {
     try recvUntil(a, " 819 A #p ", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "verb") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 818 ") == null);
+}
+
+test "threaded server: PROP user MEMBER_OF lists visible channels (WHOIS filter)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A joins a public channel and a secret one; both A and B opt into IRCX.
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #mpub\r\n");
+    try recvUntil(&a, " 366 A #mpub ", 200);
+    try writeAllFd(fd_a, "JOIN #msec\r\n");
+    try recvUntil(&a, " 366 A #msec ", 200);
+    try writeAllFd(fd_a, "MODE #msec +s\r\n");
+    try recvUntil(&a, "MODE #msec +s", 200);
+
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+
+    // Outsider B sees A's public channel but NOT the secret one.
+    b.reset();
+    try writeAllFd(fd_b, "PROP A GET MEMBER_OF\r\n");
+    try recvUntil(&b, " 818 B A MEMBER_OF :", 200);
+    try recvUntil(&b, " 819 B A ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "#mpub") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "#msec") == null);
+
+    // A querying itself sees both.
+    a.reset();
+    try writeAllFd(fd_a, "PROP A GET MEMBER_OF\r\n");
+    try recvUntil(&a, " 818 A A MEMBER_OF :", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "#mpub") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "#msec") != null);
 }
 
 test "threaded server: HOSTKEY PROP grants op on keyed join without client disclosure" {

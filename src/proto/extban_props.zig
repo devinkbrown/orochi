@@ -48,6 +48,8 @@ fn expectMatcherValid(input: []const u8, matcher: anytype) !void {
             // `input`; skip the in-bounds check for that case.
             .secure => |pattern| if (pattern.len != 0) try expectSliceWithin(input, pattern),
             .mute => |pattern| try expectSliceWithin(input, pattern),
+            // `$o` with no pattern yields an empty slice like `$z`; skip then.
+            .oper => |pattern| if (pattern.len != 0) try expectSliceWithin(input, pattern),
             .negation => |child| try std.testing.expect(child < matcher.node_count),
         }
     }

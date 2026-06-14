@@ -31,6 +31,7 @@ pub const NodeKind = enum {
     channel,
     secure,
     mute,
+    oper,
     negation,
 };
 
@@ -47,6 +48,9 @@ pub const ClientContext = struct {
     /// True when the client is connected over a secure (TLS) transport. Used by
     /// the `$z` secure-connection extban.
     secure: bool = false,
+    /// True when the client holds IRC operator status. Used by the `$o`
+    /// oper-status extban (most useful in `+e`/`+I` exception lists).
+    is_oper: bool = false,
 };
 
 pub const Node = union(NodeKind) {
@@ -62,6 +66,9 @@ pub const Node = union(NodeKind) {
     /// the ban-check path can apply it as speech suppression rather than a join
     /// denial. Matching semantics are identical to a plain hostmask.
     mute: []const u8,
+    /// `$o` oper-status: the pattern is ignored; matches when the client holds
+    /// IRC operator status.
+    oper: []const u8,
     negation: usize,
 };
 
@@ -115,6 +122,7 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 .channel => |pattern| pattern,
                 .secure => |pattern| pattern,
                 .mute => |pattern| pattern,
+                .oper => |pattern| pattern,
                 .negation => null,
             };
         }
@@ -159,6 +167,14 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 return self.appendNode(.{ .secure = typed[2..] });
             }
 
+            // `$o` (oper status) also takes no pattern: bare `$o` is valid, a
+            // trailing `:pattern` is accepted but ignored.
+            if (typed[0] == 'o') {
+                if (typed.len == 1) return self.appendNode(.{ .oper = "" });
+                if (typed[1] != ':') return error.MissingDelimiter;
+                return self.appendNode(.{ .oper = typed[2..] });
+            }
+
             if (typed.len < 2 or typed[1] != ':') return error.MissingDelimiter;
             if (typed.len == 2) return error.EmptyPattern;
 
@@ -192,6 +208,7 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 .channel => |pattern| matchAnyChannel(pattern, ctx.channels),
                 .secure => ctx.secure,
                 .mute => |pattern| patternMatch(pattern, ctx.host),
+                .oper => ctx.is_oper,
                 .negation => |child| !self.matchNode(child, ctx),
             };
         }
@@ -223,6 +240,7 @@ fn nodeKind(node: Node) NodeKind {
         .channel => .channel,
         .secure => .secure,
         .mute => .mute,
+        .oper => .oper,
         .negation => .negation,
     };
 }
