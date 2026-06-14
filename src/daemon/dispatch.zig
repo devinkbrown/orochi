@@ -950,11 +950,15 @@ pub const ClientSession = struct {
             self.account_store.set(account_name[0..@min(account_name.len, MAX_ACCOUNT_BYTES)]) catch return;
         };
         self.logged_in = true;
+        // Server-managed +r: a logged-in identity is "registered". Set here so SASL,
+        // IDENTIFY, REGISTER, EXTERNAL, and session restore all surface it uniformly.
+        self.umodes.add(.registered);
     }
 
     pub fn logout(self: *ClientSession) void {
         self.logged_in = false;
         self.account_store.len = 0;
+        self.umodes.remove(.registered);
     }
 
     pub fn registered(self: ClientSession) bool {
