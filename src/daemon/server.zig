@@ -7834,20 +7834,27 @@ pub const LinuxServer = struct {
         return a.len < b.len;
     }
 
-    fn dmHistoryKey(a: []const u8, b: []const u8, out: []u8) ?[]const u8 {
+    fn dmHistoryKey(a_nick: []const u8, a_account: ?[]const u8, b_nick: []const u8, b_account: ?[]const u8, out: []u8) ?[]const u8 {
+        const use_accounts = a_account != null and b_account != null;
+        const a = if (use_accounts) a_account.? else a_nick;
+        const b = if (use_accounts) b_account.? else b_nick;
         var la_buf: [128]u8 = undefined;
         var lb_buf: [128]u8 = undefined;
         const la = lowerCopy(&la_buf, a) orelse return null;
         const lb = lowerCopy(&lb_buf, b) orelse return null;
         const first = if (bytesLess(la, lb)) la else lb;
         const second = if (bytesLess(la, lb)) lb else la;
-        return std.fmt.bufPrint(out, "$dm:{s}:{s}", .{ first, second }) catch null;
+        const scope: []const u8 = if (use_accounts) "acct" else "nick";
+        return std.fmt.bufPrint(out, "$dm:{s}:{s}:{s}", .{ scope, first, second }) catch null;
     }
 
     fn historyKeyForTarget(self: *LinuxServer, conn: *ConnState, target: []const u8, out: []u8) []const u8 {
-        _ = self;
         if (world_model.isChannelName(target)) return target;
-        return dmHistoryKey(conn.session.displayName(), target, out) orelse target;
+        const peer_account = if (self.world.findNick(target)) |wid|
+            if (self.connFor(clientIdFromWorld(wid))) |peer| peer.session.account() else null
+        else
+            null;
+        return dmHistoryKey(conn.session.displayName(), conn.session.account(), target, peer_account, out) orelse target;
     }
 
     fn chathistoryChannelVisibleTo(self: *LinuxServer, id: client_model.ClientId, target: []const u8) bool {
@@ -7996,7 +8003,8 @@ pub const LinuxServer = struct {
             if (entry.key_ptr.*.eql(requester_wid)) continue;
             const peer = entry.value_ptr.*;
             var key_buf: [320]u8 = undefined;
-            const store_key = dmHistoryKey(conn.session.displayName(), peer, &key_buf) orelse continue;
+            const peer_account = if (self.connFor(clientIdFromWorld(entry.key_ptr.*))) |peer_conn| peer_conn.session.account() else null;
+            const store_key = dmHistoryKey(conn.session.displayName(), conn.session.account(), peer, peer_account, &key_buf) orelse continue;
             if (self.latestActivityInWindow(store_key, query)) |ts| {
                 index.touch(peer, @intCast(ts)) catch {};
             }
@@ -15224,7 +15232,7 @@ pub const LinuxServer = struct {
         }
         if (!is_notice) {
             var dm_key_buf: [320]u8 = undefined;
-            if (dmHistoryKey(conn.session.displayName(), target, &dm_key_buf)) |store_target| {
+            if (dmHistoryKey(conn.session.displayName(), conn.session.account(), target, recipient_account, &dm_key_buf)) |store_target| {
                 self.recordHistory(store_target, conn, message_id, text);
             }
         }
@@ -21213,6 +21221,65 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-one", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
     try recvUntil(&a, "BATCH -1", 200);
+}
+
+test "threaded server: CHATHISTORY DM history follows accounts over reused nicks" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    var close_a = true;
+    defer if (close_a) closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "draft/chathistory");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try saslPlainPreludeWithCaps(fd_b, "oper", "orochi", "draft/chathistory");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 381 B ", 200);
+
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :admin-oper-secret\r\n");
+    try recvUntil(&b, "PRIVMSG B :admin-oper-secret", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST A * 10\r\n");
+    try recvUntil(&b, "BATCH +1 chathistory A", 200);
+    try recvUntil(&b, ":A!alice@localhost PRIVMSG A :admin-oper-secret", 200);
+    try recvUntil(&b, "BATCH -1", 200);
+
+    try writeAllFd(fd_a, "QUIT :gone\r\n");
+    waitMillis(100);
+    closeFd(fd_a);
+    close_a = false;
+
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var c = LiveClient{ .fd = fd_c };
+    try saslPlainPreludeWithCaps(fd_c, "oper", "orochi", "draft/chathistory");
+    try writeAllFd(fd_c, "NICK A\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&c, " 381 A ", 200);
+
+    c.reset();
+    try writeAllFd(fd_c, "CHATHISTORY LATEST B * 10\r\n");
+    try recvUntil(&c, "BATCH +1 chathistory B", 200);
+    try recvUntil(&c, "BATCH -1", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "admin-oper-secret") == null);
 }
 
 test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
