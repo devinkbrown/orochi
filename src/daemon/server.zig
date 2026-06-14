@@ -19806,9 +19806,12 @@ test "threaded server: DATA respects moderated channel speech gate" {
     try writeAllFd(fd_b, "IRCX\r\n");
     try recvUntil(&a, " 800 A 1 0 ", 200);
     try recvUntil(&b, " 800 B 1 0 ", 200);
+    // Serialize the joins so A is deterministically the first member (and thus
+    // channel-op) before B joins — with the sharded reactor pool, writing both
+    // JOINs before reading either 366 races on who becomes op.
     try writeAllFd(fd_a, "JOIN #dm\r\n");
-    try writeAllFd(fd_b, "JOIN #dm\r\n");
     try recvUntil(&a, " 366 A #dm ", 200);
+    try writeAllFd(fd_b, "JOIN #dm\r\n");
     try recvUntil(&b, " 366 B #dm ", 200);
     a.reset();
     try writeAllFd(fd_a, "MODE #dm +m\r\n");
@@ -19854,11 +19857,13 @@ test "threaded server: DATA STATUSMSG target reaches ops only" {
     try recvUntil(&a, " 800 A 1 0 ", 200);
     try recvUntil(&b, " 800 B 1 0 ", 200);
     try recvUntil(&c, " 800 C 1 0 ", 200);
+    // Serialize the joins so A is deterministically first (channel-op) before
+    // B/C join — the sharded reactor pool otherwise races on who becomes op.
     try writeAllFd(fd_a, "JOIN #ds\r\n");
-    try writeAllFd(fd_b, "JOIN #ds\r\n");
-    try writeAllFd(fd_c, "JOIN #ds\r\n");
     try recvUntil(&a, " 366 A #ds ", 200);
+    try writeAllFd(fd_b, "JOIN #ds\r\n");
     try recvUntil(&b, " 366 B #ds ", 200);
+    try writeAllFd(fd_c, "JOIN #ds\r\n");
     try recvUntil(&c, " 366 C #ds ", 200);
     try writeAllFd(fd_a, "MODE #ds +o B\r\n");
     try recvUntil(&b, "MODE #ds +o B", 200);
