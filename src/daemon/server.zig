@@ -7695,6 +7695,10 @@ pub const LinuxServer = struct {
     /// stored marker (or `*`); SET advances it (monotonic) and echoes it back.
     /// Keyed by the client's account when logged in, else its nick.
     pub fn handleMarkread(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.hasCap(.read_marker)) {
+            try self.failReply(conn, "MARKREAD", "NEED_REGISTRATION", "You must negotiate the draft/read-marker capability");
+            return;
+        }
         const owner = conn.session.account() orelse conn.session.displayName();
         const req = read_marker_store.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MARKREAD"}, "Invalid MARKREAD parameters");
@@ -7781,6 +7785,24 @@ pub const LinuxServer = struct {
         _ = self;
         if (world_model.isChannelName(target)) return target;
         return dmHistoryKey(conn.session.displayName(), target, out) orelse target;
+    }
+
+    fn chathistoryChannelVisibleTo(self: *LinuxServer, id: client_model.ClientId, target: []const u8) bool {
+        const wid = worldIdFromClient(id);
+        const channel_exists = self.world.channelExists(target);
+        const is_member = self.world.isMember(target, wid);
+        const is_visible = channel_exists and
+            !self.world.channelHasFlag(target, .secret) and
+            !self.world.isPrivate(target) and
+            !self.world.isHidden(target);
+        return chathistory_cmd.channelHistoryTargetAllowed(channel_exists, is_member, is_visible);
+    }
+
+    fn ensureChathistoryTargetVisible(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, target: []const u8) !bool {
+        if (!world_model.isChannelName(target)) return true;
+        if (self.chathistoryChannelVisibleTo(id, target)) return true;
+        try self.failReply(conn, "CHATHISTORY", "ACCESS_DENIED", "Cannot access channel history");
+        return false;
     }
 
     /// Record a message into the CHATHISTORY ring (Lotus). The msgid is the same
@@ -7921,7 +7943,7 @@ pub const LinuxServer = struct {
         const targets = index.query(query, &out) catch out[0..0];
         var reply: [default_reply_bytes * 4]u8 = undefined;
         var writer = std.Io.Writer.fixed(&reply);
-        try writer.print("BATCH +1 chathistory-targets\r\n", .{});
+        try writer.print("BATCH +1 {s}\r\n", .{chathistory_cmd.targets_batch_type});
         for (targets) |target| {
             var line_buf: [192]u8 = undefined;
             const detail = chathistory_targets.formatTargetLine(&line_buf, target) catch continue;
@@ -7953,6 +7975,7 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "CHATHISTORY", code, reason);
             return;
         };
+        if (!try self.ensureChathistoryTargetVisible(id, conn, chathistory_cmd.requestTarget(req))) return;
         var buf: [64]lotus.Message = undefined;
         var target: []const u8 = "";
         var found: []const lotus.Message = buf[0..0];
@@ -7962,7 +7985,12 @@ pub const LinuxServer = struct {
                 var key_buf: [320]u8 = undefined;
                 const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
-                found = self.history.latest(store_target, n, buf[0..n]) catch buf[0..0];
+                switch (chathistory_cmd.latestMode(r)) {
+                    .unbounded => found = self.history.latest(store_target, n, buf[0..n]) catch buf[0..0],
+                    .before_bound => if (self.resolveSelector(store_target, r.lower_bound.?)) |ts| {
+                        found = self.history.before(store_target, ts, n, buf[0..n]) catch buf[0..0];
+                    },
+                }
             },
             .before => |r| {
                 target = r.target;
@@ -7988,17 +8016,19 @@ pub const LinuxServer = struct {
                 var key_buf: [320]u8 = undefined;
                 const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
-                // Collect oldest-first after the low bound, then trim to those
-                // strictly before the high bound. Each bound is a timestamp or a
-                // msgid resolved to its timestamp.
                 if (self.resolveSelector(store_target, r.start)) |s| {
                     if (self.resolveSelector(store_target, r.end)) |e| {
-                        const lo = @min(s, e);
-                        const hi = @max(s, e);
-                        const raw = self.history.after(store_target, lo, n, buf[0..n]) catch buf[0..0];
+                        const raw = switch (chathistory_cmd.rangeDirection(s, e)) {
+                            .forward => self.history.after(store_target, s, n, buf[0..n]) catch buf[0..0],
+                            .reverse => self.history.before(store_target, s, n, buf[0..n]) catch buf[0..0],
+                        };
                         var k: usize = 0;
                         for (raw) |m| {
-                            if (m.timestamp < hi) {
+                            const in_range = switch (chathistory_cmd.rangeDirection(s, e)) {
+                                .forward => m.timestamp < e,
+                                .reverse => m.timestamp > e,
+                            };
+                            if (in_range) {
                                 buf[k] = m; // safe in-place compaction (k <= source index)
                                 k += 1;
                             }
