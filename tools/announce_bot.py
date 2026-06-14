@@ -415,6 +415,7 @@ class Bot:
                     if len(revs) > len(shown):
                         self.msg(CHANNEL, f"{GREY}… +{len(revs) - len(shown)} earlier commit(s){RST}")
                     for i, rev in enumerate(shown):
+                        log.info("announcing commit %s", rev[:12])
                         self.announce(self.commit_lines(rev, tc, with_delta=(i == len(shown) - 1)))
                     self.set_topic()
 
