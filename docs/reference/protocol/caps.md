@@ -28,12 +28,13 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `draft/typing` | none | Client-only typing tags relayed through TAGMSG. | `src/daemon/dispatch.zig:335` |
 | `draft/react` | none | Client-only reaction tags relayed through TAGMSG. | `src/daemon/dispatch.zig:336` |
 | `draft/reply` | none | Client-only reply tags relayed through TAGMSG. | `src/daemon/dispatch.zig:337` |
+| `draft/event-playback` | none | CHATHISTORY/bouncer replay includes channel events (JOIN/PART/MODE/TOPIC/KICK/NICK/QUIT) rendered as `:sender CMD <body>`; clients without it get messages only. | `src/daemon/dispatch.zig:337` (`event_playback`) |
 | `batch` | none | Server emits BATCH for features such as chathistory and netsplit. | `src/daemon/dispatch.zig:338` |
 | `bot` | none | Bot mode/cap; user `+B` is surfaced in WHOIS. | `src/daemon/dispatch.zig:339` |
 | `draft/channel-rename` | none | Receive RENAME for common channel renames. | `src/daemon/dispatch.zig:342` |
 | `extended-monitor` | none | Extended MONITOR state notifications. | `src/daemon/dispatch.zig:345` |
 | `account-notify` | none | ACCOUNT lines on common-user login/logout. | `src/daemon/dispatch.zig:349` |
-| `draft/account-registration` | none | REGISTER/VERIFY account registration discovery. | `src/daemon/dispatch.zig:352` |
+| `draft/account-registration` | `custom-account-name` (CAP LS 302) | REGISTER/VERIFY account registration discovery; the 302 value signals that custom (non-nick) account names are accepted. | `src/daemon/dispatch.zig` (`account_registration`, `value_302`) |
 | `draft/metadata-2` | none | METADATA GET/SET/LIST/CLEAR and 761/762/766 numerics. | `src/daemon/dispatch.zig:354` |
 | `standard-replies` | none | FAIL/WARN/NOTE support. | `src/daemon/dispatch.zig:356` |
 | `cap-notify` | none | Static cap set support; CAP NEW/DEL do not fire for the static set. | `src/daemon/dispatch.zig:357` |

@@ -29,9 +29,9 @@ alignment decision; fill residual 9xx error set.
 | AUTH (IRCX legacy SASL) | 🟡 | Orochi uses IRCv3 SASL (CAP/AUTHENTICATE); ircx_auth lib exists. Deliberate: CAP path primary. |
 | ACCESS (801–805, OWNER/HOST/VOICE/GRANT/DENY) | ✅ | live, channel-op gated; OWNER needs owner/founder |
 | PROP (818/819) | ✅ | live; secret-key read filter; denial 913 |
-| EVENT (806–810, types CHANNEL/MEMBER/…) | 🟡 | wired ADD/DEL/LIST over Event-Spine categories; numerics+types not draft-aligned (decide: conform vs document divergence) |
-| LISTX (811–817 + query terms) | ✅ | live dispatch and filter builder |
-| CREATE (returns OID) | 🟡 | live as create-or-join founder; no OID returned |
+| EVENT (806–810, types CHANNEL/MEMBER/…) | 🟡 | Deliberate divergence: ADD/DEL/LIST run over the native Event-Spine taxonomy (richer than the draft's CHANNEL/MEMBER types), matching the locked WALLOPS/snomask→Event-Spine design. Draft 806–810 numerics are intentionally not emitted; this is a settled design choice, not an open gap. |
+| LISTX (811–817 + query terms) | ✅ | live dispatch + filters match real channel data (name/topic/subject/language masks, `C`/`T` ages, `R=`), 816 truncation cap |
+| CREATE (returns OID) | 🟡 | Deliberate: create-or-join founder semantics; the channel OID is a computed built-in queryable via `PROP <#chan> OID`, not echoed on CREATE (no Orochi numeric for it). Settled design choice. |
 | WHISPER (+w/923) | ✅ | live, member-gated |
 | DATA / REQUEST / REPLY (tag messaging) | ✅ | live tag messaging with SYS/ADM/OWN/HST prefix gating |
 | KNOCK | ✅ | live (713/711) |
