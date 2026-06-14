@@ -5,7 +5,10 @@ Branch scanned: `integ`
 
 Scope: read-only source audit of `/home/kain/orochi` using 30 delegated audit scopes plus local grep review, combined with the earlier unwired/incomplete surface audit from the same date. No daemon source was changed for this report.
 
-## Repair Run Status — landed on `main` @ `617b500` (full suite 6600/6604 pass, 0 fail, 4 skip)
+## Repair Run Status — landed on `main` @ `f131f9c` (full suite 6601/6605 pass, 0 fail, 4 skip)
+
+draft/event-playback EXTENDED to full channel-event coverage (`fdccd85`, `8e822f2`, `f131f9c`): the event renderer was generalized to `:sender CMD <body>` (body = full post-command text), so any event line replays verbatim. Recorded event types now: TOPIC, PART, JOIN, KICK, MODE — each via `recordHistoryEvent` at its broadcast site, cap-gated to `draft/event-playback` clients (others get messages only). MODE captures the applied modestring + params at the single channel-mode broadcast point. NICK is cross-channel and intentionally excluded from per-channel history. This is the complete client-facing event-playback feature.
+
 
 draft/event-playback LANDED (`617b500`): was the one genuinely-big remaining client-facing gap (cap defined in `cap.zig` but unadvertised/unwired). Wired end to end — the Lotus history entry + `chathistory_cmd.Message` gained a `command` field (default `PRIVMSG`, static-lifetime, stored by reference not duped); the batch writer renders per-command; channel TOPIC changes record as TOPIC events (`recordHistoryEvent`); CHATHISTORY + bouncer-rewind replay event entries ONLY to clients that negotiated `draft/event-playback` (others get messages only); cap added to dispatch `CapId` + advertised. TOPIC is the first event type — MODE/JOIN/PART can follow the same path. Done incrementally with lotus/chathistory green at each step. (NB: this is the only "big item" from the planning-doc sweep that was a real gap; everything else was already implemented.)
 
