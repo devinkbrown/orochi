@@ -66,11 +66,15 @@ pub const Reaction = struct {
     /// `+draft/reply` target. A bare TAGMSG react is always an `add`; removal is
     /// a separate convergent op the store applies.
     pub fn fromTags(react_value: []const u8, reply_target: ?[]const u8) Error!Reaction {
+        return fromTagsWithOp(react_value, reply_target, .add);
+    }
+
+    pub fn fromTagsWithOp(react_value: []const u8, reply_target: ?[]const u8, op: ReactionOp) Error!Reaction {
         if (react_value.len == 0) return error.EmptyReaction;
         if (react_value.len > max_reaction_len) return error.ReactionTooLong;
         const target = reply_target orelse return error.MissingReplyTarget;
         if (target.len == 0) return error.MissingReplyTarget;
-        return .{ .target_msgid = target, .reaction = react_value, .op = .add };
+        return .{ .target_msgid = target, .reaction = react_value, .op = op };
     }
 };
 
@@ -154,6 +158,11 @@ test "reaction from tags requires a reply target and a non-empty reaction" {
     try testing.expectEqualStrings("msg-7", r.target_msgid);
     try testing.expectEqualStrings("🔥", r.reaction);
     try testing.expectEqual(ReactionOp.add, r.op);
+
+    const removed = try Reaction.fromTagsWithOp("🔥", "msg-7", .remove);
+    try testing.expectEqualStrings("msg-7", removed.target_msgid);
+    try testing.expectEqualStrings("🔥", removed.reaction);
+    try testing.expectEqual(ReactionOp.remove, removed.op);
 
     try testing.expectError(error.EmptyReaction, Reaction.fromTags("", "msg-7"));
     try testing.expectError(error.MissingReplyTarget, Reaction.fromTags("👍", null));
