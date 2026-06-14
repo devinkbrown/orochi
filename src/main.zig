@@ -173,9 +173,8 @@ pub fn main(init: std.process.Init) !void {
     orochi.proto.protocol_inventory.setServerName(srv_cfg.server_name);
     // Advertise config-driven length limits (TOPICLEN) in ISUPPORT. Built once
     // here, before any connection is served; owned for the process lifetime.
-    if (orochi.daemon.server.buildIsupportTokens(allocator, srv_cfg)) |tokens| {
-        orochi.proto.protocol_inventory.setIsupportOverride(tokens);
-    } else |_| {}
+    const isupport_tokens = try orochi.daemon.server.buildIsupportTokens(allocator, srv_cfg);
+    orochi.proto.protocol_inventory.setIsupportOverride(isupport_tokens);
     // NICKLEN is enforced in the pre-registration dispatch path, which reads the
     // runtime-limits holder rather than a config handle.
     orochi.proto.protocol_inventory.setRuntimeLimits(.{ .nicklen = srv_cfg.nicklen });
