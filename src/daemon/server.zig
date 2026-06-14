@@ -5948,6 +5948,10 @@ pub const LinuxServer = struct {
         const prefix = try clientPrefix(conn, &prefix_buf);
         const account = conn.session.account() orelse "*";
 
+        // draft/event-playback: record the join as a JOIN event (`:joiner JOIN
+        // #chan`) in channel history for event-playback replay.
+        self.recordHistoryEvent(channel, conn, "JOIN", channel);
+
         var plain_buf: [default_reply_bytes]u8 = undefined;
         const plain = try formatMessage(&plain_buf, prefix, "JOIN", &.{channel}, null);
 
@@ -7017,6 +7021,11 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
         try self.broadcastChannel(args.channel, msg, null);
+        // draft/event-playback: record the kick as a KICK event in channel history.
+        var kick_ev_buf: [600]u8 = undefined;
+        if (std.fmt.bufPrint(&kick_ev_buf, "{s} {s} :{s}", .{ args.channel, args.user, reason })) |kbody| {
+            self.recordHistoryEvent(args.channel, conn, "KICK", kbody);
+        } else |_| {}
         self.world.part(args.channel, target) catch {};
     }
 
@@ -22867,6 +22876,50 @@ test "threaded server: draft/event-playback replays TOPIC events only to capable
     a.reset();
     try writeAllFd(fd_a, "CHATHISTORY LATEST #ep * 10\r\n");
     try recvUntil(&a, ":B!bob@localhost PART #ep :goodbye-all", 200);
+    try recvUntil(&a, "BATCH -1", 200);
+}
+
+test "threaded server: event-playback replays JOIN and KICK events" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A (event-playback) founds #jk; B joins (a JOIN event); A kicks B (a KICK event).
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory draft/event-playback\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #jk\r\n");
+    try recvUntil(&a, " 366 A #jk ", 200);
+    try writeAllFd(fd_b, "JOIN #jk\r\n");
+    try recvUntil(&b, " 366 B #jk ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "KICK #jk B :rude\r\n");
+    try recvUntil(&a, "KICK #jk B :rude", 200);
+
+    // A replays: the JOIN (no-trailing body) and KICK (multi-param body) events
+    // render verbatim through the generalized event renderer.
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY LATEST #jk * 10\r\n");
+    try recvUntil(&a, "BATCH +1 chathistory #jk", 200);
+    try recvUntil(&a, ":B!bob@localhost JOIN #jk", 200);
+    try recvUntil(&a, ":A!alice@localhost KICK #jk B :rude", 200);
     try recvUntil(&a, "BATCH -1", 200);
 }
 
