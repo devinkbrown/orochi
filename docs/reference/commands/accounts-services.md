@@ -104,7 +104,7 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## CHANNEL
 
 - Syntax: `CHANNEL <REGISTER|DROP|INFO|ACCESS|AKICK|SET|TRANSFER> <#channel> ...`
-- Description: Real server command for channel services. Current implemented switch handles `REGISTER`, `DROP`, `INFO`, and `SET MLOCK`; other parsed subcommands reply that they are not available yet.
+- Description: Real server command for channel services. Current implemented switch handles `REGISTER`, `DROP`, `INFO`, `ACCESS`, `AKICK`, and `SET MLOCK`; `TRANSFER` and non-MLOCK `SET` fields are parsed surfaces that still reply as unavailable.
 - Privileges: Registered client logged in to an account.
 - Parameters: Subcommand and channel-specific arguments.
 - Replies: Server notices; `REGISTER`/`DROP` also reflect live registered-channel state.

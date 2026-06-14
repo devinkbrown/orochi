@@ -50,7 +50,7 @@ Privilege strings must match the `oper.Privilege` enum names exactly (`src/daemo
 | `audit_read` | Audit read authority. |
 | `oper_override` | Force/SA-style override authority. |
 
-Unknown privilege strings are ignored during config boot conversion (`src/daemon/config_boot.zig:159`). If an oper class is missing, or its effective privileges are empty, current boot falls back to full privileges (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). Use explicit, non-empty groups.
+Unknown privilege strings are ignored during config boot conversion (`src/daemon/config_boot.zig:159`). If an oper class is missing, or its effective privileges are empty, current boot skips that oper binding (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). Use explicit, non-empty groups.
 
 Group inheritance is bounded to 32 parent links (`src/daemon/operator_groups.zig:11`). Effective privileges are the union of the group and ancestors (`src/daemon/operator_groups.zig:88`).
 

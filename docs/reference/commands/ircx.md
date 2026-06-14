@@ -115,7 +115,7 @@ The IRCX module registers discovery, typed messaging, property, access, event, m
 ## LISTX
 
 - Syntax: `LISTX [filter]`
-- Description: IRCX extended channel list. Secret and hidden channels are skipped; time-based filter terms degrade gracefully because creation/topic timestamps are not tracked here.
+- Description: IRCX extended channel list. Secret and hidden channels are skipped. Filters use live channel metadata including creation time, topic time, subject/language properties, member count, and registered state; oversized result sets are capped with `RPL_LISTXTRUNC 816`.
 - Privileges: Registered client.
 - Parameters: Optional LISTX filter.
 - Replies: IRCX list start/entry/end numerics `811`, `812`, `817`.

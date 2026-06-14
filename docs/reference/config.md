@@ -10,7 +10,7 @@ Use `etc/orochi.reference.toml` as the runnable example and copy from it when bu
 
 The config file is TOML v1.0 (`src/daemon/config_format.zig:3`). Missing keys keep typed defaults (`src/daemon/config_format.zig:4`, `src/daemon/config_format.zig:9`). Integer fields use the ranges in `parseToml`; out-of-range values return `ParseError` (`src/daemon/config_format.zig:542`). Durations are quoted strings using `ms`, `s`, `m`, or `h`, must be non-zero, and are converted to milliseconds (`src/daemon/config_format.zig:556`).
 
-The config parser supports string indirection for any string value: `env:NAME` and `@file:path` (`src/daemon/config_format.zig:486`). Current `src/main.zig` wires only the environment resolver in the CLI boot path (`src/main.zig:100`), so `@file:` is parser-supported but requires a caller or boot path that provides a file resolver (`src/daemon/config_format.zig:495`).
+The config parser supports string indirection for any string value: `env:NAME` and `@file:path` (`src/daemon/config_format.zig:486`). The CLI boot path wires both resolvers through `ResolverCtx`, so config strings can pull from the process environment or from files relative to the daemon working directory (`src/main.zig:8`, `src/main.zig:23`, `src/main.zig:64`).
 
 The live mapping is conservative: only non-empty or non-zero values are overlaid onto `server.Config` (`src/daemon/config_boot.zig:15`). TLS and STS are projected separately because `server.Config` does not own those parser structs (`src/daemon/config_boot.zig:92`, `src/daemon/config_boot.zig:119`).
 
@@ -199,7 +199,7 @@ Source: struct at `src/daemon/config_format.zig:170`, parsing at `src/daemon/con
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `enabled` | bool | `false` | `true` or `false` | Parsed but not yet wired into `server.Config` (`src/daemon/config_format.zig:389`, `src/daemon/config_boot.zig:30`). |
+| `enabled` | bool | `false` | `true` or `false` | Enables or disables the media feature surface through `server.Config.media_enabled` and `disabled_features` (`src/daemon/config_format.zig:389`, `src/daemon/config_boot.zig:30`). |
 | `max_upload_bytes` | integer | `16777216` | `0..1073741824` | Parsed but not yet wired into current daemon boot (`src/daemon/config_format.zig:390`). |
 | `max_frame_bytes` | integer | `65536` | `0..16777216` | Parsed but not yet wired into current daemon boot (`src/daemon/config_format.zig:391`). |
 | `stun_host` | string or null | unset | any string | Optional STUN host mapped to media discovery config (`src/daemon/config_boot.zig:30`, `src/daemon/server.zig:967`). |
@@ -285,7 +285,7 @@ Source: struct at `src/daemon/config_format.zig:101`, parsing at `src/daemon/con
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `account` | string | required per table | non-empty; registry validation max 128 bytes | SASL account name that becomes oper after successful SASL login (`src/daemon/config_format.zig:433`, `src/daemon/oper.zig:11`). |
-| `class` | string | `""` | registry validation max 64 bytes | Operator privilege group name. Empty maps to `"operator"` after boot (`src/daemon/config_boot.zig:183`). |
+| `class` | string | `""` | registry validation max 64 bytes | Operator privilege group name. It must name a non-empty configured group with effective privileges; otherwise the oper binding is skipped (`src/daemon/config_boot.zig:183`). |
 | `title` | string | `""` | any string | Optional WHOIS/operator title (`src/daemon/config_format.zig:441`, `src/daemon/oper.zig:139`). |
 
 There is no oper password. `OPER` is disabled and tells users to authenticate through SASL (`src/daemon/server.zig:8300`). Operator status is granted after SASL when the account matches a configured binding (`src/daemon/server.zig:8308`).
@@ -302,7 +302,7 @@ Source: struct at `src/daemon/config_format.zig:95`, parsing at `src/daemon/conf
 
 Valid privilege strings are the exact enum names from `src/daemon/oper.zig:36`: `server_rehash`, `server_restart`, `server_shutdown`, `client_moderate`, `channel_moderate`, `client_kill`, `mesh_admin`, `service_admin`, `server_admin`, `oper_grant`, `oper_spy`, `event_subscribe`, `audit_read`, and `oper_override`.
 
-Important current behavior: if an oper names a class that has no group, or resolves to an empty effective privilege set, boot falls back to full privileges (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). REHASH currently rebuilds oper bindings with full privileges and does not recompute `[[oper_groups]]` (`src/daemon/server.zig:10052`, `src/daemon/server.zig:10062`).
+Important current behavior: if an oper names a class that has no group, or resolves to an empty effective privilege set, boot skips that oper binding (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). REHASH currently rebuilds oper bindings with full privileges and does not recompute `[[oper_groups]]` (`src/daemon/server.zig:10052`, `src/daemon/server.zig:10062`).
 
 ## Parsed But Not Yet Wired
 
@@ -312,7 +312,6 @@ These keys are accepted by `parseToml` but do not currently change live daemon b
 |---|---|---|
 | `listen.webtransport` | `src/daemon/config_format.zig:464` | Parser/proto-only: no `mapToServerConfig` overlay and no listener binding from this config yet. |
 | `mesh.trust_roots` | `src/daemon/config_format.zig:349` | Parsed and tested; current secured S2S boot uses node secret key, realm, and mesh pass. |
-| `media.enabled` | `src/daemon/config_format.zig:389` | Parsed; current mapped media fields are ports, advertised host, and STUN. |
 | `media.max_upload_bytes` | `src/daemon/config_format.zig:390` | Parsed; not mapped into current server config. |
 | `media.max_frame_bytes` | `src/daemon/config_format.zig:391` | Parsed; not mapped into current server config. |
 | `sasl.enabled` | `src/daemon/config_format.zig:401` | Parsed; live SASL backend wiring is currently controlled by `sasl.account_db`. |

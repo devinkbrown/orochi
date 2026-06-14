@@ -38,10 +38,12 @@ POLL_SECS = 15  # how often to check git HEAD for new commits
 HEARTBEAT_SECS = 6 * 3600
 SEND_INTERVAL = 0.4  # min seconds between queued outbound lines (anti-flood)
 RECONNECT_MIN, RECONNECT_MAX = 6, 300
+MAX_MESSAGE_TEXT_BYTES = 360  # stay comfortably under IRC's 512-byte line cap
 # IRCv3 caps we use if the server offers them (graceful degrade otherwise).
 WANT_CAPS = {"server-time", "message-tags", "account-tag", "echo-message"}
 VERSION = "Orochi-announce 2.1 (Zig 0.16 IRC daemon build bot)"
 START = time.time()
+PROTECTED_TOPIC_CHANNELS = {"#root"}
 
 # mIRC formatting + a fuller, deliberate palette.
 C = "\x03"
@@ -193,6 +195,81 @@ HELP = (
 )
 
 
+def byte_len(text: str) -> int:
+    return len(text.encode("utf-8", "replace"))
+
+
+def split_text(text: str, limit: int = MAX_MESSAGE_TEXT_BYTES) -> list[str]:
+    """Split a message payload without exceeding the IRC text budget."""
+    if byte_len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for word in text.split(" "):
+        if not word:
+            continue
+        candidate = word if not cur else f"{cur} {word}"
+        if byte_len(candidate) <= limit:
+            cur = candidate
+            continue
+        if cur:
+            chunks.append(cur)
+            cur = ""
+        if byte_len(word) <= limit:
+            cur = word
+            continue
+        piece = ""
+        for ch in word:
+            if byte_len(piece + ch) > limit:
+                if piece:
+                    chunks.append(piece)
+                piece = ch
+            else:
+                piece += ch
+        cur = piece
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def compact(lines: list[str], limit: int = MAX_MESSAGE_TEXT_BYTES) -> list[str]:
+    """Render a multi-line bot response as compact, IRC-safe message chunks."""
+    cleaned = []
+    for line in lines:
+        text = re.sub(r"\s+", " ", line).strip()
+        if text:
+            cleaned.append(text)
+    chunks: list[str] = []
+    cur = ""
+    sep = f" {GREY}|{RST} "
+    for line in cleaned:
+        for part in split_text(line, limit):
+            candidate = part if not cur else f"{cur}{sep}{part}"
+            if byte_len(candidate) <= limit:
+                cur = candidate
+            else:
+                if cur:
+                    chunks.append(cur)
+                cur = part
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def topic_protected(channel: str) -> bool:
+    return channel.lower() in PROTECTED_TOPIC_CHANNELS
+
+
+def topic_change_protected(line: str) -> bool:
+    parts = line.strip().split()
+    if len(parts) < 2:
+        return False
+    cmd = parts[0].upper()
+    if cmd not in {"TOPIC", "FORCETOPIC"}:
+        return False
+    return topic_protected(parts[1])
+
+
 class Bot:
     def __init__(self) -> None:
         self.sock: socket.socket | None = None
@@ -220,6 +297,9 @@ class Bot:
         """Send immediately, bypassing the paced queue (PONG, registration, SASL)."""
         if not self.sock:
             return
+        if topic_change_protected(line):
+            log.info("blocked protected topic change: %s", line)
+            return
         log.debug(">> %s", line)
         try:
             self.sock.sendall((line + "\r\n").encode("utf-8", "replace"))
@@ -236,8 +316,8 @@ class Bot:
         self.enqueue(f"NOTICE {target} :{text}")
 
     def announce(self, lines: list[str], target: str | None = None) -> None:
-        for l in lines:
-            self.msg(target or CHANNEL, l)
+        for text in compact(lines):
+            self.msg(target or CHANNEL, text)
 
     def pump_out(self) -> None:
         """Drain at most one queued line per SEND_INTERVAL — never blocks recv."""
@@ -335,8 +415,7 @@ class Bot:
                     if len(revs) > len(shown):
                         self.msg(CHANNEL, f"{GREY}… +{len(revs) - len(shown)} earlier commit(s){RST}")
                     for i, rev in enumerate(shown):
-                        for l in self.commit_lines(rev, tc, with_delta=(i == len(shown) - 1)):
-                            self.msg(CHANNEL, l)
+                        self.announce(self.commit_lines(rev, tc, with_delta=(i == len(shown) - 1)))
                     self.set_topic()
 
     def tests_delta(self, tc: str) -> str:
@@ -367,18 +446,22 @@ class Bot:
         delta = self.tests_delta(tc) if with_delta else ""
         total = git("rev-list", "--count", "HEAD")
         lines = [
-            f"{accent}{B}▌{RST}{glyph} {B}{accent}{commit_field('%h', rev)}{RST} {tag}{WHITE}{clean}{RST}",
-            f"   {GREY}by {RST}{TEAL}{author}{RST} {GREY}· {when} ·{RST} {commit_stat(rev)}",
-            f"   {GREY}tests{RST} {B}{GREEN}{tc}{RST}{delta}  {GREY}modules{RST} {B}{CYAN}{module_count()}{RST}"
-            f"  {GREY}loc{RST} {B}{YEL}{loc_count()}{RST}  {GREY}#{total}{RST}",
+            f"{accent}{B}▌{RST}{glyph} {B}{accent}{commit_field('%h', rev)}{RST} {tag}{WHITE}{clean}{RST}"
+            f" {GREY}by{RST} {TEAL}{author}{RST} {GREY}· {when} ·{RST} {commit_stat(rev)}"
+            f" {GREY}tests{RST} {B}{GREEN}{tc}{RST}{delta}"
+            f" {GREY}modules{RST} {B}{CYAN}{module_count()}{RST}"
+            f" {GREY}loc{RST} {B}{YEL}{loc_count()}{RST} {GREY}#{total}{RST}",
         ]
         # Compact changed-files line for focused commits.
         files = [l.split("|")[0].strip() for l in changed_files(rev) if "|" in l]
         if files and len(files) <= 6:
-            lines.append(f"   {SILVER}└─ {' '.join(files)}{RST}")
+            lines.append(f"{SILVER}files: {' '.join(files)}{RST}")
         return lines
 
     def set_topic(self) -> None:
+        if topic_protected(CHANNEL):
+            log.info("topic updates disabled for %s", CHANNEL)
+            return
         self.send_raw(
             f"TOPIC {CHANNEL} :Orochi M2 · {git('rev-parse','--short','HEAD')} · "
             f"{test_count()} tests · {module_count()} modules · !help"
@@ -435,8 +518,7 @@ class Bot:
                 self.send_raw(f"JOIN {CHANNEL}")
                 if not self.intro_done:
                     self.intro_done = True
-                    self.announce(project_lines())
-                    self.announce(stats_lines())
+                    self.announce(project_lines() + stats_lines())
                 self.set_topic()
                 return True
 
@@ -564,7 +646,10 @@ class Bot:
                 self.msg(CHANNEL, f"{B}{MAG}announce{RST} {arg}")
         elif is_admin and cmd == "topic":
             if arg:
-                self.send_raw(f"TOPIC {CHANNEL} :{arg}")
+                if topic_protected(CHANNEL):
+                    self.notice(nick, f"topic changes are disabled for {CHANNEL}")
+                else:
+                    self.send_raw(f"TOPIC {CHANNEL} :{arg}")
         elif is_admin and cmd == "raw":
             if arg:
                 self.send_raw(arg)
