@@ -385,6 +385,10 @@ test "parse params accepts zero or one LIST filter parameter" {
     try testing.expectError(error.InvalidParameter, parseParams(testing.allocator, &.{ ">1", "#z*" }));
 }
 
+test "parse params rejects malformed LIST C filter" {
+    try testing.expectError(error.InvalidFilter, parseParams(testing.allocator, &.{"C10"}));
+}
+
 test "malformed filters are rejected" {
     try testing.expectError(error.InvalidFilter, parse(testing.allocator, ","));
     try testing.expectError(error.InvalidFilter, parse(testing.allocator, ">1,"));

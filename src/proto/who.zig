@@ -474,6 +474,20 @@ test "flags include away oper and channel prefix" {
     );
 }
 
+test "flags omit hidden oper marker when oper flag is false" {
+    var ctx = sampleContext();
+    ctx.client.away = false;
+    ctx.client.oper = false;
+    ctx.member.channel_prefix = '+';
+
+    var out: [256]u8 = undefined;
+    const line = try writeWhoReply(&out, ctx);
+    try std.testing.expectEqualStrings(
+        ":irc.example.test 352 dan #zig auser host.example irc.example.test alice H+ :0 Alice Example\r\n",
+        line,
+    );
+}
+
 test "end-of-who" {
     var out: [128]u8 = undefined;
     const line = try writeEndOfWho(&out, "irc.example.test", "dan", "#zig");
