@@ -653,6 +653,31 @@ pub const World = struct {
         return channel.members.get(client);
     }
 
+    /// Resolve `nick`'s status modes within `name` by NICK (case-insensitive
+    /// ASCII casemapping), without a ClientId in hand. Iterates the channel's
+    /// member set and maps each member's ClientId back to its display nick via
+    /// `client_nicks`. Returns null when the channel has no such member or no
+    /// such channel. NOTE: only LOCAL members are stored in the world member
+    /// set — remote mesh members live in the per-link route roster — so a remote
+    /// sender will not resolve here; callers that must enforce policy against a
+    /// remote actor consult the link roster separately.
+    pub fn memberModesByNick(self: *World, name: []const u8, nick: []const u8) ?MemberModes {
+        const channel = self.channels.getPtr(name) orelse return null;
+        var it = channel.members.iterator();
+        while (it.next()) |entry| {
+            const member_nick = self.client_nicks.get(entry.key_ptr.*) orelse continue;
+            if (std.ascii.eqlIgnoreCase(member_nick, nick)) return entry.value_ptr.*;
+        }
+        return null;
+    }
+
+    /// Whether `nick` is a (LOCAL) member of `name`, resolved by NICK
+    /// (case-insensitive). Mirrors `memberModesByNick`'s resolution; see its note
+    /// on remote members.
+    pub fn isMemberByNick(self: *World, name: []const u8, nick: []const u8) bool {
+        return self.memberModesByNick(name, nick) != null;
+    }
+
     /// Set or clear one status mode for a member. Returns true if it changed.
     pub fn setMemberMode(
         self: *World,
@@ -1714,6 +1739,32 @@ test "setMemberMode adds and removes status and reports change" {
 
     try std.testing.expectError(error.NotOnChannel, world.setMemberMode("#x", ClientId{ .shard = 0, .slot = 9, .gen = 1 }, .op, true));
     try std.testing.expect(world.memberModes("#nope", a) == null);
+}
+
+test "memberModesByNick / isMemberByNick resolve local members case-insensitively" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const b = ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    try world.registerNick("Alice", a); // founder of #x
+    try world.registerNick("Bob", b);
+    _ = try world.join("#x", a);
+    _ = try world.join("#x", b);
+    try std.testing.expect(try world.setMemberMode("#x", b, .voice, true));
+
+    // Founder a resolves with founder/operator status; case-insensitive lookup.
+    try std.testing.expect(world.memberModesByNick("#x", "alice").?.isOperator());
+    try std.testing.expect(world.isMemberByNick("#x", "ALICE"));
+    // b resolves with voice and is a member but not operator.
+    try std.testing.expect(world.memberModesByNick("#x", "bob").?.contains(.voice));
+    try std.testing.expect(!world.memberModesByNick("#x", "bob").?.isOperator());
+    try std.testing.expect(world.isMemberByNick("#x", "Bob"));
+
+    // A nick not in the channel — and an unknown channel — both resolve to null.
+    try std.testing.expect(world.memberModesByNick("#x", "carol") == null);
+    try std.testing.expect(!world.isMemberByNick("#x", "carol"));
+    try std.testing.expect(world.memberModesByNick("#nope", "alice") == null);
 }
 
 test "channel key, limit, bans, and invites with ownership" {

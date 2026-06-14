@@ -3751,6 +3751,25 @@ pub const LinuxServer = struct {
         skip_a: client_model.ClientId,
         skip_b: ?client_model.ClientId,
     ) void {
+        self.deliverSessionSyncSiblingsNick(account, tags, bytes, skip_a, skip_b, null);
+    }
+
+    /// Fan a message out to an account's other live sessions. `same_nick` (when
+    /// non-null) is the DM target nick: a sibling whose display nick equals it is
+    /// a SAME-NICK session of the same identity (e.g. one user signed in to the
+    /// same nick from two clients/devices), so it receives the message REGARDLESS
+    /// of the `orochi/session-sync` cap — that cap is opt-in mirroring of OTHER
+    /// nicks, not delivery to your own nick. Different-nick siblings still require
+    /// the cap.
+    fn deliverSessionSyncSiblingsNick(
+        self: *LinuxServer,
+        account: []const u8,
+        tags: MsgTags,
+        bytes: []const u8,
+        skip_a: client_model.ClientId,
+        skip_b: ?client_model.ClientId,
+        same_nick: ?[]const u8,
+    ) void {
         const skip_a_flat = monitorIdFromClient(skip_a);
         const skip_b_flat = if (skip_b) |id| monitorIdFromClient(id) else null;
         for (self.sessions.sessions(account)) |s| {
@@ -3762,7 +3781,11 @@ pub const LinuxServer = struct {
             // no longer logged into it.
             const cur = sibling.session.account() orelse continue;
             if (!std.mem.eql(u8, cur, account)) continue;
-            if (!allowsSessionSyncSibling(s, sibling, skip_a_flat, skip_b_flat)) continue;
+            const is_same_nick = if (same_nick) |n|
+                std.ascii.eqlIgnoreCase(sibling.session.displayName(), n)
+            else
+                false;
+            if (!allowsSessionSyncSibling(s, sibling, skip_a_flat, skip_b_flat, is_same_nick)) continue;
             self.deliverTagged(sibling_id, tags, bytes) catch continue;
         }
     }
@@ -3929,6 +3952,24 @@ pub const LinuxServer = struct {
         };
 
         if (world_model.isChannelName(clean_msg.target)) {
+            // Receiver-side defense-in-depth: re-enforce THIS node's channel
+            // policy (+n/+m/+M/+b/+Z) against the REMOTE sender before delivering
+            // to local members. A mode/ban that has desynced across the mesh (or
+            // a hostile/buggy peer) must not let a remote actor bypass local
+            // policy. Channels without those flags always deliver. The multi-hop
+            // re-forward below is unaffected (a downstream node re-checks its own
+            // policy), so a transient desync here does not strand the message.
+            if (self.relayChannelPolicyBlocks(
+                clean_msg.target,
+                clean_msg.source_nick,
+                clean_msg.source_prefix,
+                clean_msg.account,
+            )) {
+                // Still re-forward for multi-hop; just do not deliver locally.
+                const drop_scope: RelayScope = .{ .channel = clean_msg.target };
+                _ = self.relayToPeers(clean_msg, drop_scope);
+                return;
+            }
             if (self.world.memberIterator(clean_msg.target)) |*it| {
                 var members = it.*;
                 while (members.next()) |member| {
@@ -4515,6 +4556,21 @@ pub const LinuxServer = struct {
         if (std.mem.eql(u8, nick, "*")) return;
         self.world.registerNick(nick, worldIdFromClient(id)) catch |err| switch (err) {
             error.NickInUse => {
+                // Account-aware same-nick multi-session: if THIS connection is
+                // SASL-authenticated and the existing holder of `nick` is a local
+                // connection logged in to the SAME account, this is the same
+                // identity attaching from another client/device — do NOT 433/close.
+                // Let registration complete sharing the nick: the primary keeps
+                // world ownership; this conn keeps displayName == nick and is added
+                // to the account session group (trackSession) so DM/notice fan-out
+                // reaches it. (NAMES dedup + mesh-wide same-nick are out of scope;
+                // a second client may JOIN channels itself.)
+                if (conn.session.account()) |acct| {
+                    if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) {
+                        // Shared nick; the holder already notified MONITOR online.
+                        return;
+                    }
+                }
                 try queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{nick}, "Nickname is already in use");
                 conn.closing = true;
                 return;
@@ -4523,6 +4579,26 @@ pub const LinuxServer = struct {
         };
         // Notify any MONITOR watchers that this nick just came online.
         try self.monitorOnline(nick);
+    }
+
+    /// Whether `nick` is currently held in the world by a LOCAL connection that
+    /// is SASL-authenticated to the SAME `account` (case-insensitive account
+    /// compare; both must be non-empty). `self_id` is excluded so a connection
+    /// never matches itself. Used to admit a same-account same-nick multi-session
+    /// attach instead of 433/closing the new connection.
+    fn nickHeldBySameAccount(
+        self: *LinuxServer,
+        nick: []const u8,
+        account: []const u8,
+        self_id: world_model.ClientId,
+    ) bool {
+        if (account.len == 0) return false;
+        const holder = self.world.findNick(nick) orelse return false;
+        if (holder.eql(self_id)) return false;
+        const holder_conn = self.connFor(clientIdFromWorld(holder)) orelse return false;
+        const holder_acct = holder_conn.session.account() orelse return false;
+        if (holder_acct.len == 0) return false;
+        return std.ascii.eqlIgnoreCase(holder_acct, account);
     }
 
     /// Broadcast a JOIN to every channel member, choosing the IRCv3 extended-join
@@ -4983,6 +5059,99 @@ pub const LinuxServer = struct {
         return conn.s2s == null and conn.s2s_secured == null;
     }
 
+    /// Resolve a REMOTE (mesh) member's channel status bits by nick, scanning
+    /// every established peer link's converged channel roster (the route table —
+    /// the only place mesh members are represented; remote users are NOT in the
+    /// world member map). Returns the member's status (u4 prefix bits) when any
+    /// link's `#channel` roster lists `nick` (ASCII case-insensitive), else null.
+    /// Used by the inbound-relay channel-policy gate (+n/+m/+b) to decide whether
+    /// a relayed message's remote sender is a member of THIS node's projection of
+    /// the channel before delivering it to local members.
+    fn remoteMemberStatusInChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) ?u4 {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const members = if (slot.value.s2s_secured) |l|
+                    l.channelMembers(channel)
+                else if (slot.value.s2s) |l|
+                    l.channelMembers(channel)
+                else
+                    continue;
+                for (members) |m| {
+                    if (std.ascii.eqlIgnoreCase(m.nick, nick)) return m.status;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Whether `nick` is a member of `channel` in THIS node's projection — either
+    /// a local world member (resolved by nick) or a remote member in any peer
+    /// link's roster. The combined membership view used by the inbound-relay
+    /// channel-policy gate so a legitimate member's relayed message is never
+    /// dropped while a true non-member's is.
+    fn relaySenderIsMember(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
+        if (self.world.isMemberByNick(channel, nick)) return true;
+        return self.remoteMemberStatusInChannel(channel, nick) != null;
+    }
+
+    /// Effective channel status bits for `nick` in `channel` across the combined
+    /// (local world + remote roster) projection — the local member modes take
+    /// precedence if present, else the remote roster's status. Empty when the
+    /// actor is not a member anywhere. Used to evaluate +m speak rights and op
+    /// override for a relayed remote sender.
+    fn relaySenderModes(self: *LinuxServer, channel: []const u8, nick: []const u8) world_model.MemberModes {
+        if (self.world.memberModesByNick(channel, nick)) |mm| return mm;
+        if (self.remoteMemberStatusInChannel(channel, nick)) |status|
+            return world_model.MemberModes{ .bits = @as(u8, status) };
+        return world_model.MemberModes.empty();
+    }
+
+    /// Receiver-side re-enforcement of LOCAL channel policy against the REMOTE
+    /// sender of an inbound relayed PRIVMSG/NOTICE/TAGMSG, mirroring the local
+    /// `channelSpeechGate` (+n/+m/+b) for messages that arrived over the mesh.
+    /// Returns true when the relayed message must be DROPPED (not delivered to
+    /// local members). This is pure defense-in-depth: the originating node also
+    /// gates speech, but a +n/+m/ban whose state has desynced across the mesh
+    /// (or a buggy/hostile peer) must not let a remote actor bypass THIS node's
+    /// policy. Fail-CLOSED only when the relevant flag is set AND the sender
+    /// cannot be resolved as a member — channels without these flags always
+    /// deliver. `nick`/`prefix`/`account` describe the remote actor.
+    fn relayChannelPolicyBlocks(
+        self: *LinuxServer,
+        channel: []const u8,
+        nick: []const u8,
+        prefix: []const u8,
+        account: []const u8,
+    ) bool {
+        // +n no_external: only members may send. Resolve membership across the
+        // combined local+remote projection; a non-member is dropped.
+        const is_member = self.relaySenderIsMember(channel, nick);
+        if (self.world.channelHasFlag(channel, .no_external) and !is_member) return true;
+
+        const modes = self.relaySenderModes(channel, nick);
+
+        // +m moderated: a member without voice+ cannot speak.
+        if (self.world.channelHasFlag(channel, .moderated) and !modes.canSpeakModerated()) return true;
+        // +M mod_reg: an unauthenticated member without voice+ cannot speak.
+        if (self.world.channelHasFlag(channel, .mod_reg) and account.len == 0 and !modes.canSpeakModerated()) return true;
+
+        // +b bans / +Z quiet: build an extban context from the remote actor's
+        // propagated prefix (nick!user@host) + account; an op member overrides a
+        // mute but not a ban. Account/host fall through to host-glob matching.
+        const ban_ctx = world_model.World.BanContext{
+            .account = if (account.len == 0) null else account,
+            .realname = "",
+            .host = prefix,
+            .country = null,
+            .channels = &.{},
+        };
+        if (self.world.isBannedCtx(channel, ban_ctx)) return true;
+        if (!modes.canSpeakModerated() and self.world.isMutedCtx(channel, ban_ctx)) return true;
+
+        return false;
+    }
+
     /// Surface a remote (mesh) channel membership change to LOCAL members of
     /// `channel` as live IRC lines, so clients already sitting in the channel see
     /// remote users join/leave/gain-status in real time — not only on a fresh
@@ -5263,20 +5432,46 @@ pub const LinuxServer = struct {
         const changes = link.takeTopicChanges() catch return;
         const remote = link.remoteName();
         for (changes) |*ch| {
-            self.applyRemoteTopic(ch);
-            self.emitRemoteTopic(ch, remote);
+            // Only surface the topic to local members when this node actually
+            // applied it: a +t-rejected remote topic must neither change state
+            // nor be echoed as a live TOPIC line.
+            if (self.applyRemoteTopic(ch)) self.emitRemoteTopic(ch, remote);
             ch.deinit(self.allocator);
         }
         self.allocator.free(changes);
     }
 
-    fn applyRemoteTopic(self: *LinuxServer, ch: anytype) void {
-        if (!self.world.channelExists(ch.channel)) return;
-        if (ch.present) {
-            self.world.setTopic(ch.channel, ch.topic, ch.setter, ch.set_at) catch {};
-        } else {
-            self.world.setTopic(ch.channel, "", ch.setter, ch.set_at) catch {};
+    /// Apply an inbound remote TOPIC to the local projection. Returns true when
+    /// applied, false when rejected by local policy (so the caller suppresses the
+    /// live emit).
+    fn applyRemoteTopic(self: *LinuxServer, ch: anytype) bool {
+        if (!self.world.channelExists(ch.channel)) return false;
+        // Receiver-side defense-in-depth, mirroring handleTopic: when THIS node's
+        // projection has +t (topic_ops), only an op/founder may change the topic.
+        // Resolve the remote setter's status across the combined local+remote
+        // projection (the setter is a nick/prefix); reject (do not apply, do not
+        // emit) when +t is set and the setter is not op/founder. Without +t we
+        // apply as before. Fail-closed under +t only — a setter we cannot resolve
+        // as op is rejected, matching the local policy for non-ops.
+        if (self.world.channelHasFlag(ch.channel, .topic_ops)) {
+            const setter_nick = setterNick(ch.setter);
+            const modes = self.relaySenderModes(ch.channel, setter_nick);
+            if (!modes.isOperator()) return false;
         }
+        if (ch.present) {
+            self.world.setTopic(ch.channel, ch.topic, ch.setter, ch.set_at) catch return false;
+        } else {
+            self.world.setTopic(ch.channel, "", ch.setter, ch.set_at) catch return false;
+        }
+        return true;
+    }
+
+    /// Extract the bare nick from a setter field that may be a full
+    /// `nick!user@host` prefix or just a bare nick (the topic setter is stored as
+    /// the client prefix). Returns the substring up to the first `!`.
+    fn setterNick(setter: []const u8) []const u8 {
+        if (std.mem.indexOfScalar(u8, setter, '!')) |bang| return setter[0..bang];
+        return setter;
     }
 
     fn emitRemoteTopic(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
@@ -11187,10 +11382,25 @@ pub const LinuxServer = struct {
         }
 
         // Reserve the new nick (frees the old mapping for this client).
+        // Account-aware same-nick allowance (mirrors registerConnNick): if this
+        // SASL-authed client changes to a nick already held by another LOCAL
+        // connection on the SAME account, attach to it rather than 433 — the
+        // existing holder keeps world ownership; this conn shares the nick. We
+        // skip re-registering the world nick (which would collide) but still
+        // rewrite the session nick and surface the local NICK line below so the
+        // client sees its requested nick took effect.
+        var shared_same_account = false;
         self.world.registerNick(newnick, wid) catch |err| switch (err) {
             error.NickInUse => {
-                try queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{newnick}, "Nickname is already in use");
-                return;
+                if (conn.session.account()) |acct| {
+                    if (self.nickHeldBySameAccount(newnick, acct, wid)) {
+                        shared_same_account = true;
+                    }
+                }
+                if (!shared_same_account) {
+                    try queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{newnick}, "Nickname is already in use");
+                    return;
+                }
             },
             else => return err,
         };
@@ -14704,7 +14914,11 @@ pub const LinuxServer = struct {
         try self.deliverTagged(recipient_id, dtags, msg);
         const recipient_account = if (self.connFor(recipient_id)) |rconn| rconn.session.account() else null;
         if (recipient_account) |acct| {
-            self.deliverSessionSyncSiblings(acct, dtags, msg, recipient_id, id);
+            // Pass the DM target nick so SAME-NICK siblings (the same identity
+            // signed in to this nick from another client) receive the message
+            // even without the session-sync cap; different-nick siblings still
+            // need the cap to opt in.
+            self.deliverSessionSyncSiblingsNick(acct, dtags, msg, recipient_id, id, target);
         }
         if (echo) try self.deliverTagged(id, dtags, msg);
         if (conn.session.account()) |sender_account| {
@@ -15088,6 +15302,7 @@ fn allowsSessionSyncSibling(
     conn: *const ConnState,
     skip_a_flat: u64,
     skip_b_flat: ?u64,
+    same_nick: bool,
 ) bool {
     if (!session.attached) return false;
     if (session.client == skip_a_flat) return false;
@@ -15096,6 +15311,11 @@ fn allowsSessionSyncSibling(
     }
     if (conn.closing) return false;
     if (conn.s2s != null or conn.s2s_secured != null) return false;
+    // A same-nick sibling is the same identity attaching from another client
+    // (multi-session under one nick): it must receive direct messages to its own
+    // nick regardless of the session-sync cap, which only governs OPT-IN
+    // mirroring of the account's OTHER nicks.
+    if (same_nick) return true;
     return conn.session.hasCap(.orochi_session_sync);
 }
 
@@ -16114,6 +16334,7 @@ test "session-sync unit: two sessions same account both session-sync get the DM"
         &sibling,
         monitorIdFromClient(target_id),
         monitorIdFromClient(sender_id),
+        false,
     ));
 }
 
@@ -16132,6 +16353,36 @@ test "session-sync unit: a session without the cap does not get the DM" {
         &sibling,
         monitorIdFromClient(target_id),
         null,
+        false,
+    ));
+}
+
+test "session-sync unit: a same-nick sibling gets the DM even without the cap" {
+    // A same-nick sibling (same identity, second client on the same nick) must
+    // receive a DM to its own nick regardless of the session-sync cap.
+    const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const sibling_id = client_model.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    var sibling = ConnState.init(-1); // NO orochi_session_sync cap
+    const session = sessions_mod.Session{
+        .client = monitorIdFromClient(sibling_id),
+        .token = [_]u8{0} ** 16,
+        .signon_ms = 0,
+    };
+    // same_nick = true bypasses the cap requirement.
+    try std.testing.expect(allowsSessionSyncSibling(
+        session,
+        &sibling,
+        monitorIdFromClient(target_id),
+        null,
+        true,
+    ));
+    // Without same_nick, the same capless sibling is NOT eligible.
+    try std.testing.expect(!allowsSessionSyncSibling(
+        session,
+        &sibling,
+        monitorIdFromClient(target_id),
+        null,
+        false,
     ));
 }
 
@@ -16152,6 +16403,7 @@ test "session-sync unit: sender other session gets outgoing DM echo" {
         &sibling,
         monitorIdFromClient(sender_id),
         monitorIdFromClient(recipient_id),
+        false,
     ));
 }
 
@@ -16170,6 +16422,7 @@ test "session-sync unit: single-session account has no sibling copies" {
             &target_conn,
             monitorIdFromClient(target_id),
             null,
+            false,
         )) copies += 1;
     }
 
@@ -17587,6 +17840,65 @@ test "threaded server: session-sync single-session account keeps direct message 
     waitMillis(100);
     try a.readAvailable();
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(a.written(), "PRIVMSG A :single copy"));
+}
+
+// FIX 2: same account + SAME nick from a second client must attach as a session
+// and continue — it must NOT get a fatal 433 + connection drop. Both clients
+// reach 001, and a DM to the shared nick reaches the account's sessions.
+test "threaded server: same-account same-nick second client attaches, not 433-dropped" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_s = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_s);
+    const fd_k1 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_k1);
+    const fd_k2 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_k2);
+    var s = LiveClient{ .fd = fd_s };
+    var k1 = LiveClient{ .fd = fd_k1 };
+    var k2 = LiveClient{ .fd = fd_k2 };
+
+    // A plain sender, plus two clients SASL-authed to the SAME account both
+    // requesting the SAME nick "kain". The second must NOT be dropped.
+    try writeAllFd(fd_s, "NICK S\r\nUSER sender 0 * :Sender\r\n");
+    try saslPlainPrelude(fd_k1, "admin", "orochi");
+    try writeAllFd(fd_k1, "NICK kain\r\nUSER kain 0 * :Kain One\r\n");
+    try recvUntil(&k1, " 001 kain ", 200);
+    try saslPlainPrelude(fd_k2, "admin", "orochi");
+    try writeAllFd(fd_k2, "NICK kain\r\nUSER kain 0 * :Kain Two\r\n");
+    // BOTH reach 001 (the second is NOT 433'd/closed). Display nick is "kain".
+    try recvUntil(&k2, " 001 kain ", 200);
+    try recvUntil(&s, " 001 S ", 200);
+
+    // The second client must NOT have received a fatal ERR_NICKNAMEINUSE (433).
+    try std.testing.expect(std.mem.indexOf(u8, k2.written(), " 433 ") == null);
+
+    // A DM to the shared nick reaches the account's same-nick sessions. The world
+    // holder (k1) always gets it; k2 — a same-nick sibling of the same identity —
+    // receives it regardless of the session-sync cap.
+    k1.reset();
+    k2.reset();
+    try writeAllFd(fd_s, "PRIVMSG kain :hello shared\r\n");
+    try recvUntil(&k1, ":S!sender@localhost PRIVMSG kain :hello shared\r\n", 200);
+    try recvUntil(&k2, ":S!sender@localhost PRIVMSG kain :hello shared\r\n", 200);
+
+    // And the second connection is still live: it answers a PING.
+    k2.reset();
+    try writeAllFd(fd_k2, "PING probe2\r\n");
+    try recvUntil(&k2, "PONG", 200);
 }
 
 test "threaded server: draft/multiline batch reassembles + splits to recipient" {
@@ -20463,6 +20775,150 @@ test "threaded server: reciprocal [mesh].connect survives redial sweeps" {
     // not a runtime flap. Lock in that the asymmetric mesh holds.
     try runReciprocalMeshDurabilityTest(4, 1);
     try runReciprocalMeshDurabilityTest(1, 4);
+}
+
+// FIX 1: the RECEIVING node re-enforces ITS OWN channel policy against a remote
+// (mesh-relayed) actor. Two live nodes are meshed; node A's #c is set -n/-t so a
+// local non-op/non-member can legitimately speak/set-topic there and relay to
+// node B, where #c keeps the default +n/+t. The receiver gate on B must drop the
+// relayed PRIVMSG (+n, non-member) and reject the relayed TOPIC (+t, non-op),
+// while a legitimate member's message still flows. The default channel modes are
+// per-node and only converge on the 30s anti-entropy cadence, so the asymmetry
+// is stable for the test's lifetime when A sets -n/-t before B materializes #c.
+test "threaded server: inbound relay re-enforces local +n / +t against a remote actor" {
+    const alloc = std.testing.allocator;
+    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    var spec1_buf: [32]u8 = undefined;
+    var spec2_buf: [32]u8 = undefined;
+    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
+    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const node1_peers = [_][]const u8{node2_spec};
+    const node2_peers = [_][]const u8{node1_spec};
+
+    var node1 = Server.init(alloc, .{
+        .host = "127.0.0.1",       .port = 0,
+        .s2s_port = s2s_ports[0],  .node_id = 1,
+        .server_name = "node1.test", .mesh_connect = &node1_peers,
+        .num_shards = 1,           .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+    var node2 = Server.init(alloc, .{
+        .host = "127.0.0.1",       .port = 0,
+        .s2s_port = s2s_ports[1],  .node_id = 2,
+        .server_name = "node2.test", .mesh_connect = &node2_peers,
+        .num_shards = 1,           .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+    const port2 = node2.boundPort() catch return error.SkipZigTest;
+
+    var run1 = std.atomic.Value(bool).init(true);
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    defer {
+        node1.requestStop(&run1);
+        node2.requestStop(&run2);
+        thr1.join();
+        thr2.join();
+    }
+
+    // BMem on node 2 founds #c (+n/+t default) and stays. AMember on node 1 joins
+    // #c (becomes A's founder) and sets it -n -t BEFORE BMem exists on B is not
+    // possible (BMem founds B's #c); instead we set A's modes and rely on the
+    // per-node default split: B's #c is +n/+t, A's #c is -n/-t.
+    const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var bmem = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK BMem\r\nUSER bmem 0 * :B Member\r\n");
+    try recvUntil(&bmem, " 001 BMem ", 400);
+
+    // A's founder establishes #c on node 1 and relaxes it to -n -t so node 1's
+    // local gate permits a non-member/non-op to speak / set topic and relay.
+    const fd_af = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_af);
+    var afounder = LiveClient{ .fd = fd_af };
+    try writeAllFd(fd_af, "NICK AFounder\r\nUSER af 0 * :A Founder\r\n");
+    try recvUntil(&afounder, " 001 AFounder ", 400);
+    try writeAllFd(fd_af, "JOIN #c\r\n");
+    try recvUntil(&afounder, " 366 AFounder #c ", 400);
+    try writeAllFd(fd_af, "MODE #c -n\r\n");
+    try writeAllFd(fd_af, "MODE #c -t\r\n");
+    // Wait for the mesh to link both directions before BMem joins B's #c.
+    try expectMeshPeerVisible(&afounder, "node2.test", 200);
+    try expectMeshPeerVisible(&bmem, "node1.test", 200);
+
+    // BMem joins #c on node 2 (founds B's copy with default +n/+t).
+    bmem.reset();
+    try writeAllFd(fd_b, "JOIN #c\r\n");
+    try recvUntil(&bmem, " 366 BMem #c ", 400);
+
+    // --- Positive control: AFounder (a real member, gossiped into B's roster)
+    // PRIVMSGs #c; BMem must receive it (the gate allows legit members). ---
+    bmem.reset();
+    var member_ok = false;
+    var probes: usize = 0;
+    while (probes < 80 and !member_ok) : (probes += 1) {
+        try writeAllFd(fd_af, "PRIVMSG #c :from member\r\n");
+        recvUntil(&bmem, "PRIVMSG #c :from member", 120) catch {};
+        if (std.mem.indexOf(u8, bmem.written(), "PRIVMSG #c :from member") != null) member_ok = true;
+    }
+    try std.testing.expect(member_ok);
+
+    // --- Negative (+n): ANon, NOT a member of #c, speaks on node 1 (which is -n,
+    // so node 1 permits it) and node 1 relays to node 2. Node 2's #c is +n and
+    // ANon is not in B's roster, so the receiver gate must DROP it: BMem must NOT
+    // receive ANon's line within a generous window. ---
+    const fd_an = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_an);
+    var anon = LiveClient{ .fd = fd_an };
+    try writeAllFd(fd_an, "NICK ANon\r\nUSER anon 0 * :A NonMember\r\n");
+    try recvUntil(&anon, " 001 ANon ", 400);
+    bmem.reset();
+    // Fire several times to be sure the relay had every chance to arrive.
+    var n: usize = 0;
+    while (n < 10) : (n += 1) {
+        try writeAllFd(fd_an, "PRIVMSG #c :external blocked\r\n");
+        testSleepMs(20);
+    }
+    testSleepMs(150);
+    try bmem.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, bmem.written(), "external blocked") == null);
+
+    // --- Negative (+t): ANonOp, a non-op member of #c on node 1 (-t there), sets
+    // the topic; node 1 relays it to node 2 where #c is +t. Node 2 must REJECT it
+    // (topic unchanged / not echoed). We assert BMem does not see ANonOp's topic.
+    // First make ANon a member of #c on node 1 (it is -t, so a non-op can TOPIC).
+    try writeAllFd(fd_an, "JOIN #c\r\n");
+    try recvUntil(&anon, " 366 ANon #c ", 400);
+    bmem.reset();
+    n = 0;
+    while (n < 10) : (n += 1) {
+        try writeAllFd(fd_an, "TOPIC #c :hijacked topic\r\n");
+        testSleepMs(20);
+    }
+    testSleepMs(150);
+    try bmem.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, bmem.written(), "hijacked topic") == null);
+
+    // --- Positive control (+t): AFounder (op on node 1) sets the topic; node 2
+    // must APPLY+echo it to BMem (the +t gate allows ops). ---
+    bmem.reset();
+    var topic_ok = false;
+    probes = 0;
+    while (probes < 80 and !topic_ok) : (probes += 1) {
+        try writeAllFd(fd_af, "TOPIC #c :legit topic\r\n");
+        recvUntil(&bmem, "TOPIC #c :legit topic", 120) catch {};
+        if (std.mem.indexOf(u8, bmem.written(), "TOPIC #c :legit topic") != null) topic_ok = true;
+    }
+    try std.testing.expect(topic_ok);
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
