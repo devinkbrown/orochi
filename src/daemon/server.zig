@@ -2372,6 +2372,11 @@ pub const LinuxServer = struct {
                 const bytes = fabric.bytes(msg.buf);
                 const conn = self.rx().clients.get(msg.to) orelse continue;
                 if (conn.closing) continue;
+                if (msg.close_after and bytes.len == 0) {
+                    const tok = tokenFromId(msg.to) catch continue;
+                    self.closeConn(tok, msg.close_reason) catch {};
+                    continue;
+                }
                 appendToConn(conn, bytes) catch continue;
                 self.armSendIfNeeded(conn) catch {};
                 if (msg.close_after) {
@@ -3652,6 +3657,20 @@ pub const LinuxServer = struct {
 
     fn enqueueDeliveryThenClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_reason: []const u8) !void {
         return self.enqueueDeliveryMaybeClose(id, bytes, true, close_reason);
+    }
+
+    fn enqueueCloseOnOwner(self: *LinuxServer, id: client_model.ClientId, close_reason: []const u8) !void {
+        if (id.shard == self.rx().shard_id) {
+            const tok = try tokenFromId(id);
+            return self.closeConn(tok, close_reason);
+        }
+        const fabric = if (self.fabric) |*f| f else return;
+        const buf = fabric.acquire("") orelse return;
+        if (!fabric.sendTo(id.shard, .{ .to = id, .buf = buf, .close_after = true, .close_reason = close_reason })) {
+            fabric.release(buf);
+            return;
+        }
+        if (self.reactors[id.shard].wake) |*w| w.wake();
     }
 
     fn enqueueDeliveryMaybeClose(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, close_after: bool, close_reason: []const u8) !void {
@@ -9274,13 +9293,18 @@ pub const LinuxServer = struct {
             return;
         }
         const target = parsed.paramSlice()[0];
-        if (self.findSquitVictim(target)) |tok| {
-            try self.closeConn(tok, "SQUIT");
+        if (self.findSquitVictim(target)) |victim| {
+            try self.enqueueCloseOnOwner(victim.id, "SQUIT");
             try self.noticeTo(conn, "SQUIT complete");
         } else {
             try queueNumeric(conn, .ERR_NOSUCHSERVER, &.{target}, "No such server");
         }
     }
+
+    const SquitVictim = struct {
+        id: client_model.ClientId,
+        token: RingFdToken,
+    };
 
     fn peerRemoteName(conn: *const ConnState) ?[]const u8 {
         if (conn.s2s_secured) |link| return link.remoteName();
@@ -9288,11 +9312,11 @@ pub const LinuxServer = struct {
         return null;
     }
 
-    fn findSquitVictim(self: *LinuxServer, target: []const u8) ?RingFdToken {
-        var it = self.rx().clients.iterator();
+    fn findSquitVictim(self: *LinuxServer, target: []const u8) ?SquitVictim {
+        var it = self.reactors[0].clients.iterator();
         while (it.next()) |entry| {
             const remote = peerRemoteName(entry.value) orelse continue;
-            if (std.ascii.eqlIgnoreCase(remote, target)) return entry.value.token;
+            if (std.ascii.eqlIgnoreCase(remote, target)) return .{ .id = entry.id, .token = entry.value.token };
         }
         return null;
     }
@@ -12526,18 +12550,30 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
             return;
         };
-        var buf: [default_reply_bytes]u8 = undefined;
-        if (self.world.findNick(target)) |wid| {
-            if (self.rx().clients.get(clientIdFromWorld(wid))) |victim| {
-                if (!victim.closing) {
-                    const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Ghosted by {s}\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
-                    appendToConn(victim, ln) catch {};
-                    victim.close_reason = "Ghosted";
-                    victim.closing = true;
-                    self.armSendIfNeeded(victim) catch {};
-                }
-            }
+        const victim_wid = self.world.findNick(target) orelse {
+            try self.failReply(conn, "GHOST", "NICK_NOT_OWNED", "Nick is not logged in to your account");
+            return;
+        };
+        const victim_id = clientIdFromWorld(victim_wid);
+        const victim = self.connFor(victim_id) orelse {
+            try self.failReply(conn, "GHOST", "NICK_NOT_OWNED", "Nick is not logged in to your account");
+            return;
+        };
+        if (victim == conn) {
+            try self.failReply(conn, "GHOST", "NICK_NOT_OWNED", "Cannot ghost your own session");
+            return;
         }
+        const victim_account = victim.session.account() orelse {
+            try self.failReply(conn, "GHOST", "NICK_NOT_OWNED", "Nick is not logged in to your account");
+            return;
+        };
+        if (!std.ascii.eqlIgnoreCase(victim_account, account)) {
+            try self.failReply(conn, "GHOST", "NICK_NOT_OWNED", "Nick is not logged in to your account");
+            return;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Ghosted by {s}\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
+        try self.enqueueDeliveryThenClose(victim_id, ln, "Ghosted");
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Ghost session for {s} removed\r\n", .{ self.serverName(), conn.session.displayName(), target }) catch return;
         try appendToConn(conn, line);
     }
@@ -16194,24 +16230,26 @@ fn buildOperBindingsFromConfig(allocator: std.mem.Allocator, parsed: config_form
         };
     }
 
-    const bindings = try allocator.alloc(oper_mod.OperBinding, parsed.opers.len);
-    errdefer allocator.free(bindings);
-    for (parsed.opers, 0..) |o, i| {
-        const privileges = blk: {
-            if (o.class.len != 0 and groups.get(o.class) != null) {
-                const ep = groups.effectivePrivileges(o.class);
-                if (ep.count() > 0) break :blk ep;
-            }
-            break :blk oper_mod.OperPrivileges.full;
-        };
-        bindings[i] = .{
+    var bindings: std.ArrayList(oper_mod.OperBinding) = .empty;
+    errdefer bindings.deinit(allocator);
+    for (parsed.opers) |o| {
+        if (o.class.len == 0 or groups.get(o.class) == null) {
+            std.debug.print("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
+            continue;
+        }
+        const privileges = groups.effectivePrivileges(o.class);
+        if (privileges.count() == 0) {
+            std.debug.print("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
+            continue;
+        }
+        try bindings.append(allocator, .{
             .account_name = o.account,
-            .class_name = if (o.class.len != 0) o.class else "operator",
+            .class_name = o.class,
             .privileges = privileges,
             .title = o.title,
-        };
+        });
     }
-    return bindings;
+    return bindings.toOwnedSlice(allocator);
 }
 
 /// Format raw IPv6 bytes as eight colon-separated hex groups (matching the
@@ -16723,6 +16761,33 @@ test "REHASH oper binding builder preserves configured group privileges" {
     try std.testing.expect(grant.privileges.has(.audit_read));
     try std.testing.expect(!grant.privileges.has(.server_admin));
     try std.testing.expectEqualStrings("Network Guardian", grant.title);
+}
+
+test "REHASH oper binding builder skips unknown or empty classes" {
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[[oper_groups]]
+        \\name = "empty"
+        \\privileges = []
+        \\[[opers]]
+        \\account = "alice"
+        \\class = "missing"
+        \\[[opers]]
+        \\account = "bob"
+        \\class = "empty"
+        \\[[opers]]
+        \\account = "carol"
+        \\
+    ;
+    var parsed = try config_format.parseToml(std.testing.allocator, text, .{});
+    defer parsed.deinit(std.testing.allocator);
+    const bindings = try buildOperBindingsFromConfig(std.testing.allocator, parsed);
+    defer std.testing.allocator.free(bindings);
+
+    try std.testing.expectEqual(@as(usize, 0), bindings.len);
 }
 
 test "processLine answers PING with bare PONG token" {
@@ -17336,7 +17401,7 @@ test "threaded server: VERIFY accepts account argument and legacy code form" {
     try recvUntil(&bob, "VERIFY: your account email is now verified", 200);
 }
 
-test "threaded server: GHOST authenticates caller account for non-account nick" {
+test "threaded server: GHOST rejects caller account for non-account nick" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17380,8 +17445,9 @@ test "threaded server: GHOST authenticates caller account for non-account nick" 
     victim.reset();
     alice.reset();
     try writeAllFd(fd_alice, "GHOST AwayNick correcthorse\r\n");
-    try recvUntil(&alice, "Ghost session for AwayNick removed", 200);
-    try recvUntil(&victim, "ERROR :Ghosted by Alice", 200);
+    try recvUntil(&alice, "FAIL GHOST NICK_NOT_OWNED", 200);
+    try writeAllFd(fd_victim, "PING :still-here\r\n");
+    try recvUntil(&victim, "PONG :still-here", 200);
 }
 
 test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
@@ -21262,7 +21328,7 @@ test "threaded server: CHATHISTORY TARGETS lists active channels and DMs" {
 
     a.reset();
     try writeAllFd(fd_a, "CHATHISTORY TARGETS * * 10\r\n");
-    try recvUntil(&a, "BATCH +1 chathistory-targets", 200);
+    try recvUntil(&a, "BATCH +1 draft/chathistory-targets", 200);
     try recvUntil(&a, "CHATHISTORY TARGETS #t1 timestamp=", 200);
     try recvUntil(&a, "CHATHISTORY TARGETS b timestamp=", 200);
     try recvUntil(&a, "CHATHISTORY TARGETS #t2 timestamp=", 200);
@@ -21299,7 +21365,7 @@ test "threaded server: MARKREAD set then get" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_a, "CAP REQ :draft/read-marker\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
 
     // SET advances the marker and echoes it.
@@ -21534,8 +21600,6 @@ test "threaded server: MONITOR online fanout flushes beyond fixed sink size" {
         var reg_buf: [80]u8 = undefined;
         const reg = std.fmt.bufPrint(&reg_buf, "NICK W{d}\r\nUSER w{d} 0 * :Watcher {d}\r\n", .{ i, i, i }) catch unreachable;
         try writeAllFd(fds[i], reg);
-    }
-    for (0..watcher_count) |i| {
         var need: [16]u8 = undefined;
         const needle = std.fmt.bufPrint(&need, " 001 W{d} ", .{i}) catch unreachable;
         try recvUntil(&clients[i], needle, 400);
@@ -21661,8 +21725,50 @@ test "squit lookup finds secured peer entries" {
     peer.s2s_secured = secured;
 
     const found = server.findSquitVictim("SECURED.TEST") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(peer.token.slot, found.slot);
-    try std.testing.expectEqual(peer.token.gen, found.gen);
+    try std.testing.expectEqual(peer_id.shard, found.id.shard);
+    try std.testing.expectEqual(peer.token.slot, found.token.slot);
+    try std.testing.expectEqual(peer.token.gen, found.token.gen);
+}
+
+test "squit lookup finds reactor-zero peer from another shard" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    defer current_reactor = null;
+    current_reactor = &server.reactors[1];
+
+    const inner = try alloc.create(s2s_link.S2sLink);
+    try inner.init(.{
+        .allocator = alloc,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "local.test",
+    });
+    inner.peer.remote_name = try alloc.dupe(u8, "shard0.test");
+
+    const secured = try alloc.create(secured_s2s_link.SecuredLink);
+    secured.* = undefined;
+    secured.allocator = alloc;
+    secured.session = null;
+    secured.inner = inner;
+    secured.inbuf = .empty;
+    secured.out = .empty;
+
+    const peer_id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+    const peer = server.reactors[0].clients.get(peer_id).?;
+    peer.token = try tokenFromId(peer_id);
+    peer.s2s_secured = secured;
+
+    const found = server.findSquitVictim("SHARD0.TEST") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(peer_id.shard, found.id.shard);
+    try std.testing.expectEqual(@as(u12, 0), found.id.shard);
+    try std.testing.expectEqual(peer.token.slot, found.token.slot);
+    try std.testing.expectEqual(peer.token.gen, found.token.gen);
 }
 
 test "threaded server: oper CONNECT opens an outbound S2S link" {
