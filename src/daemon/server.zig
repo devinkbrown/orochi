@@ -6029,6 +6029,26 @@ pub const LinuxServer = struct {
                 return true;
             }
         }
+        // IRCX ACCESS DENY: a stored channel ACCESS entry whose mask matches the
+        // joiner and whose effective (highest-precedence) level is DENY blocks the
+        // join — the IRCX equivalent of a +b ban, managed via the ACCESS command.
+        // Like integ's +b below, this applies even to a pending invite; opers are
+        // not special-cased (mirrors +b).
+        //
+        // DELIBERATE: matchHostmask ranks DENY above GRANT/OWNER/HOST/VOICE
+        // (Level.precedence), so a joiner matching BOTH a DENY and a grant entry is
+        // denied (deny-wins). This adopts the store's deny-wins security default
+        // rather than ophion's grant-overrides-deny hierarchy — do not change
+        // without a policy decision. `catch null` is a deliberate FAIL-OPEN that
+        // matches the +b path: a hostmask failing the store's validation is treated
+        // as "no DENY match" (a registered joiner's nick!user@host is well-formed by
+        // construction, so this only bites if a vhost/cloak injects a bad host).
+        if (self.access.matchHostmask(channel, mask) catch null) |entry| {
+            if (entry.level == .deny) {
+                if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (ACCESS DENY)");
+                return true;
+            }
+        }
         // +b ban (isBannedCtx honors +e exceptions and extended bans) blocks the
         // join even when the user holds a pending invite.
         if (self.world.isBannedCtx(channel, ban_ctx)) {
@@ -15597,7 +15617,13 @@ pub const LinuxServer = struct {
                         try queueNumeric(conn, .ERR_CANTSENDTOUSER, &.{target}, "is in +g mode (must be accepted)");
                         try queueNumeric(conn, .RPL_TARGNOTIFY, &.{target}, "has been informed that you messaged them");
                     }
-                    try queueNumeric(rconn, .RPL_UMODEGMSG, &.{ sender_nick, "G" }, "is messaging you, and you have umode +g set. Use ACCEPT to allow");
+                    // 718 carries the sender's nick and user@host as distinct
+                    // tokens (ophion/charybdis RPL_UMODEGMSG layout) so the
+                    // recipient's client can populate an accept-prompt. A client
+                    // parsing by position would otherwise read a literal "G".
+                    var umask_buf: [256]u8 = undefined;
+                    const sender_uh = std.fmt.bufPrint(&umask_buf, "{s}@{s}", .{ conn.session.username(), hostOf(conn) }) catch sender_nick;
+                    try queueNumeric(rconn, .RPL_UMODEGMSG, &.{ sender_nick, sender_uh }, "is messaging you, and you have umode +g set. Use ACCEPT to allow");
                     // 718 is queued onto the recipient's connection (not the one
                     // being processed), so its send buffer must be armed explicitly
                     // or the bytes never reach the socket this reactor cycle.
@@ -21349,6 +21375,60 @@ test "threaded server: ACCESS add/list/delete gated by channel-op" {
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 804 ") == null);
 }
 
+test "threaded server: IRCX ACCESS DENY blocks the matching join" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var c = LiveClient{ .fd = fd_c };
+
+    // A founds #d (opts into IRCX for ACCESS); B has username "bob", C "carol".
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A ", 200);
+    try writeAllFd(fd_a, "JOIN #d\r\n");
+    try recvUntil(&a, " 366 A #d ", 200);
+
+    // Founder denies anyone whose user is "bob" via an ACCESS DENY entry.
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #d ADD DENY *!bob@*\r\n");
+    try recvUntil(&a, " 801 A #d DENY ", 200);
+
+    // B (user bob) is blocked from JOIN with 474; B never reaches end-of-NAMES.
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #d\r\n");
+    try recvUntil(&b, " 474 B #d :", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 366 B #d ") == null);
+
+    // C (user carol) does not match the DENY mask and joins normally.
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(&c, " 001 C ", 200);
+    c.reset();
+    try writeAllFd(fd_c, "JOIN #d\r\n");
+    try recvUntil(&c, " 366 C #d ", 200);
+}
+
 test "threaded server: EVENT subscription managed by opers" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -21632,7 +21712,9 @@ test "threaded server: +g callerid gates DM until sender is accepted" {
     b.reset();
     try writeAllFd(fd_a, "PRIVMSG B :blocked-by-callerid\r\n");
     try recvUntil(&a, " 716 A B :is in +g mode", 200);
-    try recvUntil(&b, " 718 B A ", 200);
+    // 718 carries the sender's nick + user@host as distinct tokens (host
+    // rendering of loopback varies, so assert the user@ prefix, not the host).
+    try recvUntil(&b, " 718 B A alice@", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "blocked-by-callerid") == null);
 
     // B accepts A; confirm the add landed (ACCEPT list shows A) before resending
