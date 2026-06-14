@@ -202,6 +202,7 @@ const reuseport = @import("reuseport.zig");
 const reactor_fabric = @import("reactor_fabric.zig");
 const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
+const og_mod = @import("operator_groups.zig");
 const config_format = @import("config_format.zig");
 const services_mod = @import("services.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
@@ -7266,7 +7267,7 @@ pub const LinuxServer = struct {
     /// refuses new client connections; `DRAIN OFF` resumes accepting. Existing
     /// clients and S2S links are never affected.
     pub fn handleDrain(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        // Operator gate enforced by the registry (access=.oper).
+        if (!self.requirePriv(conn, .server_admin)) return;
         const off = parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "OFF");
         self.draining = !off;
         var buf: [default_reply_bytes]u8 = undefined;
@@ -7276,7 +7277,7 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleClose(self: *LinuxServer, conn: *ConnState) !void {
-        // Operator gate enforced by the registry (access=.oper).
+        if (!self.requirePriv(conn, .client_moderate)) return;
         var closed: usize = 0;
         const line = "ERROR :Closing unregistered connection\r\n";
         for (self.reactors) |*reactor| {
@@ -7981,9 +7982,9 @@ pub const LinuxServer = struct {
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
     /// ERR_NOOPERMOTD if unset). `OPERMOTD SET :<text>` (oper-only) replaces it.
     pub fn handleOperMotd(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        // Operator gate enforced by the registry (access=.oper).
         const p = parsed.paramSlice();
         if (p.len >= 1 and std.ascii.eqlIgnoreCase(p[0], "SET")) {
+            if (!self.requirePriv(conn, .server_admin)) return;
             const text = if (p.len >= 2) p[1] else "";
             self.oper_motd.setFromText(text) catch {
                 try self.noticeTo(conn, "OPERMOTD: could not set (too long)");
@@ -8237,7 +8238,7 @@ pub const LinuxServer = struct {
     /// hostmask/channel audience). Delivered as a server NOTICE.
     pub fn handleGlobal(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         _ = id;
-        // Operator gate enforced by the registry (access=.oper).
+        if (!self.requirePriv(conn, .server_admin)) return;
         const req = global_notice.Request.parse(parsed.paramSlice()) catch {
             try self.noticeTo(conn, "Usage: GLOBAL [<mask>|#channel] :<text>");
             return;
@@ -8415,22 +8416,31 @@ pub const LinuxServer = struct {
 
     /// USERIP <nick>... — like USERHOST but shows IP (340).
     pub fn handleUserip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission Denied- You're not an IRC operator");
+            return;
+        }
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"USERIP"}, "Not enough parameters");
             return;
         }
         var targets: [5]userip.UseripTarget = undefined;
+        var ip_bufs: [5][cloak.max_cloak_len]u8 = undefined;
         var n: usize = 0;
         for (parsed.paramSlice()) |nick| {
             if (n >= targets.len) break;
             const wid = self.world.findNick(nick) orelse continue;
             const c = self.connFor(clientIdFromWorld(wid));
+            const ip = if (c) |cc|
+                if (cc.peer_addr) |addr| addrText(addr, &ip_bufs[n]) orelse default_host else default_host
+            else
+                default_host;
             targets[n] = .{
                 .nick = nick,
                 .oper = if (c) |cc| cc.session.isOper() else false,
                 .away = if (c) |cc| cc.session.awayMessage() != null else false,
                 .user = usernameOf(self, wid),
-                .ip = default_host,
+                .ip = ip,
             };
             n += 1;
         }
@@ -9121,7 +9131,7 @@ pub const LinuxServer = struct {
     /// DEBUG — oper command: dump the flight recorder (last N structured events)
     /// to the operator as notices. The "heavy debugging" entry point.
     pub fn handleDebug(self: *LinuxServer, conn: *ConnState) !void {
-        // Operator gate enforced by the registry (access=.oper).
+        if (!self.requirePriv(conn, .audit_read)) return;
         var buf: [256]tracelog.RecordedEvent = undefined;
         const events = self.trace_recorder.dump(&buf);
         var line_buf: [320]u8 = undefined;
@@ -13680,18 +13690,11 @@ pub const LinuxServer = struct {
             return;
         };
         // Build the new oper bindings (strings borrow `parsed`, kept alive below).
-        const bindings = self.allocator.alloc(oper_mod.OperBinding, parsed.opers.len) catch {
+        const bindings = buildOperBindingsFromConfig(self.allocator, parsed) catch {
             parsed.deinit(self.allocator);
             try self.noticeTo(conn, "REHASH: out of memory; keeping current config");
             return;
         };
-        for (parsed.opers, 0..) |o, i| {
-            bindings[i] = .{
-                .account_name = o.account,
-                .class_name = if (o.class.len != 0) o.class else "operator",
-                .privileges = oper_mod.OperPrivileges.full,
-            };
-        }
         const new_registry: ?oper_mod.OperRegistry = if (bindings.len != 0)
             (oper_mod.OperRegistry.init(bindings) catch {
                 self.allocator.free(bindings);
@@ -15854,6 +15857,46 @@ fn hostOf(conn: *const ConnState) []const u8 {
     return if (h.len == 0) default_host else h;
 }
 
+fn buildOperBindingsFromConfig(allocator: std.mem.Allocator, parsed: config_format.Config) std.mem.Allocator.Error![]oper_mod.OperBinding {
+    var groups = og_mod.Registry.init();
+    defer groups.deinit(allocator);
+    for (parsed.oper_groups) |g| {
+        var pbuf: [32]oper_mod.Privilege = undefined;
+        var pn: usize = 0;
+        for (g.privileges) |ps| {
+            if (std.meta.stringToEnum(oper_mod.Privilege, ps)) |p| {
+                if (pn < pbuf.len) {
+                    pbuf[pn] = p;
+                    pn += 1;
+                }
+            }
+        }
+        groups.add(allocator, g.name, oper_mod.OperPrivileges.initMany(pbuf[0..pn]), if (g.inherits.len > 0) g.inherits else null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+    }
+
+    const bindings = try allocator.alloc(oper_mod.OperBinding, parsed.opers.len);
+    errdefer allocator.free(bindings);
+    for (parsed.opers, 0..) |o, i| {
+        const privileges = blk: {
+            if (o.class.len != 0 and groups.get(o.class) != null) {
+                const ep = groups.effectivePrivileges(o.class);
+                if (ep.count() > 0) break :blk ep;
+            }
+            break :blk oper_mod.OperPrivileges.full;
+        };
+        bindings[i] = .{
+            .account_name = o.account,
+            .class_name = if (o.class.len != 0) o.class else "operator",
+            .privileges = privileges,
+            .title = o.title,
+        };
+    }
+    return bindings;
+}
+
 /// Format raw IPv6 bytes as eight colon-separated hex groups (matching the
 /// cloak module's IPv6 rendering style).
 /// True for an IPv4-mapped IPv6 address (::ffff:a.b.c.d) — the form a dual-stack
@@ -16320,6 +16363,38 @@ test "remoteGrantWhoisStatus maps grant privilege bits to WHOIS 313 flags" {
     // Unrelated privileges (no override/admin) stay silent in WHOIS.
     const plain = remoteGrantWhoisStatus(oper_mod.OperPrivileges.initMany(&.{.client_kill}).toBits());
     try std.testing.expect(!plain.is_oper and !plain.is_admin);
+}
+
+test "REHASH oper binding builder preserves configured group privileges" {
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[[oper_groups]]
+        \\name = "observer"
+        \\privileges = ["audit_read"]
+        \\[[oper_groups]]
+        \\name = "admin"
+        \\inherits = "observer"
+        \\privileges = ["server_rehash"]
+        \\[[opers]]
+        \\account = "alice"
+        \\class = "admin"
+        \\title = "Network Guardian"
+        \\
+    ;
+    var parsed = try config_format.parseToml(std.testing.allocator, text, .{});
+    defer parsed.deinit(std.testing.allocator);
+    const bindings = try buildOperBindingsFromConfig(std.testing.allocator, parsed);
+    defer std.testing.allocator.free(bindings);
+
+    const registry = try oper_mod.OperRegistry.init(bindings);
+    const grant = try registry.elevateAuthenticated(.{ .name = "alice" });
+    try std.testing.expect(grant.privileges.has(.server_rehash));
+    try std.testing.expect(grant.privileges.has(.audit_read));
+    try std.testing.expect(!grant.privileges.has(.server_admin));
+    try std.testing.expectEqualStrings("Network Guardian", grant.title);
 }
 
 test "processLine answers PING with bare PONG token" {
@@ -19285,6 +19360,84 @@ test "threaded server: oper DEBUG dumps the flight recorder" {
     try writeAllFd(fd_a, "DEBUG\r\n");
     try recvUntil(&a, "End of DEBUG flight recorder", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "operator elevated via SASL account") != null);
+}
+
+test "threaded server: USERIP is oper-only and reports real peer IP" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "USERIP B\r\n");
+    try recvUntil(&b, " 481 B ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "USERIP B\r\n");
+    try recvUntil(&a, " 340 A :B=+bob@127.0.0.1", 200);
+}
+
+test "threaded server: DRAIN requires server_admin privilege" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try saslPlainPrelude(fd_b, "oper", "orochi");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&b, " 381 B ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "DRAIN\r\n");
+    try recvUntil(&b, "requires the 'server_admin' operator privilege", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "DRAIN\r\n");
+    try recvUntil(&a, "DRAIN enabled", 200);
+    a.reset();
+    try writeAllFd(fd_a, "DRAIN OFF\r\n");
+    try recvUntil(&a, "DRAIN disabled", 200);
 }
 
 test "threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800" {
