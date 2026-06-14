@@ -4400,7 +4400,12 @@ pub const LinuxServer = struct {
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "QUIT", &.{}, reason);
+        const quit_prefix = try clientPrefix(conn, &prefix_buf);
+        const msg = try formatMessage(&msg_buf, quit_prefix, "QUIT", &.{}, reason);
+        // draft/event-playback body: `:reason` so the event renders `:nick QUIT
+        // :reason` (QUIT carries no target — recorded into each channel below).
+        var quit_body_buf: [600]u8 = undefined;
+        const quit_body = std.fmt.bufPrint(&quit_body_buf, ":{s}", .{reason}) catch ":";
 
         const nick = conn.session.displayName();
         const announce = !std.mem.eql(u8, nick, "*");
@@ -4408,6 +4413,7 @@ pub const LinuxServer = struct {
         while (it.next()) |entry| {
             if (entry.value_ptr.members.contains(worldIdFromClient(id))) {
                 try self.broadcastChannel(entry.key_ptr.*, msg, id);
+                self.recordHistoryEventSender(entry.key_ptr.*, quit_prefix, "QUIT", quit_body);
                 // Tell mesh peers this member is gone so their remote roster drops
                 // it and they emit a PART to their own local members (otherwise a
                 // disconnect leaves a ghost on the far side of the mesh).
@@ -8173,10 +8179,18 @@ pub const LinuxServer = struct {
     /// TOPIC) into the CHATHISTORY ring. Replays as `command` and is delivered
     /// only to clients that negotiated `event-playback`. A fresh msgid is minted
     /// (events carry no client msgid). `store_target` is the channel.
-    fn recordHistoryEvent(self: *LinuxServer, store_target: []const u8, conn: *ConnState, command: []const u8, text: []const u8) void {
-        const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+    fn recordHistoryEvent(self: *LinuxServer, store_target: []const u8, conn: *const ConnState, command: []const u8, text: []const u8) void {
         var prefix_buf: [256]u8 = undefined;
         const sender = clientPrefix(conn, &prefix_buf) catch return;
+        self.recordHistoryEventSender(store_target, sender, command, text);
+    }
+
+    /// Like `recordHistoryEvent` but with an explicit sender prefix — used for
+    /// cross-channel events (NICK uses the OLD prefix; QUIT records into every
+    /// channel the leaver was in) where the prefix is not simply `conn`'s current
+    /// identity at the call site.
+    fn recordHistoryEventSender(self: *LinuxServer, store_target: []const u8, sender: []const u8, command: []const u8, text: []const u8) void {
+        const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
         var msgid_buf: [msgid_mod.id_len]u8 = undefined;
         const msgid = self.msgid_gen.next(&msgid_buf);
         _ = self.history.append(store_target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts, .command = command }) catch {};
@@ -12090,6 +12104,17 @@ pub const LinuxServer = struct {
         // Deliver to self + every common-channel member (dedup, except self once).
         try self.deliver(id, msg);
         try self.notifyCommonChannels(id, msg, null, id, null);
+
+        // draft/event-playback: record the rename as a NICK event into each channel
+        // the user is in. Body is `:newnick` so it replays exactly like the live
+        // broadcast (`:oldnick NICK :newnick`), with the OLD prefix.
+        var nick_body_buf: [64]u8 = undefined;
+        const nick_body = std.fmt.bufPrint(&nick_body_buf, ":{s}", .{newnick}) catch newnick;
+        var nick_chans: [64][]const u8 = undefined;
+        const nick_chan_n = self.world.channelsOf(worldIdFromClient(id), &nick_chans);
+        for (nick_chans[0..nick_chan_n]) |cn| {
+            self.recordHistoryEventSender(cn, old_prefix, "NICK", nick_body);
+        }
 
         // Propagate the nick change across the mesh so remote members rename the
         // user and see a live NICK line (identity is nick-independent).
@@ -22930,6 +22955,54 @@ test "threaded server: event-playback replays JOIN, MODE, and KICK events" {
     try recvUntil(&a, ":B!bob@localhost JOIN #jk", 200);
     try recvUntil(&a, ":A!alice@localhost MODE #jk +m", 200);
     try recvUntil(&a, ":A!alice@localhost KICK #jk B :rude", 200);
+    try recvUntil(&a, "BATCH -1", 200);
+}
+
+test "threaded server: event-playback replays NICK and QUIT events" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A (event-playback) founds #nq; B joins, renames, then quits — both are
+    // cross-channel events recorded into #nq's history.
+    try writeAllFd(fd_a, "CAP REQ :draft/chathistory draft/event-playback\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #nq\r\n");
+    try recvUntil(&a, " 366 A #nq ", 200);
+    try writeAllFd(fd_b, "JOIN #nq\r\n");
+    try recvUntil(&b, " 366 B #nq ", 200);
+
+    a.reset();
+    try writeAllFd(fd_b, "NICK Bob2\r\n");
+    try recvUntil(&a, ":B!bob@localhost NICK :Bob2", 200);
+    try writeAllFd(fd_b, "QUIT :bye-now\r\n");
+    try recvUntil(&a, ":Bob2!bob@localhost QUIT :bye-now", 200);
+
+    // A replays both the NICK (old prefix) and QUIT (renamed prefix) events,
+    // matching the live broadcast format.
+    a.reset();
+    try writeAllFd(fd_a, "CHATHISTORY LATEST #nq * 10\r\n");
+    try recvUntil(&a, "BATCH +1 chathistory #nq", 200);
+    try recvUntil(&a, ":B!bob@localhost NICK :Bob2", 200);
+    try recvUntil(&a, ":Bob2!bob@localhost QUIT :bye-now", 200);
     try recvUntil(&a, "BATCH -1", 200);
 }
 
