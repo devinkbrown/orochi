@@ -5,7 +5,7 @@ Branch scanned: `integ`
 
 Scope: read-only source audit of `/home/kain/orochi` using 30 delegated audit scopes plus local grep review, combined with the earlier unwired/incomplete surface audit from the same date. No daemon source was changed for this report.
 
-## Verification Sweep — 2026-06-14 (`<pending>`)
+## Verification Sweep — 2026-06-14 (`d44580a`)
 
 A full re-verification of the original audit's detailed findings (the sections from "Executive Summary" down) against the **current** `integ` source, done by content match (the `src/…:line` anchors in those sections are now badly drifted and should be treated as historical). The headline: **those findings are the pre-repair snapshot and are overwhelmingly already resolved** — the repair run closed them faster than the report was annotated. Section-by-section disposition:
 
