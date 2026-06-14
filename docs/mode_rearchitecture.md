@@ -53,7 +53,8 @@ guiding principles for this review:
 - **IRCX extended channel flags** (`chanmode_ext.zig` / `ircx_modex.zig`, named via
   `MODEX`): `PRIVATE(p)`, `HIDDEN(h)`, `SECRET(s)`, `AUTHONLY(a)`, `NOFORMAT(f)`,
   `KNOCK(u)`, `AUDITORIUM(x)`, `NOWHISPER(w)`, `REGISTERED(r)`, `SERVICE(z)`,
-  `CLONEABLE(d)`, `CLONE(E)`, `NOCOMICDATA(Y)`.
+  `CLONEABLE(d)`, `CLONE(E)`, `NOCOMICDATA(V)` (reassigned from `Y`, which is the
+  network-operator PREFIX status letter `(YQqov)*` — letter-space collision).
 - **User modes** (`usermode.zig`): `invisible(i)`, `bot(B)`, `registered(r)`,
   `secure-tls(z)`, `deaf(D)`, `callerid(g)`, `no-ctcp(C)`, `cloaked(x)`.
 

@@ -62,7 +62,7 @@ pub const mode_specs = [_]ModeSpec{
     .{ .flag = .service, .letter = 'z', .name = "SERVICE", .requires_oper = true },
     .{ .flag = .auditorium, .letter = 'x', .name = "AUDITORIUM" },
     .{ .flag = .nowhisper, .letter = 'w', .name = "NOWHISPER" },
-    .{ .flag = .nocomicdata, .letter = 'Y', .name = "NOCOMICDATA" },
+    .{ .flag = .nocomicdata, .letter = 'V', .name = "NOCOMICDATA" },
     .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
     .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
@@ -73,7 +73,7 @@ const render_specs = [_]ModeSpec{
     .{ .flag = .clone, .letter = 'E', .name = "CLONE", .requires_oper = true },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
     .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
-    .{ .flag = .nocomicdata, .letter = 'Y', .name = "NOCOMICDATA" },
+    .{ .flag = .nocomicdata, .letter = 'V', .name = "NOCOMICDATA" },
     .{ .flag = .authonly, .letter = 'a', .name = "AUTHONLY" },
     .{ .flag = .cloneable, .letter = 'd', .name = "CLONEABLE" },
     .{ .flag = .noformat, .letter = 'f', .name = "NOFORMAT" },
@@ -379,7 +379,7 @@ test "renderModes returns active letters sorted by letter" {
         .hidden,
     });
 
-    try std.testing.expectEqualStrings("+EYahpz", try renderModes(flags, out));
+    try std.testing.expectEqualStrings("+EVahpz", try renderModes(flags, out));
 }
 
 test "requiresOper is true for CLONE REGISTERED SERVICE" {

@@ -103,7 +103,7 @@ The live MODE handler recognizes extended channel flags through `chanmode_ext.le
 | `z` | SERVICE | Yes | Service channel flag. | `src/proto/chanmode_ext.zig:62` |
 | `x` | AUDITORIUM | No | IRCX auditorium flag. | `src/proto/chanmode_ext.zig:63` |
 | `w` | NOWHISPER | No | Blocks channel WHISPER with `ERR_NOWHISPER`. | `src/proto/chanmode_ext.zig:64`, `src/daemon/server.zig:7790` |
-| `Y` | NOCOMICDATA | No | IRCX no comic data flag. | `src/proto/chanmode_ext.zig:65` |
+| `V` | NOCOMICDATA | No | IRCX flag: disables comic-chat `DATA` to the channel. Non-op members are refused with `ERR_NOCOMICDATA` (531); channel ops/founder and network opers bypass. (Letter was `Y`, reassigned to `V` because `Y` is the network-operator PREFIX status letter.) | `src/proto/chanmode_ext.zig:65`, `src/daemon/server.zig` (handleData) |
 | `O` | OPMODERATE | No | Routes messages blocked by moderation gates to ops instead of rejecting. | `src/proto/chanmode_ext.zig:66`, `src/daemon/server.zig:10972`, `src/daemon/server.zig:11059` |
 | `F` | FREETARGET | No | Allows channels to be forward targets without target-side op check. | `src/proto/chanmode_ext.zig:67`, `src/daemon/server.zig:4484` |
 | `D` | DISFORWARD | No | Refuses use as a forward target. | `src/proto/chanmode_ext.zig:68`, `src/daemon/server.zig:3880` |

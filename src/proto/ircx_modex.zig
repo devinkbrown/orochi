@@ -116,7 +116,7 @@ pub const mode_table = [_]ModeSpec{
     .{ .name = "SERVICE", .letter = 'z', .kind = .channel, .requires_oper = true },
     .{ .name = "AUDITORIUM", .letter = 'x', .kind = .channel },
     .{ .name = "NOWHISPER", .letter = 'w', .kind = .channel },
-    .{ .name = "NOCOMICDATA", .letter = 'Y', .kind = .channel },
+    .{ .name = "NOCOMICDATA", .letter = 'V', .kind = .channel },
     .{ .name = "FOUNDER", .letter = 'Q', .kind = .member, .status_prefix = '~' },
     .{ .name = "OWNER", .letter = 'q', .kind = .member, .status_prefix = '.' },
     .{ .name = "HOST", .letter = 'o', .kind = .member, .status_prefix = '@' },

@@ -932,6 +932,7 @@ const Numeric = enum(u16) {
     ERR_BANNEDFROMCHAN = 474,
     ERR_BADCHANNELKEY = 475,
     ERR_OPERONLYCHAN = 520,
+    ERR_NOCOMICDATA = 531,
     ERR_NEEDREGGEDNICK = 477,
     ERR_UNAVAILRESOURCE = 437,
     ERR_UNKNOWNMODE = 472,
@@ -11250,6 +11251,17 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{target}, "You're not on that channel");
                 return;
             }
+            // +V NOCOMICDATA: the channel has comic-chat DATA disabled. Members
+            // below channel-operator are refused with ERR_NOCOMICDATA (531);
+            // channel ops/founder and network opers bypass (they manage the
+            // channel / hold oper_override), mirroring moderation semantics.
+            if (self.world.channelHasExtFlag(chan, .nocomicdata)) {
+                const is_chan_op = if (self.world.memberModes(chan, worldIdFromClient(id))) |mm| mm.isOperator() else false;
+                if (!is_chan_op and !conn.session.isOper()) {
+                    try queueNumeric(conn, .ERR_NOCOMICDATA, &.{target}, "Channel does not allow comic-chat DATA (+V)");
+                    return;
+                }
+            }
             const speech = try self.channelSpeechGate(id, conn, target, chan, message, false, min_rank, true);
             if (speech == .deny) return;
             if (speech == .opmoderate or min_rank > 0) {
@@ -21168,6 +21180,57 @@ test "threaded server: DATA respects moderated channel speech gate" {
     b.reset();
     try writeAllFd(fd_b, "DATA #dm TAG :blocked\r\n");
     try recvUntil(&b, " 404 B #dm :Cannot send to channel (+m)", 200);
+}
+
+test "threaded server: +V NOCOMICDATA refuses non-op DATA with 531" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    // A founds #v, opts into IRCX, and sets +V (NOCOMICDATA). Serialized so the
+    // mode is committed before B joins/sends.
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #v\r\n");
+    try recvUntil(&a, " 366 A #v ", 200);
+    try writeAllFd(fd_a, "MODE #v +V\r\n");
+    try recvUntil(&a, "MODE #v +V", 200);
+
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+    try writeAllFd(fd_b, "JOIN #v\r\n");
+    try recvUntil(&b, " 366 B #v ", 200);
+
+    // B (a plain member) is refused DATA with ERR_NOCOMICDATA (531).
+    b.reset();
+    try writeAllFd(fd_b, "DATA #v TAG :blocked\r\n");
+    try recvUntil(&b, " 531 B #v :", 200);
+
+    // A (founder/channel-op) bypasses +V: its DATA reaches B.
+    b.reset();
+    try writeAllFd(fd_a, "DATA #v TAG :fromop\r\n");
+    try recvUntil(&b, "DATA #v TAG :fromop", 200);
 }
 
 test "threaded server: DATA STATUSMSG target reaches ops only" {

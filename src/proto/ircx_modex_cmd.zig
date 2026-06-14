@@ -104,7 +104,7 @@ pub const mode_specs = [_]ModeSpec{
     .{ .mode = .service, .letter = 'z', .name = "SERVICE", .oper_only = true },
     .{ .mode = .auditorium, .letter = 'x', .name = "AUDITORIUM" },
     .{ .mode = .nowhisper, .letter = 'w', .name = "NOWHISPER" },
-    .{ .mode = .nocomics, .letter = 'Y', .name = "NOCOMICDATA" },
+    .{ .mode = .nocomics, .letter = 'V', .name = "NOCOMICDATA" },
 };
 
 comptime {

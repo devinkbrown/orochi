@@ -90,7 +90,7 @@ pub const flag_specs = [_]FlagSpec{
     .{ .flag = .service, .letter = 'z', .name = "SERVICE" },
     .{ .flag = .auditorium, .letter = 'x', .name = "AUDITORIUM" },
     .{ .flag = .nowhisper, .letter = 'w', .name = "NOWHISPER" },
-    .{ .flag = .nocomicdata, .letter = 'Y', .name = "NOCOMICDATA" },
+    .{ .flag = .nocomicdata, .letter = 'V', .name = "NOCOMICDATA" },
     .{ .flag = .opmoderate, .letter = 'O', .name = "OPMODERATE" },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
     .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
