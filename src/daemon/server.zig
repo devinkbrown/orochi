@@ -7334,9 +7334,17 @@ pub const LinuxServer = struct {
         list.emitList(Adapter, &adapter, request, .{ .server_name = self.serverName(), .requester = conn.session.displayName(), .now_seconds = 0 }, &scratch, &sink) catch return;
     }
 
-    /// LISTX [<filter>] — IRCX extended channel list (811/812/817). Filter terms
-    /// (member-count, name/topic/subject mask, registered) per draft; time-based
-    /// terms degrade gracefully (no creation/topic timestamps tracked yet).
+    /// Upper bound on LISTX entries emitted before the reply is truncated with
+    /// RPL_LISTXTRUNC (816). Bounds pathological replies on large networks.
+    const listx_max_results: usize = 1024;
+
+    /// LISTX [<filter>] — IRCX extended channel list (811/812/816/817). Every
+    /// draft filter term is honored against real channel data: member-count,
+    /// name/topic/subject/language masks, creation-age (`C`) and topic-age (`T`)
+    /// thresholds, and the registered (`R=`) flag. Creation/topic ages are
+    /// computed in wall-clock ms from the channel's `created_unix`/`topic_time`
+    /// (unix seconds); SUBJECT/LANGUAGE come from the IRCX PROP store. The reply
+    /// is capped at `listx_max_results`, emitting 816 when truncated.
     pub fn handleListx(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const request = listx.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LISTX"}, "Invalid LISTX filter");
@@ -7345,19 +7353,37 @@ pub const LinuxServer = struct {
         const ctx = listx.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
         var buf: [default_reply_bytes]u8 = undefined;
         if (listx.writeListxStart(&buf, ctx)) |line| try appendToConn(conn, line) else |_| {}
+        const now_ms: u64 = @intCast(@max(0, platform.realtimeMillis()));
+        var emitted: usize = 0;
+        var truncated = false;
         var it = self.world.channelIterator();
         while (it.next()) |v| {
             if (v.secret or v.hidden) continue;
+            const entity = ircx_prop_store.Entity{ .kind = .channel, .id = v.name };
+            const subject = if (self.props.getProp(entity, "SUBJECT")) |ev| ev.value else |_| "";
+            const language = if (self.props.getProp(entity, "LANGUAGE")) |ev| ev.value else |_| "";
             const info = listx.ChannelInfo{
                 .name = v.name,
                 .members = @intCast(v.members),
                 .topic = v.topic,
-                .created_ms = 0,
-                .topic_ms = null,
+                .created_ms = if (v.created_unix > 0) @as(u64, @intCast(v.created_unix)) * 1000 else 0,
+                .topic_ms = if (v.topic_time > 0) @as(u64, @intCast(v.topic_time)) * 1000 else null,
+                .subject = subject,
+                .language = language,
+                .registered = v.registered,
             };
-            if (!request.matches(info, 0)) continue;
+            if (!request.matches(info, now_ms)) continue;
+            if (emitted >= listx_max_results) {
+                truncated = true;
+                break;
+            }
             var ebuf: [default_reply_bytes]u8 = undefined;
             if (listx.writeListxEntry(&ebuf, ctx, info)) |line| try appendToConn(conn, line) else |_| {}
+            emitted += 1;
+        }
+        if (truncated) {
+            var tbuf: [default_reply_bytes]u8 = undefined;
+            if (listx.writeListxTrunc(&tbuf, ctx, @intCast(emitted))) |line| try appendToConn(conn, line) else |_| {}
         }
         var endbuf: [default_reply_bytes]u8 = undefined;
         if (listx.writeListxEnd(&endbuf, ctx)) |line| try appendToConn(conn, line) else |_| {}
@@ -21579,6 +21605,49 @@ test "threaded server: DATA STATUSMSG target reaches ops only" {
     c.reset();
     try writeAllFd(fd_c, "DATA @#ds TAG :sneaky\r\n");
     try recvUntil(&c, " 482 C @#ds ", 200);
+}
+
+test "threaded server: LISTX filters on real channel SUBJECT from the PROP store" {
+    // Proves the LISTX handler reads real channel data (not hardcoded blanks):
+    // the S= subject filter must match a channel whose SUBJECT prop was set and
+    // exclude one with no subject.
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    a.* = .{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(a, " 800 A 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #alpha\r\n");
+    try recvUntil(a, " 366 A #alpha ", 200);
+    try writeAllFd(fd_a, "JOIN #beta\r\n");
+    try recvUntil(a, " 366 A #beta ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PROP #alpha SUBJECT :ziglang\r\n");
+    try recvUntil(a, " 818 A #alpha ", 200);
+
+    // S=zig* matches #alpha's real subject and excludes #beta (no subject).
+    a.reset();
+    try writeAllFd(fd_a, "LISTX S=zig*\r\n");
+    try recvUntil(a, " 817 ", 200); // RPL_LISTXEND
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "#alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "#beta") == null);
 }
 
 test "threaded server: PROP set/get gated by channel-op" {

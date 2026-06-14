@@ -1271,6 +1271,12 @@ pub const World = struct {
         topic: []const u8,
         secret: bool,
         hidden: bool,
+        /// Wall-clock unix seconds the channel was created (0 = unset).
+        created_unix: i64,
+        /// Wall-clock unix seconds the topic was last set (0 = no topic/unset).
+        topic_time: i64,
+        /// Whether the channel carries the registered (+r) ext flag.
+        registered: bool,
     };
 
     pub const ChannelViewIterator = struct {
@@ -1284,6 +1290,9 @@ pub const World = struct {
                     .topic = entry.value_ptr.topic orelse "",
                     .secret = entry.value_ptr.modes.secret,
                     .hidden = entry.value_ptr.hidden,
+                    .created_unix = entry.value_ptr.created_unix,
+                    .topic_time = entry.value_ptr.topic_time,
+                    .registered = entry.value_ptr.ext_modes.has(.registered),
                 };
             }
             return null;
