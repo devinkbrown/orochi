@@ -15776,7 +15776,26 @@ fn banContextFor(
         .host = host_mask,
         .country = if (country.len == 0) null else country,
         .channels = chan_buf[0..nchan],
+        .secure = conn.is_tls,
     };
+}
+
+test "banContextFor carries TLS state for secure extbans" {
+    var server: LinuxServer = undefined;
+    server.world = world_model.World.init(std.testing.allocator);
+    defer server.world.deinit();
+    server.metadata = metadata_store.DefaultStore.init(std.testing.allocator);
+    defer server.metadata.deinit();
+
+    var conn = ConnState.init(-1);
+    var chan_buf: [4][]const u8 = undefined;
+    const wid = world_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+
+    conn.is_tls = false;
+    try std.testing.expect(!banContextFor(&server, &conn, wid, "n!u@h", &chan_buf).secure);
+
+    conn.is_tls = true;
+    try std.testing.expect(banContextFor(&server, &conn, wid, "n!u@h", &chan_buf).secure);
 }
 
 /// Whether `text` is a CTCP request that `+C` should block — i.e. wrapped in
