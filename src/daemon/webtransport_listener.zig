@@ -156,8 +156,23 @@ const Connection = struct {
     scid: [quic_packet.max_connection_id_len]u8,
     scid_len: u8,
     /// Client-chosen Initial DCID (stable for the handshake); the other demux key.
+    /// After a Retry this is the *post-Retry* DCID (= the server's Retry SCID),
+    /// which the client now addresses; the ORIGINAL pre-Retry DCID lives in
+    /// `orig_dcid` below and is what the `original_destination_connection_id`
+    /// transport parameter must echo (RFC 9000 §7.3).
     init_dcid: [quic_packet.max_connection_id_len]u8,
     init_dcid_len: u8,
+    /// The DCID of the client's FIRST Initial (RFC 9000 §7.3 ODCID). Without a
+    /// Retry this equals `init_dcid`; after a Retry it is the pre-Retry DCID
+    /// recovered from the token. Stable storage borrowed by the transport params.
+    orig_dcid: [quic_packet.max_connection_id_len]u8,
+    orig_dcid_len: u8,
+    /// When this connection was minted after a Retry, the SCID the server placed
+    /// in the Retry packet (= this connection's post-Retry `init_dcid`), which the
+    /// `retry_source_connection_id` transport parameter MUST echo. Zero-length
+    /// (`retry_scid_len == 0`) when no Retry occurred.
+    retry_scid: [quic_packet.max_connection_id_len]u8,
+    retry_scid_len: u8 = 0,
     /// The peer's UDP return address (learned from the first datagram; this layer
     /// does not support migration, so it is fixed for the connection's life).
     peer: TransportAddress,
@@ -176,6 +191,15 @@ const Connection = struct {
     }
     fn initDcidSlice(self: *const Connection) []const u8 {
         return self.init_dcid[0..self.init_dcid_len];
+    }
+    fn origDcidSlice(self: *const Connection) []const u8 {
+        return self.orig_dcid[0..self.orig_dcid_len];
+    }
+    /// The `retry_source_connection_id` to advertise, or null when no Retry
+    /// occurred for this connection.
+    fn retryScidSlice(self: *const Connection) ?[]const u8 {
+        if (self.retry_scid_len == 0) return null;
+        return self.retry_scid[0..self.retry_scid_len];
     }
 };
 
@@ -359,8 +383,16 @@ pub const WebTransportListener = struct {
                 // The client returned a token. Accept it only if it authenticates
                 // for THIS source IP, is unexpired, and is not a replay; then the
                 // new connection is address-validated immediately (no 3× limit).
-                if (self.acceptToken(hdr.token, from, hdr.dcid)) {
-                    const conn = self.createConnection(hdr.dcid, from) orelse return null;
+                // The token carries the client's ORIGINAL (pre-Retry) DCID, which
+                // we recover here to set the ODCID transport parameter; the
+                // current `hdr.dcid` is the SCID we chose in the Retry packet, so
+                // it becomes the `retry_source_connection_id` (RFC 9000 §7.3).
+                var odcid_buf: [quic_packet.max_connection_id_len]u8 = undefined;
+                if (self.acceptToken(hdr.token, from, &odcid_buf)) |odcid| {
+                    const conn = self.createConnection(hdr.dcid, from, .{
+                        .original_dcid = odcid,
+                        .retry_scid = hdr.dcid,
+                    }) orelse return null;
                     conn.conn.markAddressValidated();
                     return conn;
                 }
@@ -374,8 +406,8 @@ pub const WebTransportListener = struct {
 
         // Fast path: mint the connection directly. It is still subject to the
         // per-connection 3× anti-amplification limit until a Handshake packet
-        // validates the address.
-        return self.createConnection(hdr.dcid, from);
+        // validates the address. No Retry → ODCID == the first-Initial DCID.
+        return self.createConnection(hdr.dcid, from, .{ .original_dcid = hdr.dcid });
     }
 
     /// Whether the Retry policy is currently active for a new Initial.
@@ -394,22 +426,28 @@ pub const WebTransportListener = struct {
     }
 
     /// Verify a returned Retry token: authenticates under our key, was minted for
-    /// `from`'s IP and the client-chosen `original_dcid`, is unexpired, and is
-    /// not a replay. Records it on success (single-use). Returns true if valid.
-    fn acceptToken(self: *WebTransportListener, token: []const u8, from: TransportAddress, original_dcid: []const u8) bool {
+    /// `from`'s IP, is unexpired, and is not a replay. On success records it
+    /// (single-use) and returns the client's ORIGINAL (pre-Retry) DCID recovered
+    /// from the token, written into `out_dcid`. Returns null if invalid.
+    fn acceptToken(
+        self: *WebTransportListener,
+        token: []const u8,
+        from: TransportAddress,
+        out_dcid: *[quic_packet.max_connection_id_len]u8,
+    ) ?[]const u8 {
         const sec = self.secret();
         var addr = from;
-        _ = quic_retry.Token.verify(
+        const v = quic_retry.Token.verify(
             token,
             sec,
             addr.bytes(),
-            original_dcid,
+            out_dcid,
             nowNs(),
             quic_retry.default_token_lifetime_ns,
-        ) catch return false;
+        ) catch return null;
         // Authenticated + fresh; enforce single-use (replay defense).
-        self.token_replay.checkAndRecord(token) catch return false;
-        return true;
+        self.token_replay.checkAndRecord(token) catch return null;
+        return v.original_dcid;
     }
 
     /// Emit a Retry packet (RFC 9000 §17.2.5): a fresh server SCID + an
@@ -743,9 +781,28 @@ pub const WebTransportListener = struct {
         return self.conns.items[idx];
     }
 
-    fn createConnection(self: *WebTransportListener, init_dcid: []const u8, from: TransportAddress) ?*Connection {
+    /// Address-validation provenance for a new connection. `original_dcid` is the
+    /// DCID of the client's first Initial (RFC 9000 §7.3 ODCID); when the
+    /// connection followed a Retry, `retry_scid` is the SCID the server chose in
+    /// the Retry packet. Without a Retry, `original_dcid == init_dcid` and
+    /// `retry_scid == null`.
+    const RetryInfo = struct {
+        original_dcid: []const u8,
+        retry_scid: ?[]const u8 = null,
+    };
+
+    fn createConnection(
+        self: *WebTransportListener,
+        init_dcid: []const u8,
+        from: TransportAddress,
+        retry: RetryInfo,
+    ) ?*Connection {
         if (self.liveCount() >= self.max_connections) return null;
         if (init_dcid.len > quic_packet.max_connection_id_len) return null;
+        if (retry.original_dcid.len > quic_packet.max_connection_id_len) return null;
+        if (retry.retry_scid) |rs| {
+            if (rs.len > quic_packet.max_connection_id_len) return null;
+        }
 
         // Mint a unique server SCID (8 bytes: counter || marker).
         var scid: [8]u8 = undefined;
@@ -766,6 +823,16 @@ pub const WebTransportListener = struct {
         conn.init_dcid_len = @intCast(init_dcid.len);
         @memcpy(conn.scid[0..scid.len], &scid);
         @memcpy(conn.init_dcid[0..init_dcid.len], init_dcid);
+        // ODCID = the original (pre-Retry) DCID — equals init_dcid without a Retry.
+        conn.orig_dcid = undefined;
+        conn.orig_dcid_len = @intCast(retry.original_dcid.len);
+        @memcpy(conn.orig_dcid[0..retry.original_dcid.len], retry.original_dcid);
+        // retry_source_connection_id, only when a Retry happened.
+        conn.retry_scid_len = 0;
+        if (retry.retry_scid) |rs| {
+            conn.retry_scid_len = @intCast(rs.len);
+            @memcpy(conn.retry_scid[0..rs.len], rs);
+        }
 
         const qconn = self.allocator.create(quic_conn.Conn) catch {
             self.allocator.destroy(conn);
@@ -780,7 +847,7 @@ pub const WebTransportListener = struct {
             .cert_chain = self.tls.cert_chain,
             .signing_key = self.tls.signing_key,
             .alpn_protocols = &[_][]const u8{"h3"},
-            .transport_params = serverTransportParams(conn.scidSlice(), conn.initDcidSlice()),
+            .transport_params = serverTransportParams(conn.scidSlice(), conn.origDcidSlice(), conn.retryScidSlice()),
             .local_cid = conn.scidSlice(),
         }) catch {
             self.allocator.destroy(qconn);
@@ -904,10 +971,19 @@ pub const WebTransportListener = struct {
 /// the transport parameters came from the endpoint it addressed. Both slices
 /// must outlive the handshake (the encoder borrows them); callers pass the
 /// connection's stable per-connection storage.
-fn serverTransportParams(scid: []const u8, original_dcid: []const u8) quic_transport_params.TransportParameters {
+fn serverTransportParams(
+    scid: []const u8,
+    original_dcid: []const u8,
+    retry_scid: ?[]const u8,
+) quic_transport_params.TransportParameters {
     return .{
         .original_destination_connection_id = original_dcid,
         .initial_source_connection_id = scid,
+        // RFC 9000 §7.3: present only when the connection followed a Retry; it is
+        // the SCID the server chose in the Retry packet. ngtcp2/curl rejects the
+        // handshake (TRANSPORT_PARAMETER_ERROR) if this is missing after a Retry
+        // or present without one.
+        .retry_source_connection_id = retry_scid,
         .max_idle_timeout = 30_000,
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 256 * 1024,
@@ -1900,4 +1976,135 @@ test "interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener" {
         },
     }
     try testing.expect(asciiContainsIgnoreCase(res.stdout, "orochi quic ok"));
+}
+
+/// The deterministic `/big` body byte at absolute offset `i` — mirrors
+/// `http3_conn.bigBodyByteAt` so the test can recompute the expected body and
+/// assert the curl download is byte-exact. Kept in lockstep with that function.
+fn expectedBigByte(i: usize) u8 {
+    const col: u8 = @intCast(i % 64);
+    const row: u8 = @intCast((i / 64) % 26);
+    if (col == 63) return '\n';
+    return 0x21 + ((col + row) % 0x5e);
+}
+
+test "interop: curl --http3 large transfer + multi-request + Retry round-trip (deep)" {
+    const allocator = testing.allocator;
+    const io = std.testing.io;
+
+    // Skip on a box whose curl lacks HTTP/3 (mirrors tools/quic_interop_deep.sh).
+    if (!curlHasHttp3(allocator)) return error.SkipZigTest;
+
+    var keys: TestServerKeys = undefined;
+    try keys.init();
+
+    // ---- variant A: large transfer + multi-request (retry off) -------------
+    {
+        var lst = WebTransportListener.init(allocator, .{
+            .cert_chain = &keys.cert_chain,
+            .signing_key = .{ .ed25519 = keys.kp },
+        }, 0);
+        defer lst.deinit();
+        lst.start(loopback_be, 0) catch |err| {
+            std.debug.print("interop-deep: bind failed ({s}); skipping\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        const port = lst.port;
+        try testing.expect(port != 0);
+
+        // Large transfer: download a 256 KiB /big body to a temp file and verify
+        // its exact length and byte-exact content (the deterministic pattern that
+        // flows through the real flow-control + congestion + ACK paths).
+        const big_n: usize = 256 * 1024;
+        var url_buf: [96]u8 = undefined;
+        const big_url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/big?n={d}", .{ port, big_n });
+        const big = std.process.run(allocator, io, .{
+            .argv = &.{ "curl", "--http3-only", "-k", "-sS", "--max-time", "30", big_url },
+        }) catch |err| {
+            std.debug.print("interop-deep: curl spawn failed ({s})\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        defer allocator.free(big.stdout);
+        defer allocator.free(big.stderr);
+        switch (big.term) {
+            .exited => |c| if (c != 0) {
+                std.debug.print("interop-deep: curl /big exited {d}; stderr: {s}\n", .{ c, big.stderr });
+                return error.CurlFailed;
+            },
+            else => return error.CurlFailed,
+        }
+        // Exact length …
+        try testing.expectEqual(big_n, big.stdout.len);
+        // … and byte-exact content (spot-check a spread of offsets incl. the
+        // boundaries — a full compare would also be correct but this is cheap and
+        // catches reordering/duplication/truncation just as well).
+        const probes = [_]usize{ 0, 1, 63, 64, 1000, 65535, 65536, 131072, big_n - 2, big_n - 1 };
+        for (probes) |off| {
+            try testing.expectEqual(expectedBigByte(off), big.stdout[off]);
+        }
+
+        // Multiple requests on ONE connection: one curl invocation, several URLs.
+        // Each `-o`/url pair writes to /dev/null; `-w` prints a per-request line.
+        var u_root: [64]u8 = undefined;
+        var u_big: [80]u8 = undefined;
+        var u_404: [80]u8 = undefined;
+        const root_url = try std.fmt.bufPrint(&u_root, "https://127.0.0.1:{d}/", .{port});
+        const small_big_url = try std.fmt.bufPrint(&u_big, "https://127.0.0.1:{d}/big?n=65536", .{port});
+        const nf_url = try std.fmt.bufPrint(&u_404, "https://127.0.0.1:{d}/nonexistent", .{port});
+        const multi = std.process.run(allocator, io, .{
+            .argv = &.{
+                "curl",      "--http3-only",                    "-k", "-sS",       "--max-time", "30",
+                "-w",        "%{http_code} %{size_download}\n", "-o", "/dev/null", root_url,     "-o",
+                "/dev/null", small_big_url,                     "-o", "/dev/null", nf_url,
+            },
+        }) catch return error.SkipZigTest;
+        defer allocator.free(multi.stdout);
+        defer allocator.free(multi.stderr);
+        switch (multi.term) {
+            .exited => |c| if (c != 0) {
+                std.debug.print("interop-deep: curl multi exited {d}; stderr: {s}\n", .{ c, multi.stderr });
+                return error.CurlFailed;
+            },
+            else => return error.CurlFailed,
+        }
+        // Each request returned its correct status + body size, over one conn.
+        try testing.expect(asciiContainsIgnoreCase(multi.stdout, "200 15"));
+        try testing.expect(asciiContainsIgnoreCase(multi.stdout, "200 65536"));
+        try testing.expect(asciiContainsIgnoreCase(multi.stdout, "404 10"));
+
+        lst.shutdown();
+    }
+
+    // ---- variant B: Retry round-trip (address validation on) ---------------
+    {
+        var lst = WebTransportListener.init(allocator, .{
+            .cert_chain = &keys.cert_chain,
+            .signing_key = .{ .ed25519 = keys.kp },
+        }, 0);
+        defer lst.deinit();
+        lst.start(loopback_be, 0) catch return error.SkipZigTest;
+        lst.retry_policy = .always; // force a Retry for every tokenless Initial.
+        const port = lst.port;
+        try testing.expect(port != 0);
+
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+        // curl must transparently handle the Retry packet (re-send its Initial
+        // with the token) and still complete the handshake + GET → 200.
+        const res = std.process.run(allocator, io, .{
+            .argv = &.{ "curl", "--http3-only", "-k", "-sS", "--max-time", "15", url },
+        }) catch return error.SkipZigTest;
+        defer allocator.free(res.stdout);
+        defer allocator.free(res.stderr);
+        switch (res.term) {
+            .exited => |c| if (c != 0) {
+                std.debug.print("interop-deep: Retry curl exited {d}; stderr: {s}\n", .{ c, res.stderr });
+                return error.CurlFailed;
+            },
+            else => return error.CurlFailed,
+        }
+        try testing.expect(asciiContainsIgnoreCase(res.stdout, "orochi quic ok"));
+
+        lst.shutdown();
+    }
 }

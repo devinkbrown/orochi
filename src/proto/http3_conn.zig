@@ -134,6 +134,18 @@ pub fn encodeFrame(allocator: Allocator, out: *std.ArrayList(u8), frame_type: u6
     try out.appendSlice(allocator, payload);
 }
 
+/// Append only an HTTP/3 frame *header* (type varint + length varint) for a
+/// frame whose `payload_len`-byte payload will be streamed separately. Used by
+/// the large-response path so a multi-hundred-KiB DATA frame never has to be
+/// buffered in one allocation: the frame header declares the length, then the
+/// body bytes follow on the same stream.
+pub fn appendFrameHeader(allocator: Allocator, out: *std.ArrayList(u8), frame_type: u64, payload_len: usize) Error!void {
+    var buf: [8]u8 = undefined;
+    try out.appendSlice(allocator, try webtransport.encodeVarint(frame_type, &buf));
+    const len_u64 = std.math.cast(u64, payload_len) orelse return error.Malformed;
+    try out.appendSlice(allocator, try webtransport.encodeVarint(len_u64, &buf));
+}
+
 /// Iterate frames in a buffer, skipping unknown/GREASE frame types. Returns the
 /// first frame whose type matches `want`, or null if the buffer is exhausted.
 /// `start` is advanced past every frame inspected so the caller can resume.
@@ -838,11 +850,33 @@ pub const Http3Conn = struct {
             return;
         }
 
+        // Split the request-target into its path and (optional) query string.
+        // `:path` is e.g. "/big?n=262144"; routing keys off the path component
+        // while the query carries the size parameter.
+        const target = splitTarget(req.path);
+
+        // Route `/big`: a large, deterministic, verifiable response body streamed
+        // as one H3 DATA frame across MANY QUIC packets. This is the path that
+        // exercises the real flow-control + congestion-window + ACK machinery;
+        // see `writeLargeResponse`. The size comes from `?n=<bytes>` (clamped to
+        // a sane maximum so a client cannot ask us to produce unbounded output).
+        if (std.mem.eql(u8, target.path, "/big")) {
+            const n = parseSizeQuery(target.query);
+            h3Dbg("HTTP/3 {s} {s} on stream {d} → 200 (big, {d} bytes)", .{ req.method, req.path, sid, n });
+            try self.writeLargeResponse(sid, n);
+            try self.events.append(self.allocator, .{ .http_responded = .{
+                .stream_id = sid,
+                .status = "200",
+                .path = req.path,
+            } });
+            return;
+        }
+
         // Route: only the root path gets the 200 body; everything else is a
         // clean 404. We respond to any request method (GET/HEAD/POST/…) — curl's
         // probe uses GET; a body on a non-GET is harmless for this minimal
         // responder.
-        const is_root = std.mem.eql(u8, req.path, "/") or req.path.len == 0;
+        const is_root = std.mem.eql(u8, target.path, "/") or target.path.len == 0;
         const status: []const u8 = if (is_root) "200" else "404";
         const body: []const u8 = if (is_root) http_ok_body else http_not_found_body;
 
@@ -881,6 +915,62 @@ pub const Http3Conn = struct {
 
         // Finish the stream: a plain HTTP/3 response is a complete message.
         self.conn.sendStream(sid, out.items, true) catch return error.NotReady;
+    }
+
+    /// Answer `GET /big` with a large, deterministic body (`total` bytes) as a
+    /// single HTTP/3 DATA frame, streamed to the QUIC layer in bounded chunks so
+    /// we never materialise the whole body at once. The QUIC engine then carries
+    /// it across many packets, paced by curl's MAX_DATA/MAX_STREAM_DATA credit
+    /// and our own congestion window (RFC 9002) — exactly the machinery a tiny
+    /// GET never touched.
+    ///
+    /// The body is a repeated, line-oriented pattern (`bigBodyByteAt`) that the
+    /// client can verify byte-exactly: the byte at absolute offset `i` is fully
+    /// determined by `i`, so a checksum/length assertion catches any reordering,
+    /// duplication, or truncation in the flow-control/loss-recovery path.
+    fn writeLargeResponse(self: *Http3Conn, sid: u64, total: usize) Error!void {
+        // 1) HEADERS frame: 200 with the exact content-length so the client knows
+        //    the full size up front (and flags truncation as a hard error).
+        var len_buf: [20]u8 = undefined;
+        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{total}) catch return error.Malformed;
+        const hdrs = [_]qpack.Header{
+            .{ .name = ":status", .value = "200" },
+            .{ .name = "content-type", .value = "application/octet-stream" },
+            .{ .name = "content-length", .value = len_str },
+        };
+        const block = try qpack.encodeFieldSection(self.allocator, &hdrs);
+        defer self.allocator.free(block);
+
+        var head: std.ArrayList(u8) = .empty;
+        defer head.deinit(self.allocator);
+        try encodeFrame(self.allocator, &head, FrameType.headers, block);
+        // The DATA frame *header* (type + length varint); its payload (the body)
+        // is streamed separately below so we never buffer `total` bytes here.
+        try appendFrameHeader(self.allocator, &head, FrameType.data, total);
+        // The HEADERS + DATA-frame-header go out first, NOT finishing the stream.
+        self.conn.sendStream(sid, head.items, false) catch return error.NotReady;
+
+        if (total == 0) {
+            self.conn.sendStream(sid, &.{}, true) catch return error.NotReady;
+            return;
+        }
+
+        // 2) Stream the deterministic body in bounded chunks. Each chunk is copied
+        //    into the QUIC send queue (which dups it), so a fixed scratch buffer
+        //    suffices — peak extra memory is one chunk, not the whole body. The
+        //    QUIC layer segments these queued bytes into <= max_datagram packets
+        //    and only puts a congestion-window's worth on the wire per flush,
+        //    re-draining as ACKs free the window. Offsets are tracked by
+        //    `sendStream`, so successive chunks append seamlessly.
+        var sent: usize = 0;
+        var chunk: [big_chunk_len]u8 = undefined;
+        while (sent < total) {
+            const n = @min(big_chunk_len, total - sent);
+            fillBigBody(chunk[0..n], sent);
+            const is_last = (sent + n == total);
+            self.conn.sendStream(sid, chunk[0..n], is_last) catch return error.NotReady;
+            sent += n;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1042,6 +1132,70 @@ const http_ok_body: []const u8 = "orochi quic ok\n";
 const http_not_found_body: []const u8 = "not found\n";
 /// Body returned for a non-WebTransport CONNECT (405 Method Not Allowed).
 const http_method_not_allowed_body: []const u8 = "method not allowed\n";
+
+// --- large-response (`/big`) parameters ------------------------------------
+
+/// How many body bytes each `sendStream` chunk carries while streaming a `/big`
+/// response. Bounds the H3 layer's peak scratch to one chunk regardless of the
+/// total size; the QUIC layer re-segments these into <= max_datagram packets.
+const big_chunk_len: usize = 16 * 1024;
+/// Default `/big` body size when `?n=` is absent (256 KiB — large enough to span
+/// hundreds of packets and many congestion-window rounds).
+const big_default_bytes: usize = 256 * 1024;
+/// Hard ceiling on a `/big` body so a client cannot request unbounded output
+/// (1 MiB). Bytes are generated on the fly, so this caps work, not memory.
+const big_max_bytes: usize = 1024 * 1024;
+
+/// The deterministic body byte at absolute offset `i`. The body is a stream of
+/// fixed-width lines `"<offset-of-line-start padded>: orochi big body line\n"`
+/// — but we don't need the textual form to verify it; what matters is that the
+/// byte at offset `i` is a pure function of `i`, so the client can recompute the
+/// full expected body (or its checksum/length) and catch any reordering,
+/// duplication, or truncation introduced by the flow-control / loss-recovery
+/// path. We use a cheap, well-mixed function of `i` that still yields printable
+/// bytes (so a `curl ... | xxd` is human-readable during triage).
+inline fn bigBodyByteAt(i: usize) u8 {
+    // A 64-byte repeating window of printable ASCII; position within the window
+    // is `i % 64`, the window's "phase" rotates every 64 bytes. This makes every
+    // 64-byte aligned block distinct from its neighbours, so a dropped or
+    // duplicated block is detectable, while keeping generation O(1) per byte.
+    const col: u8 = @intCast(i % 64);
+    const row: u8 = @intCast((i / 64) % 26);
+    if (col == 63) return '\n';
+    return 0x21 + ((col + row) % 0x5e); // printable range 0x21..0x7e
+}
+
+/// Fill `dst` with the deterministic body starting at absolute offset `start`.
+fn fillBigBody(dst: []u8, start: usize) void {
+    for (dst, 0..) |*b, k| b.* = bigBodyByteAt(start + k);
+}
+
+/// The path and (optional) query parts of an HTTP request-target. `query` is the
+/// text after the first '?', or empty when there is none.
+const RequestTarget = struct { path: []const u8, query: []const u8 };
+
+/// Split an HTTP `:path` value into its path and query components on the first
+/// '?'. Borrows `target`.
+fn splitTarget(target: []const u8) RequestTarget {
+    if (std.mem.indexOfScalar(u8, target, '?')) |q| {
+        return .{ .path = target[0..q], .query = target[q + 1 ..] };
+    }
+    return .{ .path = target, .query = "" };
+}
+
+/// Parse the `n=<bytes>` parameter from a query string into a clamped body size.
+/// Missing/invalid → the default; values above the ceiling are clamped down so a
+/// client can never request unbounded output.
+fn parseSizeQuery(query: []const u8) usize {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (std.mem.startsWith(u8, pair, "n=")) {
+            const v = std.fmt.parseInt(usize, pair[2..], 10) catch return big_default_bytes;
+            return @min(v, big_max_bytes);
+        }
+    }
+    return big_default_bytes;
+}
 
 /// HTTP/3 interop tracing, gated on `OROCHI_QUIC_DEBUG` (any non-empty value).
 /// Off by default; only read by interop triage. Linux-only (reads

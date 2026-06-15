@@ -284,10 +284,13 @@ pub fn supportsVersion(version: u32) bool {
 /// AES-256-GCM nonce length used for the token AEAD.
 const token_nonce_len: usize = 12;
 
-/// Plaintext bound to the token: client IP (len-prefixed, ≤16) + 8-byte issue
-/// timestamp (ns). The original DCID is carried in the AEAD *associated data* so
-/// it need not be echoed in plaintext but is still bound.
-const token_plaintext_max: usize = 1 + 16 + 8;
+/// Plaintext sealed into the token: client IP (len-prefixed, ≤16) + 8-byte issue
+/// timestamp (ns) + the original DCID (len-prefixed, ≤20). The original DCID is
+/// carried *in the encrypted plaintext* (not just AAD) so the stateless server
+/// can recover it on `verify` — it is the `original_destination_connection_id`
+/// transport parameter the server MUST echo after a Retry (RFC 9000 §7.3). The
+/// plaintext is AEAD-encrypted, so the DCID stays confidential and authenticated.
+const token_plaintext_max: usize = 1 + 16 + 8 + 1 + quic_packet.max_connection_id_len;
 
 /// Maximum encoded token length: 12-byte nonce ‖ ciphertext(plaintext) ‖ tag.
 pub const max_token_len: usize = token_nonce_len + token_plaintext_max + tag_len;
@@ -327,9 +330,11 @@ pub const Token = struct {
     /// Seal an address-validation token binding `client_ip`, `original_dcid`,
     /// and the issue time `now_ns`, into `out`. Returns the token length.
     ///
-    /// The token = nonce(12, random) ‖ AES-256-GCM-seal(plaintext, aad), where
-    ///   plaintext = ip_len(1) ‖ ip ‖ now_ns(8 big-endian)
-    ///   aad       = original_dcid  (bound but not transmitted in the token)
+    /// The token = nonce(12, random) ‖ AES-256-GCM-seal(plaintext), where
+    ///   plaintext = ip_len(1) ‖ ip ‖ now_ns(8 be) ‖ odcid_len(1) ‖ odcid
+    /// The original DCID is sealed *inside* the plaintext (encrypted +
+    /// authenticated) so a stateless server recovers it on `verify` to set the
+    /// `original_destination_connection_id` transport parameter (RFC 9000 §7.3).
     pub fn seal(
         out: []u8,
         secret: *const Secret,
@@ -348,6 +353,10 @@ pub const Token = struct {
         pl += client_ip.len;
         std.mem.writeInt(u64, plaintext[pl..][0..8], now_ns, .big);
         pl += 8;
+        plaintext[pl] = @intCast(original_dcid.len);
+        pl += 1;
+        @memcpy(plaintext[pl..][0..original_dcid.len], original_dcid);
+        pl += original_dcid.len;
 
         const needed = token_nonce_len + pl + tag_len;
         if (out.len < needed) return error.BufferTooSmall;
@@ -360,7 +369,8 @@ pub const Token = struct {
 
         const ct = out[token_nonce_len .. token_nonce_len + pl];
         var tag: [tag_len]u8 = undefined;
-        Aes256Gcm.encrypt(ct, &tag, plaintext[0..pl], original_dcid, nonce, secret.token_key);
+        // No associated data: everything bound is inside the encrypted plaintext.
+        Aes256Gcm.encrypt(ct, &tag, plaintext[0..pl], &.{}, nonce, secret.token_key);
         @memcpy(out[token_nonce_len + pl ..][0..tag_len], &tag);
         return needed;
     }
@@ -369,11 +379,16 @@ pub const Token = struct {
     pub const Verified = struct {
         /// The issue timestamp recovered from the token (ns).
         issued_ns: u64,
+        /// The original DCID recovered from the token — the DCID of the client's
+        /// first Initial (before the Retry). Borrows `out_dcid` (caller-provided).
+        original_dcid: []const u8,
     };
 
     /// Verify a token presented in a client Initial. Authenticates it under the
-    /// per-process key, confirms it was minted for `client_ip` and bound to
-    /// `original_dcid`, and that it is within `[now-lifetime, now]`.
+    /// per-process key, confirms it was minted for `client_ip`, recovers the
+    /// original DCID it bound, and checks it is within `[now-lifetime, now]`.
+    /// The recovered original DCID is written into `out_dcid` and returned as a
+    /// sub-slice of it (so the caller owns the storage).
     ///
     /// Returns `Verified` on success; one of the `TokenError` members otherwise.
     /// Replay is NOT checked here (it needs mutable state) — use `ReplayCache`.
@@ -381,7 +396,7 @@ pub const Token = struct {
         token: []const u8,
         secret: *const Secret,
         client_ip: []const u8,
-        original_dcid: []const u8,
+        out_dcid: *[quic_packet.max_connection_id_len]u8,
         now_ns: u64,
         lifetime_ns: u64,
     ) TokenError!Verified {
@@ -399,18 +414,25 @@ pub const Token = struct {
             plaintext[0..ct_len],
             ct,
             tag,
-            original_dcid,
+            &.{}, // no associated data
             nonce,
             secret.token_key,
         ) catch return error.BadTag;
 
-        // Decode plaintext: ip_len(1) ‖ ip ‖ now_ns(8).
+        // Decode plaintext: ip_len(1) ‖ ip ‖ now_ns(8) ‖ odcid_len(1) ‖ odcid.
         if (ct_len < 1) return error.Malformed;
         const ip_len = plaintext[0];
         if (ip_len > 16) return error.Malformed;
-        if (ct_len != 1 + @as(usize, ip_len) + 8) return error.Malformed;
-        const ip = plaintext[1 .. 1 + ip_len];
-        const issued_ns = std.mem.readInt(u64, plaintext[1 + ip_len ..][0..8], .big);
+        var pos: usize = 1 + @as(usize, ip_len);
+        if (ct_len < pos + 8 + 1) return error.Malformed;
+        const ip = plaintext[1..pos];
+        const issued_ns = std.mem.readInt(u64, plaintext[pos..][0..8], .big);
+        pos += 8;
+        const odcid_len = plaintext[pos];
+        pos += 1;
+        if (odcid_len > quic_packet.max_connection_id_len) return error.Malformed;
+        if (ct_len != pos + @as(usize, odcid_len)) return error.Malformed;
+        @memcpy(out_dcid[0..odcid_len], plaintext[pos..][0..odcid_len]);
 
         // IP must match the address the Initial actually arrived from.
         if (!secure_fns.ctEq(ip, client_ip)) return error.AddressMismatch;
@@ -420,7 +442,7 @@ pub const Token = struct {
         if (issued_ns > now_ns) return error.Expired;
         if (now_ns - issued_ns > lifetime_ns) return error.Expired;
 
-        return .{ .issued_ns = issued_ns };
+        return .{ .issued_ns = issued_ns, .original_dcid = out_dcid[0..odcid_len] };
     }
 };
 
@@ -603,8 +625,12 @@ test "Retry token round-trips: seal then verify for the same IP and DCID" {
     var tok: [max_token_len]u8 = undefined;
     const n = try Token.seal(&tok, &secret, &client_ip, &odcid, now);
 
-    const v = try Token.verify(tok[0..n], &secret, &client_ip, &odcid, now + 1000, default_token_lifetime_ns);
+    var out_dcid: [quic_packet.max_connection_id_len]u8 = undefined;
+    const v = try Token.verify(tok[0..n], &secret, &client_ip, &out_dcid, now + 1000, default_token_lifetime_ns);
     try testing.expectEqual(now, v.issued_ns);
+    // The original DCID is recovered byte-exact from the sealed plaintext (it is
+    // the ODCID the server must echo after a Retry — RFC 9000 §7.3).
+    try testing.expectEqualSlices(u8, &odcid, v.original_dcid);
 }
 
 test "Retry token verify — rejects a different client IP (AddressMismatch)" {
@@ -617,9 +643,10 @@ test "Retry token verify — rejects a different client IP (AddressMismatch)" {
     var tok: [max_token_len]u8 = undefined;
     const n = try Token.seal(&tok, &secret, &client_ip, &odcid, now);
 
+    var out_dcid: [quic_packet.max_connection_id_len]u8 = undefined;
     try testing.expectError(
         error.AddressMismatch,
-        Token.verify(tok[0..n], &secret, &wrong_ip, &odcid, now, default_token_lifetime_ns),
+        Token.verify(tok[0..n], &secret, &wrong_ip, &out_dcid, now, default_token_lifetime_ns),
     );
 }
 
@@ -634,35 +661,37 @@ test "Retry token verify — rejects an expired token" {
 
     // now advanced well past the lifetime.
     const later = now + default_token_lifetime_ns + 1;
+    var out_dcid: [quic_packet.max_connection_id_len]u8 = undefined;
     try testing.expectError(
         error.Expired,
-        Token.verify(tok[0..n], &secret, &client_ip, &odcid, later, default_token_lifetime_ns),
+        Token.verify(tok[0..n], &secret, &client_ip, &out_dcid, later, default_token_lifetime_ns),
     );
 }
 
-test "Retry token verify — rejects a forged tag and a wrong-DCID binding" {
+test "Retry token verify — rejects a forged tag; recovers the bound DCID intact" {
     const secret = Secret.fromSeed([_]u8{0x33} ** 64);
     const client_ip = [_]u8{ 10, 0, 0, 1 };
     const odcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
-    const wrong_odcid = [_]u8{ 0x00, 0x11, 0x22, 0x33 };
     const now: u64 = 1_000_000_000;
 
     var tok: [max_token_len]u8 = undefined;
     const n = try Token.seal(&tok, &secret, &client_ip, &odcid, now);
 
-    // Corrupt a ciphertext byte → BadTag.
+    var out_dcid: [quic_packet.max_connection_id_len]u8 = undefined;
+
+    // Corrupt a ciphertext byte → BadTag (the sealed plaintext, incl. the DCID,
+    // is authenticated, so any tampering is detected).
     var forged = tok;
     forged[token_nonce_len] ^= 0x80;
     try testing.expectError(
         error.BadTag,
-        Token.verify(forged[0..n], &secret, &client_ip, &odcid, now, default_token_lifetime_ns),
+        Token.verify(forged[0..n], &secret, &client_ip, &out_dcid, now, default_token_lifetime_ns),
     );
 
-    // Right token but a different bound DCID → BadTag (the AAD differs).
-    try testing.expectError(
-        error.BadTag,
-        Token.verify(tok[0..n], &secret, &client_ip, &wrong_odcid, now, default_token_lifetime_ns),
-    );
+    // The untampered token verifies and yields the exact original DCID back; an
+    // attacker cannot substitute a different DCID without breaking the AEAD tag.
+    const v = try Token.verify(tok[0..n], &secret, &client_ip, &out_dcid, now, default_token_lifetime_ns);
+    try testing.expectEqualSlices(u8, &odcid, v.original_dcid);
 }
 
 test "ReplayCache — a token is accepted once and rejected on replay" {

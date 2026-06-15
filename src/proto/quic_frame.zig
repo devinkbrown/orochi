@@ -74,6 +74,13 @@ pub const Frame = union(enum) {
     /// HANDSHAKE_DONE (RFC 9000 §19.20, type 0x1e): the server signals the
     /// handshake is confirmed. Ack-eliciting, no payload.
     HANDSHAKE_DONE: void,
+    /// MAX_DATA (RFC 9000 §19.9, type 0x10): the peer raises the connection-level
+    /// flow-control limit (total stream-data offset it will accept). We honor it
+    /// on the send side to pace large responses within the peer's credit.
+    MAX_DATA: u64,
+    /// MAX_STREAM_DATA (RFC 9000 §19.10, type 0x11): the peer raises the per-
+    /// stream flow-control limit for `stream_id`.
+    MAX_STREAM_DATA: struct { stream_id: u64, limit: u64 },
     /// Any other well-formed transport frame we parse-and-skip rather than act
     /// on (RFC 9000 §12.4 requires every frame type to be processed, but a
     /// minimal endpoint MAY treat flow-control / connection-id management frames
@@ -236,9 +243,10 @@ pub fn encodeFrame(out: *std.ArrayList(u8), allocator: std.mem.Allocator, frame:
             try out.appendSlice(allocator, &data);
         },
         .HANDSHAKE_DONE => try out.append(allocator, 0x1e),
-        // We never *originate* an OTHER frame (it only ever results from decoding
-        // a parse-and-skip transport frame); re-encoding one is unsupported.
-        .OTHER => return WireError.UnknownFrameType,
+        // We never *originate* MAX_DATA / MAX_STREAM_DATA / OTHER frames here
+        // (they only ever result from decoding an inbound frame); re-encoding one
+        // is unsupported.
+        .MAX_DATA, .MAX_STREAM_DATA, .OTHER => return WireError.UnknownFrameType,
     }
 }
 
@@ -315,20 +323,32 @@ pub fn decodeFrame(allocator: std.mem.Allocator, input: []const u8) !DecodedFram
             _ = try takeBytes(input, &pos, tok_len);
             return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
         },
-        // MAX_DATA (0x10), MAX_STREAM_DATA (0x11), MAX_STREAMS bidi/uni
-        // (0x12/0x13), DATA_BLOCKED (0x14), STREAMS_BLOCKED bidi/uni (0x16/0x17):
-        // a single varint field (MAX_STREAM_DATA has a stream id first; handled
-        // below). All are flow-control / limit frames we honor implicitly via our
-        // own generous windows, so we parse-and-skip.
-        0x10, 0x12, 0x13, 0x14, 0x16, 0x17 => {
+        // MAX_DATA (0x10, RFC 9000 §19.9): a single varint, the new connection-
+        // level send limit. Surfaced so the driver can pace within the peer's
+        // credit.
+        0x10 => {
+            const limit = try takeVarInt(input, &pos);
+            return .{ .frame = .{ .MAX_DATA = limit }, .len = pos };
+        },
+        // MAX_STREAMS bidi/uni (0x12/0x13), DATA_BLOCKED (0x14), STREAMS_BLOCKED
+        // bidi/uni (0x16/0x17): a single varint field. Stream-count / blocked
+        // signals we honor implicitly via our own generous windows; parse-and-skip.
+        0x12, 0x13, 0x14, 0x16, 0x17 => {
             _ = try takeVarInt(input, &pos);
             return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
         },
-        // MAX_STREAM_DATA (0x11) and STREAM_DATA_BLOCKED (0x15): two varints
-        // (Stream ID + limit/offset).
-        0x11, 0x15 => {
+        // MAX_STREAM_DATA (0x11, RFC 9000 §19.10): Stream ID + new per-stream send
+        // limit. Surfaced for send-side pacing.
+        0x11 => {
+            const sid = try takeVarInt(input, &pos);
+            const limit = try takeVarInt(input, &pos);
+            return .{ .frame = .{ .MAX_STREAM_DATA = .{ .stream_id = sid, .limit = limit } }, .len = pos };
+        },
+        // STREAM_DATA_BLOCKED (0x15): two varints (Stream ID + offset). A blocked
+        // signal we parse-and-skip.
+        0x15 => {
             _ = try takeVarInt(input, &pos); // stream id
-            _ = try takeVarInt(input, &pos); // limit / offset
+            _ = try takeVarInt(input, &pos); // offset
             return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
         },
         // NEW_CONNECTION_ID (RFC 9000 §19.15): Seq, Retire Prior To, CID Length
@@ -571,6 +591,15 @@ fn expectFrameEqual(expected: Frame, actual: Frame) !void {
             try std.testing.expectEqualSlices(u8, &e, &actual.PATH_RESPONSE);
         },
         .HANDSHAKE_DONE => try std.testing.expect(actual == .HANDSHAKE_DONE),
+        .MAX_DATA => |e| {
+            try std.testing.expect(actual == .MAX_DATA);
+            try std.testing.expectEqual(e, actual.MAX_DATA);
+        },
+        .MAX_STREAM_DATA => |e| {
+            try std.testing.expect(actual == .MAX_STREAM_DATA);
+            try std.testing.expectEqual(e.stream_id, actual.MAX_STREAM_DATA.stream_id);
+            try std.testing.expectEqual(e.limit, actual.MAX_STREAM_DATA.limit);
+        },
         .OTHER => |e| {
             const a = actual.OTHER;
             try std.testing.expectEqual(e.frame_type, a.frame_type);

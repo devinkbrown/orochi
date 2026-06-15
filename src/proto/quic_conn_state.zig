@@ -1106,6 +1106,13 @@ pub const Engine = struct {
                     // the ACK; the driver acts on it if it cares.
                     ack_eliciting = true;
                 },
+                .MAX_DATA, .MAX_STREAM_DATA => {
+                    // RFC 9000 §13.2.1: ack-eliciting. The send-side flow-control
+                    // limits these raise are applied by the connection driver,
+                    // which re-walks the decoded frames; the engine only owes the
+                    // ACK here.
+                    ack_eliciting = true;
+                },
                 .OTHER => |o| {
                     // A parse-and-skip transport frame (MAX_DATA, MAX_STREAMS,
                     // NEW_CONNECTION_ID, RESET_STREAM, …). We honor our peers'

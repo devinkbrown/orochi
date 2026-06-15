@@ -426,6 +426,10 @@ pub const AckOutcome = struct {
     /// Re-queueable frames from packets just declared lost, in ascending packet
     /// order. Borrows the controller's scratch list — valid until the next call.
     lost_frames: []const LostFrame,
+    /// Frames carried by packets that were just newly acknowledged. The driver
+    /// uses the STREAM entries to reclaim acknowledged send-buffer bytes. Borrows
+    /// the controller's scratch list — valid until the next call.
+    acked_frames: []const LostFrame = &.{},
     /// True if this ACK produced a new RTT sample (so the driver resets pto_count).
     rtt_updated: bool = false,
 };
@@ -508,6 +512,9 @@ pub const Recovery = struct {
     /// Scratch reused by `onAckReceived` / timeout handlers to return lost frames
     /// without per-call allocation churn.
     lost_scratch: std.ArrayList(LostFrame) = .empty,
+    /// Scratch reused by `onAckReceived` to return the frames of newly-acked
+    /// packets (so the driver can reclaim acknowledged STREAM send-buffer bytes).
+    acked_scratch: std.ArrayList(LostFrame) = .empty,
 
     pub const Options = struct {
         max_datagram: u64,
@@ -532,6 +539,7 @@ pub const Recovery = struct {
     pub fn deinit(self: *Recovery) void {
         for (&self.sent) |*r| r.deinit(self.allocator);
         self.lost_scratch.deinit(self.allocator);
+        self.acked_scratch.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -595,6 +603,7 @@ pub const Recovery = struct {
         now_ns: u64,
     ) Allocator.Error!AckOutcome {
         self.lost_scratch.clearRetainingCapacity();
+        self.acked_scratch.clearRetainingCapacity();
         const reg = self.registry(level);
 
         // Find the largest newly-acked packet that is ack-eliciting; only such a
@@ -608,6 +617,10 @@ pub const Recovery = struct {
             const sp = reg.find(pn) orelse continue;
             sp.retired = true;
             if (sp.in_flight) self.cc.onPacketAcked(sp.sent_bytes);
+            // Surface this packet's frames so the driver can reclaim acknowledged
+            // STREAM send-buffer bytes. Best-effort: an append OOM just skips the
+            // reclaim (memory stays retained, never incorrect).
+            for (sp.frames.slice()) |fr| self.acked_scratch.append(self.allocator, fr) catch {};
             if (largest_newly_acked == null or pn > largest_newly_acked.?) {
                 largest_newly_acked = pn;
                 largest_send_ns = sp.time_sent_ns;
@@ -634,7 +647,11 @@ pub const Recovery = struct {
         // A new RTT sample means the PTO timer is RTT-driven again; reset backoff.
         if (rtt_updated) self.pto_count = 0;
 
-        return .{ .lost_frames = self.lost_scratch.items, .rtt_updated = rtt_updated };
+        return .{
+            .lost_frames = self.lost_scratch.items,
+            .acked_frames = self.acked_scratch.items,
+            .rtt_updated = rtt_updated,
+        };
     }
 
     /// The effective largest-acked for loss detection: the max of the ACK's

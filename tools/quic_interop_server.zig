@@ -29,6 +29,12 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Parse flags. `--retry` turns on address validation (RFC 9000 §8.1.2):
+    // every tokenless Initial is answered with a Retry packet, forcing the client
+    // to re-send its Initial carrying the token. A real client (curl/ngtcp2) must
+    // handle that round trip transparently and still complete the handshake.
+    const want_retry = cmdlineHasFlag("--retry");
+
     // Bind an ephemeral UDP port (0); the harness reads the chosen port back
     // from the `PORT=<n>` line we print below.
     const port: u16 = 0;
@@ -56,6 +62,7 @@ pub fn main() !void {
         .signing_key = .{ .ed25519 = kp },
     }, 0); // irc_port = 0: a plain GET never opens the IRC bridge.
     defer listener.deinit();
+    if (want_retry) listener.retry_policy = .always;
 
     listener.start(any_be, port) catch |err| {
         std.debug.print("quic_interop_server: bind failed: {s}\n", .{@errorName(err)});
@@ -85,6 +92,34 @@ fn writeAll(fd: i32, bytes: []const u8) void {
         if (signed <= 0) return;
         sent += rc;
     }
+}
+
+/// Whether the process command line contains `flag` (exact NUL-delimited argv
+/// token). Reads `/proc/self/cmdline` via raw syscalls — the harness is
+/// Linux-only and this avoids depending on the Zig-version-specific args API.
+/// The arguments are NUL-separated, so a token match is an exact match.
+fn cmdlineHasFlag(flag: []const u8) bool {
+    const linux = std.os.linux;
+    const rc = linux.open("/proc/self/cmdline", .{ .ACCMODE = .RDONLY }, 0);
+    const sfd: isize = @bitCast(rc);
+    if (sfd < 0) return false;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const r = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const sr: isize = @bitCast(r);
+        if (sr <= 0) break;
+        total += @intCast(r);
+    }
+    // Split on NUL and compare each token.
+    var it = std.mem.splitScalar(u8, buf[0..total], 0);
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, flag)) return true;
+    }
+    return false;
 }
 
 /// Fill `buf` from the OS CSPRNG via the raw Linux getrandom syscall (matching

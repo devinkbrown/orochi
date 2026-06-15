@@ -108,6 +108,37 @@ pub const min_initial_datagram: usize = 1200;
 /// safe UDP payload without PMTUD; we never exceed it.
 pub const max_datagram: usize = 1252;
 
+/// Send-side flow-control fallbacks used before the peer's transport parameters
+/// are known. Deliberately small so we never blast data at a peer we have not
+/// yet heard limits from; the real (usually larger) limits replace these the
+/// moment the handshake delivers the peer's params, and MAX_DATA/MAX_STREAM_DATA
+/// raise them further. The handshake's own control streams are tiny, so these
+/// never stall it.
+const default_peer_initial_max_data: u64 = 64 * 1024;
+const default_peer_initial_max_stream_data: u64 = 64 * 1024;
+
+/// The encoded length (1/2/4/8 bytes) of `v` as a QUIC variable-length integer
+/// (RFC 9000 §16). Used to size STREAM/DATAGRAM frame headers exactly so a
+/// packet is packed right up to `max_datagram` without overshoot.
+fn varIntLen(v: u64) usize {
+    if (v < (1 << 6)) return 1;
+    if (v < (1 << 14)) return 2;
+    if (v < (1 << 30)) return 4;
+    return 8;
+}
+
+/// The exact on-wire size of a STREAM frame header (type byte + stream id varint
+/// + offset varint + length varint) for a frame at `offset` on `stream_id`. We
+/// always emit the explicit-length form (OFF + LEN bits), so the length varint
+/// is present; the offset varint is omitted only at offset 0 (matching the
+/// encoder in `quic_frame.zig`). The length varint is sized for the worst case
+/// (a full packet) so we never under-budget and overshoot `max_datagram`.
+fn streamFrameHeaderLen(stream_id: u64, offset: u64) usize {
+    const off_len: usize = if (offset != 0) varIntLen(offset) else 0;
+    // type(1) + stream_id + [offset] + length(<=2 for any <16384-byte payload).
+    return 1 + varIntLen(stream_id) + off_len + 2;
+}
+
 /// Legacy fixed PTO, retained only as the bound a test uses to advance the
 /// simulated clock past the first (pre-RTT-sample) PTO. Real loss recovery now
 /// lives in `quic_recovery.zig` (RFC 9002). The initial PTO before any RTT
@@ -298,6 +329,58 @@ const PendingStream = struct {
     offset: u64,
     fin: bool,
     data: []u8, // owned
+};
+
+/// Per-stream outbound send state (RFC 9000 §2.3 / §19.8). Owns the *retained*
+/// bytes that have been queued for sending but not yet acknowledged, so a lost
+/// STREAM range can be re-transmitted from our own buffer without the
+/// application re-supplying it (the previous offset-rollback-only scheme could
+/// not actually re-send the bytes, so a single dropped packet on a large
+/// transfer stalled the stream forever). Memory is bounded: `buf` holds only
+/// `[acked_offset, queued_offset)` — bytes the peer has acknowledged are dropped
+/// from the front, so steady-state retention is at most one congestion / flow-
+/// control window of un-acked data per stream.
+const StreamSender = struct {
+    /// Absolute stream offset of `buf[0]` — the first byte not yet acknowledged.
+    acked_offset: u64 = 0,
+    /// Absolute offset of the next byte to put on the wire. Bytes in
+    /// `[acked_offset, send_offset)` are in flight (sent, unacked); bytes in
+    /// `[send_offset, acked_offset + buf.items.len)` are queued but unsent.
+    send_offset: u64 = 0,
+    /// Retained bytes from `acked_offset` onward (unacked + unsent). Freed from
+    /// the front as ACKs advance `acked_offset`.
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// The application asked to finish the stream at `fin_offset` (the total
+    /// byte count). Null until `sendStream(..., fin=true)`.
+    fin_offset: ?u64 = null,
+    /// Whether the FIN bit has actually been transmitted in a STREAM frame.
+    fin_sent: bool = false,
+
+    fn deinit(self: *StreamSender, allocator: Allocator) void {
+        self.buf.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Total bytes ever queued (the next write's absolute offset).
+    fn queuedEnd(self: *const StreamSender) u64 {
+        return self.acked_offset + self.buf.items.len;
+    }
+
+    /// Bytes queued but not yet put on the wire.
+    fn unsent(self: *const StreamSender) u64 {
+        return self.queuedEnd() - self.send_offset;
+    }
+
+    /// Whether there is anything left to send: unsent bytes, or a FIN that has
+    /// not yet ridden a STREAM frame.
+    fn hasSendable(self: *const StreamSender) bool {
+        if (self.unsent() > 0) return true;
+        if (self.fin_offset) |fo| {
+            // A pure-FIN (zero-length tail) is sendable once all data is sent.
+            if (!self.fin_sent and self.send_offset >= fo) return true;
+        }
+        return false;
+    }
 };
 
 /// A queued application DATAGRAM (RFC 9221) awaiting an outbound 1-RTT packet.
@@ -538,9 +621,29 @@ pub const Conn = struct {
     timer_kind: quic_recovery.TimerKind = .none,
     idle_timeout_ns: u64 = default_idle_timeout_ns,
 
-    /// Application data the caller queued for the next 1-RTT send.
-    pending_streams: std.ArrayList(PendingStream),
+    /// Per-stream outbound senders (retained-bytes + send/ack cursors), keyed by
+    /// stream id. Replaces the old "queue + offset map" so a lost STREAM range is
+    /// re-sent from our own buffer (real ACK-driven retransmit). Drained
+    /// `max_datagram`-segmented and cwnd/flow-control-bounded in `buildAppDatagram`.
+    stream_senders: std.AutoHashMapUnmanaged(u64, StreamSender) = .empty,
+    /// Stream ids in FIFO insertion order, so the flush visits streams fairly and
+    /// deterministically (a HashMap iteration order is unspecified).
+    stream_order: std.ArrayList(u64),
     pending_datagrams: std.ArrayList(PendingDatagram),
+    /// Send-side connection-level flow control (RFC 9000 §4.1): the maximum total
+    /// stream-data offset the peer will accept across all streams, from the peer's
+    /// `initial_max_data` transport parameter and raised by inbound MAX_DATA. We
+    /// never send stream bytes that would push our cumulative sent offset past
+    /// this. Seeded lazily from the peer transport params on first use.
+    peer_max_data: ?u64 = null,
+    /// Cumulative stream-data bytes we have *queued to send* across all streams
+    /// (the connection-level flow-control consumption). Compared against
+    /// `peer_max_data`.
+    fc_data_sent: u64 = 0,
+    /// Per-stream send-side flow-control limit (RFC 9000 §4.1): the max offset the
+    /// peer will accept on a given stream, from the peer's
+    /// `initial_max_stream_data_*` params and raised by inbound MAX_STREAM_DATA.
+    peer_max_stream_data: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Received application DATAGRAM (RFC 9221) payloads, owned copies, awaiting
     /// the application's `recvDatagram` drain. The engine's intake only accounts
     /// the ACK obligation for a DATAGRAM frame; the driver captures the payload
@@ -553,10 +656,6 @@ pub const Conn = struct {
     /// Next stream id this endpoint will assign for `openUniStream` (client uni
     /// starts at 2, server uni at 3 — RFC 9000 §2.1). Advances by 4.
     next_uni_stream: u64,
-    /// Per-stream count of bytes already shipped, so successive `sendStream`
-    /// calls compute the correct STREAM offset even after the queue is flushed.
-    sent_stream_map: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-
     const BufferedPacket = struct {
         level: EncryptionLevel,
         bytes: []u8, // owned copy of the full single packet
@@ -629,7 +728,7 @@ pub const Conn = struct {
             .scid = scid,
             .buffered = .empty,
             .newly_acked = .empty,
-            .pending_streams = .empty,
+            .stream_order = .empty,
             .pending_datagrams = .empty,
             .pending_path_responses = .empty,
             .recv_datagrams = .empty,
@@ -654,14 +753,18 @@ pub const Conn = struct {
         for (self.buffered.items) |b| self.allocator.free(b.bytes);
         self.buffered.deinit(self.allocator);
         self.newly_acked.deinit(self.allocator);
-        for (self.pending_streams.items) |p| self.allocator.free(p.data);
-        self.pending_streams.deinit(self.allocator);
+        {
+            var it = self.stream_senders.valueIterator();
+            while (it.next()) |s| s.deinit(self.allocator);
+            self.stream_senders.deinit(self.allocator);
+        }
+        self.stream_order.deinit(self.allocator);
+        self.peer_max_stream_data.deinit(self.allocator);
         for (self.pending_datagrams.items) |p| self.allocator.free(p.data);
         self.pending_datagrams.deinit(self.allocator);
         self.pending_path_responses.deinit(self.allocator);
         for (self.recv_datagrams.items) |p| self.allocator.free(p.data);
         self.recv_datagrams.deinit(self.allocator);
-        self.sent_stream_map.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1215,6 +1318,19 @@ pub const Conn = struct {
                     .DATAGRAM => |dg| try self.captureRecvDatagram(dg.data),
                     .PATH_CHALLENGE => |data| try self.onPathChallenge(data),
                     .PATH_RESPONSE => |data| self.onPathResponse(data, now),
+                    // Send-side flow control (RFC 9000 §4.1): the peer raised a
+                    // limit. Never let it shrink (a MAX_* is monotonic per §19.9/
+                    // §19.10); take the max so a reordered older frame can't lower
+                    // our credit.
+                    .MAX_DATA => |limit| {
+                        const cur = self.peer_max_data orelse self.peerInitialMaxData();
+                        self.peer_max_data = @max(cur, limit);
+                    },
+                    .MAX_STREAM_DATA => |m| {
+                        const cur = self.peer_max_stream_data.get(m.stream_id) orelse
+                            self.peerInitialStreamDataLimit(m.stream_id);
+                        self.peer_max_stream_data.put(self.allocator, m.stream_id, @max(cur, m.limit)) catch {};
+                    },
                     else => {},
                 }
             }
@@ -1673,11 +1789,19 @@ pub const Conn = struct {
         return 1 + 4 + 1 + self.dcid.len + 1 + self.scid.len + token + 2 + 4;
     }
 
-    /// Build a 1-RTT (short-header) application datagram: owed ACK + queued
-    /// STREAM/DATAGRAM frames.
+    /// Build the 1-RTT (short-header) application flight. The FIRST packet always
+    /// carries any owed ACK / HANDSHAKE_DONE / PATH_RESPONSE / DATAGRAMs plus as
+    /// much STREAM data as fits in one `max_datagram` packet. While the
+    /// congestion window and the peer's flow-control credit still admit more
+    /// STREAM data, ADDITIONAL `max_datagram`-bounded STREAM-only packets are
+    /// appended to `out` — so a large response (e.g. `/big`) goes out across many
+    /// packets, a congestion-window's worth per call, rather than one impossible
+    /// 256 KiB "packet". The remainder stays queued in the per-stream senders and
+    /// drains on subsequent calls as ACKs free the window.
     fn buildAppDatagram(self: *Conn, out: *std.ArrayList(OutDatagram), now: u64) Error!void {
-        const keys = self.keysFor(.application) orelse return;
+        if (self.keysFor(.application) == null) return;
 
+        // ---- packet 0: control frames + first slice of STREAM/DATAGRAM data ----
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
 
@@ -1715,43 +1839,62 @@ pub const Conn = struct {
         // data is gated by `canSend` (RFC 9002 §7).
         const cwnd_open = self.recovery.canSend(max_datagram);
 
-        // Queued STREAM writes.
         if (cwnd_open) {
-            for (self.pending_streams.items) |p| {
-                try quic_frame.encodeFrame(&payload, self.allocator, .{ .STREAM = .{
-                    .stream_id = p.stream_id,
-                    .offset = p.offset,
-                    .fin = p.fin,
-                    .len = p.data.len,
-                    .data = p.data,
-                } });
-                frames.append(.{ .stream = .{
-                    .stream_id = p.stream_id,
-                    .offset = p.offset,
-                    .len = p.data.len,
-                    .fin = p.fin,
-                } });
-                ack_eliciting = true;
-            }
-            // Queued DATAGRAMs (RFC 9221). DATAGRAMs are not retransmitted on loss
-            // (RFC 9221 §5.2) so they need no re-queue descriptor.
+            // Queued DATAGRAMs (RFC 9221) ride the first packet. Not retransmitted
+            // on loss (RFC 9221 §5.2) so they need no re-queue descriptor. Each is
+            // bounded to fit a single packet; oversize ones were rejected upstream.
             for (self.pending_datagrams.items) |p| {
+                const overhead = 2 + varIntLen(p.data.len);
+                if (payload.items.len + overhead + p.data.len + quic_protect.aead_tag_len > max_datagram) break;
                 try quic_frame.encodeFrame(&payload, self.allocator, .{ .DATAGRAM = .{
                     .len = p.data.len,
                     .data = p.data,
                 } });
                 ack_eliciting = true;
             }
+            self.clearPendingDatagrams();
+
+            // Fill the rest of this first packet with STREAM data.
+            if (try self.fillStreamFrames(&payload, &frames, max_datagram)) ack_eliciting = true;
         }
 
-        if (payload.items.len == 0) return; // nothing owed
+        // Emit packet 0 if it carries anything (an ACK-only packet still goes out).
+        if (payload.items.len != 0) {
+            try self.sealAndAppendApp(out, payload.items, ack_eliciting, frames, now);
+        }
 
+        // ---- additional STREAM-only packets, cwnd + flow-control bounded -------
+        // Keep filling `max_datagram`-sized packets with STREAM data while the
+        // window admits more and data remains. `recovery.canSend` re-checks the
+        // in-flight total after each recorded send, so this loop naturally stops
+        // at one congestion window per call; the rest drains on later calls.
+        while (self.recovery.canSend(max_datagram) and self.anyStreamSendable()) {
+            var pkt: std.ArrayList(u8) = .empty;
+            defer pkt.deinit(self.allocator);
+            var pkt_frames = quic_recovery.FrameList{};
+            const wrote = try self.fillStreamFrames(&pkt, &pkt_frames, max_datagram);
+            if (!wrote or pkt.items.len == 0) break; // flow-control blocked: stop
+            try self.sealAndAppendApp(out, pkt.items, true, pkt_frames, now);
+        }
+    }
+
+    /// Seal one 1-RTT packet over `payload` and append it to `out`, updating the
+    /// key-update epoch counters and recording it for loss recovery.
+    fn sealAndAppendApp(
+        self: *Conn,
+        out: *std.ArrayList(OutDatagram),
+        payload: []const u8,
+        ack_eliciting: bool,
+        frames: quic_recovery.FrameList,
+        now: u64,
+    ) Error!void {
+        const keys = self.keysFor(.application) orelse return error.NotEstablished;
         const pn = self.engine.space(.application).nextPacketNumber();
         const pn_len: usize = 4;
         var header_buf: [long_header_max]u8 = undefined;
         const header_len = try self.buildShortHeader(&header_buf, pn, pn_len);
 
-        const total = header_len + payload.items.len + quic_protect.aead_tag_len;
+        const total = header_len + payload.len + quic_protect.aead_tag_len;
         const out_slice = try self.allocator.alloc(u8, total);
         defer self.allocator.free(out_slice);
         const sealed = quic_protect.sealPacketSuite(
@@ -1760,7 +1903,7 @@ pub const Conn = struct {
             header_len - pn_len,
             pn_len,
             pn,
-            payload.items,
+            payload,
             keys.write,
         ) catch return error.MalformedPacket;
 
@@ -1778,13 +1921,142 @@ pub const Conn = struct {
             }
         }
 
-        // The STREAM/DATAGRAM frames are now on the wire. We commit the per-stream
-        // sent offsets and clear the queues; on loss, recovery returns the
-        // re-queueable STREAM descriptors and `requeueLostFrames` re-enqueues them
-        // from `sent_stream_map`. The Engine reassembly + ACKs guarantee delivery.
-        self.clearPendingApp();
         try self.recordSent(.application, pn, sealed.len, ack_eliciting, frames, now);
         self.engine.space(.application).onAckSent();
+    }
+
+    /// Greedily pack STREAM frames from the per-stream senders into `payload`
+    /// until it would exceed `packet_budget` (the target on-wire packet size) or
+    /// the per-stream / connection flow-control credit is exhausted. Records each
+    /// emitted range in `frames` for loss recovery and advances each sender's
+    /// `send_offset`. Returns true if any STREAM frame was written. Visits streams
+    /// in FIFO order so a single huge stream cannot starve a later one within a
+    /// packet, while still letting one stream fill a packet on its own.
+    fn fillStreamFrames(
+        self: *Conn,
+        payload: *std.ArrayList(u8),
+        frames: *quic_recovery.FrameList,
+        packet_budget: usize,
+    ) Error!bool {
+        var wrote = false;
+        for (self.stream_order.items) |sid| {
+            const sender = self.stream_senders.getPtr(sid) orelse continue;
+            while (sender.hasSendable()) {
+                if (frames.len >= quic_recovery.FrameList.cap) return wrote; // recovery descriptor space
+                // Remaining room in this packet for a STREAM frame's payload,
+                // after its header (type + stream id + offset + length varints).
+                const used = payload.items.len + quic_protect.aead_tag_len;
+                if (used >= packet_budget) return wrote;
+                const room = packet_budget - used;
+
+                const data_off = sender.send_offset;
+                const hdr_overhead = streamFrameHeaderLen(sid, data_off);
+                if (room <= hdr_overhead) return wrote; // no room for even 1 data byte
+                var max_payload = room - hdr_overhead;
+
+                // Honor the peer's flow-control credit (RFC 9000 §4.1): never send
+                // past the per-stream limit or the connection-level limit.
+                const stream_credit = self.streamSendCredit(sid, data_off);
+                const conn_credit = self.connSendCredit();
+                max_payload = @min(max_payload, @min(stream_credit, conn_credit));
+
+                const unsent = sender.unsent();
+                const send_len = @min(@as(u64, max_payload), unsent);
+
+                // A pure-FIN (no data) frame: allowed only when all data is sent
+                // and flow control isn't the blocker (a zero-length frame consumes
+                // no credit).
+                const is_fin = if (sender.fin_offset) |fo|
+                    (!sender.fin_sent and data_off + send_len >= fo)
+                else
+                    false;
+
+                if (send_len == 0 and !is_fin) break; // flow-control blocked this stream
+
+                const slice_start: usize = @intCast(data_off - sender.acked_offset);
+                const slice = sender.buf.items[slice_start .. slice_start + @as(usize, @intCast(send_len))];
+
+                try quic_frame.encodeFrame(payload, self.allocator, .{ .STREAM = .{
+                    .stream_id = sid,
+                    .offset = data_off,
+                    .fin = is_fin,
+                    .len = slice.len,
+                    .data = slice,
+                } });
+                frames.append(.{ .stream = .{
+                    .stream_id = sid,
+                    .offset = data_off,
+                    .len = slice.len,
+                    .fin = is_fin,
+                } });
+                wrote = true;
+
+                sender.send_offset += send_len;
+                self.fc_data_sent += send_len;
+                if (is_fin) sender.fin_sent = true;
+
+                // If this packet is now full, move on (the outer loop opens a new
+                // packet for whatever remains).
+                if (payload.items.len + quic_protect.aead_tag_len >= packet_budget) return wrote;
+                // If flow control (not packet space) capped this frame, stop this
+                // stream and try the next one.
+                if (send_len < unsent and send_len == max_payload) break;
+            }
+        }
+        return wrote;
+    }
+
+    /// Per-stream send-side flow-control credit (RFC 9000 §4.1): how many more
+    /// bytes the peer will accept on `sid` past `offset`. Seeded from the peer's
+    /// `initial_max_stream_data_*` and raised by MAX_STREAM_DATA. A missing limit
+    /// means "not yet learned" → fall back to the connection limit only.
+    fn streamSendCredit(self: *Conn, sid: u64, offset: u64) u64 {
+        const limit = self.peer_max_stream_data.get(sid) orelse self.peerInitialStreamDataLimit(sid);
+        return if (limit > offset) limit - offset else 0;
+    }
+
+    /// Connection-level send-side flow-control credit (RFC 9000 §4.1): bytes the
+    /// peer will accept across all streams past what we have already queued.
+    fn connSendCredit(self: *Conn) u64 {
+        const limit = self.peer_max_data orelse self.peerInitialMaxData();
+        return if (limit > self.fc_data_sent) limit - self.fc_data_sent else 0;
+    }
+
+    /// The peer's advertised `initial_max_data` (or a conservative default until
+    /// the transport parameters are known — large enough to admit the handshake's
+    /// tiny control streams without stalling, small enough to be safe).
+    fn peerInitialMaxData(self: *Conn) u64 {
+        if (self.peerTransportParams()) |p| {
+            if (p.initial_max_data) |v| return v;
+        }
+        return default_peer_initial_max_data;
+    }
+
+    /// The peer's advertised per-stream initial limit for `sid`. A client-
+    /// initiated bidi stream (the case for an HTTP/3 request the server answers)
+    /// is limited by the peer's `initial_max_stream_data_bidi_remote`; uni streams
+    /// by `initial_max_stream_data_uni`.
+    fn peerInitialStreamDataLimit(self: *Conn, sid: u64) u64 {
+        const p = self.peerTransportParams() orelse return default_peer_initial_max_stream_data;
+        const is_uni = (sid & 0x2) != 0;
+        const v = if (is_uni)
+            p.initial_max_stream_data_uni
+        else
+            // We (the answerer) send on a stream the *peer* opened → from the
+            // peer's perspective it is "bidi_remote"; for a stream we opened it is
+            // "bidi_local". HTTP/3 request streams are peer-opened.
+            (p.initial_max_stream_data_bidi_remote orelse p.initial_max_stream_data_bidi_local);
+        return v orelse default_peer_initial_max_stream_data;
+    }
+
+    /// Whether any stream still has sendable bytes (data or an untransmitted FIN).
+    fn anyStreamSendable(self: *Conn) bool {
+        for (self.stream_order.items) |sid| {
+            if (self.stream_senders.getPtr(sid)) |s| {
+                if (s.hasSendable()) return true;
+            }
+        }
+        return false;
     }
 
     /// Build a candidate-path validation probe (RFC 9000 §8.2.1): a 1-RTT
@@ -2000,23 +2272,25 @@ pub const Conn = struct {
     }
 
     /// Queue `bytes` to send on `stream_id` (optionally with the fin bit). The
-    /// data is copied; it is shipped on the next `sendDatagrams`.
+    /// data is retained in the stream's send buffer until acknowledged, so a lost
+    /// STREAM range can be re-transmitted automatically; it is segmented onto the
+    /// wire (cwnd + flow-control bounded) by the next `sendDatagrams`.
     pub fn sendStream(self: *Conn, stream_id: u64, bytes: []const u8, fin: bool) Error!void {
         if (!self.established) return error.NotEstablished;
-        // Track the per-stream send offset across calls.
-        var offset: u64 = 0;
-        for (self.pending_streams.items) |p| {
-            if (p.stream_id == stream_id) offset += p.data.len;
+        const sender = try self.streamSender(stream_id);
+        if (bytes.len > 0) try sender.buf.appendSlice(self.allocator, bytes);
+        if (fin) sender.fin_offset = sender.queuedEnd();
+    }
+
+    /// Get (creating if absent) the per-stream sender, registering its id in the
+    /// FIFO visit order on first creation.
+    fn streamSender(self: *Conn, stream_id: u64) Error!*StreamSender {
+        const gop = try self.stream_senders.getOrPut(self.allocator, stream_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+            try self.stream_order.append(self.allocator, stream_id);
         }
-        offset += self.sentStreamOffset(stream_id);
-        const copy = try self.allocator.dupe(u8, bytes);
-        errdefer self.allocator.free(copy);
-        try self.pending_streams.append(self.allocator, .{
-            .stream_id = stream_id,
-            .offset = offset,
-            .fin = fin,
-            .data = copy,
-        });
+        return gop.value_ptr;
     }
 
     /// Read up to `dst.len` contiguous received bytes from `stream_id`, returns
@@ -2130,24 +2404,11 @@ pub const Conn = struct {
         self.close_pending = true;
     }
 
-    fn clearPendingApp(self: *Conn) void {
-        for (self.pending_streams.items) |p| {
-            self.sentStreamBytesAdd(p.stream_id, p.data.len);
-            self.allocator.free(p.data);
-        }
-        self.pending_streams.clearRetainingCapacity();
+    /// Free the queued application DATAGRAMs after they were copied into a packet
+    /// (RFC 9221 — not retransmitted, so no descriptor is retained).
+    fn clearPendingDatagrams(self: *Conn) void {
         for (self.pending_datagrams.items) |p| self.allocator.free(p.data);
         self.pending_datagrams.clearRetainingCapacity();
-    }
-
-    // Track per-stream sent bytes so successive sendStream calls compute the
-    // correct STREAM offset even after the queue is flushed.
-    fn sentStreamOffset(self: *Conn, stream_id: u64) u64 {
-        return self.sent_stream_map.get(stream_id) orelse 0;
-    }
-    fn sentStreamBytesAdd(self: *Conn, stream_id: u64, n: usize) void {
-        const cur = self.sent_stream_map.get(stream_id) orelse 0;
-        self.sent_stream_map.put(self.allocator, stream_id, cur + n) catch {};
     }
 
     // -----------------------------------------------------------------------
@@ -2198,6 +2459,15 @@ pub const Conn = struct {
             0, // ack_delay: our peer encodes 0 (we send delay=0); decoded ns = 0.
             now,
         );
+        // Reclaim acknowledged STREAM send-buffer bytes BEFORE re-queuing losses,
+        // so a range that is both acked (in this ACK) and previously lost ends up
+        // correctly reclaimed rather than re-sent.
+        for (outcome.acked_frames) |f| {
+            switch (f) {
+                .stream => |s| self.ackStreamRange(s.stream_id, s.offset, s.len),
+                else => {},
+            }
+        }
         try self.requeueLostFrames(outcome.lost_frames);
 
         // Once the client acknowledges any 1-RTT packet we sent, our HANDSHAKE_DONE
@@ -2250,25 +2520,47 @@ pub const Conn = struct {
         }
     }
 
-    /// Re-enqueue a lost STREAM range. The bytes still live in the per-stream
-    /// sent map accounting; we re-read them from there by reconstructing the
-    /// pending write. Because the driver does not retain a full per-stream send
-    /// history, we re-queue by referencing the already-tracked offset; the data
-    /// itself must come from the application's retained buffer. For the loopback
-    /// path the app re-supplies on demand, so here we simply re-arm the offset by
-    /// rolling back the sent-offset accounting so a re-`sendStream` recomputes
-    /// the right offset. This keeps STREAM retransmit sound without a second copy.
+    /// Re-enqueue a lost STREAM range (RFC 9002 §6 — lost data is retransmitted).
+    /// The bytes are still retained in the stream's send buffer (we drop bytes
+    /// from the buffer only when the peer ACKs them), so rolling `send_offset`
+    /// back to the lost offset re-marks them un-sent and the next `sendDatagrams`
+    /// re-emits them from our own buffer — no application re-supply needed.
+    /// A lost FIN is covered because `fin_sent` is cleared so `hasSendable` is
+    /// true again whenever the rolled-back offset reaches `fin_offset`.
     fn requeueStream(self: *Conn, stream_id: u64, offset: u64, len: u64, fin: bool) Error!void {
-        _ = fin;
-        // Roll the per-stream sent counter back to the lost offset so the bytes
-        // are considered un-sent. The retransmit is driven by the higher layer
-        // re-queuing the same data (it owns the source buffer); we only ensure
-        // the offset bookkeeping does not double-count. If the lost range is the
-        // tail of what we sent, lower the counter; otherwise leave it (a hole in
-        // the middle is covered when the surrounding data is re-queued).
-        const cur = self.sent_stream_map.get(stream_id) orelse return;
-        if (offset + len == cur) {
-            self.sent_stream_map.put(self.allocator, stream_id, offset) catch {};
+        _ = len;
+        const sender = self.stream_senders.getPtr(stream_id) orelse return;
+        // Only roll back if the lost offset is still ahead of what the peer has
+        // acknowledged (already-acked bytes were dropped from the buffer and must
+        // never be re-sent). Take the minimum so an out-of-order set of lost
+        // ranges rewinds to the earliest hole.
+        if (offset >= sender.acked_offset and offset < sender.send_offset) {
+            sender.send_offset = offset;
+        }
+        if (fin) sender.fin_sent = false;
+    }
+
+    /// Drop acknowledged bytes from a stream's send buffer (RFC 9002 §6 / RFC
+    /// 9000 §2.3): once the peer ACKs a contiguous prefix, those bytes can never
+    /// be needed again, so free them from the front to keep retention bounded.
+    /// We advance `acked_offset` to the high end of any acked range that starts
+    /// at (or before) the current acked frontier; non-contiguous acks wait for
+    /// the gap to fill. This is a conservative, contiguous-prefix reclaim.
+    fn ackStreamRange(self: *Conn, stream_id: u64, offset: u64, len: u64) void {
+        const sender = self.stream_senders.getPtr(stream_id) orelse return;
+        const end = offset + len;
+        // Only a range touching the un-acked frontier reclaims memory; a range
+        // strictly ahead leaves a hole we cannot compact yet (kept retained).
+        if (offset <= sender.acked_offset and end > sender.acked_offset) {
+            const drop: usize = @intCast(end - sender.acked_offset);
+            const have = sender.buf.items.len;
+            const n = @min(drop, have);
+            if (n > 0) {
+                std.mem.copyForwards(u8, sender.buf.items[0 .. have - n], sender.buf.items[n..]);
+                sender.buf.shrinkRetainingCapacity(have - n);
+            }
+            sender.acked_offset = end;
+            if (sender.send_offset < sender.acked_offset) sender.send_offset = sender.acked_offset;
         }
     }
 
@@ -3096,18 +3388,12 @@ test "quic conn RFC 9002 — application stream survives loss + reorder byte-exa
         // The reply leg is stamped `now+owd` so the client's RTT sample is > 0.
         _ = try lossyPump(alloc, &lb.client, &lb.server, now, &rng, 30);
         _ = try lossyPump(alloc, &lb.server, &lb.client, now + owd, &rng, 30);
-        // Re-queue any client STREAM data the recovery layer declared lost.
+        // Drain whatever the server reassembled. No application re-supply needed:
+        // the QUIC sender retains unacked bytes and re-transmits the lost ranges
+        // from its own buffer (ACK-driven), so the stream arrives byte-exact even
+        // across a lossy, reordering channel — that is exactly what this exercises.
         const n = lb.server.readStream(sid, rbuf[got..]);
         got += n;
-        // The application re-supplies the lost tail: the driver rolled the
-        // sent-offset back on loss, so a re-send picks up where retransmission
-        // needs it. We re-queue the whole payload from the last delivered offset.
-        if (got < payload.len and lb.client.pending_streams.items.len == 0) {
-            const off = lb.client.sentStreamOffset(sid);
-            if (off < payload.len) {
-                try lb.client.sendStream(sid, payload[off..], true);
-            }
-        }
         if (got >= payload.len and lb.server.streamFinished(sid)) break;
         now += step;
     }
