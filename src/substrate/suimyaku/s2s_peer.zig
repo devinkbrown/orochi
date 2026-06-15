@@ -29,7 +29,16 @@ pub const RelayVerb = message_relay.Verb;
 pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
 
 const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
-const handshake_version: u8 = 1;
+/// Wire version of the S2S handshake. v1 carried no capability byte; v2 appends a
+/// single forward-compatible capability bitfield after the description so a mixed
+/// mesh stays interoperable: a v1 peer omits the byte (parsed as caps == 0), and
+/// a v2 peer that sees an unknown future version still reads the caps byte it
+/// understands. Bumping this is backward-compatible — see `decodeHandshake`.
+const handshake_version: u8 = 2;
+
+/// Handshake capability bits (forward-compatible bitfield). Unknown bits are
+/// ignored on decode, so future capabilities never break an older peer.
+const cap_frame_signing: u8 = 1 << 0;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
@@ -40,6 +49,8 @@ const channel_prop_event = @import("../../proto/channel_prop_event.zig");
 const topic_event = @import("../../proto/topic_event.zig");
 const nick_event = @import("../../proto/nick_event.zig");
 const partition_detector = @import("partition_detector.zig");
+const signed_frame = @import("signed_frame.zig");
+const sign = @import("../../crypto/sign.zig");
 
 pub const ByteSink = struct {
     ptr: *anyopaque,
@@ -92,6 +103,17 @@ pub const Options = struct {
     channel_name: []const u8 = "#suimyaku",
     initial_send_credit: u32 = peer_link.default_send_credit,
     config: Config = .{},
+    /// Optional node Ed25519 signing keypair for END-TO-END origin authentication
+    /// of direct-owned state frames. When set (secured links pass the node
+    /// identity's key), this peer advertises `frame_signing` in its handshake and
+    /// signs every in-scope outbound frame; receivers self-certify the origin.
+    /// Null (plaintext links) keeps the legacy unsigned path unchanged.
+    ///
+    /// INVARIANT for self-certification to hold: when a key is supplied,
+    /// `local_node_id` MUST equal `signed_frame.originShortId(key.public_key)`
+    /// (i.e. `shortId(nodeIdFromPublicKey(pubkey))`). The secured link guarantees
+    /// this by deriving `local_node_id` from the same identity it signs with.
+    signing_key: ?sign.KeyPair = null,
 };
 
 const Handshake = struct {
@@ -99,6 +121,8 @@ const Handshake = struct {
     epoch_ms: u64,
     name: []const u8,
     description: []const u8,
+    /// Capability bitfield (v2+); 0 for a v1 peer that omitted it.
+    caps: u8 = 0,
 };
 
 pub const S2sPeer = struct {
@@ -122,6 +146,19 @@ pub const S2sPeer = struct {
     ping_rx_count: usize = 0,
     pong_rx_count: usize = 0,
     config: Config,
+    /// This node's Ed25519 signing keypair (set on secured links), or null on the
+    /// legacy unsigned (plaintext) path. When set, in-scope outbound frames are
+    /// wrapped in a `signed_frame` envelope iff the peer advertised signing.
+    signing_key: ?sign.KeyPair = null,
+    /// Whether the remote peer advertised the `frame_signing` capability in its
+    /// handshake. Learned on `recvHandshake`; gates both outbound wrapping (only
+    /// wrap for a signing-capable peer) and inbound enforcement (a signing-capable
+    /// peer's in-scope frames MUST be signed, else they are rejected).
+    peer_supports_signing: bool = false,
+    /// In-scope frames rejected because their signed-envelope verification failed
+    /// or the self-certified origin did not match the claimed origin. Folded into
+    /// the same audit drain as `rejected_origin_frames` (see `acceptsDirectOrigin`).
+    rejected_signature_frames: u64 = 0,
     /// Inbound cross-node user messages decoded from MESSAGE frames, awaiting the
     /// daemon to drain + deliver to local clients (the daemon owns delivery; the
     /// peer driver stays substrate-pure). Loop-guarded by `seen`.
@@ -208,6 +245,7 @@ pub const S2sPeer = struct {
             .description = description,
             .channel_name = channel_name,
             .config = options.config,
+            .signing_key = options.signing_key,
             .seen = message_relay.SeenSet.init(options.allocator, 1024),
         };
     }
@@ -245,6 +283,7 @@ pub const S2sPeer = struct {
         self.routes.deinit();
         self.registry.deinit();
         self.decoder.deinit();
+        if (self.signing_key) |*kp| kp.deinit(); // wipe our copy of the secret key
         self.* = undefined;
     }
 
@@ -631,10 +670,15 @@ pub const S2sPeer = struct {
         return self.nick_changes.toOwnedSlice(self.allocator);
     }
 
-    /// Drain origin-mismatch rejections for daemon-side audit logging.
+    /// Drain origin-mismatch + signature-rejection counts for daemon-side audit
+    /// logging. Both the link-trust origin check (`acceptsDirectOrigin`) and the
+    /// cryptographic envelope check (`verifiedPayload`) feed this one counter so
+    /// the daemon's existing audit drain surfaces every rejected direct-owned
+    /// frame regardless of which gate dropped it.
     pub fn takeRejectedOriginFrames(self: *S2sPeer) u64 {
-        const n = self.rejected_origin_frames;
+        const n = self.rejected_origin_frames +| self.rejected_signature_frames;
         self.rejected_origin_frames = 0;
+        self.rejected_signature_frames = 0;
         return n;
     }
 
@@ -642,6 +686,55 @@ pub const S2sPeer = struct {
         if (self.remote_node_id != 0 and origin_node == self.remote_node_id) return true;
         self.rejected_origin_frames +|= 1;
         return false;
+    }
+
+    /// Emit an in-scope direct-owned frame, wrapping it in a `signed_frame`
+    /// envelope (origin pubkey + signature over `type ++ payload`) when the peer
+    /// advertised signing AND we hold a signing key. Otherwise it is emitted
+    /// exactly as before (legacy unsigned path) so non-signing peers see no
+    /// change. The wrap allocates a `header_len`-larger scratch; on any wrap
+    /// failure we fall back to faulting the link (the caller's `try`).
+    fn emitSignable(self: *S2sPeer, sink: ByteSink, frame_type: s2s_frame.FrameType, payload: []const u8) !void {
+        if (!self.peer_supports_signing or self.signing_key == null) {
+            return emitFrame(self.allocator, sink, frame_type, payload);
+        }
+        const kp = &self.signing_key.?;
+        const buf = try self.allocator.alloc(u8, signed_frame.header_len + payload.len);
+        defer self.allocator.free(buf);
+        const env = try signed_frame.wrap(buf, kp, @intFromEnum(frame_type), payload);
+        try emitFrame(self.allocator, sink, frame_type, env);
+    }
+
+    /// Unwrap + verify an inbound in-scope frame against the peer's negotiated
+    /// signing capability, returning the inner (authenticated) payload to hand to
+    /// the existing `recvXxx`. Returns null when the frame must be dropped:
+    ///   * a signing-capable peer sent an UNSIGNED (too-short / unverifiable)
+    ///     frame — rejected (a signing peer MUST sign);
+    ///   * the signature failed; or
+    ///   * the self-certified origin `shortId(nodeIdFromPublicKey(pubkey))` did
+    ///     not equal the remote peer's authenticated node id.
+    /// Every rejection increments the signature-audit counter. For a non-signing
+    /// peer the raw payload is returned unchanged (legacy path, no regression).
+    fn verifiedPayload(self: *S2sPeer, frame_type: s2s_frame.FrameType, payload: []const u8) ?[]const u8 {
+        if (!self.peer_supports_signing) return payload; // legacy unsigned peer
+        const u = signed_frame.unwrap(payload) catch {
+            // A signing-capable peer's in-scope frame MUST be a signed envelope.
+            self.rejected_signature_frames +|= 1;
+            return null;
+        };
+        if (!signed_frame.verify(u, @intFromEnum(frame_type))) {
+            self.rejected_signature_frames +|= 1;
+            return null;
+        }
+        // Self-certifying origin: the key that signed must DERIVE the peer's
+        // authenticated node id. This is the cryptographic upgrade of
+        // `acceptsDirectOrigin` — a trust-pinned peer cannot assert another
+        // node's origin because it lacks that node's private key.
+        if (self.remote_node_id != 0 and signed_frame.originShortId(u.pubkey) != self.remote_node_id) {
+            self.rejected_signature_frames +|= 1;
+            return null;
+        }
+        return u.payload;
     }
 
     fn noteChannelModeStateClock(self: *S2sPeer, channel: []const u8, hlc: u64) bool {
@@ -661,7 +754,8 @@ pub const S2sPeer = struct {
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
     /// malformed payload is dropped, never fatal to the link. A real add/remove/
     /// status-change is queued so the daemon can emit the matching live IRC line.
-    fn recvMembership(self: *S2sPeer, payload: []const u8) !void {
+    fn recvMembership(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.MEMBERSHIP, frame_payload) orelse return;
         const ev = membership_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const res = self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
@@ -711,7 +805,8 @@ pub const S2sPeer = struct {
     /// Apply an inbound CHANNEL_MODE_FLAGS event to the route table (LWW by hlc).
     /// Malformed/stale/no-op payloads are dropped; only a real aggregate change is
     /// queued for the daemon to apply to its local world.
-    fn recvChannelModeFlags(self: *S2sPeer, payload: []const u8) !void {
+    fn recvChannelModeFlags(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.CHANNEL_MODE_FLAGS, frame_payload) orelse return;
         const ev = channel_mode_flags_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const outcome = self.routes.applyChannelModeFlags(ev.channel, ev.origin_node, ev.flags, ev.hlc) catch return;
@@ -726,7 +821,8 @@ pub const S2sPeer = struct {
     /// Apply an inbound CHANNEL_LIST event to the route table (LWW by hlc), then
     /// queue add/remove transitions for the daemon. Malformed or stale payloads
     /// are dropped and never fault the link.
-    fn recvChannelList(self: *S2sPeer, payload: []const u8) !void {
+    fn recvChannelList(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.CHANNEL_LIST, frame_payload) orelse return;
         const ev = channel_list_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const res = self.routes.applyChannelList(ev.channel, ev.kind, ev.mask, ev.setter, ev.set_at, ev.origin_node, ev.hlc, ev.present) catch return;
@@ -784,7 +880,7 @@ pub const S2sPeer = struct {
         };
         var buf: [membership_event.max_encoded_len]u8 = undefined;
         const wire = try membership_event.encode(ev, &buf);
-        try emitFrame(self.allocator, sink, .MEMBERSHIP, wire);
+        try self.emitSignable(sink, .MEMBERSHIP, wire);
     }
 
     /// Emit a CHANNEL_MODE_FLAGS aggregate to the peer. Best-effort; only
@@ -804,7 +900,7 @@ pub const S2sPeer = struct {
         };
         var buf: [channel_mode_flags_event.max_channel_len + 32]u8 = undefined;
         const wire = try channel_mode_flags_event.encode(ev, &buf);
-        try emitFrame(self.allocator, sink, .CHANNEL_MODE_FLAGS, wire);
+        try self.emitSignable(sink, .CHANNEL_MODE_FLAGS, wire);
     }
 
     /// Emit a CHANNEL_LIST event to announce local +b/+e/+I state.
@@ -831,12 +927,13 @@ pub const S2sPeer = struct {
         };
         var buf: [channel_list_event.max_channel_len + channel_list_event.max_mask_len + channel_list_event.max_setter_len + 40]u8 = undefined;
         const wire = try channel_list_event.encode(ev, &buf);
-        try emitFrame(self.allocator, sink, .CHANNEL_LIST, wire);
+        try self.emitSignable(sink, .CHANNEL_LIST, wire);
     }
 
     /// Queue an inbound CHANNEL_PROP event for daemon-side LWW apply. Malformed
     /// payloads and allocation failures are dropped without faulting the link.
-    fn recvChannelProp(self: *S2sPeer, payload: []const u8) !void {
+    fn recvChannelProp(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.CHANNEL_PROP, frame_payload) orelse return;
         const ev = channel_prop_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const ch = self.allocator.dupe(u8, ev.channel) catch return;
@@ -894,12 +991,13 @@ pub const S2sPeer = struct {
         };
         var buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32]u8 = undefined;
         const wire = try channel_prop_event.encode(ev, &buf);
-        try emitFrame(self.allocator, sink, .CHANNEL_PROP, wire);
+        try self.emitSignable(sink, .CHANNEL_PROP, wire);
     }
 
     /// Queue a remote parameter/IRCX channel-state snapshot for daemon apply.
     /// Only the authenticated direct peer may assert direct-owned state frames.
-    fn recvChannelModeState(self: *S2sPeer, payload: []const u8) !void {
+    fn recvChannelModeState(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.CHANNEL_MODE_STATE, frame_payload) orelse return;
         const ev = channel_mode_state_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         if (!self.noteChannelModeStateClock(ev.channel, ev.hlc)) return;
@@ -935,13 +1033,14 @@ pub const S2sPeer = struct {
         out_ev.origin_node = self.local_node_id;
         var buf: [channel_mode_state_event.max_channel_len + channel_mode_state_event.max_key_len + channel_mode_state_event.max_forward_len + 80]u8 = undefined;
         const wire = try channel_mode_state_event.encode(out_ev, &buf);
-        try emitFrame(self.allocator, sink, .CHANNEL_MODE_STATE, wire);
+        try self.emitSignable(sink, .CHANNEL_MODE_STATE, wire);
     }
 
     /// Apply an inbound TOPIC event to the route table (LWW by hlc). Malformed or
     /// stale payloads are dropped; a real change is queued so the daemon can apply
     /// it to its world and emit a live `TOPIC` line.
-    fn recvTopic(self: *S2sPeer, payload: []const u8) !void {
+    fn recvTopic(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.TOPIC, frame_payload) orelse return;
         const ev = topic_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const outcome = self.routes.applyTopic(ev.channel, ev.origin_node, ev.hlc) catch return;
@@ -992,13 +1091,14 @@ pub const S2sPeer = struct {
         };
         var buf: [topic_event.max_channel_len + topic_event.max_topic_len + topic_event.max_setter_len + 40]u8 = undefined;
         const wire = try topic_event.encode(ev, &buf);
-        try emitFrame(self.allocator, sink, .TOPIC, wire);
+        try self.emitSignable(sink, .TOPIC, wire);
     }
 
     /// Apply an inbound NICKCHANGE event: rename the user in the route table +
     /// rosters, then queue a delta so the daemon can emit the live `NICK` line.
     /// Malformed payloads and no-op renames are dropped.
-    fn recvNickChange(self: *S2sPeer, payload: []const u8) !void {
+    fn recvNickChange(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.NICKCHANGE, frame_payload) orelse return;
         const ev = nick_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
         const renamed = self.routes.renameNick(ev.old_nick, ev.new_nick, ev.origin_node, .{
@@ -1066,7 +1166,7 @@ pub const S2sPeer = struct {
         };
         var buf: [nick_event.max_nick_len * 2 + nick_event.max_user_len + nick_event.max_real_len + nick_event.max_host_len + 32]u8 = undefined;
         const wire = try nick_event.encode(ev, &buf);
-        try emitFrame(self.allocator, sink, .NICKCHANGE, wire);
+        try self.emitSignable(sink, .NICKCHANGE, wire);
     }
 
     /// Remote members the peer has announced for `channel` (borrowed roster).
@@ -1088,6 +1188,11 @@ pub const S2sPeer = struct {
         } else if (hs.node_id != self.remote_node_id) {
             return error.UnexpectedRemote;
         }
+
+        // Record the negotiated signing capability. From here on, in-scope frames
+        // to/from a signing-capable peer travel inside a `signed_frame` envelope,
+        // and an UNSIGNED in-scope frame from such a peer is rejected.
+        self.peer_supports_signing = (hs.caps & cap_frame_signing) != 0;
 
         try self.rememberRemote(hs, now_ms);
         if (!self.handshake_sent) try self.emitHandshake(sink);
@@ -1122,11 +1227,16 @@ pub const S2sPeer = struct {
     }
 
     fn emitHandshake(self: *S2sPeer, sink: ByteSink) !void {
+        // Advertise frame signing only when we actually hold a signing key (i.e.
+        // a secured link supplied the node identity). Plaintext links have no key,
+        // so they never advertise it and stay on the legacy unsigned path.
+        const caps: u8 = if (self.signing_key != null) cap_frame_signing else 0;
         const payload = try encodeHandshake(self.allocator, .{
             .node_id = self.local_node_id,
             .epoch_ms = self.local_epoch_ms,
             .name = self.server_name,
             .description = self.description,
+            .caps = caps,
         });
         defer self.allocator.free(payload);
         try emitFrame(self.allocator, sink, .HANDSHAKE, payload);
@@ -1196,6 +1306,9 @@ fn encodeHandshake(allocator: Allocator, hs: Handshake) ![]u8 {
     try writeU64(&out, allocator, hs.epoch_ms);
     try writeBytes16(&out, allocator, hs.name);
     try writeBytes16(&out, allocator, hs.description);
+    // v2 capability bitfield. A v1 peer omits this; our decoder treats a missing
+    // byte as caps == 0, so emitting it never breaks an old peer.
+    try out.append(allocator, hs.caps);
     return out.toOwnedSlice(allocator);
 }
 
@@ -1204,13 +1317,19 @@ fn decodeHandshake(bytes: []const u8) !Handshake {
     for (handshake_magic) |want| {
         if (try r.readByte() != want) return error.BadHandshake;
     }
-    if (try r.readByte() != handshake_version) return error.UnsupportedHandshake;
-    const out = Handshake{
+    // Accept this version and any older one we still understand. v1 omitted the
+    // capability byte; v2 appends it. A newer (unknown) version is rejected.
+    const ver = try r.readByte();
+    if (ver == 0 or ver > handshake_version) return error.UnsupportedHandshake;
+    var out = Handshake{
         .node_id = try r.readU64(),
         .epoch_ms = try r.readU64(),
         .name = try r.readBytes16(),
         .description = try r.readBytes16(),
+        .caps = 0,
     };
+    // v2+ carries a trailing capability bitfield; v1 ends after the description.
+    if (ver >= 2) out.caps = try r.readByte();
     if (!r.done()) return error.TrailingBytes;
     return out;
 }
@@ -1638,4 +1757,343 @@ test "Config.applyToml consolidated EFFECTIVE prod path overlay" {
     // [mesh.routing] registry + routes.
     try std.testing.expectEqual(@as(usize, 256), cfg.registry.max_nodes);
     try std.testing.expectEqual(@as(usize, 2048), cfg.routes.max_nicks);
+}
+
+// ---------------------------------------------------------------------------
+// Frame-signing (end-to-end origin authentication) tests
+// ---------------------------------------------------------------------------
+
+fn signingKeyFor(seed_byte: u8) !sign.KeyPair {
+    return sign.KeyPair.fromSeed([_]u8{seed_byte} ** sign.seed_len);
+}
+
+/// Stand up a signing-capable peer. The self-certifying invariant REQUIRES
+/// `local_node_id == originShortId(kp.public_key)`, so we derive it the same way
+/// the secured link does. `remote_short` is the peer's authenticated origin id.
+fn newSigningPeer(
+    allocator: Allocator,
+    state: *ChannelCrdt,
+    tc: *TestClock,
+    kp: sign.KeyPair,
+    remote_short: NodeId,
+    epoch: u64,
+    name: []const u8,
+) !S2sPeer {
+    return S2sPeer.init(.{
+        .allocator = allocator,
+        .state = state,
+        .clock = tc.clock(),
+        .local_node_id = signed_frame.originShortId(kp.public_key),
+        .remote_node_id = remote_short,
+        .local_epoch_ms = epoch,
+        .server_name = name,
+        .description = "test",
+        .signing_key = kp,
+        .config = .{
+            .link = .{
+                .gossip_interval_ms = 10,
+                .repair_interval_ms = 20,
+                .gossip_config = .{ .fanout = 1 },
+            },
+        },
+    });
+}
+
+test "signing peers negotiate frame_signing and a signed CHANNEL_PROP round-trips" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x11);
+    const kp_b = try signingKeyFor(0x22);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xA11CE);
+
+    // Both sides advertised + recorded the signing capability.
+    try std.testing.expect(a.peer_supports_signing);
+    try std.testing.expect(b.peer_supports_signing);
+
+    // A announces a signed CHANNEL_PROP; B accepts it after self-certifying A's
+    // origin, with no rejection counted.
+    try a.sendChannelProp(a_to_b.sink(), "#room", "TOPICLOCK", "1", "alice", 100, true);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xC0FFEE);
+
+    const props = try b.takeChannelPropChanges();
+    defer {
+        for (props) |*p| p.deinit(allocator);
+        allocator.free(props);
+    }
+    try std.testing.expectEqual(@as(usize, 1), props.len);
+    try std.testing.expectEqualStrings("#room", props[0].channel);
+    try std.testing.expectEqualStrings("TOPICLOCK", props[0].key);
+    try std.testing.expectEqualStrings("1", props[0].value);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "signing peers round-trip a signed MEMBERSHIP frame" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x31);
+    const kp_b = try signingKeyFor(0x32);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x3EE);
+
+    try a.sendMembership(a_to_b.sink(), "#room", "alice", 0, 50, true, .{ .username = "u", .realname = "r", .host = "h" });
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x3EF);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("alice", changes[0].nick);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "a forged frame (wrong signature) is rejected and counted" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x41);
+    const kp_b = try signingKeyFor(0x42);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    // B is established and knows A as its signing-capable direct peer.
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+
+    // Drive A->B handshake so B records peer_supports_signing for A.
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x4F0);
+    try std.testing.expect(b.peer_supports_signing);
+
+    // Build a VALID signed CHANNEL_PROP envelope from A, then corrupt the
+    // signature so verification fails. Frame it and feed B directly.
+    var ev_buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32]u8 = undefined;
+    const ev = channel_prop_event.ChannelPropEvent{
+        .present = true,
+        .origin_node = a_short,
+        .hlc = 200,
+        .channel = "#room",
+        .key = "K",
+        .value = "V",
+        .owner = "alice",
+    };
+    const inner = try channel_prop_event.encode(ev, &ev_buf);
+    var env_buf: [512]u8 = undefined;
+    const env = try signed_frame.wrap(&env_buf, &kp_a, @intFromEnum(s2s_frame.FrameType.CHANNEL_PROP), inner);
+    env[signed_frame.pubkey_len] ^= 0x80; // corrupt the signature
+
+    var fbuf: [1024]u8 = undefined;
+    const wire = try s2s_frame.encode(.CHANNEL_PROP, env, &fbuf);
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+    try b.feed(wire, sink.sink(), tc.now_ms, 1);
+
+    const props = try b.takeChannelPropChanges();
+    defer allocator.free(props);
+    try std.testing.expectEqual(@as(usize, 0), props.len);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+}
+
+test "a forged frame (attacker key, origin mismatch) is rejected and counted" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x51); // the legitimate peer A
+    const kp_x = try signingKeyFor(0x5A); // an attacker key (NOT A)
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId((try signingKeyFor(0x52)).public_key);
+
+    var b = try newSigningPeer(allocator, &b_state, &tc, try signingKeyFor(0x52), a_short, 2000, "b.test");
+    defer b.deinit();
+
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5F0);
+    try std.testing.expect(b.peer_supports_signing);
+
+    // The attacker mints a structurally-valid, correctly-signed CHANNEL_PROP that
+    // CLAIMS A's origin id, but signs with its OWN key. The signature verifies,
+    // but `originShortId(attacker_pubkey) != a_short`, so B rejects it.
+    var ev_buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32]u8 = undefined;
+    const ev = channel_prop_event.ChannelPropEvent{
+        .present = true,
+        .origin_node = a_short, // claims to be A
+        .hlc = 300,
+        .channel = "#room",
+        .key = "K",
+        .value = "evil",
+        .owner = "mallory",
+    };
+    const inner = try channel_prop_event.encode(ev, &ev_buf);
+    var env_buf: [512]u8 = undefined;
+    const env = try signed_frame.wrap(&env_buf, &kp_x, @intFromEnum(s2s_frame.FrameType.CHANNEL_PROP), inner);
+
+    var fbuf: [1024]u8 = undefined;
+    const wire = try s2s_frame.encode(.CHANNEL_PROP, env, &fbuf);
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+    try b.feed(wire, sink.sink(), tc.now_ms, 1);
+
+    const props = try b.takeChannelPropChanges();
+    defer allocator.free(props);
+    try std.testing.expectEqual(@as(usize, 0), props.len);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
+}
+
+test "a non-signing (v1-style) peer still interoperates unsigned" {
+    // A has no signing key (plaintext-style peer); B has one. They handshake and
+    // A's UNSIGNED in-scope frame is accepted as before — graceful rollout.
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    // A: legacy peer, plain u64 ids, NO signing key.
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 1000, "a.test");
+    defer a.deinit();
+    // B: signing-capable, but its remote (A) id is the legacy u64 1.
+    const kp_b = try signingKeyFor(0x62);
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, 1, 2000, "b.test");
+    defer b.deinit();
+    // A must believe B's id is whatever B advertises (B's derived short id).
+    a.remote_node_id = signed_frame.originShortId(kp_b.public_key);
+
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6A0);
+
+    // A never advertised signing, so B treats A as a legacy unsigned peer.
+    try std.testing.expect(!b.peer_supports_signing);
+    // B DID advertise signing, but A (no key) won't wrap — fine for a v1 peer.
+    try std.testing.expect(a.peer_supports_signing);
+
+    // A sends an UNSIGNED membership; B accepts it (legacy path, no rejection).
+    try a.sendMembership(a_to_b.sink(), "#room", "bob", 0, 60, true, .{ .username = "u", .realname = "r", .host = "h" });
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6A1);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("bob", changes[0].nick);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "a signing peer's UNSIGNED in-scope frame is rejected" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x71);
+    const kp_b = try signingKeyFor(0x72);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x7F0);
+    try std.testing.expect(b.peer_supports_signing);
+
+    // Hand-frame an UNSIGNED CHANNEL_PROP (raw event, no envelope) from A and feed
+    // B directly. Because A advertised signing, B MUST reject the unsigned frame.
+    var ev_buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32]u8 = undefined;
+    const ev = channel_prop_event.ChannelPropEvent{
+        .present = true,
+        .origin_node = a_short,
+        .hlc = 400,
+        .channel = "#room",
+        .key = "K",
+        .value = "V",
+        .owner = "alice",
+    };
+    const inner = try channel_prop_event.encode(ev, &ev_buf);
+    var fbuf: [1024]u8 = undefined;
+    const wire = try s2s_frame.encode(.CHANNEL_PROP, inner, &fbuf);
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+    try b.feed(wire, sink.sink(), tc.now_ms, 1);
+
+    const props = try b.takeChannelPropChanges();
+    defer allocator.free(props);
+    try std.testing.expectEqual(@as(usize, 0), props.len);
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
 }

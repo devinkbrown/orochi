@@ -65,7 +65,7 @@ pub const KeyPair = struct {
 
     /// Sign `msg` with plain RFC 8032 Ed25519.
     pub fn sign(self: *const KeyPair, msg: []const u8) SignError!Signature {
-        return self.signPrefixed("", msg);
+        return self.signPrefixed("", "", msg);
     }
 
     /// Sign `msg` under a compile-time domain label.
@@ -78,12 +78,27 @@ pub const KeyPair = struct {
         msg: []const u8,
     ) SignError!Signature {
         const prefix = domainPrefix(domain);
-        return self.signPrefixed(&prefix, msg);
+        return self.signPrefixed(&prefix, "", msg);
+    }
+
+    /// Sign `infix ++ msg` under a compile-time domain label, streaming both
+    /// segments into the transcript without a contiguous copy. The transcript is
+    /// `magic || len(domain) || domain || infix || msg`, so `infix` (e.g. a frame
+    /// type byte) is bound into the signature exactly as `verifyCtxInfix` checks.
+    pub fn signCtxInfix(
+        self: *const KeyPair,
+        comptime domain: []const u8,
+        infix: []const u8,
+        msg: []const u8,
+    ) SignError!Signature {
+        const prefix = domainPrefix(domain);
+        return self.signPrefixed(&prefix, infix, msg);
     }
 
     fn signPrefixed(
         self: *const KeyPair,
         prefix: []const u8,
+        infix: []const u8,
         msg: []const u8,
     ) SignError!Signature {
         var sk_bytes = self.secret_key.declassify();
@@ -111,6 +126,7 @@ pub const KeyPair = struct {
         var nonce_hash = Sha512.init(.{});
         nonce_hash.update(expanded[32..]);
         nonce_hash.update(prefix);
+        nonce_hash.update(infix);
         nonce_hash.update(msg);
         nonce_hash.final(&nonce64);
 
@@ -126,6 +142,7 @@ pub const KeyPair = struct {
         challenge_hash.update(&r_bytes);
         challenge_hash.update(&public_key);
         challenge_hash.update(prefix);
+        challenge_hash.update(infix);
         challenge_hash.update(msg);
         challenge_hash.final(&challenge64);
 
@@ -141,7 +158,7 @@ pub const KeyPair = struct {
 
 /// Verify a plain RFC 8032 Ed25519 signature.
 pub fn verify(msg: []const u8, sig: Signature, public_key: PublicKey) VerifyError!bool {
-    return verifyPrefixed("", msg, sig, public_key);
+    return verifyPrefixed("", "", msg, sig, public_key);
 }
 
 /// Verify a domain-separated Ed25519 signature created by `KeyPair.signCtx`.
@@ -152,11 +169,24 @@ pub fn verifyCtx(
     public_key: PublicKey,
 ) VerifyError!bool {
     const prefix = domainPrefix(domain);
-    return verifyPrefixed(&prefix, msg, sig, public_key);
+    return verifyPrefixed(&prefix, "", msg, sig, public_key);
+}
+
+/// Verify a signature created by `KeyPair.signCtxInfix` over `infix ++ msg`.
+pub fn verifyCtxInfix(
+    comptime domain: []const u8,
+    infix: []const u8,
+    msg: []const u8,
+    sig: Signature,
+    public_key: PublicKey,
+) VerifyError!bool {
+    const prefix = domainPrefix(domain);
+    return verifyPrefixed(&prefix, infix, msg, sig, public_key);
 }
 
 fn verifyPrefixed(
     prefix: []const u8,
+    infix: []const u8,
     msg: []const u8,
     sig: Signature,
     public_key: PublicKey,
@@ -166,6 +196,7 @@ fn verifyPrefixed(
 
     var verifier = try std_sig.verifier(pk);
     verifier.update(prefix);
+    verifier.update(infix);
     verifier.update(msg);
     verifier.verify() catch |err| switch (err) {
         error.SignatureVerificationFailed => return false,

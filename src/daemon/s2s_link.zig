@@ -20,6 +20,7 @@ const std = @import("std");
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const s2s_frame = @import("../proto/s2s_frame.zig");
+const sign = @import("../crypto/sign.zig");
 const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
@@ -44,6 +45,14 @@ pub const Options = struct {
     description: []const u8 = "",
     channel_name: []const u8 = "#suimyaku",
     now_ms: u64 = 0,
+    /// Optional node Ed25519 signing keypair for end-to-end origin
+    /// authentication of direct-owned state frames (secured links pass the node
+    /// identity's key; plaintext links leave it null to keep the unsigned path).
+    /// When set, `local_node_id` MUST equal
+    /// `signed_frame.originShortId(key.public_key)` so receivers self-certify the
+    /// origin — the secured link guarantees this by deriving both from the same
+    /// identity.
+    signing_key: ?sign.KeyPair = null,
 };
 
 pub const S2sLink = struct {
@@ -97,6 +106,7 @@ pub const S2sLink = struct {
             .server_name = opts.server_name,
             .description = opts.description,
             .channel_name = opts.channel_name,
+            .signing_key = opts.signing_key,
         });
     }
 

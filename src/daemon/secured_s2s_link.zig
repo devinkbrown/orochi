@@ -541,6 +541,13 @@ pub const SecuredLink = struct {
             .description = self.description,
             .channel_name = self.channel_name,
             .now_ms = now_ms,
+            // End-to-end frame signing: hand the inner peer this node's signing
+            // key so direct-owned state frames carry a self-certifying origin
+            // proof. `local_node_id` above is derived from the SAME identity, so
+            // the receiver's `originShortId(pubkey) == origin_node` invariant
+            // holds. The inner peer takes an independent copy and wipes it on
+            // deinit; `self.identity.sign_kp` is unaffected.
+            .signing_key = self.identity.sign_kp,
         });
         self.inner = link;
         self.phase = .established;

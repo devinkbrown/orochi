@@ -213,6 +213,31 @@ Repair target:
 - Reject frames whose claimed origin does not match the verified peer identity.
 - Carry the verified origin into policy decisions and audit logs.
 
+**Status (closed for direct-origin frames):** A signed envelope now provides
+end-to-end origin authentication for the DIRECT-ORIGIN state frames — MEMBERSHIP,
+CHANNEL_MODE_STATE, CHANNEL_MODE_FLAGS, CHANNEL_LIST, TOPIC, NICKCHANGE, and
+CHANNEL_PROP ([src/substrate/suimyaku/signed_frame.zig](../../src/substrate/suimyaku/signed_frame.zig)).
+The envelope is `[pubkey 32][ed25519 sig 64][payload]`, signed over the canonical
+message `frame_type_byte ++ payload` under a domain label (so a signature can
+never be replayed across frame types or other Ed25519 uses). Because a node id is
+self-certifying (`shortId(nodeIdFromPublicKey(pubkey))`), the receiver enforces
+both that the signature verifies AND that the signer's derived short id equals the
+frame's claimed `origin_node` — a cryptographic upgrade of the link-trust
+`acceptsDirectOrigin` gate. A compromised/trust-pinned peer can no longer forge
+another node's frame. Capability is negotiated in the handshake (v2 capability
+byte; v1 peers stay interoperable unsigned), and the signing key is the node
+identity's `sign_kp`, threaded into the peer by the secured link (which derives
+`local_node_id` from the SAME identity, so the self-cert invariant holds).
+Rejections (bad signature, origin mismatch, or an unsigned frame from a
+signing-capable peer) increment the existing origin-rejection audit counter.
+
+**Explicit follow-up (multi-hop, still open):** MESSAGE relay and CRDT
+delta/BURST re-broadcast are NOT signed end-to-end, because a relay re-emits a
+fact authored by a THIRD node with that node's `origin_node` preserved. Re-signing
+with the relay's key would either fail the receiver's origin check or erase the
+true author. Closing this requires storing the ORIGINAL signer's `(pubkey, sig)`
+alongside each CRDT fact / relayed message and re-emitting that, not the relay's.
+
 ### Secured S2S Still Allows Weak Deployment
 
 `mesh.require_secured` can reject plaintext S2S, but the default is false.
