@@ -90,6 +90,7 @@ const secure_fns = @import("../proto/secure_fns.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
+const search_index_mod = @import("search_index.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const chathistory_targets = @import("../proto/chathistory_targets.zig");
 const msgedit = @import("../proto/msgedit.zig");
@@ -1507,6 +1508,10 @@ pub const ConnState = struct {
     /// silence since the last message — NOT since the last PING/PONG or query, so
     /// it is intentionally separate from `last_activity_ms`. Seeded at signon.
     last_message_ms: i64 = 0,
+    /// Monotonic ms of the last `SEARCH` (draft/search) this client issued, or 0
+    /// if never. The handler rate-limits searches against it (anti-abuse): a
+    /// second SEARCH within `search_rate_limit_ms` is rejected with a FAIL.
+    last_search_ms: i64 = 0,
     /// True after the sweep sent an unsolicited server PING and is awaiting any
     /// inbound byte (PONG or otherwise) before the ping-timeout grace elapses.
     awaiting_pong: bool = false,
@@ -1936,6 +1941,10 @@ pub const LinuxServer = struct {
     /// Pending account email/token verifications (REGISTER -> VERIFY).
     account_verifies: account_verify_mod.VerifyStore,
     history: HistoryStore,
+    /// IRCv3 `draft/search` inverted index (word -> msgids), populated forward as
+    /// PRIVMSG/NOTICE messages are recorded into `history`. Bounded by its Config;
+    /// queried by `handleSearch`, which scopes hits back to a target's history.
+    search_index: search_index_mod.SearchIndex,
     warden: warden.Registry,
     metadata: metadata_store.DefaultStore,
     /// Background weather/news cache backing `!weather`/`!news` (lazy-started on
@@ -2346,6 +2355,7 @@ pub const LinuxServer = struct {
             .welcome = welcome_pack_mod.WelcomePack.init(allocator),
             .account_verifies = account_verify_mod.VerifyStore.init(allocator, .{ .token_bytes = 16 }),
             .history = HistoryStore.init(allocator),
+            .search_index = search_index_mod.SearchIndex.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .metadata = metadata_store.DefaultStore.init(allocator),
             .geo = geo_ptr,
@@ -2583,6 +2593,7 @@ pub const LinuxServer = struct {
             }
         }
         self.history.deinit();
+        self.search_index.deinit();
         self.warden.deinit();
         self.metadata.deinit();
         self.props.deinit();
@@ -9922,6 +9933,11 @@ pub const LinuxServer = struct {
             .command = command,
             .client_tags = client_tags,
         }) catch {};
+        // Forward-index the message body for draft/search (word -> msgid). Bounded
+        // by the index Config (max words/ids/token bytes); oversize indexes are a
+        // best-effort drop, never an error to the sender. msgid uniquely keys the
+        // entry; `handleSearch` re-scopes a hit to a target's own history.
+        self.search_index.index(msgid, text) catch {};
     }
 
     fn tagmsgHistoryEligible(tags: []const u8) bool {
@@ -10304,6 +10320,157 @@ pub const LinuxServer = struct {
     /// ordinary message) when its replay command is neither PRIVMSG nor NOTICE.
     fn historyEntryIsEvent(command: []const u8) bool {
         return !std.mem.eql(u8, command, "PRIVMSG") and !std.mem.eql(u8, command, "NOTICE") and !historyEntryIsTagmsg(command);
+    }
+
+    /// draft/search anti-abuse: the minimum gap (monotonic ms) between two SEARCH
+    /// commands from one client. Matches Ophion's 5s/client floor.
+    const search_rate_limit_ms: i64 = 5_000;
+    /// draft/search result cap: at most this many messages per query, newest
+    /// first. Matches Ophion's SEARCH_MAX_RESULTS.
+    const search_max_results: usize = 50;
+    /// draft/search query bound: at most this many distinct words are intersected
+    /// (AND). Excess words are ignored, keeping the per-query cost bounded.
+    const search_max_query_words: usize = 8;
+
+    /// Look up a single history message in `store_target` by its exact msgid,
+    /// newest-first. Returns null when no live (non-tombstoned) entry matches.
+    /// Used by SEARCH to re-scope a global index hit to one target's ring.
+    fn historyMessageExact(self: *LinuxServer, store_target: []const u8, msgid: []const u8) ?lotus.Message {
+        var buf: [256]lotus.Message = undefined;
+        const found = self.history.latest(store_target, buf.len, &buf) catch return null;
+        for (found) |message| {
+            if (std.mem.eql(u8, message.msgid, msgid)) return message;
+        }
+        return null;
+    }
+
+    /// `SEARCH <target> [<query...>]` — IRCv3 draft/search full-text message
+    /// search over the CHATHISTORY store. Tokenizes the query into words, finds
+    /// each in the inverted index, AND-intersects the msgid sets (a message must
+    /// contain EVERY query word), re-scopes the surviving msgids to `<target>`'s
+    /// own history (visibility), and replays the matches as a `chathistory` BATCH
+    /// — reusing the CHATHISTORY renderer (BATCH when the client has `batch`,
+    /// plain lines otherwise). Channel targets require membership; a non-channel
+    /// target searches the requester's DM history with that peer. Rate-limited
+    /// per client and capped at `search_max_results` (newest-first).
+    ///
+    /// Simplification vs Ophion: Ophion backs SEARCH with SQLite FTS5 (ranked
+    /// full-text). Orochi uses a bounded in-memory inverted index with exact,
+    /// case-folded word AND-matching (no stemming, no substring, no relevance
+    /// ranking) — results are ordered newest-first like CHATHISTORY LATEST.
+    pub fn handleSearch(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+        if (!conn.session.hasCap(.search)) {
+            try self.failReply(conn, "SEARCH", "NEED_REGISTRATION", "You must negotiate the draft/search capability");
+            return;
+        }
+
+        // Parse: drop the leading `SEARCH` verb, take the first whitespace token as
+        // the target, and treat the remainder (a `:`-trailing is unwrapped) as the
+        // raw query text. Tokenization mirrors the index's word splitter.
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        var rest = std.mem.trimStart(u8, trimmed, " ");
+        if (std.ascii.startsWithIgnoreCase(rest, "SEARCH")) rest = rest["SEARCH".len..];
+        rest = std.mem.trimStart(u8, rest, " ");
+
+        const target_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        const target = rest[0..target_end];
+        var query = std.mem.trimStart(u8, rest[target_end..], " ");
+        if (query.len != 0 and query[0] == ':') query = query[1..];
+
+        if (target.len == 0 or query.len == 0) {
+            try self.failReply(conn, "SEARCH", "INVALID_PARAMS", "Usage: SEARCH <target> :<query>");
+            return;
+        }
+
+        // Rate limit (anti-abuse): reject a too-fast second SEARCH.
+        const now = self.nowMs();
+        if (conn.last_search_ms != 0 and now - conn.last_search_ms < search_rate_limit_ms) {
+            try self.failReply(conn, "SEARCH", "RATE_LIMITED", "Please wait before searching again");
+            return;
+        }
+
+        // Visibility: a channel target requires membership (no leaking non-member
+        // channel history); a non-channel target resolves to the requester's DM
+        // history with that peer via the shared history key.
+        if (world_model.isChannelName(target)) {
+            if (!self.world.isMember(target, worldIdFromClient(id))) {
+                try self.failReply(conn, "SEARCH", "INVALID_TARGET", "You must be a member of the channel");
+                return;
+            }
+        }
+        conn.last_search_ms = now;
+
+        var key_buf: [320]u8 = undefined;
+        const store_target = self.historyKeyForTarget(conn, target, &key_buf);
+
+        // Tokenize the query (bounded) and AND-intersect the index hit sets. The
+        // first word seeds the candidate msgid list; each later word filters it.
+        var words: [search_max_query_words][]const u8 = undefined;
+        var word_count: usize = 0;
+        {
+            var it = std.mem.tokenizeAny(u8, query, " \t");
+            while (it.next()) |w| {
+                if (word_count >= search_max_query_words) break;
+                words[word_count] = w;
+                word_count += 1;
+            }
+        }
+        if (word_count == 0) {
+            try self.failReply(conn, "SEARCH", "INVALID_PARAMS", "Query must contain at least one word");
+            return;
+        }
+
+        // Candidate msgids = hits for the first word, scoped to this target and
+        // requiring every other query word to also hit that msgid (AND). Bounded
+        // by `search_max_results`, newest-first (the history ring is oldest-first,
+        // so we walk it in reverse).
+        var found_buf: [search_max_results]lotus.Message = undefined;
+        var found_len: usize = 0;
+        const seed_hits = self.search_index.find(words[0]);
+        // Iterate seed hits newest-first: the index appends in record order, so
+        // later indices are newer messages.
+        var hit_i: usize = seed_hits.len;
+        while (hit_i > 0 and found_len < search_max_results) {
+            hit_i -= 1;
+            const msgid = seed_hits[hit_i];
+            if (!self.searchMsgidMatchesAll(msgid, words[1..word_count])) continue;
+            const message = self.historyMessageExact(store_target, msgid) orelse continue;
+            if (!historyMessageVisibleTo(&conn.session, message)) continue;
+            found_buf[found_len] = message;
+            found_len += 1;
+        }
+
+        // Reverse into chronological (oldest-first) order for replay, matching
+        // CHATHISTORY's BATCH ordering.
+        var ordered: [search_max_results]lotus.Message = undefined;
+        var k: usize = 0;
+        while (k < found_len) : (k += 1) {
+            ordered[k] = found_buf[found_len - 1 - k];
+        }
+
+        var out_buf: [default_reply_bytes * 4]u8 = undefined;
+        const replay = self.renderHistoryReplay(conn, &out_buf, "search", target, ordered[0..found_len]) catch {
+            try self.failReply(conn, "SEARCH", "RESULTS_TOO_LARGE", "Too many results; narrow the query");
+            return;
+        };
+        try appendToConn(conn, replay);
+    }
+
+    /// AND semantics: whether `msgid` is in the index hit list for every word in
+    /// `rest`. Empty `rest` (single-word query) is vacuously true.
+    fn searchMsgidMatchesAll(self: *LinuxServer, msgid: []const u8, rest: []const []const u8) bool {
+        for (rest) |word| {
+            const hits = self.search_index.find(word);
+            var present = false;
+            for (hits) |hit| {
+                if (std.mem.eql(u8, hit, msgid)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) return false;
+        }
+        return true;
     }
 
     /// `OPERMOTD` — show the operator MOTD (RPL_OMOTDSTART/OMOTD/ENDOFOMOTD, or
@@ -14163,6 +14330,10 @@ pub const LinuxServer = struct {
             },
             else => return err,
         };
+        // Drop the redacted message from the draft/search index so SEARCH no
+        // longer surfaces it (the history slot is kept as a tombstone, but the
+        // inverted index has no tombstone concept — we evict the msgid outright).
+        _ = self.search_index.remove(msgid);
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "REDACT", &.{ channel, msgid }, reason);
@@ -14217,6 +14388,9 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "EDIT", "EDIT_FAILED", "Could not edit message");
             return;
         };
+        // Re-index the new body so SEARCH matches the edited text, not the old
+        // one. `index` first removes the msgid's prior words, then re-tokenizes.
+        self.search_index.index(edit.msgid, edit.text) catch {};
 
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, current_prefix, "PRIVMSG", &.{edit.target}, edit.text);
@@ -27800,6 +27974,376 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-one", 200);
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
     try recvUntil(&a, "BATCH -1", 200);
+}
+
+test "threaded server: SEARCH returns matching channel messages in a chathistory BATCH" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "CAP REQ :draft/search batch\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #s\r\n");
+    try recvUntil(&a, " 366 A #s ", 200);
+    try writeAllFd(fd_b, "JOIN #s\r\n");
+    try recvUntil(&b, " 366 B #s ", 200);
+
+    // Three messages; only two contain the word "apple".
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #s :apple pie\r\n");
+    try recvUntil(&a, "PRIVMSG #s :apple pie", 200);
+    try writeAllFd(fd_b, "PRIVMSG #s :banana split\r\n");
+    try recvUntil(&a, "PRIVMSG #s :banana split", 200);
+    try writeAllFd(fd_b, "PRIVMSG #s :green apple\r\n");
+    try recvUntil(&a, "PRIVMSG #s :green apple", 200);
+
+    // SEARCH (with batch cap): a chathistory BATCH containing only the matches,
+    // oldest-first, excluding the non-matching "banana split".
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #s :apple\r\n");
+    try recvUntil(&a, "BATCH +search chathistory #s", 200);
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #s :apple pie", 200);
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #s :green apple", 200);
+    try recvUntil(&a, "BATCH -search", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "banana split") == null);
+}
+
+test "threaded server: SEARCH delivers plain lines without the batch cap" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    // A negotiates draft/search but NOT batch -> results come as plain lines.
+    try writeAllFd(fd_a, "CAP REQ :draft/search\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #p\r\n");
+    try recvUntil(&a, " 366 A #p ", 200);
+    try writeAllFd(fd_b, "JOIN #p\r\n");
+    try recvUntil(&b, " 366 B #p ", 200);
+
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #p :findme now\r\n");
+    try recvUntil(&a, "PRIVMSG #p :findme now", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #p :findme\r\n");
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #p :findme now", 200);
+    // No BATCH framing when the client lacks the batch cap.
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "BATCH") == null);
+}
+
+test "threaded server: SEARCH multi-word AND narrows results" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "CAP REQ :draft/search batch\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #m\r\n");
+    try recvUntil(&a, " 366 A #m ", 200);
+    try writeAllFd(fd_b, "JOIN #m\r\n");
+    try recvUntil(&b, " 366 B #m ", 200);
+
+    // "quick" matches two; "quick brown" matches only the one with both words.
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #m :quick brown fox\r\n");
+    try recvUntil(&a, "PRIVMSG #m :quick brown fox", 200);
+    try writeAllFd(fd_b, "PRIVMSG #m :quick red hen\r\n");
+    try recvUntil(&a, "PRIVMSG #m :quick red hen", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #m :quick brown\r\n");
+    try recvUntil(&a, "BATCH +search chathistory #m", 200);
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #m :quick brown fox", 200);
+    try recvUntil(&a, "BATCH -search", 200);
+    // The AND of "quick" and "brown" excludes the "quick red hen" message.
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "quick red hen") == null);
+}
+
+test "threaded server: SEARCH rejects a non-member channel search" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    // A negotiates standard-replies so the rejection is a typed FAIL.
+    try writeAllFd(fd_a, "CAP REQ :draft/search standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    // B founds #secret and posts; A is NOT a member.
+    try writeAllFd(fd_b, "JOIN #secret\r\n");
+    try recvUntil(&b, " 366 B #secret ", 200);
+    try writeAllFd(fd_b, "PRIVMSG #secret :hidden token\r\n");
+    waitMillis(50);
+
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #secret :hidden\r\n");
+    try recvUntil(&a, "FAIL SEARCH INVALID_TARGET", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "hidden token") == null);
+}
+
+test "threaded server: SEARCH returns the requester's own DM history" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try saslPlainPreludeWithCaps(fd_a, "admin", "orochi", "draft/search batch");
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try saslPlainPreludeWithCaps(fd_b, "oper", "orochi", "draft/search batch");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 381 B ", 200);
+
+    // A DMs B; the message is recorded into A<->B DM history.
+    b.reset();
+    try writeAllFd(fd_a, "PRIVMSG B :secret rendezvous\r\n");
+    try recvUntil(&b, "PRIVMSG B :secret rendezvous", 200);
+
+    // B searches its DM history with A and finds the message.
+    b.reset();
+    try writeAllFd(fd_b, "SEARCH A :rendezvous\r\n");
+    try recvUntil(&b, "BATCH +search chathistory A", 200);
+    try recvUntil(&b, ":A!alice@localhost PRIVMSG A :secret rendezvous", 200);
+    try recvUntil(&b, "BATCH -search", 200);
+}
+
+test "threaded server: SEARCH rate limit blocks a too-fast second search" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "CAP REQ :draft/search batch standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #r\r\n");
+    try recvUntil(&a, " 366 A #r ", 200);
+    try writeAllFd(fd_b, "JOIN #r\r\n");
+    try recvUntil(&b, " 366 B #r ", 200);
+
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #r :limit word\r\n");
+    try recvUntil(&a, "PRIVMSG #r :limit word", 200);
+
+    // First SEARCH succeeds; the immediate second is rejected (5s/client floor).
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #r :limit\r\n");
+    try recvUntil(&a, "BATCH -search", 200);
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #r :limit\r\n");
+    try recvUntil(&a, "FAIL SEARCH RATE_LIMITED", 200);
+}
+
+test "threaded server: SEARCH omits a redacted message from results" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    // A founds #x (channel operator), so it can REDACT its own message.
+    try writeAllFd(fd_a, "CAP REQ :draft/search batch draft/message-redaction\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "JOIN #x\r\n");
+    try recvUntil(&a, " 366 A #x ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG #x :erase target\r\n");
+    waitMillis(50);
+    try a.readAvailable();
+    const msgid = extractMsgid(a.written()) orelse return error.SkipZigTest;
+    var redact_buf: [128]u8 = undefined;
+    const redact_line = try std.fmt.bufPrint(&redact_buf, "REDACT #x {s} :cleanup\r\n", .{msgid});
+    try writeAllFd(fd_a, redact_line);
+    try recvUntil(&a, "REDACT #x ", 200);
+
+    // The redacted message is gone from the search index.
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #x :erase\r\n");
+    try recvUntil(&a, "BATCH -search", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "erase target") == null);
+}
+
+test "threaded server: SEARCH caps results at the maximum" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "CAP REQ :draft/search batch\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #cap\r\n");
+    try recvUntil(&a, " 366 A #cap ", 200);
+    try writeAllFd(fd_b, "JOIN #cap\r\n");
+    try recvUntil(&b, " 366 B #cap ", 200);
+
+    // Post more matching messages than the result cap (search_max_results = 50).
+    const total: usize = LinuxServer.search_max_results + 5;
+    a.reset();
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var msg_buf: [64]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&msg_buf, "PRIVMSG #cap :widget number {d}\r\n", .{i});
+        try writeAllFd(fd_b, msg);
+    }
+    // Wait for the last one to round-trip so all are indexed.
+    try recvUntil(&a, "widget number 54", 400);
+
+    a.reset();
+    try writeAllFd(fd_a, "SEARCH #cap :widget\r\n");
+    try recvUntil(&a, "BATCH -search", 400);
+    // Count the delivered PRIVMSG result lines: exactly the cap, no more.
+    var count: usize = 0;
+    var cursor: usize = 0;
+    const out = a.written();
+    while (std.mem.indexOfPos(u8, out, cursor, "PRIVMSG #cap :widget")) |pos| {
+        count += 1;
+        cursor = pos + 1;
+    }
+    try std.testing.expectEqual(LinuxServer.search_max_results, count);
+}
+
+test "threaded server: CAP LS advertises draft/search" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "CAP LS 302\r\n");
+    try recvUntil(&a, "draft/search", 200);
 }
 
 test "threaded server: draft/event-playback replays TOPIC events only to capable clients" {

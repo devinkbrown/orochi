@@ -396,7 +396,7 @@ const default_specs = [_]CapSpec{
     .{ .id = .read_marker, .name = "read-marker" },
     .{ .id = .channel_rename, .name = "channel-rename" },
     .{ .id = .file_upload, .name = "file-upload" },
-    .{ .id = .search, .name = "search" },
+    .{ .id = .search, .name = "draft/search" },
     .{ .id = .reply, .name = "reply" },
     .{ .id = .react, .name = "react" },
     .{ .id = .message_editing, .name = "message-editing" },

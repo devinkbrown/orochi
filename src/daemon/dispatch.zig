@@ -269,6 +269,7 @@ pub const CapId = enum(u6) {
     multiline,
     sts,
     event_playback,
+    search,
 };
 
 const CapSet = struct {
@@ -343,6 +344,10 @@ const cap_specs = [_]CapSpec{
     //   batch                 -> server emits BATCH (chathistory, netsplit)
     //   bot                   -> +B bot flag surfaced in WHOIS (335)
     .{ .id = .chathistory, .name = "draft/chathistory" },
+    // draft/search: SEARCH <target> :<query> -> full-text message search over the
+    // CHATHISTORY store; results delivered in a `chathistory` BATCH. Backed by the
+    // live `handleSearch` handler + the forward-populated inverted index.
+    .{ .id = .search, .name = "draft/search" },
     .{ .id = .message_redaction, .name = "draft/message-redaction" },
     .{ .id = .message_editing, .name = "draft/message-editing" },
     .{ .id = .read_marker, .name = "draft/read-marker" },

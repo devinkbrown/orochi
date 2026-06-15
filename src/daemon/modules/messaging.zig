@@ -28,6 +28,10 @@ fn chathistory(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleChathistory(x.id, x.conn, x.line);
 }
+fn search(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleSearch(x.id, x.conn, x.line);
+}
 fn markread(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMarkread(x.conn, x.parsed);
@@ -54,6 +58,7 @@ pub const module = registry.Module{
         .{ .name = "REDACT", .handler = redact },
         .{ .name = "EDIT", .handler = edit },
         .{ .name = "CHATHISTORY", .handler = chathistory },
+        .{ .name = "SEARCH", .handler = search },
         .{ .name = "MARKREAD", .handler = markread },
         .{ .name = "METADATA", .handler = metadata },
         .{ .name = "MONITOR", .handler = monitor },
