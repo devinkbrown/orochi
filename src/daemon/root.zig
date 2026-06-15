@@ -128,6 +128,7 @@ pub const mention_graph = @import("mention_graph.zig");
 pub const mention_index = @import("mention_index.zig");
 pub const mention_mute = @import("mention_mute.zig");
 pub const message_flag = @import("message_flag.zig");
+pub const metrics_http = @import("metrics_http.zig");
 pub const moderation_filter = @import("moderation_filter.zig");
 pub const mod_log = @import("mod_log.zig");
 pub const module_core = @import("module_core.zig");
@@ -436,6 +437,7 @@ test {
     _ = mention_index;
     _ = mention_mute;
     _ = message_flag;
+    _ = metrics_http;
     _ = moderation_filter;
     _ = mod_log;
     _ = module_core;

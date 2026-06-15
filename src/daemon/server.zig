@@ -194,6 +194,7 @@ const ircx_saccess = @import("../proto/ircx_saccess.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
 const server_stats = @import("server_stats.zig");
+const metrics_http = @import("metrics_http.zig");
 const activity = @import("../proto/activity.zig");
 const activity_subscriptions = @import("activity_subscriptions.zig");
 const node_identity = @import("node_identity.zig");
@@ -1200,6 +1201,13 @@ pub const Config = struct {
     stats_web_dir: []const u8 = "",
     /// Minimum interval between web-stats writes, in ms.
     stats_interval_ms: i64 = 30_000,
+    /// TCP port for the live Prometheus `/metrics` HTTP listener. 0 = disabled.
+    /// When non-zero, a loopback-by-default listener thread is started in
+    /// `start()` and torn down in `deinit()`. See metrics_http.zig.
+    metrics_port: u16 = 0,
+    /// Bind address (host byte order) for the `/metrics` listener. Defaults to
+    /// loopback `127.0.0.1`; only widened deliberately via `[metrics].bind`.
+    metrics_bind_addr: u32 = 0x7f00_0001,
     /// UDP port for the media (SFU) transport plane; 0 = ephemeral. Bound on boot.
     media_port: u16 = 0,
     /// Host/IP advertised to clients as the server's media (ICE) candidate.
@@ -1852,6 +1860,10 @@ pub const LinuxServer = struct {
     /// Web-stats publishing throttle + running peak client count.
     stats_last_write_ms: i64 = 0,
     stats_peak_clients: u64 = 0,
+    /// Throttle for refreshing the live Prometheus `/metrics` snapshot (same
+    /// cadence as web stats, but independent so it runs even when web stats are
+    /// disabled). 0 = never refreshed yet.
+    metrics_last_refresh_ms: i64 = 0,
     /// Ring of recent client-count samples for the stats sparkline.
     stats_history: [60]u32 = [_]u32{0} ** 60,
     stats_hist_count: usize = 0,
@@ -1907,6 +1919,14 @@ pub const LinuxServer = struct {
     /// Observability: allocation-free runtime counters (totals + gauges), bumped
     /// inline on the hot path and rendered on demand (STATS z / Prometheus).
     stats: server_stats.Stats = .{},
+    /// Mutex-guarded latest Prometheus exposition text, refreshed on the stats
+    /// cadence (see maybeWriteStats) and served verbatim by the optional live
+    /// `/metrics` HTTP listener thread. Initialized in `init`.
+    metrics_snapshot: metrics_http.MetricsSnapshot,
+    /// Optional live Prometheus `/metrics` HTTP listener (loopback by default).
+    /// Started in `start()` when `config.metrics_port != 0`, joined in `deinit()`.
+    /// On hot-upgrade it is torn down and re-created on the new process.
+    metrics_server: ?metrics_http.MetricsServer = null,
     /// #33 ACTIVITY: per-channel real-time activity-stream subscribers.
     activity_subs: activity_subscriptions.SubscriptionStore,
     /// Phase 3: per-account live session registry (multi-device / bouncer).
@@ -2259,6 +2279,7 @@ pub const LinuxServer = struct {
             // secure_fns/getrandom) so ids are opaque and disjoint across boots.
             .msgid_gen = msgid_mod.Generator.init(secure_fns.randomU64()),
             .activity_subs = activity_subscriptions.SubscriptionStore.init(allocator),
+            .metrics_snapshot = metrics_http.MetricsSnapshot.init(allocator),
             .sessions = sessions_mod.SessionStore.initWithConfig(allocator, .{
                 .max_accounts = @intCast(config.session_max_accounts),
                 .max_sessions_per_account = config.session_max_per_account,
@@ -2322,6 +2343,45 @@ pub const LinuxServer = struct {
             // Bridge WebRTC RTP frames to any native members of each channel.
             self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
         }
+        self.startMetrics();
+    }
+
+    /// Stand up the live Prometheus `/metrics` HTTP listener when configured.
+    /// Loopback-by-default and read-only; a bind/spawn failure logs and the
+    /// daemon keeps serving IRC (metrics are non-essential). Seed the snapshot
+    /// once so a scrape before the first stats tick returns valid (if sparse)
+    /// exposition text instead of an empty body.
+    fn startMetrics(self: *LinuxServer) void {
+        if (self.config.metrics_port == 0) return;
+        self.refreshMetricsSnapshot();
+        self.metrics_server = metrics_http.MetricsServer.initWithConfig(
+            &self.metrics_snapshot,
+            self.config.metrics_port,
+            .{ .bind_addr = self.config.metrics_bind_addr },
+        ) catch |e| {
+            std.debug.print("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
+            return;
+        };
+        // Spawn on the stored field so the accept loop's `self` pointer is stable
+        // for the listener thread's lifetime.
+        self.metrics_server.?.spawn() catch |e| {
+            std.debug.print("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
+            self.metrics_server.?.shutdown();
+            self.metrics_server = null;
+            return;
+        };
+        std.debug.print("orochi: /metrics on TCP :{d}\n", .{self.metrics_server.?.port});
+    }
+
+    /// Render the current Prometheus exposition text and publish it into the
+    /// mutex-guarded snapshot. Called from the stats cadence (the only writer)
+    /// and once at startup. Best-effort: a render/alloc failure leaves the prior
+    /// snapshot intact so a scrape returns stale-but-valid data.
+    fn refreshMetricsSnapshot(self: *LinuxServer) void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        self.stats.writePrometheus(self.allocator, &out) catch return;
+        self.metrics_snapshot.set(out.items) catch return;
     }
 
     test "server start gates media transports on media_enabled" {
@@ -2378,6 +2438,14 @@ pub const LinuxServer = struct {
     }
 
     pub fn deinit(self: *LinuxServer) void {
+        // Stop + join the /metrics listener thread FIRST, before freeing the
+        // snapshot it reads. shutdown() signals the stop flag, closes the
+        // listener fd, and joins. No-op when the endpoint was never started.
+        if (self.metrics_server) |*ms| {
+            ms.shutdown();
+            self.metrics_server = null;
+        }
+        self.metrics_snapshot.deinit();
         if (self.owned_disabled_features) |owned| {
             self.allocator.free(owned);
             self.owned_disabled_features = null;
@@ -2743,6 +2811,19 @@ pub const LinuxServer = struct {
     }
 
     fn maybeWriteStats(self: *LinuxServer) void {
+        // Refresh the live Prometheus snapshot on the same throttled cadence as
+        // the web-stats files, even when web stats are disabled — the /metrics
+        // endpoint only needs the counters, not the GeoIP/web rendering below.
+        if (self.metrics_server != null) {
+            const now_m = self.nowMs();
+            if (self.metrics_last_refresh_ms == 0 or
+                now_m - self.metrics_last_refresh_ms >= self.config.stats_interval_ms)
+            {
+                self.metrics_last_refresh_ms = now_m;
+                self.refreshMetricsSnapshot();
+            }
+        }
+
         const dir = self.config.stats_web_dir;
         if (dir.len == 0) return;
         const io = self.config.crypto_io orelse return;

@@ -64,6 +64,12 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
     if (cfg.stats.interval_ms != 0) out.stats_interval_ms = cfg.stats.interval_ms;
+    // [metrics] — live Prometheus /metrics endpoint. Off unless a port is set;
+    // the bind defaults to loopback and is only widened by an explicit address.
+    if (cfg.metrics.listen != 0) {
+        out.metrics_port = cfg.metrics.listen;
+        if (parseIp4Host(cfg.metrics.bind)) |addr| out.metrics_bind_addr = addr;
+    }
     if (cfg.geoip.database.len != 0) out.geoip_db_path = cfg.geoip.database;
     if (cfg.geoip.asn_database.len != 0) out.geoip_asn_db_path = cfg.geoip.asn_database;
     out.backlog = cfg.limits.backlog;
@@ -98,6 +104,31 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     // [mesh].connect — peers this node auto-dials at boot (strings borrow cfg).
     if (cfg.mesh.connect.len != 0) out.mesh_connect = cfg.mesh.connect;
     return out;
+}
+
+/// Parse a dotted-quad IPv4 literal into a host-byte-order u32 (e.g. "127.0.0.1"
+/// → 0x7f00_0001). Returns null on any malformed input so the caller keeps its
+/// secure loopback default rather than binding an unexpected address.
+fn parseIp4Host(s: []const u8) ?u32 {
+    var octets: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) {
+        if (i >= 4) return null;
+        octets[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+    }
+    if (i != 4) return null;
+    return (@as(u32, octets[0]) << 24) | (@as(u32, octets[1]) << 16) |
+        (@as(u32, octets[2]) << 8) | @as(u32, octets[3]);
+}
+
+test "parseIp4Host parses loopback and rejects junk" {
+    try std.testing.expectEqual(@as(?u32, 0x7f00_0001), parseIp4Host("127.0.0.1"));
+    try std.testing.expectEqual(@as(?u32, 0x0000_0000), parseIp4Host("0.0.0.0"));
+    try std.testing.expectEqual(@as(?u32, 0xc0a8_0101), parseIp4Host("192.168.1.1"));
+    try std.testing.expectEqual(@as(?u32, null), parseIp4Host("127.0.0"));
+    try std.testing.expectEqual(@as(?u32, null), parseIp4Host("not-an-ip"));
+    try std.testing.expectEqual(@as(?u32, null), parseIp4Host("256.0.0.1"));
 }
 
 /// Neutral STS boot projection consumed by `main.zig` to enable IRCv3 STS per
