@@ -1,5 +1,5 @@
 //! Kakehashi (架け橋, "bridge") — the SFU media bridge between Orochi's native
-//! Suimyaku media plane (opcodec frames over CoilPack/ryusen + secure_channel)
+//! Suimyaku media plane (kagura frames over CoilPack/ryusen + secure_channel)
 //! and the WebRTC gateway (RTP/SRTP, for mobile / hardware-codec clients).
 //!
 //! The SFU forwards a transport-neutral `BridgeFrame`; each egress leg
@@ -17,11 +17,11 @@
 //! build RTP/container headers, not media). All codec work lives in the
 //! endpoints; the SFU only forwards.
 //!
-//! Codec identity is normalized here: `opcodec_frame.CodecTag` (raw=0) and
+//! Codec identity is normalized here: `kagura_frame.CodecTag` (raw=0) and
 //! `sdp.CodecTag` (raw=3) disagree on the `raw` ordinal, so Kakehashi carries
 //! its own `Codec` and maps explicitly to each side.
 const std = @import("std");
-const opcodec_frame = @import("opcodec_frame.zig");
+const kagura_frame = @import("kagura_frame.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 
 /// Canonical codec identity for the bridge (matches sdp.CodecTag ordinals).
@@ -52,10 +52,10 @@ pub const MediaKind = enum { audio, video };
 pub const Error = error{ BufferTooSmall, UnknownPayloadType, Truncated };
 
 // ---------------------------------------------------------------------------
-// Native (opcodec) leg
+// Native (kagura) leg
 // ---------------------------------------------------------------------------
 
-fn nativeToCodec(t: opcodec_frame.CodecTag) Codec {
+fn nativeToCodec(t: kagura_frame.CodecTag) Codec {
     return switch (t) {
         .opvox_audio => .opvox,
         .opvis_video => .opvis,
@@ -63,7 +63,7 @@ fn nativeToCodec(t: opcodec_frame.CodecTag) Codec {
     };
 }
 
-fn codecToNative(c: Codec) opcodec_frame.CodecTag {
+fn codecToNative(c: Codec) kagura_frame.CodecTag {
     return switch (c) {
         .opvox => .opvox_audio,
         .opvis => .opvis_video,
@@ -71,8 +71,8 @@ fn codecToNative(c: Codec) opcodec_frame.CodecTag {
     };
 }
 
-/// Ingest a native opcodec frame into the bridge (payload borrowed).
-pub fn fromNative(f: opcodec_frame.MediaFrame) BridgeFrame {
+/// Ingest a native kagura frame into the bridge (payload borrowed).
+pub fn fromNative(f: kagura_frame.MediaFrame) BridgeFrame {
     return .{
         .codec = nativeToCodec(f.codec),
         .timestamp = f.timestamp,
@@ -83,7 +83,7 @@ pub fn fromNative(f: opcodec_frame.MediaFrame) BridgeFrame {
 }
 
 /// Emit a bridge frame to a native peer (caller supplies the band/stream ids).
-pub fn toNative(bf: BridgeFrame, band_id: u8, stream_id: u32) opcodec_frame.MediaFrame {
+pub fn toNative(bf: BridgeFrame, band_id: u8, stream_id: u32) kagura_frame.MediaFrame {
     return .{
         .band_id = band_id,
         .stream_id = stream_id,
@@ -222,7 +222,7 @@ pub fn selectCommon(sets: []const []const Codec) ?Codec {
 const testing = std.testing;
 
 test "native <-> bridge frame mapping (raw ordinal differs across tag sets)" {
-    const nf = opcodec_frame.MediaFrame{
+    const nf = kagura_frame.MediaFrame{
         .band_id = 70,
         .stream_id = 9,
         .sequence = 1234,
@@ -237,13 +237,13 @@ test "native <-> bridge frame mapping (raw ordinal differs across tag sets)" {
     try testing.expect(bf.keyframe);
 
     const back = toNative(bf, 70, 9);
-    try testing.expectEqual(opcodec_frame.CodecTag.opvox_audio, back.codec);
+    try testing.expectEqual(kagura_frame.CodecTag.opvox_audio, back.codec);
     try testing.expectEqualStrings("audio-bytes", back.payload);
 
     // raw maps native(0) <-> kakehashi(3) correctly
-    const rawf = opcodec_frame.MediaFrame{ .band_id = 70, .stream_id = 1, .sequence = 1, .timestamp = 1, .keyframe = false, .codec = .raw, .payload = "x" };
+    const rawf = kagura_frame.MediaFrame{ .band_id = 70, .stream_id = 1, .sequence = 1, .timestamp = 1, .keyframe = false, .codec = .raw, .payload = "x" };
     try testing.expectEqual(Codec.raw, fromNative(rawf).codec);
-    try testing.expectEqual(opcodec_frame.CodecTag.raw, codecToNative(.raw));
+    try testing.expectEqual(kagura_frame.CodecTag.raw, codecToNative(.raw));
 }
 
 test "RTP <-> bridge round-trips through a PT map" {
@@ -270,7 +270,7 @@ test "RTP <-> bridge round-trips through a PT map" {
 test "full native->webrtc->native bridge preserves codec/payload/keyframe" {
     var map = PtMap{};
     map.add(100, .opvis);
-    const nf = opcodec_frame.MediaFrame{ .band_id = 71, .stream_id = 2, .sequence = 42, .timestamp = 9000, .keyframe = true, .codec = .opvis_video, .payload = "frame-payload" };
+    const nf = kagura_frame.MediaFrame{ .band_id = 71, .stream_id = 2, .sequence = 42, .timestamp = 9000, .keyframe = true, .codec = .opvis_video, .payload = "frame-payload" };
 
     const bf = fromNative(nf);
     var buf: [128]u8 = undefined;
@@ -278,7 +278,7 @@ test "full native->webrtc->native bridge preserves codec/payload/keyframe" {
     const bf2 = try fromRtp(rtp, &map, true);
     const nf2 = toNative(bf2, 71, 2);
 
-    try testing.expectEqual(opcodec_frame.CodecTag.opvis_video, nf2.codec);
+    try testing.expectEqual(kagura_frame.CodecTag.opvis_video, nf2.codec);
     try testing.expectEqualStrings("frame-payload", nf2.payload);
     try testing.expect(nf2.keyframe);
     try testing.expectEqual(@as(u32, 42), nf2.sequence);

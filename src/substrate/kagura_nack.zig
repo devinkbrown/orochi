@@ -1,10 +1,10 @@
-//! Native opcodec negative-ack helpers for Suimyaku media frames.
+//! Native kagura negative-ack helpers for Suimyaku media frames.
 //!
-//! This module keys retransmission and gap tracking by `opcodec_frame`
+//! This module keys retransmission and gap tracking by `kagura_frame`
 //! `sequence` values: u32 frame sequence numbers that wrap at 2^32. It is
 //! self-contained and std-only so it can be tested in isolation:
 //!
-//!     zig test src/substrate/opcodec_nack.zig
+//!     zig test src/substrate/kagura_nack.zig
 
 const std = @import("std");
 

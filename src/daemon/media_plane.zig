@@ -87,7 +87,7 @@ pub const MediaPlane = struct {
     csprng: std.Random.DefaultCsprng,
     /// Optional cross-leg sink: after relaying an RTP frame to WebRTC peers, the
     /// pump hands it here to also reach the channel's native members (rewrapped to
-    /// opcodec). Null = no native members / no bridging.
+    /// kagura). Null = no native members / no bridging.
     cross: ?media_bridge.RtpCrossSink = null,
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {

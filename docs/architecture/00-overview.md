@@ -17,7 +17,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | Reactor/threading | `src/daemon/server.zig`, `src/daemon/reactor_pool.zig`, `src/daemon/reactor_fabric.zig`, `src/substrate/reactor.zig` | io_uring completion loop, per-reactor connection slabs, optional worker pool, cross-shard delivery fabric, deterministic time seam | `src/daemon/server.zig:1229`, `src/daemon/reactor_pool.zig:1`, `src/daemon/reactor_fabric.zig:1`, `src/substrate/reactor.zig:1` |
 | Media | `src/substrate/suimyaku/media.zig`, `src/daemon/media_room.zig`, `src/daemon/media_plane.zig`, `src/daemon/native_media_transport.zig`, `src/daemon/media_bridge.zig` | SFU participant model, per-channel rooms, RTP/STUN media plane, native OPVOX/OPVIS UDP leg, cross-leg rewrap | `src/substrate/suimyaku/media.zig:1`, `src/daemon/media_room.zig:1`, `src/daemon/media_plane.zig:1`, `src/daemon/native_media_transport.zig:1`, `src/daemon/media_bridge.zig:1` |
 | Helix upgrade | `src/daemon/modules/upgrade.zig`, `src/daemon/server.zig`, `src/daemon/helix/live.zig`, `src/daemon/helix/handoff.zig` | UPGRADE command, sealed memfd arena, listener/session fd inheritance, successor adoption | `src/daemon/modules/upgrade.zig:1`, `src/daemon/server.zig:6070`, `src/daemon/helix/live.zig:1`, `src/daemon/helix/handoff.zig:1` |
-| OroWasm | `src/wasm/host/*`, `src/wasm/opcodec_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser OPVOX/OPVIS exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/opcodec_wasm.zig:1` |
+| OroWasm | `src/wasm/host/*`, `src/wasm/kagura_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser OPVOX/OPVIS exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/kagura_wasm.zig:1` |
 
 ## End-to-End Client Request Flow
 
@@ -42,7 +42,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | `src/proto/` | Protocol codecs/builders/inventory used by daemon and modules | `src/proto/protocol_inventory.zig:1`, `src/proto/protocol_inventory.zig:40` |
 | `src/substrate/` | Lower-level runtime primitives: reactor seam, transport stack, queues, EBR/HAMT, media transport helpers | `src/substrate/reactor.zig:1`, `src/substrate/transport_stack.zig:1`, `src/daemon/world_rcu.zig:9` |
 | `src/crypto/` | Cryptography namespace; not covered here | `src/root.zig:8` |
-| `src/wasm/` | OroWasm host, browser transport shim, and OPVOX/OPVIS browser exports | `src/root.zig:16`, `src/root.zig:21`, `src/wasm/opcodec_wasm.zig:1` |
+| `src/wasm/` | OroWasm host, browser transport shim, and OPVOX/OPVIS browser exports | `src/root.zig:16`, `src/root.zig:21`, `src/wasm/kagura_wasm.zig:1` |
 
 ## Architecture Index
 

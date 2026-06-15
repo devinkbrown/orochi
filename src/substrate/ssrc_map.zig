@@ -1,7 +1,7 @@
 //! Allocation-free bidirectional identity map for the Kakehashi SFU media bridge.
 //!
 //! Translates between the native media stream identity (`stream_id: u32` carried
-//! by opcodec frames) and the WebRTC RTP `ssrc: u32`, while tracking the
+//! by kagura frames) and the WebRTC RTP `ssrc: u32`, while tracking the
 //! participant that owns each binding. Pure, std-only, fixed capacity — no
 //! allocation, no hidden state.
 

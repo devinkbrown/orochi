@@ -1,4 +1,4 @@
-//! Byte-oriented binary range coder for opcodec entropy coding.
+//! Byte-oriented binary range coder for kagura entropy coding.
 //!
 //! The coder uses a fixed 12-bit probability scale and an adaptive binary
 //! model. Callers must use matching model configuration and bit order for

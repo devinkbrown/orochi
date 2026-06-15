@@ -1,6 +1,6 @@
-# S2S Media/Crypto Asset Study: opssl and opcodec
+# S2S Media/Crypto Asset Study: opssl and kagura
 
-This is a design mapping, not an import plan. `opssl` and `opcodec` are
+This is a design mapping, not an import plan. `opssl` and `kagura` are
 owner-built C reference libraries from the Ophion ecosystem. Orochi remains
 clean-room, pure Zig in core: no C ABI, no linked C library, no inherited LADON
 identity model. These libraries are useful as blueprints for algorithms, module
@@ -57,22 +57,22 @@ Notable APIs:
 - `opssl_ktls_promote`, `opssl_ktls_promote_late`, `opssl_ktls_adopt`,
   `opssl_ktls_extract_keys`
 
-### opcodec
+### kagura
 
 Read scope:
 
-- `/home/kain/ophion/subprojects/opcodec/README.md`
-- `/home/kain/ophion/subprojects/opcodec/OPCODEC.md`
-- `/home/kain/ophion/subprojects/opcodec/BWE_INTEGRATION.md`
-- `/home/kain/ophion/subprojects/opcodec/include/opcodec/*.h`
+- `/home/kain/ophion/subprojects/kagura/README.md`
+- `/home/kain/ophion/subprojects/kagura/OPCODEC.md`
+- `/home/kain/ophion/subprojects/kagura/BWE_INTEGRATION.md`
+- `/home/kain/ophion/subprojects/kagura/include/kagura/*.h`
 - active Ophion LADON module references under `/home/kain/ophion/docs/reference/modules/`
 - historical LADON media wire doc found only in
   `/home/kain/ophion/.claude/worktrees/.../doc/technical/ladon-media-wire.md`
 
 The active Ophion tree has LADON source and module references, but the
-`doc/technical/ladon-media-wire.md` path named by opcodec is not present in the
+`doc/technical/ladon-media-wire.md` path named by kagura is not present in the
 main source tree. Treat that wire Markdown as historical supporting context and
-prefer the active opcodec headers/source plus active LADON module inventory.
+prefer the active kagura headers/source plus active LADON module inventory.
 
 Important actual module names and capabilities:
 
@@ -151,7 +151,7 @@ Port algorithms and discipline, not the C API shape.
 - Orochi already has AEAD and Tsumugi ratchet code. opssl reinforces that
   ChaCha20-Poly1305 and AES-GCM are the right primitives.
 - S2S default remains ChaCha20-Poly1305 because it is fast on non-AES hardware
-  and matches opcodec `secure`. AES-GCM is a negotiated fast path only when both
+  and matches kagura `secure`. AES-GCM is a negotiated fast path only when both
   sides advertise hardware support.
 - AEAD open must authenticate before state commit. Replay counters and skipped
   keys advance only after tag success.
@@ -272,7 +272,7 @@ migration: Tsumugi ratchet, Ryusen transport, Goryu anti-entropy work, and media
 track control state must move as one coherent object. The invariant is "no
 re-handshake, no replay window reset, no lost causal position."
 
-## opcodec -> Orochi Media Bands
+## kagura -> Orochi Media Bands
 
 ### Band Layout
 
@@ -286,7 +286,7 @@ Keep the S2S band model from the current design:
 - band 5: media control
 - bands >=64: media tracks
 
-Map opcodec/LADON as follows:
+Map kagura/LADON as follows:
 
 - LADON `VOICE_JOIN`, `VIDEO_JOIN`, `MEDIA_OFFER`, `MEDIA_ANSWER`,
   `MEDIA_STATS`, `MEDIA_NACK`, `MEDIA_BYE`, `VIDEO_KEYREQ`, `SPATIAL_*`,
@@ -405,9 +405,9 @@ Keep both browser paths:
 
 Browser codec path:
 
-- Use opcodec's WASM build shape as the blueprint: OPVOX/OPVIS in a single WASM
+- Use kagura's WASM build shape as the blueprint: OPVOX/OPVIS in a single WASM
   module with `_opvox_wasm_*` and `_opvis_wasm_*` style entry points.
-- In browsers, use WebCodecs/WebAudio where useful, but keep opcodec/WASM as the
+- In browsers, use WebCodecs/WebAudio where useful, but keep kagura/WASM as the
   custom IRC-tuned codec path.
 - Browser AEAD should use WebCrypto or Tsumugi-derived keys exposed through a
   minimal JS/WASM boundary. Avoid giving long-lived root secrets to codec WASM
@@ -420,9 +420,9 @@ Server path:
 - Mixing, recording, moderation preview, transcription, and transcoding are
   separate services. Those can run in OroWasm sandboxes or external workers.
 
-### Does opcodec `secure` Compose With Tsumugi?
+### Does kagura `secure` Compose With Tsumugi?
 
-For normal S2S relay, opcodec `secure` is redundant with Tsumugi link AEAD.
+For normal S2S relay, kagura `secure` is redundant with Tsumugi link AEAD.
 Double-encrypting every frame adds overhead and failure modes without improving
 relay-to-relay authenticity, because Tsumugi already authenticates the S2S outer
 frame and binds source node, band, stream, generation, and counters.
@@ -433,7 +433,7 @@ Use one of three modes:
    encrypted Tsumugi frame. Relays that terminate Tsumugi can inspect only the
    metadata needed for scheduling and authorization.
 2. `media_e2ee`: optional client-to-client or publisher-to-subscriber privacy.
-   An inner opcodec-style `opsec` envelope protects media payload from Orochi
+   An inner kagura-style `opsec` envelope protects media payload from Orochi
    relays. Tsumugi still protects link metadata and routing.
 3. `mixed_service`: server-side mixer/transcoder is authorized to decrypt media.
    The media key is issued to the mixer service by signed control-plane policy.
@@ -459,7 +459,7 @@ authority.
 
 ### FEC And RaptorQ
 
-opcodec `fec` is useful as a first local-recovery tool:
+kagura `fec` is useful as a first local-recovery tool:
 
 - XOR 1D/2D FEC up to 8 packets
 - low CPU
@@ -486,7 +486,7 @@ Interplay:
 
 ### BWE Feeding L4S/ECN Congestion Control
 
-opcodec `netadapt` provides useful input signals: RTT, jitter, loss, acked bytes,
+kagura `netadapt` provides useful input signals: RTT, jitter, loss, acked bytes,
 bandwidth estimate, burst-loss flag, and target bitrate recommendation.
 
 Ryusen should consume media BWE, not duplicate it blindly:
@@ -574,7 +574,7 @@ Do not port directly:
 - C opaque-handle API shape
 - thread-local error stacks
 - TLS 1.2 state machine unless a later compatibility decision explicitly adds it
-- opcodec's `secure` as the default S2S encryption layer
+- kagura's `secure` as the default S2S encryption layer
 
 ## Phased Plan
 
@@ -650,7 +650,7 @@ Do not port directly:
 - **ML-KEM implementation complexity:** NTT, rejection sampling, and implicit
   rejection are easy to get subtly wrong. KATs and differential tests are
   non-negotiable.
-- **Double encryption confusion:** Tsumugi and opcodec `secure` must have clear
+- **Double encryption confusion:** Tsumugi and kagura `secure` must have clear
   roles. Default link security is Tsumugi; inner media E2EE is optional and
   domain-separated.
 - **kTLS scope creep:** kTLS helps TLS records, not custom Tsumugi or QUIC media.
@@ -673,9 +673,9 @@ Port opssl's crypto primitives and operational patterns into pure Zig where they
 touch trust: ML-KEM, X-Wing, constant-time discipline, X.509/CERTFP, TLS
 exporters, kTLS-aware migration, and session snapshot design.
 
-Do not port opcodec into core. Use its OPVOX/OPVIS module taxonomy, frame
+Do not port kagura into core. Use its OPVOX/OPVIS module taxonomy, frame
 timing, `secure` concepts, `fec`, `jitter`, and `netadapt` as the design
 blueprint for media bands. Relay media by default; decode only in OroWasm or an
 authorized worker. Keep Tsumugi as the S2S security authority, reserve inner
-opcodec-style AEAD for optional media E2EE, and make media congestion/feed-back
+kagura-style AEAD for optional media E2EE, and make media congestion/feed-back
 serve Ryusen without ever blocking core IRC and CRDT convergence.

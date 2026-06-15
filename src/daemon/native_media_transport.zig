@@ -1,6 +1,6 @@
 //! Daemon-owned native media transport: the live UDP leg for Orochi's own
 //! codec (OPVOX/OPVIS). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
-//! carries `opcodec_frame` datagrams instead of RTP, and forwards them through a
+//! carries `kagura_frame` datagrams instead of RTP, and forwards them through a
 //! per-channel `NativeMediaLink` (stream_id → publisher → recipients).
 //!
 //! Per-channel isolation: each media call (channel) has its own `NativeMediaLink`
@@ -9,7 +9,7 @@
 //! the right channel's link.
 //!
 //! The pump thread blocks on the socket (short recv timeout to observe the stop
-//! flag), and for each datagram that parses as an opcodec frame: routes by
+//! flag), and for each datagram that parses as an kagura frame: routes by
 //! stream_id to the owning channel, learns the publisher's return address from
 //! the datagram origin, computes the SFU forward set, and resends the SAME opaque
 //! bytes to each recipient. The server NEVER encodes/decodes/transcodes — frames
@@ -18,7 +18,7 @@ const std = @import("std");
 const native_media_link = @import("native_media_link.zig");
 const media_bridge = @import("media_bridge.zig");
 const media_socket = @import("../substrate/media_socket.zig");
-const opcodec_frame = @import("../substrate/opcodec_frame.zig");
+const kagura_frame = @import("../substrate/kagura_frame.zig");
 
 pub const MediaSocket = media_socket.MediaSocket;
 pub const TransportAddress = native_media_link.TransportAddress;
@@ -52,7 +52,7 @@ pub const NativeMediaTransport = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started); advertised to native clients.
     port: u16 = 0,
-    /// Runtime cap for accepted opcodec datagrams.
+    /// Runtime cap for accepted kagura datagrams.
     max_frame_bytes: usize = media_socket.max_datagram,
     /// Runtime cap reserved for upload-bearing media operations.
     max_upload_bytes: u64 = 16 * 1024 * 1024,
@@ -116,10 +116,10 @@ pub const NativeMediaTransport = struct {
         while (!self.stop_flag.load(.acquire)) {
             const sock = &(self.socket orelse return);
             const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
-            // Require opcodec framing so the port is not an open UDP reflector.
+            // Require kagura framing so the port is not an open UDP reflector.
             if (got.data.len > self.max_frame_bytes) continue;
-            if (got.data.len < opcodec_frame.MIN_FRAME_WIRE_BYTES) continue;
-            const view = opcodec_frame.decode(got.data) catch continue;
+            if (got.data.len < kagura_frame.MIN_FRAME_WIRE_BYTES) continue;
+            const view = kagura_frame.decode(got.data) catch continue;
 
             lockSpin(&self.mutex);
             var n: usize = 0;
@@ -184,7 +184,7 @@ pub const NativeMediaTransport = struct {
     /// Register/update a native participant in `channel` (MEDIA OFFER). `addr`
     /// may be a placeholder; the pump learns the real return path from the
     /// participant's first datagram. `stream_id` is what the publisher stamps
-    /// into its opcodec frames (advertised back to the client).
+    /// into its kagura frames (advertised back to the client).
     pub fn register(
         self: *NativeMediaTransport,
         channel: []const u8,
@@ -236,7 +236,7 @@ pub const NativeMediaTransport = struct {
     }
 
     /// Send `bytes` to `dest` on the native socket. Used by the WebRTC relay's
-    /// cross-leg sink to deliver opcodec-rewrapped frames to native peers.
+    /// cross-leg sink to deliver kagura-rewrapped frames to native peers.
     pub fn sendTo(self: *NativeMediaTransport, dest: TransportAddress, bytes: []const u8) void {
         if (self.socket) |*s| s.sendTo(dest, bytes);
     }
@@ -276,8 +276,8 @@ pub const NativeMediaTransport = struct {
 const testing = std.testing;
 
 fn opframe(stream_id: u32, buf: []u8) []const u8 {
-    const n = opcodec_frame.encode(.{
-        .band_id = opcodec_frame.MEDIA_BAND_FLOOR,
+    const n = kagura_frame.encode(.{
+        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
         .stream_id = stream_id,
         .sequence = 1,
         .timestamp = 0,
@@ -288,7 +288,7 @@ fn opframe(stream_id: u32, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
-test "NativeMediaTransport: pump learns sender + forwards an opcodec frame to the receiver" {
+test "NativeMediaTransport: pump learns sender + forwards an kagura frame to the receiver" {
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -362,8 +362,8 @@ test "NativeMediaTransport: setSelection drops higher layers over the wire" {
     var rbuf: [media_socket.max_datagram]u8 = undefined;
 
     // A spatial layer-1 (band floor+1) non-keyframe must be dropped for lowbw.
-    const hi = opcodec_frame.encode(.{
-        .band_id = opcodec_frame.MEDIA_BAND_FLOOR + 1,
+    const hi = kagura_frame.encode(.{
+        .band_id = kagura_frame.MEDIA_BAND_FLOOR + 1,
         .stream_id = 10,
         .sequence = 1,
         .timestamp = 0,

@@ -405,15 +405,15 @@ pub fn LayerDeclaration(comptime capacity: usize) type {
 
 /// Codecs negotiable on a Suimyaku media session.
 ///
-/// The native plane is OPVOX/OPVIS-first — Orochi's own `opcodec`
-/// implementation (see `opcodec_frame`), which is what capable clients use. The
+/// The native plane is OPVOX/OPVIS-first — Orochi's own `kagura`
+/// implementation (see `kagura_frame`), which is what capable clients use. The
 /// standard hardware codecs below exist ONLY as the interop set for the WebRTC
 /// mobile gateway (phones that need hardware decode); the SFU still never
 /// transcodes, so a mixed call must converge on one shared codec. Native local
 /// capability sets should therefore list `opvox`/`opvis` ahead of the standard
 /// codecs so `firstMutualPreferred` prefers our own.
 pub const Codec = enum(u8) {
-    // Native opcodec (primary).
+    // Native kagura (primary).
     opvox, // OPVOX audio
     opvis, // OPVIS video
     // Standard hardware codecs — WebRTC mobile-gateway interop only.

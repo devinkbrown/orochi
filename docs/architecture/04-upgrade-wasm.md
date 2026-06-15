@@ -79,7 +79,7 @@ OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/roo
 
 ## Browser WASM Is Separate
 
-`src/wasm/opcodec_wasm.zig` exports browser/client codec functions for OPVOX and OPVIS. It is a `wasm32-freestanding` codec surface and should not be confused with the daemon's OroWasm plugin host. Evidence: `src/wasm/opcodec_wasm.zig:1`, `src/wasm/opcodec_wasm.zig:3`, `src/wasm/opcodec_wasm.zig:17`, `src/wasm/opcodec_wasm.zig:35`.
+`src/wasm/kagura_wasm.zig` exports browser/client codec functions for OPVOX and OPVIS. It is a `wasm32-freestanding` codec surface and should not be confused with the daemon's OroWasm plugin host. Evidence: `src/wasm/kagura_wasm.zig:1`, `src/wasm/kagura_wasm.zig:3`, `src/wasm/kagura_wasm.zig:17`, `src/wasm/kagura_wasm.zig:35`.
 
 ## Planning Notes and Divergences
 

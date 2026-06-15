@@ -191,7 +191,7 @@ pub fn build(b: *std.Build) void {
     // so it needs no WASI/libc; the JS side drives it through linear memory.
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_mod = b.createModule(.{
-        .root_source_file = b.path("src/wasm/opcodec_wasm.zig"),
+        .root_source_file = b.path("src/wasm/kagura_wasm.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
         .strip = true,
@@ -203,7 +203,7 @@ pub fn build(b: *std.Build) void {
     const wasm_opvis = b.createModule(.{ .root_source_file = b.path("src/substrate/opvis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
     wasm_mod.addImport("opvox_adpcm", wasm_adpcm);
     wasm_mod.addImport("opvis_delta", wasm_opvis);
-    const wasm = b.addExecutable(.{ .name = "opcodec", .root_module = wasm_mod });
+    const wasm = b.addExecutable(.{ .name = "kagura", .root_module = wasm_mod });
     wasm.entry = .disabled; // a library of exports, not an entry-point program
     wasm.rdynamic = true; // keep the `export fn`s in the final module
     const wasm_step = b.step("wasm", "Build the Ocean browser WASM modules");

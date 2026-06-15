@@ -133,7 +133,7 @@ per-frame origin signing for the seven direct-owned S2S state frames
 (self-certifying `node_id=BLAKE3-160(pubkey)` envelope, handshake-negotiated,
 upgrading `acceptsDirectOrigin` from link-trust to cryptographic proof); and
 unguessable native-media stream ids (the server-issued stream id, stamped by the
-client into every opcodec frame, is now a keyed-PRF capability instead of a
+client into every kagura frame, is now a keyed-PRF capability instead of a
 public `Wyhash(channel:nick)`, so an attacker who knows the public channel/nick
 can no longer precompute a victim's stream id and hijack/inject on the
 native-media UDP port). Confirmed already-present (not gaps): channel ACCESS
@@ -149,7 +149,7 @@ Still open (genuine future work, larger or cross-component):
 - **Per-datagram native-media payload authentication.** The unguessable stream id
   closes the precompute/hijack vector server-side; a full per-datagram MAC on the
   media payload itself would still need a coordinated browser-codec change on the
-  Nexus/Ocean clients (the opcodec frame is assembled in client JS, not this
+  Nexus/Ocean clients (the kagura frame is assembled in client JS, not this
   repo), so it remains cross-component.
 - Account/user/member PROP propagation over mesh (channel PROP already
   propagates; user/member props are session-local, so this needs new

@@ -1,7 +1,7 @@
 # Orochi media subsystem — hardcoded operational/tuning constant sweep
 
 READ-ONLY survey. Scope: substrate media primitives (`media_session.zig`,
-`audio_mix.zig`, `opcodec_frame.zig`, `red_fec.zig`, `proto/rtp_profile.zig`,
+`audio_mix.zig`, `kagura_frame.zig`, `red_fec.zig`, `proto/rtp_profile.zig`,
 `proto/sdp_lite.zig`, `suimyaku/media.zig`) plus daemon media-control features
 (`media_room.zig`, `media_pin.zig`, `quality_hint.zig`, `spotlight.zig`,
 `transcript.zig`, `recording_consent.zig`, `recording_index.zig`,
@@ -26,7 +26,7 @@ documented defaults. Borderline entries are marked.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
-| src/substrate/opcodec_frame.zig:190 | `ReassemblyConfig.window` | 64 | Out-of-order reorder/jitter window depth (frames); frames outside are late-dropped | media.reorder_window_frames | uint | 64 | 8..1024 |
+| src/substrate/kagura_frame.zig:190 | `ReassemblyConfig.window` | 64 | Out-of-order reorder/jitter window depth (frames); frames outside are late-dropped | media.reorder_window_frames | uint | 64 | 8..1024 |
 | src/substrate/media_session.zig:173,196 | `Receiver(256, 64)` / `.{ .window = 16 }` call sites | max_payload 256, window_cap 64, runtime window 16 | Receiver reassembly buffer payload cap + reorder window wiring (borderline: currently only in tests but is the canonical wiring) | media.max_payload_bytes / media.reorder_window_frames | uint | 256 / 16 | 64..65535 / 8..1024 |
 
 ## [media.audio] — conference mixer / audio

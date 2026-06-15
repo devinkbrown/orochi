@@ -1,11 +1,11 @@
 //! Media bridge spine — per-channel cross-leg roster + datagram rewrap.
 //!
 //! A media call can mix participants on two transports: the native leg
-//! (opcodec_frame over UDP, our OPVOX/OPVIS codec) and the WebRTC leg (RTP/SRTP).
+//! (kagura_frame over UDP, our OPVOX/OPVIS codec) and the WebRTC leg (RTP/SRTP).
 //! Within a leg the respective plane already forwards. This module is the spine
 //! that lets a frame ingressing on ONE leg reach participants on the OTHER leg —
 //! by header-rewrap only, never transcoding. The codec payload is opaque and
-//! shared verbatim; only the transport header (opcodec container ↔ RTP) changes.
+//! shared verbatim; only the transport header (kagura container ↔ RTP) changes.
 //!
 //! `ChannelBridge` holds the call's roster (who is on which leg + their transport
 //! identity) and answers `crossTargets(leg)` — the opposite-leg recipients for a
@@ -18,7 +18,7 @@
 //! agreed opaque payload between the two wire framings.
 const std = @import("std");
 const kakehashi = @import("../substrate/kakehashi.zig");
-const opcodec_frame = @import("../substrate/opcodec_frame.zig");
+const kagura_frame = @import("../substrate/kagura_frame.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const ice = @import("../proto/ice.zig");
 
@@ -26,7 +26,7 @@ pub const Leg = kakehashi.Leg; // .native | .webrtc
 pub const TransportAddress = ice.TransportAddress;
 pub const PtMap = kakehashi.PtMap;
 
-pub const Error = kakehashi.Error || opcodec_frame.DecodeError || opcodec_frame.EncodeError;
+pub const Error = kakehashi.Error || kagura_frame.DecodeError || kagura_frame.EncodeError;
 
 const max_id_bytes = 64;
 const max_rewrap = 1600; // >= one MTU datagram after header rewrap
@@ -76,9 +76,9 @@ pub const Member = struct {
     id_len: u8 = 0,
     leg: Leg,
     addr: TransportAddress = .{},
-    /// Native identity (opcodec stream + band the egress frame carries).
+    /// Native identity (kagura stream + band the egress frame carries).
     stream_id: u32 = 0,
-    band_id: u8 = opcodec_frame.MEDIA_BAND_FLOOR,
+    band_id: u8 = kagura_frame.MEDIA_BAND_FLOOR,
     /// WebRTC identity (RTP SSRC stamped on the egress packet).
     ssrc: u32 = 0,
 
@@ -140,7 +140,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             return self.len;
         }
 
-        /// Rewrap a native opcodec `datagram` ONCE (keeping the source publisher's
+        /// Rewrap a native kagura `datagram` ONCE (keeping the source publisher's
         /// stream_id as the RTP ssrc, so receivers can demux) and send the same
         /// RTP packet to each WebRTC member of the call. Header-only; opaque
         /// payload shared verbatim. The `send` callback resolves each target's
@@ -149,14 +149,14 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             var targets: [max_participants]Member = undefined;
             const n = self.crossTargets(.native, "", &targets);
             if (n == 0) return;
-            const view = opcodec_frame.decode(datagram) catch return;
+            const view = kagura_frame.decode(datagram) catch return;
             const bf = kakehashi.fromNative(view);
             var scratch: [max_rewrap]u8 = undefined;
             const rtp = kakehashi.toRtp(bf, &self.ptmap, view.stream_id, &scratch) catch return;
             for (targets[0..n]) |*m| send(send_ctx, m, rtp);
         }
 
-        /// Rewrap an `rtp` packet ONCE to a native opcodec datagram (keeping the
+        /// Rewrap an `rtp` packet ONCE to a native kagura datagram (keeping the
         /// source ssrc as the native stream_id) and send to each native member.
         /// Used by the WebRTC relay to bridge to native peers.
         pub fn fanoutWebrtcToNative(self: *Self, rtp: []const u8, keyframe_hint: bool, send_ctx: *anyopaque, send: SendFn) void {
@@ -165,9 +165,9 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             if (n == 0) return;
             const dh = rtp_profile.decodeHeader(rtp) catch return;
             const bf = kakehashi.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
-            const nf = kakehashi.toNative(bf, opcodec_frame.MEDIA_BAND_FLOOR, dh.header.ssrc);
+            const nf = kakehashi.toNative(bf, kagura_frame.MEDIA_BAND_FLOOR, dh.header.ssrc);
             var scratch: [max_rewrap]u8 = undefined;
-            const len = opcodec_frame.encode(nf, &scratch) catch return;
+            const len = kagura_frame.encode(nf, &scratch) catch return;
             for (targets[0..n]) |*m| send(send_ctx, m, scratch[0..len]);
         }
 
@@ -193,16 +193,16 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
 // Datagram-level rewrap (reuses kakehashi; payload is borrowed/opaque).
 // ---------------------------------------------------------------------------
 
-/// Rewrap a native opcodec datagram as an RTP packet for a WebRTC target
+/// Rewrap a native kagura datagram as an RTP packet for a WebRTC target
 /// (`ssrc`). Header-only: the codec payload is copied verbatim. Returns the RTP
 /// bytes in `out`.
 pub fn nativeDatagramToRtp(datagram: []const u8, map: *const PtMap, ssrc: u32, out: []u8) Error![]const u8 {
-    const view = try opcodec_frame.decode(datagram);
+    const view = try kagura_frame.decode(datagram);
     const bf = kakehashi.fromNative(view);
     return kakehashi.toRtp(bf, map, ssrc, out);
 }
 
-/// Rewrap an RTP packet as a native opcodec datagram for a native target
+/// Rewrap an RTP packet as a native kagura datagram for a native target
 /// (`band_id`/`stream_id`). Header-only. Returns the encoded length in `out`.
 pub fn rtpToNativeDatagram(
     rtp: []const u8,
@@ -214,11 +214,11 @@ pub fn rtpToNativeDatagram(
 ) Error!usize {
     const bf = try kakehashi.fromRtp(rtp, map, keyframe_hint);
     const nf = kakehashi.toNative(bf, band_id, stream_id);
-    return opcodec_frame.encode(nf, out);
+    return kagura_frame.encode(nf, out);
 }
 
 // ---------------------------------------------------------------------------
-// Tests (run under the unified build; transitively imports opcodec/rtp_profile,
+// Tests (run under the unified build; transitively imports kagura/rtp_profile,
 // so not standalone `zig test`-able — expected).
 // ---------------------------------------------------------------------------
 
@@ -263,8 +263,8 @@ test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" 
 
     // Encode an opvis (video) native frame.
     var src: [128]u8 = undefined;
-    const slen = try opcodec_frame.encode(.{
-        .band_id = opcodec_frame.MEDIA_BAND_FLOOR + 2,
+    const slen = try kagura_frame.encode(.{
+        .band_id = kagura_frame.MEDIA_BAND_FLOOR + 2,
         .stream_id = 7,
         .sequence = 1234,
         .timestamp = 90000,
@@ -279,10 +279,10 @@ test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" 
 
     // RTP -> native (for a native peer's band/stream).
     var back: [256]u8 = undefined;
-    const blen = try rtpToNativeDatagram(rtp, &map, opcodec_frame.MEDIA_BAND_FLOOR + 2, 7, true, &back);
-    const view = try opcodec_frame.decode(back[0..blen]);
+    const blen = try rtpToNativeDatagram(rtp, &map, kagura_frame.MEDIA_BAND_FLOOR + 2, 7, true, &back);
+    const view = try kagura_frame.decode(back[0..blen]);
 
-    try testing.expectEqual(opcodec_frame.CodecTag.opvis_video, view.codec);
+    try testing.expectEqual(kagura_frame.CodecTag.opvis_video, view.codec);
     try testing.expectEqualStrings("video-payload", view.payload);
     try testing.expect(view.keyframe);
     try testing.expectEqual(@as(u32, 1234 & 0xFFFF), view.sequence); // RTP seq is 16-bit
@@ -291,8 +291,8 @@ test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" 
 test "rewrap rejects an unknown payload type" {
     var empty = PtMap{};
     var src: [64]u8 = undefined;
-    const slen = try opcodec_frame.encode(.{
-        .band_id = opcodec_frame.MEDIA_BAND_FLOOR,
+    const slen = try kagura_frame.encode(.{
+        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
         .stream_id = 1,
         .sequence = 1,
         .timestamp = 1,

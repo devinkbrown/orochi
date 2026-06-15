@@ -33,7 +33,7 @@ permission indicators, draggable voice PIP, inline property/topic edit.
 | ophion/reaction-persist | `REACTIONS.<msgid>` PROP family / TAGMSG `+draft/react`; convergent | Goryu CRDT + Event Spine |
 | ophion/role-matrix | `ROLEMX #ch` → RPL_ROLEDEF per role (perm bitmask) | IRCX Access + PROP |
 | ophion/media-policy-query | `PROP #ch LADON.MEDIA.VOICE` GET → policy matrix | IRCX PROP |
-| (future) spatial voice | MEDIAFRAME position vector → Web Audio panning | LADON + opcodec_frame |
+| (future) spatial voice | MEDIAFRAME position vector → Web Audio panning | LADON + kagura_frame |
 
 ## Integration contract phases
 1. Presence & activity (MONITOR + ACTIVITY events).

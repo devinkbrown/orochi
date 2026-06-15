@@ -169,14 +169,14 @@ fn bridgeOnNativeFrame(ctx: *anyopaque, channel: []const u8, datagram: []const u
 }
 
 /// Resolve a native target's learned address from the native transport and send
-/// the rewrapped opcodec datagram there.
+/// the rewrapped kagura datagram there.
 fn bridgeSendToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
     const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
     if (s.server.native_media.remoteFor(s.channel, target.id())) |addr|
         s.server.native_media.sendTo(addr, bytes);
 }
 
-/// Cross-leg sink invoked by the WebRTC relay: rewrap the RTP frame to opcodec
+/// Cross-leg sink invoked by the WebRTC relay: rewrap the RTP frame to kagura
 /// and fan it out to the channel's native members (live addresses per peer).
 fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void {
     const self: *LinuxServer = @ptrCast(@alignCast(ctx));
@@ -1780,9 +1780,9 @@ pub const LinuxServer = struct {
     /// resumption is enabled, then copied into every per-connection TLS config so
     /// a ticket issued on one reactor can resume on another.
     tls_ticket_key: tls_resumption.TicketKey = [_]u8{0} ** @sizeOf(tls_resumption.TicketKey),
-    /// Per-process secret keying the native-media opcodec stream-id derivation.
+    /// Per-process secret keying the native-media kagura stream-id derivation.
     /// The stream id is a server-issued capability the client stamps into every
-    /// opcodec frame; keying it makes it unguessable to anyone without the secret,
+    /// kagura frame; keying it makes it unguessable to anyone without the secret,
     /// so an attacker who knows the public (channel, nick) can no longer precompute
     /// a victim's stream id and hijack/inject on the native-media UDP port.
     /// Generated once at init (getrandom via secure_fns).
@@ -2006,7 +2006,7 @@ pub const LinuxServer = struct {
     /// thread. Started on boot (`start`), torn down on `deinit`.
     media_plane: media_plane_mod.MediaPlane,
     /// Native media transport: UDP leg for our own OPVOX/OPVIS codec
-    /// (opcodec_frame datagrams). Started on boot, torn down on `deinit`.
+    /// (kagura_frame datagrams). Started on boot, torn down on `deinit`.
     native_media: native_media_mod.NativeMediaTransport,
     /// Per-channel cross-leg bridge roster (native ↔ opt-in WebRTC). Consulted by
     /// the native pump's cross-leg sink; guarded by `media_bridges_mu`.
@@ -16162,7 +16162,7 @@ pub const LinuxServer = struct {
         }
         // Native transport (our own OPVOX/OPVIS codec leg): register this caller
         // for the channel's native call and advertise the candidate + the
-        // stream_id the client must stamp into its opcodec frames. Independent of
+        // stream_id the client must stamp into its kagura frames. Independent of
         // the WebRTC plane above; best-effort (media is optional).
         const stream_id = self.nativeStreamId(channel, nick);
         if (self.native_media.port != 0) {
@@ -16217,8 +16217,8 @@ pub const LinuxServer = struct {
         self.allocator.free(key);
     }
 
-    /// Per-(channel,participant) opcodec stream id advertised to the native client;
-    /// it stamps this into every opcodec frame it publishes so the SFU can map a
+    /// Per-(channel,participant) kagura stream id advertised to the native client;
+    /// it stamps this into every kagura frame it publishes so the SFU can map a
     /// frame back to its publisher. Keyed by the per-process `native_stream_key`
     /// (a secret PRF), so the id is UNGUESSABLE without that secret: it doubles as
     /// a capability token delivered over the TLS IRC channel, preventing an

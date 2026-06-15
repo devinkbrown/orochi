@@ -2,8 +2,8 @@
 //!
 //! Composes the existing native pieces into one forward decision: the
 //! `suimyaku.media.Session` roster (who publishes/receives) + per-receiver
-//! simulcast layer selection (`opcodec_layer.shouldForward`). It answers "for an
-//! inbound native opcodec frame from X, which participants should receive it,
+//! simulcast layer selection (`kagura_layer.shouldForward`). It answers "for an
+//! inbound native kagura frame from X, which participants should receive it,
 //! after dropping layers above each receiver's selection?" — and the server
 //! forwards the SAME opaque frame bytes to them. NO encode/decode/transcode: a
 //! receiver either gets the frame verbatim or it is dropped for being a higher
@@ -14,7 +14,7 @@
 //! plane only makes the forwarding decision.
 const std = @import("std");
 const media = @import("suimyaku/media.zig");
-const opcodec_layer = @import("opcodec_layer.zig");
+const kagura_layer = @import("kagura_layer.zig");
 
 pub const ParticipantId = media.ParticipantId;
 pub const MediaKind = media.MediaKind;
@@ -84,7 +84,7 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
             out: []ParticipantId,
         ) usize {
             const fs = self.session.forwardSet(source_id, kind, .{}) catch return 0;
-            const info = opcodec_layer.LayerInfo{
+            const info = kagura_layer.LayerInfo{
                 .spatial = frame_spatial,
                 .temporal = frame_temporal,
                 .keyframe = keyframe,
@@ -93,7 +93,7 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
             var n: usize = 0;
             for (fs.recipients[0..fs.len]) |rid| {
                 const sel = self.selectionFor(rid);
-                if (!opcodec_layer.shouldForward(info, sel.max_spatial, sel.max_temporal)) continue;
+                if (!kagura_layer.shouldForward(info, sel.max_spatial, sel.max_temporal)) continue;
                 if (n >= out.len) break;
                 out[n] = rid;
                 n += 1;
@@ -104,7 +104,7 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (run under the unified build; transitively imports opcodec via the
+// Tests (run under the unified build; transitively imports kagura via the
 // suimyaku media module, so not standalone `zig test`-able — expected).
 // ---------------------------------------------------------------------------
 

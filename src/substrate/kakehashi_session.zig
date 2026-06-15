@@ -19,7 +19,7 @@ pub const Participant = struct {
     leg: Leg,
     /// The participant's supported codecs (borrowed).
     codecs: []const Codec,
-    /// Native media identity (opcodec stream).
+    /// Native media identity (kagura stream).
     stream_id: u32 = 0,
     /// WebRTC media identity (RTP SSRC).
     ssrc: u32 = 0,
@@ -105,7 +105,7 @@ pub fn Session(comptime max_participants: usize) type {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (run under the unified build; this file transitively imports opcodec via
+// Tests (run under the unified build; this file transitively imports kagura via
 // kakehashi, so it is not standalone `zig test`-able — that's expected).
 // ---------------------------------------------------------------------------
 

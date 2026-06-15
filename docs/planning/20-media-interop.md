@@ -12,16 +12,16 @@ functionality; WebRTC is a **transport**, not a codec choice. There is exactly o
 escape hatch (the opt-in standard-codec fallback). The server never touches codec bytes in
 any mode.
 
-1. **Primary — our codec, all platforms.** `opcodec` (OPVOX audio / OPVIS video) frames in
-   `opcodec_frame` containers, with `secure_channel` (TreeKEM/HPKE) for E2E. Desktop runs
+1. **Primary — our codec, all platforms.** `kagura` (OPVOX audio / OPVIS video) frames in
+   `kagura_frame` containers, with `secure_channel` (TreeKEM/HPKE) for E2E. Desktop runs
    it natively; **browser and mobile run the same codec in WASM** (SIMD+threads). The SFU
-   forwards the *identical opaque opcodec frame* to every participant — so a phone and a
+   forwards the *identical opaque kagura frame* to every participant — so a phone and a
    desktop in the same call see the same media path. No per-platform media divergence.
 
 2. **Transport is decoupled from codec.** The preferred transport is WebTransport / QUIC
    datagrams over `ryusen`/`transport_stack` + CoilPack. On devices where that isn't
    available (notably older iOS Safari), a **WebRTC DataChannel is used purely as a carrier**
-   for our opaque opcodec frames — same bytes, same codec, different pipe. WebRTC here is
+   for our opaque kagura frames — same bytes, same codec, different pipe. WebRTC here is
    *transport only*; its media-track codecs are not used on this path.
 
 3. **Opt-in standard-codec fallback.** A user **having trouble with our custom codec** (e.g.
@@ -48,7 +48,7 @@ on the server — ever. Consequences:
 
 A transport-neutral `BridgeFrame { codec, timestamp, sequence, keyframe, payload }` the SFU
 forwards. Adapters **only rewrap headers around the borrowed, already-encoded payload**:
-- `fromNative`/`toNative` ↔ `opcodec_frame.MediaFrame` (normalizes the `opcodec raw=0` vs
+- `fromNative`/`toNative` ↔ `kagura_frame.MediaFrame` (normalizes the `kagura raw=0` vs
   `sdp raw=3` tag mismatch via its own canonical `Codec`).
 - `fromRtp`/`toRtp` ↔ RTP via a dynamic-PT↔Codec `PtMap`.
 - `negotiate` is repackage-only: `direct_relay` (shared codec) or `incompatible` (never
@@ -60,23 +60,23 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 
 - **Bridge:** `kakehashi`, `kakehashi_session`, `ssrc_map`, `rtcp_translate` (control-plane
   NACK/PLI/FIR ↔ neutral feedback).
-- **Native resilience (Suimyaku plane):** `opcodec_nack` (retransmit cache + gap tracker),
-  `opcodec_fec` (XOR FEC), `opcodec_reassembly` (reorder/jitter), `simulcast_select` +
-  `opcodec_layer` + `frame_marking` (layer forwarding without decode), `bwe_estimate`
+- **Native resilience (Suimyaku plane):** `kagura_nack` (retransmit cache + gap tracker),
+  `kagura_fec` (XOR FEC), `kagura_reassembly` (reorder/jitter), `simulcast_select` +
+  `kagura_layer` + `frame_marking` (layer forwarding without decode), `bwe_estimate`
   (delay-based target bitrate), `media_pacer` (egress pacing), `native_feedback`.
 - **WebRTC stack (transport carrier + opt-in standard-codec fallback):** `srtp`/`srtcp`,
   `dtls_srtp`/`dtls_handshake`/`dtls_keyexchange`/`dtls_fingerprint`, `rtp_ext`/`rtp_red`/
   `audio_level`/`mid_rid`/`playout_delay`, `rtcp_compound`/`rtcp_xr`/`remb`/`pli_fir`/
   `twcc_feedback`/`rtx`, `sdp_session`/`ice_candidate`/`stun_ice_attrs`, `dcep`/`sctp_chunk`,
   `sframe`, `flexfec`. `dcep`/`sctp_chunk` are what let a WebRTC DataChannel carry our opaque
-  opcodec frames (transport role); the RTP/codec pieces serve the opt-in standard fallback.
+  kagura frames (transport role); the RTP/codec pieces serve the opt-in standard fallback.
 - **Live WebRTC transport (already wired):** `media_transport`/`media_socket`/`media_plane`
   (UDP + ICE/STUN/SRTP-SDES relay + NACK).
 
 ## Remaining live wiring (serial; not yet done)
 
 1. **Native media transport in the daemon.** Today `media_plane` is only the WebRTC/UDP
-   leg. The native leg (`opcodec_frame` over `ryusen`/CoilPack + `secure_channel`) is
+   leg. The native leg (`kagura_frame` over `ryusen`/CoilPack + `secure_channel`) is
    library-only — it must be brought into the daemon as a live transport so our codec runs
    end-to-end on the default path. `native_media_link` is the forward-decision glue for it.
    **This is the gating arc.**

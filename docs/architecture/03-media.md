@@ -44,28 +44,28 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 
 ## Native OPVOX/OPVIS Transport
 
-`src/daemon/native_media_transport.zig` is the daemon-owned native UDP leg for Orochi's OPVOX/OPVIS codec framing. It forwards `opcodec_frame` datagrams, not RTP, and never transcodes. Evidence: `src/daemon/native_media_transport.zig:1`, `src/daemon/native_media_transport.zig:2`, `src/daemon/native_media_transport.zig:3`, `src/daemon/native_media_transport.zig:15`.
+`src/daemon/native_media_transport.zig` is the daemon-owned native UDP leg for Orochi's OPVOX/OPVIS codec framing. It forwards `kagura_frame` datagrams, not RTP, and never transcodes. Evidence: `src/daemon/native_media_transport.zig:1`, `src/daemon/native_media_transport.zig:2`, `src/daemon/native_media_transport.zig:3`, `src/daemon/native_media_transport.zig:15`.
 
 | Path | Behavior | Evidence |
 | --- | --- | --- |
 | Channel isolation | Each call/channel has its own `NativeMediaLink`; a stream-id index maps inbound datagrams to the owning channel. | `src/daemon/native_media_transport.zig:6`, `src/daemon/native_media_transport.zig:7`, `src/daemon/native_media_transport.zig:43`, `src/daemon/native_media_transport.zig:45` |
 | Startup | Binds UDP, records local port, sets recv timeout, starts pump thread. | `src/daemon/native_media_transport.zig:77`, `src/daemon/native_media_transport.zig:81`, `src/daemon/native_media_transport.zig:83`, `src/daemon/native_media_transport.zig:84`, `src/daemon/native_media_transport.zig:88` |
-| Frame validation | Pump requires opcodec framing and decodes before routing. | `src/daemon/native_media_transport.zig:114`, `src/daemon/native_media_transport.zig:115`, `src/daemon/native_media_transport.zig:116` |
+| Frame validation | Pump requires kagura framing and decodes before routing. | `src/daemon/native_media_transport.zig:114`, `src/daemon/native_media_transport.zig:115`, `src/daemon/native_media_transport.zig:116` |
 | Forwarding | Routes by stream id, learns publisher address, computes SFU forward set, resends same bytes to each recipient. | `src/daemon/native_media_transport.zig:122`, `src/daemon/native_media_transport.zig:124`, `src/daemon/native_media_transport.zig:136` |
 | Registration | `register` records channel, participant id, media kind, stream id, and address, then indexes stream id to channel. | `src/daemon/native_media_transport.zig:160`, `src/daemon/native_media_transport.zig:164`, `src/daemon/native_media_transport.zig:175`, `src/daemon/native_media_transport.zig:178` |
 | Cross-leg bridge | After native forwarding, a native frame can be handed to a cross-leg sink for WebRTC participants. | `src/daemon/native_media_transport.zig:54`, `src/daemon/native_media_transport.zig:63`, `src/daemon/native_media_transport.zig:138`, `src/daemon/native_media_transport.zig:140` |
 
 ## OPCodec Frame Container
 
-`src/substrate/opcodec_frame.zig` is a wire container, not the audio/video codec itself. It carries encoded payloads over media bands. Evidence: `src/substrate/opcodec_frame.zig:1`, `src/substrate/opcodec_frame.zig:3`, `src/substrate/opcodec_frame.zig:4`.
+`src/substrate/kagura_frame.zig` is a wire container, not the audio/video codec itself. It carries encoded payloads over media bands. Evidence: `src/substrate/kagura_frame.zig:1`, `src/substrate/kagura_frame.zig:3`, `src/substrate/kagura_frame.zig:4`.
 
 | Field/behavior | Evidence |
 | --- | --- |
-| Media bands are `band_id >= 64`; control bands are below 64. | `src/substrate/opcodec_frame.zig:6`, `src/substrate/opcodec_frame.zig:56`, `src/substrate/opcodec_frame.zig:119` |
-| Wire format includes payload length, band id, stream id, sequence, timestamp, keyframe flag, codec tag, and payload. | `src/substrate/opcodec_frame.zig:9`, `src/substrate/opcodec_frame.zig:11`, `src/substrate/opcodec_frame.zig:18` |
-| `CodecTag` supports `raw`, `opvox_audio`, and `opvis_video`. | `src/substrate/opcodec_frame.zig:66`, `src/substrate/opcodec_frame.zig:67` |
-| Decode rejects truncation, control band ids, trailing bytes, and unknown codec tags. | `src/substrate/opcodec_frame.zig:153`, `src/substrate/opcodec_frame.zig:155`, `src/substrate/opcodec_frame.zig:161`, `src/substrate/opcodec_frame.zig:165`, `src/substrate/opcodec_frame.zig:175` |
-| ReassemblyBuffer is a bounded jitter/reorder buffer with compile-time payload/window bounds and runtime window config. | `src/substrate/opcodec_frame.zig:211`, `src/substrate/opcodec_frame.zig:233`, `src/substrate/opcodec_frame.zig:236`, `src/substrate/opcodec_frame.zig:255` |
+| Media bands are `band_id >= 64`; control bands are below 64. | `src/substrate/kagura_frame.zig:6`, `src/substrate/kagura_frame.zig:56`, `src/substrate/kagura_frame.zig:119` |
+| Wire format includes payload length, band id, stream id, sequence, timestamp, keyframe flag, codec tag, and payload. | `src/substrate/kagura_frame.zig:9`, `src/substrate/kagura_frame.zig:11`, `src/substrate/kagura_frame.zig:18` |
+| `CodecTag` supports `raw`, `opvox_audio`, and `opvis_video`. | `src/substrate/kagura_frame.zig:66`, `src/substrate/kagura_frame.zig:67` |
+| Decode rejects truncation, control band ids, trailing bytes, and unknown codec tags. | `src/substrate/kagura_frame.zig:153`, `src/substrate/kagura_frame.zig:155`, `src/substrate/kagura_frame.zig:161`, `src/substrate/kagura_frame.zig:165`, `src/substrate/kagura_frame.zig:175` |
+| ReassemblyBuffer is a bounded jitter/reorder buffer with compile-time payload/window bounds and runtime window config. | `src/substrate/kagura_frame.zig:211`, `src/substrate/kagura_frame.zig:233`, `src/substrate/kagura_frame.zig:236`, `src/substrate/kagura_frame.zig:255` |
 
 ## Cross-Leg Bridge
 
@@ -73,8 +73,8 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 
 | Direction | Behavior | Evidence |
 | --- | --- | --- |
-| Native to WebRTC | Decode opcodec frame, map to bridge frame, write RTP using the stream id as SSRC, send to WebRTC members. | `src/daemon/media_bridge.zig:143`, `src/daemon/media_bridge.zig:148`, `src/daemon/media_bridge.zig:152`, `src/daemon/media_bridge.zig:155`, `src/daemon/media_bridge.zig:156` |
-| WebRTC to native | Decode RTP header, map to native frame with source SSRC as native stream id, encode opcodec datagram, send to native members. | `src/daemon/media_bridge.zig:159`, `src/daemon/media_bridge.zig:162`, `src/daemon/media_bridge.zig:166`, `src/daemon/media_bridge.zig:168`, `src/daemon/media_bridge.zig:170` |
+| Native to WebRTC | Decode kagura frame, map to bridge frame, write RTP using the stream id as SSRC, send to WebRTC members. | `src/daemon/media_bridge.zig:143`, `src/daemon/media_bridge.zig:148`, `src/daemon/media_bridge.zig:152`, `src/daemon/media_bridge.zig:155`, `src/daemon/media_bridge.zig:156` |
+| WebRTC to native | Decode RTP header, map to native frame with source SSRC as native stream id, encode kagura datagram, send to native members. | `src/daemon/media_bridge.zig:159`, `src/daemon/media_bridge.zig:162`, `src/daemon/media_bridge.zig:166`, `src/daemon/media_bridge.zig:168`, `src/daemon/media_bridge.zig:170` |
 | Target selection | `crossTargets` copies only members on the opposite leg, excluding the sender id when provided. | `src/daemon/media_bridge.zig:174`, `src/daemon/media_bridge.zig:177`, `src/daemon/media_bridge.zig:178`, `src/daemon/media_bridge.zig:181`, `src/daemon/media_bridge.zig:182` |
 
 The live server installs bridge callbacks around `LinuxServer.media_bridges`, `media_plane`, and `native_media`. Evidence: `src/daemon/server.zig:114`, `src/daemon/server.zig:131`, `src/daemon/server.zig:139`, `src/daemon/server.zig:158`.
@@ -96,7 +96,7 @@ Browser/client WASM exports are separate from the daemon plugin host:
 
 | File | Export surface | Evidence |
 | --- | --- | --- |
-| `src/wasm/opcodec_wasm.zig` | OPVOX audio encode/decode and OPVIS video intra/inter encode/decode for `wasm32-freestanding`. | `src/wasm/opcodec_wasm.zig:1`, `src/wasm/opcodec_wasm.zig:3`, `src/wasm/opcodec_wasm.zig:17`, `src/wasm/opcodec_wasm.zig:21`, `src/wasm/opcodec_wasm.zig:35`, `src/wasm/opcodec_wasm.zig:39`, `src/wasm/opcodec_wasm.zig:49` |
+| `src/wasm/kagura_wasm.zig` | OPVOX audio encode/decode and OPVIS video intra/inter encode/decode for `wasm32-freestanding`. | `src/wasm/kagura_wasm.zig:1`, `src/wasm/kagura_wasm.zig:3`, `src/wasm/kagura_wasm.zig:17`, `src/wasm/kagura_wasm.zig:21`, `src/wasm/kagura_wasm.zig:35`, `src/wasm/kagura_wasm.zig:39`, `src/wasm/kagura_wasm.zig:49` |
 | `src/wasm/browser_transport.zig` | Browser transport shim core is re-exported from the package root; the wasm32 export wrapper lives in `src/wasm/transport_shim.zig`. | `src/root.zig:18`, `src/root.zig:21` |
 
 ## Planning Notes and Divergences
@@ -106,5 +106,5 @@ Browser/client WASM exports are separate from the daemon plugin host:
 | Planning topic | Current status | Evidence |
 | --- | --- | --- |
 | Runtime media SFU sizing | `max_participants` remains comptime-bound at 64; config-driven participant capacity is deferred. | `src/daemon/media_room.zig:14`, `src/daemon/media_room.zig:21`, `src/daemon/media_room.zig:24` |
-| Runtime opcodec reassembly sizing | Runtime window defaults exist, but actual `ReassemblyBuffer` capacity remains comptime-bound. | `src/substrate/opcodec_frame.zig:34`, `src/substrate/opcodec_frame.zig:35`, `src/substrate/opcodec_frame.zig:236` |
+| Runtime kagura reassembly sizing | Runtime window defaults exist, but actual `ReassemblyBuffer` capacity remains comptime-bound. | `src/substrate/kagura_frame.zig:34`, `src/substrate/kagura_frame.zig:35`, `src/substrate/kagura_frame.zig:236` |
 | Mixed-leg calls | The bridge exists as header rewrap only; it requires a shared codec payload and does not transcode. | `src/daemon/media_bridge.zig:16`, `src/daemon/media_bridge.zig:17`, `src/daemon/media_bridge.zig:143`, `src/daemon/media_bridge.zig:159` |
