@@ -1093,6 +1093,13 @@ pub const Engine = struct {
                     // Not ack-eliciting (RFC 9000 §13.2.1). Signals teardown.
                     result.connection_close = close.error_code;
                 },
+                .PATH_CHALLENGE, .PATH_RESPONSE => {
+                    // Both are ack-eliciting (RFC 9000 §13.2.1). Path validation
+                    // itself (challenge/response matching + migration) lives in
+                    // the connection driver, which re-walks the decoded frames;
+                    // the engine only owes the ACK obligation here.
+                    ack_eliciting = true;
+                },
             }
         }
 

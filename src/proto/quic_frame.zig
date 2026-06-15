@@ -52,6 +52,13 @@ pub const ConnectionCloseFrame = struct {
     reason: []const u8,
 };
 
+/// PATH_CHALLENGE (0x1a) / PATH_RESPONSE (0x1b) carry an 8-byte opaque value
+/// (RFC 9000 §19.17 / §19.18). The challenger picks unpredictable `data`; the
+/// peer echoes the exact bytes in a PATH_RESPONSE to prove it can both receive
+/// on and send from the new path. The value is fixed-width (never length-
+/// prefixed on the wire), so the codec carries it inline.
+pub const PathChallengeData = [8]u8;
+
 pub const Frame = union(enum) {
     PADDING: void,
     PING: void,
@@ -60,6 +67,10 @@ pub const Frame = union(enum) {
     STREAM: StreamFrame,
     DATAGRAM: DatagramFrame,
     CONNECTION_CLOSE: ConnectionCloseFrame,
+    /// RFC 9000 §19.17 — path-validation challenge (8 opaque bytes).
+    PATH_CHALLENGE: PathChallengeData,
+    /// RFC 9000 §19.18 — path-validation response (echoes the challenge).
+    PATH_RESPONSE: PathChallengeData,
 };
 
 pub const DecodedFrame = struct {
@@ -196,6 +207,14 @@ pub fn encodeFrame(out: *std.ArrayList(u8), allocator: std.mem.Allocator, frame:
             try appendVarInt(out, allocator, close.reason_len);
             try out.appendSlice(allocator, close.reason);
         },
+        .PATH_CHALLENGE => |data| {
+            try out.append(allocator, 0x1a);
+            try out.appendSlice(allocator, &data);
+        },
+        .PATH_RESPONSE => |data| {
+            try out.append(allocator, 0x1b);
+            try out.appendSlice(allocator, &data);
+        },
     }
 }
 
@@ -264,6 +283,20 @@ pub fn decodeFrame(allocator: std.mem.Allocator, input: []const u8) !DecodedFram
                     .reason_len = reason_len,
                     .reason = reason,
                 } },
+                .len = pos,
+            };
+        },
+        0x1a, 0x1b => {
+            // PATH_CHALLENGE / PATH_RESPONSE: a fixed 8-byte opaque value
+            // (RFC 9000 §19.17 / §19.18). No length prefix on the wire.
+            const data = try takeBytes(input, &pos, 8);
+            var value: PathChallengeData = undefined;
+            @memcpy(&value, data);
+            return .{
+                .frame = if (ty == 0x1a)
+                    .{ .PATH_CHALLENGE = value }
+                else
+                    .{ .PATH_RESPONSE = value },
                 .len = pos,
             };
         },
@@ -446,6 +479,14 @@ fn expectFrameEqual(expected: Frame, actual: Frame) !void {
             try std.testing.expectEqual(e.reason_len, a.reason_len);
             try std.testing.expectEqualSlices(u8, e.reason, a.reason);
         },
+        .PATH_CHALLENGE => |e| {
+            try std.testing.expect(actual == .PATH_CHALLENGE);
+            try std.testing.expectEqualSlices(u8, &e, &actual.PATH_CHALLENGE);
+        },
+        .PATH_RESPONSE => |e| {
+            try std.testing.expect(actual == .PATH_RESPONSE);
+            try std.testing.expectEqualSlices(u8, &e, &actual.PATH_RESPONSE);
+        },
     }
 }
 
@@ -576,6 +617,54 @@ test "connection close frame round-trip" {
     const decoded = try decodeFrameExact(allocator, encoded);
     defer freeFrame(allocator, decoded);
     try expectFrameEqual(frame, decoded);
+}
+
+test "path challenge frame round-trip" {
+    const allocator = std.testing.allocator;
+    const frame = Frame{ .PATH_CHALLENGE = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef } };
+    const encoded = try encodeFrames(allocator, &.{frame});
+    defer allocator.free(encoded);
+
+    // Wire shape: type byte 0x1a then exactly 8 opaque bytes.
+    try std.testing.expectEqual(@as(usize, 9), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x1a), encoded[0]);
+
+    const decoded = try decodeFrameExact(allocator, encoded);
+    defer freeFrame(allocator, decoded);
+    try expectFrameEqual(frame, decoded);
+}
+
+test "path response frame round-trip" {
+    const allocator = std.testing.allocator;
+    const frame = Frame{ .PATH_RESPONSE = .{ 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 } };
+    const encoded = try encodeFrames(allocator, &.{frame});
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 9), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x1b), encoded[0]);
+
+    const decoded = try decodeFrameExact(allocator, encoded);
+    defer freeFrame(allocator, decoded);
+    try expectFrameEqual(frame, decoded);
+}
+
+test "path frames echo: a response carries the challenge bytes verbatim" {
+    const allocator = std.testing.allocator;
+    const challenge = Frame{ .PATH_CHALLENGE = .{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 } };
+    const enc = try encodeFrames(allocator, &.{challenge});
+    defer allocator.free(enc);
+    const dec = try decodeFrameExact(allocator, enc);
+    defer freeFrame(allocator, dec);
+
+    // The receiver echoes the exact data in a PATH_RESPONSE.
+    const response = Frame{ .PATH_RESPONSE = dec.PATH_CHALLENGE };
+    try std.testing.expectEqualSlices(u8, &challenge.PATH_CHALLENGE, &response.PATH_RESPONSE);
+}
+
+test "path challenge decode rejects a truncated value" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(WireError.BufferTooShort, decodeFrame(allocator, &.{ 0x1a, 0x00, 0x01, 0x02 }));
+    try std.testing.expectError(WireError.BufferTooShort, decodeFrame(allocator, &.{0x1b}));
 }
 
 test "multi-frame payload round-trip" {

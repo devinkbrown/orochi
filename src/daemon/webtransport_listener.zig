@@ -51,10 +51,18 @@
 //!     token is answered with a Retry packet instead of proceeding; the client
 //!     re-sends its Initial carrying the token and is validated immediately. A
 //!     replayed/expired/wrong-IP token is rejected (falls back to a new Retry).
-//!   * Stateless reset (RFC 9000 §10.3): token derivation is wired (per-process
-//!     key, HMAC of the CID); the unknown-short-header SEND path is a documented
-//!     follow-up — see `quic_retry.zig`.
-//!   * One server SCID per connection, no connection migration.
+//!   * Stateless reset (RFC 9000 §10.3): a short-header (1-RTT) datagram whose
+//!     DCID matches no live connection is answered with a Stateless Reset. The
+//!     16-byte token is HMAC(reset_key, DCID) under the per-process key; the
+//!     reset is shaped like a 1-RTT packet, never larger than the trigger
+//!     (§10.3.3 never-amplify), only sent when the trigger is large enough, and
+//!     token-bucket rate-limited (§21.11) so it cannot be used as a reflector.
+//!   * One server SCID per connection. Connection migration + path validation
+//!     (RFC 9000 §9) ARE supported: a 1-RTT packet from a new source address on
+//!     an established connection triggers a PATH_CHALLENGE to the new address
+//!     (3×-budget-limited), and only a matching PATH_RESPONSE migrates `conn.peer`
+//!     to it — the QUIC core (`quic_conn`) owns the state machine; the listener
+//!     feeds it the per-datagram source and routes probes to the candidate path.
 //!   * One WebTransport session per QUIC connection, one IRC bridge per
 //!     session (the common deployment shape; `http3_conn` rejects a 2nd CONNECT).
 //!   * Dual-stack UDP socket (`DualStackUdpSocket`, `AF_INET6` + `IPV6_V6ONLY=0`,
@@ -95,6 +103,14 @@ pub const default_max_connections: usize = 256;
 /// Default live-connection count at/above which the `.under_load` Retry policy
 /// starts forcing a stateless Retry round trip (half the connection cap).
 pub const default_retry_load_threshold: usize = 128;
+
+/// Default stateless-reset rate (RFC 9000 §10.3 / §21.11): a steady cap on
+/// resets per second once the burst is spent, and a burst allowance for short
+/// spikes. Kept low — a reset is only ever owed for a genuinely-unknown 1-RTT
+/// DCID (e.g. a peer talking to state we lost on restart), so legitimate demand
+/// is small, while a spoofed flood is throttled to a non-amplifying trickle.
+pub const default_reset_rate_per_s: f64 = 100.0;
+pub const default_reset_burst: u32 = 20;
 
 /// Retry address-validation policy (RFC 9000 §8.1.2). See the field docs on
 /// `WebTransportListener.retry_policy`.
@@ -203,6 +219,17 @@ pub const WebTransportListener = struct {
     /// a unique id (no migration / no rotation — one SCID per connection).
     scid_counter: u64 = 0,
 
+    /// Stateless-reset rate limiter (RFC 9000 §10.3 / §21.11): an unbounded reset
+    /// responder is itself a reflection/DoS amplifier, so we cap resets to a
+    /// token-bucket rate. `reset_tokens` is the current allowance (refilled over
+    /// time up to `reset_burst`); `reset_last_refill_ns` is the last refill tick.
+    reset_tokens: f64 = @floatFromInt(default_reset_burst),
+    reset_last_refill_ns: u64 = 0,
+    /// Resets per second once the burst is exhausted.
+    reset_rate_per_s: f64 = default_reset_rate_per_s,
+    /// Maximum reset burst (token-bucket capacity).
+    reset_burst: u32 = default_reset_burst,
+
     pub fn init(allocator: std.mem.Allocator, tls: TlsConfig, irc_port: u16) WebTransportListener {
         return .{ .allocator = allocator, .tls = tls, .irc_port = irc_port };
     }
@@ -288,17 +315,22 @@ pub const WebTransportListener = struct {
         const cid = peekDestCid(data) orelse return;
 
         if (self.lookup(cid)) |conn| {
-            self.feedConnection(conn, data);
+            self.feedConnection(conn, data, from);
             return;
         }
 
         // Unknown connection id. Only a long-header (Initial) packet may create a
-        // new connection; a short header for an unknown cid is dropped (a
-        // stateless reset on it is a documented follow-up — see quic_retry.zig).
-        if ((data[0] & 0x80) == 0) return;
+        // new connection; a short header (1-RTT) for an unknown cid gets a
+        // Stateless Reset (RFC 9000 §10.3) so the peer learns its connection is
+        // gone (e.g. our state was lost on restart) — subject to never-amplify +
+        // rate-limit guards in `sendStatelessReset`.
+        if ((data[0] & 0x80) == 0) {
+            self.sendStatelessReset(cid, data, from);
+            return;
+        }
 
         const conn = self.admitNewInitial(data, from) orelse return;
-        self.feedConnection(conn, data);
+        self.feedConnection(conn, data, from);
     }
 
     /// Apply the RFC 9000 §8 admission policy to a long-header Initial from an
@@ -415,16 +447,90 @@ pub const WebTransportListener = struct {
         sock.sendTo(from, out[0..n]);
     }
 
-    /// Drive QUIC recv → H3 service → flush for one connection, then handle any
-    /// session lifecycle events and pump its IRC bridge.
-    fn feedConnection(self: *WebTransportListener, conn: *Connection, data: []const u8) void {
+    /// Emit a Stateless Reset (RFC 9000 §10.3) in response to a short-header
+    /// (1-RTT) datagram whose Destination Connection ID matches no live
+    /// connection. The reset tells the peer its connection no longer exists (e.g.
+    /// our state was lost across a restart) so it can fail fast instead of timing
+    /// out.
+    ///
+    /// Security properties enforced here:
+    ///   * Never amplify (§10.3.3): the reset is shaped like an ordinary 1-RTT
+    ///     packet and MUST NOT be larger than the triggering datagram. We also
+    ///     refuse to respond at all unless the incoming packet is large enough to
+    ///     plausibly carry a reset (`min_stateless_reset_len`), so a tiny probe
+    ///     gets nothing. The reset length is `min(incoming_len, sized cap)` and is
+    ///     always ≤ the incoming size.
+    ///   * Token derivation (§10.3): the 16-byte token is HMAC(reset_key, DCID)
+    ///     under the per-process reset key. We derive it from the *incoming* DCID:
+    ///     we cannot reset a CID we never chose (we have no record of it), so —
+    ///     per standard server behaviour — we treat the DCID the peer addressed as
+    ///     the connection id and key the token off it. A peer that genuinely holds
+    ///     that connection recognises the token (it observed the same derivation
+    ///     when we issued the id); a spoofer cannot forge or correlate it without
+    ///     the key.
+    ///   * Rate limit (§21.11): a token-bucket caps resets so an attacker cannot
+    ///     turn the endpoint into a reflection amplifier by flooding unknown CIDs.
+    fn sendStatelessReset(self: *WebTransportListener, dcid: []const u8, trigger: []const u8, from: TransportAddress) void {
+        // Never-amplify floor (§10.3.3): if the triggering packet is too small to
+        // carry a reset, send nothing (a smaller reply would still be an amplifier
+        // risk and a too-small reset is invalid anyway).
+        if (trigger.len < quic_retry.min_stateless_reset_len) return;
+
+        // Rate limit before doing any work (§21.11).
+        if (!self.takeResetToken()) return;
+
+        // Size the reset like a plausible 1-RTT packet but never larger than the
+        // triggering datagram (§10.3.3). Cap at a modest size so we never reflect a
+        // large datagram back; the token lives in the trailing 16 bytes regardless.
+        const max_reset_len: usize = 64;
+        const reset_len = @min(@min(trigger.len, max_reset_len), @as(usize, quic_retry.retry_packet_max));
+        if (reset_len < quic_retry.min_stateless_reset_len) return;
+
+        const token = quic_retry.statelessResetToken(self.secret(), dcid);
+        var out: [64]u8 = undefined;
+        const n = quic_retry.encodeStatelessReset(out[0..reset_len], token) catch return;
+        if (n > trigger.len) return; // defensive: never amplify
+        const sock = if (self.socket) |*s| s else return;
+        sock.sendTo(from, out[0..n]);
+    }
+
+    /// Token-bucket gate for stateless resets (RFC 9000 §21.11). Refills
+    /// `reset_rate_per_s` tokens per second up to `reset_burst`, then consumes one
+    /// per reset. Returns false (drop the reset) when the bucket is empty.
+    fn takeResetToken(self: *WebTransportListener) bool {
         const now = nowNs();
-        conn.conn.recvDatagram(data) catch {
+        if (self.reset_last_refill_ns == 0) self.reset_last_refill_ns = now;
+        if (now > self.reset_last_refill_ns) {
+            const elapsed_s = @as(f64, @floatFromInt(now - self.reset_last_refill_ns)) /
+                @as(f64, @floatFromInt(std.time.ns_per_s));
+            self.reset_tokens = @min(
+                @as(f64, @floatFromInt(self.reset_burst)),
+                self.reset_tokens + elapsed_s * self.reset_rate_per_s,
+            );
+            self.reset_last_refill_ns = now;
+        }
+        if (self.reset_tokens < 1.0) return false;
+        self.reset_tokens -= 1.0;
+        return true;
+    }
+
+    /// Drive QUIC recv → H3 service → flush for one connection, then handle any
+    /// session lifecycle events and pump its IRC bridge. `from` is the datagram's
+    /// UDP source address, fed into the QUIC core so connection migration + path
+    /// validation (RFC 9000 §9) can run; after recv we reconcile `conn.peer` with
+    /// whatever path the core migrated to (so replies and the PROXY header follow
+    /// a validated address change).
+    fn feedConnection(self: *WebTransportListener, conn: *Connection, data: []const u8, from: TransportAddress) void {
+        const now = nowNs();
+        conn.conn.recvDatagramFrom(data, pathFromAddr(from), now) catch {
             // A malformed/undecryptable datagram is dropped by the lower layer;
             // a hard error means the connection is unusable → tear it down.
             self.teardownConnection(conn);
             return;
         };
+        // Follow a validated migration: the core only changes its primary path on
+        // a matching PATH_RESPONSE, so this address is already validated.
+        conn.peer = addrFromPath(conn.conn.currentPath());
         self.serviceConnection(conn, now);
     }
 
@@ -591,7 +697,11 @@ pub const WebTransportListener = struct {
         _ = writeAllFd(fd, line);
     }
 
-    /// Flush all datagrams the QUIC engine owes to the peer's UDP address.
+    /// Flush all datagrams the QUIC engine owes. Most go to the connection's
+    /// current primary path (`conn.peer`); a datagram carrying a `dest` override
+    /// is a path-validation probe (a PATH_CHALLENGE, RFC 9000 §8.2.1) bound for a
+    /// candidate (not-yet-migrated) address, so it is routed there instead. App
+    /// data thus keeps flowing to the old path while the new one is validated.
     fn flush(self: *WebTransportListener, conn: *Connection) void {
         var out: std.ArrayList(quic_conn.OutDatagram) = .empty;
         defer {
@@ -600,7 +710,10 @@ pub const WebTransportListener = struct {
         }
         _ = conn.conn.sendDatagrams(&out) catch return;
         const sock = if (self.socket) |*s| s else return;
-        for (out.items) |d| sock.sendTo(conn.peer, d.bytes);
+        for (out.items) |d| {
+            const dst = if (d.dest) |p| addrFromPath(p) else conn.peer;
+            sock.sendTo(dst, d.bytes);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -761,6 +874,19 @@ fn serverTransportParams(scid: []const u8) quic_transport_params.TransportParame
         .initial_max_stream_data_bidi_remote = 256 * 1024,
         .initial_max_streams_bidi = 100,
     };
+}
+
+/// Map the listener's `TransportAddress` onto the QUIC core's socketless
+/// `PathAddress` (the core never imports the socket layer). They mirror each
+/// other field-for-field (16-byte IP slot + len + port).
+fn pathFromAddr(addr: TransportAddress) quic_conn.PathAddress {
+    return quic_conn.PathAddress.fromParts(addr.ip[0..addr.ip_len], addr.port);
+}
+
+/// The inverse of `pathFromAddr`: turn a migrated `PathAddress` from the QUIC
+/// core back into the listener's `TransportAddress` for sending.
+fn addrFromPath(path: quic_conn.PathAddress) TransportAddress {
+    return .{ .ip = path.ip, .ip_len = path.ip_len, .port = path.port };
 }
 
 /// Peek the Destination Connection ID out of a QUIC packet header without
@@ -1481,4 +1607,111 @@ test "retry policy .never mints a connection directly (default fast path unaffec
     const conn = fx.lst.admitNewInitial(pkt, fx.peer_addr) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), fx.lst.liveCount());
     try testing.expect(!conn.conn.isAddressValidated());
+}
+
+// ===========================================================================
+// Stateless-reset emit (RFC 9000 §10.3) tests
+// ===========================================================================
+
+/// Build a synthetic short-header (1-RTT) datagram with an 8-byte DCID followed
+/// by `body_len` padding bytes (so the whole datagram is `1 + 8 + body_len`).
+/// The first byte has the high bit CLEAR (short header) and the fixed bit set.
+fn buildShortHeaderDatagram(out: []u8, dcid: [8]u8, body_len: usize) []const u8 {
+    out[0] = 0x40; // short header form (high bit 0), fixed bit 1
+    @memcpy(out[1..9], &dcid);
+    var i: usize = 0;
+    while (i < body_len) : (i += 1) out[9 + i] = @intCast(i & 0xff);
+    return out[0 .. 9 + body_len];
+}
+
+test "stateless reset — an unknown short-header DCID yields a reset carrying the HMAC-derived token" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+
+    // A 1-RTT packet for a DCID no live connection owns, large enough to carry a
+    // reset (≥ min_stateless_reset_len). No connection exists, so the listener
+    // must answer with a Stateless Reset.
+    const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    var buf: [128]u8 = undefined;
+    const pkt = buildShortHeaderDatagram(&buf, dcid, 40); // 49-byte datagram
+
+    var reply: [256]u8 = undefined;
+    const n = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
+
+    // Shaped like a 1-RTT packet: high bit clear, fixed bit set.
+    try testing.expectEqual(@as(u8, 0x00), reply[0] & 0x80);
+    try testing.expectEqual(@as(u8, 0x40), reply[0] & 0x40);
+    // Never amplifies: the reset is no larger than the triggering datagram.
+    try testing.expect(n <= pkt.len);
+    try testing.expect(n >= quic_retry.min_stateless_reset_len);
+
+    // The trailing 16 bytes are the stateless-reset token = HMAC(reset_key, DCID).
+    const expected = quic_retry.statelessResetToken(fx.lst.secret(), &dcid);
+    try testing.expectEqualSlices(u8, &expected, reply[n - quic_retry.stateless_reset_token_len .. n]);
+
+    // No connection was created for the unknown short-header packet.
+    try testing.expectEqual(@as(usize, 0), fx.lst.liveCount());
+}
+
+test "stateless reset — a too-small datagram yields nothing (never amplify)" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+
+    // A short-header packet smaller than min_stateless_reset_len (21 bytes): the
+    // listener must NOT reply (no amplification, and a reset that small is
+    // invalid anyway). 1 + 8 + 5 = 14 bytes < 21.
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    var buf: [64]u8 = undefined;
+    const pkt = buildShortHeaderDatagram(&buf, dcid, 5);
+    try testing.expect(pkt.len < quic_retry.min_stateless_reset_len);
+
+    var reply: [256]u8 = undefined;
+    // No reply (timeout → null).
+    try testing.expect(fx.exchange(pkt, &reply) == null);
+}
+
+test "stateless reset — the emit is rate-limited (token bucket)" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+
+    // Drain the burst to a tiny allowance so the limiter is exercised quickly.
+    fx.lst.reset_burst = 3;
+    fx.lst.reset_tokens = 3.0;
+    fx.lst.reset_rate_per_s = 0.0; // no refill within the test window
+    fx.lst.reset_last_refill_ns = nowNs();
+
+    const dcid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11 };
+    var buf: [128]u8 = undefined;
+    const pkt = buildShortHeaderDatagram(&buf, dcid, 40);
+
+    // The first 3 unknown short-header packets each get a reset; the bucket then
+    // empties and further ones are dropped (no reply).
+    var reply: [256]u8 = undefined;
+    var got: usize = 0;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        if (fx.exchange(pkt, &reply) != null) got += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), got);
+}
+
+// ===========================================================================
+// Path-address mapping (listener ↔ QUIC core) tests
+// ===========================================================================
+
+test "path mapping — TransportAddress round-trips through the QUIC-core PathAddress" {
+    const ta = try TransportAddress.fromBytes(&[_]u8{ 198, 51, 100, 7 }, 4433);
+    const path = pathFromAddr(ta);
+    try testing.expectEqual(@as(u8, 4), path.ip_len);
+    try testing.expectEqual(@as(u16, 4433), path.port);
+    const back = addrFromPath(path);
+    try testing.expect(back.eql(ta));
+
+    // IPv6 (16-byte) addresses map losslessly too.
+    const ta6 = try TransportAddress.fromBytes(&[_]u8{ 0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 5060);
+    const back6 = addrFromPath(pathFromAddr(ta6));
+    try testing.expect(back6.eql(ta6));
 }

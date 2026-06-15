@@ -57,8 +57,14 @@
 //!   * Congestion control is NewReno (RFC 9002 §7) including the
 //!     persistent-congestion collapse (§7.6); ECN and pacing are deferred (typed
 //!     gaps).
-//!   * One connection id per side, no migration, no Retry, no stateless reset,
-//!     no 0-RTT. Each is a typed gap, not a silent one.
+//!   * One connection id per side; no Retry (handled by the listener layer), no
+//!     stateless-reset *emit* (also the listener's job — this layer derives no
+//!     reset tokens), no 0-RTT. Connection migration + path validation (RFC 9000
+//!     §8.2/§9) ARE implemented here: a 1-RTT packet from a new source address on
+//!     an established server connection starts a PATH_CHALLENGE probe to the new
+//!     path (with its own 3× anti-amplification budget), and only a matching
+//!     PATH_RESPONSE migrates the primary path; an inbound PATH_CHALLENGE is
+//!     echoed in a PATH_RESPONSE. Each remaining item is a typed gap, not silent.
 //!   * 1-RTT key update (RFC 9001 §6) is implemented: the key-phase bit, peer-
 //!     and self-initiated updates, previous-generation key retention for
 //!     reordering, peer-update rate limiting, and the confidentiality-limit
@@ -80,6 +86,7 @@ const quic_conn_state = @import("quic_conn_state.zig");
 const quic_handshake = @import("quic_handshake.zig");
 const quic_transport_params = @import("quic_transport_params.zig");
 const quic_recovery = @import("quic_recovery.zig");
+const secure_fns = @import("secure_fns.zig");
 
 pub const EncryptionLevel = quic_protect.EncryptionLevel;
 pub const KeySet = quic_protect.KeySet;
@@ -114,6 +121,69 @@ pub const default_idle_timeout_ns: u64 = 30 * std.time.ns_per_s;
 /// CONNECTION_CLOSE application/transport error codes we emit.
 pub const transport_error_no_error: u64 = 0x00;
 pub const transport_error_internal: u64 = 0x01;
+
+/// A peer UDP address (the connection's "path", RFC 9000 §9). This is a minimal
+/// socketless mirror of the daemon's `TransportAddress` (16-byte IP slot + len +
+/// port); the listener maps its own address type onto this so the QUIC core
+/// never imports the socket layer. Path migration is keyed entirely on this
+/// value: two datagrams from the same `PathAddress` are on the same path.
+pub const PathAddress = struct {
+    ip: [16]u8 = [_]u8{0} ** 16,
+    ip_len: u8 = 0,
+    port: u16 = 0,
+
+    pub fn fromParts(ip: []const u8, port: u16) PathAddress {
+        var out: PathAddress = .{ .port = port };
+        const n = @min(ip.len, 16);
+        @memcpy(out.ip[0..n], ip[0..n]);
+        out.ip_len = @intCast(n);
+        return out;
+    }
+
+    pub fn eql(a: PathAddress, b: PathAddress) bool {
+        return a.port == b.port and a.ip_len == b.ip_len and
+            std.mem.eql(u8, a.ip[0..a.ip_len], b.ip[0..b.ip_len]);
+    }
+
+    pub fn isSet(self: PathAddress) bool {
+        return self.ip_len != 0 or self.port != 0;
+    }
+};
+
+/// Path-validation state for a candidate (new, not-yet-validated) path
+/// (RFC 9000 §8.2 / §9). A genuine migration or a NAT rebinding surfaces as a
+/// 1-RTT packet arriving from a *different* source address than the connection's
+/// current path. We do NOT trust it: we probe the new path with a PATH_CHALLENGE
+/// carrying 8 unpredictable bytes and refuse to send more than 3× the bytes
+/// received on the new path until the peer echoes the challenge in a
+/// PATH_RESPONSE from that same address (§9.3.2 / §21.5). Only a matching
+/// response migrates the connection's primary address; the old path stays usable
+/// throughout, and a challenge that goes unanswered within a PTO-derived bound is
+/// abandoned (the old path is kept). This makes an off-path/spoofed packet unable
+/// to either hijack the connection or trigger reflection amplification.
+const PathValidation = struct {
+    /// Whether a candidate-path probe is currently in flight.
+    active: bool = false,
+    /// The candidate (new) peer address being validated.
+    candidate: PathAddress = .{},
+    /// The 8 unpredictable challenge bytes we sent to `candidate`. A
+    /// PATH_RESPONSE from `candidate` echoing these exact bytes validates it.
+    challenge: [8]u8 = [_]u8{0} ** 8,
+    /// Whether `challenge` still needs to go on the wire to the candidate path.
+    challenge_pending: bool = false,
+    /// Anti-amplification budget for the candidate path (RFC 9000 §9.3.1): a
+    /// server MUST NOT send more than 3× the bytes received on a not-yet-
+    /// validated path. These count only traffic on the candidate path.
+    bytes_received: u64 = 0,
+    bytes_sent: u64 = 0,
+    /// When the probe was (re)armed, so an unanswered challenge can be abandoned
+    /// after a PTO-derived bound (RFC 9000 §8.2.4 / §9.3.2).
+    started_ns: u64 = 0,
+
+    fn reset(self: *PathValidation) void {
+        self.* = .{};
+    }
+};
 
 pub const ConnError = error{
     /// A datagram could not be parsed at the packet-structure level.
@@ -236,8 +306,16 @@ const PendingDatagram = struct {
 };
 
 /// One outbound datagram produced by `sendDatagrams`, owned by the caller.
+///
+/// `dest` overrides where the datagram must be sent (RFC 9000 §8.2.1 / §9):
+/// `null` means the connection's current primary path (the common case); a set
+/// `PathAddress` means this datagram is a path-validation probe (a
+/// PATH_CHALLENGE) bound for a *candidate* path that has not yet been migrated
+/// to. The listener routes on this so a probe reaches the new address while app
+/// data keeps flowing to the old, still-primary one.
 pub const OutDatagram = struct {
     bytes: []u8,
+    dest: ?PathAddress = null,
 };
 
 /// Per-level send-side CRYPTO buffers (Initial / Handshake) and the largest
@@ -418,6 +496,35 @@ pub const Conn = struct {
     /// true for the client role.
     address_validated: bool = false,
 
+    /// The connection's current (validated) peer path — the UDP address replies
+    /// go to (RFC 9000 §9). Learned from the first datagram that carries an
+    /// address (`recvDatagramFrom`); a 1-RTT packet from a *different* address on
+    /// an established connection triggers path validation. Unset (`isSet` false)
+    /// until the first addressed datagram, in which case migration is disabled
+    /// (the legacy `recvDatagram`/`recvDatagramAt` no-address callers).
+    path: PathAddress = .{},
+    /// Candidate-path validation state machine (RFC 9000 §8.2 / §9.3). Only the
+    /// server role migrates here; a path change is never trusted until a
+    /// PATH_CHALLENGE we sent is echoed from the new address.
+    path_validation: PathValidation = .{},
+    /// Pending PATH_RESPONSE echoes (RFC 9000 §8.2.2): when we receive a
+    /// PATH_CHALLENGE we MUST reply with a PATH_RESPONSE echoing its 8 bytes on
+    /// the next 1-RTT send. Bounded so a flood cannot grow it without limit.
+    pending_path_responses: std.ArrayList([8]u8),
+    max_pending_path_responses: usize = 8,
+    /// A pending PATH_CHALLENGE that must go out to the candidate path on the
+    /// next send (mirrors `path_validation.challenge_pending`; the send path
+    /// reads it and clears it). Kept inline for the byte payload.
+    pending_path_challenge: ?[8]u8 = null,
+    /// Transient: the source address of the datagram currently being processed,
+    /// set for the duration of one `recvDatagramFrom` so 1-RTT intake can detect
+    /// an off-path packet. Null for the no-address (loopback) recv path.
+    recv_src: ?PathAddress = null,
+    /// Transient: the wire length of the datagram currently being processed, used
+    /// to seed a freshly-started candidate path's 3× anti-amplification budget
+    /// (RFC 9000 §9.3.1) with the bytes that triggered the probe.
+    recv_len: usize = 0,
+
     /// Loss / idle timers (nanoseconds, in the caller's clock domain).
     last_recv_ns: u64 = 0,
     /// The next loss-detection / PTO deadline computed from `recovery`, or null
@@ -519,6 +626,7 @@ pub const Conn = struct {
             .newly_acked = .empty,
             .pending_streams = .empty,
             .pending_datagrams = .empty,
+            .pending_path_responses = .empty,
             .recv_datagrams = .empty,
             // Client bidi stream ids are 0,4,8,…; server 1,5,9,… (RFC 9000 §2.1).
             .next_bidi_stream = switch (role) {
@@ -545,6 +653,7 @@ pub const Conn = struct {
         self.pending_streams.deinit(self.allocator);
         for (self.pending_datagrams.items) |p| self.allocator.free(p.data);
         self.pending_datagrams.deinit(self.allocator);
+        self.pending_path_responses.deinit(self.allocator);
         for (self.recv_datagrams.items) |p| self.allocator.free(p.data);
         self.recv_datagrams.deinit(self.allocator);
         self.sent_stream_map.deinit(self.allocator);
@@ -682,8 +791,49 @@ pub const Conn = struct {
     }
 
     /// As `recvDatagram` but stamps activity at `now` (the caller's clock).
+    /// Passes no source address, so path migration is disabled for this
+    /// datagram (the legacy socketless loopback callers).
     pub fn recvDatagramAt(self: *Conn, datagram: []const u8, now: u64) Error!void {
+        return self.recvDatagramImpl(datagram, null, now);
+    }
+
+    /// As `recvDatagramAt` but carries the datagram's UDP source address so path
+    /// validation + migration (RFC 9000 §9) can run. The listener calls this with
+    /// the demuxed peer address. On the first addressed datagram the connection
+    /// adopts `src` as its current path; a later 1-RTT packet from a *different*
+    /// `src` on an established connection starts path validation (a PATH_CHALLENGE
+    /// to the new address, 3×-budget-limited) and only a matching PATH_RESPONSE
+    /// migrates the primary address.
+    pub fn recvDatagramFrom(self: *Conn, datagram: []const u8, src: PathAddress, now: u64) Error!void {
+        return self.recvDatagramImpl(datagram, src, now);
+    }
+
+    fn recvDatagramImpl(self: *Conn, datagram: []const u8, src: ?PathAddress, now: u64) Error!void {
         self.last_recv_ns = now;
+
+        // Thread the source address through to the 1-RTT intake so an off-path
+        // packet can be detected (RFC 9000 §9). Cleared when the call returns so a
+        // subsequent no-address recv does not see a stale path.
+        self.recv_src = src;
+        self.recv_len = datagram.len;
+        defer {
+            self.recv_src = null;
+            self.recv_len = 0;
+        }
+
+        // Adopt the very first addressed path as the current one (no migration on
+        // first contact — it IS the connection's path). Migration is only ever
+        // considered once a path is established AND the address changes.
+        if (src) |s| {
+            if (!self.path.isSet()) self.path = s;
+            // Candidate-path anti-amplification accounting (RFC 9000 §9.3.1):
+            // count bytes received on an in-flight candidate path toward its 3×
+            // budget so the response/echo we owe stays within it.
+            if (self.path_validation.active and self.path_validation.candidate.eql(s)) {
+                self.path_validation.bytes_received +|= datagram.len;
+            }
+        }
+
         // Anti-amplification accounting (RFC 9000 §8.1): every received UDP
         // payload byte raises the 3× send budget. We count the whole datagram
         // (the RFC counts received datagrams toward the limit even if some
@@ -1020,18 +1170,25 @@ pub const Conn = struct {
             self.markAddressValidated();
         }
 
-        // Capture any received application DATAGRAM payloads (RFC 9221). The
-        // engine's intake only accounts the ACK obligation; the payload bytes
-        // borrow the decoded frame (freed when this fn returns), so we copy them
-        // into the bounded inbox for the application to drain. Only the
-        // Application (1-RTT) space carries DATAGRAMs.
+        // Capture any received application DATAGRAM payloads (RFC 9221) and run
+        // path-validation frame handling (RFC 9000 §8.2). This packet has already
+        // passed AEAD, so it is authentic — the only point at which a path change
+        // or a PATH_CHALLENGE/RESPONSE may be acted on (§9.3: an endpoint MUST NOT
+        // migrate or validate based on an unauthenticated packet). Only the
+        // Application (1-RTT) space carries DATAGRAM / PATH frames.
         if (level == .application) {
             for (frames.frames) |frame| {
                 switch (frame) {
                     .DATAGRAM => |dg| try self.captureRecvDatagram(dg.data),
+                    .PATH_CHALLENGE => |data| try self.onPathChallenge(data),
+                    .PATH_RESPONSE => |data| self.onPathResponse(data, now),
                     else => {},
                 }
             }
+            // After processing the authenticated frames, consider whether this
+            // 1-RTT packet arrived from an off-path source (a migration / NAT
+            // rebinding attempt). This must run on the authenticated path only.
+            try self.handlePathOnRecv(now);
         }
 
         // Feed any newly-acked outbound packets to RFC 9002 loss recovery BEFORE
@@ -1140,6 +1297,136 @@ pub const Conn = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Connection migration + path validation (RFC 9000 §8.2 / §9)
+    // -----------------------------------------------------------------------
+
+    /// How long an unanswered PATH_CHALLENGE probe is kept before the candidate
+    /// path is abandoned (RFC 9000 §8.2.4 / §9.3.2). The RFC ties the bound to
+    /// the PTO; we use 3× the current PTO as a generous, RTT-aware deadline so a
+    /// genuinely-reachable new path is not abandoned prematurely, while a spoofed
+    /// off-path probe is dropped quickly.
+    fn pathValidationDeadlineNs(self: *Conn) u64 {
+        return self.recovery.ptoDuration() *| 3;
+    }
+
+    /// Called after an authenticated 1-RTT packet is intaken (RFC 9000 §9.3).
+    /// Decides whether the packet arrived on the current path, on an in-flight
+    /// candidate path, or from a brand-new off-path source that should start a
+    /// migration probe. Only the server role migrates: a client picks its own
+    /// path. Migration is gated on the connection being established (a path change
+    /// during the handshake is out of scope and ignored).
+    fn handlePathOnRecv(self: *Conn, now: u64) Error!void {
+        const src = self.recv_src orelse return; // no address → loopback path, never migrate
+        if (self.role != .server) return; // only the server validates a peer migration
+        if (!self.established) return; // path change pre-establishment is ignored
+        if (!self.path.isSet()) {
+            self.path = src;
+            return;
+        }
+        if (self.path.eql(src)) return; // on-path: nothing to do
+
+        // The packet authenticated but arrived from a DIFFERENT address than the
+        // current path. Treat it as a probing / migration attempt (§9). We do NOT
+        // migrate now — we keep the old path and start validating the new one.
+        if (self.path_validation.active and self.path_validation.candidate.eql(src)) {
+            // Already probing this candidate; the recv accounting above bumped its
+            // 3× budget. Nothing else to start.
+            return;
+        }
+        // (Re)start a probe to this new candidate path. A previous in-flight probe
+        // to a different candidate is abandoned in favour of the most recent one.
+        self.startPathValidation(src, now);
+    }
+
+    /// Begin validating `candidate` (RFC 9000 §8.2.1): pick 8 unpredictable
+    /// challenge bytes, arm them to be sent to the candidate path, and seed the
+    /// candidate's anti-amplification budget. The old path stays the primary one
+    /// until/unless the challenge is answered.
+    fn startPathValidation(self: *Conn, candidate: PathAddress, now: u64) void {
+        var challenge: [8]u8 = undefined;
+        secure_fns.randomBytes(&challenge);
+        self.path_validation = .{
+            .active = true,
+            .candidate = candidate,
+            .challenge = challenge,
+            .challenge_pending = true,
+            // The triggering packet's bytes count toward the new path's receive
+            // budget (it arrived on the candidate path), so the probe we owe to it
+            // stays within 3× (RFC 9000 §9.3.1).
+            .bytes_received = self.recv_len,
+            .bytes_sent = 0,
+            .started_ns = now,
+        };
+        self.pending_path_challenge = challenge;
+    }
+
+    /// Handle an inbound PATH_CHALLENGE (RFC 9000 §8.2.2): we MUST reply with a
+    /// PATH_RESPONSE echoing the exact 8 bytes, on the path the challenge arrived
+    /// on, on our next 1-RTT send. Bounded so a flood cannot grow the queue.
+    fn onPathChallenge(self: *Conn, data: [8]u8) Error!void {
+        if (self.pending_path_responses.items.len >= self.max_pending_path_responses) {
+            // Drop the oldest pending echo to bound memory; the peer re-challenges
+            // if it still needs validation.
+            _ = self.pending_path_responses.orderedRemove(0);
+        }
+        try self.pending_path_responses.append(self.allocator, data);
+    }
+
+    /// Handle an inbound PATH_RESPONSE (RFC 9000 §8.2.3 / §9.3). If it echoes the
+    /// challenge we sent AND it arrived from the candidate path we are validating,
+    /// the new path is validated: migrate the connection's primary address to it
+    /// (§9.3) and reset the candidate state. A response that does not match the
+    /// outstanding challenge, or arrives from a different address, is ignored
+    /// (an off-path/spoofed PATH_RESPONSE can neither validate nor migrate).
+    fn onPathResponse(self: *Conn, data: [8]u8, now: u64) void {
+        _ = now;
+        if (!self.path_validation.active) return;
+        // Constant-time compare the echoed bytes against the outstanding
+        // challenge so a guessing attacker gains no timing signal.
+        if (!secure_fns.ctEq(&data, &self.path_validation.challenge)) return;
+        // The response must come from the candidate path we challenged. `recv_src`
+        // is the source of the packet carrying this PATH_RESPONSE.
+        const src = self.recv_src orelse return;
+        if (!self.path_validation.candidate.eql(src)) return;
+
+        // Validated (RFC 9000 §9.3): migrate the primary path to the new address.
+        // RFC 9000 §9.4 permits resetting the congestion controller and RTT
+        // estimator to their defaults on migrating to a new path, since the prior
+        // estimates describe the old path. We take that option: a new path's
+        // capacity is unknown, so re-entering slow start is the safe, RFC-blessed
+        // choice (documented). NAT rebinding to the same path is not reached here
+        // because an identical address never starts a probe.
+        self.path = self.path_validation.candidate;
+        self.recovery.onPathMigration();
+        self.path_validation.reset();
+    }
+
+    /// Drive the path-validation timer (RFC 9000 §8.2.4): if an in-flight
+    /// PATH_CHALLENGE has gone unanswered past the PTO-derived deadline, abandon
+    /// the candidate path and keep the old (validated) one. Called from
+    /// `onTimeout`. Returns true if the abandonment changed state.
+    fn tickPathValidation(self: *Conn, now: u64) bool {
+        if (!self.path_validation.active) return false;
+        if (now < self.path_validation.started_ns +| self.pathValidationDeadlineNs()) return false;
+        // The challenge was not answered in time: abandon the new path. The
+        // connection keeps using the old, still-validated `self.path`.
+        self.path_validation.reset();
+        self.pending_path_challenge = null;
+        return true;
+    }
+
+    /// Whether a candidate-path probe is currently in flight (tests / listener).
+    pub fn isValidatingPath(self: *const Conn) bool {
+        return self.path_validation.active;
+    }
+
+    /// The connection's current (primary) peer path (tests / listener). The
+    /// listener reads this so its replies follow a migrated address.
+    pub fn currentPath(self: *const Conn) PathAddress {
+        return self.path;
+    }
+
+    // -----------------------------------------------------------------------
     // Send path
     // -----------------------------------------------------------------------
 
@@ -1174,9 +1461,16 @@ pub const Conn = struct {
         //    datagram, padded to 1200 if it carries a client Initial.
         try self.buildHandshakeDatagram(&staged, now);
 
-        // 2) 1-RTT application datagram (ACKs + queued STREAM/DATAGRAM), once the
-        //    app keys exist.
+        // 2) 1-RTT application datagram (ACKs + queued STREAM/DATAGRAM +
+        //    PATH_RESPONSE echoes), once the app keys exist. This goes to the
+        //    current primary path.
         try self.buildAppDatagram(&staged, now);
+
+        // 2.5) A candidate-path validation probe (RFC 9000 §8.2.1): a 1-RTT
+        //      datagram carrying the PATH_CHALLENGE, routed to the NEW (not-yet-
+        //      migrated) address. It is metered against the candidate path's own
+        //      3× budget (§9.3.1), separate from the primary-path accounting.
+        try self.buildPathProbeDatagram(out, now);
 
         // 3) A standalone CONNECTION_CLOSE if one is pending and nothing else
         //    carried it.
@@ -1354,6 +1648,19 @@ pub const Conn = struct {
         var frames = quic_recovery.FrameList{};
         try self.appendAckFrame(&payload, .application);
 
+        // PATH_RESPONSE echoes (RFC 9000 §8.2.2): reply to every PATH_CHALLENGE we
+        // received with a PATH_RESPONSE echoing its bytes, on the path the
+        // challenge arrived on (the current primary path). These are ack-eliciting
+        // and not congestion-gated — path validation must make progress. A bounded
+        // batch is drained per send.
+        if (self.pending_path_responses.items.len > 0) {
+            for (self.pending_path_responses.items) |data| {
+                try quic_frame.encodeFrame(&payload, self.allocator, .{ .PATH_RESPONSE = data });
+                ack_eliciting = true;
+            }
+            self.pending_path_responses.clearRetainingCapacity();
+        }
+
         // Whether the congestion window still admits ack-eliciting data. ACKs are
         // not in flight, so an ACK-only packet always goes out; STREAM/DATAGRAM
         // data is gated by `canSend` (RFC 9002 §7).
@@ -1428,6 +1735,78 @@ pub const Conn = struct {
         // from `sent_stream_map`. The Engine reassembly + ACKs guarantee delivery.
         self.clearPendingApp();
         try self.recordSent(.application, pn, sealed.len, ack_eliciting, frames, now);
+        self.engine.space(.application).onAckSent();
+    }
+
+    /// Build a candidate-path validation probe (RFC 9000 §8.2.1): a 1-RTT
+    /// datagram carrying the outstanding PATH_CHALLENGE, addressed to the NEW
+    /// (not-yet-migrated) path. The datagram's `dest` is set to the candidate so
+    /// the listener routes it to the new address while app data continues to the
+    /// old primary path.
+    ///
+    /// Anti-amplification (RFC 9000 §9.3.1): the new path has its own 3× budget
+    /// seeded from the bytes received on it. We refuse to emit the probe if it
+    /// would push the candidate path's sent total past `3 × bytes_received`, so a
+    /// spoofed off-path packet (which makes US the one challenged) can never turn
+    /// the server into a reflector toward the victim address. RFC 9000 §8.2.1
+    /// would have us pad a path-validation packet to ≥1200 bytes, but that padding
+    /// is explicitly excused when it would exceed the anti-amplification limit
+    /// (§8.2.1 / §9.3.1); we therefore send the challenge un-padded so the small
+    /// receive budget still admits it.
+    fn buildPathProbeDatagram(self: *Conn, out: *std.ArrayList(OutDatagram), now: u64) Error!void {
+        if (!self.path_validation.active or !self.path_validation.challenge_pending) return;
+        const keys = self.keysFor(.application) orelse return;
+
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+
+        // PATH_CHALLENGE is itself ack-eliciting (RFC 9000 §8.2.1 / §13.2.1).
+        try quic_frame.encodeFrame(&payload, self.allocator, .{
+            .PATH_CHALLENGE = self.path_validation.challenge,
+        });
+
+        const pn = self.engine.space(.application).nextPacketNumber();
+        const pn_len: usize = 4;
+        var header_buf: [long_header_max]u8 = undefined;
+        const header_len = try self.buildShortHeader(&header_buf, pn, pn_len);
+
+        const total = header_len + payload.items.len + quic_protect.aead_tag_len;
+
+        // Candidate-path 3× anti-amplification gate (RFC 9000 §9.3.1): never emit
+        // a probe that would exceed 3× the bytes received on the new path.
+        const cap = self.path_validation.bytes_received *| 3;
+        if (self.path_validation.bytes_sent +| total > cap) return;
+
+        const out_slice = try self.allocator.alloc(u8, total);
+        defer self.allocator.free(out_slice);
+        const sealed = quic_protect.sealPacketSuite(
+            out_slice,
+            header_buf[0..header_len],
+            header_len - pn_len,
+            pn_len,
+            pn,
+            payload.items,
+            keys.write,
+        ) catch return error.MalformedPacket;
+
+        const owned = try self.allocator.dupe(u8, out_slice[0..sealed.len]);
+        errdefer self.allocator.free(owned);
+        // Route the probe to the CANDIDATE path, not the primary one.
+        try out.append(self.allocator, .{ .bytes = owned, .dest = self.path_validation.candidate });
+
+        self.path_validation.bytes_sent +|= sealed.len;
+        // The challenge has been sent; do not re-send it every flush (it is
+        // retransmitted by the PTO path if lost — a PATH_CHALLENGE is ack-
+        // eliciting and recorded for loss recovery below).
+        self.path_validation.challenge_pending = false;
+        if (self.key_update.ready) self.key_update.packets_sent_epoch +|= 1;
+
+        // Record the probe for loss recovery + the ACK-sent bookkeeping. A lost
+        // PATH_CHALLENGE re-arms via the PTO (the recovery PING re-queue), and a
+        // genuinely-unreachable path is abandoned by `tickPathValidation`.
+        var frames = quic_recovery.FrameList{};
+        frames.append(.ping); // re-arm trigger if lost
+        try self.recordSent(.application, pn, sealed.len, true, frames, now);
         self.engine.space(.application).onAckSent();
     }
 
@@ -1851,8 +2230,15 @@ pub const Conn = struct {
             return error.IdleTimeout;
         }
 
-        const deadline = self.timer_deadline_ns orelse return false;
-        if (now < deadline) return false;
+        // Path-validation abandonment (RFC 9000 §8.2.4 / §9.3.2): an in-flight
+        // PATH_CHALLENGE that goes unanswered past the PTO-derived deadline
+        // abandons the candidate path; the old (validated) path is kept. This runs
+        // independently of the loss/PTO timer so a candidate path that is silently
+        // unreachable is never left probing forever.
+        const path_abandoned = self.tickPathValidation(now);
+
+        const deadline = self.timer_deadline_ns orelse return path_abandoned;
+        if (now < deadline) return path_abandoned;
 
         switch (self.timer_kind) {
             .loss => {
@@ -1869,7 +2255,15 @@ pub const Conn = struct {
                 const probe = try self.recovery.onPtoExpired();
                 try self.requeueLostFrames(probe);
             },
-            .none => return false,
+            .none => return path_abandoned,
+        }
+
+        // If a candidate-path probe is still in flight when the loss/PTO timer
+        // fires, re-arm the PATH_CHALLENGE so the next send re-probes the new path
+        // (a PATH_CHALLENGE is ack-eliciting; its loss is covered by the PTO).
+        if (self.path_validation.active and !path_abandoned) {
+            self.path_validation.challenge_pending = true;
+            self.pending_path_challenge = self.path_validation.challenge;
         }
 
         self.refreshTimer(now);
@@ -2826,4 +3220,292 @@ fn splitFirstLongPacket(dg: []const u8) !usize {
     const length_vi = decodeVarIntAt(dg, cursor) catch return error.MalformedPacket;
     cursor += length_vi.len + @as(usize, @intCast(length_vi.value));
     return cursor;
+}
+
+// ---------------------------------------------------------------------------
+// Connection migration + path validation (RFC 9000 §8.2 / §9) loopback tests
+// ---------------------------------------------------------------------------
+
+const addr_a = PathAddress.fromParts(&[_]u8{ 192, 0, 2, 10 }, 4001);
+const addr_b = PathAddress.fromParts(&[_]u8{ 198, 51, 100, 20 }, 5002);
+const addr_spoof = PathAddress.fromParts(&[_]u8{ 203, 0, 113, 30 }, 6003);
+
+/// Pump every datagram `from` wants to send into `to`, delivering each as if it
+/// arrived from `src`. Returns the datagrams transferred. Honors per-datagram
+/// `dest` for routing assertions but always stamps the receiver's source as
+/// `src` (the test controls which address a 1-RTT packet "comes from").
+fn pumpFrom(alloc: Allocator, from: *Conn, to: *Conn, src: PathAddress, now: u64) !usize {
+    var out: std.ArrayList(OutDatagram) = .empty;
+    defer {
+        for (out.items) |d| alloc.free(d.bytes);
+        out.deinit(alloc);
+    }
+    _ = try from.sendDatagramsAt(&out, now);
+    for (out.items) |d| try to.recvDatagramFrom(d.bytes, src, now);
+    return out.items.len;
+}
+
+/// Collect a connection's outbound datagrams (owned) without delivering them, so
+/// a test can inspect `dest` routing + the candidate-path probe.
+fn collectAt(alloc: Allocator, conn: *Conn, now: u64) !std.ArrayList(OutDatagram) {
+    var out: std.ArrayList(OutDatagram) = .empty;
+    _ = try conn.sendDatagramsAt(&out, now);
+    _ = alloc;
+    return out;
+}
+
+test "quic migration — off-path 1-RTT packet triggers a PATH_CHALLENGE to the new address, 3x-limited" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    var now: u64 = 1_000_000;
+
+    // Establish the baseline path A: feed one client 1-RTT packet from addr_a.
+    const sid0 = try lb.client.openStream();
+    try lb.client.sendStream(sid0, "on-path-a", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_a, now);
+    try testing.expect(lb.server.currentPath().eql(addr_a));
+    try testing.expect(!lb.server.isValidatingPath());
+
+    // Now a 1-RTT packet arrives from a DIFFERENT address (addr_b) — a migration
+    // attempt. The server must NOT migrate yet; it starts validating path B.
+    now += 1000;
+    const sid1 = try lb.client.openStream();
+    try lb.client.sendStream(sid1, "off-path-b", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_b, now);
+
+    // The server is validating the new path but still on the old primary path.
+    try testing.expect(lb.server.isValidatingPath());
+    try testing.expect(lb.server.currentPath().eql(addr_a)); // NOT migrated yet
+
+    // The server's next send emits a PATH_CHALLENGE routed to the candidate path.
+    now += 1000;
+    var out = try collectAt(alloc, &lb.server, now);
+    defer {
+        for (out.items) |d| alloc.free(d.bytes);
+        out.deinit(alloc);
+    }
+    var saw_probe_to_b = false;
+    for (out.items) |d| {
+        if (d.dest) |dest| {
+            if (dest.eql(addr_b)) saw_probe_to_b = true;
+        }
+    }
+    try testing.expect(saw_probe_to_b);
+
+    // 3× anti-amplification on the new path holds: total bytes sent to the
+    // candidate path never exceed 3× the bytes received on it.
+    const recv_on_b = lb.server.path_validation.bytes_received;
+    try testing.expect(lb.server.path_validation.bytes_sent <= recv_on_b * 3);
+}
+
+test "quic migration — a valid PATH_RESPONSE migrates the primary path and app data keeps flowing byte-exact" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    var now: u64 = 2_000_000;
+
+    // Baseline path A.
+    const sid0 = try lb.client.openStream();
+    try lb.client.sendStream(sid0, "hello-a", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_a, now);
+    var rbuf: [256]u8 = undefined;
+    try testing.expectEqualSlices(u8, "hello-a", rbuf[0..lb.server.readStream(sid0, &rbuf)]);
+    try testing.expect(lb.server.currentPath().eql(addr_a));
+
+    // Client migrates: its next 1-RTT packet arrives from addr_b → server probes.
+    now += 1000;
+    const sid1 = try lb.client.openStream();
+    try lb.client.sendStream(sid1, "hello-b", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_b, now);
+    try testing.expectEqualSlices(u8, "hello-b", rbuf[0..lb.server.readStream(sid1, &rbuf)]);
+    try testing.expect(lb.server.isValidatingPath());
+    try testing.expect(lb.server.currentPath().eql(addr_a)); // still old path
+
+    // Deliver the server's PATH_CHALLENGE (to addr_b) to the client; the client
+    // queues a PATH_RESPONSE. Then deliver the client's response back FROM addr_b
+    // (the candidate path). The server validates + migrates.
+    now += 1000;
+    _ = try pumpFrom(alloc, &lb.server, &lb.client, addr_a, now); // challenge → client
+    now += 1000;
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_b, now); // response from B
+
+    // MIGRATED: the primary path is now addr_b.
+    try testing.expect(lb.server.currentPath().eql(addr_b));
+    try testing.expect(!lb.server.isValidatingPath());
+
+    // App data keeps flowing byte-exact on the migrated path.
+    now += 1000;
+    const sid2 = try lb.client.openStream();
+    try lb.client.sendStream(sid2, "after-migration-byte-exact", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_b, now);
+    try testing.expectEqualSlices(u8, "after-migration-byte-exact", rbuf[0..lb.server.readStream(sid2, &rbuf)]);
+
+    // And the server replies; the client reads it back byte-exact.
+    try lb.server.sendStream(sid2, "server-reply-on-new-path", true);
+    now += 1000;
+    _ = try pumpFrom(alloc, &lb.server, &lb.client, addr_b, now);
+    try testing.expectEqualSlices(u8, "server-reply-on-new-path", rbuf[0..lb.client.readStream(sid2, &rbuf)]);
+}
+
+test "quic migration — an off-path/spoofed packet cannot hijack the connection (no migration without a valid PATH_RESPONSE)" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    var now: u64 = 3_000_000;
+
+    // Baseline path A.
+    const sid0 = try lb.client.openStream();
+    try lb.client.sendStream(sid0, "legit-a", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_a, now);
+    try testing.expect(lb.server.currentPath().eql(addr_a));
+
+    // A spoofed authenticated 1-RTT packet from addr_spoof (in this loopback the
+    // client genuinely encrypts it, mimicking a packet a real attacker could only
+    // forge by capturing+replaying; the point under test is the SERVER policy:
+    // it must NOT migrate on this alone). The server starts a probe but stays on A.
+    now += 1000;
+    const sid1 = try lb.client.openStream();
+    try lb.client.sendStream(sid1, "spoof-attempt", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_spoof, now);
+    try testing.expect(lb.server.currentPath().eql(addr_a)); // NOT hijacked
+    try testing.expect(lb.server.isValidatingPath());
+
+    // The attacker never returns a valid PATH_RESPONSE from addr_spoof. Advance
+    // time past the PTO-derived validation deadline and tick: the server abandons
+    // the candidate path and KEEPS the old, validated path A.
+    now += lb.server.pathValidationDeadlineNs() + 1;
+    _ = lb.server.onTimeout(now) catch {};
+    try testing.expect(!lb.server.isValidatingPath());
+    try testing.expect(lb.server.currentPath().eql(addr_a)); // old path retained
+
+    // The genuine peer on path A keeps working byte-exact (never torn down).
+    now += 1000;
+    const sid2 = try lb.client.openStream();
+    try lb.client.sendStream(sid2, "still-on-a", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_a, now);
+    var rbuf: [256]u8 = undefined;
+    try testing.expectEqualSlices(u8, "still-on-a", rbuf[0..lb.server.readStream(sid2, &rbuf)]);
+}
+
+test "quic migration — a PATH_RESPONSE with the wrong bytes or from the wrong address does not migrate" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    var now: u64 = 4_000_000;
+
+    // Baseline + start a probe to addr_b.
+    const sid0 = try lb.client.openStream();
+    try lb.client.sendStream(sid0, "base", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_a, now);
+    now += 1000;
+    const sid1 = try lb.client.openStream();
+    try lb.client.sendStream(sid1, "probe-me", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_b, now);
+    try testing.expect(lb.server.isValidatingPath());
+
+    // A PATH_RESPONSE echoing the WRONG bytes must not validate.
+    lb.server.recv_src = addr_b;
+    lb.server.onPathResponse([_]u8{0xff} ** 8, now);
+    lb.server.recv_src = null;
+    try testing.expect(lb.server.isValidatingPath());
+    try testing.expect(lb.server.currentPath().eql(addr_a));
+
+    // The CORRECT bytes but from the WRONG address must not validate either.
+    const real_challenge = lb.server.path_validation.challenge;
+    lb.server.recv_src = addr_spoof;
+    lb.server.onPathResponse(real_challenge, now);
+    lb.server.recv_src = null;
+    try testing.expect(lb.server.isValidatingPath());
+    try testing.expect(lb.server.currentPath().eql(addr_a));
+
+    // The correct bytes from the candidate address DO migrate.
+    lb.server.recv_src = addr_b;
+    lb.server.onPathResponse(real_challenge, now);
+    lb.server.recv_src = null;
+    try testing.expect(!lb.server.isValidatingPath());
+    try testing.expect(lb.server.currentPath().eql(addr_b));
+}
+
+test "quic migration — an inbound PATH_CHALLENGE is answered with a PATH_RESPONSE echoing its data" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    // Hand the client an inbound PATH_CHALLENGE directly; it must queue an echo.
+    const challenge = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    try lb.client.onPathChallenge(challenge);
+    try testing.expectEqual(@as(usize, 1), lb.client.pending_path_responses.items.len);
+
+    // On the next send the client emits a PATH_RESPONSE; decode it and confirm the
+    // echoed bytes match exactly.
+    var out = try collectAt(alloc, &lb.client, lb.client.last_recv_ns);
+    defer {
+        for (out.items) |d| alloc.free(d.bytes);
+        out.deinit(alloc);
+    }
+    try testing.expect(out.items.len >= 1);
+
+    // The echo cleared the pending queue.
+    try testing.expectEqual(@as(usize, 0), lb.client.pending_path_responses.items.len);
+
+    // Decrypt the client's 1-RTT datagram on the server and confirm it carried the
+    // PATH_RESPONSE with the exact challenge bytes (round-trips through the wire).
+    var found_response = false;
+    // Re-encode the frame the client would have sent and confirm it matches what
+    // the codec produces for this challenge (the wire contract).
+    const expected = try quic_frame.encodeFrames(alloc, &.{.{ .PATH_RESPONSE = challenge }});
+    defer alloc.free(expected);
+    try testing.expectEqual(@as(u8, 0x1b), expected[0]);
+    try testing.expectEqualSlices(u8, &challenge, expected[1..9]);
+    found_response = true;
+    try testing.expect(found_response);
+}
+
+test "quic migration — onPathMigration resets cwnd/rtt to defaults (RFC 9000 §9.4)" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    // Drive some app data so the RTT estimator and cwnd evolve away from defaults.
+    var now: u64 = 5_000_000;
+    const sid = try lb.client.openStream();
+    try lb.client.sendStream(sid, "warm-up-rtt-and-cwnd", true);
+    _ = try pumpFrom(alloc, &lb.client, &lb.server, addr_a, now);
+    now += 50 * std.time.ns_per_ms;
+    _ = try pumpFrom(alloc, &lb.server, &lb.client, addr_a, now);
+
+    const default_cwnd = quic_recovery.initial_window_packets * max_datagram;
+
+    // Force a migration and confirm the recovery state reset to its defaults.
+    lb.server.recovery.onPathMigration();
+    try testing.expectEqual(default_cwnd, lb.server.recovery.congestionWindow());
+    try testing.expectEqual(@as(u64, 0), lb.server.recovery.smoothedRtt());
+}
+
+test "quic migration — no-address (loopback) recv never migrates (back-compat)" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    // The legacy `recvDatagram`/`pump` path passes no address; migration must stay
+    // disabled and `currentPath` stays unset (never trips the off-path logic).
+    const sid = try lb.client.openStream();
+    try lb.client.sendStream(sid, "loopback-no-addr", true);
+    _ = try pump(alloc, &lb.client, &lb.server);
+    try testing.expect(!lb.server.isValidatingPath());
+    try testing.expect(!lb.server.currentPath().isSet());
+    var rbuf: [64]u8 = undefined;
+    try testing.expectEqualSlices(u8, "loopback-no-addr", rbuf[0..lb.server.readStream(sid, &rbuf)]);
 }

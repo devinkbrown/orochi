@@ -551,6 +551,21 @@ pub const Recovery = struct {
         self.max_ack_delay_ns = ns;
     }
 
+    /// Reset congestion control and the RTT estimator to their initial defaults
+    /// on a confirmed migration to a NEW path (RFC 9000 §9.4). The old path's
+    /// congestion window and RTT estimate describe a different network route and
+    /// MUST NOT be carried over, so the controller re-enters slow start with a
+    /// fresh window and the RTT estimator is re-seeded from the next sample. The
+    /// per-space sent registries and PTO backoff are left intact: outstanding
+    /// packets are still legitimately outstanding, only the path's capacity
+    /// assumptions are discarded.
+    pub fn onPathMigration(self: *Recovery) void {
+        const max_datagram = self.cc.max_datagram;
+        self.cc = Congestion.init(max_datagram);
+        self.rtt = RttEstimator.init();
+        self.pto_count = 0;
+    }
+
     // -----------------------------------------------------------------------
     // On send (§A.1: OnPacketSent)
     // -----------------------------------------------------------------------
