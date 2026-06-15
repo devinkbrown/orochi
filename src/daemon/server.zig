@@ -210,6 +210,8 @@ const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
 const og_mod = @import("operator_groups.zig");
 const config_format = @import("config_format.zig");
+const tls_certs = @import("tls_certs.zig");
+const x509_verify = @import("../crypto/x509_verify.zig");
 const services_mod = @import("services.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const account_register = @import("../proto/account_register.zig");
@@ -1966,6 +1968,16 @@ pub const LinuxServer = struct {
     /// on deinit. Null/empty until the first successful REHASH.
     reload_parsed: ?config_format.Config = null,
     reload_bindings: []oper_mod.OperBinding = &.{},
+    /// Server-owned TLS cert/key material re-read by the most recent REHASH cert
+    /// hot-reload. When present, `config.tls_cert_chain` + the signing-key fields
+    /// borrow from here; the boot generation (main-owned, "borrowed, outlives the
+    /// server") is left untouched. Replaced+freed on each subsequent REHASH that
+    /// reloads certs, and on deinit. Null until the first successful cert reload.
+    reload_tls: ?tls_certs.Loaded = null,
+    /// Server-owned hardened-TLS-1.2 leg minted alongside `reload_tls` when the
+    /// reloaded 1.3 leaf is neither ECDSA-P256 nor RSA (so the 1.2 leg needs its
+    /// own ECDSA-P256 leaf). Same ownership/lifetime rules as `reload_tls`.
+    reload_tls12: ?tls_certs.Tls12 = null,
     /// Monotonically increasing seed fed to S2sLink.feed for deterministic gossip
     /// rng. (The S2S/TLS listener fds, accept-armed flags, and the cross-reactor
     /// wake eventfd now live on `reactor`.)
@@ -2010,6 +2022,16 @@ pub const LinuxServer = struct {
     fn certReady(config: Config) bool {
         return config.tls_cert_chain.len != 0 and
             (config.tls_signing_key != null or config.tls_rsa_signing_key != null or config.tls_ecdsa_signing_key != null);
+    }
+
+    /// Validate a reloaded leaf chain before it goes live on REHASH. Mirrors the
+    /// boot-time `validateTlsChain` in main.zig: a non-empty chain whose simple
+    /// path verifies against the current wall clock. A rejected chain leaves the
+    /// live certs untouched (the error propagates to the REHASH caller).
+    fn validateReloadedChain(chain: []const []const u8) !void {
+        if (chain.len == 0) return error.EmptyCertificateChain;
+        const now_unix: i64 = @divTrunc(platform.realtimeMillis(), 1000);
+        try x509_verify.verifySimpleChainAt(chain, now_unix);
     }
 
     /// Build one shard's `Reactor`: its own ring, connection table (reserved to
@@ -2458,6 +2480,10 @@ pub const LinuxServer = struct {
         self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
+        // Free the server-owned TLS reload generation, if any. The boot cert
+        // generation is main-owned and is never freed here.
+        if (self.reload_tls) |*t| t.deinit(self.allocator);
+        if (self.reload_tls12) |*t| t.deinit(self.allocator);
         self.read_markers.deinit();
         self.monitor.deinit();
         self.whowas.deinit();
@@ -16203,16 +16229,119 @@ pub const LinuxServer = struct {
             null;
 
         // Commit: replace the previous reloaded generation, then point the live
-        // registry at the new bindings.
+        // registry at the new bindings. `parsed`'s strings (incl. the TLS cert/key
+        // paths consulted just below) now live in `self.reload_parsed`.
         self.allocator.free(self.reload_bindings);
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
         self.reload_parsed = parsed;
         self.reload_bindings = bindings;
         self.oper_registry = new_registry;
 
+        // Cert hot-reload: re-read the cert/key material from the reloaded paths
+        // and atomically swap the live `config.tls_*` fields so NEW TLS handshakes
+        // present the rotated leaf. Established sessions are untouched (no
+        // renegotiation). Any failure keeps the current certs and only NOTICEs.
+        const tls_outcome = self.reloadTlsCerts(io, &self.reload_parsed.?.tls) catch |err| blk: {
+            var ebuf: [default_reply_bytes]u8 = undefined;
+            const msg = std.fmt.bufPrint(&ebuf, "REHASH: TLS cert reload failed ({s}); keeping current certificates", .{@errorName(err)}) catch "REHASH: TLS cert reload failed; keeping current certificates";
+            try self.noticeTo(conn, msg);
+            break :blk TlsReloadOutcome.kept;
+        };
+
         var note_buf: [default_reply_bytes]u8 = undefined;
-        const note = std.fmt.bufPrint(&note_buf, "Configuration reloaded ({d} oper bindings)", .{bindings.len}) catch "Configuration reloaded";
+        const note = std.fmt.bufPrint(
+            &note_buf,
+            "Configuration reloaded ({d} oper bindings; {s})",
+            .{ bindings.len, tls_outcome.note() },
+        ) catch "Configuration reloaded";
         try queueNumeric(conn, .RPL_REHASHING, &.{path}, note);
+    }
+
+    /// Outcome of the REHASH cert hot-reload, folded into the RPL_REHASHING note.
+    const TlsReloadOutcome = enum {
+        /// TLS is not configured on this node — nothing to reload.
+        not_configured,
+        /// Cert/key material was re-read and the live config was swapped.
+        reloaded,
+        /// A failure (validation/decode/OOM) was reported via NOTICE; the current
+        /// certs remain live.
+        kept,
+
+        fn note(self: TlsReloadOutcome) []const u8 {
+            return switch (self) {
+                .not_configured => "TLS not configured",
+                .reloaded => "TLS certificates reloaded",
+                .kept => "TLS certificates unchanged",
+            };
+        }
+    };
+
+    /// Re-read the TLS cert chain + signing key from the reloaded config's paths
+    /// and, on success, atomically swap the live `config.tls_*` (and TLS 1.2 leg)
+    /// fields to a fresh server-owned reload generation — freeing the prior reload
+    /// generation, never the main-owned boot generation. On ANY failure the live
+    /// config is left wholly untouched (the error propagates; the caller keeps the
+    /// current certs and NOTICEs). `tls` borrows `self.reload_parsed`, which owns
+    /// the path strings for the server's lifetime.
+    fn reloadTlsCerts(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
+        // Mirror the boot gate in main.zig: only [tls] enabled nodes load certs.
+        if (!tls.enabled or self.config.tls_cert_chain.len == 0) return .not_configured;
+
+        // Load + validate the new material BEFORE touching any live field, so a
+        // failure cannot leave the listener half-swapped.
+        var loaded = try tls_certs.loadOrBootstrap(self.allocator, io, .{
+            .enabled = true,
+            .cert_path = tls.cert_path,
+            .key_path = tls.key_path,
+            .dns_name = tls.dns_name,
+        });
+        errdefer loaded.deinit(self.allocator);
+        try validateReloadedChain(loaded.cert_chain);
+
+        // Resolve the hardened TLS 1.2 leg the same way main.zig does at boot:
+        // an ECDSA-P256 or RSA leaf serves 1.2 natively (reusing the 1.3 chain);
+        // an Ed25519 leaf needs a freshly-minted ECDSA-P256 leaf for the 1.2 leg.
+        // Only mint the side leaf when the node already had a 1.2 leg configured.
+        const want_tls12 = self.config.tls12_cert_chain.len != 0;
+        var new_tls12: ?tls_certs.Tls12 = null;
+        errdefer if (new_tls12) |*t| t.deinit(self.allocator);
+        var tls12_chain: []const []const u8 = &.{};
+        var tls12_key: ?ecdsa_p256.KeyPair = null;
+        if (want_tls12) {
+            switch (loaded.key_kind) {
+                .ecdsa_p256 => {
+                    tls12_chain = loaded.cert_chain;
+                    tls12_key = loaded.ecdsa_p256_signing_key;
+                },
+                .rsa => {
+                    tls12_chain = loaded.cert_chain;
+                    // 1.2 RSA leg signs with the shared tls_rsa_signing_key (set below).
+                },
+                .ed25519 => {
+                    new_tls12 = try tls_certs.bootstrapTls12(self.allocator, io, tls.dns_name);
+                    tls12_chain = new_tls12.?.cert_chain;
+                    tls12_key = new_tls12.?.key;
+                },
+            }
+        }
+
+        // Commit: swap the live config fields, then free the PRIOR reload
+        // generation (the boot generation is main-owned and never freed here).
+        // Everything above succeeded, so no error can leave a torn swap.
+        self.config.tls_cert_chain = loaded.cert_chain;
+        self.config.tls_signing_key = loaded.signing_key;
+        self.config.tls_ecdsa_signing_key = loaded.ecdsa_p256_signing_key;
+        self.config.tls_rsa_signing_key = loaded.rsa_signing_key;
+        if (want_tls12) {
+            self.config.tls12_cert_chain = tls12_chain;
+            self.config.tls12_signing_key = tls12_key;
+        }
+
+        if (self.reload_tls) |*prior| prior.deinit(self.allocator);
+        if (self.reload_tls12) |*prior| prior.deinit(self.allocator);
+        self.reload_tls = loaded;
+        self.reload_tls12 = new_tls12;
+        return .reloaded;
     }
 
     /// INFO — RPL_INFO (371) lines bracketed by RPL_INFOSTART/RPL_ENDOFINFO.
@@ -27335,6 +27464,194 @@ test "threaded server: UPGRADE resume arena re-dials a carried mesh peer" {
         if (std.mem.indexOf(u8, c.written(), "node2.test") != null) linked = true;
     }
     try std.testing.expect(linked);
+}
+
+/// Mint a self-signed Ed25519 leaf (valid 2024..2100, `is_ca` so it self-anchors)
+/// for the REHASH cert-reload tests. Returns the DER plus the signing keypair.
+fn mintRehashTlsLeaf(buf: []u8, seed_byte: u8, cn: []const u8) !struct {
+    der: []const u8,
+    kp: std.crypto.sign.Ed25519.KeyPair,
+} {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{seed_byte} ** Ed25519.KeyPair.seed_length);
+    const der = try x509_selfsign.buildSelfSigned(buf, .{
+        .common_name = cn,
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ seed_byte, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{cn},
+        .is_ca = true,
+    });
+    return .{ .der = der, .kp = kp };
+}
+
+/// Build a cwd-relative path into a testing tmp dir (matches `tls_certs`'s helper
+/// so `std.Io.Dir.cwd()` reads resolve to the `.zig-cache/tmp/<sub>/<name>` file).
+fn rehashTmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior reload gen, keeps boot certs" {
+    const allocator = std.testing.allocator;
+    const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
+    const pem = @import("../proto/pem.zig");
+
+    // Boot generation (main-owned analogue): cert A lives on this test's stack and
+    // is NEVER freed by the server — the server must only ever free its own reload
+    // generation. Run under the testing allocator so any double-free/leak fails.
+    var a_buf: [1024]u8 = undefined;
+    const a = try mintRehashTlsLeaf(&a_buf, 0x71, "a.test");
+    const boot_chain = [_][]const u8{a.der};
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &boot_chain,
+        .tls_signing_key = a.kp,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Pre-reload: the live chain is the boot (stack-owned) cert A; no reload gen.
+    try std.testing.expectEqualSlices(u8, a.der, server.config.tls_cert_chain[0]);
+    try std.testing.expect(server.reload_tls == null);
+
+    // Write a rotated cert B + its Ed25519 key (both PEM) to a temp dir.
+    var b_buf: [1024]u8 = undefined;
+    const b = try mintRehashTlsLeaf(&b_buf, 0x72, "b.test");
+    const b_seed = [_]u8{0x72} ** std.crypto.sign.Ed25519.KeyPair.seed_length;
+    var b_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+    const b_key_der = try ed25519_pkcs8.encode(&b_key_der_buf, b_seed);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cert_pem_buf: [4096]u8 = undefined;
+    const cert_pem = try pem.encode(&cert_pem_buf, "CERTIFICATE", b.der);
+    var key_pem_buf: [4096]u8 = undefined;
+    const key_pem = try pem.encode(&key_pem_buf, "PRIVATE KEY", b_key_der);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.pem", .data = cert_pem });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.key", .data = key_pem });
+    const b_cert_path = try rehashTmpPath(allocator, tmp, "b.pem");
+    defer allocator.free(b_cert_path);
+    const b_key_path = try rehashTmpPath(allocator, tmp, "b.key");
+    defer allocator.free(b_key_path);
+
+    // Drive the cert-reload leg of REHASH directly (no socket needed): the live
+    // chain must now be cert B, owned by the server's reload generation.
+    const tls_b = config_format.Config.Tls{
+        .enabled = true,
+        .cert_path = b_cert_path,
+        .key_path = b_key_path,
+        .dns_name = "b.test",
+    };
+    const outcome_b = try server.reloadTlsCerts(std.testing.io, &tls_b);
+    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, outcome_b);
+    try std.testing.expectEqualSlices(u8, b.der, server.config.tls_cert_chain[0]);
+    try std.testing.expect(server.reload_tls != null);
+    // Boot cert A is untouched: its stack bytes are unchanged (the swap pointed the
+    // live chain at the server-owned reload gen and never freed the boot bytes —
+    // the testing allocator doesn't even own `a.der`, so any free attempt aborts).
+    var a_check_buf: [1024]u8 = undefined;
+    const a_again = try mintRehashTlsLeaf(&a_check_buf, 0x71, "a.test");
+    try std.testing.expectEqualSlices(u8, a_again.der, a.der);
+    // The new live signing key must match cert B's leaf, not boot cert A's.
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &server.config.tls_signing_key.?.public_key.toBytes(),
+        &a.kp.public_key.toBytes(),
+    ));
+    try std.testing.expectEqualSlices(
+        u8,
+        &b.kp.public_key.toBytes(),
+        &server.config.tls_signing_key.?.public_key.toBytes(),
+    );
+
+    // Second reload to cert C: the PRIOR reload generation (B) must be freed and
+    // replaced; under the testing allocator a leak or double-free here fails. The
+    // boot cert A must STILL never be freed (only the server-owned gen rotates).
+    var c_buf: [1024]u8 = undefined;
+    const c = try mintRehashTlsLeaf(&c_buf, 0x73, "c.test");
+    const c_seed = [_]u8{0x73} ** std.crypto.sign.Ed25519.KeyPair.seed_length;
+    var c_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+    const c_key_der = try ed25519_pkcs8.encode(&c_key_der_buf, c_seed);
+    var c_cert_pem_buf: [4096]u8 = undefined;
+    const c_cert_pem = try pem.encode(&c_cert_pem_buf, "CERTIFICATE", c.der);
+    var c_key_pem_buf: [4096]u8 = undefined;
+    const c_key_pem = try pem.encode(&c_key_pem_buf, "PRIVATE KEY", c_key_der);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.pem", .data = c_cert_pem });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.key", .data = c_key_pem });
+    const c_cert_path = try rehashTmpPath(allocator, tmp, "c.pem");
+    defer allocator.free(c_cert_path);
+    const c_key_path = try rehashTmpPath(allocator, tmp, "c.key");
+    defer allocator.free(c_key_path);
+
+    const tls_c = config_format.Config.Tls{
+        .enabled = true,
+        .cert_path = c_cert_path,
+        .key_path = c_key_path,
+        .dns_name = "c.test",
+    };
+    _ = try server.reloadTlsCerts(std.testing.io, &tls_c);
+    try std.testing.expectEqualSlices(u8, c.der, server.config.tls_cert_chain[0]);
+}
+
+test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" {
+    const allocator = std.testing.allocator;
+
+    var a_buf: [1024]u8 = undefined;
+    const a = try mintRehashTlsLeaf(&a_buf, 0x74, "a.test");
+    const boot_chain = [_][]const u8{a.der};
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &boot_chain,
+        .tls_signing_key = a.kp,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // A nonexistent cert path must surface an error and leave the live certs (and
+    // the absent reload generation) exactly as they were — failure keeps current.
+    const tls_bad = config_format.Config.Tls{
+        .enabled = true,
+        .cert_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.pem",
+        .key_path = ".zig-cache/tmp/__orochi_rehash_missing__/nope.key",
+        .dns_name = "a.test",
+    };
+    try std.testing.expectError(error.FileNotFound, server.reloadTlsCerts(std.testing.io, &tls_bad));
+    try std.testing.expectEqualSlices(u8, a.der, server.config.tls_cert_chain[0]);
+    try std.testing.expect(server.reload_tls == null);
+    try std.testing.expectEqualSlices(
+        u8,
+        &a.kp.public_key.toBytes(),
+        &server.config.tls_signing_key.?.public_key.toBytes(),
+    );
+}
+
+test "REHASH cert hot-reload: not configured when TLS is absent" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // No cert chain loaded at boot: the reload leg is a no-op (not_configured),
+    // regardless of `enabled`, and never touches the (empty) live cert fields.
+    const tls = config_format.Config.Tls{ .enabled = true, .dns_name = "x.test" };
+    const outcome = try server.reloadTlsCerts(std.testing.io, &tls);
+    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.not_configured, outcome);
+    try std.testing.expect(server.reload_tls == null);
+    try std.testing.expectEqual(@as(usize, 0), server.config.tls_cert_chain.len);
 }
 
 test {
