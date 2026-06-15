@@ -256,6 +256,21 @@ pub fn build(b: *std.Build) void {
     });
     release_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
 
+    // `zig build package` — a deployment bundle: the optimized daemon binary plus
+    // the operational assets an operator needs to stand a node up, all staged into
+    // the install prefix (`zig-out/` by default; override with `--prefix`). This
+    // does NOT touch the default install step — it's an explicit, separate step so
+    // `zig build` stays a plain binary install.
+    //
+    // Layout under <prefix>:
+    //   bin/orochi                              (ReleaseFast, stripped)
+    //   etc/orochi/orochi.reference.toml        (annotated reference config)
+    //   lib/systemd/system/orochi.service       (the unit; see its header)
+    const package_step = b.step("package", "Stage the daemon + deployment assets (binary, reference config, systemd unit) into the install prefix");
+    package_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
+    package_step.dependOn(&b.addInstallFile(b.path("etc/orochi.reference.toml"), "etc/orochi/orochi.reference.toml").step);
+    package_step.dependOn(&b.addInstallFile(b.path("etc/systemd/orochi.service"), "lib/systemd/system/orochi.service").step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

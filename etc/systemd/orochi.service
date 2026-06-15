@@ -1,0 +1,114 @@
+# =============================================================================
+# Orochi IRC daemon — systemd service unit
+# =============================================================================
+# Install to /etc/systemd/system/orochi.service (or let `zig build install`
+# stage it under <prefix>/lib/systemd/system/orochi.service and symlink it).
+#
+# Then:
+#   useradd --system --home-dir /var/lib/orochi --shell /usr/sbin/nologin orochi
+#   install -d -o orochi -g orochi /var/lib/orochi /etc/orochi
+#   install -m 0640 -o orochi -g orochi etc/orochi.reference.toml /etc/orochi/orochi.toml
+#   systemctl daemon-reload && systemctl enable --now orochi
+#
+# HOT UPGRADE (the whole point — see ExecReload):
+#   # stage the freshly-built binary at the ExecStart path, then:
+#   systemctl reload orochi          # -> kill -USR2 $MAINPID -> session-preserving execve
+# A plain `systemctl restart orochi` is the BOOTSTRAP / fallback path: it drops
+# sessions. SIGUSR2 (reload) re-execs in place, keeping the listener fd and all
+# live client sessions across the swap. See tools/upgrade_smoke.py.
+# =============================================================================
+
+[Unit]
+Description=Orochi IRC daemon (Suimyaku + Tsumugi mesh)
+Documentation=https://github.com/devinkbrown/orochi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# No sd_notify in the daemon (no NOTIFY_SOCKET/READY=1 in src/), so Type=simple:
+# systemd considers the unit started as soon as the binary is exec'd. If/when the
+# daemon learns sd_notify, switch to Type=notify for accurate "started" state.
+Type=simple
+
+# argv[1] is the config path (src/main.zig parses the config from argv[1]).
+ExecStart=/usr/local/bin/orochi /etc/orochi/orochi.toml
+
+# --- Hot upgrade: SIGUSR2 triggers the session-preserving execve handoff. -----
+# This is why a dedicated reload verb exists: `systemctl reload orochi` keeps the
+# bound socket and every live client session across the new image (a restart does
+# not). Stage the new binary at the ExecStart path first, then reload.
+ExecReload=/bin/kill -USR2 $MAINPID
+
+# Crash recovery (NOT used for upgrades — those are an in-place execve that keeps
+# the same PID, so systemd never sees an exit). Only restart on genuine failure.
+Restart=on-failure
+RestartSec=2s
+# Don't enter a tight crash loop: 5 failures in 60s -> give up (alert fires).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+TimeoutStopSec=15s
+KillMode=mixed
+
+# --- Identity -----------------------------------------------------------------
+# Dedicated unprivileged service account (create it; see header). DynamicUser is
+# avoided because the daemon owns persistent state under /var/lib/orochi
+# (accounts.db WAL, oper grants, bootstrapped TLS key) that must survive restarts.
+User=orochi
+Group=orochi
+
+# State directory: systemd creates/chowns /var/lib/orochi (0750) and exports it
+# as $STATE_DIRECTORY. House accounts.db, oper_grants.tsv, the bootstrapped TLS
+# leaf, and the news cache here.
+StateDirectory=orochi
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/orochi
+
+# --- Capabilities -------------------------------------------------------------
+# Needed only to bind privileged ports (6667/6697 < 1024). If you run Orochi on
+# high ports exclusively (e.g. 6680/16720 as in the configs), delete BOTH lines
+# below — the daemon then needs no capabilities at all.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Sandboxing / hardening ---------------------------------------------------
+NoNewPrivileges=true
+# ProtectSystem=strict makes the whole FS read-only except ReadWritePaths; the
+# StateDirectory is writable automatically. Add /etc/orochi as RW only if the
+# daemon must rewrite config in place (it does not by default — REHASH re-reads).
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+
+# Address families: AF_INET/AF_INET6 for IRC + the UDP media/mesh planes
+# (SFU/OPVOX media sockets and S2S all live on INET/INET6 — these are UDP and TCP
+# sockets, NOT a separate family, so AF_INET[6] covers them). AF_UNIX is kept for
+# systemd's own notify/log plumbing. NETLINK is NOT included; if GeoIP or DNS
+# resolution needs it on your libc, add AF_NETLINK here.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# IPC bind-mounts a private /dev; the daemon uses raw io_uring + sockets only.
+SystemCallArchitectures=native
+# Allow only the syscall groups a network daemon needs; @system-service already
+# covers io_uring setup/enter, socket(2), epoll, futex, mmap, and clock reads.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @clock @debug @mount @reboot @swap @cpu-emulation
+SystemCallErrorNumber=EPERM
+
+# UMask so the bootstrapped TLS key / accounts.db land 0640, not world-readable.
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

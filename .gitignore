@@ -2,3 +2,4 @@
 zig-out/
 announce_bot.log
 .claude/worktrees/
+__pycache__/
