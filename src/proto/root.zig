@@ -209,6 +209,7 @@ pub const punycode = @import("punycode.zig");
 pub const quic_datagram = @import("quic_datagram.zig");
 pub const quic_frame = @import("quic_frame.zig");
 pub const quic_packet = @import("quic_packet.zig");
+pub const quic_protect = @import("quic_protect.zig");
 pub const quic_tls = @import("quic_tls.zig");
 pub const quorum = @import("quorum.zig");
 pub const read_marker = @import("read_marker.zig");
@@ -534,6 +535,7 @@ test {
     _ = quic_datagram;
     _ = quic_frame;
     _ = quic_packet;
+    _ = quic_protect;
     _ = quic_tls;
     _ = quorum;
     _ = read_marker;
