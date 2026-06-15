@@ -38,7 +38,24 @@ pub const DeliverMsg = struct {
     /// handle layer; the server casts to/from `EventCategory`). Keeps cross-reactor
     /// client iteration on each reactor's own thread.
     broadcast_category: ?u6 = null,
+    /// Cross-shard oper-event subject (inline POD copy): the event's subject text,
+    /// carried alongside `broadcast_category` so the receiving reactor can apply
+    /// each local subscriber's per-category subject glob exactly as the publishing
+    /// reactor does. `broadcast_subject_len == 0` means the empty/wildcard subject
+    /// (match-all). Capped at `broadcast_subject_max`; longer subjects are
+    /// truncated for filtering (the displayed bytes in `buf` are untruncated).
+    broadcast_subject: [broadcast_subject_max]u8 = [_]u8{0} ** broadcast_subject_max,
+    broadcast_subject_len: u16 = 0,
+
+    /// The carried subject slice (empty when none was set).
+    pub fn broadcastSubject(self: *const DeliverMsg) []const u8 {
+        return self.broadcast_subject[0..self.broadcast_subject_len];
+    }
 };
+
+/// Inline cap for the cross-shard oper-event subject filter copy. Subjects longer
+/// than this are truncated for the per-category glob check only.
+pub const broadcast_subject_max: usize = 256;
 
 pub fn DeliverPool(comptime slots: usize) type {
     comptime {

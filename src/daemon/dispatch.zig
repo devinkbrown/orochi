@@ -36,6 +36,13 @@ const MAX_CLASS_BYTES: usize = 32;
 const MAX_OPER_TITLE_BYTES: usize = 64;
 const MAX_AWAY_BYTES: usize = 256;
 const MAX_HOST_BYTES: usize = 255;
+/// Per-category Event Spine subject-mask byte budget. A subscriber may scope an
+/// event category to a glob over the event's subject (e.g. `EVENT ADD CHANNEL
+/// #foo*`); this caps each stored mask. Matches the OBSERVE mask byte budget.
+const MAX_EVENT_MASK_BYTES: usize = 256;
+/// Number of Event Spine categories — the length of the per-session per-category
+/// subject-mask array. Derived from the enum so it tracks new categories.
+const EVENT_CATEGORY_COUNT: usize = @typeInfo(event_spine.EventCategory).@"enum".fields.len;
 
 /// ISUPPORT CHANMODES token. Every advertised letter MUST be enforced by the
 /// channel-MODE handler (see `server.zig` handleChannelMode); this is the single
@@ -792,6 +799,15 @@ pub const ClientSession = struct {
     /// delivered as typed events to sessions subscribed to the matching category
     /// (replacing the legacy +w umode). Opers are subscribed on OPER.
     event_mask: event_spine.CategoryMask = .{},
+    /// Per-category Event Spine subject-glob scope, indexed by
+    /// `@intFromEnum(EventCategory)`. An empty mask (`len == 0`) means the wildcard
+    /// `*` — match every subject for that category, which is the default and keeps
+    /// pure category-only subscriptions (the historic behavior) unchanged. A
+    /// non-empty mask narrows delivery: an event of category C reaches this session
+    /// only when its subject glob-matches `event_subject_masks[@intFromEnum(C)]`
+    /// (mirrors Ophion's per-event-type `masks[EVENT_MAX_TYPES][256]`). Owned
+    /// in-struct (FixedString), so there is nothing to free on clear/deinit.
+    event_subject_masks: [EVENT_CATEGORY_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = [_]FixedString(MAX_EVENT_MASK_BYTES){.{}} ** EVENT_CATEGORY_COUNT,
 
     pub fn init() ClientSession {
         return .{};
@@ -874,6 +890,7 @@ pub const ClientSession = struct {
         self.oper_class_store = .{};
         self.oper_title_store = .{};
         self.event_mask = .{};
+        self.clearEventSubjectMasks();
         self.umodes.remove(.admin);
     }
 
@@ -912,6 +929,36 @@ pub const ClientSession = struct {
     /// Replace the session's Event Spine subscription mask.
     pub fn setEventMask(self: *ClientSession, mask: event_spine.CategoryMask) void {
         self.event_mask = mask;
+    }
+
+    /// The subject-glob scope for `category`, or `*` when none is set. Returns
+    /// `*` (match-all) whenever the stored mask is empty, so a plain category-only
+    /// subscription behaves exactly as before this feature existed.
+    pub fn eventSubjectMask(self: *const ClientSession, category: event_spine.EventCategory) []const u8 {
+        const stored = self.event_subject_masks[@intFromEnum(category)].slice();
+        return if (stored.len == 0) "*" else stored;
+    }
+
+    /// Scope `category` to events whose subject glob-matches `mask`. An empty or
+    /// `*` mask resets to match-all. Over-length/control-byte masks are rejected
+    /// (the caller surfaces the error); on rejection the prior mask is unchanged.
+    pub fn setEventSubjectMask(self: *ClientSession, category: event_spine.EventCategory, mask: []const u8) DispatchError!void {
+        const slot = &self.event_subject_masks[@intFromEnum(category)];
+        if (mask.len == 0 or (mask.len == 1 and mask[0] == '*')) {
+            slot.len = 0;
+            return;
+        }
+        try slot.set(mask);
+    }
+
+    /// Reset `category`'s subject scope back to the wildcard `*` (match-all).
+    pub fn clearEventSubjectMask(self: *ClientSession, category: event_spine.EventCategory) void {
+        self.event_subject_masks[@intFromEnum(category)].len = 0;
+    }
+
+    /// Reset every category's subject scope to `*`. Used on CLEAR and oper logout.
+    pub fn clearEventSubjectMasks(self: *ClientSession) void {
+        for (&self.event_subject_masks) |*slot| slot.len = 0;
     }
 
     /// Render active user modes as "+iB" into `out` (caller-owned, >= 16 bytes
@@ -1957,6 +2004,56 @@ test "clearOper revokes operator status, privileges, and class" {
     try std.testing.expect(!s.isOper());
     try std.testing.expect(!s.hasPriv(.server_admin));
     try std.testing.expectEqualStrings("", s.operClass());
+}
+
+test "event subject masks: default wildcard, set/overwrite/clear lifecycle" {
+    // The per-category subject masks are owned in-struct (FixedString), so this
+    // exercises the full set/overwrite/clear/reset lifecycle for correctness; run
+    // under std.testing.allocator there is no heap to leak or double-free.
+    var s = ClientSession.init();
+    const chan: event_spine.EventCategory = .announce;
+    const user: event_spine.EventCategory = .service;
+
+    // Unset categories report the wildcard `*` (match-all = historic behavior).
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(chan));
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(user));
+
+    // Setting a mask narrows just that category; others stay `*`.
+    try s.setEventSubjectMask(chan, "#foo*");
+    try std.testing.expectEqualStrings("#foo*", s.eventSubjectMask(chan));
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(user));
+
+    // Overwrite replaces in place (no stale bytes, no leak).
+    try s.setEventSubjectMask(chan, "#bar?");
+    try std.testing.expectEqualStrings("#bar?", s.eventSubjectMask(chan));
+
+    // An explicit `*` (or empty) resets back to match-all.
+    try s.setEventSubjectMask(chan, "*");
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(chan));
+    try s.setEventSubjectMask(chan, "#foo*");
+    try s.setEventSubjectMask(chan, "");
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(chan));
+
+    // Per-category clear and the bulk reset both restore `*`.
+    try s.setEventSubjectMask(chan, "#foo*");
+    try s.setEventSubjectMask(user, "*!*@x.example");
+    s.clearEventSubjectMask(chan);
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(chan));
+    try std.testing.expectEqualStrings("*!*@x.example", s.eventSubjectMask(user));
+    s.clearEventSubjectMasks();
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(user));
+
+    // Over-length masks are rejected and leave the prior value intact.
+    try s.setEventSubjectMask(chan, "#keepme*");
+    const too_long = "#" ++ ("x" ** MAX_EVENT_MASK_BYTES);
+    try std.testing.expectError(error.TextTooLong, s.setEventSubjectMask(chan, too_long));
+    try std.testing.expectEqualStrings("#keepme*", s.eventSubjectMask(chan));
+
+    // Dropping oper status also clears every subject scope.
+    s.setOperGrant(oper.OperPrivileges.full, "netadmin", "Net Admin");
+    try s.setEventSubjectMask(chan, "#foo*");
+    s.clearOper();
+    try std.testing.expectEqualStrings("*", s.eventSubjectMask(chan));
 }
 
 test "short parameters emit ERR_NEEDMOREPARAMS" {

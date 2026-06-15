@@ -2691,11 +2691,16 @@ pub const LinuxServer = struct {
                 // only touch our own shard's client table, on our own thread).
                 if (msg.broadcast_category) |cat_raw| {
                     const category: event_spine.EventCategory = @enumFromInt(cat_raw);
+                    // The publishing reactor carried the event subject inline so this
+                    // reactor applies each local subscriber's per-category subject
+                    // glob exactly as the origin did. An empty carried subject means
+                    // match-all (the common, unscoped case).
+                    const subject = msg.broadcastSubject();
                     var it = self.rx().clients.iterator();
                     while (it.next()) |entry| {
                         const c = entry.value;
                         if (c.closing) continue;
-                        if (!c.session.subscribesTo(category)) continue;
+                        if (!sessionWantsEvent(&c.session, category, subject)) continue;
                         appendToConn(c, bytes) catch continue;
                         self.armSendIfNeeded(c) catch {};
                     }
@@ -10677,6 +10682,16 @@ pub const LinuxServer = struct {
             const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
             if (std.ascii.eqlIgnoreCase(token, c.code()) or std.ascii.eqlIgnoreCase(token, c.token())) return c;
         }
+        // IRCX draft EVENT type aliases (CHANNEL/MEMBER/SERVER/CONNECTION/SOCKET/
+        // USER) onto the Event-Spine taxonomy, mirroring ircx_event_cmd.draftAlias
+        // so draft clients can scope `EVENT ADD CHANNEL #foo*` / `EVENT ADD USER
+        // *!*@host` exactly as the pure parser documents.
+        if (std.ascii.eqlIgnoreCase(token, "CHANNEL")) return .announce;
+        if (std.ascii.eqlIgnoreCase(token, "MEMBER")) return .oper_action;
+        if (std.ascii.eqlIgnoreCase(token, "SERVER")) return .server_link;
+        if (std.ascii.eqlIgnoreCase(token, "CONNECTION")) return .connect;
+        if (std.ascii.eqlIgnoreCase(token, "SOCKET")) return .disconnect;
+        if (std.ascii.eqlIgnoreCase(token, "USER")) return .service;
         return null;
     }
 
@@ -11088,13 +11103,28 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Invalid EVENT subcommand");
             return;
         }
+        // Grammar: EVENT <op> <CATEGORY>... [<subject-mask>]
+        // Every leading token must resolve to a category; a single trailing token
+        // that does NOT resolve to a category is taken as the per-category subject
+        // glob (e.g. `EVENT ADD CHANNEL #foo*`, `EVENT ADD USER *!*@x.example`).
+        // The mask scopes ALL categories named in the same request. With no mask,
+        // the affected categories reset to the wildcard `*` (match-all), so plain
+        // category-only subscriptions keep their historic deliver-everything shape.
         var parsed_mask = event_spine.CategoryMask.empty();
-        for (params[1..]) |token| {
-            const cat = eventCategoryFromToken(token) orelse {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Unknown EVENT category");
-                return;
-            };
-            parsed_mask.add(cat);
+        var subject_mask: ?[]const u8 = null;
+        const tokens = params[1..];
+        for (tokens, 0..) |token, idx| {
+            if (eventCategoryFromToken(token)) |cat| {
+                parsed_mask.add(cat);
+                continue;
+            }
+            // Not a category: only valid as the single final token (the mask).
+            if (idx + 1 == tokens.len and parsed_mask.bits != 0) {
+                subject_mask = token;
+                break;
+            }
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Unknown EVENT category");
+            return;
         }
         if (!is_list) {
             var mask = conn.session.event_mask;
@@ -11107,14 +11137,44 @@ pub const LinuxServer = struct {
             else
                 mask.exclude(parsed_mask);
             conn.session.setEventMask(mask);
+
+            // Maintain the per-category subject scope alongside the bitmask.
+            //   CLEAR        → every category back to `*`.
+            //   DEL          → drop the named categories' scope back to `*`.
+            //   ADD/CHANGE   → set the named categories to the given mask, or `*`
+            //                  when none was supplied (default = match-all).
+            if (is_clear) {
+                conn.session.clearEventSubjectMasks();
+            } else {
+                inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
+                    const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+                    if (parsed_mask.contains(c)) {
+                        if (is_del) {
+                            conn.session.clearEventSubjectMask(c);
+                        } else {
+                            conn.session.setEventSubjectMask(c, subject_mask orelse "*") catch {
+                                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "EVENT subject mask too long");
+                                return;
+                            };
+                        }
+                    }
+                }
+            }
         }
-        // Render the current subscription set as `EVENT LIST <CATEGORY>` lines.
+        // Render the current subscription set as `EVENT LIST <CATEGORY> [<mask>]`
+        // lines. The trailing mask is shown only when the category is scoped to
+        // something narrower than `*`, so the common all-subjects case stays clean.
         const mask = conn.session.event_mask;
         inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
             const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
             if (mask.contains(c)) {
-                var lbuf: [128]u8 = undefined;
-                if (std.fmt.bufPrint(&lbuf, "EVENT LIST {s}\r\n", .{c.code()})) |line| {
+                const subj = conn.session.eventSubjectMask(c);
+                var lbuf: [default_reply_bytes]u8 = undefined;
+                const rendered = if (std.mem.eql(u8, subj, "*"))
+                    std.fmt.bufPrint(&lbuf, "EVENT LIST {s}\r\n", .{c.code()})
+                else
+                    std.fmt.bufPrint(&lbuf, "EVENT LIST {s} {s}\r\n", .{ c.code(), subj });
+                if (rendered) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
             }
@@ -16514,10 +16574,38 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// Whether `session` should receive a `category` event with subject `subject`:
+    /// it must be subscribed to the category AND the event's subject must glob-match
+    /// the session's per-category subject scope. The default scope is `*`
+    /// (match-all), so a plain category-only subscription delivers every subject —
+    /// the historic, pre-scoping behavior.
+    fn sessionWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, subject: []const u8) bool {
+        if (!session.subscribesTo(category)) return false;
+        const scope = session.eventSubjectMask(category);
+        if (std.mem.eql(u8, scope, "*")) return true;
+        return observe_mod.globMatch(scope, subject);
+    }
+
     /// Render a typed Event Spine event as `NOTE EVENT <CATEGORY>` and deliver it
     /// to every session subscribed to that category (oper notices: wallops,
     /// kills, connects, …). Replaces the legacy snote/wallops broadcast channels.
+    /// The event's subject defaults to its message text; subscribers may scope a
+    /// category to a subject glob (`EVENT ADD <CAT> <mask>`), so this is the thin
+    /// wrapper that uses the message as the subject for the common case.
     fn publishOperEvent(self: *LinuxServer, category: event_spine.EventCategory, severity: event_spine.EventSeverity, message: []const u8) !void {
+        return self.publishOperEventSubject(category, severity, message, message);
+    }
+
+    /// Core publish path with an explicit `subject` used for per-category subject
+    /// filtering (distinct from the displayed `message`). Delivery to a subscriber
+    /// requires both the category bit and a subject glob match (default scope `*`).
+    fn publishOperEventSubject(
+        self: *LinuxServer,
+        category: event_spine.EventCategory,
+        severity: event_spine.EventSeverity,
+        message: []const u8,
+        subject: []const u8,
+    ) !void {
         const event = event_spine.Event{
             .category = category,
             .severity = severity,
@@ -16533,7 +16621,7 @@ pub const LinuxServer = struct {
         const plain = event_spine.renderOperNote(.{ .server_name = self.serverName(), .event = event, .include_tags = false }, &plain_buf) catch return;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            if (!entry.value.session.subscribesTo(category)) continue;
+            if (!sessionWantsEvent(&entry.value.session, category, subject)) continue;
             const line = if (entry.value.session.hasCap(.message_tags)) tagged else plain;
             try self.deliver(entry.id, line);
         }
@@ -16550,11 +16638,15 @@ pub const LinuxServer = struct {
             while (shard < total) : (shard += 1) {
                 if (shard == my_shard) continue;
                 const buf = fabric.acquire(plain) orelse continue;
-                const fan = reactor_fabric.DeliverMsg{
+                var fan = reactor_fabric.DeliverMsg{
                     .to = client_model.ClientId.invalid,
                     .buf = buf,
                     .broadcast_category = @intFromEnum(category),
                 };
+                // Carry the subject so the receiving reactor filters identically.
+                const n = @min(subject.len, deliver_handle.broadcast_subject_max);
+                @memcpy(fan.broadcast_subject[0..n], subject[0..n]);
+                fan.broadcast_subject_len = @intCast(n);
                 if (fabric.sendTo(shard, fan)) {
                     // Wake the target via its OWN wake eventfd — the reactor loop
                     // watches Reactor.wake (its wake-poll completion runs
@@ -24914,6 +25006,189 @@ test "threaded server: EVENT subscription managed by opers" {
     a.reset();
     try writeAllFd(fd_a, "EVENT ADD NO_SUCH_CATEGORY\r\n");
     try recvUntil(&a, " 461 A EVENT :Unknown EVENT category", 200);
+}
+
+test "threaded server: EVENT LIST shows per-category subject mask" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+    try saslAdminPrelude(fd);
+    try writeAllFd(fd, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&c, " 001 A ", 200);
+    try recvUntil(&c, " 381 A ", 200);
+    try writeAllFd(fd, "IRCX\r\n");
+    try recvUntil(&c, " 800 A 1 0 ", 200);
+
+    // Scope the CHANNEL category (alias for ANNOUNCE) to `#foo*`. The trailing
+    // mask token is stored as that category's subject glob.
+    c.reset();
+    try writeAllFd(fd, "EVENT ADD CHANNEL #foo*\r\n");
+    try recvUntil(&c, "EVENT LIST :End of event list", 200);
+    // LIST renders the scoped category with its mask appended.
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST ANNOUNCE #foo*") != null);
+    // An unscoped category still renders WITHOUT a trailing mask (default `*`).
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST KILL\r\n") != null);
+
+    // Re-scoping the same category with no mask resets it back to `*` (no mask
+    // shown in LIST anymore).
+    c.reset();
+    try writeAllFd(fd, "EVENT ADD CHANNEL\r\n");
+    try recvUntil(&c, "EVENT LIST :End of event list", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST ANNOUNCE\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST ANNOUNCE #foo*") == null);
+}
+
+test "threaded server: EVENT CHANNEL subject mask filters announce delivery" {
+    // Two opers subscribed to the ANNOUNCE/CHANNEL category: A scopes it to a
+    // `#foobar`-bearing subject glob, B leaves it unscoped (default `*`). A third
+    // oper broadcasts two announces whose subjects (the broadcast text) carry
+    // `#foobar` and `#bar` respectively. A must receive only the `#foobar` one;
+    // B must receive both (the default `*` preserves deliver-everything behavior).
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_s = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_s);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var s = LiveClient{ .fd = fd_s };
+
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try saslAdminPrelude(fd_b);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try saslAdminPrelude(fd_s);
+    try writeAllFd(fd_s, "NICK S\r\nUSER sam 0 * :Sam\r\n");
+    try recvUntil(&a, " 381 A ", 300);
+    try recvUntil(&b, " 381 B ", 300);
+    try recvUntil(&s, " 381 S ", 300);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try writeAllFd(fd_s, "IRCX\r\n");
+    try recvUntil(&a, " 800 A ", 300);
+    try recvUntil(&b, " 800 B ", 300);
+    try recvUntil(&s, " 800 S ", 300);
+
+    // A scopes ANNOUNCE to subjects containing `#foobar`; B stays at default `*`.
+    try writeAllFd(fd_a, "EVENT ADD CHANNEL *#foobar*\r\n");
+    try recvUntil(&a, "EVENT LIST :End of event list", 300);
+
+    // S broadcasts a `#foobar` announce: A (scoped match) and B (unscoped) both get it.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_s, "EVENT BROADCAST :join #foobar now\r\n");
+    try recvUntil(&a, "NOTE EVENT ANNOUNCE", 500);
+    try recvUntil(&a, "#foobar", 500);
+    try recvUntil(&b, "#foobar", 500);
+
+    // S broadcasts a `#bar`-only announce: B (unscoped) gets it, A (scoped to
+    // `#foobar`) must NOT. B's receipt is the delivery fence — both announces are
+    // published by the same reactor-thread iteration over the client table, so
+    // once B's bytes are readable A's filtering decision has already been made.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_s, "EVENT BROADCAST :join #bar only\r\n");
+    try recvUntil(&b, "#bar only", 500);
+    // Drain anything queued for A; it must not have received the filtered announce.
+    waitMillis(60);
+    try a.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "#bar only") == null);
+}
+
+test "threaded server: EVENT hostmask subject mask filters; no-mask receives all" {
+    // (b) hostmask-shaped subject filtering + (c) a no-mask subscriber still gets
+    // every subject. A scopes the announce category to a `*!*@x.example` hostmask
+    // glob; B leaves it unscoped. The broadcaster S emits two announces carrying a
+    // matching and a non-matching hostmask-shaped subject. A receives only the
+    // match; B receives both. (The CHANNEL/ANNOUNCE category is the wire-triggered
+    // one; the USER alias + mask storage is covered by the LIST + session tests.)
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_s = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_s);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var s = LiveClient{ .fd = fd_s };
+
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try saslAdminPrelude(fd_b);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try saslAdminPrelude(fd_s);
+    try writeAllFd(fd_s, "NICK S\r\nUSER sam 0 * :Sam\r\n");
+    try recvUntil(&a, " 381 A ", 300);
+    try recvUntil(&b, " 381 B ", 300);
+    try recvUntil(&s, " 381 S ", 300);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try writeAllFd(fd_s, "IRCX\r\n");
+    try recvUntil(&a, " 800 A ", 300);
+    try recvUntil(&b, " 800 B ", 300);
+    try recvUntil(&s, " 800 S ", 300);
+
+    // A scopes the announce category to a hostmask glob; B leaves it default `*`.
+    try writeAllFd(fd_a, "EVENT CHANGE CHANNEL *!*@x.example*\r\n");
+    try recvUntil(&a, "EVENT LIST :End of event list", 300);
+
+    // S broadcasts a subject bearing a matching hostmask: A and B both receive it.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_s, "EVENT BROADCAST :bob!~b@x.example logged in\r\n");
+    try recvUntil(&a, "x.example logged in", 500);
+    try recvUntil(&b, "x.example logged in", 500);
+
+    // S broadcasts a non-matching hostmask: only B (unscoped) receives it.
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_s, "EVENT BROADCAST :eve!~e@evil.test logged in\r\n");
+    try recvUntil(&b, "evil.test logged in", 500);
+    waitMillis(60);
+    try a.readAvailable();
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "evil.test logged in") == null);
 }
 
 test "threaded server: oper EVENT notes carry @event-* tags with message-tags cap" {
