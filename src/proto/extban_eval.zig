@@ -25,11 +25,18 @@ pub const Candidate = struct {
     country: ?[]const u8 = null,
     channels: []const []const u8 = &.{},
     /// True when the client is connected over a secure (TLS) transport; matched
-    /// by the `$z` secure-connection extban.
+    /// by the bare `$z` secure-connection extban.
     secure: bool = false,
-    /// True when the client holds IRC operator status; matched by the `$o`
+    /// The client's TLS certificate fingerprint (lowercase SHA-256 hex), or null
+    /// when no certificate was presented. Matched by the patterned
+    /// `$z:<fingerprint>` extban; a null certfp never matches a `$z:<fp>` ban.
+    certfp: ?[]const u8 = null,
+    /// True when the client holds IRC operator status; matched by the bare `$o`
     /// oper-status extban.
     is_oper: bool = false,
+    /// The client's oper class/name (empty when not an oper or unknown); matched
+    /// by the patterned `$o:<class>` extban.
+    oper_class: []const u8 = "",
 };
 
 /// Parse through extban.zig and immediately evaluate the parsed mask.
@@ -62,9 +69,9 @@ fn evaluateNode(parsed: anytype, index: usize, candidate: Candidate) bool {
         .realname => |pattern| glob(pattern, candidate.realname),
         .country => |pattern| if (candidate.country) |country| glob(pattern, country) else false,
         .channel => |pattern| matchAnyChannel(pattern, candidate.channels),
-        .secure => candidate.secure,
+        .secure => |pattern| matchSecure(pattern, candidate),
         .mute => |pattern| matchMask(pattern, candidate),
-        .oper => candidate.is_oper,
+        .oper => |pattern| matchOper(pattern, candidate),
         .negation => |child| !evaluateNode(parsed, child, candidate),
     };
 }
@@ -79,6 +86,27 @@ fn matchAnyChannel(pattern: []const u8, channels: []const []const u8) bool {
         if (glob(pattern, channel)) return true;
     }
     return false;
+}
+
+/// `$z` secure-connection: bare `$z` (empty pattern) matches any TLS client;
+/// `$z:<fingerprint>` matches only a presented certfp equal to the pattern
+/// (case-insensitive hex). A null/empty certfp never matches a patterned `$z`.
+/// Mirrors extban.matchSecure so the live and helper paths agree.
+fn matchSecure(pattern: []const u8, candidate: Candidate) bool {
+    if (pattern.len == 0) return candidate.secure;
+    const presented = candidate.certfp orelse return false;
+    if (presented.len == 0) return false;
+    return glob(pattern, presented);
+}
+
+/// `$o` oper-status: bare `$o` (empty pattern) matches any oper;
+/// `$o:<class>` matches only an oper with a non-empty class equal to the pattern
+/// (case-insensitive, glob-capable). Mirrors extban.matchOper.
+fn matchOper(pattern: []const u8, candidate: Candidate) bool {
+    if (pattern.len == 0) return candidate.is_oper;
+    if (!candidate.is_oper) return false;
+    if (candidate.oper_class.len == 0) return false;
+    return glob(pattern, candidate.oper_class);
 }
 
 fn glob(pattern: []const u8, value: []const u8) bool {
@@ -167,6 +195,41 @@ test "evaluates oper-status extban" {
     const neg = try extban.parse("$~o");
     try std.testing.expect(!evaluate(neg, .{ .is_oper = true }));
     try std.testing.expect(evaluate(neg, .{ .is_oper = false }));
+}
+
+test "evaluates patterned certfp secure extban with null-certfp safety" {
+    const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const other = "0000000000000000000000000000000000000000000000000000000000000000";
+    const parsed = try extban.parse("$z:" ++ fp);
+
+    // Exact match (case-insensitive).
+    try std.testing.expect(evaluate(parsed, .{ .secure = true, .certfp = fp }));
+    try std.testing.expect(evaluate(parsed, .{
+        .secure = true,
+        .certfp = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789",
+    }));
+    // Wrong fingerprint does not match.
+    try std.testing.expect(!evaluate(parsed, .{ .secure = true, .certfp = other }));
+    // Non-TLS / null certfp does not match (no bypass-by-absence).
+    try std.testing.expect(!evaluate(parsed, .{ .secure = false, .certfp = null }));
+    try std.testing.expect(!evaluate(parsed, .{ .secure = true, .certfp = null }));
+    try std.testing.expect(!evaluate(parsed, .{}));
+
+    // Bare `$z` still matches any TLS client without requiring a fingerprint.
+    const bare = try extban.parse("$z");
+    try std.testing.expect(evaluate(bare, .{ .secure = true, .certfp = null }));
+}
+
+test "evaluates patterned oper-class extban" {
+    const parsed = try extban.parse("$o:netadmin");
+
+    try std.testing.expect(evaluate(parsed, .{ .is_oper = true, .oper_class = "netadmin" }));
+    try std.testing.expect(evaluate(parsed, .{ .is_oper = true, .oper_class = "NETADMIN" }));
+    try std.testing.expect(!evaluate(parsed, .{ .is_oper = true, .oper_class = "helper" }));
+    // Non-oper never matches a patterned `$o`.
+    try std.testing.expect(!evaluate(parsed, .{ .is_oper = false, .oper_class = "netadmin" }));
+    // Empty/unknown class never matches.
+    try std.testing.expect(!evaluate(parsed, .{ .is_oper = true, .oper_class = "" }));
 }
 
 test "evaluates mute extban over hostmask" {

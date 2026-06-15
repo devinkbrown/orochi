@@ -20090,7 +20090,14 @@ fn banContextFor(
         .country = if (country.len == 0) null else country,
         .channels = chan_buf[0..nchan],
         .secure = conn.is_tls,
+        // `$z:<fp>` certfp ban: the session stores the presented client cert's
+        // SHA-256 fingerprint as the same lowercase hex an operator would paste
+        // (rendered via certfp.computeHex). Null for a non-TLS / no-cert client,
+        // which the matcher refuses to match against a patterned `$z`.
+        .certfp = conn.session.tls_certfp,
         .is_oper = conn.session.isOper(),
+        // `$o:<class>` oper-class ban: empty when not an oper / class unknown.
+        .oper_class = conn.session.operClass(),
     };
 }
 
@@ -20106,10 +20113,33 @@ test "banContextFor carries TLS state for secure extbans" {
     const wid = world_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
 
     conn.is_tls = false;
-    try std.testing.expect(!banContextFor(&server, &conn, wid, "n!u@h", &chan_buf).secure);
+    {
+        const ctx = banContextFor(&server, &conn, wid, "n!u@h", &chan_buf);
+        try std.testing.expect(!ctx.secure);
+        // A non-TLS client carries a null certfp so a `$z:<fp>` ban cannot match
+        // it by accident.
+        try std.testing.expect(ctx.certfp == null);
+    }
 
     conn.is_tls = true;
-    try std.testing.expect(banContextFor(&server, &conn, wid, "n!u@h", &chan_buf).secure);
+    {
+        const ctx = banContextFor(&server, &conn, wid, "n!u@h", &chan_buf);
+        try std.testing.expect(ctx.secure);
+        // Still null until a certificate is presented.
+        try std.testing.expect(ctx.certfp == null);
+    }
+
+    // Once the session records a presented client cert fingerprint, the ban
+    // context surfaces it for `$z:<fp>` matching (same lowercase hex the
+    // operator pastes into the ban).
+    const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    @memcpy(&conn.certfp_buf, fp);
+    conn.session.tls_certfp = conn.certfp_buf[0..];
+    {
+        const ctx = banContextFor(&server, &conn, wid, "n!u@h", &chan_buf);
+        try std.testing.expect(ctx.certfp != null);
+        try std.testing.expectEqualStrings(fp, ctx.certfp.?);
+    }
 }
 
 /// Whether `text` contains a CTCP request that `+C` should block. CTCP ACTION

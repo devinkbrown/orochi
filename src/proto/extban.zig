@@ -36,6 +36,13 @@ pub const NodeKind = enum {
     negation,
 };
 
+/// Maximum bytes accepted for a `$z:<fingerprint>` certfp pattern. The daemon
+/// renders certfps as a lowercase SHA-256 hex string (64 chars via
+/// `certfp.certfpHex`); a small headroom guards against pasted whitespace-free
+/// junk without admitting an unbounded pattern. Patterns over this length are
+/// rejected at parse time.
+pub const MAX_CERTFP_PATTERN_BYTES: usize = 128;
+
 /// One client view used by extended-ban matching.
 ///
 /// All slices are caller-owned. `host` is the normalized hostmask/host string
@@ -47,11 +54,20 @@ pub const ClientContext = struct {
     country: ?[]const u8 = null,
     channels: []const []const u8 = &.{},
     /// True when the client is connected over a secure (TLS) transport. Used by
-    /// the `$z` secure-connection extban.
+    /// the bare `$z` secure-connection extban.
     secure: bool = false,
-    /// True when the client holds IRC operator status. Used by the `$o`
+    /// The client's TLS certificate fingerprint as the daemon renders it
+    /// (lowercase SHA-256 hex via `certfp.certfpHex`), or null when the client
+    /// presented no certificate / is not on TLS. Used by the patterned
+    /// `$z:<fingerprint>` extban. A null certfp NEVER matches a `$z:<fp>` ban.
+    certfp: ?[]const u8 = null,
+    /// True when the client holds IRC operator status. Used by the bare `$o`
     /// oper-status extban (most useful in `+e`/`+I` exception lists).
     is_oper: bool = false,
+    /// The client's oper class/name (empty when not an oper or unknown). Used by
+    /// the patterned `$o:<class>` extban. An empty class NEVER matches a
+    /// `$o:<class>` ban.
+    oper_class: []const u8 = "",
 };
 
 pub const Node = union(NodeKind) {
@@ -60,15 +76,20 @@ pub const Node = union(NodeKind) {
     realname: []const u8,
     country: []const u8,
     channel: []const u8,
-    /// `$z` secure-connection: the pattern is ignored; matches when the client
-    /// is on a TLS transport.
+    /// `$z` secure-connection. An EMPTY pattern (bare `$z`) matches any client
+    /// on a TLS transport. A NON-EMPTY pattern (`$z:<fingerprint>`) matches only
+    /// a client whose TLS certfp equals the pattern (exact, case-insensitive
+    /// hex); a non-TLS / null-certfp client never matches a patterned `$z`.
     secure: []const u8,
     /// `$m` mute (quiet): a hostmask-style pattern, but classified separately so
     /// the ban-check path can apply it as speech suppression rather than a join
     /// denial. Matching semantics are identical to a plain hostmask.
     mute: []const u8,
-    /// `$o` oper-status: the pattern is ignored; matches when the client holds
-    /// IRC operator status.
+    /// `$o` oper-status. An EMPTY pattern (bare `$o`) matches any client holding
+    /// IRC operator status. A NON-EMPTY pattern (`$o:<class>`) matches only an
+    /// oper whose class/name equals the pattern (case-insensitive, glob-capable
+    /// like other named patterns); a non-oper / empty-class client never matches
+    /// a patterned `$o`.
     oper: []const u8,
     negation: usize,
 };
@@ -159,23 +180,30 @@ pub fn Matcher(comptime max_nodes: usize) type {
         fn parseTyped(self: *Self, typed: []const u8) ParseError!usize {
             if (typed.len == 0) return error.MissingType;
 
-            // `$z` (secure connection) takes no pattern: bare `$z` is valid.
-            // Patterned `$z:<fp>` is rejected until certificate-fingerprint
-            // semantics are implemented, so a stored mask cannot imply a check
-            // Orochi does not actually perform.
+            // `$z` (secure connection). Bare `$z` (no pattern) matches any TLS
+            // client. Patterned `$z:<fingerprint>` matches a specific TLS
+            // certificate fingerprint: a bounded, non-empty string compared
+            // exactly and case-insensitively against the client's rendered
+            // certfp at match time. `$z:` with an empty pattern is rejected so a
+            // stored mask cannot silently match everything or nothing.
             if (typed[0] == 'z') {
                 if (typed.len == 1) return self.appendNode(.{ .secure = "" });
                 if (typed[1] != ':') return error.MissingDelimiter;
-                return error.UnexpectedPattern;
+                if (typed.len == 2) return error.EmptyPattern;
+                const fingerprint = typed[2..];
+                if (fingerprint.len > MAX_CERTFP_PATTERN_BYTES) return error.OversizeMask;
+                return self.appendNode(.{ .secure = fingerprint });
             }
 
-            // `$o` (oper status) also takes no pattern: bare `$o` is valid.
-            // Patterned `$o:<token>` is rejected until class/token semantics are
-            // represented in ClientContext.
+            // `$o` (oper status). Bare `$o` (no pattern) matches any oper.
+            // Patterned `$o:<class>` matches an oper of a specific class/name:
+            // a non-empty pattern compared against the client's oper class at
+            // match time. `$o:` with an empty pattern is rejected.
             if (typed[0] == 'o') {
                 if (typed.len == 1) return self.appendNode(.{ .oper = "" });
                 if (typed[1] != ':') return error.MissingDelimiter;
-                return error.UnexpectedPattern;
+                if (typed.len == 2) return error.EmptyPattern;
+                return self.appendNode(.{ .oper = typed[2..] });
             }
 
             if (typed.len < 2 or typed[1] != ':') return error.MissingDelimiter;
@@ -209,9 +237,9 @@ pub fn Matcher(comptime max_nodes: usize) type {
                 .realname => |pattern| patternMatch(pattern, ctx.realname),
                 .country => |pattern| if (ctx.country) |country| patternMatch(pattern, country) else false,
                 .channel => |pattern| matchAnyChannel(pattern, ctx.channels),
-                .secure => ctx.secure,
+                .secure => |pattern| matchSecure(pattern, ctx),
                 .mute => |pattern| patternMatch(pattern, ctx.host),
-                .oper => ctx.is_oper,
+                .oper => |pattern| matchOper(pattern, ctx),
                 .negation => |child| !self.matchNode(child, ctx),
             };
         }
@@ -253,6 +281,35 @@ fn matchAnyChannel(pattern: []const u8, channels: []const []const u8) bool {
         if (patternMatch(pattern, channel)) return true;
     }
     return false;
+}
+
+/// Evaluate a `$z` secure-connection node.
+///
+/// - EMPTY pattern (bare `$z`): match any TLS client, independent of certfp.
+/// - NON-EMPTY pattern (`$z:<fingerprint>`): match ONLY when the client
+///   presented a certfp AND it equals the pattern. The compare is exact,
+///   case-insensitive hex — no globbing — so the ban applies to exactly the
+///   intended fingerprint and nothing else. A client with a null certfp (no
+///   cert / non-TLS) never matches; absence cannot bypass nor falsely match.
+fn matchSecure(pattern: []const u8, ctx: ClientContext) bool {
+    if (pattern.len == 0) return ctx.secure;
+    const presented = ctx.certfp orelse return false;
+    if (presented.len == 0) return false;
+    return constantTimeEqlAsciiFold(pattern, presented);
+}
+
+/// Evaluate a `$o` oper-status node.
+///
+/// - EMPTY pattern (bare `$o`): match any oper.
+/// - NON-EMPTY pattern (`$o:<class>`): match ONLY when the client is an oper AND
+///   the supplied oper class is non-empty AND matches the pattern
+///   (case-insensitive, glob-capable like other named patterns). A non-oper or
+///   a client with an unknown/empty class never matches a patterned `$o`.
+fn matchOper(pattern: []const u8, ctx: ClientContext) bool {
+    if (pattern.len == 0) return ctx.is_oper;
+    if (!ctx.is_oper) return false;
+    if (ctx.oper_class.len == 0) return false;
+    return patternMatch(pattern, ctx.oper_class);
 }
 
 fn validateInput(input: []const u8) ParseError!void {
@@ -366,6 +423,89 @@ test "matches secure-connection extban" {
     const insecure_ban = try parse("$~z");
     try std.testing.expect(!insecure_ban.matches(.{ .secure = true }));
     try std.testing.expect(insecure_ban.matches(.{ .secure = false }));
+
+    // Bare `$z` must NOT require a fingerprint: a TLS client with no certfp
+    // still matches.
+    try std.testing.expect(secure_ban.matches(.{ .secure = true, .certfp = null }));
+}
+
+test "parses patterned certfp secure extban" {
+    const fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const matcher = try parse("$z:" ++ fp);
+    try std.testing.expectEqual(NodeKind.secure, matcher.rootKind());
+    try std.testing.expectEqualStrings(fp, matcher.rootPattern().?);
+
+    // Empty pattern after the delimiter is rejected (no silent match-all).
+    try std.testing.expectError(error.EmptyPattern, parse("$z:"));
+
+    // Pattern length is bounded.
+    const oversize = "z" ** (MAX_CERTFP_PATTERN_BYTES + 1);
+    try std.testing.expectError(error.OversizeMask, parse("$z:" ++ oversize));
+}
+
+test "matches certfp secure extban only on the exact fingerprint" {
+    const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const other = "0000000000000000000000000000000000000000000000000000000000000000";
+    const ban = try parse("$z:" ++ fp);
+
+    // Exact fingerprint match (client is TLS and presents the banned cert).
+    try std.testing.expect(ban.matches(.{ .secure = true, .certfp = fp }));
+
+    // Case-insensitive hex compare: an operator-entered uppercase fp still
+    // matches the daemon's lowercase rendering and vice-versa.
+    const fp_upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+    try std.testing.expect(ban.matches(.{ .secure = true, .certfp = fp_upper }));
+
+    // A DIFFERENT certfp must NOT match (no over-broad ban).
+    try std.testing.expect(!ban.matches(.{ .secure = true, .certfp = other }));
+
+    // A non-TLS / null-certfp client must NOT match a `$z:<fp>` ban: absence
+    // neither matches nor bypasses.
+    try std.testing.expect(!ban.matches(.{ .secure = false, .certfp = null }));
+    // Even a TLS client with no presented cert (null certfp) must NOT match.
+    try std.testing.expect(!ban.matches(.{ .secure = true, .certfp = null }));
+    // An empty-string certfp must NOT match either.
+    try std.testing.expect(!ban.matches(.{ .secure = true, .certfp = "" }));
+}
+
+test "matches negated certfp secure extban" {
+    const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const other = "0000000000000000000000000000000000000000000000000000000000000000";
+    // `$~z:<fp>` (e.g. +e exception): true for everyone EXCEPT the banned fp.
+    const neg = try parse("$~z:" ++ fp);
+    try std.testing.expectEqual(NodeKind.negation, neg.rootKind());
+    try std.testing.expectEqual(NodeKind.secure, neg.rootMatchKind());
+
+    try std.testing.expect(!neg.matches(.{ .secure = true, .certfp = fp }));
+    try std.testing.expect(neg.matches(.{ .secure = true, .certfp = other }));
+    // A null-certfp client does not match `$z:<fp>`, so the negation is true.
+    try std.testing.expect(neg.matches(.{ .secure = true, .certfp = null }));
+}
+
+test "matches patterned oper-class extban" {
+    const ban = try parse("$o:netadmin");
+    try std.testing.expectEqual(NodeKind.oper, ban.rootKind());
+    try std.testing.expectEqualStrings("netadmin", ban.rootPattern().?);
+
+    // Matching class on an oper.
+    try std.testing.expect(ban.matches(.{ .is_oper = true, .oper_class = "netadmin" }));
+    // Case-insensitive.
+    try std.testing.expect(ban.matches(.{ .is_oper = true, .oper_class = "NetAdmin" }));
+    // Different class on an oper must NOT match.
+    try std.testing.expect(!ban.matches(.{ .is_oper = true, .oper_class = "helper" }));
+    // A non-oper must NOT match a `$o:<class>` ban even if the class string is
+    // somehow set.
+    try std.testing.expect(!ban.matches(.{ .is_oper = false, .oper_class = "netadmin" }));
+    // An oper with an empty/unknown class must NOT match.
+    try std.testing.expect(!ban.matches(.{ .is_oper = true, .oper_class = "" }));
+
+    // Glob-capable like other named patterns.
+    const glob = try parse("$o:net*");
+    try std.testing.expect(glob.matches(.{ .is_oper = true, .oper_class = "netadmin" }));
+    try std.testing.expect(!glob.matches(.{ .is_oper = true, .oper_class = "helper" }));
+
+    // Empty pattern after the delimiter is rejected.
+    try std.testing.expectError(error.EmptyPattern, parse("$o:"));
 }
 
 test "matches mute extban against host like a plain hostmask" {
@@ -438,8 +578,10 @@ test "rejects malformed masks" {
     try std.testing.expectError(error.UnknownType, parse("$x:value"));
     try std.testing.expectError(error.InvalidByte, parse("$a:bad\nvalue"));
     try std.testing.expectError(error.EmptyPattern, parse("$~"));
-    try std.testing.expectError(error.UnexpectedPattern, parse("$z:certfp"));
-    try std.testing.expectError(error.UnexpectedPattern, parse("$o:admin"));
+    // Patterned `$z`/`$o` now parse; only an empty pattern after the delimiter
+    // is rejected.
+    try std.testing.expectError(error.EmptyPattern, parse("$z:"));
+    try std.testing.expectError(error.EmptyPattern, parse("$o:"));
 }
 
 test "plain hostmask fallthrough uses host glob" {

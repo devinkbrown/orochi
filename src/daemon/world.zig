@@ -1938,10 +1938,45 @@ test "malformed extended bans are rejected before storage" {
     _ = try world.join("#x", testClient(1));
 
     try std.testing.expectError(error.InvalidMask, world.addBan("#x", "$x:value", "setter", 1));
-    try std.testing.expectError(error.InvalidMask, world.addBan("#x", "$z:certfp", "setter", 2));
-    try std.testing.expectError(error.InvalidMask, world.addExempt("#x", "$o:admin", "setter", 3));
+    // An empty pattern after the `$z:` / `$o:` delimiter is still rejected so a
+    // stored mask cannot silently match everything (or nothing).
+    try std.testing.expectError(error.InvalidMask, world.addBan("#x", "$z:", "setter", 2));
+    try std.testing.expectError(error.InvalidMask, world.addExempt("#x", "$o:", "setter", 3));
     try std.testing.expectEqual(@as(usize, 0), world.bansOf("#x").?.len);
     try std.testing.expectEqual(@as(usize, 0), world.exemptsOf("#x").?.len);
+}
+
+test "$z certfp extban stores and matches the exact fingerprint" {
+    const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const other = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.join("#z", testClient(1));
+
+    // Patterned `$z:<fp>` now stores successfully (no InvalidMask).
+    try std.testing.expect(try world.addBan("#z", "$z:" ++ fp, "setter", 1));
+
+    // The matching certfp is banned; a different certfp and a non-TLS client
+    // (null certfp) are not.
+    try std.testing.expect(world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = true, .certfp = fp }));
+    try std.testing.expect(!world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = true, .certfp = other }));
+    try std.testing.expect(!world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = false, .certfp = null }));
+    try std.testing.expect(!world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = true, .certfp = null }));
+
+    // Add a broad host ban so the different-certfp client is otherwise caught,
+    // then verify a fingerprint-specific exception `+e $z:<fp>` lets only the
+    // matching client through.
+    try std.testing.expect(try world.addBan("#z", "n!*@*", "setter", 2));
+    try std.testing.expect(world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = true, .certfp = other }));
+    try std.testing.expect(try world.addExempt("#z", "$z:" ++ fp, "setter", 3));
+    // The matching certfp is now exempt from the host ban.
+    try std.testing.expect(!world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = true, .certfp = fp }));
+    // The different-certfp client is still caught by the host ban (the
+    // exception is fingerprint-specific).
+    try std.testing.expect(world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = true, .certfp = other }));
+    // A non-TLS client with that host is also still banned and not exempted.
+    try std.testing.expect(world.isBannedCtx("#z", .{ .host = "n!u@h", .secure = false, .certfp = null }));
 }
 
 test "channel flag modes set, query, and render" {
