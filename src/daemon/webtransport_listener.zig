@@ -57,8 +57,12 @@
 //!   * One server SCID per connection, no connection migration.
 //!   * One WebTransport session per QUIC connection, one IRC bridge per
 //!     session (the common deployment shape; `http3_conn` rejects a 2nd CONNECT).
-//!   * IPv4 socket (reuses the proven `MediaSocket`); the daemon's dual-stack
-//!     story is unchanged for the TCP legs. v6 UDP is a typed follow-up.
+//!   * Dual-stack UDP socket (`DualStackUdpSocket`, `AF_INET6` + `IPV6_V6ONLY=0`,
+//!     bound `[::]`): ONE socket serves both native IPv6 peers and IPv4 peers
+//!     (the latter arrive as IPv4-mapped `::ffff:a.b.c.d`, surfaced back as real
+//!     ipv4 `TransportAddress` for PROXY-protocol + logging). The per-connection
+//!     peer address + reply path are family-agnostic — they already use
+//!     `TransportAddress`. The media plane keeps its own IPv4-only `MediaSocket`.
 //!   * PROXY-protocol carry of the real client address is OPTIONAL and OFF by
 //!     default: the daemon sees the bridge's loopback identity. When the daemon
 //!     trusts loopback as a PROXY source, set `send_proxy_header = true` to
@@ -76,8 +80,10 @@ const quic_transport_params = @import("../proto/quic_transport_params.zig");
 const quic_handshake = @import("../proto/quic_handshake.zig");
 const proxy_protocol = @import("../proto/proxy_protocol.zig");
 const media_socket = @import("../substrate/media_socket.zig");
+const dualstack_udp = @import("dualstack_udp.zig");
 
 pub const MediaSocket = media_socket.MediaSocket;
+pub const DualStackUdpSocket = dualstack_udp.DualStackUdpSocket;
 pub const TransportAddress = media_socket.TransportAddress;
 pub const loopback_be = media_socket.loopback_be;
 pub const any_be = media_socket.any_be;
@@ -182,7 +188,7 @@ pub const WebTransportListener = struct {
     /// Bounded single-use cache for accepted Retry tokens (replay defense).
     token_replay: quic_retry.ReplayCache = .{},
 
-    socket: ?MediaSocket = null,
+    socket: ?DualStackUdpSocket = null,
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started).
@@ -216,9 +222,17 @@ pub const WebTransportListener = struct {
     }
 
     /// Bind on `bind_be`:`port` (port 0 = ephemeral) and spawn the pump thread.
+    ///
+    /// `bind_be` is the legacy IPv4-in-network-byte-order bind selector kept for
+    /// the existing `main.zig`/test call sites; it is mapped onto the dual-stack
+    /// socket's `BindAddr` (so the socket itself is always `AF_INET6` with
+    /// `IPV6_V6ONLY=0`, serving both families):
+    ///   * `any_be` (0.0.0.0) → bind `[::]` (all interfaces, both families).
+    ///   * `loopback_be` (127.0.0.1) → bind `::ffff:127.0.0.1` (v4-mapped loopback).
+    ///   * any other configured v4 address → bind it v4-mapped.
     pub fn start(self: *WebTransportListener, bind_be: u32, port: u16) Error!void {
         if (self.socket != null) return error.AlreadyStarted;
-        var sock = MediaSocket.bind(bind_be, port) catch return error.BindFailed;
+        var sock = DualStackUdpSocket.bind(bindAddrFromBe(bind_be), port) catch return error.BindFailed;
         errdefer sock.deinit();
         self.port = sock.localPort() catch return error.BindFailed;
         sock.setRecvTimeoutMs(recv_timeout_ms);
@@ -545,15 +559,29 @@ pub const WebTransportListener = struct {
         return true;
     }
 
+    /// Prepend a PROXY v1 line carrying the real QUIC peer address. Works for
+    /// both families: an IPv4 peer (incl. an IPv4-mapped one, surfaced as a
+    /// 4-byte address) → TCP4 with a 127.0.0.1 destination; a native IPv6 peer →
+    /// TCP6 with a ::1 destination. The peer address is already a
+    /// `TransportAddress`, so the family is just its `ip_len`.
     fn writeProxyHeader(self: *WebTransportListener, conn: *Connection, fd: linux.fd_t) void {
         _ = self;
         var out: [proxy_protocol.v1_max_line_len]u8 = undefined;
         const peer = conn.peer;
-        if (peer.ip_len != 4) return; // only the IPv4 leg is wired (typed gap)
         var dst_ip: [16]u8 = @splat(0);
-        dst_ip[0..4].* = [_]u8{ 127, 0, 0, 1 };
+        const family: proxy_protocol.Family = switch (peer.ip_len) {
+            4 => blk: {
+                dst_ip[0..4].* = [_]u8{ 127, 0, 0, 1 };
+                break :blk .tcp4;
+            },
+            16 => blk: {
+                dst_ip[15] = 1; // ::1
+                break :blk .tcp6;
+            },
+            else => return, // malformed peer address: skip the header
+        };
         const hdr = proxy_protocol.Header{
-            .family = .tcp4,
+            .family = family,
             .src_ip = peer.ip,
             .dst_ip = dst_ip,
             .src_port = peer.port,
@@ -845,6 +873,16 @@ fn firstClientWtBidiStream(h3: *http3_conn.Http3Conn) ?u64 {
     return null;
 }
 
+/// Map the legacy IPv4-in-network-byte-order bind selector to the dual-stack
+/// socket's `BindAddr`. `any_be` (0) → bind `[::]` (all interfaces, both
+/// families). A configured v4 address → bind it v4-mapped (`::ffff:a.b.c.d`), so
+/// a v4-only operator config still works over the single dual-stack socket.
+fn bindAddrFromBe(bind_be: u32) DualStackUdpSocket.BindAddr {
+    if (bind_be == any_be) return .any;
+    // `bind_be` is already in network byte order; its bytes are the v4 octets.
+    return .{ .v4_mapped = @bitCast(bind_be) };
+}
+
 fn nowNs() u64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
@@ -1024,6 +1062,11 @@ const FakeIrcServer = struct {
 };
 
 test "WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both ways" {
+    // End-to-end over the DUAL-STACK socket: `lst.start` now binds an AF_INET6
+    // socket with IPV6_V6ONLY=0, and the client below is a plain IPv4 loopback
+    // `MediaSocket`. So this also proves the full QUIC/H3/WT handshake + IRC
+    // bridge still completes after the socket swap, with the v4 client reaching
+    // the dual-stack server as an IPv4-mapped source surfaced back as ipv4.
     const alloc = testing.allocator;
     var keys: TestServerKeys = undefined;
     try keys.init();
@@ -1040,7 +1083,9 @@ test "WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both w
     try lst.start(loopback_be, 0);
     const server_port = lst.port;
 
-    // A real UDP socket acting as the QUIC/WT client, over the live socket pair.
+    // A real IPv4 UDP socket acting as the QUIC/WT client. It addresses the
+    // dual-stack server at 127.0.0.1:server_port; the server sees it as a
+    // v4-mapped source and replies via the same dual-stack socket.
     var cli_sock = try MediaSocket.bind(loopback_be, 0);
     defer cli_sock.deinit();
     cli_sock.setRecvTimeoutMs(400);
@@ -1264,8 +1309,10 @@ const PolicyFixture = struct {
             .signing_key = .{ .ed25519 = self.keys.kp },
         }, 0);
         self.lst.retry_policy = policy;
-        // Bind the listener's UDP socket WITHOUT spawning the pump thread.
-        var sock = try MediaSocket.bind(loopback_be, 0);
+        // Bind the listener's DUAL-STACK UDP socket WITHOUT spawning the pump
+        // thread (so we can call `handleDatagram` directly). It binds [::] but
+        // serves the v4 peer below as an IPv4-mapped source.
+        var sock = try DualStackUdpSocket.bind(.any, 0);
         self.lst.port = try sock.localPort();
         sock.setRecvTimeoutMs(200);
         self.lst.socket = sock;

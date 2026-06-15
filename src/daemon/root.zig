@@ -76,6 +76,7 @@ pub const dispatch = @import("dispatch.zig");
 pub const dm_request = @import("dm_request.zig");
 pub const dnsbl = @import("dnsbl.zig");
 pub const dns_verify = @import("dns_verify.zig");
+pub const dualstack_udp = @import("dualstack_udp.zig");
 pub const duplicate_filter = @import("duplicate_filter.zig");
 pub const edit_history = @import("edit_history.zig");
 pub const election = @import("election.zig");
@@ -386,6 +387,7 @@ test {
     _ = dm_request;
     _ = dnsbl;
     _ = dns_verify;
+    _ = dualstack_udp;
     _ = duplicate_filter;
     _ = edit_history;
     _ = election;

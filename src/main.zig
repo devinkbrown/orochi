@@ -488,7 +488,9 @@ pub fn main(init: std.process.Init) !void {
             .{ .cert_chain = srv_cfg.tls_cert_chain, .signing_key = signing_key },
             irc_port,
         );
-        // Bind on all interfaces (IPv4); 0.0.0.0 so external QUIC clients reach it.
+        // Bind on all interfaces, dual-stack: the listener's socket is AF_INET6
+        // with IPV6_V6ONLY=0, so `any_be` binds [::] and serves both IPv6 and
+        // IPv4 (mapped) QUIC clients on one socket.
         wt_listener.?.start(orochi.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port) catch |err| {
             std.debug.print("orochi: WebTransport bind failed on UDP :{d} ({s}); disabled\n", .{ srv_cfg.webtransport_port, @errorName(err) });
             wt_listener = null;
