@@ -12606,8 +12606,11 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// CREATE <channel> [modes] — IRCX channel creation (create-or-join as
-    /// founder). Delegates to the JOIN path after parsing the IRCX form.
+    /// CREATE <channel> [modes] [clone-source] — IRCX channel creation
+    /// (create-or-join as founder). Delegates to the JOIN path after parsing the
+    /// IRCX form. With a clone source, the source channel's channel-level modes
+    /// are copied onto the new channel (Ophion CREATE template-clone) before the
+    /// requested `modes` are applied on top as an override.
     pub fn handleCreate(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const req = ircx_create_cmd.parseParams(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CREATE"}, "Invalid CREATE");
@@ -12617,7 +12620,41 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_CHANNELEXIST, &.{req.channel}, "Channel already exists");
             return;
         }
+        if (req.clone_from) |source| {
+            // Clone the template's channel-level modes/limit/key/ext into the new
+            // (empty) target. A missing source is reported like any other missing
+            // channel and the target is NOT created.
+            const cloned = self.world.cloneChannel(source, req.channel) catch |err| switch (err) {
+                error.NoSuchChannel => {
+                    try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{source}, "No such channel");
+                    return;
+                },
+                else => return err,
+            };
+            if (!cloned) {
+                // The existing-target guard above already returned; a false here
+                // means a concurrent create won the race for the target name.
+                try queueNumeric(conn, .ERR_CHANNELEXIST, &.{req.channel}, "Channel already exists");
+                return;
+            }
+            // Seat the creator as founder of the just-cloned (empty) channel before
+            // joinOne so it skips the join gates — the channel now carries the
+            // template's modes (which could be +i/+k) but the creator owns it.
+            _ = self.world.join(req.channel, worldIdFromClient(id)) catch {};
+        }
         try self.joinOne(id, conn, req.channel, null, 0);
+        if (req.clone_from != null) {
+            // joinOne suppresses the founder-MODE broadcast on a pre-existing
+            // (cloned) channel; announce the inherited channel modes explicitly so
+            // members see the clone's flags.
+            var flags_buf: [16]u8 = undefined;
+            const flags = self.world.channelModeString(req.channel, &flags_buf);
+            if (flags.len > 1) {
+                var line_buf: [default_reply_bytes]u8 = undefined;
+                const msg = try formatMessage(&line_buf, self.serverName(), "MODE", &.{ req.channel, flags }, null);
+                try self.broadcastChannel(req.channel, msg, null);
+            }
+        }
         if (req.initial_modes) |modes| {
             var synth = irc_line.LineView{ .raw = "", .command = "MODE" };
             synth.params[0] = req.channel;
@@ -24823,6 +24860,59 @@ test "threaded server: CREATE makes founder channel" {
     try writeAllFd(fd_a, "CREATE #cr\r\n");
     try recvUntil(&a, " 366 A #cr ", 200);
     try recvUntil(&a, "!A", 200);
+}
+
+test "threaded server: CREATE clones template modes and rejects bad sources" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+
+    // Build a template channel carrying +nt (no_external + topic_ops).
+    a.reset();
+    try writeAllFd(fd_a, "CREATE #tmpl +nt\r\n");
+    try recvUntil(&a, " 366 A #tmpl ", 200);
+
+    // Clone the template into #cl, overriding with +s on top of the inherited
+    // modes. The new channel must carry the template's +nt plus the +s override.
+    a.reset();
+    try writeAllFd(fd_a, "CREATE #cl +s #tmpl\r\n");
+    try recvUntil(&a, " 366 A #cl ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #cl\r\n");
+    // Inherited +nt from the template, +s override on top, and +E (the IRCX
+    // clone marker cloneChannel stamps on every clone target).
+    try recvUntil(&a, " 324 A #cl +ntsE ", 200);
+
+    // Cloning into an existing target is rejected with ERR_CHANNELEXIST (926).
+    a.reset();
+    try writeAllFd(fd_a, "CREATE #cl +s #tmpl\r\n");
+    try recvUntil(&a, " 926 A #cl ", 200);
+
+    // Cloning from a nonexistent source is ERR_NOSUCHCHANNEL (403) naming the
+    // source, and the target must NOT be created.
+    a.reset();
+    try writeAllFd(fd_a, "CREATE #nope +nt #ghost\r\n");
+    try recvUntil(&a, " 403 A #ghost ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE #nope\r\n");
+    try recvUntil(&a, " 403 A #nope ", 200);
 }
 
 test "threaded server: HELP topic + unknown" {

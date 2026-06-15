@@ -57,10 +57,13 @@ pub const Prefix = struct {
     host: []const u8,
 };
 
-/// Parsed `CREATE <channel> [<modes>]` parameters.
+/// Parsed `CREATE <channel> [<modes>] [<clone-source>]` parameters.
 pub const CreateArgs = struct {
     channel: []const u8,
     modes: ?[]const u8 = null,
+    /// Ophion CREATE clone/template source channel: its channel-level modes are
+    /// copied onto the new channel before `modes` is applied as an override.
+    clone_from: ?[]const u8 = null,
 };
 
 /// Orochi's ordered IRCX member tiers.
@@ -104,15 +107,18 @@ pub fn parseCreateArgs(params: []const []const u8) IrcxCreateError!CreateArgs {
 /// Parse CREATE parameters with caller-selected compile-time limits.
 pub fn parseCreateArgsWith(comptime params_config: Params, params: []const []const u8) IrcxCreateError!CreateArgs {
     if (params.len == 0) return error.MissingChannel;
-    if (params.len > 2) return error.TooManyParameters;
+    if (params.len > 3) return error.TooManyParameters;
 
-    const modes = if (params.len == 2) params[1] else null;
+    const modes = if (params.len >= 2) params[1] else null;
+    const clone_from = if (params.len == 3) params[2] else null;
     try validateChannelWith(params_config, params[0]);
     if (modes) |mode_text| try validateModesWith(params_config, mode_text);
+    if (clone_from) |src| try validateChannelWith(params_config, src);
 
     return .{
         .channel = params[0],
         .modes = modes,
+        .clone_from = clone_from,
     };
 }
 
@@ -488,11 +494,24 @@ test "parse create args with modes" {
     try std.testing.expectEqual(.founder, result.creator_status);
 }
 
+test "parse create args with clone source" {
+    const raw = [_][]const u8{ "#clone", "+nt", "#template" };
+    const parsed = try parseCreateArgs(&raw);
+    try std.testing.expectEqualStrings("#clone", parsed.channel);
+    try std.testing.expectEqualStrings("+nt", parsed.modes.?);
+    try std.testing.expectEqualStrings("#template", parsed.clone_from.?);
+
+    // Clone source without modes is not possible positionally: the second
+    // parameter is always the mode string, the third is the clone source.
+    const bad_src = [_][]const u8{ "#clone", "+nt", "template" };
+    try std.testing.expectError(error.InvalidChannel, parseCreateArgs(&bad_src));
+}
+
 test "invalid create channel is rejected" {
     const missing = [_][]const u8{};
     try std.testing.expectError(error.MissingChannel, parseCreateArgs(&missing));
 
-    const too_many = [_][]const u8{ "#orochi", "+nt", "extra" };
+    const too_many = [_][]const u8{ "#orochi", "+nt", "#tmpl", "extra" };
     try std.testing.expectError(error.TooManyParameters, parseCreateArgs(&too_many));
 
     const no_prefix = [_][]const u8{"orochi"};

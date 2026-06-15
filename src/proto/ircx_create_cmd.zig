@@ -45,10 +45,14 @@ pub const InitialModes = struct {
     }
 };
 
-/// Parsed `CREATE <channel> [modes]` request.
+/// Parsed `CREATE <channel> [modes] [clone-source]` request.
 pub const Request = struct {
     channel: []const u8,
     initial_modes: ?InitialModes = null,
+    /// Ophion CREATE clone/template source: when set, the source channel's
+    /// channel-level modes are copied onto the new channel before `initial_modes`
+    /// is applied on top as an override.
+    clone_from: ?[]const u8 = null,
     creator_status: MemberTier = .founder,
 
     pub fn requestedModes(self: Request) ?[]const u8 {
@@ -114,6 +118,7 @@ pub fn parseParamsWith(comptime params_config: Params, params: []const []const u
     return .{
         .channel = args.channel,
         .initial_modes = if (args.modes) |raw_modes| .{ .raw = raw_modes } else null,
+        .clone_from = args.clone_from,
         .creator_status = .founder,
     };
 }
@@ -293,6 +298,29 @@ test "parse CREATE with modes and iterate changes" {
     try std.testing.expectEqualStrings("+nt", line_request.requestedModes().?);
 }
 
+test "parse CREATE with clone source channel" {
+    const allocator = std.testing.allocator;
+    const params = try allocator.alloc([]const u8, 3);
+    defer allocator.free(params);
+    params[0] = "#clone";
+    params[1] = "+nt";
+    params[2] = "#template";
+
+    const request = try parseParams(params);
+    try std.testing.expectEqualStrings("#clone", request.channel);
+    try std.testing.expectEqualStrings("+nt", request.requestedModes().?);
+    try std.testing.expectEqualStrings("#template", request.clone_from.?);
+    try std.testing.expectEqual(.founder, request.creator_status);
+
+    const line_request = try parse("CREATE #clone +nt #template\r\n");
+    try std.testing.expectEqualStrings("#clone", line_request.channel);
+    try std.testing.expectEqualStrings("#template", line_request.clone_from.?);
+
+    // Two-arg form leaves clone_from null.
+    const no_clone = try parse("CREATE #clone +nt\r\n");
+    try std.testing.expect(no_clone.clone_from == null);
+}
+
 test "validation rejects malformed CREATE input" {
     const allocator = std.testing.allocator;
     const missing = try allocator.alloc([]const u8, 0);
@@ -302,8 +330,11 @@ test "validation rejects malformed CREATE input" {
     const bad_channel = [_][]const u8{"orochi"};
     try std.testing.expectError(error.InvalidChannel, parseParams(&bad_channel));
 
-    const too_many = [_][]const u8{ "#orochi", "+nt", "extra" };
+    const too_many = [_][]const u8{ "#orochi", "+nt", "#tmpl", "extra" };
     try std.testing.expectError(error.TooManyParameters, parseParams(&too_many));
+
+    const bad_clone_source = [_][]const u8{ "#orochi", "+nt", "tmpl" };
+    try std.testing.expectError(error.InvalidChannel, parseParams(&bad_clone_source));
 
     const bad_modes = [_][]const u8{ "#orochi", "+n t" };
     try std.testing.expectError(error.InvalidModes, parseParams(&bad_modes));
