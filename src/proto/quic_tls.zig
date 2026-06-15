@@ -160,6 +160,158 @@ pub fn headerProtectionMask(hp_key: [hp_key_len]u8, sample: [16]u8) [5]u8 {
     return encrypted[0..5].*;
 }
 
+/// AES-256 (32-byte key) variant of the header-protection mask. Same
+/// construction as `headerProtectionMask` but with AES-256-ECB; used by the
+/// TLS_AES_256_GCM_SHA384 suite. RFC 9001 §5.4.3.
+pub fn headerProtectionMaskAes256(hp_key: [32]u8, sample: [16]u8) [5]u8 {
+    const aes = crypto.core.aes.Aes256.initEnc(hp_key);
+    var encrypted: [16]u8 = undefined;
+    aes.encrypt(&encrypted, &sample);
+    return encrypted[0..5].*;
+}
+
+/// ChaCha20 variant of the header-protection mask (RFC 9001 §5.4.4) for the
+/// TLS_CHACHA20_POLY1305_SHA256 suite.
+///
+/// > The header protection algorithm uses both the header protection key and a
+/// > sample of the ciphertext from the packet Payload field.
+/// >
+/// >   counter = sample[0..4]   (a 32-bit little-endian number)
+/// >   nonce   = sample[4..16]  (the remaining 12 bytes)
+/// >   mask    = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0})
+///
+/// i.e. the mask is the first five bytes of the ChaCha20 keystream produced with
+/// the given 32-bit block counter and 96-bit nonce — equivalently, ChaCha20
+/// encrypting a five-byte zero block. We obtain it directly from the keystream
+/// (`stream`) so no scratch plaintext is needed.
+pub fn headerProtectionMaskChaCha20(hp_key: [32]u8, sample: [16]u8) [5]u8 {
+    const ChaCha20IETF = crypto.stream.chacha.ChaCha20IETF;
+    const counter = mem.readInt(u32, sample[0..4], .little);
+    var nonce: [12]u8 = undefined;
+    @memcpy(&nonce, sample[4..16]);
+    var mask: [5]u8 = undefined;
+    ChaCha20IETF.stream(&mask, counter, hp_key, nonce);
+    return mask;
+}
+
+// ---------------------------------------------------------------------------
+// Cipher suites + per-level packet-key derivation (RFC 9001 §5.1, §5.4, §6.1)
+// ---------------------------------------------------------------------------
+
+/// The three QUIC v1 packet-protection cipher suites (RFC 9001 §5.3). These map
+/// one-to-one onto the TLS 1.3 cipher suites a QUIC handshake may negotiate.
+/// The Initial packet space always uses `aes128gcm`.
+pub const CipherSuite = enum {
+    /// TLS_AES_128_GCM_SHA256 — 16-byte key, AES-128 header protection.
+    aes128gcm,
+    /// TLS_AES_256_GCM_SHA384 — 32-byte key, AES-256 header protection.
+    aes256gcm,
+    /// TLS_CHACHA20_POLY1305_SHA256 — 32-byte key, ChaCha20 header protection.
+    chacha20poly1305,
+
+    /// AEAD key length in bytes for this suite.
+    pub fn keyLen(self: CipherSuite) usize {
+        return switch (self) {
+            .aes128gcm => 16,
+            .aes256gcm => 32,
+            .chacha20poly1305 => 32,
+        };
+    }
+
+    /// Header-protection key length in bytes for this suite (equals the AEAD
+    /// key length for all three QUIC v1 suites).
+    pub fn hpKeyLen(self: CipherSuite) usize {
+        return self.keyLen();
+    }
+
+    /// AEAD nonce / "quic iv" length in bytes (12 for all three suites).
+    pub fn ivLen(self: CipherSuite) usize {
+        _ = self;
+        return aead_iv_len;
+    }
+
+    /// AEAD authentication-tag length in bytes (16 for all three suites).
+    pub fn tagLen(self: CipherSuite) usize {
+        _ = self;
+        return 16;
+    }
+};
+
+/// The maximum AEAD/header-protection key length across all suites (AES-256 /
+/// ChaCha20 = 32). `PacketKeys` stores keys in fixed 32-byte buffers and tracks
+/// the active prefix length via `suite`, so the level/suite abstraction never
+/// allocates and the same struct serves every cipher.
+pub const max_key_len: usize = 32;
+
+/// Packet-protection keys for one direction at one encryption level, plus the
+/// suite that selects the AEAD and header-protection algorithm.
+///
+/// `key` and `hp` are fixed 32-byte buffers; only the first `suite.keyLen()`
+/// bytes are meaningful (the AES-128 case uses 16, leaving the tail zeroed and
+/// unused). Callers should always go through `keyBytes()` / `hpBytes()` rather
+/// than reading the raw arrays so the suite-dependent length is respected.
+pub const PacketKeys = struct {
+    suite: CipherSuite,
+    key: [max_key_len]u8,
+    iv: [aead_iv_len]u8,
+    hp: [max_key_len]u8,
+
+    /// The active AEAD key bytes (length = `suite.keyLen()`).
+    pub fn keyBytes(self: *const PacketKeys) []const u8 {
+        return self.key[0..self.suite.keyLen()];
+    }
+
+    /// The active header-protection key bytes (length = `suite.hpKeyLen()`).
+    pub fn hpBytes(self: *const PacketKeys) []const u8 {
+        return self.hp[0..self.suite.hpKeyLen()];
+    }
+};
+
+/// Derive QUIC `PacketKeys` from a TLS 1.3 traffic secret and a negotiated
+/// cipher suite, using the QUIC "quic key" / "quic iv" / "quic hp" labels
+/// (RFC 9001 §5.1).
+///
+///   key = HKDF-Expand-Label(secret, "quic key", "", keyLen)
+///   iv  = HKDF-Expand-Label(secret, "quic iv",  "", 12)
+///   hp  = HKDF-Expand-Label(secret, "quic hp",  "", hpKeyLen)
+///
+/// `traffic_secret` is e.g. a client/server handshake_traffic_secret or
+/// *_application_traffic_secret from the TLS 1.3 schedule. The HKDF uses
+/// SHA-256 (matching `hkdfExpandLabel`); QUIC always sizes the secret to the
+/// handshake hash, and the std HKDF accepts a 32-byte PRK here. For the
+/// AES-256-GCM suite (SHA-384) the caller passes the first 32 bytes of the
+/// 48-byte secret is **not** correct — instead they pass the full secret via a
+/// SHA-384 schedule; this helper is SHA-256-based and is the right choice for
+/// the SHA-256 suites and for the RFC 9001 Appendix A vectors. Mixed-hash
+/// derivation is handled by the connection layer, which owns the schedule hash.
+pub fn derivePacketKeys(traffic_secret: [32]u8, suite: CipherSuite) PacketKeys {
+    var pk: PacketKeys = .{
+        .suite = suite,
+        .key = [_]u8{0} ** max_key_len,
+        .iv = undefined,
+        .hp = [_]u8{0} ** max_key_len,
+    };
+    const klen = suite.keyLen();
+    const hlen = suite.hpKeyLen();
+    hkdfExpandLabel(pk.key[0..klen], traffic_secret, "quic key", "");
+    hkdfExpandLabel(&pk.iv, traffic_secret, "quic iv", "");
+    hkdfExpandLabel(pk.hp[0..hlen], traffic_secret, "quic hp", "");
+    return pk;
+}
+
+/// Roll a 1-RTT traffic secret to the next key generation (RFC 9001 §6.1):
+///
+///   next_secret = HKDF-Expand-Label(current_secret, "quic ku", "", Hash.length)
+///
+/// The new secret is then fed back through `derivePacketKeys` to obtain the next
+/// generation's key and iv. The header-protection key is **not** updated on a
+/// key update (RFC 9001 §6.1), so callers retain the previous `hp`.
+pub fn nextGenerationSecret(traffic_secret: [32]u8) [32]u8 {
+    var next: [32]u8 = undefined;
+    hkdfExpandLabel(&next, traffic_secret, "quic ku", "");
+    return next;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -383,4 +535,78 @@ test "fromHexAlloc — round-trip via testing.allocator" {
     try testing.expectEqual(@as(usize, 8), bytes.len);
     const exp = fromHex(8, "8394c8f03e515708");
     try testing.expectEqualSlices(u8, &exp, bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Cipher-suite key derivation, key update, and the ChaCha20 / AES-256 HP masks
+// ---------------------------------------------------------------------------
+
+test "RFC 9001 A.5 quic — chacha20 quic key/iv/hp from the 1-RTT secret" {
+    const secret = fromHex(32, "9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b");
+    const pk = derivePacketKeys(secret, .chacha20poly1305);
+
+    try testing.expectEqualSlices(
+        u8,
+        &fromHex(32, "c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8"),
+        pk.keyBytes(),
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &fromHex(12, "e0459b3474bdd0e44a41c144"),
+        &pk.iv,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &fromHex(32, "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4"),
+        pk.hpBytes(),
+    );
+}
+
+test "RFC 9001 A.5 chacha — header-protection mask (quic_tls primitive)" {
+    const hp = fromHex(32, "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4");
+    const sample = fromHex(16, "5e5cd55c41f69080575d7999c25a5bfb");
+    const mask = headerProtectionMaskChaCha20(hp, sample);
+    try testing.expectEqualSlices(u8, &fromHex(5, "aefefe7d03"), &mask);
+}
+
+test "RFC 9001 quic — quic ku rolls the 1-RTT secret deterministically" {
+    const secret = fromHex(32, "9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b");
+    const next = nextGenerationSecret(secret);
+    try testing.expectEqualSlices(
+        u8,
+        &fromHex(32, "1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9"),
+        &next,
+    );
+}
+
+test "quic CipherSuite — key/hp lengths per suite" {
+    try testing.expectEqual(@as(usize, 16), CipherSuite.aes128gcm.keyLen());
+    try testing.expectEqual(@as(usize, 32), CipherSuite.aes256gcm.keyLen());
+    try testing.expectEqual(@as(usize, 32), CipherSuite.chacha20poly1305.keyLen());
+    inline for (.{ CipherSuite.aes128gcm, CipherSuite.aes256gcm, CipherSuite.chacha20poly1305 }) |s| {
+        try testing.expectEqual(s.keyLen(), s.hpKeyLen());
+        try testing.expectEqual(@as(usize, 12), s.ivLen());
+        try testing.expectEqual(@as(usize, 16), s.tagLen());
+    }
+}
+
+test "quic AES-256 header-protection mask is deterministic and key-sensitive" {
+    const sample = [_]u8{0x9c} ** 16;
+    const k1 = [_]u8{0x01} ** 32;
+    const k2 = [_]u8{0x02} ** 32;
+    const m1 = headerProtectionMaskAes256(k1, sample);
+    try testing.expectEqualSlices(u8, &m1, &headerProtectionMaskAes256(k1, sample));
+    try testing.expect(!mem.eql(u8, &m1, &headerProtectionMaskAes256(k2, sample)));
+}
+
+test "quic derivePacketKeys — AES-128 path matches deriveEndpointKeys" {
+    // The suite-aware derivation with aes128gcm must reproduce the original
+    // EndpointKeys derivation byte-for-byte (RFC 9001 A.1 client secret).
+    const dcid = fromHex(8, "8394c8f03e515708");
+    const secrets = deriveInitialSecrets(&dcid);
+    const legacy = deriveEndpointKeys(secrets.client_prk);
+    const pk = derivePacketKeys(secrets.client_prk, .aes128gcm);
+    try testing.expectEqualSlices(u8, &legacy.key, pk.keyBytes());
+    try testing.expectEqualSlices(u8, &legacy.iv, &pk.iv);
+    try testing.expectEqualSlices(u8, &legacy.hp, pk.hpBytes());
 }
