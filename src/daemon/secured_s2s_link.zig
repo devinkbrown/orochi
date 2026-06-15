@@ -271,8 +271,10 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
-    /// Announce a local IRCX channel PROP set/delete over the secured CRDT link.
-    /// Outbound bytes accumulate in `out`.
+    /// Announce a local IRCX channel PROP set/delete (or re-broadcast a remote
+    /// one) over the secured CRDT link. Outbound bytes accumulate in `out`.
+    /// `origin` carries the ORIGINAL author's node id + self-contained multi-hop
+    /// origin signature (see `S2sLink.sendChannelProp`).
     pub fn sendChannelProp(
         self: *SecuredLink,
         channel: []const u8,
@@ -281,9 +283,10 @@ pub const SecuredLink = struct {
         owner: []const u8,
         hlc: u64,
         present: bool,
+        origin: s2s_peer.S2sPeer.PropOrigin,
     ) anyerror!void {
         const link = self.inner orelse return;
-        try link.sendChannelProp(channel, key, value, owner, hlc, present);
+        try link.sendChannelProp(channel, key, value, owner, hlc, present, origin);
         try self.drainInner();
     }
 

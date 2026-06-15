@@ -211,8 +211,10 @@ pub const S2sLink = struct {
         try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present, ident);
     }
 
-    /// Announce a local IRCX channel PROP set/delete to the peer.
-    /// Outbound frames accumulate in `out`.
+    /// Announce a local IRCX channel PROP set/delete (or re-broadcast a remote
+    /// one) to the peer. Outbound frames accumulate in `out`. `origin` selects
+    /// local-authored vs re-broadcast attribution and carries the self-contained
+    /// multi-hop origin signature (see `S2sPeer.PropOrigin`).
     pub fn sendChannelProp(
         self: *S2sLink,
         channel: []const u8,
@@ -221,8 +223,9 @@ pub const S2sLink = struct {
         owner: []const u8,
         hlc: u64,
         present: bool,
+        origin: s2s_peer.S2sPeer.PropOrigin,
     ) !void {
-        try self.peer.sendChannelProp(self.sink(), channel, key, value, owner, hlc, present);
+        try self.peer.sendChannelProp(self.sink(), channel, key, value, owner, hlc, present, origin);
     }
 
     /// Announce a local channel topic change to the peer.
@@ -558,8 +561,8 @@ test "CHANNEL_PROP payload round-trips across the link into takeChannelPropChang
     defer b.deinit();
 
     try a.start(10);
-    try a.sendChannelProp("#chat", "TOPIC", "hello mesh", "alice", 100, true);
-    try a.sendChannelProp("#chat", "SUBJECT", "", "alice", 101, false);
+    try a.sendChannelProp("#chat", "TOPIC", "hello mesh", "alice", 100, true, .{});
+    try a.sendChannelProp("#chat", "SUBJECT", "", "alice", 101, false, .{});
 
     var now: u64 = 11;
     var rounds: usize = 0;

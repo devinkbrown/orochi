@@ -16,6 +16,8 @@ const mod_registry = @import("registry.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
+const channel_prop_event = @import("../proto/channel_prop_event.zig");
+const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
@@ -1676,11 +1678,23 @@ const ChannelPropClock = struct {
     owner: []u8,
     hlc: u64,
     present: bool,
+    /// The ORIGINAL author's node short id for this LWW fact (preserved verbatim
+    /// across re-broadcast/burst, NOT this relay's node). Used as the claimed
+    /// origin a receiver self-certifies the stored signature against.
+    origin_node: u64,
+    /// Stored self-contained multi-hop origin signature, owned here. Empty
+    /// (`&.{}`) on the legacy unsigned path. Re-emitted byte-for-byte on
+    /// re-broadcast/burst so every hop verifies the ORIGINAL author, never the
+    /// relay. Both empty or both at their exact Ed25519 widths.
+    origin_pubkey: []u8,
+    origin_sig: []u8,
 
     fn deinit(self: *ChannelPropClock, allocator: std.mem.Allocator) void {
         allocator.free(self.channel);
         allocator.free(self.key);
         allocator.free(self.owner);
+        allocator.free(self.origin_pubkey);
+        allocator.free(self.origin_sig);
         self.* = undefined;
     }
 };
@@ -4660,6 +4674,60 @@ pub const LinuxServer = struct {
         message_relay.signInPlace(msg, &ident.sign_kp, transcript, pubkey_buf, sig_buf) catch return;
     }
 
+    /// A self-contained multi-hop origin signature for a LOCALLY-authored channel
+    /// PROP fact: the origin node id this node certifies, plus the stamped
+    /// `(pubkey, sig)` borrowing the caller's backing buffers. `pubkey`/`sig` are
+    /// empty when this node cannot sign (no node identity), in which case the
+    /// fact follows the legacy unsigned path. `node` is always `config.node_id`
+    /// (the local origin) regardless of signing.
+    const LocalPropSig = struct {
+        node: u64,
+        pubkey: []const u8 = "",
+        sig: []const u8 = "",
+    };
+
+    /// Sign a LOCALLY-authored channel PROP fact's canonical transcript ONCE, at
+    /// the origin (this node), returning the stamped `(pubkey, sig)` to STORE with
+    /// the clock and re-emit on every re-broadcast/burst. No-op (unsigned) when
+    /// this node has no node identity, OR when `config.node_id` is not the
+    /// self-certified short id of the node key — signing then would mint a
+    /// signature that fails its own origin check, so the fact is left unsigned.
+    /// Mirrors `signRelayOrigin` exactly for the CHANNEL_PROP CRDT. `pubkey_buf`/
+    /// `sig_buf` back the returned slices and MUST outlive the
+    /// `recordChannelPropClock` + announce that follow.
+    fn signLocalChannelProp(
+        self: *LinuxServer,
+        present: bool,
+        channel: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        pubkey_buf: *[channel_prop_event.pubkey_len]u8,
+        sig_buf: *[channel_prop_event.sig_len]u8,
+    ) LocalPropSig {
+        const origin_node = self.config.node_id;
+        const ident = self.config.node_identity orelse return .{ .node = origin_node };
+        // Self-certification invariant: the stamped origin id MUST equal
+        // `originShortId(pubkey)`. Only sign when `config.node_id` agrees with the
+        // node key's derived short id, so a receiver's origin check holds.
+        if (ident.shortId() != origin_node) return .{ .node = origin_node };
+
+        var ev = channel_prop_event.ChannelPropEvent{
+            .present = present,
+            .origin_node = origin_node,
+            .hlc = hlc,
+            .channel = channel,
+            .key = key,
+            .value = value,
+            .owner = owner,
+        };
+        const transcript = channel_prop_event.originTranscript(self.allocator, ev) catch return .{ .node = origin_node };
+        defer self.allocator.free(transcript);
+        channel_prop_event.signInPlace(&ev, &ident.sign_kp, transcript, pubkey_buf, sig_buf) catch return .{ .node = origin_node };
+        return .{ .node = origin_node, .pubkey = ev.origin_pubkey, .sig = ev.origin_sig };
+    }
+
     /// Deliver an inbound relayed user message to LOCAL recipients (channel
     /// members or a local nick), then re-forward to other peers for multi-hop
     /// (loop-guarded by the per-peer seen-set + origin id).
@@ -5878,6 +5946,13 @@ pub const LinuxServer = struct {
         return out[0..written.len];
     }
 
+    /// LWW-record a channel PROP clock, storing the ORIGINAL author's
+    /// `origin_node` and the self-contained multi-hop origin `(pubkey, sig)` so a
+    /// later re-broadcast/burst re-emits the original author's signature verbatim.
+    /// `origin_pubkey`/`origin_sig` are empty ("") on the legacy unsigned path.
+    /// On an LWW overwrite the previous owner + signature bytes are freed and the
+    /// new ones duped in; the insert path dupes all owned bytes. Lifetime is
+    /// balanced against `ChannelPropClock.deinit`.
     fn recordChannelPropClock(
         self: *LinuxServer,
         channel: []const u8,
@@ -5885,14 +5960,34 @@ pub const LinuxServer = struct {
         owner: []const u8,
         hlc: u64,
         present: bool,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+        origin_sig: []const u8,
     ) bool {
         if (self.channelPropClock(channel, key)) |entry| {
             if (hlc <= entry.hlc) return false;
+            // Stage all three new owned copies BEFORE mutating the entry so a mid-
+            // way allocation failure leaves the existing entry intact (no partial
+            // overwrite, no leak).
             const owner_copy = self.allocator.dupe(u8, owner) catch return false;
+            const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+                self.allocator.free(owner_copy);
+                return false;
+            };
+            const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+                self.allocator.free(owner_copy);
+                self.allocator.free(pubkey_copy);
+                return false;
+            };
             self.allocator.free(entry.owner);
+            self.allocator.free(entry.origin_pubkey);
+            self.allocator.free(entry.origin_sig);
             entry.owner = owner_copy;
+            entry.origin_pubkey = pubkey_copy;
+            entry.origin_sig = sig_copy;
             entry.hlc = hlc;
             entry.present = present;
+            entry.origin_node = origin_node;
             return true;
         }
 
@@ -5912,6 +6007,21 @@ pub const LinuxServer = struct {
             self.allocator.free(key_copy);
             return false;
         };
+        const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(channel_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            return false;
+        };
+        const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(channel_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            self.allocator.free(pubkey_copy);
+            return false;
+        };
 
         self.channel_prop_clocks.putNoClobber(self.allocator, map_key, .{
             .channel = channel_copy,
@@ -5919,14 +6029,52 @@ pub const LinuxServer = struct {
             .owner = owner_copy,
             .hlc = hlc,
             .present = present,
+            .origin_node = origin_node,
+            .origin_pubkey = pubkey_copy,
+            .origin_sig = sig_copy,
         }) catch {
             self.allocator.free(map_key);
             self.allocator.free(channel_copy);
             self.allocator.free(key_copy);
             self.allocator.free(owner_copy);
+            self.allocator.free(pubkey_copy);
+            self.allocator.free(sig_copy);
             return false;
         };
         return true;
+    }
+
+    /// The `PropOrigin` to emit for a stored clock in a burst. Returns the stored
+    /// ORIGINAL author's `(node, pubkey, sig)` only when the signature still
+    /// verifies against the EXACT `(present, value, owner, hlc)` tuple being
+    /// emitted (so a re-broadcast preserves the original author's signature). When
+    /// the live tuple has diverged from the signed one, or the fact is unsigned,
+    /// returns an unsigned origin carrying just the original `origin_node` (legacy
+    /// LWW path at the receiver) — never a stale signature that cannot verify.
+    fn burstPropOrigin(
+        self: *LinuxServer,
+        clock: *const ChannelPropClock,
+        present: bool,
+        value: []const u8,
+        owner: []const u8,
+    ) s2s_peer_mod.S2sPeer.PropOrigin {
+        if (clock.origin_pubkey.len == 0) return .{ .node = clock.origin_node };
+        const ev = channel_prop_event.ChannelPropEvent{
+            .present = present,
+            .origin_node = clock.origin_node,
+            .hlc = clock.hlc,
+            .channel = clock.channel,
+            .key = clock.key,
+            .value = value,
+            .owner = owner,
+            .origin_pubkey = clock.origin_pubkey,
+            .origin_sig = clock.origin_sig,
+        };
+        const outcome = channel_prop_event.verifyOrigin(self.allocator, ev) catch return .{ .node = clock.origin_node };
+        if (outcome == .verified) {
+            return .{ .node = clock.origin_node, .pubkey = clock.origin_pubkey, .sig = clock.origin_sig };
+        }
+        return .{ .node = clock.origin_node };
     }
 
     fn sendChannelPropBurstTo(self: *LinuxServer, conn: *ConnState) void {
@@ -5937,7 +6085,13 @@ pub const LinuxServer = struct {
             const rows = self.props.listProps(entity, &views) catch views[0..0];
             for (rows) |entry| {
                 if (self.channelPropClock(entry.entity.id, entry.key) == null) {
-                    _ = self.recordChannelPropClock(entry.entity.id, entry.key, entry.owner, self.nextChannelPropHlc(), true);
+                    // A locally-owned prop with no clock yet: seed one as a LOCAL
+                    // origin and sign it, so the burst re-emits a verifiable fact.
+                    const hlc = self.nextChannelPropHlc();
+                    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+                    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+                    const ps = self.signLocalChannelProp(true, entry.entity.id, entry.key, entry.value, entry.owner, hlc, &pk_buf, &sig_buf);
+                    _ = self.recordChannelPropClock(entry.entity.id, entry.key, entry.owner, hlc, true, ps.node, ps.pubkey, ps.sig);
                 }
             }
         }
@@ -5957,10 +6111,20 @@ pub const LinuxServer = struct {
                     present = false;
                 }
             }
+            // Re-emit the ORIGINAL author's stored origin + signature verbatim so a
+            // bursted fact still self-certifies its true author at the receiver.
+            // The signature is bound to the EXACT (present, value, owner, hlc) the
+            // author signed; the burst re-derives value/owner/present from the
+            // live store, which can diverge from the signed tuple (e.g. the prop
+            // was deleted but the clock still recorded it present). When the stored
+            // signature no longer matches the tuple being emitted, fall back to
+            // unsigned for THIS emit rather than ship a signature that cannot
+            // verify (the receiver applies it via the legacy LWW path).
+            const origin = self.burstPropOrigin(clock, present, value, owner);
             if (conn.s2s_secured) |link| {
-                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present) catch continue;
+                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present, origin) catch continue;
             } else if (conn.s2s) |link| {
-                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present) catch continue;
+                link.sendChannelProp(clock.channel, clock.key, value, owner, clock.hlc, present, origin) catch continue;
             }
         }
         if (conn.s2s_secured) |link| {
@@ -6062,6 +6226,12 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Fan a channel PROP fact out to every established peer link. `origin`
+    /// carries the ORIGINAL author's node id and self-contained multi-hop
+    /// signature (see `s2s_link.S2sLink.sendChannelProp`): the local-author path
+    /// passes this node's signed origin, and the inbound re-broadcast path passes
+    /// the remote author's stored `(node, pubkey, sig)` so every hop verifies the
+    /// ORIGINAL author rather than this relay.
     fn announceChannelProp(
         self: *LinuxServer,
         channel: []const u8,
@@ -6070,6 +6240,7 @@ pub const LinuxServer = struct {
         owner: []const u8,
         hlc: u64,
         present: bool,
+        origin: s2s_peer_mod.S2sPeer.PropOrigin,
     ) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
@@ -6077,12 +6248,12 @@ pub const LinuxServer = struct {
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
-                    link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
+                    link.sendChannelProp(channel, key, value, owner, hlc, present, origin) catch continue;
                     self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
                     link.clearOutbound();
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
-                    link.sendChannelProp(channel, key, value, owner, hlc, present) catch continue;
+                    link.sendChannelProp(channel, key, value, owner, hlc, present, origin) catch continue;
                     self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
                     link.clearOutbound();
                 }
@@ -6556,7 +6727,62 @@ pub const LinuxServer = struct {
         return flags.has(flag);
     }
 
+    /// Account + audit a dropped remote CHANNEL_PROP fact whose self-contained
+    /// multi-hop origin signature failed. Reuses the daemon-level multi-hop reject
+    /// counter (`rejected_relay_signatures`, shared with the MESSAGE relay) and the
+    /// same `.s2s` warn audit signal direct-frame origin rejections use.
+    fn recordChannelPropSignatureReject(self: *LinuxServer, ch: anytype, reason: []const u8) void {
+        self.rejected_relay_signatures +|= 1;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "dropped CHANNEL_PROP {s}/{s} claiming origin {d}: {s}",
+            .{ ch.channel, ch.key, ch.origin_node, reason },
+        ) catch "dropped CHANNEL_PROP with bad origin signature";
+        self.traceLog(.warn, .s2s, line);
+    }
+
+    /// Verify an inbound CHANNEL_PROP fact's self-contained multi-hop origin
+    /// signature. `.unsigned`/`.verified` => apply; any rejection drops the fact
+    /// (never applied, never re-emitted) and is counted + audited. Fails CLOSED on
+    /// an allocation failure during verification.
+    fn channelPropOriginVerified(self: *LinuxServer, ch: anytype) bool {
+        const ev = channel_prop_event.ChannelPropEvent{
+            .present = ch.present,
+            .origin_node = ch.origin_node,
+            .hlc = ch.hlc,
+            .channel = ch.channel,
+            .key = ch.key,
+            .value = ch.value,
+            .owner = ch.owner,
+            .origin_pubkey = ch.origin_pubkey,
+            .origin_sig = ch.origin_sig,
+        };
+        const outcome = channel_prop_event.verifyOrigin(self.allocator, ev) catch {
+            self.recordChannelPropSignatureReject(ch, "verification allocation failed");
+            return false;
+        };
+        return switch (outcome) {
+            .unsigned, .verified => true,
+            .origin_mismatch => blk: {
+                self.recordChannelPropSignatureReject(ch, "origin pubkey does not self-certify the claimed origin node");
+                break :blk false;
+            },
+            .bad_signature => blk: {
+                self.recordChannelPropSignatureReject(ch, "origin signature verification failed");
+                break :blk false;
+            },
+        };
+    }
+
     fn applyRemoteChannelProp(self: *LinuxServer, ch: anytype) bool {
+        // End-to-end origin authentication BEFORE applying. A fact carrying a
+        // self-contained signature is verified against the CLAIMED origin (self-
+        // certifying). On failure it is dropped here — never applied, never
+        // re-broadcast — so a relay cannot forge or alter another node's fact. An
+        // unsigned fact follows the legacy path unchanged (already gated at the
+        // per-link layer for signing peers).
+        if (!self.channelPropOriginVerified(ch)) return false;
         if (self.channelPropClock(ch.channel, ch.key)) |entry| {
             if (ch.hlc <= entry.hlc) return false;
         }
@@ -6568,7 +6794,10 @@ pub const LinuxServer = struct {
         } else {
             self.props.deleteProp(entity, ch.key) catch {};
         }
-        return self.recordChannelPropClock(ch.channel, ch.key, owner, ch.hlc, ch.present);
+        // Store the ORIGINAL author's origin id + signature so a later
+        // re-broadcast/burst re-emits the original author's `(pubkey, sig)` — the
+        // multi-hop guarantee — not this relay's.
+        return self.recordChannelPropClock(ch.channel, ch.key, owner, ch.hlc, ch.present, ch.origin_node, ch.origin_pubkey, ch.origin_sig);
     }
 
     fn emitRemoteChannelProp(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
@@ -12642,8 +12871,13 @@ pub const LinuxServer = struct {
                 };
                 if (m.entity.kind == .channel) {
                     const hlc = self.nextChannelPropHlc();
-                    if (self.recordChannelPropClock(ev.entity.id, ev.key, ev.owner, hlc, true)) {
-                        self.announceChannelProp(ev.entity.id, ev.key, ev.value, ev.owner, hlc, true);
+                    // LOCAL origin: sign the fact ONCE so every re-broadcast/burst
+                    // re-emits THIS node's signature and any hop self-certifies it.
+                    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+                    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+                    const ps = self.signLocalChannelProp(true, ev.entity.id, ev.key, ev.value, ev.owner, hlc, &pk_buf, &sig_buf);
+                    if (self.recordChannelPropClock(ev.entity.id, ev.key, ev.owner, hlc, true, ps.node, ps.pubkey, ps.sig)) {
+                        self.announceChannelProp(ev.entity.id, ev.key, ev.value, ev.owner, hlc, true, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                     }
                 }
                 try propEmitEntry(conn, ev);
@@ -12662,8 +12896,11 @@ pub const LinuxServer = struct {
                         const owner = conn.session.displayName();
                         for (rows) |ev| {
                             const hlc = self.nextChannelPropHlc();
-                            if (self.recordChannelPropClock(k.entity.id, ev.key, owner, hlc, false)) {
-                                self.announceChannelProp(k.entity.id, ev.key, "", owner, hlc, false);
+                            var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+                            var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+                            const ps = self.signLocalChannelProp(false, k.entity.id, ev.key, "", owner, hlc, &pk_buf, &sig_buf);
+                            if (self.recordChannelPropClock(k.entity.id, ev.key, owner, hlc, false, ps.node, ps.pubkey, ps.sig)) {
+                                self.announceChannelProp(k.entity.id, ev.key, "", owner, hlc, false, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                             }
                         }
                     }
@@ -12674,8 +12911,11 @@ pub const LinuxServer = struct {
                 if (k.entity.kind == .channel) {
                     const hlc = self.nextChannelPropHlc();
                     const owner = conn.session.displayName();
-                    if (self.recordChannelPropClock(k.entity.id, k.key, owner, hlc, false)) {
-                        self.announceChannelProp(k.entity.id, k.key, "", owner, hlc, false);
+                    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+                    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+                    const ps = self.signLocalChannelProp(false, k.entity.id, k.key, "", owner, hlc, &pk_buf, &sig_buf);
+                    if (self.recordChannelPropClock(k.entity.id, k.key, owner, hlc, false, ps.node, ps.pubkey, ps.sig)) {
+                        self.announceChannelProp(k.entity.id, k.key, "", owner, hlc, false, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                     }
                 }
                 try propEmitEnd(conn, k.entity);
@@ -20429,6 +20669,241 @@ test "deliverRelay re-forward preserves the signature for the next hop" {
     // And deliverRelay itself accepts (does not count a rejection) for a signed msg.
     server.deliverRelay(msg);
     try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+}
+
+// ---------------------------------------------------------------------------
+// CHANNEL_PROP CRDT multi-hop origin signing (daemon paths)
+// ---------------------------------------------------------------------------
+
+/// A borrowed-slice CHANNEL_PROP fact shaped like `S2sPeer.ChannelPropDelta`,
+/// for feeding the daemon's `applyRemoteChannelProp` (which reads slices and
+/// dupes into the clock). Tests own the backing buffers.
+const TestPropFact = struct {
+    channel: []const u8,
+    key: []const u8,
+    value: []const u8,
+    owner: []const u8,
+    hlc: u64,
+    present: bool,
+    origin_node: u64,
+    origin_pubkey: []const u8 = "",
+    origin_sig: []const u8 = "",
+};
+
+/// Build a CHANNEL_PROP fact signed by `kp` at its self-certified origin id.
+fn buildSignedProp(
+    kp: *const sign_mod.KeyPair,
+    channel: []const u8,
+    key: []const u8,
+    value: []const u8,
+    owner: []const u8,
+    hlc: u64,
+    present: bool,
+    pk_buf: *[channel_prop_event.pubkey_len]u8,
+    sig_buf: *[channel_prop_event.sig_len]u8,
+) !TestPropFact {
+    var ev = channel_prop_event.ChannelPropEvent{
+        .present = present,
+        .origin_node = channel_prop_event.originShortId(kp.public_key),
+        .hlc = hlc,
+        .channel = channel,
+        .key = key,
+        .value = value,
+        .owner = owner,
+    };
+    const transcript = try channel_prop_event.originTranscript(std.testing.allocator, ev);
+    defer std.testing.allocator.free(transcript);
+    try channel_prop_event.signInPlace(&ev, kp, transcript, pk_buf, sig_buf);
+    return .{
+        .channel = channel,
+        .key = key,
+        .value = value,
+        .owner = owner,
+        .hlc = hlc,
+        .present = present,
+        .origin_node = ev.origin_node,
+        .origin_pubkey = ev.origin_pubkey,
+        .origin_sig = ev.origin_sig,
+    };
+}
+
+test "channel prop: a locally-authored fact is signed and verifies against its origin" {
+    var ident = try node_identity.fromSeed([_]u8{0x71} ** 32, "local");
+    defer ident.deinit();
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+    const ps = server.signLocalChannelProp(true, "#room", "TOPICLOCK", "1", "alice", 100, &pk_buf, &sig_buf);
+    try std.testing.expectEqual(ident.shortId(), ps.node);
+    try std.testing.expectEqual(@as(usize, channel_prop_event.pubkey_len), ps.pubkey.len);
+
+    // Store + read back; the stored signature self-certifies the local origin.
+    try std.testing.expect(server.recordChannelPropClock("#room", "TOPICLOCK", "alice", 100, true, ps.node, ps.pubkey, ps.sig));
+    const clock = server.channelPropClock("#room", "TOPICLOCK").?;
+    const ev = channel_prop_event.ChannelPropEvent{
+        .present = true,
+        .origin_node = clock.origin_node,
+        .hlc = clock.hlc,
+        .channel = "#room",
+        .key = "TOPICLOCK",
+        .value = "1",
+        .owner = "alice",
+        .origin_pubkey = clock.origin_pubkey,
+        .origin_sig = clock.origin_sig,
+    };
+    try std.testing.expectEqual(channel_prop_event.VerifyOutcome.verified, try channel_prop_event.verifyOrigin(std.testing.allocator, ev));
+}
+
+test "channel prop: an inbound signed fact verifies, applies, and is stored for re-broadcast" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const founder_id = try addTestLocalClient(&server, "Founder", null);
+    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x82} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedProp(&kp, "#mesh", "SUBJECT", "hello", "remoteacct", 500, true, &pk_buf, &sig_buf);
+
+    try std.testing.expect(server.applyRemoteChannelProp(fact));
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+
+    // The ORIGINAL author's origin + signature were stored verbatim (NOT this
+    // node's), so a re-broadcast/burst re-emits the original author's signature.
+    const clock = server.channelPropClock("#mesh", "SUBJECT").?;
+    try std.testing.expectEqual(fact.origin_node, clock.origin_node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+
+    // burstPropOrigin re-derives the emit attribution and, because the live tuple
+    // still matches the signed one, re-emits the ORIGINAL author's (pubkey, sig).
+    const origin = server.burstPropOrigin(clock, true, "hello", "remoteacct");
+    try std.testing.expectEqual(fact.origin_node, origin.node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, origin.sig);
+}
+
+test "channel prop: a forged inbound fact is rejected, counted, and not applied" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const founder_id = try addTestLocalClient(&server, "Founder", null);
+    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x83} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+
+    // (1) Tampered value after signing: structure valid, signature is not.
+    var tampered = try buildSignedProp(&kp, "#mesh", "K", "original", "alice", 600, true, &pk_buf, &sig_buf);
+    tampered.value = "tampered value the origin never authored";
+    try std.testing.expect(!server.applyRemoteChannelProp(tampered));
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+    try std.testing.expect(server.channelPropClock("#mesh", "K") == null);
+
+    // (2) A pubkey whose originShortId does not self-certify the claimed origin.
+    var bad_origin = try buildSignedProp(&kp, "#mesh", "K2", "v", "alice", 601, true, &pk_buf, &sig_buf);
+    bad_origin.origin_node = channel_prop_event.originShortId(kp.public_key) ^ 0x1;
+    try std.testing.expect(!server.applyRemoteChannelProp(bad_origin));
+    try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_signatures);
+    try std.testing.expect(server.channelPropClock("#mesh", "K2") == null);
+
+    // (3) Tampered owner/channel/key each break verification too.
+    inline for (.{ "owner", "channel", "key" }) |field| {
+        var t = try buildSignedProp(&kp, "#mesh", "K3", "v", "alice", 602, true, &pk_buf, &sig_buf);
+        @field(t, field) = "HIJACKED";
+        try std.testing.expect(!server.applyRemoteChannelProp(t));
+        try std.testing.expect(server.channelPropClock("#mesh", "K3") == null);
+    }
+    try std.testing.expectEqual(@as(u64, 5), server.rejected_relay_signatures);
+}
+
+test "channel prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const founder_id = try addTestLocalClient(&server, "Founder", null);
+    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+
+    // A THIRD node authored the fact; THIS node is a relay with its own identity.
+    var ident = try node_identity.fromSeed([_]u8{0x84} ** 32, "relay");
+    defer ident.deinit();
+    server.config.node_id = ident.shortId();
+    server.config.node_identity = &ident;
+
+    var author = try sign_mod.KeyPair.fromSeed([_]u8{0x90} ** sign_mod.seed_len);
+    defer author.deinit();
+    var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [channel_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedProp(&author, "#mesh", "OWNERKEY", "v", "carol", 700, true, &pk_buf, &sig_buf);
+    // Sanity: the author is NOT this relay node.
+    try std.testing.expect(fact.origin_node != ident.shortId());
+
+    try std.testing.expect(server.applyRemoteChannelProp(fact));
+    const clock = server.channelPropClock("#mesh", "OWNERKEY").?;
+
+    // The re-broadcast attribution is the AUTHOR's, not the relay's: a receiver
+    // self-certifies `originShortId(pubkey) == origin_node` (the author), which is
+    // the whole point of multi-hop CRDT signing.
+    const origin = server.burstPropOrigin(clock, true, "v", "carol");
+    try std.testing.expectEqual(fact.origin_node, origin.node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+    const reemit = channel_prop_event.ChannelPropEvent{
+        .present = true,
+        .origin_node = origin.node,
+        .hlc = clock.hlc,
+        .channel = "#mesh",
+        .key = "OWNERKEY",
+        .value = "v",
+        .owner = "carol",
+        .origin_pubkey = origin.pubkey,
+        .origin_sig = origin.sig,
+    };
+    try std.testing.expectEqual(channel_prop_event.VerifyOutcome.verified, try channel_prop_event.verifyOrigin(std.testing.allocator, reemit));
+}
+
+test "channel prop: a legacy unsigned inbound fact still applies (backward compat)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const founder_id = try addTestLocalClient(&server, "Founder", null);
+    _ = try server.world.join("#mesh", worldIdFromClient(founder_id));
+
+    // No origin_pubkey/origin_sig: the legacy unsigned path, applied unchanged.
+    const fact = TestPropFact{
+        .channel = "#mesh",
+        .key = "LEGACY",
+        .value = "unsigned still flows",
+        .owner = "dave",
+        .hlc = 800,
+        .present = true,
+        .origin_node = 99,
+    };
+    try std.testing.expect(server.applyRemoteChannelProp(fact));
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+    const clock = server.channelPropClock("#mesh", "LEGACY").?;
+    try std.testing.expectEqual(@as(usize, 0), clock.origin_pubkey.len);
+    try std.testing.expectEqual(@as(usize, 0), clock.origin_sig.len);
+    // An unsigned clock re-emits an unsigned origin (legacy LWW at the receiver).
+    const origin = server.burstPropOrigin(clock, true, "unsigned still flows", "dave");
+    try std.testing.expectEqual(@as(u64, 99), origin.node);
+    try std.testing.expectEqual(@as(usize, 0), origin.pubkey.len);
 }
 
 test "remote aggregate channel mode flags cannot clear local +nt policy" {

@@ -583,6 +583,12 @@ pub const S2sPeer = struct {
     };
 
     /// A remote IRCX channel PROP mutation. Strings are heap-owned by the delta.
+    /// `origin_node` is the ORIGINAL author's node short id (preserved verbatim
+    /// across re-broadcast, NOT the immediate link peer). `origin_pubkey`/
+    /// `origin_sig` carry the self-contained multi-hop origin signature when the
+    /// fact was authored by a signing-capable node (empty on the legacy path);
+    /// the daemon verifies them against `origin_node` before applying and stores
+    /// them so a re-broadcast/burst re-emits the ORIGINAL author's signature.
     pub const ChannelPropDelta = struct {
         channel: []u8,
         key: []u8,
@@ -590,12 +596,17 @@ pub const S2sPeer = struct {
         owner: []u8,
         hlc: u64,
         present: bool,
+        origin_node: NodeId,
+        origin_pubkey: []u8,
+        origin_sig: []u8,
 
         pub fn deinit(self: *ChannelPropDelta, allocator: std.mem.Allocator) void {
             allocator.free(self.channel);
             allocator.free(self.key);
             allocator.free(self.value);
             allocator.free(self.owner);
+            allocator.free(self.origin_pubkey);
+            allocator.free(self.origin_sig);
             self.* = undefined;
         }
     };
@@ -932,26 +943,38 @@ pub const S2sPeer = struct {
 
     /// Queue an inbound CHANNEL_PROP event for daemon-side LWW apply. Malformed
     /// payloads and allocation failures are dropped without faulting the link.
+    ///
+    /// A CHANNEL_PROP fact is a CRDT fact that the mesh RE-BROADCASTS with the
+    /// ORIGINAL `origin_node` preserved, so the direct-peer origin gate is only
+    /// the LEGACY (unsigned) trust level: it applies when the fact carries no
+    /// self-contained multi-hop signature (the immediate peer is then asserted as
+    /// the author). When the fact carries a `(origin_pubkey, origin_sig)` pair,
+    /// the origin is a (possibly third) node certified end-to-end by the daemon's
+    /// `verifyOrigin` check, so the direct-origin gate is intentionally bypassed
+    /// here — a relay legitimately forwards a fact authored elsewhere. The pubkey/
+    /// sig are staged so the daemon can verify against the claimed origin and
+    /// preserve the ORIGINAL signature on re-broadcast.
     fn recvChannelProp(self: *S2sPeer, frame_payload: []const u8) !void {
         const payload = self.verifiedPayload(.CHANNEL_PROP, frame_payload) orelse return;
         const ev = channel_prop_event.decode(payload) catch return;
-        if (!self.acceptsDirectOrigin(ev.origin_node)) return;
+        const signed = ev.origin_pubkey.len != 0;
+        // Legacy unsigned facts keep the direct-owned origin gate (the peer must
+        // BE the asserted origin). Signed multi-hop facts skip it: the daemon's
+        // self-certifying signature check is the authoritative origin gate.
+        if (!signed and !self.acceptsDirectOrigin(ev.origin_node)) return;
+
         const ch = self.allocator.dupe(u8, ev.channel) catch return;
-        const key = self.allocator.dupe(u8, ev.key) catch {
-            self.allocator.free(ch);
-            return;
-        };
-        const value = self.allocator.dupe(u8, ev.value) catch {
-            self.allocator.free(ch);
-            self.allocator.free(key);
-            return;
-        };
-        const owner = self.allocator.dupe(u8, ev.owner) catch {
-            self.allocator.free(ch);
-            self.allocator.free(key);
-            self.allocator.free(value);
-            return;
-        };
+        errdefer self.allocator.free(ch);
+        const key = self.allocator.dupe(u8, ev.key) catch return;
+        errdefer self.allocator.free(key);
+        const value = self.allocator.dupe(u8, ev.value) catch return;
+        errdefer self.allocator.free(value);
+        const owner = self.allocator.dupe(u8, ev.owner) catch return;
+        errdefer self.allocator.free(owner);
+        const origin_pubkey = self.allocator.dupe(u8, ev.origin_pubkey) catch return;
+        errdefer self.allocator.free(origin_pubkey);
+        const origin_sig = self.allocator.dupe(u8, ev.origin_sig) catch return;
+        errdefer self.allocator.free(origin_sig);
 
         self.prop_changes.append(self.allocator, .{
             .channel = ch,
@@ -960,16 +983,34 @@ pub const S2sPeer = struct {
             .owner = owner,
             .hlc = ev.hlc,
             .present = ev.present,
-        }) catch {
-            self.allocator.free(ch);
-            self.allocator.free(key);
-            self.allocator.free(value);
-            self.allocator.free(owner);
-        };
+            .origin_node = ev.origin_node,
+            .origin_pubkey = origin_pubkey,
+            .origin_sig = origin_sig,
+        }) catch return;
     }
 
-    /// Emit a CHANNEL_PROP event to the peer announcing a local IRCX channel
-    /// property set/delete. Best-effort; only meaningful once established.
+    /// Origin attribution for a CHANNEL_PROP emit. A prop fact is a CRDT fact the
+    /// mesh re-broadcasts with the ORIGINAL author preserved, so the caller can
+    /// override the stamped origin and carry the author's self-contained multi-hop
+    /// signature verbatim:
+    ///   * `node == 0`  => the LOCAL node is the author (legacy/direct-owned path);
+    ///     `self.local_node_id` is stamped. `pubkey`/`sig` may still be supplied
+    ///     when this node signs its own freshly-authored fact.
+    ///   * `node != 0`  => a RE-BROADCAST of a fact authored elsewhere; `node` is
+    ///     stamped as the origin and `pubkey`/`sig` are the original author's,
+    ///     forwarded byte-for-byte (this node never re-signs).
+    /// `pubkey`/`sig` are empty on the unsigned path. They are encoded inside the
+    /// CHANNEL_PROP payload (NOT the per-link `signed_frame` envelope, which still
+    /// authenticates the immediate hop independently).
+    pub const PropOrigin = struct {
+        node: NodeId = 0,
+        pubkey: []const u8 = "",
+        sig: []const u8 = "",
+    };
+
+    /// Emit a CHANNEL_PROP event to the peer. Best-effort; only meaningful once
+    /// established. `origin` selects local-authored vs re-broadcast attribution
+    /// and carries the multi-hop origin signature (see `PropOrigin`).
     pub fn sendChannelProp(
         self: *S2sPeer,
         sink: ByteSink,
@@ -979,17 +1020,20 @@ pub const S2sPeer = struct {
         owner: []const u8,
         hlc: u64,
         present: bool,
+        origin: PropOrigin,
     ) !void {
         const ev = channel_prop_event.ChannelPropEvent{
             .present = present,
-            .origin_node = self.local_node_id,
+            .origin_node = if (origin.node != 0) origin.node else self.local_node_id,
             .hlc = hlc,
             .channel = channel,
             .key = key,
             .value = value,
             .owner = owner,
+            .origin_pubkey = origin.pubkey,
+            .origin_sig = origin.sig,
         };
-        var buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32]u8 = undefined;
+        var buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32 + 1 + channel_prop_event.pubkey_len + channel_prop_event.sig_len]u8 = undefined;
         const wire = try channel_prop_event.encode(ev, &buf);
         try self.emitSignable(sink, .CHANNEL_PROP, wire);
     }
@@ -1830,8 +1874,9 @@ test "signing peers negotiate frame_signing and a signed CHANNEL_PROP round-trip
     try std.testing.expect(b.peer_supports_signing);
 
     // A announces a signed CHANNEL_PROP; B accepts it after self-certifying A's
-    // origin, with no rejection counted.
-    try a.sendChannelProp(a_to_b.sink(), "#room", "TOPICLOCK", "1", "alice", 100, true);
+    // origin, with no rejection counted. (Per-link signed_frame envelope; no
+    // multi-hop origin signature carried here — origin defaults to local.)
+    try a.sendChannelProp(a_to_b.sink(), "#room", "TOPICLOCK", "1", "alice", 100, true, .{});
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xC0FFEE);
 
     const props = try b.takeChannelPropChanges();
