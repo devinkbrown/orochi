@@ -39,6 +39,10 @@ pub const Error = error{
     PemEndMissing,
     PemInvalidBase64,
     OutputTooSmall,
+    /// SubjectPublicKeyInfo uses an algorithm Orochi's verifier does not support.
+    UnsupportedKey,
+    /// SubjectPublicKeyInfo is structurally malformed for its key family.
+    InvalidKey,
 };
 
 pub const Sha256Digest = hash.Sha256.Digest;
@@ -273,6 +277,119 @@ pub const Certificate = ParsedCertificate(DefaultMaxDnsNames, DefaultMaxIpAddres
 
 pub fn parse(der: []const u8) Error!Certificate {
     return Certificate.parse(der);
+}
+
+// ---------------------------------------------------------------------------
+// SubjectPublicKeyInfo extraction.
+//
+// Recovers the raw public-key material an issuer needs to verify a child
+// certificate's signature. Slices alias the caller-owned SPKI bytes; no
+// allocation, no copying. Only the key families Orochi's X.509 verifier
+// dispatches on are recognized — anything else is `UnsupportedKey`, so callers
+// fail closed rather than treating an unknown key as trusted.
+// ---------------------------------------------------------------------------
+
+/// Algorithm OIDs found in a SubjectPublicKeyInfo AlgorithmIdentifier.
+const SpkiOid = struct {
+    /// rsaEncryption (1.2.840.113549.1.1.1).
+    const rsa_encryption = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
+    /// id-ecPublicKey (1.2.840.10045.2.1).
+    const ec_public_key = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+    /// prime256v1 / secp256r1 (1.2.840.10045.3.1.7).
+    const prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
+    /// id-Ed25519 (1.3.101.112).
+    const ed25519 = [_]u8{ 0x2B, 0x65, 0x70 };
+};
+
+/// Length of an Ed25519 raw public key.
+pub const ed25519_public_key_len = 32;
+/// Length of an uncompressed SEC1 P-256 point (0x04 || X32 || Y32).
+pub const ec_p256_sec1_len = 65;
+
+/// RSA public key recovered from an SPKI: big-endian modulus and exponent with
+/// any DER sign-padding (leading 0x00) byte stripped to the unsigned magnitude.
+pub const RsaPublicKey = struct {
+    modulus: []const u8,
+    exponent: []const u8,
+};
+
+/// A parsed SubjectPublicKeyInfo, tagged by key family.
+pub const SubjectPublicKey = union(enum) {
+    rsa: RsaPublicKey,
+    /// Uncompressed SEC1 P-256 point (`0x04 || X32 || Y32`), 65 bytes.
+    ecdsa_p256: []const u8,
+    /// Raw 32-byte Ed25519 public key.
+    ed25519: []const u8,
+};
+
+/// Parse a SubjectPublicKeyInfo (`spki_der`, the full `SEQUENCE`) into the raw
+/// public-key material. Recognizes RSA, ECDSA P-256, and Ed25519; any other
+/// algorithm is `error.UnsupportedKey`.
+pub fn extractPublicKey(spki_der: []const u8) Error!SubjectPublicKey {
+    var top = DerReader.init(spki_der);
+    const seq = try top.readExpected(Tag.sequence);
+    try top.expectEmpty();
+
+    var spki = try top.child(seq);
+    const alg_seq = try spki.readExpected(Tag.sequence);
+    const key_bits = try spki.readExpected(Tag.bit_string);
+    try spki.expectEmpty();
+
+    const alg = try parseSpkiAlgorithm(spki, alg_seq);
+    const key_bytes = try parseBitString(key_bits);
+
+    if (std.mem.eql(u8, alg.oid, &SpkiOid.rsa_encryption)) {
+        var r = DerReader.init(key_bytes);
+        const rsa_seq = try r.readExpected(Tag.sequence);
+        try r.expectEmpty();
+        var body = try r.child(rsa_seq);
+        const modulus = try unsignedInteger(try body.readExpected(Tag.integer));
+        const exponent = try unsignedInteger(try body.readExpected(Tag.integer));
+        try body.expectEmpty();
+        return .{ .rsa = .{ .modulus = modulus, .exponent = exponent } };
+    }
+    if (std.mem.eql(u8, alg.oid, &SpkiOid.ec_public_key)) {
+        const params = alg.params orelse return error.UnsupportedKey;
+        if (!std.mem.eql(u8, params, &SpkiOid.prime256v1)) return error.UnsupportedKey;
+        if (key_bytes.len != ec_p256_sec1_len or key_bytes[0] != 0x04) return error.InvalidKey;
+        return .{ .ecdsa_p256 = key_bytes };
+    }
+    if (std.mem.eql(u8, alg.oid, &SpkiOid.ed25519)) {
+        if (key_bytes.len != ed25519_public_key_len) return error.InvalidKey;
+        return .{ .ed25519 = key_bytes };
+    }
+    return error.UnsupportedKey;
+}
+
+const SpkiAlgorithm = struct {
+    oid: []const u8,
+    params: ?[]const u8,
+};
+
+fn parseSpkiAlgorithm(parent: DerReader, seq_tlv: Tlv) Error!SpkiAlgorithm {
+    var r = try parent.child(seq_tlv);
+    const oid = try r.readExpected(Tag.oid);
+    try validateOid(oid.value);
+    var params: ?[]const u8 = null;
+    if (r.hasRemaining()) {
+        const p = try r.readTlv();
+        if (p.tag == Tag.oid) params = p.value;
+    }
+    try r.expectEmpty();
+    return .{ .oid = oid.value, .params = params };
+}
+
+/// DER INTEGER content as an unsigned big-endian magnitude: rejects negatives
+/// and strips the single leading 0x00 sign byte DER requires when the magnitude
+/// MSB is set.
+fn unsignedInteger(tlv: Tlv) Error![]const u8 {
+    if (tlv.tag != Tag.integer or tlv.value.len == 0) return error.InvalidInteger;
+    try validateDerInteger(tlv.value);
+    if ((tlv.value[0] & 0x80) != 0) return error.InvalidInteger; // negative
+    var v = tlv.value;
+    if (v.len > 1 and v[0] == 0) v = v[1..];
+    if (v.len == 0) return error.InvalidInteger;
+    return v;
 }
 
 /// Decode a single CERTIFICATE PEM block into caller-provided DER storage.
@@ -815,4 +932,28 @@ test "malformed certificates and PEM are rejected" {
         error.PemInvalidBase64,
         pemToDer("-----BEGIN CERTIFICATE-----\n@@@@\n-----END CERTIFICATE-----\n", &der_buf),
     );
+}
+
+test "extractPublicKey recovers the Ed25519 key from the embedded SPKI" {
+    var der_buf: [512]u8 = undefined;
+    const der = try pemToDer(TestPem, &der_buf);
+    const cert = try parse(der);
+
+    const key = try extractPublicKey(cert.spki_der);
+    switch (key) {
+        .ed25519 => |raw| {
+            try std.testing.expectEqual(@as(usize, ed25519_public_key_len), raw.len);
+            // The embedded fixture's SPKI key bits are the 32 bytes after the
+            // BIT STRING's leading unused-bits octet.
+            try std.testing.expectEqualSlices(u8, cert.spki_value[cert.spki_value.len - 32 ..], raw);
+        },
+        else => return error.InvalidCertificate,
+    }
+}
+
+test "extractPublicKey rejects a truncated SPKI" {
+    var der_buf: [512]u8 = undefined;
+    const der = try pemToDer(TestPem, &der_buf);
+    const cert = try parse(der);
+    try std.testing.expectError(error.Truncated, extractPublicKey(cert.spki_der[0 .. cert.spki_der.len - 1]));
 }

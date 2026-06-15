@@ -10,6 +10,7 @@ const hash = @import("hash.zig");
 const aead = @import("aead.zig");
 const kx = @import("kx.zig");
 const Secret = @import("secret.zig").Secret;
+const x509_verify = @import("x509_verify.zig");
 
 pub const max_plaintext_len = 16 * 1024;
 pub const max_ciphertext_len = max_plaintext_len + 256;
@@ -525,10 +526,33 @@ pub const CertificateVerifier = struct {
         chain: CertificateChain,
         context: CertificateVerifyContext,
     ) CertificateVerifyError!void {
-        // TODO(x509): route to Orochi's DER/X.509 verifier module.
+        // Cryptographic chain integrity to a self-signed root is enforced here,
+        // independent of the caller's policy hook: every certificate's
+        // signature is verified against its issuer's public key and the chain
+        // must terminate in a self-signed root whose signature verifies. This
+        // closes the prior parse-only gap where a forged signature linking by DN
+        // alone would pass through. Anchoring (which root to trust) and naming
+        // remain the verifyFn's responsibility — see x509_verify's module header.
+        mapChainError(x509_verify.verifySimpleChain(chain.der_chain)) catch |err| return err;
         try self.verifyFn(self.ptr, chain, context);
     }
 };
+
+/// Map x509_verify chain errors onto the TLS certificate-verify error surface.
+fn mapChainError(result: x509_verify.Error!void) CertificateVerifyError!void {
+    result catch |err| switch (err) {
+        error.UnsupportedSigAlg, error.UnsupportedKey => return error.UnsupportedSigAlg,
+        error.NotYetValid, error.Expired => return error.Expired,
+        error.EmptyChain,
+        error.IssuerMismatch,
+        error.NotSelfSigned,
+        error.MissingSignature,
+        error.BadSignature,
+        error.InvalidKey,
+        => return error.CertificateInvalid,
+        else => return error.CertificateInvalid,
+    };
+}
 
 pub const CertificateVerifyError = error{
     CertificateInvalid,
@@ -862,6 +886,65 @@ test "TLS 1.3 key schedule rejects wrong transcript hash length and bad suite" {
     defer early.wipe();
     try std.testing.expectError(error.BadTranscriptHash, Tls13Sha256.deriveSecret(&early, "derived", "bad"));
     try std.testing.expectError(error.InvalidCipherSuite, Tls13Sha256.trafficKeys(.tls_rsa_with_aes_128_gcm_sha256, &early));
+}
+
+// Track whether the policy hook was reached, to prove the chain signature gate
+// runs BEFORE the caller's verifyFn (a forged chain must never reach the hook).
+const HookProbe = struct {
+    reached: bool = false,
+    fn verify(ptr: *anyopaque, chain: CertificateChain, ctx: CertificateVerifyContext) CertificateVerifyError!void {
+        _ = chain;
+        _ = ctx;
+        const self: *HookProbe = @ptrCast(@alignCast(ptr));
+        self.reached = true;
+    }
+};
+
+test "CertificateVerifier enforces chain signatures before the policy hook" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const StdEd25519 = std.crypto.sign.Ed25519;
+
+    const kp = try StdEd25519.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+    var root_buf: [512]u8 = undefined;
+    const root = try x509_selfsign.buildSelfSigned(&root_buf, .{
+        .common_name = "verifier.test.root",
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{ 0x70, 0x01 },
+        .key_pair = kp,
+        .is_ca = true,
+    });
+
+    const ctx = CertificateVerifyContext{
+        .version = .tls13,
+        .suite = .tls_aes_128_gcm_sha256,
+        .server_name = "verifier.test.root",
+        .transcript_hash = "",
+    };
+
+    // Valid self-signed chain: the signature gate passes, the hook is reached.
+    {
+        var probe = HookProbe{};
+        const verifier = CertificateVerifier{ .ptr = &probe, .verifyFn = HookProbe.verify };
+        const good = [_][]const u8{root};
+        try verifier.verify(.{ .der_chain = &good }, ctx);
+        try std.testing.expect(probe.reached);
+    }
+
+    // Forged chain: flip the trailing signature byte. The gate must reject it as
+    // CertificateInvalid and the policy hook must NOT run.
+    {
+        var forged_buf: [512]u8 = undefined;
+        @memcpy(forged_buf[0..root.len], root);
+        forged_buf[root.len - 1] ^= 0x01;
+        const forged = forged_buf[0..root.len];
+
+        var probe = HookProbe{};
+        const verifier = CertificateVerifier{ .ptr = &probe, .verifyFn = HookProbe.verify };
+        const bad = [_][]const u8{forged};
+        try std.testing.expectError(error.CertificateInvalid, verifier.verify(.{ .der_chain = &bad }, ctx));
+        try std.testing.expect(!probe.reached);
+    }
 }
 
 test {
