@@ -139,21 +139,31 @@ can no longer precompute a victim's stream id and hijack/inject on the
 native-media UDP port). Confirmed already-present (not gaps): channel ACCESS
 GRANT bypasses +l/+i/+k/+b on join.
 
-Still open (genuine future work, larger or cross-component):
+Also closed (mesh origin authentication is now complete):
 
-- **Multi-hop / CRDT re-broadcast origin signing.** Direct-owned frames are now
-  signed end-to-end; the MESSAGE relay and CRDT delta/BURST re-broadcast (which
-  re-emit a third node's fact with its `origin_node` preserved) still need
-  per-fact `(pubkey, sig)` storage so a relay forwards the ORIGINAL signer's
-  signature rather than its own. See `signed_frame.zig` FOLLOW-UP.
+- **Multi-hop / CRDT re-broadcast origin signing — DONE.** The genuinely
+  multi-hop frames now carry a self-contained origin signature verified at every
+  hop: the MESSAGE relay (`message_relay.zig`), CHANNEL_PROP CRDT facts
+  (`channel_prop_event.zig`, with the origin `(pubkey, sig)` stored in the prop
+  clock and re-emitted verbatim on re-broadcast/burst), and USER/MEMBER props via
+  a new signed `ENTITY_PROP` frame (`entity_prop_event.zig`). The direct-owned
+  frames (MEMBERSHIP, CHANNEL_MODE_STATE/FLAGS, CHANNEL_LIST, TOPIC, NICKCHANGE,
+  unsigned CHANNEL_PROP) are gated by `acceptsDirectOrigin` (origin == immediate
+  peer) and are cryptographically authenticated per-link by `signed_frame.zig`;
+  they are never re-emitted with a foreign origin, so no multi-hop case remains.
+  A relay can no longer forge or alter any node's frame.
+- **USER/MEMBER PROP propagation — DONE** (signed, LWW, multi-hop) via the
+  `ENTITY_PROP` frame. (There is no distinct `account` entity kind; account
+  metadata lives in the account backend, not IRCX props.)
+
+Still open (cross-component, lower value):
+
 - **Per-datagram native-media payload authentication.** The unguessable stream id
-  closes the precompute/hijack vector server-side; a full per-datagram MAC on the
-  media payload itself would still need a coordinated browser-codec change on the
-  Nexus/Ocean clients (the kagura frame is assembled in client JS, not this
-  repo), so it remains cross-component.
-- Account/user/member PROP propagation over mesh (channel PROP already
-  propagates; user/member props are session-local, so this needs new
-  ACCOUNT/USER PROP convergence frames for relatively low value).
+  (keyed-PRF capability) closes the precompute/hijack vector server-side; a full
+  per-datagram MAC on the media payload itself would need a coordinated change in
+  the Nexus/Ocean client JS (the kagura frame is assembled client-side, not in
+  this repo) for marginal additional benefit, so it remains cross-component and
+  is deliberately not stubbed server-only (would be inert until the clients ship).
 
 Intentional divergences / out of scope (NOT gaps): EVENT numerics `808-825`
 (Orochi uses the `NOTE EVENT` wire form by design), `RPL_LISTXPICS 813` (no
