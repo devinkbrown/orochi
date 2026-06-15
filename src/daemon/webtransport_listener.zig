@@ -211,6 +211,11 @@ pub const WebTransportListener = struct {
     /// Prepend a PROXY-protocol v1 header carrying the real QUIC peer address.
     /// Off by default (loopback identity); see module doc.
     send_proxy_header: bool = false,
+    /// Interop / echo mode: when set, every WebTransport datagram received on a
+    /// session is echoed straight back to the peer (RFC 9297/9220 datagram leg).
+    /// Off in production (the IRC bridge carries stream bytes, not datagrams);
+    /// the browser interop harness flips this on to validate the datagram path.
+    echo_wt_datagrams: bool = false,
     max_connections: usize = default_max_connections,
 
     /// Retry policy (RFC 9000 §8.1.2). `.never` is the default fast path — a new
@@ -584,6 +589,7 @@ pub const WebTransportListener = struct {
             return;
         };
         self.drainEvents(conn); // never tears down (only opens/closes the bridge)
+        if (self.echo_wt_datagrams) self.pumpDatagramEcho(conn);
         if (!self.pumpBridge(conn)) return; // may tear down on a TCP/WT fault
         self.flush(conn);
 
@@ -711,6 +717,21 @@ pub const WebTransportListener = struct {
             }
         }
         return true;
+    }
+
+    /// Interop datagram-echo pump (only runs when `echo_wt_datagrams` is set).
+    /// Drains every WebTransport datagram the session has received and re-queues
+    /// each one back to the peer verbatim. The queued datagrams are flushed by
+    /// the caller's subsequent `flush(conn)`. Bounded: `recvWtDatagram` yields at
+    /// most the engine's bounded datagram inbox per service tick, so this loop
+    /// cannot run unbounded. Echo failures are non-fatal (a full send queue just
+    /// drops; the next tick retries the next datagram).
+    fn pumpDatagramEcho(self: *WebTransportListener, conn: *Connection) void {
+        _ = self;
+        while (conn.h3.recvWtDatagram() catch null) |payload| {
+            defer conn.h3.allocator.free(payload);
+            conn.h3.sendWtDatagram(payload) catch {};
+        }
     }
 
     /// Prepend a PROXY v1 line carrying the real QUIC peer address. Works for
@@ -995,6 +1016,12 @@ fn serverTransportParams(
         .initial_max_stream_data_uni = 256 * 1024,
         .initial_max_streams_uni = 8,
         .active_connection_id_limit = 2,
+        // RFC 9221 §3: advertise a non-zero max DATAGRAM frame size so the peer
+        // may send QUIC DATAGRAM frames. WebTransport datagrams (RFC 9297/9220)
+        // ride these, so a browser (Chrome) only enables WT datagrams once it
+        // sees this. 1200 comfortably covers a WT datagram (quarter-stream-id
+        // varint + payload) inside the QUIC min-MTU envelope.
+        .max_datagram_frame_size = 1200,
     };
 }
 

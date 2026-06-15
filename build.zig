@@ -258,6 +258,24 @@ pub fn build(b: *std.Build) void {
     const interop_step = b.step("quic-interop-server", "Build the standalone QUIC/HTTP3 interop test server");
     interop_step.dependOn(&b.addInstallArtifact(interop_exe, .{}).step);
 
+    // `zig build quic-interop-wt-server` — the WebTransport-specific interop
+    // server for a real browser (Chromium): an ECDSA-P256 short-validity cert
+    // (Chrome's serverCertificateHashes requirement), a loopback TCP echo bridge
+    // target, and the listener's WT datagram-echo mode. Driven by
+    // `tools/quic_interop_browser.{mjs,sh}`.
+    const interop_wt_exe = b.addExecutable(.{
+        .name = "quic_interop_wt_server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/quic_interop_wt_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "orochi", .module = mod }},
+        }),
+    });
+    const interop_wt_step = b.step("quic-interop-wt-server", "Build the standalone WebTransport (browser) interop test server");
+    interop_wt_step.dependOn(&b.addInstallArtifact(interop_wt_exe, .{}).step);
+
     // `zig build release` — one-shot optimized, stripped daemon (ReleaseFast)
     // installed to zig-out/bin, independent of the default step's optimize mode.
     const release_step = b.step("release", "Build an optimized, stripped daemon (ReleaseFast)");

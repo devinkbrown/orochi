@@ -42,6 +42,12 @@ pub const ParamId = enum(u64) {
     active_connection_id_limit = 0x0e,
     initial_source_connection_id = 0x0f,
     retry_source_connection_id = 0x10,
+    /// RFC 9221 §3 — the maximum size (in bytes) of a DATAGRAM frame this
+    /// endpoint is willing to receive. A non-zero value advertised by a peer is
+    /// what lets the other side send DATAGRAM frames at all. WebTransport
+    /// datagrams (RFC 9297/9220) ride QUIC DATAGRAM frames, so a server MUST
+    /// advertise this for a browser (Chrome) to enable WT datagrams.
+    max_datagram_frame_size = 0x20,
     _,
 
     pub fn fromInt(value: u64) ParamId {
@@ -89,6 +95,11 @@ pub const TransportParameters = struct {
     active_connection_id_limit: ?u64 = null,
     ack_delay_exponent: ?u64 = null,
     max_ack_delay: ?u64 = null,
+    /// RFC 9221 §3 — advertised maximum DATAGRAM frame size this endpoint will
+    /// receive. Absent/null means DATAGRAM frames are not supported (the peer
+    /// MUST NOT send them). A WebTransport server advertises a non-zero value so
+    /// the browser may send WT datagrams.
+    max_datagram_frame_size: ?u64 = null,
     disable_active_migration: bool = false,
 };
 
@@ -180,6 +191,8 @@ pub fn encode(
         try appendVarintParam(out, allocator, .ack_delay_exponent, v);
     if (params.max_ack_delay) |v|
         try appendVarintParam(out, allocator, .max_ack_delay, v);
+    if (params.max_datagram_frame_size) |v|
+        try appendVarintParam(out, allocator, .max_datagram_frame_size, v);
     if (params.disable_active_migration)
         try appendEmptyParam(out, allocator, .disable_active_migration);
 }
@@ -228,6 +241,7 @@ pub fn decode(body: []const u8) Error!TransportParameters {
             .active_connection_id_limit => params.active_connection_id_limit = try integerValue(value),
             .ack_delay_exponent => params.ack_delay_exponent = try integerValue(value),
             .max_ack_delay => params.max_ack_delay = try integerValue(value),
+            .max_datagram_frame_size => params.max_datagram_frame_size = try integerValue(value),
             .disable_active_migration => {
                 // A flag parameter MUST be zero-length (RFC 9000 §18.2).
                 if (value.len != 0) return Error.Malformed;
@@ -281,6 +295,7 @@ test "transport_param round-trip of a full server parameter set" {
         .initial_max_streams_bidi = 100,
         .initial_max_streams_uni = 3,
         .active_connection_id_limit = 8,
+        .max_datagram_frame_size = 1200,
         .disable_active_migration = true,
     };
 
@@ -300,6 +315,7 @@ test "transport_param round-trip of a full server parameter set" {
     try testing.expectEqual(@as(?u64, 100), out.initial_max_streams_bidi);
     try testing.expectEqual(@as(?u64, 3), out.initial_max_streams_uni);
     try testing.expectEqual(@as(?u64, 8), out.active_connection_id_limit);
+    try testing.expectEqual(@as(?u64, 1200), out.max_datagram_frame_size);
     try testing.expect(out.disable_active_migration);
     // Omitted params stay null.
     try testing.expectEqual(@as(?[]const u8, null), out.retry_source_connection_id);

@@ -192,10 +192,15 @@ pub const Settings = struct {
         };
     }
 
-    /// True if the peer advertised everything WebTransport-over-H3 requires:
-    /// H3 Datagrams, Extended CONNECT, and WebTransport itself (RFC 9220 §3.1).
+    /// True if the peer advertised what WebTransport-over-HTTP/3 requires:
+    /// `SETTINGS_ENABLE_WEBTRANSPORT` and `SETTINGS_H3_DATAGRAM` (RFC 9220 §3.1,
+    /// RFC 9297). NOTE: `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08, RFC 8441) is an
+    /// HTTP/2 setting and is NOT used in HTTP/3 — Extended CONNECT is enabled in
+    /// H3 by the presence of `SETTINGS_ENABLE_WEBTRANSPORT` itself. Real browsers
+    /// (Chrome) therefore omit 0x08 from their H3 SETTINGS, so it MUST NOT be
+    /// required here; requiring it rejects every browser WebTransport CONNECT.
     pub fn supportsWebTransport(self: Settings) bool {
-        return self.enable_webtransport and self.h3_datagram and self.enable_connect_protocol;
+        return self.enable_webtransport and self.h3_datagram;
     }
 };
 
@@ -647,6 +652,9 @@ pub const Http3Conn = struct {
         const frame = (try findFrame(st.body_buf.items, &pos, FrameType.settings)) orelse return;
         const settings = try decodeSettingsBody(frame.payload);
         self.peer_settings = settings;
+        h3Dbg("peer SETTINGS: enable_webtransport={} h3_datagram={} supportsWT={}", .{
+            settings.enable_webtransport, settings.h3_datagram, settings.supportsWebTransport(),
+        });
         st.settings_done = true;
         // Keep any trailing bytes after the SETTINGS frame for completeness.
         const remaining = st.body_buf.items[pos..];
@@ -766,6 +774,16 @@ pub const Http3Conn = struct {
         var decoded = try decodeConnectHeaders(self.allocator, header_block);
         defer decoded.section.deinit(self.allocator);
         const req = decoded.request;
+
+        h3Dbg("CONNECT sid={d} method='{s}' protocol='{s}' scheme='{s}' path='{s}' isWT={} peerWT={}", .{
+            sid,
+            req.method,
+            req.protocol,
+            req.scheme,
+            req.path,
+            req.isWebTransport(),
+            self.peerSupportsWebTransport(),
+        });
 
         if (!req.isWebTransport()) {
             // Not a WebTransport CONNECT: serve it as a normal HTTP/3 request
@@ -1314,6 +1332,28 @@ test "settings decode ignores unknown settings and reports missing WT support" {
     try custom.appendSlice(alloc, try webtransport.encodeVarint(1, &vbuf));
     const d2 = try decodeSettingsBody(custom.items);
     try testing.expect(d2.enable_webtransport);
+}
+
+test "supportsWebTransport accepts an HTTP/3 peer that omits ENABLE_CONNECT_PROTOCOL" {
+    // RFC 9220 §3.1: in HTTP/3, WebTransport requires only
+    // SETTINGS_ENABLE_WEBTRANSPORT + SETTINGS_H3_DATAGRAM. The HTTP/2-only
+    // SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08) is NOT sent by H3 peers (Chrome
+    // 149 omits it), so its absence MUST NOT reject the session. This mirrors
+    // exactly what a real browser's H3 SETTINGS carry.
+    const browser_like = Settings{
+        .enable_webtransport = true,
+        .h3_datagram = true,
+        .enable_connect_protocol = false, // browser omits 0x08 in H3
+    };
+    try testing.expect(browser_like.supportsWebTransport());
+
+    // But datagrams are still mandatory (RFC 9297): drop them and WT is off.
+    const no_dgram = Settings{ .enable_webtransport = true, .h3_datagram = false };
+    try testing.expect(!no_dgram.supportsWebTransport());
+
+    // As is WebTransport itself.
+    const no_wt = Settings{ .enable_webtransport = false, .h3_datagram = true };
+    try testing.expect(!no_wt.supportsWebTransport());
 }
 
 test "settings decode rejects a truncated value varint" {
