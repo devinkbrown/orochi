@@ -53,8 +53,20 @@ and tests for them:
   now advertised from `[network] icon_url` when set (Ophion `n_url` parity),
   `server.zig` `buildIsupportTokens`. Bare-form-only extban claims and the
   "SEARCH missing" / "SCRAM-512 not live" findings no longer apply.
+- 2026-06-16 parity cycle (implemented + reviewed; full suite `6977/6981`, 4
+  skipped): a TLS 1.3 exporter (RFC 8446 §7.5 / 9266) + **SCRAM-SHA-512-PLUS**
+  channel binding; **SESSION-TOKEN** SASL (TLS-only issuance, SHA-256 store,
+  constant-time compare); **OAUTHBEARER** (clean-room JWT — algorithm bound to the
+  configured key type, no `alg=none`/confusion, federated identities never
+  auto-opered) + **ANONYMOUS** (gated, privilege-less guest); per-datagram
+  **native-media MAC** (`[media].native_media_require_mac`); in-daemon **ACME
+  renewal** (atomic flag + reactor-0 hot-swap); and secured-link **`SQUIT`**
+  confirmed symmetric + tested.
 
 ## Real Missing Or Incomplete Features
+
+Only genuinely-open, deferred, or by-design-excluded items remain below; the
+fixed-items list above covers everything implemented.
 
 ### IRCv3 and SASL Parity
 
@@ -62,21 +74,6 @@ and tests for them:
   `m_filehost`. Orochi currently documents DCC/filehost as intentionally absent.
   If file sharing becomes an Orochi target, this needs a native design rather
   than resurrecting DCC proxy semantics.
-- **SESSION-TOKEN SASL (implemented).** A live `SESSION-TOKEN` mechanism: the
-  services store persists `SHA-256(token) -> account` with expiry, issuance is
-  TLS-only (`SESSIONTOKEN` services command + a best-effort post-SASL notice that
-  refuses non-TLS links with `INSECURE_TRANSPORT`), and the router validates with a
-  constant-time hash compare.
-- **SCRAM-SHA-512-PLUS (implemented).** The clean-room TLS stack now derives an
-  RFC 8446 §7.5 / RFC 9266 `tls-exporter` value (`hkdf_tls13.zig`), and
-  SCRAM-SHA-512-PLUS binds `c=` to `gs2-header || exporter`
-  (`sasl_scram512_server.zig`), advertised to TLS clients only.
-- **OAUTHBEARER and ANONYMOUS (implemented).** OAUTHBEARER (RFC 7628) verifies a
-  signed JWT (HS256/RS256/ES256) against a configured key via `oauth_jwt.zig` — the
-  algorithm is bound to the configured key type (no alg-confusion / `alg=none`), and
-  OAuth identities are federated and never auto-opered. ANONYMOUS (RFC 4505) is
-  config-gated (`[sasl].allow_anonymous`, default off) and binds a privilege-less
-  guest. Each advertises only when its gate is satisfied.
 - **`oper-tag` has no Ophion grounding.** The Ophion reference has no `oper-tag`
   cap or message tag, so there is nothing to port; left out until a concrete spec
   exists. (`network-icon` is implemented as the `NETWORKICON` ISUPPORT token — see
@@ -152,28 +149,12 @@ the Ophion CAP names:
   64 in the media room/session template. A config-driven participant cap is open.
 - **Runtime Kagura reassembly sizing remains comptime-bound.** Defaults exist,
   but the actual reassembly buffer capacity is still a compile-time parameter.
-- **Per-datagram native-media MAC (server side implemented).** Each native
-  (OPVOX/OPVIS) Kagura datagram carries an HMAC-SHA256-128 tag keyed from the
-  per-stream PRF capability; verification is config-gated by
-  `[media].native_media_require_mac` (default off for back-compat) and drops
-  untagged/bad-tag datagrams before the SFU learns the sender. End-to-end still
-  needs the matching Nexus/Ocean client change — the wire format is documented as
-  the client contract, and the server advertises `mac=hmac-sha256-128` on the
-  native media line.
+- **Native-media MAC end-to-end needs the client change.** The server side is
+  implemented (see fixed items + `docs/reference/native-media-mac.md`); full
+  coverage still needs the matching Nexus/Ocean client to compute the tag.
 
 ### Mesh, Ops, And Runtime
 
-- **Secured-link `SQUIT` is symmetric (resolved).** `findSquitVictim` →
-  `peerRemoteName` checks the secured link before the plaintext one
-  (`server.zig:11785-11797`), so `SQUIT <server>` matches secured peers. Peer links
-  live only on reactor 0 by design (`server.zig:2055`); that reactor-0 search is
-  covered for secured links — including the cross-shard call path — by the
-  `findSquitVictim` `SECURED.TEST` / `reactor-zero peer from another shard` tests.
-- **In-daemon ACME renewal (implemented).** `[acme]` enables a Linux-only
-  background scheduler (`acme_renewal.zig`) that checks the `[tls].cert_path` leaf
-  expiry every `check_interval`, issues off the reactor within `renew_before_days`,
-  and signals reactor 0 to hot-swap via `reloadTlsCerts` — no restart. The renewal
-  thread never mutates live TLS state cross-thread (atomic flag + reactor-0 reload).
 - **Web admin/dashboard is absent.** Orochi has static stats export and live
   Prometheus `/metrics`; it does not ship Ophion-style optional webadmin/Python
   module equivalents.
