@@ -1,4 +1,5 @@
-//! Per-account SCRAM-SHA-256 credential store for the Orochi IRC daemon.
+//! Per-account SCRAM-SHA-256 + SCRAM-SHA-512 credential store for the Orochi
+//! IRC daemon.
 //!
 //! The account database (see `services.zig`) only persists a PBKDF2 password
 //! hash, which is enough to verify PLAIN but carries no SCRAM-specific material.
@@ -21,6 +22,7 @@
 const std = @import("std");
 
 const sasl = @import("../proto/sasl.zig");
+const scram512 = @import("../proto/sasl_scram512_server.zig");
 const mechrouter = @import("../proto/sasl_mechrouter.zig");
 const crypto_random = @import("../crypto/random.zig");
 const rwlock = @import("../substrate/rwlock.zig");
@@ -28,6 +30,10 @@ const rwlock = @import("../substrate/rwlock.zig");
 /// SCRAM-SHA-256 digest length (StoredKey / ServerKey size), in bytes.
 /// Derived from `ScramRecord` so it tracks the canonical record definition.
 pub const digest_len = @typeInfo(@FieldType(sasl.ScramRecord, "stored_key")).array.len;
+
+/// SCRAM-SHA-512 digest length (StoredKey / ServerKey size), in bytes. Derived
+/// from the SHA-512 responder's `Credential` so it tracks that definition.
+pub const digest512_len = scram512.digest_len;
 
 /// Salt length, in bytes, generated for new SCRAM credentials. 16 bytes matches
 /// the account store's PBKDF2 salt width and exceeds the RFC's minimum.
@@ -56,11 +62,21 @@ const MAX_ACCOUNT_LEN: usize = 32;
 
 /// One account's stored SCRAM material. The salt is an owned, heap-allocated
 /// slice; the digests are inline fixed arrays.
+///
+/// SHA-512 material (`stored_key_512` / `server_key_512`) is derived from the
+/// SAME password, salt, and iteration count as the SHA-256 set, so no second
+/// salt is needed. `has_512` distinguishes an account that was provisioned with
+/// SHA-512 from one loaded from an old (SHA-256-only) durable record: when
+/// false, a SHA-512 lookup returns null and SCRAM-SHA-512 is simply not offered
+/// until the account is re-provisioned.
 const Entry = struct {
     salt: []u8,
     iterations: u32,
     stored_key: [digest_len]u8,
     server_key: [digest_len]u8,
+    has_512: bool = false,
+    stored_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
+    server_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
 };
 
 /// In-memory registry of per-account SCRAM-SHA-256 credentials.
@@ -94,6 +110,8 @@ pub const ScramStore = struct {
                 self.allocator.free(entry.value_ptr.salt);
                 secureZero(&entry.value_ptr.stored_key);
                 secureZero(&entry.value_ptr.server_key);
+                secureZero(&entry.value_ptr.stored_key_512);
+                secureZero(&entry.value_ptr.server_key_512);
             }
             self.entries.deinit(self.allocator);
             for (self.lookup_salts.items) |salt| {
@@ -161,6 +179,14 @@ pub const ScramStore = struct {
         const record = sasl.recordFromPassword(password, salt, iterations) catch
             return error.DeriveFailed;
 
+        // Derive the SHA-512 SCRAM keys from the SAME password/salt/iterations
+        // (RFC 5802 with SHA-512). Reuses the proven SHA-512 responder so no
+        // SCRAM math is hand-rolled here. The intermediate `ClientKey` and
+        // `SaltedPassword` are wiped by `ScramKeys.wipe`.
+        var keys512 = scram512.deriveScramKeys(password, salt, iterations) catch
+            return error.DeriveFailed;
+        defer keys512.wipe();
+
         // Duplicate the salt into store-owned memory before touching the map so
         // a failure leaves existing state intact.
         const owned_salt = self.allocator.dupe(u8, salt) catch return error.OutOfMemory;
@@ -171,6 +197,9 @@ pub const ScramStore = struct {
             .iterations = iterations,
             .stored_key = record.stored_key,
             .server_key = record.server_key,
+            .has_512 = true,
+            .stored_key_512 = keys512.stored_key,
+            .server_key_512 = keys512.server_key,
         };
 
         if (self.entries.getEntry(account)) |existing| {
@@ -180,6 +209,8 @@ pub const ScramStore = struct {
             self.allocator.free(existing.value_ptr.salt);
             secureZero(&existing.value_ptr.stored_key);
             secureZero(&existing.value_ptr.server_key);
+            secureZero(&existing.value_ptr.stored_key_512);
+            secureZero(&existing.value_ptr.server_key_512);
             existing.value_ptr.* = new_entry;
             return;
         }
@@ -193,7 +224,24 @@ pub const ScramStore = struct {
     /// server_key) directly, WITHOUT re-deriving from a password. Used to
     /// repopulate the store from durable storage after a restart. Overwrites any
     /// existing entry for the account.
+    ///
+    /// The SHA-256-only `sasl.ScramRecord` carries no SHA-512 material, so the
+    /// imported entry has `has_512 = false` and SCRAM-SHA-512 stays unavailable
+    /// for it until re-provisioned. Use `importFullRecord` to restore SHA-512
+    /// material from a durable record that includes it.
     pub fn importRecord(self: *ScramStore, account: []const u8, record: sasl.ScramRecord) ScramStoreError!void {
+        return self.importFullRecord(account, .{
+            .salt = record.salt,
+            .iterations = record.iterations,
+            .stored_key = record.stored_key,
+            .server_key = record.server_key,
+        });
+    }
+
+    /// Insert a precomputed record that may additionally carry SHA-512 SCRAM
+    /// material. Used by the durable-store backfill loader so a SCRAM-SHA-512
+    /// login resolves after a restart. Overwrites any existing entry.
+    pub fn importFullRecord(self: *ScramStore, account: []const u8, record: FullRecord) ScramStoreError!void {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
@@ -207,6 +255,9 @@ pub const ScramStore = struct {
             .iterations = record.iterations,
             .stored_key = record.stored_key,
             .server_key = record.server_key,
+            .has_512 = record.has_512,
+            .stored_key_512 = record.stored_key_512,
+            .server_key_512 = record.server_key_512,
         };
 
         if (self.entries.getEntry(account)) |existing| {
@@ -214,6 +265,8 @@ pub const ScramStore = struct {
             self.allocator.free(existing.value_ptr.salt);
             secureZero(&existing.value_ptr.stored_key);
             secureZero(&existing.value_ptr.server_key);
+            secureZero(&existing.value_ptr.stored_key_512);
+            secureZero(&existing.value_ptr.server_key_512);
             existing.value_ptr.* = new_entry;
             return;
         }
@@ -223,13 +276,50 @@ pub const ScramStore = struct {
         try self.entries.put(self.allocator, owned_key, new_entry);
     }
 
+    /// A precomputed credential record carrying BOTH the SHA-256 SCRAM material
+    /// and, when `has_512` is set, the SHA-512 material derived from the same
+    /// password/salt/iterations. The `salt` slice borrows caller memory; copy it
+    /// if it must outlive the call. This is the durable-record shape used to
+    /// restore SCRAM-SHA-512 across a restart.
+    pub const FullRecord = struct {
+        salt: []const u8,
+        iterations: u32,
+        stored_key: [digest_len]u8,
+        server_key: [digest_len]u8,
+        has_512: bool = false,
+        stored_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
+        server_key_512: [digest512_len]u8 = [_]u8{0} ** digest512_len,
+
+        /// View the SHA-256 portion as the legacy `sasl.ScramRecord`.
+        pub fn sha256(self: FullRecord) sasl.ScramRecord {
+            return .{
+                .salt = self.salt,
+                .iterations = self.iterations,
+                .stored_key = self.stored_key,
+                .server_key = self.server_key,
+            };
+        }
+
+        /// View the SHA-512 portion as a `scram512.Credential`, or null when this
+        /// record carries no SHA-512 material.
+        pub fn sha512(self: FullRecord) ?scram512.Credential {
+            if (!self.has_512) return null;
+            return .{
+                .salt = self.salt,
+                .iterations = self.iterations,
+                .stored_key = self.stored_key_512,
+                .server_key = self.server_key_512,
+            };
+        }
+    };
+
     /// Backfill source for `resolve`: when an account is missing from the live
     /// store, `loadFn` is consulted (e.g. a durable on-disk mirror). The returned
     /// record's `salt` need only stay valid for the duration of the call —
-    /// `resolve` copies it via `importRecord` before returning.
+    /// `resolve` copies it via `importFullRecord` before returning.
     pub const Loader = struct {
         ptr: *anyopaque,
-        loadFn: *const fn (ptr: *anyopaque, account: []const u8) ?sasl.ScramRecord,
+        loadFn: *const fn (ptr: *anyopaque, account: []const u8) ?FullRecord,
     };
 
     /// Attach (or clear) the backfill loader consulted on a `resolve` miss.
@@ -239,30 +329,73 @@ pub const ScramStore = struct {
         self.loader = loader;
     }
 
-    /// Resolve SCRAM credentials for `account`: the live store first, then the
-    /// backfill loader (caching a hit via `importRecord`). This is the path the
-    /// mechrouter uses, so a SCRAM login works after a restart even before any
-    /// in-memory entry exists. Returns null when unknown everywhere.
-    pub fn resolve(self: *ScramStore, account: []const u8) ?sasl.ScramRecord {
-        if (self.lookup(account)) |r| return r;
+    /// Backfill the account from the durable loader on a live-store miss, caching
+    /// the loaded record. Returns true when the entry now exists in the live
+    /// store. Shared by the SHA-256 and SHA-512 resolve paths.
+    fn backfill(self: *ScramStore, account: []const u8) bool {
         const loader = blk: {
             self.lock.lockShared();
             defer self.lock.unlockShared();
             break :blk self.loader;
-        } orelse return null;
-        const loaded = loader.loadFn(loader.ptr, account) orelse return null;
-        self.importRecord(account, loaded) catch return null;
+        } orelse return false;
+        const loaded = loader.loadFn(loader.ptr, account) orelse return false;
+        self.importFullRecord(account, loaded) catch return false;
+        return true;
+    }
+
+    /// Resolve SCRAM-SHA-256 credentials for `account`: the live store first,
+    /// then the backfill loader (caching a hit). This is the path the mechrouter
+    /// uses, so a SCRAM login works after a restart even before any in-memory
+    /// entry exists. Returns null when unknown everywhere.
+    pub fn resolve(self: *ScramStore, account: []const u8) ?sasl.ScramRecord {
+        if (self.lookup(account)) |r| return r;
+        if (!self.backfill(account)) return null;
         return self.lookup(account);
     }
 
-    /// Number of bytes `serializeRecord` writes: u32 iterations, u16 salt length,
-    /// the salt, then the two fixed-size digests.
-    pub const serialized_max = 4 + 2 + salt_len + digest_len + digest_len;
+    /// Resolve SCRAM-SHA-512 credentials for `account`: live store first, then
+    /// the backfill loader. Returns null when the account is unknown OR when it
+    /// has no SHA-512 material (e.g. an account loaded from an old SHA-256-only
+    /// durable record, until it is re-provisioned).
+    pub fn resolve512(self: *ScramStore, account: []const u8) ?scram512.Credential {
+        if (self.lookup512(account)) |r| return r;
+        if (!self.backfill(account)) return null;
+        return self.lookup512(account);
+    }
 
-    /// Serialize a record into `out` (length `serialized_max` for a `salt_len`
-    /// salt); returns the written slice. Caller persists these bytes.
+    /// Number of bytes `serializeRecord` writes for a SHA-256-only record: u32
+    /// iterations, u16 salt length, the salt, then the two SHA-256 digests.
+    pub const serialized_v1_max = 4 + 2 + salt_len + digest_len + digest_len;
+
+    /// Maximum bytes `serializeRecord` writes for a record that also carries
+    /// SHA-512 material: the v1 layout plus a 1-byte version marker and the two
+    /// SHA-512 digests.
+    pub const serialized_max = serialized_v1_max + 1 + digest512_len + digest512_len;
+
+    /// Version marker that follows the SHA-256 portion when SHA-512 material is
+    /// appended. Old (v1) records simply end after the SHA-256 digests, so a
+    /// reader distinguishes them by length: this byte is only present when there
+    /// are trailing SHA-512 bytes.
+    const scram512_marker: u8 = 0x02;
+
+    /// Serialize a SHA-256-only record (no SHA-512 material). Kept for callers
+    /// that hold only a legacy `sasl.ScramRecord`. Produces v1 bytes.
     pub fn serializeRecord(record: sasl.ScramRecord, out: []u8) ?[]const u8 {
-        const total = 6 + record.salt.len + digest_len + digest_len;
+        return serializeFullRecord(.{
+            .salt = record.salt,
+            .iterations = record.iterations,
+            .stored_key = record.stored_key,
+            .server_key = record.server_key,
+        }, out);
+    }
+
+    /// Serialize a full record into `out`, appending the SHA-512 block only when
+    /// `record.has_512` is set. v1 (SHA-256-only) bytes remain byte-identical to
+    /// the historical format, so old readers and old records interoperate.
+    pub fn serializeFullRecord(record: FullRecord, out: []u8) ?[]const u8 {
+        const base = 6 + record.salt.len + digest_len + digest_len;
+        const sha512_block: usize = if (record.has_512) 1 + digest512_len + digest512_len else 0;
+        const total = base + sha512_block;
         if (record.salt.len > std.math.maxInt(u16) or out.len < total) return null;
         std.mem.writeInt(u32, out[0..4], record.iterations, .big);
         std.mem.writeInt(u16, out[4..6], @intCast(record.salt.len), .big);
@@ -273,18 +406,36 @@ pub const ScramStore = struct {
         off += digest_len;
         @memcpy(out[off..][0..digest_len], &record.server_key);
         off += digest_len;
+        if (record.has_512) {
+            out[off] = scram512_marker;
+            off += 1;
+            @memcpy(out[off..][0..digest512_len], &record.stored_key_512);
+            off += digest512_len;
+            @memcpy(out[off..][0..digest512_len], &record.server_key_512);
+            off += digest512_len;
+        }
         return out[0..off];
     }
 
-    /// Parse bytes produced by `serializeRecord`. The returned record's `salt`
-    /// borrows `bytes` (copy it if it must outlive them). Null on malformed input.
+    /// Parse SHA-256 bytes produced by `serializeRecord`/`serializeFullRecord`.
+    /// The returned record's `salt` borrows `bytes`. Null on malformed input.
+    /// SHA-512 trailing bytes (if any) are ignored by this view.
     pub fn deserializeRecord(bytes: []const u8) ?sasl.ScramRecord {
+        const full = deserializeFullRecord(bytes) orelse return null;
+        return full.sha256();
+    }
+
+    /// Parse bytes produced by `serializeFullRecord` into a `FullRecord`. Old
+    /// (v1) records parse with `has_512 = false`; records with the SHA-512 block
+    /// parse it through. The returned record's `salt` borrows `bytes`. Null on
+    /// malformed input.
+    pub fn deserializeFullRecord(bytes: []const u8) ?FullRecord {
         if (bytes.len < 6) return null;
         const iterations = std.mem.readInt(u32, bytes[0..4], .big);
         const sl = std.mem.readInt(u16, bytes[4..6], .big);
-        const need = 6 + @as(usize, sl) + digest_len + digest_len;
-        if (bytes.len < need) return null;
-        var rec = sasl.ScramRecord{
+        const base = 6 + @as(usize, sl) + digest_len + digest_len;
+        if (bytes.len < base) return null;
+        var rec = FullRecord{
             .salt = bytes[6 .. 6 + sl],
             .iterations = iterations,
             .stored_key = undefined,
@@ -292,12 +443,25 @@ pub const ScramStore = struct {
         };
         @memcpy(&rec.stored_key, bytes[6 + sl ..][0..digest_len]);
         @memcpy(&rec.server_key, bytes[6 + sl + digest_len ..][0..digest_len]);
+
+        // Optional SHA-512 block: present iff the version marker plus two SHA-512
+        // digests follow. A truncated trailer is treated as SHA-256-only rather
+        // than rejected, so a partially-written record still authenticates PLAIN
+        // and SCRAM-SHA-256.
+        const want_512 = base + 1 + digest512_len + digest512_len;
+        if (bytes.len >= want_512 and bytes[base] == scram512_marker) {
+            rec.has_512 = true;
+            var off = base + 1;
+            @memcpy(&rec.stored_key_512, bytes[off..][0..digest512_len]);
+            off += digest512_len;
+            @memcpy(&rec.server_key_512, bytes[off..][0..digest512_len]);
+        }
         return rec;
     }
 
-    /// Look up SCRAM credentials for `account`, returning a `ScramRecord` whose
-    /// `salt` slice is retained by the store until teardown. Returns null for an
-    /// unknown account or allocation failure.
+    /// Look up SCRAM-SHA-256 credentials for `account`, returning a `ScramRecord`
+    /// whose `salt` slice is retained by the store until teardown. Returns null
+    /// for an unknown account or allocation failure.
     pub fn lookup(self: *const ScramStore, account: []const u8) ?sasl.ScramRecord {
         const self_mut = @constCast(self);
         self_mut.lock.lockExclusive();
@@ -317,6 +481,30 @@ pub const ScramStore = struct {
         };
     }
 
+    /// Look up SCRAM-SHA-512 credentials for `account`. Returns null for an
+    /// unknown account, an account with no SHA-512 material, or allocation
+    /// failure. The returned `salt` slice is retained by the store until
+    /// teardown (same lifetime contract as `lookup`).
+    pub fn lookup512(self: *const ScramStore, account: []const u8) ?scram512.Credential {
+        const self_mut = @constCast(self);
+        self_mut.lock.lockExclusive();
+        defer self_mut.lock.unlockExclusive();
+
+        const entry = self_mut.entries.get(account) orelse return null;
+        if (!entry.has_512) return null;
+        const salt = self_mut.allocator.dupe(u8, entry.salt) catch return null;
+        self_mut.lookup_salts.append(self_mut.allocator, salt) catch {
+            self_mut.allocator.free(salt);
+            return null;
+        };
+        return .{
+            .salt = salt,
+            .iterations = entry.iterations,
+            .stored_key = entry.stored_key_512,
+            .server_key = entry.server_key_512,
+        };
+    }
+
     /// Adapter exposing this store as the mechrouter's SCRAM-SHA-256 credential
     /// source. The returned fat pointer borrows `self`, so the `ScramStore` must
     /// outlive every connection that copies it (own it alongside the `Server`).
@@ -330,6 +518,24 @@ pub const ScramStore = struct {
     fn lookupThunk(ptr: *anyopaque, username: []const u8) ?sasl.ScramRecord {
         const self: *ScramStore = @ptrCast(@alignCast(ptr));
         return self.resolve(username);
+    }
+
+    /// Adapter exposing this store as the mechrouter's SCRAM-SHA-512 credential
+    /// source. Mirrors `scram256Lookup`. The returned fat pointer borrows `self`,
+    /// so the `ScramStore` must outlive every connection that copies it. The
+    /// lookup yields null for accounts with no SHA-512 material, so the mechrouter
+    /// only advertises/serves SCRAM-SHA-512 for accounts that were provisioned
+    /// with it.
+    pub fn scram512Lookup(self: *ScramStore) mechrouter.Scram512Lookup {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        return .{ .ptr = self, .lookupFn = lookup512Thunk };
+    }
+
+    fn lookup512Thunk(ptr: *anyopaque, username: []const u8) ?scram512.Credential {
+        const self: *ScramStore = @ptrCast(@alignCast(ptr));
+        return self.resolve512(username);
     }
 };
 
@@ -497,10 +703,10 @@ test "serialize/deserialize round-trips a SCRAM record" {
 
 const TestLoader = struct {
     bytes: []const u8,
-    fn load(ptr: *anyopaque, account: []const u8) ?sasl.ScramRecord {
+    fn load(ptr: *anyopaque, account: []const u8) ?ScramStore.FullRecord {
         const self: *TestLoader = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, account, "alice")) return null;
-        return ScramStore.deserializeRecord(self.bytes);
+        return ScramStore.deserializeFullRecord(self.bytes);
     }
 };
 
@@ -521,6 +727,128 @@ test "resolve backfills a missing account from the loader, then caches" {
     try std.testing.expectEqual(src.lookup("alice").?.iterations, resolved.iterations);
     try std.testing.expect(cold.lookup("alice") != null); // now cached in-memory
     try std.testing.expect(cold.resolve("bob") == null); // loader declines
+}
+
+test "deriveAndStore provisions both SHA-256 and SHA-512 material" {
+    var store = ScramStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    try store.deriveAndStore("alice", "correct horse battery staple");
+
+    // SHA-256 lookup yields a 32-byte digest set.
+    const rec256 = store.lookup("alice").?;
+    try std.testing.expectEqual(@as(usize, digest_len), rec256.stored_key.len);
+
+    // SHA-512 lookup yields a 64-byte digest set over the SAME salt/iterations.
+    const rec512 = store.lookup512("alice").?;
+    try std.testing.expectEqual(@as(usize, digest512_len), rec512.stored_key.len);
+    try std.testing.expectEqual(rec256.iterations, rec512.iterations);
+    try std.testing.expectEqualSlices(u8, rec256.salt, rec512.salt);
+
+    // The SHA-512 keys must match a fresh independent derivation from the
+    // password and the stored salt — proving correct RFC 5802 (SHA-512) keys.
+    var keys = try scram512.deriveScramKeys("correct horse battery staple", rec512.salt, rec512.iterations);
+    defer keys.wipe();
+    try std.testing.expectEqualSlices(u8, &keys.stored_key, &rec512.stored_key);
+    try std.testing.expectEqualSlices(u8, &keys.server_key, &rec512.server_key);
+
+    try std.testing.expect(store.lookup512("nobody") == null);
+}
+
+test "storeWithSalt SHA-512 keys are deterministic for a fixed salt" {
+    var a = ScramStore.init(std.testing.allocator);
+    defer a.deinit();
+    var b = ScramStore.init(std.testing.allocator);
+    defer b.deinit();
+
+    try a.storeWithSalt("alice", "pencil", "fixed-scram-salt", 4096);
+    try b.storeWithSalt("alice", "pencil", "fixed-scram-salt", 4096);
+
+    const ra = a.lookup512("alice").?;
+    const rb = b.lookup512("alice").?;
+    try std.testing.expectEqualSlices(u8, &ra.stored_key, &rb.stored_key);
+    try std.testing.expectEqualSlices(u8, &ra.server_key, &rb.server_key);
+}
+
+test "importRecord (SHA-256 only) leaves SCRAM-SHA-512 unavailable" {
+    var store = ScramStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    // A legacy SHA-256-only record (e.g. an old durable record) provides no
+    // SHA-512 material, so SCRAM-SHA-512 must not be offered for it.
+    var seed = ScramStore.init(std.testing.allocator);
+    defer seed.deinit();
+    try seed.storeWithSalt("alice", "pencil", "some-fixed-salt0", 4096);
+    const rec256 = seed.lookup("alice").?;
+    try store.importRecord("alice", rec256);
+
+    try std.testing.expect(store.lookup("alice") != null); // SHA-256 works
+    try std.testing.expect(store.lookup512("alice") == null); // SHA-512 absent
+}
+
+test "serialize/deserialize round-trips SHA-512 material backward-compatibly" {
+    var store = ScramStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.deriveAndStore("alice", "pencil");
+
+    const rec256 = store.lookup("alice").?;
+    const rec512 = store.lookup512("alice").?;
+    const full = ScramStore.FullRecord{
+        .salt = rec256.salt,
+        .iterations = rec256.iterations,
+        .stored_key = rec256.stored_key,
+        .server_key = rec256.server_key,
+        .has_512 = true,
+        .stored_key_512 = rec512.stored_key,
+        .server_key_512 = rec512.server_key,
+    };
+
+    var buf: [ScramStore.serialized_max]u8 = undefined;
+    const bytes = ScramStore.serializeFullRecord(full, &buf).?;
+    const back = ScramStore.deserializeFullRecord(bytes).?;
+    try std.testing.expect(back.has_512);
+    try std.testing.expectEqualSlices(u8, &full.stored_key_512, &back.stored_key_512);
+    try std.testing.expectEqualSlices(u8, &full.server_key_512, &back.server_key_512);
+
+    // The SHA-256 view of the SAME bytes still parses (old readers keep working).
+    const v1 = ScramStore.deserializeRecord(bytes).?;
+    try std.testing.expectEqualSlices(u8, &rec256.stored_key, &v1.stored_key);
+
+    // A v1 (SHA-256-only) serialization carries no SHA-512 block.
+    var v1buf: [ScramStore.serialized_v1_max]u8 = undefined;
+    const v1bytes = ScramStore.serializeRecord(rec256, &v1buf).?;
+    try std.testing.expectEqual(@as(usize, ScramStore.serialized_v1_max), v1bytes.len);
+    const v1full = ScramStore.deserializeFullRecord(v1bytes).?;
+    try std.testing.expect(!v1full.has_512);
+}
+
+test "resolve512 backfills SHA-512 material from the loader, then caches" {
+    var src = ScramStore.init(std.testing.allocator);
+    defer src.deinit();
+    try src.deriveAndStore("alice", "pencil");
+    const rec256 = src.lookup("alice").?;
+    const rec512 = src.lookup512("alice").?;
+    var buf: [ScramStore.serialized_max]u8 = undefined;
+    const bytes = ScramStore.serializeFullRecord(.{
+        .salt = rec256.salt,
+        .iterations = rec256.iterations,
+        .stored_key = rec256.stored_key,
+        .server_key = rec256.server_key,
+        .has_512 = true,
+        .stored_key_512 = rec512.stored_key,
+        .server_key_512 = rec512.server_key,
+    }, &buf).?;
+
+    var cold = ScramStore.init(std.testing.allocator);
+    defer cold.deinit();
+    var loader = TestLoader{ .bytes = bytes };
+    cold.setLoader(.{ .ptr = &loader, .loadFn = TestLoader.load });
+
+    try std.testing.expect(cold.lookup512("alice") == null); // not cached yet
+    const resolved = cold.resolve512("alice").?; // backfills from loader
+    try std.testing.expectEqualSlices(u8, &rec512.stored_key, &resolved.stored_key);
+    try std.testing.expect(cold.lookup512("alice") != null); // now cached
+    try std.testing.expect(cold.resolve512("bob") == null); // loader declines
 }
 
 test {

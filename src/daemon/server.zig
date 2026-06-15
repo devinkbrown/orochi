@@ -38,6 +38,8 @@ const world_model = @import("world.zig");
 const world_projection = @import("world_projection.zig");
 const sasl = @import("../proto/sasl.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
+const sasl_scram_server_mod = @import("../proto/sasl_scram_server.zig");
+const sasl_scram512_mod = @import("../proto/sasl_scram512_server.zig");
 const certfp = @import("../proto/certfp.zig");
 const names_reply = @import("../proto/names_reply.zig");
 const chanmode = @import("chanmode.zig");
@@ -1286,6 +1288,11 @@ pub const Config = struct {
     /// Injected from the SCRAM credential store; null = SCRAM fails closed. When
     /// set, each accepted connection also gets a fresh CSPRNG server nonce.
     sasl_scram256: ?sasl_mechrouter.Scram256Lookup = null,
+    /// Optional SASL SCRAM-SHA-512 credential lookup (account -> SHA-512 SCRAM
+    /// record). Injected from the same SCRAM credential store as
+    /// `sasl_scram256`; null = SCRAM-SHA-512 fails closed. Served only for
+    /// accounts provisioned with SHA-512 material.
+    sasl_scram512: ?sasl_mechrouter.Scram512Lookup = null,
     /// Optional SASL EXTERNAL verifier (TLS certfp -> account). Injected from the
     /// account ⇄ certfp binding bridge; null = EXTERNAL fails closed.
     sasl_external: ?sasl_mechrouter.ExternalLookup = null,
@@ -5027,7 +5034,10 @@ pub const LinuxServer = struct {
             return;
         }
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
-        if (self.config.sasl_scram256) |scram| {
+        // SCRAM (both digests) needs a per-connection server nonce. Generate it
+        // once if either SCRAM lookup is configured, then attach whichever
+        // lookups are present so SCRAM-SHA-256 and SCRAM-SHA-512 share the nonce.
+        if (self.config.sasl_scram256 != null or self.config.sasl_scram512 != null) {
             if (self.config.crypto_io) |io| {
                 var raw: [16]u8 = undefined;
                 io.random(&raw);
@@ -5038,7 +5048,8 @@ pub const LinuxServer = struct {
                     hex[i * 2 + 1] = charset[b & 0x0f];
                 }
                 conn.session.setSaslServerNonce(&hex);
-                conn.session.sasl_scram256 = scram;
+                if (self.config.sasl_scram256) |scram| conn.session.sasl_scram256 = scram;
+                if (self.config.sasl_scram512) |scram| conn.session.sasl_scram512 = scram;
             }
         }
         if (self.config.sts_value) |v| conn.session.enableSts(v) catch {};
@@ -13351,6 +13362,7 @@ pub const LinuxServer = struct {
         var len: usize = 0;
         if (conn.session.sasl_plain != null) appendSaslInfoMech(out, &len, "PLAIN") catch return out[0..len];
         if (conn.session.sasl_scram256 != null) appendSaslInfoMech(out, &len, "SCRAM-SHA-256") catch return out[0..len];
+        if (conn.session.sasl_scram512 != null) appendSaslInfoMech(out, &len, "SCRAM-SHA-512") catch return out[0..len];
         if (conn.session.sasl_external != null and conn.session.tls_certfp != null) appendSaslInfoMech(out, &len, "EXTERNAL") catch return out[0..len];
         if (len == 0) return "*";
         return out[0..len];
@@ -13361,6 +13373,7 @@ pub const LinuxServer = struct {
             .plain => "PLAIN",
             .external => "EXTERNAL",
             .scram_sha_256 => "SCRAM-SHA-256",
+            .scram_sha_512 => "SCRAM-SHA-512",
             .anon, .gatekeeper, .gatekeeper_passport => null,
         };
     }
@@ -13505,6 +13518,7 @@ pub const LinuxServer = struct {
                 .plain = ircxPlainAdapter(&conn.session),
                 .external = conn.session.sasl_external,
                 .scram256 = conn.session.sasl_scram256,
+                .scram512 = conn.session.sasl_scram512,
             }, conn.session.sasl_server_nonce);
             router.tls_certfp = conn.session.tls_certfp;
             switch (router.start(mech)) {
@@ -15459,6 +15473,7 @@ pub const LinuxServer = struct {
         if (self.config.sasl_checker != null) {
             appendSaslInfoMech(&mech_buf, &mech_len, "PLAIN") catch return;
             if (self.config.sasl_scram256 != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-256") catch return;
+            if (self.config.sasl_scram512 != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512") catch return;
         }
         if (self.config.sasl_external != null) appendSaslInfoMech(&mech_buf, &mech_len, "EXTERNAL") catch return;
         const mechs = if (mech_len == 0) "(none configured)" else mech_buf[0..mech_len];
@@ -25674,12 +25689,51 @@ test "threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800" {
     a.reset();
     try writeAllFd(fd_a, "IRCX\r\n");
     try recvUntil(&a, " 800 A 1 0 ", 200);
+    // This server has no SASL store configured, so neither SCRAM digest is
+    // provisioned and the IRCX 800 package list must offer neither. The
+    // provisioned (PRESENT) case is covered by the unit test
+    // "IRCX 800 package list offers SCRAM-SHA-512 when provisioned" below.
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "SCRAM-SHA-256") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "SCRAM-SHA-512") == null);
     // MODE ISIRCX is the discovery alias — now reports enabled.
     a.reset();
     try writeAllFd(fd_a, "MODE ISIRCX\r\n");
     try recvUntil(&a, " 800 A 1 0 ", 200);
+}
+
+test "IRCX 800 package list offers SCRAM-SHA-512 when provisioned" {
+    var anchor: u8 = 0;
+    const lookup256 = sasl_mechrouter.Scram256Lookup{ .ptr = &anchor, .lookupFn = testScram256Null };
+    const lookup512 = sasl_mechrouter.Scram512Lookup{ .ptr = &anchor, .lookupFn = testScram512Null };
+
+    // Unprovisioned: no SCRAM lookups on the session -> neither digest offered.
+    var bare = ConnState{};
+    var bare_buf: [64]u8 = undefined;
+    const bare_list = LinuxServer.ircxAuthPackageList(&bare, &bare_buf);
+    try std.testing.expect(std.mem.indexOf(u8, bare_list, "SCRAM-SHA-512") == null);
+
+    // Provisioned with BOTH digests -> both appear, SHA-512 after SHA-256.
+    var conn = ConnState{};
+    conn.session.sasl_plain = .{ .ptr = &anchor, .verifyFn = testPlainTrue };
+    conn.session.sasl_scram256 = lookup256;
+    conn.session.sasl_scram512 = lookup512;
+    var buf: [64]u8 = undefined;
+    const pkg_list = LinuxServer.ircxAuthPackageList(&conn, &buf);
+    const idx256 = std.mem.indexOf(u8, pkg_list, "SCRAM-SHA-256") orelse return error.TestUnexpectedResult;
+    const idx512 = std.mem.indexOf(u8, pkg_list, "SCRAM-SHA-512") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(idx512 > idx256); // SHA-512 ordered after SHA-256
+}
+
+fn testScram256Null(_: *anyopaque, _: []const u8) ?sasl_scram_server_mod.Credential {
+    return null;
+}
+
+fn testScram512Null(_: *anyopaque, _: []const u8) ?sasl_scram512_mod.Credential {
+    return null;
+}
+
+fn testPlainTrue(_: *anyopaque, _: sasl.PlainCredentials) bool {
+    return true;
 }
 
 test "threaded server: IRCX opt-in gates DATA then permits typed channel delivery" {

@@ -67,6 +67,26 @@ pub const ServicesScramLookup = struct {
     }
 };
 
+/// Adapter exposing a `*ScramStore` as the mechrouter's SCRAM-SHA-512 credential
+/// source. The SHA-512 sibling of `ServicesScramLookup`: hand `lookup()` to
+/// `mechrouter.Callbacks.scram512` so the router can fetch each account's
+/// SHA-512 `{salt, iters, StoredKey, ServerKey}`. The lookup returns null for
+/// accounts that were never provisioned with SHA-512 material (e.g. records
+/// loaded from a pre-SHA-512 durable mirror), so SCRAM-SHA-512 is offered only
+/// where it can actually complete.
+///
+/// LIFETIME: identical to `ServicesScramLookup` — the returned fat pointer
+/// borrows the `*ScramStore`, which must outlive every connection.
+pub const ServicesScram512Lookup = struct {
+    scram: *ScramStore,
+
+    /// Build the mechrouter SCRAM-SHA-512 lookup callback. Equivalent to
+    /// `ScramStore.scram512Lookup`.
+    pub fn lookup(self: *ServicesScram512Lookup) mechrouter.Scram512Lookup {
+        return self.scram.scram512Lookup();
+    }
+};
+
 /// Adapter exposing a `*Services` as the mechrouter's SASL EXTERNAL verifier:
 /// the presented client-cert fingerprint is matched to a bound account
 /// (CERTADD). Hand `lookup()` to `mechrouter.Callbacks.external`. No secret is
@@ -260,6 +280,139 @@ test "bridge lookup returns null for an unregistered account" {
     const lookup = bridge.lookup();
 
     // Assert
+    try std.testing.expect(lookup.lookup("nobody") == null);
+}
+
+const scram512 = @import("../proto/sasl_scram512_server.zig");
+
+/// Run a full SCRAM-SHA-512 exchange against a credential sourced from the
+/// bridge. The server side is `sasl_scram512_server.Server`; the client side is
+/// built inline (there is no in-repo SHA-512 SCRAM client). Returns true if the
+/// server accepts the proof and the returned server signature verifies, false on
+/// a proof mismatch. Mirrors `runScramExchange` for the SHA-512 mechanism.
+fn runScram512Exchange(
+    allocator: std.mem.Allocator,
+    credential: scram512.Credential,
+    username: []const u8,
+    password: []const u8,
+) !bool {
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const HmacSha512 = std.crypto.auth.hmac.Hmac(Sha512);
+    const dl = scram512.digest_len;
+
+    const client_nonce = "fixedClientNonce512ForBridgeTest";
+    const server_nonce = "fixedServerNonce512ForBridgeTest";
+
+    const client_first = try std.fmt.allocPrint(allocator, "n,,n={s},r={s}", .{ username, client_nonce });
+    defer allocator.free(client_first);
+
+    var server = scram512.Server.init();
+    var server_first_buf: [scram512.MAX_MESSAGE]u8 = undefined;
+    const first = try server.receiveClientFirst(client_first, credential, server_nonce, &server_first_buf);
+
+    const without_proof = try std.fmt.allocPrint(allocator, "c=biws,r={s}", .{first.combined_nonce});
+    defer allocator.free(without_proof);
+    const auth_message = try std.fmt.allocPrint(
+        allocator,
+        "n={s},r={s},{s},{s}",
+        .{ username, client_nonce, first.server_first, without_proof },
+    );
+    defer allocator.free(auth_message);
+
+    // Client-side proof from the password + advertised salt/iterations.
+    var salted: [dl]u8 = undefined;
+    try std.crypto.pwhash.pbkdf2(&salted, password, credential.salt, credential.iterations, HmacSha512);
+    var client_key: [dl]u8 = undefined;
+    HmacSha512.create(&client_key, "Client Key", &salted);
+    var stored_key: [dl]u8 = undefined;
+    Sha512.hash(&client_key, &stored_key, .{});
+    var client_sig: [dl]u8 = undefined;
+    HmacSha512.create(&client_sig, auth_message, &stored_key);
+    var proof: [dl]u8 = undefined;
+    for (&proof, client_key, client_sig) |*dst, ck, cs| dst.* = ck ^ cs;
+
+    var proof_b64_buf: [std.base64.standard.Encoder.calcSize(dl)]u8 = undefined;
+    const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &proof);
+    const client_final = try std.fmt.allocPrint(allocator, "{s},p={s}", .{ without_proof, proof_b64 });
+    defer allocator.free(client_final);
+
+    var server_final_buf: [scram512.MAX_MESSAGE]u8 = undefined;
+    const server_final = server.receiveClientFinal(client_final, &server_final_buf) catch |err| switch (err) {
+        error.ProofMismatch => return false,
+        else => return err,
+    };
+    // The client authenticates the server too: verify v=ServerSignature.
+    var server_sig: [dl]u8 = undefined;
+    HmacSha512.create(&server_sig, auth_message, &credential.server_key);
+    var verifier_b64_buf: [std.base64.standard.Encoder.calcSize(dl)]u8 = undefined;
+    const verifier_b64 = std.base64.standard.Encoder.encode(&verifier_b64_buf, &server_sig);
+    const expected = try std.fmt.allocPrint(allocator, "v={s}", .{verifier_b64});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, server_final.server_final);
+    return true;
+}
+
+test "registered account completes a SCRAM-SHA-512 exchange via the bridge lookup" {
+    const OroStore = services_mod.OroStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-scram512.wal");
+    defer store.deinit();
+
+    var scram = ScramStore.init(std.testing.allocator);
+    defer scram.deinit();
+
+    var services = Services.init(&store, null);
+    services.attachScramStore(&scram);
+    var scratch: [768]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+
+    var bridge = ServicesScram512Lookup{ .scram = &scram };
+    const lookup = bridge.lookup();
+
+    const credential = lookup.lookup("alice") orelse return error.MissingCredential;
+    const ok = try runScram512Exchange(
+        std.testing.allocator,
+        credential,
+        "alice",
+        "correct horse battery staple",
+    );
+    try std.testing.expect(ok);
+}
+
+test "SCRAM-SHA-512 exchange rejects the wrong password for a registered account" {
+    const OroStore = services_mod.OroStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-scram512-bad.wal");
+    defer store.deinit();
+
+    var scram = ScramStore.init(std.testing.allocator);
+    defer scram.deinit();
+
+    var services = Services.init(&store, null);
+    services.attachScramStore(&scram);
+    var scratch: [768]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+
+    var bridge = ServicesScram512Lookup{ .scram = &scram };
+    const lookup = bridge.lookup();
+    const credential = lookup.lookup("alice") orelse return error.MissingCredential;
+
+    const ok = try runScram512Exchange(
+        std.testing.allocator,
+        credential,
+        "alice",
+        "wrong password value here",
+    );
+    try std.testing.expect(!ok);
+}
+
+test "SCRAM-SHA-512 bridge lookup returns null for an unregistered account" {
+    var scram = ScramStore.init(std.testing.allocator);
+    defer scram.deinit();
+    var bridge = ServicesScram512Lookup{ .scram = &scram };
+    const lookup = bridge.lookup();
     try std.testing.expect(lookup.lookup("nobody") == null);
 }
 

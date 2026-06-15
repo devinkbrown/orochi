@@ -423,11 +423,25 @@ pub const Services = struct {
     }
 
     /// Mirror an account's derived SCRAM tuple into the durable store, keyed by
-    /// account. Best-effort; the in-memory SCRAM store is authoritative live.
+    /// account. Serializes BOTH the SHA-256 and (when provisioned) SHA-512
+    /// material in a single backward-compatible record so a SCRAM-SHA-256 OR
+    /// SCRAM-SHA-512 login resolves after a restart. Best-effort; the in-memory
+    /// SCRAM store is authoritative live.
     fn persistScram(self: *Services, scram: *ScramStore, account: []const u8) void {
-        const rec = scram.lookup(account) orelse return;
+        const rec256 = scram.lookup(account) orelse return;
+        var full = ScramStore.FullRecord{
+            .salt = rec256.salt,
+            .iterations = rec256.iterations,
+            .stored_key = rec256.stored_key,
+            .server_key = rec256.server_key,
+        };
+        if (scram.lookup512(account)) |rec512| {
+            full.has_512 = true;
+            full.stored_key_512 = rec512.stored_key;
+            full.server_key_512 = rec512.server_key;
+        }
         var vbuf: [ScramStore.serialized_max]u8 = undefined;
-        const value = ScramStore.serializeRecord(rec, &vbuf) orelse return;
+        const value = ScramStore.serializeFullRecord(full, &vbuf) orelse return;
         var kb: [scram_key_max]u8 = undefined;
         const key = scramKey(&kb, account) orelse return;
         self.store.family(.props).put(key, value) catch {};
@@ -436,16 +450,17 @@ pub const Services = struct {
     /// A backfill loader for the SCRAM store that reads this services' durable
     /// mirror, so a SCRAM login resolves after a restart. The returned record's
     /// salt borrows store memory and is copied by the SCRAM store before caching.
+    /// Carries SHA-512 material when the durable record includes it.
     pub fn scramLoader(self: *Services) ScramStore.Loader {
         return .{ .ptr = self, .loadFn = scramLoadThunk };
     }
 
-    fn scramLoadThunk(ptr: *anyopaque, account: []const u8) ?sasl.ScramRecord {
+    fn scramLoadThunk(ptr: *anyopaque, account: []const u8) ?ScramStore.FullRecord {
         const self: *Services = @ptrCast(@alignCast(ptr));
         var kb: [scram_key_max]u8 = undefined;
         const key = scramKey(&kb, account) orelse return null;
         const bytes = self.store.family(.props).get(key) orelse return null;
-        return ScramStore.deserializeRecord(bytes);
+        return ScramStore.deserializeFullRecord(bytes);
     }
 
     /// The account a certfp is bound to, if any (SASL EXTERNAL verification).

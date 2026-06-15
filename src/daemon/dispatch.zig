@@ -8,6 +8,7 @@ const std = @import("std");
 const sasl = @import("../proto/sasl.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const scram_server = @import("../proto/sasl_scram_server.zig");
+const scram512_server = @import("../proto/sasl_scram512_server.zig");
 const usermode = @import("../proto/usermode.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const sts_policy = @import("../proto/sts_policy.zig");
@@ -300,13 +301,17 @@ const cap_specs = [_]CapSpec{
     .{ .id = .server_time, .name = "server-time" },
     .{ .id = .message_tags, .name = "message-tags" },
     .{ .id = .echo_message, .name = "echo-message" },
-    // handleAuthenticate routes PLAIN, SCRAM-SHA-256, and EXTERNAL through the
-    // mechrouter. The live server injects each checker from the account store
-    // (PLAIN via PBKDF2, SCRAM-SHA-256 via the mirrored credential store + a
-    // per-connection nonce, EXTERNAL via the account ⇄ certfp bindings over the
-    // mutual-TLS client cert). Each fails closed when unconfigured, exactly like
-    // PLAIN always has, so advertising all three never strands a client.
-    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN,EXTERNAL,SCRAM-SHA-256" },
+    // handleAuthenticate routes PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, and
+    // EXTERNAL through the mechrouter. The live server injects each checker from
+    // the account store (PLAIN via PBKDF2, SCRAM-SHA-256/512 via the mirrored
+    // credential store + a per-connection nonce, EXTERNAL via the account ⇄
+    // certfp bindings over the mutual-TLS client cert). Each fails closed when
+    // unconfigured, exactly like PLAIN always has, so advertising them never
+    // strands a client. NOTE: the value actually sent is built per-connection by
+    // `writeSaslCapValue`, which lists only the mechanisms live on that session;
+    // this static value_302 is the unconfigured fallback and is kept in sync so
+    // CAP LS and the 908 mechanism list agree.
+    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN,EXTERNAL,SCRAM-SHA-256,SCRAM-SHA-512" },
     .{ .id = .multi_prefix, .name = "multi-prefix" },
     .{ .id = .userhost_in_names, .name = "userhost-in-names" },
     .{ .id = .away_notify, .name = "away-notify" },
@@ -747,6 +752,10 @@ pub const ClientSession = struct {
     sasl_external: ?sasl_mechrouter.ExternalLookup = null,
     /// Injected SCRAM-SHA-256 credential lookup. Null fails closed.
     sasl_scram256: ?sasl_mechrouter.Scram256Lookup = null,
+    /// Injected SCRAM-SHA-512 credential lookup. Null fails closed. Set from the
+    /// same SCRAM store as `sasl_scram256`; advertised/served only when both this
+    /// callback and the per-connection server nonce are present.
+    sasl_scram512: ?sasl_mechrouter.Scram512Lookup = null,
     /// Per-session SASL mechanism router. Lazily initialized on the first
     /// AUTHENTICATE <mech> line so the heavy fixed buffers cost nothing for
     /// connections that never authenticate. Reset to null on abort/failure so a
@@ -1143,6 +1152,7 @@ fn writeSaslCapValue(session: *const ClientSession, out: []u8) ?[]const u8 {
     appendSaslMechanism(out, &len, session.sasl_plain != null, "PLAIN") catch return null;
     appendSaslMechanism(out, &len, session.sasl_external != null and session.tls_certfp != null, "EXTERNAL") catch return null;
     appendSaslMechanism(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-512") catch return null;
     return if (len == 0) null else out[0..len];
 }
 
@@ -1151,6 +1161,7 @@ fn writeSaslMechanismList(session: *const ClientSession, out: []u8) ?[]const u8 
     appendSaslMechanismSep(out, &len, session.sasl_plain != null, "PLAIN", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_external != null and session.tls_certfp != null, "EXTERNAL", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-512", ' ') catch return null;
     return if (len == 0) null else out[0..len];
 }
 
@@ -1529,6 +1540,7 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             .plain = saslPlainAdapter(ctx.session),
             .external = ctx.session.sasl_external,
             .scram256 = ctx.session.sasl_scram256,
+            .scram512 = ctx.session.sasl_scram512,
         }, ctx.session.sasl_server_nonce);
         router.tls_certfp = ctx.session.tls_certfp;
 
@@ -2462,6 +2474,164 @@ test "sasl SCRAM-SHA-256 full handshake through the router logs in" {
     const fl = try fd.calcSizeForSlice(written2[s2..e2]);
     try fd.decode(final_raw[0..fl], written2[s2..e2]);
     _ = try scram_server.parseServerFinal(final_raw[0..fl]);
+}
+
+const TestScram512Db = struct {
+    record: scram512_server.Credential,
+
+    fn lookup(ptr: *anyopaque, name: []const u8) ?scram512_server.Credential {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, name, "user")) return null;
+        return self.record;
+    }
+};
+
+test "sasl advertises SCRAM-SHA-512 in 908 list only when provisioned" {
+    const salt = "saltSALTsalt";
+    const iterations: u32 = 4096;
+    var keys = try scram512_server.deriveScramKeys("pencil", salt, iterations);
+    defer keys.wipe();
+    var db = TestScram512Db{ .record = .{
+        .salt = salt,
+        .iterations = iterations,
+        .stored_key = keys.stored_key,
+        .server_key = keys.server_key,
+    } };
+
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    session.sasl_scram512 = .{ .ptr = &db, .lookupFn = TestScram512Db.lookup };
+    session.sasl_server_nonce = "SERVERNONCE";
+
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "AUTHENTICATE NOT-A-MECH");
+    try expectCodesInOrder(replies.written(), &.{ " 908 ", " 904 " });
+    // SCRAM-SHA-512 is in the 908 list because the lookup + nonce are present.
+    try expectContains(replies.written(), "SCRAM-SHA-512");
+}
+
+test "sasl CAP LS sasl= value and 908 list agree on SCRAM-SHA-512" {
+    const salt = "saltSALTsalt";
+    var keys = try scram512_server.deriveScramKeys("pencil", salt, 4096);
+    defer keys.wipe();
+    var db = TestScram512Db{ .record = .{
+        .salt = salt,
+        .iterations = 4096,
+        .stored_key = keys.stored_key,
+        .server_key = keys.server_key,
+    } };
+
+    var session = ClientSession.init();
+    session.sasl_scram512 = .{ .ptr = &db, .lookupFn = TestScram512Db.lookup };
+    session.sasl_server_nonce = "SERVERNONCE";
+
+    // CAP LS value (comma-separated, used in `sasl=`).
+    var cap_buf: [64]u8 = undefined;
+    const cap_value = writeSaslCapValue(&session, &cap_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, cap_value, "SCRAM-SHA-512") != null);
+
+    // 908 mechanism list (space-separated). Both must agree that SCRAM-SHA-512
+    // is offered, since both gate on the same callback + nonce.
+    var mech_buf: [64]u8 = undefined;
+    const mech_list = writeSaslMechanismList(&session, &mech_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, mech_list, "SCRAM-SHA-512") != null);
+}
+
+test "sasl SCRAM-SHA-512 full handshake through the router logs in" {
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const HmacSha512 = std.crypto.auth.hmac.Hmac(Sha512);
+    const digest_len = Sha512.digest_length;
+
+    const salt = "saltSALTsalt";
+    const iterations: u32 = 4096;
+    const password = "pencil";
+
+    var keys = try scram512_server.deriveScramKeys(password, salt, iterations);
+    defer keys.wipe();
+    var db = TestScram512Db{ .record = .{
+        .salt = salt,
+        .iterations = iterations,
+        .stored_key = keys.stored_key,
+        .server_key = keys.server_key,
+    } };
+
+    var session = ClientSession.init();
+    session.cap.negotiated.add(.sasl);
+    session.sasl_scram512 = .{ .ptr = &db, .lookupFn = TestScram512Db.lookup };
+    session.sasl_server_nonce = "SERVERNONCE";
+
+    var storage: [2048]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    // Mechanism selection.
+    try dispatchText(&session, &replies, "AUTHENTICATE SCRAM-SHA-512");
+    try expectContains(replies.written(), "AUTHENTICATE +\r\n");
+
+    // client-first.
+    var cf_b64: [128]u8 = undefined;
+    const cf = std.base64.standard.Encoder.encode(&cf_b64, "n,,n=user,r=CLIENTNONCE");
+    var line1: [256]u8 = undefined;
+    replies.clear();
+    try dispatchText(&session, &replies, try std.fmt.bufPrint(&line1, "AUTHENTICATE {s}", .{cf}));
+
+    // Extract the server-first challenge the router emitted.
+    const written1 = replies.written();
+    const marker = "AUTHENTICATE ";
+    const start = std.mem.indexOf(u8, written1, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, written1, start, '\r').?;
+    const server_first_b64 = written1[start..end];
+    var server_first_raw: [sasl.MAX_SCRAM_MESSAGE]u8 = undefined;
+    const sf_decoder = std.base64.standard.Decoder;
+    const sf_len = try sf_decoder.calcSizeForSlice(server_first_b64);
+    try sf_decoder.decode(server_first_raw[0..sf_len], server_first_b64);
+    const server_first = server_first_raw[0..sf_len];
+    const parsed_first = try scram512_server.parseServerFirst(server_first);
+
+    // Build the client-final with a correct proof.
+    var without_proof_buf: [256]u8 = undefined;
+    const without_proof = try std.fmt.bufPrint(&without_proof_buf, "c=biws,r={s}", .{parsed_first.nonce});
+    var auth_message_buf: [768]u8 = undefined;
+    const auth_message = try std.fmt.bufPrint(&auth_message_buf, "n=user,r=CLIENTNONCE,{s},{s}", .{ server_first, without_proof });
+    var client_sig: [digest_len]u8 = undefined;
+    HmacSha512.create(&client_sig, auth_message, &keys.stored_key);
+    var proof: [digest_len]u8 = undefined;
+    for (&proof, keys.client_key, client_sig) |*dst, ck, cs| dst.* = ck ^ cs;
+    var proof_b64_buf: [std.base64.standard.Encoder.calcSize(digest_len)]u8 = undefined;
+    const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &proof);
+    var final_buf: [320]u8 = undefined;
+    const client_final = try std.fmt.bufPrint(&final_buf, "{s},p={s}", .{ without_proof, proof_b64 });
+    var final_b64_buf: [512]u8 = undefined;
+    const final_b64 = std.base64.standard.Encoder.encode(&final_b64_buf, client_final);
+
+    var line2: [640]u8 = undefined;
+    replies.clear();
+    try dispatchText(&session, &replies, try std.fmt.bufPrint(&line2, "AUTHENTICATE {s}", .{final_b64}));
+
+    try std.testing.expectEqualStrings("user", session.account().?);
+    try expectContains(replies.written(), " 900 ");
+    try expectContains(replies.written(), " 903 ");
+
+    // Tampered proof on a fresh exchange must be rejected.
+    session.logged_in = false;
+    session.account_store.len = 0;
+    session.client.registration.sasl = .idle;
+    session.sasl_router = null;
+    replies.clear();
+    try dispatchText(&session, &replies, "AUTHENTICATE SCRAM-SHA-512");
+    replies.clear();
+    try dispatchText(&session, &replies, try std.fmt.bufPrint(&line1, "AUTHENTICATE {s}", .{cf}));
+    proof[0] ^= 1;
+    const bad_proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &proof);
+    var bad_final_buf: [320]u8 = undefined;
+    const bad_final = try std.fmt.bufPrint(&bad_final_buf, "{s},p={s}", .{ without_proof, bad_proof_b64 });
+    var bad_final_b64_buf: [512]u8 = undefined;
+    const bad_final_b64 = std.base64.standard.Encoder.encode(&bad_final_b64_buf, bad_final);
+    replies.clear();
+    try dispatchText(&session, &replies, try std.fmt.bufPrint(&line2, "AUTHENTICATE {s}", .{bad_final_b64}));
+    try expectContains(replies.written(), " 904 ");
+    try std.testing.expect(session.account() == null);
 }
 
 test "host accessor prefers visible host, falls back to real then empty" {

@@ -269,9 +269,10 @@ pub fn main(init: std.process.Init) !void {
                 external_bridge = .{ .services = &account_services };
                 srv_cfg.sasl_checker = account_checker.checker();
                 srv_cfg.sasl_scram256 = scram_store.scram256Lookup();
+                srv_cfg.sasl_scram512 = scram_store.scram512Lookup();
                 srv_cfg.sasl_external = external_bridge.lookup();
                 srv_cfg.account_services = &account_services;
-                std.debug.print("orochi: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + EXTERNAL live\n", .{db});
+                std.debug.print("orochi: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL live\n", .{db});
             } else |err| {
                 std.debug.print("orochi: account store error ({s}); SASL disabled\n", .{@errorName(err)});
             }
