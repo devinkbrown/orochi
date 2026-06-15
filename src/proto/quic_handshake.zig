@@ -73,6 +73,18 @@ pub const KeySet = quic_protect.KeySet;
 pub const PacketKeys = quic_tls.PacketKeys;
 pub const QuicCipherSuite = quic_protect.CipherSuite;
 
+/// The 1-RTT (application) traffic secrets the connection driver needs to seed
+/// RFC 9001 §6 key updates: `write` is this endpoint's own secret, `read` is the
+/// peer's. Both are the 32-byte SHA-256 secret (the only width the driver's
+/// "quic ku" roll supports). `suite` selects the AEAD/header-protection used to
+/// re-derive the next-generation packet keys. Read-only snapshot; copying these
+/// out does not affect the handshake.
+pub const AppTrafficSecrets = struct {
+    write: [32]u8,
+    read: [32]u8,
+    suite: QuicCipherSuite,
+};
+
 /// The TLS 1.3 / QUIC `quic_transport_parameters` extension type (RFC 9001 §8.2).
 pub const quic_transport_parameters_ext: u16 = 0x39;
 
@@ -282,6 +294,23 @@ pub const Server = struct {
     /// server flight has been produced.
     pub fn applicationKeys(self: *const Server) ?KeySet {
         return self.application_keys;
+    }
+
+    /// The 1-RTT (application) traffic secrets used to seed key updates
+    /// (RFC 9001 §6). `write` is this endpoint's own secret (server_ap_secret),
+    /// `read` is the peer's (client_ap_secret). Returns null until the
+    /// application keys are installed, or for a SHA-384 suite (the
+    /// SHA-256 "quic ku" roll used by the driver is only valid for the 32-byte
+    /// SHA-256 secrets). This is a pure read-only accessor; it changes no state.
+    pub fn appTrafficSecrets(self: *const Server) ?AppTrafficSecrets {
+        if (self.application_keys == null) return null;
+        const suite = self.suite orelse return null;
+        if (suite == .tls_aes_256_gcm_sha384) return null; // SHA-384: see doc
+        return .{
+            .write = self.server_ap_secret[0..32].*,
+            .read = self.client_ap_secret[0..32].*,
+            .suite = suite.quicSuite(),
+        };
     }
 
     /// Feed reassembled client CRYPTO bytes for `level`. Returns nothing; the
@@ -1011,6 +1040,21 @@ pub const Client = struct {
 
     pub fn applicationKeys(self: *const Client) ?KeySet {
         return self.application_keys;
+    }
+
+    /// The 1-RTT (application) traffic secrets used to seed key updates
+    /// (RFC 9001 §6). `write` is this endpoint's own secret (client_ap_secret),
+    /// `read` is the peer's (server_ap_secret). See `Server.appTrafficSecrets`
+    /// for the SHA-384 caveat. Pure read-only accessor.
+    pub fn appTrafficSecrets(self: *const Client) ?AppTrafficSecrets {
+        if (self.application_keys == null) return null;
+        const suite = self.suite orelse return null;
+        if (suite == .tls_aes_256_gcm_sha384) return null; // SHA-384: see doc
+        return .{
+            .write = self.client_ap_secret[0..32].*,
+            .read = self.server_ap_secret[0..32].*,
+            .suite = suite.quicSuite(),
+        };
     }
 
     /// Produce the ClientHello into the Initial output buffer if not yet sent.

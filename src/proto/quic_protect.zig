@@ -408,6 +408,21 @@ pub const KeySet = struct {
     }
 };
 
+/// Re-derive a single direction's 1-RTT packet keys from a key-updated traffic
+/// secret (RFC 9001 §6.1). The AEAD key and IV roll to the new generation, but
+/// the header-protection key is **retained** from `prev` — header protection is
+/// never updated by a key update (RFC 9001 §6.1). The 32-byte SHA-256 secret is
+/// the only width supported here; the rolled secret comes from
+/// `quic_tls.nextGenerationSecret`. A (key, nonce) pair is never reused: each
+/// new generation has a fresh key while the packet number (and thus the nonce)
+/// keeps advancing monotonically within the connection.
+pub fn keyUpdateDirection(prev: PacketKeys, next_secret: [32]u8) PacketKeys {
+    var pk = quic_tls.derivePacketKeys(next_secret, prev.suite);
+    // RFC 9001 §6.1: the header-protection key is NOT rolled on a key update.
+    pk.hp = prev.hp;
+    return pk;
+}
+
 /// Result of sealing a packet: the total protected length written to the
 /// caller's output buffer.
 pub const SealResult = struct {

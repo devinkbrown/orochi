@@ -30,10 +30,13 @@
 //!     min window of 2 × max_datagram, slow start, congestion avoidance, and a
 //!     recovery period that ignores losses already in the current recovery.
 //!
-//! Deferred (typed gaps, called out in the driver's docs too): ECN, pacing,
-//! and persistent congestion (§7.6) — the controller detects single losses and
-//! halves the window but does not implement the persistent-congestion collapse
-//! to the minimum window. Everything else here is the real RFC algorithm.
+//!   * persistent congestion (`detectLost` → `Congestion.onPersistentCongestion`)
+//!     — §7.6: a span of only-lost ack-eliciting packets longer than the
+//!     persistent-congestion duration collapses the window to the minimum and
+//!     re-enters slow start.
+//!
+//! Deferred (typed gaps, called out in the driver's docs too): ECN and pacing.
+//! Everything else here is the real RFC algorithm.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -71,9 +74,8 @@ pub const minimum_window_packets: u64 = 2;
 pub const loss_reduction_num: u64 = 1;
 pub const loss_reduction_den: u64 = 2;
 
-/// kPersistentCongestionThreshold (§7.6): 3. Persistent-congestion handling is
-/// deferred (see the module doc); the constant is exported for completeness and
-/// future use.
+/// kPersistentCongestionThreshold (§7.6): 3. Multiplies the per-PTO base to give
+/// the persistent-congestion duration in `detectLost`.
 pub const persistent_congestion_threshold: u64 = 3;
 
 /// Default max_ack_delay (§6.2.1 / RFC 9000 §18.2): 25 ms. Used in the PTO once
@@ -379,6 +381,17 @@ pub const Congestion = struct {
         self.bytes_in_flight -|= bytes;
     }
 
+    /// Collapse the congestion window to the minimum and re-enter slow start
+    /// (RFC 9002 §7.6, "Persistent Congestion"). This is invoked when a span of
+    /// only-lost ack-eliciting packets exceeds the persistent-congestion
+    /// duration. Resetting `ssthresh` to max forces slow start; `recovery_start`
+    /// is cleared so the next loss can still cut the (now-minimal) window.
+    pub fn onPersistentCongestion(self: *Congestion) void {
+        self.congestion_window = self.minWindow();
+        self.ssthresh = std.math.maxInt(u64);
+        self.recovery_start_ns = null;
+    }
+
     /// Remove a discarded packet's bytes from flight when a packet-number space
     /// is dropped (§6.4 / §A.4 — "OnPacketNumberSpaceDiscarded").
     pub fn onPacketDiscarded(self: *Congestion, bytes: u64) void {
@@ -415,6 +428,49 @@ pub const AckOutcome = struct {
     lost_frames: []const LostFrame,
     /// True if this ACK produced a new RTT sample (so the driver resets pto_count).
     rtt_updated: bool = false,
+};
+
+/// Tracks the time span of an unbroken run of declared-lost ack-eliciting
+/// packets for the persistent-congestion check (RFC 9002 §7.6). The run is built
+/// up as `detectLost` walks the registry in (ascending packet-number) order;
+/// any packet that is NOT declared lost calls `breakRun`, which resets the run
+/// (a persistent-congestion window must contain *no* surviving packet between its
+/// two bounding ack-eliciting losses). `span` is the time between the first and
+/// last lost ack-eliciting packet of the current run, or null if fewer than two
+/// ack-eliciting packets are in it (a single loss can never be persistent).
+const PersistentCongestionRun = struct {
+    first_ns: ?u64 = null,
+    last_ns: ?u64 = null,
+    count: u32 = 0,
+
+    fn extend(self: *PersistentCongestionRun, time_sent_ns: u64) void {
+        if (self.first_ns == null) self.first_ns = time_sent_ns;
+        self.last_ns = time_sent_ns;
+        self.count += 1;
+    }
+
+    fn breakRun(self: *PersistentCongestionRun) void {
+        self.first_ns = null;
+        self.last_ns = null;
+        self.count = 0;
+    }
+
+    /// The span between the first and last lost ack-eliciting packet, requiring
+    /// at least two such packets (a window is bounded by two ack-eliciting
+    /// losses, §7.6). Null otherwise.
+    fn span(self: *const PersistentCongestionRun) ?u64 {
+        if (self.count < 2) return null;
+        const f = self.first_ns orelse return null;
+        const l = self.last_ns orelse return null;
+        return if (l >= f) l - f else null;
+    }
+
+    /// Whether this run's span strictly exceeds `duration_ns` (§7.6 uses a strict
+    /// "greater than" comparison).
+    fn exceeds(self: *const PersistentCongestionRun, duration_ns: u64) bool {
+        const s = self.span() orelse return false;
+        return s > duration_ns;
+    }
 };
 
 /// Indexes a per-space registry by encryption level.
@@ -582,18 +638,45 @@ pub const Recovery = struct {
     /// kPacketThreshold below the largest acked, or (b) older than the time
     /// threshold (§6.1.1, §6.1.2). Appends each lost packet's frames to
     /// `lost_scratch` and removes its bytes from flight + the congestion window.
+    ///
+    /// Also runs the persistent-congestion check (§7.6): an unbroken run of
+    /// declared-lost packets bounded by two lost *ack-eliciting* packets whose
+    /// time span exceeds the persistent-congestion duration collapses the
+    /// congestion window to the minimum and re-enters slow start. The registry
+    /// holds only still-in-doubt packets at entry (acked packets were compacted
+    /// out after their ACK pass), so any packet here that is NOT declared lost in
+    /// this pass is still in flight and therefore *breaks* the run.
     fn detectLost(self: *Recovery, reg: *SentRegistry, largest_acked: u64, now_ns: u64) Allocator.Error!void {
         const loss_delay = self.rtt.lossDelay();
         // A packet sent at or before this instant is past the time threshold.
         const lost_send_time = if (now_ns >= loss_delay) now_ns - loss_delay else 0;
 
+        // Persistent-congestion run tracking (§7.6): the earliest/latest send
+        // times of lost *ack-eliciting* packets within the current unbroken run.
+        // The threshold is computed once. We evaluate the run both when it is
+        // broken by a surviving packet and after the final packet, so a run that
+        // ends mid-registry is still detected.
+        const pc_duration = self.persistentCongestionDuration();
+        var pc = PersistentCongestionRun{};
+        var persistent = false;
+
         for (reg.packets.items) |*p| {
-            if (p.retired) continue;
-            if (p.packet_number > largest_acked) continue; // can't be lost yet
+            if (p.retired or p.packet_number > largest_acked) {
+                // Acked/retired or not-yet-loseable → a surviving packet that
+                // breaks any persistent-congestion run.
+                if (pc.exceeds(pc_duration)) persistent = true;
+                pc.breakRun();
+                continue;
+            }
 
             const beyond_threshold = (largest_acked - p.packet_number) >= packet_threshold;
             const past_time = p.time_sent_ns <= lost_send_time;
-            if (!beyond_threshold and !past_time) continue;
+            if (!beyond_threshold and !past_time) {
+                // Still in flight (in doubt) → breaks any persistent-congestion run.
+                if (pc.exceeds(pc_duration)) persistent = true;
+                pc.breakRun();
+                continue;
+            }
 
             // Packet is lost.
             p.retired = true;
@@ -601,8 +684,28 @@ pub const Recovery = struct {
                 self.cc.onPacketLost(p.sent_bytes);
                 self.cc.onCongestionEvent(p.time_sent_ns, now_ns);
             }
+            if (p.ack_eliciting) pc.extend(p.time_sent_ns);
             for (p.frames.slice()) |f| try self.lost_scratch.append(self.allocator, f);
         }
+
+        // Evaluate the final run (§7.6).
+        if (pc.exceeds(pc_duration)) persistent = true;
+        if (persistent) self.cc.onPersistentCongestion();
+    }
+
+    /// The persistent-congestion duration (RFC 9002 §7.6):
+    ///   (smoothed_rtt + max(4·rttvar, kGranularity) + max_ack_delay)
+    ///     × kPersistentCongestionThreshold(3).
+    /// Uses the RFC's initial-RTT defaults before the first sample so the check
+    /// is well-defined. `max_ack_delay` is included only once the handshake is
+    /// confirmed (it applies to the 1-RTT space where persistent congestion is
+    /// meaningful), mirroring the PTO computation.
+    fn persistentCongestionDuration(self: *const Recovery) u64 {
+        const smoothed = if (self.rtt.has_sample) self.rtt.smoothed_rtt else default_initial_rtt_ns;
+        const rttvar = if (self.rtt.has_sample) self.rtt.rttvar else default_initial_rtt_ns / 2;
+        var base = smoothed + @max(4 * rttvar, granularity_ns);
+        if (self.handshake_confirmed) base += self.max_ack_delay_ns;
+        return base * persistent_congestion_threshold;
     }
 
     // -----------------------------------------------------------------------
@@ -1046,6 +1149,109 @@ test "recovery — discardSpace removes in-flight bytes and clears the registry 
     rec.discardSpace(.initial);
     try testing.expectEqual(@as(u64, 0), rec.bytesInFlight());
     try testing.expectEqual(@as(usize, 0), rec.registry(.initial).packets.items.len);
+}
+
+test "recovery persistent congestion — a long loss burst collapses cwnd to min and re-enters slow start (§7.6)" {
+    const alloc = testing.allocator;
+    var rec = Recovery.init(alloc, .{ .max_datagram = 1252 });
+    defer rec.deinit();
+
+    // Seed an RTT so the persistent-congestion duration is well-defined:
+    // smoothed=100ms, rttvar=50ms → base = 100 + max(4*50,1)=300ms; ×3 = 900ms.
+    rec.rtt.update(100 * ms, 0, default_max_ack_delay_ns, false);
+    try testing.expectEqual(@as(u64, 900 * ms), rec.persistentCongestionDuration());
+
+    // Send packets 0..6 ack-eliciting/in-flight. Packets 0..3 span > 900ms; 4,5
+    // are recent; 6 is the one we ACK. 1200 bytes each.
+    const times = [_]u64{ 0, 1000 * ms, 1001 * ms, 1002 * ms, 1003 * ms, 1004 * ms, 1005 * ms };
+    for (times, 0..) |t, i| {
+        try rec.onPacketSent(.application, .{
+            .packet_number = @intCast(i),
+            .time_sent_ns = t,
+            .in_flight = true,
+            .ack_eliciting = true,
+            .sent_bytes = 1200,
+        });
+    }
+    const min_window = minimum_window_packets * 1252;
+    try testing.expect(rec.congestionWindow() > min_window);
+
+    // ACK packet 6 at now=1010ms. Packets 0..3 are ≥3 below largest → lost by
+    // the packet threshold and form an unbroken ack-eliciting run spanning
+    // 0..1002ms = 1002ms > 900ms → persistent congestion. Packets 4,5 are recent
+    // and within the packet threshold, so they survive and bound the run.
+    const out = try rec.onAckReceived(.application, &.{6}, 6, 0, 1010 * ms);
+    // At least packets 0..3 were declared lost (their frames are empty here, so
+    // lost_frames may be empty; the collapse is the observable effect).
+    _ = out;
+
+    // The window collapsed to the minimum and ssthresh reset → slow start.
+    try testing.expectEqual(min_window, rec.congestionWindow());
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), rec.cc.ssthresh);
+}
+
+test "recovery persistent congestion — a single loss only halves, never collapses (§7.6 vs §7.3.2)" {
+    const alloc = testing.allocator;
+    var rec = Recovery.init(alloc, .{ .max_datagram = 1252 });
+    defer rec.deinit();
+
+    rec.rtt.update(100 * ms, 0, default_max_ack_delay_ns, false);
+    const w0 = rec.congestionWindow();
+    const min_window = minimum_window_packets * 1252;
+
+    // Send packets 0..4 close together; only packet 0 will be lost (by the packet
+    // threshold when we ACK packet 4), the rest survive. One lost ack-eliciting
+    // packet can never form a two-packet run → no persistent congestion.
+    for (0..5) |i| {
+        try rec.onPacketSent(.application, .{
+            .packet_number = @intCast(i),
+            .time_sent_ns = @intCast(i * ms),
+            .in_flight = true,
+            .ack_eliciting = true,
+            .sent_bytes = 1200,
+        });
+    }
+    const out = try rec.onAckReceived(.application, &.{4}, 4, 0, 10 * ms);
+    _ = out;
+
+    // The window took a single NewReno congestion cut (≈halving) but did NOT
+    // collapse to the minimum, proving the single loss did not trip persistent
+    // congestion. (The exact value depends on slow-start growth from the ack, so
+    // we assert the band rather than a precise number.)
+    try testing.expect(rec.congestionWindow() < w0); // a cut happened
+    try testing.expect(rec.congestionWindow() > min_window); // not a collapse
+    // ssthresh was set to the halved window (finite), not reset to max as a
+    // persistent-congestion collapse would.
+    try testing.expect(rec.cc.ssthresh != std.math.maxInt(u64));
+}
+
+test "recovery persistent congestion — a short burst under the duration does not collapse (§7.6)" {
+    const alloc = testing.allocator;
+    var rec = Recovery.init(alloc, .{ .max_datagram = 1252 });
+    defer rec.deinit();
+
+    // Duration = 900ms (as above). A burst of lost ack-eliciting packets spanning
+    // only 100ms must NOT collapse — it only halves (one congestion event).
+    rec.rtt.update(100 * ms, 0, default_max_ack_delay_ns, false);
+    const w0 = rec.congestionWindow();
+    const min_window = minimum_window_packets * 1252;
+
+    const times = [_]u64{ 0, 50 * ms, 100 * ms, 101 * ms, 102 * ms, 103 * ms, 104 * ms };
+    for (times, 0..) |t, i| {
+        try rec.onPacketSent(.application, .{
+            .packet_number = @intCast(i),
+            .time_sent_ns = t,
+            .in_flight = true,
+            .ack_eliciting = true,
+            .sent_bytes = 1200,
+        });
+    }
+    // ACK packet 6: packets 0..3 are lost by the packet threshold, span 0..101ms
+    // = 101ms < 900ms → not persistent. A single congestion cut applies.
+    _ = try rec.onAckReceived(.application, &.{6}, 6, 0, 110 * ms);
+    try testing.expect(rec.congestionWindow() < w0); // a cut happened
+    try testing.expect(rec.congestionWindow() > min_window); // not a collapse
+    try testing.expect(rec.cc.ssthresh != std.math.maxInt(u64));
 }
 
 test "recovery — sent registry bounds and drops oldest on overflow" {

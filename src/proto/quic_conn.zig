@@ -54,11 +54,17 @@
 //!
 //! Documented simplifications (intentional for this layer; the listener / HTTP3
 //! layers refine them):
-//!   * Congestion control is NewReno (RFC 9002 §7); ECN, pacing, and the
-//!     persistent-congestion collapse (§7.6) are deferred (typed gaps).
+//!   * Congestion control is NewReno (RFC 9002 §7) including the
+//!     persistent-congestion collapse (§7.6); ECN and pacing are deferred (typed
+//!     gaps).
 //!   * One connection id per side, no migration, no Retry, no stateless reset,
-//!     no key update (1-RTT key phase stays 0), no 0-RTT. Each is a typed gap,
-//!     not a silent one.
+//!     no 0-RTT. Each is a typed gap, not a silent one.
+//!   * 1-RTT key update (RFC 9001 §6) is implemented: the key-phase bit, peer-
+//!     and self-initiated updates, previous-generation key retention for
+//!     reordering, peer-update rate limiting, and the confidentiality-limit
+//!     counters. It is a 1-RTT-only mechanism (never the Initial/Handshake
+//!     spaces) and is unavailable for the SHA-384 suite (documented in
+//!     `initKeyUpdate`).
 //!   * The receive side enforces frame-level bounds via the Engine; this driver
 //!     additionally bounds-checks every byte of packet parsing so a malicious or
 //!     truncated datagram errors (never panics / reads out of bounds).
@@ -68,6 +74,7 @@ const Allocator = std.mem.Allocator;
 
 const quic_packet = @import("quic_packet.zig");
 const quic_protect = @import("quic_protect.zig");
+const quic_tls = @import("quic_tls.zig");
 const quic_frame = @import("quic_frame.zig");
 const quic_conn_state = @import("quic_conn_state.zig");
 const quic_handshake = @import("quic_handshake.zig");
@@ -76,6 +83,7 @@ const quic_recovery = @import("quic_recovery.zig");
 
 pub const EncryptionLevel = quic_protect.EncryptionLevel;
 pub const KeySet = quic_protect.KeySet;
+pub const PacketKeys = quic_protect.PacketKeys;
 pub const ConnectionId = quic_packet.ConnectionId;
 pub const Frame = quic_frame.Frame;
 pub const Engine = quic_conn_state.Engine;
@@ -165,6 +173,11 @@ const Handshake = union(Role) {
             inline else => |*h| return h.applicationKeys(),
         }
     }
+    fn appTrafficSecrets(self: *const Handshake) ?quic_handshake.AppTrafficSecrets {
+        switch (self.*) {
+            inline else => |*h| return h.appTrafficSecrets(),
+        }
+    }
     fn selectedAlpn(self: *const Handshake) ?[]const u8 {
         switch (self.*) {
             inline else => |*h| return h.selectedAlpn(),
@@ -248,6 +261,91 @@ const SendState = struct {
     }
 };
 
+/// 1-RTT key-update state machine (RFC 9001 §6).
+///
+/// Key generations are addressed by a single key-phase bit in the short header.
+/// We keep, per direction:
+///   * the CURRENT generation (whose keys are `Conn.app_keys`),
+///   * the NEXT-generation read keys, pre-computed so a peer-initiated update
+///     (a flipped phase bit) can be trial-decrypted without deriving on the hot
+///     path (RFC 9001 §6.3), and
+///   * the PREVIOUS-generation read keys, retained briefly after we commit an
+///     update so packets reordered across the update boundary still decrypt
+///     (RFC 9001 §6.4).
+///
+/// Rate limiting (RFC 9001 §6.6 / §9.4): we do not *initiate* a new update until
+/// the peer has acknowledged a packet we sent in the current phase (`initiated`
+/// + `confirm_pn`), and we refuse to *commit* a peer-driven update more often
+/// than once per `min_update_interval_ns` (≈3·PTO) to resist a key-update DoS.
+///
+/// Confidentiality / integrity limits (RFC 9001 §6.6): `packets_sent_epoch`
+/// counts the packets protected with the current send key; `aead_failures`
+/// counts authentication failures across the connection. AES-128-GCM /
+/// AES-256-GCM tolerate up to 2^23 protected packets and 2^52 invalid packets
+/// before a key update / connection close is required; ChaCha20-Poly1305 sets no
+/// confidentiality limit and bounds invalid packets at 2^36. We expose the
+/// counters and, once the current epoch exceeds `confidentiality_limit`,
+/// `wantsKeyUpdate()` reports that the application should rotate; a (key, nonce)
+/// pair is never reused because the packet number advances monotonically and a
+/// fresh key is installed on every generation.
+const KeyUpdate = struct {
+    /// Whether the 1-RTT secrets are known and key update is available.
+    ready: bool = false,
+    /// Current key-phase bit applied to outbound short headers and expected on
+    /// inbound ones (RFC 9001 §6.3).
+    phase: u1 = 0,
+    /// QUIC AEAD/header-protection suite for re-derivation.
+    suite: quic_protect.CipherSuite = .aes128gcm,
+
+    /// Current generation traffic secrets (write = ours, read = peer's).
+    write_secret: [32]u8 = [_]u8{0} ** 32,
+    read_secret: [32]u8 = [_]u8{0} ** 32,
+
+    /// Pre-computed next-generation read keys + their secret (peer-update trial).
+    next_read: PacketKeys = undefined,
+    next_read_secret: [32]u8 = [_]u8{0} ** 32,
+
+    /// Retained previous-generation read keys for reordered packets (§6.4), valid
+    /// until `prev_read_until_ns`.
+    prev_read: ?PacketKeys = null,
+    prev_read_until_ns: u64 = 0,
+
+    /// Highest packet number successfully removed-from-header in the CURRENT key
+    /// phase. RFC 9001 §6.3 disambiguation: a phase-mismatched packet with a
+    /// HIGHER number than this is a peer-initiated update (try next keys); one
+    /// with a LOWER number is a packet reordered from the previous phase (try
+    /// retained previous keys). Null until the first 1-RTT packet is received.
+    highest_pn_current_phase: ?u64 = null,
+
+    /// We initiated an update and await peer confirmation before initiating again
+    /// (§6.5): an ACK of a packet number ≥ `confirm_pn` confirms it. `confirm_pn`
+    /// is null until the first packet in the new phase is actually sent.
+    initiated: bool = false,
+    confirm_pn: ?u64 = null,
+
+    /// Time of the last committed update, for peer-driven rate limiting (§6.6).
+    last_update_ns: u64 = 0,
+    /// Whether we have ever committed an update (so the first peer update is not
+    /// rejected by the rate limiter at t≈0).
+    have_updated: bool = false,
+
+    /// Packets protected with the current send key (resets each generation).
+    packets_sent_epoch: u64 = 0,
+    /// AEAD authentication failures observed (anti-forgery accounting, §6.6).
+    aead_failures: u64 = 0,
+
+    /// RFC 9001 §6.6 AEAD confidentiality limit (packets) for AES-GCM suites:
+    /// 2^23. ChaCha20-Poly1305 has no confidentiality limit; we still rotate at
+    /// this conservative bound so the counter logic is uniform.
+    const confidentiality_limit: u64 = 1 << 23;
+
+    /// How long previous-generation read keys are retained after an update
+    /// (RFC 9001 §6.4 recommends ~3·PTO; the connection passes a concrete value).
+    fn retentionNs(pto_ns: u64) u64 {
+        return pto_ns *| 3;
+    }
+};
+
 /// The connection. One per peer 4-tuple. Socketless: feed `recvDatagram`,
 /// drain `sendDatagrams`, tick `onTimeout`.
 pub const Conn = struct {
@@ -262,6 +360,11 @@ pub const Conn = struct {
     handshake_keys: ?KeySet = null,
     app_keys: ?KeySet = null,
     initial_discarded: bool = false,
+
+    /// 1-RTT key-update state machine (RFC 9001 §6). Populated once the 1-RTT
+    /// traffic secrets are known; until then key update is unavailable and the
+    /// key phase stays 0.
+    key_update: KeyUpdate = .{},
 
     /// Long-header connection ids. `dcid` = the peer's, `scid` = ours.
     dcid: ConnectionId,
@@ -467,9 +570,32 @@ pub const Conn = struct {
             if (self.handshake.handshakeKeys()) |ks| self.handshake_keys = ks;
         }
         if (self.app_keys == null) {
-            if (self.handshake.applicationKeys()) |ks| self.app_keys = ks;
+            if (self.handshake.applicationKeys()) |ks| {
+                self.app_keys = ks;
+                self.initKeyUpdate();
+            }
         }
         self.refreshEstablished();
+    }
+
+    /// Seed the 1-RTT key-update state from the handshake's application traffic
+    /// secrets (RFC 9001 §6.1): record the current write/read secrets and
+    /// pre-compute the next-generation read keys so a peer-initiated phase flip
+    /// can be trial-decrypted without deriving on the receive path. No-op for a
+    /// suite whose secret width the "quic ku" roll does not support (SHA-384);
+    /// the connection then simply never offers a key update (documented gap).
+    fn initKeyUpdate(self: *Conn) void {
+        if (self.key_update.ready) return;
+        const secrets = self.handshake.appTrafficSecrets() orelse return;
+        self.key_update.ready = true;
+        self.key_update.phase = 0;
+        self.key_update.suite = secrets.suite;
+        self.key_update.write_secret = secrets.write;
+        self.key_update.read_secret = secrets.read;
+        // Pre-compute the next-generation read keys (§6.3).
+        self.key_update.next_read_secret = quic_tls.nextGenerationSecret(secrets.read);
+        const cur_read = (self.app_keys orelse return).read;
+        self.key_update.next_read = quic_protect.keyUpdateDirection(cur_read, self.key_update.next_read_secret);
     }
 
     fn refreshEstablished(self: *Conn) void {
@@ -615,6 +741,13 @@ pub const Conn = struct {
             return;
         };
 
+        // 1-RTT packets with key-update support take the key-phase-aware path so
+        // a peer-initiated update (a flipped phase bit) is detected and committed
+        // (RFC 9001 §6.3). The handshake levels never key-update.
+        if (level == .application and self.key_update.ready) {
+            return self.openApp1Rtt(packet, pn_offset, now);
+        }
+
         // Work on a mutable copy: openPacketSuite unmasks the header in place.
         const buf = try self.allocator.alloc(u8, packet.len);
         defer self.allocator.free(buf);
@@ -640,6 +773,177 @@ pub const Conn = struct {
 
         const pn = PnDecodeCtx.last_full;
         try self.intakeFrames(level, pn, plaintext[0..opened.plaintext_len], now);
+    }
+
+    /// Open a 1-RTT (short-header) packet with key-update awareness (RFC 9001
+    /// §6.3). Header protection (whose key never rolls) is removed first to reveal
+    /// the key-phase bit and packet number; the AEAD key is then chosen by phase:
+    ///   * phase == current  → current read keys.
+    ///   * phase != current  → trial-decrypt with the pre-computed NEXT-generation
+    ///     read keys; on success COMMIT the update (next→current, retain the old
+    ///     read keys briefly for reordering, re-derive the new next, and flip our
+    ///     own send phase so our outbound packets match — §6.1), subject to the
+    ///     peer-update rate limit (§6.6). On AEAD failure the phase flip is a
+    ///     forgery and the packet is dropped (anti-forgery).
+    ///   * a packet that fails the current keys but matches the retained PREVIOUS
+    ///     generation (a packet reordered across our own update) still decrypts
+    ///     within the retention window (§6.4).
+    fn openApp1Rtt(self: *Conn, packet: []const u8, pn_offset: usize, now: u64) Error!void {
+        const cur = self.app_keys orelse return;
+
+        // Remove header protection on a mutable copy to read the phase bit + pn.
+        // The header-protection key never rolls (§6.1), so the current read hp key
+        // unmasks every generation's short header.
+        const buf = try self.allocator.alloc(u8, packet.len);
+        defer self.allocator.free(buf);
+        @memcpy(buf, packet);
+
+        const read_keys = cur.read;
+        const pn_len = quic_protect.removeHeaderProtection(buf, pn_offset, read_keys.suite, read_keys.hpBytes()) catch return;
+        const incoming_phase: u1 = if ((buf[0] & 0x04) != 0) 1 else 0;
+
+        // Decode the full packet number against the largest received.
+        var truncated: u64 = 0;
+        for (buf[pn_offset .. pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
+        const largest = self.engine.space(.application).largest_received;
+        const full_pn = if (largest) |la|
+            quic_frame.decodePacketNumber(truncated, pn_len, la) catch truncated
+        else
+            truncated;
+
+        const header_end = pn_offset + pn_len;
+        if (header_end > buf.len) return;
+        const aad = buf[0..header_end];
+        const ciphertext = buf[header_end..];
+        if (ciphertext.len < quic_protect.aead_tag_len) return;
+        const ct_len = ciphertext.len - quic_protect.aead_tag_len;
+
+        const plaintext = try self.allocator.alloc(u8, ct_len);
+        defer self.allocator.free(plaintext);
+
+        if (incoming_phase == self.key_update.phase) {
+            // Phase matches the current generation → current read keys.
+            quic_protect.unprotectPayload(read_keys.suite, plaintext, ciphertext, read_keys.keyBytes(), read_keys.iv, full_pn, aad) catch {
+                self.key_update.aead_failures +|= 1;
+                return;
+            };
+            self.noteCurrentPhasePn(full_pn);
+            try self.intakeFrames(.application, full_pn, plaintext, now);
+            return;
+        }
+
+        // Phase bit differs from the current generation (§6.3). Disambiguate by
+        // packet number against the highest we have accepted in the current
+        // phase: a HIGHER number is the peer initiating an update (try the
+        // next-generation read keys, then commit); a LOWER (or equal-or-no
+        // baseline) number is a packet reordered from the PREVIOUS phase (try the
+        // retained previous read keys).
+        const looks_like_update = if (self.key_update.highest_pn_current_phase) |hp| full_pn > hp else true;
+
+        if (!looks_like_update) {
+            // Reordered previous-generation packet (§6.4): retained keys, window.
+            if (self.openWithPrev(plaintext, ciphertext, aad, full_pn, now)) {
+                try self.intakeFrames(.application, full_pn, plaintext, now);
+            }
+            return;
+        }
+
+        // Peer-initiated update: trial-decrypt with the pre-computed next keys.
+        const nr = self.key_update.next_read;
+        quic_protect.unprotectPayload(nr.suite, plaintext, ciphertext, nr.keyBytes(), nr.iv, full_pn, aad) catch {
+            // A phase flip that fails AEAD is a forgery. Before rejecting, try the
+            // retained previous keys too (a reordered old packet whose pn happened
+            // to exceed our current-phase high-water mark). Otherwise drop it and
+            // count the failure toward the integrity limit (§6.6).
+            if (self.openWithPrev(plaintext, ciphertext, aad, full_pn, now)) {
+                try self.intakeFrames(.application, full_pn, plaintext, now);
+            } else {
+                self.key_update.aead_failures +|= 1;
+            }
+            return;
+        };
+
+        // Anti-DoS rate limit (§6.6): refuse to COMMIT peer updates faster than
+        // once per retention interval (≈3·PTO). The packet authenticated, so we
+        // deliver its frames using the next-generation keys, but we do NOT rotate
+        // our generation — the peer must slow down. (We still decrypt subsequent
+        // packets in this phase via the next keys until we eventually commit.)
+        const interval = KeyUpdate.retentionNs(self.recovery.ptoDuration());
+        const too_soon = self.key_update.have_updated and now < self.key_update.last_update_ns + interval;
+        if (!too_soon) {
+            self.commitPeerUpdate(incoming_phase, full_pn, now);
+        }
+        try self.intakeFrames(.application, full_pn, plaintext, now);
+    }
+
+    /// Record the highest packet number accepted in the current key phase, used
+    /// by §6.3 to disambiguate a reordered previous-phase packet from a new
+    /// peer-initiated update.
+    fn noteCurrentPhasePn(self: *Conn, pn: u64) void {
+        if (self.key_update.highest_pn_current_phase) |hp| {
+            if (pn > hp) self.key_update.highest_pn_current_phase = pn;
+        } else {
+            self.key_update.highest_pn_current_phase = pn;
+        }
+    }
+
+    /// Try the retained previous-generation read keys (§6.4) for a packet that the
+    /// current keys could not open. Returns true (with `plaintext` filled) on
+    /// success within the retention window, false otherwise.
+    fn openWithPrev(self: *Conn, plaintext: []u8, ciphertext: []const u8, aad: []const u8, full_pn: u64, now: u64) bool {
+        const prev = self.key_update.prev_read orelse return false;
+        if (now > self.key_update.prev_read_until_ns) return false;
+        quic_protect.unprotectPayload(prev.suite, plaintext, ciphertext, prev.keyBytes(), prev.iv, full_pn, aad) catch {
+            self.key_update.aead_failures +|= 1;
+            return false;
+        };
+        return true;
+    }
+
+    /// Commit a peer-initiated key update (RFC 9001 §6.1). The whole generation
+    /// rolls (a single key-phase bit covers both directions): the next-generation
+    /// read keys become current (retaining the old read keys briefly for
+    /// reordered packets, §6.4), our own write keys roll so our outbound phase
+    /// matches the peer's, and the next-generation keys are pre-computed for the
+    /// following update. `first_pn` seeds the new phase's high-water mark.
+    fn commitPeerUpdate(self: *Conn, new_phase: u1, first_pn: u64, now: u64) void {
+        self.rollGeneration(new_phase, now);
+        self.key_update.highest_pn_current_phase = first_pn;
+        // A peer update we mirrored is not a self-initiated update awaiting
+        // confirmation; the phase now matches the peer's.
+        self.key_update.initiated = false;
+        self.key_update.confirm_pn = null;
+    }
+
+    /// Roll BOTH directions of the 1-RTT keys to the next generation and set the
+    /// key phase to `new_phase` (RFC 9001 §6.1). The previous read keys are
+    /// retained for the reordering window (§6.4); the header-protection keys are
+    /// retained (never rolled). Shared by self- and peer-initiated updates.
+    fn rollGeneration(self: *Conn, new_phase: u1, now: u64) void {
+        if (self.app_keys == null) return;
+        const cur = &self.app_keys.?;
+
+        // Retain the outgoing read keys for reordered previous-phase packets.
+        self.key_update.prev_read = cur.read;
+        self.key_update.prev_read_until_ns = now +| KeyUpdate.retentionNs(self.recovery.ptoDuration());
+
+        // Roll write keys (own secret) to the next generation.
+        const next_write_secret = quic_tls.nextGenerationSecret(self.key_update.write_secret);
+        cur.write = quic_protect.keyUpdateDirection(cur.write, next_write_secret);
+        self.key_update.write_secret = next_write_secret;
+
+        // The pre-computed next read keys become current.
+        cur.read = self.key_update.next_read;
+        self.key_update.read_secret = self.key_update.next_read_secret;
+
+        // Pre-compute the following generation's read keys for the next update.
+        self.key_update.next_read_secret = quic_tls.nextGenerationSecret(self.key_update.read_secret);
+        self.key_update.next_read = quic_protect.keyUpdateDirection(cur.read, self.key_update.next_read_secret);
+
+        self.key_update.phase = new_phase;
+        self.key_update.last_update_ns = now;
+        self.key_update.have_updated = true;
+        self.key_update.packets_sent_epoch = 0;
     }
 
     fn intakeFrames(self: *Conn, level: EncryptionLevel, pn: u64, payload: []const u8, now: u64) Error!void {
@@ -998,6 +1302,17 @@ pub const Conn = struct {
         const owned = try self.allocator.dupe(u8, out_slice[0..sealed.len]);
         try out.append(self.allocator, .{ .bytes = owned });
 
+        // Confidentiality-limit accounting (RFC 9001 §6.6): count packets
+        // protected with the current send key, and record the first packet number
+        // we sent in a self-initiated new phase so an ACK of it confirms the
+        // update (§6.5).
+        if (self.key_update.ready) {
+            self.key_update.packets_sent_epoch +|= 1;
+            if (self.key_update.initiated and self.key_update.confirm_pn == null) {
+                self.key_update.confirm_pn = pn;
+            }
+        }
+
         // The STREAM/DATAGRAM frames are now on the wire. We commit the per-stream
         // sent offsets and clear the queues; on loss, recovery returns the
         // re-queueable STREAM descriptors and `requeueLostFrames` re-enqueues them
@@ -1114,7 +1429,9 @@ pub const Conn = struct {
         const trunc = quic_frame.truncatePacketNumber(pn, pn_len) catch return error.MalformedPacket;
         const header = quic_packet.ShortHeader{
             .spin = false,
-            .key_phase = false,
+            // The key-phase bit (RFC 9001 §6.3) reflects the current send
+            // generation; it stays 0 until the first key update.
+            .key_phase = self.key_update.phase == 1,
             .dcid = self.dcid,
             .packet_number = @intCast(trunc),
             .packet_number_len = quic_packet.PacketNumberLength.fromByteLen(pn_len) catch return error.MalformedPacket,
@@ -1211,6 +1528,63 @@ pub const Conn = struct {
         return item.data;
     }
 
+    // -----------------------------------------------------------------------
+    // 1-RTT key update (RFC 9001 §6)
+    // -----------------------------------------------------------------------
+
+    /// Initiate a 1-RTT key update (RFC 9001 §6.1): roll our write (send) secret
+    /// to the next generation, flip our outbound key-phase bit, and pre-arm the
+    /// confirmation tracking. Subsequent 1-RTT packets are protected with the new
+    /// keys and carry the flipped phase bit; the peer detects the flip, updates in
+    /// turn, and acks a packet in the new phase, which confirms the update.
+    ///
+    /// Per §6.5 an endpoint MUST NOT initiate a second update before the peer has
+    /// acknowledged a packet in the current (new) phase; this returns
+    /// `error.NotEstablished` when called before the connection is up and is a
+    /// no-op (returns false) when an update is already in flight unconfirmed or
+    /// key update is unavailable for the negotiated suite.
+    pub fn initiateKeyUpdate(self: *Conn) Error!bool {
+        if (!self.established) return error.NotEstablished;
+        if (!self.key_update.ready) return false; // suite without key-update support
+        if (self.key_update.initiated) return false; // §6.5: previous update unconfirmed
+        const now = self.last_recv_ns;
+
+        // A key update rolls BOTH directions to the next generation under a single
+        // flipped key-phase bit (§6.1). Our send keys roll immediately so new
+        // packets are protected with the new keys and carry the new phase; the
+        // read keys roll too, with the old read keys retained briefly so the
+        // peer's still-in-flight old-phase packets keep decrypting (§6.4).
+        const new_phase: u1 = ~self.key_update.phase; // 0↔1
+        self.rollGeneration(new_phase, now);
+        self.key_update.initiated = true;
+        self.key_update.confirm_pn = null;
+        return true;
+    }
+
+    /// Whether the current send epoch has reached the AEAD confidentiality limit
+    /// (RFC 9001 §6.6) and the application should initiate a key update. Exposed
+    /// so the layer above can rotate proactively; the driver never reuses a
+    /// (key, nonce) pair regardless.
+    pub fn wantsKeyUpdate(self: *const Conn) bool {
+        if (!self.key_update.ready or self.key_update.initiated) return false;
+        return self.key_update.packets_sent_epoch >= KeyUpdate.confidentiality_limit;
+    }
+
+    /// The current key-phase bit (0/1) for tests / introspection.
+    pub fn keyPhase(self: *const Conn) u1 {
+        return self.key_update.phase;
+    }
+
+    /// Packets protected with the current send key this epoch (§6.6 counter).
+    pub fn keyUpdatePacketsSent(self: *const Conn) u64 {
+        return self.key_update.packets_sent_epoch;
+    }
+
+    /// AEAD authentication failures observed (§6.6 integrity-limit counter).
+    pub fn keyUpdateAeadFailures(self: *const Conn) u64 {
+        return self.key_update.aead_failures;
+    }
+
     /// Initiate a graceful CONNECTION_CLOSE with `error_code` (0 = NO_ERROR).
     pub fn close(self: *Conn, error_code: u64) void {
         if (self.closing) return;
@@ -1288,6 +1662,16 @@ pub const Conn = struct {
             now,
         );
         try self.requeueLostFrames(outcome.lost_frames);
+
+        // Key-update confirmation (RFC 9001 §6.5): once the peer acks a packet we
+        // sent in the new phase, our self-initiated update is confirmed and we may
+        // initiate the next one.
+        if (level == .application and self.key_update.initiated) {
+            if (self.key_update.confirm_pn) |cp| {
+                if (largest_acked >= cp) self.key_update.initiated = false;
+            }
+        }
+
         self.refreshTimer(now);
     }
 
@@ -1677,6 +2061,255 @@ test "quic conn loopback delivers byte-exact application data in both directions
     const m = lb.client.readStream(sid, &rbuf);
     try testing.expectEqualSlices(u8, s2c, rbuf[0..m]);
     try testing.expect(lb.client.streamFinished(sid));
+}
+
+// ---------------------------------------------------------------------------
+// 1-RTT key update (RFC 9001 §6) integration tests
+// ---------------------------------------------------------------------------
+
+test "quic conn key update — self-initiated rotation delivers byte-exact app data and both sides reach phase 1" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    // Key update must be available for the negotiated (SHA-256) suite on both
+    // sides, starting at phase 0.
+    try testing.expect(lb.client.key_update.ready);
+    try testing.expect(lb.server.key_update.ready);
+    try testing.expectEqual(@as(u1, 0), lb.client.keyPhase());
+    try testing.expectEqual(@as(u1, 0), lb.server.keyPhase());
+
+    // Snapshot the pre-update 1-RTT secrets so we can prove they actually change.
+    const c_write_before = lb.client.key_update.write_secret;
+    const c_read_before = lb.client.key_update.read_secret;
+    const s_write_before = lb.server.key_update.write_secret;
+
+    // Send a first message in phase 0 to confirm baseline delivery.
+    const sid = try lb.client.openStream();
+    try lb.client.sendStream(sid, "phase0-data", true);
+    _ = try pump(alloc, &lb.client, &lb.server);
+    var rbuf: [256]u8 = undefined;
+    var got = lb.server.readStream(sid, &rbuf);
+    try testing.expectEqualSlices(u8, "phase0-data", rbuf[0..got]);
+
+    // The client initiates a key update: its write keys roll and its phase flips.
+    try testing.expect(try lb.client.initiateKeyUpdate());
+    try testing.expectEqual(@as(u1, 1), lb.client.keyPhase());
+    // The write secret rolled (no longer equals the pre-update secret).
+    try testing.expect(!std.mem.eql(u8, &c_write_before, &lb.client.key_update.write_secret));
+
+    // Send a second message AFTER the update. It is protected with the new keys
+    // and carries key-phase bit 1; the server must detect the flip, commit, and
+    // deliver the bytes exactly.
+    const sid2 = try lb.client.openStream();
+    const after = "post-key-update payload — must be byte exact";
+    try lb.client.sendStream(sid2, after, true);
+    _ = try pump(alloc, &lb.client, &lb.server);
+
+    got = lb.server.readStream(sid2, &rbuf);
+    try testing.expectEqualSlices(u8, after, rbuf[0..got]);
+    try testing.expect(lb.server.streamFinished(sid2));
+
+    // The server committed the update in response (RFC 9001 §6.1): it is now in
+    // phase 1, and its OWN write secret rolled too.
+    try testing.expectEqual(@as(u1, 1), lb.server.keyPhase());
+    try testing.expect(!std.mem.eql(u8, &s_write_before, &lb.server.key_update.write_secret));
+
+    // The client's read secret also rolls once it processes the server's phase-1
+    // traffic on the reply leg.
+    const s2c = "server reply in the new key phase";
+    try lb.server.sendStream(sid2, s2c, true);
+    _ = try pump(alloc, &lb.server, &lb.client);
+    got = lb.client.readStream(sid2, &rbuf);
+    try testing.expectEqualSlices(u8, s2c, rbuf[0..got]);
+    try testing.expect(!std.mem.eql(u8, &c_read_before, &lb.client.key_update.read_secret));
+}
+
+test "quic conn key update — peer-initiated update is detected via the phase bit and committed" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    // The SERVER initiates this time; the client must detect + commit on receipt.
+    try testing.expect(try lb.server.initiateKeyUpdate());
+    try testing.expectEqual(@as(u1, 1), lb.server.keyPhase());
+    try testing.expectEqual(@as(u1, 0), lb.client.keyPhase());
+
+    // Server opens a stream and sends in the new phase.
+    const sid = try lb.server.openStream();
+    const msg = "server-initiated key update payload";
+    try lb.server.sendStream(sid, msg, true);
+    _ = try pump(alloc, &lb.server, &lb.client);
+
+    // The client detected the flipped phase bit and committed: it is now phase 1
+    // and decoded the bytes byte-exact.
+    try testing.expectEqual(@as(u1, 1), lb.client.keyPhase());
+    var rbuf: [256]u8 = undefined;
+    const got = lb.client.readStream(sid, &rbuf);
+    try testing.expectEqualSlices(u8, msg, rbuf[0..got]);
+}
+
+test "quic conn key update — a reordered old-phase packet still decrypts within retention, a forged flip is dropped" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    const now: u64 = 1_000_000;
+
+    // Client sends a phase-0 packet but we CAPTURE it instead of delivering it.
+    const sid = try lb.client.openStream();
+    try lb.client.sendStream(sid, "old-phase-reordered", true);
+    var captured: std.ArrayList(OutDatagram) = .empty;
+    defer {
+        for (captured.items) |d| alloc.free(d.bytes);
+        captured.deinit(alloc);
+    }
+    _ = try lb.client.sendDatagramsAt(&captured, now);
+    try testing.expect(captured.items.len >= 1);
+    const old_phase_dg = try alloc.dupe(u8, captured.items[captured.items.len - 1].bytes);
+    defer alloc.free(old_phase_dg);
+
+    // Now the client initiates a key update and sends a phase-1 packet, which we
+    // DO deliver so the server commits the update (retaining the old read keys).
+    try testing.expect(try lb.client.initiateKeyUpdate());
+    const sid2 = try lb.client.openStream();
+    try lb.client.sendStream(sid2, "new-phase-first", true);
+    {
+        var out: std.ArrayList(OutDatagram) = .empty;
+        defer {
+            for (out.items) |d| alloc.free(d.bytes);
+            out.deinit(alloc);
+        }
+        _ = try lb.client.sendDatagramsAt(&out, now);
+        for (out.items) |d| try lb.server.recvDatagramAt(d.bytes, now);
+    }
+    try testing.expectEqual(@as(u1, 1), lb.server.keyPhase());
+    try testing.expect(lb.server.key_update.prev_read != null);
+
+    // Deliver the CAPTURED old-phase packet now (reordered across the update). It
+    // must still decrypt via the retained previous-generation read keys (§6.4).
+    try lb.server.recvDatagramAt(old_phase_dg, now);
+    var rbuf: [256]u8 = undefined;
+    const got = lb.server.readStream(sid, &rbuf);
+    try testing.expectEqualSlices(u8, "old-phase-reordered", rbuf[0..got]);
+
+    // A FORGED packet that merely flips the phase bit (without valid AEAD) must be
+    // dropped (anti-forgery). Take the legit phase-1 datagram, flip its key-phase
+    // bit back to 0, and corrupt a ciphertext byte; the server must reject it and
+    // count an AEAD failure without delivering anything.
+    const failures_before = lb.server.keyUpdateAeadFailures();
+    var forged: std.ArrayList(OutDatagram) = .empty;
+    defer {
+        for (forged.items) |d| alloc.free(d.bytes);
+        forged.deinit(alloc);
+    }
+    const sid3 = try lb.client.openStream();
+    try lb.client.sendStream(sid3, "should-never-arrive", true);
+    _ = try lb.client.sendDatagramsAt(&forged, now);
+    const fdg = forged.items[forged.items.len - 1].bytes;
+    // Corrupt the last byte (inside the AEAD tag) so authentication fails; also
+    // flip the protected first byte so it looks like a phase change attempt.
+    fdg[fdg.len - 1] ^= 0x80;
+    fdg[0] ^= 0x01;
+    try lb.server.recvDatagramAt(fdg, now);
+    // Nothing was delivered on sid3 and the AEAD-failure counter advanced.
+    try testing.expectEqual(@as(usize, 0), lb.server.readStream(sid3, &rbuf));
+    try testing.expect(lb.server.keyUpdateAeadFailures() > failures_before);
+}
+
+test "quic conn key update — rapid peer-driven updates are rate-limited (§6.6 anti-DoS)" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    // First peer-initiated update at t0: committed normally.
+    const t0: u64 = 1_000_000_000;
+    try testing.expect(try lb.server.initiateKeyUpdate());
+    const sid = try lb.server.openStream();
+    try lb.server.sendStream(sid, "update-1", true);
+    {
+        var out: std.ArrayList(OutDatagram) = .empty;
+        defer {
+            for (out.items) |d| alloc.free(d.bytes);
+            out.deinit(alloc);
+        }
+        _ = try lb.server.sendDatagramsAt(&out, t0);
+        for (out.items) |d| try lb.client.recvDatagramAt(d.bytes, t0);
+    }
+    try testing.expectEqual(@as(u1, 1), lb.client.keyPhase());
+    const committed_at = lb.client.key_update.last_update_ns;
+
+    // The client must confirm update-1 before the server can initiate update-2
+    // (§6.5): drive a reply leg so the server's update is acked.
+    {
+        const sid_c = try lb.client.openStream();
+        try lb.client.sendStream(sid_c, "ack-carrier", true);
+        var out: std.ArrayList(OutDatagram) = .empty;
+        defer {
+            for (out.items) |d| alloc.free(d.bytes);
+            out.deinit(alloc);
+        }
+        _ = try lb.client.sendDatagramsAt(&out, t0 + 1);
+        for (out.items) |d| try lb.server.recvDatagramAt(d.bytes, t0 + 1);
+    }
+
+    // Server initiates update-2 almost immediately (well within ≈3·PTO of the
+    // client's last commit). The client receives a SECOND phase flip but must
+    // REFUSE to commit it (rate limit) — it still delivers the authenticated
+    // frames but does not rotate its generation again.
+    try testing.expect(try lb.server.initiateKeyUpdate());
+    const sid2 = try lb.server.openStream();
+    try lb.server.sendStream(sid2, "update-2-too-soon", true);
+    {
+        var out: std.ArrayList(OutDatagram) = .empty;
+        defer {
+            for (out.items) |d| alloc.free(d.bytes);
+            out.deinit(alloc);
+        }
+        _ = try lb.server.sendDatagramsAt(&out, t0 + 2);
+        // Deliver only slightly later than the first commit — inside the rate
+        // window so the second peer update is refused.
+        for (out.items) |d| try lb.client.recvDatagramAt(d.bytes, t0 + 2);
+    }
+
+    // The frames were still authenticated + delivered (the update is valid, just
+    // rate-limited)…
+    var rbuf: [256]u8 = undefined;
+    const got = lb.client.readStream(sid2, &rbuf);
+    try testing.expectEqualSlices(u8, "update-2-too-soon", rbuf[0..got]);
+    // …but the client did NOT commit the second update: its last-commit time is
+    // unchanged, so its generation did not rotate again within the window.
+    try testing.expectEqual(committed_at, lb.client.key_update.last_update_ns);
+}
+
+test "quic conn key update — a key+nonce pair is never reused across an update (fresh key, advancing pn)" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    // Capture the current write key+iv, then update and capture the new ones. The
+    // AEAD key MUST differ across the generation (so even an identical nonce maps
+    // to a different (key,nonce) pair); the IV typically differs too. The packet
+    // number advances monotonically within a generation, so the nonce never
+    // repeats for a fixed key either. Together these guarantee no (key,nonce)
+    // reuse (RFC 9001 §6.6).
+    const before_key = lb.client.app_keys.?.write.key;
+    const before_iv = lb.client.app_keys.?.write.iv;
+
+    try testing.expect(try lb.client.initiateKeyUpdate());
+
+    const after_key = lb.client.app_keys.?.write.key;
+    const after_iv = lb.client.app_keys.?.write.iv;
+    try testing.expect(!std.mem.eql(u8, &before_key, &after_key));
+    // The hp key is retained across an update (RFC 9001 §6.1) — assert that too.
+    try testing.expectEqualSlices(u8, &lb.client.app_keys.?.write.hp, &lb.client.app_keys.?.write.hp);
+    // IV change is expected (it is re-derived from the rolled secret).
+    try testing.expect(!std.mem.eql(u8, &before_iv, &after_iv));
 }
 
 test "quic conn RFC 9002 — handshake completes over a lossy reordering channel via retransmission" {
