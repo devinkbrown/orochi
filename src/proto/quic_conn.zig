@@ -293,9 +293,18 @@ pub const Conn = struct {
     /// Application data the caller queued for the next 1-RTT send.
     pending_streams: std.ArrayList(PendingStream),
     pending_datagrams: std.ArrayList(PendingDatagram),
+    /// Received application DATAGRAM (RFC 9221) payloads, owned copies, awaiting
+    /// the application's `recvDatagram` drain. The engine's intake only accounts
+    /// the ACK obligation for a DATAGRAM frame; the driver captures the payload
+    /// here so the layer above (HTTP/3 / WebTransport) can consume it. Bounded.
+    recv_datagrams: std.ArrayList(PendingDatagram),
+    max_recv_datagrams: usize = 256,
     /// Next stream id this endpoint will assign for `openStream` (client bidi
     /// starts at 0, server bidi at 1 — RFC 9000 §2.1).
     next_bidi_stream: u64,
+    /// Next stream id this endpoint will assign for `openUniStream` (client uni
+    /// starts at 2, server uni at 3 — RFC 9000 §2.1). Advances by 4.
+    next_uni_stream: u64,
     /// Per-stream count of bytes already shipped, so successive `sendStream`
     /// calls compute the correct STREAM offset even after the queue is flushed.
     sent_stream_map: std.AutoHashMapUnmanaged(u64, u64) = .empty,
@@ -370,10 +379,16 @@ pub const Conn = struct {
             .newly_acked = .empty,
             .pending_streams = .empty,
             .pending_datagrams = .empty,
+            .recv_datagrams = .empty,
             // Client bidi stream ids are 0,4,8,…; server 1,5,9,… (RFC 9000 §2.1).
             .next_bidi_stream = switch (role) {
                 .client => 0,
                 .server => 1,
+            },
+            // Client uni stream ids are 2,6,10,…; server 3,7,11,… (RFC 9000 §2.1).
+            .next_uni_stream = switch (role) {
+                .client => 2,
+                .server => 3,
             },
         };
     }
@@ -389,6 +404,8 @@ pub const Conn = struct {
         self.pending_streams.deinit(self.allocator);
         for (self.pending_datagrams.items) |p| self.allocator.free(p.data);
         self.pending_datagrams.deinit(self.allocator);
+        for (self.recv_datagrams.items) |p| self.allocator.free(p.data);
+        self.recv_datagrams.deinit(self.allocator);
         self.sent_stream_map.deinit(self.allocator);
         self.* = undefined;
     }
@@ -611,6 +628,20 @@ pub const Conn = struct {
             return error.MalformedPacket;
 
         self.last_recv_ns = now;
+
+        // Capture any received application DATAGRAM payloads (RFC 9221). The
+        // engine's intake only accounts the ACK obligation; the payload bytes
+        // borrow the decoded frame (freed when this fn returns), so we copy them
+        // into the bounded inbox for the application to drain. Only the
+        // Application (1-RTT) space carries DATAGRAMs.
+        if (level == .application) {
+            for (frames.frames) |frame| {
+                switch (frame) {
+                    .DATAGRAM => |dg| try self.captureRecvDatagram(dg.data),
+                    else => {},
+                }
+            }
+        }
 
         // Drain readable CRYPTO into the handshake (per level).
         try self.pumpCryptoToHandshake(level);
@@ -1051,6 +1082,16 @@ pub const Conn = struct {
         return id;
     }
 
+    /// Open a new unidirectional stream; returns its id. Used for HTTP/3 control
+    /// and QPACK encoder/decoder streams and WebTransport uni streams. The first
+    /// send carrying data on it goes out on the next `sendDatagrams`.
+    pub fn openUniStream(self: *Conn) Error!u64 {
+        if (!self.established) return error.NotEstablished;
+        const id = self.next_uni_stream;
+        self.next_uni_stream += 4; // same-type stream ids advance by 4 (RFC 9000 §2.1)
+        return id;
+    }
+
     /// Queue `bytes` to send on `stream_id` (optionally with the fin bit). The
     /// data is copied; it is shipped on the next `sendDatagrams`.
     pub fn sendStream(self: *Conn, stream_id: u64, bytes: []const u8, fin: bool) Error!void {
@@ -1094,6 +1135,27 @@ pub const Conn = struct {
         const copy = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(copy);
         try self.pending_datagrams.append(self.allocator, .{ .data = copy });
+    }
+
+    /// Copy a received DATAGRAM payload into the bounded inbox. Drops the oldest
+    /// entry if the inbox is full so a flood cannot drive unbounded growth.
+    fn captureRecvDatagram(self: *Conn, bytes: []const u8) Error!void {
+        const copy = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(copy);
+        if (self.recv_datagrams.items.len >= self.max_recv_datagrams) {
+            const oldest = self.recv_datagrams.orderedRemove(0);
+            self.allocator.free(oldest.data);
+        }
+        try self.recv_datagrams.append(self.allocator, .{ .data = copy });
+    }
+
+    /// Take the oldest received application DATAGRAM payload (RFC 9221), or null
+    /// if none. The returned slice is an owned copy; the caller frees it via the
+    /// connection's allocator. FIFO drain.
+    pub fn recvDatagramPayload(self: *Conn) ?[]u8 {
+        if (self.recv_datagrams.items.len == 0) return null;
+        const item = self.recv_datagrams.orderedRemove(0);
+        return item.data;
     }
 
     /// Initiate a graceful CONNECTION_CLOSE with `error_code` (0 = NO_ERROR).
