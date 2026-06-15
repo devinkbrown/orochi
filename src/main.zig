@@ -243,6 +243,12 @@ pub fn main(init: std.process.Init) !void {
     var account_services: orochi.daemon.services.Services = undefined;
     var account_checker: orochi.daemon.sasl_bridge.ServicesPlainChecker = undefined;
     var external_bridge: orochi.daemon.sasl_bridge.ServicesExternalLookup = undefined;
+    var session_token_bridge: orochi.daemon.sasl_bridge.ServicesSessionTokenLookup = undefined;
+    var oauth_key: ?orochi.daemon.oauth_jwt.OwnedKey = null;
+    defer if (oauth_key) |*key| key.deinit();
+    var oauth_verifier: orochi.daemon.oauth_jwt.Verifier = undefined;
+    var oauth_jwks_text: ?[]u8 = null;
+    defer if (oauth_jwks_text) |bytes| allocator.free(bytes);
     // SCRAM-SHA-256 credential mirror: provisioned alongside each account so a
     // client can authenticate without sending its password. Must outlive the
     // server (the lookup fat-pointer captures &scram_store).
@@ -267,14 +273,50 @@ pub fn main(init: std.process.Init) !void {
                 scram_store.setLoader(account_services.scramLoader());
                 account_checker = .{ .services = &account_services };
                 external_bridge = .{ .services = &account_services };
+                session_token_bridge = .{ .services = &account_services };
                 srv_cfg.sasl_checker = account_checker.checker();
                 srv_cfg.sasl_scram256 = scram_store.scram256Lookup();
                 srv_cfg.sasl_scram512 = scram_store.scram512Lookup();
                 srv_cfg.sasl_external = external_bridge.lookup();
+                srv_cfg.sasl_session_token = session_token_bridge.lookup();
                 srv_cfg.account_services = &account_services;
-                std.debug.print("orochi: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL live\n", .{db});
+                std.debug.print("orochi: SASL account store opened ({s}); PLAIN + SCRAM-SHA-256 + SCRAM-SHA-512 + EXTERNAL + SESSION-TOKEN live\n", .{db});
             } else |err| {
                 std.debug.print("orochi: account store error ({s}); SASL disabled\n", .{@errorName(err)});
+            }
+        }
+    }
+    if (held) |h| {
+        if (srv_cfg.sasl_enabled) {
+            const oauth_key_config: ?orochi.daemon.oauth_jwt.Key = if (h.parsed.sasl.oauth_hmac_key) |key|
+                .{ .hs256 = key }
+            else if (h.parsed.sasl.oauth_jwks_file) |path| jwks: {
+                oauth_jwks_text = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| {
+                    std.debug.print("orochi: OAuth JWKS read failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
+                    break :jwks null;
+                };
+                oauth_key = orochi.daemon.oauth_jwt.OwnedKey.fromJwks(allocator, oauth_jwks_text.?) catch |err| {
+                    std.debug.print("orochi: OAuth JWKS parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
+                    break :jwks null;
+                };
+                break :jwks oauth_key.?.key;
+            } else if (h.parsed.sasl.oauth_pubkey) |pubkey| pubkey_blk: {
+                oauth_key = orochi.daemon.oauth_jwt.OwnedKey.fromPubkey(allocator, pubkey) catch |err| {
+                    std.debug.print("orochi: OAuth public key parse failed ({s}); OAUTHBEARER disabled\n", .{@errorName(err)});
+                    break :pubkey_blk null;
+                };
+                break :pubkey_blk oauth_key.?.key;
+            } else null;
+
+            if (oauth_key_config) |key| {
+                oauth_verifier = .{
+                    .key = key,
+                    .issuer = h.parsed.sasl.oauth_issuer,
+                    .audience = h.parsed.sasl.oauth_audience,
+                    .account_claim = h.parsed.sasl.oauth_account_claim orelse "sub",
+                };
+                srv_cfg.sasl_oauthbearer = oauth_verifier.lookup();
+                std.debug.print("orochi: SASL OAUTHBEARER live (local JWT verification)\n", .{});
             }
         }
     }
@@ -440,6 +482,28 @@ pub fn main(init: std.process.Init) !void {
     // is at its final address (init() returns by value, so `self` is not stable
     // inside it). No-op until a module declares lifecycle fns.
     srv.start();
+
+    const AcmeRenewalService = if (builtin.os.tag == .linux) orochi.daemon.acme_renewal.Service else void;
+    var acme_renewal: ?*AcmeRenewalService = null;
+    defer if (comptime builtin.os.tag == .linux) {
+        if (acme_renewal) |s| {
+            s.stop();
+            allocator.destroy(s);
+        }
+    };
+    if (held) |h| {
+        if (h.acme.enabled) {
+            if (comptime builtin.os.tag == .linux) {
+                srv.setAcmeTlsReloadConfig(&h.parsed.tls);
+                const svc = try allocator.create(AcmeRenewalService);
+                svc.* = AcmeRenewalService.init(allocator, init.io, &srv, h.parsed.acme, &h.parsed.tls);
+                acme_renewal = svc;
+                svc.start();
+            } else {
+                std.debug.print("orochi: [acme] enabled but in-daemon renewal is Linux-only; renewal disabled\n", .{});
+            }
+        }
+    }
 
     // Now that the server (and its live world) exists, attach the services state
     // hook so channel REGISTER/DROP reflects into the world's +r REGISTERED flag.

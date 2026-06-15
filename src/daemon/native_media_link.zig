@@ -84,6 +84,13 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             return null;
         }
 
+        pub fn idForStream(self: *Self, stream_id: u32) ?[]const u8 {
+            for (self.entries[0..self.len]) |*e| {
+                if (e.live and e.stream_id == stream_id) return e.id.slice();
+            }
+            return null;
+        }
+
         /// Register (or update) a participant: join the forwarding session and
         /// record its publishing `stream_id` and current `TransportAddress`.
         /// Re-registering the same id updates its address/stream/kind in place.

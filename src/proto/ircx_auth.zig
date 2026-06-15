@@ -28,6 +28,10 @@ pub const Package = enum {
     external,
     scram_sha_256,
     scram_sha_512,
+    scram_sha_512_plus,
+    session_token,
+    oauthbearer,
+    anonymous,
     gatekeeper,
     gatekeeper_passport,
 
@@ -37,6 +41,10 @@ pub const Package = enum {
         if (std.ascii.eqlIgnoreCase(raw, "EXTERNAL")) return .external;
         if (std.ascii.eqlIgnoreCase(raw, "SCRAM-SHA-256")) return .scram_sha_256;
         if (std.ascii.eqlIgnoreCase(raw, "SCRAM-SHA-512")) return .scram_sha_512;
+        if (std.ascii.eqlIgnoreCase(raw, "SCRAM-SHA-512-PLUS")) return .scram_sha_512_plus;
+        if (std.ascii.eqlIgnoreCase(raw, "SESSION-TOKEN")) return .session_token;
+        if (std.ascii.eqlIgnoreCase(raw, "OAUTHBEARER")) return .oauthbearer;
+        if (std.ascii.eqlIgnoreCase(raw, "ANONYMOUS")) return .anonymous;
         if (std.ascii.eqlIgnoreCase(raw, "GateKeeper")) return .gatekeeper;
         if (std.ascii.eqlIgnoreCase(raw, "GateKeeperPassport")) return .gatekeeper_passport;
         return null;
@@ -49,6 +57,10 @@ pub const Package = enum {
             .external => "EXTERNAL",
             .scram_sha_256 => "SCRAM-SHA-256",
             .scram_sha_512 => "SCRAM-SHA-512",
+            .scram_sha_512_plus => "SCRAM-SHA-512-PLUS",
+            .session_token => "SESSION-TOKEN",
+            .oauthbearer => "OAUTHBEARER",
+            .anonymous => "ANONYMOUS",
             .gatekeeper => "GateKeeper",
             .gatekeeper_passport => "GateKeeperPassport",
         };

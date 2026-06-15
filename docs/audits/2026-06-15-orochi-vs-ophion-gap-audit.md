@@ -1,710 +1,196 @@
 # Orochi Versus Ophion Gap Audit - 2026-06-15
 
-This is the canonical current gap document. It replaces the stale gap/planning
-documents deleted in the same cleanup:
-
-- `docs/audits/2026-06-14-ircx-ircv3-irc-feature-gap-audit.md`
-- `docs/planning/14-ircx-remainder.md`
-- `docs/planning/21-protocol-gaps.md`
-- `docs/planning/22-irc-gap-sweep.md`
-- `docs/planning/23-ircv3-upstream-research.md`
-- `docs/reference/ircx/CONFORMANCE.md`
+This is the current source-verified gap document for comparing Orochi against
+Ophion. It replaces the older overlapping gap/planning notes and should be
+updated in the same commit as any future parity fix.
 
 ## Scope
 
-- Orochi source: audit baseline `main` at `72ad029`; repaired through the
-  2026-06-15 implementation pass on `main`.
+- Orochi source: `/home/kain/orochi` at `c471a06`.
 - Ophion reference: `/home/kain/ophion` at `15040367`.
-- Method: read source first, use older docs only as historical hints, and keep
-  only gaps that still exist in the current source.
-- Exclusions: STARTTLS, WEBIRC, ident, and password/hostmask `/OPER` are not
-  parity targets for Orochi unless that product decision changes.
+- Method: compare current source and tests first, then use docs as navigation.
+- Exclusions: STARTTLS, WEBIRC, ident, password/hostmask `OPER`, TS6/SJOIN,
+  DCC proxy/filehost, and CPython/MAPI module parity are not Orochi product
+  targets unless that decision changes.
 
-## Already Implemented - Do Not Duplicate
+## Do Not Reopen These Fixed Items
 
-These were frequent stale-document claims but are live now:
+These were stale findings in older docs. Current Orochi source has live wiring
+and tests for them:
 
-- Channel `OID`, `created_unix`, `topic_time`, and `World.cloneChannel`.
-- `CREATE`, cloneable/full-channel auto-clone paths, `KNOCK +u`, and `LISTX`
-  metadata wiring for creation/topic times, subject, language, and registration.
-- CAP LS/LIST/REQ/END flow, backend-gated SASL advertisement, REGISTER/VERIFY
-  account commands, message-tag validation, SETNAME capability gating, MONITOR
-  dynamic notifications, and core event-playback storage paths.
-- IRCX `ACCESS` and services `CHANNEL ACCESS`/`AKICK` command handlers exist.
-  Their remaining gaps are enforcement, persistence, and Ophion numeric/semantic
-  parity, not total absence.
-- `require_secured` exists for S2S and MeshPass responder enforcement exists.
-  The remaining S2S issue is stronger identity/origin enforcement, not lack of
-  any security switch.
-
-## Priority 0 / 1 Repair Queue
-
-1. S2S origin integrity and peer pinning.
-2. Services durability and live boot replay.
-3. IRCv3 history/capability correctness.
-4. IRCX AUTH/SACCESS/PROP/EVENT/MODEX/LISTX parity.
-5. Runtime config, PROXY, TLS reload/verification, metrics/admin, and media
-   hardening.
-
-## Repair Status After 2026-06-15 Implementation Pass
-
-Closed in the repair pass:
-
-- Direct-owned S2S state frames now reject mismatched origins, count rejected
-  frames, and log the drained audit signal in both secured and plaintext S2S
-  loops. Peer pinning and `[mesh].trust_roots` are wired into secured S2S.
-- Mesh channel state now carries parameter modes (`+k`, `+l`, `+j`, `+f`),
-  private/hidden state, and IRCX extended flags, with split-recovery burst,
-  MLOCK-preserving inbound apply, and server/link regression coverage.
-- S2S message relay now preserves `STATUSMSG` minimum rank and reuses local
-  channel/direct-message policy gates for inbound relay delivery.
-- `LIST C/T`, CHATHISTORY `BATCH` gating, TAGMSG typing/reaction replay,
-  edit/redact recipient capability filters, extended-monitor event caps,
-  metadata visibility reads, MARKREAD-on-JOIN, standalone typing delivery, SASL
-  mechanism honesty, and extban store-time validation are wired and tested.
-- IRCX live surfaces now cover `MODE <nick> ISIRCX`, `AUTH`, `SACCESS` /
-  `ACCESS *`, channel `ACCESS` join overrides, prefixed channel handling,
-  MODEX `806/807`, EVENT aliases, CREATE existing-channel rejection/basic modes,
-  and LISTX prefix parity.
-- Services now persist account email verification state, replay registered
-  channels into live `+r`, replay MLOCK/AKICK/WARD, apply services access
-  automode, kick current AKICK matches, add WARD compatibility aliases, and gate
-  sensitive oper commands by named privileges.
-- Runtime config now wires PROXY trusted accept handling, `mesh.trust_roots`,
+- Config/runtime: `listen.webtransport`, `listen.proxy_protocol`,
+  `listen.trusted_proxies`, `mesh.trust_roots`, `mesh.connect`,
   `media.max_upload_bytes`, `media.max_frame_bytes`, `sasl.enabled`,
-  `sasl.realm`, TLS chain validation, native-media sender binding coverage, and
-  atomic stats-file export. `listen.webtransport` is parsed and explicitly
-  logged as not implemented.
-
-## Repair Status After 2026-06-15 Agent Pass
-
-A follow-up agent pass began with a read-first re-verification of every section
-against current source. That verification found several "still open" items had
-already been closed by the prior commit and were stale in this doc (see
-"Corrected stale findings" below). The remaining genuine gaps were then closed
-in disjoint, individually test-verified commits.
-
-Closed in this pass:
-
-- **Secured S2S CRDT stream is now encrypted and link-authenticated.** The
-  Tsumugi PQ-hybrid AKE derived per-direction keys but never applied them, so the
-  post-handshake CRDT stream (MESSAGE/MEMBERSHIP/CHANNEL_MODE_*/TOPIC/NICKCHANGE)
-  traveled in plaintext over secured links. It is now wrapped in a length-prefixed
-  ChaCha20-Poly1305 AEAD record layer keyed on the `Established` send/recv keys
-  with per-record nonce counters bound as AAD; tamper or desync drops the link.
-- **Cross-shard IRCX DATA/REQUEST/REPLY/WHISPER** now relay over mesh (previously
-  cross-shard `WHISPER` silently returned `ERR_NOSUCHNICK` and channel `DATA`
-  never reached remote members). The relay schema gained the four verbs plus
-  `data_tag`/`recipient`; inbound delivery re-applies local speech/NOWHISPER/
-  NOCOMICDATA policy with multi-hop dedup and fails closed without flooding peers.
-- **SACCESS GRANT bypass + persistence.** `enforceServerAccess` now checks GRANT
-  first (GRANT-overrides-DENY, matching Ophion), and SACCESS entries persist to
-  the durable `bans` family and replay at boot before connections are accepted.
-- **CREATE clone/template** now accepts the optional source-channel third
-  parameter and clones its modes via `world.cloneChannel`.
-- **TLS certificate hot reload on REHASH** re-reads and atomically swaps cert/key
-  material into a server-owned reload generation; failures keep current certs.
-- **ACME IPv6 nameservers** are wired (AF_INET6 UDP query path); previously
-  IPv6-only resolver environments failed.
-- **Ops/deployment assets:** hardened `etc/systemd/orochi.service` (ExecReload =
-  SIGUSR2 hot upgrade), `tools/runtime_smoke.py` fresh-boot smoke test, and a
-  `zig build package` step.
-
-Corrected stale findings (already implemented before this pass; the doc was
-behind the code):
-
-- Channel PROP **does** propagate over mesh: live `PROP SET/DELETE` fan out via
-  `announceChannelProp` → `sendChannelProp` to every established peer with HLC
-  clocks and inbound LWW apply.
-- MODEX already uses numerics `806/807`; IRCX `AUTH` is registered and bridges to
-  the SASL/account backend; `SACCESS` is registered with a real store and
-  enforcement; `MODE <nick> ISIRCX`, MODEX channel-prefix parsing, and the whole
-  IRC/IRCv3/history/tags section (LIST C/T, CHATHISTORY batch gating, TAGMSG
-  replay, edit/redact filtering, extended-monitor/metadata visibility, MARKREAD
-  on JOIN, SASL mechanism honesty, extban validation) were already done and
-  tested. Services durability (email verify, `+r` replay, AKICK, MLOCK, WARD) and
-  named oper-privilege gates were likewise already complete.
-
-Also closed in the agent pass (additional): a live read-only HTTP `/metrics`
-endpoint (loopback-default, mutex-guarded Prometheus snapshot); per-category
-EVENT subject-glob masks; full live session-state migration over mesh
-(SESSION_MIGRATE frame + capsule ship/stage/consume on reclaim); cryptographic
-per-frame origin signing for the seven direct-owned S2S state frames
-(self-certifying `node_id=BLAKE3-160(pubkey)` envelope, handshake-negotiated,
-upgrading `acceptsDirectOrigin` from link-trust to cryptographic proof); and
-unguessable native-media stream ids (the server-issued stream id, stamped by the
-client into every kagura frame, is now a keyed-PRF capability instead of a
-public `Wyhash(channel:nick)`, so an attacker who knows the public channel/nick
-can no longer precompute a victim's stream id and hijack/inject on the
-native-media UDP port). Confirmed already-present (not gaps): channel ACCESS
-GRANT bypasses +l/+i/+k/+b on join.
-
-Also closed (mesh origin authentication is now complete):
-
-- **Multi-hop / CRDT re-broadcast origin signing — DONE.** The genuinely
-  multi-hop frames now carry a self-contained origin signature verified at every
-  hop: the MESSAGE relay (`message_relay.zig`), CHANNEL_PROP CRDT facts
-  (`channel_prop_event.zig`, with the origin `(pubkey, sig)` stored in the prop
-  clock and re-emitted verbatim on re-broadcast/burst), and USER/MEMBER props via
-  a new signed `ENTITY_PROP` frame (`entity_prop_event.zig`). The direct-owned
-  frames (MEMBERSHIP, CHANNEL_MODE_STATE/FLAGS, CHANNEL_LIST, TOPIC, NICKCHANGE,
-  unsigned CHANNEL_PROP) are gated by `acceptsDirectOrigin` (origin == immediate
-  peer) and are cryptographically authenticated per-link by `signed_frame.zig`;
-  they are never re-emitted with a foreign origin, so no multi-hop case remains.
-  A relay can no longer forge or alter any node's frame.
-- **USER/MEMBER PROP propagation — DONE** (signed, LWW, multi-hop) via the
-  `ENTITY_PROP` frame. (There is no distinct `account` entity kind; account
-  metadata lives in the account backend, not IRCX props.)
-
-Still open (cross-component, lower value):
-
-- **Per-datagram native-media payload authentication.** The unguessable stream id
-  (keyed-PRF capability) closes the precompute/hijack vector server-side; a full
-  per-datagram MAC on the media payload itself would need a coordinated change in
-  the Nexus/Ocean client JS (the kagura frame is assembled client-side, not in
-  this repo) for marginal additional benefit, so it remains cross-component and
-  is deliberately not stubbed server-only (would be inert until the clients ship).
-
-Also closed (was previously an intentional exclusion):
-
-- **WebTransport is now implemented.** A from-scratch QUIC + HTTP/3 + WebTransport
-  stack was built in layers, each RFC-verified: packet protection (RFC 9001 §5,
-  Appendix A vectors), key schedule + multi-suite AEAD/HP (A.5 ChaCha20), the
-  connection frame engine (RFC 9000), the TLS-1.3-over-QUIC handshake (RFC 9001
-  §4, loopback proves both sides agree on keys for all three suites), the
-  connection driver (full handshake + app data over datagrams), HTTP/3 +
-  WebTransport sessions (RFC 9114/9220/9297, Extended CONNECT), and a live UDP
-  listener (`src/daemon/webtransport_listener.zig`) that bridges each WebTransport
-  session to the daemon's IRC port via a thread-safe loopback proxy. `main.zig`
-  starts it on `[listen].webtransport`. An end-to-end test over a real UDP socket
-  completes the QUIC/H3/WT handshake and carries IRC bytes both ways. Deferred
-  hardening (documented in the modules): congestion control / loss recovery
-  beyond a fixed PTO, connection migration, Retry/stateless-reset, 0-RTT, key
-  update, HelloRetryRequest, and IPv6 UDP. See
-  [../architecture/mesh-security.md](../architecture/mesh-security.md)'s sibling
-  transport docs.
-
-Intentional divergences / out of scope (NOT gaps): EVENT numerics `808-825`
-(Orochi uses the `NOTE EVENT` wire form by design), `RPL_LISTXPICS 813` (no
-picture feature), `sasl.realm` wire emission, CA client-auth (CertFP model
-instead), and DCC proxy/filehost (documented exclusion).
-
-## Repair Status After 2026-06-15 Implementation Pass
-
-Closed in the repair pass:
-
-- Direct-owned S2S state frames now reject mismatched origins, count rejected
-  frames, and log the drained audit signal in both secured and plaintext S2S
-  loops. Peer pinning and `[mesh].trust_roots` are wired into secured S2S.
-- Mesh channel state now carries parameter modes (`+k`, `+l`, `+j`, `+f`),
-  private/hidden state, and IRCX extended flags, with split-recovery burst,
-  MLOCK-preserving inbound apply, and server/link regression coverage.
-- S2S message relay now preserves `STATUSMSG` minimum rank and reuses local
-  channel/direct-message policy gates for inbound relay delivery.
-- `LIST C/T`, CHATHISTORY `BATCH` gating, TAGMSG typing/reaction replay,
-  edit/redact recipient capability filters, extended-monitor event caps,
-  metadata visibility reads, MARKREAD-on-JOIN, standalone typing delivery, SASL
-  mechanism honesty, and extban store-time validation are wired and tested.
-- IRCX live surfaces now cover `MODE <nick> ISIRCX`, `AUTH`, `SACCESS` /
-  `ACCESS *`, channel `ACCESS` join overrides, prefixed channel handling,
-  MODEX `806/807`, EVENT aliases, CREATE existing-channel rejection/basic modes,
-  and LISTX prefix parity.
-- Services now persist account email verification state, replay registered
-  channels into live `+r`, replay MLOCK/AKICK/WARD, apply services access
-  automode, kick current AKICK matches, add WARD compatibility aliases, and gate
-  sensitive oper commands by named privileges.
-- Runtime config now wires PROXY trusted accept handling, `mesh.trust_roots`,
-  `media.max_upload_bytes`, `media.max_frame_bytes`, `sasl.enabled`,
-  `sasl.realm`, TLS chain validation, native-media sender binding coverage, and
-  atomic stats-file export. `listen.webtransport` is parsed and explicitly
-  logged as not implemented.
-
-Still open or intentionally partial (superseded by the Agent Pass section above;
-kept for history):
-
-- Full signed envelopes for routed/multi-hop message frames remain open; the
-  current pass closes direct-owned state origin rejection and audit visibility.
-- `SESSION RESUME` is still reclaim-oriented, not full Ophion-class live session
-  migration with caps/channels/marks/history cursors over mesh.
-- Server-level IRCX SACCESS/ACCESS state is process-local. Account/user/member
-  PROP persistence/propagation, full EVENT hook/numeric parity, and complete
-  DATA/REQUEST/REPLY/WHISPER mesh semantics remain partial.
-- `RPL_LISTXPICS 813`, complete CREATE/clone template parity, ACME renewal/hot
-  cert reload, live HTTP `/metrics`/admin, datagram-level media authentication,
-  and packaged deployment/systemd smoke assets remain future work or deliberate
-  scope decisions.
-
-## Mesh And S2S
-
-### Unsigned Cross-Node Payloads
-
-`src/substrate/suimyaku/s2s_frame.zig` carries only type and payload. Message,
-membership, topic, list, and mode frames carry asserted `origin_node` values but
-not per-frame signatures. `OPER_GRANT` has stronger validation than normal user
-and channel state. This leaves remote membership, channel modes, and routed
-messages dependent on the link trust boundary rather than verifiable origin.
-
-Repair target:
-
-- Add a signed envelope or per-frame signature for MESSAGE, MEMBERSHIP,
-  CHANNEL_MODE_FLAGS, CHANNEL_LIST, CHANNEL_PROP, TOPIC, and NICKCHANGE.
-- Reject frames whose claimed origin does not match the verified peer identity.
-- Carry the verified origin into policy decisions and audit logs.
-
-**Status (closed for direct-origin frames):** A signed envelope now provides
-end-to-end origin authentication for the DIRECT-ORIGIN state frames — MEMBERSHIP,
-CHANNEL_MODE_STATE, CHANNEL_MODE_FLAGS, CHANNEL_LIST, TOPIC, NICKCHANGE, and
-CHANNEL_PROP ([src/substrate/suimyaku/signed_frame.zig](../../src/substrate/suimyaku/signed_frame.zig)).
-The envelope is `[pubkey 32][ed25519 sig 64][payload]`, signed over the canonical
-message `frame_type_byte ++ payload` under a domain label (so a signature can
-never be replayed across frame types or other Ed25519 uses). Because a node id is
-self-certifying (`shortId(nodeIdFromPublicKey(pubkey))`), the receiver enforces
-both that the signature verifies AND that the signer's derived short id equals the
-frame's claimed `origin_node` — a cryptographic upgrade of the link-trust
-`acceptsDirectOrigin` gate. A compromised/trust-pinned peer can no longer forge
-another node's frame. Capability is negotiated in the handshake (v2 capability
-byte; v1 peers stay interoperable unsigned), and the signing key is the node
-identity's `sign_kp`, threaded into the peer by the secured link (which derives
-`local_node_id` from the SAME identity, so the self-cert invariant holds).
-Rejections (bad signature, origin mismatch, or an unsigned frame from a
-signing-capable peer) increment the existing origin-rejection audit counter.
-
-**Explicit follow-up (multi-hop, still open):** MESSAGE relay and CRDT
-delta/BURST re-broadcast are NOT signed end-to-end, because a relay re-emits a
-fact authored by a THIRD node with that node's `origin_node` preserved. Re-signing
-with the relay's key would either fail the receiver's origin check or erase the
-true author. Closing this requires storing the ORIGINAL signer's `(pubkey, sig)`
-alongside each CRDT fact / relayed message and re-emitting that, not the relay's.
-
-### Secured S2S Still Allows Weak Deployment
-
-`mesh.require_secured` can reject plaintext S2S, but the default is false.
-`expected_remote` exists in secured link config, yet current server construction
-does not fully pass a pinned remote identity into every inbound/outbound path.
-
-Repair target:
-
-- Treat peer identity pinning as a first-class config path.
-- Fail closed when a secured mesh peer is configured but cannot be verified.
-- Add tests for plaintext refusal and wrong-peer rejection.
-
-### Mesh Channel State Is Incomplete
-
-Boolean channel sync covers only selected flags. Parameter and extended modes
-are still local-only or partially local-only: `+k`, `+l`, `+j`, `+f`, private /
-hidden state, and several IRCX extended flags. Split recovery has the same
-missing state families as normal sync.
-
-Repair target:
-
-- Add mesh frames for parameter modes and IRCX extended flag state.
-- Preserve MLOCK and local policy authority when applying remote state.
-- Add split-recovery tests for param modes, list modes, and IRCX flags.
-
-### STATUSMSG And Speech Policy Are Lossy Over S2S
-
-Local `PRIVMSG @#chan` / `+#chan` parsing exists, but relay sends only the bare
-channel target. Inbound S2S channel delivery also does not reapply the full local
-speech policy: no-CTCP, no-format, opmoderate, and status-rank delivery are not
-equivalent to local channel send handling.
-
-Repair target:
-
-- Carry minimum channel rank in the message relay schema.
-- Reuse one shared local/remote channel-send policy function.
-- Add S2S tests for `STATUSMSG`, `+C`, `+T`, `+U`, and no-format stripping.
-
-### Direct Message Policy Is Not Symmetric
-
-Inbound relay direct messages check registration and silence-like gates, but do
-not match local direct-message policy for user `+g`/ACCEPT and user `+C`.
-Unknown-nick routing can also flood mesh peers before a route is known.
-
-Repair target:
-
-- Reuse the local direct-message policy on inbound relays.
-- Add a route-query or no-flood default for unknown remote nicks.
-
-### Session Resume Is Reclaim, Not Full Migration
-
-`SESSION RESUME` can reclaim local and mesh tokens, but it does not restore the
-full client state expected from Ophion-class bouncer migration. Helix handoff
-support exists, but transport of live session state over mesh is still unwired.
-
-Repair target:
-
-- Define portable session-state frames for channels, away/account state,
-  marks, caps, and pending history cursor.
-- Wire Helix-style state import/export to mesh resume.
-
-## IRC, IRCv3, History, And Tags
-
-### `LIST` `C` / `T` Filters Still Use Zero Ages
-
-`handleList` parses ELIST filters but passes zero `created_ago`, `topic_age`,
-and current time values. `world.ChannelView` exposes real `created_unix` and
-`topic_time`, so the missing piece is handler wiring.
-
-Repair target:
-
-- Feed wall-clock age data into the LIST matcher.
-- Add tests for `LIST C<`, `C>`, `T<`, and `T>` filters.
-
-### CHATHISTORY / Bouncer Replay Emits `BATCH` Without `batch`
-
-History replay paths can emit `BATCH` while only gating on chathistory-style
-capabilities. Ophion gates batch frames on the `batch` capability itself.
-
-Repair target:
-
-- Require `batch` before sending `BATCH`.
-- Fall back to non-batch replay when a client has history caps but lacks
-  `batch`.
-
-### TAGMSG Reactions / Typing Are Not Fully Stored Or Replayed
-
-Reaction and typing tags are handled live, but stored history/event playback does
-not preserve the client-tag fields needed to replay channel TAGMSG events with
-Ophion-compatible behavior.
-
-Repair target:
-
-- Extend history entries with command type and client tags.
-- Record and replay eligible TAGMSG reactions/typing notifications.
-
-### EDIT / REDACT Notifications Are Over-Broadcast
-
-Senders are capability-checked, but channel recipients are not filtered by the
-matching draft edit/redact capabilities before notification delivery.
-
-Repair target:
-
-- Filter per recipient for `draft/message-editing` and
-  `draft/message-redaction`.
-- Add mixed-capability channel tests.
-
-### Extended MONITOR And Metadata Visibility Are Too Broad
-
-`extended-monitor` delivery can include event families without checking the
-event-specific capability. `metadata-2` visibility tokens are stored but not
-enforced consistently on reads.
-
-Repair target:
-
-- Require both `extended-monitor` and each event family's capability.
-- Enforce metadata visibility on every read path, not just write/storage.
-
-### MARKREAD And Typing Delivery Have Capability Edges
-
-Ophion sends stored read markers on JOIN. Orochi has MARKREAD storage paths but
-does not push the marker automatically on join. Draft typing delivery can also
-miss recipients that support `draft/typing` but not `message-tags`.
-
-Repair target:
-
-- Emit channel/account MARKREAD state on JOIN to capable clients.
-- Add a standalone `draft/typing` delivery path when `message-tags` is absent.
-
-### SASL Mechanism Reporting Overstates SCRAM-SHA-512
-
-Live CAP SASL supports PLAIN, EXTERNAL, and SCRAM-SHA-256. Some numerics still
-advertise SCRAM-SHA-512. Ophion has SCRAM-SHA-512 support.
-
-Repair target:
-
-- Either implement SCRAM-SHA-512 or remove it from every live numeric/listing.
-- Add a test that CAP and numeric mechanism listings agree.
-
-### Extban Validation Lags Ophion
-
-Orochi advertises `EXTBAN=$,acgmrz`; `$z:<fp>` and `$o:<token>` parse paths are
-not fully semantically enforced, and unknown/malformed `$` masks can degrade to
-literal host globs.
-
-Repair target:
-
-- Validate extban kinds before storing them.
-- Implement the missing `$z`/`$o` semantics or stop accepting them.
-- Reject malformed extbans rather than silently treating them as host masks.
-
-### DCC Is Parser-Only
-
-CTCP DCC detection exists, but there is no DCC proxy/filehost behavior analogous
-to Ophion's optional Python modules.
-
-Repair target:
-
-- Decide whether DCC proxy/filehost is in scope for Orochi.
-- If in scope, add explicit command/module surfaces; if out of scope, document
-  it as an intentional exclusion.
-
-## IRCX
-
-### `MODE ISIRCX` Variant Is Narrower
-
-Orochi supports `MODE ISIRCX`; Ophion accepts both `MODE ISIRCX` and
-`MODE <nick> ISIRCX`.
-
-Repair target:
-
-- Accept the nick-qualified form and preserve the existing unqualified form.
-
-### IRCX `AUTH` Is Parser-Only
-
-`src/proto/ircx_auth.zig` exists, but the IRCX module does not register a live
-`AUTH` command. Ophion maps AUTH onto SASL/account authentication behavior.
-
-Repair target:
-
-- Register `AUTH`.
-- Bridge PLAIN/EXTERNAL/SCRAM behavior to the existing SASL/account backend.
-- Keep the IRCX numerics consistent with the actual live mechanisms.
-
-### Server-Level `SACCESS` / `ACCESS *` Is Missing
-
-The parser models SACCESS-like access operations, but there is no command
-registration, storage, or enforcement for server-level IRCX access lists.
-
-Repair target:
-
-- Add a server-level access store and command registration.
-- Define enforcement points before exposing the feature.
-
-### Channel `ACCESS` Semantics Differ
-
-Orochi deny gates run before IRCX access auto-status. Ophion lets access levels
-override some join denials, depending on the list entry and channel state.
-
-Repair target:
-
-- Reconcile deny-first behavior against Ophion's access override matrix.
-- Add join tests for deny, allow, auto-op, invite-only, and key/limit cases.
-
-### `PROP` Coverage Is Partial
-
-Channel built-ins exist, but account entities, durable account/user properties,
-full user profile providers, ONJOIN/ONPART behavior, and user/member/account
-property propagation are incomplete.
-
-Repair target:
-
-- Define durable stores for account/user/member property namespaces.
-- Add property propagation over mesh.
-- Add ONJOIN/ONPART hooks if they remain an IRCX target.
-
-### `EVENT` Is A Partial Event Spine
-
-Current EVENT support covers operator categories, broadcast, and observation.
-It does not yet match Ophion's CHANGE/DELETE/CLEAR/STATUS behavior, subject
-masks, broad hook coverage, or numeric fidelity across the 808/809/810 and
-821-825 families.
-
-Repair target:
-
-- Add an EVENT conformance table from current Ophion behavior.
-- Expand event categories and numerics only with live hooks behind them.
-
-### DATA / REQUEST / REPLY / WHISPER Mesh Parity Is Incomplete
-
-Local DATA-family commands exist. Cross-node propagation and some Ophion-style
-request/reply semantics are still incomplete.
-
-Repair target:
-
-- Add typed-message relay frames or extend the existing message relay schema.
-- Preserve verb, tag, sender, target, and policy result across nodes.
-
-### MODEX Numeric And Parser Parity Differs
-
-Orochi currently uses 820/821 for MODEX listing, while Ophion uses 806/807.
-Parser support also needs to be checked for every accepted channel prefix and
-named-mode spelling.
-
-Repair target:
-
-- Match Ophion numerics or document a deliberate Orochi divergence.
-- Add parser tests for `#`, `&`, and prefixed channel names.
-
-### LISTX Prefix / Numeric Parity Still Differs
-
-LISTX now uses real channel metadata, but parity gaps remain: accepted channel
-prefixes, picture/list numeric `813`, and exact result family behavior.
-
-Repair target:
-
-- Accept all live channel prefixes.
-- Add or explicitly exclude `RPL_LISTXPICS 813`.
-
-### CREATE / OID / CLONE Semantics Differ
-
-Orochi has OID and clone support, but Ophion-compatible behavior differs:
-requested initial modes are not fully applied by CREATE, existing-channel
-handling differs, and clone/template state differs.
-
-Repair target:
-
-- Reject existing CREATE targets when Ophion does.
-- Apply requested initial modes.
-- Decide whether Orochi's richer clone state is intentional or should match
-  Ophion more closely.
-
-## Services And Operator State
-
-### REGISTER / VERIFY Email State Is Not Durable
-
-Verification tokens are process-local, and account records do not persist email
-verification state during registration. Ophion persists account email data.
-
-Repair target:
-
-- Store email and verification state in the account backend.
-- Make tokens restart-safe or expire/reissue cleanly after restart.
-
-### Registered Channels Are Not Replayed Into Live `+r`
-
-`chanregs` persist, but boot does not replay them into the live world. `+r` is
-only marked on new register/drop hooks.
-
-Repair target:
-
-- Iterate persisted channel registrations during boot.
-- Materialize registered channels or at least mark live channels as registered.
-
-### Services `CHANNEL ACCESS` Is Not Live Automode
-
-Services access entries authorize service commands, but join-time op/voice/owner
-status is wired to the separate IRCX access store.
-
-Repair target:
-
-- Decide whether services access and IRCX access should merge or bridge.
-- Apply services access on join with tests for founder/op/voice levels.
-
-### AKICK Persistence Does Not Restore Enforcement
-
-AKICK records persist, but the live join gate checks only the process-local
-mirror populated by live add/delete commands. Adding an AKICK also does not kick
-currently present matching users.
-
-Repair target:
-
-- Rebuild the live AKICK mirror from persistent services state at boot.
-- Kick current matching members when AKICK is added.
-
-### MLOCK Is Process-Local
-
-`CHANNEL SET MLOCK` stores mode locks in a server map, not the durable channel
-record, so locks vanish across restart/hot rebuild.
-
-Repair target:
-
-- Add MLOCK fields to the durable channel record.
-- Replay and enforce locks after boot.
-
-### WARD / KLINE / DLINE / XLINE Parity Is Incomplete
-
-The Warden registry is in-memory and local. Legacy K/D/G/X command names are
-classified or parser-modeled in places, but not registered as live persistent
-ban commands matching Ophion's ban database.
-
-Repair target:
-
-- Persist WARD entries and decide mesh propagation semantics.
-- Register compatibility aliases or document WARD as the only supported surface.
-
-### Oper Privilege Gates Are Too Broad In Places
-
-Sensitive commands like `USERIP` and `UPGRADE` still use broad oper status
-instead of named privileges such as `oper_spy` or `server_restart`.
-
-Repair target:
-
-- Audit every oper command against `src/daemon/oper.zig` privileges.
-- Add tests for denied opers in limited classes.
-
-## Config, TLS, Runtime, Media, And Ops
-
-### Parsed But Not Wired Config Keys
-
-The current remaining parsed-but-not-live keys are:
-
-- `listen.webtransport`
-- `mesh.trust_roots`
-- `media.max_upload_bytes`
-- `media.max_frame_bytes`
-- `sasl.enabled`
-- `sasl.realm`
-
-`media.enabled` is live now and should not be listed as unwired.
-
-### PROXY Protocol Has No Trusted Accept Path
-
-`src/proto/proxy_protocol.zig` parses PROXY protocol, but there is no trusted
-pre-IRC accept path equivalent to Ophion's trusted-proxy handling.
-
-Repair target:
-
-- Add listener-level PROXY v2 consumption before IRC/TLS/WebSocket framing.
-- Gate it by trusted proxy source IPs.
-
-### TLS Verification / Reload Parity Is Partial
-
-TLS listeners and CertFP possession proof exist. A generic X.509 verifier
-wrapper still has an integration TODO, revocation/CT parsing is not wired into
-handshakes, and client certificates are not CA-chain client-auth.
-
-Repair target:
-
-- Wire the verifier path used by outbound/admin surfaces.
-- Decide whether CA client-auth is in scope or keep CertFP-only as intentional.
-- Add hot cert reload coverage with TLS listener continuity.
-
-### ACME Is Out-Of-Band
-
-`orochi acme-issue` writes cert/key and exits. There is no daemon renewal loop or
-hot TLS reload path, and IPv6 nameservers are skipped in the current runner.
-
-Repair target:
-
-- Add renewal scheduling or document external ACME as the supported path.
-- Add a hot reload command/path for refreshed TLS material.
-
-### Metrics / Admin HTTP Parity Is Missing
-
-Orochi can write static stats files and render Prometheus text internally, but
-there is no live `/metrics` HTTP endpoint or web admin dashboard comparable to
-Ophion's optional modules.
-
-Repair target:
-
-- Add a gated metrics endpoint or document file-export-only as intentional.
-- Decide whether web admin belongs in Orochi or external tooling.
-
-### Media Runtime Hardening Remains
-
-Orochi has SFU control, RTP/STUN, native OPVOX/OPVIS UDP, and bridge headers.
-Runtime media sizing is still partly comptime-bound, and native media sender
-learning by stream id lacks per-datagram crypto authentication. S2S media
-origin policy depends on the broader signed-origin work above.
-
-Repair target:
-
-- Wire media max frame/upload config.
-- Authenticate datagram sender claims.
-- Add mesh media policy tests after signed S2S frames land.
-
-### Ops Tooling Parity Is Open
-
-Orochi has an upgrade smoke test but lacks a comparable deployment/systemd asset
-set and tarball smoke surface.
-
-Repair target:
-
-- Add systemd/deployment examples once the live install target is settled.
-- Add smoke tests that cover a packaged runtime, config load, TLS, and upgrade.
-
-## Documentation Follow-Ups
-
-This cleanup updates the most obviously stale command/config/ISUPPORT reference
-claims alongside the new audit. Future code repairs should update this document
-first or delete the completed bullet in the same commit as the fix.
+  `sasl.realm`, and `[metrics]` all project into runtime config. WebTransport,
+  PROXY trusted accept handling, live Prometheus `/metrics`, media caps, and
+  SASL disable/realm behavior are not parser-only anymore.
+- Transport/security: WebTransport is implemented as a QUIC + HTTP/3 +
+  Extended CONNECT listener and bridges IRC bytes to the daemon. TLS certificate
+  hot reload on REHASH and ACME IPv6 nameserver support exist.
+- Mesh/S2S: secured S2S records are encrypted/authenticated; direct-origin
+  state frames are signed; multi-hop MESSAGE, CHANNEL_PROP, and ENTITY_PROP
+  carry origin signatures across re-forward; `SESSION_MIGRATE` frames and
+  staged session handoff exist.
+- IRCv3/history: LIST `C`/`T`, CHATHISTORY batch gating, TAGMSG typing/reaction
+  storage/replay, edit/redact recipient capability filtering, event playback,
+  extended-monitor capability gating, metadata visibility, MARKREAD on JOIN,
+  no-implicit-names, channel-rename, labeled-response, standard-replies,
+  multiline, read-marker, message editing, and message redaction are wired.
+- SASL reporting: live lists are limited to wired mechanisms. SCRAM-SHA-512
+  helpers exist, but the live router deliberately does not advertise them.
+- IRCX/services: `AUTH`, `SACCESS` / `ACCESS *`, channel `ACCESS` enforcement,
+  `MODE <nick> ISIRCX`, MODEX `806/807`, LISTX prefix handling, CREATE
+  existing-channel rejection/template clone behavior, DATA/REQUEST/REPLY/WHISPER
+  mesh relay, EVENT subject globs, services verification persistence, registered
+  channel replay, AKICK/MLOCK/WARD replay, automode, and named oper privileges
+  are implemented.
+- Post-`c471a06` closures (rewritten per the closing rule at the bottom of this
+  file): the `draft/search` CAP and `SEARCH` command are live — cap
+  `dispatch.zig:350`, command `modules/messaging.zig:61` (`25eaf06`); SCRAM-SHA-512
+  is a live SASL mechanism advertised in the sasl cap value `dispatch.zig:315`
+  (`143295f`); and patterned `$z:<fingerprint>` and `$o:<class>` extbans are parsed
+  and matched, `extban.zig:62,81` (`505b80a`). The `NETWORKICON` ISUPPORT token is
+  now advertised from `[network] icon_url` when set (Ophion `n_url` parity),
+  `server.zig` `buildIsupportTokens`. Bare-form-only extban claims and the
+  "SEARCH missing" / "SCRAM-512 not live" findings no longer apply.
+
+## Real Missing Or Incomplete Features
+
+### IRCv3 and SASL Parity
+
+- **`draft/file-upload` / `FILEHOST` is missing by design.** Ophion has
+  `m_filehost`. Orochi currently documents DCC/filehost as intentionally absent.
+  If file sharing becomes an Orochi target, this needs a native design rather
+  than resurrecting DCC proxy semantics.
+- **SESSION-TOKEN SASL (implemented).** A live `SESSION-TOKEN` mechanism: the
+  services store persists `SHA-256(token) -> account` with expiry, issuance is
+  TLS-only (`SESSIONTOKEN` services command + a best-effort post-SASL notice that
+  refuses non-TLS links with `INSECURE_TRANSPORT`), and the router validates with a
+  constant-time hash compare.
+- **SCRAM-SHA-512-PLUS (implemented).** The clean-room TLS stack now derives an
+  RFC 8446 §7.5 / RFC 9266 `tls-exporter` value (`hkdf_tls13.zig`), and
+  SCRAM-SHA-512-PLUS binds `c=` to `gs2-header || exporter`
+  (`sasl_scram512_server.zig`), advertised to TLS clients only.
+- **OAUTHBEARER and ANONYMOUS (implemented).** OAUTHBEARER (RFC 7628) verifies a
+  signed JWT (HS256/RS256/ES256) against a configured key via `oauth_jwt.zig` — the
+  algorithm is bound to the configured key type (no alg-confusion / `alg=none`), and
+  OAuth identities are federated and never auto-opered. ANONYMOUS (RFC 4505) is
+  config-gated (`[sasl].allow_anonymous`, default off) and binds a privilege-less
+  guest. Each advertises only when its gate is satisfied.
+- **`oper-tag` has no Ophion grounding.** The Ophion reference has no `oper-tag`
+  cap or message tag, so there is nothing to port; left out until a concrete spec
+  exists. (`network-icon` is implemented as the `NETWORKICON` ISUPPORT token — see
+  the fixed items above.)
+
+### Ophion-Specific Capability Names
+
+Orochi sometimes implements the behavior under Orochi-native names instead of
+the Ophion CAP names:
+
+- `ophion/session-sync`: Orochi has `SESSION` and `SESSION_MIGRATE`, but does
+  not advertise this Ophion-specific client capability.
+- `ophion/ladon-media`: Orochi has media, native OPVOX/OPVIS UDP, and
+  WebTransport, but not the Ophion LADON client capability value or
+  `LADONMEDIA=1` compatibility surface.
+- `ophion/prop-notify`: Orochi uses `orochi/prop-notify` and signed PROP/metadata
+  propagation. If Ophion-client compatibility is required, add an alias or a
+  compatibility mode explicitly.
+- `tls`: Ophion exposes STARTTLS through `m_starttls`; Orochi intentionally uses
+  implicit TLS listeners only.
+
+### IRCX Parity
+
+- **EVENT numeric fidelity is intentionally different today.** Orochi uses the
+  `NOTE EVENT` wire form and subject globs; Ophion has the 808/809/810 and
+  821-825 numeric families. Treat this as a compatibility gap only for clients
+  that need Ophion numerics.
+- **LISTX picture numeric `813` is not implemented.** Orochi has no channel
+  picture feature, so `RPL_LISTXPICS 813` stays excluded unless a picture store
+  is added.
+- **Property-provider parity (provider-by-provider).** Core PROP, metadata-2,
+  channel/user/member/entity propagation, and signed mesh re-forward exist. The
+  live Orochi providers are registered in
+  `src/proto/ircx_prop_providers.zig:143-162` (computed) over the store in
+  `src/proto/ircx_prop_store.zig`. Mapping to Ophion's named provider modules:
+
+  | Orochi provider(s) | Scope | Visibility | Ophion provider module |
+  |---|---|---|---|
+  | `name`, `topic`, `subject`, `language`, `creation_time`, `topic_setter`, `membercount`, `memberlimit`, `registered` | channel | public | `m_ircx_prop_channel_builtins` |
+  | `ownerkey`, `opkey`, `hostkey`, `memberkey` | channel | secret (owner/host gated) | `m_ircx_prop_ownerkey` / `m_ircx_prop_opkey` |
+  | `onjoin` | channel | public (join timestamp) | `m_ircx_prop_onjoin` |
+  | `onpart` | channel | public (part timestamp) | `m_ircx_prop_onpart` |
+  | `member_of` | user | public (membership list) | `m_ircx_prop_member_of` |
+  | `account` | user | public | account binding |
+  | `user_profile` | user | public (`display/real/title/location/note`) | `m_ircx_prop_user_profile` (subset) |
+
+  Residual gap (do not claim full parity): the Orochi `user_profile` provider
+  exposes only `display/real/title/location/note`. Ophion's individual profile keys
+  (`URL`, `GENDER`, `PICTURE`, `BIO`, `EMAIL`) and its read-only GeoIP keys
+  (`COUNTRY`, `REGION`, `CITY`, `ASN`, `ASORG`) are not exposed as PROP keys yet.
+- **IRCX oper extras — command-by-command mapping.** Orochi has native oper
+  moderation commands and privilege gates under English names. Mapping Ophion's
+  IRCX oper extras:
+
+  | Ophion oper extra | Orochi equivalent | Status |
+  |---|---|---|
+  | `GAG` (silence) | `SHUN` / `UNSHUN` live oper silence (`oper_security.zig:147-148`); services `SACCESS` GAG-type access entries | covered, native surface |
+  | `OPFORCE` | `FORCEOP` / `FORCEDEOP` (+ `FORCEJOIN` / `FORCEPART`), `services_ext.zig:48-51` | covered, renamed |
+  | IRCX vhost tooling | `VHOST` command (`feature_misc.zig:49` → `handleVhost`) | covered |
+  | `ANONKILL` (anonymized kill) | `KILL` only (`oper_security.zig:139`); no anonymized variant | intentionally absent |
+  | godmode (hidden-oper) | no equivalent; Orochi has no hidden-oper concept | intentionally absent |
+
+  The Ophion command names themselves are not aliased — same custom-not-clone
+  stance as the Ophion-Specific Capability Names section above.
+
+### Media And LADON
+
+- **LADON media compatibility is not implemented.** Orochi media is not a LADON
+  module port. It does not expose Ophion's `MEDIAFRAME`, `LADONADMIN`,
+  `ophion/ladon-media` CAP value, or LADON media property/mode vocabulary as a
+  compatibility layer.
+- **Runtime SFU room sizing remains comptime-bound.** `max_participants` is still
+  64 in the media room/session template. A config-driven participant cap is open.
+- **Runtime Kagura reassembly sizing remains comptime-bound.** Defaults exist,
+  but the actual reassembly buffer capacity is still a compile-time parameter.
+- **Per-datagram native-media MAC (server side implemented).** Each native
+  (OPVOX/OPVIS) Kagura datagram carries an HMAC-SHA256-128 tag keyed from the
+  per-stream PRF capability; verification is config-gated by
+  `[media].native_media_require_mac` (default off for back-compat) and drops
+  untagged/bad-tag datagrams before the SFU learns the sender. End-to-end still
+  needs the matching Nexus/Ocean client change — the wire format is documented as
+  the client contract, and the server advertises `mac=hmac-sha256-128` on the
+  native media line.
+
+### Mesh, Ops, And Runtime
+
+- **Secured-link `SQUIT` is symmetric (resolved).** `findSquitVictim` →
+  `peerRemoteName` checks the secured link before the plaintext one
+  (`server.zig:11785-11797`), so `SQUIT <server>` matches secured peers. Peer links
+  live only on reactor 0 by design (`server.zig:2055`); that reactor-0 search is
+  covered for secured links — including the cross-shard call path — by the
+  `findSquitVictim` `SECURED.TEST` / `reactor-zero peer from another shard` tests.
+- **In-daemon ACME renewal (implemented).** `[acme]` enables a Linux-only
+  background scheduler (`acme_renewal.zig`) that checks the `[tls].cert_path` leaf
+  expiry every `check_interval`, issues off the reactor within `renew_before_days`,
+  and signals reactor 0 to hot-swap via `reloadTlsCerts` — no restart. The renewal
+  thread never mutates live TLS state cross-thread (atomic flag + reactor-0 reload).
+- **Web admin/dashboard is absent.** Orochi has static stats export and live
+  Prometheus `/metrics`; it does not ship Ophion-style optional webadmin/Python
+  module equivalents.
+- **Plugin/module ecosystem parity is intentionally not present.** Ophion's C
+  modules and CPython modules are not an Orochi target. If extensibility is
+  needed, document the intended native/WASM surface separately and track it as an
+  Orochi feature, not as C MAPI parity.
+
+## Documentation Rules
+
+- Do not list a key as parser-only unless `config_format.zig`, `config_boot.zig`,
+  `main.zig`, and `server.zig` all confirm it is not projected or consumed.
+- Do not infer missing IRCv3 support from this audit alone. Check
+  `docs/reference/protocol/caps.md`, `dispatch.zig`, and the relevant
+  `server.zig` handler/tests.
+- Keep Ophion compatibility names separate from Orochi-native functionality. A
+  feature can be implemented and still lack an Ophion-compatible CAP, command, or
+  numeric surface.
+- When closing one of the gaps above, remove or rewrite the bullet in this file
+  in the same change.

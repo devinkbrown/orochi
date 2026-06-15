@@ -339,6 +339,8 @@ pub const Client = struct {
     early_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    exporter_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    exporter_master_secret_ready: bool = false,
     resumption_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
@@ -391,6 +393,7 @@ pub const Client = struct {
         secureZero(&self.early_secret);
         secureZero(&self.handshake_secret);
         secureZero(&self.master_secret);
+        secureZero(&self.exporter_master_secret);
         secureZero(&self.resumption_master_secret);
         secureZero(&self.client_hs_secret);
         secureZero(&self.server_hs_secret);
@@ -486,6 +489,22 @@ pub const Client = struct {
 
     pub fn handshakeDone(self: *const Client) bool {
         return self.state == .connected;
+    }
+
+    /// RFC 8446 section 7.5 TLS exporter. Valid only after the handshake
+    /// reaches connected state.
+    pub fn exportKeyingMaterial(self: *const Client, label: []const u8, context: []const u8, out: []u8) Error!void {
+        if (self.state != .connected) return error.BadState;
+        if (!self.exporter_master_secret_ready) return error.BadState;
+        switch (self.hashAlg()) {
+            .sha256 => try self.exportKeyingMaterialT(Sha256, label, context, out),
+            .sha384 => try self.exportKeyingMaterialT(Sha384, label, context, out),
+        }
+    }
+
+    /// RFC 9266 tls-exporter channel binding for SCRAM-SHA-*-PLUS.
+    pub fn channelBindingTlsExporter(self: *const Client, out: *[32]u8) Error!void {
+        try self.exportKeyingMaterial("EXPORTER-Channel-Binding", "", out[0..]);
     }
 
     /// Load a serialized TLS 1.3 session ticket previously returned by
@@ -1510,6 +1529,10 @@ pub const Client = struct {
         var master = KS.SecretBytes.init(sk);
         defer master.wipe();
         const th = KS.transcriptHash(self.transcript.items);
+        var exporter_master = try KS.exporterMasterSecret(&master, &th);
+        defer exporter_master.wipe();
+        self.exporter_master_secret[0..KS.hash_len].* = exporter_master.declassify();
+        self.exporter_master_secret_ready = true;
         var traffic = try KS.applicationTrafficSecrets(&master, &th);
         defer traffic.wipe();
         self.client_app_secret[0..KS.hash_len].* = traffic.client.declassify();
@@ -1537,6 +1560,14 @@ pub const Client = struct {
         var rms = try KS.deriveSecret(&master, "res master", &th);
         defer rms.wipe();
         self.resumption_master_secret[0..KS.hash_len].* = rms.declassify();
+    }
+
+    fn exportKeyingMaterialT(self: *const Client, comptime KS: type, label: []const u8, context: []const u8, out: []u8) Error!void {
+        var sk: [KS.hash_len]u8 = undefined;
+        @memcpy(&sk, self.exporter_master_secret[0..KS.hash_len]);
+        var exporter_master = KS.SecretBytes.init(sk);
+        defer exporter_master.wipe();
+        try KS.exportKeyingMaterial(&exporter_master, label, context, out);
     }
 
     fn appendTranscript(self: *Client, bytes: []const u8) Error!void {
@@ -2560,8 +2591,11 @@ test "validateCertificateRequest enforces RFC 8446 §4.3.2 framing" {
         0x00,
         0x00, 0x0c, // outer (spurious) extensions length
         0x00, 0x0a, // inner extensions length — parsed as an extension type
-        0x00, 0x0d, 0x00, 0x06,
-        0x00, 0x04, 0x08, 0x07, 0x04, 0x03,
+        0x00, 0x0d,
+        0x00, 0x06,
+        0x00, 0x04,
+        0x08, 0x07,
+        0x04, 0x03,
     };
     try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&doubled));
 
@@ -2580,8 +2614,12 @@ test "validateCertificateRequest enforces RFC 8446 §4.3.2 framing" {
     // signature_algorithms list length disagreeing with the extension data.
     const bad_list = [_]u8{
         0x00,
-        0x00, 0x0a,
-        0x00, 0x0d, 0x00, 0x06,
+        0x00,
+        0x0a,
+        0x00,
+        0x0d,
+        0x00,
+        0x06,
         0x00, 0x06, 0x08, 0x07, 0x04, 0x03, // claims 6 list bytes, has 4
     };
     try std.testing.expectError(error.BadHandshake, validateCertificateRequest(&bad_list));

@@ -36,11 +36,21 @@ pub const Mechanism = enum {
     plain,
     external,
     scram_sha_256,
+    scram_sha_512,
+    scram_sha_512_plus,
+    session_token,
+    oauthbearer,
+    anonymous,
 
     pub fn parse(mechanism_name: []const u8) ?Mechanism {
         if (std.ascii.eqlIgnoreCase(mechanism_name, "PLAIN")) return .plain;
         if (std.ascii.eqlIgnoreCase(mechanism_name, "EXTERNAL")) return .external;
         if (std.ascii.eqlIgnoreCase(mechanism_name, "SCRAM-SHA-256")) return .scram_sha_256;
+        if (std.ascii.eqlIgnoreCase(mechanism_name, "SCRAM-SHA-512")) return .scram_sha_512;
+        if (std.ascii.eqlIgnoreCase(mechanism_name, "SCRAM-SHA-512-PLUS")) return .scram_sha_512_plus;
+        if (std.ascii.eqlIgnoreCase(mechanism_name, "SESSION-TOKEN")) return .session_token;
+        if (std.ascii.eqlIgnoreCase(mechanism_name, "OAUTHBEARER")) return .oauthbearer;
+        if (std.ascii.eqlIgnoreCase(mechanism_name, "ANONYMOUS")) return .anonymous;
         return null;
     }
 
@@ -49,6 +59,11 @@ pub const Mechanism = enum {
             .plain => "PLAIN",
             .external => "EXTERNAL",
             .scram_sha_256 => "SCRAM-SHA-256",
+            .scram_sha_512 => "SCRAM-SHA-512",
+            .scram_sha_512_plus => "SCRAM-SHA-512-PLUS",
+            .session_token => "SESSION-TOKEN",
+            .oauthbearer => "OAUTHBEARER",
+            .anonymous => "ANONYMOUS",
         };
     }
 };
@@ -177,6 +192,12 @@ pub const Dispatcher = struct {
             .plain => .plain,
             .external => .external,
             .scram_sha_256 => .{ .scram = ScramState.init() },
+            .scram_sha_512,
+            .scram_sha_512_plus,
+            .session_token,
+            .oauthbearer,
+            .anonymous,
+            => return .{ .failure = .ERR_SASLFAIL },
         };
         return .{ .continue_ = "+" };
     }
@@ -208,6 +229,12 @@ pub const Dispatcher = struct {
             .plain => self.callbacks.plain != null,
             .external => self.callbacks.external != null and self.tls_certfp != null,
             .scram_sha_256 => self.callbacks.scram != null and self.server_nonce.len != 0,
+            .scram_sha_512,
+            .scram_sha_512_plus,
+            .session_token,
+            .oauthbearer,
+            .anonymous,
+            => false,
         };
     }
 

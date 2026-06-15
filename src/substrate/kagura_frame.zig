@@ -23,6 +23,7 @@
 //! Bounded sliding-window: accepts out-of-order frames, emits in-order,
 //! drops duplicates, surfaces gap ranges for FEC/retransmit.
 const std = @import("std");
+const crypto_hash = @import("../crypto/hash.zig");
 const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
@@ -60,6 +61,13 @@ pub const MEDIA_BAND_FLOOR: u8 = 64;
 pub const HEADER_BYTES: usize = 19;
 /// Minimum encoded frame size: 4 (length prefix) + 19 (header).
 pub const MIN_FRAME_WIRE_BYTES: usize = 4 + HEADER_BYTES;
+/// Native-media datagram authentication tag size, appended after the exact
+/// Kagura frame bytes. The tag is HMAC-SHA256 truncated to 128 bits.
+pub const MAC_TAG_BYTES: usize = 16;
+/// Per-stream MAC key size derived from the native stream-id PRF root.
+pub const MAC_KEY_BYTES: usize = 32;
+/// HKDF info/domain label used to derive per-stream native-media MAC keys.
+pub const MAC_KEY_DERIVE_LABEL = "orochi native-media datagram mac v1";
 
 // -- Codec tag ---------------------------------------------------------------
 
@@ -91,6 +99,12 @@ pub const DecodeError = error{
 pub const EncodeError = error{
     BufferTooSmall,
     ControlBandId,
+};
+
+pub const MacError = DecodeError || error{
+    MissingTag,
+    BadTag,
+    BufferTooSmall,
 };
 
 // -- MediaFrame --------------------------------------------------------------
@@ -153,13 +167,52 @@ pub fn encode(frame: MediaFrame, buf: []u8) EncodeError!usize {
 /// Decode a frame from `buf`, returning a `FrameView` that borrows `buf`.
 /// Rejects truncation, control band IDs, unknown codec tags, trailing bytes.
 pub fn decode(buf: []const u8) DecodeError!FrameView {
+    const declared_total = try encodedFrameLen(buf);
+    if (buf.len > declared_total) return error.TrailingBytes;
+    return decodeExact(buf);
+}
+
+/// Return the exact Kagura frame length declared by `buf`'s length prefix,
+/// excluding any native-media MAC tag that may follow it.
+pub fn encodedFrameLen(buf: []const u8) DecodeError!usize {
     if (buf.len < MIN_FRAME_WIRE_BYTES) return error.Truncated;
+    const payload_len: usize = readU32Le(buf[0..4]);
+    const declared_total = MIN_FRAME_WIRE_BYTES + payload_len;
+    if (buf.len < declared_total) return error.Truncated;
+    return declared_total;
+}
+
+/// Decode the Kagura frame prefix from `buf`, ignoring an optional outer MAC tag
+/// that follows the declared frame bytes. Other trailing byte counts are still
+/// rejected.
+pub fn decodeMaybeAuthenticated(buf: []const u8) DecodeError!FrameView {
+    const frame_bytes = try authenticatedFrameBytes(buf);
+    return decodeExact(frame_bytes);
+}
+
+/// Return the frame prefix when `buf` is either exactly a frame or a frame plus
+/// one fixed-size native-media MAC tag.
+pub fn authenticatedFrameBytes(buf: []const u8) DecodeError![]const u8 {
+    const declared_total = try encodedFrameLen(buf);
+    if (buf.len == declared_total or buf.len == declared_total + MAC_TAG_BYTES) {
+        return buf[0..declared_total];
+    }
+    return error.TrailingBytes;
+}
+
+pub fn hasAuthenticationTag(buf: []const u8) DecodeError!bool {
+    const declared_total = try encodedFrameLen(buf);
+    if (buf.len == declared_total) return false;
+    if (buf.len == declared_total + MAC_TAG_BYTES) return true;
+    return error.TrailingBytes;
+}
+
+fn decodeExact(buf: []const u8) DecodeError!FrameView {
     var pos: usize = 0;
     const payload_len: usize = readU32Le(buf[pos..]);
     pos += 4;
     const declared_total = MIN_FRAME_WIRE_BYTES + payload_len;
-    if (buf.len < declared_total) return error.Truncated;
-    if (buf.len > declared_total) return error.TrailingBytes;
+    std.debug.assert(buf.len == declared_total);
     const band_id = buf[pos];
     pos += 1;
     if (!isMediaBand(band_id)) return error.ControlBandId;
@@ -186,6 +239,112 @@ pub fn decode(buf: []const u8) DecodeError!FrameView {
         .codec = codec,
         .payload = payload,
     };
+}
+
+/// Derive the per-stream MAC key from the existing native stream-id PRF root.
+/// This is HKDF-SHA256 extract + single-block expand with a distinct label and
+/// the stream's public `(channel, participant)` context.
+pub fn deriveNativeMediaMacKey(
+    stream_prf_key: *const [16]u8,
+    channel: []const u8,
+    participant: []const u8,
+    out: *[MAC_KEY_BYTES]u8,
+) void {
+    const HmacSha256 = crypto_hash.HmacSha256;
+    var prk = HmacSha256.create("orochi native-media mac extract v1", stream_prf_key);
+    defer std.crypto.secureZero(u8, prk[0..]);
+
+    var mac = HmacSha256.init(&prk);
+    mac.update(MAC_KEY_DERIVE_LABEL);
+    mac.update(&[_]u8{0});
+    mac.update(channel);
+    mac.update(&[_]u8{0});
+    mac.update(participant);
+    mac.update(&[_]u8{1});
+    out.* = mac.final();
+}
+
+pub fn nativeMediaMacTag(
+    stream_prf_key: *const [16]u8,
+    channel: []const u8,
+    participant: []const u8,
+    frame_bytes: []const u8,
+) [MAC_TAG_BYTES]u8 {
+    var key: [MAC_KEY_BYTES]u8 = undefined;
+    deriveNativeMediaMacKey(stream_prf_key, channel, participant, &key);
+    defer std.crypto.secureZero(u8, key[0..]);
+
+    const full = crypto_hash.HmacSha256.create(&key, frame_bytes);
+    var tag: [MAC_TAG_BYTES]u8 = undefined;
+    @memcpy(tag[0..], full[0..MAC_TAG_BYTES]);
+    return tag;
+}
+
+pub fn constantTimeTagEql(a: []const u8, b: []const u8) bool {
+    const len_diff = a.len ^ b.len;
+    const n = @min(a.len, b.len);
+    var folded = len_diff;
+    folded |= folded >> 32;
+    folded |= folded >> 16;
+    folded |= folded >> 8;
+    var diff: u8 = @truncate(folded);
+    var i: usize = 0;
+    while (i < n) : (i += 1) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
+/// Verify an appended native-media MAC tag. Returns the frame prefix on success.
+pub fn verifyNativeMediaMac(
+    stream_prf_key: *const [16]u8,
+    channel: []const u8,
+    participant: []const u8,
+    datagram: []const u8,
+) MacError![]const u8 {
+    const frame_len = try encodedFrameLen(datagram);
+    if (datagram.len == frame_len) return error.MissingTag;
+    if (datagram.len != frame_len + MAC_TAG_BYTES) return error.TrailingBytes;
+
+    const frame_bytes = datagram[0..frame_len];
+    const got = datagram[frame_len..][0..MAC_TAG_BYTES];
+    const expected = nativeMediaMacTag(stream_prf_key, channel, participant, frame_bytes);
+    if (!constantTimeTagEql(expected[0..], got)) return error.BadTag;
+    return frame_bytes;
+}
+
+/// Transition helper for the default-compatible server mode: untagged frames are
+/// accepted when `require_tag` is false, but a present tag must still verify.
+pub fn acceptNativeMediaMac(
+    stream_prf_key: *const [16]u8,
+    channel: []const u8,
+    participant: []const u8,
+    datagram: []const u8,
+    require_tag: bool,
+) MacError![]const u8 {
+    const frame_len = try encodedFrameLen(datagram);
+    if (datagram.len == frame_len) {
+        if (require_tag) return error.MissingTag;
+        return datagram[0..frame_len];
+    }
+    if (datagram.len != frame_len + MAC_TAG_BYTES) return error.TrailingBytes;
+    return verifyNativeMediaMac(stream_prf_key, channel, participant, datagram);
+}
+
+pub fn appendNativeMediaMac(
+    stream_prf_key: *const [16]u8,
+    channel: []const u8,
+    participant: []const u8,
+    frame_datagram: []const u8,
+    out: []u8,
+) MacError![]const u8 {
+    const frame_len = try encodedFrameLen(frame_datagram);
+    if (frame_datagram.len != frame_len) return error.TrailingBytes;
+    const total = frame_len + MAC_TAG_BYTES;
+    if (out.len < total) return error.BufferTooSmall;
+
+    @memcpy(out[0..frame_len], frame_datagram);
+    const tag = nativeMediaMacTag(stream_prf_key, channel, participant, out[0..frame_len]);
+    @memcpy(out[frame_len..total], &tag);
+    return out[0..total];
 }
 
 /// Encode `frame` and return a freshly-allocated slice owned by the caller.
@@ -616,6 +775,68 @@ test "decode trailing bytes rejected" {
     // Append a stray byte.
     buf[written] = 0xFF;
     try testing.expectError(error.TrailingBytes, decode(buf[0 .. written + 1]));
+}
+
+test "native media MAC compute and verify accepts a tagged datagram" {
+    const key = [_]u8{0x42} ** 16;
+    const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .opvox_audio, "voice");
+
+    var frame_buf: [128]u8 = undefined;
+    const frame_len = try encode(frame, &frame_buf);
+    var tagged_buf: [128]u8 = undefined;
+    const tagged = try appendNativeMediaMac(&key, "#call", "alice", frame_buf[0..frame_len], &tagged_buf);
+
+    try testing.expectEqual(frame_len + MAC_TAG_BYTES, tagged.len);
+    const verified = try verifyNativeMediaMac(&key, "#call", "alice", tagged);
+    try testing.expectEqualSlices(u8, frame_buf[0..frame_len], verified);
+    const view = try decodeMaybeAuthenticated(tagged);
+    try testing.expectEqual(frame.stream_id, view.stream_id);
+}
+
+test "native media MAC rejects tampered payload and tag" {
+    const key = [_]u8{0x24} ** 16;
+    const frame = testFrame(64, 0x0102_0304, 8, 123, false, .opvis_video, "video");
+
+    var frame_buf: [128]u8 = undefined;
+    const frame_len = try encode(frame, &frame_buf);
+    var tagged_buf: [128]u8 = undefined;
+    const tagged = try appendNativeMediaMac(&key, "#call", "alice", frame_buf[0..frame_len], &tagged_buf);
+
+    var tampered_payload = tagged_buf;
+    tampered_payload[MIN_FRAME_WIRE_BYTES] ^= 0x01;
+    try testing.expectError(error.BadTag, verifyNativeMediaMac(&key, "#call", "alice", tampered_payload[0..tagged.len]));
+
+    var tampered_tag = tagged_buf;
+    tampered_tag[tagged.len - 1] ^= 0x80;
+    try testing.expectError(error.BadTag, verifyNativeMediaMac(&key, "#call", "alice", tampered_tag[0..tagged.len]));
+}
+
+test "native media MAC transition mode accepts untagged only when not required" {
+    const key = [_]u8{0x11} ** 16;
+    const frame = testFrame(64, 9, 1, 2, false, .raw, "x");
+
+    var frame_buf: [128]u8 = undefined;
+    const frame_len = try encode(frame, &frame_buf);
+
+    try testing.expectEqualSlices(
+        u8,
+        frame_buf[0..frame_len],
+        try acceptNativeMediaMac(&key, "#call", "alice", frame_buf[0..frame_len], false),
+    );
+    try testing.expectError(error.MissingTag, acceptNativeMediaMac(&key, "#call", "alice", frame_buf[0..frame_len], true));
+}
+
+test "native media MAC constant-time compare covers full tag" {
+    const a = [_]u8{0xA5} ** MAC_TAG_BYTES;
+    var first_diff = a;
+    var last_diff = a;
+    first_diff[0] ^= 0x01;
+    last_diff[MAC_TAG_BYTES - 1] ^= 0x01;
+
+    try testing.expect(constantTimeTagEql(a[0..], a[0..]));
+    try testing.expect(!constantTimeTagEql(a[0..], first_diff[0..]));
+    try testing.expect(!constantTimeTagEql(a[0..], last_diff[0..]));
+    try testing.expect(!constantTimeTagEql(a[0..], a[0 .. MAC_TAG_BYTES - 1]));
 }
 
 test "decode unknown codec tag rejected" {

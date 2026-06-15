@@ -56,6 +56,12 @@ pub const NativeMediaTransport = struct {
     max_frame_bytes: usize = media_socket.max_datagram,
     /// Runtime cap reserved for upload-bearing media operations.
     max_upload_bytes: u64 = 16 * 1024 * 1024,
+    /// Require authenticated native-media datagrams. Defaults false so legacy
+    /// clients that do not append the MAC tag are still accepted.
+    require_mac: bool = false,
+    /// Existing stream-id PRF root, copied from LinuxServer.native_stream_key.
+    mac_stream_key: [16]u8 = [_]u8{0} ** 16,
+    mac_key_configured: bool = false,
     /// Optional cross-leg sink: after forwarding a native frame to native peers,
     /// the pump hands it here to also reach the channel's WebRTC members
     /// (rewrapped to RTP). Null = native-only call (no bridging).
@@ -70,8 +76,17 @@ pub const NativeMediaTransport = struct {
         self.cross = sink;
     }
 
+    pub fn configureMac(self: *NativeMediaTransport, stream_key: *const [16]u8, require_mac: bool) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.mac_stream_key = stream_key.*;
+        self.require_mac = require_mac;
+        self.mac_key_configured = true;
+    }
+
     pub fn deinit(self: *NativeMediaTransport) void {
         self.shutdown();
+        std.crypto.secureZero(u8, self.mac_stream_key[0..]);
         var it = self.channels.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.channels.deinit(self.allocator);
@@ -119,33 +134,95 @@ pub const NativeMediaTransport = struct {
             // Require kagura framing so the port is not an open UDP reflector.
             if (got.data.len > self.max_frame_bytes) continue;
             if (got.data.len < kagura_frame.MIN_FRAME_WIRE_BYTES) continue;
-            const view = kagura_frame.decode(got.data) catch continue;
+            const frame_bytes = kagura_frame.authenticatedFrameBytes(got.data) catch continue;
+            const view = kagura_frame.decode(frame_bytes) catch continue;
 
             lockSpin(&self.mutex);
             var n: usize = 0;
             var chanbuf: [256]u8 = undefined;
             var chanlen: usize = 0;
+            var forward_datagram: []const u8 = &.{};
+            var bridge_datagram: []const u8 = &.{};
             if (self.stream_index.get(view.stream_id)) |chan| {
                 if (self.channels.getPtr(chan)) |link| {
-                    n = link.inboundFrom(got.data, got.from, &targets);
-                    // Copy the channel name out under the lock so the cross-leg
-                    // sink can use it after we unlock (the key may be freed if the
-                    // channel is torn down concurrently).
-                    if (chan.len <= chanbuf.len) {
-                        @memcpy(chanbuf[0..chan.len], chan);
-                        chanlen = chan.len;
+                    if (link.idForStream(view.stream_id)) |participant| {
+                        const auth_frame = self.authenticateDatagram(chan, participant, got.data) catch null;
+                        if (auth_frame) |exact_frame| {
+                            n = link.inboundFrom(exact_frame, got.from, &targets);
+                            forward_datagram = if (got.data.len == exact_frame.len + kagura_frame.MAC_TAG_BYTES) got.data else exact_frame;
+                            bridge_datagram = exact_frame;
+                            // Copy the channel name out under the lock so the cross-leg
+                            // sink can use it after we unlock (the key may be freed if the
+                            // channel is torn down concurrently).
+                            if (chan.len <= chanbuf.len) {
+                                @memcpy(chanbuf[0..chan.len], chan);
+                                chanlen = chan.len;
+                            }
+                        }
                     }
                 }
             }
             self.mutex.unlock();
 
-            for (targets[0..n]) |dst| sock.sendTo(dst, got.data);
+            for (targets[0..n]) |dst| sock.sendTo(dst, forward_datagram);
 
             // Bridge the same frame to any WebRTC members of this channel.
             if (chanlen != 0) {
-                if (self.cross) |sink| sink.onNativeFrame(chanbuf[0..chanlen], got.data);
+                if (self.cross) |sink| sink.onNativeFrame(chanbuf[0..chanlen], bridge_datagram);
             }
         }
+    }
+
+    fn authenticateDatagram(
+        self: *const NativeMediaTransport,
+        channel: []const u8,
+        participant: []const u8,
+        datagram: []const u8,
+    ) kagura_frame.MacError![]const u8 {
+        if (!self.mac_key_configured) {
+            const exact_frame = try kagura_frame.authenticatedFrameBytes(datagram);
+            if (try kagura_frame.hasAuthenticationTag(datagram)) return error.BadTag;
+            if (self.require_mac) return error.MissingTag;
+            return exact_frame;
+        }
+        return kagura_frame.acceptNativeMediaMac(&self.mac_stream_key, channel, participant, datagram, self.require_mac);
+    }
+
+    fn tagOutbound(
+        self: *NativeMediaTransport,
+        channel: []const u8,
+        bytes: []const u8,
+        out: []u8,
+    ) kagura_frame.MacError![]const u8 {
+        if (!self.require_mac) return bytes;
+        if (!self.mac_key_configured) return error.MissingTag;
+
+        const view = try kagura_frame.decode(bytes);
+        var participant_buf: [64]u8 = undefined;
+        var participant_len: usize = 0;
+        lockSpin(&self.mutex);
+        if (self.stream_index.get(view.stream_id)) |owner| {
+            if (std.mem.eql(u8, owner, channel)) {
+                if (self.channels.getPtr(channel)) |link| {
+                    if (link.idForStream(view.stream_id)) |participant| {
+                        if (participant.len <= participant_buf.len) {
+                            @memcpy(participant_buf[0..participant.len], participant);
+                            participant_len = participant.len;
+                        }
+                    }
+                }
+            }
+        }
+        self.mutex.unlock();
+        if (participant_len == 0) return error.MissingTag;
+
+        return kagura_frame.appendNativeMediaMac(
+            &self.mac_stream_key,
+            channel,
+            participant_buf[0..participant_len],
+            bytes,
+            out,
+        );
     }
 
     // -- Main-thread registry operations (all under the mutex) --------------
@@ -237,8 +314,12 @@ pub const NativeMediaTransport = struct {
 
     /// Send `bytes` to `dest` on the native socket. Used by the WebRTC relay's
     /// cross-leg sink to deliver kagura-rewrapped frames to native peers.
-    pub fn sendTo(self: *NativeMediaTransport, dest: TransportAddress, bytes: []const u8) void {
-        if (self.socket) |*s| s.sendTo(dest, bytes);
+    pub fn sendTo(self: *NativeMediaTransport, channel: []const u8, dest: TransportAddress, bytes: []const u8) void {
+        if (self.socket) |*s| {
+            var tagged_buf: [media_socket.max_datagram]u8 = undefined;
+            const out = self.tagOutbound(channel, bytes, &tagged_buf) catch return;
+            s.sendTo(dest, out);
+        }
     }
 
     /// The learned transport address of a native participant in `channel`, or
@@ -288,6 +369,16 @@ fn opframe(stream_id: u32, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
+fn taggedOpframe(stream_id: u32, key: *const [16]u8, channel: []const u8, participant: []const u8, buf: []u8) []const u8 {
+    var frame_buf: [64]u8 = undefined;
+    const frame = opframe(stream_id, &frame_buf);
+    return kagura_frame.appendNativeMediaMac(key, channel, participant, frame, buf) catch unreachable;
+}
+
+fn mkAddr(last: u8, port: u16) TransportAddress {
+    return TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, last }, port) catch unreachable;
+}
+
 test "NativeMediaTransport: pump learns sender + forwards an kagura frame to the receiver" {
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
@@ -312,6 +403,51 @@ test "NativeMediaTransport: pump learns sender + forwards an kagura frame to the
     var rbuf: [media_socket.max_datagram]u8 = undefined;
     const got = bob.recvFrom(&rbuf) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, frame, got.data);
+}
+
+test "NativeMediaTransport: required MAC drops untagged and accepts valid tagged datagrams" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    const mac_key = [_]u8{0x5A} ** 16;
+    nmt.configureMac(&mac_key, true);
+
+    try nmt.register("#secure", "alice", .voice, 100, .{});
+    try nmt.register("#secure", "bob", .voice, 200, mkAddr(2, 5000));
+
+    var fbuf: [128]u8 = undefined;
+    const untagged = opframe(100, &fbuf);
+    try testing.expectError(error.MissingTag, nmt.authenticateDatagram("#secure", "alice", untagged));
+
+    const tagged = taggedOpframe(100, &mac_key, "#secure", "alice", &fbuf);
+    const exact_frame = try nmt.authenticateDatagram("#secure", "alice", tagged);
+    try testing.expectEqual(tagged.len - kagura_frame.MAC_TAG_BYTES, exact_frame.len);
+
+    const link = nmt.channels.getPtr("#secure").?;
+    var out: [max_call_participants]TransportAddress = undefined;
+    const n = link.inboundFrom(exact_frame, mkAddr(1, 5000), &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(out[0].eql(mkAddr(2, 5000)));
+}
+
+test "NativeMediaTransport: MAC flag off preserves untagged datagram behavior" {
+    var nmt = NativeMediaTransport.init(testing.allocator);
+    defer nmt.deinit();
+    const mac_key = [_]u8{0x33} ** 16;
+    nmt.configureMac(&mac_key, false);
+
+    try nmt.register("#compat", "alice", .voice, 100, .{});
+    try nmt.register("#compat", "bob", .voice, 200, mkAddr(2, 5000));
+
+    var fbuf: [128]u8 = undefined;
+    const untagged = opframe(100, &fbuf);
+    const exact_frame = try nmt.authenticateDatagram("#compat", "alice", untagged);
+    try testing.expectEqualSlices(u8, untagged, exact_frame);
+
+    const link = nmt.channels.getPtr("#compat").?;
+    var out: [max_call_participants]TransportAddress = undefined;
+    const n = link.inboundFrom(exact_frame, mkAddr(1, 5000), &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(out[0].eql(mkAddr(2, 5000)));
 }
 
 test "NativeMediaTransport: media never crosses channels" {

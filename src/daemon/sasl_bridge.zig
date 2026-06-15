@@ -11,6 +11,7 @@ const sasl = @import("../proto/sasl.zig");
 const mechrouter = @import("../proto/sasl_mechrouter.zig");
 const services_mod = @import("services.zig");
 const scram_store_mod = @import("scram_store.zig");
+const platform = @import("../substrate/platform.zig");
 const Services = services_mod.Services;
 const ScramStore = scram_store_mod.ScramStore;
 
@@ -109,6 +110,22 @@ pub const ServicesExternalLookup = struct {
         // same account the certificate is bound to (case-insensitive).
         if (authzid.len != 0 and !std.ascii.eqlIgnoreCase(authzid, account)) return null;
         return account;
+    }
+};
+
+/// Adapter exposing durable services SESSION-TOKEN validation to the SASL
+/// mechanism router. Tokens are checked by SHA-256(token) against the services
+/// props family; only the canonical account is returned.
+pub const ServicesSessionTokenLookup = struct {
+    services: *Services,
+
+    pub fn lookup(self: *ServicesSessionTokenLookup) mechrouter.SessionTokenLookup {
+        return .{ .ptr = self, .verifyFn = verify };
+    }
+
+    fn verify(ptr: *anyopaque, creds: mechrouter.SessionTokenCredentials, account_out: []u8) ?[]const u8 {
+        const self: *ServicesSessionTokenLookup = @ptrCast(@alignCast(ptr));
+        return self.services.validateSessionToken(creds.authcid, creds.token, @divTrunc(platform.realtimeMillis(), 1000), account_out);
     }
 };
 

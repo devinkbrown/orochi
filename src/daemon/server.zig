@@ -179,7 +179,7 @@ fn bridgeOnNativeFrame(ctx: *anyopaque, channel: []const u8, datagram: []const u
 fn bridgeSendToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
     const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
     if (s.server.native_media.remoteFor(s.channel, target.id())) |addr|
-        s.server.native_media.sendTo(addr, bytes);
+        s.server.native_media.sendTo(s.channel, addr, bytes);
 }
 
 /// Cross-leg sink invoked by the WebRTC relay: rewrap the RTP frame to kagura
@@ -1043,8 +1043,10 @@ pub const ServerError = error{
 pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     const base = protocol_inventory.isupport_tokens;
     // +2: PREFIX and STATUSMSG are appended here, derived from the single source
-    // of truth in chanmode (never hardcoded in the proto token list).
-    const out = try allocator.alloc([]const u8, base.len + 2);
+    // of truth in chanmode (never hardcoded in the proto token list). +1 more for
+    // the optional NETWORKICON token when a network icon URL is configured.
+    const has_icon = cfg.network_icon_url.len != 0;
+    const out = try allocator.alloc([]const u8, base.len + 2 + @as(usize, @intFromBool(has_icon)));
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "NETWORK=")) {
@@ -1077,6 +1079,11 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     // the advertised 005 tokens can never drift from the member-prefix model.
     out[base.len] = try std.fmt.allocPrint(allocator, "PREFIX={s}", .{chanmode.MemberModes.isupport_prefix});
     out[base.len + 1] = try std.fmt.allocPrint(allocator, "STATUSMSG={s}", .{chanmode.MemberModes.statusmsg_symbols});
+    // Optional IRCv3 network icon — Ophion NETWORKICON / n_url parity. Advertised
+    // only when [network] icon_url is set, so existing 005 bursts are unchanged.
+    if (has_icon) {
+        out[base.len + 2] = try std.fmt.allocPrint(allocator, "NETWORKICON={s}", .{cfg.network_icon_url});
+    }
     return out;
 }
 
@@ -1114,6 +1121,10 @@ pub const Config = struct {
     /// WHOIS names the right per-server description. Configurable via
     /// `[network] description`; defaults to the generic daemon tagline.
     server_description: []const u8 = "Orochi — pure-Zig mesh IRC daemon",
+    /// IRCv3 network icon URL, advertised as the `NETWORKICON=<url>` ISUPPORT
+    /// token when non-empty. Configurable via `[network] icon_url`; empty omits
+    /// the token (Ophion `n_url`/NETWORKICON parity).
+    network_icon_url: []const u8 = "",
     /// MOTD text served by the MOTD command, split on newlines. Empty = the
     /// built-in default MOTD. Configurable via `[motd] text` (supports @file:).
     motd_text_raw: []const u8 = "",
@@ -1198,6 +1209,9 @@ pub const Config = struct {
     /// Runtime cap for one UDP media datagram accepted by the WebRTC/native
     /// pumps. Set from `[media].max_frame_bytes` and clamped to the socket bound.
     media_max_frame_bytes: u64 = 64 * 1024,
+    /// Require the native OPVOX/OPVIS UDP leg to carry a per-datagram MAC tag.
+    /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
+    native_media_require_mac: bool = false,
     /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
     /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
     geoip_db_path: []const u8 = "",
@@ -1297,6 +1311,14 @@ pub const Config = struct {
     /// Optional SASL EXTERNAL verifier (TLS certfp -> account). Injected from the
     /// account ⇄ certfp binding bridge; null = EXTERNAL fails closed.
     sasl_external: ?sasl_mechrouter.ExternalLookup = null,
+    /// Optional SASL SESSION-TOKEN verifier. Injected from account services;
+    /// null = SESSION-TOKEN fails closed and is not advertised.
+    sasl_session_token: ?sasl_mechrouter.SessionTokenLookup = null,
+    /// Optional SASL OAUTHBEARER verifier. Null = OAUTHBEARER fails closed and
+    /// is not advertised.
+    sasl_oauthbearer: ?sasl_mechrouter.OAuthBearerLookup = null,
+    /// Default-off SASL ANONYMOUS gate.
+    sasl_allow_anonymous: bool = false,
     /// Mutual TLS: request a client certificate on the TLS listener so SASL
     /// EXTERNAL has a fingerprint to match. Off by default.
     tls_request_client_cert: bool = false,
@@ -1572,6 +1594,9 @@ pub const ConnState = struct {
     /// Stable backing for `session.tls_certfp` (the presented client cert's
     /// lowercase-hex SHA-256), populated once the mTLS handshake completes.
     certfp_buf: [certfp.fingerprint_len]u8 = undefined,
+    /// Stable backing for `session.tls_exporter`, populated once the TLS 1.3
+    /// handshake completes and the exporter is available.
+    tls_exporter_buf: [sasl_scram512_mod.tls_exporter_len]u8 = undefined,
     /// Client accept kind delayed behind a trusted PROXY protocol preamble.
     accept_kind: AcceptKind = .plain,
     /// True while the next received bytes must be a PROXY v1/v2 header.
@@ -2081,16 +2106,25 @@ pub const LinuxServer = struct {
     /// on deinit. Null/empty until the first successful REHASH.
     reload_parsed: ?config_format.Config = null,
     reload_bindings: []oper_mod.OperBinding = &.{},
-    /// Server-owned TLS cert/key material re-read by the most recent REHASH cert
-    /// hot-reload. When present, `config.tls_cert_chain` + the signing-key fields
-    /// borrow from here; the boot generation (main-owned, "borrowed, outlives the
-    /// server") is left untouched. Replaced+freed on each subsequent REHASH that
-    /// reloads certs, and on deinit. Null until the first successful cert reload.
+    /// Server-owned TLS cert/key material re-read by the most recent REHASH/ACME
+    /// cert hot-reload. When present, `config.tls_cert_chain` + the signing-key
+    /// fields borrow from here; the boot generation (main-owned, "borrowed,
+    /// outlives the server") is left untouched. Replaced+freed on each subsequent
+    /// reload that reloads certs, and on deinit. Null until the first successful
+    /// cert reload.
     reload_tls: ?tls_certs.Loaded = null,
     /// Server-owned hardened-TLS-1.2 leg minted alongside `reload_tls` when the
     /// reloaded 1.3 leaf is neither ECDSA-P256 nor RSA (so the 1.2 leg needs its
     /// own ECDSA-P256 leaf). Same ownership/lifetime rules as `reload_tls`.
     reload_tls12: ?tls_certs.Tls12 = null,
+    /// Cross-thread ACME signal: the renewal worker sets this only after writing
+    /// new cert/key files. Reactor 0 consumes it on the housekeeping tick and
+    /// performs the actual live TLS reload, so ACME never mutates listener state.
+    acme_reload_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Boot-time `[tls]` view used for ACME-triggered reloads. Changing `[tls]`
+    /// paths through live REHASH while ACME is enabled is intentionally unsupported;
+    /// REHASH still uses `reload_parsed` for its own operator-requested reload.
+    acme_reload_tls: ?*const config_format.Config.Tls = null,
     /// Monotonically increasing seed fed to S2sLink.feed for deterministic gossip
     /// rng. (The S2S/TLS listener fds, accept-armed flags, and the cross-reactor
     /// wake eventfd now live on `reactor`.)
@@ -2416,6 +2450,7 @@ pub const LinuxServer = struct {
             self.media_plane.max_upload_bytes = self.config.media_max_upload_bytes;
             self.native_media.max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram)));
             self.native_media.max_upload_bytes = self.config.media_max_upload_bytes;
+            self.native_media.configureMac(&self.native_stream_key, self.config.native_media_require_mac);
             // Optional STUN-based reflexive-candidate discovery at boot (before the
             // pump thread starts). Configured as an IPv4 literal + port.
             if (self.config.media_stun_port != 0) {
@@ -2834,6 +2869,7 @@ pub const LinuxServer = struct {
                 std.debug.print("orochi: SIGUSR2 UPGRADE failed: {s}\n", .{@errorName(e)});
             };
         }
+        if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
         self.sweepTimeouts();
         self.sweepTempModes();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
@@ -5065,6 +5101,9 @@ pub const LinuxServer = struct {
         }
         if (self.config.sts_value) |v| conn.session.enableSts(v) catch {};
         if (self.config.sasl_external) |ext| conn.session.sasl_external = ext;
+        if (self.config.sasl_session_token) |tok| conn.session.sasl_session_token = tok;
+        if (self.config.sasl_oauthbearer) |oauth| conn.session.sasl_oauthbearer = oauth;
+        conn.session.sasl_allow_anonymous = self.config.sasl_allow_anonymous;
     }
 
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
@@ -5227,6 +5266,11 @@ pub const LinuxServer = struct {
         // per-connection backing or lifetime concern.
         if (conn.session.tls_cipher == null and conn.tls.?.handshakeDone()) {
             conn.session.tls_cipher = conn.tls.?.cipherName();
+        }
+        if (conn.session.tls_exporter == null and conn.tls.?.handshakeDone()) {
+            if (conn.tls.?.channelBindingTlsExporter(&conn.tls_exporter_buf)) |_| {
+                conn.session.tls_exporter = conn.tls_exporter_buf;
+            } else |_| {}
         }
         if (outcome.handshake_bytes.len != 0) {
             // `handshake_bytes` are ALREADY-FORMED TLS records (the handshake
@@ -5404,6 +5448,10 @@ pub const LinuxServer = struct {
                 },
                 else => return err,
             };
+            if (conn.session.sasl_issue_session_token) {
+                conn.session.sasl_issue_session_token = false;
+                self.issueSessionTokenNotice(conn, "SASL") catch {};
+            }
             if (conn.session.registered()) {
                 // Upgrade the cloak base to the forward-confirmed reverse-DNS
                 // hostname if the background resolver has finished by now (it was
@@ -5434,7 +5482,10 @@ pub const LinuxServer = struct {
                 }
                 // SASL-only oper: elevate now if the (SASL-set) account is bound to
                 // an operator class. Emits 381 + MODE +o after the welcome burst.
-                try self.elevateOperFromAccount(conn);
+                // Gated on the mechanism allowing elevation: federated (OAUTHBEARER)
+                // and guest (ANONYMOUS) logins never auto-oper, matching the gated
+                // SASL-success/REGISTER elevation sites.
+                if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
                 self.trackSession(id, conn); // multi-session registry (SASL login)
                 try self.deliverTegami(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
@@ -11502,6 +11553,9 @@ pub const LinuxServer = struct {
             @memcpy(&conn.certfp_buf, ts.certfp);
             conn.session.tls_certfp = conn.certfp_buf[0..];
         }
+        if (t.channelBindingTlsExporter(&conn.tls_exporter_buf)) |_| {
+            conn.session.tls_exporter = conn.tls_exporter_buf;
+        } else |_| {}
         // Wire bytes the predecessor encrypted but never flushed: re-queue them
         // verbatim (already TLS records — bypass the encrypt seam). If they don't
         // fit, the client's record stream would hole; drop the client instead.
@@ -13528,9 +13582,13 @@ pub const LinuxServer = struct {
     fn ircxAuthPackageList(conn: *ConnState, out: []u8) []const u8 {
         var len: usize = 0;
         if (conn.session.sasl_plain != null) appendSaslInfoMech(out, &len, "PLAIN") catch return out[0..len];
-        if (conn.session.sasl_scram256 != null) appendSaslInfoMech(out, &len, "SCRAM-SHA-256") catch return out[0..len];
-        if (conn.session.sasl_scram512 != null) appendSaslInfoMech(out, &len, "SCRAM-SHA-512") catch return out[0..len];
-        if (conn.session.sasl_external != null and conn.session.tls_certfp != null) appendSaslInfoMech(out, &len, "EXTERNAL") catch return out[0..len];
+        if (conn.session.sasl_scram256 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(out, &len, "SCRAM-SHA-256") catch return out[0..len];
+        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(out, &len, "SCRAM-SHA-512") catch return out[0..len];
+        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0 and conn.session.tls_exporter != null) appendSaslInfoMech(out, &len, "SCRAM-SHA-512-PLUS") catch return out[0..len];
+        if (conn.session.sasl_external != null) appendSaslInfoMech(out, &len, "EXTERNAL") catch return out[0..len];
+        if (conn.session.sasl_session_token != null) appendSaslInfoMech(out, &len, "SESSION-TOKEN") catch return out[0..len];
+        if (conn.session.sasl_oauthbearer != null) appendSaslInfoMech(out, &len, "OAUTHBEARER") catch return out[0..len];
+        if (conn.session.sasl_allow_anonymous) appendSaslInfoMech(out, &len, "ANONYMOUS") catch return out[0..len];
         if (len == 0) return "*";
         return out[0..len];
     }
@@ -13541,7 +13599,29 @@ pub const LinuxServer = struct {
             .external => "EXTERNAL",
             .scram_sha_256 => "SCRAM-SHA-256",
             .scram_sha_512 => "SCRAM-SHA-512",
+            .scram_sha_512_plus => "SCRAM-SHA-512-PLUS",
+            .session_token => "SESSION-TOKEN",
+            .oauthbearer => "OAUTHBEARER",
+            .anonymous => "ANONYMOUS",
             .anon, .gatekeeper, .gatekeeper_passport => null,
+        };
+    }
+
+    fn ircxAuthAllowsOperElevation(package: ircx_auth.Package) bool {
+        return switch (package) {
+            .plain,
+            .external,
+            .scram_sha_256,
+            .scram_sha_512,
+            .scram_sha_512_plus,
+            .session_token,
+            => true,
+            .oauthbearer,
+            .anonymous,
+            .anon,
+            .gatekeeper,
+            .gatekeeper_passport,
+            => false,
         };
     }
 
@@ -13602,19 +13682,32 @@ pub const LinuxServer = struct {
             break :blk final_buf[0..final.len];
         } else null;
 
+        const oper_elevation_allowed = ircxAuthAllowsOperElevation(package);
         conn.session.sasl_router = null;
         conn.session.sasl_pending = null;
-        if (conn.session.account()) |old| {
-            if (!std.ascii.eqlIgnoreCase(old, account)) _ = self.sessions.remove(old, monitorIdFromClient(id));
+        if (result.guest) {
+            conn.session.loginGuest(account);
+        } else {
+            if (conn.session.account()) |old| {
+                if (!std.ascii.eqlIgnoreCase(old, account)) _ = self.sessions.remove(old, monitorIdFromClient(id));
+            }
+            loginSession(conn, account);
+            conn.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
         }
-        loginSession(conn, account);
         conn.session.client.registration.sasl = .succeeded;
         if (conn.session.account()) |acct| self.emitAccountChange(id, conn, acct);
         if (final_copy) |final| try ircxAuthChallenge(conn, package, final);
         var ack_buf: [default_reply_bytes]u8 = undefined;
         const ack = ircx_auth.buildAck(&ack_buf, package, account, "0") catch return;
         try appendToConn(conn, ack);
-        try self.elevateOperFromAccount(conn);
+        if (result.issue_session_token and !result.guest) self.issueSessionTokenNotice(conn, "AUTH") catch {};
+        if (result.guest) {
+            self.deliverWelcome(conn);
+            self.emitClientRegistered(id, conn);
+            self.evaluateNickProtection(conn);
+            return;
+        }
+        if (oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(id, conn);
         try self.deliverTegami(conn);
         self.applyAutojoin(id, conn);
@@ -13649,7 +13742,7 @@ pub const LinuxServer = struct {
         _ = self;
         if (enable) conn.ircx = true;
         const state: []const u8 = if (conn.ircx) "1" else "0";
-        var packages_buf: [64]u8 = undefined;
+        var packages_buf: [128]u8 = undefined;
         const packages = ircxAuthPackageList(conn, &packages_buf);
         // version 0; package-list = advertised SASL-backed AUTH packages; maxmsg 512.
         try queueNumeric(conn, .RPL_IRCX, &.{ state, "0", packages, "512" }, "*");
@@ -13686,8 +13779,12 @@ pub const LinuxServer = struct {
                 .external = conn.session.sasl_external,
                 .scram256 = conn.session.sasl_scram256,
                 .scram512 = conn.session.sasl_scram512,
+                .session_token = conn.session.sasl_session_token,
+                .oauthbearer = conn.session.sasl_oauthbearer,
+                .anonymous = conn.session.sasl_allow_anonymous,
             }, conn.session.sasl_server_nonce);
             router.tls_certfp = conn.session.tls_certfp;
+            router.tls_exporter = conn.session.tls_exporter;
             switch (router.start(mech)) {
                 .continue_ => |challenge| {
                     conn.session.sasl_pending = sasl.Mechanism.parse(mech);
@@ -15431,7 +15528,7 @@ pub const LinuxServer = struct {
                 } else |_| {}
             }
         }
-        try self.elevateOperFromAccount(conn);
+        if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
         try self.deliverTegami(conn);
         self.applyAutojoin(idFromToken(conn.token), conn);
@@ -15642,14 +15739,16 @@ pub const LinuxServer = struct {
     /// `SASLINFO` — report the SASL mechanisms this server accepts and the
     /// caller's current authentication state. Read-only; available to anyone.
     pub fn handleSaslInfo(self: *LinuxServer, conn: *ConnState) !void {
-        var mech_buf: [64]u8 = undefined;
+        var mech_buf: [128]u8 = undefined;
         var mech_len: usize = 0;
-        if (self.config.sasl_checker != null) {
-            appendSaslInfoMech(&mech_buf, &mech_len, "PLAIN") catch return;
-            if (self.config.sasl_scram256 != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-256") catch return;
-            if (self.config.sasl_scram512 != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512") catch return;
-        }
-        if (self.config.sasl_external != null) appendSaslInfoMech(&mech_buf, &mech_len, "EXTERNAL") catch return;
+        if (conn.session.sasl_plain != null) appendSaslInfoMech(&mech_buf, &mech_len, "PLAIN") catch return;
+        if (conn.session.sasl_external != null) appendSaslInfoMech(&mech_buf, &mech_len, "EXTERNAL") catch return;
+        if (conn.session.sasl_scram256 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-256") catch return;
+        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512") catch return;
+        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0 and conn.session.tls_exporter != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512-PLUS") catch return;
+        if (conn.session.sasl_session_token != null) appendSaslInfoMech(&mech_buf, &mech_len, "SESSION-TOKEN") catch return;
+        if (conn.session.sasl_oauthbearer != null) appendSaslInfoMech(&mech_buf, &mech_len, "OAUTHBEARER") catch return;
+        if (conn.session.sasl_allow_anonymous) appendSaslInfoMech(&mech_buf, &mech_len, "ANONYMOUS") catch return;
         const mechs = if (mech_len == 0) "(none configured)" else mech_buf[0..mech_len];
         var buf: [default_reply_bytes]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :SASL mechanisms: {s}\r\n", .{ self.serverName(), conn.session.displayName(), mechs }) catch return;
@@ -15657,9 +15756,42 @@ pub const LinuxServer = struct {
         var buf2: [default_reply_bytes]u8 = undefined;
         const status = if (conn.session.account()) |acct|
             std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are logged in as {s}\r\n", .{ self.serverName(), conn.session.displayName(), acct }) catch return
+        else if (conn.session.sasl_guest)
+            std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You authenticated as an anonymous guest with no registered-account privileges\r\n", .{ self.serverName(), conn.session.displayName() }) catch return
         else
             std.fmt.bufPrint(&buf2, ":{s} NOTICE {s} :You are not logged in\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
         try appendToConn(conn, status);
+    }
+
+    fn issueSessionTokenNotice(self: *LinuxServer, conn: *ConnState, command: []const u8) !void {
+        conn.session.sasl_issue_session_token = false;
+        if (!conn.is_tls) {
+            if (std.ascii.eqlIgnoreCase(command, "SESSIONTOKEN")) {
+                var fail_buf: [default_reply_bytes]u8 = undefined;
+                const fail = std.fmt.bufPrint(
+                    &fail_buf,
+                    "FAIL SESSIONTOKEN INSECURE_TRANSPORT :Session tokens require a secure connection\r\n",
+                    .{},
+                ) catch return;
+                try appendToConn(conn, fail);
+            }
+            return;
+        }
+        const svc = self.account_services orelse return self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const account = conn.session.account() orelse return self.failReply(conn, command, "NOT_LOGGED_IN", "Log in before requesting a session token");
+        const now_unix: i64 = @divTrunc(self.nowMs(), 1000);
+        const issued = svc.issueSessionToken(account, now_unix) catch return self.failReply(conn, command, "TOKEN_ISSUE_FAILED", "Could not issue session token");
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            ":{s} NOTICE {s} :SESSIONTOKEN {s} {s} expires={d}\r\n",
+            .{ self.serverName(), conn.session.displayName(), issued.account.asSlice(), issued.tokenSlice(), issued.expires_unix },
+        ) catch return;
+        try appendToConn(conn, line);
+    }
+
+    pub fn handleSessionToken(self: *LinuxServer, conn: *ConnState) !void {
+        try self.issueSessionTokenNotice(conn, "SESSIONTOKEN");
     }
 
     /// `CERTADD` — bind the TLS client-certificate fingerprint presented on this
@@ -17021,8 +17153,9 @@ pub const LinuxServer = struct {
         if (self.native_media.port != 0) {
             self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
             var nbuf: [256]u8 = undefined;
-            const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=OPVOX/OPVIS\r\n", .{
-                protocol_inventory.currentServerName(), channel, self.config.media_host, self.native_media.port, stream_id,
+            const mac_token = if (self.config.native_media_require_mac) " mac=hmac-sha256-128" else "";
+            const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=OPVOX/OPVIS{s}\r\n", .{
+                protocol_inventory.currentServerName(), channel, self.config.media_host, self.native_media.port, stream_id, mac_token,
             }) catch return;
             try appendToConn(conn, nline);
         }
@@ -17750,7 +17883,7 @@ pub const LinuxServer = struct {
     }
 
     /// Outcome of the REHASH cert hot-reload, folded into the RPL_REHASHING note.
-    const TlsReloadOutcome = enum {
+    pub const TlsReloadOutcome = enum {
         /// TLS is not configured on this node — nothing to reload.
         not_configured,
         /// Cert/key material was re-read and the live config was swapped.
@@ -17759,7 +17892,7 @@ pub const LinuxServer = struct {
         /// certs remain live.
         kept,
 
-        fn note(self: TlsReloadOutcome) []const u8 {
+        pub fn note(self: TlsReloadOutcome) []const u8 {
             return switch (self) {
                 .not_configured => "TLS not configured",
                 .reloaded => "TLS certificates reloaded",
@@ -17768,14 +17901,44 @@ pub const LinuxServer = struct {
         }
     };
 
+    pub fn setAcmeTlsReloadConfig(self: *LinuxServer, tls: *const config_format.Config.Tls) void {
+        self.acme_reload_tls = tls;
+    }
+
+    pub fn requestAcmeTlsReload(self: *LinuxServer) void {
+        self.acme_reload_requested.store(true, .release);
+    }
+
+    fn maybeReloadAcmeTls(self: *LinuxServer) void {
+        if (!self.acme_reload_requested.swap(false, .acq_rel)) return;
+        const tls = self.acme_reload_tls orelse {
+            std.debug.print("orochi: acme TLS reload requested but no [tls] config is registered\n", .{});
+            return;
+        };
+        const io = self.config.crypto_io orelse {
+            std.debug.print("orochi: acme TLS reload requested but no I/O handle is available\n", .{});
+            return;
+        };
+        const outcome = self.reloadTlsCerts(io, tls) catch |err| {
+            std.debug.print("orochi: acme TLS reload failed ({s}); keeping current certificates\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("orochi: acme TLS reload on reactor 0: {s}\n", .{outcome.note()});
+    }
+
     /// Re-read the TLS cert chain + signing key from the reloaded config's paths
-    /// and, on success, atomically swap the live `config.tls_*` (and TLS 1.2 leg)
+    /// and, on success, swap the live `config.tls_*` (and TLS 1.2 leg)
     /// fields to a fresh server-owned reload generation — freeing the prior reload
     /// generation, never the main-owned boot generation. On ANY failure the live
     /// config is left wholly untouched (the error propagates; the caller keeps the
-    /// current certs and NOTICEs). `tls` borrows `self.reload_parsed`, which owns
-    /// the path strings for the server's lifetime.
-    fn reloadTlsCerts(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
+    /// current certs and NOTICEs). `tls` borrows caller-owned config that must
+    /// outlive the reload call; REHASH uses `self.reload_parsed`, while ACME uses
+    /// main's held boot config on reactor 0.
+    pub fn reloadTlsCerts(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
+        return self.reloadTlsCertsLocked(io, tls);
+    }
+
+    fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
         // Mirror the boot gate in main.zig: only [tls] enabled nodes load certs.
         if (!tls.enabled or self.config.tls_cert_chain.len == 0) return .not_configured;
 
@@ -20535,6 +20698,17 @@ fn testExternalVerify(_: *anyopaque, _: []const u8, authzid: []const u8) ?[]cons
 var test_external_anchor: u8 = 0;
 const test_external_lookup = sasl_mechrouter.ExternalLookup{ .ptr = &test_external_anchor, .verifyFn = testExternalVerify };
 
+fn testOAuthAdminVerify(_: *anyopaque, token: []const u8, authzid: ?[]const u8, account_out: []u8) ?[]const u8 {
+    if (!std.mem.eql(u8, token, "good.jwt")) return null;
+    if (authzid) |zid| {
+        if (!std.mem.eql(u8, zid, "admin")) return null;
+    }
+    @memcpy(account_out[0.."admin".len], "admin");
+    return account_out[0.."admin".len];
+}
+var test_oauth_admin_anchor: u8 = 0;
+const test_oauth_admin_lookup = sasl_mechrouter.OAuthBearerLookup{ .ptr = &test_oauth_admin_anchor, .verifyFn = testOAuthAdminVerify };
+
 fn testMultiOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
     return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "oper")) and
         std.mem.eql(u8, creds.password, "orochi");
@@ -20598,6 +20772,18 @@ fn saslPlainPreludeWithCaps(fd: linux.fd_t, account: []const u8, password: []con
         try writeAllFd(fd, std.fmt.bufPrint(&line, "CAP REQ :sasl {s}\r\n", .{extra_caps}) catch return error.OutputTooSmall);
     }
     try writeAllFd(fd, "AUTHENTICATE PLAIN\r\n");
+    try writeAllFd(fd, std.fmt.bufPrint(&line, "AUTHENTICATE {s}\r\n", .{enc}) catch return error.OutputTooSmall);
+    try writeAllFd(fd, "CAP END\r\n");
+}
+
+fn saslOAuthBearerPrelude(fd: linux.fd_t, token: []const u8) ServerError!void {
+    var raw: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&raw, "n,,\x01auth=Bearer {s}\x01\x01", .{token}) catch return error.OutputTooSmall;
+    var b64: [384]u8 = undefined;
+    const enc = std.base64.standard.Encoder.encode(&b64, msg);
+    var line: [512]u8 = undefined;
+    try writeAllFd(fd, "CAP REQ :sasl\r\n");
+    try writeAllFd(fd, "AUTHENTICATE OAUTHBEARER\r\n");
     try writeAllFd(fd, std.fmt.bufPrint(&line, "AUTHENTICATE {s}\r\n", .{enc}) catch return error.OutputTooSmall);
     try writeAllFd(fd, "CAP END\r\n");
 }
@@ -22118,6 +22304,76 @@ test "threaded server: SASLINFO advertises EXTERNAL when configured" {
     client.reset();
     try writeAllFd(fd, "SASLINFO\r\n");
     try recvUntil(&client, "SASL mechanisms: EXTERNAL", 200);
+}
+
+test "threaded server: SESSIONTOKEN refuses non-TLS transport" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-sessiontoken-insecure.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+
+    try writeAllFd(fd, "NICK TokenUser\r\nUSER token 0 * :Token User\r\n");
+    try recvUntil(&client, " 001 TokenUser ", 200);
+    try writeAllFd(fd, "REGISTER alice * correcthorse\r\n");
+    try recvUntil(&client, "REGISTER SUCCESS alice", 200);
+
+    client.reset();
+    try writeAllFd(fd, "SESSIONTOKEN\r\n");
+    try recvUntil(&client, "FAIL SESSIONTOKEN INSECURE_TRANSPORT :Session tokens require a secure connection", 200);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "sst_") == null);
+}
+
+test "threaded server: OAUTHBEARER login does not auto-elevate oper" {
+    var cfg = operTestConfig(0);
+    cfg.sasl_oauthbearer = test_oauth_admin_lookup;
+    var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+
+    try saslOAuthBearerPrelude(fd, "good.jwt");
+    try writeAllFd(fd, "NICK OAuthAdmin\r\nUSER oauth 0 * :OAuth Admin\r\n");
+    try recvUntil(&client, " 001 OAuthAdmin ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), " 381 OAuthAdmin ") == null);
+
+    client.reset();
+    try writeAllFd(fd, "USERIP OAuthAdmin\r\n");
+    try recvUntil(&client, " 481 OAuthAdmin ", 200);
 }
 
 test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
@@ -25295,6 +25551,27 @@ test "buildIsupportTokens replaces length tokens with configured values" {
     try std.testing.expect(saw_prefix and saw_statusmsg);
 }
 
+test "buildIsupportTokens advertises NETWORKICON only when configured" {
+    // No icon configured: NETWORKICON absent, count stays base + 2.
+    const plain = try buildIsupportTokens(std.testing.allocator, .{ .port = 0 });
+    defer freeIsupportTokens(std.testing.allocator, plain);
+    for (plain) |tok| try std.testing.expect(!std.mem.startsWith(u8, tok, "NETWORKICON="));
+    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 2, plain.len);
+
+    // Icon configured: NETWORKICON=<url> present, count is base + 3.
+    const with_icon = try buildIsupportTokens(
+        std.testing.allocator,
+        .{ .port = 0, .network_icon_url = "https://eshmaki.me/icon.png" },
+    );
+    defer freeIsupportTokens(std.testing.allocator, with_icon);
+    var saw = false;
+    for (with_icon) |tok| {
+        if (std.mem.eql(u8, tok, "NETWORKICON=https://eshmaki.me/icon.png")) saw = true;
+    }
+    try std.testing.expect(saw);
+    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 3, with_icon.len);
+}
+
 test "utf8TruncateBytes caps length without splitting a codepoint" {
     // ASCII: exact byte cut.
     try std.testing.expectEqualStrings("hello", LinuxServer.utf8TruncateBytes("hello world", 5));
@@ -25906,13 +26183,23 @@ test "threaded server: IRCX/ISIRCX discovery emits RPL_IRCX 800" {
 }
 
 test "IRCX 800 package list offers SCRAM-SHA-512 when provisioned" {
+    const TokenDb = struct {
+        fn verify(_: *anyopaque, _: sasl_mechrouter.SessionTokenCredentials, _: []u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const OAuthDb = struct {
+        fn verify(_: *anyopaque, _: []const u8, _: ?[]const u8, _: []u8) ?[]const u8 {
+            return null;
+        }
+    };
     var anchor: u8 = 0;
     const lookup256 = sasl_mechrouter.Scram256Lookup{ .ptr = &anchor, .lookupFn = testScram256Null };
     const lookup512 = sasl_mechrouter.Scram512Lookup{ .ptr = &anchor, .lookupFn = testScram512Null };
 
     // Unprovisioned: no SCRAM lookups on the session -> neither digest offered.
     var bare = ConnState{};
-    var bare_buf: [64]u8 = undefined;
+    var bare_buf: [128]u8 = undefined;
     const bare_list = LinuxServer.ircxAuthPackageList(&bare, &bare_buf);
     try std.testing.expect(std.mem.indexOf(u8, bare_list, "SCRAM-SHA-512") == null);
 
@@ -25921,11 +26208,20 @@ test "IRCX 800 package list offers SCRAM-SHA-512 when provisioned" {
     conn.session.sasl_plain = .{ .ptr = &anchor, .verifyFn = testPlainTrue };
     conn.session.sasl_scram256 = lookup256;
     conn.session.sasl_scram512 = lookup512;
-    var buf: [64]u8 = undefined;
+    conn.session.sasl_server_nonce = "SERVERNONCE";
+    conn.session.sasl_session_token = .{ .ptr = &anchor, .verifyFn = TokenDb.verify };
+    conn.session.sasl_oauthbearer = .{ .ptr = &anchor, .verifyFn = OAuthDb.verify };
+    conn.session.sasl_allow_anonymous = true;
+    conn.session.tls_exporter = [_]u8{0x42} ** sasl_scram512_mod.tls_exporter_len;
+    var buf: [128]u8 = undefined;
     const pkg_list = LinuxServer.ircxAuthPackageList(&conn, &buf);
     const idx256 = std.mem.indexOf(u8, pkg_list, "SCRAM-SHA-256") orelse return error.TestUnexpectedResult;
     const idx512 = std.mem.indexOf(u8, pkg_list, "SCRAM-SHA-512") orelse return error.TestUnexpectedResult;
     try std.testing.expect(idx512 > idx256); // SHA-512 ordered after SHA-256
+    try std.testing.expect(std.mem.indexOf(u8, pkg_list, "SCRAM-SHA-512-PLUS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pkg_list, "SESSION-TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pkg_list, "OAUTHBEARER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pkg_list, "ANONYMOUS") != null);
 }
 
 fn testScram256Null(_: *anyopaque, _: []const u8) ?sasl_scram_server_mod.Credential {

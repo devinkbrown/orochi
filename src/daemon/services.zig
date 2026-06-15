@@ -62,6 +62,10 @@ const missing_account_salt: [salt_len]u8 = .{
     0x6d, 0x69, 0x7a, 0x75, 0x63, 0x68, 0x69, 0x2d,
     0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73,
 };
+pub const session_token_prefix = "sst_";
+pub const session_token_random_len: usize = 16;
+pub const session_token_len: usize = session_token_prefix.len + session_token_random_len * 2;
+pub const default_session_token_ttl_seconds: i64 = 30 * 24 * 60 * 60;
 
 pub const channel_access_family = store_mod.Family.props;
 
@@ -79,6 +83,7 @@ pub const ServiceError = StorePutError || StoreDeleteError || Pbkdf2Error || err
     InvalidRecord,
     InvalidPassword,
     InvalidValue,
+    RandomUnavailable,
     BufferTooSmall,
 };
 
@@ -195,6 +200,16 @@ pub const ChannelInfo = struct {
 pub const GhostInfo = struct {
     account: AccountName,
     nick: NickName,
+};
+
+pub const SessionTokenIssue = struct {
+    account: AccountName,
+    token: [session_token_len]u8,
+    expires_unix: i64,
+
+    pub fn tokenSlice(self: *const SessionTokenIssue) []const u8 {
+        return self.token[0..];
+    }
 };
 
 pub const AccessInfo = struct {
@@ -471,6 +486,104 @@ pub const Services = struct {
         defer @constCast(&self.lock).unlockShared();
 
         return @constCast(self).accountForCertfpUnlocked(fingerprint) catch null;
+    }
+
+    /// Issue a durable SASL SESSION-TOKEN for an already-authenticated services
+    /// account. The raw token is returned once to the caller; only SHA-256(token)
+    /// and expiry metadata are stored.
+    pub fn issueSessionToken(self: *Services, account: []const u8, now_unix: i64) ServiceError!SessionTokenIssue {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try accountKey(account);
+        const value = self.store.family(.accounts).get(key.asSlice()) orelse return error.NotFound;
+        const record = try decodeAccount(value);
+        if ((record.flags & account_flag_suspended) != 0 or (record.flags & account_flag_forbidden) != 0) return error.AuthFailed;
+
+        var token: [session_token_len]u8 = undefined;
+        @memcpy(token[0..session_token_prefix.len], session_token_prefix);
+        var random: [session_token_random_len]u8 = undefined;
+        self.store.io.randomSecure(&random) catch return error.RandomUnavailable;
+        var random_hex = std.fmt.bytesToHex(random, .lower);
+        @memcpy(token[session_token_prefix.len..], &random_hex);
+        secureZero(random[0..]);
+        secureZero(random_hex[0..]);
+
+        var digest: [hash_len]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&token, &digest, .{});
+        defer secureZero(digest[0..]);
+        var hash_hex = std.fmt.bytesToHex(digest, .lower);
+        defer secureZero(hash_hex[0..]);
+
+        var acct_key_buf: [session_token_account_key_max]u8 = undefined;
+        const acct_key = sessionTokenAccountKey(&acct_key_buf, key.asSlice()) orelse return error.BufferTooSmall;
+        if (self.store.family(.props).get(acct_key)) |old_hash| {
+            var old_token_key_buf: [session_token_key_max]u8 = undefined;
+            if (old_hash.len == hash_hex_len) {
+                if (sessionTokenKey(&old_token_key_buf, old_hash)) |old_token_key| {
+                    self.store.family(.props).delete(old_token_key) catch {};
+                }
+            }
+        }
+
+        const expires_unix = now_unix + default_session_token_ttl_seconds;
+        var value_buf: [session_token_value_max]u8 = undefined;
+        const encoded = try encodeSessionTokenRecord(record.name.asSlice(), expires_unix, hash_hex[0..], &value_buf);
+        var token_key_buf: [session_token_key_max]u8 = undefined;
+        const token_key = sessionTokenKey(&token_key_buf, hash_hex[0..]) orelse return error.BufferTooSmall;
+        try self.store.family(.props).put(token_key, encoded);
+        try self.store.family(.props).put(acct_key, hash_hex[0..]);
+
+        return .{
+            .account = record.name,
+            .token = token,
+            .expires_unix = expires_unix,
+        };
+    }
+
+    /// Validate SASL SESSION-TOKEN credentials. `authcid` must be the account
+    /// name bound to the token, and `account_out` receives the canonical account
+    /// on success. Returns null for malformed, expired, missing, suspended, or
+    /// mismatched tokens.
+    pub fn validateSessionToken(
+        self: *Services,
+        authcid: []const u8,
+        token: []const u8,
+        now_unix: i64,
+        account_out: []u8,
+    ) ?[]const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const key = accountKey(authcid) catch return null;
+        if (!validSessionTokenText(token)) return null;
+
+        var digest: [hash_len]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+        defer secureZero(digest[0..]);
+        var hash_hex = std.fmt.bytesToHex(digest, .lower);
+        defer secureZero(hash_hex[0..]);
+
+        var token_key_buf: [session_token_key_max]u8 = undefined;
+        const token_key = sessionTokenKey(&token_key_buf, hash_hex[0..]) orelse return null;
+        const encoded = self.store.family(.props).get(token_key) orelse return null;
+        const record = decodeSessionTokenRecord(encoded) catch return null;
+        if (record.expires_unix <= now_unix) return null;
+        if (!std.mem.eql(u8, record.account.asSlice(), key.asSlice())) return null;
+
+        var stored_hash: [hash_hex_len]u8 = undefined;
+        if (record.hash.len != stored_hash.len) return null;
+        @memcpy(&stored_hash, record.hash);
+        defer secureZero(stored_hash[0..]);
+        const hash_ok = std.crypto.timing_safe.eql([hash_hex_len]u8, stored_hash, hash_hex);
+        if (!hash_ok) return null;
+
+        const acct_value = self.store.family(.accounts).get(key.asSlice()) orelse return null;
+        const acct_record = decodeAccount(acct_value) catch return null;
+        if ((acct_record.flags & account_flag_suspended) != 0 or (acct_record.flags & account_flag_forbidden) != 0) return null;
+        if (acct_record.name.asSlice().len > account_out.len) return null;
+        @memcpy(account_out[0..acct_record.name.asSlice().len], acct_record.name.asSlice());
+        return account_out[0..acct_record.name.asSlice().len];
     }
 
     fn accountForCertfpUnlocked(self: *Services, fingerprint: []const u8) ServiceError![]const u8 {
@@ -1303,6 +1416,25 @@ const saccess_mask_max = 256;
 const saccess_reason_max = 512;
 const saccess_key_max = saccess_prefix.len + saccess_type_max + 1 + saccess_mask_max;
 const saccess_value_max = saccess_version.len + 1 + saccess_type_max + 1 + saccess_mask_max + 1 + 20 + 1 + saccess_reason_max;
+const session_token_version = "T1";
+const session_token_key_prefix = "sessiontok:";
+const session_token_account_key_prefix = "sessiontokacct:";
+const session_token_key_max = session_token_key_prefix.len + hash_hex_len;
+const session_token_account_key_max = session_token_account_key_prefix.len + account_max;
+const session_token_value_max = session_token_version.len + 1 + account_max + 1 + 20 + 1 + hash_hex_len;
+
+const SessionTokenRecord = struct {
+    account: AccountName,
+    expires_unix: i64,
+    hash: []const u8,
+};
+
+fn secureZero(buf: []u8) void {
+    for (buf) |*byte| {
+        const vp: *volatile u8 = @ptrCast(byte);
+        vp.* = 0;
+    }
+}
 
 /// Build the props-family key for a certfp binding, or null if it would not fit.
 fn certfpKey(buf: []u8, fingerprint: []const u8) ?[]const u8 {
@@ -1328,6 +1460,46 @@ const scram_key_max = scram_key_prefix.len + account_max;
 /// Build the props-family key for an account's SCRAM tuple, or null if too long.
 fn scramKey(buf: []u8, account: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, scram_key_prefix ++ "{s}", .{account}) catch null;
+}
+
+fn sessionTokenKey(buf: []u8, hash_hex: []const u8) ?[]const u8 {
+    if (hash_hex.len != hash_hex_len) return null;
+    return std.fmt.bufPrint(buf, session_token_key_prefix ++ "{s}", .{hash_hex}) catch null;
+}
+
+fn sessionTokenAccountKey(buf: []u8, account: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, session_token_account_key_prefix ++ "{s}", .{account}) catch null;
+}
+
+fn encodeSessionTokenRecord(account: []const u8, expires_unix: i64, hash_hex: []const u8, scratch: []u8) ServiceError![]const u8 {
+    if (hash_hex.len != hash_hex_len) return error.InvalidRecord;
+    return std.fmt.bufPrint(
+        scratch,
+        "{s}|{s}|{d}|{s}",
+        .{ session_token_version, account, expires_unix, hash_hex },
+    ) catch error.BufferTooSmall;
+}
+
+fn decodeSessionTokenRecord(value: []const u8) ServiceError!SessionTokenRecord {
+    var it = std.mem.splitScalar(u8, value, '|');
+    const version = it.next() orelse return error.InvalidRecord;
+    if (!std.mem.eql(u8, version, session_token_version)) return error.InvalidRecord;
+    const account = try accountKey(it.next() orelse return error.InvalidRecord);
+    const expires_unix = std.fmt.parseInt(i64, it.next() orelse return error.InvalidRecord, 10) catch return error.InvalidRecord;
+    const hash_hex = it.next() orelse return error.InvalidRecord;
+    if (it.next() != null) return error.InvalidRecord;
+    if (hash_hex.len != hash_hex_len) return error.InvalidRecord;
+    for (hash_hex) |ch| if (!std.ascii.isHex(ch)) return error.InvalidRecord;
+    return .{ .account = account, .expires_unix = expires_unix, .hash = hash_hex };
+}
+
+fn validSessionTokenText(token: []const u8) bool {
+    if (token.len != session_token_len) return false;
+    if (!std.mem.eql(u8, token[0..session_token_prefix.len], session_token_prefix)) return false;
+    for (token[session_token_prefix.len..]) |ch| {
+        if (!std.ascii.isHex(ch)) return false;
+    }
+    return true;
 }
 
 fn accountKey(input: []const u8) ServiceError!AccountName {
@@ -1742,6 +1914,28 @@ test "missing identify collapses to auth failed" {
     var services = Services.init(&store, null);
 
     try std.testing.expectError(error.AuthFailed, services.identifyAccount("missing", "correct horse battery staple"));
+}
+
+test "session tokens issue, validate by hash, and expire" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-session-token.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("Alice", "correct horse battery staple", &scratch);
+    const issued = try services.issueSessionToken("alice", 1000);
+    try std.testing.expectEqualStrings("alice", issued.account.asSlice());
+    try std.testing.expect(std.mem.startsWith(u8, issued.tokenSlice(), session_token_prefix));
+
+    var account_out: [account_max]u8 = undefined;
+    const account = services.validateSessionToken("ALICE", issued.tokenSlice(), 1001, &account_out) orelse return error.ExpectedValidToken;
+    try std.testing.expectEqualStrings("alice", account);
+    try std.testing.expect(services.validateSessionToken("bob", issued.tokenSlice(), 1001, &account_out) == null);
+    try std.testing.expect(services.validateSessionToken("alice", "sst_ffffffffffffffffffffffffffffffff", 1001, &account_out) == null);
+    try std.testing.expect(services.validateSessionToken("alice", issued.tokenSlice(), issued.expires_unix, &account_out) == null);
 }
 
 test "corrupt account record is rejected" {

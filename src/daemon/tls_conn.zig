@@ -150,6 +150,16 @@ pub const TlsConn = struct {
         };
     }
 
+    /// RFC 9266 tls-exporter channel-binding value for TLS 1.3 connections.
+    /// TLS 1.2 does not implement this clean-room exporter path, so callers
+    /// treat error.BadState as "not available" and keep PLUS mechanisms gated.
+    pub fn channelBindingTlsExporter(self: *const TlsConn, out: *[32]u8) Error!void {
+        return switch (self.engine) {
+            .tls13 => |*s| s.channelBindingTlsExporter(out),
+            else => error.BadState,
+        };
+    }
+
     /// Drive the connection with a chunk of bytes read from the socket. On the
     /// first call it selects the protocol version from the buffered ClientHello,
     /// then drives the chosen engine.

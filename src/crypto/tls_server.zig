@@ -249,6 +249,8 @@ pub const Server = struct {
     accepted_psk_len: usize = 0,
     handshake_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    exporter_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+    exporter_master_secret_ready: bool = false,
     resumption_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
@@ -297,6 +299,7 @@ pub const Server = struct {
         secureZero(&self.accepted_psk);
         secureZero(&self.handshake_secret);
         secureZero(&self.master_secret);
+        secureZero(&self.exporter_master_secret);
         secureZero(&self.resumption_master_secret);
         secureZero(&self.client_hs_secret);
         secureZero(&self.server_hs_secret);
@@ -318,6 +321,22 @@ pub const Server = struct {
 
     pub fn handshakeDone(self: *const Server) bool {
         return self.state == .connected;
+    }
+
+    /// RFC 8446 section 7.5 TLS exporter. Valid only after the handshake
+    /// reaches connected state.
+    pub fn exportKeyingMaterial(self: *const Server, label: []const u8, context: []const u8, out: []u8) Error!void {
+        if (self.state != .connected) return error.BadState;
+        if (!self.exporter_master_secret_ready) return error.BadState;
+        switch (self.hashAlg()) {
+            .sha256 => try self.exportKeyingMaterialT(Sha256, label, context, out),
+            .sha384 => try self.exportKeyingMaterialT(Sha384, label, context, out),
+        }
+    }
+
+    /// RFC 9266 tls-exporter channel binding for SCRAM-SHA-*-PLUS.
+    pub fn channelBindingTlsExporter(self: *const Server, out: *[32]u8) Error!void {
+        try self.exportKeyingMaterial("EXPORTER-Channel-Binding", "", out[0..]);
     }
 
     /// The verified client leaf DER (mTLS), or null. SHA-256 of this is the
@@ -571,6 +590,8 @@ pub const Server = struct {
         suite: u16,
         client_app_secret: [max_hash_len]u8,
         server_app_secret: [max_hash_len]u8,
+        exporter_master_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
+        exporter_master_secret_ready: bool = false,
         app_read_seq: u64,
         app_write_seq: u64,
     };
@@ -585,6 +606,8 @@ pub const Server = struct {
             .suite = @intFromEnum(suite),
             .client_app_secret = self.client_app_secret,
             .server_app_secret = self.server_app_secret,
+            .exporter_master_secret = self.exporter_master_secret,
+            .exporter_master_secret_ready = self.exporter_master_secret_ready,
             .app_read_seq = self.app_read_seq,
             .app_write_seq = self.app_write_seq,
         };
@@ -601,6 +624,8 @@ pub const Server = struct {
         self.selected_suite = suite;
         self.client_app_secret = st.client_app_secret;
         self.server_app_secret = st.server_app_secret;
+        self.exporter_master_secret = st.exporter_master_secret;
+        self.exporter_master_secret_ready = st.exporter_master_secret_ready;
         try deriveTrafficKeys(suite, self.client_app_secret[0..suite.hashLen()], &self.client_app_keys);
         try deriveTrafficKeys(suite, self.server_app_secret[0..suite.hashLen()], &self.server_app_keys);
         self.app_read_seq = st.app_read_seq;
@@ -1146,6 +1171,10 @@ pub const Server = struct {
         var master = KS.SecretBytes.init(sk);
         defer master.wipe();
         const th = KS.transcriptHash(self.transcript.items);
+        var exporter_master = try KS.exporterMasterSecret(&master, &th);
+        defer exporter_master.wipe();
+        self.exporter_master_secret[0..KS.hash_len].* = exporter_master.declassify();
+        self.exporter_master_secret_ready = true;
         var traffic = try KS.applicationTrafficSecrets(&master, &th);
         defer traffic.wipe();
         self.client_app_secret[0..KS.hash_len].* = traffic.client.declassify();
@@ -1173,6 +1202,14 @@ pub const Server = struct {
         var rms = try KS.deriveSecret(&master, "res master", &th);
         defer rms.wipe();
         self.resumption_master_secret[0..KS.hash_len].* = rms.declassify();
+    }
+
+    fn exportKeyingMaterialT(self: *const Server, comptime KS: type, label: []const u8, context: []const u8, out: []u8) Error!void {
+        var sk: [KS.hash_len]u8 = undefined;
+        @memcpy(&sk, self.exporter_master_secret[0..KS.hash_len]);
+        var exporter_master = KS.SecretBytes.init(sk);
+        defer exporter_master.wipe();
+        try KS.exportKeyingMaterial(&exporter_master, label, context, out);
     }
 
     fn queueNewSessionTicket(self: *Server) Error!void {
@@ -1717,6 +1754,10 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
     defer client.deinit();
 
+    var premature_binding: [32]u8 = undefined;
+    try std.testing.expectError(error.BadState, server.channelBindingTlsExporter(&premature_binding));
+    try std.testing.expectError(error.BadState, client.channelBindingTlsExporter(&premature_binding));
+
     // No suite negotiated before the ClientHello is processed.
     try std.testing.expectEqual(@as(?[]const u8, null), server.cipherName());
 
@@ -1742,6 +1783,20 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     // prefers AES-128-GCM whenever the client offers it (pickSuite).
     const negotiated = server.cipherName() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("TLS_AES_128_GCM_SHA256", negotiated);
+
+    var client_binding: [32]u8 = undefined;
+    var server_binding: [32]u8 = undefined;
+    try client.channelBindingTlsExporter(&client_binding);
+    try server.channelBindingTlsExporter(&server_binding);
+    try std.testing.expectEqualSlices(u8, &client_binding, &server_binding);
+
+    var different_label: [32]u8 = undefined;
+    try client.exportKeyingMaterial("orochi-test-exporter", "", different_label[0..]);
+    try std.testing.expect(!std.mem.eql(u8, &client_binding, &different_label));
+
+    var different_context: [32]u8 = undefined;
+    try client.exportKeyingMaterial("EXPORTER-Channel-Binding", "context", different_context[0..]);
+    try std.testing.expect(!std.mem.eql(u8, &client_binding, &different_context));
 
     // Server -> client application data.
     const s2c = try server.encrypt("hello client");
@@ -1795,6 +1850,12 @@ test "loopback: exportResume/resumeConnected carries a live session across Serve
     _ = try server.feed(cfin);
     try std.testing.expect(server.handshakeDone());
 
+    var client_binding: [32]u8 = undefined;
+    var server_binding: [32]u8 = undefined;
+    try client.channelBindingTlsExporter(&client_binding);
+    try server.channelBindingTlsExporter(&server_binding);
+    try std.testing.expectEqualSlices(u8, &client_binding, &server_binding);
+
     // Advance both sequence directions before the export so the carried seqs
     // are non-zero (the interesting case for a mid-life upgrade).
     const pre_s2c = try server.encrypt("pre-upgrade s2c");
@@ -1818,6 +1879,9 @@ test "loopback: exportResume/resumeConnected carries a live session across Serve
     var successor = try Server.resumeConnected(alloc, .{ .cert_chain = &.{der}, .signing_key = kp }, st);
     defer successor.deinit();
     try std.testing.expect(successor.handshakeDone());
+    var successor_binding: [32]u8 = undefined;
+    try successor.channelBindingTlsExporter(&successor_binding);
+    try std.testing.expectEqualSlices(u8, &client_binding, &successor_binding);
 
     const c2s = try client.encrypt("post-upgrade c2s");
     defer alloc.free(c2s);
@@ -2463,6 +2527,12 @@ test "loopback: handshake completes over TLS_AES_256_GCM_SHA384 (SHA-384 schedul
     _ = try server.feed(cfin);
     try std.testing.expect(server.handshakeDone());
 
+    var client_binding: [32]u8 = undefined;
+    var server_binding: [32]u8 = undefined;
+    try client.channelBindingTlsExporter(&client_binding);
+    try server.channelBindingTlsExporter(&server_binding);
+    try std.testing.expectEqualSlices(u8, &client_binding, &server_binding);
+
     // App data both ways under AES-256-GCM with the SHA-384 transcript/MAC.
     const s2c = try server.encrypt("aes256 down");
     defer alloc.free(s2c);
@@ -2775,12 +2845,10 @@ test "mTLS: CertificateRequest wire encoding is exact (RFC 8446 §4.3.2)" {
     // length here is exactly what broke gnutls/openssl mTLS clients.
     const expected = [_]u8{
         0x0d, 0x00, 0x00, 0x0d,
-        0x00,
-        0x00, 0x0a,
-        0x00, 0x0d, 0x00, 0x06,
-        0x00, 0x04,
-        0x08, 0x07,
-        0x04, 0x03,
+        0x00, 0x00, 0x0a, 0x00,
+        0x0d, 0x00, 0x06, 0x00,
+        0x04, 0x08, 0x07, 0x04,
+        0x03,
     };
     try std.testing.expectEqualSlices(u8, &expected, out.items);
 }

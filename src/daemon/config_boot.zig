@@ -22,6 +22,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.network.description) |v| {
         if (v.len != 0) out.server_description = v;
     }
+    if (cfg.network.icon_url) |v| {
+        if (v.len != 0) out.network_icon_url = v;
+    }
     if (cfg.motd.text) |t| out.motd_text_raw = t;
     if (cfg.admin.location.len != 0) out.admin_location = cfg.admin.location;
     if (cfg.admin.email.len != 0) out.admin_email = cfg.admin.email;
@@ -60,6 +63,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (!out.media_enabled) out.disabled_features = &.{"media"};
     out.media_max_upload_bytes = cfg.media.max_upload_bytes;
     out.media_max_frame_bytes = cfg.media.max_frame_bytes;
+    out.native_media_require_mac = cfg.media.native_media_require_mac;
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
@@ -101,6 +105,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
     out.sasl_enabled = cfg.sasl.enabled or !cfg.sasl.enabled_explicit;
     if (cfg.sasl.realm) |realm| out.sasl_realm = realm;
+    out.sasl_allow_anonymous = cfg.sasl.allow_anonymous;
     // [mesh].connect — peers this node auto-dials at boot (strings borrow cfg).
     if (cfg.mesh.connect.len != 0) out.mesh_connect = cfg.mesh.connect;
     return out;
@@ -192,6 +197,28 @@ pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
     };
 }
 
+/// Neutral boot projection for the in-daemon ACME renewal scheduler. Strings
+/// borrow `cfg`; keep the parsed config alive while the scheduler is running.
+pub const AcmeBootConfig = struct {
+    enabled: bool = false,
+    directory_url: []const u8 = config_format.acme_default_directory_url,
+    domain: ?[]const u8 = null,
+    contact: ?[]const u8 = null,
+    renew_before_days: u16 = 30,
+    check_interval_ms: u64 = 12 * 60 * 60 * 1000,
+};
+
+pub fn mapAcmeBootConfig(cfg: config_format.Config) AcmeBootConfig {
+    return .{
+        .enabled = cfg.acme.enabled,
+        .directory_url = cfg.acme.directory_url,
+        .domain = cfg.acme.domain,
+        .contact = cfg.acme.contact,
+        .renew_before_days = cfg.acme.renew_before_days,
+        .check_interval_ms = cfg.acme.check_interval_ms,
+    };
+}
+
 pub const Loaded = struct {
     config: server.Config,
     parsed: config_format.Config,
@@ -200,6 +227,9 @@ pub const Loaded = struct {
     /// Parsed `[tls]` intent (strings borrow `parsed`); the live listener and
     /// certificate loading are wired by `main.zig`, not here.
     tls: TlsBootConfig = .{},
+    /// Parsed `[acme]` renewal intent (strings borrow `parsed`); main owns the
+    /// scheduler lifetime because it needs the live server pointer.
+    acme: AcmeBootConfig = .{},
     /// Neutral IRCv3 STS boot projection; `main.zig` consumes this to enable STS.
     sts: StsBootConfig = .{},
     /// Number of worker reactor shards to spin up (`ReactorPool` size). 1 = the
@@ -274,6 +304,7 @@ pub fn loadFromText(
         .parsed = parsed,
         .oper_bindings = oper_bindings,
         .tls = mapTlsBootConfig(parsed),
+        .acme = mapAcmeBootConfig(parsed),
         .sts = mapStsBootConfig(parsed),
         .num_shards = parsed.limits.num_shards,
     };
@@ -306,6 +337,7 @@ test "config text overlays the server config" {
         \\enabled = true
         \\max_upload_bytes = 12345
         \\max_frame_bytes = 1200
+        \\native_media_require_mac = true
         \\[sasl]
         \\enabled = false
         \\realm = "ircxnet"
@@ -330,6 +362,7 @@ test "config text overlays the server config" {
     try testing.expect(loaded.config.media_enabled);
     try testing.expectEqual(@as(u64, 12345), loaded.config.media_max_upload_bytes);
     try testing.expectEqual(@as(u64, 1200), loaded.config.media_max_frame_bytes);
+    try testing.expect(loaded.config.native_media_require_mac);
     try testing.expect(!loaded.config.sasl_enabled);
     try testing.expectEqualStrings("ircxnet", loaded.config.sasl_realm);
 }
@@ -475,6 +508,33 @@ test "num_shards lifts onto the boot config and defaults to 1" {
     var dflt = try loadFromText(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{ .port = 6680 }, .{});
     defer dflt.deinit(allocator);
     try testing.expectEqual(@as(u16, 1), dflt.num_shards);
+}
+
+test "acme section lifts onto the boot config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[acme]
+        \\enabled = true
+        \\directory_url = "https://acme.example/directory"
+        \\domain = "irc.example.test"
+        \\contact = "mailto:admin@example.test"
+        \\renew_before_days = 15
+        \\check_interval = "2h"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+
+    try testing.expect(loaded.acme.enabled);
+    try testing.expectEqualStrings("https://acme.example/directory", loaded.acme.directory_url);
+    try testing.expectEqualStrings("irc.example.test", loaded.acme.domain.?);
+    try testing.expectEqualStrings("mailto:admin@example.test", loaded.acme.contact.?);
+    try testing.expectEqual(@as(u16, 15), loaded.acme.renew_before_days);
+    try testing.expectEqual(@as(u64, 2 * 60 * 60 * 1000), loaded.acme.check_interval_ms);
 }
 
 test "oper groups project configured privileges and titles" {

@@ -7,8 +7,10 @@ const std = @import("std");
 const sasl = @import("sasl.zig");
 const scram256 = @import("sasl_scram_server.zig");
 const scram512 = @import("sasl_scram512_server.zig");
+const oauthbearer = @import("sasl_oauthbearer.zig");
+const anonymous = @import("sasl_anonymous.zig");
 
-pub const SUPPORTED_MECHANISMS = "PLAIN EXTERNAL SCRAM-SHA-256";
+pub const SUPPORTED_MECHANISMS = "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512 SCRAM-SHA-512-PLUS SESSION-TOKEN OAUTHBEARER ANONYMOUS";
 pub const MAX_AUTHENTICATE_CHUNK: usize = 400;
 pub const MAX_RAW_MESSAGE: usize = sasl.MAX_SCRAM_MESSAGE;
 pub const MAX_B64_MESSAGE: usize = std.base64.standard.Encoder.calcSize(MAX_RAW_MESSAGE);
@@ -19,12 +21,20 @@ pub const Mechanism = enum {
     external,
     scram_sha_256,
     scram_sha_512,
+    scram_sha_512_plus,
+    session_token,
+    oauthbearer,
+    anonymous,
 
     pub fn parse(name_text: []const u8) ?Mechanism {
         if (std.ascii.eqlIgnoreCase(name_text, "PLAIN")) return .plain;
         if (std.ascii.eqlIgnoreCase(name_text, "EXTERNAL")) return .external;
         if (std.ascii.eqlIgnoreCase(name_text, "SCRAM-SHA-256")) return .scram_sha_256;
         if (std.ascii.eqlIgnoreCase(name_text, "SCRAM-SHA-512")) return .scram_sha_512;
+        if (std.ascii.eqlIgnoreCase(name_text, "SCRAM-SHA-512-PLUS")) return .scram_sha_512_plus;
+        if (std.ascii.eqlIgnoreCase(name_text, "SESSION-TOKEN")) return .session_token;
+        if (std.ascii.eqlIgnoreCase(name_text, "OAUTHBEARER")) return .oauthbearer;
+        if (std.ascii.eqlIgnoreCase(name_text, "ANONYMOUS")) return .anonymous;
         return null;
     }
 
@@ -34,6 +44,10 @@ pub const Mechanism = enum {
             .external => "EXTERNAL",
             .scram_sha_256 => "SCRAM-SHA-256",
             .scram_sha_512 => "SCRAM-SHA-512",
+            .scram_sha_512_plus => "SCRAM-SHA-512-PLUS",
+            .session_token => "SESSION-TOKEN",
+            .oauthbearer => "OAUTHBEARER",
+            .anonymous => "ANONYMOUS",
         };
     }
 };
@@ -52,6 +66,8 @@ pub const Failure = enum {
 pub const Success = struct {
     account: []const u8,
     final_data: ?[]const u8 = null,
+    guest: bool = false,
+    issue_session_token: bool = true,
 };
 
 pub const Outcome = union(enum) {
@@ -99,17 +115,44 @@ pub const Scram512Lookup = struct {
     }
 };
 
+pub const SessionTokenCredentials = struct {
+    authcid: []const u8,
+    token: []const u8,
+};
+
+pub const SessionTokenLookup = struct {
+    ptr: *anyopaque,
+    verifyFn: *const fn (ptr: *anyopaque, creds: SessionTokenCredentials, account_out: []u8) ?[]const u8,
+
+    pub fn verify(self: SessionTokenLookup, creds: SessionTokenCredentials, account_out: []u8) ?[]const u8 {
+        return self.verifyFn(self.ptr, creds, account_out);
+    }
+};
+
+pub const OAuthBearerLookup = struct {
+    ptr: *anyopaque,
+    verifyFn: *const fn (ptr: *anyopaque, token: []const u8, authzid: ?[]const u8, account_out: []u8) ?[]const u8,
+
+    pub fn verify(self: OAuthBearerLookup, token: []const u8, authzid: ?[]const u8, account_out: []u8) ?[]const u8 {
+        return self.verifyFn(self.ptr, token, authzid, account_out);
+    }
+};
+
 pub const Callbacks = struct {
     plain: ?PlainLookup = null,
     external: ?ExternalLookup = null,
     scram256: ?Scram256Lookup = null,
     scram512: ?Scram512Lookup = null,
+    session_token: ?SessionTokenLookup = null,
+    oauthbearer: ?OAuthBearerLookup = null,
+    anonymous: bool = false,
 };
 
 pub const Router = struct {
     callbacks: Callbacks,
     server_nonce: []const u8,
     tls_certfp: ?[]const u8 = null,
+    tls_exporter: ?[scram512.tls_exporter_len]u8 = null,
     state: State = .idle,
     pending_b64: [MAX_B64_MESSAGE]u8 = undefined,
     pending_len: usize = 0,
@@ -121,6 +164,9 @@ pub const Router = struct {
         idle,
         plain,
         external,
+        session_token,
+        oauthbearer,
+        anonymous,
         scram256: scram256.Server,
         scram512: scram512.Server,
     };
@@ -150,8 +196,12 @@ pub const Router = struct {
         self.state = switch (mechanism) {
             .plain => .plain,
             .external => .external,
+            .session_token => .session_token,
+            .oauthbearer => .oauthbearer,
+            .anonymous => .anonymous,
             .scram_sha_256 => .{ .scram256 = scram256.Server.init() },
             .scram_sha_512 => .{ .scram512 = scram512.Server.init() },
+            .scram_sha_512_plus => .{ .scram512 = scram512.Server.initTlsExporter(self.tls_exporter.?) },
         };
         return .{ .continue_ = "+" };
     }
@@ -178,6 +228,9 @@ pub const Router = struct {
             .idle => self.failReset(.invalid_state),
             .plain => self.stepPlain(raw),
             .external => self.stepExternal(raw),
+            .session_token => self.stepSessionToken(raw),
+            .oauthbearer => self.stepOAuthBearer(raw),
+            .anonymous => self.stepAnonymous(raw),
             .scram256 => |*server| self.stepScram256(server, raw, out),
             .scram512 => |*server| self.stepScram512(server, raw, out),
         };
@@ -189,6 +242,10 @@ pub const Router = struct {
             .external => self.callbacks.external != null and self.tls_certfp != null,
             .scram_sha_256 => self.callbacks.scram256 != null and self.server_nonce.len != 0,
             .scram_sha_512 => self.callbacks.scram512 != null and self.server_nonce.len != 0,
+            .scram_sha_512_plus => self.callbacks.scram512 != null and self.server_nonce.len != 0 and self.tls_exporter != null,
+            .session_token => self.callbacks.session_token != null,
+            .oauthbearer => self.callbacks.oauthbearer != null,
+            .anonymous => self.callbacks.anonymous,
         };
     }
 
@@ -208,6 +265,43 @@ pub const Router = struct {
         const copied = self.copyAccount(account) orelse return self.failReset(.invalid_message);
         self.state = .idle;
         return .{ .success = .{ .account = copied } };
+    }
+
+    fn stepSessionToken(self: *Router, raw: []const u8) Outcome {
+        const checker = self.callbacks.session_token orelse return self.failReset(.unavailable);
+        const sep = std.mem.indexOfScalar(u8, raw, 0) orelse return self.failReset(.invalid_message);
+        if (sep == 0 or sep + 1 >= raw.len) return self.failReset(.invalid_message);
+        const token = raw[sep + 1 ..];
+        if (std.mem.indexOfScalar(u8, token, 0) != null) return self.failReset(.invalid_message);
+        var account_tmp: [MAX_ACCOUNT]u8 = undefined;
+        const account = checker.verify(.{ .authcid = raw[0..sep], .token = token }, &account_tmp) orelse {
+            return self.failReset(.invalid_credentials);
+        };
+        const copied = self.copyAccount(account) orelse return self.failReset(.invalid_message);
+        self.state = .idle;
+        return .{ .success = .{ .account = copied, .issue_session_token = false } };
+    }
+
+    fn stepOAuthBearer(self: *Router, raw: []const u8) Outcome {
+        const checker = self.callbacks.oauthbearer orelse return self.failReset(.unavailable);
+        const parsed = oauthbearer.ClientFirst.parse(raw) catch return self.failReset(.invalid_message);
+        var account_tmp: [MAX_ACCOUNT]u8 = undefined;
+        const account = checker.verify(parsed.token, parsed.authzid, &account_tmp) orelse {
+            return self.failReset(.invalid_credentials);
+        };
+        const copied = self.copyAccount(account) orelse return self.failReset(.invalid_message);
+        self.state = .idle;
+        return .{ .success = .{ .account = copied } };
+    }
+
+    fn stepAnonymous(self: *Router, raw: []const u8) Outcome {
+        switch (anonymous.step(raw, .{ .enabled = self.callbacks.anonymous })) {
+            .guest => {},
+            .fail => return self.failReset(.invalid_credentials),
+        }
+        const copied = self.copyAccount("guest") orelse return self.failReset(.invalid_message);
+        self.state = .idle;
+        return .{ .success = .{ .account = copied, .guest = true, .issue_session_token = false } };
     }
 
     fn stepScram256(self: *Router, server: *scram256.Server, raw: []const u8, out: []u8) Outcome {
@@ -461,6 +555,70 @@ test "EXTERNAL accepts through router" {
     try std.testing.expectEqualStrings("kain", accepted.success.account);
 }
 
+test "SESSION-TOKEN accepts and rejects through router callback" {
+    const Db = struct {
+        fn verify(_: *anyopaque, creds: SessionTokenCredentials, account_out: []u8) ?[]const u8 {
+            if (!std.mem.eql(u8, creds.authcid, "alice")) return null;
+            if (!std.mem.eql(u8, creds.token, "sst_0123456789abcdef0123456789abcdef")) return null;
+            @memcpy(account_out[0.."alice".len], "alice");
+            return account_out[0.."alice".len];
+        }
+    };
+    var token: u8 = 0;
+    var router = Router.init(.{ .session_token = .{ .ptr = &token, .verifyFn = Db.verify } }, "serverNonce");
+    try std.testing.expectEqualStrings("+", router.start("SESSION-TOKEN").continue_);
+
+    var out: [MAX_B64_MESSAGE]u8 = undefined;
+    const good = b64("alice\x00sst_0123456789abcdef0123456789abcdef");
+    const accepted = router.receive(&good, &out);
+    try std.testing.expectEqualStrings("alice", accepted.success.account);
+    try std.testing.expect(!accepted.success.issue_session_token);
+
+    try std.testing.expectEqualStrings("+", router.start("SESSION-TOKEN").continue_);
+    const bad = b64("alice\x00sst_ffffffffffffffffffffffffffffffff");
+    const rejected = router.receive(&bad, &out);
+    try std.testing.expectEqual(Failure.invalid_credentials, rejected.fail);
+}
+
+test "OAUTHBEARER accepts and rejects through router callback" {
+    const Db = struct {
+        fn verify(_: *anyopaque, token: []const u8, authzid: ?[]const u8, account_out: []u8) ?[]const u8 {
+            if (!std.mem.eql(u8, token, "good.jwt")) return null;
+            if (authzid) |zid| {
+                if (!std.mem.eql(u8, zid, "alice")) return null;
+            }
+            @memcpy(account_out[0.."alice".len], "alice");
+            return account_out[0.."alice".len];
+        }
+    };
+    var token: u8 = 0;
+    var router = Router.init(.{ .oauthbearer = .{ .ptr = &token, .verifyFn = Db.verify } }, "serverNonce");
+    try std.testing.expectEqualStrings("+", router.start("OAUTHBEARER").continue_);
+
+    var out: [MAX_B64_MESSAGE]u8 = undefined;
+    const good = b64("n,a=alice,\x01auth=Bearer good.jwt\x01\x01");
+    const accepted = router.receive(&good, &out);
+    try std.testing.expectEqualStrings("alice", accepted.success.account);
+
+    try std.testing.expectEqualStrings("+", router.start("OAUTHBEARER").continue_);
+    const bad = b64("n,,\x01auth=Bearer bad.jwt\x01\x01");
+    const rejected = router.receive(&bad, &out);
+    try std.testing.expectEqual(Failure.invalid_credentials, rejected.fail);
+}
+
+test "ANONYMOUS is default gated and succeeds as guest when enabled" {
+    var router = Router.init(.{}, "serverNonce");
+    try std.testing.expectEqual(Failure.unavailable, router.start("ANONYMOUS").fail);
+
+    router = Router.init(.{ .anonymous = true }, "serverNonce");
+    try std.testing.expectEqualStrings("+", router.start("ANONYMOUS").continue_);
+    var out: [MAX_B64_MESSAGE]u8 = undefined;
+    const accepted = router.receive("+", &out);
+    try std.testing.expectEqualStrings("guest", accepted.success.account);
+    try std.testing.expect(accepted.success.guest);
+    try std.testing.expect(!accepted.success.issue_session_token);
+}
+
 test "unknown mechanism rejects" {
     var router = Router.init(.{}, "serverNonce");
     const rejected = router.start("NOT-A-MECH");
@@ -469,7 +627,7 @@ test "unknown mechanism rejects" {
 
 test "mechanism list string advertises supported mechanisms" {
     try std.testing.expectEqualStrings(
-        "PLAIN EXTERNAL SCRAM-SHA-256",
+        "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512 SCRAM-SHA-512-PLUS SESSION-TOKEN OAUTHBEARER ANONYMOUS",
         Router.mechanismList(),
     );
     try std.testing.expectEqualStrings(SUPPORTED_MECHANISMS, Router.mechanismList());

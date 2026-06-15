@@ -761,6 +761,12 @@ pub const ClientSession = struct {
     /// same SCRAM store as `sasl_scram256`; advertised/served only when both this
     /// callback and the per-connection server nonce are present.
     sasl_scram512: ?sasl_mechrouter.Scram512Lookup = null,
+    /// Injected SESSION-TOKEN verifier. Null fails closed.
+    sasl_session_token: ?sasl_mechrouter.SessionTokenLookup = null,
+    /// Injected OAUTHBEARER verifier. Null fails closed.
+    sasl_oauthbearer: ?sasl_mechrouter.OAuthBearerLookup = null,
+    /// Config gate for SASL ANONYMOUS. Default false.
+    sasl_allow_anonymous: bool = false,
     /// Per-session SASL mechanism router. Lazily initialized on the first
     /// AUTHENTICATE <mech> line so the heavy fixed buffers cost nothing for
     /// connections that never authenticate. Reset to null on abort/failure so a
@@ -769,6 +775,9 @@ pub const ClientSession = struct {
     /// Hex-encoded TLS client-certificate fingerprint, set at accept when the
     /// connection presents a client cert. Drives SASL EXTERNAL; null = no cert.
     tls_certfp: ?[]const u8 = null,
+    /// TLS 1.3 exporter bytes for SCRAM-SHA-512-PLUS channel binding. Null on
+    /// plaintext, pre-handshake, or exporter failure.
+    tls_exporter: ?[scram512_server.tls_exporter_len]u8 = null,
     /// IANA name of the negotiated TLS cipher suite (e.g.
     /// "TLS_AES_128_GCM_SHA256"), captured when the handshake completes. Points
     /// at a static string table, so no per-connection backing is needed; null on
@@ -781,6 +790,16 @@ pub const ClientSession = struct {
     sasl_server_nonce_buf: [32]u8 = undefined,
     account_store: FixedString(MAX_ACCOUNT_BYTES) = .{},
     logged_in: bool = false,
+    /// True only for default-off SASL ANONYMOUS. Guests complete SASL but never
+    /// become a registered services account and never receive account privileges.
+    sasl_guest: bool = false,
+    /// True only when the most recent SASL account login came from a local
+    /// verifier that may map to configured oper bindings.
+    sasl_oper_elevation_allowed: bool = false,
+    /// Set after a non-token SASL success so the server services command surface
+    /// can issue and deliver a fresh session token once the live connection layer
+    /// regains control.
+    sasl_issue_session_token: bool = false,
 
     /// Real peer host/IP captured at accept (never shown to other users once a
     /// cloak/vhost is set). `host_store` is the *visible* host: the auto-cloak of
@@ -1013,13 +1032,31 @@ pub const ClientSession = struct {
             self.account_store.set(account_name[0..@min(account_name.len, MAX_ACCOUNT_BYTES)]) catch return;
         };
         self.logged_in = true;
+        self.sasl_guest = false;
+        self.sasl_oper_elevation_allowed = false;
         // Server-managed +r: a logged-in identity is "registered". Set here so SASL,
         // IDENTIFY, REGISTER, EXTERNAL, and session restore all surface it uniformly.
         self.umodes.add(.registered);
     }
 
+    /// Record a non-privileged guest identity for SASL ANONYMOUS. This completes
+    /// the SASL exchange but deliberately leaves account() null and +r unset.
+    pub fn loginGuest(self: *ClientSession, guest_name: []const u8) void {
+        self.account_store.set(guest_name) catch {
+            self.account_store.set(guest_name[0..@min(guest_name.len, MAX_ACCOUNT_BYTES)]) catch return;
+        };
+        self.logged_in = false;
+        self.sasl_guest = true;
+        self.sasl_oper_elevation_allowed = false;
+        self.umodes.remove(.registered);
+        self.clearOper();
+    }
+
     pub fn logout(self: *ClientSession) void {
         self.logged_in = false;
+        self.sasl_guest = false;
+        self.sasl_oper_elevation_allowed = false;
+        self.sasl_issue_session_token = false;
         self.account_store.len = 0;
         self.umodes.remove(.registered);
     }
@@ -1155,19 +1192,42 @@ pub const ClientSession = struct {
 fn writeSaslCapValue(session: *const ClientSession, out: []u8) ?[]const u8 {
     var len: usize = 0;
     appendSaslMechanism(out, &len, session.sasl_plain != null, "PLAIN") catch return null;
-    appendSaslMechanism(out, &len, session.sasl_external != null and session.tls_certfp != null, "EXTERNAL") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_external != null, "EXTERNAL") catch return null;
     appendSaslMechanism(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256") catch return null;
     appendSaslMechanism(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-512") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0 and session.tls_exporter != null, "SCRAM-SHA-512-PLUS") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_session_token != null, "SESSION-TOKEN") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_oauthbearer != null, "OAUTHBEARER") catch return null;
+    appendSaslMechanism(out, &len, session.sasl_allow_anonymous, "ANONYMOUS") catch return null;
     return if (len == 0) null else out[0..len];
 }
 
 fn writeSaslMechanismList(session: *const ClientSession, out: []u8) ?[]const u8 {
     var len: usize = 0;
     appendSaslMechanismSep(out, &len, session.sasl_plain != null, "PLAIN", ' ') catch return null;
-    appendSaslMechanismSep(out, &len, session.sasl_external != null and session.tls_certfp != null, "EXTERNAL", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_external != null, "EXTERNAL", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-512", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0 and session.tls_exporter != null, "SCRAM-SHA-512-PLUS", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_session_token != null, "SESSION-TOKEN", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_oauthbearer != null, "OAUTHBEARER", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, session.sasl_allow_anonymous, "ANONYMOUS", ' ') catch return null;
     return if (len == 0) null else out[0..len];
+}
+
+fn saslMechanismAllowsOperElevation(mechanism: ?sasl.Mechanism) bool {
+    return switch (mechanism orelse return false) {
+        .plain,
+        .external,
+        .scram_sha_256,
+        .scram_sha_512,
+        .scram_sha_512_plus,
+        .session_token,
+        => true,
+        .oauthbearer,
+        .anonymous,
+        => false,
+    };
 }
 
 fn appendSaslMechanism(out: []u8, len: *usize, enabled: bool, name: []const u8) error{OutputTooSmall}!void {
@@ -1495,7 +1555,7 @@ fn handleCap(ctx: DispatchCtx) DispatchError!void {
     };
 
     const params = ctx.params();
-    var sasl_value_buf: [64]u8 = undefined;
+    var sasl_value_buf: [128]u8 = undefined;
     const sasl_value = writeSaslCapValue(ctx.session, &sasl_value_buf);
     switch (try ctx.session.cap.handle(params[0], params[1..], sasl_value, &sink)) {
         .ok => {},
@@ -1546,8 +1606,12 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             .external = ctx.session.sasl_external,
             .scram256 = ctx.session.sasl_scram256,
             .scram512 = ctx.session.sasl_scram512,
+            .session_token = ctx.session.sasl_session_token,
+            .oauthbearer = ctx.session.sasl_oauthbearer,
+            .anonymous = ctx.session.sasl_allow_anonymous,
         }, ctx.session.sasl_server_nonce);
         router.tls_certfp = ctx.session.tls_certfp;
+        router.tls_exporter = ctx.session.tls_exporter;
 
         switch (router.start(payload)) {
             .continue_ => |challenge| {
@@ -1555,6 +1619,9 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                 // can never leave logged_in set with a stale/failed account.
                 ctx.session.logged_in = false;
                 ctx.session.account_store.len = 0;
+                ctx.session.sasl_guest = false;
+                ctx.session.sasl_oper_elevation_allowed = false;
+                ctx.session.sasl_issue_session_token = false;
                 ctx.session.sasl_pending = sasl.Mechanism.parse(payload);
                 ctx.session.sasl_router = router;
                 ctx.session.client.registration.sasl = .authenticating;
@@ -1615,17 +1682,23 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                 break :blk final_buf[0..final.len];
             } else null;
 
+            const oper_elevation_allowed = saslMechanismAllowsOperElevation(ctx.session.sasl_pending);
             ctx.session.sasl_router = null;
             ctx.session.sasl_pending = null;
 
-            ctx.session.account_store.set(account) catch return saslFail(ctx, "SASL authentication failed");
+            if (result.guest) {
+                ctx.session.loginGuest(account);
+            } else {
+                ctx.session.loginAs(account);
+                ctx.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
+                ctx.session.sasl_issue_session_token = result.issue_session_token;
+            }
 
             if (final_copy) |final| {
                 const reply = if (final.len == 0) "+" else final;
                 try ctx.replies.message(null, "AUTHENTICATE", &.{reply}, null);
             }
 
-            ctx.session.logged_in = true;
             ctx.session.client.registration.sasl = .succeeded;
             try ctx.replies.numeric(ctx.session, .RPL_LOGGEDIN, &.{ ctx.session.displayName(), account }, "You are now logged in");
             try ctx.replies.numeric(ctx.session, .RPL_SASLSUCCESS, &.{}, "SASL authentication successful");
@@ -1655,6 +1728,9 @@ fn saslFail(ctx: DispatchCtx, message: []const u8) DispatchError!void {
     ctx.session.sasl_pending = null;
     ctx.session.sasl_router = null;
     ctx.session.logged_in = false;
+    ctx.session.sasl_guest = false;
+    ctx.session.sasl_oper_elevation_allowed = false;
+    ctx.session.sasl_issue_session_token = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
     try ctx.replies.numeric(ctx.session, .ERR_SASLFAIL, &.{}, message);
@@ -1664,6 +1740,9 @@ fn saslTooLong(ctx: DispatchCtx) DispatchError!void {
     ctx.session.sasl_pending = null;
     ctx.session.sasl_router = null;
     ctx.session.logged_in = false;
+    ctx.session.sasl_guest = false;
+    ctx.session.sasl_oper_elevation_allowed = false;
+    ctx.session.sasl_issue_session_token = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
     try ctx.replies.numeric(ctx.session, .ERR_SASLTOOLONG, &.{}, "SASL message too long");
@@ -1673,6 +1752,9 @@ fn saslAbort(ctx: DispatchCtx) DispatchError!void {
     ctx.session.sasl_pending = null;
     ctx.session.sasl_router = null;
     ctx.session.logged_in = false;
+    ctx.session.sasl_guest = false;
+    ctx.session.sasl_oper_elevation_allowed = false;
+    ctx.session.sasl_issue_session_token = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
     try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
@@ -2542,6 +2624,48 @@ test "sasl CAP LS sasl= value and 908 list agree on SCRAM-SHA-512" {
     var mech_buf: [64]u8 = undefined;
     const mech_list = writeSaslMechanismList(&session, &mech_buf) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, mech_list, "SCRAM-SHA-512") != null);
+}
+
+test "sasl CAP and 908 gate SESSION-TOKEN OAUTHBEARER ANONYMOUS and SCRAM-SHA-512-PLUS" {
+    const TokenDb = struct {
+        fn verify(_: *anyopaque, _: sasl_mechrouter.SessionTokenCredentials, _: []u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const OAuthDb = struct {
+        fn verify(_: *anyopaque, _: []const u8, _: ?[]const u8, _: []u8) ?[]const u8 {
+            return null;
+        }
+    };
+    var anchor: u8 = 0;
+    var session = ClientSession.init();
+    session.sasl_session_token = .{ .ptr = &anchor, .verifyFn = TokenDb.verify };
+    session.sasl_oauthbearer = .{ .ptr = &anchor, .verifyFn = OAuthDb.verify };
+    session.sasl_allow_anonymous = true;
+
+    var cap_buf: [128]u8 = undefined;
+    const cap_value = writeSaslCapValue(&session, &cap_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, cap_value, "SESSION-TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap_value, "OAUTHBEARER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap_value, "ANONYMOUS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap_value, "SCRAM-SHA-512-PLUS") == null);
+
+    var mech_buf: [128]u8 = undefined;
+    const mech_list = writeSaslMechanismList(&session, &mech_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, mech_list, "SESSION-TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mech_list, "OAUTHBEARER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mech_list, "ANONYMOUS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mech_list, "SCRAM-SHA-512-PLUS") == null);
+
+    var db = TestScram512Db{ .record = undefined };
+    session.sasl_scram512 = .{ .ptr = &db, .lookupFn = TestScram512Db.lookup };
+    session.sasl_server_nonce = "SERVERNONCE";
+    try std.testing.expect(std.mem.indexOf(u8, (writeSaslCapValue(&session, &cap_buf) orelse ""), "SCRAM-SHA-512-PLUS") == null);
+    session.tls_exporter = [_]u8{0x42} ** scram512_server.tls_exporter_len;
+    const plus_cap = writeSaslCapValue(&session, &cap_buf) orelse return error.TestUnexpectedResult;
+    const plus_908 = writeSaslMechanismList(&session, &mech_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, plus_cap, "SCRAM-SHA-512-PLUS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plus_908, "SCRAM-SHA-512-PLUS") != null);
 }
 
 test "sasl SCRAM-SHA-512 full handshake through the router logs in" {

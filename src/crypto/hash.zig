@@ -169,6 +169,9 @@ pub const HkdfError = error{
     OutputTooLong,
     /// HKDF-Expand-Label label/context exceeded the TLS 1.3 wire limits.
     LabelTooLong,
+    /// A caller-supplied runtime label was empty. Exporter labels (RFC 5705 /
+    /// 8446 §7.5) must be non-empty; an empty label yields a nonsense exporter.
+    EmptyLabel,
 };
 
 /// `Hkdf(alg)` is HKDF (RFC 5869) over the matching HMAC.
@@ -264,6 +267,42 @@ pub fn Hkdf(comptime alg: Alg) type {
             n += 1;
             @memcpy(buf[n..][0..full_label.len], full_label);
             n += full_label.len;
+
+            buf[n] = @intCast(context.len);
+            n += 1;
+            @memcpy(buf[n..][0..context.len], context);
+            n += context.len;
+
+            try expand(prk, buf[0..n], out);
+        }
+
+        /// Runtime-label form of `expandLabel`, for APIs such as the TLS 1.3
+        /// exporter where the caller supplies a protocol label.
+        pub fn expandLabelRuntime(
+            prk: *const Prk,
+            label: []const u8,
+            context: []const u8,
+            out: []u8,
+        ) HkdfError!void {
+            const prefix = "tls13 ";
+            if (label.len == 0) return HkdfError.EmptyLabel;
+            if (label.len > 255 - prefix.len) return HkdfError.LabelTooLong;
+            if (context.len > 255) return HkdfError.LabelTooLong;
+            if (out.len > std.math.maxInt(u16)) return HkdfError.OutputTooLong;
+
+            var buf: [2 + 1 + 255 + 1 + 255]u8 = undefined;
+            var n: usize = 0;
+
+            std.mem.writeInt(u16, buf[0..2], @intCast(out.len), .big);
+            n = 2;
+
+            const full_label_len = prefix.len + label.len;
+            buf[n] = @intCast(full_label_len);
+            n += 1;
+            @memcpy(buf[n..][0..prefix.len], prefix);
+            n += prefix.len;
+            @memcpy(buf[n..][0..label.len], label);
+            n += label.len;
 
             buf[n] = @intCast(context.len);
             n += 1;

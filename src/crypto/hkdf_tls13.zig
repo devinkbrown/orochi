@@ -37,6 +37,7 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
             early: SecretBytes,
             handshake: SecretBytes,
             master: SecretBytes,
+            exporter_master: SecretBytes,
             handshake_traffic: TrafficSecrets,
             application_traffic: TrafficSecrets,
 
@@ -44,6 +45,7 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
                 self.early.wipe();
                 self.handshake.wipe();
                 self.master.wipe();
+                self.exporter_master.wipe();
                 self.handshake_traffic.wipe();
                 self.application_traffic.wipe();
             }
@@ -69,6 +71,16 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
             try Hkdf.expandLabel(secret, label, context, out);
         }
 
+        /// RFC 8446 section 7.1 HKDF-Expand-Label with a runtime label.
+        pub fn hkdfExpandLabelRuntime(
+            secret: *const SecretBytes,
+            label: []const u8,
+            context: []const u8,
+            out: []u8,
+        ) Error!void {
+            try Hkdf.expandLabelRuntime(secret, label, context, out);
+        }
+
         /// RFC 8446 section 7.1 Derive-Secret.
         pub fn deriveSecret(
             secret: *const SecretBytes,
@@ -78,6 +90,18 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
             if (transcript_hash.len != hash_len) return error.BadTranscriptHash;
             var out: [hash_len]u8 = undefined;
             try hkdfExpandLabel(secret, label, transcript_hash, &out);
+            return SecretBytes.init(out);
+        }
+
+        /// RFC 8446 section 7.1 Derive-Secret with a runtime label.
+        pub fn deriveSecretRuntime(
+            secret: *const SecretBytes,
+            label: []const u8,
+            transcript_hash: []const u8,
+        ) Error!SecretBytes {
+            if (transcript_hash.len != hash_len) return error.BadTranscriptHash;
+            var out: [hash_len]u8 = undefined;
+            try hkdfExpandLabelRuntime(secret, label, transcript_hash, &out);
             return SecretBytes.init(out);
         }
 
@@ -135,6 +159,36 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
             };
         }
 
+        /// Exporter Master Secret = Derive-Secret(Master, "exp master",
+        /// Handshake Context).
+        pub fn exporterMasterSecret(
+            master: *const SecretBytes,
+            transcript_hash: []const u8,
+        ) Error!SecretBytes {
+            return deriveSecret(master, "exp master", transcript_hash);
+        }
+
+        /// RFC 8446 section 7.5 TLS-Exporter.
+        pub fn exportKeyingMaterial(
+            exporter_master_secret: *const SecretBytes,
+            label: []const u8,
+            context_value: []const u8,
+            out: []u8,
+        ) Error!void {
+            var derived = try deriveSecretRuntime(exporter_master_secret, label, &emptyTranscriptHash());
+            defer derived.wipe();
+            const context_hash = Hash.hash(context_value);
+            try hkdfExpandLabel(&derived, "exporter", &context_hash, out);
+        }
+
+        /// RFC 9266 tls-exporter channel-binding value.
+        pub fn channelBindingTlsExporter(
+            exporter_master_secret: *const SecretBytes,
+            out: *[32]u8,
+        ) Error!void {
+            try exportKeyingMaterial(exporter_master_secret, "EXPORTER-Channel-Binding", "", out[0..]);
+        }
+
         pub fn finishedKey(base_key: *const SecretBytes) Error!SecretBytes {
             var out: [hash_len]u8 = undefined;
             try hkdfExpandLabel(base_key, "finished", "", &out);
@@ -174,10 +228,14 @@ pub fn KeySchedule(comptime alg: hash.Alg) type {
             var application_traffic = try applicationTrafficSecrets(&master, application_transcript_hash);
             errdefer application_traffic.wipe();
 
+            var exporter_master = try exporterMasterSecret(&master, application_transcript_hash);
+            errdefer exporter_master.wipe();
+
             return .{
                 .early = early,
                 .handshake = handshake,
                 .master = master,
+                .exporter_master = exporter_master,
                 .handshake_traffic = handshake_traffic,
                 .application_traffic = application_traffic,
             };
@@ -297,6 +355,11 @@ test "RFC 8448 early handshake master chain over caller transcript hashes" {
         &chain.master.declassify(),
     );
     try expectHex(
+        "fe22f881176eda18eb8f44529e6792c5" ++
+            "0c9a3f89452f68d8ae311b4309d3cf50",
+        &chain.exporter_master.declassify(),
+    );
+    try expectHex(
         "9e40646ce79a7f9dc05af8889bce6552" ++
             "875afa0b06df0087f792ebb7c17504a5",
         &chain.application_traffic.client.declassify(),
@@ -312,6 +375,68 @@ test "TLS 1.3 schedule rejects malformed transcript hashes" {
     var early = Sha256.earlySecret("");
     defer early.wipe();
     try std.testing.expectError(error.BadTranscriptHash, Sha256.deriveSecret(&early, "derived", "short"));
+}
+
+test "RFC 8448 schedule exports RFC 9266 tls-exporter channel binding" {
+    const allocator = std.testing.allocator;
+    const shared_secret = try hexAlloc(
+        allocator,
+        "8bd4054fb55b9d63fdfbacf9f04b9f0d" ++
+            "35e6d63f537563efd46272900f89492d",
+    );
+    defer allocator.free(shared_secret);
+    const hello_hash = try hexAlloc(
+        allocator,
+        "860c06edc07858ee8e78f0e7428c58ed" ++
+            "d6b43f2ca3e6e95f02ed063cf0e1cad8",
+    );
+    defer allocator.free(hello_hash);
+    const server_finished_hash = try hexAlloc(
+        allocator,
+        "9608102a0f1ccc6db6250b7b7e417b1a" ++
+            "000eaada3daae4777a7686c9ff83df13",
+    );
+    defer allocator.free(server_finished_hash);
+
+    var chain = try Sha256.deriveChain("", shared_secret, hello_hash, server_finished_hash);
+    defer chain.wipe();
+
+    var channel_binding: [32]u8 = undefined;
+    try Sha256.channelBindingTlsExporter(&chain.exporter_master, &channel_binding);
+    try expectHex(
+        "e3b0946bf2f4668144f22872e0afd51d" ++
+            "c9608638c6f9b2584b98c6cd3a4affad",
+        &channel_binding,
+    );
+
+    var same_again: [32]u8 = undefined;
+    try Sha256.exportKeyingMaterial(&chain.exporter_master, "EXPORTER-Channel-Binding", "", &same_again);
+    try std.testing.expectEqualSlices(u8, &channel_binding, &same_again);
+
+    var different_context: [32]u8 = undefined;
+    try Sha256.exportKeyingMaterial(&chain.exporter_master, "EXPORTER-Channel-Binding", "x", &different_context);
+    try expectHex(
+        "31018a0846c27dd3a254e86168349f5d" ++
+            "7455d78bdd912da703bf3ef25cd2ad4b",
+        &different_context,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &channel_binding, &different_context));
+
+    var different_label: [32]u8 = undefined;
+    try Sha256.exportKeyingMaterial(&chain.exporter_master, "other", "", &different_label);
+    try expectHex(
+        "bf34b0388297e5d393dda95ace8f02f30" ++
+            "813af2032e4d98dc69e30d4805c90c1",
+        &different_label,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &channel_binding, &different_label));
+
+    var bounded = [_]u8{0xa5} ** 40;
+    try Sha256.exportKeyingMaterial(&chain.exporter_master, "EXPORTER-Channel-Binding", "", bounded[4..36]);
+    try std.testing.expectEqual(@as(u8, 0xa5), bounded[0]);
+    try std.testing.expectEqual(@as(u8, 0xa5), bounded[3]);
+    try std.testing.expectEqual(@as(u8, 0xa5), bounded[36]);
+    try std.testing.expectEqual(@as(u8, 0xa5), bounded[39]);
 }
 
 test {

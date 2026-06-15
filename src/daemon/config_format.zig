@@ -26,6 +26,8 @@ pub const Resolver = struct {
     file: ?LookupFn = null,
 };
 
+pub const acme_default_directory_url = "https://acme-v02.api.letsencrypt.org/directory";
+
 pub const Config = struct {
     node: Node = .{},
     network: Network = .{},
@@ -50,6 +52,7 @@ pub const Config = struct {
     sasl: Sasl = .{},
     cloak: Cloak = .{},
     tls: Tls = .{},
+    acme: Acme = .{},
     sts: Sts = .{},
 
     pub const Node = struct {
@@ -67,6 +70,9 @@ pub const Config = struct {
         /// Human description of THIS node, shown in VERSION and WHOIS 312 and
         /// gossiped to mesh peers (per-server description). Null = generic tagline.
         description: ?[]const u8 = null,
+        /// IRCv3 network icon: a URL to a network logo, advertised as the
+        /// `NETWORKICON=<url>` ISUPPORT token when set (Ophion `n_url` parity).
+        icon_url: ?[]const u8 = null,
     };
 
     /// Message of the Day. `text` is served by the MOTD command (split on
@@ -246,6 +252,9 @@ pub const Config = struct {
         enabled: bool = false,
         max_upload_bytes: u64 = 16 * 1024 * 1024,
         max_frame_bytes: u64 = 64 * 1024,
+        /// Require HMAC-tagged native OPVOX/OPVIS datagrams. Defaults off until
+        /// clients implement the matching Kagura-frame tag contract.
+        native_media_require_mac: bool = false,
         /// STUN server (IPv4 literal) queried at boot for the reflexive media
         /// candidate; with stun_port set, overrides listen.media_host on success.
         stun_host: ?[]const u8 = null,
@@ -285,10 +294,18 @@ pub const Config = struct {
         /// where `account_db` alone implied SASL while letting explicit false be
         /// a real off switch.
         enabled_explicit: bool = false,
+        allow_anonymous: bool = false,
         realm: ?[]const u8 = null,
         /// Path (relative to the daemon cwd) of the WAL-backed account store. When
         /// set, the daemon opens it and verifies SASL credentials against it.
         account_db: ?[]const u8 = null,
+        oauth_issuer: ?[]const u8 = null,
+        oauth_audience: ?[]const u8 = null,
+        /// Optional claim name mapped to the account. Null means "sub".
+        oauth_account_claim: ?[]const u8 = null,
+        oauth_hmac_key: ?[]const u8 = null,
+        oauth_jwks_file: ?[]const u8 = null,
+        oauth_pubkey: ?[]const u8 = null,
     };
 
     pub const Cloak = struct {
@@ -336,6 +353,18 @@ pub const Config = struct {
         early_data_max_size: u32 = 0,
     };
 
+    /// In-daemon ACME renewal scheduler. Issuance uses the existing ACME runner
+    /// and writes to the configured `[tls]` cert/key paths; this section only
+    /// controls cadence and CA/account inputs.
+    pub const Acme = struct {
+        enabled: bool = false,
+        directory_url: []const u8 = acme_default_directory_url,
+        domain: ?[]const u8 = null,
+        contact: ?[]const u8 = null,
+        renew_before_days: u16 = 30,
+        check_interval_ms: u64 = 12 * 60 * 60 * 1000,
+    };
+
     /// IRCv3 STS (Strict Transport Security) advertisement policy. When enabled,
     /// the daemon advertises an `sts=` capability instructing clients to persist
     /// a secure-transport upgrade for `duration` seconds on the secure `port`.
@@ -368,6 +397,8 @@ pub const Config = struct {
         errdefer allocator.free(geoip_db);
         const geoip_asn_db = try allocator.dupe(u8, "");
         errdefer allocator.free(geoip_asn_db);
+        const acme_directory_url = try allocator.dupe(u8, acme_default_directory_url);
+        errdefer allocator.free(acme_directory_url);
         return .{
             .network = .{ .name = try allocator.dupe(u8, "Orochi") },
             .admin = .{
@@ -380,6 +411,7 @@ pub const Config = struct {
             .stats = .{ .dir = stats_dir },
             .metrics = .{ .bind = metrics_bind },
             .geoip = .{ .database = geoip_db, .asn_database = geoip_asn_db },
+            .acme = .{ .directory_url = acme_directory_url },
         };
     }
 
@@ -389,6 +421,7 @@ pub const Config = struct {
         allocator.free(self.network.name);
         if (self.network.server_name) |v| allocator.free(v);
         if (self.network.description) |v| allocator.free(v);
+        if (self.network.icon_url) |v| allocator.free(v);
         if (self.motd.text) |value| allocator.free(value);
         allocator.free(self.admin.location);
         allocator.free(self.admin.email);
@@ -421,6 +454,12 @@ pub const Config = struct {
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
+        if (self.sasl.oauth_issuer) |value| allocator.free(value);
+        if (self.sasl.oauth_audience) |value| allocator.free(value);
+        if (self.sasl.oauth_account_claim) |value| allocator.free(value);
+        if (self.sasl.oauth_hmac_key) |value| allocator.free(value);
+        if (self.sasl.oauth_jwks_file) |value| allocator.free(value);
+        if (self.sasl.oauth_pubkey) |value| allocator.free(value);
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
         allocator.free(self.metrics.bind);
@@ -431,6 +470,9 @@ pub const Config = struct {
         allocator.free(self.tls.dns_name);
         if (self.tls.cert_path) |value| allocator.free(value);
         if (self.tls.key_path) |value| allocator.free(value);
+        allocator.free(self.acme.directory_url);
+        if (self.acme.domain) |value| allocator.free(value);
+        if (self.acme.contact) |value| allocator.free(value);
         self.* = .{};
     }
 };
@@ -457,6 +499,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setStr(allocator, resolver, doc.getString("network.name"), &cfg.network.name);
     try setOpt(allocator, resolver, doc.getString("network.server_name"), &cfg.network.server_name);
     try setOpt(allocator, resolver, doc.getString("network.description"), &cfg.network.description);
+    try setOpt(allocator, resolver, doc.getString("network.icon_url"), &cfg.network.icon_url);
 
     // [motd] — `text` may use `@file:path` to load from disk.
     try setOpt(allocator, resolver, doc.getString("motd.text"), &cfg.motd.text);
@@ -554,6 +597,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;
     cfg.media.max_upload_bytes = try uintField(doc, "media.max_upload_bytes", cfg.media.max_upload_bytes, 0, 1024 * 1024 * 1024);
     cfg.media.max_frame_bytes = try uintField(doc, "media.max_frame_bytes", cfg.media.max_frame_bytes, 0, 16 * 1024 * 1024);
+    if (doc.getBool("media.native_media_require_mac")) |b| cfg.media.native_media_require_mac = b;
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
@@ -575,6 +619,18 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     }
     try setOpt(allocator, resolver, doc.getString("sasl.realm"), &cfg.sasl.realm);
     try setOpt(allocator, resolver, doc.getString("sasl.account_db"), &cfg.sasl.account_db);
+    if (doc.getBool("sasl.allow_anonymous")) |b| cfg.sasl.allow_anonymous = b;
+    try setOpt(allocator, resolver, doc.getString("sasl.oauth_issuer"), &cfg.sasl.oauth_issuer);
+    try setOpt(allocator, resolver, doc.getString("sasl.oauth_audience"), &cfg.sasl.oauth_audience);
+    try setOpt(allocator, resolver, doc.getString("sasl.oauth_account_claim"), &cfg.sasl.oauth_account_claim);
+    try setOpt(allocator, resolver, doc.getString("sasl.oauth_hmac_key"), &cfg.sasl.oauth_hmac_key);
+    try setOpt(allocator, resolver, doc.getString("sasl.oauth_jwks_file"), &cfg.sasl.oauth_jwks_file);
+    try setOpt(allocator, resolver, doc.getString("sasl.oauth_pubkey"), &cfg.sasl.oauth_pubkey);
+    const oauth_key_sources: usize =
+        @as(usize, @intFromBool(cfg.sasl.oauth_hmac_key != null)) +
+        @as(usize, @intFromBool(cfg.sasl.oauth_jwks_file != null)) +
+        @as(usize, @intFromBool(cfg.sasl.oauth_pubkey != null));
+    if (oauth_key_sources > 1) return error.ParseError;
 
     // [cloak]
     try setOpt(allocator, resolver, doc.getString("cloak.secret"), &cfg.cloak.secret);
@@ -590,6 +646,14 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("tls.enable_tls12")) |b| cfg.tls.enable_tls12 = b;
     if (doc.getBool("tls.enable_resumption")) |b| cfg.tls.enable_resumption = b;
     cfg.tls.early_data_max_size = @intCast(try uintField(doc, "tls.early_data_max_size", cfg.tls.early_data_max_size, 0, std.math.maxInt(u32)));
+
+    // [acme]
+    if (doc.getBool("acme.enabled")) |b| cfg.acme.enabled = b;
+    try setStr(allocator, resolver, doc.getString("acme.directory_url"), &cfg.acme.directory_url);
+    try setOpt(allocator, resolver, doc.getString("acme.domain"), &cfg.acme.domain);
+    try setOpt(allocator, resolver, doc.getString("acme.contact"), &cfg.acme.contact);
+    cfg.acme.renew_before_days = @intCast(try uintField(doc, "acme.renew_before_days", cfg.acme.renew_before_days, 1, 89));
+    if (doc.getString("acme.check_interval")) |s| cfg.acme.check_interval_ms = try durationMs(s);
 
     // [sts]
     if (doc.getBool("sts.enabled")) |b| cfg.sts.enabled = b;
@@ -838,6 +902,11 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
         \\enabled = false
         \\realm = "ircxnet"
         \\account_db = "accounts.oro"
+        \\allow_anonymous = true
+        \\oauth_issuer = "https://issuer.example"
+        \\oauth_audience = "orochi"
+        \\oauth_account_claim = "preferred_username"
+        \\oauth_hmac_key = "test-secret"
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
@@ -847,8 +916,13 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
     try testing.expectEqualStrings("127.0.0.1", cfg.listen.trusted_proxies[0]);
     try testing.expect(!cfg.sasl.enabled);
     try testing.expect(cfg.sasl.enabled_explicit);
+    try testing.expect(cfg.sasl.allow_anonymous);
     try testing.expectEqualStrings("ircxnet", cfg.sasl.realm.?);
     try testing.expectEqualStrings("accounts.oro", cfg.sasl.account_db.?);
+    try testing.expectEqualStrings("https://issuer.example", cfg.sasl.oauth_issuer.?);
+    try testing.expectEqualStrings("orochi", cfg.sasl.oauth_audience.?);
+    try testing.expectEqualStrings("preferred_username", cfg.sasl.oauth_account_claim.?);
+    try testing.expectEqualStrings("test-secret", cfg.sasl.oauth_hmac_key.?);
 
     var omitted = try parseToml(allocator,
         \\[node]
@@ -859,6 +933,23 @@ test "parseToml: listen proxy protocol and SASL enabled gate project" {
     , .{});
     defer omitted.deinit(allocator);
     try testing.expect(!omitted.sasl.enabled_explicit);
+    try testing.expect(!omitted.sasl.allow_anonymous);
+    try testing.expect(omitted.sasl.oauth_account_claim == null);
+}
+
+test "parseToml: [sasl] rejects multiple OAuth key sources" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[sasl]
+        \\oauth_hmac_key = "secret"
+        \\oauth_pubkey = "{}"
+        \\
+    ;
+    try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
 }
 
 test "parseToml: [mesh].require_secured projects onto Config and defaults false" {
@@ -992,6 +1083,7 @@ test "parseToml: minimal config keeps defaults" {
     try testing.expectEqual(@as(u16, 6680), cfg.listen.irc);
     try testing.expectEqual(@as(u16, 0), cfg.listen.s2s);
     try testing.expectEqualStrings("127.0.0.1", cfg.listen.host);
+    try testing.expect(!cfg.media.native_media_require_mac);
 }
 
 test "parseToml: [tls] section projects onto Config" {
@@ -1046,6 +1138,74 @@ test "parseToml: [tls] omitted keeps secure defaults" {
     try testing.expectEqual(@as(?[]const u8, null), cfg.tls.cert_path);
     try testing.expectEqual(@as(?[]const u8, null), cfg.tls.key_path);
     try testing.expectEqualStrings("localhost", cfg.tls.dns_name);
+}
+
+test "parseToml: [acme] section projects onto Config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[acme]
+        \\enabled = true
+        \\directory_url = "https://acme.example/directory"
+        \\domain = "irc.example.test"
+        \\contact = "mailto:admin@example.test"
+        \\renew_before_days = 45
+        \\check_interval = "6h"
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+
+    try testing.expect(cfg.acme.enabled);
+    try testing.expectEqualStrings("https://acme.example/directory", cfg.acme.directory_url);
+    try testing.expectEqualStrings("irc.example.test", cfg.acme.domain.?);
+    try testing.expectEqualStrings("mailto:admin@example.test", cfg.acme.contact.?);
+    try testing.expectEqual(@as(u16, 45), cfg.acme.renew_before_days);
+    try testing.expectEqual(@as(u64, 6 * 60 * 60 * 1000), cfg.acme.check_interval_ms);
+}
+
+test "parseToml: [acme] omitted keeps renewal disabled defaults and validates ranges" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer cfg.deinit(allocator);
+
+    try testing.expect(!cfg.acme.enabled);
+    try testing.expectEqualStrings(acme_default_directory_url, cfg.acme.directory_url);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.acme.domain);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.acme.contact);
+    try testing.expectEqual(@as(u16, 30), cfg.acme.renew_before_days);
+    try testing.expectEqual(@as(u64, 12 * 60 * 60 * 1000), cfg.acme.check_interval_ms);
+
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[acme]
+        \\renew_before_days = 0
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[acme]
+        \\renew_before_days = 90
+        \\
+    , .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[acme]
+        \\check_interval = "0s"
+        \\
+    , .{}));
 }
 
 test "parseToml: [sts] section projects onto Config" {

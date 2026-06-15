@@ -41,6 +41,12 @@ name = "Orochi"
 # S2S peers. MUST be unique per node in a mesh so replies/identities don't
 # collide. Default: "orochi.local".
 # server_name = "irc.alpha.example.net"
+# Optional per-node description shown in VERSION/WHOIS and mesh peer metadata.
+# description = "Alpha node"
+# Optional IRCv3 network icon: a URL to a network logo. When set, the daemon
+# advertises a NETWORKICON=<url> ISUPPORT (005) token so clients can show the
+# logo; omitted entirely when unset.
+# icon_url = "https://eshmaki.me/icon.png"
 
 
 # --- [motd] — message of the day (personalized template) ---------------------
@@ -53,7 +59,8 @@ name = "Orochi"
 #   {nick} {account} {host} {network} {server} {version} {time} {date}
 #   {users} {opers} {channels}        live network figures
 #   {greeting}                        "Good morning/afternoon/evening" by hour
-# Conditionals ({if:COND}...{else}...{/if}; COND = oper | account | secure):
+#   {weather} {news}                  localized weather / headlines (see [weather]/[news])
+# Conditionals ({if:COND}...{else}...{/if}; COND = oper | account | secure | weather | news):
 #   {if:account}Welcome back, {account}!{else}Please register.{/if}
 #   {if:oper}You have operator privileges.{/if}
 #   {if:secure}{else}This link is not encrypted.{/if}
@@ -149,8 +156,14 @@ ws = 0
 # TESTING ONLY: stand the ws listener up WITHOUT TLS (plain ws://) when no
 # certificate is configured. Browsers require wss in production; default off.
 ws_plain = false
-# WebTransport (HTTP/3) port for browser clients (0 = disabled).
+# WebTransport (HTTP/3 over QUIC) port for browser clients (0 = disabled).
+# Requires [tls] certificate/signing material; it bridges each WT session to the
+# configured IRC listener and prepends PROXY metadata for the real QUIC peer.
 webtransport = 0
+# Accept HAProxy PROXY protocol v1/v2 headers from trusted reverse proxies before
+# IRC/TLS/WebSocket framing. Empty trusted_proxies disables this even if enabled.
+proxy_protocol = false
+# trusted_proxies = ["127.0.0.1", "::1"]
 # Server-to-server (mesh) listener port (0 = disabled / leaf node).
 s2s = 0
 # UDP port for the media (SFU) transport plane (0 = ephemeral).
@@ -180,6 +193,11 @@ request_client_cert = false
 # listener via version-dispatch. Off by default to keep the TLS 1.3-only posture;
 # when on, the 1.2 leg presents a bootstrapped ECDSA-P256 leaf.
 enable_tls12 = false
+# Enable TLS 1.3 PSK session tickets/resumption. Off by default.
+enable_resumption = false
+# Maximum 0-RTT early data bytes advertised in tickets. 0 disables early data
+# while still allowing resumption when enable_resumption is true.
+early_data_max_size = 0
 
 
 # --- [sts] — IRCv3 Strict Transport Security ---------------------------------
@@ -202,7 +220,8 @@ realm = "local"
 # Shared passphrase for plaintext S2S admission (MeshPass). For secured links
 # use [node].secret_key instead.
 # mesh_pass = "env:OROCHI_MESH_PASS"
-# Trusted peer identity roots (array of hex public keys), for secured links.
+# Trusted peer identity roots (array of hex/base64 Ed25519 public keys), for
+# secured links. When set, secured S2S expects peers to match these keys.
 # trust_roots = ["env:PEER_A_PUBKEY", "env:PEER_B_PUBKEY"]
 # Auto-connect peers: each "host:port" is dialed at boot and re-dialed while
 # its S2S link is down, so the mesh stays linked without an oper CONNECT.
@@ -263,13 +282,31 @@ max_per_account = 64   # live sessions per account (1..1000000)
 
 # --- [sasl] — SASL authentication + account store ----------------------------
 [sasl]
-# Enable SASL (PLAIN/SCRAM/EXTERNAL). Required for accounts and SASL-only opers.
+# Enable SASL (PLAIN/SCRAM-SHA-256/EXTERNAL). Explicit false disables SASL even
+# when account_db is configured; if omitted, account_db-only legacy configs still
+# enable SASL.
 enabled = false
-# Optional SASL realm.
+# Optional informational SASL/account realm. Current mechanisms do not emit it in
+# wire challenges.
 # realm = "example.net"
 # WAL-backed account store path (relative to the daemon cwd). When set, the
-# daemon opens it and verifies SASL credentials against it.
+# daemon opens it and verifies SASL credentials against it. With the store open,
+# SESSION-TOKEN (opaque reconnect tokens, issued only over TLS) is also available;
+# SCRAM-SHA-512-PLUS is offered automatically to TLS clients (tls-exporter channel
+# binding, RFC 9266).
 # account_db = "/var/lib/orochi/accounts.db"
+# Allow SASL ANONYMOUS guest logins (RFC 4505). Default false — anonymous is a
+# spam/abuse vector; a guest binds NO account and gets NO oper/services privileges.
+allow_anonymous = false
+# OAUTHBEARER (RFC 7628): verify a signed JWT bearer token against a locally
+# configured key. Advertised ONLY when exactly one key source below is set. OAuth
+# identities are federated and are NEVER auto-elevated to oper.
+#   oauth_hmac_key  = "env:OROCHI_OAUTH_HS256_SECRET"  # HS256 shared secret
+#   oauth_jwks_file = "/etc/orochi/oauth/jwks.json"    # RS256/ES256 JWKS
+#   oauth_pubkey    = "/etc/orochi/oauth/pub.pem"      # RS256/ES256 PEM/DER public key
+# oauth_issuer        = "https://idp.example.net/"     # require this `iss` when set
+# oauth_audience      = "orochi"                        # require this `aud` when set
+# oauth_account_claim = "sub"                           # JWT claim -> account (default "sub")
 
 
 # --- [oper] — operator subsystem settings ------------------------------------
@@ -295,8 +332,8 @@ enabled = false
 # Referenced by an [[opers]] block's `class`.
 # [[oper_groups]]
 # name       = "netadmin"
-# privileges = ["kill", "ward", "rehash", "upgrade", "mesh"]
-# inherits   = "oper"
+# privileges = ["client_kill", "channel_moderate", "server_rehash", "server_restart", "mesh_admin"]
+# inherits   = ""
 
 
 # --- [cloak] — hostname cloaking ---------------------------------------------
@@ -306,6 +343,23 @@ enabled = false
 # absent, a random per-boot key is used (privacy on by default, but cloaks
 # change each restart).
 # secret = "env:OROCHI_CLOAK_SECRET"
+# Optional network-identifying suffix used in generated cloak hostnames.
+# suffix = "ircxnet"
+
+
+# --- [acme] — automatic TLS certificate renewal (Linux only) -----------------
+# In-daemon ACME renewal. The daemon checks the [tls].cert_path leaf's expiry on a
+# schedule and, when within renew_before_days, issues a new certificate (clean-room
+# ACME, off the reactor) and hot-swaps it on reactor 0 — no restart. Requires [tls]
+# with cert_path/key_path set. Changing those paths via live REHASH while [acme] is
+# enabled is unsupported.
+[acme]
+enabled = false
+# directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+# domain  = "irc.example.net"
+# contact = "mailto:admin@example.net"
+renew_before_days = 30        # renew when the leaf is within N days of expiry (1..89)
+check_interval = "12h"        # how often to check the leaf expiry
 
 
 # --- [media] — voice/video (SFU) ---------------------------------------------
@@ -313,6 +367,11 @@ enabled = false
 enabled = false
 max_upload_bytes = 16777216   # 16 MiB upload cap (0..1 GiB)
 max_frame_bytes = 65536       # 64 KiB per media frame (0..16 MiB)
+# Require an authenticated per-datagram MAC on native (OPVOX/OPVIS) media. Default
+# false (accept untagged) for back-compat; when true, untagged or bad-tag datagrams
+# are dropped before the SFU learns the sender. Requires matching client support
+# (the server advertises mac=hmac-sha256-128 on the native media line).
+native_media_require_mac = false
 # STUN server (IPv4 literal) queried at boot for the reflexive media candidate;
 # with stun_port set, overrides listen.media_host on success.
 # stun_host = "stun.example.net"
@@ -327,7 +386,18 @@ max_frame_bytes = 65536       # 64 KiB per media frame (0..16 MiB)
 interval = "30s"       # minimum interval between stats writes
 
 
+# --- [metrics] — live Prometheus endpoint ------------------------------------
+[metrics]
+# TCP port for live HTTP GET /metrics. 0 = disabled. Binds loopback by default.
+listen = 0
+# Bind address for the metrics listener. Keep loopback unless a firewall/reverse
+# proxy protects the endpoint.
+bind = "127.0.0.1"
+
+
 # --- [geoip] — GeoIP enrichment ----------------------------------------------
 [geoip]
 # Path to a MaxMind .mmdb database. Empty = GeoIP disabled.
 # database = "/usr/share/GeoIP/GeoLite2-City.mmdb"
+# Optional separate ASN .mmdb database for WHOIS AS-number/org enrichment.
+# asn_database = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"

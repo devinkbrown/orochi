@@ -39,6 +39,8 @@ Source: struct at `src/daemon/config_format.zig:56`, parsing at `src/daemon/conf
 |---|---|---:|---|---|
 | `name` | string | `"Orochi"` | any string | Network name advertised in ISUPPORT `NETWORK=` and the welcome burst (`src/main.zig:129`). |
 | `server_name` | string or null | `"orochi.local"` | any hostname | This node's own server name — the source prefix of all server-originated lines (welcome numerics, the `!weather`/`!news` bot replies, ERROR/PING) and the identity presented to S2S peers. MUST be unique per node in a mesh so replies/identities don't collide (`src/proto/protocol_inventory.zig` `setServerName`). |
+| `description` | string or null | unset | any string | Per-node description shown in VERSION/WHOIS and gossiped to mesh peers (`src/daemon/config_format.zig:67`, `src/daemon/config_boot.zig:22`). |
+| `icon_url` | string or null | unset | URL string | IRCv3 network icon: when set, advertised as the `NETWORKICON=<url>` ISUPPORT token (clients may render the logo); omitted when unset. Ophion `n_url`/NETWORKICON parity (`src/daemon/server.zig` `buildIsupportTokens`, `src/daemon/config_boot.zig`). |
 
 ## `[motd]`
 
@@ -120,7 +122,10 @@ Source: struct at `src/daemon/config_format.zig:75`, parsing at `src/daemon/conf
 | `host` | string | `"127.0.0.1"` | any string accepted by bind helpers | Bind address for runtime listeners (`src/daemon/config_boot.zig:25`). |
 | `irc` | port integer | `0` before validation | required, `1..65535` | Plain IRC listener port. Current parser requires this even for TLS-first deployments. |
 | `ws` | port integer | `0` | `0..65535` | Secure-WebSocket browser listener intent. `mapToServerConfig` overlays it into `ws_enabled`/`ws_port`; the listener stands up when TLS certificates are loaded, or with testing-only `ws_plain` (`src/daemon/config_format.zig:462`, `src/daemon/config_boot.zig:45`, `src/main.zig:350`, `src/daemon/server.zig:1862`). |
-| `webtransport` | port integer | `0` | `0..65535` | Parser/proto-only: parsed by config format, but `mapToServerConfig` does not overlay it and no listener binds from it yet (`src/daemon/config_format.zig:464`, `src/daemon/config_boot.zig:42`). |
+| `webtransport` | port integer | `0` | `0..65535` | UDP WebTransport/HTTP3 listener port. `mapToServerConfig` overlays it into `webtransport_port`, and `main.zig` starts `webtransport_listener.zig` when TLS certificate/signing material and the IRC listener are available (`src/daemon/config_boot.zig:45`, `src/main.zig:472`, `src/main.zig:494`). |
+| `ws_plain` | bool | `false` | `true` or `false` | Testing-only plain WebSocket mode. Only used when `ws` is non-zero; production browser clients require TLS (`src/daemon/config_format.zig:139`, `src/daemon/config_boot.zig:54`). |
+| `proxy_protocol` | bool | `false` | `true` or `false` | Enable HAProxy PROXY v1/v2 header consumption before IRC/TLS/WebSocket framing, gated by `trusted_proxies` (`src/daemon/config_format.zig:141`, `src/daemon/config_boot.zig:46`, `src/daemon/server.zig:4107`). |
+| `trusted_proxies` | array of strings | `[]` | IP literals | Source IPs allowed to supply PROXY headers; empty disables trusted PROXY handling even if `proxy_protocol` is true (`src/daemon/config_format.zig:144`, `src/daemon/server.zig:3614`, `src/daemon/server.zig:3633`). |
 | `s2s` | port integer | `0` | `0..65535` | Server-to-server mesh listener; `0` disables it (`src/daemon/config_boot.zig:26`, `src/daemon/server.zig:1046`). |
 | `media` | port integer | `0` | `0..65535` | UDP media transport plane port; `0` means ephemeral (`src/daemon/config_boot.zig:27`, `src/daemon/server.zig:963`). |
 | `native_media` | port integer | `0` | `0..65535` | Native OPVOX/OPVIS media UDP port; `0` means ephemeral (`src/daemon/config_boot.zig:28`, `src/daemon/server.zig:971`). |
@@ -133,8 +138,9 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `realm` | string | `"local"` | any string | Realm fed into node identity derivation for secured S2S (`src/main.zig:149`). |
-| `trust_roots` | array of strings | `[]` | strings | Parsed and tested, but not consumed by current boot mapping (`src/daemon/config_format.zig:349`, `src/daemon/config_format.zig:637`). |
+| `trust_roots` | array of strings | `[]` | hex/base64 Ed25519 public keys | Parsed, mapped to `server.Config.mesh_trust_roots`, decoded at server init, and used as the expected secured-S2S peer key allowlist (`src/daemon/config_format.zig:177`, `src/daemon/config_boot.zig:101`, `src/daemon/server.zig:2272`, `src/daemon/server.zig:3833`). |
 | `mesh_pass` | string or null | unset | any string | Shared passphrase carried into S2S handshake config when node identity is configured (`src/main.zig:152`, `src/daemon/server.zig:1074`). |
+| `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; IPv6 hosts must be bracketed (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:2249`). |
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 
 Plaintext S2S is used when no node identity is configured and `require_secured` is false; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`).
@@ -195,13 +201,14 @@ Source: struct at `src/daemon/config_format.zig:164`, parsing at `src/daemon/con
 
 ## `[media]`
 
-Source: struct at `src/daemon/config_format.zig:170`, parsing at `src/daemon/config_format.zig:388`, partial mapping at `src/daemon/config_boot.zig:30`.
+Source: struct at `src/daemon/config_format.zig:245`, parsing at `src/daemon/config_format.zig:553`, mapping at `src/daemon/config_boot.zig:59`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `enabled` | bool | `false` | `true` or `false` | Enables or disables the media feature surface through `server.Config.media_enabled` and `disabled_features` (`src/daemon/config_format.zig:389`, `src/daemon/config_boot.zig:30`). |
-| `max_upload_bytes` | integer | `16777216` | `0..1073741824` | Parsed but not yet wired into current daemon boot (`src/daemon/config_format.zig:390`). |
-| `max_frame_bytes` | integer | `65536` | `0..16777216` | Parsed but not yet wired into current daemon boot (`src/daemon/config_format.zig:391`). |
+| `max_upload_bytes` | integer | `16777216` | `0..1073741824` | Runtime upload cap applied to both media planes through `server.Config.media_max_upload_bytes` (`src/daemon/config_boot.zig:61`, `src/daemon/server.zig:2399`, `src/daemon/server.zig:2401`). |
+| `max_frame_bytes` | integer | `65536` | `0..16777216` | Runtime frame cap applied to SFU/native media with each transport's protocol maximum as an upper bound (`src/daemon/config_boot.zig:62`, `src/daemon/server.zig:2397`, `src/daemon/server.zig:2400`). |
+| `native_media_require_mac` | bool | `false` | `true` or `false` | Require an authenticated per-datagram MAC on native (OPVOX/OPVIS) media. `false` accepts untagged datagrams (back-compat); `true` drops untagged/bad-tag datagrams before the SFU learns the sender. HMAC-SHA256-128 keyed from the per-stream PRF capability; needs matching client support (`src/daemon/config_format.zig:257`, `src/daemon/config_boot.zig:66`, `src/substrate/kagura_frame.zig`). |
 | `stun_host` | string or null | unset | any string | Optional STUN host mapped to media discovery config (`src/daemon/config_boot.zig:30`, `src/daemon/server.zig:967`). |
 | `stun_port` | port integer | `0` | `0..65535` | STUN port mapped when non-zero (`src/daemon/config_boot.zig:31`). |
 
@@ -214,6 +221,15 @@ Source: struct at `src/daemon/config_format.zig:180`, parsing at `src/daemon/con
 | `dir` | string | `""` | any string | Directory for `stats.json` and `index.html`; empty disables (`src/daemon/server.zig:958`). |
 | `interval` | duration string | `"30s"` | positive `ms/s/m/h` duration | Minimum interval between stats writes (`src/daemon/config_format.zig:395`). |
 
+## `[metrics]`
+
+Source: struct at `src/daemon/config_format.zig:263`, parsing at `src/daemon/config_format.zig:562`, mapping at `src/daemon/config_boot.zig:67`, live HTTP endpoint at `src/daemon/metrics_http.zig:1`.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `listen` | port integer | `0` | `0..65535` | Live Prometheus `/metrics` HTTP listener port. `0` or absent disables the endpoint (`src/daemon/config_boot.zig:69`, `src/daemon/server.zig:2443`). |
+| `bind` | string | `"127.0.0.1"` | IPv4 literal | Bind address for the metrics listener. Defaults to loopback; invalid/non-IPv4 values keep the secure loopback default (`src/daemon/config_boot.zig:71`, `src/daemon/config_boot.zig:112`). |
+
 ## `[geoip]`
 
 Source: struct at `src/daemon/config_format.zig:188`, parsing at `src/daemon/config_format.zig:397`, mapping at `src/daemon/config_boot.zig:34`.
@@ -221,6 +237,7 @@ Source: struct at `src/daemon/config_format.zig:188`, parsing at `src/daemon/con
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `database` | string | `""` | any string | MaxMind `.mmdb` path; empty disables GeoIP (`src/daemon/server.zig:955`). |
+| `asn_database` | string | `""` | any string | Optional separate ASN `.mmdb` path for WHOIS AS-number/org enrichment (`src/daemon/config_format.zig:277`, `src/daemon/config_boot.zig:74`). |
 
 ## `[sasl]`
 
@@ -228,9 +245,27 @@ Source: struct at `src/daemon/config_format.zig:193`, parsing at `src/daemon/con
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `enabled` | bool | `false` | `true` or `false` | Parsed but not currently used as the runtime gate; `account_db` controls live SASL store wiring (`src/daemon/config_format.zig:401`, `src/main.zig:177`). |
-| `realm` | string or null | unset | any string | Parsed but not currently consumed by `main.zig` or `mapToServerConfig` (`src/daemon/config_format.zig:402`). |
-| `account_db` | string or null | unset | path string | Opens the OroStore account backend; when opened, PLAIN, SCRAM-SHA-256, and EXTERNAL are wired (`src/main.zig:178`, `src/main.zig:193`). |
+| `enabled` | bool | `false` | `true` or `false` | Explicit `false` disables SASL even when `account_db` is configured. If omitted, older `account_db`-only configs still enable the account store (`src/daemon/config_format.zig:282`, `src/daemon/config_boot.zig:102`, `src/main.zig:255`). |
+| `realm` | string or null | unset | any string | Informational SASL/account realm stored in runtime config; current wire mechanisms do not emit it in challenges (`src/daemon/config_format.zig:288`, `src/daemon/config_boot.zig:103`, `src/daemon/server.zig:1387`). |
+| `account_db` | string or null | unset | path string | Opens the OroStore account backend; when opened, PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, and EXTERNAL are wired. With the store open, SESSION-TOKEN (opaque reconnect tokens, issued only over TLS) is available, and SCRAM-SHA-512-PLUS is offered to TLS clients via the RFC 9266 `tls-exporter` channel binding (`src/main.zig:178`, `src/main.zig:193`). |
+| `allow_anonymous` | bool | `false` | `true` or `false` | Allow SASL ANONYMOUS (RFC 4505) guest logins. Default off (spam vector). A guest binds no account, is left `+r`-unset, and receives no oper/services privileges (`src/daemon/config_format.zig:297`). |
+| `oauth_hmac_key` / `oauth_jwks_file` / `oauth_pubkey` | string or null | unset | secret / path | OAUTHBEARER (RFC 7628) JWT verification key. Exactly one source enables OAUTHBEARER: an HS256 shared secret, an RS256/ES256 JWKS file, or an RS256/ES256 PEM/DER public key. Unset = OAUTHBEARER is not advertised (`src/daemon/oauth_jwt.zig`, `src/daemon/config_format.zig:306`). |
+| `oauth_issuer` / `oauth_audience` / `oauth_account_claim` | string or null | unset / `"sub"` | any string | When set, `iss`/`aud` are required to match; `oauth_account_claim` selects the JWT claim mapped to the account (default `sub`). OAuth identities are federated and are never auto-elevated to oper (`src/daemon/config_format.zig:302`). |
+
+## `[acme]`
+
+Source: struct `Acme` at `src/daemon/config_format.zig:351`, parsing at `src/daemon/config_format.zig:625`, scheduler at `src/daemon/acme_renewal.zig`, reactor-0 hot-swap at `src/daemon/server.zig` (`maybeReloadAcmeTls`).
+
+Automatic in-daemon TLS certificate renewal (Linux only). A background thread checks the `[tls].cert_path` leaf expiry every `check_interval`; within `renew_before_days` it issues a new certificate off the reactor and signals reactor 0 to hot-swap it (no restart). Requires `[tls]` with `cert_path`/`key_path`. Changing those paths via live REHASH while `[acme]` is enabled is unsupported.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `enabled` | bool | `false` | `true` or `false` | Enable in-daemon ACME renewal. |
+| `directory_url` | string | Let's Encrypt prod | any URL | ACME directory endpoint. |
+| `domain` | string or null | unset | hostname | Certificate domain to renew. |
+| `contact` | string or null | unset | `mailto:…` | ACME account contact. |
+| `renew_before_days` | integer | `30` | `1..89` | Renew when the leaf is within N days of `notAfter`. |
+| `check_interval` | duration string | `"12h"` | positive `ms/s/m/h` duration | How often to check the leaf expiry. |
 
 ## `[cloak]`
 
@@ -239,6 +274,7 @@ Source: struct at `src/daemon/config_format.zig:201`, parsing at `src/daemon/con
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `secret` | string or null | unset | any string | Hash-derived stable hostname cloak key. If absent, `main.zig` generates a per-boot key (`src/main.zig:205`, `src/main.zig:210`). |
+| `suffix` | string or null | unset | any string | Optional network-identifying suffix for generated cloak hosts (`src/daemon/config_format.zig:299`, `src/daemon/config_boot.zig:40`). |
 
 ## `[tls]`
 
@@ -252,6 +288,9 @@ Source: struct at `src/daemon/config_format.zig:208`, parsing at `src/daemon/con
 | `key_path` | string or null | unset | path string | Private key path; paired with `cert_path` (`src/daemon/config_format.zig:412`). |
 | `dns_name` | string | `"localhost"` | any string | CN/SAN for self-signed bootstrap cert when files are absent (`src/main.zig:224`). |
 | `request_client_cert` | bool | `false` | `true` or `false` | Requests client certs so SASL EXTERNAL can match cert fingerprints (`src/main.zig:234`, `src/daemon/sasl_bridge.zig:70`). |
+| `enable_tls12` | bool | `false` | `true` or `false` | Also accept hardened TLS 1.2 ECDHE-AEAD clients through version dispatch. Off by default (`src/daemon/config_format.zig:324`, `src/daemon/config_boot.zig:174`, `src/main.zig:347`). |
+| `enable_resumption` | bool | `false` | `true` or `false` | Enable TLS 1.3 PSK session tickets/resumption on the live TLS listener (`src/daemon/config_format.zig:330`, `src/daemon/config_boot.zig:175`). |
+| `early_data_max_size` | integer | `0` | `0..4294967295` | Maximum TLS 1.3 0-RTT bytes advertised in issued tickets. `0` disables early data while still allowing resumption (`src/daemon/config_format.zig:334`, `src/daemon/config_boot.zig:176`). |
 
 Orochi has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig:216`, `src/daemon/dispatch.zig:369`).
 
@@ -302,20 +341,13 @@ Source: struct at `src/daemon/config_format.zig:95`, parsing at `src/daemon/conf
 
 Valid privilege strings are the exact enum names from `src/daemon/oper.zig:36`: `server_rehash`, `server_restart`, `server_shutdown`, `client_moderate`, `channel_moderate`, `client_kill`, `mesh_admin`, `service_admin`, `server_admin`, `oper_grant`, `oper_spy`, `event_subscribe`, `audit_read`, and `oper_override`.
 
-Important current behavior: if an oper names a class that has no group, or resolves to an empty effective privilege set, boot skips that oper binding (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). REHASH currently rebuilds oper bindings with full privileges and does not recompute `[[oper_groups]]` (`src/daemon/server.zig:10052`, `src/daemon/server.zig:10062`).
+Important current behavior: if an oper names a class that has no group, or resolves to an empty effective privilege set, boot skips that oper binding (`src/daemon/config_boot.zig:250`, `src/daemon/config_boot.zig:255`). REHASH rebuilds configured operator bindings through the same group resolver and has coverage for preserving group privileges (`src/daemon/server.zig:20008`, `src/daemon/server.zig:20546`).
 
 ## Parsed But Not Yet Wired
 
-These keys are accepted by `parseToml` but do not currently change live daemon behavior in the `main.zig`/`mapToServerConfig` path:
-
-| Key | Parse source | Current status |
-|---|---|---|
-| `listen.webtransport` | `src/daemon/config_format.zig:464` | Parser/proto-only: no `mapToServerConfig` overlay and no listener binding from this config yet. |
-| `mesh.trust_roots` | `src/daemon/config_format.zig:349` | Parsed and tested; current secured S2S boot uses node secret key, realm, and mesh pass. |
-| `media.max_upload_bytes` | `src/daemon/config_format.zig:390` | Parsed; not mapped into current server config. |
-| `media.max_frame_bytes` | `src/daemon/config_format.zig:391` | Parsed; not mapped into current server config. |
-| `sasl.enabled` | `src/daemon/config_format.zig:401` | Parsed; live SASL backend wiring is currently controlled by `sasl.account_db`. |
-| `sasl.realm` | `src/daemon/config_format.zig:402` | Parsed; not consumed in current boot mapping. |
+No top-level key in this reference is currently known to be parser-only in the
+`main.zig` / `config_boot.zig` / `server.zig` path as of `c471a06`. If a future
+key is accepted before it changes live behavior, add it here in the same change.
 
 ## Comptime-Bound Values Not Yet Configurable
 

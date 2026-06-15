@@ -54,6 +54,10 @@ fn session(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleSession(x.id, x.conn, x.parsed);
 }
+fn sessionToken(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleSessionToken(x.conn);
+}
 fn certAdd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleCertAdd(x.conn);
@@ -80,6 +84,7 @@ pub const GHOST_spec = registry.CommandSpec{ .name = "GHOST", .feature = account
 pub const CHANNEL_spec = registry.CommandSpec{ .name = "CHANNEL", .feature = accounts_feature, .handler = channel };
 pub const CS_spec = registry.CommandSpec{ .name = "CS", .feature = accounts_feature, .handler = channel };
 pub const SESSION_spec = registry.CommandSpec{ .name = "SESSION", .feature = accounts_feature, .handler = session };
+pub const SESSIONTOKEN_spec = registry.CommandSpec{ .name = "SESSIONTOKEN", .feature = accounts_feature, .handler = sessionToken };
 pub const CERTADD_spec = registry.CommandSpec{ .name = "CERTADD", .feature = accounts_feature, .handler = certAdd };
 pub const CERTLIST_spec = registry.CommandSpec{ .name = "CERTLIST", .feature = accounts_feature, .handler = certList };
 pub const CERTDEL_spec = registry.CommandSpec{ .name = "CERTDEL", .feature = accounts_feature, .handler = certDel };
@@ -100,6 +105,7 @@ pub const module = registry.Module{
         CHANNEL_spec,
         CS_spec,
         SESSION_spec,
+        SESSIONTOKEN_spec,
         CERTADD_spec,
         CERTLIST_spec,
         CERTDEL_spec,
@@ -111,5 +117,6 @@ test "accounts commands are feature gated except SASLINFO" {
 
     try @import("std").testing.expect(!registry.commandAvailable(REGISTER_spec, caps));
     try @import("std").testing.expect(!registry.commandAvailable(CHANNEL_spec, caps));
+    try @import("std").testing.expect(!registry.commandAvailable(SESSIONTOKEN_spec, caps));
     try @import("std").testing.expect(registry.commandAvailable(SASLINFO_spec, caps));
 }
