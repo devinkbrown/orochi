@@ -133,12 +133,18 @@ Still open (genuine future work, larger or cross-component):
 - **End-to-end per-frame signed envelopes** for routed/multi-hop frames. Secured
   links now AEAD-encrypt + authenticate point-to-point; multi-hop origin signing
   is still open.
-- **Live HTTP `/metrics`/admin endpoint** (file-export + internal Prometheus text
-  exist; a live endpoint is a convenience, not a correctness gap).
 - **Datagram-level native-media sender authentication** (TOFU address binding
-  exists; per-stream token auth needs a coordinated browser-codec wire change).
-- Account/user/member PROP propagation (channel PROP already propagates),
-  EVENT subject-mask on category subscriptions.
+  exists; per-stream token auth needs a coordinated browser-codec wire change,
+  i.e. cross-component work on the Nexus/Ocean clients, not a server-only fix).
+- Account/user/member PROP propagation over mesh (channel PROP already
+  propagates; user/member props are session-local, so this needs new
+  ACCOUNT/USER PROP convergence frames for relatively low value).
+
+Also closed in the agent pass (additional): a live read-only HTTP `/metrics`
+endpoint (loopback-default, mutex-guarded Prometheus snapshot), per-category
+EVENT subject-glob masks, and full live session-state migration over mesh
+(SESSION_MIGRATE frame + capsule ship/stage/consume on reclaim). Confirmed
+already-present (not gaps): channel ACCESS GRANT bypasses +l/+i/+k/+b on join.
 
 Intentional divergences / out of scope (NOT gaps): EVENT numerics `808-825`
 (Orochi uses the `NOTE EVENT` wire form by design), `RPL_LISTXPICS 813` (no
