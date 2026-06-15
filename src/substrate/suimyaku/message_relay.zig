@@ -12,6 +12,28 @@ pub const Verb = enum(u8) {
     privmsg = 1,
     notice = 2,
     tagmsg = 3,
+    // IRCX typed directed messaging (channel- or nick-scoped). DATA/REQUEST/REPLY
+    // carry an extra IRCX data tag in `data_tag`; WHISPER carries the recipient
+    // nick in `recipient` while `target` stays the shared channel.
+    data = 4,
+    request = 5,
+    reply = 6,
+    whisper = 7,
+
+    /// The IRCX command word rendered on the wire for this verb (server-side
+    /// reconstruction in deliverRelay). PRIVMSG/NOTICE/TAGMSG return their own
+    /// command words too so callers can share one switch.
+    pub fn commandWord(self: Verb) []const u8 {
+        return switch (self) {
+            .privmsg => "PRIVMSG",
+            .notice => "NOTICE",
+            .tagmsg => "TAGMSG",
+            .data => "DATA",
+            .request => "REQUEST",
+            .reply => "REPLY",
+            .whisper => "WHISPER",
+        };
+    }
 };
 
 pub const RelayMessage = struct {
@@ -25,6 +47,11 @@ pub const RelayMessage = struct {
     account: []const u8 = "",
     tags: []const u8 = "",
     text: []const u8,
+    /// IRCX data tag for DATA/REQUEST/REPLY (e.g. "SYS.foo"); "" otherwise.
+    data_tag: []const u8 = "",
+    /// WHISPER recipient nick (the channel co-member to deliver to); "" otherwise.
+    /// For WHISPER, `target` is the shared channel and `recipient` is the nick.
+    recipient: []const u8 = "",
     origin_node: u64,
     hlc: u64,
 };
@@ -39,6 +66,8 @@ pub const Owned = struct {
         allocator.free(self.msg.account);
         allocator.free(self.msg.tags);
         allocator.free(self.msg.text);
+        allocator.free(self.msg.data_tag);
+        allocator.free(self.msg.recipient);
         self.* = undefined;
     }
 };
@@ -55,9 +84,11 @@ pub const DecodeError = error{
 pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     var entries = [_]cpv.MapEntry{
         .{ .key = "account", .value = .{ .string = msg.account } },
+        .{ .key = "data_tag", .value = .{ .string = msg.data_tag } },
         .{ .key = "hlc", .value = .{ .unsigned = msg.hlc } },
         .{ .key = "min_rank", .value = .{ .unsigned = msg.min_rank } },
         .{ .key = "origin_node", .value = .{ .unsigned = msg.origin_node } },
+        .{ .key = "recipient", .value = .{ .string = msg.recipient } },
         .{ .key = "source_nick", .value = .{ .string = msg.source_nick } },
         .{ .key = "source_prefix", .value = .{ .string = msg.source_prefix } },
         .{ .key = "tags", .value = .{ .string = msg.tags } },
@@ -85,6 +116,8 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     var account_opt: ?[]const u8 = null;
     var tags_opt: ?[]const u8 = null;
     var text_opt: ?[]const u8 = null;
+    var data_tag_opt: ?[]const u8 = null;
+    var recipient_opt: ?[]const u8 = null;
     var min_rank: u8 = 0;
     var origin_node_opt: ?u64 = null;
     var hlc_opt: ?u64 = null;
@@ -92,12 +125,16 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.key, "account")) {
             account_opt = try readString(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "data_tag")) {
+            data_tag_opt = try readString(entry.value);
         } else if (std.mem.eql(u8, entry.key, "hlc")) {
             hlc_opt = try readU64(entry.value);
         } else if (std.mem.eql(u8, entry.key, "min_rank")) {
             min_rank = try readRank(entry.value);
         } else if (std.mem.eql(u8, entry.key, "origin_node")) {
             origin_node_opt = try readU64(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "recipient")) {
+            recipient_opt = try readString(entry.value);
         } else if (std.mem.eql(u8, entry.key, "source_nick")) {
             source_nick_opt = try readString(entry.value);
         } else if (std.mem.eql(u8, entry.key, "source_prefix")) {
@@ -121,6 +158,10 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     const account = account_opt orelse return DecodeError.MissingField;
     const tags = tags_opt orelse return DecodeError.MissingField;
     const text = text_opt orelse return DecodeError.MissingField;
+    // Optional (default ""): absent for PRIVMSG/NOTICE/TAGMSG and from older
+    // peers that predate the typed-IRCX verbs, mirroring min_rank's tolerance.
+    const data_tag = data_tag_opt orelse "";
+    const recipient = recipient_opt orelse "";
 
     const target_owned = try allocator.dupe(u8, target);
     errdefer allocator.free(target_owned);
@@ -134,6 +175,10 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     errdefer allocator.free(tags_owned);
     const text_owned = try allocator.dupe(u8, text);
     errdefer allocator.free(text_owned);
+    const data_tag_owned = try allocator.dupe(u8, data_tag);
+    errdefer allocator.free(data_tag_owned);
+    const recipient_owned = try allocator.dupe(u8, recipient);
+    errdefer allocator.free(recipient_owned);
 
     return .{ .msg = .{
         .verb = verb_opt orelse return DecodeError.MissingField,
@@ -143,6 +188,8 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
         .account = account_owned,
         .tags = tags_owned,
         .text = text_owned,
+        .data_tag = data_tag_owned,
+        .recipient = recipient_owned,
         .min_rank = min_rank,
         .origin_node = origin_node_opt orelse return DecodeError.MissingField,
         .hlc = hlc_opt orelse return DecodeError.MissingField,
@@ -218,6 +265,10 @@ fn readVerb(value: cpv.Value) DecodeError!Verb {
         1 => .privmsg,
         2 => .notice,
         3 => .tagmsg,
+        4 => .data,
+        5 => .request,
+        6 => .reply,
+        7 => .whisper,
         else => DecodeError.InvalidVerb,
     };
 }
@@ -243,6 +294,8 @@ fn expectRoundTrip(msg: RelayMessage) !void {
     try std.testing.expectEqualStrings(msg.account, owned.msg.account);
     try std.testing.expectEqualStrings(msg.tags, owned.msg.tags);
     try std.testing.expectEqualStrings(msg.text, owned.msg.text);
+    try std.testing.expectEqualStrings(msg.data_tag, owned.msg.data_tag);
+    try std.testing.expectEqualStrings(msg.recipient, owned.msg.recipient);
     try std.testing.expectEqual(msg.min_rank, owned.msg.min_rank);
     try std.testing.expectEqual(msg.origin_node, owned.msg.origin_node);
     try std.testing.expectEqual(msg.hlc, owned.msg.hlc);
@@ -284,6 +337,58 @@ test "relay messages round-trip for each verb" {
         .text = "",
         .origin_node = 9,
         .hlc = 103,
+    });
+
+    // IRCX typed channel DATA carries the data tag; recipient stays empty.
+    try expectRoundTrip(.{
+        .verb = .data,
+        .target = "#orochi",
+        .source_nick = "dave",
+        .source_prefix = "dave!u@example.invalid",
+        .account = "dave",
+        .tags = "",
+        .text = "comic frame payload",
+        .data_tag = "MSN.Avatar",
+        .min_rank = 0,
+        .origin_node = 10,
+        .hlc = 104,
+    });
+
+    // REQUEST to a nick target (no channel scope), data tag present.
+    try expectRoundTrip(.{
+        .verb = .request,
+        .target = "erin",
+        .source_nick = "dave",
+        .source_prefix = "dave!u@example.invalid",
+        .text = "ping",
+        .data_tag = "SYS.Probe",
+        .origin_node = 11,
+        .hlc = 105,
+    });
+
+    // REPLY to a STATUSMSG channel target (min_rank floor), data tag present.
+    try expectRoundTrip(.{
+        .verb = .reply,
+        .target = "#orochi",
+        .source_nick = "erin",
+        .source_prefix = "erin!u@example.invalid",
+        .text = "pong",
+        .data_tag = "SYS.Probe",
+        .min_rank = 2,
+        .origin_node = 12,
+        .hlc = 106,
+    });
+
+    // WHISPER: target is the shared channel, recipient is the co-member nick.
+    try expectRoundTrip(.{
+        .verb = .whisper,
+        .target = "#orochi",
+        .source_nick = "alice",
+        .source_prefix = "alice!u@example.invalid",
+        .text = "psst over the mesh",
+        .recipient = "bob",
+        .origin_node = 13,
+        .hlc = 107,
     });
 }
 

@@ -4444,17 +4444,28 @@ pub const LinuxServer = struct {
             .account = msg.account,
             .tags = safe_tags,
             .text = msg.text,
+            .data_tag = msg.data_tag,
+            .recipient = msg.recipient,
             .origin_node = msg.origin_node,
             .hlc = msg.hlc,
         };
-        const verb = switch (msg.verb) {
-            .privmsg => "PRIVMSG",
-            .notice => "NOTICE",
-            .tagmsg => "TAGMSG",
+        // WHISPER is nick-scoped within a shared channel; it never fans out to all
+        // channel members, so it follows a dedicated inbound path below.
+        if (clean_msg.verb == .whisper) {
+            self.deliverRelayWhisper(clean_msg);
+            return;
+        }
+        const verb = clean_msg.verb.commandWord();
+        const is_data_family = switch (clean_msg.verb) {
+            .data, .request, .reply => true,
+            else => false,
         };
         var line_buf: [default_reply_bytes]u8 = undefined;
         const line = if (clean_msg.verb == .tagmsg)
             std.fmt.bufPrint(&line_buf, ":{s} TAGMSG {s}\r\n", .{ clean_msg.source_prefix, clean_msg.target }) catch return
+        else if (is_data_family)
+            // IRCX typed line: `:prefix <CMD> <target> <data_tag> :<text>`.
+            std.fmt.bufPrint(&line_buf, ":{s} {s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, clean_msg.target, clean_msg.data_tag, clean_msg.text }) catch return
         else
             std.fmt.bufPrint(&line_buf, ":{s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, clean_msg.target, clean_msg.text }) catch return;
         var time_buf: [40]u8 = undefined;
@@ -4510,12 +4521,25 @@ pub const LinuxServer = struct {
                 clean_msg.target;
             var eff_text = clean_msg.text;
             var nf_text_buf: [1024]u8 = undefined;
-            if (clean_msg.verb != .tagmsg and self.world.channelHasExtFlag(clean_msg.target, .noformat) and color_strip.hasFormatting(clean_msg.text)) {
+            // +V NOCOMICDATA: re-enforce the local channel's comic-chat-DATA ban
+            // against a remote sender (the local handleData rejects non-op DATA
+            // here with 531; on the receive side we silently drop, still
+            // re-forwarding for multi-hop so a downstream node re-checks).
+            if (is_data_family and self.world.channelHasExtFlag(clean_msg.target, .nocomicdata) and
+                self.relaySenderModes(clean_msg.target, clean_msg.source_nick).rank() < 2)
+            {
+                const drop_scope: RelayScope = .{ .channel = clean_msg.target };
+                _ = self.relayToPeers(clean_msg, drop_scope);
+                return;
+            }
+            if (clean_msg.verb != .tagmsg and !is_data_family and self.world.channelHasExtFlag(clean_msg.target, .noformat) and color_strip.hasFormatting(clean_msg.text)) {
                 if (color_strip.stripFormatting(clean_msg.text, &nf_text_buf)) |clean| eff_text = clean else |_| {}
             }
             var channel_line_buf: [default_reply_bytes]u8 = undefined;
             const channel_line = if (clean_msg.verb == .tagmsg)
                 std.fmt.bufPrint(&channel_line_buf, ":{s} TAGMSG {s}\r\n", .{ clean_msg.source_prefix, render_target }) catch return
+            else if (is_data_family)
+                std.fmt.bufPrint(&channel_line_buf, ":{s} {s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, render_target, clean_msg.data_tag, eff_text }) catch return
             else
                 std.fmt.bufPrint(&channel_line_buf, ":{s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, render_target, eff_text }) catch return;
             if (self.world.memberIterator(clean_msg.target)) |*it| {
@@ -4550,6 +4574,43 @@ pub const LinuxServer = struct {
         else
             .{ .nick = clean_msg.target };
         _ = self.relayToPeers(clean_msg, scope);
+    }
+
+    /// Inbound IRCX WHISPER relay: deliver a `:prefix WHISPER <channel>
+    /// <recipient> :<text>` line to the LOCAL recipient nick when it shares the
+    /// channel, re-enforcing the same membership invariant the local handler does
+    /// (both sender and recipient must be on the channel). The global seen-set is
+    /// already observed by the caller (`deliverRelay`). Multi-hop re-forward is
+    /// scoped to the recipient's owning node so a WHISPER can traverse the mesh.
+    fn deliverRelayWhisper(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
+        // WHISPER is shared-channel scoped; re-forward narrows to peers with
+        // members of that channel (the recipient nick is not in the per-nick
+        // route map, only in the channel roster).
+        const reforward: RelayScope = .{ .channel = msg.target };
+        // Origin spoof guard: a peer must not assert a prefix for a nick that is
+        // live & local here (its traffic would originate locally). Still
+        // re-forward for multi-hop; never render the spoofed line.
+        if (self.nickIsLiveLocal(msg.source_nick)) {
+            _ = self.relayToPeers(msg, reforward);
+            return;
+        }
+        // Re-enforce +w NOWHISPER against the remote sender (receiver-side
+        // defense-in-depth; a desynced flag must not let a remote bypass policy).
+        if (self.world.channelExists(msg.target) and self.world.channelHasExtFlag(msg.target, .nowhisper)) {
+            _ = self.relayToPeers(msg, reforward);
+            return;
+        }
+        if (self.world.findNick(msg.recipient)) |rwid| {
+            // WHISPER invariant: the recipient must be on the shared channel.
+            if (self.world.isMember(msg.target, rwid)) {
+                var line_buf: [default_reply_bytes]u8 = undefined;
+                if (std.fmt.bufPrint(&line_buf, ":{s} WHISPER {s} {s} :{s}\r\n", .{ msg.source_prefix, msg.target, msg.recipient, msg.text })) |line| {
+                    self.deliver(clientIdFromWorld(rwid), line) catch {};
+                } else |_| {}
+            }
+        }
+        // Multi-hop re-forward toward nodes that share the channel.
+        _ = self.relayToPeers(msg, reforward);
     }
 
     fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
@@ -12543,21 +12604,110 @@ pub const LinuxServer = struct {
             }
             const speech = try self.channelSpeechGate(id, conn, target, chan, message, false, min_rank, true);
             if (speech == .deny) return;
-            if (speech == .opmoderate or min_rank > 0) {
+            if (speech == .opmoderate) {
+                // Held for ops only: no cross-node relay (mirrors the PRIVMSG
+                // opmoderate path), so a muted remote member is never reached.
                 var time_buf: [40]u8 = undefined;
                 const tags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
-                try self.broadcastChannelMinRank(chan, tags, line, null, if (speech == .opmoderate) 2 else min_rank);
-                if (speech == .opmoderate) self.publishModerationHeld(chan, conn, message);
+                try self.broadcastChannelMinRank(chan, tags, line, null, 2);
+                self.publishModerationHeld(chan, conn, message);
+                return;
+            }
+            if (min_rank > 0) {
+                var time_buf: [40]u8 = undefined;
+                const tags = MsgTags{ .time_value = serverTimeValue(&time_buf), .account = conn.session.account() };
+                try self.broadcastChannelMinRank(chan, tags, line, null, min_rank);
             } else {
                 try self.broadcastChannel(chan, line, null);
             }
+            // Cross-node relay: forward this typed DATA/REQUEST/REPLY to mesh
+            // peers that have members of `chan` so remote co-members receive it.
+            // Loop-guarded; the far side delivers only to its own local members.
+            self.relayChannelData(conn, parsed.command, chan, tag, message, min_rank);
         } else {
             const rwid = self.world.findNick(target) orelse {
+                // Not local: relay to the peer that owns this nick (route_table
+                // narrowed; an unknown route fails closed with ERR_NOSUCHNICK
+                // instead of flooding the mesh, mirroring the PRIVMSG nick path).
+                if (self.relayNickData(conn, parsed.command, target, tag, message)) return;
                 try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
                 return;
             };
             self.deliver(clientIdFromWorld(rwid), line) catch {};
         }
+    }
+
+    /// Map an IRCX typed-message command word to its relay `Verb`. Returns null
+    /// for anything that is not a relayable typed verb.
+    fn dataVerb(command: []const u8) ?message_relay.Verb {
+        const eqi = std.ascii.eqlIgnoreCase;
+        if (eqi(command, "DATA")) return .data;
+        if (eqi(command, "REQUEST")) return .request;
+        if (eqi(command, "REPLY")) return .reply;
+        return null;
+    }
+
+    /// Relay a channel-targeted DATA/REQUEST/REPLY to mesh peers with members of
+    /// `chan`. Best-effort and loop-guarded (records own origin/hlc in the
+    /// seen-set so the echo back is dropped).
+    fn relayChannelData(
+        self: *LinuxServer,
+        conn: *ConnState,
+        command: []const u8,
+        chan: []const u8,
+        data_tag: []const u8,
+        message: []const u8,
+        min_rank: u8,
+    ) void {
+        if (!self.hasEstablishedPeer()) return;
+        const verb = dataVerb(command) orelse return;
+        var pbuf: [320]u8 = undefined;
+        const prefix = clientPrefix(conn, &pbuf) catch return;
+        const hlc = self.nextMeshHlc();
+        _ = self.relay_seen.observe(self.config.node_id, hlc);
+        _ = self.relayToPeers(.{
+            .verb = verb,
+            .target = chan,
+            .min_rank = min_rank,
+            .source_nick = conn.session.displayName(),
+            .source_prefix = prefix,
+            .account = conn.session.account() orelse "",
+            .text = message,
+            .data_tag = data_tag,
+            .origin_node = self.config.node_id,
+            .hlc = hlc,
+        }, .{ .channel = chan });
+    }
+
+    /// Relay a nick-targeted DATA/REQUEST/REPLY to the peer that owns `nick`.
+    /// Returns true when at least one peer link accepted the relay (the nick is
+    /// reachable across the mesh); false when no route is known (caller then
+    /// emits ERR_NOSUCHNICK rather than flooding the mesh).
+    fn relayNickData(
+        self: *LinuxServer,
+        conn: *ConnState,
+        command: []const u8,
+        nick: []const u8,
+        data_tag: []const u8,
+        message: []const u8,
+    ) bool {
+        if (!self.hasEstablishedPeer()) return false;
+        const verb = dataVerb(command) orelse return false;
+        var pbuf: [320]u8 = undefined;
+        const prefix = clientPrefix(conn, &pbuf) catch return false;
+        const hlc = self.nextMeshHlc();
+        _ = self.relay_seen.observe(self.config.node_id, hlc);
+        return self.relayToPeers(.{
+            .verb = verb,
+            .target = nick,
+            .source_nick = conn.session.displayName(),
+            .source_prefix = prefix,
+            .account = conn.session.account() orelse "",
+            .text = message,
+            .data_tag = data_tag,
+            .origin_node = self.config.node_id,
+            .hlc = hlc,
+        }, .{ .nick = nick }) > 0;
     }
 
     /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
@@ -12590,7 +12740,13 @@ pub const LinuxServer = struct {
         };
         for (args.recipients) |nick| {
             const rwid = self.world.findNick(nick) orelse {
-                try queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick");
+                // Not a local nick: try the mesh. The recipient must be a member
+                // of THIS shared channel on a remote node (WHISPER's invariant).
+                // We scope the relay to the owning peer (never flood the mesh);
+                // a genuinely-unknown nick falls back to ERR_NOSUCHNICK.
+                if (!self.relayWhisperRemote(conn, args.channel, nick, args.text)) {
+                    try queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick");
+                }
                 continue;
             };
             if (!self.world.isMember(args.channel, rwid)) {
@@ -12604,6 +12760,68 @@ pub const LinuxServer = struct {
             // A single failed recipient (gone mid-dispatch) must not abort the rest.
             self.deliver(clientIdFromWorld(rwid), out) catch continue;
         }
+    }
+
+    /// True if `nick` is a remote member of `channel` per any peer's converged
+    /// route roster — the cross-shard form of `world.isMember` used to satisfy
+    /// WHISPER's "recipient shares the channel" invariant for remote recipients.
+    fn remoteMemberOfChannel(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |link| {
+                    if (link.established() and linkChannelHasMember(link, channel, nick)) return true;
+                } else if (slot.value.s2s) |link| {
+                    if (link.established() and linkChannelHasMember(link, channel, nick)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Per-link roster probe: does `link`'s converged roster list `nick` as a
+    /// member of `channel`? (ASCII case-insensitive, matching nick comparison.)
+    fn linkChannelHasMember(link: anytype, channel: []const u8, nick: []const u8) bool {
+        for (link.channelMembers(channel)) |m| {
+            if (std.ascii.eqlIgnoreCase(m.nick, nick)) return true;
+        }
+        return false;
+    }
+
+    /// Relay a WHISPER to a remote recipient that shares `channel`. Returns true
+    /// when the recipient is a known remote co-member AND at least one peer link
+    /// (route_table-narrowed to the owning node) accepted the relay; false
+    /// otherwise so the caller can emit ERR_NOSUCHNICK. Loop-guarded.
+    fn relayWhisperRemote(
+        self: *LinuxServer,
+        conn: *ConnState,
+        channel: []const u8,
+        nick: []const u8,
+        text: []const u8,
+    ) bool {
+        if (!self.hasEstablishedPeer()) return false;
+        // Enforce the channel-membership invariant against the remote roster
+        // before relaying so an off-channel nick yields ERR_NOSUCHNICK, not a leak.
+        if (!self.remoteMemberOfChannel(channel, nick)) return false;
+        var pbuf: [320]u8 = undefined;
+        const prefix = clientPrefix(conn, &pbuf) catch return false;
+        const hlc = self.nextMeshHlc();
+        _ = self.relay_seen.observe(self.config.node_id, hlc);
+        // Scope to peers that have members of the SHARED channel. WHISPER's
+        // recipient is known only via channel membership (the per-nick route
+        // map tracks server names, not arbitrary user nicks), so `.channel`
+        // narrowing is both correct and never floods the wider mesh.
+        return self.relayToPeers(.{
+            .verb = .whisper,
+            .target = channel,
+            .source_nick = conn.session.displayName(),
+            .source_prefix = prefix,
+            .account = conn.session.account() orelse "",
+            .text = text,
+            .recipient = nick,
+            .origin_node = self.config.node_id,
+            .hlc = hlc,
+        }, .{ .channel = channel }) > 0;
     }
 
     /// CREATE <channel> [modes] [clone-source] — IRCX channel creation
@@ -26525,6 +26743,136 @@ test "threaded server: inbound relay re-enforces local +n / +t against a remote 
         if (std.mem.indexOf(u8, bmem.written(), "TOPIC #c :legit topic") != null) topic_ok = true;
     }
     try std.testing.expect(topic_ok);
+}
+
+test "threaded server: WHISPER and DATA relay to a remote-shard channel co-member" {
+    const alloc = std.testing.allocator;
+    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    var spec1_buf: [32]u8 = undefined;
+    var spec2_buf: [32]u8 = undefined;
+    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
+    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const node1_peers = [_][]const u8{node2_spec};
+    const node2_peers = [_][]const u8{node1_spec};
+
+    var node1 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .node_id = 1,
+        .server_name = "node1.test",
+        .mesh_connect = &node1_peers,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node1.deinit();
+    var node2 = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[1],
+        .node_id = 2,
+        .server_name = "node2.test",
+        .mesh_connect = &node2_peers,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer node2.deinit();
+
+    const port1 = node1.boundPort() catch return error.SkipZigTest;
+    const port2 = node2.boundPort() catch return error.SkipZigTest;
+
+    var run1 = std.atomic.Value(bool).init(true);
+    var run2 = std.atomic.Value(bool).init(true);
+    var thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node1, &run1 });
+    var thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ &node2, &run2 });
+    defer {
+        node1.requestStop(&run1);
+        node2.requestStop(&run2);
+        thr1.join();
+        thr2.join();
+    }
+
+    // Alice on node 1 (IRCX-enabled, so she may WHISPER/DATA) joins #x.
+    const fd_a = connectLoopback(port1) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var alice = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK Alice\r\nUSER al 0 * :Alice\r\n");
+    try recvUntil(&alice, " 001 Alice ", 400);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&alice, " 800 Alice 1 0 ", 400);
+    try writeAllFd(fd_a, "JOIN #x\r\n");
+    try recvUntil(&alice, " 366 Alice #x ", 400);
+
+    // Bob on node 2 joins #x; the mesh must converge both rosters before we send.
+    const fd_b = connectLoopback(port2) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var bob = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_b, "NICK Bob\r\nUSER bo 0 * :Bob\r\n");
+    try recvUntil(&bob, " 001 Bob ", 400);
+    try writeAllFd(fd_b, "JOIN #x\r\n");
+    try recvUntil(&bob, " 366 Bob #x ", 400);
+
+    try expectMeshPeerVisible(&alice, "node2.test", 200);
+    try expectMeshPeerVisible(&bob, "node1.test", 200);
+
+    // Wait until node 1 sees Bob's remote membership of #x land in the roster
+    // (a remote JOIN is surfaced to local members of #x).
+    var saw_bob = false;
+    var jp: usize = 0;
+    while (jp < 80 and !saw_bob) : (jp += 1) {
+        alice.readAvailable() catch {};
+        if (std.mem.indexOf(u8, alice.written(), "Bob") != null and
+            std.mem.indexOf(u8, alice.written(), "JOIN") != null) saw_bob = true;
+        if (!saw_bob) testSleepMs(25);
+    }
+
+    // --- Cross-shard WHISPER: Alice (node 1) whispers Bob (node 2) on #x. The
+    // old bug returned ERR_NOSUCHNICK because Bob is not a LOCAL nick; the relay
+    // must now reach Bob. Fire several times to defeat any residual convergence
+    // lag, then assert Bob received the WHISPER and Alice got NO 401. ---
+    bob.reset();
+    alice.reset();
+    var whisper_ok = false;
+    var wp: usize = 0;
+    while (wp < 80 and !whisper_ok) : (wp += 1) {
+        try writeAllFd(fd_a, "WHISPER #x Bob :psst over the mesh\r\n");
+        recvUntil(&bob, ":Alice!al@", 120) catch {};
+        if (std.mem.indexOf(u8, bob.written(), "WHISPER #x Bob :psst over the mesh") != null) whisper_ok = true;
+    }
+    try std.testing.expect(whisper_ok);
+    try alice.readAvailable();
+    // No ERR_NOSUCHNICK (401) for the relayed WHISPER.
+    try std.testing.expect(std.mem.indexOf(u8, alice.written(), " 401 ") == null);
+
+    // --- Negative: WHISPER to a nick that is NOT a member of #x anywhere must
+    // still yield 401 (the relay fails closed, never floods peers). ---
+    alice.reset();
+    var got_401 = false;
+    var np: usize = 0;
+    while (np < 40 and !got_401) : (np += 1) {
+        try writeAllFd(fd_a, "WHISPER #x Ghost :anyone there\r\n");
+        recvUntil(&alice, " 401 ", 120) catch {};
+        if (std.mem.indexOf(u8, alice.written(), " 401 ") != null) got_401 = true;
+    }
+    try std.testing.expect(got_401);
+
+    // --- Cross-shard DATA: Alice sends a channel-targeted DATA to #x; Bob (the
+    // remote co-member) must receive the typed line. ---
+    bob.reset();
+    var data_ok = false;
+    var dp: usize = 0;
+    while (dp < 80 and !data_ok) : (dp += 1) {
+        try writeAllFd(fd_a, "DATA #x Mood :comic-frame-payload\r\n");
+        recvUntil(&bob, "DATA #x Mood :comic-frame-payload", 120) catch {};
+        if (std.mem.indexOf(u8, bob.written(), "DATA #x Mood :comic-frame-payload") != null) data_ok = true;
+    }
+    try std.testing.expect(data_ok);
 }
 
 test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
