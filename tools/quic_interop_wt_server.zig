@@ -12,11 +12,25 @@
 //! this server mints exactly that cert (Ed25519 — the default interop cert —
 //! would be rejected by Chrome's serverCertificateHashes path).
 //!
-//! Echo bridge: the listener bridges the client's first WT bidi stream to a TCP
-//! target. We spawn a tiny loopback TCP echo server in-process and point the
-//! bridge at it, so bytes the browser writes on the WT bidi stream round-trip
-//! back byte-exact. WT datagrams are echoed by the listener's `echo_wt_datagrams`
-//! interop mode (received WT datagram -> re-queued back to the peer).
+//! Bridge target: the listener bridges the client's first WT bidi stream to a
+//! TCP target on `127.0.0.1:<port>`, proxying raw bytes both ways. Two modes:
+//!
+//!   * DEFAULT (no `OROCHI_WT_BRIDGE_PORT`): spawn a tiny in-process loopback TCP
+//!     echo server and point the bridge at it, so bytes the browser writes on the
+//!     WT bidi stream round-trip back byte-exact. This is the echo-interop lane
+//!     (`tools/quic_interop_browser.{mjs,sh}`).
+//!   * `OROCHI_WT_BRIDGE_PORT=<P>` (env): point the bridge at an already-running
+//!     TCP server on `127.0.0.1:<P>` instead of the in-process echo. The IRC
+//!     interop lane (`tools/quic_interop_irc_browser.{mjs,sh}`) starts a REAL
+//!     orochi IRC daemon on a plaintext loopback port and passes that port here,
+//!     so the browser registers as a genuine IRC client. (An env var, not an
+//!     argv flag: Zig 0.16 has no `std.os.argv`/arg iterator on the no-libc Linux
+//!     target this harness builds for.)
+//!
+//! WT datagrams are echoed by the listener's `echo_wt_datagrams` interop mode
+//! (received WT datagram -> re-queued back to the peer). In `OROCHI_WT_BRIDGE_PORT`
+//! (IRC) mode datagram echo is OFF — IRC rides the reliable bidi stream, and the
+//! IRC harness never exercises the datagram leg.
 //!
 //! Output contract (read by `tools/quic_interop_browser.mjs`):
 //!   * `PORT=<udp>\n`      — the bound UDP port (bind is 127.0.0.1 only).
@@ -74,19 +88,23 @@ pub fn main() !void {
     var hash: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(cert, &hash, .{});
 
-    // --- 2. Spawn a tiny loopback TCP echo server for the WT bidi bridge. ----
-    // The listener's bridge dials 127.0.0.1:<echo_port>; the echo server reflects
-    // every byte, so the WT bidi stream round-trips through the real bridge path.
-    const echo_port = try startTcpEchoServer(allocator);
+    // --- 2. Decide the WT bidi bridge target. --------------------------------
+    // `--bridge-port <P>` / `OROCHI_WT_BRIDGE_PORT` points the bridge at an
+    // already-running TCP server on 127.0.0.1:<P> (the IRC daemon). Absent it, we
+    // spawn the in-process echo server (default echo-interop lane).
+    const bridge_port_opt = try bridgePortArg();
+    const bridge_port = bridge_port_opt orelse try startTcpEchoServer(allocator);
 
     // --- 3. Stand up the real WebTransport listener. -------------------------
     var listener = WebTransportListener.init(allocator, .{
         .cert_chain = &cert_chain,
         .signing_key = .{ .ecdsa_p256 = kp },
-    }, echo_port);
+    }, bridge_port);
     defer listener.deinit();
     // Interop datagram-echo: received WT datagrams are reflected to the peer.
-    listener.echo_wt_datagrams = true;
+    // Only meaningful for the in-process echo lane; the IRC bridge carries stream
+    // bytes, not datagrams, so leave it off when bridging to a real target.
+    listener.echo_wt_datagrams = (bridge_port_opt == null);
 
     // Bind 127.0.0.1 only (the browser connects to https://127.0.0.1:<port>).
     const loopback_be: u32 = std.mem.nativeToBig(u32, 0x7f00_0001);
@@ -234,6 +252,53 @@ fn wallClockSeconds() i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
     return @intCast(ts.sec);
+}
+
+/// Resolve the optional bridge target port from the `OROCHI_WT_BRIDGE_PORT`
+/// environment variable; null means "use the in-process echo". The port must
+/// parse as a non-zero u16. Zig 0.16 dropped `std.os.environ`/`getEnvVarOwned`
+/// on a no-libc Linux target (this harness builds without libc), so we read the
+/// raw `/proc/self/environ` blob (NUL-separated `KEY=VALUE` records) exactly as
+/// `webtransport_listener.zig` does — no allocation, bounded buffer.
+fn bridgePortArg() !?u16 {
+    var buf: [16384]u8 = undefined;
+    const env = readSelfEnviron(&buf) orelse return null;
+    const key = "OROCHI_WT_BRIDGE_PORT=";
+    var it = std.mem.splitScalar(u8, env, 0);
+    while (it.next()) |record| {
+        if (std.mem.startsWith(u8, record, key)) {
+            const val = record[key.len..];
+            if (val.len == 0) return null;
+            return try parsePort(val);
+        }
+    }
+    return null;
+}
+
+/// Read `/proc/self/environ` into `buf` via raw syscalls; returns the populated
+/// slice (NUL-separated records) or null on any read failure.
+fn readSelfEnviron(buf: []u8) ?[]const u8 {
+    const rc = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
+    const signed_fd: isize = @bitCast(rc);
+    if (signed_fd < 0) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const sn: isize = @bitCast(n);
+        if (sn <= 0) break;
+        total += n;
+    }
+    return buf[0..total];
+}
+
+fn parsePort(s: []const u8) !u16 {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    const port = std.fmt.parseInt(u16, trimmed, 10) catch return error.InvalidBridgePort;
+    if (port == 0) return error.InvalidBridgePort;
+    return port;
 }
 
 fn osEntropy(buf: []u8) !void {
