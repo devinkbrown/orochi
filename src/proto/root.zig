@@ -215,6 +215,7 @@ pub const quic_frame = @import("quic_frame.zig");
 pub const quic_handshake = @import("quic_handshake.zig");
 pub const quic_packet = @import("quic_packet.zig");
 pub const quic_protect = @import("quic_protect.zig");
+pub const quic_recovery = @import("quic_recovery.zig");
 pub const quic_tls = @import("quic_tls.zig");
 pub const quic_transport_params = @import("quic_transport_params.zig");
 pub const quorum = @import("quorum.zig");
@@ -548,6 +549,7 @@ test {
     _ = quic_handshake;
     _ = quic_packet;
     _ = quic_protect;
+    _ = quic_recovery;
     _ = quic_tls;
     _ = quic_transport_params;
     _ = quorum;
