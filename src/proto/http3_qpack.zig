@@ -286,9 +286,15 @@ pub fn encodeFieldSection(allocator: Allocator, headers: []const Header) EncodeE
     for (headers) |h| {
         const exact = staticLookupExact(h.name, h.value);
         if (exact != 0) {
-            // Indexed Field Line, T=1 (static), 6-bit index
-            // Format: 1 T 6*index  → 0b11xxxxxx  (T=1 means 0xC0 | idx)
-            const n = encodeInt(&tmp, 6, 0xC0, exact);
+            // Indexed Field Line, T=1 (static), 6-bit index.
+            // Format: 1 T 6*index  → 0b11xxxxxx  (T=1 means 0xC0 | idx).
+            // The QPACK static table is 0-indexed ON THE WIRE (RFC 9204 Appendix
+            // A: `:authority` is index 0), whereas our `STATIC_TABLE` reserves
+            // array slot 0 as a sentinel (so the lookups are 1-based). Convert to
+            // the 0-based wire index by subtracting one. (This off-by-one is
+            // exactly what breaks interop with real HTTP/3 clients — curl/ngtcp2
+            // emit and expect 0-based indices.)
+            const n = encodeInt(&tmp, 6, 0xC0, exact - 1);
             try buf.appendSlice(allocator, tmp[0..n]);
             continue;
         }
@@ -296,8 +302,9 @@ pub fn encodeFieldSection(allocator: Allocator, headers: []const Header) EncodeE
         const name_idx = staticLookupName(h.name);
         if (name_idx != 0) {
             // Literal Field Line With Name Reference (static), N=0
-            // Format: 0 1 0 0 T 4*index  → 0b0100xxxx  (T=1: 0x50 | idx)
-            const n = encodeInt(&tmp, 4, 0x50, name_idx);
+            // Format: 0 1 0 0 T 4*index  → 0b0100xxxx  (T=1: 0x50 | idx).
+            // 0-based wire index (see the indexed-field note above).
+            const n = encodeInt(&tmp, 4, 0x50, name_idx - 1);
             try buf.appendSlice(allocator, tmp[0..n]);
             // value string
             const vs = try encodeString(tmp[n..], h.value);
@@ -332,19 +339,39 @@ pub const DecodeError = error{
     IntegerOverflow,
 };
 
-/// Decode a QPACK-encoded field section.  Returns an owned slice of Headers.
-/// All name/value slices point into `data` — no extra allocation for strings.
-/// Caller must free the returned slice with `allocator.free(result)`.
-pub fn decodeFieldSection(allocator: Allocator, data: []const u8) DecodeError![]Header {
+/// A decoded QPACK field section: the header list plus the owned backing buffer
+/// that Huffman-decoded strings point into. Non-Huffman strings still borrow the
+/// caller's input `data`; Huffman-decoded ones live in `backing`. Free both with
+/// `deinit`.
+pub const FieldSection = struct {
+    headers: []Header,
+    /// The USED prefix of the Huffman backing store (empty when the block had no
+    /// Huffman literals). Header name/value slices may point into it.
+    backing: []const u8,
+    /// The FULL owned backing allocation (for `free`). `backing` is a prefix of
+    /// this; we must free the whole allocation, not the used sub-slice.
+    backing_alloc: []u8,
+
+    pub fn deinit(self: *FieldSection, allocator: Allocator) void {
+        allocator.free(self.headers);
+        if (self.backing_alloc.len != 0) allocator.free(self.backing_alloc);
+        self.* = undefined;
+    }
+};
+
+/// Decode a QPACK-encoded field section into an owned `FieldSection`. Supports
+/// the static table (0-based wire indices, RFC 9204 Appendix A) and string
+/// literals with or without Huffman coding (RFC 7541 §5.2 + Appendix B — the
+/// Huffman table is shared with HPACK and reused from `http2_hpack`). Free the
+/// result with `FieldSection.deinit`.
+pub fn decodeFieldSectionAlloc(allocator: Allocator, data: []const u8) DecodeError!FieldSection {
     if (data.len < 2) return DecodeError.Truncated;
 
     // Skip section prefix (RIC + Base); we only handle RIC=0, Base=0.
-    // RIC is an 8-bit prefix integer.
     const ric_r = decodeInt(data[0..], 8) catch return DecodeError.Truncated;
     _ = ric_r.value; // we don't validate, just skip
     if (ric_r.consumed > data.len) return DecodeError.Truncated;
 
-    // Base is a 7-bit prefix integer (S bit is bit 7 of that byte).
     const base_data = data[ric_r.consumed..];
     if (base_data.len == 0) return DecodeError.Truncated;
     const base_r = decodeInt(base_data, 7) catch return DecodeError.Truncated;
@@ -353,6 +380,14 @@ pub fn decodeFieldSection(allocator: Allocator, data: []const u8) DecodeError![]
 
     var headers = ArrayList(Header).empty;
     errdefer headers.deinit(allocator);
+
+    // One backing buffer for every Huffman-decoded string. A Huffman code is at
+    // least 5 bits per symbol, so the decoded length is at most 8/5 (= 1.6×) the
+    // encoded length; bound the whole block at 2× its size (rounded up) and never
+    // overrun it. Allocated lazily on the first Huffman literal.
+    var backing: []u8 = &.{};
+    errdefer if (backing.len != 0) allocator.free(backing);
+    var backing_used: usize = 0;
 
     var pos: usize = payload_start;
     while (pos < data.len) {
@@ -364,8 +399,10 @@ pub fn decodeFieldSection(allocator: Allocator, data: []const u8) DecodeError![]
             if (b & 0x40 == 0) return DecodeError.InvalidRepresentation; // dynamic
             const r = decodeInt(data[pos..], 6) catch return DecodeError.Truncated;
             pos += r.consumed;
-            const idx = r.value;
-            if (idx == 0 or idx > STATIC_TABLE_SIZE) return DecodeError.StaticIndexOutOfRange;
+            // 0-based wire index → 1-based array slot (see the encoder note). A
+            // valid index is 0..STATIC_TABLE_SIZE-1 on the wire.
+            if (r.value >= STATIC_TABLE_SIZE) return DecodeError.StaticIndexOutOfRange;
+            const idx = r.value + 1;
             try headers.append(allocator, .{
                 .name = STATIC_TABLE[idx].name,
                 .value = STATIC_TABLE[idx].value,
@@ -376,23 +413,27 @@ pub fn decodeFieldSection(allocator: Allocator, data: []const u8) DecodeError![]
             if (b & 0x10 == 0) return DecodeError.InvalidRepresentation; // dynamic name ref
             const r = decodeInt(data[pos..], 4) catch return DecodeError.Truncated;
             pos += r.consumed;
-            const idx = r.value;
-            if (idx == 0 or idx > STATIC_TABLE_SIZE) return DecodeError.StaticIndexOutOfRange;
+            // 0-based wire index → 1-based array slot (see the indexed-field note).
+            if (r.value >= STATIC_TABLE_SIZE) return DecodeError.StaticIndexOutOfRange;
+            const idx = r.value + 1;
             const name = STATIC_TABLE[idx].name;
-            const vs = decodeString(data[pos..]) catch return DecodeError.Truncated;
+            const vs = try decodeStringInto(allocator, data[pos..], &backing, &backing_used, data.len);
             pos += vs.consumed;
             try headers.append(allocator, .{ .name = name, .value = vs.str });
         } else if (b & 0x20 != 0) {
             // Literal With Literal Name (bit pattern 001xxxxx)
-            // Bits: 0 0 1 N H 3*name-length
-            if (b & 0x08 != 0) return DecodeError.HuffmanNotSupported; // H bit in name
+            // Bits: 0 0 1 N H 3*name-length (H = Huffman bit for the NAME).
+            const name_huffman = (b & 0x08) != 0;
             const nr = decodeInt(data[pos..], 3) catch return DecodeError.Truncated;
             pos += nr.consumed;
             const nlen: usize = @intCast(nr.value);
             if (pos + nlen > data.len) return DecodeError.Truncated;
-            const name = data[pos .. pos + nlen];
+            const name = if (name_huffman)
+                try huffInto(allocator, data[pos .. pos + nlen], &backing, &backing_used, data.len)
+            else
+                data[pos .. pos + nlen];
             pos += nlen;
-            const vs = decodeString(data[pos..]) catch return DecodeError.Truncated;
+            const vs = try decodeStringInto(allocator, data[pos..], &backing, &backing_used, data.len);
             pos += vs.consumed;
             try headers.append(allocator, .{ .name = name, .value = vs.str });
         } else {
@@ -400,7 +441,78 @@ pub fn decodeFieldSection(allocator: Allocator, data: []const u8) DecodeError![]
         }
     }
 
-    return headers.toOwnedSlice(allocator);
+    const owned = try headers.toOwnedSlice(allocator);
+    return .{ .headers = owned, .backing = backing[0..backing_used], .backing_alloc = backing };
+}
+
+/// Legacy convenience wrapper returning only the `[]Header` slice (freed with a
+/// plain `allocator.free`). Valid ONLY when the block contains no Huffman-coded
+/// strings — every returned slice then borrows the input `data`, exactly as the
+/// original zero-allocation contract. A block that needs a Huffman backing
+/// buffer returns `error.HuffmanNotSupported` here; such callers must use
+/// `decodeFieldSectionAlloc` + `FieldSection.deinit`. Retained for the codec's
+/// own round-trip tests (which never emit Huffman).
+pub fn decodeFieldSection(allocator: Allocator, data: []const u8) DecodeError![]Header {
+    var fs = try decodeFieldSectionAlloc(allocator, data);
+    if (fs.backing.len != 0) {
+        fs.deinit(allocator);
+        return DecodeError.HuffmanNotSupported;
+    }
+    return fs.headers;
+}
+
+// ---------------------------------------------------------------------------
+// Huffman-aware string decode helpers
+// ---------------------------------------------------------------------------
+
+const http2_hpack = @import("http2_hpack.zig");
+
+/// Decode a QPACK/HPACK string literal (RFC 7541 §5.2): a 7-bit-prefix length
+/// with a leading Huffman flag, then `len` bytes. A non-Huffman string borrows
+/// `data`; a Huffman string is decoded into `backing` (allocated lazily, bounded
+/// by `block_len`). Returns the resolved string and bytes consumed off `data`.
+fn decodeStringInto(
+    allocator: Allocator,
+    data: []const u8,
+    backing: *[]u8,
+    used: *usize,
+    block_len: usize,
+) DecodeError!struct { str: []const u8, consumed: usize } {
+    if (data.len == 0) return DecodeError.Truncated;
+    const huffman = (data[0] & 0x80) != 0;
+    const r = decodeInt(data, 7) catch return DecodeError.Truncated;
+    const start = r.consumed;
+    const slen: usize = @intCast(r.value);
+    const end = start + slen;
+    if (end > data.len) return DecodeError.Truncated;
+    const raw = data[start..end];
+    if (!huffman) return .{ .str = raw, .consumed = end };
+    const decoded = try huffInto(allocator, raw, backing, used, block_len);
+    return .{ .str = decoded, .consumed = end };
+}
+
+/// Huffman-decode `raw` (RFC 7541 Appendix B; shared HPACK/QPACK table) into the
+/// shared `backing` buffer, returning the decoded slice. The backing buffer is
+/// allocated on first use (sized to bound total Huffman expansion at 2× the
+/// whole field-section length) and never overrun.
+fn huffInto(
+    allocator: Allocator,
+    raw: []const u8,
+    backing: *[]u8,
+    used: *usize,
+    block_len: usize,
+) DecodeError![]const u8 {
+    if (backing.*.len == 0) {
+        // 2× the block length is a safe upper bound on total decoded Huffman
+        // bytes (min 5-bit code ⇒ ≤ 8/5 expansion), plus slack.
+        const cap = (block_len * 2) + 16;
+        backing.* = try allocator.alloc(u8, cap);
+    }
+    const dst = backing.*[used.*..];
+    const n = http2_hpack.huffmanDecode(dst, raw) catch return DecodeError.HuffmanNotSupported;
+    const out = backing.*[used.* .. used.* + n];
+    used.* += n;
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -646,11 +758,24 @@ test "decode: invalid dynamic table reference rejected" {
 
 test "decode: static index out of range" {
     const alloc = testing.allocator;
-    // Indexed static with index 0 (sentinel) → out of range
-    // 0xC0 = 1 1 xxxxxx, T=1, 6-bit index = 0
-    const data = [_]u8{ 0x00, 0x00, 0xC0 };
+    // Indexed static field line (1Txxxxxx, T=1) with a 0-based wire index of 200,
+    // far past the last valid index (99 entries → valid wire indices 0..98).
+    // 6-bit prefix: 0xC0|63 = 0xFF, then continuation 200-63 = 137 = 0x89,0x01.
+    const data = [_]u8{ 0x00, 0x00, 0xFF, 0x89, 0x01 };
     const result = decodeFieldSection(alloc, &data);
     try testing.expectError(DecodeError.StaticIndexOutOfRange, result);
+}
+
+test "decode: wire index 0 is :authority (0-based static table)" {
+    const alloc = testing.allocator;
+    // 0xC0 = Indexed Field Line, T=1, 6-bit wire index 0 → static entry 0 =
+    // ":authority" (RFC 9204 Appendix A). This is the interop-critical 0-based
+    // mapping a real HTTP/3 client (curl/ngtcp2) uses.
+    const data = [_]u8{ 0x00, 0x00, 0xC0 };
+    const decoded = try decodeFieldSection(alloc, &data);
+    defer alloc.free(decoded);
+    try testing.expectEqual(@as(usize, 1), decoded.len);
+    try testing.expectEqualStrings(":authority", decoded[0].name);
 }
 
 test "encode/decode: empty header list" {

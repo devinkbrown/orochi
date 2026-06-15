@@ -330,6 +330,7 @@ pub const WebTransportListener = struct {
         }
 
         const conn = self.admitNewInitial(data, from) orelse return;
+        dbg("admitted new QUIC connection from {d}-byte Initial", .{data.len});
         self.feedConnection(conn, data, from);
     }
 
@@ -522,9 +523,10 @@ pub const WebTransportListener = struct {
     /// a validated address change).
     fn feedConnection(self: *WebTransportListener, conn: *Connection, data: []const u8, from: TransportAddress) void {
         const now = nowNs();
-        conn.conn.recvDatagramFrom(data, pathFromAddr(from), now) catch {
+        conn.conn.recvDatagramFrom(data, pathFromAddr(from), now) catch |err| {
             // A malformed/undecryptable datagram is dropped by the lower layer;
             // a hard error means the connection is unusable → tear it down.
+            dbg("recvDatagramFrom error: {s} → teardown", .{@errorName(err)});
             self.teardownConnection(conn);
             return;
         };
@@ -538,7 +540,8 @@ pub const WebTransportListener = struct {
     /// Any step that destroys the connection short-circuits the rest (the `conn`
     /// pointer is freed by `teardownConnection`, so nothing may touch it after).
     fn serviceConnection(self: *WebTransportListener, conn: *Connection, now: u64) void {
-        conn.h3.service() catch {
+        conn.h3.service() catch |err| {
+            dbg("serviceConnection: h3.service error {s} → teardown", .{@errorName(err)});
             self.teardownConnection(conn);
             return;
         };
@@ -549,12 +552,16 @@ pub const WebTransportListener = struct {
         // Drive idle / PTO timers.
         if (conn.conn.onTimeout(now)) |owed| {
             if (owed) self.flush(conn);
-        } else |_| {
+        } else |err| {
             // Idle timeout (or fatal) → close the connection.
+            dbg("serviceConnection: onTimeout error {s} → teardown", .{@errorName(err)});
             self.teardownConnection(conn);
             return;
         }
-        if (conn.conn.isClosing()) self.teardownConnection(conn);
+        if (conn.conn.isClosing()) {
+            dbg("serviceConnection: conn.isClosing() → teardown", .{});
+            self.teardownConnection(conn);
+        }
     }
 
     /// Periodic per-iteration work: advance timers + pump bridges for every live
@@ -582,6 +589,9 @@ pub const WebTransportListener = struct {
                     self.closeBridge(conn);
                 },
                 .connect_rejected => {},
+                // A plain HTTP/3 GET/POST/… was answered directly by the H3
+                // layer (curl/browser probe). It never opens the IRC bridge.
+                .http_responded => {},
             }
         }
         // Discover the client's WT bidi data stream once established.
@@ -708,8 +718,16 @@ pub const WebTransportListener = struct {
             for (out.items) |d| self.allocator.free(d.bytes);
             out.deinit(self.allocator);
         }
-        _ = conn.conn.sendDatagrams(&out) catch return;
+        _ = conn.conn.sendDatagrams(&out) catch |err| {
+            dbg("sendDatagrams error: {s}", .{@errorName(err)});
+            return;
+        };
         const sock = if (self.socket) |*s| s else return;
+        if (out.items.len > 0) {
+            var total: usize = 0;
+            for (out.items) |d| total += d.bytes.len;
+            dbg("flush: sending {d} datagram(s), {d} bytes total", .{ out.items.len, total });
+        }
         for (out.items) |d| {
             const dst = if (d.dest) |p| addrFromPath(p) else conn.peer;
             sock.sendTo(dst, d.bytes);
@@ -727,6 +745,7 @@ pub const WebTransportListener = struct {
 
     fn createConnection(self: *WebTransportListener, init_dcid: []const u8, from: TransportAddress) ?*Connection {
         if (self.liveCount() >= self.max_connections) return null;
+        if (init_dcid.len > quic_packet.max_connection_id_len) return null;
 
         // Mint a unique server SCID (8 bytes: counter || marker).
         var scid: [8]u8 = undefined;
@@ -736,16 +755,33 @@ pub const WebTransportListener = struct {
         const conn = self.allocator.create(Connection) catch return null;
         errdefer self.allocator.destroy(conn);
 
+        // Populate the connection's *stable* connection-id storage FIRST so the
+        // QUIC transport parameters can borrow it (the handshake holds the param
+        // slices by reference and encodes them lazily into EncryptedExtensions,
+        // long after this function returns — a local `scid`/`init_dcid` would be a
+        // dangling pointer by then).
+        conn.scid = undefined;
+        conn.scid_len = @intCast(scid.len);
+        conn.init_dcid = undefined;
+        conn.init_dcid_len = @intCast(init_dcid.len);
+        @memcpy(conn.scid[0..scid.len], &scid);
+        @memcpy(conn.init_dcid[0..init_dcid.len], init_dcid);
+
         const qconn = self.allocator.create(quic_conn.Conn) catch {
             self.allocator.destroy(conn);
             return null;
         };
+        // RFC 9000 §7.3: the server MUST set `original_destination_connection_id`
+        // to the client's first-Initial DCID (and `initial_source_connection_id`
+        // to its own SCID). A real QUIC client (curl/ngtcp2) validates this and
+        // closes with TRANSPORT_PARAMETER_ERROR (0x08) if it is missing/wrong —
+        // both must point at the stable per-connection storage above.
         qconn.* = quic_conn.Conn.initServer(self.allocator, .{
             .cert_chain = self.tls.cert_chain,
             .signing_key = self.tls.signing_key,
             .alpn_protocols = &[_][]const u8{"h3"},
-            .transport_params = serverTransportParams(&scid),
-            .local_cid = &scid,
+            .transport_params = serverTransportParams(conn.scidSlice(), conn.initDcidSlice()),
+            .local_cid = conn.scidSlice(),
         }) catch {
             self.allocator.destroy(qconn);
             self.allocator.destroy(conn);
@@ -760,17 +796,12 @@ pub const WebTransportListener = struct {
         };
         h3.* = http3_conn.Http3Conn.init(self.allocator, qconn);
 
-        conn.* = .{
-            .scid = undefined,
-            .scid_len = @intCast(scid.len),
-            .init_dcid = undefined,
-            .init_dcid_len = @intCast(init_dcid.len),
-            .peer = from,
-            .conn = qconn,
-            .h3 = h3,
-        };
-        @memcpy(conn.scid[0..scid.len], &scid);
-        @memcpy(conn.init_dcid[0..init_dcid.len], init_dcid);
+        conn.peer = from;
+        conn.conn = qconn;
+        conn.h3 = h3;
+        conn.irc_fd = null;
+        conn.wt_stream_id = null;
+        conn.have_wt_stream = false;
 
         // Register the connection slot.
         const idx = self.appendSlot(conn) catch {
@@ -865,14 +896,29 @@ pub const WebTransportListener = struct {
 
 /// Local transport parameters for a server connection. Generous stream/data
 /// windows so a full IRC session streams without artificial flow-control stalls.
-fn serverTransportParams(scid: []const u8) quic_transport_params.TransportParameters {
+///
+/// `scid` is this server's chosen Source Connection ID (→ `initial_source_
+/// connection_id`). `original_dcid` is the Destination Connection ID the client
+/// put in its very first Initial; RFC 9000 §7.3 requires the server to echo it
+/// as `original_destination_connection_id` so the client can authenticate that
+/// the transport parameters came from the endpoint it addressed. Both slices
+/// must outlive the handshake (the encoder borrows them); callers pass the
+/// connection's stable per-connection storage.
+fn serverTransportParams(scid: []const u8, original_dcid: []const u8) quic_transport_params.TransportParameters {
     return .{
+        .original_destination_connection_id = original_dcid,
         .initial_source_connection_id = scid,
         .max_idle_timeout = 30_000,
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 256 * 1024,
         .initial_max_stream_data_bidi_remote = 256 * 1024,
         .initial_max_streams_bidi = 100,
+        // RFC 9000 §18.2: advertise a non-trivial uni-stream window + ack delay
+        // bits + active CID limit so an interop client's H3 control/QPACK uni
+        // streams flow and its CID bookkeeping is satisfied.
+        .initial_max_stream_data_uni = 256 * 1024,
+        .initial_max_streams_uni = 8,
+        .active_connection_id_limit = 2,
     };
 }
 
@@ -1013,6 +1059,52 @@ fn nowNs() u64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Diagnostic tracing for QUIC/HTTP3 interop debugging, gated on the
+/// `OROCHI_QUIC_DEBUG` environment variable (any non-empty value enables it).
+/// Off by default and zero-cost on the hot path beyond the env check; intended
+/// for `tools/quic_interop.sh` runs and field interop triage, never normal
+/// operation.
+var dbg_enabled: ?bool = null;
+fn dbg(comptime fmt: []const u8, args: anytype) void {
+    const on = dbg_enabled orelse blk: {
+        const enabled = envIsSet("OROCHI_QUIC_DEBUG");
+        dbg_enabled = enabled;
+        break :blk enabled;
+    };
+    if (!on) return;
+    std.debug.print("[quic-dbg] " ++ fmt ++ "\n", args);
+}
+
+/// Whether environment variable `name` is present and non-empty. Reads
+/// `/proc/self/environ` (NUL-separated `KEY=VALUE` records) via raw syscalls —
+/// Zig 0.16 dropped `std.posix.getenv`/`std.os.environ` on a no-libc Linux
+/// target, and this layer has no `std.process.Init.environ_map` handle.
+fn envIsSet(name: []const u8) bool {
+    const path = "/proc/self/environ";
+    const O_RDONLY = 0;
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    _ = O_RDONLY;
+    const signed_fd: isize = @bitCast(rc);
+    if (signed_fd < 0) return false;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    var buf: [16384]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = linux.read(fd, buf[total..].ptr, buf.len - total);
+        const sn: isize = @bitCast(n);
+        if (sn <= 0) break;
+        total += n;
+    }
+    var it = std.mem.splitScalar(u8, buf[0..total], 0);
+    while (it.next()) |record| {
+        const eq = std.mem.indexOfScalar(u8, record, '=') orelse continue;
+        if (std.mem.eql(u8, record[0..eq], name)) return record.len > eq + 1;
+    }
+    return false;
 }
 
 fn sleepMs(ms: u32) void {
@@ -1351,9 +1443,9 @@ fn connectAnswered200(alloc: std.mem.Allocator, conn: *quic_conn.Conn, cs: u64) 
     }
     var pos: usize = 0;
     const frame = (try http3_conn.findFrame(buf.items, &pos, http3_conn.FrameType.headers)) orelse return false;
-    const headers = try qpack.decodeFieldSection(alloc, frame.payload);
-    defer alloc.free(headers);
-    for (headers) |h| {
+    var section = try qpack.decodeFieldSectionAlloc(alloc, frame.payload);
+    defer section.deinit(alloc);
+    for (section.headers) |h| {
         if (std.mem.eql(u8, h.name, ":status") and std.mem.eql(u8, h.value, "200")) return true;
     }
     return false;
@@ -1714,4 +1806,98 @@ test "path mapping — TransportAddress round-trips through the QUIC-core PathAd
     const ta6 = try TransportAddress.fromBytes(&[_]u8{ 0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 5060);
     const back6 = addrFromPath(pathFromAddr(ta6));
     try testing.expect(back6.eql(ta6));
+}
+
+// ===========================================================================
+// Real third-party interop: curl --http3 → our QUIC/HTTP3 stack
+// ===========================================================================
+
+/// Whether the system `curl` supports HTTP/3 (so the interop test is meaningful).
+/// Runs `curl --version` and scans for the http3 feature; returns false on any
+/// error (curl missing / unspawnable) so the caller skips rather than fails.
+fn curlHasHttp3(allocator: std.mem.Allocator) bool {
+    const io = std.testing.io;
+    const res = std.process.run(allocator, io, .{
+        .argv = &.{ "curl", "--version" },
+    }) catch return false;
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    // The Features line lists "HTTP3"; the Protocols/banner also contain
+    // "http3"/"HTTP3". A case-insensitive substring scan is robust.
+    return asciiContainsIgnoreCase(res.stdout, "http3");
+}
+
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return needle.len == 0;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+test "interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener" {
+    const allocator = testing.allocator;
+    const io = std.testing.io;
+
+    // Skip on a box whose curl lacks HTTP/3 (CI without an h3 curl still passes).
+    if (!curlHasHttp3(allocator)) return error.SkipZigTest;
+
+    // Stand up the real listener on an ephemeral UDP loopback port with a fresh
+    // self-signed cert (the same stack `main.zig` runs). irc_port = 0: a plain
+    // GET is answered by the H3 layer and never touches the IRC bridge.
+    var keys: TestServerKeys = undefined;
+    try keys.init();
+    var lst = WebTransportListener.init(allocator, .{
+        .cert_chain = &keys.cert_chain,
+        .signing_key = .{ .ed25519 = keys.kp },
+    }, 0);
+    defer lst.deinit();
+    lst.start(loopback_be, 0) catch |err| {
+        // A sandbox that forbids binding a UDP socket cannot run this test.
+        std.debug.print("interop: bind failed ({s}); skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const port = lst.port;
+    try testing.expect(port != 0);
+
+    // Drive curl --http3 against it. Force h3 (no Alt-Svc upgrade dance), accept
+    // the self-signed cert (-k), bound the time so a hang fails fast.
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+    // curl's own --max-time 8 bounds the request; no separate spawn timeout.
+    const res = std.process.run(allocator, io, .{
+        .argv = &.{ "curl", "--http3-only", "-k", "-sS", "--max-time", "8", url },
+    }) catch |err| {
+        std.debug.print("interop: failed to spawn curl ({s})\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    // curl must exit 0 and the body must be the GET / response.
+    switch (res.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("interop: curl exited {d}; stderr: {s}\n", .{ code, res.stderr });
+                return error.CurlFailed;
+            }
+        },
+        else => {
+            std.debug.print("interop: curl terminated abnormally; stderr: {s}\n", .{res.stderr});
+            return error.CurlFailed;
+        },
+    }
+    try testing.expect(asciiContainsIgnoreCase(res.stdout, "orochi quic ok"));
 }

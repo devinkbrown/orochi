@@ -465,6 +465,11 @@ pub const Conn = struct {
     /// Whether a CONNECTION_CLOSE frame still needs to go on the wire (we send
     /// one once, in the highest available level).
     close_pending: bool = false,
+    /// Whether the server still owes a HANDSHAKE_DONE frame (RFC 9000 §19.20 /
+    /// RFC 9001 §4.1.2): the server signals handshake confirmation to the client
+    /// with this frame in a 1-RTT packet. Set when the server becomes established;
+    /// cleared once the frame has been queued. The client never sends one.
+    handshake_done_pending: bool = false,
 
     /// Packets at a level whose keys are not yet installed, buffered for replay
     /// after the next key install (RFC 9000 §5.7 / RFC 9001 §5.7). Bounded.
@@ -756,6 +761,7 @@ pub const Conn = struct {
     fn refreshEstablished(self: *Conn) void {
         if (!self.established and self.app_keys != null and self.handshake.isComplete()) {
             self.established = true;
+            connDbg("CONNECTION ESTABLISHED role={s}", .{@tagName(self.role)});
             // RFC 9001 §4.9.1/§4.9.2: by the time the handshake is complete and
             // 1-RTT keys are in use, the Initial keys are no longer needed for
             // either direction; discard them. (We keep them through the whole
@@ -768,6 +774,12 @@ pub const Conn = struct {
             // space too and switches the PTO to include max_ack_delay (§6.2.1).
             self.recovery.discardSpace(.initial);
             self.confirmHandshakeRecovery();
+            // RFC 9000 §19.20 / RFC 9001 §4.1.2: the SERVER owes a HANDSHAKE_DONE
+            // frame to confirm the handshake to the client (a real client — e.g.
+            // curl/ngtcp2 — withholds application data, including its HTTP/3
+            // request, until the handshake is confirmed). The client never sends
+            // one.
+            if (self.role == .server) self.handshake_done_pending = true;
         }
     }
 
@@ -848,7 +860,23 @@ pub const Conn = struct {
             // the datagram (a coalesced packet's PADDING leaked past Length is
             // impossible, but a peer may pad the datagram tail). Stop.
             if (datagram[pos] == 0x00) break;
-            const consumed = try self.recvOnePacket(datagram[pos..], now);
+            // A single packet that cannot be parsed or decrypted MUST be silently
+            // discarded WITHOUT failing the connection (RFC 9000 §5.2 — "packets
+            // that cannot be processed are discarded"; RFC 9001 §5.2). This is
+            // essential for interop: a real client (curl/ngtcp2) coalesces a
+            // 1-RTT packet behind the Handshake packet that completes our
+            // handshake, and may also send a packet at a level/version we cannot
+            // yet process. We stop scanning the rest of this datagram (we cannot
+            // know where the next coalesced packet begins once one fails to
+            // parse) but keep the connection alive. Truly fatal conditions
+            // (allocation failure) still propagate.
+            const consumed = self.recvOnePacket(datagram[pos..], now) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    connDbg("recvOnePacket dropped at pos={d}/{d}: {s}", .{ pos, datagram.len, @errorName(err) });
+                    break; // drop this packet + the rest of the datagram
+                },
+            };
             if (consumed == 0) break; // defensive: never loop forever
             pos += consumed;
         }
@@ -1151,12 +1179,17 @@ pub const Conn = struct {
     }
 
     fn intakeFrames(self: *Conn, level: EncryptionLevel, pn: u64, payload: []const u8, now: u64) Error!void {
-        var frames = quic_frame.decodeFrames(self.allocator, payload) catch return error.MalformedPacket;
+        var frames = quic_frame.decodeFrames(self.allocator, payload) catch |e| {
+            connDbg("decodeFrames FAILED lvl={s} pn={d} payload_len={d}: {s}", .{ @tagName(level), pn, payload.len, @errorName(e) });
+            return error.MalformedPacket;
+        };
         defer frames.deinit();
 
         self.newly_acked.clearRetainingCapacity();
-        const result = self.engine.intake(level, pn, frames.frames, &self.newly_acked) catch
+        const result = self.engine.intake(level, pn, frames.frames, &self.newly_acked) catch |e| {
+            connDbg("engine.intake FAILED lvl={s} pn={d}: {s}", .{ @tagName(level), pn, @errorName(e) });
             return error.MalformedPacket;
+        };
 
         self.last_recv_ns = now;
 
@@ -1206,6 +1239,7 @@ pub const Conn = struct {
         try self.pumpCryptoToHandshake(level);
 
         if (result.connection_close) |code| {
+            connDbg("CONNECTION_CLOSE received from peer: error_code=0x{x}", .{code});
             self.closing = true;
             self.close_error = code;
             // Do not return an error here — let the caller observe via
@@ -1227,7 +1261,10 @@ pub const Conn = struct {
             const bytes = cs.peek();
             self.handshake.feedCrypto(level, bytes) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return error.HandshakeFailed,
+                else => {
+                    connDbg("feedCrypto lvl={s} FAILED: {s}", .{ @tagName(level), @errorName(e) });
+                    return error.HandshakeFailed;
+                },
             };
             _ = cs.consume(avail);
         }
@@ -1647,6 +1684,18 @@ pub const Conn = struct {
         var ack_eliciting = false;
         var frames = quic_recovery.FrameList{};
         try self.appendAckFrame(&payload, .application);
+
+        // HANDSHAKE_DONE (RFC 9000 §19.20): the server confirms the handshake to
+        // the client. We emit it on every app datagram while it is owed (a
+        // standalone PING-equivalent for loss accounting); it is cleared once the
+        // client acknowledges by sending its own 1-RTT application data (its
+        // request), proving the confirmation propagated. Re-emitting until then is
+        // a cheap, correct retransmit without retaining the frame bytes.
+        if (self.role == .server and self.handshake_done_pending) {
+            try quic_frame.encodeFrame(&payload, self.allocator, .{ .HANDSHAKE_DONE = {} });
+            frames.append(.ping); // ack-eliciting; loss re-arms a fresh send
+            ack_eliciting = true;
+        }
 
         // PATH_RESPONSE echoes (RFC 9000 §8.2.2): reply to every PATH_CHALLENGE we
         // received with a PATH_RESPONSE echoing its bytes, on the path the
@@ -2151,6 +2200,13 @@ pub const Conn = struct {
         );
         try self.requeueLostFrames(outcome.lost_frames);
 
+        // Once the client acknowledges any 1-RTT packet we sent, our HANDSHAKE_DONE
+        // (which rode the app datagrams while pending) has demonstrably been
+        // delivered, so stop re-emitting it (RFC 9000 §13.3 — a frame is retired
+        // when acknowledged). On loss before this ack, the per-datagram re-emit
+        // above keeps confirming.
+        if (level == .application) self.handshake_done_pending = false;
+
         // Key-update confirmation (RFC 9001 §6.5): once the peer acks a packet we
         // sent in the new phase, our self-initiated update is confirmed and we may
         // initiate the next one.
@@ -2331,6 +2387,48 @@ const PnDecodeCtx = struct {
 /// requires receivers to accept it; the header's Length and Token fields are
 /// parsed with this tolerant decoder (our own sender emits a fixed 2-byte
 /// Length varint, which is non-minimal for small packets).
+/// QUIC handshake/interop tracing, gated on `OROCHI_QUIC_DEBUG` (any non-empty
+/// value). Off by default; only read by interop triage (`tools/quic_interop.sh`)
+/// and never on the normal data path beyond the cached env check.
+var conn_dbg_enabled: ?bool = null;
+fn connDbgEnabled() bool {
+    return conn_dbg_enabled orelse blk: {
+        const on = envFlagSet("OROCHI_QUIC_DEBUG");
+        conn_dbg_enabled = on;
+        break :blk on;
+    };
+}
+fn connDbg(comptime fmt: []const u8, args: anytype) void {
+    if (!connDbgEnabled()) return;
+    std.debug.print("[quic-conn] " ++ fmt ++ "\n", args);
+}
+/// Whether env var `name` is present and non-empty (reads /proc/self/environ;
+/// no-libc Linux has neither `std.posix.getenv` nor `std.os.environ`). On
+/// non-Linux targets tracing is simply unavailable (returns false) — it is a
+/// Linux-only interop-debug aid.
+fn envFlagSet(name: []const u8) bool {
+    if (@import("builtin").os.tag != .linux) return false;
+    const rc = std.os.linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
+    const sfd: isize = @bitCast(rc);
+    if (sfd < 0) return false;
+    const fd: std.os.linux.fd_t = @intCast(rc);
+    defer _ = std.os.linux.close(fd);
+    var buf: [16384]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.os.linux.read(fd, buf[total..].ptr, buf.len - total);
+        const sn: isize = @bitCast(n);
+        if (sn <= 0) break;
+        total += n;
+    }
+    var it = std.mem.splitScalar(u8, buf[0..total], 0);
+    while (it.next()) |record| {
+        const eq = std.mem.indexOfScalar(u8, record, '=') orelse continue;
+        if (std.mem.eql(u8, record[0..eq], name)) return record.len > eq + 1;
+    }
+    return false;
+}
+
 fn decodeVarIntAt(input: []const u8, off: usize) quic_frame.WireError!quic_frame.DecodedVarInt {
     if (off >= input.len) return quic_frame.WireError.BufferTooShort;
     const buf = input[off..];
@@ -3154,19 +3252,25 @@ test "quic conn buffers a packet whose keys are not yet installed without faulti
     try testing.expect(lb.client.isEstablished());
 }
 
-test "quic conn rejects malformed datagrams without panicking" {
+test "quic conn drops malformed datagrams without panicking or faulting" {
     const alloc = testing.allocator;
     const lb = try Loopback.init(alloc);
     defer lb.deinit(alloc);
 
+    // A packet that cannot be parsed or decrypted MUST be silently discarded
+    // without failing the connection (RFC 9000 §5.2 / RFC 9001 §5.2). This is
+    // essential for interop: a real client coalesces a 1-RTT packet behind a
+    // handshake packet and may send packets at levels/versions we cannot yet
+    // process — none of these may tear the connection down. Each of the
+    // following returns cleanly (the bad packet is dropped, not propagated) and
+    // never panics.
+
     // Truncated long header.
-    try testing.expectError(error.MalformedPacket, lb.server.recvDatagram(&.{ 0xc0, 0x00 }));
-    // Long header, unsupported version.
-    try testing.expectError(error.UnsupportedVersion, lb.server.recvDatagram(&.{
-        0xc3, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00,
-    }));
+    try lb.server.recvDatagram(&.{ 0xc0, 0x00 });
+    // Long header, unsupported version (dropped, not a connection error).
+    try lb.server.recvDatagram(&.{ 0xc3, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00 });
     // Long header claiming a Length that runs past the datagram.
-    try testing.expectError(error.MalformedPacket, lb.server.recvDatagram(&.{
+    try lb.server.recvDatagram(&.{
         0xc0, 0x00, 0x00, 0x00, 0x01, // version 1
         0x00, // dcid len 0
         0x00, // scid len 0
@@ -3174,9 +3278,16 @@ test "quic conn rejects malformed datagrams without panicking" {
         0x44, 0x00, // Length = 0x400 (1024) — far past the buffer
         0x00, 0x01,
         0x02, 0x03,
-    }));
+    });
     // Empty datagram is a no-op (no packets), not an error.
     try lb.server.recvDatagram(&.{});
+
+    // A separate, untouched connection still completes a full handshake — proof
+    // the drop path neither panics nor corrupts global state.
+    const lb2 = try Loopback.init(alloc);
+    defer lb2.deinit(alloc);
+    try driveHandshake(alloc, lb2);
+    try testing.expect(lb2.server.isEstablished());
 }
 
 test "quic conn graceful close emits CONNECTION_CLOSE the peer observes" {

@@ -71,6 +71,26 @@ pub const Frame = union(enum) {
     PATH_CHALLENGE: PathChallengeData,
     /// RFC 9000 §19.18 — path-validation response (echoes the challenge).
     PATH_RESPONSE: PathChallengeData,
+    /// HANDSHAKE_DONE (RFC 9000 §19.20, type 0x1e): the server signals the
+    /// handshake is confirmed. Ack-eliciting, no payload.
+    HANDSHAKE_DONE: void,
+    /// Any other well-formed transport frame we parse-and-skip rather than act
+    /// on (RFC 9000 §12.4 requires every frame type to be processed, but a
+    /// minimal endpoint MAY treat flow-control / connection-id management frames
+    /// as no-ops as long as it consumes their bytes correctly so packet framing
+    /// and coalescing stay intact). `frame_type` is the leading type byte; it is
+    /// ack-eliciting unless it is purely informational. We carry the type so the
+    /// engine can decide ack-elicitation. The fields are fully parsed off the
+    /// wire (bounds-checked) but discarded.
+    OTHER: OtherFrame,
+};
+
+/// A parsed-but-unhandled transport frame (see `Frame.OTHER`). RFC 9000 §13.2.1:
+/// all frames except ACK, PADDING, and CONNECTION_CLOSE are ack-eliciting; we
+/// record that so the receiver still schedules an ACK.
+pub const OtherFrame = struct {
+    frame_type: u64,
+    ack_eliciting: bool,
 };
 
 pub const DecodedFrame = struct {
@@ -215,6 +235,10 @@ pub fn encodeFrame(out: *std.ArrayList(u8), allocator: std.mem.Allocator, frame:
             try out.append(allocator, 0x1b);
             try out.appendSlice(allocator, &data);
         },
+        .HANDSHAKE_DONE => try out.append(allocator, 0x1e),
+        // We never *originate* an OTHER frame (it only ever results from decoding
+        // a parse-and-skip transport frame); re-encoding one is unsupported.
+        .OTHER => return WireError.UnknownFrameType,
     }
 }
 
@@ -272,9 +296,68 @@ pub fn decodeFrame(allocator: std.mem.Allocator, input: []const u8) !DecodedFram
                 .len = pos,
             };
         },
-        0x1c => {
-            const error_code = try takeVarInt(input, &pos);
+        // RESET_STREAM (RFC 9000 §19.4): Stream ID, App Error Code, Final Size.
+        0x04 => {
+            _ = try takeVarInt(input, &pos); // stream id
+            _ = try takeVarInt(input, &pos); // app error code
+            _ = try takeVarInt(input, &pos); // final size
+            return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
+        },
+        // STOP_SENDING (RFC 9000 §19.5): Stream ID, App Error Code.
+        0x05 => {
+            _ = try takeVarInt(input, &pos); // stream id
+            _ = try takeVarInt(input, &pos); // app error code
+            return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
+        },
+        // NEW_TOKEN (RFC 9000 §19.7): Token Length, Token.
+        0x07 => {
+            const tok_len = try takeVarInt(input, &pos);
+            _ = try takeBytes(input, &pos, tok_len);
+            return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
+        },
+        // MAX_DATA (0x10), MAX_STREAM_DATA (0x11), MAX_STREAMS bidi/uni
+        // (0x12/0x13), DATA_BLOCKED (0x14), STREAMS_BLOCKED bidi/uni (0x16/0x17):
+        // a single varint field (MAX_STREAM_DATA has a stream id first; handled
+        // below). All are flow-control / limit frames we honor implicitly via our
+        // own generous windows, so we parse-and-skip.
+        0x10, 0x12, 0x13, 0x14, 0x16, 0x17 => {
             _ = try takeVarInt(input, &pos);
+            return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
+        },
+        // MAX_STREAM_DATA (0x11) and STREAM_DATA_BLOCKED (0x15): two varints
+        // (Stream ID + limit/offset).
+        0x11, 0x15 => {
+            _ = try takeVarInt(input, &pos); // stream id
+            _ = try takeVarInt(input, &pos); // limit / offset
+            return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
+        },
+        // NEW_CONNECTION_ID (RFC 9000 §19.15): Seq, Retire Prior To, CID Length
+        // (1 byte), CID, 16-byte Stateless Reset Token. We keep one connection id
+        // per connection, so we acknowledge but do not act on these.
+        0x18 => {
+            _ = try takeVarInt(input, &pos); // sequence number
+            _ = try takeVarInt(input, &pos); // retire prior to
+            if (pos >= input.len) return WireError.BufferTooShort;
+            const cid_len = input[pos];
+            pos += 1;
+            if (cid_len > 20) return WireError.InvalidFrame; // RFC 9000 §19.15
+            _ = try takeBytes(input, &pos, cid_len); // connection id
+            _ = try takeBytes(input, &pos, 16); // stateless reset token
+            return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
+        },
+        // RETIRE_CONNECTION_ID (RFC 9000 §19.16): a single varint (sequence).
+        0x19 => {
+            _ = try takeVarInt(input, &pos);
+            return .{ .frame = .{ .OTHER = .{ .frame_type = ty, .ack_eliciting = true } }, .len = pos };
+        },
+        // HANDSHAKE_DONE (RFC 9000 §19.20): no payload, ack-eliciting.
+        0x1e => return .{ .frame = .{ .HANDSHAKE_DONE = {} }, .len = pos },
+        // CONNECTION_CLOSE: transport (0x1c) carries a Frame Type field; the
+        // application variant (0x1d, RFC 9000 §19.19) does NOT. Both then carry
+        // Reason Phrase Length + Reason. Neither is ack-eliciting (§13.2.1).
+        0x1c, 0x1d => {
+            const error_code = try takeVarInt(input, &pos);
+            if (ty == 0x1c) _ = try takeVarInt(input, &pos); // transport: frame type
             const reason_len = try takeVarInt(input, &pos);
             const reason = try takeBytes(input, &pos, reason_len);
             return .{
@@ -486,6 +569,12 @@ fn expectFrameEqual(expected: Frame, actual: Frame) !void {
         .PATH_RESPONSE => |e| {
             try std.testing.expect(actual == .PATH_RESPONSE);
             try std.testing.expectEqualSlices(u8, &e, &actual.PATH_RESPONSE);
+        },
+        .HANDSHAKE_DONE => try std.testing.expect(actual == .HANDSHAKE_DONE),
+        .OTHER => |e| {
+            const a = actual.OTHER;
+            try std.testing.expectEqual(e.frame_type, a.frame_type);
+            try std.testing.expectEqual(e.ack_eliciting, a.ack_eliciting);
         },
     }
 }

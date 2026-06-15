@@ -272,16 +272,17 @@ pub const ConnectRequest = struct {
 };
 
 /// Decode a QPACK header block (the HEADERS frame payload) into a
-/// `ConnectRequest`. The returned strings borrow `headers` (owned by caller).
-/// Caller frees `headers` with `allocator.free`.
+/// `ConnectRequest`. The returned strings borrow `section` (owned by caller);
+/// free it with `section.deinit(allocator)`. The `FieldSection` owns any
+/// Huffman-decoded string bytes the request pseudo-headers point into.
 pub fn decodeConnectHeaders(allocator: Allocator, header_block: []const u8) Error!struct {
     request: ConnectRequest,
-    headers: []qpack.Header,
+    section: qpack.FieldSection,
 } {
-    const headers = try qpack.decodeFieldSection(allocator, header_block);
-    errdefer allocator.free(headers);
+    var section = try qpack.decodeFieldSectionAlloc(allocator, header_block);
+    errdefer section.deinit(allocator);
     var req = ConnectRequest{};
-    for (headers) |h| {
+    for (section.headers) |h| {
         if (std.mem.eql(u8, h.name, ":method")) {
             req.method = h.value;
         } else if (std.mem.eql(u8, h.name, ":protocol")) {
@@ -294,7 +295,7 @@ pub fn decodeConnectHeaders(allocator: Allocator, header_block: []const u8) Erro
             req.path = h.value;
         }
     }
-    return .{ .request = req, .headers = headers };
+    return .{ .request = req, .section = section };
 }
 
 /// Encode the QPACK header block for an Extended CONNECT request (client side,
@@ -394,6 +395,11 @@ pub const Event = union(enum) {
     /// A CONNECT request was rejected (e.g. not WebTransport). The stream was
     /// answered with `status` and finished.
     connect_rejected: struct { stream_id: u64, status: []const u8 },
+    /// A plain (non-WebTransport) HTTP/3 request was answered with a complete
+    /// response (HEADERS + optional DATA + fin). `status` is the `:status` we
+    /// sent; `path` borrows the request's `:path`. Used by curl/browser GETs that
+    /// probe the endpoint; the WebTransport bridge ignores this event.
+    http_responded: struct { stream_id: u64, status: []const u8, path: []const u8 },
 };
 
 /// The server-side HTTP/3 + WebTransport driver. Wraps a `*quic_conn.Conn`
@@ -487,6 +493,14 @@ pub const Http3Conn = struct {
 
     pub fn sessionEstablished(self: *const Http3Conn) bool {
         return self.session != null and !self.session.?.closed;
+    }
+
+    /// Whether the peer advertised the settings WebTransport-over-HTTP/3 requires
+    /// (RFC 9220 §3.1). A plain HTTP/3 client omits them; this gates only the
+    /// Extended CONNECT path, never ordinary requests.
+    pub fn peerSupportsWebTransport(self: *const Http3Conn) bool {
+        const s = self.peer_settings orelse return false;
+        return s.supportsWebTransport();
     }
 
     /// Drain the next pending event, or null. Events borrow this struct's owned
@@ -605,7 +619,13 @@ pub const Http3Conn = struct {
     }
 
     /// Process the peer control stream: decode its SETTINGS frame (the first
-    /// frame on the control stream per RFC 9114 §6.2.1) and require WebTransport.
+    /// frame on the control stream per RFC 9114 §6.2.1) and record it. We do NOT
+    /// reject a peer that lacks the WebTransport settings here: a plain HTTP/3
+    /// client (curl, a browser doing a normal `fetch`/navigation) legitimately
+    /// omits them and must still be served ordinary requests. The WebTransport
+    /// requirement is enforced only when a client actually attempts the Extended
+    /// CONNECT handshake (`handleConnect` → `isWebTransport`), where a missing
+    /// capability is the relevant failure. See `peerSupportsWebTransport`.
     fn processPeerControl(self: *Http3Conn, st: *UniStreamState) Error!void {
         if (st.settings_done) {
             st.body_buf.clearRetainingCapacity();
@@ -615,7 +635,6 @@ pub const Http3Conn = struct {
         const frame = (try findFrame(st.body_buf.items, &pos, FrameType.settings)) orelse return;
         const settings = try decodeSettingsBody(frame.payload);
         self.peer_settings = settings;
-        if (!settings.supportsWebTransport()) return error.WebTransportUnsupported;
         st.settings_done = true;
         // Keep any trailing bytes after the SETTINGS frame for completeness.
         const remaining = st.body_buf.items[pos..];
@@ -679,6 +698,7 @@ pub const Http3Conn = struct {
         // Try to decode a HEADERS frame.
         var pos: usize = 0;
         const headers_frame = (try findFrame(buf.items, &pos, FrameType.headers)) orelse return;
+        h3Dbg("request on bidi stream {d}: HEADERS frame ({d} bytes)", .{ sid, headers_frame.payload.len });
         try self.handleConnect(sid, headers_frame.payload);
 
         // Done with this stream's request buffer.
@@ -725,19 +745,34 @@ pub const Http3Conn = struct {
         return true;
     }
 
-    /// Validate and answer an Extended CONNECT. On success, establish the WT
-    /// session and answer `:status=200`; on failure answer a 4xx and finish.
+    /// Validate and answer a request on a client bidi stream. A WebTransport
+    /// Extended CONNECT establishes the WT session and answers `:status=200`
+    /// (stream stays open). Any other request (a plain `GET`/`POST`/… from
+    /// curl/a browser, or a non-WT CONNECT) is answered as an ordinary HTTP/3
+    /// response and the stream is finished — see `respondHttpRequest`.
     fn handleConnect(self: *Http3Conn, sid: u64, header_block: []const u8) Error!void {
-        const decoded = try decodeConnectHeaders(self.allocator, header_block);
-        defer self.allocator.free(decoded.headers);
+        var decoded = try decodeConnectHeaders(self.allocator, header_block);
+        defer decoded.section.deinit(self.allocator);
         const req = decoded.request;
 
         if (!req.isWebTransport()) {
-            // Non-WebTransport / malformed CONNECT — reject without faulting.
-            try self.answerStatus(sid, "400");
+            // Not a WebTransport CONNECT: serve it as a normal HTTP/3 request
+            // (curl/browser GET probing the endpoint). This keeps the server
+            // answerable by an independent HTTP/3 client without touching the
+            // WebTransport path.
+            try self.respondHttpRequest(sid, req);
+            return;
+        }
+        // A WebTransport CONNECT requires the peer to have advertised the
+        // WebTransport-over-HTTP/3 settings (RFC 9220 §3.1: Extended CONNECT +
+        // H3 Datagrams + WebTransport). If it did not, reject this CONNECT (501
+        // Not Implemented for the requested protocol) rather than failing the
+        // whole connection — a plain client never reaches this branch.
+        if (!self.peerSupportsWebTransport()) {
+            try self.answerStatus(sid, "501");
             try self.events.append(self.allocator, .{ .connect_rejected = .{
                 .stream_id = sid,
-                .status = "400",
+                .status = "501",
             } });
             return;
         }
@@ -779,6 +814,73 @@ pub const Http3Conn = struct {
         try encodeFrame(self.allocator, &out, FrameType.headers, block);
         const is_reject = !std.mem.eql(u8, status, "200");
         self.conn.sendStream(sid, out.items, is_reject) catch return error.NotReady;
+    }
+
+    /// Answer a plain (non-WebTransport) HTTP/3 request on bidi stream `sid` with
+    /// a complete, real HTTP/3 response: a QPACK-encoded HEADERS frame
+    /// (`:status`, `content-type: text/plain`, `content-length`) followed by a
+    /// DATA frame carrying a short body, finishing the stream. `GET /` → 200 with
+    /// a small body; any other path → 404 (still a valid, finished response). The
+    /// stream is marked handled so we never re-CONNECT it, and an
+    /// `http_responded` event is queued for the caller. No WebTransport state is
+    /// touched.
+    fn respondHttpRequest(self: *Http3Conn, sid: u64, req: ConnectRequest) Error!void {
+        // A non-WebTransport CONNECT (i.e. CONNECT without :protocol=webtransport)
+        // is not a method this endpoint serves as a content request: answer 405
+        // Method Not Allowed, preserving the "rejected" semantics for the
+        // WebTransport handshake path.
+        if (std.mem.eql(u8, req.method, "CONNECT")) {
+            try self.writeHttpResponse(sid, "405", http_method_not_allowed_body);
+            try self.events.append(self.allocator, .{ .connect_rejected = .{
+                .stream_id = sid,
+                .status = "405",
+            } });
+            return;
+        }
+
+        // Route: only the root path gets the 200 body; everything else is a
+        // clean 404. We respond to any request method (GET/HEAD/POST/…) — curl's
+        // probe uses GET; a body on a non-GET is harmless for this minimal
+        // responder.
+        const is_root = std.mem.eql(u8, req.path, "/") or req.path.len == 0;
+        const status: []const u8 = if (is_root) "200" else "404";
+        const body: []const u8 = if (is_root) http_ok_body else http_not_found_body;
+
+        h3Dbg("HTTP/3 {s} {s} on stream {d} → {s}", .{ req.method, req.path, sid, status });
+        try self.writeHttpResponse(sid, status, body);
+        try self.events.append(self.allocator, .{ .http_responded = .{
+            .stream_id = sid,
+            .status = status,
+            .path = req.path,
+        } });
+    }
+
+    /// Encode + send a full HTTP/3 response (HEADERS + DATA + fin) on `sid`. The
+    /// HEADERS field section is QPACK-encoded with the static table + literals
+    /// (no dynamic table), matching the zero-capacity QPACK settings we
+    /// advertise, so any conformant HTTP/3 client (curl/ngtcp2, browsers) decodes
+    /// it. `content-length` is set from the body so the client knows the message
+    /// is complete even before the FIN.
+    fn writeHttpResponse(self: *Http3Conn, sid: u64, status: []const u8, body: []const u8) Error!void {
+        // content-length as decimal text.
+        var len_buf: [20]u8 = undefined;
+        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch return error.Malformed;
+
+        const hdrs = [_]qpack.Header{
+            .{ .name = ":status", .value = status },
+            .{ .name = "content-type", .value = "text/plain" },
+            .{ .name = "content-length", .value = len_str },
+        };
+        const block = try qpack.encodeFieldSection(self.allocator, &hdrs);
+        defer self.allocator.free(block);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        try encodeFrame(self.allocator, &out, FrameType.headers, block);
+        if (body.len > 0) try encodeFrame(self.allocator, &out, FrameType.data, body);
+
+        // Finish the stream: a plain HTTP/3 response is a complete message.
+        self.conn.sendStream(sid, out.items, true) catch return error.NotReady;
     }
 
     // -----------------------------------------------------------------------
@@ -933,6 +1035,51 @@ pub const Http3Conn = struct {
 /// streams fit comfortably.
 const max_scanned_streams: u64 = 64;
 
+/// Body returned for `GET /` — a short, fixed text/plain payload proving the
+/// QUIC + TLS-1.3-over-QUIC + HTTP/3 stack answered an independent client.
+const http_ok_body: []const u8 = "orochi quic ok\n";
+/// Body returned for any other path (a clean 404; still a valid response).
+const http_not_found_body: []const u8 = "not found\n";
+/// Body returned for a non-WebTransport CONNECT (405 Method Not Allowed).
+const http_method_not_allowed_body: []const u8 = "method not allowed\n";
+
+/// HTTP/3 interop tracing, gated on `OROCHI_QUIC_DEBUG` (any non-empty value).
+/// Off by default; only read by interop triage. Linux-only (reads
+/// /proc/self/environ; no-libc Linux lacks std.posix.getenv / std.os.environ).
+var h3_dbg_enabled: ?bool = null;
+fn h3Dbg(comptime fmt: []const u8, args: anytype) void {
+    const on = h3_dbg_enabled orelse blk: {
+        const e = h3EnvFlagSet("OROCHI_QUIC_DEBUG");
+        h3_dbg_enabled = e;
+        break :blk e;
+    };
+    if (!on) return;
+    std.debug.print("[h3] " ++ fmt ++ "\n", args);
+}
+fn h3EnvFlagSet(name: []const u8) bool {
+    if (@import("builtin").os.tag != .linux) return false;
+    const linux = std.os.linux;
+    const rc = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
+    const sfd: isize = @bitCast(rc);
+    if (sfd < 0) return false;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var b: [16384]u8 = undefined;
+    var total: usize = 0;
+    while (total < b.len) {
+        const n = linux.read(fd, b[total..].ptr, b.len - total);
+        const sn: isize = @bitCast(n);
+        if (sn <= 0) break;
+        total += n;
+    }
+    var it = std.mem.splitScalar(u8, b[0..total], 0);
+    while (it.next()) |record| {
+        const eq = std.mem.indexOfScalar(u8, record, '=') orelse continue;
+        if (std.mem.eql(u8, record[0..eq], name)) return record.len > eq + 1;
+    }
+    return false;
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1027,8 +1174,8 @@ test "qpack: decodes CONNECT pseudo-headers from the static table + literals" {
     const block = try encodeConnectHeaders(alloc, "irc.example", "/wt");
     defer alloc.free(block);
 
-    const decoded = try decodeConnectHeaders(alloc, block);
-    defer alloc.free(decoded.headers);
+    var decoded = try decodeConnectHeaders(alloc, block);
+    defer decoded.section.deinit(alloc);
     const req = decoded.request;
     try testing.expectEqualStrings("CONNECT", req.method);
     try testing.expectEqualStrings("webtransport", req.protocol);
@@ -1042,11 +1189,11 @@ test "qpack: encodes :status=200 decodable with the static table" {
     const alloc = testing.allocator;
     const block = try encodeStatusHeaders(alloc, "200");
     defer alloc.free(block);
-    const headers = try qpack.decodeFieldSection(alloc, block);
-    defer alloc.free(headers);
-    try testing.expectEqual(@as(usize, 1), headers.len);
-    try testing.expectEqualStrings(":status", headers[0].name);
-    try testing.expectEqualStrings("200", headers[0].value);
+    var section = try qpack.decodeFieldSectionAlloc(alloc, block);
+    defer section.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), section.headers.len);
+    try testing.expectEqualStrings(":status", section.headers[0].name);
+    try testing.expectEqualStrings("200", section.headers[0].value);
 }
 
 test "connect request without :protocol=webtransport is not WebTransport" {
@@ -1059,8 +1206,8 @@ test "connect request without :protocol=webtransport is not WebTransport" {
     };
     const block = try qpack.encodeFieldSection(alloc, &hdrs);
     defer alloc.free(block);
-    const decoded = try decodeConnectHeaders(alloc, block);
-    defer alloc.free(decoded.headers);
+    var decoded = try decodeConnectHeaders(alloc, block);
+    defer decoded.section.deinit(alloc);
     try testing.expect(!decoded.request.isWebTransport());
 }
 
@@ -1214,9 +1361,9 @@ const WtClient = struct {
         }
         var pos: usize = 0;
         const frame = (try findFrame(self.connect_buf.items, &pos, FrameType.headers)) orelse return;
-        const headers = try qpack.decodeFieldSection(self.alloc, frame.payload);
-        defer self.alloc.free(headers);
-        for (headers) |h| {
+        var section = try qpack.decodeFieldSectionAlloc(self.alloc, frame.payload);
+        defer section.deinit(self.alloc);
+        for (section.headers) |h| {
             if (std.mem.eql(u8, h.name, ":status") and std.mem.eql(u8, h.value, "200")) {
                 self.status_ok = true;
             }
@@ -1495,7 +1642,9 @@ test "wt loopback rejects a CONNECT without :protocol=webtransport" {
         while (server_h3.nextEvent()) |ev| {
             switch (ev) {
                 .connect_rejected => |cr| {
-                    try testing.expectEqualStrings("400", cr.status);
+                    // A non-WebTransport CONNECT is answered 405 (not a content
+                    // request); the WT session is still not established.
+                    try testing.expectEqualStrings("405", cr.status);
                     rejected = true;
                 },
                 else => {},
@@ -1514,4 +1663,139 @@ test "wt malformed HEADERS block on the CONNECT stream errors without panicking"
     // which the static-only decoder rejects. Drive it through decodeConnectHeaders.
     const bad_block = [_]u8{ 0x00, 0x00, 0x80 }; // RIC=0, Base=0, indexed dynamic
     try testing.expectError(error.InvalidRepresentation, decodeConnectHeaders(alloc, &bad_block));
+}
+
+// ---- plain HTTP/3 GET responder (curl / browser probe) --------------------
+
+/// Encode a plain HTTP/3 request HEADERS block (no WebTransport :protocol),
+/// QPACK static-table + literals — the exact shape an ordinary H3 client emits.
+fn encodeGetHeaders(alloc: Allocator, method: []const u8, path: []const u8) ![]u8 {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = method },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "irc.example" },
+        .{ .name = ":path", .value = path },
+    };
+    return qpack.encodeFieldSection(alloc, &hdrs);
+}
+
+/// Drive a handshake + server SETTINGS + client control SETTINGS, then send one
+/// plain HTTP/3 request and return the parsed (status, body) the server sent.
+/// Asserts the response is a single HEADERS frame followed by a DATA frame and
+/// that the stream was finished by the server.
+const GetResult = struct { status: [8]u8, status_len: usize, body: std.ArrayListUnmanaged(u8), finished: bool };
+
+fn runPlainRequest(alloc: Allocator, lb: *WtLoopback, server_h3: *Http3Conn, method: []const u8, path: []const u8) !GetResult {
+    // Server opens its control stream + SETTINGS.
+    try server_h3.service();
+
+    // Client control stream + SETTINGS (an H3 client MUST send these first).
+    const ctl = try lb.client.openUniStream();
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        var vbuf: [8]u8 = undefined;
+        try out.appendSlice(alloc, try webtransport.encodeVarint(UniStreamType.control, &vbuf));
+        const body = try encodeSettingsBody(alloc, Settings.serverDefault());
+        defer alloc.free(body);
+        try encodeFrame(alloc, &out, FrameType.settings, body);
+        try lb.client.sendStream(ctl, out.items, false);
+    }
+
+    // Plain request HEADERS on a fresh bidi stream, fin (request complete).
+    const cs = try lb.client.openStream();
+    {
+        const block = try encodeGetHeaders(alloc, method, path);
+        defer alloc.free(block);
+        var req: std.ArrayList(u8) = .empty;
+        defer req.deinit(alloc);
+        try encodeFrame(alloc, &req, FrameType.headers, block);
+        try lb.client.sendStream(cs, req.items, true);
+    }
+
+    // Drive round trips: deliver the request, let the server answer, collect.
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer resp.deinit(alloc);
+    var got_response = false;
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        try pumpBoth(alloc, lb);
+        try server_h3.service();
+        var scratch: [2048]u8 = undefined;
+        while (true) {
+            const n = lb.client.readStream(cs, &scratch);
+            if (n == 0) break;
+            try resp.appendSlice(alloc, scratch[0..n]);
+            got_response = true;
+        }
+        if (got_response and lb.client.streamFinished(cs)) break;
+    }
+
+    // Parse: HEADERS frame (status) then DATA frame (body).
+    var result = GetResult{ .status = undefined, .status_len = 0, .body = .empty, .finished = lb.client.streamFinished(cs) };
+    errdefer result.body.deinit(alloc);
+
+    var pos: usize = 0;
+    const hf = (try findFrame(resp.items, &pos, FrameType.headers)) orelse return error.NoHeaders;
+    var section = try qpack.decodeFieldSectionAlloc(alloc, hf.payload);
+    defer section.deinit(alloc);
+    for (section.headers) |h| {
+        if (std.mem.eql(u8, h.name, ":status")) {
+            @memcpy(result.status[0..h.value.len], h.value);
+            result.status_len = h.value.len;
+        }
+    }
+    // DATA frame (resume scanning after the HEADERS frame).
+    if (try findFrame(resp.items, &pos, FrameType.data)) |df| {
+        try result.body.appendSlice(alloc, df.payload);
+    }
+    resp.deinit(alloc);
+    return result;
+}
+
+test "h3 plain GET / is answered 200 text/plain with a body, stream finished" {
+    const alloc = testing.allocator;
+    const lb = try WtLoopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    var server_h3 = Http3Conn.init(alloc, &lb.server);
+    defer server_h3.deinit();
+
+    var result = try runPlainRequest(alloc, lb, &server_h3, "GET", "/");
+    defer result.body.deinit(alloc);
+
+    try testing.expectEqualStrings("200", result.status[0..result.status_len]);
+    try testing.expectEqualStrings("orochi quic ok\n", result.body.items);
+    try testing.expect(result.finished);
+
+    // An http_responded event was queued (the WT session was NOT established).
+    var saw = false;
+    while (server_h3.nextEvent()) |ev| switch (ev) {
+        .http_responded => |r| {
+            try testing.expectEqualStrings("200", r.status);
+            try testing.expectEqualStrings("/", r.path);
+            saw = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw);
+    try testing.expect(!server_h3.sessionEstablished());
+}
+
+test "h3 plain GET of an unknown path is answered 404" {
+    const alloc = testing.allocator;
+    const lb = try WtLoopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+
+    var server_h3 = Http3Conn.init(alloc, &lb.server);
+    defer server_h3.deinit();
+
+    var result = try runPlainRequest(alloc, lb, &server_h3, "GET", "/nope");
+    defer result.body.deinit(alloc);
+
+    try testing.expectEqualStrings("404", result.status[0..result.status_len]);
+    try testing.expectEqualStrings("not found\n", result.body.items);
+    try testing.expect(result.finished);
 }

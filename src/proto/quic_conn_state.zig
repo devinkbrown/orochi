@@ -1100,6 +1100,21 @@ pub const Engine = struct {
                     // the engine only owes the ACK obligation here.
                     ack_eliciting = true;
                 },
+                .HANDSHAKE_DONE => {
+                    // RFC 9000 §19.20: ack-eliciting. The client uses it to
+                    // confirm the handshake; the server never receives one. We owe
+                    // the ACK; the driver acts on it if it cares.
+                    ack_eliciting = true;
+                },
+                .OTHER => |o| {
+                    // A parse-and-skip transport frame (MAX_DATA, MAX_STREAMS,
+                    // NEW_CONNECTION_ID, RESET_STREAM, …). We honor our peers'
+                    // limits implicitly via our own generous windows and keep a
+                    // single connection id, so there is nothing to act on — but we
+                    // MUST still owe an ACK for an ack-eliciting frame (RFC 9000
+                    // §13.2.1) so the peer's loss recovery makes progress.
+                    if (o.ack_eliciting) ack_eliciting = true;
+                },
             }
         }
 

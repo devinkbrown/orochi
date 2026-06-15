@@ -240,6 +240,24 @@ pub fn build(b: *std.Build) void {
     check_exe.generated_bin = null; // analyze only; do not codegen/link an artifact
     check_step.dependOn(&check_exe.step);
 
+    // `zig build quic-interop-server` — a standalone test harness binary that
+    // stands up the real `WebTransportListener` (QUIC/HTTP3) on an ephemeral UDP
+    // port with a self-signed cert and blocks, so `tools/quic_interop.sh` can run
+    // a real third-party HTTP/3 client (curl --http3) against it. Built into
+    // zig-out/bin so the script finds it deterministically.
+    const interop_exe = b.addExecutable(.{
+        .name = "quic_interop_server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/quic_interop_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "orochi", .module = mod }},
+        }),
+    });
+    const interop_step = b.step("quic-interop-server", "Build the standalone QUIC/HTTP3 interop test server");
+    interop_step.dependOn(&b.addInstallArtifact(interop_exe, .{}).step);
+
     // `zig build release` — one-shot optimized, stripped daemon (ReleaseFast)
     // installed to zig-out/bin, independent of the default step's optimize mode.
     const release_step = b.step("release", "Build an optimized, stripped daemon (ReleaseFast)");
