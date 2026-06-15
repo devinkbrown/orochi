@@ -76,7 +76,107 @@ Closed in the repair pass:
   atomic stats-file export. `listen.webtransport` is parsed and explicitly
   logged as not implemented.
 
-Still open or intentionally partial:
+## Repair Status After 2026-06-15 Agent Pass
+
+A follow-up agent pass began with a read-first re-verification of every section
+against current source. That verification found several "still open" items had
+already been closed by the prior commit and were stale in this doc (see
+"Corrected stale findings" below). The remaining genuine gaps were then closed
+in disjoint, individually test-verified commits.
+
+Closed in this pass:
+
+- **Secured S2S CRDT stream is now encrypted and link-authenticated.** The
+  Tsumugi PQ-hybrid AKE derived per-direction keys but never applied them, so the
+  post-handshake CRDT stream (MESSAGE/MEMBERSHIP/CHANNEL_MODE_*/TOPIC/NICKCHANGE)
+  traveled in plaintext over secured links. It is now wrapped in a length-prefixed
+  ChaCha20-Poly1305 AEAD record layer keyed on the `Established` send/recv keys
+  with per-record nonce counters bound as AAD; tamper or desync drops the link.
+- **Cross-shard IRCX DATA/REQUEST/REPLY/WHISPER** now relay over mesh (previously
+  cross-shard `WHISPER` silently returned `ERR_NOSUCHNICK` and channel `DATA`
+  never reached remote members). The relay schema gained the four verbs plus
+  `data_tag`/`recipient`; inbound delivery re-applies local speech/NOWHISPER/
+  NOCOMICDATA policy with multi-hop dedup and fails closed without flooding peers.
+- **SACCESS GRANT bypass + persistence.** `enforceServerAccess` now checks GRANT
+  first (GRANT-overrides-DENY, matching Ophion), and SACCESS entries persist to
+  the durable `bans` family and replay at boot before connections are accepted.
+- **CREATE clone/template** now accepts the optional source-channel third
+  parameter and clones its modes via `world.cloneChannel`.
+- **TLS certificate hot reload on REHASH** re-reads and atomically swaps cert/key
+  material into a server-owned reload generation; failures keep current certs.
+- **ACME IPv6 nameservers** are wired (AF_INET6 UDP query path); previously
+  IPv6-only resolver environments failed.
+- **Ops/deployment assets:** hardened `etc/systemd/orochi.service` (ExecReload =
+  SIGUSR2 hot upgrade), `tools/runtime_smoke.py` fresh-boot smoke test, and a
+  `zig build package` step.
+
+Corrected stale findings (already implemented before this pass; the doc was
+behind the code):
+
+- Channel PROP **does** propagate over mesh: live `PROP SET/DELETE` fan out via
+  `announceChannelProp` → `sendChannelProp` to every established peer with HLC
+  clocks and inbound LWW apply.
+- MODEX already uses numerics `806/807`; IRCX `AUTH` is registered and bridges to
+  the SASL/account backend; `SACCESS` is registered with a real store and
+  enforcement; `MODE <nick> ISIRCX`, MODEX channel-prefix parsing, and the whole
+  IRC/IRCv3/history/tags section (LIST C/T, CHATHISTORY batch gating, TAGMSG
+  replay, edit/redact filtering, extended-monitor/metadata visibility, MARKREAD
+  on JOIN, SASL mechanism honesty, extban validation) were already done and
+  tested. Services durability (email verify, `+r` replay, AKICK, MLOCK, WARD) and
+  named oper-privilege gates were likewise already complete.
+
+Still open (genuine future work, larger or cross-component):
+
+- **Full Ophion-class live session migration** over mesh: the `migration_relay` /
+  `session_migrate` modules exist and are tested but are not wired to a live S2S
+  frame or the reclaim path. `SESSION RESUME` remains reclaim/redirect-oriented.
+- **End-to-end per-frame signed envelopes** for routed/multi-hop frames. Secured
+  links now AEAD-encrypt + authenticate point-to-point; multi-hop origin signing
+  is still open.
+- **Live HTTP `/metrics`/admin endpoint** (file-export + internal Prometheus text
+  exist; a live endpoint is a convenience, not a correctness gap).
+- **Datagram-level native-media sender authentication** (TOFU address binding
+  exists; per-stream token auth needs a coordinated browser-codec wire change).
+- Account/user/member PROP propagation (channel PROP already propagates),
+  EVENT subject-mask on category subscriptions.
+
+Intentional divergences / out of scope (NOT gaps): EVENT numerics `808-825`
+(Orochi uses the `NOTE EVENT` wire form by design), `RPL_LISTXPICS 813` (no
+picture feature), `sasl.realm` wire emission, `listen.webtransport`, CA
+client-auth (CertFP model instead), and DCC proxy/filehost (documented exclusion).
+
+## Repair Status After 2026-06-15 Implementation Pass
+
+Closed in the repair pass:
+
+- Direct-owned S2S state frames now reject mismatched origins, count rejected
+  frames, and log the drained audit signal in both secured and plaintext S2S
+  loops. Peer pinning and `[mesh].trust_roots` are wired into secured S2S.
+- Mesh channel state now carries parameter modes (`+k`, `+l`, `+j`, `+f`),
+  private/hidden state, and IRCX extended flags, with split-recovery burst,
+  MLOCK-preserving inbound apply, and server/link regression coverage.
+- S2S message relay now preserves `STATUSMSG` minimum rank and reuses local
+  channel/direct-message policy gates for inbound relay delivery.
+- `LIST C/T`, CHATHISTORY `BATCH` gating, TAGMSG typing/reaction replay,
+  edit/redact recipient capability filters, extended-monitor event caps,
+  metadata visibility reads, MARKREAD-on-JOIN, standalone typing delivery, SASL
+  mechanism honesty, and extban store-time validation are wired and tested.
+- IRCX live surfaces now cover `MODE <nick> ISIRCX`, `AUTH`, `SACCESS` /
+  `ACCESS *`, channel `ACCESS` join overrides, prefixed channel handling,
+  MODEX `806/807`, EVENT aliases, CREATE existing-channel rejection/basic modes,
+  and LISTX prefix parity.
+- Services now persist account email verification state, replay registered
+  channels into live `+r`, replay MLOCK/AKICK/WARD, apply services access
+  automode, kick current AKICK matches, add WARD compatibility aliases, and gate
+  sensitive oper commands by named privileges.
+- Runtime config now wires PROXY trusted accept handling, `mesh.trust_roots`,
+  `media.max_upload_bytes`, `media.max_frame_bytes`, `sasl.enabled`,
+  `sasl.realm`, TLS chain validation, native-media sender binding coverage, and
+  atomic stats-file export. `listen.webtransport` is parsed and explicitly
+  logged as not implemented.
+
+Still open or intentionally partial (superseded by the Agent Pass section above;
+kept for history):
 
 - Full signed envelopes for routed/multi-hop message frames remain open; the
   current pass closes direct-owned state origin rejection and audit visibility.
