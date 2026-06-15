@@ -7,6 +7,21 @@
 const std = @import("std");
 
 const cpv = @import("../../proto/coilpack_value.zig");
+const sign = @import("../../crypto/sign.zig");
+const signed_frame = @import("signed_frame.zig");
+
+pub const pubkey_len = sign.public_key_len; // 32
+pub const sig_len = sign.signature_len; // 64
+
+/// Domain label folded into the Ed25519 transcript of a self-contained MESSAGE
+/// origin signature (via `sign.signCtx`). Distinct from `signed_frame`'s
+/// per-link `sign_domain` and from every other Ed25519 use in Orochi, so a
+/// relay-message signature can never validate in another context (a per-link
+/// state frame, a node identity, an oper grant, or a migration token).
+pub const sign_domain = "orochi-s2s-relay-msg-v1";
+
+pub const SignError = sign.SignError || error{NoSpaceLeft};
+pub const VerifyError = sign.VerifyError;
 
 pub const Verb = enum(u8) {
     privmsg = 1,
@@ -54,6 +69,19 @@ pub const RelayMessage = struct {
     recipient: []const u8 = "",
     origin_node: u64,
     hlc: u64,
+    /// SELF-CONTAINED multi-hop origin signature: the origin node's 32-byte
+    /// Ed25519 public key, created ONCE at the author and forwarded VERBATIM by
+    /// every relay. Empty ("") on the legacy unsigned path (older peers / single
+    /// node with no node identity). When non-empty it is exactly `pubkey_len`
+    /// bytes and self-certifies the origin: a receiver requires
+    /// `signed_frame.originShortId(origin_pubkey) == origin_node`.
+    origin_pubkey: []const u8 = "",
+    /// The 64-byte Ed25519 signature over the canonical origin transcript (see
+    /// `originTranscript`), bound to `sign_domain`. Empty when unsigned. A relay
+    /// re-emits this byte-for-byte; it never re-signs (re-signing with its own
+    /// key would either fail the receiver's origin check or erase the true
+    /// author). Always paired with `origin_pubkey` (both empty or both present).
+    origin_sig: []const u8 = "",
 };
 
 pub const Owned = struct {
@@ -68,6 +96,8 @@ pub const Owned = struct {
         allocator.free(self.msg.text);
         allocator.free(self.msg.data_tag);
         allocator.free(self.msg.recipient);
+        allocator.free(self.msg.origin_pubkey);
+        allocator.free(self.msg.origin_sig);
         self.* = undefined;
     }
 };
@@ -88,6 +118,10 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
         .{ .key = "hlc", .value = .{ .unsigned = msg.hlc } },
         .{ .key = "min_rank", .value = .{ .unsigned = msg.min_rank } },
         .{ .key = "origin_node", .value = .{ .unsigned = msg.origin_node } },
+        // Raw Ed25519 key/signature bytes are binary (not valid UTF-8), so they
+        // ride as CoilPack `bytes`, not `string`.
+        .{ .key = "origin_pubkey", .value = .{ .bytes = msg.origin_pubkey } },
+        .{ .key = "origin_sig", .value = .{ .bytes = msg.origin_sig } },
         .{ .key = "recipient", .value = .{ .string = msg.recipient } },
         .{ .key = "source_nick", .value = .{ .string = msg.source_nick } },
         .{ .key = "source_prefix", .value = .{ .string = msg.source_prefix } },
@@ -118,6 +152,8 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     var text_opt: ?[]const u8 = null;
     var data_tag_opt: ?[]const u8 = null;
     var recipient_opt: ?[]const u8 = null;
+    var origin_pubkey_opt: ?[]const u8 = null;
+    var origin_sig_opt: ?[]const u8 = null;
     var min_rank: u8 = 0;
     var origin_node_opt: ?u64 = null;
     var hlc_opt: ?u64 = null;
@@ -133,6 +169,10 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
             min_rank = try readRank(entry.value);
         } else if (std.mem.eql(u8, entry.key, "origin_node")) {
             origin_node_opt = try readU64(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "origin_pubkey")) {
+            origin_pubkey_opt = try readBytes(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "origin_sig")) {
+            origin_sig_opt = try readBytes(entry.value);
         } else if (std.mem.eql(u8, entry.key, "recipient")) {
             recipient_opt = try readString(entry.value);
         } else if (std.mem.eql(u8, entry.key, "source_nick")) {
@@ -162,6 +202,15 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     // peers that predate the typed-IRCX verbs, mirroring min_rank's tolerance.
     const data_tag = data_tag_opt orelse "";
     const recipient = recipient_opt orelse "";
+    // Optional self-contained origin signature. Absent (legacy / unsigned)
+    // decodes to "". Present must be the exact Ed25519 field widths; a wrong
+    // length is a malformed frame, rejected up front so verification never sees
+    // a truncated key/signature. Both must be present together or both absent.
+    const origin_pubkey = origin_pubkey_opt orelse "";
+    const origin_sig = origin_sig_opt orelse "";
+    if (origin_pubkey.len != 0 and origin_pubkey.len != pubkey_len) return DecodeError.InvalidFieldType;
+    if (origin_sig.len != 0 and origin_sig.len != sig_len) return DecodeError.InvalidFieldType;
+    if ((origin_pubkey.len == 0) != (origin_sig.len == 0)) return DecodeError.InvalidFieldType;
 
     const target_owned = try allocator.dupe(u8, target);
     errdefer allocator.free(target_owned);
@@ -179,6 +228,10 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     errdefer allocator.free(data_tag_owned);
     const recipient_owned = try allocator.dupe(u8, recipient);
     errdefer allocator.free(recipient_owned);
+    const origin_pubkey_owned = try allocator.dupe(u8, origin_pubkey);
+    errdefer allocator.free(origin_pubkey_owned);
+    const origin_sig_owned = try allocator.dupe(u8, origin_sig);
+    errdefer allocator.free(origin_sig_owned);
 
     return .{ .msg = .{
         .verb = verb_opt orelse return DecodeError.MissingField,
@@ -193,7 +246,132 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
         .min_rank = min_rank,
         .origin_node = origin_node_opt orelse return DecodeError.MissingField,
         .hlc = hlc_opt orelse return DecodeError.MissingField,
+        .origin_pubkey = origin_pubkey_owned,
+        .origin_sig = origin_sig_owned,
     } };
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained multi-hop origin signature
+//
+// MESSAGE is relayed VERBATIM with the original `origin_node` preserved, so a
+// per-link envelope (like `signed_frame`, where the sending peer IS the origin)
+// cannot authenticate it past the first hop. Instead the AUTHOR signs a
+// canonical transcript of its IMMUTABLE fields ONCE; every relay forwards the
+// `(origin_pubkey, origin_sig)` pair byte-for-byte, and every hop verifies it
+// against the CLAIMED origin. Because the node id is self-certifying
+// (`node_id = BLAKE3-160(pubkey)`, `origin_node = shortId(node_id)`), a receiver
+// needs NO key distribution: it checks `originShortId(pubkey) == origin_node`
+// plus the signature. A relay cannot forge or alter an authored message without
+// the origin's private key.
+//
+// SIGNED FIELDS (immutable, origin-authored): origin_node, hlc, verb,
+// source_prefix, target, text, data_tag, recipient. EXCLUDED (mutable / hop-
+// local, so signing them would break legitimate relays): min_rank (relays raise
+// it to 2 for op-moderation / status floors), tags (msgid is server-stamped and
+// per-hop client-tag filtered), source_nick and account (derivable / advisory;
+// the authoritative identity is the signed source_prefix).
+// ---------------------------------------------------------------------------
+
+/// Re-export so callers verify the self-certifying `originShortId(pubkey) ==
+/// origin_node` invariant without importing `signed_frame` directly.
+pub const originShortId = signed_frame.originShortId;
+
+/// Append a length-prefixed string field to the transcript: a u32-LE length
+/// followed by the raw bytes. Length-framing every variable field makes the
+/// serialization unambiguous (no field boundary can be shifted by moving bytes
+/// between adjacent fields).
+fn appendLenPrefixed(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, field: []const u8) !void {
+    var len_le: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_le, @intCast(field.len), .little);
+    try out.appendSlice(allocator, &len_le);
+    try out.appendSlice(allocator, field);
+}
+
+/// Build the canonical signed transcript of `msg`'s immutable origin-authored
+/// fields into a freshly-allocated buffer the caller owns. Deterministic across
+/// nodes: fixed field order, fixed-width integers (LE), and u32-LE length
+/// framing on every string. Independent of CoilPack map ordering and of the
+/// mutable/hop-local fields, so a relay that legitimately adjusts `min_rank` or
+/// re-stamps `tags`/`msgid` does not invalidate the signature.
+pub fn originTranscript(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var u64_le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &u64_le, msg.origin_node, .little);
+    try out.appendSlice(allocator, &u64_le);
+    std.mem.writeInt(u64, &u64_le, msg.hlc, .little);
+    try out.appendSlice(allocator, &u64_le);
+    try out.append(allocator, @intFromEnum(msg.verb));
+    try appendLenPrefixed(&out, allocator, msg.source_prefix);
+    try appendLenPrefixed(&out, allocator, msg.target);
+    try appendLenPrefixed(&out, allocator, msg.text);
+    try appendLenPrefixed(&out, allocator, msg.data_tag);
+    try appendLenPrefixed(&out, allocator, msg.recipient);
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Sign `msg`'s canonical origin transcript with the author's Ed25519 keypair
+/// and STAMP `origin_pubkey`/`origin_sig` in place. Call this ONCE, at the node
+/// that creates the relay message (where `origin_node` is the local node). The
+/// caller MUST guarantee the self-certifying invariant
+/// `originShortId(kp.public_key) == msg.origin_node`; otherwise the stamped
+/// signature would fail every receiver's origin check (sign at the origin or not
+/// at all). `pubkey_buf`/`sig_buf` back the stamped slices and must outlive the
+/// encode that follows.
+pub fn signInPlace(
+    msg: *RelayMessage,
+    kp: *const sign.KeyPair,
+    transcript: []const u8,
+    pubkey_buf: *[pubkey_len]u8,
+    sig_buf: *[sig_len]u8,
+) sign.SignError!void {
+    const sig = try kp.signCtx(sign_domain, transcript);
+    pubkey_buf.* = kp.public_key;
+    sig_buf.* = sig;
+    msg.origin_pubkey = pubkey_buf;
+    msg.origin_sig = sig_buf;
+}
+
+pub const VerifyOutcome = enum {
+    /// No `(origin_pubkey, origin_sig)` present: legacy unsigned path. The caller
+    /// follows the existing (pre-signature) behavior unchanged.
+    unsigned,
+    /// Signature present, origin self-certifies, and the transcript verifies.
+    verified,
+    /// Signature present but the self-certified origin id did not match
+    /// `origin_node` (a peer asserting another node's origin without its key).
+    origin_mismatch,
+    /// Signature present and origin matched, but the Ed25519 signature over the
+    /// canonical transcript failed (forged or tampered message).
+    bad_signature,
+};
+
+/// Verify `msg`'s self-contained origin signature. Allocates the transcript
+/// internally (freed before return). Returns `.unsigned` when no signature is
+/// carried (backward-compatible legacy path), `.verified` on full success, or a
+/// specific rejection reason. Field-width invariants are enforced at decode, so
+/// a non-empty `origin_pubkey`/`origin_sig` here is always exactly sized.
+pub fn verifyOrigin(allocator: std.mem.Allocator, msg: RelayMessage) !VerifyOutcome {
+    if (msg.origin_pubkey.len == 0 and msg.origin_sig.len == 0) return .unsigned;
+    // Decode-time validation guarantees the pair is present and exactly sized;
+    // be defensive anyway so a hand-built struct can never index out of range.
+    if (msg.origin_pubkey.len != pubkey_len or msg.origin_sig.len != sig_len) return .bad_signature;
+
+    const pubkey: sign.PublicKey = msg.origin_pubkey[0..pubkey_len].*;
+    // Self-certifying origin: the key that signed must DERIVE the claimed
+    // origin id. A relay cannot assert another node's origin because it lacks
+    // that node's private key (substituting its own key changes the derived id).
+    if (originShortId(pubkey) != msg.origin_node) return .origin_mismatch;
+
+    const sig: sign.Signature = msg.origin_sig[0..sig_len].*;
+    const transcript = try originTranscript(allocator, msg);
+    defer allocator.free(transcript);
+
+    const ok = sign.verifyCtx(sign_domain, transcript, sig, pubkey) catch return .bad_signature;
+    return if (ok) .verified else .bad_signature;
 }
 
 pub const SeenSet = struct {
@@ -252,6 +430,13 @@ fn readString(value: cpv.Value) DecodeError![]const u8 {
     };
 }
 
+fn readBytes(value: cpv.Value) DecodeError![]const u8 {
+    return switch (value) {
+        .bytes => |bytes| bytes,
+        else => DecodeError.InvalidFieldType,
+    };
+}
+
 fn readU64(value: cpv.Value) DecodeError!u64 {
     return switch (value) {
         .unsigned => |n| n,
@@ -299,6 +484,8 @@ fn expectRoundTrip(msg: RelayMessage) !void {
     try std.testing.expectEqual(msg.min_rank, owned.msg.min_rank);
     try std.testing.expectEqual(msg.origin_node, owned.msg.origin_node);
     try std.testing.expectEqual(msg.hlc, owned.msg.hlc);
+    try std.testing.expectEqualSlices(u8, msg.origin_pubkey, owned.msg.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, msg.origin_sig, owned.msg.origin_sig);
 }
 
 test "relay messages round-trip for each verb" {
@@ -419,4 +606,196 @@ test "seen set detects repeats and evicts oldest" {
     try std.testing.expect(!seen.observe(3, 30));
     try std.testing.expect(!seen.observe(1, 10));
     try std.testing.expect(seen.observe(3, 30));
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained origin signature tests
+// ---------------------------------------------------------------------------
+
+fn testKeyPair(seed_byte: u8) !sign.KeyPair {
+    return sign.KeyPair.fromSeed([_]u8{seed_byte} ** sign.seed_len);
+}
+
+/// Build a base relay message whose `origin_node` is the self-certified short id
+/// of `kp` (so a signature minted by `kp` satisfies the receiver's origin check),
+/// then sign it in place using caller-provided backing buffers.
+fn signSample(
+    kp: *const sign.KeyPair,
+    pubkey_buf: *[pubkey_len]u8,
+    sig_buf: *[sig_len]u8,
+) !RelayMessage {
+    var msg = RelayMessage{
+        .verb = .privmsg,
+        .target = "#orochi",
+        .source_nick = "alice",
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .tags = "+draft/reply=42",
+        .text = "authored once, relayed everywhere",
+        .min_rank = 0,
+        .origin_node = originShortId(kp.public_key),
+        .hlc = 4242,
+    };
+    const transcript = try originTranscript(std.testing.allocator, msg);
+    defer std.testing.allocator.free(transcript);
+    try signInPlace(&msg, kp, transcript, pubkey_buf, sig_buf);
+    return msg;
+}
+
+test "relay message round-trips WITH a signature" {
+    var kp = try testKeyPair(0xA1);
+    defer kp.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    const msg = try signSample(&kp, &pk_buf, &sig_buf);
+    // Round-trips and the verifier accepts the decoded copy.
+    try expectRoundTrip(msg);
+
+    const allocator = std.testing.allocator;
+    const wire = try encode(allocator, msg);
+    defer allocator.free(wire);
+    var owned = try decode(allocator, wire);
+    defer owned.deinit(allocator);
+    try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(allocator, owned.msg));
+}
+
+test "relay message round-trips WITHOUT a signature (legacy unsigned)" {
+    const msg = RelayMessage{
+        .verb = .notice,
+        .target = "bob",
+        .source_nick = "service",
+        .source_prefix = "service!svc@example.invalid",
+        .text = "legacy unsigned path",
+        .origin_node = 7,
+        .hlc = 9,
+    };
+    try expectRoundTrip(msg);
+    // No signature carried => the verifier reports the legacy path, never a reject.
+    try std.testing.expectEqual(VerifyOutcome.unsigned, try verifyOrigin(std.testing.allocator, msg));
+}
+
+test "a signed relay message verifies" {
+    var kp = try testKeyPair(0xB2);
+    defer kp.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    const msg = try signSample(&kp, &pk_buf, &sig_buf);
+    try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(std.testing.allocator, msg));
+}
+
+test "a forged signature (valid structure, wrong key) is rejected" {
+    var origin_kp = try testKeyPair(0xC3);
+    defer origin_kp.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    var msg = try signSample(&origin_kp, &pk_buf, &sig_buf);
+
+    // Attacker re-signs the SAME transcript with its OWN key but keeps the
+    // victim's origin_node + pubkey. The pubkey no longer matches the sig.
+    var attacker = try testKeyPair(0xC4);
+    defer attacker.deinit();
+    const transcript = try originTranscript(std.testing.allocator, msg);
+    defer std.testing.allocator.free(transcript);
+    sig_buf = try attacker.signCtx(sign_domain, transcript);
+    msg.origin_sig = &sig_buf;
+    try std.testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(std.testing.allocator, msg));
+}
+
+test "a pubkey whose originShortId != origin_node is rejected" {
+    var attacker = try testKeyPair(0xD5);
+    defer attacker.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    var msg = try signSample(&attacker, &pk_buf, &sig_buf);
+    // The attacker validly signs with its OWN key, but claims a DIFFERENT
+    // origin_node than its key self-certifies: the origin check must fail.
+    msg.origin_node = originShortId(attacker.public_key) ^ 0x1;
+    try std.testing.expectEqual(VerifyOutcome.origin_mismatch, try verifyOrigin(std.testing.allocator, msg));
+}
+
+test "tampering with text after signing fails verification" {
+    var kp = try testKeyPair(0xE6);
+    defer kp.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    var msg = try signSample(&kp, &pk_buf, &sig_buf);
+    msg.text = "tampered body the origin never authored";
+    try std.testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(std.testing.allocator, msg));
+}
+
+test "tampering with target after signing fails verification" {
+    var kp = try testKeyPair(0xE7);
+    defer kp.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    var msg = try signSample(&kp, &pk_buf, &sig_buf);
+    msg.target = "#hijacked";
+    try std.testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(std.testing.allocator, msg));
+}
+
+test "re-forward preserves the signature: a relayed copy still verifies" {
+    var kp = try testKeyPair(0xF8);
+    defer kp.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    const origin_msg = try signSample(&kp, &pk_buf, &sig_buf);
+
+    const allocator = std.testing.allocator;
+    // Hop 1 receives, decodes, then re-encodes VERBATIM (forward without re-sign).
+    const wire1 = try encode(allocator, origin_msg);
+    defer allocator.free(wire1);
+    var hop1 = try decode(allocator, wire1);
+    defer hop1.deinit(allocator);
+    try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(allocator, hop1.msg));
+
+    // Hop 1 re-forwards the decoded message unchanged; hop 2 still verifies the
+    // ORIGINAL origin (not hop 1), which is the whole point of multi-hop signing.
+    const wire2 = try encode(allocator, hop1.msg);
+    defer allocator.free(wire2);
+    var hop2 = try decode(allocator, wire2);
+    defer hop2.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, origin_msg.origin_pubkey, hop2.msg.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, origin_msg.origin_sig, hop2.msg.origin_sig);
+    try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(allocator, hop2.msg));
+}
+
+test "mutable fields (min_rank, tags, msgid) do not invalidate the signature" {
+    var kp = try testKeyPair(0x19);
+    defer kp.deinit();
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    var msg = try signSample(&kp, &pk_buf, &sig_buf);
+    // A relay legitimately raises the status floor and re-stamps client tags; the
+    // signature (over the immutable fields only) must still verify.
+    msg.min_rank = 2;
+    msg.tags = "+server-time=2026-06-15T00:00:00.000Z;msgid=abcdef";
+    msg.account = "rewritten-by-relay";
+    msg.source_nick = "ALICE";
+    try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(std.testing.allocator, msg));
+}
+
+test "decode rejects a wrong-width origin_pubkey" {
+    const allocator = std.testing.allocator;
+    // Hand-build a CoilPack map with a 31-byte pubkey (one short of 32).
+    var bad_pubkey = [_]u8{0xAB} ** 31;
+    var bad_sig = [_]u8{0xCD} ** sig_len;
+    var entries = [_]cpv.MapEntry{
+        .{ .key = "account", .value = .{ .string = "" } },
+        .{ .key = "data_tag", .value = .{ .string = "" } },
+        .{ .key = "hlc", .value = .{ .unsigned = 1 } },
+        .{ .key = "min_rank", .value = .{ .unsigned = 0 } },
+        .{ .key = "origin_node", .value = .{ .unsigned = 5 } },
+        .{ .key = "origin_pubkey", .value = .{ .bytes = bad_pubkey[0..] } },
+        .{ .key = "origin_sig", .value = .{ .bytes = bad_sig[0..] } },
+        .{ .key = "recipient", .value = .{ .string = "" } },
+        .{ .key = "source_nick", .value = .{ .string = "n" } },
+        .{ .key = "source_prefix", .value = .{ .string = "n!u@h" } },
+        .{ .key = "tags", .value = .{ .string = "" } },
+        .{ .key = "target", .value = .{ .string = "#x" } },
+        .{ .key = "text", .value = .{ .string = "hi" } },
+        .{ .key = "verb", .value = .{ .unsigned = 1 } },
+    };
+    const wire = try cpv.Encoder.encode(allocator, .{ .map = entries[0..] });
+    defer allocator.free(wire);
+    try std.testing.expectError(DecodeError.InvalidFieldType, decode(allocator, wire));
 }

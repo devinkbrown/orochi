@@ -1798,6 +1798,13 @@ pub const LinuxServer = struct {
     /// (origin_node, hlc). Per-peer seen-sets miss cross-path duplicates in a
     /// cyclic mesh; this global set dedups deliver + re-forward across all paths.
     relay_seen: message_relay.SeenSet,
+    /// Count of inbound relayed MESSAGEs dropped in `deliverRelay` because their
+    /// self-contained origin signature failed (bad Ed25519 signature, or a pubkey
+    /// whose `originShortId` did not match the claimed `origin_node`). Such a
+    /// message is neither delivered nor re-forwarded. Mirrors the per-link
+    /// `rejected_origin_frames`/`rejected_signature_frames` audit counters that
+    /// the direct-owned state frames use, but at the daemon (multi-hop) layer.
+    rejected_relay_signatures: u64 = 0,
     /// Per-reactor I/O (ring, connection table, listeners, wake). One entry per
     /// shard, heap-allocated at init (`reactors.len == clamped num_shards`).
     /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
@@ -4587,12 +4594,85 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// Verify the self-contained origin signature of an inbound relayed message.
+    /// Returns true when the message is safe to deliver + re-forward:
+    ///   * it carries NO signature (legacy unsigned peer) — backward compatible, or
+    ///   * it carries a signature that verifies against the self-certified origin.
+    /// Returns false (drop) when a carried signature is bad or the origin id does
+    /// not match the signing key; the failure is counted + audited so an operator
+    /// can see a forging/desynced peer. The transcript alloc is short-lived.
+    fn relayOriginVerified(self: *LinuxServer, msg: s2s_link.RelayMessage) bool {
+        const outcome = message_relay.verifyOrigin(self.allocator, msg) catch {
+            // Allocation failure verifying: fail CLOSED (drop) rather than deliver
+            // an unverified message. Counted as a rejection for audit visibility.
+            self.recordRelaySignatureReject(msg, "verification allocation failed");
+            return false;
+        };
+        return switch (outcome) {
+            .unsigned, .verified => true,
+            .origin_mismatch => blk: {
+                self.recordRelaySignatureReject(msg, "origin pubkey does not self-certify the claimed origin node");
+                break :blk false;
+            },
+            .bad_signature => blk: {
+                self.recordRelaySignatureReject(msg, "origin signature verification failed");
+                break :blk false;
+            },
+        };
+    }
+
+    /// Account + audit a dropped relayed message whose origin signature failed.
+    /// Bumps the daemon-level reject counter and emits the same `.s2s` warn audit
+    /// signal that direct-owned frame origin rejections use (`drainOriginRejections`).
+    fn recordRelaySignatureReject(self: *LinuxServer, msg: s2s_link.RelayMessage, reason: []const u8) void {
+        self.rejected_relay_signatures +|= 1;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "dropped relayed {s} claiming origin {d}: {s}",
+            .{ msg.verb.commandWord(), msg.origin_node, reason },
+        ) catch "dropped relayed message with bad origin signature";
+        self.traceLog(.warn, .s2s, line);
+    }
+
+    /// Sign a relay message's canonical origin transcript in place at the ORIGIN
+    /// (this node authored it), stamping `origin_pubkey`/`origin_sig` so every hop
+    /// can verify it. No-op (legacy unsigned path) when this node has no node
+    /// identity, OR when `config.node_id` is not the self-certified short id of
+    /// the node key — signing then would mint a signature that fails its own
+    /// origin check, so we deliberately leave the message unsigned instead.
+    /// `pubkey_buf`/`sig_buf` back the stamped slices and MUST outlive the
+    /// `relayToPeers` send (the encode reads them); both are caller stack buffers.
+    fn signRelayOrigin(
+        self: *LinuxServer,
+        msg: *s2s_link.RelayMessage,
+        pubkey_buf: *[message_relay.pubkey_len]u8,
+        sig_buf: *[message_relay.sig_len]u8,
+    ) void {
+        const ident = self.config.node_identity orelse return;
+        // Self-certification invariant: the stamped origin id MUST equal
+        // `originShortId(pubkey)`. `origin_node` is `config.node_id`, which an
+        // operator can set independently of the node key; only sign when they
+        // agree so a receiver's `originShortId(pubkey) == origin_node` check holds.
+        if (ident.shortId() != msg.origin_node) return;
+        const transcript = message_relay.originTranscript(self.allocator, msg.*) catch return;
+        defer self.allocator.free(transcript);
+        message_relay.signInPlace(msg, &ident.sign_kp, transcript, pubkey_buf, sig_buf) catch return;
+    }
+
     /// Deliver an inbound relayed user message to LOCAL recipients (channel
     /// members or a local nick), then re-forward to other peers for multi-hop
     /// (loop-guarded by the per-peer seen-set + origin id).
     fn deliverRelay(self: *LinuxServer, msg: s2s_link.RelayMessage) void {
         // Global mesh-wide dedup (handles cross-path duplicates in a cyclic mesh).
         if (self.relay_seen.observe(msg.origin_node, msg.hlc)) return;
+        // End-to-end origin authentication at EVERY hop. A message that carries a
+        // self-contained signature is verified against the CLAIMED origin (self-
+        // certifying: the signing key must derive `origin_node`). On failure the
+        // message is dropped here — never delivered, never re-forwarded — so a
+        // relay cannot forge or tamper with an authored message. A message with
+        // no signature follows the legacy (unsigned) path unchanged.
+        if (!self.relayOriginVerified(msg)) return;
         var safe_tag_buf: [256]u8 = undefined;
         const safe_tags = clientOnlyTags(msg.tags, &safe_tag_buf);
         const clean_msg = s2s_link.RelayMessage{
@@ -4608,6 +4688,12 @@ pub const LinuxServer = struct {
             .recipient = msg.recipient,
             .origin_node = msg.origin_node,
             .hlc = msg.hlc,
+            // Preserve the ORIGINAL author's signature verbatim so a 3rd-hop node
+            // re-verifies the true origin, not this relay. `tags` is sanitized
+            // above (server-stamped msgid / client-tag filtered) but is NOT a
+            // signed field, so the carried signature stays valid downstream.
+            .origin_pubkey = msg.origin_pubkey,
+            .origin_sig = msg.origin_sig,
         };
         // WHISPER is nick-scoped within a shared channel; it never fans out to all
         // channel members, so it follows a dedicated inbound path below.
@@ -11808,7 +11894,7 @@ pub const LinuxServer = struct {
         if (self.hasEstablishedPeer()) {
             const hlc = self.nextMeshHlc();
             _ = self.relay_seen.observe(self.config.node_id, hlc);
-            const relay_msg = s2s_link.RelayMessage{
+            var relay_msg = s2s_link.RelayMessage{
                 .verb = .notice,
                 .target = chan,
                 .source_nick = origin,
@@ -11817,6 +11903,9 @@ pub const LinuxServer = struct {
                 .origin_node = self.config.node_id,
                 .hlc = hlc,
             };
+            var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+            var sig_buf: [message_relay.sig_len]u8 = undefined;
+            self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
             _ = self.relayToPeers(relay_msg, .{ .channel = chan });
         }
     }
@@ -12920,7 +13009,7 @@ pub const LinuxServer = struct {
         const prefix = clientPrefix(conn, &pbuf) catch return;
         const hlc = self.nextMeshHlc();
         _ = self.relay_seen.observe(self.config.node_id, hlc);
-        _ = self.relayToPeers(.{
+        var relay_msg = s2s_link.RelayMessage{
             .verb = verb,
             .target = chan,
             .min_rank = min_rank,
@@ -12931,7 +13020,11 @@ pub const LinuxServer = struct {
             .data_tag = data_tag,
             .origin_node = self.config.node_id,
             .hlc = hlc,
-        }, .{ .channel = chan });
+        };
+        var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+        var sig_buf: [message_relay.sig_len]u8 = undefined;
+        self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+        _ = self.relayToPeers(relay_msg, .{ .channel = chan });
     }
 
     /// Relay a nick-targeted DATA/REQUEST/REPLY to the peer that owns `nick`.
@@ -12952,7 +13045,7 @@ pub const LinuxServer = struct {
         const prefix = clientPrefix(conn, &pbuf) catch return false;
         const hlc = self.nextMeshHlc();
         _ = self.relay_seen.observe(self.config.node_id, hlc);
-        return self.relayToPeers(.{
+        var relay_msg = s2s_link.RelayMessage{
             .verb = verb,
             .target = nick,
             .source_nick = conn.session.displayName(),
@@ -12962,7 +13055,11 @@ pub const LinuxServer = struct {
             .data_tag = data_tag,
             .origin_node = self.config.node_id,
             .hlc = hlc,
-        }, .{ .nick = nick }) > 0;
+        };
+        var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+        var sig_buf: [message_relay.sig_len]u8 = undefined;
+        self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+        return self.relayToPeers(relay_msg, .{ .nick = nick }) > 0;
     }
 
     /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
@@ -13066,7 +13163,7 @@ pub const LinuxServer = struct {
         // recipient is known only via channel membership (the per-nick route
         // map tracks server names, not arbitrary user nicks), so `.channel`
         // narrowing is both correct and never floods the wider mesh.
-        return self.relayToPeers(.{
+        var relay_msg = s2s_link.RelayMessage{
             .verb = .whisper,
             .target = channel,
             .source_nick = conn.session.displayName(),
@@ -13076,7 +13173,11 @@ pub const LinuxServer = struct {
             .recipient = nick,
             .origin_node = self.config.node_id,
             .hlc = hlc,
-        }, .{ .channel = channel }) > 0;
+        };
+        var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+        var sig_buf: [message_relay.sig_len]u8 = undefined;
+        self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+        return self.relayToPeers(relay_msg, .{ .channel = channel }) > 0;
     }
 
     /// CREATE <channel> [modes] [clone-source] — IRCX channel creation
@@ -18092,7 +18193,7 @@ pub const LinuxServer = struct {
                     const hlc = self.nextMeshHlc();
                     _ = self.relay_seen.observe(self.config.node_id, hlc); // drop an echo back
                     var relay_tag_buf: [256]u8 = undefined;
-                    _ = self.relayToPeers(.{
+                    var relay_msg = s2s_link.RelayMessage{
                         .verb = if (is_notice) .notice else .privmsg,
                         .target = chan,
                         .min_rank = min_rank,
@@ -18103,7 +18204,11 @@ pub const LinuxServer = struct {
                         .text = eff_text,
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
-                    }, .{ .channel = chan }); // route_table: only peers with members
+                    };
+                    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+                    var sig_buf: [message_relay.sig_len]u8 = undefined;
+                    self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
+                    _ = self.relayToPeers(relay_msg, .{ .channel = chan }); // route_table: only peers with members
                 } else |_| {}
             }
             // Record into the CHATHISTORY ring (full status-prefix stripped: bare
@@ -18121,7 +18226,7 @@ pub const LinuxServer = struct {
                     const hlc = self.nextMeshHlc();
                     _ = self.relay_seen.observe(self.config.node_id, hlc);
                     var relay_tag_buf: [256]u8 = undefined;
-                    const relay_msg = s2s_link.RelayMessage{
+                    var relay_msg = s2s_link.RelayMessage{
                         .verb = if (is_notice) .notice else .privmsg,
                         .target = target,
                         .source_nick = conn.session.displayName(),
@@ -18132,6 +18237,9 @@ pub const LinuxServer = struct {
                         .origin_node = self.config.node_id,
                         .hlc = hlc,
                     };
+                    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+                    var sig_buf: [message_relay.sig_len]u8 = undefined;
+                    self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
                     // route_table: send only to the peer that owns this nick.
                     // Unknown routes fail closed instead of flooding the mesh.
                     if (self.relayToPeers(relay_msg, .{ .nick = target }) == 0) {
@@ -20164,6 +20272,163 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
         false,
         2,
     ));
+}
+
+// Build a relay PRIVMSG signed by `kp`, stamping the carried pubkey/sig into the
+// caller-owned `pk_buf`/`sig_buf` (which must outlive any deliverRelay call). The
+// `origin_node` is the self-certified short id of `kp`, so a receiver's
+// `originShortId(pubkey) == origin_node` invariant holds.
+fn buildSignedRelay(
+    kp: *const sign_mod.KeyPair,
+    target: []const u8,
+    source_prefix: []const u8,
+    text: []const u8,
+    hlc: u64,
+    pk_buf: *[message_relay.pubkey_len]u8,
+    sig_buf: *[message_relay.sig_len]u8,
+) !message_relay.RelayMessage {
+    var msg = message_relay.RelayMessage{
+        .verb = .privmsg,
+        .target = target,
+        .source_nick = "Remote",
+        .source_prefix = source_prefix,
+        .account = "",
+        .tags = "",
+        .text = text,
+        .origin_node = message_relay.originShortId(kp.public_key),
+        .hlc = hlc,
+    };
+    const transcript = try message_relay.originTranscript(std.testing.allocator, msg);
+    defer std.testing.allocator.free(transcript);
+    try message_relay.signInPlace(&msg, kp, transcript, pk_buf, sig_buf);
+    return msg;
+}
+
+const sign_mod = @import("../crypto/sign.zig");
+
+test "deliverRelay accepts a correctly signed origin message" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+    const target = server.connFor(target_id).?;
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x21} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+    var sig_buf: [message_relay.sig_len]u8 = undefined;
+    const msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "signed and delivered", 1, &pk_buf, &sig_buf);
+
+    server.deliverRelay(msg);
+    try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :signed and delivered\r\n");
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+}
+
+test "deliverRelay rejects a forged signature: not delivered, counted" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+    const target = server.connFor(target_id).?;
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x31} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+    var sig_buf: [message_relay.sig_len]u8 = undefined;
+    var msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "forged body", 2, &pk_buf, &sig_buf);
+    // Tamper the text AFTER signing: structure is valid, signature no longer is.
+    msg.text = "tampered body the origin never authored";
+
+    server.deliverRelay(msg);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+}
+
+test "deliverRelay rejects a pubkey whose originShortId != origin_node" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+    const target = server.connFor(target_id).?;
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x41} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+    var sig_buf: [message_relay.sig_len]u8 = undefined;
+    var msg = try buildSignedRelay(&kp, "Target", "Remote!r@elsewhere", "claims a different origin", 3, &pk_buf, &sig_buf);
+    // Claim an origin id the carried key does not self-certify.
+    msg.origin_node = message_relay.originShortId(kp.public_key) ^ 0x1;
+
+    server.deliverRelay(msg);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+}
+
+test "deliverRelay still delivers a legacy unsigned message (backward compat)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const target_id = try addTestLocalClient(&server, "Target", "targetacct");
+    const target = server.connFor(target_id).?;
+
+    // No origin_pubkey/origin_sig: the legacy unsigned path, unchanged.
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "Target",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@elsewhere",
+        .account = "",
+        .tags = "",
+        .text = "legacy unsigned still flows",
+        .origin_node = 99,
+        .hlc = 7,
+    });
+    try expectContains(target.send_buf[0..target.send_len], ":Remote!r@elsewhere PRIVMSG Target :legacy unsigned still flows\r\n");
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+}
+
+test "deliverRelay re-forward preserves the signature for the next hop" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // No local recipient for #relay here: deliverRelay's job is the re-forward
+    // path. We assert the message that WOULD be re-forwarded (clean_msg) keeps the
+    // original signature, by re-verifying the encoded copy at std-allocator level.
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x51} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [message_relay.pubkey_len]u8 = undefined;
+    var sig_buf: [message_relay.sig_len]u8 = undefined;
+    const msg = try buildSignedRelay(&kp, "#relay", "Remote!r@elsewhere", "multi-hop authored once", 9, &pk_buf, &sig_buf);
+
+    // The relayed clean_msg copies origin_pubkey/origin_sig verbatim; an encode
+    // round-trip (what a real re-forward does over the wire) still verifies as the
+    // ORIGINAL origin at the next hop.
+    const wire = try message_relay.encode(std.testing.allocator, msg);
+    defer std.testing.allocator.free(wire);
+    var hop2 = try message_relay.decode(std.testing.allocator, wire);
+    defer hop2.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, msg.origin_pubkey, hop2.msg.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, msg.origin_sig, hop2.msg.origin_sig);
+    try std.testing.expectEqual(message_relay.VerifyOutcome.verified, try message_relay.verifyOrigin(std.testing.allocator, hop2.msg));
+
+    // And deliverRelay itself accepts (does not count a rejection) for a signed msg.
+    server.deliverRelay(msg);
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
 }
 
 test "remote aggregate channel mode flags cannot clear local +nt policy" {
