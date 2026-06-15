@@ -647,6 +647,32 @@ test "parse ACCESS star and SACCESS add each server entry type" {
     try std.testing.expectEqualStrings("badnick*", nonick.add.mask);
 }
 
+test "ServerAccessStore matches grant deny and gag masks independently" {
+    var store = ServerAccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    try store.add(.{ .entry_type = .deny, .mask = "*!*@bad.test", .reason = "denied" });
+    try store.add(.{ .entry_type = .grant, .mask = "good!*@bad.test" });
+    try store.add(.{ .entry_type = .gag, .mask = "*!*@noisy.test" });
+
+    // A trusted client matches BOTH the deny and the grant: the enforcement
+    // layer consults grant first (GRANT overrides DENY). The store exposes each
+    // independently so the caller can implement that precedence.
+    try std.testing.expect(store.matchHostmask(.deny, "good!user@bad.test") != null);
+    try std.testing.expect(store.matchHostmask(.grant, "good!user@bad.test") != null);
+    // A non-trusted client on the same host matches deny but NOT grant.
+    try std.testing.expect(store.matchHostmask(.deny, "evil!user@bad.test") != null);
+    try std.testing.expect(store.matchHostmask(.grant, "evil!user@bad.test") == null);
+    // Gag is its own axis.
+    try std.testing.expect(store.matchHostmask(.gag, "any!user@noisy.test") != null);
+    try std.testing.expect(store.matchHostmask(.grant, "any!user@noisy.test") == null);
+
+    // Removing the grant leaves the deny in force.
+    try std.testing.expect(try store.remove(.grant, "good!*@bad.test"));
+    try std.testing.expect(store.matchHostmask(.grant, "good!user@bad.test") == null);
+    try std.testing.expect(store.matchHostmask(.deny, "good!user@bad.test") != null);
+}
+
 test "parse delete list and clear subcommands" {
     const del = try parseSaccess(&.{ "DELETE", "GAG", "flooder!*@*" });
     try std.testing.expectEqual(EntryType.gag, del.delete.entry_type);

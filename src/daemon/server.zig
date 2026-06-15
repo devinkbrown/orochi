@@ -6662,6 +6662,11 @@ pub const LinuxServer = struct {
     fn enforceServerAccess(self: *LinuxServer, conn: *ConnState) !bool {
         var mask_buf: [256]u8 = undefined;
         const mask = clientPrefix(conn, &mask_buf) catch return false;
+        // IRCX processing order: GRANT, then DENY/GAG (GRANT overrides DENY).
+        // A server-level GRANT is a whitelist exemption: a connecting client
+        // whose mask matches a GRANT entry bypasses the SACCESS deny/gag
+        // firewall entirely. Mirrors ophion m_ircx_access_server.c.
+        if (self.saccess.matchHostmask(.grant, mask) != null) return false;
         if (self.saccess.matchHostmask(.deny, mask)) |entry| {
             var buf: [default_reply_bytes]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "ERROR :{s}\r\n", .{serverAccessReason(entry, "Access denied by SACCESS")}) catch "ERROR :Access denied by SACCESS\r\n";
@@ -9747,6 +9752,33 @@ pub const LinuxServer = struct {
         svc.deleteWard(match.token(), pattern, &scratch) catch {};
     }
 
+    /// Persist a live SACCESS ADD to the durable store so the server-access
+    /// firewall (DENY/GAG/GRANT/NOCHANNEL/NONICK) survives restart and hot
+    /// rebuild. Mirrors `persistWardMirror`; best-effort, never blocks the live
+    /// add (the in-memory `self.saccess` already holds the authoritative entry).
+    fn persistSaccessMirror(self: *LinuxServer, entry: ircx_saccess.Entry) void {
+        const svc = self.account_services orelse return;
+        var scratch: [512]u8 = undefined;
+        svc.persistSaccess(.{
+            .entry_type = entry.entry_type.token(),
+            .mask = entry.mask,
+            .duration = entry.duration orelse 0,
+            .reason = entry.reason orelse "",
+        }, &scratch) catch {};
+    }
+
+    fn deleteSaccessMirror(self: *LinuxServer, entry_type: ircx_saccess.EntryType, mask: []const u8) void {
+        const svc = self.account_services orelse return;
+        var scratch: [512]u8 = undefined;
+        svc.deleteSaccess(entry_type.token(), mask, &scratch) catch {};
+    }
+
+    fn clearSaccessMirror(self: *LinuxServer, entry_type: ?ircx_saccess.EntryType) void {
+        const svc = self.account_services orelse return;
+        const tok: ?[]const u8 = if (entry_type) |et| et.token() else null;
+        svc.clearSaccess(tok) catch {};
+    }
+
     fn addWardLive(
         self: *LinuxServer,
         conn: *ConnState,
@@ -11951,18 +11983,26 @@ pub const LinuxServer = struct {
                     try queueNumeric(conn, .ERR_TOOMANYACCESSES, &.{"*"}, "Cannot add SACCESS entry");
                     return;
                 };
+                // Durable mirror: persist AFTER the live add succeeds so the
+                // entry replays on the next boot.
+                self.persistSaccessMirror(entry);
                 if (ircx_saccess.buildAccessAdd(&buf, ctx, entry)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
             },
             .delete => |entry| {
-                _ = self.saccess.remove(entry.entry_type, entry.mask) catch false;
+                const removed = self.saccess.remove(entry.entry_type, entry.mask) catch false;
+                // Persist the delete unconditionally so a stale persisted entry
+                // (e.g. one that pre-dated this process) is also reaped.
+                self.deleteSaccessMirror(entry.entry_type, entry.mask);
+                _ = removed;
                 if (ircx_saccess.buildAccessDelete(&buf, ctx, entry)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
             },
             .clear => |entry_type| {
                 _ = self.saccess.clear(entry_type);
+                self.clearSaccessMirror(entry_type);
                 if (ircx_saccess.buildAccessEnd(&buf, ctx)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
@@ -14140,6 +14180,20 @@ pub const LinuxServer = struct {
                     else => return error.InvalidRecord,
                 };
             }
+
+            fn onSaccess(ctx: *anyopaque, replay: services_mod.ReplaySaccess) services_mod.ServiceError!void {
+                const self_ctx: *@This() = @ptrCast(@alignCast(ctx));
+                const entry_type = ircx_saccess.EntryType.parse(replay.entry_type) orelse return error.InvalidRecord;
+                self_ctx.server.saccess.add(.{
+                    .entry_type = entry_type,
+                    .mask = replay.mask,
+                    .duration = if (replay.duration != 0) replay.duration else null,
+                    .reason = if (replay.reason.len != 0) replay.reason else null,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidRecord,
+                };
+            }
         };
 
         var ctx = ReplayCtx{ .server = self };
@@ -14148,14 +14202,15 @@ pub const LinuxServer = struct {
             .channel = ReplayCtx.onChannel,
             .akick = ReplayCtx.onAkick,
             .ward = ReplayCtx.onWard,
+            .saccess = ReplayCtx.onSaccess,
         }) catch |err| {
             std.debug.print("orochi: services live-state replay failed ({s})\n", .{@errorName(err)});
             return;
         };
-        if (summary.channels != 0 or summary.akicks != 0 or summary.wards != 0) {
+        if (summary.channels != 0 or summary.akicks != 0 or summary.wards != 0 or summary.saccesses != 0) {
             std.debug.print(
-                "orochi: services replay restored {d} channel(s), {d} MLOCK(s), {d} AKICK(s), {d} WARD(s)\n",
-                .{ summary.channels, summary.mlocks, summary.akicks, summary.wards },
+                "orochi: services replay restored {d} channel(s), {d} MLOCK(s), {d} AKICK(s), {d} WARD(s), {d} SACCESS(es)\n",
+                .{ summary.channels, summary.mlocks, summary.akicks, summary.wards, summary.saccesses },
             );
         }
     }
@@ -19924,6 +19979,83 @@ test "server services replay restores registered channels mlocks akicks and ward
     try std.testing.expectEqualStrings("spam", ward.reason);
 }
 
+// GAP 2: SACCESS entries persist to the durable store and replay into the live
+// `self.saccess` at boot. Simulates a restart by persisting via one Services
+// handle and replaying into a freshly-initialized server, asserting the
+// restored entries are present and enforce (matchHostmask).
+test "server services replay restores persisted SACCESS entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-replay.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+
+    // Persist a DENY (with duration + reason), a GAG, and a GRANT.
+    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "bad!*@*", .duration = 60, .reason = "abuse" }, &scratch);
+    try services.persistSaccess(.{ .entry_type = "GAG", .mask = "noisy!*@*" }, &scratch);
+    try services.persistSaccess(.{ .entry_type = "GRANT", .mask = "trusted!*@*" }, &scratch);
+    // A deleted entry must NOT come back after replay.
+    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "temp!*@*" }, &scratch);
+    try services.deleteSaccess("DENY", "temp!*@*", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    server.replayServicesLiveState(&services);
+
+    const deny = server.saccess.matchHostmask(.deny, "bad!user@host") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("bad!*@*", deny.mask);
+    try std.testing.expectEqual(@as(?u64, 60), deny.duration);
+    try std.testing.expectEqualStrings("abuse", deny.reason.?);
+    try std.testing.expect(server.saccess.matchHostmask(.gag, "noisy!x@y") != null);
+    try std.testing.expect(server.saccess.matchHostmask(.grant, "trusted!x@y") != null);
+    // The deleted DENY did not survive.
+    try std.testing.expect(server.saccess.matchHostmask(.deny, "temp!x@y") == null);
+}
+
+// GAP 2: a CLEAR mutation is durable. After clearing one type, replay restores
+// only the surviving types.
+test "server services replay honors persisted SACCESS clear" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-clear.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+
+    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "a!*@*" }, &scratch);
+    try services.persistSaccess(.{ .entry_type = "DENY", .mask = "b!*@*" }, &scratch);
+    try services.persistSaccess(.{ .entry_type = "GAG", .mask = "c!*@*" }, &scratch);
+    // Clear only DENY; the GAG must remain.
+    try services.clearSaccess("DENY");
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    server.replayServicesLiveState(&services);
+
+    try std.testing.expect(server.saccess.matchHostmask(.deny, "a!x@y") == null);
+    try std.testing.expect(server.saccess.matchHostmask(.deny, "b!x@y") == null);
+    try std.testing.expect(server.saccess.matchHostmask(.gag, "c!x@y") != null);
+}
+
 test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -20011,6 +20143,84 @@ test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
     admin.reset();
     try writeAllFd(fd_admin, "ACCOUNT NOEXPIRE bob off\r\n");
     try recvUntil(&admin, "noexpire=false", 200);
+}
+
+// GAP 1: a server-level SACCESS GRANT is a whitelist that OVERRIDES a DENY. A
+// connecting client whose mask matches a GRANT entry bypasses the SACCESS
+// deny/gag firewall even when a matching DENY exists. Loopback clients present
+// host "localhost", so `*!*@localhost` matches every test connection.
+test "threaded server: SACCESS GRANT overrides DENY at registration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-grant.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Admin opers up (gains service_admin) and installs both a blanket DENY and
+    // an overriding GRANT for all loopback clients.
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    var admin = LiveClient{ .fd = fd_admin };
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try recvUntil(&admin, " 381 Oper ", 200);
+
+    // SACCESS is an IRCX-family command, gated behind ISIRCX negotiation.
+    admin.reset();
+    try writeAllFd(fd_admin, "IRCX\r\n");
+    try recvUntil(&admin, " 800 Oper 1 0 ", 200);
+
+    admin.reset();
+    // Reason follows a duration over the wire (the line parser strips a leading
+    // ':' from the trailing param, so the reason rides in the 4th SACCESS arg).
+    try writeAllFd(fd_admin, "SACCESS ADD DENY *!*@localhost 0 :denied\r\n");
+    try recvUntil(&admin, "801 Oper * DENY *!*@localhost", 200);
+    admin.reset();
+    try writeAllFd(fd_admin, "SACCESS ADD GRANT *!*@localhost\r\n");
+    try recvUntil(&admin, "801 Oper * GRANT *!*@localhost", 200);
+
+    // A fresh loopback client matches BOTH the DENY and the GRANT. GRANT wins:
+    // the client registers normally (001) instead of being firewalled.
+    const fd_ok = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_ok);
+    var ok = LiveClient{ .fd = fd_ok };
+    try writeAllFd(fd_ok, "NICK Granted\r\nUSER g 0 * :Granted\r\n");
+    try recvUntil(&ok, " 001 Granted ", 200);
+
+    // Remove the GRANT: now the DENY bites and a new loopback client is refused
+    // with the ERROR firewall line. This proves the bypass is GRANT-driven and
+    // the deny path is otherwise intact.
+    admin.reset();
+    try writeAllFd(fd_admin, "SACCESS DELETE GRANT *!*@localhost\r\n");
+    try recvUntil(&admin, "802 Oper * GRANT *!*@localhost", 200);
+
+    const fd_deny = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_deny);
+    var denied = LiveClient{ .fd = fd_deny };
+    try writeAllFd(fd_deny, "NICK Denied\r\nUSER d 0 * :Denied\r\n");
+    try recvUntil(&denied, "ERROR :denied", 200);
 }
 
 test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects lifecycle flags" {

@@ -52,10 +52,12 @@ const access_version = "X1";
 const akick_version = "K1";
 const verify_version = "V1";
 const ward_version = "W1";
+const saccess_version = "S1";
 const access_prefix = "chanaccess:";
 const akick_prefix = "chanakick:";
 const verify_prefix = "acctverify:";
 const ward_prefix = "ward:";
+const saccess_prefix = "saccess:";
 const missing_account_salt: [salt_len]u8 = .{
     0x6d, 0x69, 0x7a, 0x75, 0x63, 0x68, 0x69, 0x2d,
     0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73,
@@ -226,11 +228,22 @@ pub const ReplayWard = struct {
     expires_ms: i64,
 };
 
+/// Server-level IRCX ACCESS (SACCESS) entry as carried across the persistence
+/// boundary. Fields borrow from caller-owned buffers / decoded WAL values.
+pub const ReplaySaccess = struct {
+    /// Entry-type token: DENY / GAG / GRANT / NOCHANNEL / NONICK.
+    entry_type: []const u8,
+    mask: []const u8,
+    duration: u64 = 0,
+    reason: []const u8 = "",
+};
+
 pub const LiveReplaySummary = struct {
     channels: usize = 0,
     mlocks: usize = 0,
     akicks: usize = 0,
     wards: usize = 0,
+    saccesses: usize = 0,
 };
 
 pub const LiveReplaySink = struct {
@@ -238,6 +251,7 @@ pub const LiveReplaySink = struct {
     channel: *const fn (ctx: *anyopaque, channel: []const u8, mlock: []const u8) ServiceError!void,
     akick: ?*const fn (ctx: *anyopaque, channel: []const u8, mask: []const u8, reason: []const u8, setter: []const u8) ServiceError!void = null,
     ward: ?*const fn (ctx: *anyopaque, ward: ReplayWard) ServiceError!void = null,
+    saccess: ?*const fn (ctx: *anyopaque, entry: ReplaySaccess) ServiceError!void = null,
 };
 
 pub const CommandResult = union(enum) {
@@ -977,6 +991,64 @@ pub const Services = struct {
         try self.store.family(.bans).delete(key);
     }
 
+    /// Persist (add or replace) one server-level IRCX ACCESS / SACCESS entry so
+    /// it survives restart and hot-rebuild. Mirrors `persistWard`: keyed by
+    /// `saccess:<type>:<mask>` in the durable `bans` family. Idempotent — a
+    /// re-add of the same type+mask overwrites the prior value.
+    pub fn persistSaccess(self: *Services, entry: ReplaySaccess, scratch: []u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try saccessKey(entry.entry_type, entry.mask, scratch);
+        var value_buf: [saccess_value_max]u8 = undefined;
+        const value = try encodeSaccess(entry, &value_buf);
+        try self.store.family(.bans).put(key, value);
+    }
+
+    /// Remove one persisted SACCESS entry by type+mask. Restart-safe: a delete
+    /// that mutated the live store is durably reflected.
+    pub fn deleteSaccess(self: *Services, entry_type: []const u8, mask: []const u8, scratch: []u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const key = try saccessKey(entry_type, mask, scratch);
+        try self.store.family(.bans).delete(key);
+    }
+
+    /// Remove all persisted SACCESS entries (optionally one type). Mirrors the
+    /// live `ServerAccessStore.clear` so a CLEAR is durable across restart.
+    ///
+    /// Keys are snapshotted into a caller-owned buffer BEFORE any delete: the
+    /// store frees the map-owned key on delete, so deleting straight from a
+    /// borrowed iterator key would be a use-after-free (the WAL/changefeed
+    /// re-reads the key after the map entry is freed).
+    pub fn clearSaccess(self: *Services, entry_type: ?[]const u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var key_store: [256][saccess_key_max]u8 = undefined;
+        var key_lens: [256]usize = undefined;
+        var keys_len: usize = 0;
+        {
+            var it = self.store.maps[@intFromEnum(store_mod.Family.bans)].map.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (!std.mem.startsWith(u8, key, saccess_prefix)) continue;
+                if (entry_type) |want| {
+                    const decoded = decodeSaccess(entry.value_ptr.*) catch continue;
+                    if (!std.ascii.eqlIgnoreCase(decoded.entry_type, want)) continue;
+                }
+                if (keys_len >= key_store.len or key.len > saccess_key_max) continue;
+                @memcpy(key_store[keys_len][0..key.len], key);
+                key_lens[keys_len] = key.len;
+                keys_len += 1;
+            }
+        }
+        for (0..keys_len) |idx| {
+            self.store.family(.bans).delete(key_store[idx][0..key_lens[idx]]) catch {};
+        }
+    }
+
     pub fn replayLiveState(self: *Services, sink: LiveReplaySink) ServiceError!LiveReplaySummary {
         self.lock.lockShared();
         defer self.lock.unlockShared();
@@ -1009,6 +1081,15 @@ pub const Services = struct {
                 const ward = decodeWard(entry.value_ptr.*) catch continue;
                 try on_ward(sink.ptr, ward);
                 summary.wards += 1;
+            }
+        }
+        if (sink.saccess) |on_saccess| {
+            var it = self.store.maps[@intFromEnum(store_mod.Family.bans)].map.iterator();
+            while (it.next()) |entry| {
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, saccess_prefix)) continue;
+                const sa = decodeSaccess(entry.value_ptr.*) catch continue;
+                try on_saccess(sink.ptr, sa);
+                summary.saccesses += 1;
             }
         }
         return summary;
@@ -1198,6 +1279,15 @@ const verify_value_max = verify_version.len + 1 + account_max + 1 + email_max + 
 const default_verify_ttl_ms: u64 = 15 * 60 * 1000;
 const ward_key_max = ward_prefix.len + 16 + 1 + 256;
 const ward_value_max = ward_version.len + 1 + 16 + 1 + 256 + 1 + 16 + 1 + 16 + 1 + 20 + 1 + 20 + 1 + 64 + 1 + 512;
+
+// SACCESS persistence sizing. Entry-type token <= 9 ("NOCHANNEL"); mask is the
+// IRCX access mask (DEFAULT_MAX_MASK_BYTES = 128); reason <= 256; duration is a
+// u64 (<= 20 digits). Generous bounds keep this restart-safe under any config.
+const saccess_type_max = 16;
+const saccess_mask_max = 256;
+const saccess_reason_max = 512;
+const saccess_key_max = saccess_prefix.len + saccess_type_max + 1 + saccess_mask_max;
+const saccess_value_max = saccess_version.len + 1 + saccess_type_max + 1 + saccess_mask_max + 1 + 20 + 1 + saccess_reason_max;
 
 /// Build the props-family key for a certfp binding, or null if it would not fit.
 fn certfpKey(buf: []u8, fingerprint: []const u8) ?[]const u8 {
@@ -1518,6 +1608,43 @@ fn decodeWard(value: []const u8) ServiceError!ReplayWard {
         .created_ms = std.fmt.parseInt(i64, created, 10) catch return error.InvalidRecord,
         .expires_ms = std.fmt.parseInt(i64, expires, 10) catch return error.InvalidRecord,
         .setter = setter,
+        .reason = reason,
+    };
+}
+
+fn saccessKey(entry_type: []const u8, mask: []const u8, out: []u8) ServiceError![]const u8 {
+    try validateWardField(entry_type, saccess_type_max);
+    try validateWardField(mask, saccess_mask_max);
+    if (saccess_prefix.len + entry_type.len + 1 + mask.len > @min(out.len, saccess_key_max)) return error.BufferTooSmall;
+    return std.fmt.bufPrint(out, saccess_prefix ++ "{s}:{s}", .{ entry_type, mask }) catch error.BufferTooSmall;
+}
+
+fn encodeSaccess(entry: ReplaySaccess, out: []u8) ServiceError![]const u8 {
+    try validateWardField(entry.entry_type, saccess_type_max);
+    try validateWardField(entry.mask, saccess_mask_max);
+    try validateWardOptionalField(entry.reason, saccess_reason_max);
+    return std.fmt.bufPrint(
+        out,
+        "{s}|{s}|{s}|{d}|{s}",
+        .{ saccess_version, entry.entry_type, entry.mask, entry.duration, entry.reason },
+    ) catch error.BufferTooSmall;
+}
+
+fn decodeSaccess(value: []const u8) ServiceError!ReplaySaccess {
+    var it = std.mem.splitScalar(u8, value, '|');
+    if (!std.mem.eql(u8, it.next() orelse return error.InvalidRecord, saccess_version)) return error.InvalidRecord;
+    const entry_type = it.next() orelse return error.InvalidRecord;
+    const mask = it.next() orelse return error.InvalidRecord;
+    const duration = it.next() orelse return error.InvalidRecord;
+    const reason = it.next() orelse "";
+    if (it.next() != null) return error.InvalidRecord;
+    try validateWardField(entry_type, saccess_type_max);
+    try validateWardField(mask, saccess_mask_max);
+    try validateWardOptionalField(reason, saccess_reason_max);
+    return .{
+        .entry_type = entry_type,
+        .mask = mask,
+        .duration = std.fmt.parseInt(u64, duration, 10) catch return error.InvalidRecord,
         .reason = reason,
     };
 }
@@ -1971,6 +2098,107 @@ test "channel mlock access akick and ward replay from durable services" {
         try std.testing.expectEqualStrings("Bad!*@*", recorder.ward_pattern[0..recorder.ward_pattern_len]);
         try std.testing.expectEqualStrings("spam", recorder.ward_reason[0..recorder.ward_reason_len]);
     }
+}
+
+test "SACCESS entries persist across a WAL reopen and replay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-saccess-replay.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var scratch: [record_max]u8 = undefined;
+
+        try services.persistSaccess(.{ .entry_type = "DENY", .mask = "bad!*@*", .duration = 60, .reason = "abuse" }, &scratch);
+        try services.persistSaccess(.{ .entry_type = "GRANT", .mask = "trusted!*@*" }, &scratch);
+        try services.persistSaccess(.{ .entry_type = "GAG", .mask = "noisy!*@*" }, &scratch);
+        // A deleted entry must not survive the reopen.
+        try services.persistSaccess(.{ .entry_type = "DENY", .mask = "temp!*@*" }, &scratch);
+        try services.deleteSaccess("DENY", "temp!*@*", &scratch);
+        // A re-add of the same type+mask is idempotent (overwrite, not duplicate).
+        try services.persistSaccess(.{ .entry_type = "GAG", .mask = "noisy!*@*", .reason = "updated" }, &scratch);
+    }
+
+    {
+        // Reopen the WAL — this is the actual "restart": state comes only from disk.
+        var store = try openTestStore(tmp, "services-saccess-replay.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+
+        const Recorder = struct {
+            count: usize = 0,
+            deny_mask: [256]u8 = [_]u8{0} ** 256,
+            deny_mask_len: usize = 0,
+            deny_duration: u64 = 0,
+            deny_reason: [512]u8 = [_]u8{0} ** 512,
+            deny_reason_len: usize = 0,
+            saw_grant: bool = false,
+            saw_gag: bool = false,
+            gag_reason: [512]u8 = [_]u8{0} ** 512,
+            gag_reason_len: usize = 0,
+            saw_temp: bool = false,
+
+            fn onChannel(_: *anyopaque, _: []const u8, _: []const u8) ServiceError!void {}
+
+            fn onSaccess(ctx: *anyopaque, entry: ReplaySaccess) ServiceError!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                self.count += 1;
+                if (std.mem.eql(u8, entry.entry_type, "DENY") and std.mem.eql(u8, entry.mask, "bad!*@*")) {
+                    @memcpy(self.deny_mask[0..entry.mask.len], entry.mask);
+                    self.deny_mask_len = entry.mask.len;
+                    self.deny_duration = entry.duration;
+                    @memcpy(self.deny_reason[0..entry.reason.len], entry.reason);
+                    self.deny_reason_len = entry.reason.len;
+                }
+                if (std.mem.eql(u8, entry.entry_type, "DENY") and std.mem.eql(u8, entry.mask, "temp!*@*")) self.saw_temp = true;
+                if (std.mem.eql(u8, entry.entry_type, "GRANT")) self.saw_grant = true;
+                if (std.mem.eql(u8, entry.entry_type, "GAG")) {
+                    self.saw_gag = true;
+                    @memcpy(self.gag_reason[0..entry.reason.len], entry.reason);
+                    self.gag_reason_len = entry.reason.len;
+                }
+            }
+        };
+        var recorder = Recorder{};
+        const summary = try services.replayLiveState(.{
+            .ptr = &recorder,
+            .channel = Recorder.onChannel,
+            .saccess = Recorder.onSaccess,
+        });
+
+        // 3 survivors: DENY bad, GRANT trusted, GAG noisy (temp DENY was deleted,
+        // and the duplicate GAG add overwrote rather than added).
+        try std.testing.expectEqual(@as(usize, 3), summary.saccesses);
+        try std.testing.expectEqual(@as(usize, 3), recorder.count);
+        try std.testing.expectEqualStrings("bad!*@*", recorder.deny_mask[0..recorder.deny_mask_len]);
+        try std.testing.expectEqual(@as(u64, 60), recorder.deny_duration);
+        try std.testing.expectEqualStrings("abuse", recorder.deny_reason[0..recorder.deny_reason_len]);
+        try std.testing.expect(recorder.saw_grant);
+        try std.testing.expect(recorder.saw_gag);
+        try std.testing.expectEqualStrings("updated", recorder.gag_reason[0..recorder.gag_reason_len]);
+        try std.testing.expect(!recorder.saw_temp);
+    }
+}
+
+test "SACCESS codec round-trips and rejects malformed records" {
+    var key_buf: [saccess_key_max]u8 = undefined;
+    const key = try saccessKey("DENY", "bad!*@*", &key_buf);
+    try std.testing.expectEqualStrings("saccess:DENY:bad!*@*", key);
+
+    var val_buf: [saccess_value_max]u8 = undefined;
+    const encoded = try encodeSaccess(.{ .entry_type = "GAG", .mask = "x!*@*", .duration = 7, .reason = "hush" }, &val_buf);
+    const decoded = try decodeSaccess(encoded);
+    try std.testing.expectEqualStrings("GAG", decoded.entry_type);
+    try std.testing.expectEqualStrings("x!*@*", decoded.mask);
+    try std.testing.expectEqual(@as(u64, 7), decoded.duration);
+    try std.testing.expectEqualStrings("hush", decoded.reason);
+
+    // A pipe in a field would corrupt the delimiter; encode rejects it.
+    try std.testing.expectError(error.InvalidValue, encodeSaccess(.{ .entry_type = "DENY", .mask = "a|b", .duration = 0, .reason = "" }, &val_buf));
+    // Wrong version / truncated record is rejected on decode.
+    try std.testing.expectError(error.InvalidRecord, decodeSaccess("S9|DENY|m|0|"));
+    try std.testing.expectError(error.InvalidRecord, decodeSaccess("S1|DENY"));
 }
 
 test "non-admin channel mutations are forbidden" {
