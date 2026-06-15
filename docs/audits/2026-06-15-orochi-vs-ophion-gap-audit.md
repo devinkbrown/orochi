@@ -125,26 +125,35 @@ behind the code):
   tested. Services durability (email verify, `+r` replay, AKICK, MLOCK, WARD) and
   named oper-privilege gates were likewise already complete.
 
+Also closed in the agent pass (additional): a live read-only HTTP `/metrics`
+endpoint (loopback-default, mutex-guarded Prometheus snapshot); per-category
+EVENT subject-glob masks; full live session-state migration over mesh
+(SESSION_MIGRATE frame + capsule ship/stage/consume on reclaim); cryptographic
+per-frame origin signing for the seven direct-owned S2S state frames
+(self-certifying `node_id=BLAKE3-160(pubkey)` envelope, handshake-negotiated,
+upgrading `acceptsDirectOrigin` from link-trust to cryptographic proof); and
+unguessable native-media stream ids (the server-issued stream id, stamped by the
+client into every opcodec frame, is now a keyed-PRF capability instead of a
+public `Wyhash(channel:nick)`, so an attacker who knows the public channel/nick
+can no longer precompute a victim's stream id and hijack/inject on the
+native-media UDP port). Confirmed already-present (not gaps): channel ACCESS
+GRANT bypasses +l/+i/+k/+b on join.
+
 Still open (genuine future work, larger or cross-component):
 
-- **Full Ophion-class live session migration** over mesh: the `migration_relay` /
-  `session_migrate` modules exist and are tested but are not wired to a live S2S
-  frame or the reclaim path. `SESSION RESUME` remains reclaim/redirect-oriented.
-- **End-to-end per-frame signed envelopes** for routed/multi-hop frames. Secured
-  links now AEAD-encrypt + authenticate point-to-point; multi-hop origin signing
-  is still open.
-- **Datagram-level native-media sender authentication** (TOFU address binding
-  exists; per-stream token auth needs a coordinated browser-codec wire change,
-  i.e. cross-component work on the Nexus/Ocean clients, not a server-only fix).
+- **Multi-hop / CRDT re-broadcast origin signing.** Direct-owned frames are now
+  signed end-to-end; the MESSAGE relay and CRDT delta/BURST re-broadcast (which
+  re-emit a third node's fact with its `origin_node` preserved) still need
+  per-fact `(pubkey, sig)` storage so a relay forwards the ORIGINAL signer's
+  signature rather than its own. See `signed_frame.zig` FOLLOW-UP.
+- **Per-datagram native-media payload authentication.** The unguessable stream id
+  closes the precompute/hijack vector server-side; a full per-datagram MAC on the
+  media payload itself would still need a coordinated browser-codec change on the
+  Nexus/Ocean clients (the opcodec frame is assembled in client JS, not this
+  repo), so it remains cross-component.
 - Account/user/member PROP propagation over mesh (channel PROP already
   propagates; user/member props are session-local, so this needs new
   ACCOUNT/USER PROP convergence frames for relatively low value).
-
-Also closed in the agent pass (additional): a live read-only HTTP `/metrics`
-endpoint (loopback-default, mutex-guarded Prometheus snapshot), per-category
-EVENT subject-glob masks, and full live session-state migration over mesh
-(SESSION_MIGRATE frame + capsule ship/stage/consume on reclaim). Confirmed
-already-present (not gaps): channel ACCESS GRANT bypasses +l/+i/+k/+b on join.
 
 Intentional divergences / out of scope (NOT gaps): EVENT numerics `808-825`
 (Orochi uses the `NOTE EVENT` wire form by design), `RPL_LISTXPICS 813` (no

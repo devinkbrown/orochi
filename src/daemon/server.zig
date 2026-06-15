@@ -1780,6 +1780,13 @@ pub const LinuxServer = struct {
     /// resumption is enabled, then copied into every per-connection TLS config so
     /// a ticket issued on one reactor can resume on another.
     tls_ticket_key: tls_resumption.TicketKey = [_]u8{0} ** @sizeOf(tls_resumption.TicketKey),
+    /// Per-process secret keying the native-media opcodec stream-id derivation.
+    /// The stream id is a server-issued capability the client stamps into every
+    /// opcodec frame; keying it makes it unguessable to anyone without the secret,
+    /// so an attacker who knows the public (channel, nick) can no longer precompute
+    /// a victim's stream id and hijack/inject on the native-media UDP port.
+    /// Generated once at init (getrandom via secure_fns).
+    native_stream_key: [16]u8 = [_]u8{0} ** 16,
     /// Shared anti-replay ring for accepted 0-RTT binders. The guard is
     /// internally synchronized because all reactor threads share it.
     tls_replay_guard: tls_resumption.ReplayGuard = .{},
@@ -2252,6 +2259,11 @@ pub const LinuxServer = struct {
             .wasm = wasm_bridge.Bridge.init(allocator),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
             .tls_ticket_key = tls_ticket_key,
+            .native_stream_key = blk: {
+                var k: [16]u8 = undefined;
+                secure_fns.randomBytes(&k);
+                break :blk k;
+            },
             .reactors = reactors,
             .mesh_dials = mesh_dials,
             .mesh_trusted_node_keys = mesh_trusted_node_keys,
@@ -16051,7 +16063,7 @@ pub const LinuxServer = struct {
         // for the channel's native call and advertise the candidate + the
         // stream_id the client must stamp into its opcodec frames. Independent of
         // the WebRTC plane above; best-effort (media is optional).
-        const stream_id = nativeStreamId(channel, nick);
+        const stream_id = self.nativeStreamId(channel, nick);
         if (self.native_media.port != 0) {
             self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
             var nbuf: [256]u8 = undefined;
@@ -16104,16 +16116,45 @@ pub const LinuxServer = struct {
         self.allocator.free(key);
     }
 
-    /// Deterministic per-(channel,participant) opcodec stream id advertised to the
-    /// native client; it stamps this into every opcodec frame it publishes so the
-    /// SFU can map a frame back to its publisher. Never 0 (0 reads as "unset").
-    fn nativeStreamId(channel: []const u8, nick: []const u8) u32 {
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(channel);
-        hasher.update(":");
-        hasher.update(nick);
-        const v: u32 = @truncate(hasher.final());
+    /// Per-(channel,participant) opcodec stream id advertised to the native client;
+    /// it stamps this into every opcodec frame it publishes so the SFU can map a
+    /// frame back to its publisher. Keyed by the per-process `native_stream_key`
+    /// (a secret PRF), so the id is UNGUESSABLE without that secret: it doubles as
+    /// a capability token delivered over the TLS IRC channel, preventing an
+    /// attacker who knows the public (channel, nick) from precomputing a victim's
+    /// stream id and hijacking/injecting on the native-media UDP port. Stable per
+    /// (channel,nick) for the process lifetime so re-JOIN is idempotent. Never 0.
+    fn nativeStreamId(self: *const LinuxServer, channel: []const u8, nick: []const u8) u32 {
+        return nativeStreamIdKeyed(&self.native_stream_key, channel, nick);
+    }
+
+    /// Pure keyed derivation behind `nativeStreamId` (HMAC-SHA256 over
+    /// `channel ":" nick` under `key`, low 32 bits). Factored out so it is unit
+    /// testable without constructing a full server.
+    fn nativeStreamIdKeyed(key: *const [16]u8, channel: []const u8, nick: []const u8) u32 {
+        const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+        var mac = HmacSha256.init(key);
+        mac.update(channel);
+        mac.update(":");
+        mac.update(nick);
+        var out: [HmacSha256.mac_length]u8 = undefined;
+        mac.final(&out);
+        const v = std.mem.readInt(u32, out[0..4], .little);
         return if (v == 0) 1 else v;
+    }
+
+    test "native stream id is keyed, stable per key, and unguessable across keys" {
+        const key_a = [_]u8{0xA1} ** 16;
+        const key_b = [_]u8{0xB2} ** 16;
+        // Stable per (key, channel, nick): re-JOIN must reproduce the same id.
+        const a1 = nativeStreamIdKeyed(&key_a, "#chan", "alice");
+        try std.testing.expectEqual(a1, nativeStreamIdKeyed(&key_a, "#chan", "alice"));
+        // A different secret yields a different id, so the public (channel, nick)
+        // does not reveal the id without the per-process key.
+        try std.testing.expect(a1 != nativeStreamIdKeyed(&key_b, "#chan", "alice"));
+        // Distinct participants get distinct ids; never 0.
+        try std.testing.expect(a1 != nativeStreamIdKeyed(&key_a, "#chan", "bob"));
+        try std.testing.expect(a1 != 0);
     }
 
     /// `MEDIA ANSWER <#chan> <codec[,codec...]>` — a later participant reconciles
