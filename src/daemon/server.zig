@@ -25676,6 +25676,7 @@ test "squit lookup finds secured peer entries" {
     secured.inner = inner;
     secured.inbuf = .empty;
     secured.out = .empty;
+    secured.rec_inbuf = .empty;
 
     const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
     const peer = server.rx().clients.get(peer_id).?;
@@ -25716,6 +25717,7 @@ test "squit lookup finds reactor-zero peer from another shard" {
     secured.inner = inner;
     secured.inbuf = .empty;
     secured.out = .empty;
+    secured.rec_inbuf = .empty;
 
     const peer_id = try server.reactors[0].clients.alloc(ConnState.init(-1));
     const peer = server.reactors[0].clients.get(peer_id).?;

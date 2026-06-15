@@ -3,10 +3,18 @@
 //! `tsumugi_session` drives the AKE message-at-a-time; on a real TCP stream the
 //! TOFU preamble, M1, and M2 must be delimited so they survive coalescing and
 //! splitting. This adapter length-prefixes ONLY those three handshake messages
-//! (u32 LE length + payload, reassembled through an inbound buffer); once the AKE
-//! establishes it hands off to the inner `S2sLink`, whose own `s2s_frame` decoder
-//! already frames the CRDT stream — so post-handshake bytes pass through raw, with
-//! no double-framing.
+//! (u32 LE length + payload, reassembled through an inbound buffer). Those three
+//! messages — the prekey preamble plus M1/M2 — ARE the handshake and travel in
+//! plaintext (their own contents are already AKE-protected).
+//!
+//! Once the AKE establishes, the inner `S2sLink` CRDT stream is NOT trusted to
+//! the wire raw: every byte is wrapped in an AEAD record layer keyed on the
+//! Tsumugi `Established` directional keys (`send_key`/`recv_key`) so the entire
+//! post-handshake MESSAGE/MEMBERSHIP/MODE/TOPIC/NICK stream is confidential and
+//! tamper-evident on secured mesh links. See `record_*` constants for the wire
+//! format. The inner link's own `s2s_frame` decoder still frames the *plaintext*
+//! CRDT messages inside each record, so there is no semantic double-framing — the
+//! AEAD layer only secures the byte stream the inner decoder consumes.
 //!
 //! TOFU bootstrap (decision: trust-on-first-use): the responder announces its
 //! signed prekey as the preamble; the initiator verifies the signature + validity
@@ -27,6 +35,38 @@ pub const Role = tsumugi_session.Role;
 /// Bound on a single buffered handshake message (prekey ~1.3KB, M1/M2 a few KB).
 const max_handshake_msg: u32 = 64 * 1024;
 pub const max_expected_remotes: usize = 16;
+
+// --- Post-AKE AEAD record layer -------------------------------------------
+//
+// Wire format of one secured record (little-endian), emitted back-to-back:
+//
+//   [u32 len][ciphertext (len - tag_len bytes)][Poly1305 tag (tag_len bytes)]
+//
+// `len` counts the ciphertext+tag that follow the 4-byte length prefix (i.e.
+// `plaintext_len + record_tag_len`). The ciphertext is the inner CRDT bytes
+// sealed with the session `send_key` and a per-record nonce derived from the
+// base `send_nonce` plus a strictly-incrementing 64-bit record counter (one
+// record per `drainInner` chunk). The peer parses the length prefix, opens the
+// record with `recv_key` + the matching counter, and feeds the recovered
+// plaintext to the inner link. A tag/length failure drops the link.
+
+const RecordChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const record_len_prefix: usize = 4;
+const record_tag_len: usize = RecordChaCha.tag_length;
+
+/// Upper bound on a single inbound record's `len` field. A drained inner chunk
+/// is at most one CRDT frame batch; cap generously but finitely so a desync or
+/// hostile peer can't make us buffer unboundedly.
+const max_record_len: u32 = 16 * 1024 * 1024;
+
+/// AAD bound into every record: the record counter as 8 LE bytes. This binds the
+/// ordinal into the tag so a reordered/replayed record cannot validate against a
+/// different position even if an attacker rewrote the length prefix.
+fn recordAad(counter: u64) [8]u8 {
+    var aad: [8]u8 = undefined;
+    std.mem.writeInt(u64, &aad, counter, .little);
+    return aad;
+}
 
 /// Named errors this adapter raises (it also surfaces handshake, allocation, and
 /// inner-link errors; the methods use `anyerror` to carry the union).
@@ -80,6 +120,13 @@ pub const SecuredLink = struct {
     inbuf: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     feed_seq: u64 = 0,
+    /// Post-AKE AEAD record counters (per direction). Strictly incremented for
+    /// every record so no (key, nonce) pair is ever reused.
+    send_counter: u64 = 0,
+    recv_counter: u64 = 0,
+    /// Reassembly buffer for inbound secured records: the transport delivers a
+    /// byte stream, so partial records carry across `feedInner` calls here.
+    rec_inbuf: std.ArrayList(u8) = .empty,
 
     /// Initialize. The responder immediately queues its prekey preamble and stands
     /// up its session; the initiator waits for the responder's preamble.
@@ -135,6 +182,7 @@ pub const SecuredLink = struct {
         }
         self.inbuf.deinit(self.allocator);
         self.out.deinit(self.allocator);
+        self.rec_inbuf.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -379,7 +427,8 @@ pub const SecuredLink = struct {
     }
 
     /// Feed inbound stream bytes. Handshake messages are length-deframed; once
-    /// established, bytes flow straight to the inner CRDT link.
+    /// established, bytes are deframed as AEAD records, decrypted, and fed to the
+    /// inner CRDT link (see the record-layer constants for the wire format).
     pub fn feed(self: *SecuredLink, bytes: []const u8, now_ms: u64) anyerror!void {
         if (self.phase == .established) {
             try self.feedInner(bytes, now_ms);
@@ -403,7 +452,8 @@ pub const SecuredLink = struct {
             std.mem.copyForwards(u8, self.inbuf.items[0..rest], self.inbuf.items[consumed..]);
             self.inbuf.shrinkRetainingCapacity(rest);
         }
-        // Established: any trailing bytes are the start of the raw CRDT stream.
+        // Established: any trailing bytes are the start of the secured record
+        // stream — route them through feedInner so they buffer + decrypt.
         if (self.inbuf.items.len != 0) {
             const tail = try self.allocator.dupe(u8, self.inbuf.items);
             defer self.allocator.free(tail);
@@ -482,20 +532,85 @@ pub const SecuredLink = struct {
         }
     }
 
+    /// The established Tsumugi keys (present once `phase == .established`). The
+    /// inner link is only created alongside establishment, so this never returns
+    /// null on the post-AKE paths that call it.
+    fn establishedKeys(self: *const SecuredLink) *const hs.Established {
+        return self.session.?.established().?;
+    }
+
+    /// Inbound: append the transport bytes to the record reassembly buffer, then
+    /// open every complete length-prefixed AEAD record and feed the recovered
+    /// plaintext to the inner CRDT link. Leftover partial-record bytes stay
+    /// buffered for the next call. A tag/length failure returns an error so the
+    /// caller drops the link (no corrupt plaintext is ever delivered).
     fn feedInner(self: *SecuredLink, bytes: []const u8, now_ms: u64) anyerror!void {
-        const link = self.inner.?;
-        self.feed_seq +%= 1;
-        try link.feed(bytes, now_ms, self.feed_seq);
+        try self.rec_inbuf.appendSlice(self.allocator, bytes);
+        try self.drainRecords(now_ms);
         try self.drainInner();
     }
 
+    fn drainRecords(self: *SecuredLink, now_ms: u64) anyerror!void {
+        const link = self.inner.?;
+        const keys = self.establishedKeys();
+        var consumed: usize = 0;
+        while (true) {
+            const buf = self.rec_inbuf.items[consumed..];
+            if (buf.len < record_len_prefix) break;
+            const body_len = std.mem.readInt(u32, buf[0..4], .little);
+            if (body_len > max_record_len) return error.HandshakeTooLarge;
+            if (body_len < record_tag_len) return error.AuthFailed; // malformed: no room for a tag, can never authenticate
+            const total = record_len_prefix + body_len;
+            if (buf.len < total) break; // wait for the rest of this record
+            const body = buf[record_len_prefix..total];
+            const ct = body[0 .. body.len - record_tag_len];
+            const tag = body[body.len - record_tag_len ..][0..record_tag_len].*;
+
+            const aad = recordAad(self.recv_counter);
+            const pt = try self.allocator.alloc(u8, ct.len);
+            defer self.allocator.free(pt);
+            // AEAD-open: a tamper/desync surfaces as error.AuthFailed, which we
+            // propagate so the link is dropped before any plaintext is fed in.
+            try keys.openRecord(self.recv_counter, &aad, ct, tag, pt);
+            self.recv_counter +%= 1;
+
+            self.feed_seq +%= 1;
+            try link.feed(pt, now_ms, self.feed_seq);
+            consumed += total;
+        }
+        if (consumed != 0) {
+            const rest = self.rec_inbuf.items.len - consumed;
+            std.mem.copyForwards(u8, self.rec_inbuf.items[0..rest], self.rec_inbuf.items[consumed..]);
+            self.rec_inbuf.shrinkRetainingCapacity(rest);
+        }
+    }
+
+    /// Outbound: take the inner link's pending plaintext and emit it as ONE
+    /// length-prefixed AEAD record (sealed with `send_key` + the next record
+    /// counter), appended to `self.out`. Each drained chunk becomes its own
+    /// record; the counter advances so nonces never repeat.
     fn drainInner(self: *SecuredLink) anyerror!void {
         const link = self.inner.?;
         const o = link.outbound();
-        if (o.len != 0) {
-            try self.out.appendSlice(self.allocator, o);
-            link.clearOutbound();
-        }
+        if (o.len == 0) return;
+        try self.sealRecordTo(o);
+        link.clearOutbound();
+    }
+
+    /// Seal `pt` into one record (`[u32 len][ct][tag]`) and append to `self.out`.
+    fn sealRecordTo(self: *SecuredLink, pt: []const u8) anyerror!void {
+        const keys = self.establishedKeys();
+        const body_len = pt.len + record_tag_len;
+        std.debug.assert(body_len <= max_record_len);
+
+        const start = self.out.items.len;
+        try self.out.resize(self.allocator, start + record_len_prefix + body_len);
+        const rec = self.out.items[start..];
+        std.mem.writeInt(u32, rec[0..4], @intCast(body_len), .little);
+
+        const aad = recordAad(self.send_counter);
+        keys.sealRecord(self.send_counter, &aad, pt, rec[record_len_prefix..]);
+        self.send_counter +%= 1;
     }
 };
 
@@ -607,6 +722,123 @@ test "secured link: TOFU preamble + IK handshake + CRDT over a whole-buffer stre
 
 test "secured link survives 1-byte fragmentation of every handshake message" {
     try runScenario(true);
+}
+
+/// Fully-built initiator/responder pair sharing the test allocator. Drives the
+/// AKE to establishment so data-path tests start from a secured link.
+const EstablishedPair = struct {
+    ida: node_identity.NodeIdentity,
+    idb: node_identity.NodeIdentity,
+    a: SecuredLink,
+    b: SecuredLink,
+
+    fn init() !EstablishedPair {
+        var ida = try node_identity.fromSeed([_]u8{0x11} ** 32, "local");
+        errdefer ida.deinit();
+        var idb = try node_identity.fromSeed([_]u8{0x22} ** 32, "local");
+        errdefer idb.deinit();
+        const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+        const pre_b = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1);
+        var rng = DeterministicIo{ .s = 0x5151 };
+        var a = try SecuredLink.init(.{
+            .allocator = testing.allocator,
+            .role = .initiator,
+            .identity = &ida,
+            .local_prekey = pre_a,
+            .cfg = cfgFor(ida.realm, "mp"),
+            .rng = rng.io(),
+            .server_name = "a.orochi",
+        });
+        errdefer a.deinit();
+        var b = try SecuredLink.init(.{
+            .allocator = testing.allocator,
+            .role = .responder,
+            .identity = &idb,
+            .local_prekey = pre_b,
+            .cfg = cfgFor(idb.realm, ""),
+            .rng = rng.io(),
+            .server_name = "b.orochi",
+        });
+        errdefer b.deinit();
+        try pump(&a, &b, false);
+        return .{ .ida = ida, .idb = idb, .a = a, .b = b };
+    }
+
+    fn deinit(self: *EstablishedPair) void {
+        self.a.deinit();
+        self.b.deinit();
+        self.ida.deinit();
+        self.idb.deinit();
+    }
+};
+
+test "post-handshake bytes on the wire are ciphertext, not inner plaintext" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    try testing.expect(p.a.established());
+    try testing.expect(p.b.established());
+
+    // Both sides have drained the establishment exchange; start clean.
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    // Snapshot the inner link's plaintext for this membership announcement, then
+    // produce the secured wire bytes for the same announcement.
+    const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "real name", .host = "h.example" };
+    try p.a.inner.?.sendMembership("#suimyaku", "alice", 0, 100, true, ident);
+    const plaintext = try testing.allocator.dupe(u8, p.a.inner.?.outbound());
+    defer testing.allocator.free(plaintext);
+    try testing.expect(plaintext.len != 0);
+
+    try p.a.drainInner(); // seals the pending inner bytes into one record
+    const wire = p.a.outbound();
+    // Framed record is longer than the plaintext (4-byte len + tag) and does not
+    // contain the plaintext verbatim.
+    try testing.expect(wire.len == plaintext.len + 4 + 16);
+    try testing.expect(std.mem.indexOf(u8, wire, plaintext) == null);
+}
+
+test "a single flipped bit in a transit record fails decryption" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "r", .host = "h" };
+    try p.a.sendMembership("#suimyaku", "bob", 0, 200, true, ident);
+    const record = try testing.allocator.dupe(u8, p.a.outbound());
+    defer testing.allocator.free(record);
+    try testing.expect(record.len > 4 + 16);
+    p.a.clearOutbound();
+
+    // Flip a bit in the ciphertext body (past the 4-byte length prefix).
+    record[record.len - 1] ^= 1;
+    // The tamper must surface as an AEAD auth failure, not silent plaintext.
+    try testing.expectError(error.AuthFailed, p.b.feed(record, 99));
+}
+
+test "a CRDT membership frame round-trips end-to-end over the secured record layer" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    const ident = s2s_peer.MemberIdentity{ .username = "ann", .realname = "Ann Real", .host = "host.a" };
+    try p.a.sendMembership("#suimyaku", "ann", 0, 300, true, ident);
+
+    // Pump the secured record(s) A->B (and any B->A acks) to convergence.
+    try pump(&p.a, &p.b, false);
+
+    const changes = try p.b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(testing.allocator);
+        testing.allocator.free(changes);
+    }
+    var saw_ann = false;
+    for (changes) |c| {
+        if (std.mem.eql(u8, c.nick, "ann")) saw_ann = true;
+    }
+    try testing.expect(saw_ann);
 }
 
 test "a trust-pin mismatch rejects the peer prekey" {

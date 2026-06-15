@@ -95,7 +95,43 @@ pub const Established = struct {
         self.send_key.wipe();
         self.recv_key.wipe();
     }
+
+    /// AEAD-seal one post-handshake record with the send direction's key.
+    ///
+    /// The record nonce is the handshake-derived base `send_nonce` with a 64-bit
+    /// little-endian counter mixed (added) into its low 8 bytes — `counter`
+    /// strictly increments per record so no (key, nonce) pair is ever reused.
+    /// Writes `pt.len + tag_length` bytes into `out` (which must be exactly that
+    /// long) and never mutates session state.
+    pub fn sealRecord(self: *const Established, counter: u64, aad: []const u8, pt: []const u8, out: []u8) void {
+        std.debug.assert(out.len == pt.len + ChaCha.tag_length);
+        const nonce = recordNonce(self.send_nonce, counter);
+        const key: [ChaCha.key_length]u8 = self.send_key.declassify();
+        ChaCha.encrypt(out[0..pt.len], out[pt.len..][0..ChaCha.tag_length], pt, aad, nonce, key);
+    }
+
+    /// AEAD-open one post-handshake record with the recv direction's key. The
+    /// nonce derivation mirrors `sealRecord` against `recv_nonce`. Returns
+    /// `error.AuthFailed` on tag mismatch (tamper / desync) without writing any
+    /// plaintext; `out` must be exactly `ct.len` bytes.
+    pub fn openRecord(self: *const Established, counter: u64, aad: []const u8, ct: []const u8, tag: [ChaCha.tag_length]u8, out: []u8) error{AuthFailed}!void {
+        std.debug.assert(out.len == ct.len);
+        const nonce = recordNonce(self.recv_nonce, counter);
+        const key: [ChaCha.key_length]u8 = self.recv_key.declassify();
+        ChaCha.decrypt(out, ct, tag, aad, nonce, key) catch return error.AuthFailed;
+    }
 };
+
+/// Mix a per-record counter into a base 96-bit nonce: add the 64-bit LE counter
+/// into the low 8 bytes (wrapping), leaving the high 4 bytes from the base. The
+/// base nonces are independent per direction, so initiator and responder never
+/// collide for a given counter.
+fn recordNonce(base: Nonce96, counter: u64) Nonce96 {
+    var nonce = base;
+    const low = std.mem.readInt(u64, nonce[0..8], .little);
+    std.mem.writeInt(u64, nonce[0..8], low +% counter, .little);
+    return nonce;
+}
 
 pub const SignedPrekey = struct {
     realm: RealmId,
@@ -751,6 +787,48 @@ const DeterministicIo = struct {
         break :blk vt;
     };
 };
+
+test "established record layer round-trips and rejects tamper across counters" {
+    var fx = try makeFixture(std.testing.allocator);
+    defer fx.deinit();
+    var rng = DeterministicIo{ .s = 0x6161 };
+    var initr = Initiator.init(std.testing.allocator, &fx.i_node, fx.i_pre, &fx.i_kem.secret_key, fx.r_pre, fx.cfg_i);
+    defer initr.deinit();
+    var respr = Responder.init(std.testing.allocator, &fx.r_node, fx.r_pre, &fx.r_kem.secret_key, fx.cfg_r);
+    defer respr.deinit();
+    const m1 = try initr.start(rng.io());
+    defer std.testing.allocator.free(m1);
+    const m2 = try respr.recv(m1, rng.io());
+    defer std.testing.allocator.free(m2);
+    var est_i = try initr.recv(m2);
+    defer est_i.deinit();
+    const est_r = &respr.established.?;
+
+    // Initiator seals two records with distinct counters; responder opens with
+    // its recv key (== initiator send key) and the same counters.
+    const messages = [_][]const u8{ "hello mesh", "" };
+    inline for (messages, 0..) |pt, idx| {
+        const counter: u64 = idx;
+        var sealed: [pt.len + ChaCha.tag_length]u8 = undefined;
+        est_i.sealRecord(counter, "aad", pt, &sealed);
+        // Ciphertext is not the plaintext.
+        if (pt.len != 0) try std.testing.expect(!std.mem.eql(u8, pt, sealed[0..pt.len]));
+        const ct = sealed[0..pt.len];
+        const tag = sealed[pt.len..][0..ChaCha.tag_length].*;
+        var opened: [pt.len]u8 = undefined;
+        try est_r.openRecord(counter, "aad", ct, tag, &opened);
+        try std.testing.expectEqualSlices(u8, pt, &opened);
+
+        // A flipped tag bit fails authentication.
+        if (pt.len != 0) {
+            var bad_tag = tag;
+            bad_tag[0] ^= 1;
+            try std.testing.expectError(error.AuthFailed, est_r.openRecord(counter, "aad", ct, bad_tag, &opened));
+            // Wrong counter (nonce desync) also fails.
+            try std.testing.expectError(error.AuthFailed, est_r.openRecord(counter + 1, "aad", ct, tag, &opened));
+        }
+    }
+}
 
 test "two parties complete Tsumugi handshake and derive crossed keys" {
     var fx = try makeFixture(std.testing.allocator);
