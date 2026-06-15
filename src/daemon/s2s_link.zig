@@ -341,6 +341,19 @@ pub const S2sLink = struct {
         return self.peer.takeOperGrants();
     }
 
+    /// Ship a live-session migration capsule (`migration_relay` frame bytes) to
+    /// the peer (best-effort; only meaningful once established).
+    pub fn sendSessionMigrate(self: *S2sLink, frame_bytes: []const u8) !void {
+        try self.peer.sendSessionMigrate(self.sink(), frame_bytes);
+    }
+
+    /// Drain queued inbound session-migration capsules decoded from this peer.
+    /// Caller owns + frees each raw frame-bytes slice and the outer slice; each
+    /// is handed to `MigrationTarget.accept` for verification.
+    pub fn takeSessionMigrations(self: *S2sLink) ![][]u8 {
+        return self.peer.takeSessionMigrations();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis.
     pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
         return self.peer.collectTopology(out);

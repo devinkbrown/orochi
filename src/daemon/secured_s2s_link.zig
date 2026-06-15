@@ -412,6 +412,24 @@ pub const SecuredLink = struct {
         return link.takeOperGrants();
     }
 
+    /// Ship a live-session migration capsule (`migration_relay` frame bytes) to
+    /// the peer over the secured CRDT link (no-op until established). The capsule
+    /// carries sensitive session state, so it only rides the authenticated,
+    /// encrypted leg — never the plaintext S2S path.
+    pub fn sendSessionMigrate(self: *SecuredLink, frame_bytes: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendSessionMigrate(frame_bytes);
+        try self.drainInner();
+    }
+
+    /// Drain queued inbound session-migration capsules decoded by the inner link.
+    /// Caller owns + frees each raw frame-bytes slice and the outer slice; each is
+    /// verified+decoded by `MigrationTarget.accept` before any state is restored.
+    pub fn takeSessionMigrations(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeSessionMigrations();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis
     /// (empty until the inner CRDT link is established).
     pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {

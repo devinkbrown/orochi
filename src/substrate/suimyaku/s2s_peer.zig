@@ -156,6 +156,11 @@ pub const S2sPeer = struct {
     /// Remote user nick changes, awaiting the daemon to rename the user in its
     /// world and surface a live `:old!u@h NICK new` line to shared-channel members.
     nick_changes: std.ArrayListUnmanaged(NickDelta) = .empty,
+    /// Inbound live-session migration capsules (raw `migration_relay` frame
+    /// bytes) decoded from SESSION_MIGRATE frames, awaiting the daemon to verify
+    /// (MigrationTarget.accept) + stage into PendingMigrations. The peer driver
+    /// stays substrate-pure: it never opens the signed capsule, only stages it.
+    session_migrations: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -229,6 +234,8 @@ pub const S2sPeer = struct {
         self.topic_changes.deinit(self.allocator);
         for (self.nick_changes.items) |*d| d.deinit(self.allocator);
         self.nick_changes.deinit(self.allocator);
+        for (self.session_migrations.items) |m| self.allocator.free(m);
+        self.session_migrations.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -374,6 +381,7 @@ pub const S2sPeer = struct {
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
             .CHANNEL_MODE_STATE => try self.recvChannelModeState(frame.payload),
+            .SESSION_MIGRATE => try self.recvSessionMigrate(frame.payload),
         }
     }
 
@@ -393,6 +401,33 @@ pub const S2sPeer = struct {
     /// Emit a signed oper-grant to this peer (best-effort; only once established).
     pub fn sendOperGrant(self: *S2sPeer, sink: ByteSink, signed: []const u8) !void {
         try emitFrame(self.allocator, sink, .OPER_GRANT, signed);
+    }
+
+    /// Queue an inbound live-session migration capsule (raw `migration_relay`
+    /// frame bytes) for the daemon to verify + stage. The capsule carries its own
+    /// signed token, so the daemon authenticates it cryptographically; here we
+    /// only gate on the link being an authenticated direct peer (mirroring the
+    /// `acceptsDirectOrigin` gate the other direct-owned frames use) and stage a
+    /// copy. Oversize/alloc failures drop it rather than fault the link.
+    fn recvSessionMigrate(self: *S2sPeer, payload: []const u8) !void {
+        if (!self.acceptsDirectOrigin(self.remote_node_id)) return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.session_migrations.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued inbound session-migration capsules (caller owns + frees each
+    /// raw frame-bytes slice and the outer slice). Each is a `migration_relay`
+    /// frame the daemon hands to `MigrationTarget.accept`.
+    pub fn takeSessionMigrations(self: *S2sPeer) ![][]u8 {
+        return self.session_migrations.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a live-session migration capsule to this peer. `frame_bytes` are the
+    /// `migration_relay` offer frame minted by `MigrationOrigin.prepare`. The
+    /// daemon stamps + signs the capsule; this peer only frames + ships it.
+    /// Best-effort; only meaningful once established.
+    pub fn sendSessionMigrate(self: *S2sPeer, sink: ByteSink, frame_bytes: []const u8) !void {
+        try emitFrame(self.allocator, sink, .SESSION_MIGRATE, frame_bytes);
     }
 
     /// Decode an inbound cross-node MESSAGE and queue it for the daemon to
@@ -1514,6 +1549,66 @@ test "partial inbound bytes are buffered until complete frame" {
     try std.testing.expectEqual(@as(usize, 1), b.ping_rx_count);
     try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 1);
     try std.testing.expectEqual(@as(usize, 1), a.pong_rx_count);
+}
+
+test "SESSION_MIGRATE frame is dispatched and staged for the daemon to drain" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    var a = try newPeer(allocator, &a_state, &tc, 1, 2, 10, "a.test");
+    defer a.deinit();
+    var b = try newPeer(allocator, &b_state, &tc, 2, 1, 20, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    // A ships an opaque migration capsule (the daemon mints the real one; here
+    // any bytes exercise the frame/dispatch/stage seam) to B, which knows A as
+    // its authenticated direct peer (remote_node_id == 1).
+    const capsule_bytes = "migration-capsule-frame-bytes";
+    try a.sendSessionMigrate(a_to_b.sink(), capsule_bytes);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5E55);
+
+    const staged = try b.takeSessionMigrations();
+    defer {
+        for (staged) |m| allocator.free(m);
+        allocator.free(staged);
+    }
+    try std.testing.expectEqual(@as(usize, 1), staged.len);
+    try std.testing.expectEqualStrings(capsule_bytes, staged[0]);
+    // Drained: a second take yields nothing.
+    const again = try b.takeSessionMigrations();
+    defer allocator.free(again);
+    try std.testing.expectEqual(@as(usize, 0), again.len);
+}
+
+test "SESSION_MIGRATE from an unknown origin is rejected, not staged" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1 };
+    var state = ChannelCrdt.init(allocator, 2);
+    defer state.deinit();
+    // remote_node_id == 0 => the peer has no authenticated direct origin yet.
+    var b = try newPeer(allocator, &state, &tc, 2, 0, 20, "b.test");
+    defer b.deinit();
+
+    // Feed a SESSION_MIGRATE frame directly (no handshake => remote unknown).
+    const payload = "capsule";
+    var buf: [s2s_frame.header_len + payload.len]u8 = undefined;
+    const wire = try s2s_frame.encode(.SESSION_MIGRATE, payload, &buf);
+    var sink = BufferSink{};
+    defer sink.deinit(allocator);
+    try b.feed(wire, sink.sink(), tc.now_ms, 1);
+
+    const staged = try b.takeSessionMigrations();
+    defer allocator.free(staged);
+    try std.testing.expectEqual(@as(usize, 0), staged.len);
+    // The rejection was accounted for in the origin-mismatch audit counter.
+    try std.testing.expectEqual(@as(u64, 1), b.takeRejectedOriginFrames());
 }
 
 test "Config.applyToml consolidated EFFECTIVE prod path overlay" {

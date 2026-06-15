@@ -53,6 +53,8 @@ const route_report = @import("../proto/route_report.zig");
 const swim_report = @import("../proto/swim_report.zig");
 const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
+const migration_relay = @import("helix/migration_relay.zig");
+const session_migrate = @import("helix/session_migrate.zig");
 const oper_cred_share = @import("../proto/oper_cred_share.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
@@ -1934,6 +1936,24 @@ pub const LinuxServer = struct {
     /// Replay tracker for cross-server (mesh-sealed) session reclaim nonces, so a
     /// captured mesh reclaim token cannot be replayed against this node.
     session_reclaim_replay: session_reclaim_mesh.ReplayRing(256) = .{},
+    /// Holding area for live-session migration capsules that arrived over the
+    /// mesh ahead of the client's reconnect. Keyed by the 16-byte session token
+    /// (the `session_id` the mesh-sealed reclaim token carries), populated when a
+    /// SESSION_MIGRATE frame is verified by `MigrationTarget.accept`, and consumed
+    /// in `handleMeshReclaim` to restore the full session. Initialized in start().
+    pending_migrations: ?session_migrate.PendingMigrations = null,
+    /// Replay/stale-epoch journal for the migration-relay TARGET side, persisting
+    /// across capsules so a replayed SESSION_MIGRATE frame is rejected exactly as
+    /// the relay's own tests require. Lives beside `pending_migrations`.
+    migration_target_policy: migration_relay.Policy = .{},
+    migration_target_journal: migration_relay.Journal = .{},
+    /// ORIGIN-side replay journal + policy, so re-preparing the same migration
+    /// nonce/epoch for an account is rejected rather than re-shipped.
+    migration_origin_policy: migration_relay.Policy = .{},
+    migration_origin_journal: migration_relay.Journal = .{},
+    /// Monotonic nonce source for minted migration capsules (deterministic, never
+    /// drawn from the relay itself which forbids touching the CSPRNG).
+    migration_nonce: u64 = 0,
     /// Recent mesh events (peer up/down, oper grant, …) for the `MESH LOG` oper
     /// audit view. Bounded ring; oldest entries roll off.
     mesh_log: mesh_event_log.MeshEventLog(128) = .{},
@@ -2303,6 +2323,12 @@ pub const LinuxServer = struct {
     pub fn start(self: *LinuxServer) void {
         self.driveLifecycle(.init);
         self.driveLifecycle(.ready);
+        // Holding area for cross-mesh live-session migration capsules awaiting the
+        // client's reconnect. Allocated once here so handleMeshReclaim and the S2S
+        // drain both see a live store (null until start = migration inert).
+        if (self.pending_migrations == null) {
+            self.pending_migrations = session_migrate.PendingMigrations.init(self.allocator);
+        }
         // Restore runtime operator grants persisted by a previous run.
         self.loadGrants();
         if (self.config.media_enabled) {
@@ -2535,6 +2561,11 @@ pub const LinuxServer = struct {
         self.account_verifies.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
+        if (self.pending_migrations) |*pm| pm.deinit();
+        self.migration_target_policy.deinit(self.allocator);
+        self.migration_target_journal.deinit(self.allocator);
+        self.migration_origin_policy.deinit(self.allocator);
+        self.migration_origin_journal.deinit(self.allocator);
         self.content_filter.deinit();
         self.media_rooms.deinit();
         self.media_plane.deinit();
@@ -3821,6 +3852,11 @@ pub const LinuxServer = struct {
         self.drainNickChanges(link);
         // Audit origin-spoofed or misrouted direct-owned S2S frames.
         self.drainOriginRejections(link);
+        // Drain inbound live-session migration capsules: verify each against the
+        // peer's authenticated node key (MigrationTarget.accept) and stage it in
+        // pending_migrations for the client's eventual reconnect+reclaim. Only the
+        // secured leg carries these (the capsule holds account/host state).
+        self.drainSessionMigrations(link);
         // Drain inbound cross-mesh oper grants. Each is verified against the
         // peer's authenticated Ed25519 key from the Tsumugi handshake before it
         // can confer operator authority locally — an unverifiable grant is
@@ -15161,21 +15197,309 @@ pub const LinuxServer = struct {
             }
         }
         const origin_is_self = std.mem.eql(u8, fields.origin_node, self.serverName());
+        // A live-session migration capsule for this exact session token may have
+        // been shipped ahead of the client by the owning node. The token's HMAC,
+        // expiry, account-ownership, and replay checks above gate this restore
+        // EXACTLY as they gate the legacy grant paths — migration never weakens
+        // them. A staged capsule means the full session state is now HERE, so a
+        // would-be redirect becomes a local restore.
+        const migrate_token: ?session_migrate.Token = sessionTokenFromHex(fields.session_id);
+        const have_capsule = if (self.pending_migrations) |*pm|
+            (if (migrate_token) |mt| pm.has(mt) else false)
+        else
+            false;
         const seen = self.session_reclaim_replay.check(fields.nonce);
         var buf: [default_reply_bytes]u8 = undefined;
+        // Replay/expiry still win over a staged capsule: a replayed or expired
+        // reclaim is denied and the capsule is left untouched for a legitimate
+        // future reconnect (or TTL eviction). Only a fresh, valid reclaim consumes.
+        if (have_capsule and !seen and now <= fields.expiry_ms) {
+            if (self.consumeMigration(id, conn, account, migrate_token.?)) {
+                if (ghost) |g| _ = self.sessions.remove(account, g);
+                const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session migrated + reclaimed (cross-server)\r\n", .{protocol_inventory.currentServerName()}) catch return;
+                try appendToConn(conn, line);
+                return;
+            }
+            // Restore failed mid-way: fall through to the legacy decision so the
+            // client still gets a coherent (redirect/deny) answer.
+        }
         switch (session_reclaim_mesh.decide(fields, ghost != null, origin_is_self, seen, now)) {
             .grant_local => {
-                if (ghost) |g| _ = self.sessions.remove(account, g);
+                // This node owns the detached session. Ship a migration capsule of
+                // the ghost's full state to the secured mesh BEFORE consuming it,
+                // so a future reconnect on any peer restores the complete session
+                // (nick/umodes/account/away/host/channels) rather than just a
+                // token grant. Best-effort; the local reclaim succeeds regardless.
+                if (ghost) |g| {
+                    if (migrate_token) |mt| {
+                        if (self.connFor(clientIdFromMonitor(g))) |gconn| {
+                            self.shipSessionMigration(clientIdFromMonitor(g), gconn, account, mt);
+                        }
+                    }
+                    _ = self.sessions.remove(account, g);
+                }
                 const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION RESUME :Session reclaimed (cross-server)\r\n", .{protocol_inventory.currentServerName()}) catch return;
                 try appendToConn(conn, line);
             },
             .grant_redirect => |node| {
+                // The session lives on `node`; the client must reconnect there. The
+                // owning node ships the migration capsule from its own grant_local
+                // path (above) when it consumes the ghost, so the peer the client
+                // lands on already has the staged capsule to restore from.
                 const line = std.fmt.bufPrint(&buf, ":{s} NOTE SESSION REDIRECT :Session lives on {s}; reconnect there to reclaim\r\n", .{ self.serverName(), node }) catch return;
                 try appendToConn(conn, line);
             },
             .deny_expired => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token expired"),
             .deny_replay => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "reclaim token already used"),
             .deny_unknown => try self.failReply(conn, "SESSION", "NO_SESSION", "no matching session on origin node"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Live cross-mesh session migration (Helix migration_relay over Suimyaku).
+    //
+    // A node that holds a detached session ("origin"/owner) ships a signed
+    // migration capsule to its secured peers ahead of the client's reconnect.
+    // The peer that receives the capsule verifies it (`MigrationTarget.accept`)
+    // and stages it in `pending_migrations`, keyed by the 16-byte session token.
+    // When the client reconnects there and presents its mesh-sealed reclaim
+    // token, `handleMeshReclaim` consumes the staged capsule and restores the
+    // full session, REUSING the same restore helpers as the Helix UPGRADE path
+    // (`session.restore` + `world.registerNick` + `world.restoreMember`).
+    // -----------------------------------------------------------------------
+
+    /// The Ed25519 signing identity for migration capsules — the SAME key used to
+    /// sign oper grants (node identity), so a receiving peer verifies a capsule
+    /// against `peerNodeKey()` exactly as it does an oper grant.
+    fn migrationKeypair(self: *LinuxServer) ?migration_relay.KeyPair {
+        return self.meshSignKey();
+    }
+
+    /// Build a borrowed `migration_relay.Snapshot` of `conn`'s session into the
+    /// caller-provided channel-name buffer. The returned snapshot borrows `conn`'s
+    /// inline session buffers + `chan_buf`, so it must be encoded before `conn` is
+    /// mutated. Mirrors the field set the Helix UPGRADE snapshot carries.
+    fn buildMigrationSnapshot(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        chan_buf: [][]const u8,
+        umode_buf: []u8,
+    ) migration_relay.Snapshot {
+        const nch = self.world.channelsOf(worldIdFromClient(id), chan_buf);
+        const umodes = conn.session.umodeString(umode_buf);
+        return .{
+            .nick = conn.session.displayName(),
+            .umodes = umodes,
+            .channels = chan_buf[0..nch],
+            .realname = conn.session.realname(),
+            .host = conn.session.host(),
+            .account = conn.session.account() orelse "",
+            .away = conn.session.awayMessage() orelse "",
+            .is_oper = conn.session.isOper(),
+        };
+    }
+
+    /// Ship a live-session migration capsule for the detached ghost `conn` (the
+    /// session identified by the 16-byte `session_token`) to every established
+    /// secured peer, so whichever node the client reconnects to can restore the
+    /// full session. Best-effort: a missing signing key or any encode/ship failure
+    /// silently no-ops (the legacy redirect path still works). Reuses the relay's
+    /// `MigrationOrigin.prepare` (signature + replay journal) verbatim by lending
+    /// it the server-persistent origin policy/journal around the call.
+    fn shipSessionMigration(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        session_token: session_migrate.Token,
+    ) void {
+        const kp = self.migrationKeypair() orelse return;
+
+        var chan_buf: [64][]const u8 = undefined;
+        var umode_buf: [usermode.MAX_MODE_CHANGES + 2]u8 = undefined;
+        const snapshot = self.buildMigrationSnapshot(id, conn, chan_buf[0..], umode_buf[0..]);
+
+        // Lend the persistent origin policy/journal to a transient MigrationOrigin
+        // so replay/stale-epoch state survives across capsules without re-deriving
+        // the relay's logic here. Moved back out on return.
+        var origin = migration_relay.MigrationOrigin.init(self.allocator, kp);
+        origin.policy = self.migration_origin_policy;
+        origin.journal = self.migration_origin_journal;
+        defer {
+            self.migration_origin_policy = origin.policy;
+            self.migration_origin_journal = origin.journal;
+            origin.policy = .{};
+            origin.journal = .{};
+            origin.deinit();
+        }
+
+        self.migration_nonce +%= 1;
+        const epoch: u64 = @intCast(@max(@as(i64, 1), self.nowMs()));
+        var prepared = origin.prepare(account, snapshot, self.migration_nonce, epoch) catch return;
+        defer prepared.deinit(self.allocator);
+
+        // Wrap the relay frame in a session_migrate.Capsule keyed by the 16-byte
+        // session token (the key the reclaim side looks up), and ship it over the
+        // secured mesh. The relay frame bytes ARE the capsule's snapshot blob.
+        const cap = session_migrate.Capsule{
+            .token = session_token,
+            .account = account,
+            .snapshot = prepared.frame_bytes,
+        };
+        const wire = session_migrate.encode(self.allocator, cap) catch return;
+        defer self.allocator.free(wire);
+        self.broadcastSessionMigration(wire);
+    }
+
+    /// Broadcast an encoded `session_migrate` capsule to every established secured
+    /// peer (the encrypted, authenticated leg — never the plaintext S2S path,
+    /// since the capsule carries account/host state). Mirrors `broadcastOperGrant`.
+    fn broadcastSessionMigration(self: *LinuxServer, wire: []const u8) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established()) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                link.sendSessionMigrate(wire) catch continue;
+                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    /// Drain a secured link's inbound session-migration capsules: verify each via
+    /// `MigrationTarget.accept` (pinned to the peer's node key, lent the server's
+    /// persistent target policy/journal for replay defense), then stage the
+    /// decoded session into `pending_migrations` keyed by its 16-byte session
+    /// token. A capsule that fails verification or whose outer/inner accounts
+    /// disagree is dropped, never fatal to the link.
+    fn drainSessionMigrations(self: *LinuxServer, link: anytype) void {
+        const caps = link.takeSessionMigrations() catch return;
+        defer self.allocator.free(caps);
+        const expected_signer = link.peerNodeKey() orelse {
+            for (caps) |c| self.allocator.free(c);
+            return;
+        };
+        const pm = if (self.pending_migrations) |*p| p else {
+            for (caps) |c| self.allocator.free(c);
+            return;
+        };
+        for (caps) |c| {
+            defer self.allocator.free(c);
+            self.stageSessionMigration(pm, expected_signer, c);
+        }
+    }
+
+    /// Verify + stage one inbound `session_migrate` capsule wire blob. Splits the
+    /// 16-byte session-token key from the embedded relay frame, runs the relay's
+    /// `MigrationTarget.accept` (full signature/account/hash/replay checks) using
+    /// the server-persistent target journal/policy, and on success copies the
+    /// decoded session snapshot into `pm` under the session-token key.
+    fn stageSessionMigration(
+        self: *LinuxServer,
+        pm: *session_migrate.PendingMigrations,
+        expected_signer: migration_relay.PublicKey,
+        wire: []const u8,
+    ) void {
+        const outer = session_migrate.decode(wire) catch return;
+
+        var target = migration_relay.MigrationTarget.init(self.allocator, expected_signer);
+        target.policy = self.migration_target_policy;
+        target.journal = self.migration_target_journal;
+        defer {
+            self.migration_target_policy = target.policy;
+            self.migration_target_journal = target.journal;
+            target.policy = .{};
+            target.journal = .{};
+            target.deinit();
+        }
+
+        var capsule = target.accept(outer.snapshot) catch return;
+        defer capsule.deinit(self.allocator);
+
+        // The relay capsule's account must match the outer session_migrate
+        // account — a spliced token/snapshot pairing is dropped.
+        if (!std.mem.eql(u8, capsule.account, outer.account)) return;
+
+        // Re-encode the verified snapshot so the staged blob is a self-contained
+        // migration_relay.Snapshot the reclaim side decodes directly.
+        const snap_bytes = capsule.snapshot.encode(self.allocator) catch return;
+        defer self.allocator.free(snap_bytes);
+
+        pm.put(.{
+            .token = outer.token,
+            .account = outer.account,
+            .snapshot = snap_bytes,
+        }) catch return;
+    }
+
+    /// Consume the staged migration capsule for `session_token` and restore the
+    /// full session into the live `conn`, REUSING the Helix-upgrade restore
+    /// helpers (`session.restore` + `world.registerNick` + `world.restoreMember`)
+    /// so join/mode logic is never duplicated. Returns true on a successful
+    /// restore (capsule consumed); false if no capsule was staged or it failed to
+    /// decode (capsule then left/dropped, caller falls back to legacy behavior).
+    /// Caller has ALREADY passed the mesh token HMAC/expiry/account/replay gates.
+    fn consumeMigration(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        session_token: session_migrate.Token,
+    ) bool {
+        const pm = if (self.pending_migrations) |*p| p else return false;
+        const entry = pm.take(session_token) orelse return false;
+        defer pm.freeEntry(entry);
+
+        var snap = migration_relay.Snapshot.decode(self.allocator, entry.snapshot) catch return false;
+        defer snap.deinit(self.allocator);
+
+        // Restore identity/account/away/oper through the SAME session restore the
+        // UPGRADE path uses, by projecting the migration snapshot onto a
+        // session_snapshot.Snapshot. The fd is irrelevant (the client is already
+        // connected here); restore() does not touch it.
+        conn.session.restore(.{
+            .nick = snap.nick,
+            .realname = snap.realname,
+            .account = if (snap.account.len != 0) snap.account else account,
+            .host = snap.host,
+            .away = snap.away,
+            .logged_in = snap.account.len != 0,
+            .away_active = snap.away.len != 0,
+            .is_oper = snap.is_oper,
+        });
+        self.injectSessionState(conn);
+
+        // Re-apply the migrated user modes (server source, so server-managed
+        // letters carry too). +o/+r are derived from is_oper/logged_in already.
+        self.applyMigratedUmodes(conn, snap.umodes);
+
+        // Re-register the nick so the migrated client stays addressable, then
+        // re-join every carried channel with its exact member modes — the exact
+        // helpers `adoptInheritedClient` calls on UPGRADE resume.
+        if (snap.nick.len != 0 and !std.mem.eql(u8, snap.nick, "*")) {
+            self.world.registerNick(snap.nick, worldIdFromClient(id)) catch {};
+        }
+        for (snap.channels) |chan| {
+            // The migration snapshot carries channel NAMES (member modes are not
+            // part of the relay snapshot); restore as a plain member, then any
+            // status modes converge via the normal mesh roster burst.
+            self.world.restoreMember(chan, worldIdFromClient(id), .{ .bits = 0 }) catch {};
+        }
+        return true;
+    }
+
+    /// Apply a rendered umode string (e.g. "+iwx") to `conn`'s session as a
+    /// server-sourced change, skipping the derived `o`/`r` letters. Best-effort.
+    fn applyMigratedUmodes(self: *LinuxServer, conn: *ConnState, mode_str: []const u8) void {
+        _ = self;
+        for (mode_str) |letter| {
+            if (letter == '+' or letter == '-') continue;
+            if (letter == 'o' or letter == 'r') continue; // derived from is_oper/logged_in
+            const mode = usermode.modeFromLetter(letter) orelse continue;
+            _ = conn.session.setUmode(mode, true);
         }
     }
 

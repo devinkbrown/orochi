@@ -131,6 +131,7 @@ pub const PendingMigrations = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const migration_relay = @import("migration_relay.zig");
 
 test "migration capsule encode/decode round-trips" {
     const allocator = testing.allocator;
@@ -185,4 +186,109 @@ test "put replaces an existing token without leaking" {
     const e = pm.take(t).?;
     defer pm.freeEntry(e);
     try testing.expectEqualStrings("new", e.account);
+}
+
+test "end-to-end: origin prepare -> session_migrate wrap -> target accept -> PendingMigrations -> reclaim consume" {
+    // Exercises exactly the server seam: the origin mints a signed migration
+    // capsule, wraps it in a session_migrate.Capsule keyed by the 16-byte session
+    // token, the target verifies it (MigrationTarget.accept) and stages it under
+    // that key, then a reclaim by the matching token takes + decodes the full
+    // restored snapshot (nick/umodes/channels/away/account/host/is_oper).
+    const allocator = testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x7E} ** Ed25519.KeyPair.seed_length);
+
+    // ORIGIN: build the full session snapshot and mint the relay frame.
+    const channels = [_][]const u8{ "#orochi", "#helix", "#ops" };
+    const snapshot = migration_relay.Snapshot{
+        .nick = "kain",
+        .umodes = "+iwx",
+        .channels = channels[0..],
+        .realname = "Kain Example",
+        .host = "cloak-ab12.orochi",
+        .account = "kain",
+        .away = "migrating",
+        .is_oper = true,
+    };
+    var origin = migration_relay.MigrationOrigin.init(allocator, kp);
+    defer origin.deinit();
+    var prepared = try origin.prepare("kain", snapshot, 0xCAFEBABE, 7);
+    defer prepared.deinit(allocator);
+
+    // ORIGIN: wrap the relay frame in a session_migrate capsule keyed by the
+    // 16-byte session token (the reclaim-side lookup key) and serialize for S2S.
+    const session_token: Token = .{ 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const wire = try encode(allocator, .{
+        .token = session_token,
+        .account = "kain",
+        .snapshot = prepared.frame_bytes,
+    });
+    defer allocator.free(wire);
+
+    // TARGET: decode the outer capsule, verify+decode the relay frame, then stage
+    // the re-encoded snapshot under the session-token key.
+    const outer = try decode(wire);
+    try testing.expectEqualSlices(u8, &session_token, &outer.token);
+
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+    {
+        var target = migration_relay.MigrationTarget.init(allocator, kp.public_key.toBytes());
+        defer target.deinit();
+        var capsule = try target.accept(outer.snapshot);
+        defer capsule.deinit(allocator);
+        try testing.expectEqualStrings("kain", capsule.account);
+
+        const snap_bytes = try capsule.snapshot.encode(allocator);
+        defer allocator.free(snap_bytes);
+        try pm.put(.{ .token = outer.token, .account = outer.account, .snapshot = snap_bytes });
+    }
+    try testing.expect(pm.has(session_token));
+
+    // RECLAIM: the client reconnects + presents the matching token; consume.
+    const entry = pm.take(session_token) orelse return error.TestUnexpectedResult;
+    defer pm.freeEntry(entry);
+    try testing.expectEqualStrings("kain", entry.account);
+    try testing.expect(!pm.has(session_token)); // consumed
+
+    var restored = try migration_relay.Snapshot.decode(allocator, entry.snapshot);
+    defer restored.deinit(allocator);
+    try testing.expectEqualStrings("kain", restored.nick);
+    try testing.expectEqualStrings("+iwx", restored.umodes);
+    try testing.expectEqual(@as(usize, 3), restored.channels.len);
+    try testing.expectEqualStrings("#orochi", restored.channels[0]);
+    try testing.expectEqualStrings("#ops", restored.channels[2]);
+    try testing.expectEqualStrings("Kain Example", restored.realname);
+    try testing.expectEqualStrings("cloak-ab12.orochi", restored.host);
+    try testing.expectEqualStrings("kain", restored.account);
+    try testing.expectEqualStrings("migrating", restored.away);
+    try testing.expect(restored.is_oper);
+}
+
+test "end-to-end: target rejects a capsule signed by the wrong key (no staging)" {
+    const allocator = testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const real = try Ed25519.KeyPair.generateDeterministic([_]u8{0x01} ** Ed25519.KeyPair.seed_length);
+    const attacker = try Ed25519.KeyPair.generateDeterministic([_]u8{0x02} ** Ed25519.KeyPair.seed_length);
+
+    const channels = [_][]const u8{"#orochi"};
+    const snapshot = migration_relay.Snapshot{ .nick = "kain", .umodes = "+i", .channels = channels[0..] };
+    var origin = migration_relay.MigrationOrigin.init(allocator, attacker); // signs with attacker key
+    defer origin.deinit();
+    var prepared = try origin.prepare("kain", snapshot, 0x1, 1);
+    defer prepared.deinit(allocator);
+
+    const session_token: Token = .{1} ** 16;
+    const wire = try encode(allocator, .{ .token = session_token, .account = "kain", .snapshot = prepared.frame_bytes });
+    defer allocator.free(wire);
+    const outer = try decode(wire);
+
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+    var target = migration_relay.MigrationTarget.init(allocator, real.public_key.toBytes()); // pins the REAL key
+    defer target.deinit();
+    // Verification fails: nothing is staged.
+    try testing.expectError(error.BadSignature, target.accept(outer.snapshot));
+    try testing.expect(!pm.has(session_token));
+    try testing.expectEqual(@as(usize, 0), pm.count());
 }

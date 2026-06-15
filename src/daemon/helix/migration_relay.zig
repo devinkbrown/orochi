@@ -137,6 +137,11 @@ pub const FsmState = enum(u8) {
 
 /// A point-in-time view of a logged-in session, sufficient to recreate it on a
 /// new node. Borrowed slices on construction; owned slices after `decode`.
+///
+/// The field set mirrors `helix/session_snapshot.zig` (the local Helix-upgrade
+/// snapshot) so a cross-machine migration restores the same recognizable session
+/// a same-machine UPGRADE does: identity (nick/realname/account/host), away
+/// state, oper status, user modes, and channel membership.
 pub const Snapshot = struct {
     /// Client nickname at migration time.
     nick: []const u8,
@@ -144,6 +149,16 @@ pub const Snapshot = struct {
     umodes: []const u8,
     /// Channels the client occupies, by name.
     channels: []const []const u8,
+    /// GECOS / realname.
+    realname: []const u8 = "",
+    /// Visible (cloaked) host the client presents.
+    host: []const u8 = "",
+    /// Authenticated account name ("" when not logged in).
+    account: []const u8 = "",
+    /// Away message ("" = not away; any non-empty value = away with that text).
+    away: []const u8 = "",
+    /// Whether the migrating session held operator status.
+    is_oper: bool = false,
 
     /// Canonically encode the snapshot into owned CoilPack bytes.
     pub fn encode(self: Snapshot, allocator: std.mem.Allocator) Error![]u8 {
@@ -155,16 +170,21 @@ pub const Snapshot = struct {
         }
 
         var entries = [_]cpv.MapEntry{
-            .{ .key = "nick", .value = .{ .string = self.nick } },
-            .{ .key = "umodes", .value = .{ .string = self.umodes } },
+            .{ .key = "account", .value = .{ .string = self.account } },
+            .{ .key = "away", .value = .{ .string = self.away } },
             .{ .key = "channels", .value = .{ .array = chan_values } },
+            .{ .key = "host", .value = .{ .string = self.host } },
+            .{ .key = "is_oper", .value = .{ .unsigned = @intFromBool(self.is_oper) } },
+            .{ .key = "nick", .value = .{ .string = self.nick } },
+            .{ .key = "realname", .value = .{ .string = self.realname } },
+            .{ .key = "umodes", .value = .{ .string = self.umodes } },
         };
         return canonicalEncode(allocator, .{ .map = entries[0..] });
     }
 
     /// Decode an owned snapshot from CoilPack bytes. The returned snapshot owns
-    /// its `nick`, `umodes`, and each `channels` entry plus the outer slice.
-    /// Release with `deinit`.
+    /// its `nick`, `umodes`, identity strings, and each `channels` entry plus the
+    /// outer slice. Release with `deinit`.
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Snapshot {
         var value = cpv.Decoder.decode(allocator, bytes) catch return error.MalformedCapsule;
         defer value.deinit(allocator);
@@ -173,11 +193,26 @@ pub const Snapshot = struct {
         const nick_src = mapString(value.map, "nick") orelse return error.MalformedCapsule;
         const umodes_src = mapString(value.map, "umodes") orelse return error.MalformedCapsule;
         const chans_src = mapArray(value.map, "channels") orelse return error.MalformedCapsule;
+        // Identity/state fields default to empty/false so an older-format capsule
+        // missing them still decodes (forward-compatible widening).
+        const realname_src = mapString(value.map, "realname") orelse "";
+        const host_src = mapString(value.map, "host") orelse "";
+        const account_src = mapString(value.map, "account") orelse "";
+        const away_src = mapString(value.map, "away") orelse "";
+        const is_oper = (mapUnsigned(value.map, "is_oper") orelse 0) != 0;
 
         const nick = try allocator.dupe(u8, nick_src);
         errdefer allocator.free(nick);
         const umodes = try allocator.dupe(u8, umodes_src);
         errdefer allocator.free(umodes);
+        const realname = try allocator.dupe(u8, realname_src);
+        errdefer allocator.free(realname);
+        const host = try allocator.dupe(u8, host_src);
+        errdefer allocator.free(host);
+        const account = try allocator.dupe(u8, account_src);
+        errdefer allocator.free(account);
+        const away = try allocator.dupe(u8, away_src);
+        errdefer allocator.free(away);
 
         var channels = try allocator.alloc([]const u8, chans_src.len);
         var filled: usize = 0;
@@ -191,7 +226,16 @@ pub const Snapshot = struct {
             filled += 1;
         }
 
-        return .{ .nick = nick, .umodes = umodes, .channels = channels };
+        return .{
+            .nick = nick,
+            .umodes = umodes,
+            .channels = channels,
+            .realname = realname,
+            .host = host,
+            .account = account,
+            .away = away,
+            .is_oper = is_oper,
+        };
     }
 
     /// Release an owned snapshot returned by `decode`. Safe only on owned
@@ -199,6 +243,10 @@ pub const Snapshot = struct {
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.nick);
         allocator.free(self.umodes);
+        allocator.free(self.realname);
+        allocator.free(self.host);
+        allocator.free(self.account);
+        allocator.free(self.away);
         for (self.channels) |chan| allocator.free(chan);
         allocator.free(self.channels);
         self.* = undefined;
@@ -927,6 +975,11 @@ fn sampleSnapshot() Snapshot {
         .nick = "kain",
         .umodes = "+iwx",
         .channels = channels[0..],
+        .realname = "Kain Example",
+        .host = "cloak-ab12.orochi",
+        .account = "kain",
+        .away = "biab",
+        .is_oper = true,
     };
 }
 
@@ -941,7 +994,16 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     defer target.deinit();
 
     const channels = [_][]const u8{ "#orochi", "#helix" };
-    const snapshot = Snapshot{ .nick = "kain", .umodes = "+iwx", .channels = channels[0..] };
+    const snapshot = Snapshot{
+        .nick = "kain",
+        .umodes = "+iwx",
+        .channels = channels[0..],
+        .realname = "Kain Example",
+        .host = "cloak-ab12.orochi",
+        .account = "kain",
+        .away = "biab",
+        .is_oper = true,
+    };
 
     // Act
     var prepared = try origin.prepare("kain", snapshot, 0xABCD, 1);
@@ -956,6 +1018,12 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     try testing.expectEqual(@as(usize, 2), capsule.snapshot.channels.len);
     try testing.expectEqualStrings("#orochi", capsule.snapshot.channels[0]);
     try testing.expectEqualStrings("#helix", capsule.snapshot.channels[1]);
+    // The widened identity/state fields survive too.
+    try testing.expectEqualStrings("Kain Example", capsule.snapshot.realname);
+    try testing.expectEqualStrings("cloak-ab12.orochi", capsule.snapshot.host);
+    try testing.expectEqualStrings("kain", capsule.snapshot.account);
+    try testing.expectEqualStrings("biab", capsule.snapshot.away);
+    try testing.expect(capsule.snapshot.is_oper);
     try testing.expectEqualStrings("kain", capsule.account);
     try testing.expectEqual(@as(u64, 0xABCD), capsule.token.nonce);
     try testing.expectEqual(@as(u64, 1), origin.metrics.prepared);
@@ -1117,8 +1185,48 @@ test "snapshot encode/decode round-trips an empty channel list" {
     var decoded = try Snapshot.decode(allocator, bytes);
     defer decoded.deinit(allocator);
 
-    // Assert
+    // Assert: the unset identity/state fields default to empty/false.
     try testing.expectEqualStrings("lone", decoded.nick);
     try testing.expectEqualStrings("+i", decoded.umodes);
     try testing.expectEqual(@as(usize, 0), decoded.channels.len);
+    try testing.expectEqualStrings("", decoded.realname);
+    try testing.expectEqualStrings("", decoded.host);
+    try testing.expectEqualStrings("", decoded.account);
+    try testing.expectEqualStrings("", decoded.away);
+    try testing.expect(!decoded.is_oper);
+}
+
+test "snapshot encode/decode round-trips the widened identity + state fields" {
+    // Arrange
+    const allocator = testing.allocator;
+    const channels = [_][]const u8{ "#ops", "#lounge", "#dev" };
+    const snapshot = Snapshot{
+        .nick = "alice",
+        .umodes = "+iwxo",
+        .channels = channels[0..],
+        .realname = "Alice Liddell",
+        .host = "cloak-1a2b.users.orochi",
+        .account = "alice",
+        .away = "in the rabbit hole",
+        .is_oper = true,
+    };
+
+    // Act
+    const bytes = try snapshot.encode(allocator);
+    defer allocator.free(bytes);
+    var decoded = try Snapshot.decode(allocator, bytes);
+    defer decoded.deinit(allocator);
+
+    // Assert: every field round-trips byte-for-byte.
+    try testing.expectEqualStrings("alice", decoded.nick);
+    try testing.expectEqualStrings("+iwxo", decoded.umodes);
+    try testing.expectEqual(@as(usize, 3), decoded.channels.len);
+    try testing.expectEqualStrings("#ops", decoded.channels[0]);
+    try testing.expectEqualStrings("#lounge", decoded.channels[1]);
+    try testing.expectEqualStrings("#dev", decoded.channels[2]);
+    try testing.expectEqualStrings("Alice Liddell", decoded.realname);
+    try testing.expectEqualStrings("cloak-1a2b.users.orochi", decoded.host);
+    try testing.expectEqualStrings("alice", decoded.account);
+    try testing.expectEqualStrings("in the rabbit hole", decoded.away);
+    try testing.expect(decoded.is_oper);
 }

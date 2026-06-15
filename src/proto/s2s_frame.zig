@@ -47,6 +47,10 @@ pub const FrameType = enum(u8) {
     NICKCHANGE = 0x0F,
     /// Parameter/IRCX channel state snapshot (+k/+l/+j/+f/private/hidden/ext).
     CHANNEL_MODE_STATE = 0x10,
+    /// Live session-migration capsule (migration_relay frame bytes): a signed
+    /// snapshot the origin ships to the owning node so a reconnecting client
+    /// lands with its nick/umodes/account/away/channels restored.
+    SESSION_MIGRATE = 0x11,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -70,6 +74,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.TOPIC) => .TOPIC,
             @intFromEnum(FrameType.NICKCHANGE) => .NICKCHANGE,
             @intFromEnum(FrameType.CHANNEL_MODE_STATE) => .CHANNEL_MODE_STATE,
+            @intFromEnum(FrameType.SESSION_MIGRATE) => .SESSION_MIGRATE,
             else => null,
         };
     }
@@ -192,6 +197,7 @@ const all_frame_types = [_]FrameType{
     .TOPIC,
     .NICKCHANGE,
     .CHANNEL_MODE_STATE,
+    .SESSION_MIGRATE,
 };
 
 test "encode/decode round-trip each type" {
