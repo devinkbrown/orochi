@@ -13,6 +13,7 @@ from convention or from the design notes in `planning/`, the docs flag it.
 - [Reactor & threading](architecture/01-reactor-threading.md) — io_uring + sharded workers
 - [World, dispatch & modules](architecture/02-world-dispatch-modules.md) — the SerpentRegistry command system
 - [Mesh & S2S](architecture/mesh-s2s.md) — Suimyaku CRDT, links, partition detection, oper-grant sharing
+- [Mesh security](architecture/mesh-security.md) — threat model, AEAD record layer, self-certifying per-frame & multi-hop origin signing, media stream-id capabilities
 - [Cryptography](architecture/crypto.md) — Tsumugi handshake, Yoroi, signing, sealed tokens
 - [Media](architecture/03-media.md) — SFU, transport stack, codecs, WASM shims
 - [Upgrade & WASM host](architecture/04-upgrade-wasm.md) — Helix in-place upgrade, OroWasm plugins

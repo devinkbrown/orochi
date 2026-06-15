@@ -33,9 +33,21 @@ The daemon also keeps operational mesh state outside the substrate: peer health,
 | `GOSSIP` | `0x04` | Applies gossip membership payloads. |
 | `PING` / `PONG` | `0x05` / `0x06` | PING replies with matching PONG payload. |
 | `QUIT` | `0x07` | Closes the remote peer state. |
-| `MEMBERSHIP` | `0x08` | Applies remote channel-member route table facts. |
-| `MESSAGE` | `0x09` | Queues cross-node PRIVMSG/NOTICE/TAGMSG payloads for daemon delivery. |
+| `MEMBERSHIP` | `0x08` | Applies remote channel-member route table facts (direct-origin, per-link signed). |
+| `MESSAGE` | `0x09` | Queues cross-node PRIVMSG/NOTICE/TAGMSG/DATA/WHISPER payloads; carries a self-contained origin signature verified at every hop. |
 | `OPER_GRANT` | `0x0A` | Queues signed oper-grant payloads for daemon verification. |
+| `CHANNEL_MODE_FLAGS` | `0x0B` | Boolean channel-mode flag facts (direct-origin, per-link signed). |
+| `CHANNEL_LIST` | `0x0C` | Channel list-mode (ban/except/invex) facts (direct-origin, per-link signed). |
+| `CHANNEL_PROP` | `0x0D` | IRCX channel property LWW facts; multi-hop origin signature stored in the prop clock and re-emitted verbatim. |
+| `TOPIC` | `0x0E` | Channel topic facts (direct-origin, per-link signed). |
+| `NICKCHANGE` | `0x0F` | Remote nick-change facts (direct-origin, per-link signed). |
+| `CHANNEL_MODE_STATE` | `0x10` | Parameter/extended channel-mode state (+k/+l/+j/+f, private/hidden, IRCX flags); direct-origin, per-link signed. |
+| `SESSION_MIGRATE` | `0x11` | Ships a signed session-migration capsule to the owning node for live reclaim. |
+| `ENTITY_PROP` | `0x12` | IRCX user/member property LWW facts; multi-hop origin signature (kind-tagged transcript), re-emitted verbatim. |
+
+> Origin authentication, the per-link vs multi-hop signing modes, and the
+> handshake-negotiated signing capability are documented in
+> [mesh-security.md](mesh-security.md).
 
 The enum and tag mapping are in `FrameType` ([src/proto/s2s_frame.zig:26](../../src/proto/s2s_frame.zig:26)), and the streaming decoder buffers partial input until a complete frame is available ([src/proto/s2s_frame.zig:116](../../src/proto/s2s_frame.zig:116)). Unknown frame tags are rejected as malformed ([src/proto/s2s_frame.zig:123](../../src/proto/s2s_frame.zig:123)).
 
@@ -47,7 +59,7 @@ Once established, the peer records the remote server in the registry, maps the r
 
 `S2sLink` is reactor-independent: it owns the per-peer CRDT state, a stable monotonic clock cell, and an outbound buffer used by the peer driver's `ByteSink` ([src/daemon/s2s_link.zig:1](../../src/daemon/s2s_link.zig:1), [src/daemon/s2s_link.zig:46](../../src/daemon/s2s_link.zig:46), [src/daemon/s2s_link.zig:62](../../src/daemon/s2s_link.zig:62)). The daemon calls `start` after outbound connect completion for plaintext links ([src/daemon/server.zig:2719](../../src/daemon/server.zig:2719)).
 
-`SecuredLink` wraps the same inner path with Tsumugi. During the handshake only the TOFU prekey preamble and the two AKE messages are length-prefixed with a four-byte little-endian length; after establishment, bytes are passed raw to `S2sLink` because `s2s_frame` already frames the CRDT stream ([src/daemon/secured_s2s_link.zig:1](../../src/daemon/secured_s2s_link.zig:1), [src/daemon/secured_s2s_link.zig:5](../../src/daemon/secured_s2s_link.zig:5), [src/daemon/secured_s2s_link.zig:197](../../src/daemon/secured_s2s_link.zig:197)). The responder immediately queues its signed prekey; the initiator verifies the prekey and optional trust pin before opening the Tsumugi session ([src/daemon/secured_s2s_link.zig:71](../../src/daemon/secured_s2s_link.zig:71), [src/daemon/secured_s2s_link.zig:95](../../src/daemon/secured_s2s_link.zig:95), [src/daemon/secured_s2s_link.zig:231](../../src/daemon/secured_s2s_link.zig:231), [src/daemon/secured_s2s_link.zig:237](../../src/daemon/secured_s2s_link.zig:237)).
+`SecuredLink` wraps the same inner path with Tsumugi. During the handshake only the TOFU prekey preamble and the two AKE messages are length-prefixed with a four-byte little-endian length. After establishment the post-handshake CRDT byte stream is **encrypted**: `feedInner`/`drainInner` wrap each inner chunk in a ChaCha20-Poly1305 AEAD record keyed on the Tsumugi `Established` send/recv keys with a per-record counter nonce bound as AAD, so a tampered or reordered record drops the link rather than reaching `S2sLink` ([src/daemon/secured_s2s_link.zig:1](../../src/daemon/secured_s2s_link.zig:1), [src/crypto/tsumugi_handshake.zig](../../src/crypto/tsumugi_handshake.zig)). The responder immediately queues its signed prekey; the initiator verifies the prekey and optional trust pin before opening the Tsumugi session ([src/daemon/secured_s2s_link.zig:71](../../src/daemon/secured_s2s_link.zig:71), [src/daemon/secured_s2s_link.zig:95](../../src/daemon/secured_s2s_link.zig:95), [src/daemon/secured_s2s_link.zig:231](../../src/daemon/secured_s2s_link.zig:231), [src/daemon/secured_s2s_link.zig:237](../../src/daemon/secured_s2s_link.zig:237)). The end-to-end origin-authentication and capability-negotiation model layered on top of this is documented separately in [mesh-security.md](mesh-security.md).
 
 The secured adapter exposes `peerNodeKey`, the authenticated raw Ed25519 signing public key recovered from the Tsumugi session, and the daemon uses that key to verify cross-mesh oper grants ([src/daemon/secured_s2s_link.zig:127](../../src/daemon/secured_s2s_link.zig:127), [src/daemon/server.zig:2650](../../src/daemon/server.zig:2650)).
 
