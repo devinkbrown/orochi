@@ -824,25 +824,87 @@ fn secureZero(buf: []u8) void {
     std.crypto.secureZero(u8, buf);
 }
 
+/// Coerce any error from the stepwise client methods (whose inferred error set
+/// is broad) into a member of this module's `Error` set. The structured
+/// failures we care about (handshake / finished / version / crypto) are passed
+/// through; everything else collapses to `BadHandshake`, which the connection
+/// driver maps to a fatal CONNECTION_CLOSE.
+fn mapClientError(e: anyerror) Error {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadState => error.BadState,
+        error.BadHandshake => error.BadHandshake,
+        error.UnsupportedGroup => error.UnsupportedGroup,
+        error.UnsupportedCipherSuite => error.UnsupportedCipherSuite,
+        error.ProtocolVersion => error.ProtocolVersion,
+        error.MissingExtension => error.MissingExtension,
+        error.FinishedMismatch => error.FinishedMismatch,
+        error.NoCertificate => error.NoCertificate,
+        error.SignatureFailed => error.SignatureFailed,
+        error.Entropy => error.Entropy,
+        else => error.BadHandshake,
+    };
+}
+
+/// Scan a buffered Handshake-level CRYPTO flight for a complete Finished message
+/// (handshake type 20). Returns true once every message up to and including the
+/// Finished is fully present, so the client can process the flight in one pass.
+/// Fully bounds-checked: a truncated trailing message returns false (wait).
+fn flightHasFinished(buf: []const u8) bool {
+    var pos: usize = 0;
+    while (pos + 4 <= buf.len) {
+        const len = (@as(usize, buf[pos + 1]) << 16) | (@as(usize, buf[pos + 2]) << 8) | buf[pos + 3];
+        const end = pos + 4 + len;
+        if (end > buf.len) return false; // message not fully buffered yet
+        if (buf[pos] == @intFromEnum(HandshakeType.finished)) return true;
+        pos = end;
+    }
+    return false;
+}
+
 // ===========================================================================
-// Test-only QUIC TLS 1.3 client — the loopback peer
+// QUIC TLS 1.3 client — the symmetric loopback peer of `Server`
 // ===========================================================================
 //
-// A minimal client just sufficient to exercise the server end to end: it emits
-// a ClientHello (x25519 + supported_versions + ALPN + transport params),
+// A client just sufficient to bring up a connection end to end: it emits a
+// ClientHello (x25519 + supported_versions + ALPN + transport params),
 // processes the server flight (ServerHello → install handshake keys; then the
 // encrypted flight: EncryptedExtensions, Certificate, CertificateVerify,
 // Finished), verifies the server CertificateVerify (Ed25519) and Finished, and
-// emits the client Finished. It derives the same traffic secrets so the test
-// can assert both sides agree on the handshake AND application keys.
+// emits the client Finished. It derives the same traffic secrets so both sides
+// agree on the handshake AND application keys.
+//
+// It exposes the same socketless surface as `Server` — `feedCrypto(level,
+// bytes)` / `takeFlight(level)` / `isComplete()` / `handshakeKeys()` /
+// `applicationKeys()` — so the connection driver in `quic_conn.zig` can drive
+// either role through one interface. The lower-level `start` / `feedInitial` /
+// `feedHandshake` methods remain for direct stepwise tests.
 
-const TestClient = struct {
+/// Client-side handshake configuration. Mirrors the relevant `Server` fields.
+pub const ClientConfig = struct {
+    /// ALPN protocols to offer, in preference order (server chooses). QUIC
+    /// requires ALPN; empty disables the extension (test only).
+    alpn_protocols: []const []const u8 = &.{},
+    /// The client's QUIC transport parameters, emitted in the ClientHello.
+    transport_params: quic_transport_params.TransportParameters = .{},
+    /// Deterministic X25519 seed (tests). When null a fresh seed is drawn from
+    /// the OS at `init`.
+    x25519_seed: ?[kx.X25519Kx.seed_len]u8 = null,
+    /// Deterministic ClientHello random (tests). When null a fresh 32-byte
+    /// random is drawn from the OS.
+    client_random: ?[32]u8 = null,
+};
+
+pub const Client = struct {
     allocator: Allocator,
     suite: ?CipherSuite = null,
     x25519_pair: kx.X25519Kx.KeyPair,
     client_random: [32]u8,
     leaf_pubkey: ?Ed25519.PublicKey = null,
     selected_alpn: ?[]const u8 = null,
+    /// Owned copy of the selected ALPN bytes so `selectedAlpn()` stays valid
+    /// after the EncryptedExtensions CRYPTO buffer it was parsed from is freed.
+    selected_alpn_storage: [256]u8 = undefined,
     peer_params: ?quic_transport_params.TransportParameters = null,
     peer_params_storage: std.ArrayList(u8) = .empty,
 
@@ -851,6 +913,16 @@ const TestClient = struct {
 
     transcript: std.ArrayList(u8) = .empty,
     done: bool = false,
+
+    /// Driver state for the `feedCrypto`/`takeFlight` surface.
+    started: bool = false,
+    hs_done: bool = false,
+    /// Reassembled server CRYPTO at the level we currently expect input on.
+    recv_initial: std.ArrayList(u8) = .empty,
+    recv_handshake: std.ArrayList(u8) = .empty,
+    /// Client CRYPTO output buffered per level until the caller drains it.
+    out_initial: std.ArrayList(u8) = .empty,
+    out_handshake: std.ArrayList(u8) = .empty,
 
     client_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
     server_hs_secret: [max_hash_len]u8 = [_]u8{0} ** max_hash_len,
@@ -861,12 +933,36 @@ const TestClient = struct {
     handshake_keys: ?KeySet = null,
     application_keys: ?KeySet = null,
 
+    /// Construct a client from a `ClientConfig` (the public path).
+    pub fn initConfig(allocator: Allocator, config: ClientConfig) Error!Client {
+        var seed: [kx.X25519Kx.seed_len]u8 = undefined;
+        if (config.x25519_seed) |s| {
+            seed = s;
+        } else {
+            try osEntropy(&seed);
+        }
+        defer secureZero(&seed);
+        var random: [32]u8 = undefined;
+        if (config.client_random) |r| {
+            random = r;
+        } else {
+            try osEntropy(&random);
+        }
+        return .{
+            .allocator = allocator,
+            .x25519_pair = kx.X25519Kx.generateDeterministic(seed) catch return error.BadState,
+            .client_random = random,
+            .alpn_protocols = config.alpn_protocols,
+            .transport_params = config.transport_params,
+        };
+    }
+
     fn init(
         allocator: Allocator,
         seed: [kx.X25519Kx.seed_len]u8,
         alpn_protocols: []const []const u8,
         transport_params: quic_transport_params.TransportParameters,
-    ) !TestClient {
+    ) !Client {
         return .{
             .allocator = allocator,
             .x25519_pair = try kx.X25519Kx.generateDeterministic(seed),
@@ -876,16 +972,102 @@ const TestClient = struct {
         };
     }
 
-    fn deinit(self: *TestClient) void {
+    pub fn deinit(self: *Client) void {
         self.x25519_pair.wipe();
+        secureZero(&self.handshake_secret);
+        secureZero(&self.client_hs_secret);
+        secureZero(&self.server_hs_secret);
+        secureZero(&self.client_ap_secret);
+        secureZero(&self.server_ap_secret);
         self.transcript.deinit(self.allocator);
         self.peer_params_storage.deinit(self.allocator);
+        self.recv_initial.deinit(self.allocator);
+        self.recv_handshake.deinit(self.allocator);
+        self.out_initial.deinit(self.allocator);
+        self.out_handshake.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn isComplete(self: *const Client) bool {
+        return self.done;
+    }
+
+    pub fn selectedAlpn(self: *const Client) ?[]const u8 {
+        return self.selected_alpn;
+    }
+
+    pub fn peerTransportParams(self: *const Client) ?quic_transport_params.TransportParameters {
+        return self.peer_params;
+    }
+
+    pub fn cipherName(self: *const Client) ?[]const u8 {
+        const s = self.suite orelse return null;
+        return s.name();
+    }
+
+    pub fn handshakeKeys(self: *const Client) ?KeySet {
+        return self.handshake_keys;
+    }
+
+    pub fn applicationKeys(self: *const Client) ?KeySet {
+        return self.application_keys;
+    }
+
+    /// Produce the ClientHello into the Initial output buffer if not yet sent.
+    /// The connection driver calls this once before its first send so a
+    /// `takeFlight(.initial)` yields the ClientHello CRYPTO bytes.
+    pub fn startHandshake(self: *Client) Error!void {
+        if (self.started) return;
+        var ch = try self.start();
+        defer ch.deinit(self.allocator);
+        try self.out_initial.appendSlice(self.allocator, ch.items);
+        self.started = true;
+    }
+
+    /// Feed reassembled server CRYPTO bytes for `level`. Initial carries the
+    /// ServerHello; Handshake carries EE/Certificate/CertificateVerify/Finished.
+    /// Drives the handshake forward, buffering the client Finished into the
+    /// Handshake output buffer once the server flight is verified.
+    pub fn feedCrypto(self: *Client, level: EncryptionLevel, data: []const u8) Error!void {
+        if (!self.started) try self.startHandshake();
+        switch (level) {
+            .initial => {
+                if (self.handshake_keys != null) return; // ServerHello already done
+                try self.recv_initial.appendSlice(self.allocator, data);
+                var off: usize = 0;
+                if (parseHandshakeMaybe(self.recv_initial.items, &off) == null) return;
+                self.feedInitial(self.recv_initial.items[0..off]) catch |e| return mapClientError(e);
+                consumePrefix(&self.recv_initial, off);
+            },
+            .handshake => {
+                if (self.hs_done) return;
+                try self.recv_handshake.appendSlice(self.allocator, data);
+                // Need the entire server flight (through Finished) buffered. Scan
+                // for a Finished message; until it arrives, wait for more.
+                if (!flightHasFinished(self.recv_handshake.items)) return;
+                var cfin = self.feedHandshake(self.recv_handshake.items) catch |e| return mapClientError(e);
+                defer cfin.deinit(self.allocator);
+                try self.out_handshake.appendSlice(self.allocator, cfin.items);
+                self.recv_handshake.clearRetainingCapacity();
+                self.hs_done = true;
+            },
+            .application => return error.BadState,
+        }
+    }
+
+    /// Take ownership of all buffered client CRYPTO bytes at `level`.
+    pub fn takeFlight(self: *Client, level: EncryptionLevel) Error![]u8 {
+        const buf = switch (level) {
+            .initial => &self.out_initial,
+            .handshake => &self.out_handshake,
+            .application => return self.allocator.alloc(u8, 0),
+        };
+        return buf.toOwnedSlice(self.allocator);
     }
 
     /// Build the ClientHello CRYPTO bytes (Initial level). Offers all three
     /// suites by default so the server picks per its preference.
-    fn start(self: *TestClient) !std.ArrayList(u8) {
+    fn start(self: *Client) !std.ArrayList(u8) {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
         try appendU16(self.allocator, &body, legacy_version);
@@ -929,7 +1111,7 @@ const TestClient = struct {
     }
 
     /// Process the server's Initial-level flight (just ServerHello).
-    fn feedInitial(self: *TestClient, data: []const u8) !void {
+    fn feedInitial(self: *Client, data: []const u8) !void {
         var off: usize = 0;
         const msg = parseHandshakeMaybe(data, &off) orelse return error.BadHandshake;
         if (msg.typ != .server_hello) return error.BadHandshake;
@@ -941,7 +1123,7 @@ const TestClient = struct {
     /// Process the server's Handshake-level flight (EE, Cert, CertVerify,
     /// Finished). Verifies CertificateVerify + Finished. Returns the client
     /// Finished CRYPTO bytes (Handshake level).
-    fn feedHandshake(self: *TestClient, data: []const u8) !std.ArrayList(u8) {
+    fn feedHandshake(self: *Client, data: []const u8) !std.ArrayList(u8) {
         var pos: usize = 0;
         while (true) {
             var off: usize = 0;
@@ -982,7 +1164,7 @@ const TestClient = struct {
         return out;
     }
 
-    fn parseServerHello(self: *TestClient, body: []const u8) ![32]u8 {
+    fn parseServerHello(self: *Client, body: []const u8) ![32]u8 {
         var c = Cursor.init(body);
         if (try c.readU16() != legacy_version) return error.ProtocolVersion;
         _ = try c.take(32); // server random
@@ -1012,12 +1194,17 @@ const TestClient = struct {
         return secret.declassify();
     }
 
-    fn parseEncryptedExtensions(self: *TestClient, body: []const u8) !void {
+    fn parseEncryptedExtensions(self: *Client, body: []const u8) !void {
         var it = tls_extension.Iterator.init(try tls_extension.unwrap(body));
         while (try it.next()) |ext| {
             if (ext.ext_type == @intFromEnum(tls_extension.ExtensionType.alpn)) {
                 var names = tls_alpn.Iterator.fromBlock(ext.data) catch continue;
-                if (names.next() catch null) |proto| self.selected_alpn = proto;
+                if (names.next() catch null) |proto| {
+                    if (proto.len <= self.selected_alpn_storage.len) {
+                        @memcpy(self.selected_alpn_storage[0..proto.len], proto);
+                        self.selected_alpn = self.selected_alpn_storage[0..proto.len];
+                    }
+                }
             } else if (ext.ext_type == quic_transport_parameters_ext) {
                 self.peer_params_storage.clearRetainingCapacity();
                 try self.peer_params_storage.appendSlice(self.allocator, ext.data);
@@ -1026,7 +1213,7 @@ const TestClient = struct {
         }
     }
 
-    fn parseCertificate(self: *TestClient, body: []const u8) !void {
+    fn parseCertificate(self: *Client, body: []const u8) !void {
         var c = Cursor.init(body);
         const ctx = try c.take(try c.readU8());
         if (ctx.len != 0) return error.BadHandshake;
@@ -1038,7 +1225,7 @@ const TestClient = struct {
         self.leaf_pubkey = try ed25519KeyFromCert(der);
     }
 
-    fn verifyCertificateVerify(self: *TestClient, body: []const u8) !void {
+    fn verifyCertificateVerify(self: *Client, body: []const u8) !void {
         if (body.len < 4) return error.BadHandshake;
         const scheme = std.mem.readInt(u16, body[0..2], .big);
         const sig_len = std.mem.readInt(u16, body[2..4], .big);
@@ -1056,7 +1243,7 @@ const TestClient = struct {
         Ed25519.Signature.fromBytes(sig_bytes).verify(input, pk) catch return error.FinishedMismatch;
     }
 
-    fn installHandshakeKeys(self: *TestClient, shared: [32]u8) !void {
+    fn installHandshakeKeys(self: *Client, shared: [32]u8) !void {
         const suite = self.suite.?;
         switch (suite) {
             .tls_aes_256_gcm_sha384 => try self.installHandshakeKeysT(Sha384, suite, shared),
@@ -1064,7 +1251,7 @@ const TestClient = struct {
         }
     }
 
-    fn installHandshakeKeysT(self: *TestClient, comptime KS: type, suite: CipherSuite, shared: [32]u8) !void {
+    fn installHandshakeKeysT(self: *Client, comptime KS: type, suite: CipherSuite, shared: [32]u8) !void {
         var early = KS.earlySecret("");
         defer early.wipe();
         var handshake = try KS.handshakeSecret(&early, &shared);
@@ -1079,7 +1266,7 @@ const TestClient = struct {
         self.handshake_keys = installKeys(KS, .handshake, suite, &self.client_hs_secret, &self.server_hs_secret);
     }
 
-    fn installApplicationKeys(self: *TestClient) !void {
+    fn installApplicationKeys(self: *Client) !void {
         const suite = self.suite.?;
         switch (suite) {
             .tls_aes_256_gcm_sha384 => try self.installApplicationKeysT(Sha384, suite),
@@ -1087,7 +1274,7 @@ const TestClient = struct {
         }
     }
 
-    fn installApplicationKeysT(self: *TestClient, comptime KS: type, suite: CipherSuite) !void {
+    fn installApplicationKeysT(self: *Client, comptime KS: type, suite: CipherSuite) !void {
         var sk: [KS.hash_len]u8 = undefined;
         @memcpy(&sk, self.handshake_secret[0..KS.hash_len]);
         var hs = KS.SecretBytes.init(sk);
@@ -1102,7 +1289,7 @@ const TestClient = struct {
         self.application_keys = installKeys(KS, .application, suite, &self.client_ap_secret, &self.server_ap_secret);
     }
 
-    fn transcriptHash(self: *const TestClient, out: *[max_hash_len]u8) usize {
+    fn transcriptHash(self: *const Client, out: *[max_hash_len]u8) usize {
         return switch (self.suite.?) {
             .tls_aes_256_gcm_sha384 => blk: {
                 const d = Sha384.transcriptHash(self.transcript.items);
@@ -1117,7 +1304,7 @@ const TestClient = struct {
         };
     }
 
-    fn finishedVerify(self: *const TestClient, base_key: *const [max_hash_len]u8, received: []const u8) bool {
+    fn finishedVerify(self: *const Client, base_key: *const [max_hash_len]u8, received: []const u8) bool {
         var th: [max_hash_len]u8 = undefined;
         _ = self.transcriptHash(&th);
         return switch (self.suite.?) {
@@ -1126,7 +1313,7 @@ const TestClient = struct {
         };
     }
 
-    fn finishedVerifyData(self: *const TestClient, base_key: *const [max_hash_len]u8, out: *[max_hash_len]u8) usize {
+    fn finishedVerifyData(self: *const Client, base_key: *const [max_hash_len]u8, out: *[max_hash_len]u8) usize {
         var th: [max_hash_len]u8 = undefined;
         _ = self.transcriptHash(&th);
         switch (self.suite.?) {
@@ -1166,6 +1353,10 @@ fn ed25519KeyFromCert(der: []const u8) !Ed25519.PublicKey {
 
 const testing = std.testing;
 const x509_selfsign = @import("x509_selfsign.zig");
+
+/// The loopback client used to be a test-only `TestClient`; it is now the public
+/// `Client`. This alias keeps the stepwise handshake tests below unchanged.
+const TestClient = Client;
 
 fn mintEd25519Cert(out: *[1024]u8, kp: Ed25519.KeyPair) ![]const u8 {
     return x509_selfsign.buildSelfSigned(out, .{
@@ -1379,7 +1570,7 @@ test "quic handshake loopback agrees on keys for AES-256-GCM-SHA384" {
 /// Rebuild the client's ClientHello offering exactly one cipher suite (so the
 /// server's preference resolves to it). Mirrors `TestClient.start` but with a
 /// single-element cipher_suites list.
-fn buildSingleSuiteHello(alloc: Allocator, client: *TestClient, only: CipherSuite) !std.ArrayList(u8) {
+fn buildSingleSuiteHello(alloc: Allocator, client: *Client, only: CipherSuite) !std.ArrayList(u8) {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
     try appendU16(alloc, &body, legacy_version);
