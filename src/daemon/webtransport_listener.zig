@@ -37,8 +37,24 @@
 //!     Initials past the cap is dropped (no per-flood allocation).
 //!   * Each `Conn`/`Http3Conn`/proxy is fixed-shape; the QUIC engine already
 //!     bounds per-connection buffers (flow control, bounded datagram inbox).
-//!   * One server SCID per connection, no connection migration, no Retry,
-//!     no stateless reset (inherited from the `quic_conn` layer's typed gaps).
+//!   * Anti-amplification (RFC 9000 §8.1): every new server connection is
+//!     amplification-limited to 3× the bytes received until the peer's address
+//!     is validated (a decrypted Handshake packet, or a returned Retry token).
+//!     This gate lives in the `quic_conn` layer; the listener feeds it.
+//!   * Version Negotiation (RFC 9000 §17.2.1): an Initial with an unsupported
+//!     QUIC version is answered with a VN packet (listing v1) and no connection
+//!     is created. The VN reply is always ≤ the triggering Initial, never an
+//!     amplifier.
+//!   * Retry (RFC 9000 §8.1.2): OFF by default (fast path). When
+//!     `retry_policy = .always` (or `.under_load` past `retry_load_threshold`
+//!     live connections), a fresh Initial WITHOUT a valid address-validation
+//!     token is answered with a Retry packet instead of proceeding; the client
+//!     re-sends its Initial carrying the token and is validated immediately. A
+//!     replayed/expired/wrong-IP token is rejected (falls back to a new Retry).
+//!   * Stateless reset (RFC 9000 §10.3): token derivation is wired (per-process
+//!     key, HMAC of the CID); the unknown-short-header SEND path is a documented
+//!     follow-up — see `quic_retry.zig`.
+//!   * One server SCID per connection, no connection migration.
 //!   * One WebTransport session per QUIC connection, one IRC bridge per
 //!     session (the common deployment shape; `http3_conn` rejects a 2nd CONNECT).
 //!   * IPv4 socket (reuses the proven `MediaSocket`); the daemon's dual-stack
@@ -54,6 +70,7 @@ const posix = std.posix;
 
 const quic_conn = @import("../proto/quic_conn.zig");
 const quic_packet = @import("../proto/quic_packet.zig");
+const quic_retry = @import("../proto/quic_retry.zig");
 const http3_conn = @import("../proto/http3_conn.zig");
 const quic_transport_params = @import("../proto/quic_transport_params.zig");
 const quic_handshake = @import("../proto/quic_handshake.zig");
@@ -68,6 +85,22 @@ pub const any_be = media_socket.any_be;
 /// Default cap on concurrent QUIC connections (DoS bound). A flood of fresh
 /// handshakes past this is dropped without allocation.
 pub const default_max_connections: usize = 256;
+
+/// Default live-connection count at/above which the `.under_load` Retry policy
+/// starts forcing a stateless Retry round trip (half the connection cap).
+pub const default_retry_load_threshold: usize = 128;
+
+/// Retry address-validation policy (RFC 9000 §8.1.2). See the field docs on
+/// `WebTransportListener.retry_policy`.
+pub const RetryPolicy = enum {
+    /// Never issue a Retry; mint connections directly (anti-amplification still
+    /// applies). The default fast path.
+    never,
+    /// Issue a Retry for every tokenless new Initial.
+    always,
+    /// Issue a Retry only once the live connection count reaches the threshold.
+    under_load,
+};
 
 /// Scratch read buffer size for a single UDP datagram (QUIC keeps datagrams
 /// under ~1252 bytes; allow generous slack).
@@ -133,6 +166,21 @@ pub const WebTransportListener = struct {
     /// Off by default (loopback identity); see module doc.
     send_proxy_header: bool = false,
     max_connections: usize = default_max_connections,
+
+    /// Retry policy (RFC 9000 §8.1.2). `.never` is the default fast path — a new
+    /// Initial mints a connection directly (still anti-amplification-limited).
+    /// `.always` issues a Retry for every tokenless Initial. `.under_load` issues
+    /// a Retry only once the live connection count reaches `retry_load_threshold`
+    /// (a cheap DoS valve: under attack, force every client through a stateless
+    /// round trip before any per-connection state is allocated).
+    retry_policy: RetryPolicy = .never,
+    /// Live-connection count at/above which `.under_load` starts issuing Retries.
+    retry_load_threshold: usize = default_retry_load_threshold,
+    /// Per-process address-validation / stateless-reset key bundle (RFC 9000
+    /// §8.1.2 / §10.3). Minted on first use from the OS CSPRNG.
+    retry_secret: ?quic_retry.Secret = null,
+    /// Bounded single-use cache for accepted Retry tokens (replay defense).
+    token_replay: quic_retry.ReplayCache = .{},
 
     socket: ?MediaSocket = null,
     thread: ?std.Thread = null,
@@ -216,17 +264,141 @@ pub const WebTransportListener = struct {
 
     /// Process one inbound UDP datagram: demux to (or create) a connection, feed
     /// the QUIC engine, service H3/WT, and flush owed datagrams to the peer.
+    ///
+    /// A previously-unseen connection id triggers the address-validation policy
+    /// (RFC 9000 §8): Version Negotiation for an unsupported version, an optional
+    /// Retry to force an address round trip, and — once a connection is minted —
+    /// the per-connection 3× anti-amplification limit in `quic_conn`.
     fn handleDatagram(self: *WebTransportListener, data: []const u8, from: TransportAddress) void {
         if (data.len == 0) return;
         const cid = peekDestCid(data) orelse return;
 
-        const conn = self.lookup(cid) orelse blk: {
-            // Only a long-header (Initial) packet may create a new connection.
-            if ((data[0] & 0x80) == 0) return; // short header for unknown cid → drop
-            break :blk self.createConnection(cid, from) orelse return;
+        if (self.lookup(cid)) |conn| {
+            self.feedConnection(conn, data);
+            return;
+        }
+
+        // Unknown connection id. Only a long-header (Initial) packet may create a
+        // new connection; a short header for an unknown cid is dropped (a
+        // stateless reset on it is a documented follow-up — see quic_retry.zig).
+        if ((data[0] & 0x80) == 0) return;
+
+        const conn = self.admitNewInitial(data, from) orelse return;
+        self.feedConnection(conn, data);
+    }
+
+    /// Apply the RFC 9000 §8 admission policy to a long-header Initial from an
+    /// unknown connection id and, if it passes, mint the connection. Returns null
+    /// (after possibly emitting a VN or Retry packet) when no connection should
+    /// be created for this datagram.
+    fn admitNewInitial(self: *WebTransportListener, data: []const u8, from: TransportAddress) ?*Connection {
+        const hdr = parseInitialHeader(data) orelse {
+            // A long header we cannot parse as an Initial (e.g. a 0-RTT/Retry/
+            // Handshake for an unknown cid): drop without state.
+            return null;
         };
 
-        self.feedConnection(conn, data);
+        // Version Negotiation (RFC 9000 §17.2.1): unsupported version → reply with
+        // a VN packet listing v1 and create NO connection. The VN is ≤ the
+        // triggering datagram, so it never amplifies.
+        if (!quic_retry.supportsVersion(hdr.version)) {
+            self.sendVersionNegotiation(hdr, from, data.len);
+            return null;
+        }
+
+        // Retry / address-validation token policy (RFC 9000 §8.1.2).
+        if (self.retryActive()) {
+            if (hdr.token.len > 0) {
+                // The client returned a token. Accept it only if it authenticates
+                // for THIS source IP, is unexpired, and is not a replay; then the
+                // new connection is address-validated immediately (no 3× limit).
+                if (self.acceptToken(hdr.token, from, hdr.dcid)) {
+                    const conn = self.createConnection(hdr.dcid, from) orelse return null;
+                    conn.conn.markAddressValidated();
+                    return conn;
+                }
+                // A bad/expired/replayed token: fall through and issue a fresh
+                // Retry rather than trusting it.
+            }
+            // No token (or a rejected one): issue a Retry and create no state.
+            self.sendRetry(hdr, from);
+            return null;
+        }
+
+        // Fast path: mint the connection directly. It is still subject to the
+        // per-connection 3× anti-amplification limit until a Handshake packet
+        // validates the address.
+        return self.createConnection(hdr.dcid, from);
+    }
+
+    /// Whether the Retry policy is currently active for a new Initial.
+    fn retryActive(self: *const WebTransportListener) bool {
+        return switch (self.retry_policy) {
+            .never => false,
+            .always => true,
+            .under_load => self.liveCount() >= self.retry_load_threshold,
+        };
+    }
+
+    /// Lazily mint (once) and return the per-process address-validation secret.
+    fn secret(self: *WebTransportListener) *const quic_retry.Secret {
+        if (self.retry_secret == null) self.retry_secret = quic_retry.Secret.generate();
+        return &self.retry_secret.?;
+    }
+
+    /// Verify a returned Retry token: authenticates under our key, was minted for
+    /// `from`'s IP and the client-chosen `original_dcid`, is unexpired, and is
+    /// not a replay. Records it on success (single-use). Returns true if valid.
+    fn acceptToken(self: *WebTransportListener, token: []const u8, from: TransportAddress, original_dcid: []const u8) bool {
+        const sec = self.secret();
+        var addr = from;
+        _ = quic_retry.Token.verify(
+            token,
+            sec,
+            addr.bytes(),
+            original_dcid,
+            nowNs(),
+            quic_retry.default_token_lifetime_ns,
+        ) catch return false;
+        // Authenticated + fresh; enforce single-use (replay defense).
+        self.token_replay.checkAndRecord(token) catch return false;
+        return true;
+    }
+
+    /// Emit a Retry packet (RFC 9000 §17.2.5): a fresh server SCID + an
+    /// address-validation token binding the client IP and original DCID. Creates
+    /// no per-connection state — the client must re-send its Initial with the
+    /// token. Failure to build/send is silently dropped (the client will retry).
+    fn sendRetry(self: *WebTransportListener, hdr: InitialHeader, from: TransportAddress) void {
+        const sec = self.secret();
+        // Mint the token (bind IP + the client's original DCID + issue time).
+        var addr = from;
+        var token_buf: [quic_retry.max_token_len]u8 = undefined;
+        const token = quic_retry.Token.seal(&token_buf, sec, addr.bytes(), hdr.dcid, nowNs()) catch return;
+
+        // A fresh server SCID (the connection-id the client will address next).
+        var scid: [8]u8 = undefined;
+        std.mem.writeInt(u64, scid[0..8], self.scid_counter, .big);
+        self.scid_counter +%= 1;
+
+        // Retry's DCID = the client's SCID (so the client recognises the reply).
+        var out: [quic_retry.retry_packet_max]u8 = undefined;
+        const n = quic_retry.encodeRetry(&out, hdr.scid, &scid, token_buf[0..token], hdr.dcid) catch return;
+        const sock = if (self.socket) |*s| s else return;
+        sock.sendTo(from, out[0..n]);
+    }
+
+    /// Emit a Version Negotiation packet (RFC 9000 §17.2.1) in response to an
+    /// unsupported-version Initial. The VN swaps the connection ids and lists the
+    /// versions we support (v1). It is sent only when it cannot exceed the
+    /// triggering datagram's size (`trigger_len`), so it can never amplify.
+    fn sendVersionNegotiation(self: *WebTransportListener, hdr: InitialHeader, from: TransportAddress, trigger_len: usize) void {
+        var out: [256]u8 = undefined;
+        // Our DCID = the client's SCID; our SCID = the client's DCID (§17.2.1).
+        const n = quic_retry.encodeVersionNegotiation(&out, hdr.scid, hdr.dcid) catch return;
+        if (n > trigger_len) return; // never amplify (defensive; always holds here)
+        const sock = if (self.socket) |*s| s else return;
+        sock.sendTo(from, out[0..n]);
     }
 
     /// Drive QUIC recv → H3 service → flush for one connection, then handle any
@@ -581,6 +753,83 @@ fn peekDestCid(data: []const u8) ?[]const u8 {
     const dcid_len: usize = 8;
     if (data.len < 1 + dcid_len) return null;
     return data[1 .. 1 + dcid_len];
+}
+
+/// The fields of a long-header Initial the admission policy needs, parsed
+/// without decrypting. Slices borrow from the input datagram.
+const InitialHeader = struct {
+    version: u32,
+    /// The client-chosen Destination Connection ID (stable for the handshake;
+    /// also the "original DCID" the Retry token binds, RFC 9000 §17.2.5.2).
+    dcid: []const u8,
+    /// The client's Source Connection ID (becomes the Retry/VN reply's DCID).
+    scid: []const u8,
+    /// The address-validation token the client echoed (empty on a first Initial).
+    token: []const u8,
+};
+
+/// Parse a long-header Initial's version, connection ids, and token, bounds-
+/// checked. Returns null for a non-Initial long header or any truncation, so a
+/// malformed datagram is dropped without allocation (and never amplifies).
+///
+/// Layout (RFC 9000 §17.2.2): first(1) ‖ version(4) ‖ DCIDL(1) ‖ DCID ‖
+/// SCIDL(1) ‖ SCID ‖ TokenLen(varint) ‖ Token ‖ Length(varint) ‖ ...
+fn parseInitialHeader(data: []const u8) ?InitialHeader {
+    if (data.len < 6) return null;
+    if ((data[0] & 0x80) == 0) return null; // not a long header
+
+    // Long packet type lives in bits 4–5 of the first byte. Only Initial (0b00)
+    // may create a connection via this path; the type bits are NOT
+    // header-protected on a long header, so we can read them in the clear.
+    const ptype = (data[0] >> 4) & 0x03;
+    if (ptype != @intFromEnum(quic_packet.LongPacketType.initial)) return null;
+
+    const version = std.mem.readInt(u32, data[1..5], .big);
+
+    var pos: usize = 5;
+    if (pos >= data.len) return null;
+    const dcid_len = data[pos];
+    pos += 1;
+    if (dcid_len > quic_packet.max_connection_id_len) return null;
+    if (pos + dcid_len + 1 > data.len) return null;
+    const dcid = data[pos .. pos + dcid_len];
+    pos += dcid_len;
+
+    const scid_len = data[pos];
+    pos += 1;
+    if (scid_len > quic_packet.max_connection_id_len) return null;
+    if (pos + scid_len > data.len) return null;
+    const scid = data[pos .. pos + scid_len];
+    pos += scid_len;
+
+    // Token length varint, then the token bytes.
+    const tok_vi = decodeVarintAt(data, pos) orelse return null;
+    pos += tok_vi.len;
+    const tok_len = std.math.cast(usize, tok_vi.value) orelse return null;
+    if (pos + tok_len > data.len) return null;
+    const token = data[pos .. pos + tok_len];
+
+    return .{ .version = version, .dcid = dcid, .scid = scid, .token = token };
+}
+
+/// A QUIC varint decoded from `data[off..]` (RFC 9000 §16). Returns null on
+/// truncation. Tolerant of non-minimal encodings (the spec permits them).
+const DecodedVarint = struct { value: u64, len: usize };
+fn decodeVarintAt(data: []const u8, off: usize) ?DecodedVarint {
+    if (off >= data.len) return null;
+    const tag = data[off] >> 6;
+    const len: usize = switch (tag) {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        else => unreachable,
+    };
+    if (off + len > data.len) return null;
+    var value: u64 = data[off] & 0x3f;
+    var i: usize = 1;
+    while (i < len) : (i += 1) value = (value << 8) | data[off + i];
+    return .{ .value = value, .len = len };
 }
 
 /// The QUIC stream id of the first *client-opened* WebTransport bidirectional
@@ -946,4 +1195,243 @@ fn readWtBidi(conn: *quic_conn.Conn, sid: u64, dst: []u8, session_id: webtranspo
     _ = session_id;
     if (dst.len == 0) return 0;
     return conn.readStream(sid, dst);
+}
+
+// ===========================================================================
+// Address-validation policy tests (RFC 9000 §8 / §17.2.1 / §17.2.5)
+// ===========================================================================
+
+/// Build a synthetic long-header Initial header with the given fields and an
+/// optional token, into `out`. Returns the slice. This is only the header (no
+/// frames/padding) — enough to drive the listener's admission/parse path.
+fn buildInitialHeader(out: []u8, version: u32, dcid: []const u8, scid: []const u8, token: []const u8) []const u8 {
+    var pos: usize = 0;
+    out[pos] = 0xc0; // long header, fixed bit, Initial type (0b00)
+    pos += 1;
+    std.mem.writeInt(u32, out[pos..][0..4], version, .big);
+    pos += 4;
+    out[pos] = @intCast(dcid.len);
+    pos += 1;
+    @memcpy(out[pos..][0..dcid.len], dcid);
+    pos += dcid.len;
+    out[pos] = @intCast(scid.len);
+    pos += 1;
+    @memcpy(out[pos..][0..scid.len], scid);
+    pos += scid.len;
+    // Token length varint (1-byte form for < 64).
+    out[pos] = @intCast(token.len);
+    pos += 1;
+    @memcpy(out[pos..][0..token.len], token);
+    pos += token.len;
+    // A minimal Length varint + a byte so the packet looks structurally sane.
+    out[pos] = 0x00;
+    pos += 1;
+    return out[0..pos];
+}
+
+test "parseInitialHeader extracts version, cids, and token; rejects truncation" {
+    var buf: [64]u8 = undefined;
+    const dcid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const scid = [_]u8{ 0x11, 0x22 };
+    const token = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    const pkt = buildInitialHeader(&buf, 0x0000_0001, &dcid, &scid, &token);
+
+    const hdr = parseInitialHeader(pkt) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0x0000_0001), hdr.version);
+    try testing.expectEqualSlices(u8, &dcid, hdr.dcid);
+    try testing.expectEqualSlices(u8, &scid, hdr.scid);
+    try testing.expectEqualSlices(u8, &token, hdr.token);
+
+    // A short-header (no long bit) is not an Initial.
+    try testing.expect(parseInitialHeader(&[_]u8{ 0x40, 1, 2, 3, 4, 5, 6, 7, 8 }) == null);
+    // Truncated mid-header → null (no panic).
+    try testing.expect(parseInitialHeader(pkt[0..7]) == null);
+}
+
+/// A listener bound to a real UDP socket but NOT started (no pump thread), so we
+/// can call `handleDatagram` directly and read what it sends from a peer socket.
+const PolicyFixture = struct {
+    keys: TestServerKeys,
+    lst: WebTransportListener,
+    peer: MediaSocket,
+    server_addr: TransportAddress,
+    peer_addr: TransportAddress,
+
+    fn init(self: *PolicyFixture, policy: RetryPolicy) !void {
+        try self.keys.init();
+        self.lst = WebTransportListener.init(testing.allocator, .{
+            .cert_chain = &self.keys.cert_chain,
+            .signing_key = .{ .ed25519 = self.keys.kp },
+        }, 0);
+        self.lst.retry_policy = policy;
+        // Bind the listener's UDP socket WITHOUT spawning the pump thread.
+        var sock = try MediaSocket.bind(loopback_be, 0);
+        self.lst.port = try sock.localPort();
+        sock.setRecvTimeoutMs(200);
+        self.lst.socket = sock;
+
+        // A peer socket to send Initials from and read VN/Retry replies on.
+        self.peer = try MediaSocket.bind(loopback_be, 0);
+        self.peer.setRecvTimeoutMs(300);
+        self.server_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, self.lst.port);
+        self.peer_addr = try TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, 1 }, try self.peer.localPort());
+    }
+
+    fn deinit(self: *PolicyFixture) void {
+        // The listener never started its pump, so deinit just frees state +
+        // closes the socket we handed it.
+        self.lst.deinit();
+        self.peer.deinit();
+    }
+
+    /// Feed `data` to the listener as if it arrived from the peer, then read one
+    /// reply datagram the listener sent back (or null on timeout).
+    fn exchange(self: *PolicyFixture, data: []const u8, reply: []u8) ?usize {
+        self.lst.handleDatagram(data, self.peer_addr);
+        const got = self.peer.recvFrom(reply) orelse return null;
+        return got.data.len;
+    }
+};
+
+test "version negotiation — an Initial with version 0xff000099 yields a VN listing v1 and no connection" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+
+    // A real client Initial is padded to ≥1200 bytes (RFC 9000 §14.1), so the VN
+    // reply (a few dozen bytes) never amplifies. We mimic that here: the parsed
+    // header is the same, but the on-wire datagram is padded so the VN passes the
+    // never-amplify guard.
+    var buf: [1300]u8 = [_]u8{0} ** 1300;
+    const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+    const scid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4 };
+    const hdr = buildInitialHeader(&buf, 0xff00_0099, &dcid, &scid, &.{});
+    const pkt = buf[0..1200]; // header + trailing zero PADDING to 1200 bytes
+    _ = hdr;
+
+    var reply: [256]u8 = undefined;
+    const n = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
+
+    // A VN packet: high bit set, version field == 0, lists v1 in the trailer.
+    try testing.expect((reply[0] & 0x80) != 0);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, reply[1..5], .big));
+    try testing.expectEqual(quic_retry.quic_version_1, std.mem.readInt(u32, reply[n - 4 ..][0..4], .big));
+    // No connection was created for an unsupported version.
+    try testing.expectEqual(@as(usize, 0), fx.lst.liveCount());
+    // VN never amplifies relative to the trigger.
+    try testing.expect(n <= pkt.len);
+}
+
+test "retry — a tokenless Initial under .always policy is answered with a Retry and no connection" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.always);
+    defer fx.deinit();
+
+    var buf: [64]u8 = undefined;
+    const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+    const scid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4 };
+    const pkt = buildInitialHeader(&buf, quic_retry.quic_version_1, &dcid, &scid, &.{});
+
+    var reply: [256]u8 = undefined;
+    const n = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
+
+    // The reply is a Retry packet: long header, Retry type bits 0b11.
+    try testing.expect((reply[0] & 0x80) != 0);
+    try testing.expectEqual(@as(u8, @intFromEnum(quic_packet.LongPacketType.retry)), (reply[0] >> 4) & 0x03);
+    // Retry's DCID = the client's SCID (so the client recognises the reply).
+    try testing.expectEqual(@as(u8, scid.len), reply[5]);
+    try testing.expectEqualSlices(u8, &scid, reply[6 .. 6 + scid.len]);
+    // No connection state was allocated.
+    try testing.expectEqual(@as(usize, 0), fx.lst.liveCount());
+    // The Retry's integrity tag (last 16 bytes) verifies against the §5.8
+    // construction over the pseudo-packet (binding the client's original DCID).
+    const expected_tag = try quic_retry.retryIntegrityTag(&dcid, reply[0 .. n - quic_retry.tag_len]);
+    try testing.expectEqualSlices(u8, &expected_tag, reply[n - quic_retry.tag_len .. n]);
+}
+
+test "retry — a client returning a valid token is address-validated immediately (no 3x cap)" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.always);
+    defer fx.deinit();
+
+    const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+    const scid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4 };
+
+    // Step 1: tokenless Initial → the listener issues a Retry carrying a token.
+    var buf: [128]u8 = undefined;
+    const pkt = buildInitialHeader(&buf, quic_retry.quic_version_1, &dcid, &scid, &.{});
+    var reply: [256]u8 = undefined;
+    const rn = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
+
+    // Extract the token from the Retry: after first(1)+ver(4)+DCIDL(1)+DCID+
+    // SCIDL(1)+SCID, the token runs to the 16-byte integrity tag.
+    var pos: usize = 5;
+    const r_dcidl = reply[pos];
+    pos += 1 + r_dcidl;
+    const r_scidl = reply[pos];
+    pos += 1 + r_scidl;
+    const token = reply[pos .. rn - quic_retry.tag_len];
+    try testing.expect(token.len > 0);
+
+    // Step 2: the client re-sends its Initial WITH the token. It must now be
+    // accepted, the connection created, and the address validated (no 3× cap).
+    // We call `admitNewInitial` directly (the admission decision under test);
+    // feeding the synthetic header through the full recv path would tear the
+    // connection down on the (intentionally undecryptable) body.
+    var buf2: [256]u8 = undefined;
+    const pkt2 = buildInitialHeader(&buf2, quic_retry.quic_version_1, &dcid, &scid, token);
+    const conn = fx.lst.admitNewInitial(pkt2, fx.peer_addr) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), fx.lst.liveCount());
+    try testing.expect(conn.conn.isAddressValidated());
+
+    // Step 3: a REPLAY of the same token (new DCID, same IP) is rejected — the
+    // listener issues a fresh Retry instead of a second validated connection.
+    const dcid2 = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
+    var buf3: [256]u8 = undefined;
+    const pkt3 = buildInitialHeader(&buf3, quic_retry.quic_version_1, &dcid2, &scid, token);
+    try testing.expect(fx.lst.admitNewInitial(pkt3, fx.peer_addr) == null);
+    // No new validated connection for the replayed token.
+    try testing.expect(fx.lst.lookup(&dcid2) == null);
+}
+
+test "retry — a token from a different client IP is rejected" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.always);
+    defer fx.deinit();
+
+    const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+
+    // Seal a token bound to a DIFFERENT IP than the peer's loopback address.
+    const sec = fx.lst.secret();
+    var token_buf: [quic_retry.max_token_len]u8 = undefined;
+    const tn = try quic_retry.Token.seal(&token_buf, sec, &[_]u8{ 203, 0, 113, 5 }, &dcid, nowNs());
+
+    var buf: [256]u8 = undefined;
+    const scid = [_]u8{ 0xb1, 0xb2 };
+    const pkt = buildInitialHeader(&buf, quic_retry.quic_version_1, &dcid, &scid, token_buf[0..tn]);
+    // The Initial arrives from the peer's loopback IP, which the token does NOT
+    // match → rejected → a fresh Retry, no connection.
+    var reply: [256]u8 = undefined;
+    _ = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
+    try testing.expect(fx.lst.lookup(&dcid) == null);
+    try testing.expectEqual(@as(u8, @intFromEnum(quic_packet.LongPacketType.retry)), (reply[0] >> 4) & 0x03);
+}
+
+test "retry policy .never mints a connection directly (default fast path unaffected)" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+
+    var buf: [64]u8 = undefined;
+    const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+    const scid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4 };
+    const pkt = buildInitialHeader(&buf, quic_retry.quic_version_1, &dcid, &scid, &.{});
+
+    // No Retry/VN under .never: the connection is created directly (still
+    // anti-amplification-limited until a Handshake validates the address). We
+    // exercise the admission decision in isolation (admitNewInitial) since the
+    // synthetic header has no valid encrypted body to feed through recv.
+    const conn = fx.lst.admitNewInitial(pkt, fx.peer_addr) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), fx.lst.liveCount());
+    try testing.expect(!conn.conn.isAddressValidated());
 }

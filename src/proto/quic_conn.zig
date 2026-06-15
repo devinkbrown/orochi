@@ -401,6 +401,23 @@ pub const Conn = struct {
     /// drives the loss/PTO timers and the send-gating window.
     recovery: quic_recovery.Recovery,
 
+    /// Anti-amplification accounting (RFC 9000 §8.1). Until the peer's address is
+    /// validated, a server MUST NOT send more than 3× the bytes it has received
+    /// from that address. `bytes_received` is the running total of UDP payload
+    /// bytes accepted from the peer; `bytes_sent_unvalidated` is the total the
+    /// server has emitted while still unvalidated. The cap is `3 ×
+    /// bytes_received`. `address_validated` lifts the limit entirely. A client
+    /// is never amplification-limited (it initiates), so this only gates the
+    /// server role.
+    bytes_received: u64 = 0,
+    bytes_sent_unvalidated: u64 = 0,
+    /// Whether the peer's address is validated (RFC 9000 §8.1): set when the
+    /// server receives a Handshake packet from the client (proves it received
+    /// the server's Handshake keys, so it owns the address), or when a valid
+    /// Retry/NEW_TOKEN token was presented (via `markAddressValidated`). Always
+    /// true for the client role.
+    address_validated: bool = false,
+
     /// Loss / idle timers (nanoseconds, in the caller's clock domain).
     last_recv_ns: u64 = 0,
     /// The next loss-detection / PTO deadline computed from `recovery`, or null
@@ -492,6 +509,9 @@ pub const Conn = struct {
             .engine = Engine.init(allocator, local, engine_config),
             .send = .{},
             .recovery = quic_recovery.Recovery.init(allocator, .{ .max_datagram = max_datagram }),
+            // The client initiates, so it is never amplification-limited; only a
+            // server gates on peer-address validation (RFC 9000 §8.1).
+            .address_validated = role == .client,
             .initial_keys = null,
             .dcid = dcid,
             .scid = scid,
@@ -537,6 +557,32 @@ pub const Conn = struct {
 
     pub fn isEstablished(self: *const Conn) bool {
         return self.established;
+    }
+
+    /// Whether the peer's address is validated (RFC 9000 §8.1) and the 3×
+    /// anti-amplification send limit no longer applies. Always true for a client.
+    pub fn isAddressValidated(self: *const Conn) bool {
+        return self.address_validated;
+    }
+
+    /// Mark the peer's address as validated, lifting the anti-amplification
+    /// limit (RFC 9000 §8.1). Called internally on a decrypted Handshake packet;
+    /// the listener also calls this when a client echoes a valid Retry/NEW_TOKEN
+    /// address-validation token in its Initial (RFC 9000 §8.1.2), which validates
+    /// the address immediately without a Retry round trip.
+    pub fn markAddressValidated(self: *Conn) void {
+        self.address_validated = true;
+    }
+
+    /// Total UDP payload bytes received from the peer while unvalidated (the base
+    /// of the 3× anti-amplification budget). Exposed for tests / introspection.
+    pub fn bytesReceived(self: *const Conn) u64 {
+        return self.bytes_received;
+    }
+
+    /// Total bytes the server has emitted while the peer was unvalidated.
+    pub fn bytesSentUnvalidated(self: *const Conn) u64 {
+        return self.bytes_sent_unvalidated;
     }
 
     pub fn isClosing(self: *const Conn) bool {
@@ -638,6 +684,14 @@ pub const Conn = struct {
     /// As `recvDatagram` but stamps activity at `now` (the caller's clock).
     pub fn recvDatagramAt(self: *Conn, datagram: []const u8, now: u64) Error!void {
         self.last_recv_ns = now;
+        // Anti-amplification accounting (RFC 9000 §8.1): every received UDP
+        // payload byte raises the 3× send budget. We count the whole datagram
+        // (the RFC counts received datagrams toward the limit even if some
+        // packets in them fail to decrypt), saturating so a long-lived peer
+        // never wraps the counter.
+        if (!self.address_validated) {
+            self.bytes_received +|= datagram.len;
+        }
         var pos: usize = 0;
         while (pos < datagram.len) {
             // A 0x00 byte where a packet should start is padding to the end of
@@ -672,7 +726,7 @@ pub const Conn = struct {
             .initial => .initial,
             .handshake => .handshake,
             .zero_rtt => return error.MalformedPacket, // 0-RTT unsupported (typed gap)
-            .retry => return error.MalformedPacket, // Retry unsupported (typed gap)
+            .retry => return error.MalformedPacket, // Retry handled by the listener layer (typed gap here)
         };
 
         // The server learns the client's DCID from the first Initial and derives
@@ -956,6 +1010,16 @@ pub const Conn = struct {
 
         self.last_recv_ns = now;
 
+        // Anti-amplification (RFC 9000 §8.1): a server validates the peer's
+        // address on the first *successfully decrypted* Handshake packet — the
+        // client can only have produced one after receiving the server's
+        // Handshake keys, which proves it owns the source address. We mark on the
+        // authenticated frame path (not the header type) so a spoofed/forged
+        // long header cannot lift the 3× limit. The limit is then lifted.
+        if (self.role == .server and level == .handshake and !self.address_validated) {
+            self.markAddressValidated();
+        }
+
         // Capture any received application DATAGRAM payloads (RFC 9221). The
         // engine's intake only accounts the ACK obligation; the payload bytes
         // borrow the decoded frame (freed when this fn returns), so we copy them
@@ -1100,19 +1164,64 @@ pub const Conn = struct {
 
         const before = out.items.len;
 
+        // Build everything owed into a staging list first; the
+        // anti-amplification gate (RFC 9000 §8.1) then decides how many of those
+        // datagrams may actually leave before the peer's address is validated.
+        var staged: std.ArrayList(OutDatagram) = .empty;
+        defer staged.deinit(self.allocator);
+
         // 1) Coalesce the handshake levels (Initial + Handshake) into one
         //    datagram, padded to 1200 if it carries a client Initial.
-        try self.buildHandshakeDatagram(out, now);
+        try self.buildHandshakeDatagram(&staged, now);
 
         // 2) 1-RTT application datagram (ACKs + queued STREAM/DATAGRAM), once the
         //    app keys exist.
-        try self.buildAppDatagram(out, now);
+        try self.buildAppDatagram(&staged, now);
 
         // 3) A standalone CONNECTION_CLOSE if one is pending and nothing else
         //    carried it.
-        if (self.close_pending) try self.buildCloseDatagram(out, now);
+        if (self.close_pending) try self.buildCloseDatagram(&staged, now);
+
+        // Move staged datagrams into `out`, enforcing the 3× anti-amplification
+        // budget while the address is unvalidated. `emitWithinBudget` owns the
+        // free of any datagram it withholds.
+        try self.emitWithinBudget(&staged, out);
 
         return out.items.len - before;
+    }
+
+    /// Transfer datagrams from `staged` to `out`, enforcing the RFC 9000 §8.1
+    /// anti-amplification limit. While the peer's address is unvalidated, a
+    /// server may emit at most `3 × bytes_received` total bytes; the first staged
+    /// datagram that would push `bytes_sent_unvalidated` past that cap, and every
+    /// datagram after it, is withheld and freed here. Once validated (or for the
+    /// client role) every staged datagram passes through unmetered.
+    ///
+    /// Withholding whole datagrams rather than truncating one keeps each emitted
+    /// datagram a valid, self-contained QUIC packet; the loss-recovery PTO still
+    /// fires later and re-stages the withheld flight, so progress resumes the
+    /// moment more bytes arrive (which raises the budget) — the handshake is
+    /// never deadlocked, only paced.
+    fn emitWithinBudget(self: *Conn, staged: *std.ArrayList(OutDatagram), out: *std.ArrayList(OutDatagram)) Error!void {
+        for (staged.items, 0..) |d, i| {
+            if (!self.address_validated) {
+                const cap = self.bytes_received *| 3;
+                const projected = self.bytes_sent_unvalidated +| d.bytes.len;
+                if (projected > cap) {
+                    // Over budget: withhold this and every remaining staged
+                    // datagram. Free them (they will not go on the wire).
+                    for (staged.items[i..]) |w| self.allocator.free(w.bytes);
+                    return;
+                }
+                self.bytes_sent_unvalidated = projected;
+            }
+            // `out.append` may fail (OOM). On failure free this datagram and the
+            // rest so nothing leaks, then propagate.
+            out.append(self.allocator, d) catch |e| {
+                for (staged.items[i..]) |w| self.allocator.free(w.bytes);
+                return e;
+            };
+        }
     }
 
     /// Assemble Initial and Handshake packets and coalesce them into a single
@@ -2061,6 +2170,119 @@ test "quic conn loopback delivers byte-exact application data in both directions
     const m = lb.client.readStream(sid, &rbuf);
     try testing.expectEqualSlices(u8, s2c, rbuf[0..m]);
     try testing.expect(lb.client.streamFinished(sid));
+}
+
+// ---------------------------------------------------------------------------
+// Anti-amplification (RFC 9000 §8.1) DoS tests
+// ---------------------------------------------------------------------------
+
+/// Drain everything a connection wants to send into an owned list (no peer).
+/// The returned list is owned by the caller (free via `freeOut`).
+fn collectSend(conn: *Conn, now: u64) !std.ArrayList(OutDatagram) {
+    var out: std.ArrayList(OutDatagram) = .empty;
+    _ = try conn.sendDatagramsAt(&out, now);
+    return out;
+}
+
+fn freeOut(alloc: Allocator, out: *std.ArrayList(OutDatagram)) void {
+    for (out.items) |d| alloc.free(d.bytes);
+    out.deinit(alloc);
+}
+
+fn totalBytes(out: *const std.ArrayList(OutDatagram)) usize {
+    var n: usize = 0;
+    for (out.items) |d| n += d.bytes.len;
+    return n;
+}
+
+test "quic amplification — a single client Initial cannot make the server emit > 3x received before validation" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+
+    const now: u64 = 1_000;
+
+    // The server is unvalidated at birth (server role, no Handshake yet).
+    try testing.expect(!lb.server.isAddressValidated());
+
+    // The client emits exactly one Initial flight (padded to ≥1200 bytes).
+    var c_out = try collectSend(&lb.client, now);
+    defer freeOut(alloc, &c_out);
+    const received: usize = totalBytes(&c_out);
+    try testing.expect(received >= min_initial_datagram); // ≥1200, RFC 9000 §14.1
+
+    // Feed that one Initial datagram (only the first) to the server.
+    try lb.server.recvDatagramAt(c_out.items[0].bytes, now);
+    try testing.expectEqual(@as(u64, c_out.items[0].bytes.len), lb.server.bytesReceived());
+
+    // The server is STILL unvalidated (it has not received a Handshake packet).
+    try testing.expect(!lb.server.isAddressValidated());
+
+    // Drive the server's responses, but pump them NOWHERE (so the client never
+    // produces a Handshake packet to validate the address). Across many send
+    // attempts the server's cumulative emitted bytes must never exceed 3× the
+    // bytes it received from that single Initial.
+    const cap: u64 = @as(u64, lb.server.bytesReceived()) * 3;
+    var emitted_total: u64 = 0;
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        var s_out = try collectSend(&lb.server, now + round);
+        defer freeOut(alloc, &s_out);
+        emitted_total += totalBytes(&s_out);
+        // Invariant after every flush: never over the cap while unvalidated.
+        try testing.expect(emitted_total <= cap);
+        try testing.expect(lb.server.bytesSentUnvalidated() <= cap);
+        // Tick the PTO so the loss-recovery probe path also runs (it must stay
+        // capped too).
+        _ = lb.server.onTimeout(now + round * 1000) catch {};
+    }
+    // The server is provably amplification-limited: it has sent at most 3× and is
+    // still unvalidated.
+    try testing.expect(!lb.server.isAddressValidated());
+    try testing.expect(emitted_total <= cap);
+}
+
+test "quic amplification — receiving a Handshake packet lifts the cap and the handshake completes" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+
+    // Run the real loopback handshake. Along the way the server WILL receive a
+    // Handshake packet from the client, which lifts the limit.
+    try driveHandshake(alloc, lb);
+
+    // After completion the server's address is validated and both sides are up.
+    try testing.expect(lb.server.isAddressValidated());
+    try testing.expect(lb.server.isEstablished());
+    try testing.expect(lb.client.isEstablished());
+}
+
+test "quic amplification — a token-validated server is unmetered from the first send" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+
+    const now: u64 = 1_000;
+
+    // Simulate the listener having accepted a valid address-validation token in
+    // the client's Initial: it calls markAddressValidated() on the new server
+    // connection before the first send (RFC 9000 §8.1.2 — a returned token
+    // validates the address immediately, no 3× limit).
+    lb.server.markAddressValidated();
+    try testing.expect(lb.server.isAddressValidated());
+
+    // Feed one client Initial so the server has a flight to answer.
+    var c_out = try collectSend(&lb.client, now);
+    defer freeOut(alloc, &c_out);
+    try lb.server.recvDatagramAt(c_out.items[0].bytes, now);
+
+    // The server may now emit its full flight (which can exceed 3× the single
+    // Initial) because the address is already validated.
+    var s_out = try collectSend(&lb.server, now);
+    defer freeOut(alloc, &s_out);
+    // It sent something, and `bytes_sent_unvalidated` stayed 0 (never metered).
+    try testing.expect(s_out.items.len > 0);
+    try testing.expectEqual(@as(u64, 0), lb.server.bytesSentUnvalidated());
 }
 
 // ---------------------------------------------------------------------------
