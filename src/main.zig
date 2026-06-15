@@ -230,9 +230,9 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (srv_cfg.webtransport_port != 0) {
-        std.debug.print("orochi: [listen] webtransport={d} parsed but no WebTransport listener is implemented; ignoring\n", .{srv_cfg.webtransport_port});
-    }
+    // The WebTransport (QUIC/HTTP3) listener is started AFTER the server is up
+    // (it bridges to the daemon's bound IRC port via loopback TCP). See below,
+    // after `srv.start()`.
 
     // SASL account backend: when `[sasl] account_db` is configured, open the
     // WAL-backed account store and verify SASL PLAIN credentials against it. The
@@ -460,6 +460,42 @@ pub fn main(init: std.process.Init) !void {
     // the running image while keeping every live client session attached,
     // instead of dropping them with a hard `systemctl restart`.
     orochi.daemon.server.installUpgradeSignalHandler();
+
+    // WebTransport (QUIC/HTTP3) listener: a real UDP endpoint built on the
+    // from-scratch QUIC stack. It demuxes inbound QUIC datagrams to per-peer
+    // connections, establishes a WebTransport session over Extended CONNECT, and
+    // bridges each session to the daemon's IRC listener over a loopback TCP
+    // proxy (the WT user is handled as an ordinary local IRC client — no reactor
+    // changes). Requires the TLS cert chain + a signing key matching the leaf.
+    var wt_listener: ?orochi.daemon.webtransport_listener.WebTransportListener = null;
+    defer if (wt_listener) |*l| l.deinit();
+    if (srv_cfg.webtransport_port != 0) wt: {
+        if (srv_cfg.tls_cert_chain.len == 0) {
+            std.debug.print("orochi: [listen] webtransport={d} ignored — no TLS certificate loaded (enable [tls]; QUIC needs a cert)\n", .{srv_cfg.webtransport_port});
+            break :wt;
+        }
+        const signing_key: orochi.proto.quic_handshake.SigningKey =
+            if (srv_cfg.tls_ecdsa_signing_key) |k| .{ .ecdsa_p256 = k } else if (srv_cfg.tls_signing_key) |k| .{ .ed25519 = k } else if (srv_cfg.tls_rsa_signing_key) |k| .{ .rsa = k } else {
+                std.debug.print("orochi: [listen] webtransport={d} ignored — no usable TLS signing key\n", .{srv_cfg.webtransport_port});
+                break :wt;
+            };
+        const irc_port = srv.boundPort() catch {
+            std.debug.print("orochi: [listen] webtransport — IRC port not bound; WebTransport disabled\n", .{});
+            break :wt;
+        };
+        wt_listener = orochi.daemon.webtransport_listener.WebTransportListener.init(
+            allocator,
+            .{ .cert_chain = srv_cfg.tls_cert_chain, .signing_key = signing_key },
+            irc_port,
+        );
+        // Bind on all interfaces (IPv4); 0.0.0.0 so external QUIC clients reach it.
+        wt_listener.?.start(orochi.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port) catch |err| {
+            std.debug.print("orochi: WebTransport bind failed on UDP :{d} ({s}); disabled\n", .{ srv_cfg.webtransport_port, @errorName(err) });
+            wt_listener = null;
+            break :wt;
+        };
+        std.debug.print("orochi: WebTransport listening on UDP :{d} (QUIC/HTTP3 → loopback IRC :{d})\n", .{ wt_listener.?.port, irc_port });
+    }
 
     std.debug.print(
         "orochi: listening on 127.0.0.1:{d} (Ringlane io_uring) — PING + registration live\n",

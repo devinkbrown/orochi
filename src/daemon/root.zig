@@ -295,6 +295,7 @@ pub const warden_exempt = @import("warden_exempt.zig");
 pub const warden = @import("warden.zig");
 pub const warn_list = @import("warn_list.zig");
 pub const watch_list = @import("watch_list.zig");
+pub const webtransport_listener = @import("webtransport_listener.zig");
 pub const welcome_pack = @import("welcome_pack.zig");
 pub const whiteboard = @import("whiteboard.zig");
 pub const whois = @import("whois.zig");
@@ -604,6 +605,7 @@ test {
     _ = warden;
     _ = warn_list;
     _ = watch_list;
+    _ = webtransport_listener;
     _ = welcome_pack;
     _ = whiteboard;
     _ = whois;
