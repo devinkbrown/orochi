@@ -17,6 +17,7 @@ const wasm_bridge = @import("../wasm/host/bridge.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/suimyaku/message_relay.zig");
 const channel_prop_event = @import("../proto/channel_prop_event.zig");
+const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
@@ -1699,6 +1700,33 @@ const ChannelPropClock = struct {
     }
 };
 
+/// LWW clock for a user/member PROP fact (ENTITY_PROP). The non-channel
+/// counterpart of `ChannelPropClock`: `kind` distinguishes user vs member and
+/// `entity` is the raw entity id ("alice" / "#chat:bob"). All slices are owned
+/// here and freed in `deinit`; the multi-hop origin `(pubkey, sig)` is stored
+/// verbatim and re-emitted on re-broadcast/burst so every hop verifies the
+/// ORIGINAL author, never this relay. Empty (`&.{}`) on the legacy unsigned path.
+const EntityPropClock = struct {
+    kind: entity_prop_event.EntityKind,
+    entity: []u8,
+    key: []u8,
+    owner: []u8,
+    hlc: u64,
+    present: bool,
+    origin_node: u64,
+    origin_pubkey: []u8,
+    origin_sig: []u8,
+
+    fn deinit(self: *EntityPropClock, allocator: std.mem.Allocator) void {
+        allocator.free(self.entity);
+        allocator.free(self.key);
+        allocator.free(self.owner);
+        allocator.free(self.origin_pubkey);
+        allocator.free(self.origin_sig);
+        self.* = undefined;
+    }
+};
+
 const RuntimeFeatureConfig = struct {
     config: Config,
     owned_disabled_features: ?[][]const u8 = null,
@@ -1913,6 +1941,7 @@ pub const LinuxServer = struct {
     /// Mesh LWW clocks for IRCX channel PROP facts. Current values live in
     /// `props`; this table retains delete tombstones for relink convergence.
     channel_prop_clocks: std.StringHashMapUnmanaged(ChannelPropClock) = .empty,
+    entity_prop_clocks: std.StringHashMapUnmanaged(EntityPropClock) = .empty,
     access: ircx_access_store.AccessStore,
     saccess: ircx_saccess.ServerAccessStore,
     /// Per-channel AKICK (registered auto-kick) list — masks matched on JOIN.
@@ -2557,6 +2586,14 @@ pub const LinuxServer = struct {
                 entry.value_ptr.deinit(self.allocator);
             }
             self.channel_prop_clocks.deinit(self.allocator);
+        }
+        {
+            var it = self.entity_prop_clocks.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.entity_prop_clocks.deinit(self.allocator);
         }
         self.access.deinit();
         self.saccess.deinit();
@@ -3884,6 +3921,8 @@ pub const LinuxServer = struct {
         self.drainChannelListChanges(link);
         // Apply remote IRCX channel PROP changes and surface non-secret updates.
         self.drainChannelPropChanges(link);
+        // Apply remote IRCX user/member PROP changes (ENTITY_PROP) to the store.
+        self.drainEntityPropChanges(link);
         // Apply/surface remote channel topic changes in real time.
         self.drainTopicChanges(link);
         // Surface remote user nick changes to shared-channel local members.
@@ -3971,6 +4010,8 @@ pub const LinuxServer = struct {
         self.drainChannelListChanges(link);
         // Apply remote IRCX channel PROP changes and surface non-secret updates.
         self.drainChannelPropChanges(link);
+        // Apply remote IRCX user/member PROP changes (ENTITY_PROP) to the store.
+        self.drainEntityPropChanges(link);
         // Apply/surface remote channel topic changes in real time.
         self.drainTopicChanges(link);
         // Surface remote user nick changes to shared-channel local members.
@@ -4725,6 +4766,43 @@ pub const LinuxServer = struct {
         const transcript = channel_prop_event.originTranscript(self.allocator, ev) catch return .{ .node = origin_node };
         defer self.allocator.free(transcript);
         channel_prop_event.signInPlace(&ev, &ident.sign_kp, transcript, pubkey_buf, sig_buf) catch return .{ .node = origin_node };
+        return .{ .node = origin_node, .pubkey = ev.origin_pubkey, .sig = ev.origin_sig };
+    }
+
+    /// Sign a LOCALLY-authored user/member PROP fact's canonical transcript ONCE,
+    /// at the origin (this node). The ENTITY_PROP counterpart of
+    /// `signLocalChannelProp`: identical no-op-unless-self-certifying contract.
+    /// `pubkey_buf`/`sig_buf` back the returned slices and MUST outlive the
+    /// `recordEntityPropClock` + announce that follow.
+    fn signLocalEntityProp(
+        self: *LinuxServer,
+        present: bool,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        pubkey_buf: *[entity_prop_event.pubkey_len]u8,
+        sig_buf: *[entity_prop_event.sig_len]u8,
+    ) LocalPropSig {
+        const origin_node = self.config.node_id;
+        const ident = self.config.node_identity orelse return .{ .node = origin_node };
+        if (ident.shortId() != origin_node) return .{ .node = origin_node };
+
+        var ev = entity_prop_event.EntityPropEvent{
+            .present = present,
+            .kind = kind,
+            .origin_node = origin_node,
+            .hlc = hlc,
+            .entity = entity,
+            .key = key,
+            .value = value,
+            .owner = owner,
+        };
+        const transcript = entity_prop_event.originTranscript(self.allocator, ev) catch return .{ .node = origin_node };
+        defer self.allocator.free(transcript);
+        entity_prop_event.signInPlace(&ev, &ident.sign_kp, transcript, pubkey_buf, sig_buf) catch return .{ .node = origin_node };
         return .{ .node = origin_node, .pubkey = ev.origin_pubkey, .sig = ev.origin_sig };
     }
 
@@ -5675,6 +5753,7 @@ pub const LinuxServer = struct {
         self.sendChannelModeFlagsBurstTo(conn);
         self.sendChannelModeStateBurstTo(conn);
         self.sendChannelPropBurstTo(conn);
+        self.sendEntityPropBurstTo(conn);
         self.sendTopicBurstTo(conn);
     }
 
@@ -6075,6 +6154,338 @@ pub const LinuxServer = struct {
             return .{ .node = clock.origin_node, .pubkey = clock.origin_pubkey, .sig = clock.origin_sig };
         }
         return .{ .node = clock.origin_node };
+    }
+
+    // ---- user/member (ENTITY_PROP) LWW clocks -----------------------------
+    //
+    // Parallel to the channel-prop clock machinery above. A separate map keyed by
+    // `kind || entity || key` (the kind tag disambiguates a user prop on "alice"
+    // from a member prop whose entity is "alice"-ish, and keeps the namespace
+    // distinct from channel clocks which live in their own map).
+
+    fn writeEntityPropClockKey(out: []u8, kind: entity_prop_event.EntityKind, entity: []const u8, key: []const u8) ?[]const u8 {
+        const need = 1 + entity.len + 1 + key.len;
+        if (out.len < need) return null;
+        out[0] = @intFromEnum(kind);
+        for (entity, 0..) |byte, i| out[1 + i] = std.ascii.toLower(byte);
+        out[1 + entity.len] = 0x1f;
+        for (key, 0..) |byte, i| out[1 + entity.len + 1 + i] = std.ascii.toLower(byte);
+        return out[0..need];
+    }
+
+    fn entityPropClock(self: *LinuxServer, kind: entity_prop_event.EntityKind, entity: []const u8, key: []const u8) ?*EntityPropClock {
+        var key_buf: [1 + entity_prop_event.max_entity_len + 1 + ircx_prop_store.default_max_key]u8 = undefined;
+        const map_key = writeEntityPropClockKey(&key_buf, kind, entity, key) orelse return null;
+        return self.entity_prop_clocks.getPtr(map_key);
+    }
+
+    fn allocEntityPropClockKey(self: *LinuxServer, kind: entity_prop_event.EntityKind, entity: []const u8, key: []const u8) ![]u8 {
+        const out = try self.allocator.alloc(u8, 1 + entity.len + 1 + key.len);
+        errdefer self.allocator.free(out);
+        const written = writeEntityPropClockKey(out, kind, entity, key) orelse return error.OutOfMemory;
+        return out[0..written.len];
+    }
+
+    /// LWW-record a user/member PROP clock. The ENTITY_PROP counterpart of
+    /// `recordChannelPropClock`: stores the ORIGINAL author's `origin_node` + the
+    /// self-contained multi-hop `(pubkey, sig)` so a later re-broadcast/burst
+    /// re-emits the original author's signature verbatim. Empty on the legacy
+    /// unsigned path. Owned-bytes lifetime is balanced against
+    /// `EntityPropClock.deinit`; on an LWW overwrite the previous owner + signature
+    /// are freed and the new ones duped in. Staged-before-mutate so a mid-way alloc
+    /// failure leaves the existing entry intact.
+    fn recordEntityPropClock(
+        self: *LinuxServer,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+        origin_node: u64,
+        origin_pubkey: []const u8,
+        origin_sig: []const u8,
+    ) bool {
+        if (self.entityPropClock(kind, entity, key)) |existing| {
+            if (hlc <= existing.hlc) return false;
+            const owner_copy = self.allocator.dupe(u8, owner) catch return false;
+            const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+                self.allocator.free(owner_copy);
+                return false;
+            };
+            const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+                self.allocator.free(owner_copy);
+                self.allocator.free(pubkey_copy);
+                return false;
+            };
+            self.allocator.free(existing.owner);
+            self.allocator.free(existing.origin_pubkey);
+            self.allocator.free(existing.origin_sig);
+            existing.owner = owner_copy;
+            existing.origin_pubkey = pubkey_copy;
+            existing.origin_sig = sig_copy;
+            existing.hlc = hlc;
+            existing.present = present;
+            existing.origin_node = origin_node;
+            return true;
+        }
+
+        const map_key = self.allocEntityPropClockKey(kind, entity, key) catch return false;
+        const entity_copy = self.allocator.dupe(u8, entity) catch {
+            self.allocator.free(map_key);
+            return false;
+        };
+        const key_copy = self.allocator.dupe(u8, key) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            return false;
+        };
+        const owner_copy = self.allocator.dupe(u8, owner) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            return false;
+        };
+        const pubkey_copy = self.allocator.dupe(u8, origin_pubkey) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            return false;
+        };
+        const sig_copy = self.allocator.dupe(u8, origin_sig) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            self.allocator.free(pubkey_copy);
+            return false;
+        };
+
+        self.entity_prop_clocks.putNoClobber(self.allocator, map_key, .{
+            .kind = kind,
+            .entity = entity_copy,
+            .key = key_copy,
+            .owner = owner_copy,
+            .hlc = hlc,
+            .present = present,
+            .origin_node = origin_node,
+            .origin_pubkey = pubkey_copy,
+            .origin_sig = sig_copy,
+        }) catch {
+            self.allocator.free(map_key);
+            self.allocator.free(entity_copy);
+            self.allocator.free(key_copy);
+            self.allocator.free(owner_copy);
+            self.allocator.free(pubkey_copy);
+            self.allocator.free(sig_copy);
+            return false;
+        };
+        return true;
+    }
+
+    /// The `PropOrigin` to emit for a stored ENTITY_PROP clock in a burst. The
+    /// counterpart of `burstPropOrigin`: re-emits the ORIGINAL author's stored
+    /// `(node, pubkey, sig)` only when the signature still verifies against the
+    /// EXACT `(present, value, owner, hlc)` tuple being emitted; otherwise an
+    /// unsigned origin carrying just `origin_node` (never a stale signature).
+    fn burstEntityPropOrigin(
+        self: *LinuxServer,
+        clock: *const EntityPropClock,
+        present: bool,
+        value: []const u8,
+        owner: []const u8,
+    ) s2s_peer_mod.S2sPeer.PropOrigin {
+        if (clock.origin_pubkey.len == 0) return .{ .node = clock.origin_node };
+        const ev = entity_prop_event.EntityPropEvent{
+            .present = present,
+            .kind = clock.kind,
+            .origin_node = clock.origin_node,
+            .hlc = clock.hlc,
+            .entity = clock.entity,
+            .key = clock.key,
+            .value = value,
+            .owner = owner,
+            .origin_pubkey = clock.origin_pubkey,
+            .origin_sig = clock.origin_sig,
+        };
+        const outcome = entity_prop_event.verifyOrigin(self.allocator, ev) catch return .{ .node = clock.origin_node };
+        if (outcome == .verified) {
+            return .{ .node = clock.origin_node, .pubkey = clock.origin_pubkey, .sig = clock.origin_sig };
+        }
+        return .{ .node = clock.origin_node };
+    }
+
+    /// Fan a user/member PROP fact out to every established peer link over
+    /// ENTITY_PROP. The counterpart of `announceChannelProp`.
+    fn announceEntityProp(
+        self: *LinuxServer,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+        origin: s2s_peer_mod.S2sPeer.PropOrigin,
+    ) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendEntityProp(kind, entity, key, value, owner, hlc, present, origin) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendEntityProp(kind, entity, key, value, owner, hlc, present, origin) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
+            }
+        }
+    }
+
+    /// Sign + record + announce a freshly LOCALLY-authored user/member PROP fact.
+    /// Shared by the PROP set and delete paths in `handleProp` so both fan a signed
+    /// ENTITY_PROP out to the mesh and seed a local clock for later bursts.
+    fn propagateLocalEntityProp(
+        self: *LinuxServer,
+        present: bool,
+        store_kind: ircx_prop_store.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+    ) void {
+        const kind = entity_prop_event.EntityKind.fromStoreKind(store_kind) orelse return;
+        const hlc = self.nextChannelPropHlc();
+        var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        const ps = self.signLocalEntityProp(present, kind, entity, key, value, owner, hlc, &pk_buf, &sig_buf);
+        if (self.recordEntityPropClock(kind, entity, key, owner, hlc, present, ps.node, ps.pubkey, ps.sig)) {
+            self.announceEntityProp(kind, entity, key, value, owner, hlc, present, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
+        }
+    }
+
+    /// Account + audit a dropped remote ENTITY_PROP fact whose self-contained
+    /// multi-hop origin signature failed. Reuses the daemon-level multi-hop reject
+    /// counter (`rejected_relay_signatures`).
+    fn recordEntityPropSignatureReject(self: *LinuxServer, ch: anytype, reason: []const u8) void {
+        self.rejected_relay_signatures +|= 1;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "dropped ENTITY_PROP {s}/{s} claiming origin {d}: {s}",
+            .{ ch.entity, ch.key, ch.origin_node, reason },
+        ) catch "dropped ENTITY_PROP with bad origin signature";
+        self.traceLog(.warn, .s2s, line);
+    }
+
+    /// Verify an inbound ENTITY_PROP fact's self-contained multi-hop origin
+    /// signature. The counterpart of `channelPropOriginVerified`. Fails CLOSED on
+    /// an allocation failure during verification.
+    fn entityPropOriginVerified(self: *LinuxServer, ch: anytype) bool {
+        const ev = entity_prop_event.EntityPropEvent{
+            .present = ch.present,
+            .kind = ch.kind,
+            .origin_node = ch.origin_node,
+            .hlc = ch.hlc,
+            .entity = ch.entity,
+            .key = ch.key,
+            .value = ch.value,
+            .owner = ch.owner,
+            .origin_pubkey = ch.origin_pubkey,
+            .origin_sig = ch.origin_sig,
+        };
+        const outcome = entity_prop_event.verifyOrigin(self.allocator, ev) catch {
+            self.recordEntityPropSignatureReject(ch, "verification allocation failed");
+            return false;
+        };
+        return switch (outcome) {
+            .unsigned, .verified => true,
+            .origin_mismatch => blk: {
+                self.recordEntityPropSignatureReject(ch, "origin pubkey does not self-certify the claimed origin node");
+                break :blk false;
+            },
+            .bad_signature => blk: {
+                self.recordEntityPropSignatureReject(ch, "origin signature verification failed");
+                break :blk false;
+            },
+        };
+    }
+
+    /// Apply an inbound ENTITY_PROP fact LWW into the local prop store + clock.
+    /// The counterpart of `applyRemoteChannelProp`: verify-then-LWW, dropping a
+    /// forged fact before it is applied or re-broadcast. The entity id is validated
+    /// by the store on insert; a malformed id (rejected by `Entity.fromId`) simply
+    /// fails to apply.
+    fn applyRemoteEntityProp(self: *LinuxServer, ch: anytype) bool {
+        if (!self.entityPropOriginVerified(ch)) return false;
+        if (self.entityPropClock(ch.kind, ch.entity, ch.key)) |existing| {
+            if (ch.hlc <= existing.hlc) return false;
+        }
+
+        const entity = ircx_prop_store.Entity{ .kind = ch.kind.toStoreKind(), .id = ch.entity };
+        const owner = if (ch.owner.len != 0) ch.owner else "remote";
+        if (ch.present) {
+            _ = self.props.setProp(entity, ch.key, ch.value, .{ .id = owner, .access = .server }) catch return false;
+        } else {
+            self.props.deleteProp(entity, ch.key) catch {};
+        }
+        return self.recordEntityPropClock(ch.kind, ch.entity, ch.key, owner, ch.hlc, ch.present, ch.origin_node, ch.origin_pubkey, ch.origin_sig);
+    }
+
+    /// Drain a link's remote user/member PROP changes (ENTITY_PROP), apply them LWW
+    /// to the local store. Unlike channel props there is no live channel-member
+    /// broadcast surface for user/member props — they are answered on demand via
+    /// PROP GET — so this only converges the store + clock for later replies.
+    fn drainEntityPropChanges(self: *LinuxServer, link: anytype) void {
+        const changes = link.takeEntityPropChanges() catch return;
+        for (changes) |*ch| {
+            _ = self.applyRemoteEntityProp(ch);
+            ch.deinit(self.allocator);
+        }
+        self.allocator.free(changes);
+    }
+
+    /// Burst every stored user/member PROP clock to a freshly-established peer, the
+    /// counterpart of `sendChannelPropBurstTo`. Re-emits the ORIGINAL author's
+    /// stored origin + signature verbatim (or seeds + signs a locally-owned prop
+    /// that has no clock yet), falling back to unsigned for an emit whose live
+    /// tuple diverged from the signed one.
+    fn sendEntityPropBurstTo(self: *LinuxServer, conn: *ConnState) void {
+        var it = self.entity_prop_clocks.iterator();
+        while (it.next()) |entry| {
+            const clock = entry.value_ptr;
+            var present = clock.present;
+            var value: []const u8 = "";
+            var owner: []const u8 = clock.owner;
+            if (clock.present) {
+                const entity = ircx_prop_store.Entity{ .kind = clock.kind.toStoreKind(), .id = clock.entity };
+                if (self.props.getProp(entity, clock.key)) |ev| {
+                    value = ev.value;
+                    owner = ev.owner;
+                } else |_| {
+                    present = false;
+                }
+            }
+            const origin = self.burstEntityPropOrigin(clock, present, value, owner);
+            if (conn.s2s_secured) |link| {
+                link.sendEntityProp(clock.kind, clock.entity, clock.key, value, owner, clock.hlc, present, origin) catch continue;
+            } else if (conn.s2s) |link| {
+                link.sendEntityProp(clock.kind, clock.entity, clock.key, value, owner, clock.hlc, present, origin) catch continue;
+            }
+        }
+        if (conn.s2s_secured) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        } else if (conn.s2s) |link| {
+            self.flushS2sOutbound(conn, link.outbound()) catch {};
+            link.clearOutbound();
+        }
     }
 
     fn sendChannelPropBurstTo(self: *LinuxServer, conn: *ConnState) void {
@@ -12879,6 +13290,10 @@ pub const LinuxServer = struct {
                     if (self.recordChannelPropClock(ev.entity.id, ev.key, ev.owner, hlc, true, ps.node, ps.pubkey, ps.sig)) {
                         self.announceChannelProp(ev.entity.id, ev.key, ev.value, ev.owner, hlc, true, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                     }
+                } else {
+                    // user/member props propagate over ENTITY_PROP with the same
+                    // signed multi-hop LWW guarantees.
+                    self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
                 }
                 try propEmitEntry(conn, ev);
                 try propEmitEnd(conn, m.entity);
@@ -12891,9 +13306,11 @@ pub const LinuxServer = struct {
                 if (k.key.len == 0) {
                     var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
                     const rows = self.props.listProps(k.entity, &views) catch views[0..0];
-                    self.props.clearEntity(k.entity) catch {};
+                    const owner = conn.session.displayName();
+                    // Sign + announce each deletion while the rows (which borrow the
+                    // store's key bytes) are still live, THEN clear the store —
+                    // clearing first would free `ev.key` out from under the loop.
                     if (k.entity.kind == .channel) {
-                        const owner = conn.session.displayName();
                         for (rows) |ev| {
                             const hlc = self.nextChannelPropHlc();
                             var pk_buf: [channel_prop_event.pubkey_len]u8 = undefined;
@@ -12903,7 +13320,12 @@ pub const LinuxServer = struct {
                                 self.announceChannelProp(k.entity.id, ev.key, "", owner, hlc, false, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                             }
                         }
+                    } else {
+                        for (rows) |ev| {
+                            self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, ev.key, "", owner);
+                        }
                     }
+                    self.props.clearEntity(k.entity) catch {};
                     try propEmitEnd(conn, k.entity);
                     return;
                 }
@@ -12917,6 +13339,8 @@ pub const LinuxServer = struct {
                     if (self.recordChannelPropClock(k.entity.id, k.key, owner, hlc, false, ps.node, ps.pubkey, ps.sig)) {
                         self.announceChannelProp(k.entity.id, k.key, "", owner, hlc, false, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                     }
+                } else {
+                    self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, k.key, "", conn.session.displayName());
                 }
                 try propEmitEnd(conn, k.entity);
             },
@@ -20904,6 +21328,292 @@ test "channel prop: a legacy unsigned inbound fact still applies (backward compa
     const origin = server.burstPropOrigin(clock, true, "unsigned still flows", "dave");
     try std.testing.expectEqual(@as(u64, 99), origin.node);
     try std.testing.expectEqual(@as(usize, 0), origin.pubkey.len);
+}
+
+// ---------------------------------------------------------------------------
+// ENTITY_PROP CRDT multi-hop origin signing (user/member daemon paths)
+// ---------------------------------------------------------------------------
+
+/// A borrowed-slice ENTITY_PROP fact shaped like `S2sPeer.EntityPropDelta`, for
+/// feeding the daemon's `applyRemoteEntityProp`. Tests own the backing buffers.
+const TestEntityPropFact = struct {
+    kind: entity_prop_event.EntityKind,
+    entity: []const u8,
+    key: []const u8,
+    value: []const u8,
+    owner: []const u8,
+    hlc: u64,
+    present: bool,
+    origin_node: u64,
+    origin_pubkey: []const u8 = "",
+    origin_sig: []const u8 = "",
+};
+
+/// Build an ENTITY_PROP fact signed by `kp` at its self-certified origin id.
+fn buildSignedEntityProp(
+    kp: *const sign_mod.KeyPair,
+    kind: entity_prop_event.EntityKind,
+    entity: []const u8,
+    key: []const u8,
+    value: []const u8,
+    owner: []const u8,
+    hlc: u64,
+    present: bool,
+    pk_buf: *[entity_prop_event.pubkey_len]u8,
+    sig_buf: *[entity_prop_event.sig_len]u8,
+) !TestEntityPropFact {
+    var ev = entity_prop_event.EntityPropEvent{
+        .present = present,
+        .kind = kind,
+        .origin_node = entity_prop_event.originShortId(kp.public_key),
+        .hlc = hlc,
+        .entity = entity,
+        .key = key,
+        .value = value,
+        .owner = owner,
+    };
+    const transcript = try entity_prop_event.originTranscript(std.testing.allocator, ev);
+    defer std.testing.allocator.free(transcript);
+    try entity_prop_event.signInPlace(&ev, kp, transcript, pk_buf, sig_buf);
+    return .{
+        .kind = kind,
+        .entity = entity,
+        .key = key,
+        .value = value,
+        .owner = owner,
+        .hlc = hlc,
+        .present = present,
+        .origin_node = ev.origin_node,
+        .origin_pubkey = ev.origin_pubkey,
+        .origin_sig = ev.origin_sig,
+    };
+}
+
+test "entity prop: a local user prop and member prop are signed and verify against their origin" {
+    var ident = try node_identity.fromSeed([_]u8{0x61} ** 32, "local");
+    defer ident.deinit();
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .node_id = ident.shortId(), .node_identity = &ident }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    inline for (.{
+        .{ entity_prop_event.EntityKind.user, "alice", "alice" },
+        .{ entity_prop_event.EntityKind.member, "#room:alice", "#room:alice" },
+    }) |spec| {
+        const kind = spec[0];
+        const entity = spec[1];
+        var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+        var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+        const ps = server.signLocalEntityProp(true, kind, entity, "MARK", "1", "alice", 100, &pk_buf, &sig_buf);
+        try std.testing.expectEqual(ident.shortId(), ps.node);
+        try std.testing.expectEqual(@as(usize, entity_prop_event.pubkey_len), ps.pubkey.len);
+
+        try std.testing.expect(server.recordEntityPropClock(kind, entity, "MARK", "alice", 100, true, ps.node, ps.pubkey, ps.sig));
+        const clock = server.entityPropClock(kind, entity, "MARK").?;
+        const ev = entity_prop_event.EntityPropEvent{
+            .present = true,
+            .kind = kind,
+            .origin_node = clock.origin_node,
+            .hlc = clock.hlc,
+            .entity = entity,
+            .key = "MARK",
+            .value = "1",
+            .owner = "alice",
+            .origin_pubkey = clock.origin_pubkey,
+            .origin_sig = clock.origin_sig,
+        };
+        try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(std.testing.allocator, ev));
+    }
+}
+
+test "entity prop: an inbound signed user fact verifies, applies, and is stored for re-broadcast" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x62} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(&kp, .user, "carol", "STATUS", "busy", "carol", 500, true, &pk_buf, &sig_buf);
+
+    try std.testing.expect(server.applyRemoteEntityProp(fact));
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+
+    // The value landed in the store and is answerable via PROP GET.
+    const stored = try server.props.getProp(.{ .kind = .user, .id = "carol" }, "STATUS");
+    try std.testing.expectEqualStrings("busy", stored.value);
+
+    // The ORIGINAL author's origin + signature were stored verbatim.
+    const clock = server.entityPropClock(.user, "carol", "STATUS").?;
+    try std.testing.expectEqual(fact.origin_node, clock.origin_node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, clock.origin_pubkey);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, clock.origin_sig);
+
+    const origin = server.burstEntityPropOrigin(clock, true, "busy", "carol");
+    try std.testing.expectEqual(fact.origin_node, origin.node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+    try std.testing.expectEqualSlices(u8, fact.origin_sig, origin.sig);
+}
+
+test "entity prop: an inbound signed member fact verifies and applies" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x63} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(&kp, .member, "#mesh:dave", "ROLE", "mod", "founder", 510, true, &pk_buf, &sig_buf);
+
+    try std.testing.expect(server.applyRemoteEntityProp(fact));
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+    const stored = try server.props.getProp(.{ .kind = .member, .id = "#mesh:dave" }, "ROLE");
+    try std.testing.expectEqualStrings("mod", stored.value);
+}
+
+test "entity prop: a forged inbound fact is rejected, counted, and not applied" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var kp = try sign_mod.KeyPair.fromSeed([_]u8{0x64} ** sign_mod.seed_len);
+    defer kp.deinit();
+    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+
+    // (1) Tampered value after signing.
+    var tampered = try buildSignedEntityProp(&kp, .user, "alice", "K", "original", "alice", 600, true, &pk_buf, &sig_buf);
+    tampered.value = "tampered value the origin never authored";
+    try std.testing.expect(!server.applyRemoteEntityProp(tampered));
+    try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_signatures);
+    try std.testing.expect(server.entityPropClock(.user, "alice", "K") == null);
+
+    // (2) A pubkey whose originShortId does not self-certify the claimed origin.
+    var bad_origin = try buildSignedEntityProp(&kp, .user, "alice", "K2", "v", "alice", 601, true, &pk_buf, &sig_buf);
+    bad_origin.origin_node = entity_prop_event.originShortId(kp.public_key) ^ 0x1;
+    try std.testing.expect(!server.applyRemoteEntityProp(bad_origin));
+    try std.testing.expectEqual(@as(u64, 2), server.rejected_relay_signatures);
+    try std.testing.expect(server.entityPropClock(.user, "alice", "K2") == null);
+
+    // (3) Reclassifying the kind (user -> member) breaks the signature.
+    var reclassified = try buildSignedEntityProp(&kp, .user, "alice", "K3", "v", "alice", 602, true, &pk_buf, &sig_buf);
+    reclassified.kind = .member;
+    try std.testing.expect(!server.applyRemoteEntityProp(reclassified));
+    try std.testing.expectEqual(@as(u64, 3), server.rejected_relay_signatures);
+
+    // (4) Tampered owner/entity/key each break verification too.
+    inline for (.{ "owner", "entity", "key" }) |field| {
+        var t = try buildSignedEntityProp(&kp, .user, "alice", "K4", "v", "alice", 603, true, &pk_buf, &sig_buf);
+        @field(t, field) = "HIJACKED";
+        try std.testing.expect(!server.applyRemoteEntityProp(t));
+        try std.testing.expect(server.entityPropClock(.user, "alice", "K4") == null);
+    }
+    try std.testing.expectEqual(@as(u64, 6), server.rejected_relay_signatures);
+}
+
+test "entity prop: a re-broadcast preserves the ORIGINAL author's signature (multi-hop)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // A THIRD node authored the fact; THIS node is a relay with its own identity.
+    var ident = try node_identity.fromSeed([_]u8{0x65} ** 32, "relay");
+    defer ident.deinit();
+    server.config.node_id = ident.shortId();
+    server.config.node_identity = &ident;
+
+    var author = try sign_mod.KeyPair.fromSeed([_]u8{0x91} ** sign_mod.seed_len);
+    defer author.deinit();
+    var pk_buf: [entity_prop_event.pubkey_len]u8 = undefined;
+    var sig_buf: [entity_prop_event.sig_len]u8 = undefined;
+    const fact = try buildSignedEntityProp(&author, .user, "erin", "STATUS", "away", "erin", 700, true, &pk_buf, &sig_buf);
+    try std.testing.expect(fact.origin_node != ident.shortId());
+
+    try std.testing.expect(server.applyRemoteEntityProp(fact));
+    const clock = server.entityPropClock(.user, "erin", "STATUS").?;
+
+    const origin = server.burstEntityPropOrigin(clock, true, "away", "erin");
+    try std.testing.expectEqual(fact.origin_node, origin.node);
+    try std.testing.expectEqualSlices(u8, fact.origin_pubkey, origin.pubkey);
+    const reemit = entity_prop_event.EntityPropEvent{
+        .present = true,
+        .kind = .user,
+        .origin_node = origin.node,
+        .hlc = clock.hlc,
+        .entity = "erin",
+        .key = "STATUS",
+        .value = "away",
+        .owner = "erin",
+        .origin_pubkey = origin.pubkey,
+        .origin_sig = origin.sig,
+    };
+    try std.testing.expectEqual(entity_prop_event.VerifyOutcome.verified, try entity_prop_event.verifyOrigin(std.testing.allocator, reemit));
+}
+
+test "entity prop: a legacy unsigned inbound fact still applies (backward compat)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const fact = TestEntityPropFact{
+        .kind = .user,
+        .entity = "frank",
+        .key = "LEGACY",
+        .value = "unsigned still flows",
+        .owner = "frank",
+        .hlc = 800,
+        .present = true,
+        .origin_node = 99,
+    };
+    try std.testing.expect(server.applyRemoteEntityProp(fact));
+    try std.testing.expectEqual(@as(u64, 0), server.rejected_relay_signatures);
+    const clock = server.entityPropClock(.user, "frank", "LEGACY").?;
+    try std.testing.expectEqual(@as(usize, 0), clock.origin_pubkey.len);
+    try std.testing.expectEqual(@as(usize, 0), clock.origin_sig.len);
+    const origin = server.burstEntityPropOrigin(clock, true, "unsigned still flows", "frank");
+    try std.testing.expectEqual(@as(u64, 99), origin.node);
+    try std.testing.expectEqual(@as(usize, 0), origin.pubkey.len);
+}
+
+test "entity prop: newer hlc wins, older is ignored (LWW for user and member)" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    inline for (.{
+        .{ entity_prop_event.EntityKind.user, "grace" },
+        .{ entity_prop_event.EntityKind.member, "#g:grace" },
+    }) |spec| {
+        const kind = spec[0];
+        const entity = spec[1];
+        // hlc 200 applies.
+        const newer = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "new", .owner = "x", .hlc = 200, .present = true, .origin_node = 5 };
+        try std.testing.expect(server.applyRemoteEntityProp(newer));
+        try std.testing.expectEqual(@as(u64, 200), server.entityPropClock(kind, entity, "K").?.hlc);
+
+        // An older hlc 100 is rejected by LWW and does not overwrite.
+        const older = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "old", .owner = "y", .hlc = 100, .present = true, .origin_node = 6 };
+        try std.testing.expect(!server.applyRemoteEntityProp(older));
+        const stored = try server.props.getProp(.{ .kind = kind.toStoreKind(), .id = entity }, "K");
+        try std.testing.expectEqualStrings("new", stored.value);
+        try std.testing.expectEqual(@as(u64, 200), server.entityPropClock(kind, entity, "K").?.hlc);
+    }
 }
 
 test "remote aggregate channel mode flags cannot clear local +nt policy" {

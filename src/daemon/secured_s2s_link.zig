@@ -29,6 +29,7 @@ const node_short_id = @import("../crypto/node_short_id.zig");
 const s2s_link = @import("s2s_link.zig");
 const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
+const entity_prop_event = @import("../proto/entity_prop_event.zig");
 
 pub const Role = tsumugi_session.Role;
 
@@ -290,6 +291,26 @@ pub const SecuredLink = struct {
         try self.drainInner();
     }
 
+    /// Announce a local IRCX user/member PROP set/delete (or re-broadcast a remote
+    /// one) over the secured CRDT link via ENTITY_PROP. Outbound bytes accumulate
+    /// in `out`. `origin` carries the ORIGINAL author's node id + self-contained
+    /// multi-hop origin signature (see `S2sLink.sendEntityProp`).
+    pub fn sendEntityProp(
+        self: *SecuredLink,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+        origin: s2s_peer.S2sPeer.PropOrigin,
+    ) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendEntityProp(kind, entity, key, value, owner, hlc, present, origin);
+        try self.drainInner();
+    }
+
     /// Announce a local channel topic change over the secured CRDT link.
     pub fn sendTopic(
         self: *SecuredLink,
@@ -397,6 +418,13 @@ pub const SecuredLink = struct {
     pub fn takeChannelPropChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.ChannelPropDelta {
         const link = self.inner orelse return &.{};
         return link.takeChannelPropChanges();
+    }
+
+    /// Drain remote user/member PROP changes (ENTITY_PROP) for daemon-side LWW
+    /// apply.
+    pub fn takeEntityPropChanges(self: *SecuredLink) anyerror![]s2s_peer.S2sPeer.EntityPropDelta {
+        const link = self.inner orelse return &.{};
+        return link.takeEntityPropChanges();
     }
 
     /// Forward a signed cross-mesh operator grant to the peer over the secured

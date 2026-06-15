@@ -47,6 +47,7 @@ pub const chanmode_ext = @import("chanmode_ext.zig");
 pub const channel_list_event = @import("channel_list_event.zig");
 pub const channel_rename = @import("channel_rename.zig");
 pub const channel_prop_event = @import("channel_prop_event.zig");
+pub const entity_prop_event = @import("entity_prop_event.zig");
 pub const topic_event = @import("topic_event.zig");
 pub const nick_event = @import("nick_event.zig");
 pub const chanserv_cmd = @import("chanserv_cmd.zig");
@@ -371,6 +372,7 @@ test {
     _ = channel_list_event;
     _ = channel_rename;
     _ = channel_prop_event;
+    _ = entity_prop_event;
     _ = topic_event;
     _ = nick_event;
     _ = chanserv_cmd;

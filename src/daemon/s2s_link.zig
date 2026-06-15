@@ -22,6 +22,7 @@ const partition_detector = @import("../substrate/suimyaku/partition_detector.zig
 const s2s_frame = @import("../proto/s2s_frame.zig");
 const sign = @import("../crypto/sign.zig");
 const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig");
+const entity_prop_event = @import("../proto/entity_prop_event.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
@@ -228,6 +229,24 @@ pub const S2sLink = struct {
         try self.peer.sendChannelProp(self.sink(), channel, key, value, owner, hlc, present, origin);
     }
 
+    /// Announce a local IRCX user/member PROP set/delete (or re-broadcast a remote
+    /// one) to the peer over ENTITY_PROP. Outbound frames accumulate in `out`.
+    /// `origin` selects local-authored vs re-broadcast attribution and carries the
+    /// self-contained multi-hop origin signature (see `S2sPeer.PropOrigin`).
+    pub fn sendEntityProp(
+        self: *S2sLink,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+        origin: s2s_peer.S2sPeer.PropOrigin,
+    ) !void {
+        try self.peer.sendEntityProp(self.sink(), kind, entity, key, value, owner, hlc, present, origin);
+    }
+
     /// Announce a local channel topic change to the peer.
     pub fn sendTopic(
         self: *S2sLink,
@@ -340,6 +359,12 @@ pub const S2sLink = struct {
     /// the slice + each delta's strings.
     pub fn takeChannelPropChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.ChannelPropDelta {
         return self.peer.takeChannelPropChanges();
+    }
+
+    /// Drain remote user/member PROP changes (ENTITY_PROP) for daemon-side LWW
+    /// apply. Caller owns the slice + each delta's strings.
+    pub fn takeEntityPropChanges(self: *S2sLink) ![]s2s_peer.S2sPeer.EntityPropDelta {
+        return self.peer.takeEntityPropChanges();
     }
 
     /// Forward a signed cross-mesh operator grant to the peer (best-effort; only
@@ -595,6 +620,56 @@ test "CHANNEL_PROP payload round-trips across the link into takeChannelPropChang
     try std.testing.expectEqualStrings("alice", changes[0].owner);
     try std.testing.expect(!changes[1].present);
     try std.testing.expectEqualStrings("SUBJECT", changes[1].key);
+}
+
+test "ENTITY_PROP payload round-trips across the link into takeEntityPropChanges" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    try a.start(10);
+    try a.sendEntityProp(.user, "alice", "STATUS", "away mesh", "alice", 100, true, .{});
+    try a.sendEntityProp(.member, "#chat:bob", "ROLE", "", "founder", 101, false, .{});
+
+    var now: u64 = 11;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const changes = try b.takeEntityPropChanges();
+    defer {
+        for (changes) |*ch| ch.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), changes.len);
+    try std.testing.expectEqual(entity_prop_event.EntityKind.user, changes[0].kind);
+    try std.testing.expect(changes[0].present);
+    try std.testing.expectEqual(@as(u64, 100), changes[0].hlc);
+    try std.testing.expectEqualStrings("alice", changes[0].entity);
+    try std.testing.expectEqualStrings("STATUS", changes[0].key);
+    try std.testing.expectEqualStrings("away mesh", changes[0].value);
+    try std.testing.expectEqualStrings("alice", changes[0].owner);
+    try std.testing.expectEqual(entity_prop_event.EntityKind.member, changes[1].kind);
+    try std.testing.expect(!changes[1].present);
+    try std.testing.expectEqualStrings("#chat:bob", changes[1].entity);
+    try std.testing.expectEqualStrings("ROLE", changes[1].key);
 }
 
 test "CHANNEL_MODE_STATE propagates parameter and IRCX state across the link" {

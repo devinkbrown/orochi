@@ -46,6 +46,7 @@ const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.z
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
 const channel_prop_event = @import("../../proto/channel_prop_event.zig");
+const entity_prop_event = @import("../../proto/entity_prop_event.zig");
 const topic_event = @import("../../proto/topic_event.zig");
 const nick_event = @import("../../proto/nick_event.zig");
 const partition_detector = @import("partition_detector.zig");
@@ -187,6 +188,9 @@ pub const S2sPeer = struct {
     /// Remote IRCX channel PROP events awaiting daemon-side LWW apply into the
     /// local prop store. The daemon owns prop clocks and client emission policy.
     prop_changes: std.ArrayListUnmanaged(ChannelPropDelta) = .empty,
+    /// Remote IRCX user/member PROP events (ENTITY_PROP) awaiting daemon-side LWW
+    /// apply. The non-channel counterpart of `prop_changes`; same ownership model.
+    entity_prop_changes: std.ArrayListUnmanaged(EntityPropDelta) = .empty,
     /// Remote channel topic changes that altered LWW state, awaiting the daemon
     /// to apply them to its local world and emit a live `TOPIC` line.
     topic_changes: std.ArrayListUnmanaged(TopicDelta) = .empty,
@@ -268,6 +272,8 @@ pub const S2sPeer = struct {
         self.channel_list_changes.deinit(self.allocator);
         for (self.prop_changes.items) |*d| d.deinit(self.allocator);
         self.prop_changes.deinit(self.allocator);
+        for (self.entity_prop_changes.items) |*d| d.deinit(self.allocator);
+        self.entity_prop_changes.deinit(self.allocator);
         for (self.topic_changes.items) |*d| d.deinit(self.allocator);
         self.topic_changes.deinit(self.allocator);
         for (self.nick_changes.items) |*d| d.deinit(self.allocator);
@@ -419,6 +425,7 @@ pub const S2sPeer = struct {
             .MESSAGE => try self.recvMessage(frame.payload),
             .OPER_GRANT => try self.recvOperGrant(frame.payload),
             .CHANNEL_PROP => try self.recvChannelProp(frame.payload),
+            .ENTITY_PROP => try self.recvEntityProp(frame.payload),
             .CHANNEL_MODE_STATE => try self.recvChannelModeState(frame.payload),
             .SESSION_MIGRATE => try self.recvSessionMigrate(frame.payload),
         }
@@ -611,6 +618,38 @@ pub const S2sPeer = struct {
         }
     };
 
+    /// A remote IRCX user/member PROP mutation (ENTITY_PROP). The non-channel
+    /// counterpart of `ChannelPropDelta`: `kind` distinguishes user vs member and
+    /// `entity` is the raw entity id ("alice" or "#chat:bob"). Strings are
+    /// heap-owned by the delta. `origin_node` is the ORIGINAL author's node short
+    /// id (preserved verbatim across re-broadcast). `origin_pubkey`/`origin_sig`
+    /// carry the self-contained multi-hop origin signature when signed (empty on
+    /// the legacy path); the daemon verifies them against `origin_node` before
+    /// applying and stores them so a re-broadcast/burst re-emits the ORIGINAL
+    /// author's signature.
+    pub const EntityPropDelta = struct {
+        kind: entity_prop_event.EntityKind,
+        entity: []u8,
+        key: []u8,
+        value: []u8,
+        owner: []u8,
+        hlc: u64,
+        present: bool,
+        origin_node: NodeId,
+        origin_pubkey: []u8,
+        origin_sig: []u8,
+
+        pub fn deinit(self: *EntityPropDelta, allocator: std.mem.Allocator) void {
+            allocator.free(self.entity);
+            allocator.free(self.key);
+            allocator.free(self.value);
+            allocator.free(self.owner);
+            allocator.free(self.origin_pubkey);
+            allocator.free(self.origin_sig);
+            self.* = undefined;
+        }
+    };
+
     /// Drain queued remote channel MODE flag changes. Caller owns the slice and
     /// each delta's channel string (call `deinit` per entry, then free slice).
     pub fn takeChannelModeFlagChanges(self: *S2sPeer) ![]ChannelModeFlagsDelta {
@@ -633,6 +672,12 @@ pub const S2sPeer = struct {
     /// delta's strings (call `deinit` per entry, then free the slice).
     pub fn takeChannelPropChanges(self: *S2sPeer) ![]ChannelPropDelta {
         return self.prop_changes.toOwnedSlice(self.allocator);
+    }
+
+    /// Drain queued remote user/member PROP changes (ENTITY_PROP). Caller owns the
+    /// slice and each delta's strings (call `deinit` per entry, then free slice).
+    pub fn takeEntityPropChanges(self: *S2sPeer) ![]EntityPropDelta {
+        return self.entity_prop_changes.toOwnedSlice(self.allocator);
     }
 
     /// A remote channel's topic changed (LWW winner). Strings are heap-owned.
@@ -1036,6 +1081,77 @@ pub const S2sPeer = struct {
         var buf: [channel_prop_event.max_channel_len + channel_prop_event.max_key_len + channel_prop_event.max_value_len + channel_prop_event.max_owner_len + 32 + 1 + channel_prop_event.pubkey_len + channel_prop_event.sig_len]u8 = undefined;
         const wire = try channel_prop_event.encode(ev, &buf);
         try self.emitSignable(sink, .CHANNEL_PROP, wire);
+    }
+
+    /// Queue an inbound ENTITY_PROP (user/member) event for daemon-side LWW apply.
+    /// Malformed payloads and allocation failures are dropped without faulting the
+    /// link. Mirrors `recvChannelProp` exactly: a signed fact bypasses the
+    /// direct-peer origin gate (the daemon's self-certifying signature check is the
+    /// authoritative origin gate for a re-broadcast authored elsewhere), while a
+    /// legacy unsigned fact keeps the direct-owned origin gate.
+    fn recvEntityProp(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.ENTITY_PROP, frame_payload) orelse return;
+        const ev = entity_prop_event.decode(payload) catch return;
+        const signed = ev.origin_pubkey.len != 0;
+        if (!signed and !self.acceptsDirectOrigin(ev.origin_node)) return;
+
+        const entity = self.allocator.dupe(u8, ev.entity) catch return;
+        errdefer self.allocator.free(entity);
+        const key = self.allocator.dupe(u8, ev.key) catch return;
+        errdefer self.allocator.free(key);
+        const value = self.allocator.dupe(u8, ev.value) catch return;
+        errdefer self.allocator.free(value);
+        const owner = self.allocator.dupe(u8, ev.owner) catch return;
+        errdefer self.allocator.free(owner);
+        const origin_pubkey = self.allocator.dupe(u8, ev.origin_pubkey) catch return;
+        errdefer self.allocator.free(origin_pubkey);
+        const origin_sig = self.allocator.dupe(u8, ev.origin_sig) catch return;
+        errdefer self.allocator.free(origin_sig);
+
+        self.entity_prop_changes.append(self.allocator, .{
+            .kind = ev.kind,
+            .entity = entity,
+            .key = key,
+            .value = value,
+            .owner = owner,
+            .hlc = ev.hlc,
+            .present = ev.present,
+            .origin_node = ev.origin_node,
+            .origin_pubkey = origin_pubkey,
+            .origin_sig = origin_sig,
+        }) catch return;
+    }
+
+    /// Emit an ENTITY_PROP (user/member) event to the peer. Best-effort; only
+    /// meaningful once established. `origin` selects local-authored vs re-broadcast
+    /// attribution and carries the multi-hop origin signature (see `PropOrigin`).
+    pub fn sendEntityProp(
+        self: *S2sPeer,
+        sink: ByteSink,
+        kind: entity_prop_event.EntityKind,
+        entity: []const u8,
+        key: []const u8,
+        value: []const u8,
+        owner: []const u8,
+        hlc: u64,
+        present: bool,
+        origin: PropOrigin,
+    ) !void {
+        const ev = entity_prop_event.EntityPropEvent{
+            .present = present,
+            .kind = kind,
+            .origin_node = if (origin.node != 0) origin.node else self.local_node_id,
+            .hlc = hlc,
+            .entity = entity,
+            .key = key,
+            .value = value,
+            .owner = owner,
+            .origin_pubkey = origin.pubkey,
+            .origin_sig = origin.sig,
+        };
+        var buf: [entity_prop_event.max_entity_len + entity_prop_event.max_key_len + entity_prop_event.max_value_len + entity_prop_event.max_owner_len + 32 + 1 + entity_prop_event.pubkey_len + entity_prop_event.sig_len]u8 = undefined;
+        const wire = try entity_prop_event.encode(ev, &buf);
+        try self.emitSignable(sink, .ENTITY_PROP, wire);
     }
 
     /// Queue a remote parameter/IRCX channel-state snapshot for daemon apply.
@@ -1888,6 +2004,54 @@ test "signing peers negotiate frame_signing and a signed CHANNEL_PROP round-trip
     try std.testing.expectEqualStrings("#room", props[0].channel);
     try std.testing.expectEqualStrings("TOPICLOCK", props[0].key);
     try std.testing.expectEqualStrings("1", props[0].value);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "signing peers round-trip a signed ENTITY_PROP (user and member)" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x13);
+    const kp_b = try signingKeyFor(0x24);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xA11CE);
+    try std.testing.expect(a.peer_supports_signing);
+    try std.testing.expect(b.peer_supports_signing);
+
+    try a.sendEntityProp(a_to_b.sink(), .user, "alice", "STATUS", "away", "alice", 100, true, .{});
+    try a.sendEntityProp(a_to_b.sink(), .member, "#room:bob", "ROLE", "mod", "founder", 101, true, .{});
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0xC0FFEE);
+
+    const props = try b.takeEntityPropChanges();
+    defer {
+        for (props) |*p| p.deinit(allocator);
+        allocator.free(props);
+    }
+    try std.testing.expectEqual(@as(usize, 2), props.len);
+    try std.testing.expectEqual(entity_prop_event.EntityKind.user, props[0].kind);
+    try std.testing.expectEqualStrings("alice", props[0].entity);
+    try std.testing.expectEqualStrings("STATUS", props[0].key);
+    try std.testing.expectEqualStrings("away", props[0].value);
+    try std.testing.expectEqual(entity_prop_event.EntityKind.member, props[1].kind);
+    try std.testing.expectEqualStrings("#room:bob", props[1].entity);
+    try std.testing.expectEqualStrings("mod", props[1].value);
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 

@@ -51,6 +51,10 @@ pub const FrameType = enum(u8) {
     /// snapshot the origin ships to the owning node so a reconnecting client
     /// lands with its nick/umodes/account/away/channels restored.
     SESSION_MIGRATE = 0x11,
+    /// IRCX user/member PROP convergence event (entity_kind/entity/key/value/owner
+    /// LWW by hlc). The non-channel counterpart of CHANNEL_PROP: channels ride
+    /// CHANNEL_PROP, `user`/`member` entities ride ENTITY_PROP.
+    ENTITY_PROP = 0x12,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -75,6 +79,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.NICKCHANGE) => .NICKCHANGE,
             @intFromEnum(FrameType.CHANNEL_MODE_STATE) => .CHANNEL_MODE_STATE,
             @intFromEnum(FrameType.SESSION_MIGRATE) => .SESSION_MIGRATE,
+            @intFromEnum(FrameType.ENTITY_PROP) => .ENTITY_PROP,
             else => null,
         };
     }
@@ -198,6 +203,7 @@ const all_frame_types = [_]FrameType{
     .NICKCHANGE,
     .CHANNEL_MODE_STATE,
     .SESSION_MIGRATE,
+    .ENTITY_PROP,
 };
 
 test "encode/decode round-trip each type" {
