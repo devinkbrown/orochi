@@ -165,10 +165,29 @@ Still open (cross-component, lower value):
   this repo) for marginal additional benefit, so it remains cross-component and
   is deliberately not stubbed server-only (would be inert until the clients ship).
 
+Also closed (was previously an intentional exclusion):
+
+- **WebTransport is now implemented.** A from-scratch QUIC + HTTP/3 + WebTransport
+  stack was built in layers, each RFC-verified: packet protection (RFC 9001 §5,
+  Appendix A vectors), key schedule + multi-suite AEAD/HP (A.5 ChaCha20), the
+  connection frame engine (RFC 9000), the TLS-1.3-over-QUIC handshake (RFC 9001
+  §4, loopback proves both sides agree on keys for all three suites), the
+  connection driver (full handshake + app data over datagrams), HTTP/3 +
+  WebTransport sessions (RFC 9114/9220/9297, Extended CONNECT), and a live UDP
+  listener (`src/daemon/webtransport_listener.zig`) that bridges each WebTransport
+  session to the daemon's IRC port via a thread-safe loopback proxy. `main.zig`
+  starts it on `[listen].webtransport`. An end-to-end test over a real UDP socket
+  completes the QUIC/H3/WT handshake and carries IRC bytes both ways. Deferred
+  hardening (documented in the modules): congestion control / loss recovery
+  beyond a fixed PTO, connection migration, Retry/stateless-reset, 0-RTT, key
+  update, HelloRetryRequest, and IPv6 UDP. See
+  [../architecture/mesh-security.md](../architecture/mesh-security.md)'s sibling
+  transport docs.
+
 Intentional divergences / out of scope (NOT gaps): EVENT numerics `808-825`
 (Orochi uses the `NOTE EVENT` wire form by design), `RPL_LISTXPICS 813` (no
-picture feature), `sasl.realm` wire emission, `listen.webtransport`, CA
-client-auth (CertFP model instead), and DCC proxy/filehost (documented exclusion).
+picture feature), `sasl.realm` wire emission, CA client-auth (CertFP model
+instead), and DCC proxy/filehost (documented exclusion).
 
 ## Repair Status After 2026-06-15 Implementation Pass
 
