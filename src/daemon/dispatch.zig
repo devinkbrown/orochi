@@ -270,6 +270,10 @@ pub const CapId = enum(u6) {
     sts,
     event_playback,
     search,
+    account_extban,
+    utf8_only,
+    netsplit,
+    netjoin,
 };
 
 const CapSet = struct {
@@ -407,6 +411,14 @@ const cap_specs = [_]CapSpec{
     // so a default build that has not enabled STS advertises nothing -- never
     // stranding a client by promising TLS that no listener serves.
     .{ .id = .sts, .name = "sts", .requires_policy = true },
+    // IRCv3 discovery caps for behavior Orochi already implements unconditionally,
+    // so clients can negotiate/use them: account-extban=a ($a account bans),
+    // utf8-only (the server enforces valid UTF-8 globally), and draft/netsplit +
+    // draft/netjoin (netsplit/netjoin are framed as typed BATCHes, gated on `batch`).
+    .{ .id = .account_extban, .name = "account-extban", .value_302 = "a" },
+    .{ .id = .utf8_only, .name = "utf8-only" },
+    .{ .id = .netsplit, .name = "draft/netsplit" },
+    .{ .id = .netjoin, .name = "draft/netjoin" },
 };
 
 /// Per-session STS advertisement policy.
@@ -2012,6 +2024,11 @@ test "CAP negotiation holds registration until CAP END" {
 
     try dispatchText(&session, &replies, "CAP LS 302");
     try expectContains(replies.written(), " CAP * LS :");
+    // IRCv3 discovery caps for already-implemented behavior are advertised.
+    try expectContains(replies.written(), "account-extban=a");
+    try expectContains(replies.written(), "utf8-only");
+    try expectContains(replies.written(), "draft/netsplit");
+    try expectContains(replies.written(), "draft/netjoin");
     replies.clear();
 
     try dispatchText(&session, &replies, "NICK kain");
