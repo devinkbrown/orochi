@@ -6,6 +6,7 @@
 const std = @import("std");
 
 const sasl = @import("sasl.zig");
+const secure_fns = @import("secure_fns.zig");
 
 const crypto_hash = struct {
     const Sha512 = struct {
@@ -222,7 +223,9 @@ pub const Server = struct {
             @memcpy(expected_cb_buf[self.gs2_header_len..][0..exporter.len], &exporter);
             break :blk expected_cb_buf[0 .. self.gs2_header_len + exporter.len];
         } else self.gs2_header_buf[0..self.gs2_header_len];
-        if (!std.mem.eql(u8, cb, expected_cb)) {
+        // Constant-time so the channel-binding check can't be probed byte-by-byte
+        // via timing (mirrors the proof comparison below).
+        if (!secure_fns.ctEq(cb, expected_cb)) {
             return error.InvalidAttribute;
         }
 
