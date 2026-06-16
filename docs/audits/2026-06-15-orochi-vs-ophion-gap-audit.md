@@ -89,9 +89,11 @@ the Ophion CAP names:
 - `ophion/ladon-media`: Orochi has media, native OPVOX/OPVIS UDP, and
   WebTransport, but not the Ophion LADON client capability value or
   `LADONMEDIA=1` compatibility surface.
-- `ophion/prop-notify`: Orochi uses `orochi/prop-notify` and signed PROP/metadata
-  propagation. If Ophion-client compatibility is required, add an alias or a
-  compatibility mode explicitly.
+- `ophion/prop-notify`: Orochi delivers PROP-change notifications gated on IRCX
+  mode (there is no separate capability — being in IRCX mode is the gate; opers
+  are auto-placed in IRCX on SASL login), with signed PROP/metadata propagation.
+  If Ophion-client compatibility is required, add an alias or a compatibility
+  mode explicitly.
 - `tls`: Ophion exposes STARTTLS through `m_starttls`; Orochi intentionally uses
   implicit TLS listeners only.
 
@@ -113,7 +115,7 @@ the Ophion CAP names:
   | Orochi provider(s) | Scope | Visibility | Ophion provider module |
   |---|---|---|---|
   | `name`, `topic`, `subject`, `language`, `creation_time`, `topic_setter`, `membercount`, `memberlimit`, `registered` | channel | public | `m_ircx_prop_channel_builtins` |
-  | `ownerkey`, `opkey`, `hostkey`, `memberkey` | channel | secret (owner/host gated) | `m_ircx_prop_ownerkey` / `m_ircx_prop_opkey` |
+  | `ownerkey`, `hostkey`, `voicekey`, `memberkey` | channel | secret, per-tier read (OWNERKEY→owner, HOSTKEY→op, VOICEKEY→voice, MEMBERKEY→any member; opers always). Orochi has no `opkey` — `hostkey` is the op tier; `voicekey` is settable by op+ | `m_ircx_prop_ownerkey` / `m_ircx_prop_opkey` |
   | `onjoin` | channel | public (join timestamp) | `m_ircx_prop_onjoin` |
   | `onpart` | channel | public (part timestamp) | `m_ircx_prop_onpart` |
   | `member_of` | user | public (membership list) | `m_ircx_prop_member_of` |
