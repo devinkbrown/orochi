@@ -841,6 +841,12 @@ pub const ClientSession = struct {
     /// (mirrors Ophion's per-event-type `masks[EVENT_MAX_TYPES][256]`). Owned
     /// in-struct (FixedString), so there is nothing to free on clear/deinit.
     event_subject_masks: [EVENT_CATEGORY_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = [_]FixedString(MAX_EVENT_MASK_BYTES){.{}} ** EVENT_CATEGORY_COUNT,
+    /// IRCX EVENT subscriptions in Ophion wire terms. This state is separate from
+    /// the daemon-native Event Spine category mask so `EVENT ADD CHANNEL`, `LIST`,
+    /// duplicate checks, and missing-subscription errors behave like Ophion even
+    /// when an operator is already subscribed to daemon oper notices.
+    ircx_event_mask: event_spine.IrcxEventMask = .{},
+    ircx_event_subject_masks: [event_spine.IRCX_EVENT_TYPE_COUNT]FixedString(MAX_EVENT_MASK_BYTES) = [_]FixedString(MAX_EVENT_MASK_BYTES){.{}} ** event_spine.IRCX_EVENT_TYPE_COUNT,
 
     pub fn init() ClientSession {
         return .{};
@@ -928,6 +934,7 @@ pub const ClientSession = struct {
         self.oper_title_store = .{};
         self.event_mask = .{};
         self.clearEventSubjectMasks();
+        self.clearIrcxEventSubscriptions();
         self.umodes.remove(.admin);
         self.umodes.remove(.override);
     }
@@ -997,6 +1004,49 @@ pub const ClientSession = struct {
     /// Reset every category's subject scope to `*`. Used on CLEAR and oper logout.
     pub fn clearEventSubjectMasks(self: *ClientSession) void {
         for (&self.event_subject_masks) |*slot| slot.len = 0;
+    }
+
+    pub fn subscribesToIrcxEvent(self: *const ClientSession, typ: event_spine.IrcxEventType) bool {
+        return self.ircx_event_mask.contains(typ);
+    }
+
+    pub fn hasIrcxEventSubscriptions(self: *const ClientSession) bool {
+        return !self.ircx_event_mask.isEmpty();
+    }
+
+    pub fn ircxEventSubjectMask(self: *const ClientSession, typ: event_spine.IrcxEventType) []const u8 {
+        const stored = self.ircx_event_subject_masks[@intFromEnum(typ)].slice();
+        return if (stored.len == 0) "*" else stored;
+    }
+
+    pub fn setIrcxEventSubscription(self: *ClientSession, typ: event_spine.IrcxEventType, mask: []const u8) DispatchError!void {
+        try self.setIrcxEventSubjectMask(typ, mask);
+        self.ircx_event_mask.add(typ);
+    }
+
+    pub fn clearIrcxEventSubscription(self: *ClientSession, typ: event_spine.IrcxEventType) bool {
+        if (!self.ircx_event_mask.contains(typ)) return false;
+        self.ircx_event_mask.remove(typ);
+        self.clearIrcxEventSubjectMask(typ);
+        return true;
+    }
+
+    pub fn clearIrcxEventSubscriptions(self: *ClientSession) void {
+        self.ircx_event_mask = .{};
+        for (&self.ircx_event_subject_masks) |*slot| slot.len = 0;
+    }
+
+    pub fn setIrcxEventSubjectMask(self: *ClientSession, typ: event_spine.IrcxEventType, mask: []const u8) DispatchError!void {
+        const slot = &self.ircx_event_subject_masks[@intFromEnum(typ)];
+        if (mask.len == 0 or (mask.len == 1 and mask[0] == '*')) {
+            slot.len = 0;
+            return;
+        }
+        try slot.set(mask);
+    }
+
+    pub fn clearIrcxEventSubjectMask(self: *ClientSession, typ: event_spine.IrcxEventType) void {
+        self.ircx_event_subject_masks[@intFromEnum(typ)].len = 0;
     }
 
     /// Render active user modes as "+iB" into `out` (caller-owned, >= 16 bytes
@@ -2108,6 +2158,7 @@ test "clearOper revokes operator status, privileges, and class" {
     try std.testing.expect(!s.isOper());
     try std.testing.expect(!s.hasPriv(.server_admin));
     try std.testing.expectEqualStrings("", s.operClass());
+    try std.testing.expect(!s.hasIrcxEventSubscriptions());
 }
 
 test "event subject masks: default wildcard, set/overwrite/clear lifecycle" {
@@ -2158,6 +2209,33 @@ test "event subject masks: default wildcard, set/overwrite/clear lifecycle" {
     try s.setEventSubjectMask(chan, "#foo*");
     s.clearOper();
     try std.testing.expectEqualStrings("*", s.eventSubjectMask(chan));
+}
+
+test "IRCX EVENT subscriptions: per-type mask lifecycle" {
+    var s = ClientSession.init();
+
+    try std.testing.expect(!s.subscribesToIrcxEvent(.channel));
+    try std.testing.expectEqualStrings("*", s.ircxEventSubjectMask(.channel));
+
+    try s.setIrcxEventSubscription(.channel, "#ops*");
+    try std.testing.expect(s.subscribesToIrcxEvent(.channel));
+    try std.testing.expect(!s.subscribesToIrcxEvent(.member));
+    try std.testing.expectEqualStrings("#ops*", s.ircxEventSubjectMask(.channel));
+    try std.testing.expectEqualStrings("*", s.ircxEventSubjectMask(.member));
+
+    try s.setIrcxEventSubscription(.channel, "*");
+    try std.testing.expectEqualStrings("*", s.ircxEventSubjectMask(.channel));
+
+    try s.setIrcxEventSubscription(.user, "*!*@example");
+    try std.testing.expect(s.subscribesToIrcxEvent(.user));
+    try std.testing.expect(s.clearIrcxEventSubscription(.channel));
+    try std.testing.expect(!s.clearIrcxEventSubscription(.channel));
+    try std.testing.expect(!s.subscribesToIrcxEvent(.channel));
+    try std.testing.expect(s.subscribesToIrcxEvent(.user));
+
+    s.clearIrcxEventSubscriptions();
+    try std.testing.expect(!s.hasIrcxEventSubscriptions());
+    try std.testing.expectEqualStrings("*", s.ircxEventSubjectMask(.user));
 }
 
 test "short parameters emit ERR_NEEDMOREPARAMS" {

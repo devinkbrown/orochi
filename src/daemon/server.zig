@@ -911,7 +911,7 @@ const Numeric = enum(u16) {
     ERR_KEYINVALID = 767,
     ERR_KEYNOPERMISSION = 769,
     // IRCX draft: 913 IRCERR_NOACCESS ("insufficient privileges for operation").
-    // (918 is IRCERR_EVENTDUP — do not reuse it for PROP denial.)
+    // EVENT duplicate handling uses Ophion's ERR_EVENTDUP 821; keep 918 for PROP.
     ERR_NOACCESS = 913,
     ERR_NOWHISPER = 923,
     ERR_BADVALUE = 906,
@@ -942,6 +942,14 @@ const Numeric = enum(u16) {
     RPL_STATSKLINE = 216,
     RPL_STATSDLINE = 225,
     RPL_ENDOFSTATS = 219,
+    RPL_EVENTADD = 808,
+    RPL_EVENTLIST = 809,
+    RPL_EVENTEND = 810,
+    ERR_EVENTDUP = 821,
+    ERR_EVENTMIS = 822,
+    ERR_NOSUCHEVENT = 823,
+    RPL_EVENTDELETE = 824,
+    RPL_EVENTCHANGE = 825,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHSERVER = 402,
     ERR_NOSUCHCHANNEL = 403,
@@ -5205,9 +5213,13 @@ pub const LinuxServer = struct {
             // Media: drop the departing nick from any call, notifying members.
             if (conn.session.registered()) self.leaveAllMediaRooms(id, conn);
             // OBSERVE: push a quit record, then drop this client's own subscription.
-            if (conn.session.registered()) self.notifyObservers(.quit, observeSubject(conn, reason));
+            if (conn.session.registered()) {
+                self.notifyObservers(.quit, observeSubject(conn, reason));
+                if (self.world.nickOf(worldIdFromClient(id)) != null) self.publishUserDisconnectEvent(conn, reason) catch {};
+            }
             _ = self.observe.clear(monitorIdFromClient(id));
             try self.broadcastQuit(id, conn, reason);
+            self.publishChannelDestroyEventsForClient(id);
             closeFd(conn.fd);
             _ = self.rx().clients.free(id);
         }
@@ -5504,6 +5516,7 @@ pub const LinuxServer = struct {
                 try self.deliverTegami(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
                 self.notifyObservers(.connect, observeSubject(conn, ""));
+                self.publishUserConnectEvent(conn) catch {};
                 // Apply any operator-approved vhost waiting for this account.
                 self.maybeApplyApprovedVhost(id, conn);
                 // Auto-join the account's configured channels.
@@ -8000,6 +8013,7 @@ pub const LinuxServer = struct {
         }
 
         _ = try self.world.join(join_target, wid);
+        if (creating) try self.publishChannelEvent("CREATE", join_target);
 
         // IRCX tiered keys: a presented key matching the channel's HOSTKEY/OWNERKEY
         // property grants graduated status (op / owner) on join — additive, so a
@@ -8063,6 +8077,7 @@ pub const LinuxServer = struct {
         }
 
         try self.broadcastJoin(join_target, conn);
+        try self.publishMemberEvent("JOIN", join_target, conn.session.displayName(), null);
         if (creating) {
             var flags_buf: [16]u8 = undefined;
             const flags = self.world.channelModeString(join_target, &flags_buf);
@@ -8143,8 +8158,11 @@ pub const LinuxServer = struct {
         } else {
             try self.broadcastChannel(channel, msg, null);
         }
+        const destroys_channel = self.willChannelDestroyOnPart(channel);
         const parted_nick = conn.session.displayName();
+        try self.publishMemberEvent("PART", channel, parted_nick, reason);
         try self.world.part(channel, wid);
+        if (destroys_channel and !self.world.channelExists(channel)) try self.publishChannelEvent("DESTROY", channel);
         // Tell mesh peers this member left.
         self.announceMembership(channel, parted_nick, 0, false, .{});
     }
@@ -8703,6 +8721,7 @@ pub const LinuxServer = struct {
         try line.append(targets.written());
         try line.append("\r\n");
         try self.broadcastChannel(channel, line.written(), null);
+        try self.publishChannelEvent("MODE", channel);
         // draft/event-playback: record the channel mode change as a MODE event
         // (`:setter MODE #chan <applied> <params>`) for event-playback replay.
         var mode_ev_buf: [default_reply_bytes]u8 = undefined;
@@ -8856,12 +8875,15 @@ pub const LinuxServer = struct {
         const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
         try self.broadcastChannel(args.channel, msg, null);
         if (override_kick_bypass) self.auditOverrideUse(conn, "KICK", args.channel, args.user);
+        try self.publishMemberEvent("KICK", args.channel, args.user, reason);
         // draft/event-playback: record the kick as a KICK event in channel history.
         var kick_ev_buf: [600]u8 = undefined;
         if (std.fmt.bufPrint(&kick_ev_buf, "{s} {s} :{s}", .{ args.channel, args.user, reason })) |kbody| {
             self.recordHistoryEvent(args.channel, conn, "KICK", kbody);
         } else |_| {}
+        const destroys_channel = self.willChannelDestroyOnPart(args.channel);
         self.world.part(args.channel, target) catch {};
+        if (destroys_channel and !self.world.channelExists(args.channel)) try self.publishChannelEvent("DESTROY", args.channel);
     }
 
     /// ISON <nick>... — reply RPL_ISON (303) with the subset that is online.
@@ -12111,11 +12133,10 @@ pub const LinuxServer = struct {
         try self.handleMode(id, conn, &synth);
     }
 
-    /// EVENT <ADD|DEL|LIST> [category...] — IRCX Event Spine subscription control.
-    /// Opers manage which oper-visible event categories they receive (the same
-    /// CategoryMask that WALLOPS/KILL/oper-action publish through). Parsed
-    /// daemon-native against the real event_spine (the ircx_event_cmd builder
-    /// carries its own proto-local mask facade that can't see daemon types).
+    /// EVENT ADD|CHANGE|DELETE|CLEAR|LIST — IRCX EVENT subscription control.
+    /// Opers manage Ophion-compatible CHANNEL/MEMBER/USER subscriptions with
+    /// per-type subject masks; delivery maps those IRCX types onto Event Spine
+    /// categories while replies stay on the IRCX numeric surface.
     pub fn handleEvent(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
             try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT is for operators");
@@ -12123,14 +12144,10 @@ pub const LinuxServer = struct {
         }
         if (!self.requirePriv(conn, .event_subscribe)) return;
         const params = parsed.paramSlice();
-        if (params.len == 0) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
-            return;
-        }
         // EVENT BROADCAST :<message> — send an oper announce (the former WALLOPS,
         // now folded into the Event Spine): delivered as NOTE EVENT ANNOUNCE to
         // every announce-subscribed operator.
-        if (std.ascii.eqlIgnoreCase(params[0], "BROADCAST")) {
+        if (params.len > 0 and std.ascii.eqlIgnoreCase(params[0], "BROADCAST")) {
             if (params.len < 2 or params[1].len == 0) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
                 return;
@@ -12147,96 +12164,114 @@ pub const LinuxServer = struct {
         // operator's interest mask and pushes a live NOTE EVENT OBSERVE feed of
         // matching client lifecycle events (with real hosts); subscribing also
         // emits an immediate snapshot of the currently-matching population.
-        if (std.ascii.eqlIgnoreCase(params[0], "OBSERVE")) {
+        if (params.len > 0 and std.ascii.eqlIgnoreCase(params[0], "OBSERVE")) {
             try self.handleObserve(conn, params);
             return;
         }
-        const is_add = std.ascii.eqlIgnoreCase(params[0], "ADD");
-        const is_change = std.ascii.eqlIgnoreCase(params[0], "CHANGE");
-        const is_del = std.ascii.eqlIgnoreCase(params[0], "DEL") or std.ascii.eqlIgnoreCase(params[0], "DELETE");
-        const is_clear = std.ascii.eqlIgnoreCase(params[0], "CLEAR");
-        const is_list = std.ascii.eqlIgnoreCase(params[0], "LIST") or std.ascii.eqlIgnoreCase(params[0], "STATUS");
-        if (!is_add and !is_change and !is_del and !is_clear and !is_list) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Invalid EVENT subcommand");
-            return;
-        }
-        // Grammar: EVENT <op> <CATEGORY>... [<subject-mask>]
-        // Every leading token must resolve to a category; a single trailing token
-        // that does NOT resolve to a category is taken as the per-category subject
-        // glob (e.g. `EVENT ADD CHANNEL #foo*`, `EVENT ADD USER *!*@x.example`).
-        // The mask scopes ALL categories named in the same request. With no mask,
-        // the affected categories reset to the wildcard `*` (match-all), so plain
-        // category-only subscriptions keep their historic deliver-everything shape.
-        var parsed_mask = event_spine.CategoryMask.empty();
-        var subject_mask: ?[]const u8 = null;
-        const tokens = params[1..];
-        for (tokens, 0..) |token, idx| {
-            if (eventCategoryFromToken(token)) |cat| {
-                parsed_mask.add(cat);
-                continue;
-            }
-            // Not a category: only valid as the single final token (the mask).
-            if (idx + 1 == tokens.len and parsed_mask.bits != 0) {
-                subject_mask = token;
-                break;
-            }
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Unknown EVENT category");
-            return;
-        }
-        if (!is_list) {
-            var mask = conn.session.event_mask;
-            mask = if (is_clear)
-                event_spine.CategoryMask.empty()
-            else if (is_change)
-                parsed_mask
-            else if (is_add)
-                mask.include(parsed_mask)
-            else
-                mask.exclude(parsed_mask);
-            conn.session.setEventMask(mask);
 
-            // Maintain the per-category subject scope alongside the bitmask.
-            //   CLEAR        → every category back to `*`.
-            //   DEL          → drop the named categories' scope back to `*`.
-            //   ADD/CHANGE   → set the named categories to the given mask, or `*`
-            //                  when none was supplied (default = match-all).
-            if (is_clear) {
-                conn.session.clearEventSubjectMasks();
-            } else {
-                inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
-                    const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
-                    if (parsed_mask.contains(c)) {
-                        if (is_del) {
-                            conn.session.clearEventSubjectMask(c);
-                        } else {
-                            conn.session.setEventSubjectMask(c, subject_mask orelse "*") catch {
-                                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "EVENT subject mask too long");
-                                return;
-                            };
-                        }
-                    }
+        if (params.len == 0 or std.ascii.eqlIgnoreCase(params[0], "LIST")) {
+            const filter: ?event_spine.IrcxEventType = if (params.len >= 2) blk: {
+                break :blk event_spine.IrcxEventType.parse(params[1]) orelse {
+                    try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
+                    return;
+                };
+            } else null;
+
+            for (event_spine.ircx_event_types) |typ| {
+                if (filter) |wanted| {
+                    if (wanted != typ) continue;
                 }
+                if (!conn.session.subscribesToIrcxEvent(typ)) continue;
+                try queueNumeric(conn, .RPL_EVENTLIST, &.{ typ.wireName(), conn.session.ircxEventSubjectMask(typ) }, "Event subscription");
             }
+            try queueNumeric(conn, .RPL_EVENTEND, &.{}, "End of event list");
+            return;
         }
-        // Render the current subscription set as `EVENT LIST <CATEGORY> [<mask>]`
-        // lines. The trailing mask is shown only when the category is scoped to
-        // something narrower than `*`, so the common all-subjects case stays clean.
-        const mask = conn.session.event_mask;
-        inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
-            const c: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
-            if (mask.contains(c)) {
-                const subj = conn.session.eventSubjectMask(c);
-                var lbuf: [default_reply_bytes]u8 = undefined;
-                const rendered = if (std.mem.eql(u8, subj, "*"))
-                    std.fmt.bufPrint(&lbuf, "EVENT LIST {s}\r\n", .{c.code()})
-                else
-                    std.fmt.bufPrint(&lbuf, "EVENT LIST {s} {s}\r\n", .{ c.code(), subj });
-                if (rendered) |line| {
-                    try appendToConn(conn, line);
-                } else |_| {}
+
+        if (std.ascii.eqlIgnoreCase(params[0], "ADD")) {
+            if (params.len < 2) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT ADD"}, "Not enough parameters");
+                return;
             }
+            const typ = event_spine.IrcxEventType.parse(params[1]) orelse {
+                try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
+                return;
+            };
+            if (conn.session.subscribesToIrcxEvent(typ)) {
+                try queueNumeric(conn, .ERR_EVENTDUP, &.{params[1]}, "Event already subscribed");
+                return;
+            }
+            const mask = if (params.len >= 3 and params[2].len != 0) params[2] else "*";
+            conn.session.setIrcxEventSubscription(typ, mask) catch {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT ADD"}, "EVENT subject mask too long");
+                return;
+            };
+            conn.session.setEventMask(conn.session.event_mask.include(typ.categoryMask()));
+            try queueNumeric(conn, .RPL_EVENTADD, &.{ params[1], conn.session.ircxEventSubjectMask(typ) }, "Event added");
+            return;
         }
-        try appendToConn(conn, "EVENT LIST :End of event list\r\n");
+
+        if (std.ascii.eqlIgnoreCase(params[0], "CHANGE")) {
+            if (params.len < 2) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT CHANGE"}, "Not enough parameters");
+                return;
+            }
+            const typ = event_spine.IrcxEventType.parse(params[1]) orelse {
+                try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
+                return;
+            };
+            if (!conn.session.subscribesToIrcxEvent(typ)) {
+                try queueNumeric(conn, .ERR_EVENTMIS, &.{params[1]}, "Not subscribed to event");
+                return;
+            }
+            const mask = if (params.len >= 3 and params[2].len != 0) params[2] else "*";
+            conn.session.setIrcxEventSubscription(typ, mask) catch {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT CHANGE"}, "EVENT subject mask too long");
+                return;
+            };
+            conn.session.setEventMask(conn.session.event_mask.include(typ.categoryMask()));
+            try queueNumeric(conn, .RPL_EVENTCHANGE, &.{ params[1], conn.session.ircxEventSubjectMask(typ) }, "Event updated");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(params[0], "DELETE")) {
+            if (params.len < 2) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT DELETE"}, "Not enough parameters");
+                return;
+            }
+            const typ = event_spine.IrcxEventType.parse(params[1]) orelse {
+                try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
+                return;
+            };
+            if (!conn.session.clearIrcxEventSubscription(typ)) {
+                try queueNumeric(conn, .ERR_EVENTMIS, &.{params[1]}, "Not subscribed to event");
+                return;
+            }
+            try queueNumeric(conn, .RPL_EVENTDELETE, &.{params[1]}, "Event removed");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(params[0], "CLEAR")) {
+            if (params.len >= 2) {
+                const typ = event_spine.IrcxEventType.parse(params[1]) orelse {
+                    try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
+                    return;
+                };
+                if (!conn.session.clearIrcxEventSubscription(typ)) {
+                    try queueNumeric(conn, .ERR_EVENTMIS, &.{params[1]}, "Not subscribed to event");
+                    return;
+                }
+                try queueNumeric(conn, .RPL_EVENTDELETE, &.{params[1]}, "Event removed");
+            } else {
+                conn.session.clearIrcxEventSubscriptions();
+                try self.noticeTo(conn, "All event subscriptions cleared");
+            }
+            return;
+        }
+
+        var notice_buf: [256]u8 = undefined;
+        const notice = std.fmt.bufPrint(&notice_buf, "Unknown EVENT subcommand '{s}'. Usage: EVENT ADD|CHANGE|DELETE|CLEAR|LIST <CHANNEL|MEMBER|USER> [mask]", .{params[0]}) catch "Unknown EVENT subcommand";
+        try self.noticeTo(conn, notice);
     }
 
     /// Stable observer key for a connection (bitcast ClientId, matching the
@@ -12256,6 +12291,64 @@ pub const LinuxServer = struct {
             .account = conn.session.account(),
             .detail = detail,
         };
+    }
+
+    fn publishChannelEvent(self: *LinuxServer, action: []const u8, channel: []const u8) !void {
+        var msg_buf: [256]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "CHANNEL {s} {s}", .{ action, channel }) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.announce, .notice, message, channel);
+    }
+
+    fn publishMemberEvent(self: *LinuxServer, action: []const u8, channel: []const u8, nick: []const u8, detail: ?[]const u8) !void {
+        var msg_buf: [512]u8 = undefined;
+        const message = if (detail) |text|
+            std.fmt.bufPrint(&msg_buf, "MEMBER {s} {s} {s} :{s}", .{ action, channel, nick, text }) catch return error.OutputTooSmall
+        else
+            std.fmt.bufPrint(&msg_buf, "MEMBER {s} {s} {s}", .{ action, channel, nick }) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.oper_action, .notice, message, channel);
+    }
+
+    fn userEventSubject(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
+        const real_host = conn.session.realHost();
+        const host = if (real_host.len == 0) default_host else real_host;
+        return std.fmt.bufPrint(storage, "{s}!{s}@{s}", .{ conn.session.displayName(), conn.session.username(), host }) catch return error.OutputTooSmall;
+    }
+
+    fn publishUserConnectEvent(self: *LinuxServer, conn: *const ConnState) !void {
+        var subject_buf: [256]u8 = undefined;
+        const subject = try userEventSubject(conn, &subject_buf);
+        var msg_buf: [320]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "USER CONNECT {s}", .{subject}) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.connect, .notice, message, subject);
+    }
+
+    fn publishUserDisconnectEvent(self: *LinuxServer, conn: *const ConnState, reason: []const u8) !void {
+        var subject_buf: [256]u8 = undefined;
+        const subject = try userEventSubject(conn, &subject_buf);
+        var msg_buf: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "USER DISCONNECT {s} :{s}", .{ subject, reason }) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.disconnect, .notice, message, subject);
+    }
+
+    fn publishUserNickEvent(self: *LinuxServer, old_prefix: []const u8, newnick: []const u8) !void {
+        var msg_buf: [384]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "USER NICK {s} -> {s}", .{ old_prefix, newnick }) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.oper_action, .notice, message, old_prefix);
+    }
+
+    fn willChannelDestroyOnPart(self: *LinuxServer, channel: []const u8) bool {
+        return self.world.memberCount(channel) == 1 and !self.world.channelHasExtFlag(channel, .registered);
+    }
+
+    fn publishChannelDestroyEventsForClient(self: *LinuxServer, id: client_model.ClientId) void {
+        const wid = worldIdFromClient(id);
+        var it = self.world.channels.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.members.contains(wid)) continue;
+            if (entry.value_ptr.members.count() != 1) continue;
+            if (entry.value_ptr.ext_modes.has(.registered)) continue;
+            self.publishChannelEvent("DESTROY", entry.key_ptr.*) catch {};
+        }
     }
 
     /// Push a live OBSERVE record to every operator whose standing filter matches
@@ -15260,6 +15353,7 @@ pub const LinuxServer = struct {
         var dbuf: [80]u8 = undefined;
         const detail = std.fmt.bufPrint(&dbuf, "<- {s}", .{old}) catch "";
         self.notifyObservers(.nick, observeSubject(conn, detail));
+        try self.publishUserNickEvent(old_prefix, newnick);
 
         // Nick protection: a newly-taken registered nick (while unauthenticated)
         // starts the grace timer; the sweep enforces a Guest rename on expiry.
@@ -18051,15 +18145,29 @@ pub const LinuxServer = struct {
     }
 
     /// Whether `session` should receive a `category` event with subject `subject`:
-    /// it must be subscribed to the category AND the event's subject must glob-match
-    /// the session's per-category subject scope. The default scope is `*`
-    /// (match-all), so a plain category-only subscription delivers every subject —
-    /// the historic, pre-scoping behavior.
+    /// an IRCX EVENT mask can add delivery for mapped CHANNEL/MEMBER/USER events,
+    /// and the native Event Spine subscription still delivers all category matches
+    /// allowed by its own subject scope.
     fn sessionWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, subject: []const u8) bool {
+        if (sessionIrcxWantsEvent(session, category, subject)) return true;
         if (!session.subscribesTo(category)) return false;
         const scope = session.eventSubjectMask(category);
         if (std.mem.eql(u8, scope, "*")) return true;
         return observe_mod.globMatch(scope, subject);
+    }
+
+    /// IRCX EVENT masks are per IRCX type (CHANNEL/MEMBER/USER), not per daemon
+    /// EventCategory. They are additive overlays: a matching IRCX type+subject
+    /// grants delivery, but a non-matching IRCX mask never subtracts native Event
+    /// Spine delivery.
+    fn sessionIrcxWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, subject: []const u8) bool {
+        for (event_spine.ircx_event_types) |typ| {
+            if (!session.subscribesToIrcxEvent(typ)) continue;
+            if (!typ.categoryMask().contains(category)) continue;
+            const scope = session.ircxEventSubjectMask(typ);
+            if (std.mem.eql(u8, scope, "*") or observe_mod.globMatch(scope, subject)) return true;
+        }
+        return false;
     }
 
     /// Render a typed Event Spine event as `NOTE EVENT <CATEGORY>` and deliver it
@@ -19815,6 +19923,7 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "TOPIC", &.{channel}, text);
         try self.broadcastChannel(channel, msg, null);
+        try self.publishChannelEvent("TOPIC", channel);
         // draft/event-playback: record the topic change in channel history so it
         // replays as a TOPIC event (`:setter TOPIC #chan :topic`) to event-playback
         // clients. The event body is the full post-command text (target + trailing).
@@ -19843,8 +19952,10 @@ pub const LinuxServer = struct {
             const mask = clientPrefix(conn, &mb) catch "";
             self.recordSeen(acct, mask, .logout);
         }
+        self.publishUserDisconnectEvent(conn, reason) catch {};
         self.recordWhowas(conn); // before removeClient: snapshot the live identity
         try self.broadcastQuit(id, conn, reason);
+        self.publishChannelDestroyEventsForClient(id);
         self.world.removeClient(worldIdFromClient(id));
         conn.closing = true;
     }
@@ -27970,7 +28081,7 @@ test "threaded server: narrowing live GRANT clears armed override" {
     try recvUntil(&t, " 481 T ", 200);
 }
 
-test "threaded server: EVENT subscription managed by opers" {
+test "threaded server: IRCX EVENT subscription numerics match Ophion" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -28005,25 +28116,52 @@ test "threaded server: EVENT subscription managed by opers" {
     try writeAllFd(fd_b, "EVENT LIST\r\n");
     try recvUntil(&b, " 481 ", 200);
 
-    // A is oper (auto-subscribed to all categories); DEL KILL removes just one.
     // OPER status reflects +o in the user mode query (RPL_UMODEIS 221).
     a.reset();
     try writeAllFd(fd_a, "MODE A\r\n");
     try recvUntil(&a, " 221 A :+o", 200);
-    try writeAllFd(fd_a, "EVENT DEL KILL\r\n");
-    try recvUntil(&a, "EVENT LIST :End of event list", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT ADD CHANNEL #foo*\r\n");
+    try recvUntil(&a, " 808 A CHANNEL #foo* :Event added", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT ADD CHANNEL #bar*\r\n");
+    try recvUntil(&a, " 821 A CHANNEL :Event already subscribed", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT ADD NO_SUCH_EVENT\r\n");
+    try recvUntil(&a, " 823 A NO_SUCH_EVENT :No such event", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT CHANGE CHANNEL #bar*\r\n");
+    try recvUntil(&a, " 825 A CHANNEL #bar* :Event updated", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT CHANGE MEMBER #members*\r\n");
+    try recvUntil(&a, " 822 A MEMBER :Not subscribed to event", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT ADD USER *!*@example\r\n");
+    try recvUntil(&a, " 808 A USER *!*@example :Event added", 200);
+
     a.reset();
     try writeAllFd(fd_a, "EVENT LIST\r\n");
-    try recvUntil(&a, "EVENT LIST :End of event list", 200);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT LIST CONNECT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "EVENT LIST KILL") == null);
+    try recvUntil(&a, " 810 A :End of event list", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 809 A CHANNEL #bar* :Event subscription") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 809 A USER *!*@example :Event subscription") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 809 A MEMBER ") == null);
 
     a.reset();
-    try writeAllFd(fd_a, "EVENT ADD NO_SUCH_CATEGORY\r\n");
-    try recvUntil(&a, " 461 A EVENT :Unknown EVENT category", 200);
+    try writeAllFd(fd_a, "EVENT DELETE CHANNEL\r\n");
+    try recvUntil(&a, " 824 A CHANNEL :Event removed", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "EVENT DELETE CHANNEL\r\n");
+    try recvUntil(&a, " 822 A CHANNEL :Not subscribed to event", 200);
 }
 
-test "threaded server: EVENT LIST shows per-category subject mask" {
+test "threaded server: EVENT LIST shows IRCX per-type subject mask" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -28047,31 +28185,29 @@ test "threaded server: EVENT LIST shows per-category subject mask" {
     try writeAllFd(fd, "IRCX\r\n");
     try recvUntil(&c, " 800 A 1 0 ", 200);
 
-    // Scope the CHANNEL category (alias for ANNOUNCE) to `#foo*`. The trailing
-    // mask token is stored as that category's subject glob.
     c.reset();
     try writeAllFd(fd, "EVENT ADD CHANNEL #foo*\r\n");
-    try recvUntil(&c, "EVENT LIST :End of event list", 200);
-    // LIST renders the scoped category with its mask appended.
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST ANNOUNCE #foo*") != null);
-    // An unscoped category still renders WITHOUT a trailing mask (default `*`).
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST KILL\r\n") != null);
+    try recvUntil(&c, " 808 A CHANNEL #foo* :Event added", 200);
 
-    // Re-scoping the same category with no mask resets it back to `*` (no mask
-    // shown in LIST anymore).
     c.reset();
-    try writeAllFd(fd, "EVENT ADD CHANNEL\r\n");
-    try recvUntil(&c, "EVENT LIST :End of event list", 200);
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST ANNOUNCE\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, c.written(), "EVENT LIST ANNOUNCE #foo*") == null);
+    try writeAllFd(fd, "EVENT LIST CHANNEL\r\n");
+    try recvUntil(&c, " 810 A :End of event list", 200);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), " 809 A CHANNEL #foo* :Event subscription") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), " 809 A USER ") == null);
+
+    c.reset();
+    try writeAllFd(fd, "EVENT CHANGE CHANNEL\r\n");
+    try recvUntil(&c, " 825 A CHANNEL * :Event updated", 200);
+
+    c.reset();
+    try writeAllFd(fd, "EVENT LIST CHANNEL\r\n");
+    try recvUntil(&c, " 809 A CHANNEL * :Event subscription", 200);
 }
 
-test "threaded server: EVENT CHANNEL subject mask filters announce delivery" {
-    // Two opers subscribed to the ANNOUNCE/CHANNEL category: A scopes it to a
-    // `#foobar`-bearing subject glob, B leaves it unscoped (default `*`). A third
-    // oper broadcasts two announces whose subjects (the broadcast text) carry
-    // `#foobar` and `#bar` respectively. A must receive only the `#foobar` one;
-    // B must receive both (the default `*` preserves deliver-everything behavior).
+test "threaded server: IRCX EVENT CHANNEL mask is additive over oper announce feed" {
+    // Opers are subscribed to all Event Spine categories on elevation. Adding an
+    // IRCX CHANNEL mask must only add matching IRCX delivery; it must never take
+    // over and subtract the existing ANNOUNCE feed when the IRCX mask misses.
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -28112,39 +28248,24 @@ test "threaded server: EVENT CHANNEL subject mask filters announce delivery" {
     try recvUntil(&b, " 800 B ", 300);
     try recvUntil(&s, " 800 S ", 300);
 
-    // A scopes ANNOUNCE to subjects containing `#foobar`; B stays at default `*`.
-    try writeAllFd(fd_a, "EVENT ADD CHANNEL *#foobar*\r\n");
-    try recvUntil(&a, "EVENT LIST :End of event list", 300);
+    // A scopes IRCX CHANNEL to `#foo*`.
+    try writeAllFd(fd_a, "EVENT ADD CHANNEL #foo*\r\n");
+    try recvUntil(&a, " 808 A CHANNEL #foo* :Event added", 300);
 
-    // S broadcasts a `#foobar` announce: A (scoped match) and B (unscoped) both get it.
-    a.reset();
-    b.reset();
-    try writeAllFd(fd_s, "EVENT BROADCAST :join #foobar now\r\n");
-    try recvUntil(&a, "NOTE EVENT ANNOUNCE", 500);
-    try recvUntil(&a, "#foobar", 500);
-    try recvUntil(&b, "#foobar", 500);
-
-    // S broadcasts a `#bar`-only announce: B (unscoped) gets it, A (scoped to
-    // `#foobar`) must NOT. B's receipt is the delivery fence — both announces are
-    // published by the same reactor-thread iteration over the client table, so
-    // once B's bytes are readable A's filtering decision has already been made.
+    // A still receives a non-#foo announce because the native oper ANNOUNCE
+    // subscription remains in force.
     a.reset();
     b.reset();
     try writeAllFd(fd_s, "EVENT BROADCAST :join #bar only\r\n");
+    try recvUntil(&a, "NOTE EVENT ANNOUNCE", 500);
+    try recvUntil(&a, "#bar only", 500);
     try recvUntil(&b, "#bar only", 500);
-    // Drain anything queued for A; it must not have received the filtered announce.
-    waitMillis(60);
-    try a.readAvailable();
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "#bar only") == null);
 }
 
-test "threaded server: EVENT hostmask subject mask filters; no-mask receives all" {
-    // (b) hostmask-shaped subject filtering + (c) a no-mask subscriber still gets
-    // every subject. A scopes the announce category to a `*!*@x.example` hostmask
-    // glob; B leaves it unscoped. The broadcaster S emits two announces carrying a
-    // matching and a non-matching hostmask-shaped subject. A receives only the
-    // match; B receives both. (The CHANNEL/ANNOUNCE category is the wire-triggered
-    // one; the USER alias + mask storage is covered by the LIST + session tests.)
+test "threaded server: IRCX EVENT hostmask mask is additive over oper announce feed" {
+    // Hostmask-shaped IRCX masks use the same additive overlay: a matching subject
+    // grants delivery, and a non-matching subject does not suppress the native
+    // oper ANNOUNCE subscription.
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -28185,9 +28306,9 @@ test "threaded server: EVENT hostmask subject mask filters; no-mask receives all
     try recvUntil(&b, " 800 B ", 300);
     try recvUntil(&s, " 800 S ", 300);
 
-    // A scopes the announce category to a hostmask glob; B leaves it default `*`.
-    try writeAllFd(fd_a, "EVENT CHANGE CHANNEL *!*@x.example*\r\n");
-    try recvUntil(&a, "EVENT LIST :End of event list", 300);
+    // A scopes IRCX CHANNEL to a hostmask glob; B leaves it default `*`.
+    try writeAllFd(fd_a, "EVENT ADD CHANNEL *!*@x.example*\r\n");
+    try recvUntil(&a, " 808 A CHANNEL *!*@x.example* :Event added", 300);
 
     // S broadcasts a subject bearing a matching hostmask: A and B both receive it.
     a.reset();
@@ -28196,14 +28317,127 @@ test "threaded server: EVENT hostmask subject mask filters; no-mask receives all
     try recvUntil(&a, "x.example logged in", 500);
     try recvUntil(&b, "x.example logged in", 500);
 
-    // S broadcasts a non-matching hostmask: only B (unscoped) receives it.
+    // S broadcasts a non-matching hostmask: A still receives it through the
+    // native oper ANNOUNCE subscription.
     a.reset();
     b.reset();
     try writeAllFd(fd_s, "EVENT BROADCAST :eve!~e@evil.test logged in\r\n");
+    try recvUntil(&a, "evil.test logged in", 500);
     try recvUntil(&b, "evil.test logged in", 500);
-    waitMillis(60);
-    try a.readAvailable();
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "evil.test logged in") == null);
+}
+
+test "threaded server: IRCX EVENT CHANNEL receives real channel event" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 300);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A ", 300);
+    try writeAllFd(fd_a, "EVENT ADD CHANNEL #evchan*\r\n");
+    try recvUntil(&a, " 808 A CHANNEL #evchan* :Event added", 300);
+
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 300);
+
+    a.reset();
+    try writeAllFd(fd_b, "JOIN #evchan\r\n");
+    try recvUntil(&b, " 366 B #evchan ", 300);
+    try recvUntil(&a, "NOTE EVENT ANNOUNCE :CHANNEL CREATE #evchan", 500);
+}
+
+test "threaded server: IRCX EVENT MEMBER receives real membership event" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 300);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A ", 300);
+    try writeAllFd(fd_a, "EVENT ADD MEMBER #evmember*\r\n");
+    try recvUntil(&a, " 808 A MEMBER #evmember* :Event added", 300);
+
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 300);
+
+    a.reset();
+    try writeAllFd(fd_b, "JOIN #evmember\r\n");
+    try recvUntil(&b, " 366 B #evmember ", 300);
+    try recvUntil(&a, "NOTE EVENT OPER_ACTION :MEMBER JOIN #evmember B", 500);
+}
+
+test "threaded server: IRCX EVENT USER receives real user lifecycle event" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 300);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A ", 300);
+    try writeAllFd(fd_a, "EVENT ADD USER B!*@localhost\r\n");
+    try recvUntil(&a, " 808 A USER B!*@localhost :Event added", 300);
+
+    a.reset();
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 300);
+    try recvUntil(&a, "NOTE EVENT CONNECT :USER CONNECT B!bob@localhost", 500);
 }
 
 test "threaded server: oper EVENT notes carry @event-* tags with message-tags cap" {

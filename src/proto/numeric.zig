@@ -228,6 +228,15 @@ pub const Numeric = enum(u16) {
     RPL_TARGNOTIFY = 717,
     RPL_UMODEGMSG = 718,
 
+    RPL_EVENTADD = 808,
+    RPL_EVENTLIST = 809,
+    RPL_EVENTEND = 810,
+    ERR_EVENTDUP = 821,
+    ERR_EVENTMIS = 822,
+    ERR_NOSUCHEVENT = 823,
+    RPL_EVENTDELETE = 824,
+    RPL_EVENTCHANGE = 825,
+
     RPL_LOGGEDIN = 900,
     RPL_LOGGEDOUT = 901,
     ERR_NICKLOCKED = 902,
@@ -328,4 +337,7 @@ test "selected canonical codes are exact" {
     try std.testing.expectEqual(@as(u16, 1), code(.RPL_WELCOME));
     try std.testing.expectEqual(@as(u16, 366), code(.RPL_ENDOFNAMES));
     try std.testing.expectEqual(@as(u16, 401), code(.ERR_NOSUCHNICK));
+    try std.testing.expectEqual(@as(u16, 808), code(.RPL_EVENTADD));
+    try std.testing.expectEqual(@as(u16, 823), code(.ERR_NOSUCHEVENT));
+    try std.testing.expectEqual(@as(u16, 825), code(.RPL_EVENTCHANGE));
 }

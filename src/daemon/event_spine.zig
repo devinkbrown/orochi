@@ -117,6 +117,76 @@ pub const CategoryMask = struct {
     }
 };
 
+pub const IRCX_EVENT_TYPE_COUNT: usize = @typeInfo(IrcxEventType).@"enum".fields.len;
+
+/// IRCX EVENT subscription types supported by Ophion's client-facing command.
+/// These are intentionally distinct from Orochi's EventCategory taxonomy:
+/// command replies/listing use the IRCX names, while delivery maps each type to
+/// the closest existing Event Spine categories.
+pub const IrcxEventType = enum(u3) {
+    channel,
+    member,
+    user,
+
+    pub fn wireName(self: IrcxEventType) []const u8 {
+        return switch (self) {
+            .channel => "CHANNEL",
+            .member => "MEMBER",
+            .user => "USER",
+        };
+    }
+
+    pub fn parse(raw: []const u8) ?IrcxEventType {
+        inline for (@typeInfo(IrcxEventType).@"enum".fields) |field| {
+            const typ: IrcxEventType = @enumFromInt(field.value);
+            if (std.ascii.eqlIgnoreCase(raw, typ.wireName())) return typ;
+        }
+        return null;
+    }
+
+    pub fn bit(self: IrcxEventType) u8 {
+        return @as(u8, 1) << @intCast(@intFromEnum(self));
+    }
+
+    pub fn categoryMask(self: IrcxEventType) CategoryMask {
+        return switch (self) {
+            // Channel lifecycle/state notices are published through ANNOUNCE.
+            .channel => CategoryMask.only(.announce),
+            // Membership notices share OPER_ACTION.
+            .member => CategoryMask.only(.oper_action),
+            // User lifecycle/administrative events use the existing typed
+            // categories.
+            .user => CategoryMask.fromCategories(&.{ .connect, .disconnect, .kill, .service, .oper_action }),
+        };
+    }
+};
+
+pub const ircx_event_types = [_]IrcxEventType{ .channel, .member, .user };
+
+pub const IrcxEventMask = struct {
+    bits: u8 = 0,
+
+    pub fn empty() IrcxEventMask {
+        return .{};
+    }
+
+    pub fn add(self: *IrcxEventMask, typ: IrcxEventType) void {
+        self.bits |= typ.bit();
+    }
+
+    pub fn remove(self: *IrcxEventMask, typ: IrcxEventType) void {
+        self.bits &= ~typ.bit();
+    }
+
+    pub fn contains(self: IrcxEventMask, typ: IrcxEventType) bool {
+        return (self.bits & typ.bit()) != 0;
+    }
+
+    pub fn isEmpty(self: IrcxEventMask) bool {
+        return self.bits == 0;
+    }
+};
+
 /// Borrowed event payload. `timestamp_ms` is supplied by the caller.
 pub const Event = struct {
     category: EventCategory,
@@ -419,6 +489,31 @@ test "category masks add remove and combine categories" {
     try std.testing.expect(combined.contains(.flood));
     try std.testing.expect(combined.contains(.debug));
     try std.testing.expect(combined.contains(.@"error"));
+}
+
+test "IRCX event types parse and map to delivery categories" {
+    try std.testing.expectEqual(IrcxEventType.channel, IrcxEventType.parse("CHANNEL").?);
+    try std.testing.expectEqual(IrcxEventType.member, IrcxEventType.parse("member").?);
+    try std.testing.expectEqual(IrcxEventType.user, IrcxEventType.parse("User").?);
+    try std.testing.expectEqual(@as(?IrcxEventType, null), IrcxEventType.parse("SERVER"));
+
+    try std.testing.expect(IrcxEventType.channel.categoryMask().contains(.announce));
+    try std.testing.expect(IrcxEventType.member.categoryMask().contains(.oper_action));
+    try std.testing.expect(IrcxEventType.user.categoryMask().contains(.connect));
+    try std.testing.expect(IrcxEventType.user.categoryMask().contains(.kill));
+}
+
+test "IRCX event mask tracks distinct subscription bits" {
+    var mask = IrcxEventMask.empty();
+    try std.testing.expect(mask.isEmpty());
+    mask.add(.channel);
+    mask.add(.user);
+    try std.testing.expect(mask.contains(.channel));
+    try std.testing.expect(!mask.contains(.member));
+    try std.testing.expect(mask.contains(.user));
+    mask.remove(.channel);
+    try std.testing.expect(!mask.contains(.channel));
+    try std.testing.expect(!mask.isEmpty());
 }
 
 test "multi-subscriber fan-out preserves subscription order" {

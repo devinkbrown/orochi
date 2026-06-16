@@ -425,8 +425,16 @@ pub const numeric_replies = [_]NumericReply{
     .{ .code = 803, .name = "RPL_ACCESSSTART", .text = "ACCESS list begins" },
     .{ .code = 804, .name = "RPL_ACCESSENTRY", .text = "ACCESS list entry" },
     .{ .code = 805, .name = "RPL_ACCESSEND", .text = "ACCESS list ends" },
+    .{ .code = 808, .name = "RPL_EVENTADD", .text = "Event added" },
+    .{ .code = 809, .name = "RPL_EVENTLIST", .text = "Event subscription" },
+    .{ .code = 810, .name = "RPL_EVENTEND", .text = "Event list ends" },
     .{ .code = 818, .name = "RPL_PROPLIST", .text = "PROP list entry" },
     .{ .code = 819, .name = "RPL_PROPEND", .text = "PROP list ends" },
+    .{ .code = 821, .name = "ERR_EVENTDUP", .text = "Event already subscribed" },
+    .{ .code = 822, .name = "ERR_EVENTMIS", .text = "Not subscribed to event" },
+    .{ .code = 823, .name = "ERR_NOSUCHEVENT", .text = "No such event" },
+    .{ .code = 824, .name = "RPL_EVENTDELETE", .text = "Event removed" },
+    .{ .code = 825, .name = "RPL_EVENTCHANGE", .text = "Event updated" },
     .{ .code = 915, .name = "ERR_ACCESS_MISSING", .text = "ACCESS entry missing" },
     .{ .code = 916, .name = "ERR_ACCESS_TOOMANY", .text = "Too many ACCESS entries" },
     .{ .code = 917, .name = "ERR_PROP_TOOMANY", .text = "Too many properties" },
@@ -662,4 +670,15 @@ test "IRCX enable parse" {
 
     try std.testing.expectEqual(IrcxCommand.isircx, try parseIrcxCommand("ISIRCX"));
     try std.testing.expectError(error.UnknownIrcxCommand, parseIrcxCommand("PING token"));
+}
+
+test "IRCX numeric metadata includes Ophion EVENT numerics" {
+    try std.testing.expectEqualStrings("RPL_EVENTADD", numericByCode(808).?.name);
+    try std.testing.expectEqualStrings("RPL_EVENTLIST", numericByCode(809).?.name);
+    try std.testing.expectEqualStrings("RPL_EVENTEND", numericByCode(810).?.name);
+    try std.testing.expectEqualStrings("ERR_EVENTDUP", numericByCode(821).?.name);
+    try std.testing.expectEqualStrings("ERR_EVENTMIS", numericByCode(822).?.name);
+    try std.testing.expectEqualStrings("ERR_NOSUCHEVENT", numericByCode(823).?.name);
+    try std.testing.expectEqualStrings("RPL_EVENTDELETE", numericByCode(824).?.name);
+    try std.testing.expectEqualStrings("RPL_EVENTCHANGE", numericByCode(825).?.name);
 }
