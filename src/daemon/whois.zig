@@ -184,8 +184,14 @@ pub fn writeWhoisWith(
 
     try writeWhoisUserLine(params, sink, server_name, requester_nick, subject);
     try writeWhoisServerLine(params, sink, server_name, requester_nick, subject.nick, subject_server, subject_server_info);
+    // A middle param cannot begin with ':' (it would parse as the trailing arg).
+    // A full IPv6 literal is a valid host param, but a compressed form like
+    // `::1` starts with ':' — skip the RPL_WHOISACTUALLY line in that rare case
+    // rather than emit a malformed param; the rest of the WHOIS still renders.
     if (subject.actual_host) |host| {
-        try writeWhoisActuallyLine(params, sink, server_name, requester_nick, subject.nick, host);
+        if (host.len != 0 and host[0] != ':') {
+            try writeWhoisActuallyLine(params, sink, server_name, requester_nick, subject.nick, host);
+        }
     }
     try writeWhoisIdleLine(params, sink, server_name, requester_nick, subject);
     try writeWhoisChannelLines(params, sink, server_name, requester_nick, subject.nick, subject.channels);
@@ -259,7 +265,7 @@ pub fn validateSubjectWith(comptime params: Params, subject: WhoisSubject) Whois
     if (subject.away) |away_message| try validateAwayMessageWith(params, away_message);
     if (subject.certfp) |fp| try validateRenderedTrailingText(fp, error.InvalidRealname);
     if (subject.secure_cipher) |cipher| try validateRenderedTrailingText(cipher, error.InvalidRealname);
-    if (subject.actual_host) |host| try validateRenderedParam(host, error.InvalidHost);
+    if (subject.actual_host) |host| try validateRenderedHost(host, error.InvalidHost);
     if (subject.geo) |geo_text| try validateRenderedTrailingText(geo_text, error.InvalidRealname);
     for (subject.channels) |membership| {
         try validateChannelMembershipWith(params, membership);
@@ -702,6 +708,16 @@ fn validateRenderedParam(value: []const u8, err: WhoisError) WhoisError!void {
     }
 }
 
+/// Validate a host/IP-shaped param value (RPL_WHOISACTUALLY): like a param but
+/// `:` is allowed, since a real address is frequently an IPv6 literal full of
+/// colons. (`validParamByte` rejects `:` outright, which previously made an
+/// IPv6 `actual_host` fail validation and silently drop the ENTIRE WHOIS reply.)
+fn validateRenderedHost(value: []const u8, err: WhoisError) WhoisError!void {
+    for (value) |ch| {
+        if (!validHostByte(ch)) return err;
+    }
+}
+
 fn validTrailingByte(ch: u8) bool {
     return ch >= 0x20 and ch != 0x7f;
 }
@@ -927,6 +943,46 @@ test "actual_host emits RPL_WHOISACTUALLY 338 after the server line" {
     }
     try std.testing.expect(idx_338 != null);
     try std.testing.expect(idx_338.? == idx_312 + 1); // immediately after the server line
+}
+
+test "IPv6 actual_host renders (does not suppress the whole WHOIS)" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.actual_host = "2607:fb91:abcd:1234::1"; // colons must NOT fail validation
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    const lines = sink.slice();
+    var has_338 = false;
+    var has_318 = false;
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 338 dan alice 2607:fb91:abcd:1234::1 ") != null) has_338 = true;
+        if (std.mem.indexOf(u8, line.bytes, " 318 ") != null) has_318 = true;
+    }
+    try std.testing.expect(has_338); // the IPv6 host is shown
+    try std.testing.expect(has_318); // and the reply completes (End of WHOIS)
+}
+
+test "leading-colon actual_host is skipped but the WHOIS still completes" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.actual_host = "::1"; // a leading ':' would misparse as a trailing arg
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    const lines = sink.slice();
+    var has_338 = false;
+    var has_318 = false;
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 338 ") != null) has_338 = true;
+        if (std.mem.indexOf(u8, line.bytes, " 318 ") != null) has_318 = true;
+    }
+    try std.testing.expect(!has_338); // skipped (no malformed param)
+    try std.testing.expect(has_318); // but the reply still completes
 }
 
 test "ERR_NOSUCHNICK builder emits 401" {

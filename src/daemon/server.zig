@@ -9356,7 +9356,9 @@ pub const LinuxServer = struct {
         }
 
         const subject = whois.WhoisSubject{
-            .nick = target_nick,
+            // Show the target's nick in the exact case they registered, not the
+            // case the requester happened to type in the WHOIS command.
+            .nick = tconn.session.displayName(),
             .user = tconn.session.username(),
             .host = hostOf(tconn),
             .realname = tconn.session.realname(),
@@ -27633,6 +27635,44 @@ test "threaded server: oper SASL login auto-enables IRCX" {
     // without ever having sent IRCX.
     try writeAllFd(fd_a, "ISIRCX\r\n");
     try recvUntil(&a, " 800 A 1 0 ", 200);
+}
+
+test "threaded server: WHOIS shows the target's registered case + nick re-case allowed" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    // A registers as "Kain" (capital K).
+    try writeAllFd(fd_a, "NICK Kain\r\nUSER kain 0 * :Kain\r\n");
+    try recvUntil(&a, " 001 Kain ", 200);
+    try writeAllFd(fd_b, "NICK bob\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 bob ", 200);
+    // B whois-es "kain" (lowercase) — the reply must show the registered case "Kain".
+    b.reset();
+    try writeAllFd(fd_b, "WHOIS kain\r\n");
+    try recvUntil(&b, " 311 bob Kain ", 200); // canonical case, not the typed "kain"
+    try recvUntil(&b, " 318 bob Kain ", 200);
+    // A re-cases its own nick Kain -> kain: allowed (no 433), broadcast with old prefix.
+    a.reset();
+    try writeAllFd(fd_a, "NICK kain\r\n");
+    try recvUntil(&a, ":Kain!", 200);
+    try recvUntil(&a, "NICK :kain", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 433 ") == null);
 }
 
 test "threaded server: PROP user profile extended keys round-trip and enforce access" {
