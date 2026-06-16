@@ -120,10 +120,11 @@ the Ophion CAP names:
   | `account` | user | public | account binding |
   | `user_profile` | user | public (`display/real/title/location/note`) | `m_ircx_prop_user_profile` (subset) |
 
-  Residual gap (do not claim full parity): the Orochi `user_profile` provider
-  exposes only `display/real/title/location/note`. Ophion's individual profile keys
-  (`URL`, `GENDER`, `PICTURE`, `BIO`, `EMAIL`) and its read-only GeoIP keys
-  (`COUNTRY`, `REGION`, `CITY`, `ASN`, `ASORG`) are not exposed as PROP keys yet.
+  GeoIP keys (implemented): `COUNTRY`, `REGION`, `CITY`, `ASN`, `ASORG` are now
+  exposed as read-only user PROP providers (`ircx_prop_providers.zig`), gated
+  self-or-oper to match the WHOIS geo policy so a cloaked user's IP-geolocation is
+  not world-readable. Remaining residual: Ophion's individual profile keys (`URL`,
+  `GENDER`, `PICTURE`, `BIO`, `EMAIL`) beyond `display/real/title/location/note`.
 - **IRCX oper extras — command-by-command mapping.** Orochi has native oper
   moderation commands and privilege gates under English names. Mapping Ophion's
   IRCX oper extras:
@@ -145,10 +146,15 @@ the Ophion CAP names:
   module port. It does not expose Ophion's `MEDIAFRAME`, `LADONADMIN`,
   `ophion/ladon-media` CAP value, or LADON media property/mode vocabulary as a
   compatibility layer.
-- **Runtime SFU room sizing remains comptime-bound.** `max_participants` is still
-  64 in the media room/session template. A config-driven participant cap is open.
-- **Runtime Kagura reassembly sizing remains comptime-bound.** Defaults exist,
-  but the actual reassembly buffer capacity is still a compile-time parameter.
+- **SFU room sizing (config-driven runtime cap implemented).** `[media].max_participants`
+  (default 64, range 1..256) is enforced at room join; the per-room (heap-allocated)
+  inline roster ceiling is 256, native call leg 64. The roster stays inline/comptime
+  by design (allocation-free hot path) — true unbounded runtime sizing would need a
+  heap-roster redesign and is deliberately not done.
+- **Kagura reorder window (config-driven implemented).** `[media].reorder_window_frames`
+  (default 64, range 1..64) sets the runtime reassembly window, clamped to the
+  comptime `window_cap`. The ring `window_cap`/`max_payload` ceilings stay comptime
+  by design.
 - **Native-media MAC end-to-end needs the client change.** The server side is
   implemented (see fixed items + `docs/reference/native-media-mac.md`); full
   coverage still needs the matching Nexus/Ocean client to compute the tag.
