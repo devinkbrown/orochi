@@ -911,7 +911,11 @@ pub const ClientSession = struct {
         // Network administrators carry the server-managed +a umode automatically:
         // the server_admin privilege is what `isAdmin()` keys on, so the visible
         // mode tracks it (set on elevation, cleared on logout below).
-        if (privileges.has(.server_admin)) self.umodes.add(.admin);
+        if (privileges.has(.server_admin)) {
+            self.umodes.add(.admin);
+        } else {
+            self.umodes.remove(.admin);
+        }
     }
 
     /// Drop operator status. Because oper is SASL-account-derived, ending the
@@ -925,6 +929,7 @@ pub const ClientSession = struct {
         self.event_mask = .{};
         self.clearEventSubjectMasks();
         self.umodes.remove(.admin);
+        self.umodes.remove(.override);
     }
 
     /// Whether the client is quarantined (Warden quarantine / SHUN): connected

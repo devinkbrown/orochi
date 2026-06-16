@@ -41,6 +41,7 @@ pub const help_topics = [_]HelpTopic{
             "MODE <target> [modes] [mode parameters]",
             "Changes or displays user and channel modes.",
             "Channel modes such as +o, +v, +b, +k, and +l may require parameters.",
+            "Operator user mode +j (override) enables audited channel override and SYSTEM kill attribution.",
         },
     },
     .{

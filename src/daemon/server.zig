@@ -7675,11 +7675,14 @@ pub const LinuxServer = struct {
         precomputed_mask: ?[]const u8,
         quiet: bool,
     ) !bool {
-        if (conn.session.isOper()) return false;
         if (self.chan_akick.count(channel) == 0) return false;
         var mask_buf: [256]u8 = undefined;
         const mask = precomputed_mask orelse (clientPrefix(conn, &mask_buf) catch return false);
         if (self.chan_akick.matchOnJoin(channel, mask, conn.session.account(), self.nowMs())) |ak| {
+            if (conn.session.isOper()) {
+                if (overrideActive(conn)) self.auditOverrideUse(conn, "JOIN", channel, "matched channel AKICK");
+                return false;
+            }
             if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, ak.reason);
             return true;
         }
@@ -7730,6 +7733,7 @@ pub const LinuxServer = struct {
     ) !bool {
         const wid = worldIdFromClient(id);
         const invited = self.world.hasInvite(channel, wid);
+        const active_override = overrideActive(conn);
 
         // Warden quarantine (network silence / SHUN): a restricted client may not
         // join any channel. Opers are never restricted.
@@ -7752,15 +7756,23 @@ pub const LinuxServer = struct {
             return true;
         }
         if (self.world.channelHasFlag(channel, .admin_only) and !conn.session.isAdmin()) {
-            if (!quiet) try queueNumeric(conn, .ERR_OPERONLYCHAN, &.{channel}, "Cannot join channel (+A) - server administrator required");
-            return true;
+            if (active_override) {
+                self.auditOverrideUse(conn, "JOIN", channel, "bypassed +A admin-only");
+            } else {
+                if (!quiet) try queueNumeric(conn, .ERR_OPERONLYCHAN, &.{channel}, "Cannot join channel (+A) - server administrator required");
+                return true;
+            }
         }
 
         // +a AUTHONLY (IRCX): only authenticated accounts may join, regardless of
         // invite. Enforced before all other gates.
         if (self.world.channelHasExtFlag(channel, .authonly) and conn.session.account() == null) {
-            if (!quiet) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{channel}, "Cannot join channel (+a) - you must be authenticated");
-            return true;
+            if (active_override) {
+                self.auditOverrideUse(conn, "JOIN", channel, "bypassed +a authonly");
+            } else {
+                if (!quiet) try queueNumeric(conn, .ERR_NEEDREGGEDNICK, &.{channel}, "Cannot join channel (+a) - you must be authenticated");
+                return true;
+            }
         }
 
         // Channel RESV: a services-reserved channel name refuses entry for
@@ -7769,6 +7781,10 @@ pub const LinuxServer = struct {
             if (self.chan_resv.match(channel, self.nowMs())) |resv| {
                 if (!quiet) try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{channel}, resv.reason);
                 return true;
+            }
+        } else if (active_override) {
+            if (self.chan_resv.match(channel, self.nowMs()) != null) {
+                self.auditOverrideUse(conn, "JOIN", channel, "bypassed channel RESV");
             }
         }
 
@@ -7788,25 +7804,41 @@ pub const LinuxServer = struct {
         const access_override = if (access_entry) |entry| accessEntryAllowsJoin(entry) else false;
         if (access_entry) |entry| {
             if (entry.level == .deny) {
-                if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (ACCESS DENY)");
-                return true;
+                if (active_override) {
+                    self.auditOverrideUse(conn, "JOIN", channel, "bypassed ACCESS DENY");
+                } else {
+                    if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (ACCESS DENY)");
+                    return true;
+                }
             }
         }
         // +b ban (isBannedCtx honors +e exceptions and extended bans) blocks the
         // join even when the user holds a pending invite.
         if (!access_override and self.world.isBannedCtx(channel, ban_ctx)) {
-            if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
-            return true;
+            if (active_override) {
+                self.auditOverrideUse(conn, "JOIN", channel, "bypassed +b ban");
+            } else {
+                if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+b)");
+                return true;
+            }
         }
         // +i blocks unless the user holds an invite OR matches a +I invex mask.
         if (!access_override and !invited and self.world.channelHasFlag(channel, .invite_only) and !self.world.isInvexedCtx(channel, ban_ctx)) {
-            if (!quiet) try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
-            return true;
+            if (active_override) {
+                self.auditOverrideUse(conn, "JOIN", channel, "bypassed +i invite-only");
+            } else {
+                if (!quiet) try queueNumeric(conn, .ERR_INVITEONLYCHAN, &.{channel}, "Cannot join channel (+i)");
+                return true;
+            }
         }
         if (self.world.channelKey(channel)) |key| {
             if (!access_override and (supplied_key == null or !std.mem.eql(u8, supplied_key.?, key))) {
-                if (!quiet) try queueNumeric(conn, .ERR_BADCHANNELKEY, &.{channel}, "Cannot join channel (+k)");
-                return true;
+                if (active_override) {
+                    self.auditOverrideUse(conn, "JOIN", channel, "bypassed +k key");
+                } else {
+                    if (!quiet) try queueNumeric(conn, .ERR_BADCHANNELKEY, &.{channel}, "Cannot join channel (+k)");
+                    return true;
+                }
             }
         }
         // NOTE: +l (full) is handled separately in joinOne so it can fall back to
@@ -7906,6 +7938,7 @@ pub const LinuxServer = struct {
         var clone_buf: [160]u8 = undefined;
         var fwd_buf: [80]u8 = undefined;
         var join_target = channel;
+        const active_override = overrideActive(conn);
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
             const invited = self.world.hasInvite(channel, wid);
             // +f forward: when refused, redirect to the forward target (one hop).
@@ -7934,7 +7967,9 @@ pub const LinuxServer = struct {
             // otherwise it is a hard 471.
             const access_override = if (self.ircxAccessJoinEntry(channel, conn)) |entry| accessEntryAllowsJoin(entry) else false;
             if (!access_override and !invited and self.isChannelFull(channel)) {
-                if (self.world.channelHasExtFlag(channel, .cloneable)) {
+                if (active_override) {
+                    self.auditOverrideUse(conn, "JOIN", channel, "bypassed +l limit");
+                } else if (self.world.channelHasExtFlag(channel, .cloneable)) {
                     join_target = (try self.resolveCloneTarget(channel, &clone_buf)) orelse {
                         try queueNumeric(conn, .ERR_CHANNELISFULL, &.{channel}, "Cannot join channel (+l)");
                         return;
@@ -8292,14 +8327,18 @@ pub const LinuxServer = struct {
             return;
         }
 
-        const setter = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
+        const active_override = overrideActive(conn);
+        const setter_opt = self.world.memberModes(channel, worldIdFromClient(id));
+        if (setter_opt == null and !active_override) {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
             return;
-        };
-        if (!setter.isOperator() and !conn.session.hasPriv(.oper_override)) {
+        }
+        const setter = setter_opt orelse world_model.MemberModes.empty();
+        if (!setter.isOperator() and !active_override) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
+        var override_mode_bypass = active_override and !setter.isOperator();
 
         const mode_str = parsed.paramSlice()[1];
 
@@ -8369,9 +8408,13 @@ pub const LinuxServer = struct {
                     // rank is <= their own highest rank. So op manages op/voice,
                     // owner manages owner/op/voice, founder manages all — and an
                     // owner can NEVER strip a founder, nor an op an owner.
-                    if (setter.rank() < chanmode.rankOfMode(mode) and !conn.session.hasPriv(.oper_override)) {
-                        try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Insufficient channel privilege for that mode");
-                        continue;
+                    if (setter.rank() < chanmode.rankOfMode(mode)) {
+                        if (active_override) {
+                            override_mode_bypass = true;
+                        } else {
+                            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Insufficient channel privilege for that mode");
+                            continue;
+                        }
                     }
                     const target = self.world.findNick(target_nick) orelse {
                         try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
@@ -8381,11 +8424,13 @@ pub const LinuxServer = struct {
                     // member ranked above you (an owner can't strip a founder, an
                     // op can't strip an owner, …). Acting on yourself is always
                     // allowed (e.g. dropping your own status). Server opers bypass.
-                    if (!conn.session.isOper() and !target.eql(worldIdFromClient(id))) {
+                    if (!target.eql(worldIdFromClient(id))) {
                         const target_rank = (self.world.memberModes(channel, target) orelse world_model.MemberModes.empty()).rank();
-                        if (setter.rank() < target_rank) {
+                        if (!conn.session.isOper() and setter.rank() < target_rank) {
                             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Cannot change the modes of a higher-ranked member");
                             continue;
+                        } else if (active_override and setter.rank() < target_rank) {
+                            override_mode_bypass = true;
                         }
                     }
                     const changed = self.world.setMemberMode(channel, target, mode, adding) catch {
@@ -8644,6 +8689,7 @@ pub const LinuxServer = struct {
         if (channel_flags_changed) self.announceChannelModeFlags(channel, self.channelModeFlagBits(channel));
         if (channel_state_changed) self.announceChannelModeState(channel);
         if (applied.written().len == 0) return;
+        if (override_mode_bypass) self.auditOverrideUse(conn, "MODE", channel, "changed channel modes without normal channel authority");
 
         var prefix_buf: [256]u8 = undefined;
         var line_buf: [default_reply_bytes]u8 = undefined;
@@ -8696,12 +8742,21 @@ pub const LinuxServer = struct {
                 else => {
                     // Catalog-driven: apply any client-writable user mode (i, B, D,
                     // g, C, R, p, …). Server-managed modes (r/z/x) and unknown
-                    // letters are silently ignored.
+                    // letters are silently ignored. +j override is client-toggled
+                    // but privilege-gated because it grants audited operator power.
                     const mode = usermode.modeFromLetter(ch) orelse continue;
                     const spec = usermode.specFor(mode) orelse continue;
                     if (spec.policy != .client_writable) continue;
+                    if (mode == .override and adding and !conn.session.hasPriv(.oper_override)) {
+                        try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied: requires the 'oper_override' operator privilege");
+                        continue;
+                    }
                     if (conn.session.setUmode(mode, adding)) {
                         appendModeLetter(&applied, &emitted_sign, if (adding) '+' else '-', ch);
+                        if (mode == .override) {
+                            const detail = if (adding) "enabled override" else "disabled override";
+                            self.auditOverrideUse(conn, "UMODE", conn.session.displayName(), detail);
+                        }
                     }
                 },
             }
@@ -8766,14 +8821,18 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
             return;
         }
-        const kicker = self.world.memberModes(args.channel, worldIdFromClient(id)) orelse {
+        const active_override = overrideActive(conn);
+        const kicker_opt = self.world.memberModes(args.channel, worldIdFromClient(id));
+        if (kicker_opt == null and !active_override) {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{args.channel}, "You're not on that channel");
             return;
-        };
-        if (!kicker.isOperator() and !conn.session.hasPriv(.oper_override)) {
+        }
+        const kicker = kicker_opt orelse world_model.MemberModes.empty();
+        if (!kicker.isOperator() and !active_override) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "You're not channel operator");
             return;
         }
+        var override_kick_bypass = active_override and !kicker.isOperator();
         const target = self.world.findNick(args.user) orelse {
             try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ args.user, args.channel }, "They aren't on that channel");
             return;
@@ -8785,6 +8844,8 @@ pub const LinuxServer = struct {
         if (!conn.session.isOper() and kicker.rank() < target_mm.rank()) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "Cannot kick a higher-ranked member");
             return;
+        } else if (active_override and kicker.rank() < target_mm.rank()) {
+            override_kick_bypass = true;
         }
 
         const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = hostOf(conn) };
@@ -8794,6 +8855,7 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = kick.buildKickBroadcastWith(.{ .require_utf8 = false }, &msg_buf, kicker_prefix, args.channel, args.user, reason) catch return;
         try self.broadcastChannel(args.channel, msg, null);
+        if (override_kick_bypass) self.auditOverrideUse(conn, "KICK", args.channel, args.user);
         // draft/event-playback: record the kick as a KICK event in channel history.
         var kick_ev_buf: [600]u8 = undefined;
         if (std.fmt.bufPrint(&kick_ev_buf, "{s} {s} :{s}", .{ args.channel, args.user, reason })) |kbody| {
@@ -9527,17 +9589,24 @@ pub const LinuxServer = struct {
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const killer = conn.session.displayName();
-        const kill_line = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), "KILL", &.{target_nick}, reason);
+        const active_override = overrideActive(conn);
+        const real_killer = conn.session.displayName();
+        const public_killer = if (active_override) "SYSTEM" else real_killer;
+        if (active_override) self.auditOverrideUse(conn, "KILL", target_nick, "anonymous SYSTEM attribution");
+        const kill_prefix = if (active_override) "SYSTEM" else try clientPrefix(conn, &prefix_buf);
+        const kill_line = try formatMessage(&msg_buf, kill_prefix, "KILL", &.{target_nick}, reason);
         try self.deliver(target_id, kill_line);
 
         var err_buf: [default_reply_bytes]u8 = undefined;
-        const err_line = std.fmt.bufPrint(&err_buf, "ERROR :Closing Link: {s} (Killed ({s} ({s})))\r\n", .{ target_nick, killer, reason }) catch return error.OutputTooSmall;
+        const err_line = std.fmt.bufPrint(&err_buf, "ERROR :Closing Link: {s} (Killed ({s} ({s})))\r\n", .{ target_nick, public_killer, reason }) catch return error.OutputTooSmall;
         try self.enqueueDeliveryThenClose(target_id, err_line, "Killed");
 
         // Oper-visible KILL event through the Event Spine (kill category).
         var kev_buf: [512]u8 = undefined;
-        const kev = std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s})", .{ killer, target_nick, reason }) catch reason;
+        const kev = if (active_override)
+            (std.fmt.bufPrint(&kev_buf, "{s} killed {s} as SYSTEM ({s})", .{ real_killer, target_nick, reason }) catch "anonymous kill")
+        else
+            (std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s})", .{ real_killer, target_nick, reason }) catch reason);
         try self.publishOperEvent(.kill, .warn, kev);
 
         // Graceful close: the send-drain path fires QUIT to channels and frees
@@ -10153,9 +10222,9 @@ pub const LinuxServer = struct {
         const mm = std.fmt.parseInt(i64, s[14..16], 10) catch return null;
         const ss = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
         const ms = std.fmt.parseInt(i64, s[20..23], 10) catch return null;
-        const y = if (month <= 2) year - 1 else year;
-        const era = @divFloor(if (y >= 0) y else y - 399, 400);
-        const yoe = y - era * 400;
+        const j = if (month <= 2) year - 1 else year;
+        const era = @divFloor(if (j >= 0) j else j - 399, 400);
+        const yoe = j - era * 400;
         const mp: i64 = if (month > 2) month - 3 else month + 9;
         const doy = @divFloor(153 * mp + 2, 5) + day - 1;
         const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
@@ -11979,14 +12048,18 @@ pub const LinuxServer = struct {
         var direct_applied = Buf{ .storage = &direct_applied_buf };
         var direct_sign: u8 = 0;
         if (has_named_ext) {
-            const setter = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
+            const active_override = overrideActive(conn);
+            const setter_opt = self.world.memberModes(channel, worldIdFromClient(id));
+            if (setter_opt == null and !active_override) {
                 try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
                 return;
-            };
-            if (!setter.isOperator() and !conn.session.hasPriv(.oper_override)) {
+            }
+            const setter = setter_opt orelse world_model.MemberModes.empty();
+            if (!setter.isOperator() and !active_override) {
                 try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
                 return;
             }
+            const override_modex_bypass = active_override and !setter.isOperator();
             for (req.changes) |chg| {
                 const flag = modexDirectExtFlag(chg) orelse continue;
                 if (chanmode_ext.requiresOper(flag) and !conn.session.isOper()) {
@@ -12003,6 +12076,7 @@ pub const LinuxServer = struct {
                 const msg = try formatMessage(&line_buf, try clientPrefix(conn, &prefix_buf), "MODE", &.{ channel, direct_applied.written() }, null);
                 try self.broadcastChannel(channel, msg, null);
                 self.announceChannelModeState(channel);
+                if (override_modex_bypass) self.auditOverrideUse(conn, "MODEX", channel, "changed named channel mode without normal channel authority");
             }
         }
         // Set: synthesize equivalent MODE letters for the non-direct cases and
@@ -12262,6 +12336,15 @@ pub const LinuxServer = struct {
             if (lv == .owner) return mm.contains(.owner) or mm.contains(.founder);
         }
         return mm.isOperator();
+    }
+
+    fn accessOverrideWouldBypass(self: *LinuxServer, id: client_model.ClientId, channel: []const u8, level: ?ircx_access_store.Level) bool {
+        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse return true;
+        if (level) |lv| {
+            if (lv == .founder) return !mm.contains(.founder);
+            if (lv == .owner) return !(mm.contains(.owner) or mm.contains(.founder));
+        }
+        return !mm.isOperator();
     }
 
     /// Enforce the Warden registry against a freshly registered client. The
@@ -13262,6 +13345,11 @@ pub const LinuxServer = struct {
                     try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{a.channel}, "You're not channel operator");
                     return;
                 }
+                if (overrideActive(conn) and self.accessOverrideWouldBypass(id, a.channel, a.level)) {
+                    var detail_buf: [192]u8 = undefined;
+                    const detail = std.fmt.bufPrint(&detail_buf, "ADD {s} {s}", .{ a.level.token(), a.mask }) catch "ADD";
+                    self.auditOverrideUse(conn, "ACCESS", a.channel, detail);
+                }
                 self.access.add(a.channel, a.level, a.mask, conn.session.displayName(), a.timeout) catch {
                     try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{a.channel}, "Cannot add ACCESS entry");
                     return;
@@ -13282,6 +13370,11 @@ pub const LinuxServer = struct {
                     try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{d.channel}, "You're not channel operator");
                     return;
                 }
+                if (overrideActive(conn) and self.accessOverrideWouldBypass(id, d.channel, d.level)) {
+                    var detail_buf: [192]u8 = undefined;
+                    const detail = std.fmt.bufPrint(&detail_buf, "DELETE {s} {s}", .{ d.level.token(), d.mask }) catch "DELETE";
+                    self.auditOverrideUse(conn, "ACCESS", d.channel, detail);
+                }
                 _ = self.access.remove(d.channel, d.level, d.mask) catch false;
                 if (ircx_access_store.buildAccessDelete(&buf, ctx, d)) |line| {
                     try appendToConn(conn, line);
@@ -13291,6 +13384,14 @@ pub const LinuxServer = struct {
                 if (!self.accessCanManage(id, conn, sel.channel, sel.level)) {
                     try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{sel.channel}, "You're not channel operator");
                     return;
+                }
+                if (overrideActive(conn) and self.accessOverrideWouldBypass(id, sel.channel, sel.level)) {
+                    var detail_buf: [64]u8 = undefined;
+                    const detail = if (sel.level) |level|
+                        (std.fmt.bufPrint(&detail_buf, "CLEAR {s}", .{level.token()}) catch "CLEAR")
+                    else
+                        "CLEAR *";
+                    self.auditOverrideUse(conn, "ACCESS", sel.channel, detail);
                 }
                 _ = self.access.clear(sel) catch 0;
                 if (ircx_access_store.buildAccessEnd(&buf, ctx, sel.channel)) |line| {
@@ -13318,6 +13419,22 @@ pub const LinuxServer = struct {
             },
             .user => return if (std.ascii.eqlIgnoreCase(entity.id, conn.session.displayName())) .member else null,
         }
+    }
+
+    fn propOverrideWouldBypass(self: *LinuxServer, id: client_model.ClientId, entity: ircx_prop_store.Entity) bool {
+        return switch (entity.kind) {
+            .channel => blk: {
+                const mm = self.world.memberModes(entity.id, worldIdFromClient(id)) orelse break :blk true;
+                break :blk !mm.isOperator();
+            },
+            .member => blk: {
+                const split = std.mem.indexOfScalar(u8, entity.id, ':') orelse break :blk true;
+                const chan = entity.id[0..split];
+                const mm = self.world.memberModes(chan, worldIdFromClient(id)) orelse break :blk true;
+                break :blk !mm.isOperator();
+            },
+            .user => false,
+        };
     }
 
     /// Whether `key` on `entity` is an IRCX secret channel property (the *KEY
@@ -13651,6 +13768,11 @@ pub const LinuxServer = struct {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Insufficient access to set property");
                     return;
                 };
+                if (overrideActive(conn) and self.propOverrideWouldBypass(id, m.entity)) {
+                    var detail_buf: [192]u8 = undefined;
+                    const detail = std.fmt.bufPrint(&detail_buf, "SET {s}", .{m.key}) catch "SET";
+                    self.auditOverrideUse(conn, "PROP", m.entity.id, detail);
+                }
                 // Linked built-ins (MEMBERKEY<->+k, MEMBERLIMIT<->+l) write through
                 // to live channel state instead of the generic store, and broadcast
                 // the equivalent MODE so member mode views stay in sync.
@@ -13698,6 +13820,14 @@ pub const LinuxServer = struct {
                 if (self.propAccess(id, conn, k.entity) == null) {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Insufficient access to delete property");
                     return;
+                }
+                if (overrideActive(conn) and self.propOverrideWouldBypass(id, k.entity)) {
+                    var detail_buf: [192]u8 = undefined;
+                    const detail = if (k.key.len == 0)
+                        "DELETE *"
+                    else
+                        (std.fmt.bufPrint(&detail_buf, "DELETE {s}", .{k.key}) catch "DELETE");
+                    self.auditOverrideUse(conn, "PROP", k.entity.id, detail);
                 }
                 if (k.entity.kind == .user and k.key.len != 0 and isReadOnlyGeoUserBuiltinKey(k.key)) {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Cannot delete that property");
@@ -14041,7 +14171,11 @@ pub const LinuxServer = struct {
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const line = formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), parsed.command, &.{ target, tag }, message) catch return;
         if (is_chan) {
-            if (!self.world.channelExists(chan) or !self.world.isMember(chan, worldIdFromClient(id))) {
+            if (!self.world.channelExists(chan)) {
+                try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{target}, "You're not on that channel");
+                return;
+            }
+            if (!self.world.isMember(chan, worldIdFromClient(id)) and !overrideActive(conn)) {
                 try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{target}, "You're not on that channel");
                 return;
             }
@@ -15249,18 +15383,42 @@ pub const LinuxServer = struct {
     }
 
     /// Elevate every already-registered local session for `account` that is not
-    /// yet an operator, using the live grant registry. Called when a cross-mesh
-    /// grant is ingested so an account that was already connected here gains oper
-    /// status without re-authenticating. Same-shard only (the multi-reactor model
+    /// yet an operator, or reconcile already-oper sessions on a live re-grant,
+    /// using the live grant registry. Same-shard only (the multi-reactor model
     /// keeps each client on one worker); peer/link connections are skipped.
     fn elevateGrantedSessions(self: *LinuxServer, account: []const u8) void {
+        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const grant = self.oper_grants.lookup(account, now) orelse return;
+        if (grant.privilege_bits == 0) return;
+        const privileges = oper_mod.OperPrivileges.fromBits(grant.privilege_bits);
         for (self.rx().clients.slots.items) |*slot| {
             if (!slot.occupied) continue;
             const c = &slot.value;
             if (c.s2s != null or c.s2s_secured != null) continue; // not a client
-            if (!c.session.registered() or c.session.isOper()) continue;
+            if (!c.session.registered()) continue;
             const acct = c.session.account() orelse continue;
             if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
+            if (self.oper_registry) |reg| {
+                if (reg.lookup(acct) != null) {
+                    if (c.session.isOper()) continue; // configured oper authority wins over runtime grants
+                }
+            }
+            if (c.session.isOper()) {
+                const override_was_set = c.session.hasUmode(.override);
+                const had_override_priv = c.session.hasPriv(.oper_override);
+                c.session.setOperGrant(privileges, grant.class, grant.title);
+                if (override_was_set and had_override_priv and !privileges.has(.oper_override)) {
+                    if (c.session.setUmode(.override, false)) {
+                        self.auditOverrideUse(c, "UMODE", c.session.displayName(), "cleared override after oper_override privilege was removed");
+                        var mode_buf: [default_reply_bytes]u8 = undefined;
+                        const nick = c.session.displayName();
+                        const line = formatMessage(&mode_buf, self.serverName(), "MODE", &.{ nick, "-j" }, null) catch "";
+                        if (line.len != 0) appendToConn(c, line) catch {};
+                    }
+                }
+                self.armSendIfNeeded(c) catch {};
+                continue;
+            }
             self.elevateOperFromAccount(c) catch continue;
             // Flush the YOUREOPER numeric + MODE reflection promptly.
             self.armSendIfNeeded(c) catch {};
@@ -16820,11 +16978,17 @@ pub const LinuxServer = struct {
     /// Apply a rendered umode string (e.g. "+iwx") to `conn`'s session as a
     /// server-sourced change, skipping the derived `o`/`r` letters. Best-effort.
     fn applyMigratedUmodes(self: *LinuxServer, conn: *ConnState, mode_str: []const u8) void {
-        _ = self;
         for (mode_str) |letter| {
             if (letter == '+' or letter == '-') continue;
             if (letter == 'o' or letter == 'r') continue; // derived from is_oper/logged_in
             const mode = usermode.modeFromLetter(letter) orelse continue;
+            if (mode == .override) {
+                if (!conn.session.hasPriv(.oper_override)) continue;
+                if (conn.session.setUmode(.override, true)) {
+                    self.auditOverrideUse(conn, "UMODE", conn.session.displayName(), "override restored via migration");
+                }
+                continue;
+            }
             _ = conn.session.setUmode(mode, true);
         }
     }
@@ -17870,6 +18034,22 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    fn overrideActive(conn: *const ConnState) bool {
+        return conn.session.hasUmode(.override) and conn.session.hasPriv(.oper_override);
+    }
+
+    fn auditOverrideUse(self: *LinuxServer, conn: *const ConnState, action: []const u8, target: []const u8, detail: []const u8) void {
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "override {s} by {s} on {s}: {s}", .{
+            action,
+            conn.session.displayName(),
+            target,
+            detail,
+        }) catch return;
+        self.publishOperEvent(.oper_action, .notice, msg) catch {};
+        self.publishOperEvent(.security, .notice, msg) catch {};
+    }
+
     /// Whether `session` should receive a `category` event with subject `subject`:
     /// it must be subscribed to the category AND the event's subject must glob-match
     /// the session's per-category subject scope. The default scope is `*`
@@ -18792,9 +18972,37 @@ pub const LinuxServer = struct {
         min_rank: u8,
         allow_opmoderate: bool,
     ) !ChannelSpeechResult {
-        if (!self.world.isMember(chan, worldIdFromClient(id)) and
-            self.world.channelHasFlag(chan, .no_external))
-        {
+        const wid = worldIdFromClient(id);
+        const is_member = self.world.isMember(chan, wid);
+        const member_modes = self.world.memberModes(chan, wid) orelse world_model.MemberModes.empty();
+        const active_override = overrideActive(conn);
+
+        if (active_override) {
+            const bypass = blk: {
+                if (!is_member and self.world.channelHasFlag(chan, .no_external)) break :blk "+n no-external";
+                if (self.world.channelHasFlag(chan, .moderated) and !member_modes.canSpeakModerated()) break :blk "+m moderated";
+                if (self.world.channelHasFlag(chan, .mod_reg) and conn.session.account() == null and !member_modes.canSpeakModerated()) break :blk "+M registered-only speech";
+
+                var mask_buf: [256]u8 = undefined;
+                const mask = clientPrefix(conn, &mask_buf) catch "";
+                if (mask.len != 0) {
+                    var chan_buf: [64][]const u8 = undefined;
+                    const ban_ctx = banContextFor(self, conn, wid, mask, &chan_buf);
+                    if (self.world.isBannedCtx(chan, ban_ctx)) break :blk "+b ban";
+                    if (!member_modes.canSpeakModerated() and self.world.isMutedCtx(chan, ban_ctx)) break :blk "+Z quiet";
+                }
+
+                const channel_op = member_modes.isOperator();
+                if (!channel_op and self.world.channelHasFlag(chan, .no_ctcp) and isBlockableCtcp(text)) break :blk "+C no-CTCP";
+                if (is_notice and !channel_op and self.world.channelHasFlag(chan, .no_notice)) break :blk "+T no-NOTICE";
+                if (min_rank > 0 and member_modes.rank() < 1) break :blk "statusmsg rank";
+                break :blk null;
+            };
+            if (bypass) |reason| self.auditOverrideUse(conn, "SEND", chan, reason);
+            return .allow;
+        }
+
+        if (!is_member and self.world.channelHasFlag(chan, .no_external)) {
             if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+n)");
             return .deny;
         }
@@ -18802,7 +19010,6 @@ pub const LinuxServer = struct {
         const opmod = allow_opmoderate and self.world.channelHasExtFlag(chan, .opmoderate);
         var opmod_route = false;
 
-        const member_modes = self.world.memberModes(chan, worldIdFromClient(id)) orelse world_model.MemberModes.empty();
         if (self.world.channelHasFlag(chan, .moderated) and !member_modes.canSpeakModerated()) {
             if (opmod) {
                 opmod_route = true;
@@ -18826,7 +19033,7 @@ pub const LinuxServer = struct {
             const mask = clientPrefix(conn, &mask_buf) catch "";
             if (mask.len != 0) {
                 var chan_buf: [64][]const u8 = undefined;
-                const ban_ctx = banContextFor(self, conn, worldIdFromClient(id), mask, &chan_buf);
+                const ban_ctx = banContextFor(self, conn, wid, mask, &chan_buf);
                 if (self.world.isBannedCtx(chan, ban_ctx)) {
                     if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+b)");
                     return .deny;
@@ -20888,6 +21095,13 @@ const test_multi_oper_bindings = [_]oper_mod.OperBinding{
     .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
 };
 
+fn testRuntimeGrantVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
+    return (std.mem.eql(u8, creds.authcid, "admin") or std.mem.eql(u8, creds.authcid, "target")) and
+        std.mem.eql(u8, creds.password, "orochi");
+}
+var test_runtime_grant_anchor: u8 = 0;
+const test_runtime_grant_checker = sasl.PlainChecker{ .ptr = &test_runtime_grant_anchor, .verifyFn = testRuntimeGrantVerify };
+
 /// Config for the live oper tests: SASL PLAIN verifier + an oper binding for the
 /// "admin" account, so a client that SASL-authenticates as admin is elevated.
 fn operTestConfig(port: u16) Config {
@@ -20906,6 +21120,16 @@ fn multiOperTestConfig(port: u16) Config {
         .num_shards = 1,
         .sasl_checker = test_multi_oper_checker,
         .oper_registry = oper_mod.OperRegistry.init(&test_multi_oper_bindings) catch unreachable,
+    };
+}
+
+fn runtimeGrantTestConfig(port: u16) Config {
+    return .{
+        .host = "127.0.0.1",
+        .port = port,
+        .num_shards = 1,
+        .sasl_checker = test_runtime_grant_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
     };
 }
 
@@ -22181,7 +22405,7 @@ test "entity prop: newer hlc wins, older is ignored (LWW for user and member)" {
         try std.testing.expectEqual(@as(u64, 200), server.entityPropClock(kind, entity, "K").?.hlc);
 
         // An older hlc 100 is rejected by LWW and does not overwrite.
-        const older = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "old", .owner = "y", .hlc = 100, .present = true, .origin_node = 6 };
+        const older = TestEntityPropFact{ .kind = kind, .entity = entity, .key = "K", .value = "old", .owner = "j", .hlc = 100, .present = true, .origin_node = 6 };
         try std.testing.expect(!server.applyRemoteEntityProp(older));
         const stored = try server.props.getProp(.{ .kind = kind.toStoreKind(), .id = entity }, "K");
         try std.testing.expectEqualStrings("new", stored.value);
@@ -22776,10 +23000,10 @@ test "server services replay restores persisted SACCESS entries" {
     try std.testing.expectEqualStrings("bad!*@*", deny.mask);
     try std.testing.expectEqual(@as(?u64, 60), deny.duration);
     try std.testing.expectEqualStrings("abuse", deny.reason.?);
-    try std.testing.expect(server.saccess.matchHostmask(.gag, "noisy!x@y") != null);
-    try std.testing.expect(server.saccess.matchHostmask(.grant, "trusted!x@y") != null);
+    try std.testing.expect(server.saccess.matchHostmask(.gag, "noisy!x@j") != null);
+    try std.testing.expect(server.saccess.matchHostmask(.grant, "trusted!x@j") != null);
     // The deleted DENY did not survive.
-    try std.testing.expect(server.saccess.matchHostmask(.deny, "temp!x@y") == null);
+    try std.testing.expect(server.saccess.matchHostmask(.deny, "temp!x@j") == null);
 }
 
 // GAP 2: a CLEAR mutation is durable. After clearing one type, replay restores
@@ -22811,9 +23035,9 @@ test "server services replay honors persisted SACCESS clear" {
 
     server.replayServicesLiveState(&services);
 
-    try std.testing.expect(server.saccess.matchHostmask(.deny, "a!x@y") == null);
-    try std.testing.expect(server.saccess.matchHostmask(.deny, "b!x@y") == null);
-    try std.testing.expect(server.saccess.matchHostmask(.gag, "c!x@y") != null);
+    try std.testing.expect(server.saccess.matchHostmask(.deny, "a!x@j") == null);
+    try std.testing.expect(server.saccess.matchHostmask(.deny, "b!x@j") == null);
+    try std.testing.expect(server.saccess.matchHostmask(.gag, "c!x@j") != null);
 }
 
 test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
@@ -27508,6 +27732,244 @@ test "threaded server: IRCX ACCESS GRANT auto-applies member status on join" {
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "+C") == null);
 }
 
+test "threaded server: override user mode gates and audits channel bypasses" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var o = LiveClient{ .fd = fd_o };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try writeAllFd(fd_a, "NICK A\r\nUSER admin 0 * :Admin\r\n");
+    try saslPlainPrelude(fd_o, "oper", "orochi");
+    try writeAllFd(fd_o, "NICK O\r\nUSER oper 0 * :Oper\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&o, " 381 O ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+
+    o.reset();
+    try writeAllFd(fd_o, "MODE O +j\r\n");
+    try recvUntil(&o, " 481 O ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE B +j\r\n");
+    try recvUntil(&b, " 481 B ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "JOIN #ov\r\n");
+    try recvUntil(&b, " 366 B #ov ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE #ov +b A!*@*\r\n");
+    try recvUntil(&b, "MODE #ov +b A!*@*", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE #ov +k secret\r\n");
+    try recvUntil(&b, "MODE #ov +k secret", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE #ov +i\r\n");
+    try recvUntil(&b, "MODE #ov +i", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE #ov +l 1\r\n");
+    try recvUntil(&b, "MODE #ov +l 1", 200);
+    b.reset();
+    try writeAllFd(fd_b, "MODE #ov +m\r\n");
+    try recvUntil(&b, "MODE #ov +m", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "MODE #ov +s\r\n");
+    try recvUntil(&a, " 442 A #ov ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "MODE A +j\r\n");
+    try recvUntil(&a, "MODE A +j", 200);
+    try expectContains(a.written(), "NOTE EVENT OPER_ACTION :override UMODE");
+    try expectContains(a.written(), "NOTE EVENT SECURITY :override UMODE");
+    try expectContains(a.written(), "enabled override");
+
+    a.reset();
+    try writeAllFd(fd_a, "MODE A -j\r\n");
+    try recvUntil(&a, "MODE A -j", 200);
+    try expectContains(a.written(), "NOTE EVENT OPER_ACTION :override UMODE");
+    try expectContains(a.written(), "NOTE EVENT SECURITY :override UMODE");
+    try expectContains(a.written(), "disabled override");
+
+    a.reset();
+    try writeAllFd(fd_a, "MODE A +j\r\n");
+    try recvUntil(&a, "MODE A +j", 200);
+    a.reset();
+    try writeAllFd(fd_a, "MODE A\r\n");
+    try recvUntil(&a, " 221 A :+", 200);
+    try expectContains(a.written(), "j");
+
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #ov wrong\r\n");
+    try recvUntil(&a, " 366 A #ov ", 200);
+    try expectContains(a.written(), "NOTE EVENT OPER_ACTION :override JOIN");
+
+    a.reset();
+    try writeAllFd(fd_a, "MODE #ov +s\r\n");
+    try recvUntil(&a, "MODE #ov +s", 200);
+    try expectContains(a.written(), "override MODE");
+
+    a.reset();
+    try writeAllFd(fd_a, "ACCESS #ov ADD VOICE *!*@trusted.example\r\n");
+    try recvUntil(&a, " 801 A #ov VOICE *!*@trusted.example", 200);
+    try expectContains(a.written(), "override ACCESS");
+
+    a.reset();
+    try writeAllFd(fd_a, "PROP #ov LANGUAGE :en\r\n");
+    try recvUntil(&a, " 819 A #ov ", 200);
+    try expectContains(a.written(), " 818 A #ov LANGUAGE :en");
+    try expectContains(a.written(), "override PROP");
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "PART #ov\r\n");
+    try recvUntil(&a, "PART #ov", 200);
+    a.reset();
+    try writeAllFd(fd_a, "PRIVMSG #ov :override hi\r\n");
+    try recvUntil(&b, "PRIVMSG #ov :override hi", 200);
+    try recvUntil(&a, "override SEND", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "DATA #ov MSG :override data\r\n");
+    try recvUntil(&b, "DATA #ov MSG :override data", 200);
+    try recvUntil(&a, "override SEND", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "KICK #ov B :override kick\r\n");
+    try recvUntil(&b, "KICK #ov B :override kick", 200);
+    try recvUntil(&a, "override KICK", 200);
+
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "KILL B :override kill\r\n");
+    try recvUntil(&b, "Killed (SYSTEM (override kill))", 200);
+    try expectContains(b.written(), ":SYSTEM KILL B :override kill");
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "A!admin@") == null);
+    try recvUntil(&a, "override KILL", 200);
+    try recvUntil(&a, "A killed B as SYSTEM", 200);
+}
+
+test "override user mode letter does not collide with advertised mode catalogs" {
+    const override_letter = usermode.letterOf(.override) orelse return error.ModeNotInCatalog;
+    const folded = std.ascii.toLower(override_letter);
+    try std.testing.expectEqual(@as(u8, 'j'), override_letter);
+
+    for (usermode.default_specs) |spec| {
+        if (spec.mode == .override) continue;
+        try std.testing.expect(std.ascii.toLower(spec.letter) != folded);
+    }
+    for (chanmode.default_specs) |spec| {
+        try std.testing.expect(std.ascii.toLower(spec.letter) != folded);
+    }
+    for (chanmode_ext.mode_specs) |spec| {
+        try std.testing.expect(std.ascii.toLower(spec.letter) != folded);
+    }
+    const prefix_letters = [_]u8{
+        chanmode.oper_mode_letter,
+        chanmode.memberModeLetter(.founder),
+        chanmode.memberModeLetter(.owner),
+        chanmode.memberModeLetter(.op),
+        chanmode.memberModeLetter(.voice),
+    };
+    for (prefix_letters) |letter| {
+        try std.testing.expect(std.ascii.toLower(letter) != folded);
+    }
+}
+
+test "migrated override user mode is gated by oper_override privilege" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var plain = ConnState.init(-1);
+    try plain.session.setNick("Plain");
+    server.applyMigratedUmodes(&plain, "+ij");
+    try std.testing.expect(plain.session.hasUmode(.invisible));
+    try std.testing.expect(!plain.session.hasUmode(.override));
+
+    var privileged = ConnState.init(-1);
+    try privileged.session.setNick("Priv");
+    privileged.session.setOperGrant(oper_mod.OperPrivileges.initMany(&.{.oper_override}), "netadmin", "");
+    server.applyMigratedUmodes(&privileged, "+j");
+    try std.testing.expect(privileged.session.hasUmode(.override));
+}
+
+test "threaded server: narrowing live GRANT clears armed override" {
+    var server = Server.init(std.testing.allocator, runtimeGrantTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_t = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_t);
+    var a = LiveClient{ .fd = fd_a };
+    var t = LiveClient{ .fd = fd_t };
+
+    try saslPlainPrelude(fd_a, "admin", "orochi");
+    try writeAllFd(fd_a, "NICK A\r\nUSER admin 0 * :Admin\r\n");
+    try saslPlainPrelude(fd_t, "target", "orochi");
+    try writeAllFd(fd_t, "NICK T\r\nUSER target 0 * :Target\r\n");
+    try recvUntil(&a, " 381 A ", 200);
+    try recvUntil(&t, " 001 T ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, t.written(), " 381 T ") == null);
+
+    t.reset();
+    try writeAllFd(fd_a, "GRANT target netadmin\r\n");
+    try recvUntil(&t, " 381 T ", 300);
+
+    t.reset();
+    try writeAllFd(fd_t, "MODE T +j\r\n");
+    try recvUntil(&t, "MODE T +j", 200);
+
+    t.reset();
+    try writeAllFd(fd_a, "GRANT target ircop client_kill\r\n");
+    try recvUntil(&t, "MODE T -j", 300);
+    try expectContains(t.written(), "cleared override after oper_override privilege was removed");
+
+    t.reset();
+    try writeAllFd(fd_t, "MODE T +j\r\n");
+    try recvUntil(&t, " 481 T ", 200);
+}
+
 test "threaded server: EVENT subscription managed by opers" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -28158,7 +28620,7 @@ test "threaded server: METADATA set then get" {
     try recvUntil(&a, " 761 A * url members :http://x", 200);
     // Writing another user's metadata is denied (ERR_KEYNOPERMISSION 769).
     a.reset();
-    try writeAllFd(fd_a, "METADATA Bob SET url :http://y\r\n");
+    try writeAllFd(fd_a, "METADATA Bob SET url :http://j\r\n");
     try recvUntil(&a, " 769 A Bob url ", 200);
     // A second client's `*` namespace is isolated from A's: B's GET misses (766),
     // proving `*` resolves per-client rather than into one shared bucket.
@@ -29556,15 +30018,15 @@ test "threaded server: JOIN/PART comma-lists" {
 
     // One JOIN with two channels -> both NAMES-end (366) arrive.
     a.reset();
-    try writeAllFd(fd_a, "JOIN #x,#y\r\n");
+    try writeAllFd(fd_a, "JOIN #x,#j\r\n");
     try recvUntil(&a, " 366 A #x ", 200);
-    try recvUntil(&a, " 366 A #y ", 200);
+    try recvUntil(&a, " 366 A #j ", 200);
 
     // One PART with two channels -> both PART lines echoed back to A.
     a.reset();
-    try writeAllFd(fd_a, "PART #x,#y :later\r\n");
+    try writeAllFd(fd_a, "PART #x,#j :later\r\n");
     try recvUntil(&a, "PART #x :later\r\n", 200);
-    try recvUntil(&a, "PART #y :later\r\n", 200);
+    try recvUntil(&a, "PART #j :later\r\n", 200);
 }
 
 test "threaded server: registered NICK change broadcasts + collision" {

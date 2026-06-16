@@ -25,6 +25,7 @@ pub const UserMode = enum(u4) {
     media_presence_private, // P: suppress automatic media presence broadcasts
     admin, // a: network administrator. Server-managed; derived from the
     // server_admin oper privilege on auto-elevation, never client-settable.
+    override, // j: operator channel override plus SYSTEM kill attribution.
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".fields.len;
@@ -156,6 +157,7 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .media_tx_deny, .letter = 'M', .name = "media-tx-deny", .policy = .server_managed },
     .{ .mode = .media_presence_private, .letter = 'P', .name = "media-presence-private" },
     .{ .mode = .admin, .letter = 'a', .name = "admin", .policy = .server_managed },
+    .{ .mode = .override, .letter = 'j', .name = "override" },
 };
 
 pub const DefaultCatalog = Catalog(&default_specs);
@@ -393,6 +395,19 @@ test "media user modes expose server-managed transmit deny and client privacy" {
     _ = try apply(&modes, client_changes, .server);
     var out: [MAX_MODE_CHANGES + 1]u8 = undefined;
     try std.testing.expectEqualStrings("+MP", try writeModeString(modes, &out));
+}
+
+test "override user mode uses non-colliding +j catalog letter" {
+    try std.testing.expectEqual(@as(?UserMode, .override), modeFromLetter('j'));
+    try std.testing.expectEqual(@as(?u8, 'j'), letterOf(.override));
+    try std.testing.expect(DefaultCatalog.isClientWritable(.override));
+    try std.testing.expectEqualStrings("override", (specFor(.override) orelse return error.ModeNotInCatalog).name);
+
+    var changes_buf: [MAX_MODE_CHANGES]ModeChange = undefined;
+    const changes = try parse("+j", &changes_buf);
+    var modes = UmodeSet.empty();
+    _ = try apply(&modes, changes, .client);
+    try std.testing.expect(modes.contains(.override));
 }
 
 test "unknown mode rejected" {
