@@ -11,6 +11,7 @@ pub const default_max_key: usize = ircx.MAX_PROP_NAME;
 pub const default_max_value: usize = ircx.MAX_PROP_VALUE;
 pub const default_max_owner_bytes: usize = 128;
 pub const default_max_request_keys: usize = 16;
+pub const user_profile_max_value: usize = 200;
 
 pub const Params = struct {
     max_entities: usize = default_max_entities,
@@ -186,6 +187,42 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
         .account => .{ .key = key, .max_value = 31, .min_setter = .sysop_manager },
         .clientguid, .servicepath => .{ .key = key, .max_value = default_max_value, .min_setter = .owner },
     };
+}
+
+pub const UserProfilePropKey = enum {
+    url,
+    gender,
+    picture,
+    bio,
+    email,
+
+    pub fn token(self: UserProfilePropKey) []const u8 {
+        return switch (self) {
+            .url => "URL",
+            .gender => "GENDER",
+            .picture => "PICTURE",
+            .bio => "BIO",
+            .email => "EMAIL",
+        };
+    }
+};
+
+pub const UserProfilePropInfo = struct {
+    key: UserProfilePropKey,
+    max_value: usize,
+};
+
+pub fn userProfilePropKey(raw: []const u8) ?UserProfilePropKey {
+    inline for (@typeInfo(UserProfilePropKey).@"enum".fields) |field| {
+        const key: UserProfilePropKey = @field(UserProfilePropKey, field.name);
+        if (std.ascii.eqlIgnoreCase(raw, key.token())) return key;
+    }
+    return null;
+}
+
+pub fn userProfilePropInfo(raw: []const u8) ?UserProfilePropInfo {
+    const key = userProfilePropKey(raw) orelse return null;
+    return .{ .key = key, .max_value = user_profile_max_value };
 }
 
 pub const EntryView = struct {
@@ -643,6 +680,10 @@ fn validateValueFor(entity: Entity, key: []const u8, value: []const u8, access: 
         } else if (!access.allows(.host)) {
             return error.AccessDenied;
         }
+    } else if (entity.kind == .user) {
+        if (userProfilePropInfo(key)) |info| {
+            limit = @min(limit, info.max_value);
+        }
     }
     try validateValue(value, limit);
 }
@@ -845,6 +886,40 @@ test "limits and built-in channel property metadata are enforced" {
     const chan = try Entity.fromId("#mc");
     try std.testing.expectError(error.ReadOnlyProperty, full.setProp(chan, "MEMBERCOUNT", "1", .{ .id = "server", .access = .server }));
     _ = try full.setProp(chan, "MEMBERLIMIT", "50", .{ .id = "host", .access = .host });
+}
+
+test "user profile properties use the profile value limit" {
+    var store = DefaultStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const entity = try Entity.fromId("Alice");
+    const setter = Setter{ .id = "Alice", .access = .member };
+    const cases = [_]struct {
+        key: []const u8,
+        value: []const u8,
+    }{
+        .{ .key = "URL", .value = "https://example.test/alice" },
+        .{ .key = "GENDER", .value = "nonbinary" },
+        .{ .key = "PICTURE", .value = "https://example.test/a.png" },
+        .{ .key = "BIO", .value = "Orochi operator" },
+        .{ .key = "EMAIL", .value = "alice@example.test" },
+    };
+
+    for (cases) |case| {
+        const ev = try store.setProp(entity, case.key, case.value, setter);
+        try std.testing.expectEqualStrings(case.key, ev.key);
+        try std.testing.expectEqualStrings(case.value, ev.value);
+        try std.testing.expect(userProfilePropKey(case.key) != null);
+    }
+
+    var too_long = [_]u8{'x'} ** (user_profile_max_value + 1);
+    try std.testing.expectError(error.InvalidValue, store.setProp(entity, "URL", too_long[0..], setter));
+
+    // The tighter cap applies only to the newly added Ophion-profile fields.
+    // Existing Orochi profile keys and generic user props retain the store-wide
+    // value budget.
+    _ = try store.setProp(entity, "display", too_long[0..], setter);
+    _ = try store.setProp(entity, "custom", too_long[0..], setter);
 }
 
 test "reply builders and no-leak clear path" {

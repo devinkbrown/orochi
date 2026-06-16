@@ -75,6 +75,16 @@ pub const Snapshot = struct {
     profile_location: ?[]const u8 = null,
     /// Free-form note used by the user profile provider.
     profile_note: ?[]const u8 = null,
+    /// Website URL used by the user profile provider.
+    profile_url: ?[]const u8 = null,
+    /// Gender identity used by the user profile provider.
+    profile_gender: ?[]const u8 = null,
+    /// Avatar/picture URL used by the user profile provider.
+    profile_picture: ?[]const u8 = null,
+    /// Short biography used by the user profile provider.
+    profile_bio: ?[]const u8 = null,
+    /// Contact email used by the user profile provider.
+    profile_email: ?[]const u8 = null,
     /// GeoIP country code exposed by the user GeoIP providers.
     geo_country: ?[]const u8 = null,
     /// GeoIP region/subdivision exposed by the user GeoIP providers.
@@ -270,6 +280,11 @@ fn readUserProfile(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue 
     try appendProfileField(&writer, &first, "title", ctx.profile_title);
     try appendProfileField(&writer, &first, "location", ctx.profile_location);
     try appendProfileField(&writer, &first, "note", ctx.profile_note);
+    try appendProfileField(&writer, &first, "url", ctx.profile_url);
+    try appendProfileField(&writer, &first, "gender", ctx.profile_gender);
+    try appendProfileField(&writer, &first, "picture", ctx.profile_picture);
+    try appendProfileField(&writer, &first, "bio", ctx.profile_bio);
+    try appendProfileField(&writer, &first, "email", ctx.profile_email);
 
     return .{ .text = writer.slice() };
 }
@@ -517,6 +532,29 @@ test "user_profile provider skips missing and empty fields" {
 
     // Assert
     try expectText(value, "display=Alice;note=Ready");
+}
+
+test "user_profile provider includes extended profile fields" {
+    const allocator = std.testing.allocator;
+
+    // Arrange
+    const out = try allocator.alloc(u8, 256);
+    defer allocator.free(out);
+    var registry = ProviderRegistry.init();
+    defer registry.deinit();
+    const snapshot = Snapshot{
+        .profile_url = "https://example.test/alice",
+        .profile_gender = "nonbinary",
+        .profile_picture = "https://example.test/a.png",
+        .profile_bio = "Orochi operator",
+        .profile_email = "alice@example.test",
+    };
+
+    // Act
+    const value = try registry.query("user_profile", &snapshot, out);
+
+    // Assert
+    try expectText(value, "url=https://example.test/alice;gender=nonbinary;picture=https://example.test/a.png;bio=Orochi operator;email=alice@example.test");
 }
 
 test "user_profile provider reports small caller buffers" {

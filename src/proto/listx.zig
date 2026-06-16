@@ -10,6 +10,7 @@ const limits_config = @import("limits_config.zig");
 
 pub const RPL_LISTXSTART: u16 = 811;
 pub const RPL_LISTXENTRY: u16 = 812;
+pub const RPL_LISTXPICS: u16 = 813;
 pub const RPL_LISTXTRUNC: u16 = 816;
 pub const RPL_LISTXEND: u16 = 817;
 
@@ -21,6 +22,7 @@ pub const DEFAULT_MAX_NAME_BYTES: usize = 255;
 pub const DEFAULT_MAX_REQUESTER_BYTES: usize = 64;
 pub const DEFAULT_MAX_CHANNEL_BYTES: usize = 128;
 pub const DEFAULT_MAX_TOPIC_BYTES: usize = 512;
+pub const DEFAULT_MAX_PICS_BYTES: usize = 255;
 
 pub const ListxError = error{
     InvalidParameter,
@@ -48,6 +50,7 @@ pub const Params = struct {
     max_requester_bytes: usize = DEFAULT_MAX_REQUESTER_BYTES,
     max_channel_bytes: usize = DEFAULT_MAX_CHANNEL_BYTES,
     max_topic_bytes: usize = DEFAULT_MAX_TOPIC_BYTES,
+    max_pics_bytes: usize = DEFAULT_MAX_PICS_BYTES,
 
     /// Derive `Params` from the central policy limits (config-driven).
     /// `max_line_bytes` and `max_filter_bytes` are wire budgets and keep their
@@ -418,6 +421,32 @@ pub fn writeListxTrunc(out: []u8, ctx: ReplyContext, emitted: u64) ListxError![]
     return writeListxTruncWith(.{}, out, ctx, emitted);
 }
 
+/// Build one RPL_LISTXPICS (813) line.
+pub fn writeListxPics(out: []u8, ctx: ReplyContext, channel: []const u8, pics: []const u8) ListxError![]const u8 {
+    return writeListxPicsWith(.{}, out, ctx, channel, pics);
+}
+
+/// Build one RPL_LISTXPICS (813) line with caller-selected limits.
+pub fn writeListxPicsWith(
+    comptime params: Params,
+    out: []u8,
+    ctx: ReplyContext,
+    channel: []const u8,
+    pics: []const u8,
+) ListxError![]const u8 {
+    try validateContextWith(params, ctx);
+    try validateChannelNameWith(params, channel);
+    if (pics.len > params.max_pics_bytes) return error.InvalidValue;
+    try validateTrailingBytes(pics, error.InvalidValue);
+
+    var b = LineBuilder.init(out, params.max_line_bytes);
+    try b.numericPrefix(RPL_LISTXPICS, ctx.server_name, ctx.requester);
+    try b.spaceParam(channel);
+    try b.spaceTrailing(pics);
+    try b.crlf();
+    return b.slice();
+}
+
 /// Build RPL_LISTXTRUNC (816) with caller-selected limits.
 pub fn writeListxTruncWith(
     comptime params: Params,
@@ -457,10 +486,14 @@ fn validateContextWith(comptime params: Params, ctx: ReplyContext) ListxError!vo
 }
 
 fn validateChannelWith(comptime params: Params, channel: ChannelInfo) ListxError!void {
-    try validateParamBounded(channel.name, params.max_channel_bytes, error.InvalidChannelName);
-    if (!validChannelNamePrefix(channel.name)) return error.InvalidChannelName;
+    try validateChannelNameWith(params, channel.name);
     if (channel.topic.len > params.max_topic_bytes) return error.InvalidTopic;
     try validateTrailingBytes(channel.topic, error.InvalidTopic);
+}
+
+fn validateChannelNameWith(comptime params: Params, name: []const u8) ListxError!void {
+    try validateParamBounded(name, params.max_channel_bytes, error.InvalidChannelName);
+    if (!validChannelNamePrefix(name)) return error.InvalidChannelName;
 }
 
 fn validChannelNamePrefix(name: []const u8) bool {
@@ -844,6 +877,10 @@ test "line builders emit LISTX numerics" {
         try writeListxEntry(&buf, ctx, channel),
     );
     try std.testing.expectEqualStrings(
+        ":irc.example.test 813 dan #zig :rated-safe\r\n",
+        try writeListxPics(&buf, ctx, channel.name, "rated-safe"),
+    );
+    try std.testing.expectEqualStrings(
         ":irc.example.test 816 dan 100 :LISTX results truncated\r\n",
         try writeListxTrunc(&buf, ctx, 100),
     );
@@ -870,4 +907,5 @@ test "line builders validate attacker bytes and buffer bounds" {
 
     var short: [8]u8 = undefined;
     try std.testing.expectError(error.OutputTooSmall, writeListxEnd(&short, good_ctx));
+    try std.testing.expectError(error.InvalidValue, writeListxPics(&buf, good_ctx, "#zig", "bad\rpics"));
 }

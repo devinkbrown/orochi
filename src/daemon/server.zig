@@ -9130,6 +9130,12 @@ pub const LinuxServer = struct {
             }
             var ebuf: [default_reply_bytes]u8 = undefined;
             if (listx.writeListxEntry(&ebuf, ctx, info)) |line| try appendToConn(conn, line) else |_| {}
+            if (self.props.getProp(entity, "PICS")) |ev| {
+                if (ev.value.len != 0) {
+                    var pbuf: [default_reply_bytes]u8 = undefined;
+                    if (listx.writeListxPics(&pbuf, ctx, info.name, ev.value)) |line| try appendToConn(conn, line) else |_| {}
+                }
+            } else |_| {}
             emitted += 1;
         }
         if (truncated) {
@@ -13419,6 +13425,56 @@ pub const LinuxServer = struct {
         snapshot.geo_asorg = asn_info.asorg;
     }
 
+    fn userProfileValue(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8) ?[]const u8 {
+        const ev = self.props.getProp(entity, key) catch return null;
+        return if (ev.value.len == 0) null else ev.value;
+    }
+
+    fn fillUserProfileSnapshot(self: *LinuxServer, entity: ircx_prop_store.Entity, snapshot: *ircx_prop_providers.Snapshot) bool {
+        var filled = false;
+        if (self.userProfileValue(entity, "display")) |value| {
+            snapshot.profile_display_name = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "real")) |value| {
+            snapshot.profile_real_name = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "title")) |value| {
+            snapshot.profile_title = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "location")) |value| {
+            snapshot.profile_location = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "note")) |value| {
+            snapshot.profile_note = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "URL")) |value| {
+            snapshot.profile_url = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "GENDER")) |value| {
+            snapshot.profile_gender = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "PICTURE")) |value| {
+            snapshot.profile_picture = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "BIO")) |value| {
+            snapshot.profile_bio = value;
+            filled = true;
+        }
+        if (self.userProfileValue(entity, "EMAIL")) |value| {
+            snapshot.profile_email = value;
+            filled = true;
+        }
+        return filled;
+    }
+
     /// Computed IRCX built-in properties for a `user` entity. GET-only (computed,
     /// not stored), consulted ahead of the generic store:
     ///   - MEMBER_OF (aka MEMBEROF): the channels the target is in, space-
@@ -13426,6 +13482,7 @@ pub const LinuxServer = struct {
     ///     omitted unless the requester is the target, an operator, or a member).
     ///   - ACCOUNT: the target's logged-in services account. Public (mirrors
     ///     WHOIS 330 / `account-tag`), so no visibility gate. Local target only.
+    ///   - USER_PROFILE: a joined view of stored profile fields.
     ///   - COUNTRY/REGION/CITY/ASN/ASORG: read-only GeoIP fields from the target
     ///     connection, visible only to the target user or an operator. Missing
     ///     GeoIP data renders as an empty value.
@@ -13435,15 +13492,18 @@ pub const LinuxServer = struct {
         const is_member_of = std.ascii.eqlIgnoreCase(provider.name, "member_of");
         const is_account = std.ascii.eqlIgnoreCase(provider.name, "account");
         const is_geo = isGeoUserProviderName(provider.name);
-        if (!is_member_of and !is_account and !is_geo) return null;
+        const is_profile = std.ascii.eqlIgnoreCase(provider.name, "user_profile");
+        if (!is_member_of and !is_account and !is_geo and !is_profile) return null;
 
-        const target_wid = self.world.findNick(entity.id) orelse return null;
-        const requester_wid = worldIdFromClient(requester_id);
         var snapshot = ircx_prop_providers.Snapshot{};
         var memberships: [64][]const u8 = undefined;
         var country_buf: [4]u8 = undefined;
 
-        if (is_member_of) {
+        if (is_profile) {
+            if (!self.fillUserProfileSnapshot(entity, &snapshot)) return null;
+        } else if (is_member_of) {
+            const target_wid = self.world.findNick(entity.id) orelse return null;
+            const requester_wid = worldIdFromClient(requester_id);
             const sees_all = conn.session.isOper() or requester_wid.eql(target_wid);
             var names: [64][]const u8 = undefined;
             const n = self.world.channelsOf(target_wid, &names);
@@ -13455,6 +13515,8 @@ pub const LinuxServer = struct {
             }
             snapshot.member_of = memberships[0..visible];
         } else {
+            const target_wid = self.world.findNick(entity.id) orelse return null;
+            const requester_wid = worldIdFromClient(requester_id);
             const target_cid = client_model.ClientId{ .shard = target_wid.shard, .slot = target_wid.slot, .gen = target_wid.gen };
             const tconn = self.connFor(target_cid) orelse return null;
             if (is_account) {
@@ -13571,9 +13633,9 @@ pub const LinuxServer = struct {
                         try propEmitBuiltin(conn, q.entity, key, val);
                         continue;
                     }
-                    // Computed user built-ins (MEMBER_OF) need a wider buffer for
-                    // the channel list and the requester context for visibility.
-                    var ubuf: [400]u8 = undefined;
+                    // Computed user built-ins need the requester context for
+                    // visibility and enough room for joined profile fields.
+                    var ubuf: [default_reply_bytes]u8 = undefined;
                     if (self.userBuiltinGet(q.entity, key, &ubuf, id, conn)) |val| {
                         try propEmitBuiltin(conn, q.entity, key, val);
                         continue;
@@ -26690,6 +26752,54 @@ test "threaded server: LISTX filters on real channel SUBJECT from the PROP store
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "#beta") == null);
 }
 
+test "threaded server: LISTX emits PICS 813 after channel entries" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #alpha\r\n");
+    try recvUntil(&a, " 366 A #alpha ", 200);
+    // Seed PICS AFTER the creating JOIN: channel creation clearChannel-purges any
+    // pre-seeded IRCX state, so seeding before would be wiped before LISTX.
+    _ = try server.props.setProp(
+        try ircx_prop_store.Entity.fromId("#alpha"),
+        "PICS",
+        "rated-safe",
+        .{ .id = "server", .access = .server },
+    );
+    try writeAllFd(fd_a, "JOIN #beta\r\n");
+    try recvUntil(&a, " 366 A #beta ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "LISTX\r\n");
+    try recvUntil(&a, " 817 ", 200);
+
+    const written = a.written();
+    const entry_index = std.mem.indexOf(u8, written, " 812 A #alpha ") orelse return error.TestExpectedEqual;
+    const pics_index = std.mem.indexOf(u8, written, " 813 A #alpha :rated-safe\r\n") orelse return error.TestExpectedEqual;
+    try std.testing.expect(pics_index > entry_index);
+    try std.testing.expect(std.mem.indexOf(u8, written, " 813 A #beta ") == null);
+}
+
 test "threaded server: PROP set/get gated by channel-op" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -26766,6 +26876,91 @@ test "threaded server: PROP set/get gated by channel-op" {
     try recvUntil(a, " 819 A #p ", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "verb") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 818 ") == null);
+}
+
+test "threaded server: PROP user profile extended keys round-trip and enforce access" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+
+    const cases = [_]struct {
+        key: []const u8,
+        value: []const u8,
+        profile_fragment: []const u8,
+    }{
+        .{ .key = "URL", .value = "https://example.test/a", .profile_fragment = "url=https://example.test/a" },
+        .{ .key = "GENDER", .value = "nonbinary", .profile_fragment = "gender=nonbinary" },
+        .{ .key = "PICTURE", .value = "https://example.test/a.png", .profile_fragment = "picture=https://example.test/a.png" },
+        .{ .key = "BIO", .value = "Orochi operator", .profile_fragment = "bio=Orochi operator" },
+        .{ .key = "EMAIL", .value = "alice@example.test", .profile_fragment = "email=alice@example.test" },
+    };
+
+    for (cases) |case| {
+        a.reset();
+        try writeAllFd(fd_a, "PROP A SET ");
+        try writeAllFd(fd_a, case.key);
+        try writeAllFd(fd_a, " :");
+        try writeAllFd(fd_a, case.value);
+        try writeAllFd(fd_a, "\r\n");
+        try recvUntil(&a, " 819 A A ", 200);
+        try std.testing.expect(std.mem.indexOf(u8, a.written(), case.value) != null);
+
+        a.reset();
+        try writeAllFd(fd_a, "PROP A GET ");
+        try writeAllFd(fd_a, case.key);
+        try writeAllFd(fd_a, "\r\n");
+        try recvUntil(&a, " 819 A A ", 200);
+        try std.testing.expect(std.mem.indexOf(u8, a.written(), case.value) != null);
+    }
+
+    a.reset();
+    try writeAllFd(fd_a, "PROP A GET user_profile\r\n");
+    try recvUntil(&a, " 818 A A user_profile :", 200);
+    try recvUntil(&a, " 819 A A ", 200);
+    for (cases) |case| {
+        try std.testing.expect(std.mem.indexOf(u8, a.written(), case.profile_fragment) != null);
+    }
+
+    var too_long = [_]u8{'x'} ** (ircx_prop_store.user_profile_max_value + 1);
+    a.reset();
+    try writeAllFd(fd_a, "PROP A SET URL :");
+    try writeAllFd(fd_a, too_long[0..]);
+    try writeAllFd(fd_a, "\r\n");
+    try recvUntil(&a, " 913 ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "PROP A SET URL :https://example.test/b\r\n");
+    try recvUntil(&b, " 913 ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "PROP A SET display :Mallory\r\n");
+    try recvUntil(&b, " 913 ", 200);
 }
 
 test "threaded server: PROP user MEMBER_OF lists visible channels (WHOIS filter)" {
