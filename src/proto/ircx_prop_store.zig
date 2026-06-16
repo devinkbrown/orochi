@@ -114,6 +114,7 @@ pub const ChannelPropKey = enum {
     language,
     ownerkey,
     hostkey,
+    voicekey,
     memberkey,
     pics,
     topic,
@@ -136,6 +137,7 @@ pub const ChannelPropKey = enum {
             .language => "LANGUAGE",
             .ownerkey => "OWNERKEY",
             .hostkey => "HOSTKEY",
+            .voicekey => "VOICEKEY",
             .memberkey => "MEMBERKEY",
             .pics => "PICS",
             .topic => "TOPIC",
@@ -179,6 +181,9 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
         .language => .{ .key = key, .max_value = 31, .min_setter = .host },
         .ownerkey => .{ .key = key, .max_value = 31, .min_setter = .owner, .secret = true },
         .hostkey, .memberkey => .{ .key = key, .max_value = 31, .min_setter = .owner, .secret = true },
+        // VOICEKEY is settable by operators and above (op-tier), unlike the
+        // owner-set OWNER/HOST/MEMBER keys; its value is still secret.
+        .voicekey => .{ .key = key, .max_value = 31, .min_setter = .host, .secret = true },
         .pics => .{ .key = key, .max_value = 255, .min_setter = .sysop_manager },
         .topic => .{ .key = key, .max_value = 160, .min_setter = .host },
         .subject => .{ .key = key, .max_value = 31, .min_setter = .host },

@@ -7324,19 +7324,21 @@ pub const LinuxServer = struct {
     }
 
     fn emitRemoteChannelProp(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
-        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = ch.channel };
-        if (propIsSecret(entity, ch.key)) return;
         const host = if (remote_name.len != 0) remote_name else self.serverName();
         var buf: [900]u8 = undefined;
         const line = if (ch.present)
             std.fmt.bufPrint(&buf, ":{s} PROP {s} {s} :{s}\r\n", .{ host, ch.channel, ch.key, ch.value }) catch return
         else
             std.fmt.bufPrint(&buf, ":{s} PROP {s} {s} :\r\n", .{ host, ch.channel, ch.key }) catch return;
-        self.broadcastChannel(ch.channel, line, null) catch {};
+        // Same IRCX-gated, per-tier fanout as a local change: a secret key reaches
+        // only local members at/above its tier (no leak), a non-secret key reaches
+        // all local IRCX members. No local setter to exclude (mesh origin).
+        self.fanChannelPropNotify(ch.channel, ch.key, line, null);
     }
 
     /// Drain a link's remote IRCX channel PROP changes, apply them LWW to the
-    /// local store, and emit non-secret live PROP lines to local channel members.
+    /// local store, and fan PROP-change lines out to local IRCX members (per-tier
+    /// for secret keys), mirroring a local change's visibility.
     fn drainChannelPropChanges(self: *LinuxServer, link: anytype) void {
         const changes = link.takeChannelPropChanges() catch return;
         const remote = link.remoteName();
@@ -13568,11 +13570,119 @@ pub const LinuxServer = struct {
     }
 
     /// Whether `key` on `entity` is an IRCX secret channel property (the *KEY
-    /// family), which must not be disclosed to clients lacking write access.
+    /// family), which must not be disclosed to clients lacking the read tier.
     fn propIsSecret(entity: ircx_prop_store.Entity, key: []const u8) bool {
         if (entity.kind != .channel) return false;
         const info = ircx_prop_store.channelPropInfo(key) orelse return false;
         return info.secret;
+    }
+
+    /// Minimum channel member rank required to READ a secret channel key, in the
+    /// per-tier visibility model: OWNERKEY → owner, HOSTKEY → op, VOICEKEY →
+    /// voice, MEMBERKEY → any member. Ranks match `chanmode.MemberModes.rank()`
+    /// (founder 4 > owner 3 > op 2 > voice 1 > plain member 0).
+    fn secretKeyMinRank(key: []const u8) u8 {
+        const k = ircx_prop_store.channelPropKey(key) orelse return 0;
+        return switch (k) {
+            .ownerkey => chanmode.rankOfMode(.owner),
+            .hostkey => chanmode.rankOfMode(.op),
+            .voicekey => chanmode.rankOfMode(.voice),
+            else => 0, // memberkey (any member) + any non-tier key
+        };
+    }
+
+    /// Whether member `id`/`conn` may READ the secret key `key` on `entity`.
+    /// Channel keys use the per-tier rank gate (`secretKeyMinRank`); opers always
+    /// may; non-channel entities fall back to the coarse `propAccess` gate. This
+    /// is the single source of truth for secret-key visibility — PROP GET/LIST
+    /// and the PROP-change notify fanout MUST both use it so a member is never
+    /// notified of a value they could not GET.
+    fn maySeeSecretKey(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, entity: ircx_prop_store.Entity, key: []const u8) bool {
+        if (conn.session.isOper()) return true;
+        if (entity.kind != .channel) return self.propAccess(id, conn, entity) != null;
+        const mm = self.world.memberModes(entity.id, worldIdFromClient(id)) orelse return false;
+        return mm.rank() >= secretKeyMinRank(key);
+    }
+
+    /// Fan a PROP set/delete out to LOCAL IRCX clients permitted to see it,
+    /// mirroring PROP GET visibility exactly (a client is never notified of a
+    /// value it could not GET). Wire form `:<setter-prefix> PROP <entity> <key>
+    /// :<value>` (empty value = delete). The IRCX gate (`conn.ircx`) is what makes
+    /// PROP-notify "just work"; there is no separate capability. Reactor-local:
+    /// peer links carry the signed mesh fact separately, so a target on another
+    /// shard converges via the S2S burst, not this fanout.
+    fn notifyLocalPropChange(
+        self: *LinuxServer,
+        setter_conn: *ConnState,
+        entity: ircx_prop_store.Entity,
+        key: []const u8,
+        value: []const u8,
+    ) void {
+        var prefix_buf: [256]u8 = undefined;
+        const prefix = clientPrefix(setter_conn, &prefix_buf) catch return;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, ":{s} PROP {s} {s} :{s}\r\n", .{ prefix, entity.id, key, value }) catch return;
+        switch (entity.kind) {
+            .channel => self.fanChannelPropNotify(entity.id, key, line, setter_conn),
+            .member => {
+                // member entity id is "<channel>:<nick>" — fan to the channel.
+                const split = std.mem.indexOfScalar(u8, entity.id, ':') orelse return;
+                self.fanChannelPropNotify(entity.id[0..split], key, line, setter_conn);
+            },
+            .user => self.fanUserPropNotify(entity.id, line, setter_conn),
+        }
+    }
+
+    /// Deliver `line` to every LOCAL IRCX member of `channel` allowed to see
+    /// `key` (per-tier rank gate for secret keys, all members otherwise), except
+    /// `except` if given (the local setter, who gets the direct echo). `except`
+    /// is null for mesh-originated changes (no local setter).
+    fn fanChannelPropNotify(self: *LinuxServer, channel: []const u8, key: []const u8, line: []const u8, except: ?*ConnState) void {
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const secret = propIsSecret(entity, key);
+        const min_rank: u8 = if (secret) secretKeyMinRank(key) else 0;
+        var members = self.world.memberIterator(channel) orelse return;
+        while (members.next()) |member| {
+            if (secret) {
+                const mm = self.world.memberModes(channel, member.*) orelse continue;
+                if (mm.rank() < min_rank) continue;
+            }
+            const mid = clientIdFromWorld(member.*);
+            const mconn = self.connFor(mid) orelse continue;
+            if (except) |e| if (mconn == e) continue;
+            if (!mconn.ircx) continue;
+            self.deliver(mid, line) catch continue;
+        }
+    }
+
+    /// Deliver `line` to the target user (if local + IRCX) and to every local
+    /// IRCX client sharing a channel with the target (deduped), except `except`.
+    fn fanUserPropNotify(self: *LinuxServer, target_nick: []const u8, line: []const u8, except: *ConnState) void {
+        const twid = self.world.findNick(target_nick) orelse return;
+        var seen = std.AutoHashMap(u64, void).init(self.allocator);
+        defer seen.deinit();
+        const tid = clientIdFromWorld(twid);
+        if (self.connFor(tid)) |tconn| {
+            if (tconn != except and tconn.ircx) {
+                seen.put(@as(u64, @bitCast(tid)), {}) catch {};
+                self.deliver(tid, line) catch {};
+            }
+        }
+        var it = self.world.channels.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.members.contains(twid)) continue;
+            var members = self.world.memberIterator(entry.key_ptr.*) orelse continue;
+            while (members.next()) |member| {
+                const mid = clientIdFromWorld(member.*);
+                const skey = @as(u64, @bitCast(mid));
+                if (seen.contains(skey)) continue;
+                seen.put(skey, {}) catch {};
+                const mconn = self.connFor(mid) orelse continue;
+                if (mconn == except) continue;
+                if (!mconn.ircx) continue;
+                self.deliver(mid, line) catch continue;
+            }
+        }
     }
 
     /// Computed/linked IRCX channel built-in property reads. These reflect live
@@ -13898,23 +14008,22 @@ pub const LinuxServer = struct {
         };
         switch (req) {
             .list => |entity| {
-                // Secret props (channel keys) are only visible to those who could
-                // write them — never leak OWNERKEY/HOSTKEY/MEMBERKEY to bystanders.
-                const may_see_secret = self.propAccess(id, conn, entity) != null;
+                // Secret props (channel keys) use the per-tier read gate: each
+                // key is visible only to members at/above its tier (OWNERKEY→owner,
+                // HOSTKEY→op, VOICEKEY→voice, MEMBERKEY→any member; opers always).
                 var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
                 const rows = self.props.listProps(entity, &views) catch views[0..0];
                 for (rows) |ev| {
-                    if (propIsSecret(entity, ev.key) and !may_see_secret) continue;
+                    if (propIsSecret(entity, ev.key) and !self.maySeeSecretKey(id, conn, entity, ev.key)) continue;
                     try propEmitEntry(conn, ev);
                 }
                 try propEmitEnd(conn, entity);
             },
             .get => |q| {
-                const may_see_secret = self.propAccess(id, conn, q.entity) != null;
                 var it = std.mem.splitScalar(u8, q.keys, ',');
                 while (it.next()) |key| {
                     if (key.len == 0) continue;
-                    if (propIsSecret(q.entity, key) and !may_see_secret) continue;
+                    if (propIsSecret(q.entity, key) and !self.maySeeSecretKey(id, conn, q.entity, key)) continue;
                     // Computed/linked built-ins (NAME/MEMBERCOUNT/MEMBERLIMIT)
                     // reflect live channel state, ahead of the generic store.
                     var bbuf: [64]u8 = undefined;
@@ -13985,6 +14094,9 @@ pub const LinuxServer = struct {
                     // signed multi-hop LWW guarantees.
                     self.propagateLocalEntityProp(true, ev.entity.kind, ev.entity.id, ev.key, ev.value, ev.owner);
                 }
+                // Notify local IRCX clients that may see this entity (per-tier
+                // for secret channel keys); the setter's own echo follows.
+                self.notifyLocalPropChange(conn, ev.entity, ev.key, ev.value);
                 try propEmitEntry(conn, ev);
                 try propEmitEnd(conn, m.entity);
             },
@@ -14021,10 +14133,12 @@ pub const LinuxServer = struct {
                             if (self.recordChannelPropClock(k.entity.id, ev.key, owner, hlc, false, ps.node, ps.pubkey, ps.sig)) {
                                 self.announceChannelProp(k.entity.id, ev.key, "", owner, hlc, false, .{ .node = ps.node, .pubkey = ps.pubkey, .sig = ps.sig });
                             }
+                            self.notifyLocalPropChange(conn, k.entity, ev.key, "");
                         }
                     } else {
                         for (rows) |ev| {
                             self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, ev.key, "", owner);
+                            self.notifyLocalPropChange(conn, k.entity, ev.key, "");
                         }
                     }
                     self.props.clearEntity(k.entity) catch {};
@@ -14044,6 +14158,7 @@ pub const LinuxServer = struct {
                 } else {
                     self.propagateLocalEntityProp(false, k.entity.kind, k.entity.id, k.key, "", conn.session.displayName());
                 }
+                self.notifyLocalPropChange(conn, k.entity, k.key, "");
                 try propEmitEnd(conn, k.entity);
             },
         }
@@ -15694,6 +15809,10 @@ pub const LinuxServer = struct {
         // Capture the granted privilege set + class on the session so handlers
         // can gate sensitive actions on specific privileges, not just is_oper.
         conn.session.setOperGrant(privileges, class_name, title);
+        // Opers are always in IRCX mode: SASL oper elevation auto-enables it, so
+        // the IRCX command surface + PROP-change notifications "just work" without
+        // an explicit IRCX command or a separate capability.
+        conn.ircx = true;
         // Locally-authorized opers mint a signed grant so peers recognize them.
         if (from_local) self.mintOperGrant(account, privileges, class_name, title);
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
@@ -27391,6 +27510,101 @@ test "threaded server: PROP set/get gated by channel-op" {
     try recvUntil(a, " 819 A #p ", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "verb") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 818 ") == null);
+}
+
+test "threaded server: PROP notify is IRCX-gated and per-tier secret" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    const c = try alloc.create(LiveClient);
+    defer alloc.destroy(c);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    c.* = .{ .fd = fd_c };
+    // A founds #p (IRCX). B is an IRCX member; C is a member who never enables IRCX.
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\nJOIN #p\r\n");
+    try recvUntil(a, " 366 A #p ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IRCX\r\nJOIN #p\r\n");
+    try recvUntil(b, " 366 B #p ", 200);
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try recvUntil(c, " 001 C ", 200);
+    try writeAllFd(fd_c, "JOIN #p\r\n"); // no IRCX
+    try recvUntil(c, " 366 C #p ", 200);
+    b.reset();
+
+    // Non-secret prop change reaches the IRCX member B.
+    try writeAllFd(fd_a, "PROP #p SUBJECT :hello\r\n");
+    try recvUntil(b, "PROP #p SUBJECT :hello", 200);
+    b.reset();
+
+    // A secret OWNERKEY change must NOT reach plain member B; a trailing
+    // non-secret marker proves B's stream advanced past the secret set.
+    try writeAllFd(fd_a, "PROP #p OWNERKEY :sekret\r\nPROP #p SUBJECT :marker\r\n");
+    try recvUntil(b, "PROP #p SUBJECT :marker", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "OWNERKEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "sekret") == null);
+
+    // Promote B to owner; now an OWNERKEY change reaches B (per-tier visibility).
+    try writeAllFd(fd_a, "MODE #p +q B\r\n");
+    try recvUntil(b, "+q B", 200);
+    b.reset();
+    try writeAllFd(fd_a, "PROP #p OWNERKEY :sekret2\r\n");
+    try recvUntil(b, "PROP #p OWNERKEY :sekret2", 200);
+
+    // C never enabled IRCX, so it received no PROP fanout at all.
+    try std.testing.expect(std.mem.indexOf(u8, c.written(), "PROP #p") == null);
+}
+
+test "threaded server: oper SASL login auto-enables IRCX" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 A ", 200); // elevated on SASL login
+    a.reset();
+    // ISIRCX only queries — yet the oper is already in IRCX mode (state 1)
+    // without ever having sent IRCX.
+    try writeAllFd(fd_a, "ISIRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
 }
 
 test "threaded server: PROP user profile extended keys round-trip and enforce access" {
