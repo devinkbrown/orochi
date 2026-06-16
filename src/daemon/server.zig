@@ -6550,14 +6550,38 @@ pub const LinuxServer = struct {
         return self.recordEntityPropClock(ch.kind, ch.entity, ch.key, owner, ch.hlc, ch.present, ch.origin_node, ch.origin_pubkey, ch.origin_sig);
     }
 
+    /// Mesh counterpart of a local user/member PROP-notify: fan a remote
+    /// ENTITY_PROP change out to local IRCX clients with the remote node name as
+    /// prefix. A user prop reaches the target + common-channel IRCX peers; a
+    /// member prop reaches the member's channel under the per-tier secret gate.
+    fn emitRemoteEntityProp(self: *LinuxServer, ch: anytype, remote_name: []const u8) void {
+        const host = if (remote_name.len != 0) remote_name else self.serverName();
+        var buf: [900]u8 = undefined;
+        const line = if (ch.present)
+            std.fmt.bufPrint(&buf, ":{s} PROP {s} {s} :{s}\r\n", .{ host, ch.entity, ch.key, ch.value }) catch return
+        else
+            std.fmt.bufPrint(&buf, ":{s} PROP {s} {s} :\r\n", .{ host, ch.entity, ch.key }) catch return;
+        switch (ch.kind.toStoreKind()) {
+            .user => self.fanUserPropNotify(ch.entity, line, null),
+            .member => {
+                const split = std.mem.indexOfScalar(u8, ch.entity, ':') orelse return;
+                self.fanChannelPropNotify(ch.entity[0..split], ch.key, line, null);
+            },
+            .channel => {},
+        }
+    }
+
     /// Drain a link's remote user/member PROP changes (ENTITY_PROP), apply them LWW
-    /// to the local store. Unlike channel props there is no live channel-member
-    /// broadcast surface for user/member props — they are answered on demand via
-    /// PROP GET — so this only converges the store + clock for later replies.
+    /// to the local store, then fan each applied change out to local IRCX clients
+    /// (mirroring a local change's visibility) in addition to the on-demand
+    /// PROP GET reply path.
     fn drainEntityPropChanges(self: *LinuxServer, link: anytype) void {
         const changes = link.takeEntityPropChanges() catch return;
+        const remote = link.remoteName();
         for (changes) |*ch| {
-            _ = self.applyRemoteEntityProp(ch);
+            if (self.applyRemoteEntityProp(ch)) {
+                self.emitRemoteEntityProp(ch, remote);
+            }
             ch.deinit(self.allocator);
         }
         self.allocator.free(changes);
@@ -13656,14 +13680,16 @@ pub const LinuxServer = struct {
     }
 
     /// Deliver `line` to the target user (if local + IRCX) and to every local
-    /// IRCX client sharing a channel with the target (deduped), except `except`.
-    fn fanUserPropNotify(self: *LinuxServer, target_nick: []const u8, line: []const u8, except: *ConnState) void {
+    /// IRCX client sharing a channel with the target (deduped), except `except`
+    /// if given (null for mesh-originated changes — no local setter).
+    fn fanUserPropNotify(self: *LinuxServer, target_nick: []const u8, line: []const u8, except: ?*ConnState) void {
         const twid = self.world.findNick(target_nick) orelse return;
         var seen = std.AutoHashMap(u64, void).init(self.allocator);
         defer seen.deinit();
         const tid = clientIdFromWorld(twid);
         if (self.connFor(tid)) |tconn| {
-            if (tconn != except and tconn.ircx) {
+            const is_except = if (except) |e| tconn == e else false;
+            if (!is_except and tconn.ircx) {
                 seen.put(@as(u64, @bitCast(tid)), {}) catch {};
                 self.deliver(tid, line) catch {};
             }
@@ -13678,7 +13704,7 @@ pub const LinuxServer = struct {
                 if (seen.contains(skey)) continue;
                 seen.put(skey, {}) catch {};
                 const mconn = self.connFor(mid) orelse continue;
-                if (mconn == except) continue;
+                if (except) |e| if (mconn == e) continue;
                 if (!mconn.ircx) continue;
                 self.deliver(mid, line) catch continue;
             }
