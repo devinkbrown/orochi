@@ -28,7 +28,14 @@ pub const loopback_be = media_socket.loopback_be;
 pub const any_be = media_socket.any_be;
 pub const max_datagram = media_socket.max_datagram;
 
-/// Max participants per native call (forward fan-out bound).
+/// Max participants per native call (inline forward fan-out bound).
+///
+/// The native (OPVOX/OPVIS) leg is for point-to-point / small calls; group
+/// sessions go through the SFU `Room` (ceiling 256, pointer-indirected per room).
+/// This `Link` is stored BY VALUE in a rehashing map, so its inline ceiling stays
+/// at 64 to keep the per-entry size (and rehash memcpy cost) bounded; the
+/// `[media].max_participants` runtime cap still applies (clamped to this ceiling).
+pub const default_max_call_participants = 64;
 pub const max_call_participants = 64;
 
 pub const Link = native_media_link.NativeMediaLink(max_call_participants);
@@ -56,6 +63,8 @@ pub const NativeMediaTransport = struct {
     max_frame_bytes: usize = media_socket.max_datagram,
     /// Runtime cap reserved for upload-bearing media operations.
     max_upload_bytes: u64 = 16 * 1024 * 1024,
+    /// Runtime cap for per-channel native participants below the inline ceiling.
+    max_participants: usize = default_max_call_participants,
     /// Require authenticated native-media datagrams. Defaults false so legacy
     /// clients that do not append the MAC tag are still accepted.
     require_mac: bool = false,
@@ -68,7 +77,14 @@ pub const NativeMediaTransport = struct {
     cross: ?media_bridge.CrossLegSink = null,
 
     pub fn init(allocator: std.mem.Allocator) NativeMediaTransport {
-        return .{ .allocator = allocator };
+        return initConfig(allocator, default_max_call_participants);
+    }
+
+    pub fn initConfig(allocator: std.mem.Allocator, max_participants: usize) NativeMediaTransport {
+        return .{
+            .allocator = allocator,
+            .max_participants = @min(max_participants, max_call_participants),
+        };
     }
 
     /// Install the cross-leg sink (call before `start`, or while stopped).
@@ -235,7 +251,7 @@ pub const NativeMediaTransport = struct {
                 return e;
             };
             gop.key_ptr.* = key;
-            gop.value_ptr.* = Link.init();
+            gop.value_ptr.* = Link.initConfig(self.max_participants);
         }
         return gop.value_ptr;
     }
@@ -532,6 +548,17 @@ test "NativeMediaTransport: unregister drops the channel and frees its index" {
     // channel torn down; re-registering works cleanly (no stale key/index)
     try nmt.register("#call", "carol", .voice, 300, .{});
     try testing.expectEqual(@as(usize, 1), nmt.countChannel("#call"));
+}
+
+test "NativeMediaTransport: register enforces runtime participant cap" {
+    var nmt = NativeMediaTransport.initConfig(testing.allocator, 2);
+    defer nmt.deinit();
+
+    try nmt.register("#call", "alice", .voice, 100, .{});
+    try nmt.register("#call", "bob", .voice, 200, .{});
+    try testing.expectError(error.Full, nmt.register("#call", "carol", .voice, 300, .{}));
+    try nmt.register("#call", "alice", .video, 400, .{});
+    try testing.expectEqual(@as(usize, 2), nmt.countChannel("#call"));
 }
 
 const rtp_profile = @import("../proto/rtp_profile.zig");

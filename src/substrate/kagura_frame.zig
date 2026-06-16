@@ -31,6 +31,7 @@ const Allocator = std.mem.Allocator;
 /// Default out-of-order reorder/jitter window depth (frames). Frames outside the
 /// window are late-dropped. Mirrors `ReassemblyConfig.window`'s default.
 pub const default_reorder_window_frames: u32 = 64;
+pub const window_cap: u32 = 64;
 
 /// Runtime-tunable reassembly defaults. The actual ring storage of
 /// `ReassemblyBuffer(max_payload, window_cap)` is comptime-bound (DEFERRED); only
@@ -392,27 +393,27 @@ pub const PushResult = enum { buffered, duplicate, late_drop };
 /// Jitter/reorder reassembly buffer.  Accepts out-of-order frames, emits
 /// in-order.  `max_payload` and `window_cap` are compile-time bounds;
 /// runtime window from `ReassemblyConfig` must be <= `window_cap`.
-pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) type {
+pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_limit: u32) type {
     return struct {
         const Self = @This();
         const RingSlot = Slot(max_payload);
 
-        ring: [window_cap]RingSlot = [_]RingSlot{.{}} ** window_cap,
+        ring: [window_limit]RingSlot = [_]RingSlot{.{}} ** window_limit,
         next_seq: u32 = 0,
         anchored: bool = false,
         /// Highest buffered sequence; bounds gap scanning in reportGaps.
         high_watermark: u32 = 0,
         high_watermark_set: bool = false,
-        window: u32 = window_cap,
+        window: u32 = window_limit,
         // Statistics (all public, read-only by callers).
         late_drop_count: u64 = 0,
         duplicate_count: u64 = 0,
         gap_count: u64 = 0,
         // Bitset: recovered[offset] = FEC has synthesised next_seq+offset.
-        recovered_bits: [window_cap / 8 + 1]u8 = [_]u8{0} ** (window_cap / 8 + 1),
+        recovered_bits: [window_limit / 8 + 1]u8 = [_]u8{0} ** (window_limit / 8 + 1),
 
         pub fn init(cfg: ReassemblyConfig) Self {
-            std.debug.assert(cfg.window > 0 and cfg.window <= window_cap);
+            std.debug.assert(cfg.window > 0 and cfg.window <= window_limit);
             var self = Self{};
             self.window = cfg.window;
             if (cfg.initial_seq) |s| {
@@ -442,7 +443,7 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
                 // seq is behind next_seq (already-consumed region). Only a true
                 // re-send of a slot still holding this exact seq is a duplicate;
                 // anything else is a distinct frame that arrived too late.
-                const idx = seq % window_cap;
+                const idx = seq % window_limit;
                 const slot = &self.ring[idx];
                 if ((slot.state == .consumed or slot.state == .filled) and slot.frame.sequence == seq) {
                     self.duplicate_count += 1;
@@ -455,7 +456,7 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
                 return .late_drop;
             }
 
-            const idx = seq % window_cap;
+            const idx = seq % window_limit;
             var slot = &self.ring[idx];
 
             if (slot.state == .filled and slot.frame.sequence == seq) {
@@ -494,7 +495,7 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
         pub fn drain(self: *Self, out_slice: []MediaFrame) usize {
             var count: usize = 0;
             while (count < out_slice.len) {
-                const idx = self.next_seq % window_cap;
+                const idx = self.next_seq % window_limit;
                 const slot = &self.ring[idx];
                 if (slot.state != .filled or slot.frame.sequence != self.next_seq) break;
 
@@ -521,7 +522,7 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
             var offset: u32 = 0;
             while (offset < scan_count) : (offset += 1) {
                 const seq = self.next_seq +% offset;
-                const slot = &self.ring[seq % window_cap];
+                const slot = &self.ring[seq % window_limit];
                 const filled = slot.state == .filled and slot.frame.sequence == seq;
                 if (!filled and !self.isRecoveredBit(offset)) {
                     if (gap_start == null) gap_start = seq;
@@ -540,7 +541,7 @@ pub fn ReassemblyBuffer(comptime max_payload: usize, comptime window_cap: u32) t
             const delta = wrappingDelta(self.next_seq, seq);
             if (delta >= self.window) return;
             self.setRecoveredBit(delta);
-            const idx = seq % window_cap;
+            const idx = seq % window_limit;
             var slot = &self.ring[idx];
             if (slot.state != .filled) {
                 slot.payload_len = 0;

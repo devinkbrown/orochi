@@ -30,6 +30,7 @@ const svc_lastseen = @import("svc_lastseen.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
 const media_session = @import("../substrate/media_session.zig");
+const kagura_frame = @import("../substrate/kagura_frame.zig");
 const sdp = @import("../proto/sdp.zig");
 const event_spine = @import("event_spine.zig");
 const observe_mod = @import("observe.zig");
@@ -1210,6 +1211,12 @@ pub const Config = struct {
     /// Runtime cap for one UDP media datagram accepted by the WebRTC/native
     /// pumps. Set from `[media].max_frame_bytes` and clamped to the socket bound.
     media_max_frame_bytes: u64 = 64 * 1024,
+    /// Runtime Kagura reorder window for media reassembly. Validated by the
+    /// config parser to fit the inline reassembly window ceiling.
+    media_reorder_window_frames: u32 = kagura_frame.default_reorder_window_frames,
+    /// Runtime SFU participant cap per room, bounded by the inline roster
+    /// ceiling in media_room/native media link.
+    media_max_participants: usize = media_room.default_max_participants,
     /// Require the native OPVOX/OPVIS UDP leg to carry a per-datagram MAC tag.
     /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
     native_media_require_mac: bool = false,
@@ -1451,6 +1458,10 @@ pub const Config = struct {
     /// binary is what actually boots. Null falls back to `/proc/self/exe`.
     exe_path: ?[]const u8 = null,
 };
+
+pub fn mediaReassemblyConfig(config: Config) kagura_frame.ReassemblyConfig {
+    return media_session.reassemblyConfig(.{ .reorder_window_frames = config.media_reorder_window_frames });
+}
 
 /// Per-connection daemon state used by both the pure command core and the
 /// socket loop. No slices in this struct borrow from transient recv buffers.
@@ -2419,9 +2430,11 @@ pub const LinuxServer = struct {
                 .max_sessions_per_account = config.session_max_per_account,
             }),
             .content_filter = content_filter_mod.ContentFilter.init(allocator),
-            .media_rooms = media_room.MediaRooms.init(allocator),
+            .media_rooms = media_room.MediaRooms.initConfig(allocator, .{
+                .max_participants = config.media_max_participants,
+            }),
             .media_plane = media_plane_mod.MediaPlane.init(allocator),
-            .native_media = native_media_mod.NativeMediaTransport.init(allocator),
+            .native_media = native_media_mod.NativeMediaTransport.initConfig(allocator, config.media_max_participants),
             .tegami = tegami_mod.TegamiBox.init(allocator),
             .transcript = transcript_mod.TranscriptLog.init(allocator),
             .oper_registry = config.oper_registry,

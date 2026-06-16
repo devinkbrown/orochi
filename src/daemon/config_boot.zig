@@ -11,6 +11,8 @@ const config_format = @import("config_format.zig");
 const server = @import("server.zig");
 const oper_mod = @import("oper.zig");
 const og_mod = @import("operator_groups.zig");
+const kagura_frame = @import("../substrate/kagura_frame.zig");
+const media_session = @import("../substrate/media_session.zig");
 
 /// Overlay non-empty/non-zero config values onto `base` (which carries defaults).
 /// `cfg`'s string fields (e.g. host) are borrowed — keep `cfg` alive as long as
@@ -63,6 +65,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (!out.media_enabled) out.disabled_features = &.{"media"};
     out.media_max_upload_bytes = cfg.media.max_upload_bytes;
     out.media_max_frame_bytes = cfg.media.max_frame_bytes;
+    out.media_reorder_window_frames = cfg.media.reorder_window_frames;
+    out.media_max_participants = cfg.media.max_participants;
     out.native_media_require_mac = cfg.media.native_media_require_mac;
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
@@ -337,6 +341,8 @@ test "config text overlays the server config" {
         \\enabled = true
         \\max_upload_bytes = 12345
         \\max_frame_bytes = 1200
+        \\reorder_window_frames = 32
+        \\max_participants = 2
         \\native_media_require_mac = true
         \\[sasl]
         \\enabled = false
@@ -362,6 +368,12 @@ test "config text overlays the server config" {
     try testing.expect(loaded.config.media_enabled);
     try testing.expectEqual(@as(u64, 12345), loaded.config.media_max_upload_bytes);
     try testing.expectEqual(@as(u64, 1200), loaded.config.media_max_frame_bytes);
+    try testing.expectEqual(@as(u32, 32), loaded.config.media_reorder_window_frames);
+    try testing.expectEqual(@as(usize, 2), loaded.config.media_max_participants);
+    const reassembly_cfg = server.mediaReassemblyConfig(loaded.config);
+    try testing.expectEqual(@as(u32, 32), reassembly_cfg.window);
+    var rx = media_session.Receiver(media_session.default_max_payload_bytes, kagura_frame.window_cap).init(reassembly_cfg);
+    _ = &rx;
     try testing.expect(loaded.config.native_media_require_mac);
     try testing.expect(!loaded.config.sasl_enabled);
     try testing.expectEqualStrings("ircxnet", loaded.config.sasl_realm);

@@ -367,6 +367,11 @@ check_interval = "12h"        # how often to check the leaf expiry
 enabled = false
 max_upload_bytes = 16777216   # 16 MiB upload cap (0..1 GiB)
 max_frame_bytes = 65536       # 64 KiB per media frame (0..16 MiB)
+# Max participants per SFU room (group voice/video), enforced at join. Range 1..256
+# (the inline roster ceiling); the native OPVOX/OPVIS call leg caps at 64. Default 64.
+max_participants = 64
+# Kagura media reorder/reassembly window in frames, clamped to 1..64. Default 64.
+reorder_window_frames = 64
 # Require an authenticated per-datagram MAC on native (OPVOX/OPVIS) media. Default
 # false (accept untagged) for back-compat; when true, untagged or bad-tag datagrams
 # are dropped before the SFU learns the sender. Requires matching client support

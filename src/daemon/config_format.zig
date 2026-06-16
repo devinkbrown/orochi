@@ -11,6 +11,8 @@
 const std = @import("std");
 const toml = @import("../proto/toml.zig");
 const shard = @import("shard.zig");
+const kagura_frame = @import("../substrate/kagura_frame.zig");
+const media_room = @import("media_room.zig");
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("config_format requires a 64-bit target");
@@ -252,6 +254,8 @@ pub const Config = struct {
         enabled: bool = false,
         max_upload_bytes: u64 = 16 * 1024 * 1024,
         max_frame_bytes: u64 = 64 * 1024,
+        reorder_window_frames: u32 = kagura_frame.default_reorder_window_frames,
+        max_participants: u32 = @intCast(media_room.default_max_participants),
         /// Require HMAC-tagged native OPVOX/OPVIS datagrams. Defaults off until
         /// clients implement the matching Kagura-frame tag contract.
         native_media_require_mac: bool = false,
@@ -597,6 +601,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;
     cfg.media.max_upload_bytes = try uintField(doc, "media.max_upload_bytes", cfg.media.max_upload_bytes, 0, 1024 * 1024 * 1024);
     cfg.media.max_frame_bytes = try uintField(doc, "media.max_frame_bytes", cfg.media.max_frame_bytes, 0, 16 * 1024 * 1024);
+    cfg.media.reorder_window_frames = @intCast(try uintField(doc, "media.reorder_window_frames", cfg.media.reorder_window_frames, 1, kagura_frame.window_cap));
+    cfg.media.max_participants = @intCast(try uintField(doc, "media.max_participants", cfg.media.max_participants, 1, media_room.max_participants));
     if (doc.getBool("media.native_media_require_mac")) |b| cfg.media.native_media_require_mac = b;
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
@@ -1084,6 +1090,47 @@ test "parseToml: minimal config keeps defaults" {
     try testing.expectEqual(@as(u16, 0), cfg.listen.s2s);
     try testing.expectEqualStrings("127.0.0.1", cfg.listen.host);
     try testing.expect(!cfg.media.native_media_require_mac);
+}
+
+test "parseToml: media sizing keys default, lift, and validate ranges" {
+    const allocator = testing.allocator;
+    const base =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\
+    ;
+    var dflt = try parseToml(allocator, base, .{});
+    defer dflt.deinit(allocator);
+    try testing.expectEqual(kagura_frame.default_reorder_window_frames, dflt.media.reorder_window_frames);
+    try testing.expectEqual(@as(u32, @intCast(media_room.default_max_participants)), dflt.media.max_participants);
+
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[media]
+        \\reorder_window_frames = 32
+        \\max_participants = 2
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 32), cfg.media.reorder_window_frames);
+    try testing.expectEqual(@as(u32, 2), cfg.media.max_participants);
+
+    try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media]\nreorder_window_frames = 0\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media]\nmax_participants = 0\n", .{}));
+
+    const too_wide_window = try std.fmt.allocPrint(allocator, "{s}[media]\nreorder_window_frames = {d}\n", .{ base, kagura_frame.window_cap + 1 });
+    defer allocator.free(too_wide_window);
+    try testing.expectError(error.ParseError, parseToml(allocator, too_wide_window, .{}));
+
+    const too_many_participants = try std.fmt.allocPrint(allocator, "{s}[media]\nmax_participants = {d}\n", .{ base, media_room.max_participants + 1 });
+    defer allocator.free(too_many_participants);
+    try testing.expectError(error.ParseError, parseToml(allocator, too_many_participants, .{}));
 }
 
 test "parseToml: [tls] section projects onto Config" {

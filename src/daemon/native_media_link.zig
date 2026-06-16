@@ -66,9 +66,17 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
         plane: native_plane.NativeMediaPlane(max_participants),
         entries: [max_participants]Entry = undefined,
         len: usize = 0,
+        max_participants_runtime: usize = max_participants,
 
         pub fn init() Self {
-            return .{ .plane = native_plane.NativeMediaPlane(max_participants).init() };
+            return initConfig(max_participants);
+        }
+
+        pub fn initConfig(max_participants_runtime: usize) Self {
+            return .{
+                .plane = native_plane.NativeMediaPlane(max_participants).init(),
+                .max_participants_runtime = @min(max_participants_runtime, max_participants),
+            };
         }
 
         fn findById(self: *Self, id: ParticipantId) ?*Entry {
@@ -115,7 +123,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
                 return;
             }
 
-            if (self.len >= max_participants) return error.Full;
+            if (self.len >= @min(self.max_participants_runtime, max_participants)) return error.Full;
             self.plane.join(id, kind) catch return error.Full;
             self.entries[self.len] = .{
                 .id = id,
@@ -333,6 +341,16 @@ test "unregister removes a participant from the forward set" {
     link.unregister("b");
     try testing.expectEqual(@as(usize, 0), link.inbound(frame(1, floor, 2, false, &fbuf), &out));
     try testing.expectEqual(@as(usize, 1), link.count());
+}
+
+test "register refuses new native participants at runtime cap" {
+    var link = NativeMediaLink(8).initConfig(2);
+    try link.register("a", .voice, 1, mkAddr(1, 7000));
+    try link.register("b", .voice, 2, mkAddr(2, 7000));
+    try testing.expectError(error.Full, link.register("c", .voice, 3, mkAddr(3, 7000)));
+    try link.register("a", .video, 4, mkAddr(4, 7000));
+    try testing.expectEqual(@as(usize, 2), link.count());
+    try testing.expectEqual(@as(?u32, 4), link.streamIdFor("a"));
 }
 
 test "inboundFrom learns the publisher's address and still forwards to others" {

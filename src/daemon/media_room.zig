@@ -11,27 +11,22 @@ const media = @import("../substrate/suimyaku/media.zig");
 const toml = @import("../proto/toml.zig");
 const sdp = @import("../proto/sdp.zig");
 
-pub const max_participants: usize = 64;
+pub const default_max_participants: usize = 64;
+pub const max_participants: usize = 256;
 pub const Room = media.Session(max_participants);
 pub const MediaKind = media.MediaKind;
 pub const Participant = media.Participant;
 
-/// Runtime-tunable media-room bounds.
-///
-/// `max_participants` is intentionally NOT here: it parameterizes the comptime
-/// `Session(N)` roster type (`[N]Participant` inline storage) and cannot be made
-/// runtime without reworking the substrate Session into heap storage. It stays a
-/// comptime constant; `[media.sfu] max_participants_per_room` is DEFERRED.
-///
-/// Only the runtime breakout-label cap is config-driven here. Defaults equal the
-/// bare constants; `applyToml` overlays the `[media.sfu]` section.
+/// Runtime-tunable media-room bounds. `max_participants` is still the inline
+/// `Session(N)` ceiling; `Config.max_participants` is a runtime cap below it.
 pub const Config = struct {
+    max_participants: usize = default_max_participants,
     max_breakout_bytes: usize = max_breakout_bytes,
 };
 
-/// Overlay `[media.sfu]` keys from a parsed TOML document onto `cfg`.
-/// `max_participants_per_room` is deferred (comptime) and ignored here.
+/// Overlay media room keys from a parsed TOML document onto `cfg`.
 pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
+    if (doc.getUint("media.max_participants")) |v| cfg.max_participants = @intCast(v);
     if (doc.getUint("media.sfu.max_breakout_label_bytes")) |v| cfg.max_breakout_bytes = @intCast(v);
 }
 
@@ -273,6 +268,8 @@ pub const MediaRooms = struct {
     pub fn join(self: *MediaRooms, channel: []const u8, pid: []const u8, kind: MediaKind) Error!void {
         const id = try media.ParticipantId.init(pid);
         const r = try self.ensure(channel);
+        if (r.participant(id) == null and r.count() >= @min(self.config.max_participants, max_participants))
+            return error.ParticipantCapacityExceeded;
         try r.join(id, kind);
     }
 
@@ -444,19 +441,22 @@ test "applyToml defaults match historical constants" {
     defer doc.deinit(testing.allocator);
     var cfg: Config = .{};
     applyToml(&cfg, &doc);
+    try testing.expectEqual(default_max_participants, cfg.max_participants);
     try testing.expectEqual(max_breakout_bytes, cfg.max_breakout_bytes);
 }
 
-test "applyToml overlays media.sfu breakout label cap" {
+test "applyToml overlays media participant and sfu breakout caps" {
     const src =
+        \\[media]
+        \\max_participants = 8
         \\[media.sfu]
         \\max_breakout_label_bytes = 4
-        \\max_participants_per_room = 8
     ;
     var doc = try toml.parse(testing.allocator, src);
     defer doc.deinit(testing.allocator);
     var cfg: Config = .{};
     applyToml(&cfg, &doc);
+    try testing.expectEqual(@as(usize, 8), cfg.max_participants);
     try testing.expectEqual(@as(usize, 4), cfg.max_breakout_bytes);
 
     var m = MediaRooms.initConfig(testing.allocator, cfg);
@@ -464,4 +464,14 @@ test "applyToml overlays media.sfu breakout label cap" {
     try m.join("#c", "alice", .voice);
     try m.setBreakout("#c", "alice", "engineering"); // truncated to 4 bytes
     try testing.expectEqualStrings("engi", m.breakoutOf("#c", "alice"));
+}
+
+test "join refuses new participants at runtime cap" {
+    var m = MediaRooms.initConfig(testing.allocator, .{ .max_participants = 2 });
+    defer m.deinit();
+    try m.join("#c", "alice", .voice);
+    try m.join("#c", "bob", .voice);
+    try testing.expectError(error.ParticipantCapacityExceeded, m.join("#c", "carol", .voice));
+    try m.join("#c", "alice", .video);
+    try testing.expectEqual(@as(usize, 2), m.roster("#c").len);
 }
