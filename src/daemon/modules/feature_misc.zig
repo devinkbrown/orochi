@@ -33,10 +33,11 @@ fn geoipCmd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleGeoip(x.conn, x.parsed);
 }
-/// SUMMON is intentionally disabled (RFC 2812 §4.5); reply 445.
+/// SUMMON <nick> <channel> — repurposed as an operator force-join (the classic
+/// host-paging form, RFC 1459 §4.5, is obsolete). Oper-gated by the registry.
 fn summon(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
-    try x.reply(.ERR_SUMMONDISABLED, &.{}, "SUMMON has been disabled");
+    try x.server.handleSummon(x.conn, x.parsed);
 }
 /// A registered client's PONG heartbeat reply: accepted, no response.
 fn pong(c: *anyopaque, _: I) anyerror!void {
@@ -53,7 +54,7 @@ pub const module = registry.Module{
         .{ .name = "TEGAMI", .handler = tegami },
         .{ .name = "ACTIVITY", .handler = activity },
         .{ .name = "GEOIP", .min_params = 1, .access = .oper, .handler = geoipCmd, .summary = "GeoIP lookup of an IP (oper)" },
-        .{ .name = "SUMMON", .access = .any, .handler = summon },
+        .{ .name = "SUMMON", .min_params = 2, .access = .oper, .handler = summon },
         .{ .name = "PONG", .access = .any, .handler = pong },
     },
 };

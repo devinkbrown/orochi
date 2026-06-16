@@ -887,6 +887,7 @@ const Numeric = enum(u16) {
     RPL_NOTOPIC = 331,
     RPL_TOPIC = 332,
     RPL_TOPICWHOTIME = 333,
+    RPL_SUMMONING = 342,
     RPL_CHANNELMODEIS = 324,
     RPL_CREATIONTIME = 329,
     RPL_UMODEIS = 221,
@@ -8433,11 +8434,29 @@ pub const LinuxServer = struct {
                         try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Founder is set at channel creation, not by MODE");
                         continue;
                     }
-                    // Authority: a member may only set/clear a status tier whose
-                    // rank is <= their own highest rank. So op manages op/voice,
-                    // owner manages owner/op/voice, founder manages all — and an
-                    // owner can NEVER strip a founder, nor an op an owner.
-                    if (setter.rank() < chanmode.rankOfMode(mode)) {
+                    const target = self.world.findNick(target_nick) orelse {
+                        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+                        continue;
+                    };
+                    const target_modes = self.world.memberModes(channel, target) orelse {
+                        try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ target_nick, channel }, "They aren't on that channel");
+                        continue;
+                    };
+                    // Ophion-faithful cumulative hierarchy (founder > owner > op):
+                    // expand the named change into the concrete tier ops it implies.
+                    // A deop strips the higher tiers it carries; a higher-tier
+                    // removal demotes one rank. Voice is independent. See
+                    // `chanmode.cascadeStatusOps`.
+                    var ops_buf: [3]chanmode.TierOp = undefined;
+                    const ops = ops_buf[0..chanmode.cascadeStatusOps(target_modes, mode, adding, &ops_buf)];
+                    if (ops.len == 0) continue; // already in the desired state
+                    // Authority: the actor must outrank the HIGHEST tier the cascade
+                    // touches, not just the letter typed (a `-o` that strips a founder
+                    // needs founder-level authority). Server opers with active
+                    // override bypass and are audited.
+                    var required_rank: u8 = 0;
+                    for (ops) |op| required_rank = @max(required_rank, chanmode.rankOfMode(op.mode));
+                    if (setter.rank() < required_rank) {
                         if (active_override) {
                             override_mode_bypass = true;
                         } else {
@@ -8445,16 +8464,10 @@ pub const LinuxServer = struct {
                             continue;
                         }
                     }
-                    const target = self.world.findNick(target_nick) orelse {
-                        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
-                        continue;
-                    };
-                    // Rank protection: you cannot change the status modes of a
-                    // member ranked above you (an owner can't strip a founder, an
-                    // op can't strip an owner, …). Acting on yourself is always
-                    // allowed (e.g. dropping your own status). Server opers bypass.
+                    // Rank protection: you cannot change a member ranked above you
+                    // (acting on yourself is always allowed). Server opers bypass.
                     if (!target.eql(worldIdFromClient(id))) {
-                        const target_rank = (self.world.memberModes(channel, target) orelse world_model.MemberModes.empty()).rank();
+                        const target_rank = target_modes.rank();
                         if (!conn.session.isOper() and setter.rank() < target_rank) {
                             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "Cannot change the modes of a higher-ranked member");
                             continue;
@@ -8462,20 +8475,24 @@ pub const LinuxServer = struct {
                             override_mode_bypass = true;
                         }
                     }
-                    const changed = self.world.setMemberMode(channel, target, mode, adding) catch {
-                        try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ target_nick, channel }, "They aren't on that channel");
-                        continue;
-                    };
-                    if (changed) {
+                    // Apply each concrete tier op; echo every one that actually
+                    // flipped (so the cascade is visible on the wire).
+                    var any_changed = false;
+                    for (ops) |op| {
+                        const changed = self.world.setMemberMode(channel, target, op.mode, op.on) catch continue;
+                        if (!changed) continue;
+                        any_changed = true;
                         channel_flags_changed = true;
-                        const want_sign: u8 = if (adding) '+' else '-';
+                        const want_sign: u8 = if (op.on) '+' else '-';
                         if (emitted_sign != want_sign) {
                             applied.appendByte(want_sign) catch break;
                             emitted_sign = want_sign;
                         }
-                        applied.appendByte(ch) catch break;
+                        applied.appendByte(chanmode.memberModeLetter(op.mode)) catch break;
                         targets.appendByte(' ') catch break;
                         targets.append(target_nick) catch break;
+                    }
+                    if (any_changed) {
                         // Propagate the member's new prefix status to mesh peers so
                         // remote rosters + clients converge immediately (not only via
                         // the periodic re-burst). Local target only — a remote member's
@@ -11394,6 +11411,10 @@ pub const LinuxServer = struct {
             }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
+            // Carry the monotonic signon/last-message clocks so WHOIS idle/signon
+            // survive the in-place UPGRADE (CLOCK_MONOTONIC is unchanged by execve).
+            snap.connected_at_ms = e.value.connected_at_ms;
+            snap.last_message_ms = e.value.last_message_ms;
             // Capture channel memberships + member modes so the successor re-joins.
             // Use a separate write index: a channel whose member modes can't be
             // read is skipped entirely, never leaving an undefined slot inside the
@@ -11594,9 +11615,14 @@ pub const LinuxServer = struct {
             closeFd(snap.fd);
             return false;
         };
-        conn.connected_at_ms = self.nowMs();
-        conn.last_activity_ms = conn.connected_at_ms;
-        conn.last_message_ms = conn.connected_at_ms;
+        // Restore the carried monotonic signon/last-message clocks so WHOIS idle
+        // and signon stay continuous across the UPGRADE; a pre-signon snapshot
+        // (or a fresh session) carries 0 → fall back to "now". last_activity is a
+        // liveness/PING clock for THIS attachment, so it legitimately resets now.
+        const now = self.nowMs();
+        conn.connected_at_ms = if (snap.connected_at_ms != 0) snap.connected_at_ms else now;
+        conn.last_message_ms = if (snap.last_message_ms != 0) snap.last_message_ms else now;
+        conn.last_activity_ms = now;
         conn.session.restore(snap);
         self.injectSessionState(conn);
         // TLS client: rebuild the live engine BEFORE anything else can touch the
@@ -15485,6 +15511,26 @@ pub const LinuxServer = struct {
         // binding (see elevateOperFromAccount). There is no password credential.
         _ = self;
         try queueNumeric(conn, .ERR_NOOPERHOST, &.{}, "OPER is disabled; authenticate via SASL (operator status is granted on login)");
+    }
+
+    /// SUMMON <nick> <channel> — force the target user into <channel>. Classic
+    /// host-paging SUMMON (RFC 1459 §4.5) has no meaning on a modern network
+    /// daemon, so Orochi repurposes it as an operator force-join (the registry
+    /// gates it `.access = .oper`). Reuses the same target resolution + join path
+    /// as `FORCEJOIN`, then replies `RPL_SUMMONING` (342) to the requester.
+    pub fn handleSummon(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SUMMON"}, "Not enough parameters (SUMMON <nick> <channel>)");
+            return;
+        }
+        const target_nick = parsed.paramSlice()[0];
+        const channel = parsed.paramSlice()[1];
+        // resolveTargetConn emits ERR_NOSUCHNICK on a miss; joinOne performs the
+        // actual join + membership broadcast + channel-name validation (same path
+        // FORCEJOIN uses).
+        const t = self.resolveTargetConn(conn, target_nick) orelse return;
+        try self.joinOne(t.id, t.conn, channel, null, 0);
+        try queueNumeric(conn, .RPL_SUMMONING, &.{ target_nick, channel }, "Summoned user to channel");
     }
 
     /// SASL-only operator elevation: if `conn` is authenticated as an account with
@@ -26257,19 +26303,56 @@ test "threaded server: NAMES honors multi-prefix cap" {
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_a);
     var a = LiveClient{ .fd = fd_a };
-    // Negotiate multi-prefix, register, become founder of #m, then self-op so the
-    // member holds two tiers (~ founder + @ op).
+    // Negotiate multi-prefix, register, become founder of #m, then self-voice so
+    // the member holds two tiers (! founder + + voice). Voice is independent of
+    // the authority chain, so it stacks; a chain tier like +o would instead
+    // DEMOTE the founder under the cumulative hierarchy.
     try writeAllFd(fd_a, "CAP REQ :multi-prefix\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
     try recvUntil(&a, " 001 A ", 200);
     try writeAllFd(fd_a, "JOIN #m\r\n");
     try recvUntil(&a, " 366 A #m ", 200);
-    try writeAllFd(fd_a, "MODE #m +o A\r\n");
-    try recvUntil(&a, "MODE #m +o A", 200);
+    try writeAllFd(fd_a, "MODE #m +v A\r\n");
+    try recvUntil(&a, "MODE #m +v A", 200);
     a.reset();
-    // With multi-prefix the NAMES entry carries every held prefix (~@), not just
+    // With multi-prefix the NAMES entry carries every held prefix (!+), not just
     // the highest.
     try writeAllFd(fd_a, "NAMES #m\r\n");
-    try recvUntil(&a, "!@A", 200);
+    try recvUntil(&a, "!+A", 200);
+}
+
+test "threaded server: SUMMON force-joins the target (oper-gated)" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    // A is an operator (admin account via SASL); B is a normal user.
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&a, " 381 A ", 200); // auto-elevated on SASL login
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    a.reset();
+    b.reset();
+    // A summons B into #ops → B is force-joined, A gets RPL_SUMMONING (342).
+    try writeAllFd(fd_a, "SUMMON B #ops\r\n");
+    try recvUntil(&b, "JOIN #ops", 200);
+    try recvUntil(&a, " 342 A B #ops ", 200);
 }
 
 test "threaded server: WHISPER delivers to channel co-member only" {

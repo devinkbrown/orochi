@@ -439,6 +439,69 @@ pub fn rankOfMode(mode: MemberMode) u8 {
     };
 }
 
+/// One concrete tier change produced by `cascadeStatusOps`.
+pub const TierOp = struct { mode: MemberMode, on: bool };
+
+/// Expand a single named status MODE change into the ordered set of concrete
+/// tier ops realizing Ophion's cumulative-authority hierarchy (modelled on
+/// `/home/kain/ophion/ircd/chmode.c` chm_owner/chm_op): the chain
+/// founder > owner > op means a tier carries every authority below it, so a
+/// member occupies exactly ONE chain level (Orochi stores the single highest
+/// tier — the creator holds founder alone, `world.zig`). Voice is independent.
+///
+///   ADD `+X` (X ∈ owner/op; `+Q` is creation-only and rejected by the caller):
+///     the member's chain level becomes exactly X — set X, clear any other chain
+///     tier (promote a lower member, demote a higher one).
+///   DEL `-X` (X ∈ founder/owner/op): clear X and every tier above it that is
+///     held; then — unless a tier was stripped and X is the chain floor (op) —
+///     set the tier directly below X so the member lands one rank down. So
+///     `-Q` demotes founder→owner, `-q` demotes →op, and `-o` strips the chain
+///     entirely. A `-X` that finds nothing at/above X is a no-op.
+///
+/// Ops are written high→low (founder, owner, op) so the wire echo reads
+/// naturally. Returns the count written into `out` (0 = no change). The caller
+/// still applies its own authority/rank checks against the highest tier touched.
+pub fn cascadeStatusOps(current: MemberModes, named: MemberMode, adding: bool, out: *[3]TierOp) usize {
+    // Voice sits outside the authority chain — a plain independent toggle.
+    if (named == .voice) {
+        out[0] = .{ .mode = .voice, .on = adding };
+        return 1;
+    }
+    const chain = [_]MemberMode{ .founder, .owner, .op };
+    const named_rank = rankOfMode(named);
+    var n: usize = 0;
+    if (adding) {
+        // Single-tier: the member's chain level becomes exactly `named`.
+        for (chain) |t| {
+            const desired = (t == named);
+            if (current.contains(t) != desired) {
+                out[n] = .{ .mode = t, .on = desired };
+                n += 1;
+            }
+        }
+    } else {
+        // Clear the named tier and every tier above it that is currently held.
+        var stripped = false;
+        for (chain) |t| {
+            if (rankOfMode(t) >= named_rank and current.contains(t)) {
+                out[n] = .{ .mode = t, .on = false };
+                n += 1;
+                stripped = true;
+            }
+        }
+        // Land one rank down: set the tier directly below `named` (founder→owner,
+        // owner→op). `-o` is the chain floor and strips to nothing.
+        if (stripped and named != .op) {
+            const below: MemberMode = if (named == .founder) .owner else .op;
+            if (!current.contains(below)) {
+                out[n] = .{ .mode = below, .on = true };
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
 /// Apply a MODE change string plus parameter vector to channel state.
 pub fn apply(
     modes: *ChannelModes,
@@ -925,4 +988,87 @@ test "oper-only and admin-only channel modes round-trip" {
     var param_buf: [1][]const u8 = undefined;
     const serialized = try writeModeString(&modes, &mode_buf, &param_buf);
     try std.testing.expectEqualStrings("+OA", serialized.mode_string);
+}
+
+// --- cascadeStatusOps: Ophion-faithful cumulative hierarchy --------------------
+
+/// Render the ops `cascadeStatusOps` produces as a wire-style mode string
+/// (e.g. "-q+o") so the cumulative cascade is easy to assert in tests.
+fn renderCascade(current: MemberModes, named: MemberMode, adding: bool, buf: []u8) []const u8 {
+    var ops: [3]TierOp = undefined;
+    const n = cascadeStatusOps(current, named, adding, &ops);
+    var len: usize = 0;
+    var sign: u8 = 0;
+    for (ops[0..n]) |op| {
+        const want: u8 = if (op.on) '+' else '-';
+        if (sign != want) {
+            buf[len] = want;
+            len += 1;
+            sign = want;
+        }
+        buf[len] = memberModeLetter(op.mode);
+        len += 1;
+    }
+    return buf[0..len];
+}
+
+test "cascade: deop strips the higher tiers it carries" {
+    var buf: [8]u8 = undefined;
+    const founder = MemberModes.fromModes(&.{.founder});
+    const owner = MemberModes.fromModes(&.{.owner});
+    const op = MemberModes.fromModes(&.{.op});
+    // -o on a founder removes the founder tier (its authority includes op).
+    try std.testing.expectEqualStrings("-Q", renderCascade(founder, .op, false, &buf));
+    // -o on an owner removes ownership.
+    try std.testing.expectEqualStrings("-q", renderCascade(owner, .op, false, &buf));
+    // -o on a plain op just removes op.
+    try std.testing.expectEqualStrings("-o", renderCascade(op, .op, false, &buf));
+}
+
+test "cascade: higher-tier removal demotes exactly one rank" {
+    var buf: [8]u8 = undefined;
+    const founder = MemberModes.fromModes(&.{.founder});
+    const owner = MemberModes.fromModes(&.{.owner});
+    // -Q on a founder lands them at owner.
+    try std.testing.expectEqualStrings("-Q+q", renderCascade(founder, .founder, false, &buf));
+    // -q on an owner lands them at op.
+    try std.testing.expectEqualStrings("-q+o", renderCascade(owner, .owner, false, &buf));
+    // -q on a founder strips owner-and-above, leaving op.
+    try std.testing.expectEqualStrings("-Q+o", renderCascade(founder, .owner, false, &buf));
+}
+
+test "cascade: promotion moves the single tier" {
+    var buf: [8]u8 = undefined;
+    const none = MemberModes.empty();
+    const op = MemberModes.fromModes(&.{.op});
+    const owner = MemberModes.fromModes(&.{.owner});
+    // +q on a plain member grants owner.
+    try std.testing.expectEqualStrings("+q", renderCascade(none, .owner, true, &buf));
+    // +q on an op promotes op→owner (clears the op tier).
+    try std.testing.expectEqualStrings("+q-o", renderCascade(op, .owner, true, &buf));
+    // +o on an owner demotes owner→op.
+    try std.testing.expectEqualStrings("-q+o", renderCascade(owner, .op, true, &buf));
+}
+
+test "cascade: no-op and independent voice" {
+    var buf: [8]u8 = undefined;
+    const owner = MemberModes.fromModes(&.{.owner});
+    const op = MemberModes.fromModes(&.{.op});
+    // -Q on a non-founder changes nothing.
+    try std.testing.expectEqualStrings("", renderCascade(op, .founder, false, &buf));
+    // +q on someone already owner is a no-op.
+    try std.testing.expectEqualStrings("", renderCascade(owner, .owner, true, &buf));
+    // Voice is independent of the authority chain.
+    try std.testing.expectEqualStrings("+v", renderCascade(owner, .voice, true, &buf));
+    try std.testing.expectEqualStrings("-v", renderCascade(MemberModes.fromModes(&.{ .owner, .voice }), .voice, false, &buf));
+}
+
+test "cascade: required rank is the highest tier touched" {
+    var ops: [3]TierOp = undefined;
+    const founder = MemberModes.fromModes(&.{.founder});
+    // -o on a founder must require founder-level authority, not op-level.
+    const n = cascadeStatusOps(founder, .op, false, &ops);
+    var required: u8 = 0;
+    for (ops[0..n]) |op| required = @max(required, rankOfMode(op.mode));
+    try std.testing.expectEqual(@as(u8, 4), required);
 }

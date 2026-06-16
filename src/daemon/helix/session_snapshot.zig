@@ -13,6 +13,15 @@
 //!   [u8 flags]   bit0=logged_in  bit1=away_active  bit2=is_oper
 //!   [i32 fd]     the client's socket fd (inherited across execve), -1 if none
 //!   [u16 nchan]  ( [u16 len][name][u8 member-modes] )*   channel memberships
+//!   [i64 connected_at_ms][i64 last_message_ms]   OPTIONAL trailing block
+//!
+//! The trailing signon block carries the client's CLOCK_MONOTONIC signon and
+//! last-message timestamps so WHOIS idle/signon survive an in-place UPGRADE.
+//! CLOCK_MONOTONIC is system-wide and unaffected by execve, so the predecessor's
+//! values stay directly comparable on the successor (same host, same boot). The
+//! block is OPTIONAL: a snapshot written by a pre-signon build omits it, and the
+//! decoder defaults both to 0 so the successor falls back to "now" — no client is
+//! dropped on the single upgrade that crosses this format change.
 const std = @import("std");
 
 pub const Error = error{ Truncated, TooLong };
@@ -42,6 +51,11 @@ pub const Snapshot = struct {
     channels: []const ChannelMembership = &.{},
     /// The raw trailing channel-list bytes (DECODE output); walk via `channelIter`.
     channels_blob: []const u8 = "",
+    /// CLOCK_MONOTONIC signon timestamp (ms). 0 = unknown (pre-signon snapshot);
+    /// the successor falls back to its own "now" when restoring.
+    connected_at_ms: i64 = 0,
+    /// CLOCK_MONOTONIC last-message timestamp (ms) driving WHOIS idle. 0 = unknown.
+    last_message_ms: i64 = 0,
 };
 
 const flag_logged_in: u8 = 1 << 0;
@@ -80,6 +94,13 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
         try out.appendSlice(allocator, ch.name);
         try out.append(allocator, ch.modes);
     }
+    // Trailing signon block (see file header): two monotonic timestamps so the
+    // successor can restore WHOIS idle/signon across an in-place UPGRADE.
+    var ts_le: [8]u8 = undefined;
+    std.mem.writeInt(i64, &ts_le, snap.connected_at_ms, .little);
+    try out.appendSlice(allocator, &ts_le);
+    std.mem.writeInt(i64, &ts_le, snap.last_message_ms, .little);
+    try out.appendSlice(allocator, &ts_le);
     return out.toOwnedSlice(allocator);
 }
 
@@ -94,7 +115,19 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     const away = try r.lenPrefixed();
     const flags = try r.byte();
     const fd = try r.i32le();
-    const channels_blob = r.buf[r.pos..]; // trailing channel list, walked lazily
+    // The channel list begins here; the iterator self-limits by its leading count,
+    // so `channels_blob` stays "the rest" exactly as before — trailing signon
+    // bytes (if any) sit past the counted entries and are never iterated.
+    const channels_blob = r.buf[r.pos..];
+    // Locate the optional trailing signon block by walking past the channel list.
+    var connected_at_ms: i64 = 0;
+    var last_message_ms: i64 = 0;
+    if (channelRegionEnd(r.buf, r.pos)) |chan_end| {
+        if (r.buf.len - chan_end >= 16) {
+            connected_at_ms = std.mem.readInt(i64, r.buf[chan_end..][0..8], .little);
+            last_message_ms = std.mem.readInt(i64, r.buf[chan_end + 8 ..][0..8], .little);
+        }
+    }
     return .{
         .nick = nick,
         .realname = realname,
@@ -107,6 +140,8 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .is_oper = flags & flag_is_oper != 0,
         .fd = fd,
         .channels_blob = channels_blob,
+        .connected_at_ms = connected_at_ms,
+        .last_message_ms = last_message_ms,
     };
 }
 
@@ -141,6 +176,25 @@ pub const ChannelIter = struct {
 
 pub fn channelIter(blob: []const u8) ChannelIter {
     return .{ .blob = blob };
+}
+
+/// Return the absolute offset in `buf` one past the channel list that starts at
+/// `start` (a u16 count followed by that many `[u16 len][name][u8 modes]` entries),
+/// or null if the list is malformed/truncated. Used only to locate the optional
+/// trailing signon block; channel iteration itself is unaffected.
+fn channelRegionEnd(buf: []const u8, start: usize) ?usize {
+    if (buf.len - start < 2) return null;
+    const nchan = std.mem.readInt(u16, buf[start..][0..2], .little);
+    var p = start + 2;
+    var i: u16 = 0;
+    while (i < nchan) : (i += 1) {
+        if (p + 2 > buf.len) return null;
+        const n = std.mem.readInt(u16, buf[p..][0..2], .little);
+        p += 2;
+        if (p + n + 1 > buf.len) return null;
+        p += n + 1;
+    }
+    return p;
 }
 
 const Reader = struct {
@@ -193,12 +247,16 @@ test "snapshot encode/decode round-trips identity + flags" {
             .{ .name = "#ops", .modes = 0b101 },
             .{ .name = "#lounge", .modes = 0 },
         },
+        .connected_at_ms = 1_700_000_000_123,
+        .last_message_ms = 1_700_000_500_456,
     };
     const bytes = try encode(allocator, snap);
     defer allocator.free(bytes);
 
     const got = try decode(bytes);
     try testing.expectEqual(@as(i32, 42), got.fd);
+    try testing.expectEqual(@as(i64, 1_700_000_000_123), got.connected_at_ms);
+    try testing.expectEqual(@as(i64, 1_700_000_500_456), got.last_message_ms);
     var it = channelIter(got.channels_blob);
     const c0 = it.next().?;
     try testing.expectEqualStrings("#ops", c0.name);
@@ -222,6 +280,34 @@ test "empty snapshot round-trips" {
     const got = try decode(bytes);
     try testing.expectEqual(@as(usize, 0), got.nick.len);
     try testing.expect(!got.logged_in and !got.away_active and !got.is_oper);
+    try testing.expectEqual(@as(i64, 0), got.connected_at_ms);
+    try testing.expectEqual(@as(i64, 0), got.last_message_ms);
+}
+
+test "decode tolerates a pre-signon snapshot (no trailing block)" {
+    const allocator = testing.allocator;
+    // Build a snapshot, then truncate the 16-byte trailing signon block to emulate
+    // a capsule written by a build that predates the signon-carry format change.
+    const bytes = try encode(allocator, .{
+        .nick = "bob",
+        .fd = 7,
+        .channels = &.{.{ .name = "#a", .modes = 1 }},
+        .connected_at_ms = 1234,
+        .last_message_ms = 5678,
+    });
+    defer allocator.free(bytes);
+    const old = bytes[0 .. bytes.len - 16];
+
+    const got = try decode(old);
+    try testing.expectEqualStrings("bob", got.nick);
+    try testing.expectEqual(@as(i32, 7), got.fd);
+    // Channels still parse; signon defaults to 0 → successor falls back to "now".
+    var it = channelIter(got.channels_blob);
+    const c0 = it.next().?;
+    try testing.expectEqualStrings("#a", c0.name);
+    try testing.expect(it.next() == null);
+    try testing.expectEqual(@as(i64, 0), got.connected_at_ms);
+    try testing.expectEqual(@as(i64, 0), got.last_message_ms);
 }
 
 test "decode rejects a truncated buffer" {
