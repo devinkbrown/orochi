@@ -11,6 +11,7 @@ const config_format = @import("config_format.zig");
 const server = @import("server.zig");
 const oper_mod = @import("oper.zig");
 const og_mod = @import("operator_groups.zig");
+const event_spine = @import("event_spine.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_session = @import("../substrate/media_session.zig");
 
@@ -295,6 +296,7 @@ pub fn loadFromText(
             .class_name = o.class,
             .privileges = privileges,
             .title = o.title,
+            .presubscribe_bits = event_spine.categoryMaskFromTokens(o.presubscribe).bits,
         });
     }
     const oper_bindings = try bindings.toOwnedSlice(allocator);

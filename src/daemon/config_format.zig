@@ -178,6 +178,10 @@ pub const Config = struct {
         /// Optional custom title shown in WHOIS (e.g. "Network Guardian"). When
         /// empty the generic operator/administrator wording is used.
         title: []const u8 = "",
+        /// Event-Spine categories this oper is auto-subscribed to on elevation
+        /// (e.g. `["ANNOUNCE", "KILL"]`, or `["ALL"]`). Empty = none — the oper
+        /// opts in per-category with `EVENT ADD`.
+        presubscribe: []const []const u8 = &.{},
     };
 
     pub const Mesh = struct {
@@ -444,6 +448,7 @@ pub const Config = struct {
             allocator.free(oper.account);
             allocator.free(oper.class);
             allocator.free(oper.title);
+            freeStringList(allocator, oper.presubscribe);
         }
         allocator.free(self.opers);
         for (self.oper_groups) |g| {
@@ -674,6 +679,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
             for (list.items) |o| {
                 allocator.free(o.account);
                 allocator.free(o.class);
+                allocator.free(o.title);
+                freeStringList(allocator, o.presubscribe);
             }
             list.deinit(allocator);
         }
@@ -690,7 +697,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
                 try resolveStr(allocator, resolver, t)
             else
                 try allocator.dupe(u8, "");
-            try list.append(allocator, .{ .account = account, .class = class, .title = title });
+            errdefer allocator.free(title);
+            const presubscribe: []const []const u8 = if (item.getArray("presubscribe")) |parr|
+                try ownStringArray(allocator, resolver, parr)
+            else
+                &.{};
+            try list.append(allocator, .{ .account = account, .class = class, .title = title, .presubscribe = presubscribe });
         }
         cfg.opers = try list.toOwnedSlice(allocator);
     }

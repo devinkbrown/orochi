@@ -117,6 +117,24 @@ pub const CategoryMask = struct {
     }
 };
 
+/// Build a `CategoryMask` from config tokens: case-insensitive `EventCategory`
+/// names (e.g. "ANNOUNCE", "KILL", "OPER_ACTION") or the special "ALL". Unknown
+/// tokens are ignored. Used by `[[opers]] presubscribe`.
+pub fn categoryMaskFromTokens(tokens: []const []const u8) CategoryMask {
+    var mask = CategoryMask.empty();
+    for (tokens) |tok| {
+        if (std.ascii.eqlIgnoreCase(tok, "ALL")) {
+            mask = mask.include(CategoryMask.all());
+            continue;
+        }
+        inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
+            const cat: EventCategory = @field(EventCategory, field.name);
+            if (std.ascii.eqlIgnoreCase(tok, cat.token())) mask.add(cat);
+        }
+    }
+    return mask;
+}
+
 pub const IRCX_EVENT_TYPE_COUNT: usize = @typeInfo(IrcxEventType).@"enum".fields.len;
 
 /// IRCX EVENT subscription types supported by Ophion's client-facing command.

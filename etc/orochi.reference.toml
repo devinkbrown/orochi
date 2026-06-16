@@ -325,6 +325,10 @@ allow_anonymous = false
 # account = "alice"
 # class   = "netadmin"
 # title   = "Network Guardian"   # optional; shown in WHOIS
+# # Event-Spine categories this oper is AUTO-subscribed to on elevation. Default
+# # is none — an oper receives nothing until it opts in with `EVENT ADD <cat>`.
+# # Tokens are EventCategory names (case-insensitive) or "ALL".
+# presubscribe = ["ANNOUNCE", "KILL", "OPER_ACTION"]   # or ["ALL"]
 
 
 # --- [[oper_groups]] — role-based privilege classes --------------------------

@@ -138,6 +138,12 @@ pub const OperBinding = struct {
     privileges: OperPrivileges,
     /// Optional custom WHOIS title (e.g. "Network Guardian"). Empty = generic.
     title: []const u8 = "",
+    /// Event-Spine categories this oper is auto-subscribed to on elevation, as a
+    /// raw `event_spine.CategoryMask.bits` value (stored as bits to keep this
+    /// module dependency-free). 0 = subscribe to nothing; the oper must opt in
+    /// per-category with `EVENT ADD`. Set from the `[[opers]]` `presubscribe`
+    /// list at config load.
+    presubscribe_bits: u64 = 0,
 };
 
 /// Successful operator elevation.
@@ -146,6 +152,10 @@ pub const OperGrant = struct {
     class_name: []const u8,
     privileges: OperPrivileges,
     title: []const u8 = "",
+    /// Event-Spine auto-subscription mask bits carried from the binding (see
+    /// `OperBinding.presubscribe_bits`). A cross-mesh grant leaves this 0 — a
+    /// remote oper subscribes explicitly.
+    presubscribe_bits: u64 = 0,
 
     pub fn has(self: OperGrant, privilege: Privilege) bool {
         return self.privileges.has(privilege);
@@ -242,6 +252,7 @@ pub const OperRegistry = struct {
             .class_name = binding.class_name,
             .privileges = binding.privileges,
             .title = binding.title,
+            .presubscribe_bits = binding.presubscribe_bits,
         };
     }
 

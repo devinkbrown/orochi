@@ -15747,7 +15747,12 @@ pub const LinuxServer = struct {
                 c.session.setOperGrant(privileges, grant.class, grant.title);
                 if (override_was_set and had_override_priv and !privileges.has(.oper_override)) {
                     if (c.session.setUmode(.override, false)) {
-                        self.auditOverrideUse(c, "UMODE", c.session.displayName(), "cleared override after oper_override privilege was removed");
+                        const reason = "cleared override after oper_override privilege was removed";
+                        self.auditOverrideUse(c, "UMODE", c.session.displayName(), reason);
+                        // Tell the affected oper directly — they may not be
+                        // subscribed to the oper-action event feed, but they must
+                        // still learn WHY their override was removed.
+                        self.noticeTo(c, reason) catch {};
                         var mode_buf: [default_reply_bytes]u8 = undefined;
                         const nick = c.session.displayName();
                         const line = formatMessage(&mode_buf, self.serverName(), "MODE", &.{ nick, "-j" }, null) catch "";
@@ -15818,12 +15823,18 @@ pub const LinuxServer = struct {
         var privileges: oper_mod.OperPrivileges = undefined;
         var class_name: []const u8 = undefined;
         var title: []const u8 = undefined;
+        // Event-Spine auto-subscription on elevation: ONLY the categories the
+        // oper's binding presubscribes to (0 = none — they must `EVENT ADD`).
+        // A cross-mesh grant carries no presubscribe, so a remote oper defaults
+        // to no auto-subscription.
+        var presubscribe_bits: u64 = 0;
         var from_local = false;
         if (self.oper_registry) |registry| {
             if (registry.elevate(.{ .name = account })) |grant| {
                 privileges = grant.privileges;
                 class_name = grant.class_name;
                 title = grant.title;
+                presubscribe_bits = grant.presubscribe_bits;
                 from_local = true;
             } else |_| {}
         }
@@ -15846,8 +15857,11 @@ pub const LinuxServer = struct {
         // Locally-authorized opers mint a signed grant so peers recognize them.
         if (from_local) self.mintOperGrant(account, privileges, class_name, title);
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
-        // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events.
-        conn.session.setEventMask(event_spine.CategoryMask.all());
+        // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events,
+        // but ONLY for the categories this oper presubscribed to (per the
+        // `[[opers]] presubscribe` config). With none configured the oper gets
+        // nothing until it opts in via `EVENT ADD <category>`.
+        conn.session.setEventMask(event_spine.CategoryMask{ .bits = presubscribe_bits });
         try queueNumeric(conn, .RPL_YOUREOPER, &.{}, "You are now an IRC operator");
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
@@ -21424,8 +21438,12 @@ fn testOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
 }
 var test_oper_anchor: u8 = 0;
 const test_oper_checker = sasl.PlainChecker{ .ptr = &test_oper_anchor, .verifyFn = testOperVerify };
+// Test opers presubscribe to ALL event categories (the legacy auto-subscribe),
+// so the existing Event-Spine delivery tests keep receiving events without each
+// having to `EVENT ADD` first. Production opers default to none (opt-in).
+const test_presub_all_bits: u64 = event_spine.CategoryMask.all().bits;
 const test_oper_bindings = [_]oper_mod.OperBinding{
-    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
+    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full, .presubscribe_bits = test_presub_all_bits },
 };
 
 fn testExternalVerify(_: *anyopaque, _: []const u8, authzid: []const u8) ?[]const u8 {
@@ -21452,8 +21470,8 @@ fn testMultiOperVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
 var test_multi_oper_anchor: u8 = 0;
 const test_multi_oper_checker = sasl.PlainChecker{ .ptr = &test_multi_oper_anchor, .verifyFn = testMultiOperVerify };
 const test_multi_oper_bindings = [_]oper_mod.OperBinding{
-    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
-    .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
+    .{ .account_name = "admin", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full, .presubscribe_bits = test_presub_all_bits },
+    .{ .account_name = "oper", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}), .presubscribe_bits = test_presub_all_bits },
 };
 
 fn testRuntimeGrantVerify(_: *anyopaque, creds: sasl.PlainCredentials) bool {
