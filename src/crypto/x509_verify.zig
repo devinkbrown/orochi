@@ -184,6 +184,24 @@ pub fn verifySimpleChainAt(chain_der: []const []const u8, now_epoch_seconds: i64
     return verifySimpleChain(chain_der);
 }
 
+/// Validate the daemon's OWN leaf-first server certificate chain at load.
+///
+/// A server presents `chain[0]` (its leaf) plus any issuing intermediates as
+/// opaque DER for the *client* to anchor at a trusted root. It therefore must
+/// NOT be held to `verifySimpleChain`'s client-anchoring rules: a real CA-issued
+/// server chain never ships a self-signed root (`NotSelfSigned`), and its
+/// issuing intermediate may use a key type/curve the server does not itself sign
+/// with — e.g. a P-384 Let's Encrypt intermediate — which `verifySimpleChain`
+/// would reject as `UnsupportedKey` while verifying the leaf→issuer signature.
+///
+/// So validate only what the server actually owns: the LEAF must parse and be
+/// within its validity window. Intermediates are relayed verbatim and never
+/// key-parsed here; the matching signing key is verified separately at load.
+pub fn validateServerChainAt(chain_der: []const []const u8, now_epoch_seconds: i64) Error!void {
+    if (chain_der.len == 0) return error.EmptyChain;
+    try validateDerAt(chain_der[0], now_epoch_seconds);
+}
+
 fn requireSignature(info: LinkInfo) Error!void {
     if (!info.hasSignature()) return error.MissingSignature;
 }

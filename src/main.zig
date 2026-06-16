@@ -32,7 +32,10 @@ fn fileLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) 
 fn validateTlsChain(chain: []const []const u8) anyerror!void {
     if (chain.len == 0) return error.EmptyCertificateChain;
     const now_unix: i64 = @divTrunc(orochi.substrate.platform.realtimeMillis(), 1000);
-    try orochi.crypto.x509_verify.verifySimpleChainAt(chain, now_unix);
+    // The daemon's OWN chain: validate the leaf only (a CA-issued server chain
+    // ships leaf + intermediates, never a self-signed root, and its intermediate
+    // may use a key type the server does not sign with). See validateServerChainAt.
+    try orochi.crypto.x509_verify.validateServerChainAt(chain, now_unix);
 }
 
 /// Services → live-world bridge: a channel registration marks the live channel

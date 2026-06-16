@@ -2196,13 +2196,15 @@ pub const LinuxServer = struct {
     }
 
     /// Validate a reloaded leaf chain before it goes live on REHASH. Mirrors the
-    /// boot-time `validateTlsChain` in main.zig: a non-empty chain whose simple
-    /// path verifies against the current wall clock. A rejected chain leaves the
-    /// live certs untouched (the error propagates to the REHASH caller).
+    /// boot-time `validateTlsChain` in main.zig: the daemon's OWN chain is checked
+    /// leaf-only (a CA-issued server chain ships leaf + intermediates, never a
+    /// self-signed root, and an intermediate may use a key type the server does
+    /// not sign with). A rejected leaf leaves the live certs untouched (the error
+    /// propagates to the REHASH caller).
     fn validateReloadedChain(chain: []const []const u8) !void {
         if (chain.len == 0) return error.EmptyCertificateChain;
         const now_unix: i64 = @divTrunc(platform.realtimeMillis(), 1000);
-        try x509_verify.verifySimpleChainAt(chain, now_unix);
+        try x509_verify.validateServerChainAt(chain, now_unix);
     }
 
     /// Build one shard's `Reactor`: its own ring, connection table (reserved to
