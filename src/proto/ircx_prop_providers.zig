@@ -75,6 +75,16 @@ pub const Snapshot = struct {
     profile_location: ?[]const u8 = null,
     /// Free-form note used by the user profile provider.
     profile_note: ?[]const u8 = null,
+    /// GeoIP country code exposed by the user GeoIP providers.
+    geo_country: ?[]const u8 = null,
+    /// GeoIP region/subdivision exposed by the user GeoIP providers.
+    geo_region: ?[]const u8 = null,
+    /// GeoIP city exposed by the user GeoIP providers.
+    geo_city: ?[]const u8 = null,
+    /// GeoIP ASN exposed by the user GeoIP providers.
+    geo_asn: ?u32 = null,
+    /// GeoIP ASN organization exposed by the user GeoIP providers.
+    geo_asorg: ?[]const u8 = null,
 };
 
 /// Function type implemented by each computed property provider.
@@ -148,6 +158,11 @@ const builtin_providers = [_]Provider{
     .{ .name = "opkey", .scope = .channel, .read = readOpKey, .secret = true },
     .{ .name = "ownerkey", .scope = .channel, .read = readOwnerKey, .secret = true },
     .{ .name = "user_profile", .scope = .user, .read = readUserProfile },
+    .{ .name = "country", .scope = .user, .read = readGeoCountry },
+    .{ .name = "region", .scope = .user, .read = readGeoRegion },
+    .{ .name = "city", .scope = .user, .read = readGeoCity },
+    .{ .name = "asn", .scope = .user, .read = readGeoAsn },
+    .{ .name = "asorg", .scope = .user, .read = readGeoAsOrg },
     .{ .name = "creation_time", .scope = .channel, .read = readCreationTime },
     .{ .name = "topic_setter", .scope = .channel, .read = readTopicSetter },
     .{ .name = "name", .scope = .channel, .read = readChannelName },
@@ -257,6 +272,31 @@ fn readUserProfile(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue 
     try appendProfileField(&writer, &first, "note", ctx.profile_note);
 
     return .{ .text = writer.slice() };
+}
+
+fn readGeoCountry(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.geo_country orelse "" };
+}
+
+fn readGeoRegion(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.geo_region orelse "" };
+}
+
+fn readGeoCity(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.geo_city orelse "" };
+}
+
+fn readGeoAsn(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    const asn = ctx.geo_asn orelse return .{ .text = "" };
+    return .{ .text = std.fmt.bufPrint(out_buf, "{d}", .{asn}) catch return error.OutputTooSmall };
+}
+
+fn readGeoAsOrg(ctx: *const Snapshot, out_buf: []u8) ProviderError!PropValue {
+    _ = out_buf;
+    return .{ .text = ctx.geo_asorg orelse "" };
 }
 
 fn appendProfileField(
@@ -496,6 +536,46 @@ test "user_profile provider reports small caller buffers" {
     try std.testing.expectError(error.OutputTooSmall, result);
 }
 
+test "user GeoIP providers return snapshot values or empty strings" {
+    const allocator = std.testing.allocator;
+
+    // Arrange
+    const out = try allocator.alloc(u8, 32);
+    defer allocator.free(out);
+    var registry = ProviderRegistry.init();
+    defer registry.deinit();
+    const snapshot = Snapshot{
+        .geo_country = "DE",
+        .geo_region = "Berlin",
+        .geo_city = "Berlin",
+        .geo_asn = 64512,
+        .geo_asorg = "Example Net",
+    };
+    const empty = Snapshot{};
+
+    // Act / Assert
+    try expectText(try registry.query("COUNTRY", &snapshot, out), "DE");
+    try expectText(try registry.query("REGION", &snapshot, out), "Berlin");
+    try expectText(try registry.query("CITY", &snapshot, out), "Berlin");
+    try expectText(try registry.query("ASN", &snapshot, out), "64512");
+    try expectText(try registry.query("ASORG", &snapshot, out), "Example Net");
+
+    try expectText(try registry.query("COUNTRY", &empty, out), "");
+    try expectText(try registry.query("REGION", &empty, out), "");
+    try expectText(try registry.query("CITY", &empty, out), "");
+    try expectText(try registry.query("ASN", &empty, out), "");
+    try expectText(try registry.query("ASORG", &empty, out), "");
+}
+
+test "user ASN provider reports small caller buffers" {
+    var registry = ProviderRegistry.init();
+    defer registry.deinit();
+    const snapshot = Snapshot{ .geo_asn = 64512 };
+    var out: [2]u8 = undefined;
+
+    try std.testing.expectError(error.OutputTooSmall, registry.query("ASN", &snapshot, &out));
+}
+
 test "creation_time provider returns the channel creation timestamp" {
     const allocator = std.testing.allocator;
 
@@ -640,11 +720,16 @@ test "listForScope filters user and channel providers" {
     const channels = registry.listForScope(.channel, channel_buf);
 
     // Assert
-    try std.testing.expectEqual(@as(usize, 3), users.len);
+    try std.testing.expectEqual(@as(usize, 8), users.len);
     try std.testing.expectEqual(@as(usize, 15), channels.len);
     try std.testing.expectEqualStrings("account", users[0].name);
     try std.testing.expectEqualStrings("member_of", users[1].name);
     try std.testing.expectEqualStrings("user_profile", users[2].name);
+    try std.testing.expectEqualStrings("country", users[3].name);
+    try std.testing.expectEqualStrings("region", users[4].name);
+    try std.testing.expectEqualStrings("city", users[5].name);
+    try std.testing.expectEqualStrings("asn", users[6].name);
+    try std.testing.expectEqualStrings("asorg", users[7].name);
     try std.testing.expectEqualStrings("onjoin", channels[0].name);
     try std.testing.expectEqualStrings("topic_setter", channels[5].name);
     try std.testing.expectEqualStrings("name", channels[6].name);

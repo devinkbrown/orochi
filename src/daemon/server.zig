@@ -99,6 +99,7 @@ const whox = @import("../proto/whox.zig");
 const metadata_proto = @import("../proto/metadata.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
 const ircx_prop_store = @import("../proto/ircx_prop_store.zig");
+const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
 const chanmode_ext = @import("../proto/chanmode_ext.zig");
 const ircx_modex = @import("../proto/ircx_modex.zig");
@@ -9190,15 +9191,8 @@ pub const LinuxServer = struct {
                     city = db.lookupName(gip, "city", "en") catch null;
                     region = db.lookupString(gip, &.{ "subdivisions", "0", "names", "en" }) catch null;
                 }
-                var asn: ?u32 = null;
-                var asn_org: ?[]const u8 = null;
-                if (self.ensureGeoipAsn()) |adb| {
-                    if (adb.lookupInfo(gip) catch null) |ai| {
-                        asn = ai.asn;
-                        asn_org = ai.asn_org orelse ai.org orelse ai.isp;
-                    }
-                }
-                geo_text = buildGeoWhois(&geo_buf, city, region, country, asn, asn_org);
+                const asn_info = self.lookupGeoAsn(gip);
+                geo_text = buildGeoWhois(&geo_buf, city, region, country, asn_info.asn, asn_info.asorg);
             }
         }
 
@@ -12713,6 +12707,20 @@ pub const LinuxServer = struct {
         return db;
     }
 
+    const GeoAsnLookup = struct {
+        asn: ?u32 = null,
+        asorg: ?[]const u8 = null,
+    };
+
+    fn lookupGeoAsn(self: *LinuxServer, ip: geoip.Ip) GeoAsnLookup {
+        const db = self.ensureGeoipAsn() orelse return .{};
+        const info = (db.lookupInfo(ip) catch null) orelse return .{};
+        return .{
+            .asn = info.asn,
+            .asorg = info.asn_org orelse info.org orelse info.isp,
+        };
+    }
+
     /// On registration, record the client's `location` (city or country) and
     /// `country` (ISO) metadata from GeoIP, falling back to the configured
     /// default location. This gives `!weather` a per-user location with no
@@ -13330,47 +13338,124 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    fn userBuiltinProviderForKey(key: []const u8) ?ircx_prop_providers.Provider {
+        const lookup_key: []const u8 = if (std.ascii.eqlIgnoreCase(key, "MEMBEROF")) "MEMBER_OF" else key;
+        var registry = ircx_prop_providers.ProviderRegistry.init();
+        defer registry.deinit();
+        const provider = registry.lookup(lookup_key) orelse return null;
+        if (provider.scope != .user) return null;
+        return provider;
+    }
+
+    fn isGeoUserProviderName(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "country") or
+            std.ascii.eqlIgnoreCase(name, "region") or
+            std.ascii.eqlIgnoreCase(name, "city") or
+            std.ascii.eqlIgnoreCase(name, "asn") or
+            std.ascii.eqlIgnoreCase(name, "asorg");
+    }
+
+    fn isReadOnlyGeoUserBuiltinKey(key: []const u8) bool {
+        const provider = userBuiltinProviderForKey(key) orelse return false;
+        return isGeoUserProviderName(provider.name);
+    }
+
+    fn renderUserProviderValue(value: ircx_prop_providers.PropValue, buf: []u8) ?[]const u8 {
+        return switch (value) {
+            .text => |text| text,
+            .number => |n| std.fmt.bufPrint(buf, "{d}", .{n}) catch null,
+            .boolean => |flag| if (flag) "1" else "0",
+            .list => |items| blk: {
+                var w: usize = 0;
+                for (items) |item| {
+                    const need = item.len + @as(usize, if (w == 0) 0 else 1);
+                    if (w + need > buf.len) break;
+                    if (w != 0) {
+                        buf[w] = ' ';
+                        w += 1;
+                    }
+                    @memcpy(buf[w .. w + item.len], item);
+                    w += item.len;
+                }
+                break :blk buf[0..w];
+            },
+        };
+    }
+
+    fn fillUserGeoSnapshot(
+        self: *LinuxServer,
+        target_nick: []const u8,
+        tconn: *const ConnState,
+        snapshot: *ircx_prop_providers.Snapshot,
+        country_buf: *[4]u8,
+    ) void {
+        const stored_country = self.metaValue(target_nick, "country");
+        if (stored_country.len != 0) snapshot.geo_country = stored_country;
+
+        const ip = parseGeoIp(tconn.session.realHost()) orelse return;
+        if (self.ensureGeoip()) |db| {
+            if (snapshot.geo_country == null) {
+                snapshot.geo_country = db.lookupCountry(ip, country_buf) catch null;
+            }
+            snapshot.geo_city = db.lookupName(ip, "city", "en") catch null;
+            snapshot.geo_region = db.lookupString(ip, &.{ "subdivisions", "0", "names", "en" }) catch null;
+        }
+
+        const asn_info = self.lookupGeoAsn(ip);
+        snapshot.geo_asn = asn_info.asn;
+        snapshot.geo_asorg = asn_info.asorg;
+    }
+
     /// Computed IRCX built-in properties for a `user` entity. GET-only (computed,
     /// not stored), consulted ahead of the generic store:
     ///   - MEMBER_OF (aka MEMBEROF): the channels the target is in, space-
     ///     separated, with the WHOIS visibility filter (secret/private channels
     ///     omitted unless the requester is the target, an operator, or a member).
     ///   - ACCOUNT: the target's logged-in services account. Public (mirrors
-    ///     WHOIS 330 / `account-tag`), so no visibility gate. Local target only —
-    ///     a remote (mesh) user has no local ConnState, so the provider declines.
+    ///     WHOIS 330 / `account-tag`), so no visibility gate. Local target only.
+    ///   - COUNTRY/REGION/CITY/ASN/ASORG: read-only GeoIP fields from the target
+    ///     connection, visible only to the target user or an operator. Missing
+    ///     GeoIP data renders as an empty value.
     fn userBuiltinGet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, buf: []u8, requester_id: client_model.ClientId, conn: *const ConnState) ?[]const u8 {
         if (entity.kind != .user) return null;
-        const is_member_of = std.ascii.eqlIgnoreCase(key, "MEMBER_OF") or std.ascii.eqlIgnoreCase(key, "MEMBEROF");
-        const is_account = std.ascii.eqlIgnoreCase(key, "ACCOUNT");
-        if (!is_member_of and !is_account) return null;
-        const target_wid = self.world.findNick(entity.id) orelse return null;
+        const provider = userBuiltinProviderForKey(key) orelse return null;
+        const is_member_of = std.ascii.eqlIgnoreCase(provider.name, "member_of");
+        const is_account = std.ascii.eqlIgnoreCase(provider.name, "account");
+        const is_geo = isGeoUserProviderName(provider.name);
+        if (!is_member_of and !is_account and !is_geo) return null;
 
-        if (is_account) {
+        const target_wid = self.world.findNick(entity.id) orelse return null;
+        const requester_wid = worldIdFromClient(requester_id);
+        var snapshot = ircx_prop_providers.Snapshot{};
+        var memberships: [64][]const u8 = undefined;
+        var country_buf: [4]u8 = undefined;
+
+        if (is_member_of) {
+            const sees_all = conn.session.isOper() or requester_wid.eql(target_wid);
+            var names: [64][]const u8 = undefined;
+            const n = self.world.channelsOf(target_wid, &names);
+            var visible: usize = 0;
+            for (names[0..n]) |cn| {
+                if (!sees_all and self.channelHiddenFromWhois(cn, requester_wid)) continue;
+                memberships[visible] = cn;
+                visible += 1;
+            }
+            snapshot.member_of = memberships[0..visible];
+        } else {
             const target_cid = client_model.ClientId{ .shard = target_wid.shard, .slot = target_wid.slot, .gen = target_wid.gen };
             const tconn = self.connFor(target_cid) orelse return null;
-            const acct = tconn.session.account() orelse return null;
-            if (acct.len == 0 or acct.len > buf.len) return null;
-            @memcpy(buf[0..acct.len], acct);
-            return buf[0..acct.len];
+            if (is_account) {
+                const acct = tconn.session.account() orelse return null;
+                if (acct.len == 0) return null;
+                snapshot.account_name = acct;
+            } else {
+                if (!(conn.session.isOper() or requester_wid.eql(target_wid))) return null;
+                self.fillUserGeoSnapshot(tconn.session.displayName(), tconn, &snapshot, &country_buf);
+            }
         }
 
-        const requester_wid = worldIdFromClient(requester_id);
-        const sees_all = conn.session.isOper() or requester_wid.eql(target_wid);
-        var names: [64][]const u8 = undefined;
-        const n = self.world.channelsOf(target_wid, &names);
-        var w: usize = 0;
-        for (names[0..n]) |cn| {
-            if (!sees_all and self.channelHiddenFromWhois(cn, requester_wid)) continue;
-            const need = cn.len + @as(usize, if (w == 0) 0 else 1);
-            if (w + need > buf.len) break;
-            if (w != 0) {
-                buf[w] = ' ';
-                w += 1;
-            }
-            @memcpy(buf[w .. w + cn.len], cn);
-            w += cn.len;
-        }
-        return buf[0..w];
+        const value = provider.read(&snapshot, buf) catch return null;
+        return renderUserProviderValue(value, buf);
     }
 
     /// Computed/linked IRCX channel built-in property writes. MEMBERKEY <-> +k
@@ -13507,6 +13592,10 @@ pub const LinuxServer = struct {
                     },
                     .not_handled => {},
                 }
+                if (m.entity.kind == .user and isReadOnlyGeoUserBuiltinKey(m.key)) {
+                    try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Cannot set that property");
+                    return;
+                }
                 const setter = ircx_prop_store.Setter{ .id = conn.session.displayName(), .access = access };
                 const ev = self.props.setProp(m.entity, m.key, m.value, setter) catch {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{m.entity.id}, "Cannot set that property");
@@ -13533,6 +13622,10 @@ pub const LinuxServer = struct {
             .delete => |k| {
                 if (self.propAccess(id, conn, k.entity) == null) {
                     try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Insufficient access to delete property");
+                    return;
+                }
+                if (k.entity.kind == .user and k.key.len != 0 and isReadOnlyGeoUserBuiltinKey(k.key)) {
+                    try queueNumeric(conn, .ERR_NOACCESS, &.{k.entity.id}, "Cannot delete that property");
                     return;
                 }
                 if (k.key.len == 0) {
@@ -26767,6 +26860,213 @@ test "threaded server: PROP user ACCOUNT provider returns the target's login" {
     try writeAllFd(fd_b, "PROP B GET ACCOUNT\r\n");
     try recvUntil(&b, " 819 B B ", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "ACCOUNT :") == null);
+}
+
+const PropGeoTestBytes = std.array_list.Managed(u8);
+
+fn propGeoAppendHeader(out: *PropGeoTestBytes, value_type: u8, size: usize) !void {
+    const ctrl_type: u8 = if (value_type >= 8) 0 else value_type;
+    const ext: ?u8 = if (value_type >= 8) value_type - 7 else null;
+    if (size < 29) {
+        try out.append((ctrl_type << 5) | @as(u8, @intCast(size)));
+        if (ext) |e| try out.append(e);
+    } else if (size < 285) {
+        try out.append((ctrl_type << 5) | 29);
+        if (ext) |e| try out.append(e);
+        try out.append(@intCast(size - 29));
+    } else if (size < 65821) {
+        const n = size - 285;
+        try out.append((ctrl_type << 5) | 30);
+        if (ext) |e| try out.append(e);
+        try out.append(@intCast(n >> 8));
+        try out.append(@intCast(n & 0xff));
+    } else {
+        const n = size - 65821;
+        try out.append((ctrl_type << 5) | 31);
+        if (ext) |e| try out.append(e);
+        try out.append(@intCast((n >> 16) & 0xff));
+        try out.append(@intCast((n >> 8) & 0xff));
+        try out.append(@intCast(n & 0xff));
+    }
+}
+
+fn propGeoAppendString(out: *PropGeoTestBytes, bytes: []const u8) !void {
+    try propGeoAppendHeader(out, 2, bytes.len);
+    try out.appendSlice(bytes);
+}
+
+fn propGeoAppendUint(out: *PropGeoTestBytes, value_type: u8, value: u64) !void {
+    const max_len: usize = switch (value_type) {
+        5 => 2,
+        6 => 4,
+        9 => 8,
+        else => return error.UnsupportedDatabase,
+    };
+    var tmp = [_]u8{0} ** 8;
+    var value_copy = value;
+    var len: usize = 0;
+    while (value_copy != 0) : (value_copy >>= 8) len += 1;
+    if (len > max_len) return error.InvalidDatabase;
+
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const shift: u6 = @intCast((len - 1 - i) * 8);
+        tmp[i] = @intCast((value >> shift) & 0xff);
+    }
+
+    try propGeoAppendHeader(out, value_type, len);
+    try out.appendSlice(tmp[0..len]);
+}
+
+fn propGeoAppendMapHeader(out: *PropGeoTestBytes, pairs: usize) !void {
+    try propGeoAppendHeader(out, 7, pairs);
+}
+
+fn propGeoAppendArrayHeader(out: *PropGeoTestBytes, items: usize) !void {
+    try propGeoAppendHeader(out, 11, items);
+}
+
+fn propGeoAppendNode24(out: *PropGeoTestBytes, left: u32, right: u32) !void {
+    try out.append(@intCast((left >> 16) & 0xff));
+    try out.append(@intCast((left >> 8) & 0xff));
+    try out.append(@intCast(left & 0xff));
+    try out.append(@intCast((right >> 16) & 0xff));
+    try out.append(@intCast((right >> 8) & 0xff));
+    try out.append(@intCast(right & 0xff));
+}
+
+fn propGeoAppendMetadata(out: *PropGeoTestBytes, node_count: u32, record_size: u16, ip_version: u16) !void {
+    try out.appendSlice("\xab\xcd\xefMaxMind.com");
+    try propGeoAppendMapHeader(out, 3);
+    try propGeoAppendString(out, "node_count");
+    try propGeoAppendUint(out, 6, node_count);
+    try propGeoAppendString(out, "record_size");
+    try propGeoAppendUint(out, 5, record_size);
+    try propGeoAppendString(out, "ip_version");
+    try propGeoAppendUint(out, 5, ip_version);
+}
+
+fn buildPropGeoTestMmdb(allocator: std.mem.Allocator) ![]u8 {
+    var bytes = PropGeoTestBytes.init(allocator);
+    defer bytes.deinit();
+
+    const data_separator_len = 16;
+    const record_pointer: u32 = 1 + data_separator_len;
+    try propGeoAppendNode24(&bytes, record_pointer, record_pointer);
+    try bytes.appendNTimes(0, data_separator_len);
+
+    try propGeoAppendMapHeader(&bytes, 5);
+
+    try propGeoAppendString(&bytes, "country");
+    try propGeoAppendMapHeader(&bytes, 1);
+    try propGeoAppendString(&bytes, "iso_code");
+    try propGeoAppendString(&bytes, "ZZ");
+
+    try propGeoAppendString(&bytes, "city");
+    try propGeoAppendMapHeader(&bytes, 1);
+    try propGeoAppendString(&bytes, "names");
+    try propGeoAppendMapHeader(&bytes, 1);
+    try propGeoAppendString(&bytes, "en");
+    try propGeoAppendString(&bytes, "Testopolis");
+
+    try propGeoAppendString(&bytes, "subdivisions");
+    try propGeoAppendArrayHeader(&bytes, 1);
+    try propGeoAppendMapHeader(&bytes, 1);
+    try propGeoAppendString(&bytes, "names");
+    try propGeoAppendMapHeader(&bytes, 1);
+    try propGeoAppendString(&bytes, "en");
+    try propGeoAppendString(&bytes, "Testregion");
+
+    try propGeoAppendString(&bytes, "autonomous_system_number");
+    try propGeoAppendUint(&bytes, 6, 64512);
+
+    try propGeoAppendString(&bytes, "autonomous_system_organization");
+    try propGeoAppendString(&bytes, "Example Net");
+
+    try propGeoAppendMetadata(&bytes, 1, 24, 4);
+    return allocator.dupe(u8, bytes.items);
+}
+
+fn installPropGeoTestDatabases(server: *LinuxServer) !void {
+    const city_bytes = try buildPropGeoTestMmdb(server.allocator);
+    errdefer server.allocator.free(city_bytes);
+    const city_db = try geoip.Database.init(city_bytes);
+
+    const asn_bytes = try buildPropGeoTestMmdb(server.allocator);
+    errdefer server.allocator.free(asn_bytes);
+    const asn_db = try geoip.Database.init(asn_bytes);
+
+    server.geoip_bytes = city_bytes;
+    server.geoip_db = city_db;
+    server.geoip_tried = true;
+    server.geoip_asn_bytes = asn_bytes;
+    server.geoip_asn_db = asn_db;
+    server.geoip_asn_tried = true;
+}
+
+test "threaded server: PROP user geo fields are self-or-oper only" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    try installPropGeoTestDatabases(&server);
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_oper = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_oper);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    var oper = LiveClient{ .fd = fd_oper };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try saslAdminPrelude(fd_oper);
+    try writeAllFd(fd_oper, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try recvUntil(&oper, " 381 Oper ", 200);
+
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_b, "IRCX\r\n");
+    try writeAllFd(fd_oper, "IRCX\r\n");
+    try recvUntil(&a, " 800 A 1 0 ", 200);
+    try recvUntil(&b, " 800 B 1 0 ", 200);
+    try recvUntil(&oper, " 800 Oper 1 0 ", 200);
+
+    b.reset();
+    try writeAllFd(fd_b, "PROP A GET CITY,ASN\r\n");
+    try recvUntil(&b, " 819 B A ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "Testopolis") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "64512") == null);
+
+    // Self and oper PASS the gate: they receive the 818 CITY line (a non-oper,
+    // non-self requester gets no 818 at all — asserted above). The value is empty
+    // for a loopback test client whose 127.0.0.1 has no GeoIP record; in production
+    // it carries the resolved city. The access *decision* is what this asserts;
+    // value rendering is covered by the ircx_prop_providers unit tests.
+    a.reset();
+    try writeAllFd(fd_a, "PROP A GET CITY\r\n");
+    try recvUntil(&a, " 818 A A CITY ", 200);
+    try recvUntil(&a, " 819 A A ", 200);
+
+    oper.reset();
+    try writeAllFd(fd_oper, "PROP A GET CITY\r\n");
+    try recvUntil(&oper, " 818 Oper A CITY ", 200);
+    try recvUntil(&oper, " 819 Oper A ", 200);
 }
 
 test "threaded server: HOSTKEY PROP grants op on keyed join without client disclosure" {
