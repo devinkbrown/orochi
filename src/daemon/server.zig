@@ -2165,6 +2165,9 @@ pub const LinuxServer = struct {
     account_services: ?*services_mod.Services = null,
     /// Monotonic millis captured at init, for STATS u uptime.
     start_ms: i64 = 0,
+    /// Wall-clock Unix seconds captured at init, for the registration 003
+    /// creation line. Kept separate from `start_ms`, which is monotonic.
+    boot_unix: i64 = 0,
 
     /// The reactor this call is running on. Single embedded reactor today, so it
     /// is just `&self.reactor`; when the daemon shards into N reactor threads this
@@ -2293,6 +2296,10 @@ pub const LinuxServer = struct {
         const runtime_features = try runtimeDisabledFeatures(allocator, raw_config);
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
         const config = runtime_features.config;
+        const boot_unix = @divTrunc(platform.realtimeMillis(), 1000);
+        protocol_inventory.setBootUnix(boot_unix);
+        protocol_inventory.setNodeId(config.node_id);
+        protocol_inventory.setMeshPeerCount(0);
         const shard_count = clampShards(config);
         // For >1 shard EVERY listener (shard 0 included) must be SO_REUSEPORT or
         // the kernel rejects the second bind on the shared port. The single-shard
@@ -2449,6 +2456,7 @@ pub const LinuxServer = struct {
             .account_services = config.account_services,
             .reactor = config.reactor,
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
+            .boot_unix = boot_unix,
         };
     }
 
@@ -5524,6 +5532,9 @@ pub const LinuxServer = struct {
                 // Set the client's `location`/`country` metadata from GeoIP (or
                 // the configured default) so `!weather` has a per-user location.
                 self.setGeoLocation(conn);
+                // Welcome-burst origin line: the client's OWN GeoIP location + ASN,
+                // shown only to them (privacy-safe — never another user's geo/ASN).
+                self.emitGeoOriginNotice(conn);
                 self.deliverWelcome(conn);
                 self.emitClientRegistered(id, conn);
                 self.evaluateNickProtection(conn);
@@ -13635,6 +13646,48 @@ pub const LinuxServer = struct {
         snapshot.geo_asorg = asn_info.asorg;
     }
 
+    /// Welcome-burst origin NOTICE: "connecting from <City>, <Region>, <Country> ·
+    /// AS<n> (<org>)" derived from the client's OWN real IP. Shown only to the
+    /// connecting user (privacy-safe; the GeoIP PROP keys gate cross-user reads).
+    /// Omitted entirely when GeoIP yields nothing.
+    fn emitGeoOriginNotice(self: *LinuxServer, conn: *ConnState) void {
+        var snapshot = ircx_prop_providers.Snapshot{};
+        var country_buf: [4]u8 = undefined;
+        self.fillUserGeoSnapshot(conn.session.displayName(), conn, &snapshot, &country_buf);
+
+        // Location segment: "City, Region, Country" (skip empty parts).
+        var geo_buf: [256]u8 = undefined;
+        var geo_len: usize = 0;
+        for ([_][]const u8{ snapshot.geo_city orelse "", snapshot.geo_region orelse "", snapshot.geo_country orelse "" }) |p| {
+            if (p.len == 0) continue;
+            const seg = std.fmt.bufPrint(geo_buf[geo_len..], "{s}{s}", .{ if (geo_len == 0) "" else ", ", p }) catch break;
+            geo_len += seg.len;
+        }
+        const geo = geo_buf[0..geo_len];
+
+        // Network segment: "AS<n> (<org>)".
+        var asn_buf: [80]u8 = undefined;
+        const asorg = snapshot.geo_asorg orelse "";
+        const asn: []const u8 = if (snapshot.geo_asn) |n|
+            (if (asorg.len != 0)
+                std.fmt.bufPrint(&asn_buf, "AS{d} ({s})", .{ n, asorg }) catch ""
+            else
+                std.fmt.bufPrint(&asn_buf, "AS{d}", .{n}) catch "")
+        else
+            "";
+
+        if (geo.len == 0 and asn.len == 0) return;
+
+        var out: [default_reply_bytes]u8 = undefined;
+        const line = (if (geo.len != 0 and asn.len != 0)
+            std.fmt.bufPrint(&out, ":{s} NOTICE {s} :connecting from {s} · {s}\r\n", .{ self.serverName(), conn.session.displayName(), geo, asn })
+        else if (geo.len != 0)
+            std.fmt.bufPrint(&out, ":{s} NOTICE {s} :connecting from {s}\r\n", .{ self.serverName(), conn.session.displayName(), geo })
+        else
+            std.fmt.bufPrint(&out, ":{s} NOTICE {s} :connecting via {s}\r\n", .{ self.serverName(), conn.session.displayName(), asn })) catch return;
+        appendToConn(conn, line) catch {};
+    }
+
     fn userProfileValue(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8) ?[]const u8 {
         const ev = self.props.getProp(entity, key) catch return null;
         return if (ev.value.len == 0) null else ev.value;
@@ -18636,7 +18689,9 @@ pub const LinuxServer = struct {
             @memcpy(self.mesh_peer_names[i][0..len], nm[0..len]);
             self.mesh_peer_name_lens[i] = @intCast(len);
         }
-        self.net_peer_count.store(@intCast(n), .release);
+        const count: u32 = @intCast(n);
+        protocol_inventory.setMeshPeerCount(count);
+        self.net_peer_count.store(count, .release);
     }
 
     /// Copy the published peer names into `out` (cross-shard safe). Returns the
@@ -21526,7 +21581,16 @@ test "processLine registration sequence emits welcome numerics" {
     const allocator = std.testing.allocator;
     _ = allocator;
 
+    protocol_inventory.setBootUnix(1735689600);
+    defer protocol_inventory.setBootUnix(null);
+    protocol_inventory.setNodeId(99);
+    defer protocol_inventory.setNodeId(null);
+    protocol_inventory.setMeshPeerCount(2);
+    defer protocol_inventory.setMeshPeerCount(0);
+
     var conn = ConnState.init(-1);
+    conn.session.setVisibleHost("cloak-test.orochi");
+    conn.session.tls_cipher = "TLS_AES_256_GCM_SHA384";
     var storage: [4096]u8 = undefined;
     var sink = TestSink{ .storage = &storage };
 
@@ -21536,7 +21600,40 @@ test "processLine registration sequence emits welcome numerics" {
 
     try std.testing.expect(conn.session.registered());
     try expectCodesInOrder(sink.written(), &.{ " 001 ", " 002 ", " 003 ", " 004 ", " 005 " });
-    try expectContains(sink.written(), "Welcome to the Orochi IRC Network");
+    try expectContains(sink.written(), " 001 kain :Welcome to the Orochi network, kain");
+    try expectContains(sink.written(), "you are kain!kain@cloak-test.orochi");
+    try expectContains(sink.written(), " 002 kain :Your host is orochi.local (node 99), running " ++ server_version);
+    try expectContains(sink.written(), " 003 kain :This node has been weaving the mesh since 01 Jan 2025 00:00 UTC");
+
+    var myinfo_buf: [256]u8 = undefined;
+    const myinfo = try std.fmt.bufPrint(&myinfo_buf, " 004 kain orochi.local {s} {s} {s} {s}\r\n", .{
+        server_version,
+        usermode.default_mode_letters,
+        chanmode.default_mode_letters,
+        chanmode.default_param_mode_letters,
+    });
+    try expectContains(sink.written(), myinfo);
+    try expectContains(sink.written(), " 005 kain ");
+    try expectContains(sink.written(), ":are supported by this server\r\n");
+    try expectContains(sink.written(), " NOTICE kain :secured (TLS1.3 AES-256-GCM) · you are cloak-test.orochi · not logged in\r\n");
+    try expectContains(sink.written(), " NOTICE kain :mesh: 3 nodes linked · /HELP to get started\r\n");
+}
+
+test "processLine registration welcome warns plaintext sessions" {
+    protocol_inventory.setBootUnix(1735689600);
+    defer protocol_inventory.setBootUnix(null);
+
+    var conn = ConnState.init(-1);
+    var storage: [4096]u8 = undefined;
+    var sink = TestSink{ .storage = &storage };
+
+    try processLine(&conn, "NICK plain", &sink);
+    try processLine(&conn, "USER plain 0 * :Plain User", &sink);
+
+    try std.testing.expect(conn.session.registered());
+    try expectContains(sink.written(), "you are plain!plain@localhost");
+    try expectContains(sink.written(), " NOTICE plain :plaintext — consider connecting over TLS · you are localhost · not logged in\r\n");
+    try expectContains(sink.written(), " NOTICE plain :mesh: 1 node active · /HELP to get started\r\n");
 }
 
 test "processLine rejects malformed input without writing" {

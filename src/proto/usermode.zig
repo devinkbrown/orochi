@@ -160,7 +160,31 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .override, .letter = 'j', .name = "override" },
 };
 
+pub const derived_operator_letter = 'o';
+pub const default_mode_letters_storage = sortedLettersWithOperator(&default_specs);
+pub const default_mode_letters: []const u8 = default_mode_letters_storage[0..];
+
 pub const DefaultCatalog = Catalog(&default_specs);
+
+fn sortedLettersWithOperator(comptime specs: []const ModeSpec) [specs.len + 1]u8 {
+    comptime var out: [specs.len + 1]u8 = undefined;
+    inline for (specs, 0..) |spec, i| out[i] = spec.letter;
+    out[specs.len] = derived_operator_letter;
+    sortLetters(&out);
+    return out;
+}
+
+fn sortLetters(comptime letters: []u8) void {
+    comptime var i: usize = 1;
+    inline while (i < letters.len) : (i += 1) {
+        const key = letters[i];
+        comptime var j: usize = i;
+        inline while (j > 0 and key < letters[j - 1]) : (j -= 1) {
+            letters[j] = letters[j - 1];
+        }
+        letters[j] = key;
+    }
+}
 
 /// Compile-time user-mode catalog with parser, policy, and serializer helpers.
 pub fn Catalog(comptime specs: []const ModeSpec) type {

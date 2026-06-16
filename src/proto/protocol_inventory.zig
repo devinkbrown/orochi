@@ -122,6 +122,37 @@ pub fn setRuntimeLimits(limits: RuntimeLimits) void {
     active_limits = limits;
 }
 
+/// Runtime metadata used by the registration welcome burst. These values are
+/// installed once at boot by the daemon layer; tests may set deterministic
+/// values directly before driving the preregistration dispatcher.
+var boot_unix_override: ?i64 = null;
+var node_id_override: ?u64 = null;
+var mesh_peer_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+pub fn currentBootUnix() ?i64 {
+    return boot_unix_override;
+}
+
+pub fn setBootUnix(unix: ?i64) void {
+    boot_unix_override = unix;
+}
+
+pub fn currentNodeId() ?u64 {
+    return node_id_override;
+}
+
+pub fn setNodeId(id: ?u64) void {
+    node_id_override = id;
+}
+
+pub fn currentMeshPeerCount() u32 {
+    return mesh_peer_count.load(.acquire);
+}
+
+pub fn setMeshPeerCount(count: u32) void {
+    mesh_peer_count.store(count, .release);
+}
+
 test "isupport tokens are well-formed key[=value] pairs" {
     for (isupport_tokens) |token| {
         try std.testing.expect(token.len > 0);

@@ -10,6 +10,7 @@ const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const scram_server = @import("../proto/sasl_scram_server.zig");
 const scram512_server = @import("../proto/sasl_scram512_server.zig");
 const usermode = @import("../proto/usermode.zig");
+const chanmode = @import("chanmode.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
 const sts_policy = @import("../proto/sts_policy.zig");
 const event_spine = @import("event_spine.zig");
@@ -28,6 +29,8 @@ pub const DispatchError = error{
 
 const SERVER_NAME = "orochi.local";
 const NETWORK_NAME = protocol_inventory.network_name;
+const SERVER_VERSION = "orochi-" ++ @import("build_info").git_commit;
+const DEFAULT_HOST = "localhost";
 const MAX_PARAMS: usize = 15;
 const MAX_NICK_BYTES: usize = 64;
 const MAX_UID_BYTES: usize = 16;
@@ -1864,13 +1867,135 @@ fn maybeCompleteRegistration(session: *ClientSession, replies: *ReplyCtx) Dispat
 }
 
 fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
-    try replies.numeric(session, .RPL_WELCOME, &.{}, "Welcome to the Orochi IRC Network");
+    const nick = session.displayName();
+    const user = session.username();
+    const host = displayHost(session);
+
+    var mask_buf: [MAX_NICK_BYTES + MAX_UID_BYTES + MAX_HOST_BYTES + 2]u8 = undefined;
+    const mask = std.fmt.bufPrint(&mask_buf, "{s}!{s}@{s}", .{ nick, user, host }) catch nick;
+
+    var welcome_buf: [512]u8 = undefined;
+    const welcome_line = std.fmt.bufPrint(
+        &welcome_buf,
+        "Welcome to the {s} network, {s} — you are {s}",
+        .{ replies.network_name, nick, mask },
+    ) catch "Welcome to Orochi";
+    try replies.numeric(session, .RPL_WELCOME, &.{}, welcome_line);
+
     var host_buf: [256]u8 = undefined;
-    const host_line = std.fmt.bufPrint(&host_buf, "Your host is {s}, running Orochi", .{replies.server_name}) catch "Your host is this server, running Orochi";
+    const host_line = if (protocol_inventory.currentNodeId()) |node_id|
+        std.fmt.bufPrint(&host_buf, "Your host is {s} (node {d}), running {s}", .{ replies.server_name, node_id, SERVER_VERSION }) catch "Your host is this server"
+    else
+        std.fmt.bufPrint(&host_buf, "Your host is {s}, running {s}", .{ replies.server_name, SERVER_VERSION }) catch "Your host is this server";
     try replies.numeric(session, .RPL_YOURHOST, &.{}, host_line);
-    try replies.numeric(session, .RPL_CREATED, &.{}, "This server is running Orochi");
-    try replies.numeric(session, .RPL_MYINFO, &.{ replies.server_name, "orochi-" ++ @import("build_info").git_commit, "io", "ov" }, "are supported by this server");
+
+    var date_buf: [64]u8 = undefined;
+    const created = std.fmt.bufPrint(
+        &host_buf,
+        "This node has been weaving the mesh since {s}",
+        .{formatBootDate(protocol_inventory.currentBootUnix() orelse 0, &date_buf)},
+    ) catch "This node has been weaving the mesh since 01 Jan 1970 00:00 UTC";
+    try replies.numeric(session, .RPL_CREATED, &.{}, created);
+
+    try replies.message(
+        replies.server_name,
+        "004",
+        &.{ nick, replies.server_name, SERVER_VERSION, usermode.default_mode_letters, chanmode.default_mode_letters, chanmode.default_param_mode_letters },
+        null,
+    );
     try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
+    try emitWelcomeNotices(session, replies, host);
+}
+
+fn displayHost(session: *const ClientSession) []const u8 {
+    const host = session.host();
+    return if (host.len == 0) DEFAULT_HOST else host;
+}
+
+fn formatBootDate(unix: i64, out: []u8) []const u8 {
+    const secs: u64 = @intCast(@max(unix, 0));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(out, "{d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2} UTC", .{
+        @as(u16, md.day_index) + 1,
+        monthName(@intCast(md.month.numeric())),
+        yd.year,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+    }) catch "01 Jan 1970 00:00 UTC";
+}
+
+fn monthName(month: u8) []const u8 {
+    return switch (month) {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        else => "Jan",
+    };
+}
+
+fn emitWelcomeNotices(session: *const ClientSession, replies: *ReplyCtx, host: []const u8) DispatchError!void {
+    var account_buf: [MAX_ACCOUNT_BYTES + 16]u8 = undefined;
+    const account_text = if (session.account()) |account|
+        std.fmt.bufPrint(&account_buf, "logged in as {s}", .{account}) catch "logged in"
+    else if (session.sasl_guest)
+        "guest session"
+    else
+        "not logged in";
+
+    var security_buf: [512]u8 = undefined;
+    const security_text = if (session.tls_cipher) |cipher|
+        std.fmt.bufPrint(&security_buf, "secured ({s} {s}) · you are {s} · {s}", .{
+            tlsVersionLabel(cipher),
+            tlsCipherLabel(cipher),
+            host,
+            account_text,
+        }) catch "secured · account state unavailable"
+    else
+        std.fmt.bufPrint(&security_buf, "plaintext — consider connecting over TLS · you are {s} · {s}", .{
+            host,
+            account_text,
+        }) catch "plaintext — consider connecting over TLS";
+    try replies.message(replies.server_name, "NOTICE", &.{session.displayName()}, security_text);
+
+    const peers = protocol_inventory.currentMeshPeerCount();
+    const nodes: u32 = peers + 1;
+    var mesh_buf: [128]u8 = undefined;
+    const mesh_text = if (peers == 0)
+        std.fmt.bufPrint(&mesh_buf, "mesh: 1 node active · /HELP to get started", .{}) catch "mesh: 1 node active"
+    else
+        std.fmt.bufPrint(&mesh_buf, "mesh: {d} {s} linked · /HELP to get started", .{
+            nodes,
+            if (nodes == 1) "node" else "nodes",
+        }) catch "mesh linked · /HELP to get started";
+    try replies.message(replies.server_name, "NOTICE", &.{session.displayName()}, mesh_text);
+}
+
+fn tlsVersionLabel(cipher: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, cipher, "TLS_AES_") or
+        std.mem.startsWith(u8, cipher, "TLS_CHACHA20_"))
+    {
+        return "TLS1.3";
+    }
+    return "TLS";
+}
+
+fn tlsCipherLabel(cipher: []const u8) []const u8 {
+    if (std.mem.eql(u8, cipher, "TLS_AES_256_GCM_SHA384")) return "AES-256-GCM";
+    if (std.mem.eql(u8, cipher, "TLS_AES_128_GCM_SHA256")) return "AES-128-GCM";
+    if (std.mem.eql(u8, cipher, "TLS_CHACHA20_POLY1305_SHA256")) return "CHACHA20-POLY1305";
+    return cipher;
 }
 
 fn emitUnknownCommand(
@@ -2403,8 +2528,6 @@ test "sasl reauth after registration emits 907" {
 }
 
 test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
-    const chanmode = @import("chanmode.zig");
-
     // The token must keep the four-class A,B,C,D shape.
     const eq = "CHANMODES=";
     try std.testing.expect(std.mem.startsWith(u8, CHANMODES_TOKEN, eq));

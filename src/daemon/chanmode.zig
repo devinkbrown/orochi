@@ -114,6 +114,58 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .admin_only, .letter = 'A', .name = "admin-only", .kind = .flag_d },
 };
 
+pub const default_mode_letters_storage = sortedLetters(&default_specs);
+pub const default_mode_letters: []const u8 = default_mode_letters_storage[0..];
+pub const default_param_mode_letters_storage = sortedParamLetters(&default_specs);
+pub const default_param_mode_letters: []const u8 = default_param_mode_letters_storage[0..];
+
+fn sortedLetters(comptime specs: []const ModeSpec) [specs.len]u8 {
+    comptime var out: [specs.len]u8 = undefined;
+    inline for (specs, 0..) |spec, i| out[i] = spec.letter;
+    sortLetters(&out);
+    return out;
+}
+
+fn sortedParamLetters(comptime specs: []const ModeSpec) [paramModeCount(specs)]u8 {
+    comptime var out: [paramModeCount(specs)]u8 = undefined;
+    comptime var n: usize = 0;
+    inline for (specs) |spec| {
+        if (modeKindTakesParam(spec.kind)) {
+            out[n] = spec.letter;
+            n += 1;
+        }
+    }
+    sortLetters(&out);
+    return out;
+}
+
+fn paramModeCount(comptime specs: []const ModeSpec) usize {
+    comptime var count: usize = 0;
+    inline for (specs) |spec| {
+        if (modeKindTakesParam(spec.kind)) count += 1;
+    }
+    return count;
+}
+
+fn modeKindTakesParam(kind: ModeKind) bool {
+    return switch (kind) {
+        .list_a, .param_b, .param_c => true,
+        .flag_d => false,
+    };
+}
+
+fn sortLetters(comptime letters: []u8) void {
+    comptime var i: usize = 1;
+    inline while (i < letters.len) : (i += 1) {
+        const key = letters[i];
+        comptime var j: usize = i;
+        inline while (j > 0 and key < letters[j - 1]) : (j -= 1) {
+            letters[j] = letters[j - 1];
+        }
+        letters[j] = key;
+    }
+}
+
 /// Caller-owned storage for one type-A channel mode list.
 pub const ModeList = struct {
     entries: [][]const u8,
