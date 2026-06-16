@@ -36,8 +36,10 @@ and tests for them:
   extended-monitor capability gating, metadata visibility, MARKREAD on JOIN,
   no-implicit-names, channel-rename, labeled-response, standard-replies,
   multiline, read-marker, message editing, and message redaction are wired.
-- SASL reporting: live lists are limited to wired mechanisms. SCRAM-SHA-512
-  helpers exist, but the live router deliberately does not advertise them.
+- SASL reporting: live lists are limited to wired mechanisms. SCRAM-SHA-256,
+  SCRAM-SHA-512, and — over TLS 1.3 — SCRAM-SHA-512-PLUS (RFC 9266 tls-exporter
+  channel binding, verified server-side against the gs2 header) are all live and
+  advertised (the latter only once the session's exporter is available).
 - IRCX/services: `AUTH`, `SACCESS` / `ACCESS *`, channel `ACCESS` enforcement,
   `MODE <nick> ISIRCX`, MODEX `806/807`, LISTX prefix handling, CREATE
   existing-channel rejection/template clone behavior, DATA/REQUEST/REPLY/WHISPER
