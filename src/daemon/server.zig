@@ -7035,18 +7035,21 @@ pub const LinuxServer = struct {
             "Connection class requires SASL authentication"
         else
             null;
-        // Per-class concurrent-connection cap per source IP. The global clone
-        // limiter (enforced at accept, before the class is known) is the hard
-        // ceiling; this only tightens it for a named class. Counted across all
-        // shards including this just-registered connection, so the Nth admitted
-        // connection trips when the count exceeds the limit.
-        if (reason == null and p.max_per_ip != 0) {
-            if (conn.peer_addr) |addr| {
-                const reg = if (self.config.class_registry) |*r| r else null;
-                if (reg) |r| {
-                    const name = r.classFor(matchCtx(conn)).name;
-                    if (self.sameIpClassCount(addr, name) > p.max_per_ip) {
-                        reason = "Too many connections from your host in this connection class";
+        // Per-class population caps, evaluated once the class is final. The
+        // global clone limiter (enforced at accept, before the class is known)
+        // is the hard per-IP ceiling; these only tighten things for a named
+        // class. Both counts include this just-registered connection, so the
+        // Nth admitted client trips when the running count exceeds the limit.
+        if (reason == null and (p.max_clients != 0 or p.max_per_ip != 0)) {
+            if (self.config.class_registry) |*r| {
+                const name = r.classFor(matchCtx(conn)).name;
+                if (p.max_clients != 0 and self.countClassMembers(name) > p.max_clients) {
+                    reason = "Connection class is full (too many clients)";
+                } else if (p.max_per_ip != 0) {
+                    if (conn.peer_addr) |addr| {
+                        if (self.sameIpClassCount(addr, name) > p.max_per_ip) {
+                            reason = "Too many connections from your host in this connection class";
+                        }
                     }
                 }
             }
