@@ -8,8 +8,11 @@ const std = @import("std");
 const numeric = @import("numeric.zig");
 const limits_config = @import("limits_config.zig");
 
-pub const RPL_MODEXLIST: u16 = 806;
-pub const RPL_MODEXEND: u16 = 807;
+// MODEX is an Orochi/Ophion extension and is NOT in draft-pfenning-04, which
+// assigns 806/807 to EVENT ADD/DEL. To stay draft-faithful for EVENT, MODEX's
+// list/end numerics live just past the EVENT range at 826/827.
+pub const RPL_MODEXLIST: u16 = 826;
+pub const RPL_MODEXEND: u16 = 827;
 
 pub const DEFAULT_MAX_CHANGES: usize = 16;
 pub const DEFAULT_MAX_LINE_BYTES: usize = 512;
@@ -326,7 +329,7 @@ fn parseModeTokenForTarget(comptime params: Params, target: Target, token: []con
     };
 }
 
-/// Build RPL_MODEXLIST (806): `<target> :<space-separated named modes>`.
+/// Build RPL_MODEXLIST (826): `<target> :<space-separated named modes>`.
 pub fn writeModexList(
     out: []u8,
     ctx: ReplyContext,
@@ -336,7 +339,7 @@ pub fn writeModexList(
     return writeModexListWith(.{}, out, ctx, target, mode_names);
 }
 
-/// Build RPL_MODEXLIST (806) with caller-selected limits.
+/// Build RPL_MODEXLIST (826) with caller-selected limits.
 pub fn writeModexListWith(
     comptime params: Params,
     out: []u8,
@@ -362,12 +365,12 @@ pub fn writeModexListWith(
     return b.slice();
 }
 
-/// Build RPL_MODEXEND (807): `<target> :End of modes`.
+/// Build RPL_MODEXEND (827): `<target> :End of modes`.
 pub fn writeModexEnd(out: []u8, ctx: ReplyContext, target: []const u8) ModexError![]const u8 {
     return writeModexEndWith(.{}, out, ctx, target);
 }
 
-/// Build RPL_MODEXEND (807) with caller-selected limits.
+/// Build RPL_MODEXEND (827) with caller-selected limits.
 pub fn writeModexEndWith(comptime params: Params, out: []u8, ctx: ReplyContext, target: []const u8) ModexError![]const u8 {
     try validateContextWith(params, ctx);
     _ = try parseTargetWith(params, target);
@@ -602,7 +605,7 @@ test "parse channel query request" {
     try std.testing.expectEqual(@as(?[]const u8, null), request.target.member);
 }
 
-test "query list builders emit 806 and 807" {
+test "query list builders emit 826 and 827" {
     const ctx = ReplyContext{ .server_name = "irc.example", .requester = "alice" };
     const modes = [_][]const u8{ "PUBLIC", "TOPICOP", "NOEXTERN" };
     var list_buf: [128]u8 = undefined;
@@ -611,8 +614,8 @@ test "query list builders emit 806 and 807" {
     const list = try writeModexList(&list_buf, ctx, "#team", &modes);
     const end = try writeModexEnd(&end_buf, ctx, "#team");
 
-    try std.testing.expectEqualStrings(":irc.example 806 alice #team :PUBLIC TOPICOP NOEXTERN\r\n", list);
-    try std.testing.expectEqualStrings(":irc.example 807 alice #team :End of modes\r\n", end);
+    try std.testing.expectEqualStrings(":irc.example 826 alice #team :PUBLIC TOPICOP NOEXTERN\r\n", list);
+    try std.testing.expectEqualStrings(":irc.example 827 alice #team :End of modes\r\n", end);
 }
 
 test "unknown mode name is rejected" {
@@ -633,5 +636,5 @@ test "empty member mode list can be emitted" {
     var buf: [96]u8 = undefined;
 
     const list = try writeModexList(&buf, ctx, "#team,bob", &modes);
-    try std.testing.expectEqualStrings(":irc.example 806 alice #team,bob :\r\n", list);
+    try std.testing.expectEqualStrings(":irc.example 826 alice #team,bob :\r\n", list);
 }

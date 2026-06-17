@@ -513,8 +513,8 @@ test "build reply bytes from supplied state" {
     });
 
     try std.testing.expectEqualStrings(
-        ":irc.example 806 alice #team :HIDDEN MODERATED TOPICOP AUDITORIUM OWNERKEY HOSTKEY\r\n" ++
-            ":irc.example 807 alice #team :End of modes\r\n",
+        ":irc.example 826 alice #team :HIDDEN MODERATED TOPICOP AUDITORIUM OWNERKEY HOSTKEY\r\n" ++
+            ":irc.example 827 alice #team :End of modes\r\n",
         reply,
     );
 }
@@ -527,7 +527,7 @@ test "public reply is the no-visibility fallback" {
 
     const reply = try buildReply(out.items, .{ .server_name = "s", .requester = "n" }, "#plain", .{});
     try std.testing.expectEqualStrings(
-        ":s 806 n #plain :PUBLIC\r\n:s 807 n #plain :End of modes\r\n",
+        ":s 826 n #plain :PUBLIC\r\n:s 827 n #plain :End of modes\r\n",
         reply,
     );
 }

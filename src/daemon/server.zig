@@ -943,13 +943,16 @@ const Numeric = enum(u16) {
     RPL_STATSKLINE = 216,
     RPL_STATSDLINE = 225,
     RPL_ENDOFSTATS = 219,
-    RPL_EVENTADD = 808,
+    // EVENT command replies follow draft-pfenning-04: 806 ADD, 807 DEL,
+    // 808 START, 809 LIST, 810 END. CHANGE (825) is a non-draft extension.
+    RPL_EVENTADD = 806,
+    RPL_EVENTDELETE = 807,
+    RPL_EVENTSTART = 808,
     RPL_EVENTLIST = 809,
     RPL_EVENTEND = 810,
     ERR_EVENTDUP = 821,
     ERR_EVENTMIS = 822,
     ERR_NOSUCHEVENT = 823,
-    RPL_EVENTDELETE = 824,
     RPL_EVENTCHANGE = 825,
     ERR_NOSUCHNICK = 401,
     ERR_NOSUCHSERVER = 402,
@@ -12084,7 +12087,7 @@ pub const LinuxServer = struct {
     /// MODEX <#chan[,nick]> [+/-NAMED...] — IRCX named-mode front-end. Translates
     /// named modes (AUTHONLY/OWNER/…) to mode letters and delegates to the regular
     /// MODE engine (which gates + broadcasts). A bare MODEX queries active modes
-    /// (RPL_MODEXLIST 806 + RPL_MODEXEND 807).
+    /// (RPL_MODEXLIST 826 + RPL_MODEXEND 827).
     pub fn handleModex(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var changes_buf: [ircx_modex.DEFAULT_MAX_CHANGES]ircx_modex.ModeChange = undefined;
         const req = ircx_modex.parseParams(parsed.paramSlice(), &changes_buf) catch {
@@ -12244,6 +12247,9 @@ pub const LinuxServer = struct {
                 };
             } else null;
 
+            // draft-pfenning-04: RPL_EVENTSTART (808) opens the list, one
+            // RPL_EVENTLIST (809) per subscribed event, RPL_EVENTEND (810) closes.
+            try queueNumeric(conn, .RPL_EVENTSTART, &.{}, "Start of event list");
             for (event_spine.ircx_event_types) |typ| {
                 if (filter) |wanted| {
                     if (wanted != typ) continue;
@@ -26577,9 +26583,9 @@ test "threaded server: WHISPER delivers to channel co-member only" {
     try recvUntil(a, "MODE #w +a", 200);
     a.reset();
     try writeAllFd(fd_a, "MODEX #w\r\n");
-    try recvUntil(a, " 806 ", 200);
+    try recvUntil(a, " 826 ", 200);
     try recvUntil(a, "AUTHONLY", 200);
-    try recvUntil(a, " 807 ", 200);
+    try recvUntil(a, " 827 ", 200);
 }
 
 test "threaded server: +x auditorium hides regular members in NAMES" {
@@ -28603,7 +28609,7 @@ test "threaded server: IRCX EVENT subscription numerics match Ophion" {
 
     a.reset();
     try writeAllFd(fd_a, "EVENT ADD CHANNEL #foo*\r\n");
-    try recvUntil(&a, " 808 A CHANNEL #foo* :Event added", 200);
+    try recvUntil(&a, " 806 A CHANNEL #foo* :Event added", 200);
 
     a.reset();
     try writeAllFd(fd_a, "EVENT ADD CHANNEL #bar*\r\n");
@@ -28623,18 +28629,21 @@ test "threaded server: IRCX EVENT subscription numerics match Ophion" {
 
     a.reset();
     try writeAllFd(fd_a, "EVENT ADD USER *!*@example\r\n");
-    try recvUntil(&a, " 808 A USER *!*@example :Event added", 200);
+    try recvUntil(&a, " 806 A USER *!*@example :Event added", 200);
 
     a.reset();
     try writeAllFd(fd_a, "EVENT LIST\r\n");
     try recvUntil(&a, " 810 A :End of event list", 200);
+    // draft-pfenning-04: the list opens with RPL_EVENTSTART (808), one
+    // RPL_EVENTLIST (809) per subscription, RPL_EVENTEND (810) closes.
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " 808 A :Start of event list") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 809 A CHANNEL #bar* :Event subscription") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 809 A USER *!*@example :Event subscription") != null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 809 A MEMBER ") == null);
 
     a.reset();
     try writeAllFd(fd_a, "EVENT DELETE CHANNEL\r\n");
-    try recvUntil(&a, " 824 A CHANNEL :Event removed", 200);
+    try recvUntil(&a, " 807 A CHANNEL :Event removed", 200);
 
     a.reset();
     try writeAllFd(fd_a, "EVENT DELETE CHANNEL\r\n");
@@ -28667,7 +28676,7 @@ test "threaded server: EVENT LIST shows IRCX per-type subject mask" {
 
     c.reset();
     try writeAllFd(fd, "EVENT ADD CHANNEL #foo*\r\n");
-    try recvUntil(&c, " 808 A CHANNEL #foo* :Event added", 200);
+    try recvUntil(&c, " 806 A CHANNEL #foo* :Event added", 200);
 
     c.reset();
     try writeAllFd(fd, "EVENT LIST CHANNEL\r\n");
@@ -28730,7 +28739,7 @@ test "threaded server: IRCX EVENT CHANNEL mask is additive over oper announce fe
 
     // A scopes IRCX CHANNEL to `#foo*`.
     try writeAllFd(fd_a, "EVENT ADD CHANNEL #foo*\r\n");
-    try recvUntil(&a, " 808 A CHANNEL #foo* :Event added", 300);
+    try recvUntil(&a, " 806 A CHANNEL #foo* :Event added", 300);
 
     // A still receives a non-#foo announce because the native oper ANNOUNCE
     // subscription remains in force.
@@ -28788,7 +28797,7 @@ test "threaded server: IRCX EVENT hostmask mask is additive over oper announce f
 
     // A scopes IRCX CHANNEL to a hostmask glob; B leaves it default `*`.
     try writeAllFd(fd_a, "EVENT ADD CHANNEL *!*@x.example*\r\n");
-    try recvUntil(&a, " 808 A CHANNEL *!*@x.example* :Event added", 300);
+    try recvUntil(&a, " 806 A CHANNEL *!*@x.example* :Event added", 300);
 
     // S broadcasts a subject bearing a matching hostmask: A and B both receive it.
     a.reset();
@@ -28834,7 +28843,7 @@ test "threaded server: IRCX EVENT CHANNEL receives real channel event" {
     try writeAllFd(fd_a, "IRCX\r\n");
     try recvUntil(&a, " 800 A ", 300);
     try writeAllFd(fd_a, "EVENT ADD CHANNEL #evchan*\r\n");
-    try recvUntil(&a, " 808 A CHANNEL #evchan* :Event added", 300);
+    try recvUntil(&a, " 806 A CHANNEL #evchan* :Event added", 300);
 
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 300);
@@ -28873,7 +28882,7 @@ test "threaded server: IRCX EVENT MEMBER receives real membership event" {
     try writeAllFd(fd_a, "IRCX\r\n");
     try recvUntil(&a, " 800 A ", 300);
     try writeAllFd(fd_a, "EVENT ADD MEMBER #evmember*\r\n");
-    try recvUntil(&a, " 808 A MEMBER #evmember* :Event added", 300);
+    try recvUntil(&a, " 806 A MEMBER #evmember* :Event added", 300);
 
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 300);
@@ -28912,7 +28921,7 @@ test "threaded server: IRCX EVENT USER receives real user lifecycle event" {
     try writeAllFd(fd_a, "IRCX\r\n");
     try recvUntil(&a, " 800 A ", 300);
     try writeAllFd(fd_a, "EVENT ADD USER B!*@localhost\r\n");
-    try recvUntil(&a, " 808 A USER B!*@localhost :Event added", 300);
+    try recvUntil(&a, " 806 A USER B!*@localhost :Event added", 300);
 
     a.reset();
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
