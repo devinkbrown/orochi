@@ -234,6 +234,9 @@ pub const Config = struct {
         silencelimit: u32 = 32,
         max_clones_per_ip: u32 = 0,
         max_clones_per_net: u32 = 0,
+        /// Nick-delay window (ms): how long a released nick is held against reuse
+        /// after its owner exits. `0` disables nick delay entirely.
+        nick_delay_ms: u64 = 0,
         reputation_refuse_threshold: u32 = 0,
         reputation_half_life_ms: u64 = 60_000,
         /// Period of the io_uring timeout-sweep timer; sets the enforcement
@@ -610,6 +613,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.monitorlimit = @intCast(try uintField(doc, "limits.monitorlimit", cfg.limits.monitorlimit, 1, 100000));
     cfg.limits.silencelimit = @intCast(try uintField(doc, "limits.silencelimit", cfg.limits.silencelimit, 1, 256));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
+    if (doc.getString("limits.nick_delay")) |s| cfg.limits.nick_delay_ms = try durationMs(s);
     if (doc.getString("limits.handshake_timeout")) |s| cfg.limits.handshake_timeout_ms = try durationMs(s);
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);
     if (doc.getString("limits.ping_timeout")) |s| cfg.limits.ping_timeout_ms = try durationMs(s);
@@ -794,6 +798,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
                 policy.require_tls = item.getBool("require_tls") orelse policy.require_tls;
                 policy.require_sasl = item.getBool("require_sasl") orelse policy.require_sasl;
                 policy.flood_exempt = item.getBool("flood_exempt") orelse policy.flood_exempt;
+                policy.nick_delay_exempt = item.getBool("nick_delay_exempt") orelse policy.nick_delay_exempt;
                 policy.max_targets = try classU32(item, "max_targets", policy.max_targets);
                 policy.monitor = try classU32(item, "monitor", policy.monitor);
                 policy.silence = try classU32(item, "silence", policy.silence);

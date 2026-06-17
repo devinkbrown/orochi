@@ -73,6 +73,9 @@ pub const Policy = struct {
     require_sasl: bool = false,
     /// Exempt this class from flood/throttle enforcement entirely.
     flood_exempt: bool = false,
+    /// Exempt this class from nick-delay holds: a member may take a held nick
+    /// without waiting out its window (like operators do).
+    nick_delay_exempt: bool = false,
     /// Per-class overrides of global feature caps (0 = inherit global).
     max_targets: u32 = 0,
     monitor: u32 = 0,

@@ -122,6 +122,7 @@ const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 const chan_forward = @import("../proto/chan_forward.zig");
 const clone_limit_mod = @import("clone_limit.zig");
+const nick_delay_mod = @import("nick_delay.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
 const channel_rename = @import("../proto/channel_rename.zig");
@@ -1334,6 +1335,11 @@ pub const Config = struct {
     /// Max concurrent client connections aggregated across a /24 (IPv4) or /64
     /// (IPv6) prefix (0 = unlimited).
     max_clones_per_net: u32 = 0,
+    /// Nick-delay window (ms): how long a released nick is held against reuse
+    /// after its owner exits, so a hijacker cannot grab it the instant the owner
+    /// drops. The owning account may reclaim during the window; opers and
+    /// `nick_delay_exempt` classes bypass. `0` disables nick delay.
+    nick_delay_ms: u64 = 0,
     /// IP-reputation refuse threshold: a peer whose decaying penalty score
     /// reaches this is refused at accept (0 = reputation disabled entirely).
     reputation_refuse_threshold: u32 = 0,
@@ -2088,6 +2094,9 @@ pub const LinuxServer = struct {
     /// Concurrent-connection clone limiter (per exact IP and per /24|/64 prefix).
     /// Limits come from Config; a zero limit disables that dimension.
     clone_limit: clone_limit_mod.CloneLimiter,
+    /// Nick-delay registry: nicks held against reuse after their owner exits
+    /// (inert when `config.nick_delay_ms == 0`).
+    nick_delay: nick_delay_mod.NickDelay,
     /// Decaying per-IP penalty table. Only consulted/updated when Config's
     /// reputation_refuse_threshold is non-zero (otherwise reputation is off).
     reputation: ip_reputation_mod.IpReputation,
@@ -2507,6 +2516,7 @@ pub const LinuxServer = struct {
                 .max_per_ip = config.max_clones_per_ip,
                 .max_per_net = config.max_clones_per_net,
             }),
+            .nick_delay = nick_delay_mod.NickDelay.init(allocator),
             .reputation = ip_reputation_mod.IpReputation.init(allocator, .{
                 .half_life_ms = @intCast(@max(1, config.reputation_half_life_ms)),
                 .refuse_threshold = @floatFromInt(config.reputation_refuse_threshold),
@@ -2761,6 +2771,7 @@ pub const LinuxServer = struct {
         self.chan_akick.deinit();
         self.chan_resv.deinit();
         self.clone_limit.deinit();
+        self.nick_delay.deinit();
         self.reputation.deinit();
         self.accepts.deinit();
         self.silence.deinit();
@@ -2984,6 +2995,9 @@ pub const LinuxServer = struct {
         }
         if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
         self.sweepTimeouts();
+        // Evict lapsed nick-delay holds (reactor-0 only, like other shared-state
+        // maintenance; runs under the same world write lock as hold/check/release).
+        if (self.rx() == &self.reactors[0] and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
         self.sweepTempModes();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
@@ -5316,6 +5330,10 @@ pub const LinuxServer = struct {
             } else {
                 _ = self.sessions.removeClient(monitorIdFromClient(id));
             }
+            // Hold this nick against reuse for the nick-delay window before the
+            // world drops it. No-op on a clean QUIT (handleQuit already held +
+            // removed the nick) and for anonymous/unregistered/shared sessions.
+            self.holdNickOnExit(id, conn);
             defer self.world.removeClient(worldIdFromClient(id));
             // Record only for abrupt drops: a clean QUIT already recorded (and
             // removed the nick) in handleQuit, so skip to avoid a duplicate.
@@ -5863,6 +5881,11 @@ pub const LinuxServer = struct {
             conn.closing = true;
             return;
         }
+        if (self.nickDelayBlocks(conn, nick)) {
+            try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{nick}, "Nick is held (nick delay); try again shortly");
+            conn.closing = true;
+            return;
+        }
         self.world.registerNick(nick, worldIdFromClient(id)) catch |err| switch (err) {
             error.NickInUse => {
                 // Account-aware same-nick multi-session: if THIS connection is
@@ -5886,6 +5909,9 @@ pub const LinuxServer = struct {
             },
             else => return err,
         };
+        // This nick is now live: clear any nick-delay hold an oper / exempt class
+        // bypassed, so a later expiry sweep cannot evict a stale entry for it.
+        if (self.config.nick_delay_ms != 0) self.nick_delay.release(nick);
         // Notify any MONITOR watchers that this nick just came online. Best-effort:
         // a fanout failure (e.g. a watcher's send queue, or the >64-watcher path)
         // must never abort the registering client's own registration / welcome.
@@ -5916,6 +5942,38 @@ pub const LinuxServer = struct {
         const holder_acct = holder_conn.session.account() orelse return false;
         if (holder_acct.len == 0) return false;
         return std.ascii.eqlIgnoreCase(holder_acct, account);
+    }
+
+    /// Whether nick-delay refuses `conn`'s attempt to take `nick`. False when
+    /// nick delay is disabled, the nick is not held (or its window lapsed), the
+    /// requester is an operator or a `nick_delay_exempt` class, or the requester
+    /// is authenticated to the account that owns the hold — a legitimate reclaim,
+    /// which clears the hold.
+    fn nickDelayBlocks(self: *LinuxServer, conn: *ConnState, nick: []const u8) bool {
+        if (self.config.nick_delay_ms == 0) return false;
+        const held = self.nick_delay.check(nick, self.nowMs()) orelse return false;
+        if (conn.session.isOper()) return false;
+        if (conn.class_policy.nick_delay_exempt) return false;
+        if (held.owner) |owner| {
+            if (conn.session.account()) |acct| {
+                if (std.ascii.eqlIgnoreCase(owner, acct)) {
+                    self.nick_delay.release(nick); // rightful owner reclaims it
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Hold `conn`'s current world nick after it exits so it cannot be grabbed
+    /// for `nick_delay_ms`. No-op when nick delay is disabled or the connection
+    /// owns no world nick (anonymous / unregistered / a shared secondary
+    /// session). Call before `world.removeClient`, while the nick still resolves.
+    fn holdNickOnExit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        if (self.config.nick_delay_ms == 0) return;
+        const nick = self.world.nickOf(worldIdFromClient(id)) orelse return;
+        const expires = self.nowMs() + @as(i64, @intCast(self.config.nick_delay_ms));
+        self.nick_delay.hold(nick, expires, conn.session.account()) catch {};
     }
 
     /// Broadcast a JOIN to every channel member, choosing the IRCv3 extended-join
@@ -10282,7 +10340,7 @@ pub const LinuxServer = struct {
                 if (self.config.class_registry) |*reg| {
                     for (reg.classes) |*cls| {
                         var buf: [900]u8 = undefined;
-                        const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_chan={d} max_targets={d} monitor={d} silence={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
+                        const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_chan={d} max_targets={d} monitor={d} silence={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} nick_delay_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
                             cls.policy.sendq,            cls.policy.recvq,
                             cls.policy.max_clients,      cls.policy.max_per_ip,
                             cls.policy.max_channels,     cls.policy.max_targets,
@@ -10291,9 +10349,9 @@ pub const LinuxServer = struct {
                             cls.policy.register_timeout_ms, cls.policy.flood_lines,
                             cls.policy.flood_window_ms,  cls.policy.require_tls,
                             cls.policy.require_sasl,     cls.policy.flood_exempt,
-                            cls.cidrs.len,               cls.tls_only,
-                            cls.account_only,            cls.oper_only,
-                            self.countClassMembers(cls.name),
+                            cls.policy.nick_delay_exempt, cls.cidrs.len,
+                            cls.tls_only,                cls.account_only,
+                            cls.oper_only,               self.countClassMembers(cls.name),
                         }) catch continue;
                         try queueNumeric(conn, .RPL_STATSYLINE, &.{ "Y", cls.name }, text);
                     }
@@ -15894,6 +15952,14 @@ pub const LinuxServer = struct {
             }
         }
 
+        // Nick delay: refuse changing to a nick held against reuse (unless oper /
+        // exempt / the held account's owner reclaiming). Checked before the world
+        // register, which would otherwise succeed for a freed-but-held nick.
+        if (self.nickDelayBlocks(conn, newnick)) {
+            try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{newnick}, "Nick is held (nick delay); try again shortly");
+            return;
+        }
+
         // Reserve the new nick (frees the old mapping for this client).
         // Account-aware same-nick allowance (mirrors registerConnNick): if this
         // SASL-authed client changes to a nick already held by another LOCAL
@@ -15917,6 +15983,9 @@ pub const LinuxServer = struct {
             },
             else => return err,
         };
+        // The nick is now this client's: clear any hold an oper / exempt class
+        // bypassed so a later sweep cannot evict a stale entry for a live nick.
+        if (self.config.nick_delay_ms != 0 and !shared_same_account) self.nick_delay.release(newnick);
 
         // Build the NICK line with the OLD prefix before rewriting the session.
         var prefix_buf: [256]u8 = undefined;
@@ -19147,6 +19216,10 @@ pub const LinuxServer = struct {
         const nclasses = if (self.config.class_registry) |*r| r.classes.len else 0;
         if (std.fmt.bufPrint(&b, "Connection classes: {d} active (see STATS Y for per-class sendq/recvq/limits/match)", .{nclasses})) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
 
+        if (self.config.nick_delay_ms != 0) {
+            if (std.fmt.bufPrint(&b, "Nick delay: {d}ms hold on release - {d} nick(s) currently held", .{ self.config.nick_delay_ms, self.nick_delay.count() })) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
+        }
+
         var peers: usize = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
@@ -20638,6 +20711,7 @@ pub const LinuxServer = struct {
         self.recordWhowas(conn); // before removeClient: snapshot the live identity
         try self.broadcastQuit(id, conn, reason);
         self.publishChannelDestroyEventsForClient(id);
+        self.holdNickOnExit(id, conn); // hold the nick before the world drops it
         self.world.removeClient(worldIdFromClient(id));
         conn.closing = true;
     }
