@@ -133,7 +133,105 @@ pub const MeshClones = struct {
     }
 };
 
+// -- Wire codec --------------------------------------------------------------
+// A clone-count gossip frame payload is a bounded batch of (hash, count) pairs
+// in a fixed little-endian binary layout — no text, no escaping, no allocation.
+// The originating node is NOT in the payload: the receiver attributes the counts
+// to the authenticated S2S link's node id, so a peer cannot spoof another node's
+// counts. Layout: `u32 n` then `n × (u64 hash, u32 count)`.
+
+/// Cap on entries per frame, bounding both encode size and decode work.
+pub const max_entries_per_frame: usize = 2048;
+/// Bytes per (hash, count) entry.
+pub const entry_bytes: usize = 12;
+
+pub const Entry = struct { hash: u64, count: u32 };
+
+pub const CodecError = error{ Truncated, TooManyEntries, ShortBuffer };
+
+/// Bytes needed to encode `n` entries.
+pub fn encodedLen(n: usize) usize {
+    return 4 + n * entry_bytes;
+}
+
+/// Encode `entries` into `out`; returns the written slice.
+pub fn encodeCounts(out: []u8, entries: []const Entry) CodecError![]u8 {
+    if (entries.len > max_entries_per_frame) return error.TooManyEntries;
+    const need = encodedLen(entries.len);
+    if (out.len < need) return error.ShortBuffer;
+    std.mem.writeInt(u32, out[0..4], @intCast(entries.len), .little);
+    var off: usize = 4;
+    for (entries) |e| {
+        std.mem.writeInt(u64, out[off..][0..8], e.hash, .little);
+        std.mem.writeInt(u32, out[off + 8 ..][0..4], e.count, .little);
+        off += entry_bytes;
+    }
+    return out[0..need];
+}
+
+/// A validated, non-owning view over a decoded counts payload. `get(i)` for
+/// `i < n` is bounds-safe because `decodeCounts` proved the body length.
+pub const CountsView = struct {
+    n: u32,
+    body: []const u8,
+
+    pub fn get(self: CountsView, i: u32) Entry {
+        const off = @as(usize, i) * entry_bytes;
+        return .{
+            .hash = std.mem.readInt(u64, self.body[off..][0..8], .little),
+            .count = std.mem.readInt(u32, self.body[off + 8 ..][0..4], .little),
+        };
+    }
+};
+
+/// Decode a counts payload, rejecting truncated input and over-long batches.
+/// Never allocates and never reads out of bounds.
+pub fn decodeCounts(payload: []const u8) CodecError!CountsView {
+    if (payload.len < 4) return error.Truncated;
+    const n = std.mem.readInt(u32, payload[0..4], .little);
+    if (n > max_entries_per_frame) return error.TooManyEntries;
+    const need = encodedLen(n);
+    if (payload.len < need) return error.Truncated;
+    return .{ .n = n, .body = payload[4..need] };
+}
+
 // -- Tests -------------------------------------------------------------------
+
+test "counts codec round-trips a batch" {
+    var buf: [256]u8 = undefined;
+    const entries = [_]Entry{
+        .{ .hash = 0x0102030405060708, .count = 3 },
+        .{ .hash = 0xdeadbeefcafef00d, .count = 1 },
+        .{ .hash = 0, .count = 0 },
+    };
+    const wire = try encodeCounts(&buf, &entries);
+    try std.testing.expectEqual(encodedLen(entries.len), wire.len);
+
+    const view = try decodeCounts(wire);
+    try std.testing.expectEqual(@as(u32, 3), view.n);
+    for (entries, 0..) |e, i| {
+        const got = view.get(@intCast(i));
+        try std.testing.expectEqual(e.hash, got.hash);
+        try std.testing.expectEqual(e.count, got.count);
+    }
+}
+
+test "counts codec rejects malformed input" {
+    // Empty / too-short header.
+    try std.testing.expectError(error.Truncated, decodeCounts(&[_]u8{}));
+    try std.testing.expectError(error.Truncated, decodeCounts(&[_]u8{ 1, 0 }));
+    // Header claims 2 entries but the body is short.
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 2, .little);
+    try std.testing.expectError(error.Truncated, decodeCounts(buf[0..6]));
+    // Absurd entry count is rejected before any body read.
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, 999_999, .little);
+    try std.testing.expectError(error.TooManyEntries, decodeCounts(&hdr));
+    // Encode guards the output buffer + entry cap.
+    var small: [4]u8 = undefined;
+    try std.testing.expectError(error.ShortBuffer, encodeCounts(&small, &[_]Entry{.{ .hash = 1, .count = 1 }}));
+}
 
 test "hashIp is stable and IP-distinct under a shared key" {
     const key = [_]u8{0x5a} ** 16;
