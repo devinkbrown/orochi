@@ -883,6 +883,11 @@ const default_reply_bytes: usize = 8192;
 const default_sendq_cap: usize = 1 << 20; // 1 MiB
 const default_recv_bytes: usize = 4096;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
+/// Default inbound RecvQ ceiling: the physical inline line buffer. A connection
+/// class may raise it (lines spill to a heap overflow) or lower it; `0` in the
+/// class policy means "use this default". Preserves the historical single-line
+/// LineTooLong bound when no class overrides recvq.
+const default_recvq_cap: usize = default_line_bytes;
 const server_name = "orochi.local";
 const default_host = "localhost";
 
@@ -1566,8 +1571,18 @@ pub const ConnState = struct {
     token: RingFdToken = .{ .slot = 0, .gen = 0 },
     session: dispatch.ClientSession = dispatch.ClientSession.init(),
     recv_buf: [default_recv_bytes]u8 = undefined,
+    /// Inline inbound accumulator: the current partial line, fast path (no heap).
     line_buf: [default_line_bytes]u8 = undefined,
     line_len: usize = 0,
+    /// Inbound RecvQ overflow: a single line longer than `line_buf` spills here
+    /// (heap), bounded by `recvq_cap`. Empty on the fast path; non-empty exactly
+    /// when the pending line has spilled. Backed by `overflow_allocator` (shared
+    /// with the SendQ overflow). `pendingInbound` reads inline-or-overflow.
+    recv_overflow: std.ArrayListUnmanaged(u8) = .empty,
+    /// Inbound queue ceiling in bytes for this connection's class: the maximum
+    /// length of one unterminated line before the connection is dropped. Set by
+    /// `assignConnClass`; defaults to the physical inline buffer.
+    recvq_cap: usize = default_recvq_cap,
     send_buf: [default_reply_bytes]u8 = undefined,
     send_len: usize = 0,
     send_offset: usize = 0,
@@ -5227,9 +5242,10 @@ pub const LinuxServer = struct {
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
         if (self.rx().clients.get(id)) |conn| {
-            // Release any SendQ overflow heap before the slot is freed/reused (covers
-            // every close path below, including S2S links that carry mesh bursts).
+            // Release any SendQ / RecvQ overflow heap before the slot is freed/reused
+            // (covers every close path below, including S2S links that carry mesh bursts).
             if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+            if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
                 const dropped_node = link.peerShortId();
@@ -5459,7 +5475,7 @@ pub const LinuxServer = struct {
                     // the IRC message even without a trailing CRLF. Synthesize
                     // one so both frame-per-message clients and CRLF-framing
                     // clients parse identically.
-                    if (d.fin and conn.line_len != 0) try self.feedBytes(id, conn, "\r\n");
+                    if (d.fin and pendingInbound(conn) != 0) try self.feedBytes(id, conn, "\r\n");
                     if (conn.closing) return;
                 },
                 .ping => |payload| wsQueueControl(conn, .pong, payload),
@@ -5476,21 +5492,17 @@ pub const LinuxServer = struct {
 
     fn feedBytes(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, bytes: []const u8) !void {
         for (bytes) |byte| {
-            if (conn.line_len == conn.line_buf.len) {
-                conn.closing = true;
-                self.stats.onError();
-                return error.LineTooLong;
-            }
-            conn.line_buf[conn.line_len] = byte;
-            conn.line_len += 1;
-
-            if (conn.line_len >= 2 and
-                conn.line_buf[conn.line_len - 2] == '\r' and conn.line_buf[conn.line_len - 1] == '\n')
-            {
-                self.stats.onLine();
-                try self.processLiveLine(id, conn, conn.line_buf[0..conn.line_len]);
-                conn.line_len = 0;
-            }
+            const line = (recvqPush(conn, byte) catch |err| switch (err) {
+                error.LineTooLong => {
+                    conn.closing = true;
+                    self.stats.onError();
+                    return error.LineTooLong;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            }) orelse continue;
+            self.stats.onLine();
+            try self.processLiveLine(id, conn, line);
+            recvqReset(conn);
         }
     }
 
@@ -7005,6 +7017,7 @@ pub const LinuxServer = struct {
         const class = reg.classFor(matchCtx(conn));
         conn.class_policy = class.policy;
         conn.sendq_cap = class.policy.sendq;
+        conn.recvq_cap = if (class.policy.recvq != 0) @intCast(class.policy.recvq) else default_recvq_cap;
     }
 
     /// Build the connection-class match context for `conn` from its live session
@@ -21181,6 +21194,54 @@ fn wsRefuseHttp(conn: *ConnState, comptime status: []const u8) void {
     conn.closing = true;
 }
 
+// -- Inbound RecvQ (growable line accumulator) -------------------------------
+// The inbound twin of the SendQ below: an inline `line_buf` fast path that
+// spills to a `recv_overflow` heap once a line outgrows it, bounded by the
+// per-class `recvq_cap`. Server-free so the framing logic unit-tests directly.
+
+/// Bytes of unprocessed inbound buffered for `conn` (the pending partial line):
+/// the heap overflow once a line has spilled past the inline `line_buf`, else
+/// the inline accumulator. The RecvQ ceiling bounds this.
+fn pendingInbound(conn: *const ConnState) usize {
+    return if (conn.recv_overflow.items.len != 0) conn.recv_overflow.items.len else conn.line_len;
+}
+
+/// Accumulate one inbound byte into `conn`'s growable RecvQ. Returns the
+/// complete line (with CRLF) when `byte` terminates one, else null. Returns
+/// `error.LineTooLong` when the pending line would exceed the connection's
+/// `recvq_cap`. The caller dispatches the returned line and then calls
+/// `recvqReset`.
+fn recvqPush(conn: *ConnState, byte: u8) error{ LineTooLong, OutOfMemory }!?[]const u8 {
+    const spilled = conn.recv_overflow.items.len != 0;
+    if (pendingInbound(conn) >= conn.recvq_cap) return error.LineTooLong;
+
+    if (!spilled and conn.line_len < conn.line_buf.len) {
+        conn.line_buf[conn.line_len] = byte;
+        conn.line_len += 1;
+        if (conn.line_len >= 2 and
+            conn.line_buf[conn.line_len - 2] == '\r' and conn.line_buf[conn.line_len - 1] == '\n')
+            return conn.line_buf[0..conn.line_len];
+        return null;
+    }
+
+    // The line outgrew the inline buffer: migrate the inline prefix to the heap
+    // once (so the whole line stays contiguous), then keep appending there.
+    if (!spilled) try conn.recv_overflow.appendSlice(conn.overflow_allocator, conn.line_buf[0..conn.line_len]);
+    try conn.recv_overflow.append(conn.overflow_allocator, byte);
+    const items = conn.recv_overflow.items;
+    const n = items.len;
+    if (n >= 2 and items[n - 2] == '\r' and items[n - 1] == '\n') return items[0..n];
+    return null;
+}
+
+/// Reset the RecvQ accumulator after a completed line has been dispatched,
+/// releasing the overflow heap when it was used (steady-state memory stays
+/// bounded; the rare oversized line does not pin `recvq_cap` bytes).
+fn recvqReset(conn: *ConnState) void {
+    if (conn.recv_overflow.items.len != 0) conn.recv_overflow.clearAndFree(conn.overflow_allocator);
+    conn.line_len = 0;
+}
+
 fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
     // Fast path: with nothing already spilled to overflow, reclaim the sent prefix
     // [0, send_offset) by sliding the unsent tail to the front, then use the inline
@@ -21263,6 +21324,58 @@ test "SendQ: inline fast path, heap overflow, refill, and per-class cap" {
     refillFromOverflow(&conn);
     try std.testing.expectEqual(@as(usize, 4096), conn.send_len);
     try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.capacity);
+}
+
+test "RecvQ: inline fast path, CRLF dispatch, and per-class cap drop" {
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = std.testing.allocator;
+    defer if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
+
+    // Fast path: a short line accumulates inline (no heap) and the CRLF byte
+    // returns the whole contiguous line.
+    conn.recvq_cap = default_recvq_cap;
+    const msg = "NICK alice\r\n";
+    var got: ?[]const u8 = null;
+    for (msg) |b| got = try recvqPush(&conn, b);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings(msg, got.?);
+    try std.testing.expectEqual(@as(usize, 0), conn.recv_overflow.items.len); // stayed inline
+    recvqReset(&conn);
+    try std.testing.expectEqual(@as(usize, 0), conn.line_len);
+
+    // Cap: a tight recvq_cap admits exactly `cap` bytes, then drops the line.
+    conn.recvq_cap = 4;
+    for ("abcd") |b| try std.testing.expectEqual(@as(?[]const u8, null), try recvqPush(&conn, b));
+    try std.testing.expectError(error.LineTooLong, recvqPush(&conn, 'e'));
+    recvqReset(&conn);
+}
+
+test "RecvQ: a line past the inline buffer spills to a contiguous heap overflow" {
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = std.testing.allocator;
+    defer if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
+
+    const inline_len = conn.line_buf.len; // physical inline capacity
+    const body = inline_len + 8; // 8 bytes past the inline buffer
+    conn.recvq_cap = inline_len + 64; // raised class ceiling → spill is allowed
+
+    var i: usize = 0;
+    while (i < body) : (i += 1) {
+        try std.testing.expectEqual(@as(?[]const u8, null), try recvqPush(&conn, 'a'));
+    }
+    try std.testing.expect(conn.recv_overflow.items.len != 0); // spilled to heap
+    try std.testing.expectEqual(@as(?[]const u8, null), try recvqPush(&conn, '\r'));
+    const line = try recvqPush(&conn, '\n');
+    try std.testing.expect(line != null);
+    // The dispatched slice is the inline prefix + heap tail, contiguous, w/ CRLF.
+    try std.testing.expectEqual(@as(usize, body + 2), line.?.len);
+    try std.testing.expectEqual(@as(u8, '\r'), line.?[line.?.len - 2]);
+    try std.testing.expectEqual(@as(u8, '\n'), line.?[line.?.len - 1]);
+
+    // Reset releases the overflow heap and clears the inline accumulator.
+    recvqReset(&conn);
+    try std.testing.expectEqual(@as(usize, 0), conn.recv_overflow.capacity);
+    try std.testing.expectEqual(@as(usize, 0), conn.line_len);
 }
 
 /// Format a server numeric line (`:<server> <code> <nick> <params> :<trailing>`)

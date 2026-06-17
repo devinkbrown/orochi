@@ -44,13 +44,15 @@ pub const Error = error{
 pub const ParseError = error{ Invalid, OutOfRange };
 
 /// Per-connection policy. A `0` count/duration means "unlimited" (counts) or
-/// "inherit the daemon global" (durations); `sendq`/`recvq` always carry a
-/// concrete byte cap (defaulted by the built-in classes).
+/// "inherit the daemon global" (durations); `recvq` also follows the `0 =
+/// inherit` convention. `sendq` always carries a concrete byte cap.
 pub const Policy = struct {
     /// Outbound send-queue cap in bytes (the growable SendQ ceiling).
     sendq: u64 = 1 << 20, // 1 MiB
-    /// Inbound flood-buffer cap in bytes.
-    recvq: u64 = 8 << 10, // 8 KiB
+    /// Inbound RecvQ ceiling in bytes: the max length of one unterminated line
+    /// before the connection is dropped (lines spill to a heap overflow past the
+    /// inline buffer). `0` = inherit the daemon's physical line-buffer default.
+    recvq: u64 = 0,
     /// Max live connections in this class (0 = unlimited).
     max_clients: u32 = 0,
     /// Max simultaneous connections from one IP in this class (0 = unlimited).
@@ -244,7 +246,7 @@ pub const Builder = struct {
     /// storage; the builder is consumed.
     pub fn finish(self: *Builder) Error!Registry {
         const user_idx = try self.ensureBuiltin("user", .{});
-        const server_idx = try self.ensureBuiltin("server", .{ .sendq = 8 << 20, .recvq = 1 << 20 });
+        const server_idx = try self.ensureBuiltin("server", .{ .sendq = 8 << 20 });
         const classes = try self.list.toOwnedSlice(self.allocator);
         return .{
             .allocator = self.allocator,
