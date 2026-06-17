@@ -970,6 +970,8 @@ const Numeric = enum(u16) {
     RPL_STATSOLINE = 243,
     RPL_STATSKLINE = 216,
     RPL_STATSDLINE = 225,
+    RPL_STATSYLINE = 218, // connection class (Y line)
+    RPL_STATSLLINE = 211, // server-link / peer stats (STATS l)
     RPL_ENDOFSTATS = 219,
     // EVENT command replies follow draft-pfenning-04: 806 ADD, 807 DEL,
     // 808 START, 809 LIST, 810 END. CHANGE (825) is a non-draft extension.
@@ -7006,6 +7008,36 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// Count live connections currently in connection class `name` (across all
+    /// reactor shards; safe — STATS runs under the world lock). S2S links count as
+    /// `server`; registered clients are re-matched. Used by STATS Y.
+    fn countClassMembers(self: *LinuxServer, name: []const u8) usize {
+        const reg = if (self.config.class_registry) |*r| r else return 0;
+        var n: usize = 0;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const c = &slot.value;
+                if (c.s2s != null or c.s2s_secured != null) {
+                    if (std.ascii.eqlIgnoreCase(name, "server")) n += 1;
+                    continue;
+                }
+                if (!c.session.registered()) continue;
+                const cls = reg.classFor(.{
+                    .ip_text = c.session.realHost(),
+                    .is_tls = c.tls != null,
+                    .has_account = c.session.account() != null,
+                    .is_oper = c.session.isOper(),
+                    .ident = c.session.username(),
+                    .host = c.session.realHost(),
+                    .is_server_link = false,
+                });
+                if (std.ascii.eqlIgnoreCase(cls.name, name)) n += 1;
+            }
+        }
+        return n;
+    }
+
     /// Resolve a REMOTE (mesh) member's channel status bits by nick, scanning
     /// every established peer link's converged channel roster (the route table —
     /// the only place mesh members are represented; remote users are NOT in the
@@ -10127,8 +10159,10 @@ pub const LinuxServer = struct {
         self.monitor.removeClient(monitorIdFromClient(id));
     }
 
-    /// STATS <letter> — server statistics. Supports u (uptime, 242) and o (oper
-    /// blocks, 243). All queries terminate with RPL_ENDOFSTATS (219).
+    /// STATS <letter> — server statistics. Supports u (uptime, 242), o (oper
+    /// blocks, 243), k/d (WARD ban masks/addresses, 216/225), y (connection
+    /// classes + per-class policy/match/live, 218), l (established S2S peer links,
+    /// 211), and z (runtime counters, 249, oper-only). Terminates with 219.
     pub fn handleStats(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"STATS"}, "Not enough parameters");
@@ -10156,6 +10190,49 @@ pub const LinuxServer = struct {
             },
             'k', 'K' => try self.statsLines(conn, .mask, .RPL_STATSKLINE),
             'd', 'D' => try self.statsLines(conn, .address, .RPL_STATSDLINE),
+            'y', 'Y' => {
+                // Connection classes (`[class.*]`): one line per class with its full
+                // policy, match summary, and live-member count.
+                if (self.config.class_registry) |*reg| {
+                    for (reg.classes) |*cls| {
+                        var buf: [900]u8 = undefined;
+                        const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_chan={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
+                            cls.policy.sendq,            cls.policy.recvq,
+                            cls.policy.max_clients,      cls.policy.max_per_ip,
+                            cls.policy.max_channels,     cls.policy.ping_interval_ms,
+                            cls.policy.ping_timeout_ms,  cls.policy.register_timeout_ms,
+                            cls.policy.flood_lines,      cls.policy.flood_window_ms,
+                            cls.policy.require_tls,      cls.policy.require_sasl,
+                            cls.policy.flood_exempt,     cls.cidrs.len,
+                            cls.tls_only,                cls.account_only,
+                            cls.oper_only,               self.countClassMembers(cls.name),
+                        }) catch continue;
+                        try queueNumeric(conn, .RPL_STATSYLINE, &.{ "Y", cls.name }, text);
+                    }
+                }
+            },
+            'l', 'L' => {
+                // Established S2S peer links: name, SendQ ceiling + queued, uptime.
+                const now = self.nowMs();
+                for (self.reactors) |*reactor| {
+                    for (reactor.clients.slots.items) |*slot| {
+                        if (!slot.occupied) continue;
+                        const c = &slot.value;
+                        const rname: ?[]const u8 = if (c.s2s_secured) |l|
+                            (if (l.established()) l.remoteName() else null)
+                        else if (c.s2s) |l|
+                            (if (l.established()) l.remoteName() else null)
+                        else
+                            null;
+                        const name = rname orelse continue;
+                        const queued = (c.send_len - c.send_offset) + c.send_overflow.items.len;
+                        const up_s: i64 = @divTrunc(now - c.connected_at_ms, 1000);
+                        var buf: [256]u8 = undefined;
+                        const text = std.fmt.bufPrint(&buf, "sendq_cap={d} queued={d} uptime={d}s", .{ c.sendq_cap, queued, @max(@as(i64, 0), up_s) }) catch continue;
+                        try queueNumeric(conn, .RPL_STATSLLINE, &.{ if (name.len != 0) name else "*" }, text);
+                    }
+                }
+            },
             'z', 'Z' => {
                 // Runtime counters (RPL_STATSDEBUG 249), oper-only.
                 if (!conn.session.isOper()) {
@@ -18957,7 +19034,37 @@ pub const LinuxServer = struct {
             if (it.peek() == null and line.len == 0) break;
             try queueNumeric(conn, .RPL_INFO, &.{}, text);
         }
+        try self.infoRuntimeLines(conn);
         try queueNumeric(conn, .RPL_ENDOFINFO, &.{}, "End of /INFO list");
+    }
+
+    /// Append the runtime-detail INFO block: advertised limits, connection-class
+    /// count, established mesh peers, and the active subsystem inventory.
+    fn infoRuntimeLines(self: *LinuxServer, conn: *ConnState) !void {
+        try queueNumeric(conn, .RPL_INFO, &.{}, " ");
+        var b: [480]u8 = undefined;
+        if (std.fmt.bufPrint(&b, "Limits: NICKLEN={d} CHANNELLEN={d} TOPICLEN={d} AWAYLEN={d} KICKLEN={d} CHANLIMIT={d} MAXTARGETS={d} MONITOR={d} SILENCE={d} MAXLIST={d}", .{
+            self.config.nicklen,      self.config.channellen, self.config.topiclen,
+            self.config.awaylen,      self.config.kicklen,    self.config.chanlimit,
+            self.config.maxtargets,   self.config.monitorlimit, self.config.silencelimit,
+            self.config.maxlist,
+        })) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
+
+        const nclasses = if (self.config.class_registry) |*r| r.classes.len else 0;
+        if (std.fmt.bufPrint(&b, "Connection classes: {d} active (see STATS Y for per-class sendq/recvq/limits/match)", .{nclasses})) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
+
+        var peers: usize = 0;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const c = &slot.value;
+                const up = if (c.s2s_secured) |l| l.established() else if (c.s2s) |l| l.established() else false;
+                if (up) peers += 1;
+            }
+        }
+        if (std.fmt.bufPrint(&b, "Mesh: {d} established S2S peer link(s) - Suimyaku CRDT routing over Tsumugi forward-secret transport", .{peers})) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
+
+        try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, opssl TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (OPVOX/OPVIS)");
     }
 
     /// USERS — local user listing (RPL_USERSSTART/RPL_USERS/RPL_ENDOFUSERS).
