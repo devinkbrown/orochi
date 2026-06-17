@@ -10269,16 +10269,18 @@ pub const LinuxServer = struct {
                 if (self.config.class_registry) |*reg| {
                     for (reg.classes) |*cls| {
                         var buf: [900]u8 = undefined;
-                        const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_chan={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
+                        const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_chan={d} max_targets={d} monitor={d} silence={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
                             cls.policy.sendq,            cls.policy.recvq,
                             cls.policy.max_clients,      cls.policy.max_per_ip,
-                            cls.policy.max_channels,     cls.policy.ping_interval_ms,
-                            cls.policy.ping_timeout_ms,  cls.policy.register_timeout_ms,
-                            cls.policy.flood_lines,      cls.policy.flood_window_ms,
-                            cls.policy.require_tls,      cls.policy.require_sasl,
-                            cls.policy.flood_exempt,     cls.cidrs.len,
-                            cls.tls_only,                cls.account_only,
-                            cls.oper_only,               self.countClassMembers(cls.name),
+                            cls.policy.max_channels,     cls.policy.max_targets,
+                            cls.policy.monitor,          cls.policy.silence,
+                            cls.policy.ping_interval_ms, cls.policy.ping_timeout_ms,
+                            cls.policy.register_timeout_ms, cls.policy.flood_lines,
+                            cls.policy.flood_window_ms,  cls.policy.require_tls,
+                            cls.policy.require_sasl,     cls.policy.flood_exempt,
+                            cls.cidrs.len,               cls.tls_only,
+                            cls.account_only,            cls.oper_only,
+                            self.countClassMembers(cls.name),
                         }) catch continue;
                         try queueNumeric(conn, .RPL_STATSYLINE, &.{ "Y", cls.name }, text);
                     }
