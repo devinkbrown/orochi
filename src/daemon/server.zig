@@ -4988,11 +4988,15 @@ pub const LinuxServer = struct {
         };
 
         // Origin spoof guard: a relayed message must never be RENDERED locally as a
-        // nick that is live & local on THIS node. A genuinely-local nick's traffic
-        // originates here (handlePrivmsg), never via a peer, and nick collisions are
-        // resolved by rename-to-UID — so a peer asserting a local nick's prefix is a
-        // spoof. Still re-forward for multi-hop; just never deliver the spoofed line.
-        if (self.nickIsLiveLocal(clean_msg.source_nick)) {
+        // nick that is live & local on THIS node — UNLESS it is the SAME account.
+        // Multi-client / one-nick is by design: `kain` may be live on this node and
+        // on a peer at once (same authenticated account), so a relayed line from that
+        // sibling session is legitimate and must be delivered (so the user's other
+        // devices + co-channel members see it). Only a DIFFERENT account asserting a
+        // local nick's prefix is a real spoof — drop that (re-forward for multi-hop).
+        if (self.nickIsLiveLocal(clean_msg.source_nick) and
+            !self.localNickSameAccount(clean_msg.source_nick, clean_msg.account))
+        {
             const spoof_scope: RelayScope = if (world_model.isChannelName(clean_msg.target))
                 .{ .channel = clean_msg.target }
             else
@@ -5098,9 +5102,12 @@ pub const LinuxServer = struct {
         // route map, only in the channel roster).
         const reforward: RelayScope = .{ .channel = msg.target };
         // Origin spoof guard: a peer must not assert a prefix for a nick that is
-        // live & local here (its traffic would originate locally). Still
-        // re-forward for multi-hop; never render the spoofed line.
-        if (self.nickIsLiveLocal(msg.source_nick)) {
+        // live & local here — UNLESS it is the SAME account (a legitimate
+        // multi-client / one-nick sibling on a peer; see deliverRelay). Still
+        // re-forward for multi-hop; only a DIFFERENT account's assertion is dropped.
+        if (self.nickIsLiveLocal(msg.source_nick) and
+            !self.localNickSameAccount(msg.source_nick, msg.account))
+        {
             _ = self.relayToPeers(msg, reforward);
             return;
         }
@@ -6893,6 +6900,20 @@ pub const LinuxServer = struct {
         const wid = self.world.findNick(nick) orelse return false;
         const conn = self.connFor(clientIdFromWorld(wid)) orelse return false;
         return conn.s2s == null and conn.s2s_secured == null;
+    }
+
+    /// True when a live-local `nick` is logged in to `account` (case-insensitive,
+    /// both non-empty). Used to tell a legitimate multi-client / one-nick SIBLING
+    /// session (same account on another mesh node — by design) apart from a real
+    /// origin spoof (a peer asserting a DIFFERENT account's hold on a local nick).
+    /// `account` is the relayed message's authenticated account (origin-verified).
+    fn localNickSameAccount(self: *LinuxServer, nick: []const u8, account: []const u8) bool {
+        if (account.len == 0) return false;
+        const wid = self.world.findNick(nick) orelse return false;
+        const conn = self.connFor(clientIdFromWorld(wid)) orelse return false;
+        if (conn.s2s != null or conn.s2s_secured != null) return false;
+        const local_acct = conn.session.account() orelse return false;
+        return std.ascii.eqlIgnoreCase(local_acct, account);
     }
 
     /// Resolve a REMOTE (mesh) member's channel status bits by nick, scanning
