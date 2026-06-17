@@ -424,6 +424,25 @@ const cap_specs = [_]CapSpec{
     .{ .id = .netjoin, .name = "draft/netjoin" },
 };
 
+/// Exact upper bound on the rendered, space-separated negotiated-cap-name list
+/// (every cap name + one separator each). A buffer of this size can hold the full
+/// set, so the Helix UPGRADE seal never truncates a client's carried caps.
+pub const max_cap_names_len = blk: {
+    var total: usize = 0;
+    for (cap_specs) |spec| total += spec.name.len + 1;
+    break :blk total;
+};
+
+/// Resolve a CAP name back to its CapId. Returns null for a name this build does
+/// not define — so a cap carried across an UPGRADE that since removed it is simply
+/// dropped rather than mis-mapped onto a shifted bit position.
+fn capIdFromName(name: []const u8) ?CapId {
+    for (cap_specs) |spec| {
+        if (std.mem.eql(u8, spec.name, name)) return spec.id;
+    }
+    return null;
+}
+
 /// Per-session STS advertisement policy.
 ///
 /// DEFAULT OFF: a freshly initialized session has `enabled == false`, so the
@@ -1171,6 +1190,9 @@ pub const ClientSession = struct {
         if (snap.logged_in and snap.account.len > 0) self.loginAs(snap.account) else self.logout();
         if (snap.away_active) self.setAway(snap.away) else self.clearAway();
         self.is_oper = snap.is_oper;
+        // Re-enable the negotiated IRCv3 caps carried across the UPGRADE (by name),
+        // so echo-message and friends keep working without a client reconnect.
+        self.restoreNegotiatedCaps(snap.caps);
         self.registration.registered = true;
     }
 
@@ -1229,6 +1251,38 @@ pub const ClientSession = struct {
     /// and by tests; normal clients arrive here via CAP REQ).
     pub fn addCap(self: *ClientSession, id: CapId) void {
         self.cap.negotiated.add(id);
+    }
+
+    /// Render the negotiated CAP set into `buf` as a space-separated name list
+    /// (e.g. "echo-message server-time sasl"), returning the used slice. Carried
+    /// across a Helix UPGRADE BY NAME so the set stays correct even when an upgrade
+    /// shifts CapId bit positions. `buf` should be `max_cap_names_len`; anything
+    /// that would overflow is dropped (the buffer is sized to never overflow).
+    pub fn renderNegotiatedCaps(self: *const ClientSession, buf: []u8) []const u8 {
+        var w: usize = 0;
+        for (cap_specs) |spec| {
+            if (!self.cap.negotiated.contains(spec.id)) continue;
+            const sep: usize = if (w == 0) 0 else 1;
+            if (w + sep + spec.name.len > buf.len) break;
+            if (sep == 1) {
+                buf[w] = ' ';
+                w += 1;
+            }
+            @memcpy(buf[w .. w + spec.name.len], spec.name);
+            w += spec.name.len;
+        }
+        return buf[0..w];
+    }
+
+    /// Restore the negotiated CAP set from a space-separated name list (the inverse
+    /// of `renderNegotiatedCaps`). Unknown names are skipped — a cap the successor
+    /// build no longer defines is dropped rather than mis-mapped. Called from
+    /// `restore` when adopting a session across a Helix UPGRADE.
+    pub fn restoreNegotiatedCaps(self: *ClientSession, names: []const u8) void {
+        var it = std.mem.tokenizeScalar(u8, names, ' ');
+        while (it.next()) |name| {
+            if (capIdFromName(name)) |id| self.cap.negotiated.add(id);
+        }
     }
 
     /// Point `sasl_server_nonce` at a stable per-connection copy of `nonce`
@@ -2100,9 +2154,16 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     s.setVisibleHost("cloak-ab12.orochi");
     s.setAway("brb");
     s.is_oper = true;
+    // Negotiated caps must survive the UPGRADE too (carried by name).
+    s.addCap(.echo_message);
+    s.addCap(.server_time);
+    s.addCap(.message_tags);
 
     const allocator = std.testing.allocator;
-    const bytes = try session_snapshot.encode(allocator, s.snapshot());
+    var snap = s.snapshot();
+    var caps_buf: [max_cap_names_len]u8 = undefined;
+    snap.caps = s.renderNegotiatedCaps(&caps_buf);
+    const bytes = try session_snapshot.encode(allocator, snap);
     defer allocator.free(bytes);
     const decoded = try session_snapshot.decode(bytes);
 
@@ -2117,6 +2178,11 @@ test "session snapshot -> encode -> decode -> restore round-trips" {
     try std.testing.expectEqualStrings("brb", s2.awayMessage().?);
     try std.testing.expect(s2.isOper());
     try std.testing.expect(s2.registered());
+    // Caps carried across the round-trip; an un-negotiated cap stays off.
+    try std.testing.expect(s2.hasCap(.echo_message));
+    try std.testing.expect(s2.hasCap(.server_time));
+    try std.testing.expect(s2.hasCap(.message_tags));
+    try std.testing.expect(!s2.hasCap(.sasl));
 }
 
 test "full registration handshake emits welcome numerics" {

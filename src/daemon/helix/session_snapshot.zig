@@ -5,7 +5,7 @@
 //! to reconstruct a recognizable registered session (nick, realname, account,
 //! visible + real host, away, oper). The client's socket fd is carried separately
 //! (SCM_RIGHTS / inherited fd); this is only the session state that pairs with it.
-//! Caps, umodes, and channel membership are a later increment.
+//! umodes are a later increment.
 //!
 //! Wire format (all integers little-endian):
 //!   [u16 len][nick][u16 len][realname][u16 len][account]
@@ -14,6 +14,7 @@
 //!   [i32 fd]     the client's socket fd (inherited across execve), -1 if none
 //!   [u16 nchan]  ( [u16 len][name][u8 member-modes] )*   channel memberships
 //!   [i64 connected_at_ms][i64 last_message_ms]   OPTIONAL trailing block
+//!   [u16 len][caps]   OPTIONAL trailing CAP list (space-separated names)
 //!
 //! The trailing signon block carries the client's CLOCK_MONOTONIC signon and
 //! last-message timestamps so WHOIS idle/signon survive an in-place UPGRADE.
@@ -22,6 +23,14 @@
 //! block is OPTIONAL: a snapshot written by a pre-signon build omits it, and the
 //! decoder defaults both to 0 so the successor falls back to "now" — no client is
 //! dropped on the single upgrade that crosses this format change.
+//!
+//! The caps block (also OPTIONAL, written only after the signon block) carries the
+//! negotiated IRCv3 CAP set BY NAME — a space-separated list like
+//! "echo-message server-time message-tags". Names, not raw bits, because the
+//! CapId bit positions shift whenever an upgrade adds/removes/reorders a cap; a
+//! name survives that and an unknown name is simply dropped on restore. Omitting
+//! it (pre-caps build) decodes to "" so the successor restores no caps — exactly
+//! the pre-fix behavior, never a misattributed bit.
 const std = @import("std");
 
 pub const Error = error{ Truncated, TooLong };
@@ -56,6 +65,10 @@ pub const Snapshot = struct {
     connected_at_ms: i64 = 0,
     /// CLOCK_MONOTONIC last-message timestamp (ms) driving WHOIS idle. 0 = unknown.
     last_message_ms: i64 = 0,
+    /// Negotiated IRCv3 CAP names, space-separated (e.g. "echo-message sasl").
+    /// Empty = no caps carried (pre-caps snapshot, or none negotiated). Carried
+    /// by name so it survives a build that adds/removes/reorders cap bits.
+    caps: []const u8 = "",
 };
 
 const flag_logged_in: u8 = 1 << 0;
@@ -101,6 +114,13 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     try out.appendSlice(allocator, &ts_le);
     std.mem.writeInt(i64, &ts_le, snap.last_message_ms, .little);
     try out.appendSlice(allocator, &ts_le);
+    // Trailing CAP block (see file header): the negotiated cap set, by name, so it
+    // survives a build that shifts cap bit positions. Sits past the signon block.
+    if (snap.caps.len > std.math.maxInt(u16)) return error.TooLong;
+    var caps_len_le: [2]u8 = undefined;
+    std.mem.writeInt(u16, &caps_len_le, @intCast(snap.caps.len), .little);
+    try out.appendSlice(allocator, &caps_len_le);
+    try out.appendSlice(allocator, snap.caps);
     return out.toOwnedSlice(allocator);
 }
 
@@ -119,13 +139,23 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     // so `channels_blob` stays "the rest" exactly as before — trailing signon
     // bytes (if any) sit past the counted entries and are never iterated.
     const channels_blob = r.buf[r.pos..];
-    // Locate the optional trailing signon block by walking past the channel list.
+    // Locate the optional trailing signon block by walking past the channel list,
+    // then the optional CAP block immediately after it. Both default-empty so a
+    // capsule from a build predating either field still decodes cleanly.
     var connected_at_ms: i64 = 0;
     var last_message_ms: i64 = 0;
+    var caps: []const u8 = "";
     if (channelRegionEnd(r.buf, r.pos)) |chan_end| {
         if (r.buf.len - chan_end >= 16) {
             connected_at_ms = std.mem.readInt(i64, r.buf[chan_end..][0..8], .little);
             last_message_ms = std.mem.readInt(i64, r.buf[chan_end + 8 ..][0..8], .little);
+            const caps_start = chan_end + 16;
+            if (r.buf.len - caps_start >= 2) {
+                const n = std.mem.readInt(u16, r.buf[caps_start..][0..2], .little);
+                if (caps_start + 2 + n <= r.buf.len) {
+                    caps = r.buf[caps_start + 2 .. caps_start + 2 + n];
+                }
+            }
         }
     }
     return .{
@@ -142,6 +172,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .channels_blob = channels_blob,
         .connected_at_ms = connected_at_ms,
         .last_message_ms = last_message_ms,
+        .caps = caps,
     };
 }
 
@@ -249,6 +280,7 @@ test "snapshot encode/decode round-trips identity + flags" {
         },
         .connected_at_ms = 1_700_000_000_123,
         .last_message_ms = 1_700_000_500_456,
+        .caps = "echo-message server-time sasl",
     };
     const bytes = try encode(allocator, snap);
     defer allocator.free(bytes);
@@ -257,6 +289,7 @@ test "snapshot encode/decode round-trips identity + flags" {
     try testing.expectEqual(@as(i32, 42), got.fd);
     try testing.expectEqual(@as(i64, 1_700_000_000_123), got.connected_at_ms);
     try testing.expectEqual(@as(i64, 1_700_000_500_456), got.last_message_ms);
+    try testing.expectEqualStrings("echo-message server-time sasl", got.caps);
     var it = channelIter(got.channels_blob);
     const c0 = it.next().?;
     try testing.expectEqualStrings("#ops", c0.name);
@@ -282,12 +315,21 @@ test "empty snapshot round-trips" {
     try testing.expect(!got.logged_in and !got.away_active and !got.is_oper);
     try testing.expectEqual(@as(i64, 0), got.connected_at_ms);
     try testing.expectEqual(@as(i64, 0), got.last_message_ms);
+    try testing.expectEqual(@as(usize, 0), got.caps.len);
 }
 
-test "decode tolerates a pre-signon snapshot (no trailing block)" {
+test "caps round-trip and empty caps decode to empty" {
     const allocator = testing.allocator;
-    // Build a snapshot, then truncate the 16-byte trailing signon block to emulate
-    // a capsule written by a build that predates the signon-carry format change.
+    const bytes = try encode(allocator, .{ .nick = "n", .caps = "" });
+    defer allocator.free(bytes);
+    const got = try decode(bytes);
+    try testing.expectEqual(@as(usize, 0), got.caps.len);
+}
+
+test "decode tolerates a pre-signon snapshot (no trailing blocks)" {
+    const allocator = testing.allocator;
+    // Build a snapshot, then truncate the 16-byte signon block + 2-byte caps block
+    // to emulate a capsule written by a build that predates both trailing fields.
     const bytes = try encode(allocator, .{
         .nick = "bob",
         .fd = 7,
@@ -296,7 +338,7 @@ test "decode tolerates a pre-signon snapshot (no trailing block)" {
         .last_message_ms = 5678,
     });
     defer allocator.free(bytes);
-    const old = bytes[0 .. bytes.len - 16];
+    const old = bytes[0 .. bytes.len - 18];
 
     const got = try decode(old);
     try testing.expectEqualStrings("bob", got.nick);
@@ -308,6 +350,28 @@ test "decode tolerates a pre-signon snapshot (no trailing block)" {
     try testing.expect(it.next() == null);
     try testing.expectEqual(@as(i64, 0), got.connected_at_ms);
     try testing.expectEqual(@as(i64, 0), got.last_message_ms);
+    try testing.expectEqual(@as(usize, 0), got.caps.len);
+}
+
+test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
+    const allocator = testing.allocator;
+    // A capsule from the signon-carry build: it has the 16-byte signon block but no
+    // 2-byte caps block. Strip only the caps block; signon must still restore.
+    const bytes = try encode(allocator, .{
+        .nick = "carol",
+        .fd = 9,
+        .connected_at_ms = 4321,
+        .last_message_ms = 8765,
+        .caps = "echo-message",
+    });
+    defer allocator.free(bytes);
+    const old = bytes[0 .. bytes.len - ("echo-message".len + 2)];
+
+    const got = try decode(old);
+    try testing.expectEqualStrings("carol", got.nick);
+    try testing.expectEqual(@as(i64, 4321), got.connected_at_ms);
+    try testing.expectEqual(@as(i64, 8765), got.last_message_ms);
+    try testing.expectEqual(@as(usize, 0), got.caps.len);
 }
 
 test "decode rejects a truncated buffer" {

@@ -11462,6 +11462,11 @@ pub const LinuxServer = struct {
                 chan_n += 1;
             }
             snap.channels = chans[0..chan_n];
+            // Carry the negotiated IRCv3 caps (by name) so echo-message and friends
+            // survive the UPGRADE without a client reconnect. The buffer lives until
+            // encode() copies it below; it is sized to hold the full cap set.
+            var caps_buf: [dispatch.max_cap_names_len]u8 = undefined;
+            snap.caps = e.value.session.renderNegotiatedCaps(&caps_buf);
             const blob = session_snapshot.encode(self.allocator, snap) catch {
                 if (tls_blob) |tb| self.allocator.free(tb);
                 continue;
