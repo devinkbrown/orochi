@@ -370,62 +370,40 @@ pub const EventSpine = struct {
     }
 };
 
-/// Render one structured oper event wire line with IRCv3-style message tags.
-pub const RenderOptions = struct {
-    server_name: []const u8,
-    event: Event,
-    max_line_len: usize = 8191,
-    include_tags: bool = true,
-};
+/// Maximum rendered event line length (classic IRC 512 is too small for IRCv3-era
+/// hosts/reasons; matches the prior renderer's cap).
+pub const max_event_line_len: usize = 8191;
 
-/// Build `[ @event-* ] :server NOTE EVENT <CATEGORY> :message\r\n` into `out`.
-pub fn renderOperNote(options: RenderOptions, out: []u8) RenderError![]const u8 {
-    try validateServerName(options.server_name);
-    try validateEvent(options.event);
-
-    const needed = try renderedLen(options);
-    if (needed > options.max_line_len) return error.MessageTooLong;
+/// Render one chatsvc-faithful raw EVENT line into `out`:
+///   `:<server> EVENT <target> <message>\r\n`
+///
+/// Modeled after the MS Exchange 5.5 Chat Service (chatsvc), whose event
+/// notifications are raw `:<srv> EVENT <target> <TYPE> <SUBTYPE> <args>` lines —
+/// NOT the IRCv3 `NOTE EVENT`/draft-numeric form. `target` is the recipient (the
+/// subscribed oper's nick); `message` is the structured payload the caller built,
+/// e.g. "USER CONNECT n!u@h", "USER DISCONNECT n!u@h :quit", "MEMBER JOIN #c nick",
+/// "SERVER LINK ircx.us". The subscription category is applied upstream for
+/// filtering; it is intentionally absent from the wire (the TYPE leads the body).
+pub fn renderEvent(server_name: []const u8, target: []const u8, message: []const u8, out: []u8) RenderError![]const u8 {
+    try validateServerName(server_name);
+    if (!validAtom(target)) return error.InvalidMessage; // recipient nick atom
+    if (message.len == 0) return error.InvalidMessage;
+    for (message) |ch| {
+        if (unsafeTextByte(ch)) return error.InvalidMessage;
+    }
+    const needed = ":".len + server_name.len + " EVENT ".len + target.len + " ".len + message.len + "\r\n".len;
+    if (needed > max_event_line_len) return error.MessageTooLong;
     if (out.len < needed) return error.OutputTooSmall;
 
     var writer = SliceWriter{ .buf = out };
-    if (options.include_tags) {
-        try writer.append("@event-category=");
-        try writer.append(options.event.category.token());
-        try writer.append(";event-severity=");
-        try writer.append(options.event.severity.token());
-        try writer.append(";event-timestamp-ms=");
-        try writer.appendInt(options.event.timestamp_ms);
-        try writer.append(" ");
-    }
     try writer.append(":");
-    try writer.append(options.server_name);
-    try writer.append(" NOTE EVENT ");
-    try writer.append(options.event.category.code());
-    try writer.append(" :");
-    try writer.append(options.event.message);
+    try writer.append(server_name);
+    try writer.append(" EVENT ");
+    try writer.append(target);
+    try writer.append(" ");
+    try writer.append(message);
     try writer.append("\r\n");
     return out[0..writer.len];
-}
-
-fn renderedLen(options: RenderOptions) RenderError!usize {
-    var total: usize = 0;
-    if (options.include_tags) {
-        try addLen(&total, "@event-category=".len);
-        try addLen(&total, options.event.category.token().len);
-        try addLen(&total, ";event-severity=".len);
-        try addLen(&total, options.event.severity.token().len);
-        try addLen(&total, ";event-timestamp-ms=".len);
-        try addLen(&total, decimalLen(@intCast(options.event.timestamp_ms)));
-        try addLen(&total, " ".len);
-    }
-    try addLen(&total, ":".len);
-    try addLen(&total, options.server_name.len);
-    try addLen(&total, " NOTE EVENT ".len);
-    try addLen(&total, options.event.category.code().len);
-    try addLen(&total, " :".len);
-    try addLen(&total, options.event.message.len);
-    try addLen(&total, "\r\n".len);
-    return total;
 }
 
 fn validateSubscriberId(id: []const u8) SubscriptionError!void {
@@ -434,14 +412,6 @@ fn validateSubscriberId(id: []const u8) SubscriptionError!void {
 
 fn validateServerName(name: []const u8) RenderError!void {
     if (!validAtom(name)) return error.InvalidServerName;
-}
-
-fn validateEvent(event: Event) RenderError!void {
-    if (event.timestamp_ms < 0) return error.InvalidTimestamp;
-    if (event.message.len == 0) return error.InvalidMessage;
-    for (event.message) |ch| {
-        if (unsafeTextByte(ch)) return error.InvalidMessage;
-    }
 }
 
 fn validAtom(text: []const u8) bool {
@@ -456,21 +426,6 @@ fn unsafeTextByte(ch: u8) bool {
     return ch < ' ' or ch == 0x7f;
 }
 
-fn decimalLen(value: u64) usize {
-    var remaining = value;
-    var len: usize = 1;
-    while (remaining >= 10) {
-        remaining /= 10;
-        len += 1;
-    }
-    return len;
-}
-
-fn addLen(total: *usize, amount: usize) RenderError!void {
-    if (amount > std.math.maxInt(usize) - total.*) return error.MessageTooLong;
-    total.* += amount;
-}
-
 const SliceWriter = struct {
     buf: []u8,
     len: usize = 0,
@@ -479,13 +434,6 @@ const SliceWriter = struct {
         if (bytes.len > self.buf.len - self.len) return error.OutputTooSmall;
         @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
         self.len += bytes.len;
-    }
-
-    fn appendInt(self: *SliceWriter, value: i64) RenderError!void {
-        const written = std.fmt.bufPrint(self.buf[self.len..], "{}", .{value}) catch {
-            return error.OutputTooSmall;
-        };
-        self.len += written.len;
     }
 };
 
@@ -573,39 +521,21 @@ test "unsubscribe removes selected categories and drops empty subscribers" {
     try std.testing.expect(!try spine.unsubscribeAll("oper-a"));
 }
 
-test "render output is structured NOTE event line with tags" {
+test "render output is a chatsvc-faithful raw EVENT line (per-recipient target)" {
     var out: [256]u8 = undefined;
-    const line = try renderOperNote(.{
-        .server_name = "orochi.local",
-        .event = .{
-            .category = .server_link,
-            .severity = .notice,
-            .timestamp_ms = 17000042,
-            .message = "mesh link established",
-        },
-    }, &out);
-
+    const line = try renderEvent("orochi.local", "kain", "SERVER LINK ircx.us", &out);
     try std.testing.expectEqualStrings(
-        "@event-category=server_link;event-severity=notice;event-timestamp-ms=17000042 :orochi.local NOTE EVENT SERVER_LINK :mesh link established\r\n",
+        ":orochi.local EVENT kain SERVER LINK ircx.us\r\n",
         line,
     );
 }
 
-test "render output can omit message-tags prefix" {
+test "render carries a structured body with a trailing reason verbatim" {
     var out: [256]u8 = undefined;
-    const line = try renderOperNote(.{
-        .server_name = "orochi.local",
-        .event = .{
-            .category = .announce,
-            .severity = .notice,
-            .timestamp_ms = 17000042,
-            .message = "oper announcement",
-        },
-        .include_tags = false,
-    }, &out);
-
+    // A ':'-introduced reason and an IPv6 host (colons) must survive in the body.
+    const line = try renderEvent("orochi.local", "kain", "USER DISCONNECT n!u@fe80:0:0:0:1 :Client quit", &out);
     try std.testing.expectEqualStrings(
-        ":orochi.local NOTE EVENT ANNOUNCE :oper announcement\r\n",
+        ":orochi.local EVENT kain USER DISCONNECT n!u@fe80:0:0:0:1 :Client quit\r\n",
         line,
     );
 }
@@ -651,23 +581,10 @@ test "publish reports too-small sinks before partial fan-out" {
 test "renderer validates unsafe wire text and caller-owned output size" {
     var out: [64]u8 = undefined;
 
-    try std.testing.expectError(error.InvalidMessage, renderOperNote(.{
-        .server_name = "orochi.local",
-        .event = .{
-            .category = .@"error",
-            .severity = .@"error",
-            .timestamp_ms = 1,
-            .message = "bad\nline",
-        },
-    }, &out));
-
-    try std.testing.expectError(error.OutputTooSmall, renderOperNote(.{
-        .server_name = "orochi.local",
-        .event = .{
-            .category = .connect,
-            .severity = .info,
-            .timestamp_ms = 1,
-            .message = "connected",
-        },
-    }, out[0..8]));
+    // Control bytes in the body are rejected.
+    try std.testing.expectError(error.InvalidMessage, renderEvent("orochi.local", "kain", "bad\nline", &out));
+    // A bad target (contains ':') is rejected.
+    try std.testing.expectError(error.InvalidMessage, renderEvent("orochi.local", "ka:in", "connected", &out));
+    // Output buffer too small for the rendered line.
+    try std.testing.expectError(error.OutputTooSmall, renderEvent("orochi.local", "kain", "USER CONNECT n!u@host", out[0..8]));
 }

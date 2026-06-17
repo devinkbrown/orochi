@@ -2,7 +2,7 @@
 //!
 //! This is NOT a stateless "spy and dump" query. An operator declares a standing
 //! *interest mask* with `EVENT OBSERVE <mask>`; the daemon then keeps that filter
-//! and **pushes** a live `NOTE EVENT OBSERVE` record (carrying the subject's real,
+//! and **pushes** a live `:<srv> EVENT <oper> OBSERVE` record (carrying the subject's real,
 //! uncloaked identity) every time a matching client's lifecycle changes —
 //! connect, quit, nick change, join, part, host change, oper-up. Subscribing also
 //! emits an immediate snapshot of the currently-matching population.
@@ -158,14 +158,16 @@ pub const Registry = struct {
         return globMatch(filter.mask, hm);
     }
 
-    /// Render the `NOTE EVENT OBSERVE` line for an action+subject into `out`.
-    /// Format: `:<server> NOTE EVENT OBSERVE :<action> <nick>!<user>@<host>[ <acct>][ <detail>]`
-    pub fn formatNote(out: []u8, server_name: []const u8, action: Action, subject: Subject) ?[]const u8 {
+    /// Render the chatsvc-faithful OBSERVE event line into `out`:
+    ///   `:<server> EVENT <target> OBSERVE <action> <nick>!<user>@<host> acct=<acct>[ <detail>]`
+    /// `target` is the watching operator's nick (the recipient), matching the raw
+    /// `:<srv> EVENT <target> <body>` form every other Event-Spine event now uses.
+    pub fn formatNote(out: []u8, server_name: []const u8, target: []const u8, action: Action, subject: Subject) ?[]const u8 {
         const acct = subject.account orelse "*";
         if (subject.detail.len == 0) {
-            return std.fmt.bufPrint(out, ":{s} NOTE EVENT OBSERVE :{s} {s}!{s}@{s} acct={s}\r\n", .{ server_name, action.token(), subject.nick, subject.user, subject.host, acct }) catch null;
+            return std.fmt.bufPrint(out, ":{s} EVENT {s} OBSERVE {s} {s}!{s}@{s} acct={s}\r\n", .{ server_name, target, action.token(), subject.nick, subject.user, subject.host, acct }) catch null;
         }
-        return std.fmt.bufPrint(out, ":{s} NOTE EVENT OBSERVE :{s} {s}!{s}@{s} acct={s} {s}\r\n", .{ server_name, action.token(), subject.nick, subject.user, subject.host, acct, subject.detail }) catch null;
+        return std.fmt.bufPrint(out, ":{s} EVENT {s} OBSERVE {s} {s}!{s}@{s} acct={s} {s}\r\n", .{ server_name, target, action.token(), subject.nick, subject.user, subject.host, acct, subject.detail }) catch null;
     }
 };
 
@@ -252,13 +254,13 @@ test "set enforces limits" {
     try std.testing.expectError(error.EmptyMask, reg.set(1, "", all_actions, 0));
 }
 
-test "formatNote renders with and without detail" {
+test "formatNote renders the chatsvc EVENT line with and without detail" {
     const subj = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .account = "bob" };
     var buf: [256]u8 = undefined;
-    const a = Registry.formatNote(&buf, "orochi.local", .connect, subj).?;
-    try std.testing.expect(std.mem.indexOf(u8, a, "NOTE EVENT OBSERVE :connect bob!~b@10.0.0.4 acct=bob") != null);
+    const a = Registry.formatNote(&buf, "orochi.local", "kain", .connect, subj).?;
+    try std.testing.expectEqualStrings(":orochi.local EVENT kain OBSERVE connect bob!~b@10.0.0.4 acct=bob\r\n", a);
     var buf2: [256]u8 = undefined;
     const subj2 = Subject{ .nick = "bob", .user = "~b", .host = "10.0.0.4", .detail = "-> robert" };
-    const b = Registry.formatNote(&buf2, "orochi.local", .nick, subj2).?;
-    try std.testing.expect(std.mem.indexOf(u8, b, "acct=* -> robert") != null);
+    const b = Registry.formatNote(&buf2, "orochi.local", "kain", .nick, subj2).?;
+    try std.testing.expectEqualStrings(":orochi.local EVENT kain OBSERVE nick bob!~b@10.0.0.4 acct=* -> robert\r\n", b);
 }

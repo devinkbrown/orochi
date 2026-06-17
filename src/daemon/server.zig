@@ -2878,12 +2878,17 @@ pub const LinuxServer = struct {
                     // glob exactly as the origin did. An empty carried subject means
                     // match-all (the common, unscoped case).
                     const subject = msg.broadcastSubject();
+                    // `bytes` is the raw chatsvc event BODY; render the per-recipient
+                    // `:<srv> EVENT <target> <body>` line for each local subscriber
+                    // (target = that subscriber's own nick), matching the origin shard.
                     var it = self.rx().clients.iterator();
                     while (it.next()) |entry| {
                         const c = entry.value;
                         if (c.closing) continue;
                         if (!sessionWantsEvent(&c.session, category, subject)) continue;
-                        appendToConn(c, bytes) catch continue;
+                        var line_buf: [default_reply_bytes]u8 = undefined;
+                        const line = event_spine.renderEvent(self.serverName(), c.session.displayName(), bytes, &line_buf) catch continue;
+                        appendToConn(c, line) catch continue;
                         self.armSendIfNeeded(c) catch {};
                     }
                     continue;
@@ -12278,8 +12283,8 @@ pub const LinuxServer = struct {
         if (!self.requirePriv(conn, .event_subscribe)) return;
         const params = parsed.paramSlice();
         // EVENT BROADCAST :<message> — send an oper announce (the former WALLOPS,
-        // now folded into the Event Spine): delivered as NOTE EVENT ANNOUNCE to
-        // every announce-subscribed operator.
+        // now folded into the Event Spine): delivered as a chatsvc `:<srv> EVENT
+        // <oper> <message>` line to every announce-subscribed operator.
         if (params.len > 0 and std.ascii.eqlIgnoreCase(params[0], "BROADCAST")) {
             if (params.len < 2 or params[1].len == 0) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
@@ -12294,8 +12299,8 @@ pub const LinuxServer = struct {
         }
         // EVENT OBSERVE <mask> [actions…] | OFF | LIST — a standing operator
         // observation subscription. Unlike a one-shot spy dump, this records the
-        // operator's interest mask and pushes a live NOTE EVENT OBSERVE feed of
-        // matching client lifecycle events (with real hosts); subscribing also
+        // operator's interest mask and pushes a live `EVENT <oper> OBSERVE …` feed
+        // of matching client lifecycle events (with real hosts); subscribing also
         // emits an immediate snapshot of the currently-matching population.
         if (params.len > 0 and std.ascii.eqlIgnoreCase(params[0], "OBSERVE")) {
             try self.handleObserve(conn, params);
@@ -12497,7 +12502,7 @@ pub const LinuxServer = struct {
             const filter = self.observe.get(observeKey(entry.value)) orelse continue;
             if (!observe_mod.Registry.matches(filter, subject, action)) continue;
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = observe_mod.Registry.formatNote(&buf, self.serverName(), action, subject) orelse continue;
+            const line = observe_mod.Registry.formatNote(&buf, self.serverName(), entry.value.session.displayName(), action, subject) orelse continue;
             self.deliver(entry.id, line) catch {};
         }
     }
@@ -12510,7 +12515,7 @@ pub const LinuxServer = struct {
             if (self.observe.get(key)) |f| {
                 try self.noticeTo(conn, "OBSERVE: active");
                 var lbuf: [default_reply_bytes]u8 = undefined;
-                if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :filter {s}\r\n", .{ self.serverName(), f.mask })) |line| {
+                if (std.fmt.bufPrint(&lbuf, ":{s} EVENT {s} OBSERVE filter {s}\r\n", .{ self.serverName(), conn.session.displayName(), f.mask })) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
             } else {
@@ -12533,7 +12538,7 @@ pub const LinuxServer = struct {
             return;
         };
         var hbuf: [default_reply_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&hbuf, ":{s} NOTE EVENT OBSERVE :watching {s}\r\n", .{ self.serverName(), params[1] })) |line| {
+        if (std.fmt.bufPrint(&hbuf, ":{s} EVENT {s} OBSERVE watching {s}\r\n", .{ self.serverName(), conn.session.displayName(), params[1] })) |line| {
             try appendToConn(conn, line);
         } else |_| {}
         // Immediate snapshot: enumerate the currently-matching population so the
@@ -12546,7 +12551,7 @@ pub const LinuxServer = struct {
             const mask_str = std.fmt.bufPrint(&hm, "{s}!{s}@{s}", .{ subj.nick, subj.user, subj.host }) catch continue;
             if (!observe_mod.globMatch(params[1], mask_str)) continue;
             var lbuf: [default_reply_bytes]u8 = undefined;
-            if (std.fmt.bufPrint(&lbuf, ":{s} NOTE EVENT OBSERVE :present {s}!{s}@{s} acct={s}\r\n", .{ self.serverName(), subj.nick, subj.user, subj.host, subj.account orelse "*" })) |line| {
+            if (std.fmt.bufPrint(&lbuf, ":{s} EVENT {s} OBSERVE present {s}!{s}@{s} acct={s}\r\n", .{ self.serverName(), conn.session.displayName(), subj.nick, subj.user, subj.host, subj.account orelse "*" })) |line| {
                 try appendToConn(conn, line);
             } else |_| {}
         }
@@ -18501,9 +18506,10 @@ pub const LinuxServer = struct {
         return false;
     }
 
-    /// Render a typed Event Spine event as `NOTE EVENT <CATEGORY>` and deliver it
-    /// to every session subscribed to that category (oper notices: wallops,
-    /// kills, connects, …). Replaces the legacy snote/wallops broadcast channels.
+    /// Render a typed Event Spine event as a chatsvc-faithful `:<srv> EVENT
+    /// <target> <message>` line (per recipient) and deliver it to every session
+    /// subscribed to that category (oper notices: wallops, kills, connects, …).
+    /// Replaces the legacy snote/wallops broadcast channels.
     /// The event's subject defaults to its message text; subscribers may scope a
     /// category to a subject glob (`EVENT ADD <CAT> <mask>`), so this is the thin
     /// wrapper that uses the message as the subject for the common case.
@@ -18521,23 +18527,17 @@ pub const LinuxServer = struct {
         message: []const u8,
         subject: []const u8,
     ) !void {
-        const event = event_spine.Event{
-            .category = category,
-            .severity = severity,
-            .timestamp_ms = platform.realtimeMillis(),
-            .message = message,
-        };
-        // Render two forms: the IRCv3 `@event-*` message-tags variant for clients
-        // that negotiated `message-tags`, and a plain variant for everyone else.
-        // A client without message-tags must never be handed a tag-prefixed line.
-        var tagged_buf: [default_reply_bytes]u8 = undefined;
-        var plain_buf: [default_reply_bytes]u8 = undefined;
-        const tagged = event_spine.renderOperNote(.{ .server_name = self.serverName(), .event = event, .include_tags = true }, &tagged_buf) catch return;
-        const plain = event_spine.renderOperNote(.{ .server_name = self.serverName(), .event = event, .include_tags = false }, &plain_buf) catch return;
+        _ = severity; // kept on the spine type for callers; absent from the chatsvc wire
+        // chatsvc-faithful delivery: render a raw `:<srv> EVENT <target> <message>`
+        // line PER RECIPIENT, where <target> is the subscribed oper's OWN nick. No
+        // NOTE wrapper, no IRCv3 `@event-*` tags, no draft numerics — modeled after
+        // the MS Exchange 5.5 Chat Service. The category still gates delivery; the
+        // TYPE leads the carried `message` body (e.g. "USER CONNECT …").
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!sessionWantsEvent(&entry.value.session, category, subject)) continue;
-            const line = if (entry.value.session.hasCap(.message_tags)) tagged else plain;
+            var line_buf: [default_reply_bytes]u8 = undefined;
+            const line = event_spine.renderEvent(self.serverName(), entry.value.session.displayName(), message, &line_buf) catch continue;
             try self.deliver(entry.id, line);
         }
         // Cross-shard fan-out: opers on OTHER reactors are not in this reactor's
@@ -18552,7 +18552,10 @@ pub const LinuxServer = struct {
             var shard: u12 = 0;
             while (shard < total) : (shard += 1) {
                 if (shard == my_shard) continue;
-                const buf = fabric.acquire(plain) orelse continue;
+                // Carry the raw event BODY (not a pre-rendered line): the receiving
+                // reactor renders `:<srv> EVENT <target> <message>` per its OWN local
+                // subscribers (the chatsvc <target> is per-recipient).
+                const buf = fabric.acquire(message) orelse continue;
                 var fan = reactor_fabric.DeliverMsg{
                     .to = client_model.ClientId.invalid,
                     .buf = buf,
@@ -18580,8 +18583,11 @@ pub const LinuxServer = struct {
     /// 0 owns the peer links), consistent with every other publishOperEvent caller.
     fn publishServerLink(self: *LinuxServer, remote: []const u8, up: bool) void {
         if (remote.len == 0) return;
+        // chatsvc SERVER topology event body: `SERVER LINK <peer>` / `SERVER UNLINK
+        // <peer>` (the `<TYPE> <SUBTYPE> <args>` form). Orochi identifies peers by
+        // mesh server name rather than chatsvc's <ip>:<port> <id> <id>.
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{s} {s}", .{ remote, if (up) "linked" else "delinked" }) catch return;
+        const msg = std.fmt.bufPrint(&buf, "SERVER {s} {s}", .{ if (up) "LINK" else "UNLINK", remote }) catch return;
         self.publishOperEvent(.server_link, .notice, msg) catch {};
     }
 
@@ -24046,11 +24052,11 @@ test "threaded server: oper EVENT delivery + cross-shard fan-out under num_shard
     for (0..n_opers) |i| clients[i].reset();
     try writeAllFd(fds[0], "EVENT BROADCAST :crossshard\r\n");
 
-    // Every oper receives the announce. The line is
-    // `NOTE EVENT ANNOUNCE :<sender-mask>: <message>`, so match the category line
-    // and the message text separately (the mask sits between them).
+    // Every oper receives the announce. The chatsvc line is
+    // `:<srv> EVENT <oper-nick> <sender-mask>: <message>`, so match the raw EVENT
+    // wrapper and the message text separately (the target + mask sit between them).
     for (0..n_opers) |i| {
-        try recvUntil(&clients[i], "NOTE EVENT ANNOUNCE :", 500);
+        try recvUntil(&clients[i], " EVENT ", 500);
         try recvUntil(&clients[i], "crossshard", 500);
     }
 }
@@ -24198,9 +24204,9 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     try recvUntil(&a, " 313 A A ", 200);
     a.reset();
     // EVENT BROADCAST (the former WALLOPS) is delivered as an oper-visible Event
-    // Spine announce: A, subscribed on elevation, receives NOTE EVENT ANNOUNCE.
+    // Spine announce: A, subscribed on elevation, receives `:<srv> EVENT A …`.
     try writeAllFd(fd_a, "EVENT BROADCAST :hello opers\r\n");
-    try recvUntil(&a, "NOTE EVENT ANNOUNCE :", 200);
+    try recvUntil(&a, " EVENT ", 200);
     try recvUntil(&a, "hello opers", 200);
     // A negotiated `setname`, not `message-tags`, so its event note must arrive
     // WITHOUT the @event-* tag prefix (the cap-gated plain-delivery branch).
@@ -24242,8 +24248,9 @@ test "threaded server: AWAY/SETNAME/EVENT-broadcast/INFO/USERS/LINKS/MAP end-to-
     b.reset();
     try writeAllFd(fd_a, "KILL B :spam\r\n");
     try recvUntil(&b, "KILL B :spam\r\n", 200);
-    // Oper A (subscribed) also sees the KILL as an Event Spine notice.
-    try recvUntil(&a, "NOTE EVENT KILL ", 200);
+    // Oper A (subscribed) also sees the KILL as an Event Spine event
+    // (`:<srv> EVENT A <killer> killed <target> (<reason>)`).
+    try recvUntil(&a, "killed B ", 200);
 }
 
 test "threaded server: SETNAME self echo requires setname cap" {
@@ -27407,7 +27414,7 @@ test "threaded server: +U OPMODERATE held message surfaces a POLICY event to ope
     // POLICY event naming the channel, sender, and held text.
     a.reset();
     try writeAllFd(fd_b, "PRIVMSG #o :held-here\r\n");
-    try recvUntil(&a, "NOTE EVENT POLICY :#o held message from B: held-here", 200);
+    try recvUntil(&a, "#o held message from B: held-here", 200);
 }
 
 test "threaded server: DATA STATUSMSG target reaches ops only" {
@@ -28472,15 +28479,15 @@ test "threaded server: override user mode gates and audits channel bypasses" {
     a.reset();
     try writeAllFd(fd_a, "MODE A +j\r\n");
     try recvUntil(&a, "MODE A +j", 200);
-    try expectContains(a.written(), "NOTE EVENT OPER_ACTION :override UMODE");
-    try expectContains(a.written(), "NOTE EVENT SECURITY :override UMODE");
+    // Override fires to the oper_action + security categories; both now render in
+    // the chatsvc raw form `:<srv> EVENT A override UMODE …` (category off-wire).
+    try expectContains(a.written(), "EVENT A override UMODE");
     try expectContains(a.written(), "enabled override");
 
     a.reset();
     try writeAllFd(fd_a, "MODE A -j\r\n");
     try recvUntil(&a, "MODE A -j", 200);
-    try expectContains(a.written(), "NOTE EVENT OPER_ACTION :override UMODE");
-    try expectContains(a.written(), "NOTE EVENT SECURITY :override UMODE");
+    try expectContains(a.written(), "EVENT A override UMODE");
     try expectContains(a.written(), "disabled override");
 
     a.reset();
@@ -28494,7 +28501,7 @@ test "threaded server: override user mode gates and audits channel bypasses" {
     a.reset();
     try writeAllFd(fd_a, "JOIN #ov wrong\r\n");
     try recvUntil(&a, " 366 A #ov ", 200);
-    try expectContains(a.written(), "NOTE EVENT OPER_ACTION :override JOIN");
+    try expectContains(a.written(), "EVENT A override JOIN");
 
     a.reset();
     try writeAllFd(fd_a, "MODE #ov +s\r\n");
@@ -28817,7 +28824,7 @@ test "threaded server: IRCX EVENT CHANNEL mask is additive over oper announce fe
     a.reset();
     b.reset();
     try writeAllFd(fd_s, "EVENT BROADCAST :join #bar only\r\n");
-    try recvUntil(&a, "NOTE EVENT ANNOUNCE", 500);
+    try recvUntil(&a, " EVENT ", 500);
     try recvUntil(&a, "#bar only", 500);
     try recvUntil(&b, "#bar only", 500);
 }
@@ -28922,7 +28929,7 @@ test "threaded server: IRCX EVENT CHANNEL receives real channel event" {
     a.reset();
     try writeAllFd(fd_b, "JOIN #evchan\r\n");
     try recvUntil(&b, " 366 B #evchan ", 300);
-    try recvUntil(&a, "NOTE EVENT ANNOUNCE :CHANNEL CREATE #evchan", 500);
+    try recvUntil(&a, "EVENT A CHANNEL CREATE #evchan", 500);
 }
 
 test "threaded server: IRCX EVENT MEMBER receives real membership event" {
@@ -28961,7 +28968,7 @@ test "threaded server: IRCX EVENT MEMBER receives real membership event" {
     a.reset();
     try writeAllFd(fd_b, "JOIN #evmember\r\n");
     try recvUntil(&b, " 366 B #evmember ", 300);
-    try recvUntil(&a, "NOTE EVENT OPER_ACTION :MEMBER JOIN #evmember B", 500);
+    try recvUntil(&a, "EVENT A MEMBER JOIN #evmember B", 500);
 }
 
 test "threaded server: IRCX EVENT USER receives real user lifecycle event" {
@@ -28997,10 +29004,10 @@ test "threaded server: IRCX EVENT USER receives real user lifecycle event" {
     a.reset();
     try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
     try recvUntil(&b, " 001 B ", 300);
-    try recvUntil(&a, "NOTE EVENT CONNECT :USER CONNECT B!bob@localhost", 500);
+    try recvUntil(&a, "EVENT A USER CONNECT B!bob@localhost", 500);
 }
 
-test "threaded server: oper EVENT notes carry @event-* tags with message-tags cap" {
+test "threaded server: oper EVENT notes are tag-free chatsvc EVENT lines even with message-tags cap" {
     // Mirrors the proven AWAY/SETNAME EVENT-broadcast setup (operTestConfig, an
     // admin oper plus a filler user, both IRCX-opted-in), but A negotiates
     // `message-tags` so its own announce copy must carry the @event-* tag prefix.
@@ -29037,13 +29044,14 @@ test "threaded server: oper EVENT notes carry @event-* tags with message-tags ca
     try writeAllFd(fd_a, "IRCX\r\n");
     try recvUntil(&a, " 800 A 1 0 ", 200);
 
-    // A broadcasts an oper announce; with message-tags negotiated, A's own copy
-    // carries the @event-* tag prefix.
+    // A broadcasts an oper announce. The chatsvc EVENT line is tag-free for
+    // everyone — even though A negotiated message-tags, its copy must arrive as a
+    // raw `:<srv> EVENT A …` line with NO `@event-*` prefix.
     a.reset();
     try writeAllFd(fd_a, "EVENT BROADCAST :tagtest\r\n");
-    try recvUntil(&a, "NOTE EVENT ANNOUNCE", 300);
+    try recvUntil(&a, " EVENT A ", 300);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "tagtest") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "@event-category=announce") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "@event-") == null);
 }
 
 test "threaded server: EVENT requires event_subscribe privilege" {
@@ -29131,13 +29139,13 @@ test "threaded server: REDACT broadcast + WARD alias oper events" {
     // KLINE/DLINE/XLINE are WARD aliases and emit oper-action Event Spine notices.
     a.reset();
     try writeAllFd(fd_a, "KLINE bad!*@* :spam\r\n");
-    try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
+    try recvUntil(&a, " EVENT ", 200);
     a.reset();
     try writeAllFd(fd_a, "DLINE 203.0.113.0/24 :blocked\r\n");
-    try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
+    try recvUntil(&a, " EVENT ", 200);
     a.reset();
     try writeAllFd(fd_a, "XLINE BadReal* :bad realname\r\n");
-    try recvUntil(&a, "NOTE EVENT OPER_ACTION ", 200);
+    try recvUntil(&a, " EVENT ", 200);
     // TRACE -> 205 user line + 262 end.
     a.reset();
     try writeAllFd(fd_a, "TRACE\r\n");
@@ -31317,10 +31325,10 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
     try std.testing.expect(peer.knownServers() >= 2);
 
     // SERVER_LINK Event Spine mirror: the oper A (auto-subscribed to every
-    // category on elevation) receives a NOTE EVENT SERVER_LINK when the peer link
+    // category on elevation) receives an `EVENT A SERVER LINK <peer>` when the peer link
     // comes up, alongside the mesh_event_log entry. The peer named itself
     // "remote.test", so that is the link subject. Asserted before the reset below.
-    try recvUntil(&a, "NOTE EVENT SERVER_LINK :remote.test linked", 400);
+    try recvUntil(&a, "EVENT A SERVER LINK remote.test", 400);
 
     // Deterministic readiness gate (no timing race): LINKS is idempotent and only
     // lists ESTABLISHED, handshake-NAMED peers. Poll it until 'remote.test'
