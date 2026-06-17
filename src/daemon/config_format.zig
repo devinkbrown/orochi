@@ -789,6 +789,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
                 policy.recvq = try classSize(item, "recvq", policy.recvq);
                 policy.max_clients = try classU32(item, "max_clients", policy.max_clients);
                 policy.max_per_ip = try classU32(item, "max_per_ip", policy.max_per_ip);
+                policy.max_per_account = try classU32(item, "max_per_account", policy.max_per_account);
+                policy.max_per_host = try classU32(item, "max_per_host", policy.max_per_host);
                 policy.max_channels = try classU32(item, "max_channels", policy.max_channels);
                 policy.ping_interval_ms = try classDur(item, "ping_interval", policy.ping_interval_ms);
                 policy.ping_timeout_ms = try classDur(item, "ping_timeout", policy.ping_timeout_ms);

@@ -56,7 +56,17 @@ pub const Policy = struct {
     /// Max live connections in this class (0 = unlimited).
     max_clients: u32 = 0,
     /// Max simultaneous connections from one IP in this class (0 = unlimited).
+    /// Skipped for loopback / trusted-proxy sources (a shared proxy IP must not
+    /// lump distinct WebSocket clients together).
     max_per_ip: u32 = 0,
+    /// Max simultaneous connections authenticated to one account in this class
+    /// (0 = unlimited). Account is known at registration, so this is WebSocket-
+    /// and proxy-safe regardless of the source IP.
+    max_per_account: u32 = 0,
+    /// Max simultaneous connections from one resolved host in this class
+    /// (0 = unlimited). Skipped for the loopback host for the same reason as
+    /// `max_per_ip`.
+    max_per_host: u32 = 0,
     /// Max channels a member of this class may join (0 = inherit global).
     max_channels: u32 = 0,
     /// PING keepalive interval / timeout (ms; 0 = inherit global).

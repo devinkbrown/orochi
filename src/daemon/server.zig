@@ -3775,6 +3775,14 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Whether `addr` is an IPv4 (127.0.0.0/8) or IPv6 (::1) loopback address.
+    fn addrIsLoopback(addr: dns.Address) bool {
+        return switch (addr) {
+            .ipv4 => |b| b[0] == 127,
+            .ipv6 => |b| std.mem.eql(u8, &b, &([_]u8{0} ** 15 ++ [_]u8{1})),
+        };
+    }
+
     /// Format an address as its canonical text (IPv4 dotted-quad / IPv6) into
     /// `buf`, returning the slice or null on overflow.
     fn addrText(addr: dns.Address, buf: []u8) ?[]const u8 {
@@ -7106,22 +7114,29 @@ pub const LinuxServer = struct {
             "Connection class requires SASL authentication"
         else
             null;
-        // Per-class population caps, evaluated once the class is final. The
-        // global clone limiter (enforced at accept, before the class is known)
-        // is the hard per-IP ceiling; these only tighten things for a named
-        // class. Both counts include this just-registered connection, so the
-        // Nth admitted client trips when the running count exceeds the limit.
-        if (reason == null and (p.max_clients != 0 or p.max_per_ip != 0)) {
+        // Per-class population caps, evaluated once the class is final (post
+        // SASL/oper, post PROXY-header IP resolution — so account, host, and the
+        // real source IP are all known, making these WebSocket/proxy-safe). One
+        // scan yields every dimension; each count includes this just-registered
+        // connection, so the Nth admitted client trips when the count exceeds the
+        // limit. The IP and host dimensions are skipped for loopback/trusted-proxy
+        // sources, which legitimately aggregate many distinct clients.
+        if (reason == null and (p.max_clients != 0 or p.max_per_ip != 0 or
+            p.max_per_account != 0 or p.max_per_host != 0))
+        {
             if (self.config.class_registry) |*r| {
                 const name = r.classFor(matchCtx(conn)).name;
-                if (p.max_clients != 0 and self.countClassMembers(name) > p.max_clients) {
+                const counts = self.classCounts(conn, name);
+                const ip_exempt = self.ipCloneExempt(conn);
+                const host_exempt = ip_exempt or std.mem.eql(u8, conn.session.realHost(), default_host);
+                if (p.max_clients != 0 and counts.total > p.max_clients) {
                     reason = "Connection class is full (too many clients)";
-                } else if (p.max_per_ip != 0) {
-                    if (conn.peer_addr) |addr| {
-                        if (self.sameIpClassCount(addr, name) > p.max_per_ip) {
-                            reason = "Too many connections from your host in this connection class";
-                        }
-                    }
+                } else if (p.max_per_ip != 0 and !ip_exempt and counts.ip > p.max_per_ip) {
+                    reason = "Too many connections from your host in this connection class";
+                } else if (p.max_per_account != 0 and conn.session.account() != null and counts.account > p.max_per_account) {
+                    reason = "Too many connections from your account in this connection class";
+                } else if (p.max_per_host != 0 and !host_exempt and counts.host > p.max_per_host) {
+                    reason = "Too many connections from your host in this connection class";
                 }
             }
         }
@@ -7156,27 +7171,59 @@ pub const LinuxServer = struct {
         return n;
     }
 
-    /// Count registered (non-server) connections that share both the source
-    /// address `addr` and connection class `class_name`, across all reactor
-    /// shards. Includes the calling connection once it is in a slot. Backs the
-    /// per-class `max_per_ip` admission cap, which tightens the global accept-time
-    /// clone limiter for a named class. Safe under the world lock (STATS/register).
-    fn sameIpClassCount(self: *LinuxServer, addr: dns.Address, class_name: []const u8) usize {
-        const reg = if (self.config.class_registry) |*r| r else return 0;
-        var n: usize = 0;
+    /// Per-class population counts relative to `conn`. Used by the registration
+    /// admission caps; one scan yields every dimension.
+    const ClassCounts = struct { total: u32 = 0, ip: u32 = 0, account: u32 = 0, host: u32 = 0 };
+
+    /// Single-pass per-class counts relative to `conn`, across all reactor shards:
+    /// total same-class members, plus how many share `conn`'s exact source IP,
+    /// account, and resolved host. Includes `conn` itself once it is in a slot.
+    /// Backs the per-class max_clients / max_per_ip / max_per_account /
+    /// max_per_host caps. Safe under the world lock (registration runs under it).
+    fn classCounts(self: *LinuxServer, conn: *const ConnState, class_name: []const u8) ClassCounts {
+        const reg = if (self.config.class_registry) |*r| r else return .{};
+        var out = ClassCounts{};
+        const my_ip = conn.peer_addr;
+        const my_acct = conn.session.account();
+        const my_host = conn.session.realHost();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
                 if (!slot.occupied) continue;
                 const c = &slot.value;
                 if (c.s2s != null or c.s2s_secured != null) continue;
                 if (!c.session.registered()) continue;
-                const peer = c.peer_addr orelse continue;
-                if (!std.meta.eql(peer, addr)) continue;
                 const cls = reg.classFor(matchCtx(c));
-                if (std.ascii.eqlIgnoreCase(cls.name, class_name)) n += 1;
+                if (!std.ascii.eqlIgnoreCase(cls.name, class_name)) continue;
+                out.total += 1;
+                if (my_ip) |ip| {
+                    if (c.peer_addr) |cip| {
+                        if (std.meta.eql(cip, ip)) out.ip += 1;
+                    }
+                }
+                if (my_acct) |acct| {
+                    if (c.session.account()) |cacct| {
+                        if (std.ascii.eqlIgnoreCase(cacct, acct)) out.account += 1;
+                    }
+                }
+                if (my_host.len != 0 and std.ascii.eqlIgnoreCase(c.session.realHost(), my_host)) out.host += 1;
             }
         }
-        return n;
+        return out;
+    }
+
+    /// Whether `conn`'s source IP must be EXEMPT from IP/host-keyed clone limits:
+    /// loopback or a configured trusted proxy. Such addresses aggregate many
+    /// distinct real clients (a reverse proxy fronting WebSocket clients, or local
+    /// bots/services), so an IP/host clone cap there would falsely lump them.
+    fn ipCloneExempt(self: *const LinuxServer, conn: *const ConnState) bool {
+        const addr = conn.peer_addr orelse return true;
+        if (addrIsLoopback(addr)) return true;
+        if (self.config.proxy_protocol_enabled) {
+            for (self.config.trusted_proxies) |t| {
+                if (trustedProxyMatches(addr, t)) return true;
+            }
+        }
+        return false;
     }
 
     /// Resolve a REMOTE (mesh) member's channel status bits by nick, scanning
@@ -10340,9 +10387,10 @@ pub const LinuxServer = struct {
                 if (self.config.class_registry) |*reg| {
                     for (reg.classes) |*cls| {
                         var buf: [900]u8 = undefined;
-                        const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_chan={d} max_targets={d} monitor={d} silence={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} nick_delay_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
+                        const text = std.fmt.bufPrint(&buf, "sendq={d} recvq={d} max_clients={d} max_per_ip={d} max_per_account={d} max_per_host={d} max_chan={d} max_targets={d} monitor={d} silence={d} ping={d}ms ping_timeout={d}ms reg_timeout={d}ms flood={d}/{d}ms require_tls={} require_sasl={} flood_exempt={} nick_delay_exempt={} cidrs={d} tls_only={} account_only={} oper_only={} live={d}", .{
                             cls.policy.sendq,            cls.policy.recvq,
                             cls.policy.max_clients,      cls.policy.max_per_ip,
+                            cls.policy.max_per_account,  cls.policy.max_per_host,
                             cls.policy.max_channels,     cls.policy.max_targets,
                             cls.policy.monitor,          cls.policy.silence,
                             cls.policy.ping_interval_ms, cls.policy.ping_timeout_ms,
