@@ -5,24 +5,24 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 ## PRIVMSG
 
 - Syntax: `PRIVMSG <target> :<text>`
-- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies UTF-8/content gates, channel mode gates, `SILENCE`, echo-message, history recording, away replies, and mesh relay.
+- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies UTF-8/content gates, channel mode gates, `SILENCE`, echo-message, history recording, away replies, mesh relay, and the caller's `MAXTARGETS` fan-out cap; a connection class can tighten that cap with `max_targets`.
 - Privileges: Registered client.
 - Parameters: `target` and non-empty text.
 - Replies: Delivery line to recipients; `RPL_AWAY 301` when messaging an away user.
-- Errors: `ERR_NOSUCHNICK 401`, `ERR_NOSUCHCHANNEL 403`, `ERR_CANNOTSENDTOCHAN 404`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NEEDREGGEDNICK 477`, `ERR_NEEDMOREPARAMS 461`, IRCv3 `FAIL` for invalid UTF-8 or content filter blocks.
+- Errors: `ERR_NOSUCHNICK 401`, `ERR_NOSUCHCHANNEL 403`, `ERR_CANNOTSENDTOCHAN 404`, `ERR_TOOMANYTARGETS 407`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NEEDREGGEDNICK 477`, `ERR_NEEDMOREPARAMS 461`, IRCv3 `FAIL` for invalid UTF-8 or content filter blocks.
 - Example: `PRIVMSG #ops :status?`
-- Sources: `src/daemon/modules/messaging.zig:47`, `src/daemon/server.zig:10740`, `src/daemon/server.zig:10919`
+- Sources: `src/daemon/modules/messaging.zig:47`, `src/daemon/server.zig:20164`, `src/daemon/server.zig:20169`
 
 ## NOTICE
 
 - Syntax: `NOTICE <target> :<text>`
-- Description: Same delivery engine as `PRIVMSG`, but delivery-failure numerics are suppressed for `NOTICE` to prevent automatic error loops.
+- Description: Same delivery engine as `PRIVMSG`, including the caller's `MAXTARGETS` fan-out cap and any tighter per-class `max_targets` cap, but delivery-failure numerics are suppressed for `NOTICE` to prevent automatic error loops.
 - Privileges: Registered client.
 - Parameters: `target` and text.
 - Replies: Delivery line to recipients.
-- Errors: `ERR_NEEDMOREPARAMS 461`; most delivery errors are intentionally suppressed.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_TOOMANYTARGETS 407` for the fan-out cap; most delivery errors are intentionally suppressed.
 - Example: `NOTICE suzu :heads up`
-- Sources: `src/daemon/modules/messaging.zig:48`, `src/daemon/server.zig:10740`, `src/daemon/server.zig:10941`
+- Sources: `src/daemon/modules/messaging.zig:48`, `src/daemon/server.zig:20164`, `src/daemon/server.zig:20169`
 
 ## CTCP And DCC
 

@@ -10,7 +10,8 @@ default · range`.
 - **Engine overhaul (done):** real TOML v1.0 (`proto/toml.zig`) is the single
   config parser; the three legacy custom parsers are consolidated to one.
 - **Threaded so far:** server-core runtime knobs — `[limits].sweep_interval`,
-  `[reputation].*`, `[io].ring_entries`.
+  `[limits].nick_delay`, `[reputation].*`, `[io].ring_entries`, and connection
+  classes `[class.<name>]` (per-connection resource and admission policy).
 - **Remaining:** the rest of these tables, in subsystem waves. Notes:
   - Many subsystems already expose a `Config` struct → wire it from TOML at the
     construction site.

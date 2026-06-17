@@ -50,3 +50,7 @@ The normal listener default is port `6680` before config overlay (`src/main.zig:
 ## Config Indirection
 
 The parser supports `env:NAME` and `@file:path` string indirection (`src/daemon/config_format.zig:486`). The current CLI boot resolver wires `env:` only (`src/main.zig:100`), so `@file:` currently requires a boot path that provides a file resolver.
+
+## Connection Classes
+
+After the basic setup, consider defining connection classes under `[class.<name>]` to control per-client resource limits, flood policies, and admission rules by IP/TLS/account/oper status. See [operators.md](operators.md) for detailed coverage. Every custom class inherits sensible fallbacks via the built-in `user` and `server` classes.

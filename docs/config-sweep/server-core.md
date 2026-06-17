@@ -38,6 +38,7 @@ mapped through `config_boot.zig`. Other rows are NOT yet liftable via TOML.
 | server.zig:714 | `Config.reputation_half_life_ms` | `60_000` | half-life of IP-reputation penalty decay | `limits.reputation_half_life` *(schema-backed; default 60s)* | duration | 60s | >=1s |
 | server.zig:531 | `timer_interval_ms` | `2_000` | period of the io_uring timeout-sweep timer (drives reg/ping/idle enforcement granularity) | `limits.sweep_interval` (NEW) | duration | 2s | 100ms..60s |
 | dispatch.zig:956 | `sasl_decode_cap` | `8192` | max decoded SASL AUTHENTICATE payload bytes (oversize fails closed) — borderline (security cap) | `limits.sasl_decode_max_bytes` (NEW) | uint | 8192 | 256..65536 |
+| config_format.zig:239 | `Config.nick_delay_ms` | `0` (disabled) | hold window for released nicks after owner exits; prevents nick-camping; `0` = disabled | `limits.nick_delay` *(schema-backed)* | duration | 0 | 0..– |
 
 ## [io] (NEW — io_uring / transport tuning)
 
@@ -69,6 +70,23 @@ mapped through `config_boot.zig`. Other rows are NOT yet liftable via TOML.
 | server.zig:540 | `server_name` | `"orochi.local"` | server name in numerics/prefixes/ERROR lines — borderline (identity, not tuning) | `node.server_name` (NEW) | string | orochi.local | – |
 | dispatch.zig:20 | `SERVER_NAME` | `"orochi.local"` | server name in dispatch-layer replies (isolation/test path mirror) — borderline | `node.server_name` (reuse) | string | orochi.local | – |
 | dispatch.zig:21 | `NETWORK_NAME` | `"Orochi"` | network name advertised in ISUPPORT — borderline (identity) | `node.network_name` (NEW) | string | Orochi | – |
+
+## [class.<name>] (NEW — per-connection policy classes)
+
+Source: `Policy`/`ClassDef` at `src/daemon/conn_class.zig`, config parsing at `src/daemon/config_format.zig:247`, registry bootstrap at `src/daemon/config_boot.zig`, live inspection at `STATS Y` (numeric 218 RPL_STATSYLINE).
+
+A **connection class** is a named bundle of per-connection resource, admission, and flood policy, matched at client registration by IP/CIDR, TLS status, account auth, oper status, ident/host globs. The first class in file order whose match criteria are all satisfied wins; a catch-all (no criteria) is fallback. Two built-in classes always exist: `user` (regular clients) and `server` (mesh S2S links). Per-class limits override the matching `[limits]` global values; `0` means "inherit global". Size parameters accept `K`/`M`/`G` suffixes; durations are strings (`"30s"`).
+
+| Concept | What it controls |
+|---------|------------------|
+| Match criteria | `match` (IPv4/IPv6 CIDR array), `match_tls` (implicit-TLS only), `match_account` (SASL-auth only), `match_oper` (opered clients only), `match_ident` / `match_host` (glob patterns on username/hostname) |
+| Resource policy | `sendq` (outbound queue ceiling; growable up to this limit), `recvq` (inbound line buffer ceiling; 0 = inherit physical default), `max_clients` (cap on class membership), `max_per_ip` (concurrent connections per IP within class) |
+| Per-connection limits | `max_channels` (JOIN cap; 0 = inherit chanlimit), `max_targets` (PRIVMSG targets; 0 = inherit maxtargets), `monitor` (MONITOR entries; 0 = inherit monitorlimit), `silence` (SILENCE masks; 0 = inherit silencelimit) |
+| Timeout policy | `ping_interval`, `ping_timeout`, `register_timeout` (durations; 0 = inherit `[limits]` global) |
+| Flood control | `flood_lines` (max inbound lines per window; 0 = no limit), `flood_window` (duration; defaults to 10s if only flood_lines set); exempt via `flood_exempt` |
+| Admission gates | `require_tls` (refuse non-TLS), `require_sasl` (refuse unauthenticated); `nick_delay_exempt` (bypass nick-delay hold) |
+
+See `docs/reference/config.md` (`[class.<name>]` section) and `etc/orochi.reference.toml` for full parameter table and examples.
 
 ---
 

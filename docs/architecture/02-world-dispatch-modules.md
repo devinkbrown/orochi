@@ -68,6 +68,16 @@ Hooks are typed by `HookId`, and `HookPayload(id)` maps each hook id to a concre
 
 The server currently fires the `client_registered` hook after welcome. Evidence: `src/daemon/server.zig:3385`, `src/daemon/server.zig:3547`, `src/daemon/server.zig:3555`.
 
+## Connection Classes and Nick Delay Integration
+
+Connection classes are not a module but a foundational daemon subsystem. Each connection is matched to a class at registration based on source IP (CIDR), TLS, SASL auth, oper status, and ident/host globs. The first matching class wins; built-in fallback classes (`user` and `server`) exist for all connections. Evidence: `src/daemon/conn_class.zig:1`, `src/daemon/server.zig:7073`.
+
+Per-class enforcement hooks into the registration flow (nick assignment to the world) and the per-connection admission check. The class policy enforces SendQ/RecvQ ceilings, flood lines, max_clients/per_ip/channels, require_tls/sasl, and nick_delay exemption. Evidence: `src/daemon/server.zig:3615`, `src/daemon/server.zig:5675`, `src/daemon/server.zig:10343`.
+
+Nick delay is a daemon-global but per-account and per-nick-class feature. When a nick is released (via QUIT or NICK change), it is held for a configured window to prevent nick camping. During the hold, only the owning account can reclaim it (oper bypass always applies, and `nick_delay_exempt` classes bypass). Evidence: `src/daemon/nick_delay.zig:1`, `src/daemon/server.zig:5949`, `src/daemon/server.zig:5954`.
+
+STATS reporting includes per-class policy and live member count (numeric 218 RPL_STATSYLINE) and per-S2S-peer sendq_cap, queued bytes, and uptime (numeric 211 RPL_STATSLLINE). Nick-delay status is reported by INFO. Evidence: `src/daemon/server.zig:10343`, `src/daemon/server.zig:10356`, `src/daemon/server.zig:10377`, `src/daemon/server.zig:19220`.
+
 ## Live Module Manifest and Command Families
 
 `modules/manifest.zig` is the single enabled-module list. `Live` is the comptime-assembled and validated registry. Evidence: `src/daemon/modules/manifest.zig:1`, `src/daemon/modules/manifest.zig:22`, `src/daemon/modules/manifest.zig:40`, `src/daemon/modules/manifest.zig:42`.

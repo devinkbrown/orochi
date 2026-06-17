@@ -2,6 +2,8 @@
 
 These commands are accepted through the lower command table used by `dispatchRegistered` for connection-level verbs (`src/daemon/server.zig:3502`, `src/daemon/dispatch.zig:1233`). `NICK`, `PONG`, and `QUIT` are also registered module commands (`src/daemon/modules/user_query.zig:80`, `src/daemon/modules/feature_misc.zig:57`).
 
+Successful client registration assigns a connection class after SASL/oper state is known and before the welcome burst. The matched class applies per-connection SendQ/RecvQ ceilings and class policy, and class admission can close the connection before welcome if the policy refuses it.
+
 ## PASS
 
 - Syntax: `PASS <token>`
@@ -16,24 +18,24 @@ These commands are accepted through the lower command table used by `dispatchReg
 ## NICK
 
 - Syntax: `NICK <nick>`
-- Description: Before registration, stores the nick and checks control bytes and configured `NICKLEN`. After registration, `handleNickChange` changes the live nick and updates the world nick registry.
+- Description: Before registration, stores the nick and checks control bytes and configured `NICKLEN`. After registration, `handleNickChange` changes the live nick and updates the world nick registry. When nick delay is enabled, a held nick is refused during initial registration or registered nick change unless reclaimed by its owning account or bypassed by an operator or `nick_delay_exempt` connection class.
 - Privileges: Any client before registration; registered client afterward.
 - Parameters: `nick` is required.
 - Replies: On registered nick change, broadcasts a `NICK` line to visible peers.
-- Errors: `ERR_ERRONEUSNICKNAME 432`, `ERR_NICKNAMEINUSE 433`, `ERR_NONICKNAMEGIVEN 431`, `ERR_NEEDMOREPARAMS 461`.
+- Errors: `ERR_ERRONEUSNICKNAME 432`, `ERR_NICKNAMEINUSE 433`, `ERR_NONICKNAMEGIVEN 431`, `ERR_UNAVAILRESOURCE 437` with `Nick is held (nick delay); try again shortly`, `ERR_NEEDMOREPARAMS 461`.
 - Example: `NICK suzu`
-- Sources: `src/daemon/dispatch.zig:1235`, `src/daemon/dispatch.zig:1263`, `src/daemon/modules/user_query.zig:80`, `src/daemon/server.zig:8157`
+- Sources: `src/daemon/dispatch.zig:1235`, `src/daemon/dispatch.zig:1263`, `src/daemon/modules/user_query.zig:80`, `src/daemon/server.zig:5885`, `src/daemon/server.zig:15959`, `src/daemon/nick_delay.zig:1`
 
 ## USER
 
 - Syntax: `USER <username> <mode> <unused> :<realname>`
-- Description: Pre-registration only. Stores username and realname after control-byte validation.
+- Description: Pre-registration only. Stores username and realname after control-byte validation. When `NICK`, `USER`, and capability negotiation permit registration, the daemon matches the now-identified client to a connection class before welcome.
 - Privileges: Any pre-registration client.
 - Parameters: Four parameters are required by the lower command table; the handler uses parameter 1 as username and parameter 4 as realname.
 - Replies: May complete registration and emit welcome numerics when `NICK`, `USER`, and capability negotiation permit it.
 - Errors: `ERR_ALREADYREGISTRED 462`; `ERR_NEEDMOREPARAMS 461`.
 - Example: `USER suzu 0 * :Orochi User`
-- Sources: `src/daemon/dispatch.zig:1236`, `src/daemon/dispatch.zig:1283`, `src/daemon/dispatch.zig:1482`
+- Sources: `src/daemon/dispatch.zig:1236`, `src/daemon/dispatch.zig:1283`, `src/daemon/dispatch.zig:1482`, `src/daemon/server.zig:5673`, `src/daemon/server.zig:7073`
 
 ## CAP
 
@@ -82,10 +84,10 @@ These commands are accepted through the lower command table used by `dispatchReg
 ## QUIT
 
 - Syntax: `QUIT [:reason]`
-- Description: Before registration, marks the session closing. After registration, records WHOWAS/SEEN data, broadcasts quit, removes the client from the world, and closes the connection.
+- Description: Before registration, marks the session closing. After registration, records WHOWAS/SEEN data, broadcasts quit, holds the world nick for the configured nick-delay window when enabled, removes the client from the world, and closes the connection.
 - Privileges: Any client.
 - Parameters: Optional reason; registered handler defaults to `Client quit`.
 - Replies: Broadcast `QUIT` to visible peers; no numeric success reply.
 - Errors: None specific in the handler.
 - Example: `QUIT :done`
-- Sources: `src/daemon/dispatch.zig:1241`, `src/daemon/dispatch.zig:1478`, `src/daemon/modules/user_query.zig:81`, `src/daemon/server.zig:11217`
+- Sources: `src/daemon/dispatch.zig:1241`, `src/daemon/dispatch.zig:1478`, `src/daemon/modules/user_query.zig:81`, `src/daemon/server.zig:5972`, `src/daemon/server.zig:20702`

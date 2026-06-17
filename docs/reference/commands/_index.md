@@ -55,11 +55,11 @@ Registry commands default to registered-client access unless the command table s
 | `VERSION` | Show server version. | [informational.md](informational.md#version) |
 | `TIME` | Show server time. | [informational.md](informational.md#time) |
 | `ADMIN` | Show configured admin contact. | [informational.md](informational.md#admin) |
-| `INFO` | Show implementation info. | [informational.md](informational.md#info) |
+| `INFO` | Show implementation and runtime info. | [informational.md](informational.md#info) |
 | `MOTD` | Show configured MOTD. | [informational.md](informational.md#motd) |
 | `LUSERS` | Show local/global user summary. | [informational.md](informational.md#lusers) |
 | `USERS` | Show registered users. | [informational.md](informational.md#users) |
-| `STATS` | Show stats; `z` is oper-only inside handler. | [informational.md](informational.md#stats) |
+| `STATS` | Show uptime, class, S2S, ban, oper, or debug stats; `z` is oper-only inside handler. | [informational.md](informational.md#stats) |
 | `TRACE` | Oper trace of local users. | [informational.md](informational.md#trace) |
 | `ETRACE` | Oper extended trace rows. | [informational.md](informational.md#etrace) |
 | `MODULES` | Oper registry module inventory. | [informational.md](informational.md#modules) |

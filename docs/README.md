@@ -5,6 +5,11 @@ C `ophion` daemon, not a clone. It speaks IRCv3 + IRCX, runs a custom Suimyaku
 CRDT mesh with forward-secret Tsumugi server links, and ships its own pure-Zig
 TLS (Yoroi), media codecs (OPVOX/OPVIS), and in-place upgrade (Helix).
 
+The current daemon surface includes `[class.*]` connection classes for
+registration-time resource/admission/flood policy, bounded growable SendQ and
+RecvQ, optional nick-delay holds against camping, and live operator
+introspection through `STATS Y`, `STATS l`, and richer `INFO`.
+
 This tree is generated from, and cites, the live source. Where the code diverges
 from convention or from the design notes in `planning/`, the docs flag it.
 
@@ -24,7 +29,7 @@ from convention or from the design notes in `planning/`, the docs flag it.
 - [Messaging](reference/commands/messaging.md)
 - [Channels](reference/commands/channels.md)
 - [Queries](reference/commands/queries.md)
-- [Informational](reference/commands/informational.md)
+- [Informational](reference/commands/informational.md) — `INFO`, `STATS Y`, `STATS l`
 - [Operator & moderation](reference/commands/oper-moderation.md)
 - [Mesh operations](reference/commands/mesh-ops.md)
 - [Accounts & services](reference/commands/accounts-services.md)
@@ -38,7 +43,7 @@ from convention or from the design notes in `planning/`, the docs flag it.
 - [Capabilities (IRCv3)](reference/protocol/caps.md)
 
 ## Configuration
-- [Config reference](reference/config.md) — every section and key
+- [Config reference](reference/config.md) — every section and key, including `[limits].nick_delay` and `[class.*]`
 - [`etc/orochi.reference.toml`](../etc/orochi.reference.toml) — runnable annotated example
 
 ## Operator guide

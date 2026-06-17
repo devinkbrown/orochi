@@ -2,6 +2,185 @@
 
 Orochi operators are SASL-only. `OPER` never accepts a password; it returns an error telling the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
 
+## Connection Classes
+
+A connection class is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching the connection's source IP, TLS status, SASL authentication, operator status, and ident/host. The **first class (in file order) whose match criteria are ALL satisfied wins**; a class with no criteria is a catch-all fallback. Two built-in classes always exist: `user` (regular clients) and `server` (mesh links) (`src/daemon/conn_class.zig:8`).
+
+### Match Criteria
+
+| Criterion | Meaning | Examples |
+|---|---|---|
+| `match` | Array of source IP/CIDR (IPv4 and IPv6) | `["10.0.0.0/8", "2001:db8::/32", "192.168.1.5"]` |
+| `match_tls` | Match only implicit-TLS connections | `true` |
+| `match_account` | Match only SASL-authenticated connections | `true` |
+| `match_oper` | Match only opered-up connections | `true` |
+| `match_ident` | Glob pattern on the connection's ident/username | `"admin*"` |
+| `match_host` | Glob pattern on the connection's hostname | `"*.example.com"` |
+
+All specified criteria must match for the class to apply. See `docs/reference/config.md` `[class.<name>]` for the complete configuration table.
+
+### Policy Knobs
+
+Per-class policy fields override their `[limits]` global counterparts. A `0` value means "inherit the global limit" (unless noted otherwise).
+
+| Policy | Meaning | Default |
+|---|---|---|
+| `sendq` | Outbound SendQ ceiling in bytes | `1M` (`8M` for server class) |
+| `recvq` | Inbound line ceiling in bytes; `0` = physical line buffer | `0` |
+| `max_clients` | Max live connections in this class; `0` = unlimited | `0` |
+| `max_per_ip` | Max concurrent connections per IP in this class; `0` = unlimited | `0` |
+| `max_channels` | Max channels a member may join; `0` = inherit global `chanlimit` | `0` |
+| `max_targets` | Max PRIVMSG/NOTICE targets; `0` = inherit global `maxtargets` | `0` |
+| `monitor` | Max MONITOR entries; `0` = inherit global `monitorlimit` | `0` |
+| `silence` | Max SILENCE masks; `0` = inherit global `silencelimit` | `0` |
+| `ping_interval` | Per-class PING keepalive interval; `0` = inherit global | `0` |
+| `ping_timeout` | Per-class grace after PING before disconnect; `0` = inherit global | `0` |
+| `register_timeout` | Per-class registration handshake timeout; `0` = inherit global | `0` |
+| `flood_lines` | Max inbound lines per `flood_window`; `0` = no flood limit | `0` |
+| `flood_window` | Window for `flood_lines`; `0` = default `10s` when only `flood_lines` is set | `0` |
+| `require_tls` | Refuse admission unless connection is TLS | `false` |
+| `require_sasl` | Refuse admission unless SASL-authenticated | `false` |
+| `flood_exempt` | Exempt from flood/throttle enforcement | `false` |
+| `nick_delay_exempt` | Exempt from nick-delay holds; member may take a held nick immediately | `false` |
+
+### Example
+
+```toml
+[class.user]
+# Built-in: the catchall for regular clients
+sendq = "1M"
+recvq = "8K"
+max_per_ip = 5
+max_channels = 50
+
+[class.server]
+# Built-in: every S2S mesh link
+sendq = "8M"
+recvq = "1M"
+
+[class.trusted]
+# Custom: local/corporate VPN clients
+match = ["10.0.0.0/8", "::1"]
+match_tls = true
+sendq = "16M"
+max_per_ip = 0
+flood_exempt = true
+
+[class.restricted_net]
+# Custom: throttled public wifi
+match = ["203.0.113.0/24"]
+flood_lines = 10
+flood_window = "10s"
+require_tls = true
+```
+
+### Inspecting Classes Live
+
+```
+/STATS Y
+```
+
+Numeric **218 RPL_STATSYLINE** reports one line per registered connection class with its full policy, match summary, and live member count (`src/daemon/server.zig:10356`). Example output shows class name, policy fields (sendq, recvq, max_clients, max_per_ip, max_channels, max_targets, monitor, silence, timeouts, flood settings), match facets (match criteria, TLS-only, account-only, oper-only), CIDR count, and current member count (`src/daemon/server.zig:10343`).
+
+### SendQ and RecvQ
+
+**SendQ** (outbound): Each connection maintains an ~8 KiB inline send buffer plus a heap overflow, bounded by the per-class `sendq` ceiling. The buffer is io_uring zero-copy safe (the armed send buffer is never moved/freed during flight). Exceeding the ceiling drops appended data with "output too small" error (`src/daemon/conn_class.zig`).
+
+**RecvQ** (inbound): Pending unterminated lines accumulate in an inline line buffer and spill to a heap overflow once they outgrow it, bounded by the per-class `recvq` ceiling. A `recvq` of `0` inherits the daemon's physical line-buffer default. A line exceeding the ceiling drops the connection (LineTooLong error).
+
+## Nick Delay
+
+Nick delay is an anti-camping protection: when a registered account's nick is released (by the owner disconnecting or QUITing), the daemon holds that nick against reuse for a configured window (`src/daemon/nick_delay.zig:1`).
+
+### Configuration
+
+```toml
+[limits]
+nick_delay = "30s"  # or "0" to disable (the default)
+```
+
+Set `[limits].nick_delay` to a duration string (`"30s"`, `"1m"`, etc.) to enable. `"0"` disables nick delay entirely (`src/daemon/config_format.zig:172`).
+
+### Behavior
+
+- A nick is held **only when its owner exits** (disconnect or QUIT). Voluntary `NICK` changes do NOT apply nick delay.
+- During the hold window:
+  - The **owning account** (if the releaser was SASL-authenticated) may reclaim the nick immediately.
+  - **Server operators** (any opered connection) bypass the hold entirely.
+  - Connections flagged `nick_delay_exempt` in their class bypass the hold.
+  - **Everyone else** is refused with numeric **437 ERR_UNAVAILRESOURCE**: `"Nick is held (nick delay); try again shortly"` (`src/daemon/server.zig:5885`).
+- Once the window expires, the nick is free for anyone to claim.
+
+### Per-Class Exemption
+
+A connection class can exempt its members from nick delay holds via the `nick_delay_exempt` policy flag (`src/daemon/nick_delay.zig:8`):
+
+```toml
+[class.services]
+match = ["10.0.0.5"]
+nick_delay_exempt = true
+```
+
+Members of this class may take a held nick without waiting, just like operators.
+
+### Live Status
+
+`INFO` reports nick-delay status when enabled:
+
+```
+/INFO
+```
+
+Look for a line like: `"Nick delay: 30000ms hold on release - 5 nick(s) currently held"` (`src/daemon/server.zig:19219`).
+
+## Per-Class Flood Control
+
+Each connection class can enforce line-rate limiting via the `flood_lines` and `flood_window` policy fields. This is independent of server-wide throttle policies and applies per-connection at the registration boundary.
+
+### Configuration
+
+```toml
+[class.restricted_net]
+match = ["203.0.113.0/24"]
+flood_lines = 10      # Max lines per flood_window
+flood_window = "10s"  # Enforcement window (default if only flood_lines set)
+
+[class.exempt_vip]
+flood_lines = 0       # No per-line flood limit
+flood_exempt = true   # Exempt from throttle/flood entirely
+```
+
+### Behavior
+
+- **`flood_lines`**: Maximum inbound lines allowed per `flood_window`. `0` = no limit.
+- **`flood_window`**: Duration for the flood check. If only `flood_lines` is set, the window defaults to `10s`.
+- When a registered (non-oper) client exceeds the limit, the daemon closes the connection with `ERROR :Excess Flood` (`src/daemon/server.zig:5557`).
+- **`flood_exempt`**: When true, the class entirely bypasses flood checks and throttle enforcement.
+- **S2S server links** are always exempt from flood limits (the `server` class carries mesh traffic which may burst immediately after connection) (`src/daemon/server.zig:5546`).
+- Only registered connections are subject to flood control; the registration handshake itself is not throttled by these limits.
+
+## Server Links and Peer Inspection
+
+### Per-Link Statistics
+
+```
+/STATS l
+```
+
+Numeric **211 RPL_STATSLLINE** reports one line per established S2S peer link with `sendq_cap` (the `server` class SendQ ceiling), queued bytes currently pending, and link uptime (`src/daemon/server.zig:10378`). Use this to monitor mesh health and detect SendQ backlog on remote links.
+
+### Mesh Health Commands
+
+Operators with `mesh_admin` privilege can inspect and manage the mesh:
+
+| Command | Purpose |
+|---|---|
+| `MESH` or `NETSTAT` | Direct S2S peer/link health, reachability, partition summary (`src/daemon/server.zig:10218`, `src/daemon/server.zig:10308`). |
+| `ROUTE` | Current routing table: this node plus established one-hop peers (`src/daemon/server.zig:10452`). |
+| `NETHEALTH` | SWIM-style liveness view using peer RTT and idle time (`src/daemon/server.zig:10474`). |
+| `CONNECT <host> <port>` | Open outbound S2S to a peer (`src/daemon/server.zig:6304`). |
+| `SQUIT <server>` | Tear down an S2S link by server name (`src/daemon/server.zig:6371`). |
+
 ## Account Binding
 
 ```toml

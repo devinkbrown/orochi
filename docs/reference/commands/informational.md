@@ -41,13 +41,13 @@ Stateless server information commands are registered by `query.info` (`src/daemo
 ## INFO
 
 - Syntax: `INFO`
-- Description: Returns implementation information lines and an end marker.
+- Description: Returns implementation information lines, then runtime `RPL_INFO` lines for advertised limits, active connection-class count, nick-delay window and held-nick count when nick delay is enabled, established mesh peer count, subsystem inventory, and an end marker.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: None specific.
 - Example: `INFO`
-- Sources: `src/daemon/modules/query_info.zig:64`, `src/daemon/server.zig:10089`
+- Sources: `src/daemon/modules/query_info.zig:64`, `src/daemon/server.zig:19171`, `src/daemon/server.zig:19206`
 
 ## MOTD
 
@@ -85,13 +85,14 @@ Stateless server information commands are registered by `query.info` (`src/daemo
 ## STATS
 
 - Syntax: `STATS <letter>`
-- Description: Returns selected server stats. `u` reports uptime, `o` configured oper bindings, `k/K` and `d/D` report Warden-derived line views, and `z` reports runtime debug counters but is oper-only inside the handler.
+- Description: Returns selected server stats. `u` reports uptime, `o` configured oper bindings, `k/K` and `d/D` report Warden-derived line views, `Y/y` reports connection classes, `l/L` reports established S2S peer links, and `z/Z` reports runtime debug counters but is oper-only inside the handler.
 - Privileges: Registered client; `STATS z` requires oper.
 - Parameters: One stats letter.
-- Replies: `RPL_STATSUPTIME 242`, `RPL_STATSOLINE 243`, `RPL_STATSKLINE 216`, `RPL_STATSDLINE 225`, `RPL_STATSDEBUG 249`, terminated by `RPL_ENDOFSTATS 219`.
+- Replies: `RPL_STATSUPTIME 242`, `RPL_STATSOLINE 243`, `RPL_STATSKLINE 216`, `RPL_STATSDLINE 225`, `RPL_STATSYLINE 218`, `RPL_STATSLLINE 211`, `RPL_STATSDEBUG 249`, terminated by `RPL_ENDOFSTATS 219`.
+- Notes: `STATS Y` emits one `RPL_STATSYLINE 218` row per connection class as `Y <class>`, with trailing text containing `sendq`, `recvq`, `max_clients`, `max_per_ip`, `max_chan`, `max_targets`, `monitor`, `silence`, `ping`, `ping_timeout`, `reg_timeout`, `flood`, `require_tls`, `require_sasl`, `flood_exempt`, `nick_delay_exempt`, match summary fields `cidrs`, `tls_only`, `account_only`, `oper_only`, and `live` member count. `STATS l` emits one `RPL_STATSLLINE 211` row per established S2S peer link with `sendq_cap`, queued bytes, and `uptime` seconds.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481` for `z` when not oper.
 - Example: `STATS u`
-- Sources: `src/daemon/modules/oper_security.zig:127`, `src/daemon/server.zig:5306`
+- Sources: `src/daemon/modules/oper_security.zig:127`, `src/daemon/server.zig:10310`
 
 ## TRACE
 

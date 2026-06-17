@@ -45,10 +45,12 @@ Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `
 | ---: | --- | --- | --- | --- |
 | 015 | `RPL_MAP` | `/MAP` renders local node and peer topology. | Dynamic map detail. | `src/daemon/server.zig:703`, `src/daemon/server.zig:10170`, `src/daemon/server.zig:10177`, `src/proto/numeric.zig:18` |
 | 017 | `RPL_MAPEND` | Terminates `/MAP`. | `End of /MAP` | `src/daemon/server.zig:704`, `src/daemon/server.zig:10185`, `src/proto/numeric.zig:20` |
-| 219 | `RPL_ENDOFSTATS` | Terminates `/STATS`. | `End of /STATS report` | `src/daemon/server.zig:772`, `src/daemon/server.zig:5348`, `src/proto/numeric.zig:40` |
-| 242 | `RPL_STATSUPTIME` | `/STATS u`. | Dynamic uptime text. | `src/daemon/server.zig:768`, `src/daemon/server.zig:5321`, `src/proto/numeric.zig:48` |
-| 243 | `RPL_STATSOLINE` | `/STATS o` configured oper bindings. | Empty trailing text; params carry binding. | `src/daemon/server.zig:769`, `src/daemon/server.zig:5324`, `src/daemon/server.zig:5327`, `src/proto/numeric.zig:49` |
-| 249 | `RPL_STATSDEBUG` | Oper-only `/STATS z` runtime counters. | Dynamic counter line. | `src/daemon/server.zig:767`, `src/daemon/server.zig:5336`, `src/daemon/server.zig:5341`, `src/proto/numeric.zig:54` |
+| 211 | `RPL_STATSLLINE` | `/STATS l` established S2S peer links. | Dynamic peer-link detail: `sendq_cap`, queued bytes, and uptime seconds. | `src/daemon/server.zig:980`, `src/daemon/server.zig:10360`, `src/daemon/server.zig:10377`, `src/daemon/server.zig:10378` |
+| 218 | `RPL_STATSYLINE` | `/STATS Y` connection-class rows. | Dynamic class policy, match summary, and live member count. | `src/daemon/server.zig:979`, `src/daemon/server.zig:10337`, `src/daemon/server.zig:10343`, `src/daemon/server.zig:10356`, `src/proto/numeric.zig:39` |
+| 219 | `RPL_ENDOFSTATS` | Terminates `/STATS`. | `End of /STATS report` | `src/daemon/server.zig:981`, `src/daemon/server.zig:10397`, `src/proto/numeric.zig:40` |
+| 242 | `RPL_STATSUPTIME` | `/STATS u`. | Dynamic uptime text. | `src/daemon/server.zig:975`, `src/daemon/server.zig:10317`, `src/daemon/server.zig:10325`, `src/proto/numeric.zig:48` |
+| 243 | `RPL_STATSOLINE` | `/STATS o` configured oper bindings. | Empty trailing text; params carry binding. | `src/daemon/server.zig:976`, `src/daemon/server.zig:10327`, `src/daemon/server.zig:10331`, `src/proto/numeric.zig:49` |
+| 249 | `RPL_STATSDEBUG` | Oper-only `/STATS z` runtime counters. | Dynamic counter line. | `src/daemon/server.zig:974`, `src/daemon/server.zig:10382`, `src/daemon/server.zig:10390`, `src/proto/numeric.zig:54` |
 | 270 | `RPL_PRIVS` | Oper privilege/class query. | Dynamic privilege list. | `src/daemon/server.zig:705`, `src/daemon/server.zig:9695`, `src/daemon/server.zig:9731`, `src/proto/numeric.zig:70` |
 | 364 | `RPL_LINKS` | `/LINKS` lists local server and one-hop mesh neighbours. | Dynamic link detail. | `src/daemon/server.zig:708`, `src/daemon/server.zig:10141`, `src/daemon/server.zig:10146`, `src/proto/numeric.zig:123` |
 | 365 | `RPL_ENDOFLINKS` | Terminates `/LINKS`. | `End of /LINKS list` | `src/daemon/server.zig:709`, `src/daemon/server.zig:10154`, `src/proto/numeric.zig:124` |
@@ -83,7 +85,7 @@ Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `
 | 407 | `ERR_TOOMANYTARGETS` | PRIVMSG/NOTICE exceeds `MAXTARGETS`. | `Too many recipients` | `src/daemon/server.zig:731`, `src/daemon/server.zig:10769`, `src/proto/numeric.zig:154` |
 | 431 | `ERR_NONICKNAMEGIVEN` | NICK command without nickname. | `No nickname given` | `src/daemon/server.zig:786`, `src/daemon/server.zig:8159`, `src/proto/numeric.zig:167` |
 | 433 | `ERR_NICKNAMEINUSE` | NICK collision. | `Nickname is already in use` | `src/daemon/server.zig:788`, `src/daemon/server.zig:3563`, `src/daemon/server.zig:8197`, `src/proto/numeric.zig:169` |
-| 437 | `ERR_UNAVAILRESOURCE` | Reserved channel/nick resource blocks JOIN. | Dynamic reservation reason. | `src/daemon/server.zig:782`, `src/daemon/server.zig:3785`, `src/proto/numeric.zig:172` |
+| 437 | `ERR_UNAVAILRESOURCE` | Reserved channel/nick resource blocks JOIN or a requested nick is held by nick delay. | Dynamic reservation reason, or `Nick is held (nick delay); try again shortly`. | `src/daemon/server.zig:1007`, `src/daemon/server.zig:5884`, `src/daemon/server.zig:5885`, `src/daemon/server.zig:15958`, `src/daemon/server.zig:15959`, `src/proto/numeric.zig:172` |
 | 441 | `ERR_USERNOTINCHANNEL` | Target user is not on channel for MODE/KICK/WHISPER/etc. | `They aren't on that channel` | `src/daemon/server.zig:789`, `src/daemon/server.zig:4306`, `src/proto/numeric.zig:175` |
 | 442 | `ERR_NOTONCHANNEL` | Acting client is not on the channel. | `You're not on that channel` | `src/daemon/server.zig:791`, `src/daemon/server.zig:4215`, `src/proto/numeric.zig:176` |
 | 443 | `ERR_USERONCHANNEL` | INVITE target already joined. | `is already on channel` | `src/daemon/server.zig:790`, `src/daemon/server.zig:4980`, `src/proto/numeric.zig:177` |

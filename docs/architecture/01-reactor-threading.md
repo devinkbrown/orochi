@@ -12,9 +12,11 @@ Orochi's live Linux server is built around a Ringlane wrapper over `std.os.linux
 | Completion demux | `reapCompletions` copies CQEs, decodes each completion, and calls the provided handler. | `src/daemon/server.zig:666`, `src/daemon/server.zig:669`, `src/daemon/server.zig:670` |
 | Deterministic seam | `src/substrate/reactor.zig` is a separate vtable seam for monotonic time; its header still says io_uring submit/poll/accept/recv/send are future work for that seam, while the live io_uring wrapper is inside `server.zig`. | `src/substrate/reactor.zig:1`, `src/substrate/reactor.zig:16`, `src/substrate/reactor.zig:26`, `src/daemon/server.zig:466` |
 
-## Per-Reactor State
+## Per-Reactor State and Connection Classes
 
 `LinuxServer` stores a heap slice of `Reactor` structs. Each `Reactor` owns its ring, connection table, listener fds, timer/wake state, and shard id. Evidence: `src/daemon/server.zig:1229`, `src/daemon/server.zig:1235`, `src/daemon/server.zig:1237`, `src/daemon/server.zig:1240`, `src/daemon/server.zig:1243`, `src/daemon/server.zig:1258`.
+
+Each connection is assigned a **connection class** at registration by matching the connection's source IP (IPv4 and IPv6 CIDR), TLS status, SASL authentication, oper status, and ident/host glob patterns. The first matching class wins; a catch-all fallback class exists for each type (built-in `user` for regular clients, `server` for mesh links). Evidence: `src/daemon/conn_class.zig:1`, `src/daemon/server.zig:7073`.
 
 | Field | Ownership rule | Evidence |
 | --- | --- | --- |
@@ -25,6 +27,17 @@ Orochi's live Linux server is built around a Ringlane wrapper over `std.os.linux
 | wake fd | A per-reactor eventfd may be polled so another thread can wake the loop. | `src/daemon/server.zig:1258`, `src/daemon/reactor_fabric.zig:155` |
 
 The current reactor is held in `threadlocal var current_reactor`, and handlers call `self.rx()` to resolve the current thread's reactor or fall back to reactor 0 outside reactor threads. Evidence: `src/daemon/server.zig:1277`, `src/daemon/server.zig:1283`, `src/daemon/server.zig:1455`, `src/daemon/server.zig:1460`.
+
+## SendQ and RecvQ
+
+Every connection has a **SendQ** (outbound) and a **RecvQ** (inbound) bounded by the per-class policy, enforced at registration.
+
+| Buffer | Structure | Ceiling | Evidence |
+| --- | --- | --- | --- |
+| **SendQ** | Inline ~8 KiB send buffer (`send_buf`) plus a heap-allocated overflow queue. The armed inline buffer is never moved or freed (io_uring zero-copy safe). | Per-class `sendq` ceiling (default 1 MiB for user class, 8 MiB for server class). | `src/daemon/server.zig:1592`, `src/daemon/server.zig:1596`, `src/daemon/server.zig:1601`, `src/daemon/conn_class.zig:50` |
+| **RecvQ** | Inline line buffer (`line_buf`, ~512 B) accumulates the current unterminated line; overflow spills to a heap queue. The physical inline buffer default is inherited unless the class sets `recvq > 0`. | Per-class `recvq` ceiling (`0` = physical line-buffer default, ~512 B). A line exceeding this ceiling closes the connection with `LineTooLong`. | `src/daemon/server.zig:1579`, `src/daemon/server.zig:1583`, `src/daemon/server.zig:1591`, `src/daemon/conn_class.zig:52` |
+
+SendQ overflow is drained back into the inline buffer on send completions, so the kernel never reads a heap buffer that could move or free during the io_uring zero-copy send. RecvQ overflow is pulled into the inline buffer as it drains. Both share the same `overflow_allocator` (the owning reactor's allocator). Evidence: `src/daemon/server.zig:1613`, `src/daemon/server.zig:3612`, `src/daemon/server.zig:4385`, `src/daemon/server.zig:5259`.
 
 ## Initialization
 

@@ -11,6 +11,26 @@ Orochi keeps ophion's full feature surface (IRCv3, IRCX, SASL, in-process
 services, WebSocket, CHATHISTORY, voice/video) and replaces the legacy **TS6** S2S
 protocol with the native **Suimyaku + Tsumugi** cryptographic mesh.
 
+The daemon policy surface is now explicit and inspectable. `[class.*]` connection
+classes match clients at registration by IPv4/IPv6 CIDR, implicit TLS, SASL
+account state, oper state, ident glob, and host glob, then apply per-class
+SendQ/RecvQ, flood, admission, clone, channel, target, MONITOR/SILENCE, PING, and
+registration-timeout overrides. The first configured class whose criteria all
+match wins before the built-in `user` and `server` fallbacks cover ordinary
+clients and mesh links.
+
+Queueing is elastic but bounded: outbound SendQ uses an inline buffer plus heap
+overflow under the matched class's `sendq` cap, while inbound RecvQ is the same
+idea for one pending unterminated line under `recvq` (`0` keeps the physical line
+buffer default). SendQ appends fail when the cap would be exceeded; RecvQ lines
+that exceed the cap drop the connection as too long. `[limits].nick_delay`
+optionally holds a released nick after disconnect/QUIT to reduce nick camping;
+voluntary `NICK` changes are not held, and the owning account, server operators,
+and `nick_delay_exempt` classes may bypass the hold. Operators can inspect class
+policy and live member counts with `STATS Y`, established mesh peer SendQ state
+with `STATS l`, and advertised limits, class count, nick-delay state, mesh peer
+count, and subsystem inventory through `INFO`.
+
 ## Mandate: 100% freedom — invent
 This is not a port. Every worker has license to **invent new technologies,
 algorithms, and abstractions** that a from-scratch Zig design makes possible.
@@ -37,7 +57,9 @@ name it and specify it well enough to build.
 2. **Crypto + TLS (opssl successor, Zig-native).** Modern, TLS 1.3 + a hardened 1.2 profile,
    PQ-hybrid by default, constant-time *by construction* (ideally comptime-verified),
    plus the Tsumugi transport crypto. Invent where the design allows.
-3. **Daemon core + comptime module system + 100% feature parity** with ophion.
+3. **Daemon core + comptime module system + 100% feature parity** with ophion,
+   including class-based admission/resource policy, bounded growable SendQ/RecvQ,
+   nick-delay protection, and `STATS`/`INFO` introspection.
 4. **Suimyaku + Tsumugi mesh** as the only S2S protocol (no TS6). CRDT network state,
    Sazanami gossip, Merkle anti-entropy, Tsumugi frame crypto + ratchet. Innovate on the
    spec, don't just implement it.
