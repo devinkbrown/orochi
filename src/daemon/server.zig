@@ -7002,7 +7002,17 @@ pub const LinuxServer = struct {
     /// (the generous default cap stands).
     fn assignConnClass(self: *LinuxServer, conn: *ConnState) void {
         const reg = if (self.config.class_registry) |*r| r else return;
-        const class = reg.classFor(.{
+        const class = reg.classFor(matchCtx(conn));
+        conn.class_policy = class.policy;
+        conn.sendq_cap = class.policy.sendq;
+    }
+
+    /// Build the connection-class match context for `conn` from its live session
+    /// state. Shared by every site that matches or re-matches a connection to a
+    /// class (assignment, member counts, per-IP cap), so the criteria stay in one
+    /// place.
+    fn matchCtx(conn: *const ConnState) conn_class.MatchContext {
+        return .{
             .ip_text = conn.session.realHost(),
             .is_tls = conn.tls != null,
             .has_account = conn.session.account() != null,
@@ -7010,9 +7020,7 @@ pub const LinuxServer = struct {
             .ident = conn.session.username(),
             .host = conn.session.realHost(),
             .is_server_link = conn.s2s != null or conn.s2s_secured != null,
-        });
-        conn.class_policy = class.policy;
-        conn.sendq_cap = class.policy.sendq;
+        };
     }
 
     /// Enforce the matched class's admission policy (require_tls / require_sasl).
@@ -7021,12 +7029,28 @@ pub const LinuxServer = struct {
     /// so call it after that (post-SASL/oper, when the class is final).
     fn enforceClassAdmission(self: *LinuxServer, conn: *ConnState) bool {
         const p = conn.class_policy;
-        const reason: ?[]const u8 = if (p.require_tls and conn.tls == null)
+        var reason: ?[]const u8 = if (p.require_tls and conn.tls == null)
             "Connection class requires a TLS (implicit-TLS) connection"
         else if (p.require_sasl and conn.session.account() == null)
             "Connection class requires SASL authentication"
         else
             null;
+        // Per-class concurrent-connection cap per source IP. The global clone
+        // limiter (enforced at accept, before the class is known) is the hard
+        // ceiling; this only tightens it for a named class. Counted across all
+        // shards including this just-registered connection, so the Nth admitted
+        // connection trips when the count exceeds the limit.
+        if (reason == null and p.max_per_ip != 0) {
+            if (conn.peer_addr) |addr| {
+                const reg = if (self.config.class_registry) |*r| r else null;
+                if (reg) |r| {
+                    const name = r.classFor(matchCtx(conn)).name;
+                    if (self.sameIpClassCount(addr, name) > p.max_per_ip) {
+                        reason = "Too many connections from your host in this connection class";
+                    }
+                }
+            }
+        }
         if (reason) |r| {
             self.noticeTo(conn, r) catch {};
             conn.close_reason = "Connection class policy";
@@ -7051,16 +7075,31 @@ pub const LinuxServer = struct {
                     continue;
                 }
                 if (!c.session.registered()) continue;
-                const cls = reg.classFor(.{
-                    .ip_text = c.session.realHost(),
-                    .is_tls = c.tls != null,
-                    .has_account = c.session.account() != null,
-                    .is_oper = c.session.isOper(),
-                    .ident = c.session.username(),
-                    .host = c.session.realHost(),
-                    .is_server_link = false,
-                });
+                const cls = reg.classFor(matchCtx(c));
                 if (std.ascii.eqlIgnoreCase(cls.name, name)) n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Count registered (non-server) connections that share both the source
+    /// address `addr` and connection class `class_name`, across all reactor
+    /// shards. Includes the calling connection once it is in a slot. Backs the
+    /// per-class `max_per_ip` admission cap, which tightens the global accept-time
+    /// clone limiter for a named class. Safe under the world lock (STATS/register).
+    fn sameIpClassCount(self: *LinuxServer, addr: dns.Address, class_name: []const u8) usize {
+        const reg = if (self.config.class_registry) |*r| r else return 0;
+        var n: usize = 0;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const c = &slot.value;
+                if (c.s2s != null or c.s2s_secured != null) continue;
+                if (!c.session.registered()) continue;
+                const peer = c.peer_addr orelse continue;
+                if (!std.meta.eql(peer, addr)) continue;
+                const cls = reg.classFor(matchCtx(c));
+                if (std.ascii.eqlIgnoreCase(cls.name, class_name)) n += 1;
             }
         }
         return n;
