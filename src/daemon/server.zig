@@ -1585,6 +1585,10 @@ pub const ConnState = struct {
     /// that rebuilds the registry never dangles). Set by `assignConnClass`; read by
     /// admission + the per-class limit enforcement.
     class_policy: conn_class.Policy = .{},
+    /// Per-class inbound line-flood window state (monotonic ms window start +
+    /// lines seen in it). Inert unless the class sets `flood_lines`.
+    flood_window_start_ms: i64 = 0,
+    flood_line_count: u32 = 0,
     /// Allocator backing `send_overflow` (the owning reactor's). `undefined` on a
     /// test-only `ConnState.init(-1)`; only touched once overflow is non-empty,
     /// which such conns never reach.
@@ -5504,6 +5508,30 @@ pub const LinuxServer = struct {
             },
         };
         const was_registered = conn.session.registered();
+
+        // Per-class inbound flood control: at most `flood_lines` lines per
+        // `flood_window_ms` (default 10s window when only the line count is set).
+        // Inert unless the matched class sets a limit and is not flood_exempt;
+        // applies only to registered, non-server connections.
+        if (was_registered and conn.class_policy.flood_lines != 0 and !conn.class_policy.flood_exempt and
+            conn.s2s == null and conn.s2s_secured == null)
+        {
+            const now = self.nowMs();
+            const window: i64 = @intCast(if (conn.class_policy.flood_window_ms != 0) conn.class_policy.flood_window_ms else 10_000);
+            if (now - conn.flood_window_start_ms > window) {
+                conn.flood_window_start_ms = now;
+                conn.flood_line_count = 1;
+            } else {
+                conn.flood_line_count += 1;
+                if (conn.flood_line_count > conn.class_policy.flood_lines) {
+                    emitServerLine(conn, "ERROR :Excess Flood");
+                    conn.close_reason = "Excess Flood";
+                    conn.closing = true;
+                    self.armSendIfNeeded(conn) catch {};
+                    return;
+                }
+            }
+        }
 
         if (!was_registered) {
             // IRCX discovery must work BEFORE registration (draft-pfenning): an
