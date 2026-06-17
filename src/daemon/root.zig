@@ -57,7 +57,7 @@ pub const command_stats = @import("command_stats.zig");
 pub const compose_draft = @import("compose_draft.zig");
 pub const config_boot = @import("config_boot.zig");
 pub const config_format = @import("config_format.zig");
-pub const connection_class = @import("connection_class.zig");
+pub const conn_class = @import("conn_class.zig");
 pub const connection_throttle = @import("connection_throttle.zig");
 pub const conn_summary = @import("conn_summary.zig");
 pub const consensus_poll = @import("consensus_poll.zig");
@@ -370,7 +370,7 @@ test {
     _ = compose_draft;
     _ = config_boot;
     _ = config_format;
-    _ = connection_class;
+    _ = conn_class;
     _ = connection_throttle;
     _ = conn_summary;
     _ = consensus_poll;
