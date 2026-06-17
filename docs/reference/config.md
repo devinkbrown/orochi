@@ -169,9 +169,44 @@ Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/con
 | `silencelimit` | integer | `32` | `1..256` | SILENCE mask limit (`src/daemon/server.zig:948`). |
 | `max_clones_per_ip` | integer | `0` | `0..65535` | Exact-IP clone cap; `0` disables (`src/daemon/server.zig:1005`). |
 | `max_clones_per_net` | integer | `0` | `0..65535` | Network-prefix clone cap; `0` disables (`src/daemon/server.zig:1009`). |
+| `nick_delay` | duration string | `"0"` (disabled) | non-negative `ms/s/m/h` duration | Hold a released nick against reuse for this window after its owner exits (anti nick-camping). The owning account may reclaim during the window; opers and `nick_delay_exempt` classes bypass. `0` disables (`src/daemon/config_format.zig`, `src/daemon/nick_delay.zig`). |
 | `reputation_refuse_threshold` | integer | `0` | `0..1000000` | Refuse connects at or above decaying reputation score; `0` disables (`src/daemon/server.zig:1012`). |
 | `reputation_half_life` | duration string | `"1m"` | positive `ms/s/m/h` duration | IP reputation score decay half-life (`src/daemon/config_boot.zig:53`). |
 | `sweep_interval` | duration string | `"2s"` | positive `ms/s/m/h` duration | Timeout sweep timer granularity (`src/daemon/config_boot.zig:54`). |
+
+## `[class.<name>]`
+
+Source: `Policy`/`ClassDef` at `src/daemon/conn_class.zig` and `src/daemon/config_format.zig:247`, parsing at `src/daemon/config_format.zig:780`, registry built at `src/daemon/config_boot.zig`.
+
+A **connection class** is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching its IP, TLS, account, oper status, and ident/host. The first class (in file order) whose `match_*` criteria are all satisfied wins; a class with no criteria is a catch-all. Two built-ins always exist as fallbacks: `user` and `server`. Per-class limits **override** the matching `[limits]` / `nick_delay` globals; a `0` value means "inherit the global". Inspect live classes and per-class member counts with `STATS Y`.
+
+Sizes accept `K`/`M`/`G` suffixes (`"1M"` = 1048576). Durations are strings (`"30s"`).
+
+| Key | Type | Default | What it controls |
+|---|---|---:|---|
+| `match` | string array | `[]` | Source IP/CIDR list to match (IPv4 + IPv6). |
+| `match_tls` | bool | `false` | Match only implicit-TLS connections. |
+| `match_account` | bool | `false` | Match only SASL-authenticated connections. |
+| `match_oper` | bool | `false` | Match only connections that have opered up. |
+| `match_ident` | string (glob) | unset | Glob on the connection's ident/username. |
+| `match_host` | string (glob) | unset | Glob on the connection's hostname. |
+| `sendq` | size | `1M` (`8M` server) | Outbound SendQ ceiling in bytes. |
+| `recvq` | size | `0` (inherit) | Inbound line ceiling in bytes; `0` = physical line buffer. |
+| `max_clients` | integer | `0` | Max members of this class; `0` = unlimited. |
+| `max_per_ip` | integer | `0` | Max concurrent connections per IP in this class; `0` = unlimited. |
+| `max_channels` | integer | `0` | Max channels a member may join; `0` = inherit `chanlimit`. |
+| `max_targets` | integer | `0` | Max PRIVMSG/NOTICE targets; `0` = inherit `maxtargets`. |
+| `monitor` | integer | `0` | Max MONITOR entries; `0` = inherit `monitorlimit`. |
+| `silence` | integer | `0` | Max SILENCE masks; `0` = inherit `silencelimit`. |
+| `ping_interval` | duration | `0` (inherit) | Per-class PING interval override. |
+| `ping_timeout` | duration | `0` (inherit) | Per-class PING-timeout grace override. |
+| `register_timeout` | duration | `0` (inherit) | Per-class registration-handshake timeout override. |
+| `flood_lines` | integer | `0` | Max inbound lines per `flood_window`; `0` = no flood limit. |
+| `flood_window` | duration | `0` (`10s` when only `flood_lines` set) | Window for `flood_lines`. |
+| `require_tls` | bool | `false` | Refuse admission unless the connection is TLS. |
+| `require_sasl` | bool | `false` | Refuse admission unless SASL-authenticated. |
+| `flood_exempt` | bool | `false` | Exempt this class from flood/throttle enforcement. |
+| `nick_delay_exempt` | bool | `false` | Let members take a held nick without waiting out nick delay. |
 
 ## `[io]`
 

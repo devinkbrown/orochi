@@ -261,6 +261,11 @@ max_clones_per_ip = 0          # 0 = unlimited (0..65535)
 max_clones_per_net = 0         # 0 = unlimited (0..65535)
 reputation_refuse_threshold = 0  # refuse connections above this penalty (0 = off)
 reputation_half_life = "1m"    # decay half-life of the reputation penalty
+# Nick delay: hold a nick against reuse for this window after its owner exits, so
+# a hijacker cannot grab it the instant the owner drops (anti nick-camping). The
+# owning account may reclaim during the window; opers and connection classes
+# flagged `nick_delay_exempt` bypass it. Duration string; "0" disables (default).
+# nick_delay = "30s"
 
 
 # --- [io] — io_uring tuning --------------------------------------------------
@@ -272,6 +277,48 @@ ring_entries = 32      # io_uring SQ entries per reactor (8..4096)
 [reputation]
 registration_timeout_penalty = 50.0   # added when a client times out (0..1000)
 clone_refuse_penalty = 25.0           # added when a clone is refused (0..1000)
+
+
+# --- [class.<name>] — connection classes -------------------------------------
+# A connection class is a named bundle of per-connection resource, admission, and
+# flood policy, assigned to a client at registration by matching its IP, TLS,
+# account, oper status, and ident/host. The FIRST class (in file order) whose
+# match criteria are all satisfied wins; a class with no match_* criteria is a
+# catch-all. Two built-in classes always exist as fallbacks: `user` (regular
+# clients) and `server` (mesh links). Per-class limits OVERRIDE the matching
+# `[limits]` / nick-delay globals; a `0` value means "inherit the global".
+# Inspect the live classes and per-class member counts with `STATS Y`.
+#
+# Sizes accept K/M/G suffixes ("1M" = 1048576). Durations are strings ("30s").
+#
+# [class.trusted]
+# # --- match criteria (a connection must satisfy ALL that are set) ---
+# match        = ["10.0.0.0/8", "2001:db8::/32"]  # source IP/CIDR list (v4 + v6)
+# match_tls    = true        # only connections over implicit TLS
+# match_account = true       # only SASL-authenticated connections
+# match_oper   = true        # only connections that have opered up
+# match_ident  = "~*"        # glob on ident (username)
+# match_host   = "*.corp.example.net"  # glob on hostname
+# # --- resource limits ---
+# sendq        = "8M"        # outbound SendQ ceiling in bytes
+# recvq        = "16K"       # inbound line ceiling in bytes (0 = physical default)
+# max_clients  = 0           # max members of this class (0 = unlimited)
+# max_per_ip   = 0           # max concurrent connections per IP (0 = unlimited)
+# max_channels = 0           # max channels a member may join (0 = inherit chanlimit)
+# max_targets  = 0           # max PRIVMSG/NOTICE targets (0 = inherit maxtargets)
+# monitor      = 0           # max MONITOR entries (0 = inherit monitorlimit)
+# silence      = 0           # max SILENCE masks (0 = inherit silencelimit)
+# # --- timeouts (0 = inherit the [limits] global) ---
+# ping_interval    = "2m"
+# ping_timeout     = "1m"
+# register_timeout = "30s"
+# # --- flood + admission ---
+# flood_lines  = 0           # max inbound lines per flood_window (0 = no limit)
+# flood_window = "10s"       # window for flood_lines
+# require_tls  = false       # refuse admission unless the connection is TLS
+# require_sasl = false       # refuse admission unless SASL-authenticated
+# flood_exempt = false       # exempt this class from flood/throttle enforcement
+# nick_delay_exempt = false  # let members take a held nick without waiting
 
 
 # --- [sessions] — multi-session / bouncer registry sizing --------------------
