@@ -228,6 +228,7 @@ Privilege strings must match the `oper.Privilege` enum names exactly (`src/daemo
 | `event_subscribe` | Event Spine subscription authority. |
 | `audit_read` | Audit read authority. |
 | `oper_override` | Force/SA-style override authority. |
+| `limit_exempt` | Bypass all per-class connection caps (clone limits by IP/account/host). |
 
 Unknown privilege strings are ignored during config boot conversion (`src/daemon/config_boot.zig:159`). If an oper class is missing, or its effective privileges are empty, current boot skips that oper binding (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). Use explicit, non-empty groups.
 

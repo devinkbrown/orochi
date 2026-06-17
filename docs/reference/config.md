@@ -184,6 +184,8 @@ A **connection class** is a named bundle of per-connection resource, admission, 
 
 Sizes accept `K`/`M`/`G` suffixes (`"1M"` = 1048576). Durations are strings (`"30s"`).
 
+The source-keyed clone caps (`max_per_ip` / `max_per_host` / `max_per_account`) are enforced at registration, so they see the real post-PROXY source IP, account, and host (WebSocket/proxy-safe). Authenticated accounts get a **+2 bonus** above the configured value on those dimensions; operators holding the `limit_exempt` privilege bypass every per-class cap.
+
 | Key | Type | Default | What it controls |
 |---|---|---:|---|
 | `match` | string array | `[]` | Source IP/CIDR list to match (IPv4 + IPv6). |
