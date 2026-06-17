@@ -20347,13 +20347,21 @@ pub const LinuxServer = struct {
         // peers for this channel. Deduped against already-listed nicks; the stored
         // u4 status IS the MemberModes bitset, so prefixes/auditorium rank apply
         // uniformly. Host is the origin server name (placeholder user).
-        for (self.rx().clients.slots.items) |*slot| {
-            if (count >= max_members) break;
-            if (!slot.occupied) continue;
-            if (slot.value.s2s_secured) |link| {
-                if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
-            } else if (slot.value.s2s) |link| {
-                if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+        //
+        // Iterate ALL reactors, not just the requester's shard: S2S peer links live
+        // only on reactor 0, so a `self.rx()` scan would show remote members only to
+        // shard-0 clients (the multi-shard NAMES gap). The whole completion runs
+        // under `world.lockWrite`, so this cross-reactor read is race-free — the
+        // same pattern `findRemoteWhois`/`relayToPeers` already rely on.
+        outer: for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (count >= max_members) break :outer;
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |link| {
+                    if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+                } else if (slot.value.s2s) |link| {
+                    if (link.established()) count = self.addRemoteMembers(&members_buf, &prefix_buf, count, is_auditorium, viewer_rank, link.remoteName(), link.channelMembers(channel));
+                }
             }
         }
 
