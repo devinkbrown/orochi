@@ -242,6 +242,9 @@ pub const Config = struct {
         /// sources are exempt (a shared proxy must not throttle distinct clients).
         throttle_connects: u32 = 0,
         throttle_window_ms: u64 = 10_000,
+        /// Network-wide (mesh) concurrent connections per source IP. `0` disables.
+        /// Requires a shared `[mesh] pass` so every node salts IPs identically.
+        max_clones_per_ip_net: u32 = 0,
         reputation_refuse_threshold: u32 = 0,
         reputation_half_life_ms: u64 = 60_000,
         /// Period of the io_uring timeout-sweep timer; sets the enforcement
@@ -621,6 +624,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getString("limits.nick_delay")) |s| cfg.limits.nick_delay_ms = try durationMs(s);
     cfg.limits.throttle_connects = @intCast(try uintField(doc, "limits.throttle_connects", cfg.limits.throttle_connects, 0, 1_000_000));
     if (doc.getString("limits.throttle_window")) |s| cfg.limits.throttle_window_ms = try durationMs(s);
+    cfg.limits.max_clones_per_ip_net = @intCast(try uintField(doc, "limits.max_clones_per_ip_net", cfg.limits.max_clones_per_ip_net, 0, 65535));
     if (doc.getString("limits.handshake_timeout")) |s| cfg.limits.handshake_timeout_ms = try durationMs(s);
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);
     if (doc.getString("limits.ping_timeout")) |s| cfg.limits.ping_timeout_ms = try durationMs(s);

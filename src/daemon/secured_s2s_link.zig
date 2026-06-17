@@ -199,6 +199,12 @@ pub const SecuredLink = struct {
     pub fn peerShortId(self: *const SecuredLink) ?u64 {
         return if (self.session) |s| s.peerShortId() else null;
     }
+    /// The peer's node id as a `u64` (the authenticated session short id),
+    /// matching the plaintext link's `remoteNodeId` shape so generic mesh code
+    /// (e.g. network-wide clone aggregation) can key uniformly on either leg.
+    pub fn remoteNodeId(self: *const SecuredLink) ?u64 {
+        return self.peerShortId();
+    }
     pub fn peerNodeId(self: *const SecuredLink) ?[20]u8 {
         return if (self.session) |s| s.peerNodeId() else null;
     }

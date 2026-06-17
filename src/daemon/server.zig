@@ -123,6 +123,7 @@ const resolv_conf = @import("../proto/resolv_conf.zig");
 const chan_forward = @import("../proto/chan_forward.zig");
 const clone_limit_mod = @import("clone_limit.zig");
 const clone_detect_mod = @import("clone_detect.zig");
+const mesh_clones_mod = @import("mesh_clones.zig");
 const nick_delay_mod = @import("nick_delay.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
@@ -1346,6 +1347,11 @@ pub const Config = struct {
     /// are exempt so a shared reverse proxy never throttles distinct clients.
     throttle_connects: u32 = 0,
     throttle_window_ms: u64 = 10_000,
+    /// Network-wide (mesh) concurrent connections per source IP: counts local +
+    /// every peer's connections from the same salted-IP-hash. `0` disables it.
+    /// Authenticated accounts get +2; opers with `limit_exempt` bypass; loopback
+    /// and trusted proxies are exempt (WebSocket-safe).
+    max_clones_per_ip_net: u32 = 0,
     /// IP-reputation refuse threshold: a peer whose decaying penalty score
     /// reaches this is refused at accept (0 = reputation disabled entirely).
     reputation_refuse_threshold: u32 = 0,
@@ -1656,6 +1662,10 @@ pub const ConnState = struct {
     /// True once this connection was admitted (recorded) by the connection-rate
     /// throttle, so its slot is released exactly once on close.
     throttle_counted: bool = false,
+    /// True once this connection was added to the network-wide clone aggregate;
+    /// `mesh_clone_hash` is its salted-IP-hash, so close releases exactly one.
+    mesh_clone_counted: bool = false,
+    mesh_clone_hash: u64 = 0,
     /// Whether this session was accepted over TLS (implicit-TLS connection fact;
     /// there is no STARTTLS). Gates +S channels. False until TLS lands.
     is_tls: bool = false,
@@ -2109,6 +2119,12 @@ pub const LinuxServer = struct {
     /// Connection-rate throttle (per source IP); null when disabled
     /// (`config.throttle_connects == 0`). Concurrent caps live in `clone_limit`.
     conn_throttle: ?clone_detect_mod.CloneDetector,
+    /// Network-wide clone aggregate: local + per-peer connection counts keyed by
+    /// salted-IP-hash, for the `max_clones_per_ip_net` cap. Inert when that cap is 0.
+    mesh_clones: mesh_clones_mod.MeshClones,
+    /// 16-byte salt derived from the shared mesh secret, so every node maps a
+    /// given IP to the SAME hash. Raw IPs never leave the node.
+    clone_key: [16]u8,
     /// Decaying per-IP penalty table. Only consulted/updated when Config's
     /// reputation_refuse_threshold is non-zero (otherwise reputation is off).
     reputation: ip_reputation_mod.IpReputation,
@@ -2540,6 +2556,8 @@ pub const LinuxServer = struct {
                 .max_connects_per_window = config.throttle_connects,
                 .window_ms = @max(@as(u64, 1), config.throttle_window_ms),
             }) else null,
+            .mesh_clones = mesh_clones_mod.MeshClones.init(allocator),
+            .clone_key = deriveCloneKey(config.mesh_pass),
             .reputation = ip_reputation_mod.IpReputation.init(allocator, .{
                 .half_life_ms = @intCast(@max(1, config.reputation_half_life_ms)),
                 .refuse_threshold = @floatFromInt(config.reputation_refuse_threshold),
@@ -2795,6 +2813,7 @@ pub const LinuxServer = struct {
         self.chan_resv.deinit();
         self.clone_limit.deinit();
         if (self.conn_throttle) |*t| t.deinit();
+        self.mesh_clones.deinit();
         self.nick_delay.deinit();
         self.reputation.deinit();
         self.accepts.deinit();
@@ -3804,6 +3823,19 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Derive the 16-byte network-wide IP-salt from the shared mesh secret. A
+    /// fixed domain tag separates it from other uses of the secret; the same
+    /// secret yields the same key on every node, so an IP hashes identically
+    /// mesh-wide. (An empty secret still yields a stable key — fine for hashing.)
+    fn deriveCloneKey(mesh_pass: []const u8) [16]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("orochi-clone-salt\x00");
+        h.update(mesh_pass);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return digest[0..16].*;
+    }
+
     /// Whether `addr` is an IPv4 (127.0.0.0/8) or IPv6 (::1) loopback address.
     fn addrIsLoopback(addr: dns.Address) bool {
         return switch (addr) {
@@ -4192,6 +4224,8 @@ pub const LinuxServer = struct {
         self.drainNickChanges(link);
         // Audit origin-spoofed or misrouted direct-owned S2S frames.
         self.drainOriginRejections(link);
+        // Fold this peer's network-wide clone counts into the aggregate.
+        self.drainCloneCountsFrom(link);
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
@@ -4214,6 +4248,7 @@ pub const LinuxServer = struct {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
             self.rebroadcastLocalOpers(); // propagate this node's opers to the new peer
+            self.sendCloneAntiEntropy(conn, link); // converge clone counts on the new peer
         }
     }
 
@@ -4281,9 +4316,12 @@ pub const LinuxServer = struct {
         self.drainNickChanges(link);
         // Audit origin-spoofed or misrouted direct-owned S2S frames.
         self.drainOriginRejections(link);
+        // Fold this peer's network-wide clone counts into the aggregate.
+        self.drainCloneCountsFrom(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
+            self.sendCloneAntiEntropy(conn, link); // converge clone counts on the new peer
         }
     }
 
@@ -5344,6 +5382,9 @@ pub const LinuxServer = struct {
                 // surviving link, so its members never left — no netsplit.
                 if (!conn.s2s_dedup) self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 if (!conn.s2s_dedup) if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
+                // Drop this peer's network-wide clone contributions (keyed by the
+                // same node id `setRemote` used, so a dedup'd duplicate is skipped).
+                if (!conn.s2s_dedup) if (link.remoteNodeId()) |node| self.mesh_clones.dropNode(node);
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
@@ -5364,6 +5405,8 @@ pub const LinuxServer = struct {
                 // surviving link, so its members never left — no netsplit.
                 if (!conn.s2s_dedup) self.netsplitOnPeerDrop(conn); // #64: notify locals before the roster is gone
                 if (!conn.s2s_dedup) if (dropped_node) |node| self.clearDroppedPeerRouteOrigin(node);
+                // Drop this peer's network-wide clone contributions.
+                if (!conn.s2s_dedup) if (dropped_node) |node| self.mesh_clones.dropNode(node);
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s = null;
@@ -5395,6 +5438,7 @@ pub const LinuxServer = struct {
                 conn.clone_counted = false;
             }
             self.releaseThrottle(conn);
+            self.meshCloneRelease(conn);
             self.activity_subs.removeClient(monitorIdFromClient(id));
             // Multi-session: a logged-in client's session is *retained* as
             // detached (for reclaim/bouncer); an anonymous client is dropped.
@@ -5747,6 +5791,7 @@ pub const LinuxServer = struct {
                 // the class admission policy (require_tls / require_sasl).
                 self.assignConnClass(conn);
                 if (self.enforceClassAdmission(conn)) return;
+                self.meshCloneAdd(conn); // count toward the network-wide IP aggregate + gossip
                 self.trackSession(id, conn); // multi-session registry (SASL login)
                 try self.deliverTegami(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
@@ -7208,6 +7253,17 @@ pub const LinuxServer = struct {
                 }
             }
         }
+        // Network-wide (mesh) per-IP clone cap: local + every peer's count for the
+        // same salted-IP-hash. Same exemptions: `limit_exempt` opers bypass,
+        // accounts get +2, loopback/trusted-proxy are skipped (meshCloneHash → null).
+        if (reason == null and !conn.session.hasPriv(.limit_exempt) and self.config.max_clones_per_ip_net != 0) {
+            if (self.meshCloneHash(conn)) |hash| {
+                const net_bonus: u32 = if (conn.session.account() != null) 2 else 0;
+                if (self.mesh_clones.networkCount(hash) >= self.config.max_clones_per_ip_net + net_bonus) {
+                    reason = "Too many connections from your IP across the network";
+                }
+            }
+        }
         if (reason) |r| {
             self.noticeTo(conn, r) catch {};
             conn.close_reason = "Connection class policy";
@@ -7215,6 +7271,125 @@ pub const LinuxServer = struct {
             return true;
         }
         return false;
+    }
+
+    /// The salted-IP-hash for `conn`'s source, or null when network-wide clone
+    /// counting does not apply: disabled, no address, or a loopback/trusted-proxy
+    /// source that must not be IP-counted (WebSocket-safe). Raw IPs never leave
+    /// the node — only this keyed hash is gossiped.
+    fn meshCloneHash(self: *LinuxServer, conn: *const ConnState) ?u64 {
+        if (self.config.max_clones_per_ip_net == 0) return null;
+        if (self.ipCloneExempt(conn)) return null;
+        const addr = conn.peer_addr orelse return null;
+        return switch (addr) {
+            .ipv4 => |b| mesh_clones_mod.hashIp(self.clone_key, &b),
+            .ipv6 => |b| mesh_clones_mod.hashIp(self.clone_key, &b),
+        };
+    }
+
+    /// Record `conn` in the network-wide clone aggregate after it is admitted, and
+    /// gossip the new local count for its IP-hash to peers. No-op when the IP is
+    /// exempt / network counting is disabled.
+    fn meshCloneAdd(self: *LinuxServer, conn: *ConnState) void {
+        const hash = self.meshCloneHash(conn) orelse return;
+        const n = self.mesh_clones.addLocal(hash) catch return;
+        conn.mesh_clone_hash = hash;
+        conn.mesh_clone_counted = true;
+        self.publishCloneCount(hash, n);
+    }
+
+    /// Release `conn` from the network-wide clone aggregate on close and gossip the
+    /// decremented count. Exactly-once via `mesh_clone_counted`.
+    fn meshCloneRelease(self: *LinuxServer, conn: *ConnState) void {
+        if (!conn.mesh_clone_counted) return;
+        conn.mesh_clone_counted = false;
+        const n = self.mesh_clones.removeLocal(conn.mesh_clone_hash);
+        self.publishCloneCount(conn.mesh_clone_hash, n);
+    }
+
+    /// Gossip a single `(hash, count)` update to every established peer link.
+    fn publishCloneCount(self: *LinuxServer, hash: u64, count: u32) void {
+        var buf: [mesh_clones_mod.encodedLen(1)]u8 = undefined;
+        const payload = mesh_clones_mod.encodeCounts(&buf, &.{.{ .hash = hash, .count = count }}) catch return;
+        self.broadcastCloneCounts(payload);
+    }
+
+    /// Send a CLONE_COUNT payload to every established peer link (both legs),
+    /// flushing each link's framing to its connection. Best-effort.
+    fn broadcastCloneCounts(self: *LinuxServer, payload: []const u8) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendCloneCounts(payload) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendCloneCounts(payload) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
+            }
+        }
+    }
+
+    /// Decode and ingest a peer's inbound CLONE_COUNT payloads, attributing each
+    /// entry to that peer's `node` in the network-wide aggregate. Malformed
+    /// payloads are skipped (never fatal). Caller passes the link's authenticated
+    /// node id so a peer can only assert ITS OWN counts.
+    fn ingestCloneCounts(self: *LinuxServer, node: u64, payloads: [][]u8) void {
+        defer {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+        }
+        for (payloads) |p| {
+            const view = mesh_clones_mod.decodeCounts(p) catch continue;
+            var i: u32 = 0;
+            while (i < view.n) : (i += 1) {
+                const e = view.get(i);
+                self.mesh_clones.setRemote(node, e.hash, e.count) catch {};
+            }
+        }
+    }
+
+    /// Drain a peer's inbound CLONE_COUNT payloads and fold them into the
+    /// aggregate under that link's authenticated node id. Always frees the queued
+    /// payloads (even when the link has no node id yet).
+    fn drainCloneCountsFrom(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeCloneCounts() catch return;
+        const node = link.remoteNodeId() orelse {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+            return;
+        };
+        self.ingestCloneCounts(node, payloads);
+    }
+
+    /// Anti-entropy: ship this node's local count table to a freshly linked peer
+    /// so it converges immediately. Chunked (bounded stack); best-effort. Flushes
+    /// through `conn` (the drive path owns the connection, not a pid).
+    fn sendCloneAntiEntropy(self: *LinuxServer, conn: *ConnState, link: anytype) void {
+        if (self.config.max_clones_per_ip_net == 0) return;
+        const chunk = 256;
+        var buf: [mesh_clones_mod.encodedLen(chunk)]u8 = undefined;
+        var entries: [chunk]mesh_clones_mod.Entry = undefined;
+        var it = self.mesh_clones.localIterator();
+        while (true) {
+            var n: usize = 0;
+            while (n < entries.len) {
+                const e = it.next() orelse break;
+                entries[n] = .{ .hash = e.key_ptr.*, .count = e.value_ptr.* };
+                n += 1;
+            }
+            if (n == 0) break;
+            const payload = mesh_clones_mod.encodeCounts(&buf, entries[0..n]) catch return;
+            link.sendCloneCounts(payload) catch return;
+            appendToConn(conn, link.outbound()) catch return;
+            link.clearOutbound();
+        }
     }
 
     /// Count live connections currently in connection class `name` (across all
@@ -13915,6 +14090,13 @@ pub const LinuxServer = struct {
                 self.config.max_clones_per_ip, clones_ip, self.config.max_clones_per_net, clones_net,
             }) catch "CLONES policy";
             try self.noticeTo(conn, hdr);
+            if (self.config.max_clones_per_ip_net != 0) {
+                var nb: [200]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, "CLONES network-wide: max_per_ip_net={d} (mesh-aggregated, salted IP hash; accounts +2, limit_exempt opers bypass); {d} hash(es) tracked", .{
+                    self.config.max_clones_per_ip_net, self.mesh_clones.local.count() + self.mesh_clones.remote_total.count(),
+                }) catch "CLONES network-wide";
+                try self.noticeTo(conn, nl);
+            }
             if (self.conn_throttle) |*t| {
                 var tb: [200]u8 = undefined;
                 const tl = std.fmt.bufPrint(&tb, "CLONES throttle: {d} connect(s)/{d}ms per IP (loopback + trusted-proxy exempt); {d} IP(s) tracked", .{
@@ -19204,6 +19386,7 @@ pub const LinuxServer = struct {
         self.config.max_clones_per_ip = lim.max_clones_per_ip;
         self.config.max_clones_per_net = lim.max_clones_per_net;
         self.clone_limit.config = .{ .max_per_ip = lim.max_clones_per_ip, .max_per_net = lim.max_clones_per_net };
+        self.config.max_clones_per_ip_net = lim.max_clones_per_ip_net; // network-wide IP cap (aggregate is kept live)
         self.config.nick_delay_ms = lim.nick_delay_ms;
 
         // Connection-rate throttle: rebuild from the new window/limit. Drops the
