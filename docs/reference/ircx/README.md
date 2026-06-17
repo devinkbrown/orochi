@@ -17,7 +17,7 @@ channel modes (a/x/w/u/f/d/E/r/z/Y), and AUTH (lib). Studying the draft surfaced
 | Orochi now | Draft says | Action |
 | --- | --- | --- |
 | `ERR_PROPDENIED = 918` (PROP set/delete denial) | **918 = IRCERR_EVENTDUP** | **BUG.** PROP permission denial should be **908 IRCERR_SECURITY** (or 913 NOACCESS). Move it; free 918 for EVENT-dup. |
-| `RPL_MODEXLIST/END = 806/807` | **806/807 = IRCRPL_EVENTADD/DEL** | **COLLISION.** MODEX is a Orochi extension; pick numerics outside 800–819 (draft-reserved) — e.g. a private 8xx range clear of ACCESS/EVENT/LISTX/PROP, and document it. |
+| `RPL_MODEXLIST/END = 826/827` | 806/807 = IRCRPL_EVENTADD/DEL | ✅ resolved. EVENT now uses the draft `806–810` (ADD/DEL/START/LIST/END); MODEX (a non-draft Orochi extension) moved to `826/827`, clear of ACCESS/EVENT/LISTX/PROP. |
 | `ERR_NOWHISPER = 923` | 923 IRCERR_NOWHISPER | ✅ correct |
 | ACCESS 801–805 | 801–805 ACCESS* | ✅ correct |
 | PROP 818/819 | 818/819 PROPLIST/END | ✅ correct |
