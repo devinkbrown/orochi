@@ -52,6 +52,7 @@ pub const clone_detect = @import("clone_detect.zig");
 pub const clone_limit = @import("clone_limit.zig");
 pub const color_pref = @import("color_pref.zig");
 pub const nick_delay = @import("nick_delay.zig");
+pub const mesh_clones = @import("mesh_clones.zig");
 pub const command_class = @import("command_class.zig");
 pub const commands = @import("commands.zig");
 pub const command_stats = @import("command_stats.zig");
@@ -366,6 +367,7 @@ test {
     _ = clone_limit;
     _ = color_pref;
     _ = nick_delay;
+    _ = mesh_clones;
     _ = command_class;
     _ = commands;
     _ = command_stats;
