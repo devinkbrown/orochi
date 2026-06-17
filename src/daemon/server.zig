@@ -877,6 +877,10 @@ pub fn installUpgradeSignalHandler() void {
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
+/// Pre-registration SendQ ceiling, used until a connection is matched to a class
+/// (which sets its real `sendq_cap`). Generous so a handshake/MOTD burst never
+/// trips before the class is known.
+const default_sendq_cap: usize = 1 << 20; // 1 MiB
 const default_recv_bytes: usize = 4096;
 const default_line_bytes: usize = irc_line.MAX_LINE_BODY + 2;
 const server_name = "orochi.local";
@@ -1566,6 +1570,19 @@ pub const ConnState = struct {
     send_len: usize = 0,
     send_offset: usize = 0,
     send_armed: bool = false,
+    /// SendQ overflow heap queue: bytes that did not fit the inline `send_buf`
+    /// while it was full/armed. Drained back into `send_buf` on send-completion.
+    /// The kernel never reads this directly (only the fixed inline `send_buf`),
+    /// so the zero-copy send is never reading a buffer that could move/free.
+    send_overflow: std.ArrayListUnmanaged(u8) = .empty,
+    /// Per-connection SendQ ceiling = (inline-queued + overflow) cap, from the
+    /// matched connection class. Set at registration; a generous default covers
+    /// the pre-registration window.
+    sendq_cap: usize = default_sendq_cap,
+    /// Allocator backing `send_overflow` (the owning reactor's). `undefined` on a
+    /// test-only `ConnState.init(-1)`; only touched once overflow is non-empty,
+    /// which such conns never reach.
+    overflow_allocator: std.mem.Allocator = undefined,
     closing: bool = false,
     /// When this connection took a REGISTERED nick while unauthenticated (UNIX ms;
     /// 0 = nick is free / owned by this account). The sweep enforces the grace.
@@ -3550,6 +3567,13 @@ pub const LinuxServer = struct {
         // an occupied slot (which deinit would then try to tear down).
         errdefer _ = self.rx().clients.free(id);
         const conn = self.rx().clients.get(id).?;
+        conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
+        // S2S links get the `server` class SendQ cap immediately (they carry mesh
+        // bursts from the first frame); clients keep the generous default until
+        // `assignConnClass` matches them at registration.
+        if (is_s2s) {
+            if (self.config.class_registry) |*reg| conn.sendq_cap = reg.classFor(.{ .is_server_link = true }).policy.sendq;
+        }
         conn.token = try tokenFromId(id);
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
@@ -4316,6 +4340,9 @@ pub const LinuxServer = struct {
         if (conn.send_offset >= conn.send_len) {
             conn.send_offset = 0;
             conn.send_len = 0;
+            // Inline buffer drained: pull the next chunk of the SendQ overflow into
+            // it (nothing is armed here, so refilling the inline buffer is safe).
+            refillFromOverflow(conn);
         }
 
         try self.armSendIfNeeded(conn);
@@ -5187,6 +5214,9 @@ pub const LinuxServer = struct {
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
         const id = idFromToken(token);
         if (self.rx().clients.get(id)) |conn| {
+            // Release any SendQ overflow heap before the slot is freed/reused (covers
+            // every close path below, including S2S links that carry mesh bursts).
+            if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
             // S2S peer: tear down the link, close, free the slot — no IRC quit path.
             if (conn.s2s_secured) |link| {
                 const dropped_node = link.peerShortId();
@@ -5572,6 +5602,9 @@ pub const LinuxServer = struct {
                 // and guest (ANONYMOUS) logins never auto-oper, matching the gated
                 // SASL-success/REGISTER elevation sites.
                 if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
+                // Match the now-fully-identified client (IP/TLS/account/oper) to its
+                // connection class and apply the per-class SendQ ceiling.
+                self.assignConnClass(conn);
                 self.trackSession(id, conn); // multi-session registry (SASL login)
                 try self.deliverTegami(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
@@ -6921,6 +6954,25 @@ pub const LinuxServer = struct {
         if (conn.s2s != null or conn.s2s_secured != null) return false;
         const local_acct = conn.session.account() orelse return false;
         return std.ascii.eqlIgnoreCase(local_acct, account);
+    }
+
+    /// Match a connection to its `[class.*]` class and apply the per-class policy.
+    /// Today it sets the SendQ ceiling; recvq, clone/channel caps, timeouts,
+    /// admission, and flood limits layer onto this same assignment point. Called at
+    /// registration and after USR2 adoption; a no-op when no class registry is set
+    /// (the generous default cap stands).
+    fn assignConnClass(self: *LinuxServer, conn: *ConnState) void {
+        const reg = if (self.config.class_registry) |*r| r else return;
+        const class = reg.classFor(.{
+            .ip_text = conn.session.realHost(),
+            .is_tls = conn.tls != null,
+            .has_account = conn.session.account() != null,
+            .is_oper = conn.session.isOper(),
+            .ident = conn.session.username(),
+            .host = conn.session.realHost(),
+            .is_server_link = conn.s2s != null or conn.s2s_secured != null,
+        });
+        conn.sendq_cap = class.policy.sendq;
     }
 
     /// Resolve a REMOTE (mesh) member's channel status bits by nick, scanning
@@ -11524,12 +11576,25 @@ pub const LinuxServer = struct {
             var tls_blob: ?[]u8 = null;
             if (e.value.tls) |t| {
                 const rs = t.exportResume() catch continue;
+                // Wire bytes encrypted but not yet flushed: carried verbatim so the
+                // client's record sequence has no hole after the swap. The FULL
+                // SendQ is the inline tail plus any heap overflow, made contiguous.
+                const tail = e.value.send_buf[e.value.send_offset..e.value.send_len];
+                const ovf = e.value.send_overflow.items;
+                var pend_tmp: ?[]u8 = null;
+                var pending: []const u8 = tail;
+                if (ovf.len != 0) {
+                    const buf = self.allocator.alloc(u8, tail.len + ovf.len) catch continue;
+                    @memcpy(buf[0..tail.len], tail);
+                    @memcpy(buf[tail.len..], ovf);
+                    pend_tmp = buf;
+                    pending = buf;
+                }
+                defer if (pend_tmp) |p| self.allocator.free(p);
                 tls_blob = tls_snapshot.encode(self.allocator, .{
                     .fd = e.value.fd,
                     .state = rs,
-                    // Wire bytes encrypted but not yet flushed: carried verbatim so
-                    // the client's record sequence has no hole after the swap.
-                    .pending_out = e.value.send_buf[e.value.send_offset..e.value.send_len],
+                    .pending_out = pending,
                     .certfp = if (e.value.session.tls_certfp) |fp| fp else &.{},
                 }) catch continue;
             }
@@ -11739,6 +11804,7 @@ pub const LinuxServer = struct {
             return false;
         };
         const conn = self.rx().clients.get(id).?;
+        conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
         conn.token = tokenFromId(id) catch {
             _ = self.rx().clients.free(id);
             closeFd(snap.fd);
@@ -11791,6 +11857,8 @@ pub const LinuxServer = struct {
         // CLOEXEC so it never leaks into any other child. The next UPGRADE
         // clears it again for exactly the connections it carries.
         _ = linux.fcntl(snap.fd, posix.F.SETFD, posix.FD_CLOEXEC);
+        // Re-apply the connection class (the restored session carries the facets).
+        self.assignConnClass(conn);
         return true;
     }
 
@@ -11830,6 +11898,10 @@ pub const LinuxServer = struct {
         // verbatim (already TLS records — bypass the encrypt seam). If they don't
         // fit, the client's record stream would hole; drop the client instead.
         if (ts.pending_out.len != 0) {
+            // Carried SendQ (inline + overflow): lift the cap to cover it so the
+            // restore never truncates a legitimately-buffered burst. `assignConnClass`
+            // sets the real per-class cap afterward; the carried bytes still drain.
+            conn.sendq_cap = @max(conn.sendq_cap, ts.pending_out.len);
             rawAppendToConn(conn, ts.pending_out) catch {
                 t.deinit();
                 self.allocator.destroy(t);
@@ -11996,6 +12068,8 @@ pub const LinuxServer = struct {
         const id = try self.rx().clients.alloc(ConnState.init(fd));
         errdefer _ = self.rx().clients.free(id);
         const peer = self.rx().clients.get(id).?;
+        peer.overflow_allocator = self.allocator; // backs the SendQ overflow heap
+        if (self.config.class_registry) |*reg| peer.sendq_cap = reg.classFor(.{ .is_server_link = true }).policy.sendq;
         peer.token = try tokenFromId(id);
         peer.s2s_connect_addr = addr;
         peer.s2s_initiator = true; // we dialed: this is the initiator side
@@ -20880,22 +20954,87 @@ fn wsRefuseHttp(conn: *ConnState, comptime status: []const u8) void {
 }
 
 fn rawAppendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
-    if (conn.send_len + bytes.len > conn.send_buf.len) {
-        // Reclaim the already-sent prefix [0, send_offset) for a slow consumer by
-        // sliding the unsent tail to the front. NEVER do this while a send SQE is
-        // armed: the kernel is still reading send_buf[send_offset..send_len] for
-        // the in-flight zero-copy send, so moving those bytes would corrupt the
-        // wire. Appending fresh bytes at [send_len..] is always safe.
-        if (conn.send_offset > 0 and !conn.send_armed) {
+    // Fast path: with nothing already spilled to overflow, reclaim the sent prefix
+    // [0, send_offset) by sliding the unsent tail to the front, then use the inline
+    // buffer if it fits. NEVER compact while a send SQE is armed: the kernel is
+    // still reading send_buf[send_offset..send_len] for the in-flight zero-copy
+    // send, so moving those bytes would corrupt the wire.
+    if (conn.send_overflow.items.len == 0) {
+        if (conn.send_len + bytes.len > conn.send_buf.len and conn.send_offset > 0 and !conn.send_armed) {
             const tail = conn.send_len - conn.send_offset;
             std.mem.copyForwards(u8, conn.send_buf[0..tail], conn.send_buf[conn.send_offset..conn.send_len]);
             conn.send_len = tail;
             conn.send_offset = 0;
         }
-        if (conn.send_len + bytes.len > conn.send_buf.len) return error.OutputTooSmall;
+        if (conn.send_len + bytes.len <= conn.send_buf.len) {
+            @memcpy(conn.send_buf[conn.send_len .. conn.send_len + bytes.len], bytes);
+            conn.send_len += bytes.len;
+            return;
+        }
     }
-    @memcpy(conn.send_buf[conn.send_len .. conn.send_len + bytes.len], bytes);
-    conn.send_len += bytes.len;
+    // Overflow (real SendQ): the inline buffer is full or busy, so spill to the heap
+    // queue — refilled into the inline buffer on send-completion (the kernel only
+    // ever reads the fixed inline buffer, so this never moves an armed buffer).
+    // Drop as "SendQ exceeded" only when inline-unsent + overflow + these bytes
+    // would blow the connection's per-class ceiling.
+    const queued = (conn.send_len - conn.send_offset) + conn.send_overflow.items.len;
+    if (queued + bytes.len > conn.sendq_cap) return error.OutputTooSmall;
+    conn.send_overflow.appendSlice(conn.overflow_allocator, bytes) catch return error.OutputTooSmall;
+}
+
+/// Refill the drained inline `send_buf` with the next chunk of the SendQ overflow.
+/// Called from the send-completion handler with nothing armed, so writing the
+/// inline buffer is safe. The overflow heap is freed entirely once fully drained
+/// so a one-off burst never pins memory.
+fn refillFromOverflow(conn: *ConnState) void {
+    if (conn.send_overflow.items.len == 0) return;
+    const n = @min(conn.send_buf.len, conn.send_overflow.items.len);
+    @memcpy(conn.send_buf[0..n], conn.send_overflow.items[0..n]);
+    conn.send_len = n;
+    conn.send_offset = 0;
+    if (n == conn.send_overflow.items.len) {
+        conn.send_overflow.clearAndFree(conn.overflow_allocator);
+    } else {
+        const remaining = conn.send_overflow.items.len - n;
+        std.mem.copyForwards(u8, conn.send_overflow.items[0..remaining], conn.send_overflow.items[n..]);
+        conn.send_overflow.items.len = remaining;
+    }
+}
+
+test "SendQ: inline fast path, heap overflow, refill, and per-class cap" {
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = std.testing.allocator;
+    conn.sendq_cap = 20 * 1024; // 20 KiB
+    defer if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+
+    const chunk = [_]u8{'a'} ** 4096;
+    // Two chunks fill the inline 8 KiB buffer exactly (no heap).
+    try rawAppendToConn(&conn, &chunk);
+    try rawAppendToConn(&conn, &chunk);
+    try std.testing.expectEqual(@as(usize, 8192), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+
+    // Next three chunks spill to the overflow heap, up to the 20 KiB ceiling.
+    try rawAppendToConn(&conn, &chunk);
+    try rawAppendToConn(&conn, &chunk);
+    try rawAppendToConn(&conn, &chunk);
+    try std.testing.expectEqual(@as(usize, 12288), conn.send_overflow.items.len);
+    // One more byte blows the cap (8192 + 12288 = 20480 == cap).
+    try std.testing.expectError(error.OutputTooSmall, rawAppendToConn(&conn, "x"));
+
+    // Drain the inline buffer → refill pulls the next 8 KiB from overflow.
+    conn.send_offset = 0;
+    conn.send_len = 0;
+    refillFromOverflow(&conn);
+    try std.testing.expectEqual(@as(usize, 8192), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 4096), conn.send_overflow.items.len);
+
+    // Drain again → the last 4 KiB refills and the overflow heap is freed.
+    conn.send_offset = 0;
+    conn.send_len = 0;
+    refillFromOverflow(&conn);
+    try std.testing.expectEqual(@as(usize, 4096), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.capacity);
 }
 
 /// Format a server numeric line (`:<server> <code> <nick> <params> :<trailing>`)
