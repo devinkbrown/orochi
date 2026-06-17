@@ -1577,8 +1577,12 @@ pub const ConnState = struct {
     send_overflow: std.ArrayListUnmanaged(u8) = .empty,
     /// Per-connection SendQ ceiling = (inline-queued + overflow) cap, from the
     /// matched connection class. Set at registration; a generous default covers
-    /// the pre-registration window.
+    /// the pre-registration window. (Hot-path duplicate of `class_policy.sendq`.)
     sendq_cap: usize = default_sendq_cap,
+    /// The matched connection class's full policy (a value copy, so a live REHASH
+    /// that rebuilds the registry never dangles). Set by `assignConnClass`; read by
+    /// admission + the per-class limit enforcement.
+    class_policy: conn_class.Policy = .{},
     /// Allocator backing `send_overflow` (the owning reactor's). `undefined` on a
     /// test-only `ConnState.init(-1)`; only touched once overflow is non-empty,
     /// which such conns never reach.
@@ -5603,8 +5607,10 @@ pub const LinuxServer = struct {
                 // SASL-success/REGISTER elevation sites.
                 if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
                 // Match the now-fully-identified client (IP/TLS/account/oper) to its
-                // connection class and apply the per-class SendQ ceiling.
+                // connection class, apply the per-class SendQ ceiling, then enforce
+                // the class admission policy (require_tls / require_sasl).
                 self.assignConnClass(conn);
+                if (self.enforceClassAdmission(conn)) return;
                 self.trackSession(id, conn); // multi-session registry (SASL login)
                 try self.deliverTegami(conn); // hand over any offline messages
                 // OBSERVE: push a connect record to watching operators.
@@ -6972,7 +6978,29 @@ pub const LinuxServer = struct {
             .host = conn.session.realHost(),
             .is_server_link = conn.s2s != null or conn.s2s_secured != null,
         });
+        conn.class_policy = class.policy;
         conn.sendq_cap = class.policy.sendq;
+    }
+
+    /// Enforce the matched class's admission policy (require_tls / require_sasl).
+    /// Returns true and tears the client down (notice + close) when the class
+    /// refuses it; false to admit. Reads the policy stored by `assignConnClass`,
+    /// so call it after that (post-SASL/oper, when the class is final).
+    fn enforceClassAdmission(self: *LinuxServer, conn: *ConnState) bool {
+        const p = conn.class_policy;
+        const reason: ?[]const u8 = if (p.require_tls and conn.tls == null)
+            "Connection class requires a TLS (implicit-TLS) connection"
+        else if (p.require_sasl and conn.session.account() == null)
+            "Connection class requires SASL authentication"
+        else
+            null;
+        if (reason) |r| {
+            self.noticeTo(conn, r) catch {};
+            conn.close_reason = "Connection class policy";
+            conn.closing = true;
+            return true;
+        }
+        return false;
     }
 
     /// Resolve a REMOTE (mesh) member's channel status bits by nick, scanning
@@ -8127,9 +8155,12 @@ pub const LinuxServer = struct {
         // member. Creating a fresh channel (founder path) bypasses all gates.
         const wid = worldIdFromClient(id);
         // CHANLIMIT: cap how many channels a non-oper may be in. Only a NEW join
-        // counts; re-JOIN of a channel already joined is a no-op and exempt.
+        // counts; re-JOIN of a channel already joined is a no-op and exempt. The
+        // connection class may override the global limit (`max_channels`, 0 =
+        // inherit `[limits].chanlimit`).
+        const chan_cap = if (conn.class_policy.max_channels != 0) conn.class_policy.max_channels else self.config.chanlimit;
         if (!conn.session.isOper() and !self.world.isMember(channel, wid) and
-            self.world.channelCountOf(wid) >= self.config.chanlimit)
+            self.world.channelCountOf(wid) >= chan_cap)
         {
             try queueNumeric(conn, .ERR_TOOMANYCHANNELS, &.{channel}, "You have joined too many channels");
             return;
