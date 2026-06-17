@@ -100,6 +100,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.max_clones_per_ip = cfg.limits.max_clones_per_ip;
     out.max_clones_per_net = cfg.limits.max_clones_per_net;
     out.nick_delay_ms = cfg.limits.nick_delay_ms;
+    out.throttle_connects = cfg.limits.throttle_connects;
+    out.throttle_window_ms = cfg.limits.throttle_window_ms;
     out.reputation_refuse_threshold = cfg.limits.reputation_refuse_threshold;
     if (cfg.limits.reputation_half_life_ms != 0) out.reputation_half_life_ms = @intCast(cfg.limits.reputation_half_life_ms);
     if (cfg.limits.sweep_interval_ms != 0) out.sweep_interval_ms = @intCast(cfg.limits.sweep_interval_ms);

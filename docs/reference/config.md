@@ -170,6 +170,8 @@ Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/con
 | `max_clones_per_ip` | integer | `0` | `0..65535` | Exact-IP clone cap; `0` disables (`src/daemon/server.zig:1005`). |
 | `max_clones_per_net` | integer | `0` | `0..65535` | Network-prefix clone cap; `0` disables (`src/daemon/server.zig:1009`). |
 | `nick_delay` | duration string | `"0"` (disabled) | non-negative `ms/s/m/h` duration | Hold a released nick against reuse for this window after its owner exits (anti nick-camping). The owning account may reclaim during the window; opers and `nick_delay_exempt` classes bypass. `0` disables (`src/daemon/config_format.zig`, `src/daemon/nick_delay.zig`). |
+| `throttle_connects` | integer | `0` (disabled) | `0..1000000` | Connection-rate throttle: max NEW connections one source IP may open within `throttle_window`; excess is refused at accept. Loopback and `trusted_proxies` are exempt (a shared reverse proxy is never throttled as one IP), making it WebSocket-safe. `0` disables (`src/daemon/clone_detect.zig`, `src/daemon/server.zig` `refuseSilentClient`). |
+| `throttle_window` | duration string | `"10s"` | positive `ms/s/m/h` duration | Sliding window for `throttle_connects`. |
 | `reputation_refuse_threshold` | integer | `0` | `0..1000000` | Refuse connects at or above decaying reputation score; `0` disables (`src/daemon/server.zig:1012`). |
 | `reputation_half_life` | duration string | `"1m"` | positive `ms/s/m/h` duration | IP reputation score decay half-life (`src/daemon/config_boot.zig:53`). |
 | `sweep_interval` | duration string | `"2s"` | positive `ms/s/m/h` duration | Timeout sweep timer granularity (`src/daemon/config_boot.zig:54`). |
@@ -193,7 +195,9 @@ Sizes accept `K`/`M`/`G` suffixes (`"1M"` = 1048576). Durations are strings (`"3
 | `sendq` | size | `1M` (`8M` server) | Outbound SendQ ceiling in bytes. |
 | `recvq` | size | `0` (inherit) | Inbound line ceiling in bytes; `0` = physical line buffer. |
 | `max_clients` | integer | `0` | Max members of this class; `0` = unlimited. |
-| `max_per_ip` | integer | `0` | Max concurrent connections per IP in this class; `0` = unlimited. |
+| `max_per_ip` | integer | `0` | Max concurrent connections per IP in this class; `0` = unlimited. Skipped for loopback / trusted-proxy sources (WebSocket-safe). |
+| `max_per_account` | integer | `0` | Max concurrent connections per account in this class; `0` = unlimited. Always proxy/WebSocket-safe (per-identity). |
+| `max_per_host` | integer | `0` | Max concurrent connections per resolved host in this class; `0` = unlimited. Skipped for the loopback host. |
 | `max_channels` | integer | `0` | Max channels a member may join; `0` = inherit `chanlimit`. |
 | `max_targets` | integer | `0` | Max PRIVMSG/NOTICE targets; `0` = inherit `maxtargets`. |
 | `monitor` | integer | `0` | Max MONITOR entries; `0` = inherit `monitorlimit`. |

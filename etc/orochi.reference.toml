@@ -257,8 +257,15 @@ maxtargets = 4         # max targets per PRIVMSG/NOTICE (1..64)
 monitorlimit = 128     # max MONITOR targets per client (1..100000)
 silencelimit = 32      # max SILENCE masks per client (1..256)
 # Anti-abuse:
-max_clones_per_ip = 0          # 0 = unlimited (0..65535)
-max_clones_per_net = 0         # 0 = unlimited (0..65535)
+max_clones_per_ip = 0          # concurrent connections per exact IP; 0 = unlimited (0..65535)
+max_clones_per_net = 0         # concurrent connections per /24|/64; 0 = unlimited (0..65535)
+# Connection-rate throttle: max NEW connections one source IP may open within
+# throttle_window. 0 disables it. Loopback and configured trusted_proxies are
+# EXEMPT, so a reverse proxy fronting many WebSocket clients is never throttled
+# as a single IP. Per-class concurrent caps (max_per_ip/account/host) live in
+# [class.*]; this is the global accept-time rate gate.
+# throttle_connects = 10       # 0 = disabled (0..1000000)
+# throttle_window = "10s"      # window for throttle_connects
 reputation_refuse_threshold = 0  # refuse connections above this penalty (0 = off)
 reputation_half_life = "1m"    # decay half-life of the reputation penalty
 # Nick delay: hold a nick against reuse for this window after its owner exits, so
@@ -303,7 +310,9 @@ clone_refuse_penalty = 25.0           # added when a clone is refused (0..1000)
 # sendq        = "8M"        # outbound SendQ ceiling in bytes
 # recvq        = "16K"       # inbound line ceiling in bytes (0 = physical default)
 # max_clients  = 0           # max members of this class (0 = unlimited)
-# max_per_ip   = 0           # max concurrent connections per IP (0 = unlimited)
+# max_per_ip   = 0           # max concurrent connections per IP (0 = unlimited; loopback/proxy exempt)
+# max_per_account = 0        # max concurrent connections per account (0 = unlimited; proxy-safe)
+# max_per_host = 0           # max concurrent connections per resolved host (0 = unlimited; loopback exempt)
 # max_channels = 0           # max channels a member may join (0 = inherit chanlimit)
 # max_targets  = 0           # max PRIVMSG/NOTICE targets (0 = inherit maxtargets)
 # monitor      = 0           # max MONITOR entries (0 = inherit monitorlimit)

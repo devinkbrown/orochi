@@ -237,6 +237,11 @@ pub const Config = struct {
         /// Nick-delay window (ms): how long a released nick is held against reuse
         /// after its owner exits. `0` disables nick delay entirely.
         nick_delay_ms: u64 = 0,
+        /// Connection throttle: max new connections one source IP may open within
+        /// `throttle_window_ms`. `0` disables the throttle. Loopback / trusted-proxy
+        /// sources are exempt (a shared proxy must not throttle distinct clients).
+        throttle_connects: u32 = 0,
+        throttle_window_ms: u64 = 10_000,
         reputation_refuse_threshold: u32 = 0,
         reputation_half_life_ms: u64 = 60_000,
         /// Period of the io_uring timeout-sweep timer; sets the enforcement
@@ -614,6 +619,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.silencelimit = @intCast(try uintField(doc, "limits.silencelimit", cfg.limits.silencelimit, 1, 256));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
     if (doc.getString("limits.nick_delay")) |s| cfg.limits.nick_delay_ms = try durationMs(s);
+    cfg.limits.throttle_connects = @intCast(try uintField(doc, "limits.throttle_connects", cfg.limits.throttle_connects, 0, 1_000_000));
+    if (doc.getString("limits.throttle_window")) |s| cfg.limits.throttle_window_ms = try durationMs(s);
     if (doc.getString("limits.handshake_timeout")) |s| cfg.limits.handshake_timeout_ms = try durationMs(s);
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);
     if (doc.getString("limits.ping_timeout")) |s| cfg.limits.ping_timeout_ms = try durationMs(s);

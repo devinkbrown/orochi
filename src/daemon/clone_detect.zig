@@ -106,7 +106,10 @@ pub const CloneDetector = struct {
     }
 
     fn classifyExisting(self: *CloneDetector, now_ms: i64, state: *IpState) CloneDetectError!Decision {
-        if (state.active >= self.params.max_concurrent_per_ip) {
+        // `max_concurrent_per_ip == 0` disables the concurrent dimension, leaving
+        // a pure connection-rate throttle (used when a separate limiter owns the
+        // concurrent cap). `active` is still tracked for empty-state pruning.
+        if (self.params.max_concurrent_per_ip != 0 and state.active >= self.params.max_concurrent_per_ip) {
             return .clone_limited;
         }
         if (state.recent.items.len >= self.params.max_connects_per_window) {
@@ -172,8 +175,9 @@ const IpState = struct {
 };
 
 fn validParams(params: Params) bool {
-    return params.max_concurrent_per_ip > 0 and
-        params.max_connects_per_window > 0 and
+    // `max_concurrent_per_ip` may be 0 (concurrent dimension disabled → pure
+    // connection-rate throttle); the rate window must always be configured.
+    return params.max_connects_per_window > 0 and
         params.window_ms > 0 and
         params.max_tracked_ips > 0 and
         params.max_ip_len > 0;
@@ -228,6 +232,26 @@ test "releases on disconnect" {
     try std.testing.expect(detector.disconnect("203.0.113.4"));
     try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(2, "203.0.113.4"));
     try std.testing.expectEqual(@as(usize, 1), detector.activeCount("203.0.113.4"));
+}
+
+test "concurrent dimension disabled leaves a pure rate throttle" {
+    // max_concurrent_per_ip = 0 → unlimited concurrent; only the rate window caps.
+    var detector = try CloneDetector.initChecked(std.testing.allocator, .{
+        .max_concurrent_per_ip = 0,
+        .max_connects_per_window = 3,
+        .window_ms = 1000,
+    });
+    defer detector.deinit();
+
+    // Three rapid connects pass without ever tripping clone_limited, even though
+    // all three stay active (no disconnect).
+    try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(0, "192.0.2.1"));
+    try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(1, "192.0.2.1"));
+    try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(2, "192.0.2.1"));
+    // Fourth within the window is rate-throttled, not clone-limited.
+    try std.testing.expectEqual(Decision.connect_throttled, try detector.classifyConnect(3, "192.0.2.1"));
+    // After the window slides, connects flow again.
+    try std.testing.expectEqual(Decision.allow, try detector.classifyConnect(1001, "192.0.2.1"));
 }
 
 test "state is bounded and prunes empty expired IPs" {

@@ -122,6 +122,7 @@ const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 const chan_forward = @import("../proto/chan_forward.zig");
 const clone_limit_mod = @import("clone_limit.zig");
+const clone_detect_mod = @import("clone_detect.zig");
 const nick_delay_mod = @import("nick_delay.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
 const chghost = @import("../proto/chghost.zig");
@@ -1340,6 +1341,11 @@ pub const Config = struct {
     /// drops. The owning account may reclaim during the window; opers and
     /// `nick_delay_exempt` classes bypass. `0` disables nick delay.
     nick_delay_ms: u64 = 0,
+    /// Connection throttle: max new connections one source IP may open within
+    /// `throttle_window_ms`. `0` disables it. Loopback / trusted-proxy sources
+    /// are exempt so a shared reverse proxy never throttles distinct clients.
+    throttle_connects: u32 = 0,
+    throttle_window_ms: u64 = 10_000,
     /// IP-reputation refuse threshold: a peer whose decaying penalty score
     /// reaches this is refused at accept (0 = reputation disabled entirely).
     reputation_refuse_threshold: u32 = 0,
@@ -1647,6 +1653,9 @@ pub const ConnState = struct {
     /// True once this connection was counted by the clone limiter, so `closeConn`
     /// releases exactly the registrations it made (refused accepts never count).
     clone_counted: bool = false,
+    /// True once this connection was admitted (recorded) by the connection-rate
+    /// throttle, so its slot is released exactly once on close.
+    throttle_counted: bool = false,
     /// Whether this session was accepted over TLS (implicit-TLS connection fact;
     /// there is no STARTTLS). Gates +S channels. False until TLS lands.
     is_tls: bool = false,
@@ -2097,6 +2106,9 @@ pub const LinuxServer = struct {
     /// Nick-delay registry: nicks held against reuse after their owner exits
     /// (inert when `config.nick_delay_ms == 0`).
     nick_delay: nick_delay_mod.NickDelay,
+    /// Connection-rate throttle (per source IP); null when disabled
+    /// (`config.throttle_connects == 0`). Concurrent caps live in `clone_limit`.
+    conn_throttle: ?clone_detect_mod.CloneDetector,
     /// Decaying per-IP penalty table. Only consulted/updated when Config's
     /// reputation_refuse_threshold is non-zero (otherwise reputation is off).
     reputation: ip_reputation_mod.IpReputation,
@@ -2211,6 +2223,12 @@ pub const LinuxServer = struct {
     /// on deinit. Null/empty until the first successful REHASH.
     reload_parsed: ?config_format.Config = null,
     reload_bindings: []oper_mod.OperBinding = &.{},
+    /// Server-owned connection-class registry installed by the most recent REHASH.
+    /// The INITIAL registry stays owned by `Loaded` (freed by its deinit); each
+    /// REHASH builds a fresh self-owning registry here, frees the prior one, and
+    /// repoints `config.class_registry` — so the initial allocation is never
+    /// double-freed and rehash generations are freed at server deinit.
+    reload_class_registry: ?conn_class.Registry = null,
     /// Server-owned TLS cert/key material re-read by the most recent REHASH/ACME
     /// cert hot-reload. When present, `config.tls_cert_chain` + the signing-key
     /// fields borrow from here; the boot generation (main-owned, "borrowed,
@@ -2517,6 +2535,11 @@ pub const LinuxServer = struct {
                 .max_per_net = config.max_clones_per_net,
             }),
             .nick_delay = nick_delay_mod.NickDelay.init(allocator),
+            .conn_throttle = if (config.throttle_connects != 0) clone_detect_mod.CloneDetector.init(allocator, .{
+                .max_concurrent_per_ip = 0, // concurrent caps are clone_limit's job; this is pure rate
+                .max_connects_per_window = config.throttle_connects,
+                .window_ms = @max(@as(u64, 1), config.throttle_window_ms),
+            }) else null,
             .reputation = ip_reputation_mod.IpReputation.init(allocator, .{
                 .half_life_ms = @intCast(@max(1, config.reputation_half_life_ms)),
                 .refuse_threshold = @floatFromInt(config.reputation_refuse_threshold),
@@ -2771,6 +2794,7 @@ pub const LinuxServer = struct {
         self.chan_akick.deinit();
         self.chan_resv.deinit();
         self.clone_limit.deinit();
+        if (self.conn_throttle) |*t| t.deinit();
         self.nick_delay.deinit();
         self.reputation.deinit();
         self.accepts.deinit();
@@ -2820,6 +2844,7 @@ pub const LinuxServer = struct {
         self.tegami.deinit();
         self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
+        if (self.reload_class_registry) |*r| r.deinit();
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
         // Free the server-owned TLS reload generation, if any. The boot cert
         // generation is main-owned and is never freed here.
@@ -2998,6 +3023,10 @@ pub const LinuxServer = struct {
         // Evict lapsed nick-delay holds (reactor-0 only, like other shared-state
         // maintenance; runs under the same world write lock as hold/check/release).
         if (self.rx() == &self.reactors[0] and self.config.nick_delay_ms != 0) _ = self.nick_delay.sweep(self.nowMs());
+        // Prune the throttle's expired/empty per-IP state on the same cadence.
+        if (self.rx() == &self.reactors[0]) {
+            if (self.conn_throttle) |*t| t.prune(self.nowMs());
+        }
         self.sweepTempModes();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
         // rate-capped per peer, no-op while a dial is in flight or established).
@@ -3853,6 +3882,25 @@ pub const LinuxServer = struct {
                 if (self.reputation.shouldRefuse(addr, self.nowU64())) refuse = true;
             }
         }
+        // Connection-rate throttle: too many new connects from one source IP in
+        // the window are refused. Skipped for loopback / trusted-proxy sources
+        // (a shared reverse proxy fronting WebSocket clients must not be
+        // throttled as one IP). Fails open on any allocator/tracking error.
+        if (!refuse and self.conn_throttle != null and !self.ipCloneExempt(conn)) {
+            if (conn.peer_addr) |addr| {
+                var ipbuf: [64]u8 = undefined;
+                if (addrText(addr, &ipbuf)) |ip| {
+                    const decision = self.conn_throttle.?.classifyConnect(self.nowMs(), ip) catch .allow;
+                    switch (decision) {
+                        .allow => conn.throttle_counted = true,
+                        .connect_throttled, .clone_limited => {
+                            self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                            refuse = true;
+                        },
+                    }
+                }
+            }
+        }
         if (!refuse) {
             if (conn.peer_addr) |addr| {
                 if (self.clone_limit.register(addr)) {
@@ -3867,10 +3915,26 @@ pub const LinuxServer = struct {
             }
         }
         if (!refuse) return false;
+        // Refuse path bypasses closeConn, so release the throttle slot we may have
+        // recorded above before tearing the fd down (clone_limit only counts on
+        // the accept path, never here).
+        self.releaseThrottle(conn);
         closeFd(conn.fd);
         _ = self.rx().clients.free(id);
         self.stats.onAccept();
         return true;
+    }
+
+    /// Release this connection's connection-rate throttle slot (if it holds one).
+    /// Renders the same source-IP text used at `classifyConnect`. Used by both the
+    /// refuse path and `closeConn`.
+    fn releaseThrottle(self: *LinuxServer, conn: *ConnState) void {
+        if (!conn.throttle_counted) return;
+        conn.throttle_counted = false;
+        const t = if (self.conn_throttle) |*tt| tt else return;
+        const addr = conn.peer_addr orelse return;
+        var ipbuf: [64]u8 = undefined;
+        if (addrText(addr, &ipbuf)) |ip| _ = t.disconnect(ip);
     }
 
     fn startAcceptedTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, arm_recv: bool) !bool {
@@ -5330,6 +5394,7 @@ pub const LinuxServer = struct {
                 if (conn.peer_addr) |addr| self.clone_limit.release(addr);
                 conn.clone_counted = false;
             }
+            self.releaseThrottle(conn);
             self.activity_subs.removeClient(monitorIdFromClient(id));
             // Multi-session: a logged-in client's session is *retained* as
             // detached (for reclaim/bouncer); an anonymous client is dropped.
@@ -13837,6 +13902,27 @@ pub const LinuxServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
+        // Anti-clone policy summary: the global concurrent caps, the connection
+        // rate throttle, and a pointer to the per-class caps (STATS Y).
+        {
+            var sb: [320]u8 = undefined;
+            const clones_ip = if (self.config.max_clones_per_ip == 0) "off" else "on";
+            const clones_net = if (self.config.max_clones_per_net == 0) "off" else "on";
+            const hdr = std.fmt.bufPrint(&sb, "CLONES policy: max_per_ip={d} ({s}) max_per_net={d} ({s}); per-class clone caps via STATS Y", .{
+                self.config.max_clones_per_ip, clones_ip, self.config.max_clones_per_net, clones_net,
+            }) catch "CLONES policy";
+            try self.noticeTo(conn, hdr);
+            if (self.conn_throttle) |*t| {
+                var tb: [200]u8 = undefined;
+                const tl = std.fmt.bufPrint(&tb, "CLONES throttle: {d} connect(s)/{d}ms per IP (loopback + trusted-proxy exempt); {d} IP(s) tracked", .{
+                    self.config.throttle_connects, self.config.throttle_window_ms, t.trackedIps(),
+                }) catch "CLONES throttle";
+                try self.noticeTo(conn, tl);
+            } else {
+                try self.noticeTo(conn, "CLONES throttle: disabled (set [limits] throttle_connects)");
+            }
+        }
+
         var conns: std.ArrayListUnmanaged(svc_clonescan.Connection) = .empty;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
@@ -19079,6 +19165,11 @@ pub const LinuxServer = struct {
         self.reload_bindings = bindings;
         self.oper_registry = new_registry;
 
+        // Reload the anti-abuse runtime: connection classes (per-class clone /
+        // flood / admission policy), the global clone caps, the connection-rate
+        // throttle, and the nick-delay window — all from the freshly parsed config.
+        self.applyReloadedLimits(&self.reload_parsed.?);
+
         // Cert hot-reload: re-read the cert/key material from the reloaded paths
         // and atomically swap the live `config.tls_*` fields so NEW TLS handshakes
         // present the rotated leaf. Established sessions are untouched (no
@@ -19097,6 +19188,64 @@ pub const LinuxServer = struct {
             .{ bindings.len, tls_outcome.note() },
         ) catch "Configuration reloaded";
         try queueNumeric(conn, .RPL_REHASHING, &.{path}, note);
+    }
+
+    /// Apply the anti-abuse runtime knobs from a freshly parsed config on REHASH:
+    /// the connection-class registry (per-class clone/flood/admission policy), the
+    /// global clone caps, the connection-rate throttle, and the nick-delay window.
+    /// Best-effort: a failed class-registry rebuild keeps the current registry.
+    fn applyReloadedLimits(self: *LinuxServer, parsed: *const config_format.Config) void {
+        const lim = parsed.limits;
+
+        // Scalar caps — pure value updates (no ownership concerns).
+        self.config.max_clones_per_ip = lim.max_clones_per_ip;
+        self.config.max_clones_per_net = lim.max_clones_per_net;
+        self.clone_limit.config = .{ .max_per_ip = lim.max_clones_per_ip, .max_per_net = lim.max_clones_per_net };
+        self.config.nick_delay_ms = lim.nick_delay_ms;
+
+        // Connection-rate throttle: rebuild from the new window/limit. Drops the
+        // in-flight rate windows (a momentary, harmless leniency); the concurrent
+        // dimension stays owned by clone_limit.
+        self.config.throttle_connects = lim.throttle_connects;
+        self.config.throttle_window_ms = lim.throttle_window_ms;
+        if (self.conn_throttle) |*t| t.deinit();
+        self.conn_throttle = if (lim.throttle_connects != 0) clone_detect_mod.CloneDetector.init(self.allocator, .{
+            .max_concurrent_per_ip = 0,
+            .max_connects_per_window = lim.throttle_connects,
+            .window_ms = @max(@as(u64, 1), lim.throttle_window_ms),
+        }) else null;
+
+        // Connection classes: build a fresh self-owning registry (the Builder dupes
+        // everything), then free the prior server-owned generation and repoint the
+        // live registry. The initial registry stays owned by `Loaded`.
+        var cb = conn_class.Builder.init(self.allocator);
+        var ok = true;
+        for (parsed.classes) |c| {
+            cb.add(.{
+                .name = c.name,
+                .policy = c.policy,
+                .cidr_texts = c.match_texts,
+                .tls_only = c.match_tls,
+                .account_only = c.match_account,
+                .oper_only = c.match_oper,
+                .ident_glob = c.ident_glob,
+                .host_glob = c.host_glob,
+            }) catch {
+                ok = false;
+                break;
+            };
+        }
+        if (ok) {
+            if (cb.finish()) |new_reg| {
+                if (self.reload_class_registry) |*old| old.deinit();
+                self.reload_class_registry = new_reg;
+                self.config.class_registry = new_reg;
+            } else |_| {
+                cb.deinit();
+            }
+        } else {
+            cb.deinit();
+        }
     }
 
     /// Outcome of the REHASH cert hot-reload, folded into the RPL_REHASHING note.
@@ -33149,6 +33298,59 @@ test "REHASH cert hot-reload: not configured when TLS is absent" {
     try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.not_configured, outcome);
     try std.testing.expect(server.reload_tls == null);
     try std.testing.expectEqual(@as(usize, 0), server.config.tls_cert_chain.len);
+}
+
+test "REHASH applyReloadedLimits: swaps class registry + throttle without double-free" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit(); // testing allocator fails on any leak / double-free below
+
+    try std.testing.expect(server.conn_throttle == null);
+
+    // First reload: enable the throttle + a custom class with a per-account cap.
+    // node.id + listen.irc are required for parseToml to validate.
+    const toml1 =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\throttle_connects = 5
+        \\throttle_window = "10s"
+        \\[class.vip]
+        \\match_account = true
+        \\max_per_account = 3
+        \\
+    ;
+    var p1 = try config_format.parseToml(allocator, toml1, .{});
+    server.applyReloadedLimits(&p1);
+    p1.deinit(allocator); // the registry duped everything; freeing parsed is safe
+    try std.testing.expect(server.conn_throttle != null);
+    try std.testing.expectEqual(@as(u32, 5), server.config.throttle_connects);
+    try std.testing.expect(server.reload_class_registry != null);
+    try std.testing.expectEqual(@as(u32, 3), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
+
+    // Second reload: disable the throttle + change the class — frees gen 1.
+    const toml2 =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[limits]
+        \\throttle_connects = 0
+        \\[class.vip]
+        \\match_account = true
+        \\max_per_account = 7
+        \\
+    ;
+    var p2 = try config_format.parseToml(allocator, toml2, .{});
+    server.applyReloadedLimits(&p2);
+    p2.deinit(allocator);
+    try std.testing.expect(server.conn_throttle == null); // throttle disabled
+    try std.testing.expectEqual(@as(u32, 7), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
 }
 
 test {
