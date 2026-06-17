@@ -3320,14 +3320,17 @@ pub const LinuxServer = struct {
     /// this same sweep.)
     fn sweepTimeouts(self: *LinuxServer) void {
         const now = self.nowMs();
-        const reg_deadline = self.config.registration_timeout_ms;
-        const ping_interval = self.config.ping_interval_ms;
-        const ping_grace = self.config.ping_timeout_ms;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             const c = entry.value;
             if (c.closing) continue; // already tearing down
             if (c.s2s != null or c.s2s_secured != null) continue; // server links exempt
+            // Per-class timeout overrides (0 = inherit the `[limits]` global). The
+            // default class_policy on an unregistered conn inherits the global,
+            // which is correct — the class is not matched until registration.
+            const reg_deadline = if (c.class_policy.register_timeout_ms != 0) @as(i64, @intCast(c.class_policy.register_timeout_ms)) else self.config.registration_timeout_ms;
+            const ping_interval = if (c.class_policy.ping_interval_ms != 0) @as(i64, @intCast(c.class_policy.ping_interval_ms)) else self.config.ping_interval_ms;
+            const ping_grace = if (c.class_policy.ping_timeout_ms != 0) @as(i64, @intCast(c.class_policy.ping_timeout_ms)) else self.config.ping_timeout_ms;
 
             if (!c.session.registered()) {
                 // Unregistered: enforce the registration handshake window.
