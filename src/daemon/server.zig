@@ -387,6 +387,29 @@ const default_motd_template =
     "Note: this link is not encrypted — reconnect over TLS for privacy.{/if}\n" ++
     "Orochi — a clean-room, Zig-native IRCX/IRCv3 daemon: Suimyaku CRDT mesh, forward-secret Tsumugi links.";
 
+/// Reserved pseudo-channel used to gossip per-user PRESENCE across the mesh.
+///
+/// Channel membership is the only mesh-wide nick replication, so a remote user in
+/// no real channel was previously unroutable for cross-node DMs. Every registered
+/// local user is also announced as a member of this pseudo-channel (on register, in
+/// the anti-entropy burst, and withdrawn on quit), which lands them in each peer's
+/// route_table `nick_to_node` index exactly like a real membership — so the PRIVMSG
+/// relay can resolve them.
+///
+/// The name is route-only and never surfaces to users: it leads with `~`, which no
+/// channel-name validator accepts (`world.isChannelName` only takes `#`/`&`/`%`;
+/// `svc_forceaction.isChannelName` adds `+`/`!`), so it can't be JOINed/NAMEd/LISTed
+/// and is never created as a `world` channel; `drainMembershipChanges` also skips it
+/// so no fabricated JOIN/PART leaks. It must stay printable & space-free: the
+/// MEMBERSHIP codec (`membership_event.decode`) rejects control bytes (<0x20) in the
+/// channel field, so a control-char sentinel would be silently dropped on receive.
+/// See [[reference-orochi-crossnode-routing]].
+const presence_channel: []const u8 = "~presence~";
+
+inline fn isPresenceChannel(name: []const u8) bool {
+    return std.mem.eql(u8, name, presence_channel);
+}
+
 /// Sink adapter that writes complete (CRLF-terminated) builder lines to a conn.
 const ConnLineSink = struct {
     conn: *ConnState,
@@ -5281,6 +5304,10 @@ pub const LinuxServer = struct {
                 if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false, .{});
             }
         }
+        // Withdraw the user's mesh PRESENCE (the no-channel-aware counterpart of the
+        // per-channel parts above) so peers drop them from the route_table even if
+        // they were in no channel. Mirrors the announce in `registerConnNick`.
+        if (announce) self.announceMembership(presence_channel, nick, 0, false, .{});
     }
 
     /// Drive an implicit-TLS client's recv chunk: frame + decrypt through the
@@ -5760,6 +5787,12 @@ pub const LinuxServer = struct {
         // a fanout failure (e.g. a watcher's send queue, or the >64-watcher path)
         // must never abort the registering client's own registration / welcome.
         self.monitorOnline(nick) catch {};
+        // Gossip this user's PRESENCE to the mesh so cross-node DMs reach them even
+        // when they are in no channel (channel membership alone wouldn't replicate
+        // them). Idempotent + re-affirmed by the anti-entropy burst; withdrawn in
+        // `broadcastQuit`. The same-account-share path returned above, so a second
+        // session sharing the nick doesn't re-announce (the primary already did).
+        self.announceMembership(presence_channel, nick, 0, true, membershipIdentityOf(conn));
     }
 
     /// Whether `nick` is currently held in the world by a LOCAL connection that
@@ -5948,6 +5981,27 @@ pub const LinuxServer = struct {
             }
             if (self.world.mutesOf(cv.name)) |entries| {
                 for (entries) |entry| self.sendChannelListToConn(conn, cv.name, .quiet, entry.mask, entry.setter, entry.set_at, hlc, true);
+            }
+        }
+        // PRESENCE burst: announce every local registered user (channel or not) into
+        // the peer's `presence_channel` roster so it can route cross-node DMs to them.
+        // Reuses the signed MEMBERSHIP path; `presence_channel` is suppressed from all
+        // user-visible emit, so it only ever populates the peer's route index. Runs on
+        // link-establish AND the periodic anti-entropy resync (idempotent, HLC-keyed).
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const mc = &slot.value;
+                if (mc.s2s != null or mc.s2s_secured != null) continue; // skip peer links
+                if (!mc.session.registered()) continue;
+                const pnick = mc.session.displayName();
+                if (std.mem.eql(u8, pnick, "*")) continue;
+                const pident = membershipIdentityOf(mc);
+                if (conn.s2s_secured) |link| {
+                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident) catch continue;
+                } else if (conn.s2s) |link| {
+                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident) catch continue;
+                }
             }
         }
         if (conn.s2s_secured) |link| {
@@ -7065,15 +7119,19 @@ pub const LinuxServer = struct {
                 while (j < changes.len and changes[j].kind == .joined and
                     std.mem.eql(u8, changes[j].channel, chan)) : (j += 1)
                 {}
-                if (j - i >= 2) {
-                    self.emitNetjoinRun(chan, remote, changes[i..j]);
-                } else {
-                    self.emitRemoteMembership(&changes[i], remote);
+                // The PRESENCE pseudo-channel is route-only: applyMembership already
+                // updated the route_table; never surface it to clients as a JOIN.
+                if (!isPresenceChannel(chan)) {
+                    if (j - i >= 2) {
+                        self.emitNetjoinRun(chan, remote, changes[i..j]);
+                    } else {
+                        self.emitRemoteMembership(&changes[i], remote);
+                    }
                 }
                 for (changes[i..j]) |*ch| ch.deinit(self.allocator);
                 i = j;
             } else {
-                self.emitRemoteMembership(&changes[i], remote);
+                if (!isPresenceChannel(changes[i].channel)) self.emitRemoteMembership(&changes[i], remote);
                 changes[i].deinit(self.allocator);
                 i += 1;
             }
