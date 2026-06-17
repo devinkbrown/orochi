@@ -10132,7 +10132,10 @@ pub const LinuxServer = struct {
         var replies_buf: [64]monitor.MonitorReply = undefined;
         var storage: [default_reply_bytes]u8 = undefined;
         var sink = monitor.MonitorReplySink{ .replies = &replies_buf, .storage = &storage };
-        self.monitor.handle(monitorIdFromClient(id), parsed.paramSlice(), &sink) catch |err| switch (err) {
+        // A per-connection-class `monitor` cap (when set) overrides the global
+        // advertised MONITOR limit for this client's adds.
+        const monitor_cap: ?usize = if (conn.class_policy.monitor != 0) conn.class_policy.monitor else null;
+        self.monitor.handleWithLimit(monitorIdFromClient(id), parsed.paramSlice(), &sink, monitor_cap) catch |err| switch (err) {
             error.MissingParameter => return queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"MONITOR"}, "Not enough parameters"),
             error.OutOfMemory => return error.OutOfMemory,
             else => return, // InvalidTarget / TooManyReplies / OutputTooSmall: best-effort
@@ -10382,9 +10385,15 @@ pub const LinuxServer = struct {
         };
         var prefix_buf: [256]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
+        // A per-connection-class `silence` cap (when set) overrides the global
+        // advertised SILENCE limit for this owner's adds.
+        const silence_cap: usize = if (conn.class_policy.silence != 0)
+            conn.class_policy.silence
+        else
+            self.silence.params.max_masks_per_owner;
         for (req.slice()) |op| {
             const changed = switch (op.kind) {
-                .add => self.silence.add(owner, op.mask) catch continue,
+                .add => self.silence.addWithLimit(owner, op.mask, silence_cap) catch continue,
                 .remove => self.silence.remove(owner, op.mask) catch continue,
             };
             if (!changed) continue;
@@ -20069,6 +20078,12 @@ pub const LinuxServer = struct {
         var ntarget: u32 = 0;
         var unique_targets: [64][]const u8 = undefined;
         var unique_count: usize = 0;
+        // A per-connection-class `max_targets` cap (when set) overrides the global
+        // advertised MAXTARGETS for this client's fan-out.
+        const target_cap: u32 = if (conn.class_policy.max_targets != 0)
+            conn.class_policy.max_targets
+        else
+            self.config.maxtargets;
         while (targets.next()) |target| {
             if (target.len == 0) continue;
             var duplicate = false;
@@ -20080,7 +20095,7 @@ pub const LinuxServer = struct {
             }
             if (duplicate) continue;
             ntarget += 1;
-            if (ntarget > self.config.maxtargets) {
+            if (ntarget > target_cap) {
                 try queueNumeric(conn, .ERR_TOOMANYTARGETS, &.{target}, "Too many recipients");
                 break;
             }

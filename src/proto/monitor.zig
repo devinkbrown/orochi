@@ -159,12 +159,24 @@ pub const MonitorStore = struct {
         params: []const []const u8,
         sink: *MonitorReplySink,
     ) MonitorError!void {
+        return self.handleWithLimit(client, params, sink, null);
+    }
+
+    /// As `handle`, but `max_override` (when non-null) replaces the store-wide
+    /// `max_monitor` for MONITOR + adds — the per-connection-class `monitor` cap.
+    pub fn handleWithLimit(
+        self: *MonitorStore,
+        client: ClientId,
+        params: []const []const u8,
+        sink: *MonitorReplySink,
+        max_override: ?usize,
+    ) MonitorError!void {
         if (params.len == 0) return error.MissingParameter;
         const subcommand = try parseSubcommand(params[0]);
         switch (subcommand) {
             .add => {
                 if (params.len < 2) return error.MissingParameter;
-                try self.addTargets(client, params[1], sink);
+                try self.addTargetsWithLimit(client, params[1], sink, max_override);
             },
             .remove => {
                 if (params.len < 2) return error.MissingParameter;
@@ -183,11 +195,23 @@ pub const MonitorStore = struct {
         target_list: []const u8,
         sink: *MonitorReplySink,
     ) MonitorError!void {
+        return self.addTargetsWithLimit(client, target_list, sink, null);
+    }
+
+    /// As `addTargets`, but `max_override` (when non-null) replaces the store-wide
+    /// `max_monitor` ceiling for this batch.
+    pub fn addTargetsWithLimit(
+        self: *MonitorStore,
+        client: ClientId,
+        target_list: []const u8,
+        sink: *MonitorReplySink,
+        max_override: ?usize,
+    ) MonitorError!void {
         var cursor: usize = 0;
         while (cursor <= target_list.len) {
             const next = findByte(target_list, cursor, ',') orelse target_list.len;
             const target = target_list[cursor..next];
-            try self.addOne(client, target, sink);
+            try self.addOne(client, target, sink, max_override);
             if (next == target_list.len) break;
             cursor = next + 1;
         }
@@ -293,6 +317,7 @@ pub const MonitorStore = struct {
         client: ClientId,
         target: []const u8,
         sink: *MonitorReplySink,
+        max_override: ?usize,
     ) MonitorError!void {
         const normalized = try NickKey.init(target, true);
         const display = try NickKey.init(target, false);
@@ -300,7 +325,10 @@ pub const MonitorStore = struct {
         const state = try self.clientState(client);
         if (state.targets.contains(normalized)) return;
 
-        if (state.targets.count() >= self.max_monitor) {
+        // A per-connection-class cap (when set) overrides the store-wide
+        // `max_monitor`; null falls back to the global advertised limit.
+        const cap = max_override orelse self.max_monitor;
+        if (state.targets.count() >= cap) {
             try sink.append(.ERR_MONLISTFULL, client, target, "Monitor list is full");
             return;
         }
@@ -613,4 +641,33 @@ test "list full emits ERR_MONLISTFULL without adding overflow target" {
     try std.testing.expect(!try store.isMonitoring(7, "c"));
     try expectReply(sink.replies[2], .ERR_MONLISTFULL, 7, "c");
     try std.testing.expectEqualStrings("Monitor list is full", sink.replies[2].text);
+}
+
+test "per-class override tightens the monitor cap below the store-wide limit" {
+    // Store-wide limit is generous (8); a class override of 1 must win.
+    var store = MonitorStore.init(std.testing.allocator, 8);
+    defer store.deinit();
+
+    var replies: [16]MonitorReply = undefined;
+    var storage: [1024]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+
+    try store.handleWithLimit(3, &.{ "+", "a,b" }, &sink, 1);
+    try std.testing.expectEqual(@as(usize, 1), store.monitorCount(3));
+    try std.testing.expect(try store.isMonitoring(3, "a"));
+    try std.testing.expect(!try store.isMonitoring(3, "b"));
+    try expectReply(sink.replies[1], .ERR_MONLISTFULL, 3, "b");
+}
+
+test "per-class override loosens the monitor cap above the store-wide limit" {
+    // Store-wide limit is 1; a class override of 3 must allow all three.
+    var store = MonitorStore.init(std.testing.allocator, 1);
+    defer store.deinit();
+
+    var replies: [16]MonitorReply = undefined;
+    var storage: [1024]u8 = undefined;
+    var sink = MonitorReplySink{ .replies = &replies, .storage = &storage };
+
+    try store.handleWithLimit(4, &.{ "+", "a,b,c" }, &sink, 3);
+    try std.testing.expectEqual(@as(usize, 3), store.monitorCount(4));
 }

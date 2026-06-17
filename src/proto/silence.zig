@@ -121,11 +121,18 @@ pub const Store = struct {
 
     /// Add `mask` to `owner`'s SILENCE list. Returns false for duplicates.
     pub fn add(self: *Store, owner: []const u8, mask: []const u8) SilenceError!bool {
+        return self.addWithLimit(owner, mask, self.params.max_masks_per_owner);
+    }
+
+    /// As `add`, but `max_masks` replaces the store-wide `max_masks_per_owner`
+    /// ceiling — the per-connection-class `silence` cap. Pass the global default
+    /// to preserve the standard behavior.
+    pub fn addWithLimit(self: *Store, owner: []const u8, mask: []const u8, max_masks: usize) SilenceError!bool {
         try validateOwner(owner, self.params.max_owner_bytes);
         try validateMask(mask, self.params.max_mask_bytes);
 
         if (self.owners.getPtr(owner)) |client_list| {
-            return client_list.add(self.allocator, self.params.max_masks_per_owner, mask);
+            return client_list.add(self.allocator, max_masks, mask);
         }
 
         const owner_copy = try self.allocator.dupe(u8, owner);
@@ -135,7 +142,7 @@ pub const Store = struct {
         };
         if (gop.found_existing) {
             self.allocator.free(owner_copy);
-            return gop.value_ptr.add(self.allocator, self.params.max_masks_per_owner, mask);
+            return gop.value_ptr.add(self.allocator, max_masks, mask);
         }
 
         gop.key_ptr.* = owner_copy;
@@ -147,7 +154,7 @@ pub const Store = struct {
             self.allocator.free(owned_key);
         }
 
-        return gop.value_ptr.add(self.allocator, self.params.max_masks_per_owner, mask);
+        return gop.value_ptr.add(self.allocator, max_masks, mask);
     }
 
     /// Remove `mask` from `owner`'s SILENCE list. Returns false when absent.
@@ -483,6 +490,20 @@ test "limit and buffer bounds" {
     var short: [4]u8 = undefined;
     try std.testing.expectError(error.OutputTooSmall, store.list("alice", &short));
     try std.testing.expectError(error.TooManyOperations, parseWith(.{ .max_operations = 1 }, &.{ "+a!*@h", "-b!*@h" }));
+}
+
+test "addWithLimit overrides the store-wide silence cap per call" {
+    // Store-wide cap is 1; a per-class override of 2 admits the second mask,
+    // while the global `add` path still trips at 1.
+    var store = Store.initWithParams(std.testing.allocator, .{ .max_masks_per_owner = 1 });
+    defer store.deinit();
+
+    try std.testing.expect(try store.addWithLimit("alice", "one!*@host", 2));
+    try std.testing.expect(try store.addWithLimit("alice", "two!*@host", 2));
+    try std.testing.expectError(error.LimitReached, store.addWithLimit("alice", "three!*@host", 2));
+    // The default (global) cap still tightens back to 1 for a fresh owner.
+    try std.testing.expect(try store.add("bob", "one!*@host"));
+    try std.testing.expectError(error.LimitReached, store.add("bob", "two!*@host"));
 }
 
 test "no leak after owner removal" {
