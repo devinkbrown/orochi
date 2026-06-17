@@ -52,6 +52,8 @@ pub const Privilege = enum {
     oper_spy, // see private info (GEOIP, OPERSPY, real host/IP)
     event_subscribe,
     audit_read,
+    // Connection limits.
+    limit_exempt, // bypass clone / per-class connection caps (and the +2 account bonus)
     // Catch-all override for force/sa-style actions.
     oper_override,
 };

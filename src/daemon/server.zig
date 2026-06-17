@@ -7185,22 +7185,25 @@ pub const LinuxServer = struct {
         // scan yields every dimension; each count includes this just-registered
         // connection, so the Nth admitted client trips when the count exceeds the
         // limit. The IP and host dimensions are skipped for loopback/trusted-proxy
-        // sources, which legitimately aggregate many distinct clients.
-        if (reason == null and (p.max_clients != 0 or p.max_per_ip != 0 or
-            p.max_per_account != 0 or p.max_per_host != 0))
+        // sources, which legitimately aggregate many distinct clients. Operators
+        // holding `limit_exempt` bypass every cap; authenticated accounts get a +2
+        // bonus on the source-keyed caps (IP / host / account).
+        if (reason == null and !conn.session.hasPriv(.limit_exempt) and
+            (p.max_clients != 0 or p.max_per_ip != 0 or p.max_per_account != 0 or p.max_per_host != 0))
         {
             if (self.config.class_registry) |*r| {
                 const name = r.classFor(matchCtx(conn)).name;
                 const counts = self.classCounts(conn, name);
                 const ip_exempt = self.ipCloneExempt(conn);
                 const host_exempt = ip_exempt or std.mem.eql(u8, conn.session.realHost(), default_host);
+                const bonus: u32 = if (conn.session.account() != null) 2 else 0;
                 if (p.max_clients != 0 and counts.total > p.max_clients) {
                     reason = "Connection class is full (too many clients)";
-                } else if (p.max_per_ip != 0 and !ip_exempt and counts.ip > p.max_per_ip) {
+                } else if (p.max_per_ip != 0 and !ip_exempt and counts.ip > p.max_per_ip + bonus) {
                     reason = "Too many connections from your host in this connection class";
-                } else if (p.max_per_account != 0 and conn.session.account() != null and counts.account > p.max_per_account) {
+                } else if (p.max_per_account != 0 and conn.session.account() != null and counts.account > p.max_per_account + bonus) {
                     reason = "Too many connections from your account in this connection class";
-                } else if (p.max_per_host != 0 and !host_exempt and counts.host > p.max_per_host) {
+                } else if (p.max_per_host != 0 and !host_exempt and counts.host > p.max_per_host + bonus) {
                     reason = "Too many connections from your host in this connection class";
                 }
             }
