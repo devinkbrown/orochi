@@ -399,6 +399,9 @@ pub const RouteTable = struct {
     /// stored one for this nick) are ignored, so out-of-order gossip converges.
     /// `ident` carries the member's propagated username/realname/visible-host;
     /// on a newer event the stored identity is replaced (LWW, like the status).
+    /// Also maintains the `nick_to_node` routing index (so `nickNode` resolves the
+    /// remote nick for PRIVMSG relay): a present apply upserts the location, a part
+    /// drops it once the nick is absent from every channel roster.
     pub fn applyMembership(
         self: *Self,
         chan: []const u8,
@@ -426,11 +429,20 @@ pub const RouteTable = struct {
                 cur.node = node;
                 cur.status = status;
                 cur.hlc = hlc;
+                // Keep the nick->node routing index in sync so PRIVMSG relay can
+                // resolve this remote nick (best-effort: a full index degrades to
+                // NAMES/WHOIS-only, never breaks membership). Re-run even on a
+                // re-affirmation so entries predating this wiring self-heal.
+                self.setNickLocation(nick, node) catch {};
                 return .{ .outcome = if (changed) .status_changed else .unchanged, .prev_status = prev };
             } else {
                 cur.freeStrings(self.allocator);
                 _ = list.entries.swapRemove(idx);
                 self.pruneIfEmpty(chan);
+                // Drop the nick->node route only when the member is gone from EVERY
+                // known channel; channel membership is the only mesh-wide nick
+                // replication, so a still-present membership keeps the route alive.
+                if (self.findMember(nick) == null) _ = self.removeNick(nick);
                 return .{ .outcome = .parted, .prev_status = prev };
             }
         }
@@ -453,6 +465,9 @@ pub const RouteTable = struct {
             .status = status,
             .hlc = hlc,
         });
+        // Index this newly-learned remote nick for PRIVMSG relay routing
+        // (best-effort, see the upsert branch above).
+        self.setNickLocation(nick, node) catch {};
         return .{ .outcome = .joined };
     }
 
@@ -941,6 +956,29 @@ test "applyMembership part removes a member and prunes an empty channel" {
     // Newer part removes; the now-empty channel is pruned.
     _ = try table.applyMembership("#x", "alice", 10, 0, 2, false, .{});
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
+}
+
+test "applyMembership maintains the nick->node routing index for PRIVMSG relay" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // A join makes the remote nick resolvable to its owning node — this is the
+    // index the cross-node PRIVMSG relay consults (`nickNode`). Before the fix it
+    // stayed empty (only NAMES/WHOIS, which scan the roster, worked) so every
+    // cross-node PM fell through to ERR_NOSUCHNICK.
+    _ = try table.applyMembership("#a", "alice", 10, 0, 1, true, .{});
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
+
+    // The same nick in a second channel must keep one location; parting ONE
+    // channel must NOT drop the route while another membership remains.
+    _ = try table.applyMembership("#b", "alice", 10, 0, 1, true, .{});
+    _ = try table.applyMembership("#a", "alice", 10, 0, 2, false, .{}); // part #a
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
+
+    // Parting the LAST channel drops the route (channel membership is the only
+    // mesh-wide nick replication, so a no-channel remote user is unroutable).
+    _ = try table.applyMembership("#b", "alice", 10, 0, 3, false, .{}); // part #b
+    try std.testing.expect(table.nickNode("alice") == null);
 }
 
 test "applyChannelList tracks list masks with last-writer-wins tombstones" {
