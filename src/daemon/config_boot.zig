@@ -10,6 +10,7 @@ const std = @import("std");
 const config_format = @import("config_format.zig");
 const server = @import("server.zig");
 const oper_mod = @import("oper.zig");
+const conn_class = @import("conn_class.zig");
 const og_mod = @import("operator_groups.zig");
 const event_spine = @import("event_spine.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
@@ -244,6 +245,7 @@ pub const Loaded = struct {
 
     pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
         allocator.free(self.oper_bindings);
+        if (self.config.class_registry) |*r| r.deinit();
         self.parsed.deinit(allocator);
         self.* = undefined;
     }
@@ -304,6 +306,28 @@ pub fn loadFromText(
     var config = mapToServerConfig(parsed, base);
     if (oper_bindings.len != 0) {
         config.oper_registry = try oper_mod.OperRegistry.init(oper_bindings);
+    }
+    // Build the connection-class registry from `[class.*]`. A malformed class is
+    // skipped with a warning rather than aborting boot; the registry always ends
+    // up with at least the built-in `user`/`server` fallbacks. The registry value
+    // lives on `config` (a copy reaches the daemon, sharing the heap); `Loaded`
+    // owns the allocation and frees it once in `deinit` — mirroring oper_registry.
+    {
+        var cb = conn_class.Builder.init(allocator);
+        errdefer cb.deinit();
+        for (parsed.classes) |c| {
+            cb.add(.{
+                .name = c.name,
+                .policy = c.policy,
+                .cidr_texts = c.match_texts,
+                .tls_only = c.match_tls,
+                .account_only = c.match_account,
+                .oper_only = c.match_oper,
+                .ident_glob = c.ident_glob,
+                .host_glob = c.host_glob,
+            }) catch |e| std.debug.print("orochi: skipping connection class '{s}': {s}\n", .{ c.name, @errorName(e) });
+        }
+        config.class_registry = try cb.finish();
     }
     return .{
         .config = config,
@@ -678,4 +702,38 @@ test "missing required [node].id is rejected" {
     const allocator = testing.allocator;
     const text = "[listen]\nirc = 6680\n";
     try testing.expectError(error.ParseError, loadFromText(allocator, text, .{ .port = 6680 }, .{}));
+}
+
+test "[class.*] parses into the connection-class registry with v4/v6 + TLS match" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[class.user]
+        \\sendq = "2M"
+        \\max_per_ip = 4
+        \\[class.server]
+        \\sendq = "16M"
+        \\[class.trusted]
+        \\sendq = "8M"
+        \\flood_exempt = true
+        \\match = ["10.0.0.0/8", "::1"]
+        \\match_tls = true
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    const reg = &loaded.config.class_registry.?;
+    // Built-in overrides honored; custom class present.
+    try testing.expectEqual(@as(u64, 2 << 20), reg.byName("user").?.policy.sendq);
+    try testing.expectEqual(@as(u32, 4), reg.byName("user").?.policy.max_per_ip);
+    try testing.expectEqual(@as(u64, 16 << 20), reg.byName("server").?.policy.sendq);
+    try testing.expect(reg.byName("trusted").?.policy.flood_exempt);
+    // Matching: 10.x over TLS -> trusted; without TLS -> user; v6 ::1 TLS -> trusted.
+    try testing.expectEqualStrings("trusted", reg.classFor(.{ .ip_text = "10.1.2.3", .is_tls = true }).name);
+    try testing.expectEqualStrings("user", reg.classFor(.{ .ip_text = "10.1.2.3", .is_tls = false }).name);
+    try testing.expectEqualStrings("trusted", reg.classFor(.{ .ip_text = "::1", .is_tls = true }).name);
+    try testing.expectEqualStrings("server", reg.classFor(.{ .is_server_link = true }).name);
 }

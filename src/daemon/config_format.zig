@@ -10,6 +10,7 @@
 //! defaults stand. Required: `[node].id` and `[listen].irc`.
 const std = @import("std");
 const toml = @import("../proto/toml.zig");
+const conn_class = @import("conn_class.zig");
 const shard = @import("shard.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const media_room = @import("media_room.zig");
@@ -42,6 +43,9 @@ pub const Config = struct {
     listen: Listen = .{},
     opers: []Oper = &.{},
     oper_groups: []OperGroup = &.{},
+    /// `[class.*]` connection classes (owned). Built into a `conn_class.Registry`
+    /// by `config_boot`; assignment/enforcement live in the daemon.
+    classes: []ClassDef = &.{},
     mesh: Mesh = .{},
     limits: Limits = .{},
     io: Io = .{},
@@ -235,6 +239,20 @@ pub const Config = struct {
         /// Period of the io_uring timeout-sweep timer; sets the enforcement
         /// granularity of registration/ping/idle timeouts.
         sweep_interval_ms: u64 = 2_000,
+    };
+
+    /// One `[class.<name>]` connection class as parsed from TOML (owned strings).
+    /// `policy` carries the resource/admission/flood limits; the `match_*` fields
+    /// carry the criteria a connection must satisfy to be assigned the class.
+    pub const ClassDef = struct {
+        name: []const u8 = "",
+        policy: conn_class.Policy = .{},
+        match_texts: []const []const u8 = &.{},
+        match_tls: bool = false,
+        match_account: bool = false,
+        match_oper: bool = false,
+        ident_glob: ?[]const u8 = null,
+        host_glob: ?[]const u8 = null,
     };
 
     /// io_uring / per-connection transport tuning.
@@ -457,6 +475,13 @@ pub const Config = struct {
             allocator.free(g.inherits);
         }
         allocator.free(self.oper_groups);
+        for (self.classes) |c| {
+            allocator.free(c.name);
+            freeStringList(allocator, c.match_texts);
+            if (c.ident_glob) |g| allocator.free(g);
+            if (c.host_glob) |g| allocator.free(g);
+        }
+        allocator.free(self.classes);
         allocator.free(self.mesh.realm);
         freeStringList(allocator, self.mesh.trust_roots);
         freeStringList(allocator, self.mesh.connect);
@@ -735,12 +760,105 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         cfg.oper_groups = try list.toOwnedSlice(allocator);
     }
 
+    // [class.*] connection classes — a table of named sub-tables. Each becomes a
+    // ClassDef (policy + match criteria); config_boot builds the live Registry.
+    if (doc.get("class")) |class_val| switch (class_val.*) {
+        .table => |tbl| {
+            var list: std.ArrayList(Config.ClassDef) = .empty;
+            errdefer {
+                for (list.items) |c| {
+                    allocator.free(c.name);
+                    freeStringList(allocator, c.match_texts);
+                    if (c.ident_glob) |g| allocator.free(g);
+                    if (c.host_glob) |g| allocator.free(g);
+                }
+                list.deinit(allocator);
+            }
+            var it = tbl.iterator();
+            while (it.next()) |entry| {
+                const item = entry.value_ptr;
+                if (std.meta.activeTag(item.*) != .table) continue;
+                const name = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(name);
+                var policy = conn_class.Policy{};
+                policy.sendq = try classSize(item, "sendq", policy.sendq);
+                policy.recvq = try classSize(item, "recvq", policy.recvq);
+                policy.max_clients = try classU32(item, "max_clients", policy.max_clients);
+                policy.max_per_ip = try classU32(item, "max_per_ip", policy.max_per_ip);
+                policy.max_channels = try classU32(item, "max_channels", policy.max_channels);
+                policy.ping_interval_ms = try classDur(item, "ping_interval", policy.ping_interval_ms);
+                policy.ping_timeout_ms = try classDur(item, "ping_timeout", policy.ping_timeout_ms);
+                policy.register_timeout_ms = try classDur(item, "register_timeout", policy.register_timeout_ms);
+                policy.flood_lines = try classU32(item, "flood_lines", policy.flood_lines);
+                policy.flood_window_ms = try classDur(item, "flood_window", policy.flood_window_ms);
+                policy.require_tls = item.getBool("require_tls") orelse policy.require_tls;
+                policy.require_sasl = item.getBool("require_sasl") orelse policy.require_sasl;
+                policy.flood_exempt = item.getBool("flood_exempt") orelse policy.flood_exempt;
+                policy.max_targets = try classU32(item, "max_targets", policy.max_targets);
+                policy.monitor = try classU32(item, "monitor", policy.monitor);
+                policy.silence = try classU32(item, "silence", policy.silence);
+                const match_texts: []const []const u8 = if (item.getArray("match")) |marr|
+                    try ownStringArray(allocator, resolver, marr)
+                else
+                    &.{};
+                errdefer freeStringList(allocator, match_texts);
+                const ident_glob: ?[]const u8 = if (item.getString("match_ident")) |g| try resolveStr(allocator, resolver, g) else null;
+                errdefer if (ident_glob) |g| allocator.free(g);
+                const host_glob: ?[]const u8 = if (item.getString("match_host")) |g| try resolveStr(allocator, resolver, g) else null;
+                errdefer if (host_glob) |g| allocator.free(g);
+                try list.append(allocator, .{
+                    .name = name,
+                    .policy = policy,
+                    .match_texts = match_texts,
+                    .match_tls = item.getBool("match_tls") orelse false,
+                    .match_account = item.getBool("match_account") orelse false,
+                    .match_oper = item.getBool("match_oper") orelse false,
+                    .ident_glob = ident_glob,
+                    .host_glob = host_glob,
+                });
+            }
+            cfg.classes = try list.toOwnedSlice(allocator);
+        },
+        else => {},
+    };
+
     // Required-field validation.
     if (cfg.node.id == 0) return error.ParseError;
     if (cfg.listen.irc == 0) return error.ParseError;
     for (cfg.opers) |o| if (o.account.len == 0) return error.ParseError;
 
     return cfg;
+}
+
+/// Read a class byte-size field: a string ("1M") parsed via `conn_class.parseSize`
+/// or a bare integer (bytes). Missing → `current`.
+fn classSize(item: *const toml.Value, key: []const u8, current: u64) TomlError!u64 {
+    if (item.getString(key)) |s| return conn_class.parseSize(s) catch return error.ParseError;
+    if (item.getInt(key)) |n| {
+        if (n < 0) return error.ParseError;
+        return @intCast(n);
+    }
+    return current;
+}
+
+/// Read a class duration field (ms): a string ("120s") via `parseDurationMs` or a
+/// bare integer (ms). Missing → `current`.
+fn classDur(item: *const toml.Value, key: []const u8, current: u64) TomlError!u64 {
+    if (item.getString(key)) |s| return conn_class.parseDurationMs(s) catch return error.ParseError;
+    if (item.getInt(key)) |n| {
+        if (n < 0) return error.ParseError;
+        return @intCast(n);
+    }
+    return current;
+}
+
+/// Read a class u32 count field. Missing → `current`.
+fn classU32(item: *const toml.Value, key: []const u8, current: u32) TomlError!u32 {
+    if (item.getInt(key)) |n| {
+        if (n < 0 or n > std.math.maxInt(u32)) return error.ParseError;
+        return @intCast(n);
+    }
+    return current;
 }
 
 /// Resolve a raw TOML string into an owned value, honoring `env:NAME` /

@@ -219,6 +219,7 @@ const reuseport = @import("reuseport.zig");
 const reactor_fabric = @import("reactor_fabric.zig");
 const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
+const conn_class = @import("conn_class.zig");
 const og_mod = @import("operator_groups.zig");
 const config_format = @import("config_format.zig");
 const tls_certs = @import("tls_certs.zig");
@@ -1465,6 +1466,12 @@ pub const Config = struct {
     /// Oper is SASL-only: a client is elevated on SASL login if its account has a
     /// binding here. Null/empty = no operators (the OPER command never grants).
     oper_registry: ?oper_mod.OperRegistry = null,
+    /// Connection-class registry (`[class.*]`): per-connection policy (sendq/recvq,
+    /// limits, timeouts, admission, flood) chosen by IP/TLS/account/oper matching.
+    /// A value copy here shares the heap with `config_boot.Loaded`, which owns the
+    /// allocation and frees it once at shutdown (mirrors `oper_registry`). Null =
+    /// only the built-in `user`/`server` defaults apply.
+    class_registry: ?conn_class.Registry = null,
     /// Account services (REGISTER/IDENTIFY/DROP/…) backed by the WAL store. Null =
     /// account management disabled. Borrowed; outlives the server (owned by main).
     account_services: ?*services_mod.Services = null,
