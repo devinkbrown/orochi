@@ -461,6 +461,19 @@ pub const SecuredLink = struct {
         return link.takeSessionMigrations();
     }
 
+    /// Emit a CLONE_COUNT batch over the encrypted leg, then flush ciphertext.
+    pub fn sendCloneCounts(self: *SecuredLink, payload: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendCloneCounts(payload);
+        try self.drainInner();
+    }
+
+    /// Drain queued inbound CLONE_COUNT payloads decoded by the inner link.
+    pub fn takeCloneCounts(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeCloneCounts();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis
     /// (empty until the inner CRDT link is established).
     pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {

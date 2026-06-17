@@ -202,6 +202,10 @@ pub const S2sPeer = struct {
     /// (MigrationTarget.accept) + stage into PendingMigrations. The peer driver
     /// stays substrate-pure: it never opens the signed capsule, only stages it.
     session_migrations: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Inbound CLONE_COUNT payloads (raw `mesh_clones` counts-codec bytes) from
+    /// this peer, awaiting the daemon to decode + fold into its network-wide clone
+    /// aggregate. The peer driver stays substrate-pure: it never decodes them.
+    clone_counts: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -280,6 +284,8 @@ pub const S2sPeer = struct {
         self.nick_changes.deinit(self.allocator);
         for (self.session_migrations.items) |m| self.allocator.free(m);
         self.session_migrations.deinit(self.allocator);
+        for (self.clone_counts.items) |m| self.allocator.free(m);
+        self.clone_counts.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -428,6 +434,7 @@ pub const S2sPeer = struct {
             .ENTITY_PROP => try self.recvEntityProp(frame.payload),
             .CHANNEL_MODE_STATE => try self.recvChannelModeState(frame.payload),
             .SESSION_MIGRATE => try self.recvSessionMigrate(frame.payload),
+            .CLONE_COUNT => try self.recvCloneCounts(frame.payload),
         }
     }
 
@@ -474,6 +481,29 @@ pub const S2sPeer = struct {
     /// Best-effort; only meaningful once established.
     pub fn sendSessionMigrate(self: *S2sPeer, sink: ByteSink, frame_bytes: []const u8) !void {
         try emitFrame(self.allocator, sink, .SESSION_MIGRATE, frame_bytes);
+    }
+
+    /// Queue an inbound CLONE_COUNT payload (raw `mesh_clones` counts bytes) for
+    /// the daemon to decode + aggregate. Gated to authenticated direct peers
+    /// (matching the other direct-owned frames); a copy is taken, and oversize /
+    /// alloc failures drop it rather than fault the link. The daemon attributes
+    /// the counts to THIS peer's node id, so a peer cannot inject another node's.
+    fn recvCloneCounts(self: *S2sPeer, payload: []const u8) !void {
+        if (!self.acceptsDirectOrigin(self.remote_node_id)) return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.clone_counts.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued inbound CLONE_COUNT payloads (caller owns + frees each slice
+    /// and the outer slice). Each is decoded with `mesh_clones.decodeCounts`.
+    pub fn takeCloneCounts(self: *S2sPeer) ![][]u8 {
+        return self.clone_counts.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a CLONE_COUNT batch to this peer. `payload` is a `mesh_clones`
+    /// counts-codec buffer. Best-effort; only meaningful once established.
+    pub fn sendCloneCounts(self: *S2sPeer, sink: ByteSink, payload: []const u8) !void {
+        try emitFrame(self.allocator, sink, .CLONE_COUNT, payload);
     }
 
     /// Decode an inbound cross-node MESSAGE and queue it for the daemon to

@@ -55,6 +55,10 @@ pub const FrameType = enum(u8) {
     /// LWW by hlc). The non-channel counterpart of CHANNEL_PROP: channels ride
     /// CHANNEL_PROP, `user`/`member` entities ride ENTITY_PROP.
     ENTITY_PROP = 0x12,
+    /// Network-wide clone counts: a batch of (salted-IP-hash, count) pairs this
+    /// node currently holds. Raw IPs never appear — only keyed hashes. Decoded by
+    /// the `mesh_clones` binary codec and attributed to the authenticated link.
+    CLONE_COUNT = 0x13,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -80,6 +84,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.CHANNEL_MODE_STATE) => .CHANNEL_MODE_STATE,
             @intFromEnum(FrameType.SESSION_MIGRATE) => .SESSION_MIGRATE,
             @intFromEnum(FrameType.ENTITY_PROP) => .ENTITY_PROP,
+            @intFromEnum(FrameType.CLONE_COUNT) => .CLONE_COUNT,
             else => null,
         };
     }

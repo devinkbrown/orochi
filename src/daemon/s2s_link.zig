@@ -392,6 +392,17 @@ pub const S2sLink = struct {
         return self.peer.takeSessionMigrations();
     }
 
+    /// Emit a CLONE_COUNT batch (`mesh_clones` counts bytes) to this peer.
+    pub fn sendCloneCounts(self: *S2sLink, payload: []const u8) !void {
+        try self.peer.sendCloneCounts(self.sink(), payload);
+    }
+
+    /// Drain queued inbound CLONE_COUNT payloads from this peer (caller owns +
+    /// frees each slice and the outer slice).
+    pub fn takeCloneCounts(self: *S2sLink) ![][]u8 {
+        return self.peer.takeCloneCounts();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis.
     pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
         return self.peer.collectTopology(out);
@@ -519,6 +530,55 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
         now += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), b.channelMembers("#chat").len);
+}
+
+test "CLONE_COUNT batch propagates across the link and decodes intact" {
+    const allocator = std.testing.allocator;
+    const mesh_clones = @import("mesh_clones.zig");
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    try a.start(10);
+    // A ships a counts batch; pump both directions to deliver it to B.
+    var wire: [64]u8 = undefined;
+    const entries = [_]mesh_clones.Entry{ .{ .hash = 0xAABBCCDD11223344, .count = 4 }, .{ .hash = 7, .count = 1 } };
+    const payload = try mesh_clones.encodeCounts(&wire, &entries);
+    try a.sendCloneCounts(payload);
+
+    var now: u64 = 11;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+
+    const got = try b.takeCloneCounts();
+    defer {
+        for (got) |p| allocator.free(p);
+        allocator.free(got);
+    }
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    const view = try mesh_clones.decodeCounts(got[0]);
+    try std.testing.expectEqual(@as(u32, 2), view.n);
+    try std.testing.expectEqual(@as(u64, 0xAABBCCDD11223344), view.get(0).hash);
+    try std.testing.expectEqual(@as(u32, 4), view.get(0).count);
+    try std.testing.expectEqual(@as(u64, 7), view.get(1).hash);
+    try std.testing.expectEqual(@as(u32, 1), view.get(1).count);
 }
 
 test "CHANNEL_MODE_FLAGS propagates aggregate flag state across the link" {
