@@ -3,9 +3,9 @@
 //!
 //! This is the *content* of a per-client capsule field: the identity/state needed
 //! to reconstruct a recognizable registered session (nick, realname, account,
-//! visible + real host, away, oper). The client's socket fd is carried separately
-//! (SCM_RIGHTS / inherited fd); this is only the session state that pairs with it.
-//! umodes are a later increment.
+//! visible + real host, away, oper + the full oper grant). The client's socket fd
+//! is carried separately (SCM_RIGHTS / inherited fd); this is only the session
+//! state that pairs with it. Client-settable umodes are a later increment.
 //!
 //! Wire format (all integers little-endian):
 //!   [u16 len][nick][u16 len][realname][u16 len][account]
@@ -15,6 +15,13 @@
 //!   [u16 nchan]  ( [u16 len][name][u8 member-modes] )*   channel memberships
 //!   [i64 connected_at_ms][i64 last_message_ms]   OPTIONAL trailing block
 //!   [u16 len][caps]   OPTIONAL trailing CAP list (space-separated names)
+//!   [u64 oper_priv_bits][u16 len][oper_class][u16 len][oper_title]  OPTIONAL
+//!
+//! The oper-grant block (OPTIONAL, written after the caps block) carries the
+//! operator's privilege bits (OperPrivileges.toBits — append-only ordinals) plus
+//! class + title, so a restored oper keeps its FULL grant and the server-managed
+//! +a admin umode derives correctly. Omitting it (pre-grant build) decodes to 0
+//! bits → a bare `is_oper` with no privileges, exactly the pre-fix behavior.
 //!
 //! The trailing signon block carries the client's CLOCK_MONOTONIC signon and
 //! last-message timestamps so WHOIS idle/signon survive an in-place UPGRADE.
@@ -69,6 +76,14 @@ pub const Snapshot = struct {
     /// Empty = no caps carried (pre-caps snapshot, or none negotiated). Carried
     /// by name so it survives a build that adds/removes/reorders cap bits.
     caps: []const u8 = "",
+    /// Operator grant carried across the UPGRADE so a restored oper keeps its FULL
+    /// privilege set — and the derived +a admin umode — not just the `is_oper`
+    /// bool. `oper_priv_bits` is `OperPrivileges.toBits()` (append-only ordinals).
+    /// 0 bits / empty strings = no grant carried (pre-grant snapshot) → restores
+    /// as a bare `is_oper`, exactly the prior behavior.
+    oper_priv_bits: u64 = 0,
+    oper_class: []const u8 = "",
+    oper_title: []const u8 = "",
 };
 
 const flag_logged_in: u8 = 1 << 0;
@@ -121,6 +136,18 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     std.mem.writeInt(u16, &caps_len_le, @intCast(snap.caps.len), .little);
     try out.appendSlice(allocator, &caps_len_le);
     try out.appendSlice(allocator, snap.caps);
+    // Trailing oper-grant block (see header): privilege bits + class + title so a
+    // restored oper keeps its full grant (and the derived +a). Sits past caps.
+    var bits_le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bits_le, snap.oper_priv_bits, .little);
+    try out.appendSlice(allocator, &bits_le);
+    inline for (.{ snap.oper_class, snap.oper_title }) |s| {
+        if (s.len > std.math.maxInt(u16)) return error.TooLong;
+        var len_le: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_le, @intCast(s.len), .little);
+        try out.appendSlice(allocator, &len_le);
+        try out.appendSlice(allocator, s);
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -145,15 +172,39 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     var connected_at_ms: i64 = 0;
     var last_message_ms: i64 = 0;
     var caps: []const u8 = "";
+    var oper_priv_bits: u64 = 0;
+    var oper_class: []const u8 = "";
+    var oper_title: []const u8 = "";
+    // Walk the optional trailing blocks with a running cursor `p`: signon (16) →
+    // caps ([u16][bytes]) → oper grant ([u64][u16][class][u16][title]). Each is
+    // gated on enough bytes remaining, so a capsule from a build predating any
+    // block decodes cleanly with that block (and everything after it) defaulted.
     if (channelRegionEnd(r.buf, r.pos)) |chan_end| {
-        if (r.buf.len - chan_end >= 16) {
-            connected_at_ms = std.mem.readInt(i64, r.buf[chan_end..][0..8], .little);
-            last_message_ms = std.mem.readInt(i64, r.buf[chan_end + 8 ..][0..8], .little);
-            const caps_start = chan_end + 16;
-            if (r.buf.len - caps_start >= 2) {
-                const n = std.mem.readInt(u16, r.buf[caps_start..][0..2], .little);
-                if (caps_start + 2 + n <= r.buf.len) {
-                    caps = r.buf[caps_start + 2 .. caps_start + 2 + n];
+        var p = chan_end;
+        if (r.buf.len - p >= 16) {
+            connected_at_ms = std.mem.readInt(i64, r.buf[p..][0..8], .little);
+            last_message_ms = std.mem.readInt(i64, r.buf[p + 8 ..][0..8], .little);
+            p += 16;
+            if (r.buf.len - p >= 2) {
+                const n = std.mem.readInt(u16, r.buf[p..][0..2], .little);
+                p += 2;
+                if (p + n <= r.buf.len) {
+                    caps = r.buf[p .. p + n];
+                    p += n;
+                } else p = r.buf.len; // malformed caps length → stop
+            }
+            if (r.buf.len - p >= 8) {
+                oper_priv_bits = std.mem.readInt(u64, r.buf[p..][0..8], .little);
+                p += 8;
+                inline for (.{ &oper_class, &oper_title }) |dst| {
+                    if (r.buf.len - p >= 2) {
+                        const m = std.mem.readInt(u16, r.buf[p..][0..2], .little);
+                        p += 2;
+                        if (p + m <= r.buf.len) {
+                            dst.* = r.buf[p .. p + m];
+                            p += m;
+                        }
+                    }
                 }
             }
         }
@@ -173,6 +224,9 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .connected_at_ms = connected_at_ms,
         .last_message_ms = last_message_ms,
         .caps = caps,
+        .oper_priv_bits = oper_priv_bits,
+        .oper_class = oper_class,
+        .oper_title = oper_title,
     };
 }
 
@@ -372,6 +426,42 @@ test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
     try testing.expectEqual(@as(i64, 4321), got.connected_at_ms);
     try testing.expectEqual(@as(i64, 8765), got.last_message_ms);
     try testing.expectEqual(@as(usize, 0), got.caps.len);
+}
+
+test "oper grant round-trips (priv bits + class + title)" {
+    const allocator = testing.allocator;
+    const bytes = try encode(allocator, .{
+        .nick = "kain",
+        .account = "kain",
+        .logged_in = true,
+        .is_oper = true,
+        .caps = "sasl",
+        .oper_priv_bits = 0x0000_0000_0000_0140, // arbitrary bitmask
+        .oper_class = "admin",
+        .oper_title = "Server Administrator",
+    });
+    defer allocator.free(bytes);
+    const got = try decode(bytes);
+    try testing.expect(got.is_oper);
+    try testing.expectEqual(@as(u64, 0x0000_0000_0000_0140), got.oper_priv_bits);
+    try testing.expectEqualStrings("admin", got.oper_class);
+    try testing.expectEqualStrings("Server Administrator", got.oper_title);
+    try testing.expectEqualStrings("sasl", got.caps); // caps still parse before the oper block
+}
+
+test "decode tolerates a pre-oper-grant snapshot (caps present, oper block absent)" {
+    const allocator = testing.allocator;
+    // A capsule from the caps-carry build: signon + caps blocks, but no oper block.
+    // Strip the oper block (8 bits + two empty len-prefixed strings = 8+2+2=12).
+    const bytes = try encode(allocator, .{ .nick = "dan", .caps = "echo-message", .is_oper = true });
+    defer allocator.free(bytes);
+    const old = bytes[0 .. bytes.len - 12];
+    const got = try decode(old);
+    try testing.expectEqualStrings("dan", got.nick);
+    try testing.expectEqualStrings("echo-message", got.caps);
+    try testing.expect(got.is_oper);
+    try testing.expectEqual(@as(u64, 0), got.oper_priv_bits); // defaulted → bare is_oper
+    try testing.expectEqual(@as(usize, 0), got.oper_class.len);
 }
 
 test "decode rejects a truncated buffer" {

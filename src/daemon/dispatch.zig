@@ -1168,6 +1168,11 @@ pub const ClientSession = struct {
             .logged_in = self.logged_in,
             .away_active = self.away_active,
             .is_oper = self.is_oper,
+            // Carry the full oper grant so the successor restores privileges +
+            // the derived +a admin umode, not just the bare is_oper bool.
+            .oper_priv_bits = self.oper_priv.toBits(),
+            .oper_class = self.operClass(),
+            .oper_title = self.operTitle(),
         };
     }
 
@@ -1189,7 +1194,15 @@ pub const ClientSession = struct {
         };
         if (snap.logged_in and snap.account.len > 0) self.loginAs(snap.account) else self.logout();
         if (snap.away_active) self.setAway(snap.away) else self.clearAway();
-        self.is_oper = snap.is_oper;
+        // Reconstitute the FULL operator grant (privileges + class + title), which
+        // also re-derives the server-managed +a admin umode — not just the bare
+        // is_oper bool. A pre-grant snapshot carries 0 bits, so this restores a bare
+        // oper exactly as before; a current snapshot restores admin/all privileges.
+        if (snap.is_oper) {
+            self.setOperGrant(oper.OperPrivileges.fromBits(snap.oper_priv_bits), snap.oper_class, snap.oper_title);
+        } else {
+            self.is_oper = false;
+        }
         // Re-enable the negotiated IRCv3 caps carried across the UPGRADE (by name),
         // so echo-message and friends keep working without a client reconnect.
         self.restoreNegotiatedCaps(snap.caps);
