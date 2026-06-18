@@ -548,6 +548,9 @@ pub fn main(init: std.process.Init) !void {
         srv.replayServicesLiveState(&account_services);
     }
 
+    // OroWasm: load any *.wasm control-plane plugins from [wasm] plugin_dir.
+    srv.loadWasmPlugins();
+
     // Helix UPGRADE successor: re-attach the carried-over client connections
     // (inherited socket fds + restored sessions) now that the ring exists.
     if (comptime builtin.os.tag == .linux) srv.adoptInheritedSessions();

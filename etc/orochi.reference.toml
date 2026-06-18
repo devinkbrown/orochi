@@ -371,6 +371,18 @@ allow_anonymous = false
 # oauth_account_claim = "sub"                           # JWT claim -> account (default "sub")
 
 
+# --- [wasm] — OroWasm plugin module system -----------------------------------
+[wasm]
+# Directory scanned at boot (and on REHASH) for `*.wasm` control-plane plugins.
+# Each plugin registers IRC commands that are consulted AFTER the built-in
+# command registry — so a plugin can extend the command surface but can NEVER
+# shadow a core command. Plugins run in a sandboxed interpreter with only the
+# host capabilities they negotiate (reply/log/time). Unset = the system stays
+# dormant (no plugins loaded). A missing dir / malformed plugin is logged, never
+# fatal.
+# plugin_dir = "/var/lib/orochi/plugins"
+
+
 # --- [oper] — operator subsystem settings ------------------------------------
 [oper]
 # Auto-enable the +j override umode on elevation for any operator holding the

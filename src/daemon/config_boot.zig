@@ -47,6 +47,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.geo.news_cache_dir) |v| out.geo_news_cache_dir = v;
     if (cfg.oper.grants_path) |v| out.oper_grants_path = v;
     out.oper_auto_override = cfg.oper.auto_override;
+    if (cfg.wasm.plugin_dir) |v| out.wasm_plugin_dir = v;
     if (cfg.listen.irc != 0) out.port = cfg.listen.irc;
     if (cfg.listen.host.len != 0) out.host = cfg.listen.host;
     if (cfg.listen.s2s != 0) out.s2s_port = cfg.listen.s2s;
@@ -512,6 +513,22 @@ test "limits overlay clone caps" {
     defer loaded.deinit(allocator);
     try testing.expectEqual(@as(u32, 4), loaded.config.max_clones_per_ip);
     try testing.expectEqual(@as(u32, 32), loaded.config.max_clones_per_net);
+}
+
+test "wasm plugin_dir maps into the live config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[wasm]
+        \\plugin_dir = "/var/lib/orochi/plugins"
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqualStrings("/var/lib/orochi/plugins", loaded.config.wasm_plugin_dir);
 }
 
 test "limits overlay reputation knobs" {

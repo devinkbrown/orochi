@@ -40,6 +40,7 @@ pub const Config = struct {
     news: News = .{},
     geo: Geo = .{},
     oper: OperSection = .{},
+    wasm: Wasm = .{},
     listen: Listen = .{},
     opers: []Oper = &.{},
     oper_groups: []OperGroup = &.{},
@@ -134,6 +135,14 @@ pub const Config = struct {
     };
 
     /// Operator subsystem settings (distinct from the `[[opers]]` bindings).
+    /// `[wasm]` — OroWasm plugin module system.
+    pub const Wasm = struct {
+        /// Directory scanned at boot (and on REHASH) for `*.wasm` control-plane
+        /// plugins; each registers IRC commands consulted AFTER the built-in
+        /// registry (so a plugin can never shadow a core command). Unset = off.
+        plugin_dir: ?[]const u8 = null,
+    };
+
     pub const OperSection = struct {
         /// Path for persisting runtime GRANT/REVOKE grants across restarts.
         grants_path: ?[]const u8 = null,
@@ -475,6 +484,7 @@ pub const Config = struct {
         if (self.geo.default_location) |v| allocator.free(v);
         if (self.geo.news_cache_dir) |v| allocator.free(v);
         if (self.oper.grants_path) |v| allocator.free(v);
+        if (self.wasm.plugin_dir) |v| allocator.free(v);
         allocator.free(self.listen.host);
         freeStringList(allocator, self.listen.trusted_proxies);
         allocator.free(self.listen.media_host);
@@ -580,6 +590,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [oper]
     try setOpt(allocator, resolver, doc.getString("oper.grants_path"), &cfg.oper.grants_path);
     if (doc.getBool("oper.auto_override")) |b| cfg.oper.auto_override = b;
+    try setOpt(allocator, resolver, doc.getString("wasm.plugin_dir"), &cfg.wasm.plugin_dir);
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);

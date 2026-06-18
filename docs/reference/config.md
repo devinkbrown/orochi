@@ -362,6 +362,14 @@ at `src/daemon/config_boot.zig`.
 | `grants_path` | string or null | unset | path | File for persisting runtime `GRANT`/`REVOKE` operator grants. When set, active grants are written here on change and reloaded at boot, so runtime-granted opers survive a restart; revoked accounts are dropped. See [commands/oper-moderation.md](commands/oper-moderation.md#grant). |
 | `auto_override` | bool | `false` | — | Auto-enable the `+j` override umode on elevation for any operator holding the `oper_override` privilege, so admins get full channel authority (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. `false` keeps override an explicit, audited opt-in (`src/daemon/server.zig` `applyOperAutoOverride`). |
 
+## `[wasm]`
+
+OroWasm plugin module system. Source: `src/daemon/config_format.zig` (`Wasm`), mapping at `src/daemon/config_boot.zig`, loaded by `src/daemon/server.zig` `loadWasmPlugins` (boot + REHASH), dispatched via `src/wasm/host/bridge.zig`.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `plugin_dir` | string or null | unset (dormant) | directory path | Directory scanned at boot and on REHASH for `*.wasm` control-plane plugins. Each registers IRC commands consulted **after** the built-in registry — a plugin can extend, never shadow, a core command. Plugins run sandboxed with only their negotiated host capabilities (reply/log/time). Missing dir / malformed plugin is logged, never fatal. |
+
 ## `[[opers]]`
 
 Source: struct at `src/daemon/config_format.zig:101`, parsing at `src/daemon/config_format.zig:422`, SASL-only runtime behavior at `src/daemon/server.zig:8300`.

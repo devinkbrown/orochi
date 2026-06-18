@@ -1221,6 +1221,9 @@ pub const Config = struct {
     /// oper_override privilege (full channel authority without `/mode +j`).
     /// `[oper] auto_override`.
     oper_auto_override: bool = false,
+    /// Directory scanned at boot/REHASH for `*.wasm` OroWasm control-plane
+    /// plugins. Empty = the plugin system stays dormant. `[wasm] plugin_dir`.
+    wasm_plugin_dir: []const u8 = "",
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -19463,6 +19466,26 @@ pub const LinuxServer = struct {
         } else {
             cb.deinit();
         }
+
+        // Reload OroWasm plugins from the (possibly changed) [wasm] plugin_dir.
+        // Rebuild the bridge so removed plugins disappear; the dir string lives in
+        // the just-committed reload_parsed, so repoint the live config at it first.
+        self.config.wasm_plugin_dir = if (parsed.wasm.plugin_dir) |v| v else "";
+        self.wasm.deinit();
+        self.wasm = wasm_bridge.Bridge.init(self.allocator);
+        self.loadWasmPlugins();
+    }
+
+    /// Load OroWasm control-plane plugins from `[wasm] plugin_dir` (best-effort).
+    /// Called at boot and on REHASH. A missing dir / malformed plugin is logged,
+    /// never fatal — the plugin system simply stays empty.
+    pub fn loadWasmPlugins(self: *LinuxServer) void {
+        if (self.config.wasm_plugin_dir.len == 0) return;
+        const n = self.wasm.loadFromDir(self.config.wasm_plugin_dir) catch |err| {
+            std.debug.print("orochi: wasm plugin load from {s} failed: {s}\n", .{ self.config.wasm_plugin_dir, @errorName(err) });
+            return;
+        };
+        if (n > 0) std.debug.print("orochi: loaded {d} OroWasm plugin(s) from {s}\n", .{ n, self.config.wasm_plugin_dir });
     }
 
     /// Outcome of the REHASH cert hot-reload, folded into the RPL_REHASHING note.
