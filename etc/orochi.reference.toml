@@ -266,6 +266,12 @@ max_clones_per_net = 0         # concurrent connections per /24|/64; 0 = unlimit
 # [class.*]; this is the global accept-time rate gate.
 # throttle_connects = 10       # 0 = disabled (0..1000000)
 # throttle_window = "10s"      # window for throttle_connects
+# Network-wide (mesh) concurrent connections per source IP: counts this node plus
+# every peer's connections from the same IP, gossiped as a SALTED hash (raw IPs
+# never cross the wire). Requires a shared [mesh] pass so all nodes salt alike.
+# Authenticated accounts get +2; opers with the limit_exempt privilege bypass;
+# loopback/trusted_proxies are exempt (WebSocket-safe). 0 disables.
+# max_clones_per_ip_net = 0     # 0 = disabled (0..65535)
 reputation_refuse_threshold = 0  # refuse connections above this penalty (0 = off)
 reputation_half_life = "1m"    # decay half-life of the reputation penalty
 # Nick delay: hold a nick against reuse for this window after its owner exits, so
