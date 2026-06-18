@@ -5552,14 +5552,16 @@ pub const LinuxServer = struct {
                 self.recordHistoryEventSender(entry.key_ptr.*, quit_prefix, "QUIT", quit_body);
                 // Tell mesh peers this member is gone so their remote roster drops
                 // it and they emit a PART to their own local members (otherwise a
-                // disconnect leaves a ghost on the far side of the mesh).
-                if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false, .{});
+                // disconnect leaves a ghost on the far side of the mesh). Carry the
+                // real identity so the far side renders the member's actual
+                // `user@host`, not the `mesh@<origin>` placeholder.
+                if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false, membershipIdentityOf(conn));
             }
         }
         // Withdraw the user's mesh PRESENCE (the no-channel-aware counterpart of the
         // per-channel parts above) so peers drop them from the route_table even if
         // they were in no channel. Mirrors the announce in `registerConnNick`.
-        if (announce) self.announceMembership(presence_channel, nick, 0, false, .{});
+        if (announce) self.announceMembership(presence_channel, nick, 0, false, membershipIdentityOf(conn));
     }
 
     /// Drive an implicit-TLS client's recv chunk: frame + decrypt through the
@@ -8907,8 +8909,9 @@ pub const LinuxServer = struct {
         try self.publishMemberEvent("PART", channel, parted_nick, reason);
         try self.world.part(channel, wid);
         if (destroys_channel and !self.world.channelExists(channel)) try self.publishChannelEvent("DESTROY", channel);
-        // Tell mesh peers this member left.
-        self.announceMembership(channel, parted_nick, 0, false, .{});
+        // Tell mesh peers this member left, carrying the real identity so the far
+        // side renders the member's actual `user@host`, not the placeholder.
+        self.announceMembership(channel, parted_nick, 0, false, membershipIdentityOf(conn));
     }
 
     pub fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
