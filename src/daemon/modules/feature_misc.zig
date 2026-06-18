@@ -52,6 +52,7 @@ pub const module = registry.Module{
         .{ .name = "FILTER", .handler = filter },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
         .{ .name = "TEGAMI", .handler = tegami },
+        .{ .name = "MEMO", .handler = tegami }, // alias: TEGAMI (手紙) is the memo system
         .{ .name = "ACTIVITY", .handler = activity },
         .{ .name = "GEOIP", .min_params = 1, .access = .oper, .handler = geoipCmd, .summary = "GeoIP lookup of an IP (oper)" },
         .{ .name = "SUMMON", .min_params = 2, .access = .oper, .handler = summon },

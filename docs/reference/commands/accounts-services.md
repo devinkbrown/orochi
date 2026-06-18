@@ -189,8 +189,8 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 
 ## TEGAMI
 
-- Syntax: `TEGAMI [LIST|CLEAR|SEND <account> :message]`
-- Description: Offline account messages. `LIST` is default and does not clear; login delivery clears pending messages.
+- Syntax: `TEGAMI [LIST|CLEAR|SEND <account> :message]` (alias: `MEMO`)
+- Description: Offline account messages (手紙 — "letter"). `MEMO` is an alias for the same command. `LIST` is default and does not clear; login delivery clears pending messages.
 - Privileges: Registered client; account login required for list/clear/send.
 - Parameters: Optional subcommand; `SEND` target account and message.
 - Replies: `NOTE TEGAMI` lines, clear count, or delivery notice.
