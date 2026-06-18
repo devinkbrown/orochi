@@ -215,6 +215,32 @@ test "a part event (present=false) round-trips" {
     try testing.expectEqualStrings("&local", got.channel);
 }
 
+test "a part event (present=false) carries identity (mesh-host departure fix)" {
+    // The daemon now propagates the departing member's real identity on QUIT/PART
+    // (not an empty placeholder), so the far side renders user@host not mesh@srv.
+    // Identity must round-trip just like a JOIN, since the codec never branches on
+    // `present` — only the membership FACT (present/status/hlc) drives convergence.
+    const ev = MembershipEvent{
+        .present = false,
+        .status = 0,
+        .origin_node = 1,
+        .hlc = 42,
+        .channel = "#root",
+        .nick = "sh0rt1e",
+        .username = "sh0rt1e",
+        .realname = "real name with spaces",
+        .host = "8f384d80.c665a180.c2555cf6.ip.ircxnet",
+    };
+    var buf: [max_encoded_len]u8 = undefined;
+    const wire = try encode(ev, &buf);
+    const got = try decode(wire);
+    try testing.expectEqual(false, got.present);
+    try testing.expectEqualStrings("sh0rt1e", got.nick);
+    try testing.expectEqualStrings("sh0rt1e", got.username);
+    try testing.expectEqualStrings("real name with spaces", got.realname);
+    try testing.expectEqualStrings("8f384d80.c665a180.c2555cf6.ip.ircxnet", got.host);
+}
+
 test "truncated input is rejected" {
     const ev = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .username = "u", .realname = "r", .host = "h" };
     var buf: [max_encoded_len]u8 = undefined;
