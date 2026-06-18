@@ -360,6 +360,7 @@ at `src/daemon/config_boot.zig`.
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `grants_path` | string or null | unset | path | File for persisting runtime `GRANT`/`REVOKE` operator grants. When set, active grants are written here on change and reloaded at boot, so runtime-granted opers survive a restart; revoked accounts are dropped. See [commands/oper-moderation.md](commands/oper-moderation.md#grant). |
+| `auto_override` | bool | `false` | — | Auto-enable the `+j` override umode on elevation for any operator holding the `oper_override` privilege, so admins get full channel authority (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. `false` keeps override an explicit, audited opt-in (`src/daemon/server.zig` `applyOperAutoOverride`). |
 
 ## `[[opers]]`
 

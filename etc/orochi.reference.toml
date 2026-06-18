@@ -373,6 +373,11 @@ allow_anonymous = false
 
 # --- [oper] — operator subsystem settings ------------------------------------
 [oper]
+# Auto-enable the +j override umode on elevation for any operator holding the
+# `oper_override` privilege, so admins get full channel authority (KICK / MODE /
+# TOPIC / PROP / …) without a manual `/mode +j`. Default false keeps override an
+# explicit, audited opt-in (the oper sets +j when they intend to override).
+# auto_override = true
 # Path for persisting runtime GRANT/REVOKE operator grants. When set, the active
 # grants (from the GRANT command) are written here on change and reloaded at
 # boot, so runtime-granted opers survive a restart. Revoked accounts are dropped

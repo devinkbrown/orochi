@@ -1217,6 +1217,10 @@ pub const Config = struct {
     /// active grants are written here on change and reloaded at boot so they
     /// survive a restart. `[oper] grants_path`.
     oper_grants_path: []const u8 = "",
+    /// Auto-enable the +j override umode on elevation for opers with the
+    /// oper_override privilege (full channel authority without `/mode +j`).
+    /// `[oper] auto_override`.
+    oper_auto_override: bool = false,
     /// Maximum stored channel topic length in bytes (advertised as TOPICLEN and
     /// enforced by handleTopic). Configurable via `[limits] topiclen`.
     topiclen: u32 = 390,
@@ -9559,6 +9563,15 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ args.user, args.channel }, "They aren't on that channel");
             return;
         };
+        // Always protect +Y: a network operator (oper holding oper_override, the
+        // `*` prefix above founder) outranks every channel member. +Y is
+        // oper-derived, NOT a member-mode bit, so the rank check below misses it —
+        // gate explicitly. Only a server operator may kick a +Y; an owner/op who
+        // is not an operator cannot. Covers local + propagated cross-mesh opers.
+        if (!conn.session.isOper() and self.isOverrideOper(args.user)) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "Cannot kick a network operator");
+            return;
+        }
         if (!conn.session.isOper() and kicker.rank() < target_mm.rank()) {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "Cannot kick a higher-ranked member");
             return;
@@ -12373,6 +12386,7 @@ pub const LinuxServer = struct {
         conn.last_message_ms = if (snap.last_message_ms != 0) snap.last_message_ms else now;
         conn.last_activity_ms = now;
         conn.session.restore(snap);
+        self.applyOperAutoOverride(conn); // re-affirm +j across USR2 for auto_override admins
         self.injectSessionState(conn);
         // TLS client: rebuild the live engine BEFORE anything else can touch the
         // socket. Any failure drops this client cleanly (fd closed, slot freed) —
@@ -16514,6 +16528,7 @@ pub const LinuxServer = struct {
                 const override_was_set = c.session.hasUmode(.override);
                 const had_override_priv = c.session.hasPriv(.oper_override);
                 c.session.setOperGrant(privileges, grant.class, grant.title);
+                self.applyOperAutoOverride(c); // re-affirm +j if auto_override + still holds oper_override
                 if (override_was_set and had_override_priv and !privileges.has(.oper_override)) {
                     if (c.session.setUmode(.override, false)) {
                         const reason = "cleared override after oper_override privilege was removed";
@@ -16619,6 +16634,7 @@ pub const LinuxServer = struct {
         // Capture the granted privilege set + class on the session so handlers
         // can gate sensitive actions on specific privileges, not just is_oper.
         conn.session.setOperGrant(privileges, class_name, title);
+        self.applyOperAutoOverride(conn); // [oper] auto_override → +j for oper_override holders
         // Opers are always in IRCX mode: SASL oper elevation auto-enables it, so
         // the IRCX command surface + PROP-change notifications "just work" without
         // an explicit IRCX command or a separate capability.
@@ -16652,8 +16668,23 @@ pub const LinuxServer = struct {
                 ml += 1;
             }
         }
+        // +j override is client-writable (skipped by the server-managed loop), so
+        // announce it explicitly when auto_override turned it on at elevation.
+        if (conn.session.hasUmode(.override)) {
+            modes_buf[ml] = 'j';
+            ml += 1;
+        }
         const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, modes_buf[0..ml] }, null);
         try appendToConn(conn, msg);
+    }
+
+    /// When `[oper] auto_override` is set, auto-enable the +j override umode for an
+    /// operator holding the `oper_override` privilege — so admins get full channel
+    /// authority (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. No-op when
+    /// the option is off or the oper lacks the privilege.
+    fn applyOperAutoOverride(self: *LinuxServer, conn: *ConnState) void {
+        if (!self.config.oper_auto_override) return;
+        if (conn.session.hasPriv(.oper_override)) _ = conn.session.setUmode(.override, true);
     }
 
     /// Drop operator status from every connected session of `account` (a

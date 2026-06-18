@@ -137,6 +137,11 @@ pub const Config = struct {
     pub const OperSection = struct {
         /// Path for persisting runtime GRANT/REVOKE grants across restarts.
         grants_path: ?[]const u8 = null,
+        /// Auto-enable the +j override umode on elevation for any operator holding
+        /// the `oper_override` privilege, so admins get full channel authority
+        /// (KICK/MODE/TOPIC/PROP/…) without a manual `/mode +j`. Default false
+        /// keeps override an explicit, audited opt-in.
+        auto_override: bool = false,
     };
 
     pub const Listen = struct {
@@ -574,6 +579,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [oper]
     try setOpt(allocator, resolver, doc.getString("oper.grants_path"), &cfg.oper.grants_path);
+    if (doc.getBool("oper.auto_override")) |b| cfg.oper.auto_override = b;
 
     // [listen]
     try setStr(allocator, resolver, doc.getString("listen.host"), &cfg.listen.host);
