@@ -256,6 +256,11 @@ pub const Config = struct {
         /// sources are exempt (a shared proxy must not throttle distinct clients).
         throttle_connects: u32 = 0,
         throttle_window_ms: u64 = 10_000,
+        /// Network raid guard: default join-throttle for channels without an
+        /// explicit `+j`. `raid_joins` joins per `raid_window` before new joins are
+        /// denied and a one-shot oper raid alert fires. `0` disables the default.
+        raid_joins: u16 = 0,
+        raid_window_ms: u64 = 10_000,
         /// Network-wide (mesh) concurrent connections per source IP. `0` disables.
         /// Requires a shared `[mesh] pass` so every node salts IPs identically.
         max_clones_per_ip_net: u32 = 0,
@@ -641,6 +646,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getString("limits.nick_delay")) |s| cfg.limits.nick_delay_ms = try durationMs(s);
     cfg.limits.throttle_connects = @intCast(try uintField(doc, "limits.throttle_connects", cfg.limits.throttle_connects, 0, 1_000_000));
     if (doc.getString("limits.throttle_window")) |s| cfg.limits.throttle_window_ms = try durationMs(s);
+    cfg.limits.raid_joins = @intCast(try uintField(doc, "limits.raid_joins", cfg.limits.raid_joins, 0, 65535));
+    if (doc.getString("limits.raid_window")) |s| cfg.limits.raid_window_ms = try durationMs(s);
     cfg.limits.max_clones_per_ip_net = @intCast(try uintField(doc, "limits.max_clones_per_ip_net", cfg.limits.max_clones_per_ip_net, 0, 65535));
     if (doc.getString("limits.handshake_timeout")) |s| cfg.limits.handshake_timeout_ms = try durationMs(s);
     if (doc.getString("limits.ping_interval")) |s| cfg.limits.ping_interval_ms = try durationMs(s);
@@ -825,6 +832,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
                 policy.register_timeout_ms = try classDur(item, "register_timeout", policy.register_timeout_ms);
                 policy.flood_lines = try classU32(item, "flood_lines", policy.flood_lines);
                 policy.flood_window_ms = try classDur(item, "flood_window", policy.flood_window_ms);
+                policy.flood_excess = try classU32(item, "flood_excess", policy.flood_excess);
+                policy.flood_targets = try classU32(item, "flood_targets", policy.flood_targets);
                 policy.require_tls = item.getBool("require_tls") orelse policy.require_tls;
                 policy.require_sasl = item.getBool("require_sasl") orelse policy.require_sasl;
                 policy.flood_exempt = item.getBool("flood_exempt") orelse policy.flood_exempt;

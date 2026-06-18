@@ -25,6 +25,7 @@
 //! human size/duration literals live here so config + tests share one grammar.
 const std = @import("std");
 const cidr = @import("../proto/cidr.zig");
+const flood_guard = @import("flood_guard.zig");
 
 pub const max_classes: usize = 64;
 pub const max_cidrs_per_class: usize = 64;
@@ -74,10 +75,21 @@ pub const Policy = struct {
     ping_timeout_ms: u64 = 0,
     /// Registration (handshake) timeout (ms; 0 = inherit global).
     register_timeout_ms: u64 = 0,
-    /// Line-flood: at most `flood_lines` inbound lines per `flood_window_ms`
-    /// (0 lines = no line-flood limit).
+    /// Line-flood: the per-class command-rate budget — at most `flood_lines`
+    /// weighted commands per `flood_window_ms` (0 lines = no flood limit). This
+    /// drives the runtime `flood_runtime.FloodGuard` command bucket: keep-alives
+    /// (PING/PONG) are free, PRIVMSG/NOTICE/JOIN carry weight, and sustained
+    /// over-budget traffic accrues excess strikes toward disconnect.
     flood_lines: u32 = 0,
     flood_window_ms: u64 = 0,
+    /// Excess-flood strikes tolerated before disconnect (0 = auto: max(20, 2×
+    /// flood_lines)). Each over-budget command adds a strike; strikes decay at
+    /// ~1/sec, so a brief burst recovers but a sustained flood is cut.
+    flood_excess: u32 = 0,
+    /// Distinct PRIVMSG targets a client may spray per `flood_window_ms` before
+    /// the spread-spam throttle bites (0 = auto: max(8, flood_lines)). Counters a
+    /// bot that messages many users/channels without repeating a target.
+    flood_targets: u32 = 0,
     /// Admission policy: refuse the connection unless it is TLS / SASL-authed.
     require_tls: bool = false,
     require_sasl: bool = false,
@@ -90,6 +102,28 @@ pub const Policy = struct {
     max_targets: u32 = 0,
     monitor: u32 = 0,
     silence: u32 = 0,
+
+    /// Derive this class's runtime flood policy from its own knobs — the single
+    /// place per-class flood config turns into a live `flood_guard.FloodGuard`.
+    /// The guard is enabled only when the class sets `flood_lines` and is not
+    /// `flood_exempt`; `flood_excess`/`flood_targets` auto-derive when left at 0.
+    pub fn floodGuardConfig(self: *const Policy) flood_guard.GuardConfig {
+        if (self.flood_lines == 0 or self.flood_exempt) return .{ .enabled = false };
+        const window: u64 = if (self.flood_window_ms != 0) self.flood_window_ms else 10_000;
+        const lines: u64 = self.flood_lines;
+        const targets: u64 = if (self.flood_targets != 0) self.flood_targets else @max(@as(u64, 8), lines);
+        const excess: u64 = if (self.flood_excess != 0) self.flood_excess else @max(@as(u64, 20), lines * 2);
+        return .{
+            .enabled = true,
+            // The command bucket is the single rate gate; message/byte are left
+            // disabled so there is exactly one dimension per concept.
+            .messages = .{},
+            .bytes = .{},
+            .commands = .{ .capacity = lines, .refill_tokens = lines, .refill_period_ms = window },
+            .target_changes = .{ .capacity = targets, .refill_tokens = targets, .refill_period_ms = window },
+            .excess = .{ .threshold = excess, .decay_points = 1, .decay_period_ms = 1000 },
+        };
+    }
 };
 
 /// The facets of a live connection used to choose its class.

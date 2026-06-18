@@ -7,6 +7,7 @@ const scram_store_mod = @import("scram_store.zig");
 const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const rwlock = @import("../substrate/rwlock.zig");
+const svc_enforce = @import("svc_enforce.zig");
 
 pub const OroStore = store_mod.OroStore;
 pub const ScramStore = scram_store_mod.ScramStore;
@@ -151,7 +152,7 @@ pub const AccessLevel = enum(u8) {
     }
 };
 
-pub const AccountSetField = union(enum) { email: []const u8, flags: u32 };
+pub const AccountSetField = union(enum) { email: []const u8, flags: u32, secure: bool, enforce: bool };
 pub const ChannelSetField = union(enum) { flags: u32, mlock: []const u8 };
 pub const AccessAction = enum { query, grant, revoke };
 pub const AkickAction = enum { add, remove, query };
@@ -161,6 +162,14 @@ pub const ChannelRef = struct { name: ChannelName };
 pub const account_flag_suspended: u32 = 1 << 0;
 pub const account_flag_forbidden: u32 = 1 << 1;
 pub const account_flag_noexpire: u32 = 1 << 2;
+/// Owner-settable nick-protection flags (NOT privileged). Stored so the bit
+/// layout stays backward-compatible: a fresh/old account record has these 0,
+/// which means "ENFORCE on, SECURE off" — exactly today's always-on behavior.
+/// `enforce_off` is inverted (set = the owner opted OUT of auto-enforcement on
+/// their registered nick) so default protection is preserved without a DB
+/// format change. `secure` = recognize the account only via identify.
+pub const account_flag_enforce_off: u32 = 1 << 3;
+pub const account_flag_secure: u32 = 1 << 4;
 pub const account_flags_privileged: u32 = account_flag_suspended | account_flag_forbidden | account_flag_noexpire;
 
 pub const AccountInfo = struct {
@@ -764,6 +773,10 @@ pub const Services = struct {
                 if ((flags & account_flags_privileged) != preserved) return error.Forbidden;
                 record.flags = preserved | (flags & ~account_flags_privileged);
             },
+            // SECURE on/off. ENFORCE on/off is stored inverted (`enforce_off`) so
+            // the default-0 record keeps today's always-on enforcement.
+            .secure => |on| setFlag(&record.flags, account_flag_secure, on),
+            .enforce => |on| setFlag(&record.flags, account_flag_enforce_off, !on),
         }
         const encoded = try encodeAccount(record, scratch);
         try self.store.family(.accounts).put(record.name.asSlice(), encoded);
@@ -776,6 +789,26 @@ pub const Services = struct {
 
         const record = try self.loadAccount(name);
         return .{ .account_info = record.info() };
+    }
+
+    /// Server-side (no password) read of an account's nick-protection settings,
+    /// for the registration sweep. An unknown account yields the protective
+    /// default (ENFORCE on, SECURE off). ENFORCETIME is the configured grace,
+    /// supplied by the caller as `enforce_seconds` since it is not per-account.
+    pub fn accountSecurity(self: *Services, name: []const u8, enforce_seconds: u32) svc_enforce.AccountSecurity {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        const key = accountKey(name) catch return .{ .enforce = true, .enforce_seconds = enforce_seconds };
+        const value = self.store.family(.accounts).get(key.asSlice()) orelse
+            return .{ .enforce = true, .enforce_seconds = enforce_seconds };
+        const record = decodeAccount(value) catch
+            return .{ .enforce = true, .enforce_seconds = enforce_seconds };
+        return .{
+            .secure = (record.flags & account_flag_secure) != 0,
+            .enforce = (record.flags & account_flag_enforce_off) == 0,
+            .enforce_seconds = enforce_seconds,
+        };
     }
 
     pub fn setAccountSuspended(self: *Services, name: []const u8, suspended: bool, scratch: []u8) ServiceError!AccountAdminInfo {

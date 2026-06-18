@@ -46,6 +46,14 @@ fn ghost(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleGhost(x.conn, x.parsed);
 }
+fn recover(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleRecover(x.conn, x.parsed);
+}
+fn release(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleRelease(x.conn, x.parsed);
+}
 fn channel(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleChannel(x.conn, x.parsed);
@@ -81,6 +89,8 @@ pub const ACCOUNT_spec = registry.CommandSpec{ .name = "ACCOUNT", .access = .ope
 pub const SASLINFO_spec = registry.CommandSpec{ .name = "SASLINFO", .handler = saslInfo };
 pub const ACCOUNTSET_spec = registry.CommandSpec{ .name = "ACCOUNTSET", .feature = accounts_feature, .handler = accountSet };
 pub const GHOST_spec = registry.CommandSpec{ .name = "GHOST", .feature = accounts_feature, .handler = ghost };
+pub const RECOVER_spec = registry.CommandSpec{ .name = "RECOVER", .feature = accounts_feature, .handler = recover, .summary = "force an unauthenticated holder off your registered nick" };
+pub const RELEASE_spec = registry.CommandSpec{ .name = "RELEASE", .feature = accounts_feature, .handler = release, .summary = "drop a server hold on your registered nick" };
 pub const CHANNEL_spec = registry.CommandSpec{ .name = "CHANNEL", .feature = accounts_feature, .handler = channel };
 pub const CS_spec = registry.CommandSpec{ .name = "CS", .feature = accounts_feature, .handler = channel };
 pub const SESSION_spec = registry.CommandSpec{ .name = "SESSION", .feature = accounts_feature, .handler = session };
@@ -102,6 +112,8 @@ pub const module = registry.Module{
         SASLINFO_spec,
         ACCOUNTSET_spec,
         GHOST_spec,
+        RECOVER_spec,
+        RELEASE_spec,
         CHANNEL_spec,
         CS_spec,
         SESSION_spec,

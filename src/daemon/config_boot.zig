@@ -104,6 +104,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.nick_delay_ms = cfg.limits.nick_delay_ms;
     out.throttle_connects = cfg.limits.throttle_connects;
     out.throttle_window_ms = cfg.limits.throttle_window_ms;
+    out.raid_joins = cfg.limits.raid_joins;
+    out.raid_secs = @intCast(@max(@as(u64, 1), cfg.limits.raid_window_ms / 1000));
     out.max_clones_per_ip_net = cfg.limits.max_clones_per_ip_net;
     out.reputation_refuse_threshold = cfg.limits.reputation_refuse_threshold;
     if (cfg.limits.reputation_half_life_ms != 0) out.reputation_half_life_ms = @intCast(cfg.limits.reputation_half_life_ms);

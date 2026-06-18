@@ -44,6 +44,10 @@ fn ward(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleWard(x.conn, x.parsed);
 }
+fn spamtrap(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleSpamtrap(x.conn, x.parsed);
+}
 fn kline(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleWardAlias(x.conn, x.parsed, .kline);
@@ -141,6 +145,7 @@ pub const module = registry.Module{
         .{ .name = "DRAIN", .access = .oper, .handler = drain },
         .{ .name = "UNREJECT", .access = .oper, .handler = unreject },
         .{ .name = "WARD", .access = .oper, .handler = ward },
+        .{ .name = "SPAMTRAP", .access = .oper, .handler = spamtrap },
         .{ .name = "KLINE", .access = .oper, .handler = kline },
         .{ .name = "DLINE", .access = .oper, .handler = dline },
         .{ .name = "XLINE", .access = .oper, .handler = xline },

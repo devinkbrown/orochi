@@ -194,6 +194,10 @@ const Channel = struct {
     throttle_joins: u16 = 0,
     throttle_secs: u32 = 0,
     throttle_times: std.ArrayListUnmanaged(i64) = .empty,
+    /// Last time (ms) a join-throttle denial raised a raid alert on this channel.
+    /// Rate-limits the oper alert to one per throttle window so a sustained raid
+    /// does not spam the Event Spine. 0 = never alerted.
+    throttle_alert_ms: i64 = 0,
     /// Pending invitations (INVITE) that satisfy +i, by client id.
     invites: std.AutoHashMapUnmanaged(ClientId, void) = .empty,
     /// +f forward target: when a join here is refused (+i/+k/+b/+l), the user is
@@ -1069,18 +1073,26 @@ pub const World = struct {
         return channel.forward;
     }
 
+    /// Outcome of a join against the throttle window. `throttled_alert` means the
+    /// join was denied AND this is the first denial in the current window, so the
+    /// caller should raise a one-shot raid alert (the per-channel alert timestamp
+    /// has already been stamped).
+    pub const ThrottleResult = enum { admitted, throttled, throttled_alert };
+
     /// +j join-throttle config.
     pub fn setThrottle(self: *World, name: []const u8, joins: u16, secs: u32) WorldError!void {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
         channel.throttle_joins = joins;
         channel.throttle_secs = secs;
         channel.throttle_times.clearRetainingCapacity();
+        channel.throttle_alert_ms = 0;
     }
     pub fn clearThrottle(self: *World, name: []const u8) WorldError!void {
         const channel = self.channels.getPtr(name) orelse return error.NoSuchChannel;
         channel.throttle_joins = 0;
         channel.throttle_secs = 0;
         channel.throttle_times.clearRetainingCapacity();
+        channel.throttle_alert_ms = 0;
     }
     /// Returns the active throttle as {joins, secs}, or null when disabled.
     pub fn throttleOf(self: *World, name: []const u8) ?struct { joins: u16, secs: u32 } {
@@ -1088,13 +1100,20 @@ pub const World = struct {
         if (channel.throttle_joins == 0) return null;
         return .{ .joins = channel.throttle_joins, .secs = channel.throttle_secs };
     }
-    /// Admit one join against the +j window: prune expired timestamps, then deny
-    /// (return false) without recording if the window is full, else record `now`
-    /// and allow. No-op allow when throttle is disabled.
-    pub fn throttleAdmit(self: *World, name: []const u8, now_ms: i64) bool {
-        const channel = self.channels.getPtr(name) orelse return true;
-        if (channel.throttle_joins == 0) return true;
-        const window_ms: i64 = @as(i64, channel.throttle_secs) * 1000;
+    /// Admit one join against the join-throttle window. The effective rate is the
+    /// channel's explicit +j when set, otherwise the network default
+    /// (`default_joins`/`default_secs`, 0 = no default) — so a server-wide raid
+    /// guard reuses the exact same machinery as the per-channel mode. Prunes
+    /// expired timestamps, then denies without recording if the window is full,
+    /// else records `now` and admits. A denial stamps `throttle_alert_ms` once per
+    /// window and reports `.throttled_alert` so the caller can fire a raid alert.
+    pub fn throttleAdmit(self: *World, name: []const u8, now_ms: i64, default_joins: u16, default_secs: u32) ThrottleResult {
+        const channel = self.channels.getPtr(name) orelse return .admitted;
+        const explicit = channel.throttle_joins != 0;
+        const joins: u16 = if (explicit) channel.throttle_joins else default_joins;
+        const secs: u32 = if (explicit) channel.throttle_secs else default_secs;
+        if (joins == 0 or secs == 0) return .admitted;
+        const window_ms: i64 = @as(i64, secs) * 1000;
         // Prune timestamps outside the window (compact in place).
         var kept: usize = 0;
         for (channel.throttle_times.items) |ts| {
@@ -1104,9 +1123,16 @@ pub const World = struct {
             }
         }
         channel.throttle_times.shrinkRetainingCapacity(kept);
-        if (channel.throttle_times.items.len >= channel.throttle_joins) return false;
-        channel.throttle_times.append(self.allocator, now_ms) catch return true; // alloc fail: fail-open
-        return true;
+        if (channel.throttle_times.items.len >= joins) {
+            // Window full: deny. Alert at most once per window per channel.
+            if (channel.throttle_alert_ms == 0 or now_ms - channel.throttle_alert_ms >= window_ms) {
+                channel.throttle_alert_ms = now_ms;
+                return .throttled_alert;
+            }
+            return .throttled;
+        }
+        channel.throttle_times.append(self.allocator, now_ms) catch return .admitted; // alloc fail: fail-open
+        return .admitted;
     }
 
     /// Whether `hostmask` (nick!user@host) matches any +b entry (case-insensitive
@@ -2033,9 +2059,9 @@ test "+j join throttle: token bucket admits up to N per window, then denies" {
     const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
     _ = try world.join("#j", a);
 
-    // Disabled by default: every join admitted, throttleOf is null.
+    // Disabled by default (no +j, no network default): every join admitted.
     try std.testing.expect(world.throttleOf("#j") == null);
-    try std.testing.expect(world.throttleAdmit("#j", 0));
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#j", 0, 0, 0));
 
     // Configure 2 joins per 10 seconds.
     try world.setThrottle("#j", 2, 10);
@@ -2043,21 +2069,42 @@ test "+j join throttle: token bucket admits up to N per window, then denies" {
     try std.testing.expectEqual(@as(u16, 2), cfg.joins);
     try std.testing.expectEqual(@as(u32, 10), cfg.secs);
 
-    // First two joins in the window are admitted; the third is denied.
-    try std.testing.expect(world.throttleAdmit("#j", 1000));
-    try std.testing.expect(world.throttleAdmit("#j", 2000));
-    try std.testing.expect(!world.throttleAdmit("#j", 3000));
+    // First two joins in the window are admitted; the third is denied. The first
+    // denial in a window reports throttled_alert (one-shot), later ones throttled.
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#j", 1000, 0, 0));
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#j", 2000, 0, 0));
+    try std.testing.expectEqual(World.ThrottleResult.throttled_alert, world.throttleAdmit("#j", 3000, 0, 0));
+    try std.testing.expectEqual(World.ThrottleResult.throttled, world.throttleAdmit("#j", 3500, 0, 0));
 
     // After the window elapses, old timestamps prune and joins admit again.
-    try std.testing.expect(world.throttleAdmit("#j", 13000)); // 1000ms entry expired
-    try std.testing.expect(world.throttleAdmit("#j", 13500)); // 2000ms entry expired
-    try std.testing.expect(!world.throttleAdmit("#j", 14000)); // window full again
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#j", 13000, 0, 0)); // 1000ms entry expired
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#j", 13500, 0, 0)); // 2000ms entry expired
+    try std.testing.expectEqual(World.ThrottleResult.throttled_alert, world.throttleAdmit("#j", 14000, 0, 0)); // window full, new alert window
 
-    // Clearing disables the throttle entirely.
+    // Clearing the +j mode disables the per-channel throttle entirely.
     try world.clearThrottle("#j");
     try std.testing.expect(world.throttleOf("#j") == null);
-    try std.testing.expect(world.throttleAdmit("#j", 99999));
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#j", 99999, 0, 0));
     try std.testing.expectError(error.NoSuchChannel, world.setThrottle("#nope", 1, 1));
+}
+
+test "join throttle: network default applies to channels without explicit +j" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const a = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try world.join("#r", a);
+
+    // No +j set, but a network default of 2 joins / 5s applies and alerts once.
+    try std.testing.expect(world.throttleOf("#r") == null); // mode still reads as unset
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#r", 0, 2, 5));
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#r", 100, 2, 5));
+    try std.testing.expectEqual(World.ThrottleResult.throttled_alert, world.throttleAdmit("#r", 200, 2, 5));
+    try std.testing.expectEqual(World.ThrottleResult.throttled, world.throttleAdmit("#r", 300, 2, 5));
+
+    // An explicit +j overrides the network default (tighter or looser).
+    try world.setThrottle("#r", 1, 5);
+    try std.testing.expectEqual(World.ThrottleResult.admitted, world.throttleAdmit("#r", 10000, 2, 5));
+    try std.testing.expectEqual(World.ThrottleResult.throttled_alert, world.throttleAdmit("#r", 10100, 2, 5));
 }
 
 test "+f forward target: set (owned dupe), read, replace, clear" {

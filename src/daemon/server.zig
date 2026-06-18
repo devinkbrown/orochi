@@ -29,6 +29,9 @@ const svc_clonescan = @import("svc_clonescan.zig");
 const svc_lastseen = @import("svc_lastseen.zig");
 const gag_set = @import("gag_set.zig");
 const nick_enforcement = @import("nick_enforcement.zig");
+const svc_enforce = @import("svc_enforce.zig");
+const svc_recover = @import("svc_recover.zig");
+const spamtrap_mod = @import("spamtrap.zig");
 const media_session = @import("../substrate/media_session.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const sdp = @import("../proto/sdp.zig");
@@ -223,6 +226,7 @@ const reactor_fabric = @import("reactor_fabric.zig");
 const deliver_handle = @import("deliver_handle.zig");
 const oper_mod = @import("oper.zig");
 const conn_class = @import("conn_class.zig");
+const flood_guard = @import("flood_guard.zig");
 const og_mod = @import("operator_groups.zig");
 const config_format = @import("config_format.zig");
 const tls_certs = @import("tls_certs.zig");
@@ -1354,6 +1358,13 @@ pub const Config = struct {
     /// are exempt so a shared reverse proxy never throttles distinct clients.
     throttle_connects: u32 = 0,
     throttle_window_ms: u64 = 10_000,
+    /// Network raid guard: the default join-throttle applied to channels that have
+    /// no explicit `+j` mode. At most `raid_joins` joins per `raid_secs` window
+    /// before new joins are denied (ERR_THROTTLE) and a one-shot Event-Spine raid
+    /// alert fires. `raid_joins == 0` disables the network default; an explicit
+    /// `+j` on a channel always overrides it. Opers and invited users bypass.
+    raid_joins: u16 = 0,
+    raid_secs: u32 = 0,
     /// Network-wide (mesh) concurrent connections per source IP: counts local +
     /// every peer's connections from the same salted-IP-hash. `0` disables it.
     /// Authenticated accounts get +2; opers with `limit_exempt` bypass; loopback
@@ -1625,10 +1636,11 @@ pub const ConnState = struct {
     /// that rebuilds the registry never dangles). Set by `assignConnClass`; read by
     /// admission + the per-class limit enforcement.
     class_policy: conn_class.Policy = .{},
-    /// Per-class inbound line-flood window state (monotonic ms window start +
-    /// lines seen in it). Inert unless the class sets `flood_lines`.
-    flood_window_start_ms: i64 = 0,
-    flood_line_count: u32 = 0,
+    /// The connection's single flood guard, derived from its matched class policy
+    /// at `assignConnClass`. `null` when the class sets no flood limit, is
+    /// flood-exempt, or for S2S links. Retuned in place when the class is
+    /// re-assigned (oper-up, USR2 adoption).
+    flood_guard: ?flood_guard.FloodGuard = null,
     /// Allocator backing `send_overflow` (the owning reactor's). `undefined` on a
     /// test-only `ConnState.init(-1)`; only touched once overflow is non-empty,
     /// which such conns never reach.
@@ -2099,6 +2111,14 @@ pub const LinuxServer = struct {
     /// queried by `handleSearch`, which scopes hits back to a target's history.
     search_index: search_index_mod.SearchIndex,
     warden: warden.Registry,
+    /// Operator-designated spam-trap (honeypot) registry: nicks/channels a
+    /// legitimate user has no reason to contact. A non-oper that touches one
+    /// trips the trap (oper alert + offender flagging). Server-wide, so it is
+    /// guarded by `spamtrap_mu`; `spamtrap_active` is a lock-free fast path that
+    /// keeps the JOIN/PRIVMSG hot path free of the lock when no traps are set.
+    spamtrap: spamtrap_mod.DefaultSpamtrap,
+    spamtrap_mu: std.atomic.Mutex = .unlocked,
+    spamtrap_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     metadata: metadata_store.DefaultStore,
     /// Background weather/news cache backing `!weather`/`!news` (lazy-started on
     /// first fantasy use; heap-owned so its address is stable for the thread).
@@ -2546,6 +2566,7 @@ pub const LinuxServer = struct {
             .history = HistoryStore.init(allocator),
             .search_index = search_index_mod.SearchIndex.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
+            .spamtrap = spamtrap_mod.DefaultSpamtrap.init(allocator),
             .metadata = metadata_store.DefaultStore.init(allocator),
             .geo = geo_ptr,
             .props = ircx_prop_store.DefaultStore.init(allocator),
@@ -2796,6 +2817,7 @@ pub const LinuxServer = struct {
         self.history.deinit();
         self.search_index.deinit();
         self.warden.deinit();
+        self.spamtrap.deinit();
         self.metadata.deinit();
         self.props.deinit();
         {
@@ -3438,20 +3460,30 @@ pub const LinuxServer = struct {
 
             // Nick protection: a registered nick held by an unauthenticated user
             // is force-renamed to a Guest nick once the grace window elapses. The
-            // check self-clears once the user identifies (authenticated_to_owner).
+            // policy is the OWNER account's per-account SECURE/ENFORCE settings
+            // (svc_enforce); the mechanism (guest-nick generation) stays in
+            // nick_enforcement. The owner account name equals the registered nick.
+            // Self-clears once the user identifies. Default (no flags set) keeps
+            // today's always-on enforcement.
             if (c.nick_claimed_at_ms != 0) {
+                const owner_nick = c.session.displayName();
                 const authed_owner = if (c.session.account()) |a|
-                    std.ascii.eqlIgnoreCase(a, c.session.displayName())
+                    std.ascii.eqlIgnoreCase(a, owner_nick)
                 else
                     false;
-                switch (nick_enforcement.evaluate(.{
-                    .nick_is_registered = true,
-                    .authenticated_to_owner = authed_owner,
+                const grace_secs: u32 = @intCast(@max(@as(i64, 0), self.config.nick_grace_ms) / 1000);
+                const settings: svc_enforce.AccountSecurity = if (self.account_services) |svc|
+                    svc.accountSecurity(owner_nick, grace_secs)
+                else
+                    .{ .enforce = true, .enforce_seconds = grace_secs };
+                switch (svc_enforce.decide(settings, .{
+                    .identified = authed_owner,
+                    // An unauthenticated holder never satisfies the access list here.
+                    .access_match = false,
                     .claimed_at_ms = c.nick_claimed_at_ms,
                     .now_ms = now,
-                    .grace_ms = self.config.nick_grace_ms,
                 })) {
-                    .allow => c.nick_claimed_at_ms = 0,
+                    .recognized, .allow => c.nick_claimed_at_ms = 0,
                     .warn => {},
                     .enforce => {
                         var gbuf: [32]u8 = undefined;
@@ -5663,21 +5695,15 @@ pub const LinuxServer = struct {
         };
         const was_registered = conn.session.registered();
 
-        // Per-class inbound flood control: at most `flood_lines` lines per
-        // `flood_window_ms` (default 10s window when only the line count is set).
-        // Inert unless the matched class sets a limit and is not flood_exempt;
-        // applies only to registered, non-server connections.
-        if (was_registered and conn.class_policy.flood_lines != 0 and !conn.class_policy.flood_exempt and
-            conn.s2s == null and conn.s2s_secured == null)
-        {
-            const now = self.nowMs();
-            const window: i64 = @intCast(if (conn.class_policy.flood_window_ms != 0) conn.class_policy.flood_window_ms else 10_000);
-            if (now - conn.flood_window_start_ms > window) {
-                conn.flood_window_start_ms = now;
-                conn.flood_line_count = 1;
-            } else {
-                conn.flood_line_count += 1;
-                if (conn.flood_line_count > conn.class_policy.flood_lines) {
+        // The single per-connection flood guard. Set up from the matched class in
+        // `assignConnClass` (null when exempt / no limit / S2S). Keep-alives are
+        // free, commands are weighted, and a spread-spam throttle plus a decaying
+        // excess budget escalate a sustained flood to disconnect. A `.throttle`
+        // keeps processing the line (no silently dropped user input) while excess
+        // climbs; only `.disconnect` tears the client down.
+        if (was_registered and conn.s2s == null and conn.s2s_secured == null) {
+            if (conn.flood_guard) |*guard| {
+                if (guard.classifyRaw(self.nowMs(), line) == .disconnect) {
                     emitServerLine(conn, "ERROR :Excess Flood");
                     conn.close_reason = "Excess Flood";
                     conn.closing = true;
@@ -7201,6 +7227,20 @@ pub const LinuxServer = struct {
         conn.class_policy = class.policy;
         conn.sendq_cap = class.policy.sendq;
         conn.recvq_cap = if (class.policy.recvq != 0) @intCast(class.policy.recvq) else default_recvq_cap;
+
+        // The single flood guard is derived here from the matched class. Re-match
+        // (oper-up moving to a flood_exempt class, USR2 adoption) retunes it in
+        // place or clears it, so policy lives in exactly one spot.
+        const fg_cfg = class.policy.floodGuardConfig();
+        if (fg_cfg.enabled) {
+            if (conn.flood_guard) |*g| {
+                g.reconfigure(fg_cfg);
+            } else {
+                conn.flood_guard = flood_guard.FloodGuard.init(fg_cfg, self.nowMs());
+            }
+        } else {
+            conn.flood_guard = null;
+        }
     }
 
     /// Build the connection-class match context for `conn` from its live session
@@ -8657,14 +8697,24 @@ pub const LinuxServer = struct {
                 }
                 return;
             }
-            // +j join throttle: deny if the per-channel window is full. Opers and
-            // invited users bypass. Checked after the hard gates so a denied join
-            // does not consume a throttle slot.
-            if (!conn.session.isOper() and !invited and
-                !self.world.throttleAdmit(channel, self.nowMs()))
-            {
-                try queueNumeric(conn, .ERR_THROTTLE, &.{channel}, "Cannot join channel (+j) - join rate exceeded, try again shortly");
-                return;
+            // Join throttle: deny if the window is full. The effective rate is the
+            // channel's explicit +j, else the network-wide raid-guard default
+            // (`raid_joins`/`raid_secs`, 0 = off). Opers and invited users bypass.
+            // Checked after the hard gates so a denied join consumes no slot. The
+            // first denial in a window fires a one-shot raid alert on the Spine.
+            if (!conn.session.isOper() and !invited) {
+                switch (self.world.throttleAdmit(channel, self.nowMs(), self.config.raid_joins, self.config.raid_secs)) {
+                    .admitted => {},
+                    .throttled => {
+                        try queueNumeric(conn, .ERR_THROTTLE, &.{channel}, "Cannot join channel (+j) - join rate exceeded, try again shortly");
+                        return;
+                    },
+                    .throttled_alert => {
+                        self.raidAlert(channel);
+                        try queueNumeric(conn, .ERR_THROTTLE, &.{channel}, "Cannot join channel (+j) - join rate exceeded, try again shortly");
+                        return;
+                    },
+                }
             }
             // +l full: IRCX +d cloneable channels redirect the join to a clone;
             // otherwise it is a hard 471.
@@ -8767,6 +8817,10 @@ pub const LinuxServer = struct {
         }
 
         try self.broadcastJoin(join_target, conn);
+        // Spamtrap: a non-oper joining an operator-designated honeypot channel
+        // trips the trap (oper alert + offender flag). Lock-free no-op when no
+        // channel traps are configured.
+        self.spamtrapCheck(conn.session.displayName(), .channel, join_target, conn.session.isOper());
         try self.publishMemberEvent("JOIN", join_target, conn.session.displayName(), null);
         if (creating) {
             var flags_buf: [16]u8 = undefined;
@@ -17334,7 +17388,7 @@ pub const LinuxServer = struct {
     pub fn handleAccountSet(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "ACCOUNTSET", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count < 4) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCOUNTSET"}, "Usage: ACCOUNTSET <account> <password> <email|flags> <value>");
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCOUNTSET"}, "Usage: ACCOUNTSET <account> <password> <email|flags|secure|enforce> <value>");
             return;
         }
         const p = parsed.paramSlice();
@@ -17348,7 +17402,23 @@ pub const LinuxServer = struct {
                 };
                 break :blk .{ .flags = flags };
             }
-            try self.failReply(conn, "ACCOUNTSET", "INVALID_FIELD", "Unknown field (use email or flags)");
+            // SECURE: recognize this account only via identify. ENFORCE: protect
+            // the registered nick from unauthenticated holders (on by default).
+            if (std.ascii.eqlIgnoreCase(p[2], "secure")) {
+                const on = parseOnOff(p[3]) orelse {
+                    try self.failReply(conn, "ACCOUNTSET", "INVALID_VALUE", "secure must be on or off");
+                    return;
+                };
+                break :blk .{ .secure = on };
+            }
+            if (std.ascii.eqlIgnoreCase(p[2], "enforce")) {
+                const on = parseOnOff(p[3]) orelse {
+                    try self.failReply(conn, "ACCOUNTSET", "INVALID_VALUE", "enforce must be on or off");
+                    return;
+                };
+                break :blk .{ .enforce = on };
+            }
+            try self.failReply(conn, "ACCOUNTSET", "INVALID_FIELD", "Unknown field (use email, flags, secure, or enforce)");
             return;
         };
         var scratch: [512]u8 = undefined;
@@ -17409,6 +17479,117 @@ pub const LinuxServer = struct {
         try self.enqueueDeliveryThenClose(victim_id, ln, "Ghosted");
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Ghost session for {s} removed\r\n", .{ self.serverName(), conn.session.displayName(), target }) catch return;
         try appendToConn(conn, line);
+    }
+
+    /// Shared RECOVER/RELEASE gate: whether `nick` maps to a registered account,
+    /// and whether the requester is identified to (owns) that account. Both feed
+    /// `svc_recover.decide`; kept in one place so the two commands never drift.
+    fn recoverOwnership(svc: *services_mod.Services, conn: *ConnState, nick: []const u8) struct { registered: bool, owns: bool } {
+        const registered = blk: {
+            _ = svc.accountInfo(nick) catch break :blk false;
+            break :blk true;
+        };
+        const owns = if (conn.session.account()) |a| svc_recover.namesEqual(a, nick) else false;
+        return .{ .registered = registered, .owns = owns };
+    }
+
+    /// `RECOVER <nick>` — the account owner forces an unauthenticated holder off
+    /// their registered nick immediately (instead of waiting out the protection
+    /// grace), then briefly holds the nick (nick-delay) so the owner can reclaim
+    /// it. The requester MUST be identified to the account that owns the nick.
+    /// Real server command; decision logic is the pure `svc_recover`.
+    pub fn handleRecover(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "RECOVER", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RECOVER"}, "Usage: RECOVER <nick>");
+            return;
+        }
+        const nick = parsed.paramSlice()[0];
+        const gate = recoverOwnership(svc, conn, nick);
+
+        // Holder state: is some OTHER live connection sitting on the nick, and is
+        // it the owner's own authed session (which must never be ejected)?
+        var holder_present = false;
+        var holder_authed = false;
+        var holder_wid: ?world_model.ClientId = null;
+        if (self.world.findNick(nick)) |wid| {
+            const id = clientIdFromWorld(wid);
+            if (self.connFor(id)) |hc| {
+                if (hc != conn) {
+                    holder_present = true;
+                    holder_wid = wid;
+                    if (hc.session.account()) |ha| holder_authed = svc_recover.namesEqual(ha, nick);
+                }
+            }
+        }
+
+        switch (svc_recover.decide(.{
+            .command = .recover,
+            .nick_is_registered = gate.registered,
+            .requester_owns_account = gate.owns,
+            .holder_present = holder_present,
+            .holder_authenticated_to_owner = holder_authed,
+            .reservation_held = false,
+        })) {
+            .no_such_account => try self.failReply(conn, "RECOVER", "NICK_NOT_REGISTERED", "That nick is not registered"),
+            .not_owner => try self.failReply(conn, "RECOVER", "ACCESS_DENIED", "You must be identified to that account to recover its nick"),
+            .nothing_to_recover => try self.noticeTo(conn, "RECOVER: nobody else is holding that nick"),
+            .recover_holder => {
+                const wid = holder_wid.?;
+                const id = clientIdFromWorld(wid);
+                if (self.connFor(id)) |hc| {
+                    var gbuf: [32]u8 = undefined;
+                    const seed: u64 = @as(u64, @bitCast(id)) & 0xFFFFFF;
+                    if (nick_enforcement.guestNick(&gbuf, seed)) |guest| {
+                        self.forceRenameTo(id, hc, guest);
+                        self.armSendIfNeeded(hc) catch {};
+                    } else |_| {}
+                }
+                // Briefly hold the freed nick for the owner to reclaim.
+                if (self.config.nick_delay_ms != 0) {
+                    const expires = self.nowMs() + @as(i64, @intCast(self.config.nick_delay_ms));
+                    self.nick_delay.hold(nick, expires, conn.session.account()) catch {};
+                }
+                var b: [default_reply_bytes]u8 = undefined;
+                const note = std.fmt.bufPrint(&b, "RECOVER: forced the holder off {s}; reclaim it now", .{nick}) catch return;
+                try self.noticeTo(conn, note);
+            },
+            .release_reservation => {},
+        }
+    }
+
+    /// `RELEASE <nick>` — the account owner drops a server-held nick reservation
+    /// (nick-delay) on their own registered nick ahead of its window, making the
+    /// nick immediately available again. Requires identification to the account.
+    pub fn handleRelease(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "RELEASE", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RELEASE"}, "Usage: RELEASE <nick>");
+            return;
+        }
+        const nick = parsed.paramSlice()[0];
+        const gate = recoverOwnership(svc, conn, nick);
+        const reservation_held = self.config.nick_delay_ms != 0 and self.nick_delay.check(nick, self.nowMs()) != null;
+
+        switch (svc_recover.decide(.{
+            .command = .release,
+            .nick_is_registered = gate.registered,
+            .requester_owns_account = gate.owns,
+            .holder_present = false,
+            .holder_authenticated_to_owner = false,
+            .reservation_held = reservation_held,
+        })) {
+            .no_such_account => try self.failReply(conn, "RELEASE", "NICK_NOT_REGISTERED", "That nick is not registered"),
+            .not_owner => try self.failReply(conn, "RELEASE", "ACCESS_DENIED", "You must be identified to that account to release its nick"),
+            .nothing_to_recover => try self.noticeTo(conn, "RELEASE: there is no server hold on that nick"),
+            .release_reservation => {
+                self.nick_delay.release(nick);
+                var b: [default_reply_bytes]u8 = undefined;
+                const note = std.fmt.bufPrint(&b, "RELEASE: dropped the server hold on {s}", .{nick}) catch return;
+                try self.noticeTo(conn, note);
+            },
+            .recover_holder => {},
+        }
     }
 
     /// Emit a `NOTICE` from the server to this connection (services replies use
@@ -19246,6 +19427,93 @@ pub const LinuxServer = struct {
         return self.publishOperEventSubject(category, severity, message, message);
     }
 
+    /// Raise a one-shot Event-Spine raid alert for a channel whose join throttle
+    /// (explicit +j or the network raid-guard default) just tripped. `world`
+    /// already rate-limited this to one call per throttle window per channel, so
+    /// this just renders and publishes. Best-effort: alert failure never blocks
+    /// the join-deny path.
+    fn raidAlert(self: *LinuxServer, channel: []const u8) void {
+        var buf: [default_reply_bytes]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "FLOOD possible raid on {s}: join rate exceeded, throttling new joins", .{channel}) catch return;
+        self.publishOperEvent(.flood, .notice, msg) catch {};
+    }
+
+    /// Hot-path spam-trap check for a non-oper that just touched `target` (a nick
+    /// via PRIVMSG, or a channel via JOIN). Skips the lock entirely via the
+    /// lock-free `spamtrap_active` atomic when no traps are configured — the
+    /// common case. On a trip, raises a one-shot `.flood` oper alert; the actor
+    /// is flagged inside the registry for later `SPAMTRAP`/`WARD` follow-up.
+    fn spamtrapCheck(self: *LinuxServer, actor: []const u8, kind: spamtrap_mod.TrapKind, target: []const u8, actor_is_oper: bool) void {
+        if (!self.spamtrap_active.load(.acquire)) return;
+        lockSpin(&self.spamtrap_mu);
+        const tripped = self.spamtrap.triggered(actor, kind, target, actor_is_oper) catch false;
+        self.spamtrap_mu.unlock();
+        if (!tripped) return;
+        var buf: [default_reply_bytes]u8 = undefined;
+        const kindstr = if (kind == .nick) "nick" else "channel";
+        const msg = std.fmt.bufPrint(&buf, "FLOOD spamtrap tripped: {s} touched honeypot {s} {s}", .{ actor, kindstr, target }) catch return;
+        self.publishOperEvent(.flood, .warn, msg) catch {};
+    }
+
+    /// `SPAMTRAP <ADD|DEL> <NICK|CHAN> <target>` / `SPAMTRAP LIST` — operators
+    /// manage the honeypot registry. Oper-gated (client_moderate).
+    pub fn handleSpamtrap(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.requirePriv(conn, .client_moderate)) return;
+        const p = parsed.paramSlice();
+        if (p.len < 1) {
+            try self.noticeTo(conn, "Usage: SPAMTRAP <ADD|DEL> <NICK|CHAN> <target> | SPAMTRAP LIST");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(p[0], "LIST")) {
+            lockSpin(&self.spamtrap_mu);
+            const nnick = self.spamtrap.trapNickCount();
+            const nchan = self.spamtrap.trapChannelCount();
+            const noff = self.spamtrap.offenderCount();
+            const ntrips = self.spamtrap.totalTripCount();
+            self.spamtrap_mu.unlock();
+            var b: [default_reply_bytes]u8 = undefined;
+            const note = std.fmt.bufPrint(&b, "SPAMTRAP: {d} trap nick(s), {d} trap channel(s), {d} offender(s), {d} total trip(s)", .{ nnick, nchan, noff, ntrips }) catch return;
+            try self.noticeTo(conn, note);
+            return;
+        }
+        if (p.len < 3) {
+            try self.noticeTo(conn, "Usage: SPAMTRAP <ADD|DEL> <NICK|CHAN> <target>");
+            return;
+        }
+        const adding = std.ascii.eqlIgnoreCase(p[0], "ADD");
+        const deleting = std.ascii.eqlIgnoreCase(p[0], "DEL") or
+            std.ascii.eqlIgnoreCase(p[0], "DELETE") or std.ascii.eqlIgnoreCase(p[0], "REMOVE");
+        if (!adding and !deleting) {
+            try self.noticeTo(conn, "SPAMTRAP: subcommand must be ADD, DEL, or LIST");
+            return;
+        }
+        const is_nick = std.ascii.eqlIgnoreCase(p[1], "NICK");
+        const is_chan = std.ascii.eqlIgnoreCase(p[1], "CHAN") or std.ascii.eqlIgnoreCase(p[1], "CHANNEL");
+        if (!is_nick and !is_chan) {
+            try self.noticeTo(conn, "SPAMTRAP: target kind must be NICK or CHAN");
+            return;
+        }
+        const target = p[2];
+        lockSpin(&self.spamtrap_mu);
+        const res = if (adding)
+            (if (is_nick) self.spamtrap.addTrapNick(target) else self.spamtrap.addTrapChannel(target))
+        else
+            (if (is_nick) self.spamtrap.removeTrapNick(target) else self.spamtrap.removeTrapChannel(target));
+        self.spamtrap_active.store(self.spamtrap.trapNickCount() + self.spamtrap.trapChannelCount() > 0, .release);
+        self.spamtrap_mu.unlock();
+
+        res catch |err| {
+            var eb: [160]u8 = undefined;
+            const emsg = std.fmt.bufPrint(&eb, "SPAMTRAP: {s} failed ({s})", .{ p[0], @errorName(err) }) catch return;
+            try self.noticeTo(conn, emsg);
+            return;
+        };
+        var b: [default_reply_bytes]u8 = undefined;
+        const note = std.fmt.bufPrint(&b, "SPAMTRAP {s} {s} {s}", .{ if (adding) "ADD" else "DEL", if (is_nick) "NICK" else "CHAN", target }) catch return;
+        try self.publishOperEvent(.oper_action, .notice, note);
+        try self.noticeTo(conn, note);
+    }
+
     /// Core publish path with an explicit `subject` used for per-category subject
     /// filtering (distinct from the displayed `message`). Delivery to a subscriber
     /// requires both the category bit and a subject glob match (default scope `*`).
@@ -19428,6 +19696,10 @@ pub const LinuxServer = struct {
         // dimension stays owned by clone_limit.
         self.config.throttle_connects = lim.throttle_connects;
         self.config.throttle_window_ms = lim.throttle_window_ms;
+        // Network raid-guard default join-throttle (live retune; channels keep any
+        // explicit +j, which always overrides this default).
+        self.config.raid_joins = lim.raid_joins;
+        self.config.raid_secs = @intCast(@max(@as(u64, 1), lim.raid_window_ms / 1000));
         if (self.conn_throttle) |*t| t.deinit();
         self.conn_throttle = if (lim.throttle_connects != 0) clone_detect_mod.CloneDetector.init(self.allocator, .{
             .max_concurrent_per_ip = 0,
@@ -20814,6 +21086,14 @@ pub const LinuxServer = struct {
         text: []const u8,
         client_tags: ?[]const u8,
     ) !void {
+        // Spamtrap: a non-oper messaging an operator-designated honeypot nick
+        // trips the trap (channel honeypots trip on JOIN instead). Lock-free
+        // no-op when no nick traps are configured; checked before delivery so a
+        // trap nick need not be online to flag the sender.
+        if (!world_model.isChannelName(target)) {
+            self.spamtrapCheck(conn.session.displayName(), .nick, target, conn.session.isOper());
+        }
+
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const msg = try formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), command, &.{target}, text);
