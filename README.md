@@ -10,11 +10,13 @@ policy with bounded growable SendQ/RecvQ and nick-delay protection, and replaces
 the legacy TS6 server-to-server protocol with the native **Suimyaku + Tsumugi**
 cryptographic mesh.
 
-> **Status: running M1 daemon.** Boots on a real io_uring socket, answers `PING`,
-> completes `NICK`/`USER` registration (welcome burst), and wires connection
-> classes, bounded SendQ/RecvQ, nick-delay holds, and `STATS`/`INFO` operator
-> visibility. 30+ Zig modules, 192 tests green under Zig 0.16. See
-> [`docs/BRIEF.md`](docs/BRIEF.md) and [`docs/planning/`](docs/planning/).
+> **Status: in production.** Runs a live two-node post-quantum mesh with
+> session-preserving `USR2` hot-upgrades, serving IRCv3/IRCX clients and a
+> browser WebSocket client. Full IRCv3 + IRCX + SASL surface, in-process
+> channel/nick services, class-based connection policy, a single runtime flood
+> guard, `+j` network raid protection, and spam-trap honeypots. 900+ Zig source
+> files (300+ daemon modules), 6,900+ tests green under Zig 0.16. See
+> [`docs/BRIEF.md`](docs/BRIEF.md) and [`docs/guide/`](docs/guide/).
 
 ## Design pillars
 - **Zig top to bottom, no C interop.** Substrate, crypto, daemon, and tooling are
@@ -37,6 +39,13 @@ cryptographic mesh.
   matched class. Optional `[limits].nick_delay` holds released nicks after exit to
   reduce nick camping, while `STATS Y`, `STATS l`, and richer `INFO` expose the
   live policy and mesh state.
+- **Layered anti-abuse.** A single per-connection flood guard (keep-alives free,
+  commands weighted, distinct-target spread throttle, decaying excess →
+  disconnect) derived from each class's policy; a `+j` join-throttle with a
+  network-wide raid-guard default (`[limits].raid_joins`) and one-shot operator
+  raid alerts; operator-designated spam-trap honeypots (`SPAMTRAP`); and
+  first-class nick services (`RECOVER`/`RELEASE`, per-account `SECURE`/`ENFORCE`)
+  — all real server commands, no pseudo-clients.
 - **Full feature parity** with ophion — no regressions.
 
 ## Architecture
@@ -45,12 +54,13 @@ cryptographic mesh.
 | `src/substrate` | Ringlane io_uring reactor, lock-free queues, allocators, and the Suimyaku math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Sazanami, sketches) + the Deterministic Ocean simulator |
 | `src/crypto` | `Secret(T)`, SHA-2/HMAC/HKDF, AEADs, X25519 + ML-KEM key schedule, Tsumugi ratchet |
 | `src/proto` | zero-copy IRCv3 parser, CoilPack wire codec, CAP FSM, Suimyaku frame layer, SASL |
-| `src/daemon` | SerpentRegistry (comptime modules), client/channel model, connection classes, growable SendQ/RecvQ, nick delay, command dispatch, OroStore, `STATS`/`INFO`, the M1 server |
+| `src/daemon` | SerpentRegistry (comptime modules), client/channel model, connection classes, growable SendQ/RecvQ, nick delay + nick services, runtime flood guard, `+j` raid guard, spam-trap, command dispatch, OroStore, `STATS`/`INFO`, the live mesh server |
 
 ## Build & run
 ```sh
 zig build              # build (Zig 0.16)
-zig build test         # 192 tests
+zig build test         # ~6,900 tests
+zig build release      # optimized, stripped ReleaseFast daemon -> zig-out/bin/orochi
 zig build run          # start the daemon (listens on 127.0.0.1:6680)
 ./tools/genroots.sh    # regenerate package-root imports from the files present
 ```

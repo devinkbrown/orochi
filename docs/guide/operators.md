@@ -135,29 +135,44 @@ Look for a line like: `"Nick delay: 30000ms hold on release - 5 nick(s) currentl
 
 ## Per-Class Flood Control
 
-Each connection class can enforce line-rate limiting via the `flood_lines` and `flood_window` policy fields. This is independent of server-wide throttle policies and applies per-connection at the registration boundary.
+Each connection class drives a single runtime flood guard (`src/daemon/flood_guard.zig`) from its `flood_lines`/`flood_window` budget. The guard is more than a line counter: keep-alives (`PING`/`PONG`) are free, `PRIVMSG`/`NOTICE`/`JOIN` are weighted, a distinct-PRIVMSG-target spread check counters spray-spam, and sustained over-budget traffic accrues decaying excess strikes toward an `ERROR :Excess Flood` disconnect. It retunes live on `REHASH`.
 
 ### Configuration
 
 ```toml
 [class.restricted_net]
 match = ["203.0.113.0/24"]
-flood_lines = 10      # Max lines per flood_window
-flood_window = "10s"  # Enforcement window (default if only flood_lines set)
+flood_lines   = 10     # Command-rate budget per flood_window
+flood_window  = "10s"  # Enforcement window (default if only flood_lines set)
+flood_excess  = 0      # Excess strikes before disconnect (0 = auto: max(20, 2*flood_lines))
+flood_targets = 0      # Distinct PRIVMSG targets/window before spread throttle (0 = auto: max(8, flood_lines))
 
 [class.exempt_vip]
-flood_lines = 0       # No per-line flood limit
+flood_lines = 0       # No flood limit
 flood_exempt = true   # Exempt from throttle/flood entirely
 ```
 
 ### Behavior
 
-- **`flood_lines`**: Maximum inbound lines allowed per `flood_window`. `0` = no limit.
-- **`flood_window`**: Duration for the flood check. If only `flood_lines` is set, the window defaults to `10s`.
-- When a registered (non-oper) client exceeds the limit, the daemon closes the connection with `ERROR :Excess Flood` (`src/daemon/server.zig:5557`).
-- **`flood_exempt`**: When true, the class entirely bypasses flood checks and throttle enforcement.
-- **S2S server links** are always exempt from flood limits (the `server` class carries mesh traffic which may burst immediately after connection) (`src/daemon/server.zig:5546`).
+- **`flood_lines`**: Command-rate budget (weighted token bucket) per `flood_window`. `0` = no limit.
+- **`flood_window`**: Duration for the budget. If only `flood_lines` is set, the window defaults to `10s`.
+- **`flood_excess`**: Excess strikes tolerated before disconnect; `0` = auto (`max(20, 2×flood_lines)`). Each over-budget command adds a strike; strikes decay ~1/s, so a brief burst recovers but a sustained flood is cut with `ERROR :Excess Flood`. Throttled lines are still processed (no silently dropped user input) — only the excess threshold disconnects.
+- **`flood_targets`**: Distinct PRIVMSG targets a client may spray per `flood_window` before the spread-spam throttle adds excess; `0` = auto (`max(8, flood_lines)`).
+- **`flood_exempt`**: When true, the class entirely bypasses the flood guard and throttle enforcement.
+- **S2S server links** are always exempt (the `server` class carries mesh traffic which may burst immediately after connection).
 - Only registered connections are subject to flood control; the registration handshake itself is not throttled by these limits.
+
+## Network Raid Guard
+
+Beyond the per-channel `+j` join-throttle mode, `[limits].raid_joins` / `raid_window` apply a **default** join-throttle to every channel that has no explicit `+j`. When more than `raid_joins` clients join such a channel within `raid_window`, further joins are denied (`ERR_THROTTLE`) and a one-shot `FLOOD` raid alert is published to subscribed operators on the Event Spine. An explicit `+j` always overrides the default; operators and invited users bypass; `raid_joins = 0` disables it.
+
+```toml
+[limits]
+raid_joins  = 20     # default join-throttle for channels without +j (0 = disabled)
+raid_window = "10s"
+```
+
+Operators can also plant **spam-trap honeypots** with `SPAMTRAP ADD NICK <nick>` / `SPAMTRAP ADD CHAN <#channel>`: a non-oper that contacts a trap trips a `FLOOD` alert and is flagged for `WARD` follow-up. See [commands/oper-moderation.md](../reference/commands/oper-moderation.md).
 
 ## Server Links and Peer Inspection
 

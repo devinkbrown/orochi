@@ -81,14 +81,34 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 
 ## ACCOUNTSET
 
-- Syntax: `ACCOUNTSET <account> <password> <email|flags> <value>`
-- Description: Updates account email or numeric flags after password verification.
-- Privileges: Registered client.
+- Syntax: `ACCOUNTSET <account> <password> <email|flags|secure|enforce> <value>`
+- Description: Updates account settings after password verification. `email` sets the address; `flags` sets the non-privileged numeric flag bits; `secure on|off` recognizes the account only via identify (never an access-list match alone); `enforce on|off` controls nick protection on the account's registered nick (on by default — `off` opts the account out of the auto force-rename sweep).
+- Privileges: Registered client (the account owner).
 - Parameters: Account, password, field, value.
 - Replies: Server `NOTICE` confirming update.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, `FAIL ACCOUNTSET INVALID_VALUE`, `FAIL ACCOUNTSET INVALID_FIELD`, `FAIL ACCOUNTSET TEMPORARILY_UNAVAILABLE`.
-- Example: `ACCOUNTSET alice correct-horse email alice@example.net`
-- Sources: `src/daemon/modules/accounts.zig:67`, `src/daemon/server.zig:8636`
+- Example: `ACCOUNTSET alice correct-horse secure on`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleAccountSet`, `src/daemon/svc_enforce.zig`
+
+## RECOVER
+
+- Syntax: `RECOVER <nick>`
+- Description: The account owner forces an unauthenticated holder off their registered nick immediately — instead of waiting out the protection grace — then briefly holds the nick (nick-delay) so the owner can reclaim it. The requester MUST be identified to the account that owns the nick. A holder that is the owner's own authenticated session is never ejected. Decision logic is the pure `svc_recover`.
+- Privileges: Registered client identified to the owning account.
+- Replies: Server `NOTICE`; the holder is force-renamed to a `Guest…` nick.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL RECOVER NICK_NOT_REGISTERED`, `FAIL RECOVER ACCESS_DENIED`, `FAIL RECOVER TEMPORARILY_UNAVAILABLE`.
+- Example: `RECOVER alice`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleRecover`, `src/daemon/svc_recover.zig`
+
+## RELEASE
+
+- Syntax: `RELEASE <nick>`
+- Description: The account owner drops a server-held nick reservation (nick-delay) on their own registered nick ahead of its window, making the nick immediately available again. Requires identification to the account.
+- Privileges: Registered client identified to the owning account.
+- Replies: Server `NOTICE`.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL RELEASE NICK_NOT_REGISTERED`, `FAIL RELEASE ACCESS_DENIED`, `FAIL RELEASE TEMPORARILY_UNAVAILABLE`.
+- Example: `RELEASE alice`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleRelease`, `src/daemon/svc_recover.zig`
 
 ## GHOST
 

@@ -121,6 +121,17 @@ The operator/security module registers oper and moderation commands (`src/daemon
 - Example: `WARD ADD address 203.0.113.0/24 mesh refuse 3600 :abuse`
 - Sources: `src/daemon/modules/oper_security.zig:116`, `src/daemon/server.zig:5892`, `src/daemon/warden.zig:21`
 
+## SPAMTRAP
+
+- Syntax: `SPAMTRAP ADD <NICK|CHAN> <target> | SPAMTRAP DEL <NICK|CHAN> <target> | SPAMTRAP LIST`
+- Description: Operator-designated spam-trap (honeypot) registry. A trap nick or channel is one a legitimate user has no reason to contact; a non-operator that PRIVMSGs a trap nick or JOINs a trap channel trips the trap, which raises a one-shot `FLOOD` Event-Spine alert and flags the offender for follow-up (e.g. `WARD`). The hot path is lock-free when no traps are configured. `LIST` reports trap and offender counts.
+- Privileges: Oper plus `client_moderate` privilege.
+- Parameters: Subcommand, target kind (`NICK`/`CHAN`), and target.
+- Replies: Server notice + oper event; offenders are flagged in the registry.
+- Errors: `ERR_NOPRIVILEGES 481`; usage and add/remove failures are server notices.
+- Example: `SPAMTRAP ADD CHAN #freenudes`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig` `handleSpamtrap`, `src/daemon/spamtrap.zig`
+
 ## SHUN
 
 - Syntax: `SHUN <nick|ip|mask> [:reason]`
