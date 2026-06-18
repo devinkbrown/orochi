@@ -19672,14 +19672,20 @@ pub const LinuxServer = struct {
     /// a 1-hop neighbour (RPL_LINKS 364 / RPL_ENDOFLINKS 365). Reflects both
     /// plaintext and PQ-secured links, matching the MESH peer view.
     pub fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
-        var line_buf: [128]u8 = undefined;
-        const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{"Orochi IRC daemon"}) catch return;
+        var line_buf: [256]u8 = undefined;
+        // This server's own line carries its CONFIGURED description.
+        const own_desc = if (self.config.server_description.len != 0) self.config.server_description else "Orochi IRC daemon";
+        const detail = std.fmt.bufPrint(&line_buf, "0 {s}", .{own_desc}) catch return;
         try queueNumeric(conn, .RPL_LINKS, &.{ self.serverName(), protocol_inventory.currentServerName() }, detail);
         var seen: [32][]const u8 = undefined;
         var seen_n: usize = 0;
-        var it = self.rx().clients.iterator();
+        // S2S peer links live ONLY on reactor 0; iterate it directly (under the
+        // world lock) so LINKS finds every peer regardless of which shard answered
+        // this query — previously `self.rx()` missed peers on shards 1..N.
+        var it = self.reactors[0].clients.iterator();
         outer: while (it.next()) |entry| {
-            const rname = establishedPeerName(entry.value) orelse continue;
+            const c = entry.value;
+            const rname = establishedPeerName(c) orelse continue;
             // One line per distinct peer: a transient duplicate link to the same
             // server must not appear twice.
             for (seen[0..seen_n]) |s| {
@@ -19689,11 +19695,28 @@ pub const LinuxServer = struct {
                 seen[seen_n] = rname;
                 seen_n += 1;
             }
-            var lbuf: [128]u8 = undefined;
-            const ldetail = std.fmt.bufPrint(&lbuf, "1 {s}", .{"Suimyaku peer"}) catch continue;
+            // The peer's REAL handshake-gossiped description (not a generic).
+            const pdesc = peerDescription(c) orelse "Suimyaku peer";
+            var lbuf: [256]u8 = undefined;
+            const ldetail = std.fmt.bufPrint(&lbuf, "1 {s}", .{pdesc}) catch continue;
             try queueNumeric(conn, .RPL_LINKS, &.{ rname, protocol_inventory.currentServerName() }, ldetail);
         }
         try queueNumeric(conn, .RPL_ENDOFLINKS, &.{"*"}, "End of /LINKS list");
+    }
+
+    /// The handshake-gossiped description of the established S2S peer on `conn`,
+    /// or null when not an established peer / no description was carried.
+    fn peerDescription(conn: *const ConnState) ?[]const u8 {
+        if (conn.s2s) |l| {
+            if (l.established()) if (l.remoteNodeId()) |nid| {
+                if (l.nodeDescription(nid)) |d| if (d.len != 0) return d;
+            };
+        } else if (conn.s2s_secured) |l| {
+            if (l.established()) if (l.remoteNodeId()) |nid| {
+                if (l.nodeDescription(nid)) |d| if (d.len != 0) return d;
+            };
+        }
+        return null;
     }
 
     /// The remote name of an established S2S peer on `conn` (plaintext or
