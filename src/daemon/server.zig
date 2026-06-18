@@ -1759,8 +1759,13 @@ pub fn processLine(conn_state: *ConnState, line: []const u8, sink: anytype) !voi
 
     if (std.ascii.eqlIgnoreCase(parsed.command, "PING") and parsed.param_count != 0) {
         const token = parsed.paramSlice()[0];
-        var pong: [irc_line.MAX_LINE_BODY + 16]u8 = undefined;
-        const out = try std.fmt.bufPrint(&pong, "PONG :{s}\r\n", .{token});
+        // RFC-compliant reply: `:<server> PONG <server> :<token>`. A bare
+        // `PONG :<token>` (no server source/name) is rejected by strict clients —
+        // mIRC refuses to finish connecting, and HexChat's keepalive ping is not
+        // recognized, so it treats the link as dead and reconnects.
+        const srv = protocol_inventory.currentServerName();
+        var pong: [irc_line.MAX_LINE_BODY + 200]u8 = undefined;
+        const out = try std.fmt.bufPrint(&pong, ":{s} PONG {s} :{s}\r\n", .{ srv, srv, token });
         try sink.write(out);
         return;
     }
@@ -23186,7 +23191,7 @@ test "REHASH oper binding builder skips unknown or empty classes" {
     try std.testing.expectEqual(@as(usize, 0), bindings.len);
 }
 
-test "processLine answers PING with bare PONG token" {
+test "processLine answers PING with an RFC-compliant server-sourced PONG" {
     const allocator = std.testing.allocator;
     _ = allocator;
 
@@ -23195,7 +23200,7 @@ test "processLine answers PING with bare PONG token" {
     var sink = TestSink{ .storage = &storage };
 
     try processLine(&conn, "PING :abc", &sink);
-    try std.testing.expectEqualStrings("PONG :abc\r\n", sink.written());
+    try std.testing.expectEqualStrings(":orochi.local PONG orochi.local :abc\r\n", sink.written());
 }
 
 test "processLine registration sequence emits welcome numerics" {
@@ -25229,7 +25234,7 @@ test "threaded server: GHOST rejects caller account for non-account nick" {
     try writeAllFd(fd_alice, "GHOST AwayNick correcthorse\r\n");
     try recvUntil(&alice, "FAIL GHOST NICK_NOT_OWNED", 200);
     try writeAllFd(fd_victim, "PING :still-here\r\n");
-    try recvUntil(&victim, "PONG :still-here", 200);
+    try recvUntil(&victim, "PONG orochi.local :still-here", 200);
 }
 
 test "threaded server: cross-shard PRIVMSG delivery (num_shards=2)" {
@@ -25602,7 +25607,7 @@ test "threaded server: SETNAME self echo requires setname cap" {
 
     a.reset();
     try writeAllFd(fd_a, "SETNAME :No Echo\r\nPING :setname-gate\r\n");
-    try recvUntil(&a, "PONG :setname-gate", 200);
+    try recvUntil(&a, "PONG orochi.local :setname-gate", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "SETNAME :No Echo\r\n") == null);
 }
 
@@ -27620,7 +27625,7 @@ test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
     // A param-less NOTICE must be silently dropped; the trailing PING proves the
     // server kept processing and that no 461 was interleaved.
     try writeAllFd(fd_a, "NOTICE\r\nPING :tok\r\n");
-    try recvUntil(&a, "PONG :tok", 200);
+    try recvUntil(&a, "PONG orochi.local :tok", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 461 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 411 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 412 ") == null);
@@ -27635,7 +27640,7 @@ test "threaded server: empty NOTICE never returns ERR_NEEDMOREPARAMS" {
 
     a.reset();
     try writeAllFd(fd_a, "NOTICE A\r\nPING :tok2\r\n");
-    try recvUntil(&a, "PONG :tok2", 200);
+    try recvUntil(&a, "PONG orochi.local :tok2", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 411 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), " 412 ") == null);
 }
@@ -28268,7 +28273,7 @@ test "threaded server: media user modes block transmit and hide automatic presen
     a.reset();
     try writeAllFd(fd_b, "MEDIA JOIN #media voice\r\n");
     try writeAllFd(fd_a, "PING :media-private\r\n");
-    try recvUntil(&a, "PONG :media-private", 200);
+    try recvUntil(&a, "PONG orochi.local :media-private", 200);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "NOTE MEDIA #media JOIN B voice") == null);
 
     a.reset();
@@ -33533,7 +33538,7 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     defer plain.deinit(alloc);
     var rbuf: [4096]u8 = undefined;
     var guard: usize = 0;
-    while (std.mem.indexOf(u8, plain.items, "PONG :across-upgrade") == null) : (guard += 1) {
+    while (std.mem.indexOf(u8, plain.items, "PONG orochi.local :across-upgrade") == null) : (guard += 1) {
         if (guard > 64) return error.TestUnexpectedResult;
         const n = try readFd(sp[1], &rbuf);
         if (n == 0) return error.TestUnexpectedResult;
@@ -33553,9 +33558,9 @@ test "threaded server: UPGRADE resume arena re-attaches a live TLS client" {
     // The predecessor's unflushed record arrived FIRST (no sequence hole) ...
     try expectContains(plain.items, ":upgrade.test NOTICE TLSY :carried-across");
     // ... and fresh traffic flows both ways on the resumed engine.
-    try expectContains(plain.items, "PONG :across-upgrade");
+    try expectContains(plain.items, "PONG orochi.local :across-upgrade");
     const before = std.mem.indexOf(u8, plain.items, "carried-across").?;
-    const after = std.mem.indexOf(u8, plain.items, "PONG :across-upgrade").?;
+    const after = std.mem.indexOf(u8, plain.items, "PONG orochi.local :across-upgrade").?;
     try std.testing.expect(before < after);
 }
 
