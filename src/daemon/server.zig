@@ -1098,11 +1098,12 @@ pub const ServerError = error{
 /// `protocol_inventory.setIsupportOverride` and free with `freeIsupportTokens`.
 pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     const base = protocol_inventory.isupport_tokens;
-    // +2: PREFIX and STATUSMSG are appended here, derived from the single source
-    // of truth in chanmode (never hardcoded in the proto token list). +1 more for
-    // the optional NETWORKICON token when a network icon URL is configured.
+    // +3: PREFIX, STATUSMSG, and MODES are appended here. PREFIX/STATUSMSG derive
+    // from the single source of truth in chanmode (never hardcoded in the proto
+    // token list); MODES is the config-tunable per-command channel-mode cap. +1
+    // more for the optional NETWORKICON token when a network icon URL is set.
     const has_icon = cfg.network_icon_url.len != 0;
-    const out = try allocator.alloc([]const u8, base.len + 2 + @as(usize, @intFromBool(has_icon)));
+    const out = try allocator.alloc([]const u8, base.len + 3 + @as(usize, @intFromBool(has_icon)));
     errdefer allocator.free(out);
     for (base, 0..) |tok, i| {
         if (std.mem.startsWith(u8, tok, "NETWORK=")) {
@@ -1135,10 +1136,14 @@ pub fn buildIsupportTokens(allocator: std.mem.Allocator, cfg: Config) ![]const [
     // the advertised 005 tokens can never drift from the member-prefix model.
     out[base.len] = try std.fmt.allocPrint(allocator, "PREFIX={s}", .{chanmode.MemberModes.isupport_prefix});
     out[base.len + 1] = try std.fmt.allocPrint(allocator, "STATUSMSG={s}", .{chanmode.MemberModes.statusmsg_symbols});
+    // MODES: how many channel modes a client should combine per MODE command
+    // (`[limits] modes_per_line`, default 4). Clients that honor it (mIRC,
+    // HexChat) send one mode/target per line when set to 1.
+    out[base.len + 2] = try std.fmt.allocPrint(allocator, "MODES={d}", .{cfg.modes_per_line});
     // Optional IRCv3 network icon — Ophion NETWORKICON / n_url parity. Advertised
     // only when [network] icon_url is set, so existing 005 bursts are unchanged.
     if (has_icon) {
-        out[base.len + 2] = try std.fmt.allocPrint(allocator, "NETWORKICON={s}", .{cfg.network_icon_url});
+        out[base.len + 3] = try std.fmt.allocPrint(allocator, "NETWORKICON={s}", .{cfg.network_icon_url});
     }
     return out;
 }
@@ -1254,6 +1259,10 @@ pub const Config = struct {
     /// MAXTARGETS, enforced by handleMessage). Configurable via `[limits]
     /// maxtargets`.
     maxtargets: u32 = 4,
+    /// How many channel-mode changes a client should combine per MODE command
+    /// (advertised as MODES). Honored by mIRC/HexChat — set to 1 for one
+    /// mode/target per line. Configurable via `[limits] modes_per_line`.
+    modes_per_line: u32 = 4,
     /// Max MONITOR targets per client (advertised as MONITOR, enforced by the
     /// MonitorStore). Configurable via `[limits] monitorlimit`.
     monitorlimit: u32 = 128,
@@ -27762,12 +27771,13 @@ test "buildIsupportTokens replaces length tokens with configured values" {
         if (std.mem.eql(u8, tok, "MAXTARGETS=3")) hits += 1;
         if (std.mem.eql(u8, tok, "MONITOR=64")) hits += 1;
         if (std.mem.eql(u8, tok, "SILENCE=16")) hits += 1;
+        if (std.mem.eql(u8, tok, "MODES=4")) hits += 1; // default modes_per_line
         // static tokens carry through unchanged.
         if (std.mem.startsWith(u8, tok, "NETWORK=")) try std.testing.expect(tok.len > "NETWORK=".len);
     }
-    try std.testing.expectEqual(@as(usize, 10), hits);
-    // base tokens + the two derived ones (PREFIX, STATUSMSG) appended from chanmode.
-    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 2, tokens.len);
+    try std.testing.expectEqual(@as(usize, 11), hits);
+    // base tokens + the three derived ones (PREFIX, STATUSMSG, MODES) appended.
+    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 3, tokens.len);
     // PREFIX/STATUSMSG come from the single source of truth, not a hardcoded copy.
     var saw_prefix = false;
     var saw_statusmsg = false;
@@ -27779,13 +27789,14 @@ test "buildIsupportTokens replaces length tokens with configured values" {
 }
 
 test "buildIsupportTokens advertises NETWORKICON only when configured" {
-    // No icon configured: NETWORKICON absent, count stays base + 2.
+    // No icon configured: NETWORKICON absent, count stays base + 3 (PREFIX,
+    // STATUSMSG, MODES).
     const plain = try buildIsupportTokens(std.testing.allocator, .{ .port = 0 });
     defer freeIsupportTokens(std.testing.allocator, plain);
     for (plain) |tok| try std.testing.expect(!std.mem.startsWith(u8, tok, "NETWORKICON="));
-    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 2, plain.len);
+    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 3, plain.len);
 
-    // Icon configured: NETWORKICON=<url> present, count is base + 3.
+    // Icon configured: NETWORKICON=<url> present, count is base + 4.
     const with_icon = try buildIsupportTokens(
         std.testing.allocator,
         .{ .port = 0, .network_icon_url = "https://eshmaki.me/icon.png" },
@@ -27796,7 +27807,7 @@ test "buildIsupportTokens advertises NETWORKICON only when configured" {
         if (std.mem.eql(u8, tok, "NETWORKICON=https://eshmaki.me/icon.png")) saw = true;
     }
     try std.testing.expect(saw);
-    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 3, with_icon.len);
+    try std.testing.expectEqual(protocol_inventory.isupport_tokens.len + 4, with_icon.len);
 }
 
 test "utf8TruncateBytes caps length without splitting a codepoint" {

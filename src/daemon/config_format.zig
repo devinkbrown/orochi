@@ -242,6 +242,9 @@ pub const Config = struct {
         chanlimit: u32 = 50,
         /// Max comma-separated targets per PRIVMSG/NOTICE (advertised MAXTARGETS).
         maxtargets: u32 = 4,
+        /// Channel-mode changes a client should combine per MODE command
+        /// (advertised as MODES). Set to 1 for one mode/target per line.
+        modes_per_line: u32 = 4,
         /// Max MONITOR targets per client (advertised as MONITOR).
         monitorlimit: u32 = 128,
         /// Max SILENCE masks per client (advertised as SILENCE).
@@ -640,6 +643,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.maxlist = @intCast(try uintField(doc, "limits.maxlist", cfg.limits.maxlist, 1, 10000));
     cfg.limits.chanlimit = @intCast(try uintField(doc, "limits.chanlimit", cfg.limits.chanlimit, 1, 10000));
     cfg.limits.maxtargets = @intCast(try uintField(doc, "limits.maxtargets", cfg.limits.maxtargets, 1, 64));
+    cfg.limits.modes_per_line = @intCast(try uintField(doc, "limits.modes_per_line", cfg.limits.modes_per_line, 1, 20));
     cfg.limits.monitorlimit = @intCast(try uintField(doc, "limits.monitorlimit", cfg.limits.monitorlimit, 1, 100000));
     cfg.limits.silencelimit = @intCast(try uintField(doc, "limits.silencelimit", cfg.limits.silencelimit, 1, 256));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));

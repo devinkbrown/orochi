@@ -165,6 +165,7 @@ Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/con
 | `maxlist` | integer | `100` | `1..10000` | Per-channel list mode cap for `+b/+e/+I/+Z` (`src/daemon/server.zig:935`). |
 | `chanlimit` | integer | `50` | `1..10000` | Max channels per non-oper (`src/daemon/server.zig:938`). |
 | `maxtargets` | integer | `4` | `1..64` | Max comma-separated PRIVMSG/NOTICE targets (`src/daemon/server.zig:941`). |
+| `modes_per_line` | integer | `4` | `1..20` | Channel-mode changes a client should combine per MODE command, advertised as the `MODES` ISUPPORT token. Clients that honor it (mIRC, HexChat) send one mode/target per line when set to `1` (`src/daemon/server.zig` `buildIsupportTokens`). |
 | `monitorlimit` | integer | `128` | `1..100000` | MONITOR target limit (`src/daemon/server.zig:945`). |
 | `silencelimit` | integer | `32` | `1..256` | SILENCE mask limit (`src/daemon/server.zig:948`). |
 | `max_clones_per_ip` | integer | `0` | `0..65535` | Exact-IP clone cap; `0` disables (`src/daemon/server.zig:1005`). |

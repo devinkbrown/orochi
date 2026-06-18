@@ -254,6 +254,7 @@ channellen = 64        # CHANNELLEN (2..200)
 maxlist = 100          # per-channel cap on each list mode +b/+e/+I/+Z (1..10000)
 chanlimit = 50         # max channels a non-oper may join (1..10000)
 maxtargets = 4         # max targets per PRIVMSG/NOTICE (1..64)
+modes_per_line = 4     # channel modes a client combines per MODE cmd (MODES; 1..20; 1 = one mode/target per line)
 monitorlimit = 128     # max MONITOR targets per client (1..100000)
 silencelimit = 32      # max SILENCE masks per client (1..256)
 # Anti-abuse:
