@@ -172,6 +172,8 @@ Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/con
 | `nick_delay` | duration string | `"0"` (disabled) | non-negative `ms/s/m/h` duration | Hold a released nick against reuse for this window after its owner exits (anti nick-camping). The owning account may reclaim during the window; opers and `nick_delay_exempt` classes bypass. `0` disables (`src/daemon/config_format.zig`, `src/daemon/nick_delay.zig`). |
 | `throttle_connects` | integer | `0` (disabled) | `0..1000000` | Connection-rate throttle: max NEW connections one source IP may open within `throttle_window`; excess is refused at accept. Loopback and `trusted_proxies` are exempt (a shared reverse proxy is never throttled as one IP), making it WebSocket-safe. `0` disables (`src/daemon/clone_detect.zig`, `src/daemon/server.zig` `refuseSilentClient`). |
 | `throttle_window` | duration string | `"10s"` | positive `ms/s/m/h` duration | Sliding window for `throttle_connects`. |
+| `raid_joins` | integer | `0` (disabled) | `0..65535` | Network raid guard: a default join-throttle applied to channels with no explicit `+j` mode. At most `raid_joins` joins per `raid_window` before new joins are denied (`ERR_THROTTLE`) and a one-shot `.flood` Event-Spine raid alert fires. An explicit `+j` always overrides this default; opers and invited users bypass. `0` disables (`src/daemon/world.zig` `throttleAdmit`, `src/daemon/server.zig` `raidAlert`). |
+| `raid_window` | duration string | `"10s"` | positive `ms/s/m/h` duration | Window for `raid_joins`. |
 | `max_clones_per_ip_net` | integer | `0` (disabled) | `0..65535` | Network-wide (mesh) concurrent connections per source IP: this node plus every peer's count for the same IP, gossiped as a salted hash (raw IPs never cross the wire; needs a shared `[mesh] pass`). Authenticated accounts get +2; `limit_exempt` opers bypass; loopback/trusted proxies exempt (`src/daemon/mesh_clones.zig`, `src/daemon/server.zig`). |
 | `reputation_refuse_threshold` | integer | `0` | `0..1000000` | Refuse connects at or above decaying reputation score; `0` disables (`src/daemon/server.zig:1012`). |
 | `reputation_half_life` | duration string | `"1m"` | positive `ms/s/m/h` duration | IP reputation score decay half-life (`src/daemon/config_boot.zig:53`). |
@@ -208,8 +210,10 @@ The source-keyed clone caps (`max_per_ip` / `max_per_host` / `max_per_account`) 
 | `ping_interval` | duration | `0` (inherit) | Per-class PING interval override. |
 | `ping_timeout` | duration | `0` (inherit) | Per-class PING-timeout grace override. |
 | `register_timeout` | duration | `0` (inherit) | Per-class registration-handshake timeout override. |
-| `flood_lines` | integer | `0` | Max inbound lines per `flood_window`; `0` = no flood limit. |
+| `flood_lines` | integer | `0` | Per-class command-rate budget driving the runtime flood guard (`src/daemon/flood_guard.zig`): keep-alives are free, PRIVMSG/NOTICE/JOIN are weighted, sustained over-budget traffic accrues excess toward an Excess Flood disconnect. `0` = no flood limit. |
 | `flood_window` | duration | `0` (`10s` when only `flood_lines` set) | Window for `flood_lines`. |
+| `flood_excess` | integer | `0` (auto) | Excess strikes tolerated before disconnect; `0` = auto (`max(20, 2×flood_lines)`). Each over-budget command adds a strike; strikes decay ~1/s. |
+| `flood_targets` | integer | `0` (auto) | Distinct PRIVMSG targets a client may spray per `flood_window` before the spread-spam throttle bites; `0` = auto (`max(8, flood_lines)`). |
 | `require_tls` | bool | `false` | Refuse admission unless the connection is TLS. |
 | `require_sasl` | bool | `false` | Refuse admission unless SASL-authenticated. |
 | `flood_exempt` | bool | `false` | Exempt this class from flood/throttle enforcement. |

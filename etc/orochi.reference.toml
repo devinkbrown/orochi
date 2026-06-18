@@ -279,6 +279,13 @@ reputation_half_life = "1m"    # decay half-life of the reputation penalty
 # owning account may reclaim during the window; opers and connection classes
 # flagged `nick_delay_exempt` bypass it. Duration string; "0" disables (default).
 # nick_delay = "30s"
+# Network raid guard: a default join-throttle applied to channels that have NO
+# explicit `+j` mode. At most `raid_joins` joins per `raid_window` before new
+# joins are denied (ERR_THROTTLE) and a one-shot oper raid alert fires on the
+# Event Spine. An explicit `+j` always overrides this default; opers and invited
+# users bypass. `raid_joins = 0` disables the network default.
+# raid_joins = 0               # 0 = disabled (0..65535)
+# raid_window = "10s"          # window for raid_joins
 
 
 # --- [io] — io_uring tuning --------------------------------------------------
@@ -328,8 +335,14 @@ clone_refuse_penalty = 25.0           # added when a clone is refused (0..1000)
 # ping_timeout     = "1m"
 # register_timeout = "30s"
 # # --- flood + admission ---
-# flood_lines  = 0           # max inbound lines per flood_window (0 = no limit)
-# flood_window = "10s"       # window for flood_lines
+# # flood_lines is the per-class command-rate budget driving the runtime flood
+# # guard: keep-alives (PING/PONG) are free, PRIVMSG/NOTICE/JOIN are weighted, and
+# # sustained over-budget traffic accrues excess strikes toward an Excess Flood
+# # disconnect. A distinct-PRIVMSG-target spread check counters spray-spam.
+# flood_lines   = 0          # command-rate budget per flood_window (0 = no limit)
+# flood_window  = "10s"      # window for flood_lines
+# flood_excess  = 0          # excess strikes before disconnect (0 = auto: max(20, 2*flood_lines))
+# flood_targets = 0          # distinct PRIVMSG targets/window before spread throttle (0 = auto: max(8, flood_lines))
 # require_tls  = false       # refuse admission unless the connection is TLS
 # require_sasl = false       # refuse admission unless SASL-authenticated
 # flood_exempt = false       # exempt this class from flood/throttle enforcement
