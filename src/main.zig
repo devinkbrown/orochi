@@ -112,6 +112,35 @@ pub fn main(init: std.process.Init) !void {
             // predecessor — not the built-in defaults.
             config_path_arg = args.next();
         } else
+        // `orochi --check-config <path>` parses a config and reports OK/ERROR
+        // WITHOUT booting (no ports bound, no mesh dialed) — safe pre-deploy
+        // validation. Exits 0 on success, 1 on any read/parse error.
+        if (std.mem.eql(u8, first, "--check-config")) {
+            const path = args.next() orelse {
+                std.debug.print("usage: orochi --check-config <path>\n", .{});
+                std.process.exit(2);
+            };
+            const resolver = orochi.daemon.config_format.Resolver{
+                .ctx = @ptrCast(&resolver_ctx),
+                .env = envLookup,
+                .file = fileLookup,
+            };
+            if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
+                defer allocator.free(text);
+                if (orochi.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
+                    var l = loaded;
+                    l.deinit(allocator);
+                    std.debug.print("config OK: {s}\n", .{path});
+                    return;
+                } else |err| {
+                    std.debug.print("config ERROR in {s}: {s}\n", .{ path, @errorName(err) });
+                    std.process.exit(1);
+                }
+            } else |err| {
+                std.debug.print("config ERROR: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(1);
+            }
+        } else
         // `orochi acme-issue ...` runs an out-of-band ACME issuance and exits.
         // Linux-only (raw socket syscalls); comptime-gated so non-linux targets
         // never analyze the linux-specific ACME path.
