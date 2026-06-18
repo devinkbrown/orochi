@@ -46,16 +46,31 @@ pub const DeliverMsg = struct {
     /// truncated for filtering (the displayed bytes in `buf` are untruncated).
     broadcast_subject: [broadcast_subject_max]u8 = [_]u8{0} ** broadcast_subject_max,
     broadcast_subject_len: u16 = 0,
+    /// Cross-shard oper-event ORIGIN server name (inline POD copy): the server the
+    /// event was raised on, so a network-wide event fanned to other shards renders
+    /// `:<origin> EVENT …` with the originating node — not the local one. Empty
+    /// (`broadcast_origin_len == 0`) means "use the local server name" (the case
+    /// for a locally-raised event). Capped at `broadcast_origin_max`.
+    broadcast_origin: [broadcast_origin_max]u8 = [_]u8{0} ** broadcast_origin_max,
+    broadcast_origin_len: u16 = 0,
 
     /// The carried subject slice (empty when none was set).
     pub fn broadcastSubject(self: *const DeliverMsg) []const u8 {
         return self.broadcast_subject[0..self.broadcast_subject_len];
+    }
+
+    /// The carried origin server name (empty when none was set => local server).
+    pub fn broadcastOrigin(self: *const DeliverMsg) []const u8 {
+        return self.broadcast_origin[0..self.broadcast_origin_len];
     }
 };
 
 /// Inline cap for the cross-shard oper-event subject filter copy. Subjects longer
 /// than this are truncated for the per-category glob check only.
 pub const broadcast_subject_max: usize = 256;
+
+/// Inline cap for the cross-shard oper-event origin server name copy.
+pub const broadcast_origin_max: usize = 128;
 
 pub fn DeliverPool(comptime slots: usize) type {
     comptime {

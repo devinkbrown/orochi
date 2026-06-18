@@ -42,6 +42,7 @@ const cap_frame_signing: u8 = 1 << 0;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
+const oper_event = @import("../../proto/oper_event.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
@@ -206,6 +207,10 @@ pub const S2sPeer = struct {
     /// this peer, awaiting the daemon to decode + fold into its network-wide clone
     /// aggregate. The peer driver stays substrate-pure: it never decodes them.
     clone_counts: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified OPER_EVENT payloads received from this peer, awaiting the daemon
+    /// to decode + deliver to its local oper subscribers. Substrate-pure: never
+    /// decoded here.
+    oper_events: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -286,6 +291,8 @@ pub const S2sPeer = struct {
         self.session_migrations.deinit(self.allocator);
         for (self.clone_counts.items) |m| self.allocator.free(m);
         self.clone_counts.deinit(self.allocator);
+        for (self.oper_events.items) |m| self.allocator.free(m);
+        self.oper_events.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -435,6 +442,7 @@ pub const S2sPeer = struct {
             .CHANNEL_MODE_STATE => try self.recvChannelModeState(frame.payload),
             .SESSION_MIGRATE => try self.recvSessionMigrate(frame.payload),
             .CLONE_COUNT => try self.recvCloneCounts(frame.payload),
+            .OPER_EVENT => try self.recvOperEvent(frame.payload),
         }
     }
 
@@ -504,6 +512,35 @@ pub const S2sPeer = struct {
     /// counts-codec buffer. Best-effort; only meaningful once established.
     pub fn sendCloneCounts(self: *S2sPeer, sink: ByteSink, payload: []const u8) !void {
         try emitFrame(self.allocator, sink, .CLONE_COUNT, payload);
+    }
+
+    /// Queue a verified inbound OPER_EVENT for the daemon to decode and deliver to
+    /// its local oper subscribers. Signed-frame gated (a peer cannot inject
+    /// unsigned alerts); a copy is taken, oversize/alloc failures drop it.
+    fn recvOperEvent(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.OPER_EVENT, frame_payload) orelse return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.oper_events.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued inbound OPER_EVENT payloads (caller owns + frees each slice and
+    /// the outer slice). Each decodes with `oper_event.decode`.
+    pub fn takeOperEvents(self: *S2sPeer) ![][]u8 {
+        return self.oper_events.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed OPER_EVENT to this peer (network-wide Event-Spine fan-out).
+    /// Best-effort; only meaningful once established.
+    pub fn sendOperEvent(self: *S2sPeer, sink: ByteSink, category: u6, severity: u8, origin_server: []const u8, message: []const u8) !void {
+        const ev = oper_event.OperEvent{
+            .category = category,
+            .severity = severity,
+            .origin_server = truncated(origin_server, oper_event.max_origin_len),
+            .message = truncated(message, oper_event.max_message_len),
+        };
+        var buf: [oper_event.max_encoded_len]u8 = undefined;
+        const wire = try oper_event.encode(ev, &buf);
+        try self.emitSignable(sink, .OPER_EVENT, wire);
     }
 
     /// Decode an inbound cross-node MESSAGE and queue it for the daemon to

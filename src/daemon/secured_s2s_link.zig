@@ -480,6 +480,19 @@ pub const SecuredLink = struct {
         return link.takeCloneCounts();
     }
 
+    /// Emit a signed OPER_EVENT over the encrypted leg, then flush ciphertext.
+    pub fn sendOperEvent(self: *SecuredLink, category: u6, severity: u8, origin_server: []const u8, message: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendOperEvent(category, severity, origin_server, message);
+        try self.drainInner();
+    }
+
+    /// Drain queued inbound OPER_EVENT payloads decoded by the inner link.
+    pub fn takeOperEvents(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeOperEvents();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis
     /// (empty until the inner CRDT link is established).
     pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {

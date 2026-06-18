@@ -403,6 +403,17 @@ pub const S2sLink = struct {
         return self.peer.takeCloneCounts();
     }
 
+    /// Emit a signed OPER_EVENT to this peer (network-wide Event-Spine fan-out).
+    pub fn sendOperEvent(self: *S2sLink, category: u6, severity: u8, origin_server: []const u8, message: []const u8) !void {
+        try self.peer.sendOperEvent(self.sink(), category, severity, origin_server, message);
+    }
+
+    /// Drain queued inbound OPER_EVENT payloads from this peer (caller owns +
+    /// frees each slice and the outer slice; decode with `oper_event.decode`).
+    pub fn takeOperEvents(self: *S2sLink) ![][]u8 {
+        return self.peer.takeOperEvents();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis.
     pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
         return self.peer.collectTopology(out);

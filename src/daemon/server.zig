@@ -36,6 +36,7 @@ const media_session = @import("../substrate/media_session.zig");
 const kagura_frame = @import("../substrate/kagura_frame.zig");
 const sdp = @import("../proto/sdp.zig");
 const event_spine = @import("event_spine.zig");
+const oper_event = @import("../proto/oper_event.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
@@ -3025,8 +3026,13 @@ pub const LinuxServer = struct {
                     // glob exactly as the origin did. An empty carried subject means
                     // match-all (the common, unscoped case).
                     const subject = msg.broadcastSubject();
+                    // Origin server: the node where the event was raised. Empty means
+                    // a locally-raised event, so use this server's name; a network-
+                    // wide event fanned in from a peer carries the true origin.
+                    const carried_origin = msg.broadcastOrigin();
+                    const origin = if (carried_origin.len != 0) carried_origin else self.serverName();
                     // `bytes` is the raw chatsvc event BODY; render the per-recipient
-                    // `:<srv> EVENT <target> <body>` line for each local subscriber
+                    // `:<origin> EVENT <target> <body>` line for each local subscriber
                     // (target = that subscriber's own nick), matching the origin shard.
                     var it = self.rx().clients.iterator();
                     while (it.next()) |entry| {
@@ -3034,7 +3040,7 @@ pub const LinuxServer = struct {
                         if (c.closing) continue;
                         if (!sessionWantsEvent(&c.session, category, subject)) continue;
                         var line_buf: [default_reply_bytes]u8 = undefined;
-                        const line = event_spine.renderEvent(self.serverName(), c.session.displayName(), bytes, &line_buf) catch continue;
+                        const line = event_spine.renderEvent(origin, c.session.displayName(), bytes, &line_buf) catch continue;
                         appendToConn(c, line) catch continue;
                         self.armSendIfNeeded(c) catch {};
                     }
@@ -4279,6 +4285,7 @@ pub const LinuxServer = struct {
         self.drainOriginRejections(link);
         // Fold this peer's network-wide clone counts into the aggregate.
         self.drainCloneCountsFrom(link);
+        self.drainOperEvents(link);
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
@@ -4371,6 +4378,7 @@ pub const LinuxServer = struct {
         self.drainOriginRejections(link);
         // Fold this peer's network-wide clone counts into the aggregate.
         self.drainCloneCountsFrom(link);
+        self.drainOperEvents(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
@@ -19541,24 +19549,38 @@ pub const LinuxServer = struct {
         message: []const u8,
         subject: []const u8,
     ) !void {
-        _ = severity; // kept on the spine type for callers; absent from the chatsvc wire
-        // chatsvc-faithful delivery: render a raw `:<srv> EVENT <target> <message>`
-        // line PER RECIPIENT, where <target> is the subscribed oper's OWN nick. No
-        // NOTE wrapper, no IRCv3 `@event-*` tags, no draft numerics — modeled after
-        // the MS Exchange 5.5 Chat Service. The category still gates delivery; the
-        // TYPE leads the carried `message` body (e.g. "USER CONNECT …").
+        // Deliver to THIS node's local oper subscribers (rendered with our server
+        // name as the origin), then fan the same event to every mesh peer so opers
+        // on OTHER nodes see it too — network-wide Event Spine. A peer renders it
+        // with THIS node's name as the origin (carried on the wire).
+        self.deliverOperEventLocal(self.serverName(), category, subject, message);
+        self.meshBroadcastOperEvent(category, severity, message);
+    }
+
+    /// Deliver one Event-Spine event to this node's local oper subscribers across
+    /// ALL shards, rendered `:<origin_server> EVENT <oper-nick> <message>`. Shared
+    /// by the local publish path (origin = this server) and the mesh drain (origin
+    /// = the peer that raised it). Pure local fan-out; never touches the wire.
+    fn deliverOperEventLocal(
+        self: *LinuxServer,
+        origin_server: []const u8,
+        category: event_spine.EventCategory,
+        subject: []const u8,
+        message: []const u8,
+    ) void {
+        // chatsvc-faithful delivery: render a raw `:<origin> EVENT <target> <body>`
+        // line PER RECIPIENT (target = the subscribed oper's OWN nick). Category
+        // gates delivery; the TYPE leads the body (e.g. "USER CONNECT …").
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!sessionWantsEvent(&entry.value.session, category, subject)) continue;
             var line_buf: [default_reply_bytes]u8 = undefined;
-            const line = event_spine.renderEvent(self.serverName(), entry.value.session.displayName(), message, &line_buf) catch continue;
-            try self.deliver(entry.id, line);
+            const line = event_spine.renderEvent(origin_server, entry.value.session.displayName(), message, &line_buf) catch continue;
+            self.deliver(entry.id, line) catch continue;
         }
         // Cross-shard fan-out: opers on OTHER reactors are not in this reactor's
-        // client table, so hand the PLAIN form to each other shard's inbox and that
-        // reactor delivers it to its own category-subscribers on its own thread.
-        // (Off-reactor message-tags opers receive the plain form — always valid
-        // IRCv3; same-reactor opers already got the cap-correct line above.) The
+        // client table, so hand the BODY + subject + ORIGIN to each other shard's
+        // inbox and that reactor renders/delivers to its own subscribers. The
         // fabric is null for a single-shard daemon, so this is a no-op there.
         if (self.fabric) |*fabric| {
             const my_shard = self.rx().shard_id;
@@ -19566,27 +19588,74 @@ pub const LinuxServer = struct {
             var shard: u12 = 0;
             while (shard < total) : (shard += 1) {
                 if (shard == my_shard) continue;
-                // Carry the raw event BODY (not a pre-rendered line): the receiving
-                // reactor renders `:<srv> EVENT <target> <message>` per its OWN local
-                // subscribers (the chatsvc <target> is per-recipient).
                 const buf = fabric.acquire(message) orelse continue;
                 var fan = reactor_fabric.DeliverMsg{
                     .to = client_model.ClientId.invalid,
                     .buf = buf,
                     .broadcast_category = @intFromEnum(category),
                 };
-                // Carry the subject so the receiving reactor filters identically.
-                const n = @min(subject.len, deliver_handle.broadcast_subject_max);
-                @memcpy(fan.broadcast_subject[0..n], subject[0..n]);
-                fan.broadcast_subject_len = @intCast(n);
+                const sn = @min(subject.len, deliver_handle.broadcast_subject_max);
+                @memcpy(fan.broadcast_subject[0..sn], subject[0..sn]);
+                fan.broadcast_subject_len = @intCast(sn);
+                // Carry the origin server so the receiving reactor renders the right
+                // source (the local server name, or a peer's for a network event).
+                const on = @min(origin_server.len, deliver_handle.broadcast_origin_max);
+                @memcpy(fan.broadcast_origin[0..on], origin_server[0..on]);
+                fan.broadcast_origin_len = @intCast(on);
                 if (fabric.sendTo(shard, fan)) {
-                    // Wake the target via its OWN wake eventfd — the reactor loop
-                    // watches Reactor.wake (its wake-poll completion runs
-                    // drainFabric), not the fabric's wake fds. Same path the normal
-                    // cross-shard delivery uses.
                     if (self.reactors[shard].wake) |*w| w.wake();
                 } else fabric.release(buf);
             }
+        }
+    }
+
+    /// Fan a locally-raised Event-Spine event to every established mesh peer as a
+    /// signed OPER_EVENT, carrying our server name as the origin. Best-effort; a
+    /// send failure to one peer never blocks the others or the local delivery.
+    fn meshBroadcastOperEvent(self: *LinuxServer, category: event_spine.EventCategory, severity: event_spine.EventSeverity, message: []const u8) void {
+        const cat: u6 = @intFromEnum(category);
+        const sev: u8 = @intFromEnum(severity);
+        const origin = self.serverName();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendOperEvent(cat, sev, origin, message) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendOperEvent(cat, sev, origin, message) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
+            }
+        }
+    }
+
+    /// Decode a peer's inbound OPER_EVENT payloads and deliver each to this node's
+    /// local oper subscribers, rendered with the ORIGIN server the event carries
+    /// (NOT this node). Never re-broadcast — that would loop the mesh; a peer
+    /// already fanned it to every node directly. Malformed payloads are skipped.
+    fn drainOperEvents(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeOperEvents() catch return;
+        defer {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+        }
+        for (payloads) |p| {
+            const ev = oper_event.decode(p) catch continue;
+            // Reject a category value that is not a defined EventCategory variant
+            // (a hostile peer could send any in-range u6) — never @enumFromInt blind.
+            var category_opt: ?event_spine.EventCategory = null;
+            inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |f| {
+                if (f.value == ev.category) category_opt = @enumFromInt(ev.category);
+            }
+            const category = category_opt orelse continue;
+            // Subject == message (callers that publish locally use the same).
+            self.deliverOperEventLocal(ev.origin_server, category, ev.message, ev.message);
         }
     }
 

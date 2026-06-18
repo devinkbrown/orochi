@@ -59,6 +59,11 @@ pub const FrameType = enum(u8) {
     /// node currently holds. Raw IPs never appear — only keyed hashes. Decoded by
     /// the `mesh_clones` binary codec and attributed to the authenticated link.
     CLONE_COUNT = 0x13,
+    /// Network-wide operator event: a one-shot Event-Spine alert (raid, spamtrap,
+    /// oper action, …) raised on `origin_server`, fanned to every node so opers
+    /// anywhere see it, rendered with the origin server name. Carries
+    /// {origin_server, category, severity, message}; signed like other facts.
+    OPER_EVENT = 0x14,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -85,6 +90,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.SESSION_MIGRATE) => .SESSION_MIGRATE,
             @intFromEnum(FrameType.ENTITY_PROP) => .ENTITY_PROP,
             @intFromEnum(FrameType.CLONE_COUNT) => .CLONE_COUNT,
+            @intFromEnum(FrameType.OPER_EVENT) => .OPER_EVENT,
             else => null,
         };
     }
