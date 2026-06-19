@@ -64,6 +64,12 @@ pub const FrameType = enum(u8) {
     /// anywhere see it, rendered with the origin server name. Carries
     /// {origin_server, category, severity, message}; signed like other facts.
     OPER_EVENT = 0x14,
+    /// Network-wide operator OBSERVE feed: a one-shot lifecycle record (connect,
+    /// quit, nick, oper-up) for a watched subject raised on `origin_server`, fanned
+    /// to every node so a standing `EVENT OBSERVE <mask>` matches network-wide.
+    /// Carries {action, origin_server, nick, user, host, account, detail}; signed
+    /// (the subject's host is the REAL/uncloaked host — an operator-trust surface).
+    OBSERVE_EVENT = 0x15,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -91,6 +97,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.ENTITY_PROP) => .ENTITY_PROP,
             @intFromEnum(FrameType.CLONE_COUNT) => .CLONE_COUNT,
             @intFromEnum(FrameType.OPER_EVENT) => .OPER_EVENT,
+            @intFromEnum(FrameType.OBSERVE_EVENT) => .OBSERVE_EVENT,
             else => null,
         };
     }

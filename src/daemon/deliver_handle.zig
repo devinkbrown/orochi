@@ -53,6 +53,13 @@ pub const DeliverMsg = struct {
     /// for a locally-raised event). Capped at `broadcast_origin_max`.
     broadcast_origin: [broadcast_origin_max]u8 = [_]u8{0} ** broadcast_origin_max,
     broadcast_origin_len: u16 = 0,
+    /// Cross-shard OBSERVE fan-out: when true, `buf` holds an encoded
+    /// `observe_event` payload (action + origin + structured subject), and the
+    /// owning reactor decodes it, matches its OWN clients' standing OBSERVE filters,
+    /// and pushes a per-watcher `EVENT … OBSERVE` line. Distinct from the
+    /// `broadcast_category` Event-Spine path (different subscription model). `to` is
+    /// ignored. Keeps cross-reactor client iteration on each reactor's own thread.
+    broadcast_observe: bool = false,
 
     /// The carried subject slice (empty when none was set).
     pub fn broadcastSubject(self: *const DeliverMsg) []const u8 {

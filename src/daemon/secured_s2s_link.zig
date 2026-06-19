@@ -493,6 +493,19 @@ pub const SecuredLink = struct {
         return link.takeOperEvents();
     }
 
+    /// Emit a signed OBSERVE_EVENT over the encrypted leg, then flush ciphertext.
+    pub fn sendObserveEvent(self: *SecuredLink, action: u8, origin_server: []const u8, nick: []const u8, user: []const u8, host: []const u8, account: ?[]const u8, detail: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendObserveEvent(action, origin_server, nick, user, host, account, detail);
+        try self.drainInner();
+    }
+
+    /// Drain queued inbound OBSERVE_EVENT payloads decoded by the inner link.
+    pub fn takeObserveEvents(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeObserveEvents();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis
     /// (empty until the inner CRDT link is established).
     pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {

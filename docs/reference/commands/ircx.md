@@ -93,7 +93,7 @@ The IRCX module registers discovery, typed messaging, property, access, event, m
 ## EVENT
 
 - Syntax: `EVENT <ADD|DEL|LIST|BROADCAST|OBSERVE> ...`
-- Description: Event Spine control. `ADD`/`DEL` manage the caller's oper event category mask, `LIST` renders subscriptions, `BROADCAST` sends an oper announcement, and `OBSERVE` manages standing operator observation filters. WALLOPS functionality rides `EVENT BROADCAST`; it is not a `+w` user mode path.
+- Description: Event Spine control. `ADD`/`DEL` manage the caller's oper event category mask, `LIST` renders subscriptions, `BROADCAST` sends an oper announcement, and `OBSERVE` manages standing operator observation filters. A standing `OBSERVE` mask matches lifecycle records (connect, quit, nick, oper-up) network-wide: an event raised on any mesh node is fanned to every node (rendered with the originating server name), so an operator sees matching subjects regardless of which node they are on. WALLOPS functionality rides `EVENT BROADCAST`; it is not a `+w` user mode path.
 - Privileges: Oper checked inside handler.
 - Parameters: Subcommand; categories or observe arguments as needed.
 - Replies: Raw `EVENT LIST` lines, `NOTE EVENT` observe/broadcast lines, and server notices.

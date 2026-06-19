@@ -43,6 +43,7 @@ const cap_frame_signing: u8 = 1 << 0;
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
 const oper_event = @import("../../proto/oper_event.zig");
+const observe_event = @import("../../proto/observe_event.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
@@ -211,6 +212,10 @@ pub const S2sPeer = struct {
     /// to decode + deliver to its local oper subscribers. Substrate-pure: never
     /// decoded here.
     oper_events: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified OBSERVE_EVENT payloads received from this peer, awaiting the daemon
+    /// to decode + match against its local OBSERVE registry. Substrate-pure: never
+    /// decoded here.
+    observe_events: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -293,6 +298,8 @@ pub const S2sPeer = struct {
         self.clone_counts.deinit(self.allocator);
         for (self.oper_events.items) |m| self.allocator.free(m);
         self.oper_events.deinit(self.allocator);
+        for (self.observe_events.items) |m| self.allocator.free(m);
+        self.observe_events.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -443,6 +450,7 @@ pub const S2sPeer = struct {
             .SESSION_MIGRATE => try self.recvSessionMigrate(frame.payload),
             .CLONE_COUNT => try self.recvCloneCounts(frame.payload),
             .OPER_EVENT => try self.recvOperEvent(frame.payload),
+            .OBSERVE_EVENT => try self.recvObserveEvent(frame.payload),
         }
     }
 
@@ -541,6 +549,48 @@ pub const S2sPeer = struct {
         var buf: [oper_event.max_encoded_len]u8 = undefined;
         const wire = try oper_event.encode(ev, &buf);
         try self.emitSignable(sink, .OPER_EVENT, wire);
+    }
+
+    /// Queue a verified inbound OBSERVE_EVENT for the daemon to decode and match
+    /// against its local OBSERVE registry. Signed-frame gated (the subject's real
+    /// host is operator-trust); a copy is taken, oversize/alloc failures drop it.
+    fn recvObserveEvent(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.OBSERVE_EVENT, frame_payload) orelse return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.observe_events.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued inbound OBSERVE_EVENT payloads (caller owns + frees each slice
+    /// and the outer slice). Each decodes with `observe_event.decode`.
+    pub fn takeObserveEvents(self: *S2sPeer) ![][]u8 {
+        return self.observe_events.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).
+    /// Best-effort; only meaningful once established.
+    pub fn sendObserveEvent(
+        self: *S2sPeer,
+        sink: ByteSink,
+        action: u8,
+        origin_server: []const u8,
+        nick: []const u8,
+        user: []const u8,
+        host: []const u8,
+        account: ?[]const u8,
+        detail: []const u8,
+    ) !void {
+        const ev = observe_event.ObserveEvent{
+            .action = action,
+            .origin_server = truncated(origin_server, observe_event.max_origin_len),
+            .nick = truncated(nick, observe_event.max_nick_len),
+            .user = truncated(user, observe_event.max_user_len),
+            .host = truncated(host, observe_event.max_host_len),
+            .account = if (account) |a| truncated(a, observe_event.max_account_len) else null,
+            .detail = truncated(detail, observe_event.max_detail_len),
+        };
+        var buf: [observe_event.max_encoded_len]u8 = undefined;
+        const wire = try observe_event.encode(ev, &buf);
+        try self.emitSignable(sink, .OBSERVE_EVENT, wire);
     }
 
     /// Decode an inbound cross-node MESSAGE and queue it for the daemon to

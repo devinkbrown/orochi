@@ -37,6 +37,7 @@ const kagura_frame = @import("../substrate/kagura_frame.zig");
 const sdp = @import("../proto/sdp.zig");
 const event_spine = @import("event_spine.zig");
 const oper_event = @import("../proto/oper_event.zig");
+const observe_event = @import("../proto/observe_event.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
@@ -3016,6 +3017,13 @@ pub const LinuxServer = struct {
             for (msgs[0..n]) |msg| {
                 defer fabric.release(msg.buf);
                 const bytes = fabric.bytes(msg.buf);
+                // Cross-shard OBSERVE fan-out: `bytes` is an encoded observe_event;
+                // decode it and push a per-watcher OBSERVE line to THIS reactor's
+                // matching opers (its own client table, on its own thread).
+                if (msg.broadcast_observe) {
+                    self.deliverObserveFromWire(bytes);
+                    continue;
+                }
                 // Cross-shard oper-event fan-out: deliver to every one of THIS
                 // reactor's clients subscribed to the carried category (safe — we
                 // only touch our own shard's client table, on our own thread).
@@ -4286,6 +4294,7 @@ pub const LinuxServer = struct {
         // Fold this peer's network-wide clone counts into the aggregate.
         self.drainCloneCountsFrom(link);
         self.drainOperEvents(link);
+        self.drainObserveEvents(link);
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
@@ -4379,6 +4388,7 @@ pub const LinuxServer = struct {
         // Fold this peer's network-wide clone counts into the aggregate.
         self.drainCloneCountsFrom(link);
         self.drainOperEvents(link);
+        self.drainObserveEvents(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
@@ -13252,7 +13262,27 @@ pub const LinuxServer = struct {
 
     /// Push a live OBSERVE record to every operator whose standing filter matches
     /// the subject for this action. Best-effort; delivery failures are ignored.
+    /// Publish a lifecycle OBSERVE record: deliver to THIS node's watching opers
+    /// (across ALL shards) AND fan it to every mesh peer so a standing
+    /// `EVENT OBSERVE <mask>` matches network-wide. Mirror of the Event-Spine
+    /// publish split (`publishOperEventSubject`).
     fn notifyObservers(self: *LinuxServer, action: observe_mod.Action, subject: observe_mod.Subject) void {
+        self.deliverObserveLocal(self.serverName(), action, subject);
+        self.meshBroadcastObserveEvent(action, subject);
+    }
+
+    fn truncObserve(s: []const u8, max: usize) []const u8 {
+        return if (s.len > max) s[0..max] else s;
+    }
+
+    /// Deliver one OBSERVE record to this node's watching opers across ALL shards,
+    /// rendered `:<origin_server> EVENT <oper> OBSERVE …` (origin = this server for
+    /// a local event, or the raising peer for a mesh-drained one). Pure local
+    /// fan-out; never touches the wire.
+    /// Push an OBSERVE line to watchers homed on THIS reactor only (no cross-shard
+    /// fan). Shared by the local-publish path and the cross-shard receive
+    /// (`deliverObserveFromWire`), so the receiving shard never re-fans (loop-safe).
+    fn deliverObserveToReactor(self: *LinuxServer, origin_server: []const u8, action: observe_mod.Action, subject: observe_mod.Subject) void {
         if (self.observe.count() == 0) return;
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
@@ -13260,8 +13290,120 @@ pub const LinuxServer = struct {
             const filter = self.observe.get(observeKey(entry.value)) orelse continue;
             if (!observe_mod.Registry.matches(filter, subject, action)) continue;
             var buf: [default_reply_bytes]u8 = undefined;
-            const line = observe_mod.Registry.formatNote(&buf, self.serverName(), entry.value.session.displayName(), action, subject) orelse continue;
+            const line = observe_mod.Registry.formatNote(&buf, origin_server, entry.value.session.displayName(), action, subject) orelse continue;
             self.deliver(entry.id, line) catch {};
+        }
+    }
+
+    const ObserveDecoded = struct { origin: []const u8, action: observe_mod.Action, subject: observe_mod.Subject };
+
+    /// Decode an observe_event payload into an origin + action + structured
+    /// subject, rejecting an action `u8` that is not a defined `observe_mod.Action`
+    /// variant (a hostile peer could send any value). Borrows `bytes`.
+    fn decodeObserveEvent(bytes: []const u8) ?ObserveDecoded {
+        const ev = observe_event.decode(bytes) catch return null;
+        var action_opt: ?observe_mod.Action = null;
+        inline for (@typeInfo(observe_mod.Action).@"enum".fields) |f| {
+            if (f.value == ev.action) action_opt = @enumFromInt(ev.action);
+        }
+        const action = action_opt orelse return null;
+        return .{ .origin = ev.origin_server, .action = action, .subject = .{
+            .nick = ev.nick,
+            .user = ev.user,
+            .host = ev.host,
+            .account = ev.account,
+            .detail = ev.detail,
+        } };
+    }
+
+    /// Decode a cross-shard-handed observe_event payload and deliver it to THIS
+    /// reactor's watchers (no re-fan — the publishing shard already addressed every
+    /// other shard).
+    fn deliverObserveFromWire(self: *LinuxServer, bytes: []const u8) void {
+        const d = decodeObserveEvent(bytes) orelse return;
+        self.deliverObserveToReactor(d.origin, d.action, d.subject);
+    }
+
+    fn deliverObserveLocal(self: *LinuxServer, origin_server: []const u8, action: observe_mod.Action, subject: observe_mod.Subject) void {
+        // Watchers homed on THIS reactor.
+        self.deliverObserveToReactor(origin_server, action, subject);
+        // Cross-shard: watchers on OTHER reactors are not in this reactor's client
+        // table. Encode the event once and hand it to each other shard's inbox; that
+        // reactor decodes (`drainFabric`) and matches its own watchers. The fabric is
+        // null for a single-shard daemon, so this is a no-op there.
+        if (self.fabric) |*fabric| {
+            var enc: [observe_event.max_encoded_len]u8 = undefined;
+            const wire = observe_event.encode(.{
+                .action = @intFromEnum(action),
+                .origin_server = truncObserve(origin_server, observe_event.max_origin_len),
+                .nick = truncObserve(subject.nick, observe_event.max_nick_len),
+                .user = truncObserve(subject.user, observe_event.max_user_len),
+                .host = truncObserve(subject.host, observe_event.max_host_len),
+                .account = if (subject.account) |a| truncObserve(a, observe_event.max_account_len) else null,
+                .detail = truncObserve(subject.detail, observe_event.max_detail_len),
+            }, &enc) catch return;
+            const my_shard = self.rx().shard_id;
+            const total: u12 = @intCast(fabric.numShards());
+            var shard: u12 = 0;
+            while (shard < total) : (shard += 1) {
+                if (shard == my_shard) continue;
+                const buf = fabric.acquire(wire) orelse continue;
+                const fan = reactor_fabric.DeliverMsg{
+                    .to = client_model.ClientId.invalid,
+                    .buf = buf,
+                    .broadcast_observe = true,
+                };
+                if (fabric.sendTo(shard, fan)) {
+                    if (self.reactors[shard].wake) |*w| w.wake();
+                } else fabric.release(buf);
+            }
+        }
+    }
+
+    /// Fan a locally-raised OBSERVE record to every established mesh peer as a
+    /// signed OBSERVE_EVENT carrying our server name as the origin. Best-effort; a
+    /// send failure to one peer never blocks the others or the local delivery.
+    /// Unconditional like the Event-Spine fan-out — the fired actions (connect,
+    /// quit, nick, oper-up) are session-lifecycle, the same low volume the
+    /// `.connect`/`.disconnect` Event-Spine categories already broadcast.
+    fn meshBroadcastObserveEvent(self: *LinuxServer, action: observe_mod.Action, subject: observe_mod.Subject) void {
+        const act: u8 = @intFromEnum(action);
+        const origin = self.serverName();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    link.sendObserveEvent(act, origin, subject.nick, subject.user, subject.host, subject.account, subject.detail) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    link.sendObserveEvent(act, origin, subject.nick, subject.user, subject.host, subject.account, subject.detail) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
+            }
+        }
+    }
+
+    /// Decode a peer's inbound OBSERVE_EVENT payloads and deliver each to this
+    /// node's watching opers (all shards), rendered with the ORIGIN server the
+    /// event carries (NOT this node). Never re-broadcast — a peer already fanned it
+    /// to every node directly. An action value that is not a defined
+    /// `observe_mod.Action` variant (a hostile peer could send any `u8`) is skipped.
+    fn drainObserveEvents(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeObserveEvents() catch return;
+        defer {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+        }
+        for (payloads) |p| {
+            const d = decodeObserveEvent(p) orelse continue;
+            // Mesh-drained: deliver to THIS node's watchers across all shards
+            // (reactor 0 owns the link; fan to the rest). Never re-broadcast.
+            self.deliverObserveLocal(d.origin, d.action, d.subject);
         }
     }
 

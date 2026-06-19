@@ -415,6 +415,17 @@ pub const S2sLink = struct {
         return self.peer.takeOperEvents();
     }
 
+    /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).
+    pub fn sendObserveEvent(self: *S2sLink, action: u8, origin_server: []const u8, nick: []const u8, user: []const u8, host: []const u8, account: ?[]const u8, detail: []const u8) !void {
+        try self.peer.sendObserveEvent(self.sink(), action, origin_server, nick, user, host, account, detail);
+    }
+
+    /// Drain queued inbound OBSERVE_EVENT payloads from this peer (caller owns +
+    /// frees each slice and the outer slice; decode with `observe_event.decode`).
+    pub fn takeObserveEvents(self: *S2sLink) ![][]u8 {
+        return self.peer.takeObserveEvents();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis.
     pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
         return self.peer.collectTopology(out);

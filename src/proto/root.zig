@@ -161,6 +161,7 @@ pub const lusers = @import("lusers.zig");
 pub const markdown = @import("markdown.zig");
 pub const membership_event = @import("membership_event.zig");
 pub const oper_event = @import("oper_event.zig");
+pub const observe_event = @import("observe_event.zig");
 pub const merkle_tree = @import("merkle_tree.zig");
 pub const mesh_event_log = @import("mesh_event_log.zig");
 pub const meshpass = @import("meshpass.zig");
@@ -497,6 +498,7 @@ test {
     _ = markdown;
     _ = membership_event;
     _ = oper_event;
+    _ = observe_event;
     _ = merkle_tree;
     _ = mesh_event_log;
     _ = meshpass;
