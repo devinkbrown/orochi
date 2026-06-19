@@ -585,6 +585,9 @@ pub const S2sPeer = struct {
         username: []u8,
         realname: []u8,
         host: []u8,
+        /// The nick that set this status (explicit `/MODE`), so the daemon renders
+        /// `:setter MODE …` instead of the origin server. "" = none.
+        setter: []u8,
         kind: Kind,
         /// New status bits (for joined/status); the member's prefix modes.
         status: u4,
@@ -597,6 +600,7 @@ pub const S2sPeer = struct {
             allocator.free(self.username);
             allocator.free(self.realname);
             allocator.free(self.host);
+            allocator.free(self.setter);
             self.* = undefined;
         }
     };
@@ -913,12 +917,15 @@ pub const S2sPeer = struct {
         errdefer self.allocator.free(rn);
         const ho = try self.allocator.dupe(u8, ev.host);
         errdefer self.allocator.free(ho);
+        const st = try self.allocator.dupe(u8, ev.setter);
+        errdefer self.allocator.free(st);
         try self.membership_changes.append(self.allocator, .{
             .channel = ch,
             .nick = nk,
             .username = un,
             .realname = rn,
             .host = ho,
+            .setter = st,
             .kind = kind,
             .status = ev.status,
             .prev_status = prev_status,
@@ -989,6 +996,7 @@ pub const S2sPeer = struct {
         hlc: u64,
         present: bool,
         ident: MemberIdentity,
+        setter: []const u8,
     ) !void {
         const ev = membership_event.MembershipEvent{
             .present = present,
@@ -1000,6 +1008,7 @@ pub const S2sPeer = struct {
             .username = truncated(ident.username, membership_event.max_username_len),
             .realname = truncated(ident.realname, membership_event.max_realname_len),
             .host = truncated(ident.host, membership_event.max_host_len),
+            .setter = truncated(setter, membership_event.max_setter_len),
         };
         var buf: [membership_event.max_encoded_len]u8 = undefined;
         const wire = try membership_event.encode(ev, &buf);
@@ -2148,7 +2157,7 @@ test "signing peers round-trip a signed MEMBERSHIP frame" {
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x3EE);
 
-    try a.sendMembership(a_to_b.sink(), "#room", "alice", 0, 50, true, .{ .username = "u", .realname = "r", .host = "h" });
+    try a.sendMembership(a_to_b.sink(), "#room", "alice", 0, 50, true, .{ .username = "u", .realname = "r", .host = "h" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x3EF);
 
     const changes = try b.takeMembershipChanges();
@@ -2309,7 +2318,7 @@ test "a non-signing (v1-style) peer still interoperates unsigned" {
     try std.testing.expect(a.peer_supports_signing);
 
     // A sends an UNSIGNED membership; B accepts it (legacy path, no rejection).
-    try a.sendMembership(a_to_b.sink(), "#room", "bob", 0, 60, true, .{ .username = "u", .realname = "r", .host = "h" });
+    try a.sendMembership(a_to_b.sink(), "#room", "bob", 0, 60, true, .{ .username = "u", .realname = "r", .host = "h" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6A1);
 
     const changes = try b.takeMembershipChanges();

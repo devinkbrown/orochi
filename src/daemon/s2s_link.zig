@@ -208,8 +208,9 @@ pub const S2sLink = struct {
         hlc: u64,
         present: bool,
         ident: MemberIdentity,
+        setter: []const u8,
     ) !void {
-        try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present, ident);
+        try self.peer.sendMembership(self.sink(), channel, nick, status, hlc, present, ident, setter);
     }
 
     /// Announce a local IRCX channel PROP set/delete (or re-broadcast a remote
@@ -490,7 +491,7 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
         .username = "alice",
         .realname = "Alice Liddell",
         .host = "cloak-1a2b.users.orochi",
-    }); // op bit
+    }, ""); // op bit
     var rounds: usize = 0;
     while (rounds < 32) : (rounds += 1) {
         const a_out = a.outbound();
@@ -529,7 +530,7 @@ test "MEMBERSHIP propagates a member across the link into channelMembers" {
     try std.testing.expectEqualStrings("cloak-1a2b.users.orochi", deltas[0].host);
 
     // A part removes her on B too.
-    try a.sendMembership("#chat", "alice", 0, 101, false, .{});
+    try a.sendMembership("#chat", "alice", 0, 101, false, .{}, "");
     rounds = 0;
     while (rounds < 16) : (rounds += 1) {
         const a_out = a.outbound();
@@ -889,7 +890,7 @@ test "NICKCHANGE renames a remote member and yields a delta" {
 
     try a.start(10);
     // Announce the member first so b's roster knows it, then rename.
-    try a.sendMembership("#chat", "Guest1", 0, 100, true, .{ .username = "guest", .realname = "G", .host = "old.host" });
+    try a.sendMembership("#chat", "Guest1", 0, 100, true, .{ .username = "guest", .realname = "G", .host = "old.host" }, "");
     try a.sendNickChange("Guest1", "kain", .{ .username = "kain", .realname = "Devin", .host = "cloak.host" }, 200);
 
     var now: u64 = 11;

@@ -23,6 +23,7 @@ pub const max_nick_len = 64;
 pub const max_username_len = 32;
 pub const max_realname_len = 256;
 pub const max_host_len = 255;
+pub const max_setter_len = 64;
 const fixed_prefix = 1 + 1 + 8 + 8; // present, status, origin_node, hlc
 
 /// Upper bound on one encoded event (all fields at their limits) — size the
@@ -32,7 +33,8 @@ pub const max_encoded_len = fixed_prefix +
     2 + max_nick_len +
     2 + max_username_len +
     2 + max_realname_len +
-    2 + max_host_len;
+    2 + max_host_len +
+    2 + max_setter_len;
 
 pub const Error = error{
     Truncated,
@@ -53,6 +55,12 @@ pub const MembershipEvent = struct {
     realname: []const u8 = "",
     /// The member's VISIBLE host — cloak/vhost when set ("" = unknown).
     host: []const u8 = "",
+    /// The nick that SET this member's status (for an explicit `/MODE +q`), so a
+    /// remote node renders `:setter MODE …` instead of the origin server. "" =
+    /// none (join auto-status, services, …); when empty the field is OMITTED from
+    /// the wire so an empty-setter event stays byte-identical to the pre-setter
+    /// format — backward-compatible for every membership event except a MODE.
+    setter: []const u8 = "",
 };
 
 pub fn encodedLen(ev: MembershipEvent) Error!usize {
@@ -60,12 +68,16 @@ pub fn encodedLen(ev: MembershipEvent) Error!usize {
     if (ev.username.len > max_username_len) return error.NameTooLong;
     if (ev.realname.len > max_realname_len) return error.NameTooLong;
     if (ev.host.len > max_host_len) return error.NameTooLong;
+    if (ev.setter.len > max_setter_len) return error.NameTooLong;
     return fixed_prefix +
         2 + ev.channel.len +
         2 + ev.nick.len +
         2 + ev.username.len +
         2 + ev.realname.len +
-        2 + ev.host.len;
+        2 + ev.host.len +
+        // Setter is appended ONLY when present; an empty setter keeps the encoding
+        // byte-identical to the pre-setter wire format.
+        (if (ev.setter.len != 0) @as(usize, 2 + ev.setter.len) else 0);
 }
 
 fn putBytes16(out: []u8, i: *usize, bytes: []const u8) void {
@@ -93,6 +105,8 @@ pub fn encode(ev: MembershipEvent, out: []u8) Error![]const u8 {
     putBytes16(out, &i, ev.username);
     putBytes16(out, &i, ev.realname);
     putBytes16(out, &i, ev.host);
+    // Optional trailing setter — omitted when empty (backward-compatible).
+    if (ev.setter.len != 0) putBytes16(out, &i, ev.setter);
     return out[0..i];
 }
 
@@ -134,6 +148,10 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     const username = try takeBytes16(bytes, &i, max_username_len);
     const realname = try takeBytes16(bytes, &i, max_realname_len);
     const host = try takeBytes16(bytes, &i, max_host_len);
+    // Optional trailing setter: present only on a MODE event (newer peers). Its
+    // absence (i == bytes.len) is the common, pre-setter wire format.
+    var setter: []const u8 = "";
+    if (i < bytes.len) setter = try takeBytes16(bytes, &i, max_setter_len);
 
     if (i != bytes.len) return error.TrailingBytes;
     if (channel.len == 0 or nick.len == 0) return error.NameTooLong;
@@ -142,6 +160,7 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     try validateLineField(username, false);
     try validateLineField(realname, false);
     try validateLineField(host, false);
+    try validateLineField(setter, true);
     return .{
         .present = present,
         .status = @intCast(status_raw),
@@ -152,6 +171,7 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
         .username = username,
         .realname = realname,
         .host = host,
+        .setter = setter,
     };
 }
 
@@ -253,13 +273,34 @@ test "truncated input is rejected" {
 }
 
 test "trailing bytes are rejected" {
-    const ev = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n" };
+    // Encode WITH a setter so the optional-setter read consumes it; the pad byte
+    // after the full event is then the genuine trailing-bytes case.
+    const ev = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .setter = "kain" };
     var buf: [max_encoded_len]u8 = undefined;
     const wire = try encode(ev, &buf);
     var padded: [max_encoded_len + 1]u8 = undefined;
     @memcpy(padded[0..wire.len], wire);
     padded[wire.len] = 0xAA;
     try testing.expectError(error.TrailingBytes, decode(padded[0 .. wire.len + 1]));
+}
+
+test "setter round-trips and an empty setter stays old-format compatible" {
+    // A MODE event carries the setter; it round-trips.
+    const with_setter = MembershipEvent{ .present = true, .status = 0b0100, .origin_node = 2, .hlc = 9, .channel = "#root", .nick = "trev", .setter = "kain" };
+    var b1: [max_encoded_len]u8 = undefined;
+    const w1 = try encode(with_setter, &b1);
+    try testing.expectEqualStrings("kain", (try decode(w1)).setter);
+
+    // An empty setter is OMITTED from the wire: the encoding is byte-identical to
+    // a struct built WITHOUT a setter field at all (backward/forward compatible).
+    const no_setter = MembershipEvent{ .present = true, .status = 0, .origin_node = 2, .hlc = 9, .channel = "#root", .nick = "trev" };
+    const empty_setter = MembershipEvent{ .present = true, .status = 0, .origin_node = 2, .hlc = 9, .channel = "#root", .nick = "trev", .setter = "" };
+    var b2: [max_encoded_len]u8 = undefined;
+    var b3: [max_encoded_len]u8 = undefined;
+    const w2 = try encode(no_setter, &b2);
+    const w3 = try encode(empty_setter, &b3);
+    try testing.expectEqualSlices(u8, w2, w3); // empty setter => identical bytes
+    try testing.expectEqualStrings("", (try decode(w3)).setter);
 }
 
 test "over-long names are rejected by encode and decode" {

@@ -255,9 +255,9 @@ pub const SecuredLink = struct {
     /// Announce a local member to the peer over the secured CRDT link (no-op until
     /// established), carrying the member's real username/realname/visible-host.
     /// Outbound bytes accumulate in `out`.
-    pub fn sendMembership(self: *SecuredLink, channel: []const u8, nick: []const u8, status: u4, hlc: u64, present: bool, ident: s2s_peer.MemberIdentity) anyerror!void {
+    pub fn sendMembership(self: *SecuredLink, channel: []const u8, nick: []const u8, status: u4, hlc: u64, present: bool, ident: s2s_peer.MemberIdentity, setter: []const u8) anyerror!void {
         const link = self.inner orelse return;
-        try link.sendMembership(channel, nick, status, hlc, present, ident);
+        try link.sendMembership(channel, nick, status, hlc, present, ident, setter);
         try self.drainInner();
     }
 
@@ -873,7 +873,7 @@ test "post-handshake bytes on the wire are ciphertext, not inner plaintext" {
     // Snapshot the inner link's plaintext for this membership announcement, then
     // produce the secured wire bytes for the same announcement.
     const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "real name", .host = "h.example" };
-    try p.a.inner.?.sendMembership("#suimyaku", "alice", 0, 100, true, ident);
+    try p.a.inner.?.sendMembership("#suimyaku", "alice", 0, 100, true, ident, "");
     const plaintext = try testing.allocator.dupe(u8, p.a.inner.?.outbound());
     defer testing.allocator.free(plaintext);
     try testing.expect(plaintext.len != 0);
@@ -893,7 +893,7 @@ test "a single flipped bit in a transit record fails decryption" {
     p.b.clearOutbound();
 
     const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "r", .host = "h" };
-    try p.a.sendMembership("#suimyaku", "bob", 0, 200, true, ident);
+    try p.a.sendMembership("#suimyaku", "bob", 0, 200, true, ident, "");
     const record = try testing.allocator.dupe(u8, p.a.outbound());
     defer testing.allocator.free(record);
     try testing.expect(record.len > 4 + 16);
@@ -912,7 +912,7 @@ test "a CRDT membership frame round-trips end-to-end over the secured record lay
     p.b.clearOutbound();
 
     const ident = s2s_peer.MemberIdentity{ .username = "ann", .realname = "Ann Real", .host = "host.a" };
-    try p.a.sendMembership("#suimyaku", "ann", 0, 300, true, ident);
+    try p.a.sendMembership("#suimyaku", "ann", 0, 300, true, ident, "");
 
     // Pump the secured record(s) A->B (and any B->A acks) to convergence.
     try pump(&p.a, &p.b, false);

@@ -5577,13 +5577,13 @@ pub const LinuxServer = struct {
                 // disconnect leaves a ghost on the far side of the mesh). Carry the
                 // real identity so the far side renders the member's actual
                 // `user@host`, not the `mesh@<origin>` placeholder.
-                if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false, membershipIdentityOf(conn));
+                if (announce) self.announceMembership(entry.key_ptr.*, nick, 0, false, membershipIdentityOf(conn), "");
             }
         }
         // Withdraw the user's mesh PRESENCE (the no-channel-aware counterpart of the
         // per-channel parts above) so peers drop them from the route_table even if
         // they were in no channel. Mirrors the announce in `registerConnNick`.
-        if (announce) self.announceMembership(presence_channel, nick, 0, false, membershipIdentityOf(conn));
+        if (announce) self.announceMembership(presence_channel, nick, 0, false, membershipIdentityOf(conn), "");
     }
 
     /// Drive an implicit-TLS client's recv chunk: frame + decrypt through the
@@ -6096,7 +6096,7 @@ pub const LinuxServer = struct {
         // them). Idempotent + re-affirmed by the anti-entropy burst; withdrawn in
         // `broadcastQuit`. The same-account-share path returned above, so a second
         // session sharing the nick doesn't re-announce (the primary already did).
-        self.announceMembership(presence_channel, nick, 0, true, membershipIdentityOf(conn));
+        self.announceMembership(presence_channel, nick, 0, true, membershipIdentityOf(conn), "");
     }
 
     /// Whether `nick` is currently held in the world by a LOCAL connection that
@@ -6301,9 +6301,9 @@ pub const LinuxServer = struct {
                 const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
                 const ident = membershipIdentityOf(mconn);
                 if (conn.s2s_secured) |link| {
-                    link.sendMembership(cv.name, nick, status, hlc, true, ident) catch continue;
+                    link.sendMembership(cv.name, nick, status, hlc, true, ident, "") catch continue;
                 } else if (conn.s2s) |link| {
-                    link.sendMembership(cv.name, nick, status, hlc, true, ident) catch continue;
+                    link.sendMembership(cv.name, nick, status, hlc, true, ident, "") catch continue;
                 }
             }
             if (self.world.bansOf(cv.name)) |entries| {
@@ -6334,9 +6334,9 @@ pub const LinuxServer = struct {
                 if (std.mem.eql(u8, pnick, "*")) continue;
                 const pident = membershipIdentityOf(mc);
                 if (conn.s2s_secured) |link| {
-                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident) catch continue;
+                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch continue;
                 } else if (conn.s2s) |link| {
-                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident) catch continue;
+                    link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch continue;
                 }
             }
         }
@@ -7097,7 +7097,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool, ident: s2s_link.S2sLink.MemberIdentity) void {
+    fn announceMembership(self: *LinuxServer, channel: []const u8, nick: []const u8, status: u4, present: bool, ident: s2s_link.S2sLink.MemberIdentity, setter: []const u8) void {
         const hlc: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
@@ -7105,12 +7105,12 @@ pub const LinuxServer = struct {
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
-                    link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
+                    link.sendMembership(channel, nick, status, hlc, present, ident, setter) catch continue;
                     self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
                     link.clearOutbound();
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
-                    link.sendMembership(channel, nick, status, hlc, present, ident) catch continue;
+                    link.sendMembership(channel, nick, status, hlc, present, ident, setter) catch continue;
                     self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
                     link.clearOutbound();
                 }
@@ -7671,12 +7671,12 @@ pub const LinuxServer = struct {
                 // user, so re-JOINing would duplicate them — surface only the
                 // status diff.
                 if (self.nickIsLiveLocal(ch.nick)) {
-                    if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status);
+                    if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status, ch.setter);
                     return;
                 }
                 const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} JOIN :{s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch return;
-                if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, 0, ch.status);
+                if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, 0, ch.status, ch.setter);
             },
             .parted => {
                 // Echo artifact: the user is still connected here — a fabricated
@@ -7685,7 +7685,7 @@ pub const LinuxServer = struct {
                 const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} PART {s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch {};
             },
-            .status => self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status),
+            .status => self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status, ch.setter),
         }
     }
 
@@ -7693,7 +7693,7 @@ pub const LinuxServer = struct {
     /// remote member whose prefix modes changed from `prev` to `now`. Combines
     /// the additions and removals into one line (each member mode repeats the
     /// nick as its parameter).
-    fn emitRemoteModeDiff(self: *LinuxServer, channel: []const u8, nick: []const u8, host: []const u8, prev: u4, now: u4) void {
+    fn emitRemoteModeDiff(self: *LinuxServer, channel: []const u8, nick: []const u8, host: []const u8, prev: u4, now: u4, setter: []const u8) void {
         const added = now & ~prev;
         const removed = prev & ~now;
         if (added == 0 and removed == 0) return;
@@ -7720,8 +7720,12 @@ pub const LinuxServer = struct {
                 }
             }
         }
+        // Prefer the actual setter (the oper/owner who ran /MODE) as the source
+        // prefix so cross-node MODE reads `:kain MODE …`, not the origin server.
+        // Empty setter (link-up resync, no operation context) falls back to host.
+        const source = if (setter.len != 0) setter else host;
         var line_buf: [600]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, ":{s} MODE {s} {s}{s}\r\n", .{ host, channel, modes_buf[0..ml], params_buf[0..pl] }) catch return;
+        const line = std.fmt.bufPrint(&line_buf, ":{s} MODE {s} {s}{s}\r\n", .{ source, channel, modes_buf[0..ml], params_buf[0..pl] }) catch return;
         self.broadcastChannel(channel, line, null) catch {};
     }
 
@@ -7824,7 +7828,7 @@ pub const LinuxServer = struct {
         // Prefix modes for the joined members, after the batch (display-only;
         // world roster was already updated on receive).
         for (run) |*ch| {
-            if (ch.status != 0) self.emitRemoteModeDiff(channel, ch.nick, server_host, 0, ch.status);
+            if (ch.status != 0) self.emitRemoteModeDiff(channel, ch.nick, server_host, 0, ch.status, ch.setter);
         }
     }
 
@@ -8869,7 +8873,7 @@ pub const LinuxServer = struct {
         // Propagate this membership to mesh peers (status = the joiner's modes,
         // e.g. founder on a freshly created/cloned channel).
         const jmodes = self.world.memberModes(join_target, wid) orelse world_model.MemberModes.empty();
-        self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true, membershipIdentityOf(conn));
+        self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true, membershipIdentityOf(conn), "");
     }
 
     pub fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -8933,7 +8937,7 @@ pub const LinuxServer = struct {
         if (destroys_channel and !self.world.channelExists(channel)) try self.publishChannelEvent("DESTROY", channel);
         // Tell mesh peers this member left, carrying the real identity so the far
         // side renders the member's actual `user@host`, not the placeholder.
-        self.announceMembership(channel, parted_nick, 0, false, membershipIdentityOf(conn));
+        self.announceMembership(channel, parted_nick, 0, false, membershipIdentityOf(conn), "");
     }
 
     pub fn handleNames(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -9256,7 +9260,9 @@ pub const LinuxServer = struct {
                         // status is owned by its home node.
                         const nm = self.world.memberModes(channel, target) orelse world_model.MemberModes.empty();
                         const tident = if (self.connFor(clientIdFromWorld(target))) |tc| membershipIdentityOf(tc) else s2s_link.S2sLink.MemberIdentity{};
-                        self.announceMembership(channel, target_nick, @truncate(nm.bits), true, tident);
+                        // Carry the SETTER (the oper running /MODE) so the remote node
+                        // renders `:setter MODE …`, not the origin server placeholder.
+                        self.announceMembership(channel, target_nick, @truncate(nm.bits), true, tident, conn.session.displayName());
                     }
                 },
                 'i', 'm', 'n', 't', 's', 'C', 'T', 'N', 'g', 'S', 'M', 'W', 'O', 'A' => {
@@ -32766,7 +32772,7 @@ test "threaded server: oper CONNECT opens an outbound S2S link" {
         .username = "zed",
         .realname = "Zed Remote",
         .host = "cloak-zed.users.test",
-    });
+    }, "");
     if (peer.outbound().len != 0) {
         try writeAllFd(peer_fd, peer.outbound());
         peer.clearOutbound();

@@ -3,3 +3,7 @@ zig-out/
 announce_bot.log
 .claude/worktrees/
 __pycache__/
+
+# Mesh node signing key — never commit
+orochi-node.key
+*-node.key
