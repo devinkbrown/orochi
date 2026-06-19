@@ -24,7 +24,10 @@ cryptographic mesh.
   codecs and dispatch tables.
 - **Mesh, not tree.** **Suimyaku** (水脈) — a CRDT state mesh with Sazanami gossip and
   Merkle anti-entropy — over **Tsumugi** (紬) — a PQ-hybrid (X25519 + ML-KEM-768)
-  forward-secret ratchet. No TS6.
+  forward-secret ratchet. No TS6. Operator surfaces are network-wide: the Event
+  Spine (connect/quit/oper alerts and the targeted `EVENT OBSERVE` feed) fans every
+  event to all nodes rendered with the origin server, and a cross-node `MODE` shows
+  the setter's nick, not the server.
 - **Safety as a type.** `Secret(T)` makes a data-dependent branch on secret bytes a
   compile error; TLS is **1.3 + a hardened 1.2 profile** (AEAD/ECDHE-only; no RSA key exchange, CBC, compression, or renegotiation).
 - **Trust through simulation.** Deterministic-simulation testing (the *Deterministic

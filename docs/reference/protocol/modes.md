@@ -36,6 +36,10 @@ The member-prefix rank order is founder `+Q` (`!`) > owner `+q` (`.`) > op `+o` 
 
 Rank gating: a member may only set/clear a tier whose rank is less than or equal to their own highest rank, and may not change modes of a higher-ranked member unless they are a server oper (`src/daemon/server.zig:4282`, `src/daemon/server.zig:4294`).
 
+**Modes combined per line** are advertised through the `MODES` ISUPPORT token, sourced from `[limits] modes_per_line` (default `4`, range `1..20`; `buildIsupportTokens` in `src/daemon/server.zig`). Clients that honor it (mIRC, HexChat) emit one mode/target per `MODE` command when it is set to `1`. The token tunes how many changes a *client* should batch; the server itself always accepts a full multi-mode `MODE` line.
+
+**Cross-node MODE attribution:** when a member-prefix MODE is applied to a user homed on another mesh node, the remote node renders the change under the **setter's** nick — `:<setter> MODE #chan +q nick` — not the origin server. The setter is carried as an optional field on the `MEMBERSHIP` frame (see [mesh-s2s.md](../../architecture/mesh-s2s.md)); a join/auto-status change with no explicit setter falls back to the origin server name.
+
 ## Advertised Channel Mode Classes
 
 | Class | Advertised Letters | Param Rules | Source |

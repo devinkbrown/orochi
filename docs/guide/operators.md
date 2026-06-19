@@ -196,6 +196,31 @@ Operators with `mesh_admin` privilege can inspect and manage the mesh:
 | `CONNECT <host> <port>` | Open outbound S2S to a peer (`src/daemon/server.zig:6304`). |
 | `SQUIT <server>` | Tear down an S2S link by server name (`src/daemon/server.zig:6371`). |
 
+## Network-Wide Operator Events
+
+Operator-facing events are delivered over the **Event Spine**, and an event raised
+on any node is fanned to every mesh node — rendered with the **originating** server
+name, so opers see the whole network from a single node. Two opt-in subscription
+models ride it:
+
+- **Category feed** — `EVENT ADD <category>` (e.g. `CONNECT`, `DISCONNECT`,
+  `FLOOD`, `KILL`, `SERVER_LINK`, `OPER_ACTION`) subscribes to a snomask-style
+  stream. User connects/disconnects/nick changes and the raid/flood/oper-action
+  alerts all publish here, so subscribing on one node surfaces matching events
+  network-wide (carried as the signed `OPER_EVENT` S2S frame). `EVENT LIST` shows
+  your subscriptions; `EVENT DEL <category>` unsubscribes.
+- **Targeted OBSERVE feed** — `EVENT OBSERVE <mask> [actions…]` installs a standing
+  `nick!user@host` glob filter (optionally narrowed to `connect`/`quit`/`nick`/
+  `oper`). A matching subject's lifecycle is pushed as
+  `:<origin-server> EVENT <you> OBSERVE <action> <nick>!<user>@<host> acct=…`,
+  carrying the subject's **real, uncloaked** host (operator-trust). OBSERVE matches
+  subjects on **every** mesh node (signed `OBSERVE_EVENT` frame); `EVENT OBSERVE
+  LIST` shows the active filter and `EVENT OBSERVE OFF` clears it.
+
+`EVENT BROADCAST :<text>` sends a one-shot network-wide oper announcement (this is
+the WALLOPS path — there is no `+w` user mode). See
+[reference/commands/ircx.md](../reference/commands/ircx.md) for full `EVENT` syntax.
+
 ## Account Binding
 
 ```toml
