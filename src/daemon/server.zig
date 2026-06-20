@@ -8911,6 +8911,20 @@ pub const LinuxServer = struct {
         // e.g. founder on a freshly created/cloned channel).
         const jmodes = self.world.memberModes(join_target, wid) orelse world_model.MemberModes.empty();
         self.announceMembership(join_target, conn.session.displayName(), @truncate(jmodes.bits), true, membershipIdentityOf(conn), "");
+
+        // IRCX ONJOIN: deliver the channel's on-join message PROP to the joiner.
+        self.deliverChannelPropMessage(conn, join_target, "ONJOIN");
+    }
+
+    /// Deliver a channel's IRCX on-join/on-part message PROP (ONJOIN/ONPART) to a
+    /// single user as a server NOTICE, tagged with the channel. No-op when unset.
+    /// Reuses the live IRCX PROP store (durable + mesh-synced + access-controlled).
+    fn deliverChannelPropMessage(self: *LinuxServer, conn: *ConnState, channel: []const u8, key: []const u8) void {
+        const ev = self.props.getProp(.{ .kind = .channel, .id = channel }, key) catch return;
+        if (ev.value.len == 0) return;
+        var buf: [default_reply_bytes]u8 = undefined;
+        const out = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :[{s}] {s}\r\n", .{ self.serverName(), conn.session.displayName(), channel, ev.value }) catch return;
+        appendToConn(conn, out) catch {};
     }
 
     pub fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -8936,6 +8950,9 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
             return;
         }
+
+        // IRCX ONPART: deliver the channel's on-part message PROP to the leaver.
+        self.deliverChannelPropMessage(conn, channel, "ONPART");
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
