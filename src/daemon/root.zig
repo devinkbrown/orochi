@@ -224,7 +224,6 @@ pub const svc_acclist = @import("svc_acclist.zig");
 pub const svc_akick = @import("svc_akick.zig");
 pub const svc_chanbadwords = @import("svc_chanbadwords.zig");
 pub const svc_clonescan = @import("svc_clonescan.zig");
-pub const svc_email = @import("svc_email.zig");
 pub const svc_enforce = @import("svc_enforce.zig");
 pub const svc_forceaction = @import("svc_forceaction.zig");
 pub const svc_getkey = @import("svc_getkey.zig");
@@ -518,7 +517,6 @@ test {
     _ = svc_akick;
     _ = svc_chanbadwords;
     _ = svc_clonescan;
-    _ = svc_email;
     _ = svc_enforce;
     _ = svc_forceaction;
     _ = svc_getkey;
