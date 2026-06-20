@@ -3046,7 +3046,10 @@ pub const LinuxServer = struct {
                     while (it.next()) |entry| {
                         const c = entry.value;
                         if (c.closing) continue;
-                        if (!sessionWantsEvent(&c.session, category, subject)) continue;
+                        // `bytes` is the raw event BODY, which is also the IRCX
+                        // type-routing key (its leading TYPE token), so the
+                        // receiving shard classifies exactly as the origin shard.
+                        if (!sessionWantsEvent(&c.session, category, bytes, subject)) continue;
                         var line_buf: [default_reply_bytes]u8 = undefined;
                         const line = event_spine.renderEvent(origin, c.session.displayName(), bytes, &line_buf) catch continue;
                         appendToConn(c, line) catch continue;
@@ -9566,7 +9569,15 @@ pub const LinuxServer = struct {
         try line.append(targets.written());
         try line.append("\r\n");
         try self.broadcastChannel(channel, line.written(), null);
-        try self.publishChannelEvent("MODE", channel);
+        // CHANNEL MODE event carries the applied mode delta + params so subscribers
+        // see WHAT changed (e.g. "CHANNEL MODE #c +nt-l", "CHANNEL MODE #c +o nick"),
+        // not just that a mode changed.
+        var mode_detail_buf: [default_reply_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&mode_detail_buf, "{s}{s}", .{ applied.written(), targets.written() })) |mode_detail| {
+            try self.publishChannelEventDetail("MODE", channel, mode_detail);
+        } else |_| {
+            try self.publishChannelEvent("MODE", channel);
+        }
         // draft/event-playback: record the channel mode change as a MODE event
         // (`:setter MODE #chan <applied> <params>`) for event-playback replay.
         var mode_ev_buf: [default_reply_bytes]u8 = undefined;
@@ -10570,6 +10581,10 @@ pub const LinuxServer = struct {
             try self.deliverNumeric(op_id, .RPL_KNOCK, &.{ channel, mask }, reason);
         }
         try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
+
+        // MEMBER KNOCK event: a non-member asked to enter a gated channel. Lets
+        // MEMBER subscribers (and legacy oper-action opers) see knocks network-wide.
+        try self.publishMemberEvent("KNOCK", channel, conn.session.displayName(), reason);
     }
 
     /// RENAME <#old> <#new> [:reason] — IRCv3 draft/channel-rename. A channel
@@ -10620,6 +10635,18 @@ pub const LinuxServer = struct {
             std.fmt.bufPrint(&rline_buf, ":{s} RENAME {s} {s} :{s}\r\n", .{ pfx, old, new, args.reason }) catch return
         else
             std.fmt.bufPrint(&rline_buf, ":{s} RENAME {s} {s}\r\n", .{ pfx, old, new }) catch return;
+
+        // CHANNEL RENAME event: a channel changed name in place. The body reads
+        // chronologically ("CHANNEL RENAME #old #new") while the match subject is
+        // the SURVIVING channel, so CHANNEL subscribers' channel globs track the
+        // new name. Emitted before the member fan-out so it fires even for a
+        // single-member channel.
+        {
+            var ren_buf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&ren_buf, "CHANNEL RENAME {s} {s}", .{ old, new })) |ren_msg| {
+                try self.publishOperEventSubject(.announce, .notice, ren_msg, new);
+            } else |_| {}
+        }
 
         // Fan out to every member (channel now lives under the new key).
         var members = self.world.memberIterator(new) orelse return;
@@ -13352,7 +13379,9 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT ADD"}, "EVENT subject mask too long");
                 return;
             };
-            conn.session.setEventMask(conn.session.event_mask.include(typ.categoryMask()));
+            // IRCX EVENT lives on its own subscription plane (token-routed by
+            // type); it deliberately does NOT pollute the legacy oper category
+            // mask, so a USER subscriber receives only USER events.
             try queueNumeric(conn, .RPL_EVENTADD, &.{ params[1], conn.session.ircxEventSubjectMask(typ) }, "Event added");
             return;
         }
@@ -13375,7 +13404,6 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT CHANGE"}, "EVENT subject mask too long");
                 return;
             };
-            conn.session.setEventMask(conn.session.event_mask.include(typ.categoryMask()));
             try queueNumeric(conn, .RPL_EVENTCHANGE, &.{ params[1], conn.session.ircxEventSubjectMask(typ) }, "Event updated");
             return;
         }
@@ -13445,6 +13473,17 @@ pub const LinuxServer = struct {
         try self.publishOperEventSubject(.announce, .notice, message, channel);
     }
 
+    /// CHANNEL event carrying a trailing detail token (e.g. the applied mode
+    /// string for MODE, or the new name for RENAME): `"CHANNEL <action> <chan>
+    /// <detail>"`. Subject stays the channel so CHANNEL subscribers' channel-glob
+    /// masks match. An empty detail degrades to the bare channel form.
+    fn publishChannelEventDetail(self: *LinuxServer, action: []const u8, channel: []const u8, detail: []const u8) !void {
+        if (detail.len == 0) return self.publishChannelEvent(action, channel);
+        var msg_buf: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "CHANNEL {s} {s} {s}", .{ action, channel, detail }) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.announce, .notice, message, channel);
+    }
+
     fn publishMemberEvent(self: *LinuxServer, action: []const u8, channel: []const u8, nick: []const u8, detail: ?[]const u8) !void {
         var msg_buf: [512]u8 = undefined;
         const message = if (detail) |text|
@@ -13480,6 +13519,21 @@ pub const LinuxServer = struct {
         var msg_buf: [384]u8 = undefined;
         const message = std.fmt.bufPrint(&msg_buf, "USER NICK {s} -> {s}", .{ old_prefix, newnick }) catch return error.OutputTooSmall;
         try self.publishOperEventSubject(.oper_action, .notice, message, old_prefix);
+    }
+
+    /// Generic USER administrative-lifecycle event (e.g. OPER): `"USER <action>
+    /// <subject> [:detail]"`. Published under OPER_ACTION so legacy oper
+    /// subscribers see operator-status transitions, while IRCX USER subscribers
+    /// receive it via leading-token routing. An empty detail omits the trailer.
+    fn publishUserEvent(self: *LinuxServer, conn: *const ConnState, action: []const u8, detail: []const u8) !void {
+        var subject_buf: [256]u8 = undefined;
+        const subject = try userEventSubject(conn, &subject_buf);
+        var msg_buf: [512]u8 = undefined;
+        const message = if (detail.len != 0)
+            std.fmt.bufPrint(&msg_buf, "USER {s} {s} :{s}", .{ action, subject, detail }) catch return error.OutputTooSmall
+        else
+            std.fmt.bufPrint(&msg_buf, "USER {s} {s}", .{ action, subject }) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.oper_action, .notice, message, subject);
     }
 
     fn willChannelDestroyOnPart(self: *LinuxServer, channel: []const u8) bool {
@@ -17166,6 +17220,10 @@ pub const LinuxServer = struct {
         // nothing until it opts in via `EVENT ADD <category>`.
         conn.session.setEventMask(event_spine.CategoryMask{ .bits = presubscribe_bits });
         try queueNumeric(conn, .RPL_YOUREOPER, &.{}, "You are now an IRC operator");
+        // USER OPER event: an account elevated to operator. A network-significant
+        // privilege transition — published so USER subscribers and oper-action
+        // opers see who gained operator status (and under what title/class).
+        self.publishUserEvent(conn, "OPER", if (title.len != 0) title else class_name) catch {};
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
@@ -19876,26 +19934,27 @@ pub const LinuxServer = struct {
     /// an IRCX EVENT mask can add delivery for mapped CHANNEL/MEMBER/USER events,
     /// and the native Event Spine subscription still delivers all category matches
     /// allowed by its own subject scope.
-    fn sessionWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, subject: []const u8) bool {
-        if (sessionIrcxWantsEvent(session, category, subject)) return true;
+    fn sessionWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, message: []const u8, subject: []const u8) bool {
+        if (sessionIrcxWantsEvent(session, message, subject)) return true;
         if (!session.subscribesTo(category)) return false;
         const scope = session.eventSubjectMask(category);
         if (std.mem.eql(u8, scope, "*")) return true;
         return observe_mod.globMatch(scope, subject);
     }
 
-    /// IRCX EVENT masks are per IRCX type (CHANNEL/MEMBER/USER), not per daemon
-    /// EventCategory. They are additive overlays: a matching IRCX type+subject
-    /// grants delivery, but a non-matching IRCX mask never subtracts native Event
-    /// Spine delivery.
-    fn sessionIrcxWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, subject: []const u8) bool {
-        for (event_spine.ircx_event_types) |typ| {
-            if (!session.subscribesToIrcxEvent(typ)) continue;
-            if (!typ.categoryMask().contains(category)) continue;
-            const scope = session.ircxEventSubjectMask(typ);
-            if (std.mem.eql(u8, scope, "*") or observe_mod.globMatch(scope, subject)) return true;
-        }
-        return false;
+    /// IRCX EVENT masks are per IRCX type (CHANNEL/MEMBER/USER), keyed on the
+    /// event body's leading TYPE token — NOT the daemon EventCategory. Token
+    /// routing is exact: a USER subscriber never receives MEMBER lines and a
+    /// MEMBER subscriber never receives USER lines, eliminating the cross-talk
+    /// that category-overlap caused (MEMBER and USER both rode OPER_ACTION). It is
+    /// an additive overlay: a matching IRCX type+subject grants delivery, but a
+    /// non-matching IRCX mask never subtracts native Event Spine (category)
+    /// delivery to legacy oper subscribers.
+    fn sessionIrcxWantsEvent(session: *const dispatch.ClientSession, message: []const u8, subject: []const u8) bool {
+        const typ = event_spine.IrcxEventType.fromMessage(message) orelse return false;
+        if (!session.subscribesToIrcxEvent(typ)) return false;
+        const scope = session.ircxEventSubjectMask(typ);
+        return std.mem.eql(u8, scope, "*") or observe_mod.globMatch(scope, subject);
     }
 
     /// Render a typed Event Spine event as a chatsvc-faithful `:<srv> EVENT
@@ -20030,7 +20089,7 @@ pub const LinuxServer = struct {
         // gates delivery; the TYPE leads the body (e.g. "USER CONNECT …").
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            if (!sessionWantsEvent(&entry.value.session, category, subject)) continue;
+            if (!sessionWantsEvent(&entry.value.session, category, message, subject)) continue;
             var line_buf: [default_reply_bytes]u8 = undefined;
             const line = event_spine.renderEvent(origin_server, entry.value.session.displayName(), message, &line_buf) catch continue;
             self.deliver(entry.id, line) catch continue;
@@ -25981,6 +26040,58 @@ test "threaded server: oper EVENT delivery + cross-shard fan-out under num_shard
         try recvUntil(&clients[i], " EVENT ", 500);
         try recvUntil(&clients[i], "crossshard", 500);
     }
+}
+
+test "event routing: IRCX type subscriptions are token-routed with no category cross-talk" {
+    // The core delivery-filter contract: an IRCX EVENT subscriber matches events
+    // by the body's leading TYPE token (CHANNEL/MEMBER/USER), independent of the
+    // daemon EventCategory the event was published under. This eliminates the
+    // old cross-talk where MEMBER and USER both rode OPER_ACTION.
+    var user_sub = dispatch.ClientSession.init();
+    try user_sub.setIrcxEventSubscription(.user, "*");
+    // USER-typed events match (even though they publish under different
+    // categories: CONNECT under .connect, NICK under .oper_action).
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .connect, "USER CONNECT n!u@h", "n!u@h"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .oper_action, "USER NICK old!u@h -> new", "old!u@h"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .oper_action, "USER OPER n!u@h :Net Admin", "n!u@h"));
+    // The regression guard: a USER subscriber must NOT receive MEMBER or CHANNEL
+    // lines, nor non-IRCX oper prose, despite shared categories.
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .oper_action, "MEMBER JOIN #c nick", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .announce, "CHANNEL MODE #c +nt", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .kill, "k killed s (flood)", "k killed s (flood)"));
+
+    // A MEMBER subscriber receives only MEMBER-typed events — not USER NICK,
+    // which previously leaked because both used OPER_ACTION.
+    var member_sub = dispatch.ClientSession.init();
+    try member_sub.setIrcxEventSubscription(.member, "*");
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&member_sub, .oper_action, "MEMBER JOIN #c nick", "#c"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&member_sub, .oper_action, "MEMBER KNOCK #c nick :let me in", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&member_sub, .oper_action, "USER NICK old!u@h -> new", "old!u@h"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&member_sub, .connect, "USER CONNECT n!u@h", "n!u@h"));
+
+    // Subject globs still scope IRCX matches by channel/mask.
+    var scoped = dispatch.ClientSession.init();
+    try scoped.setIrcxEventSubscription(.channel, "#ops*");
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&scoped, .announce, "CHANNEL MODE #ops-eu +i", "#ops-eu"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&scoped, .announce, "CHANNEL MODE #lobby +i", "#lobby"));
+}
+
+test "event routing: legacy oper category subscriptions are independent of the IRCX plane" {
+    // An oper subscribed to a category (e.g. via [[opers]] presubscribe) with NO
+    // IRCX EVENT subscription still matches purely by category, and an IRCX
+    // subscription never bleeds into the legacy category mask.
+    var oper = dispatch.ClientSession.init();
+    oper.setEventMask(event_spine.CategoryMask.only(.kill));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&oper, .kill, "k killed s (flood)", "k killed s (flood)"));
+    // Categories it did not subscribe to are filtered, IRCX-typed body or not.
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&oper, .announce, "CHANNEL MODE #c +nt", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&oper, .connect, "USER CONNECT n!u@h", "n!u@h"));
+
+    // An IRCX USER subscription must not grant legacy-category delivery: a USER
+    // subscriber receives a KILL-category event only if its body is USER-typed.
+    var ircx = dispatch.ClientSession.init();
+    try ircx.setIrcxEventSubscription(.user, "*");
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&ircx, .kill, "k killed s (flood)", "k killed s (flood)"));
 }
 
 test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to-end" {

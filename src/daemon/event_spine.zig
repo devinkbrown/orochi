@@ -162,20 +162,21 @@ pub const IrcxEventType = enum(u3) {
         return null;
     }
 
-    pub fn bit(self: IrcxEventType) u8 {
-        return @as(u8, 1) << @intCast(@intFromEnum(self));
+    /// Classify an Event-Spine message BODY by its leading TYPE token — every IRCX
+    /// lifecycle event is published as `"<TYPE> <ACTION> <subject> …"` (e.g.
+    /// "CHANNEL MODE #c +nt", "MEMBER JOIN #c nick", "USER CONNECT n!u@h"). This is
+    /// the authoritative routing key for IRCX EVENT subscribers: it is exact (no
+    /// category cross-talk between MEMBER and USER) and survives the wire verbatim,
+    /// so local, cross-shard, and mesh-drained events all classify identically.
+    /// Returns null for non-IRCX oper notices (kill prose, "SERVER LINK …", flood
+    /// warnings), which reach legacy oper subscribers purely by EventCategory.
+    pub fn fromMessage(message: []const u8) ?IrcxEventType {
+        const end = std.mem.indexOfScalar(u8, message, ' ') orelse message.len;
+        return parse(message[0..end]);
     }
 
-    pub fn categoryMask(self: IrcxEventType) CategoryMask {
-        return switch (self) {
-            // Channel lifecycle/state notices are published through ANNOUNCE.
-            .channel => CategoryMask.only(.announce),
-            // Membership notices share OPER_ACTION.
-            .member => CategoryMask.only(.oper_action),
-            // User lifecycle/administrative events use the existing typed
-            // categories.
-            .user => CategoryMask.fromCategories(&.{ .connect, .disconnect, .kill, .service, .oper_action }),
-        };
+    pub fn bit(self: IrcxEventType) u8 {
+        return @as(u8, 1) << @intCast(@intFromEnum(self));
     }
 };
 
@@ -457,16 +458,27 @@ test "category masks add remove and combine categories" {
     try std.testing.expect(combined.contains(.@"error"));
 }
 
-test "IRCX event types parse and map to delivery categories" {
+test "IRCX event types parse from a bare token" {
     try std.testing.expectEqual(IrcxEventType.channel, IrcxEventType.parse("CHANNEL").?);
     try std.testing.expectEqual(IrcxEventType.member, IrcxEventType.parse("member").?);
     try std.testing.expectEqual(IrcxEventType.user, IrcxEventType.parse("User").?);
     try std.testing.expectEqual(@as(?IrcxEventType, null), IrcxEventType.parse("SERVER"));
+}
 
-    try std.testing.expect(IrcxEventType.channel.categoryMask().contains(.announce));
-    try std.testing.expect(IrcxEventType.member.categoryMask().contains(.oper_action));
-    try std.testing.expect(IrcxEventType.user.categoryMask().contains(.connect));
-    try std.testing.expect(IrcxEventType.user.categoryMask().contains(.kill));
+test "IRCX event type classification from a message body routes by leading token" {
+    // Each lifecycle body classifies to exactly one IRCX type — no cross-talk.
+    try std.testing.expectEqual(IrcxEventType.channel, IrcxEventType.fromMessage("CHANNEL MODE #ops +nt").?);
+    try std.testing.expectEqual(IrcxEventType.member, IrcxEventType.fromMessage("MEMBER JOIN #ops kain").?);
+    try std.testing.expectEqual(IrcxEventType.member, IrcxEventType.fromMessage("MEMBER KNOCK #ops nick :let me in").?);
+    try std.testing.expectEqual(IrcxEventType.user, IrcxEventType.fromMessage("USER CONNECT n!u@h").?);
+    try std.testing.expectEqual(IrcxEventType.user, IrcxEventType.fromMessage("USER NICK old!u@h -> new").?);
+    // A single-token body still classifies (no trailing space).
+    try std.testing.expectEqual(IrcxEventType.user, IrcxEventType.fromMessage("USER").?);
+    // Non-IRCX oper notices never match an IRCX type — they reach legacy
+    // EventCategory subscribers only.
+    try std.testing.expectEqual(@as(?IrcxEventType, null), IrcxEventType.fromMessage("SERVER LINK ircx.us"));
+    try std.testing.expectEqual(@as(?IrcxEventType, null), IrcxEventType.fromMessage("kain killed spammer (flood)"));
+    try std.testing.expectEqual(@as(?IrcxEventType, null), IrcxEventType.fromMessage(""));
 }
 
 test "IRCX event mask tracks distinct subscription bits" {
