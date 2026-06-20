@@ -8806,7 +8806,19 @@ pub const LinuxServer = struct {
         }
 
         _ = try self.world.join(join_target, wid);
-        if (creating) try self.publishChannelEvent("CREATE", join_target);
+        if (creating) {
+            try self.publishChannelEvent("CREATE", join_target);
+            // KEEPTOPIC: restore a registered channel's saved topic on recreation,
+            // so a topic the founder set isn't lost when the channel empties.
+            if (self.account_services) |kt| {
+                var ktbuf: [512]u8 = undefined;
+                if (kt.chanKeepTopicGet(join_target, &ktbuf)) |saved| {
+                    if (self.world.topic(join_target) == null) {
+                        self.world.setTopic(join_target, saved, self.serverName(), @divFloor(platform.realtimeMillis(), 1000)) catch {};
+                    }
+                }
+            }
+        }
 
         // IRCX tiered keys: a presented key matching the channel's HOSTKEY/OWNERKEY
         // property grants graduated status (op / owner) on join — additive, so a
@@ -18112,6 +18124,19 @@ pub const LinuxServer = struct {
                         return;
                     };
                     try channelNotice(conn, "Channel {s} MLOCK set to {s}", .{ r.channel, r.value });
+                } else if (r.field == .keeptopic) {
+                    const on = std.ascii.eqlIgnoreCase(r.value, "on") or std.ascii.eqlIgnoreCase(r.value, "true") or std.ascii.eqlIgnoreCase(r.value, "yes") or std.mem.eql(u8, r.value, "1");
+                    svc.chanKeepTopicEnable(r.channel, on) catch {
+                        try self.failReply(conn, "CHANNEL", "TEMPORARILY_UNAVAILABLE", "Could not store KEEPTOPIC");
+                        return;
+                    };
+                    // On enable, snapshot the current live topic so it is remembered now.
+                    if (on) {
+                        if (self.world.topic(r.channel)) |cur| {
+                            if (cur.len != 0) svc.chanKeepTopicSave(r.channel, cur) catch {};
+                        }
+                    }
+                    try channelNotice(conn, "Channel {s} KEEPTOPIC {s}", .{ r.channel, if (on) "on" else "off" });
                 } else {
                     try channelNotice(conn, "CHANNEL SET {s} is not available yet", .{@tagName(r.field)});
                 }
@@ -21921,6 +21946,8 @@ pub const LinuxServer = struct {
         const setter = try clientPrefix(conn, &setter_buf);
         const set_at = @divFloor(platform.realtimeMillis(), 1000);
         try self.world.setTopic(channel, text, setter, set_at);
+        // KEEPTOPIC: persist the new topic for a registered channel that opted in.
+        if (self.account_services) |kt| kt.chanKeepTopicSave(channel, text) catch {};
 
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;

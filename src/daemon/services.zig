@@ -1597,6 +1597,58 @@ pub const Services = struct {
         return false;
     }
 
+    // ── Durable KEEPTOPIC (registered-channel topic survives recreation) ────────
+    // "ktp\x00<channel>" in `.props`: presence = enabled; value = the saved topic
+    // (empty when enabled but nothing saved yet). Restored on channel recreation.
+    const keeptopic_prefix = "ktp\x00";
+    const keeptopic_key_max: usize = keeptopic_prefix.len + channel_max;
+    const keeptopic_value_max: usize = 512;
+
+    fn keepTopicKey(buf: []u8, channel: []const u8) ?[]const u8 {
+        if (channel.len == 0 or channel.len > channel_max) return null;
+        if (buf.len < keeptopic_prefix.len + channel.len) return null;
+        @memcpy(buf[0..keeptopic_prefix.len], keeptopic_prefix);
+        for (channel, 0..) |c, i| buf[keeptopic_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. keeptopic_prefix.len + channel.len];
+    }
+
+    pub fn chanKeepTopicEnable(self: *Services, channel: []const u8, on: bool) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [keeptopic_key_max]u8 = undefined;
+        const k = keepTopicKey(&kb, channel) orelse return;
+        if (on) {
+            if (self.store.family(.props).get(k) == null) try self.store.family(.props).put(k, "");
+        } else {
+            try self.store.family(.props).delete(k);
+        }
+    }
+
+    /// Persist `topic` for `channel` — only when KEEPTOPIC is enabled (key present).
+    pub fn chanKeepTopicSave(self: *Services, channel: []const u8, topic: []const u8) ServiceError!void {
+        if (topic.len > keeptopic_value_max) return;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [keeptopic_key_max]u8 = undefined;
+        const k = keepTopicKey(&kb, channel) orelse return;
+        if (self.store.family(.props).get(k) == null) return; // not enabled
+        try self.store.family(.props).put(k, topic);
+    }
+
+    /// Copy the saved topic for `channel` into `out` when KEEPTOPIC is enabled and a
+    /// non-empty topic is stored; else null. Returns a slice into `out`.
+    pub fn chanKeepTopicGet(self: *Services, channel: []const u8, out: []u8) ?[]const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [keeptopic_key_max]u8 = undefined;
+        const k = keepTopicKey(&kb, channel) orelse return null;
+        const blob = self.store.family(.props).get(k) orelse return null;
+        if (blob.len == 0) return null;
+        const n = @min(blob.len, out.len);
+        @memcpy(out[0..n], blob[0..n]);
+        return out[0..n];
+    }
+
     pub fn replayLiveState(self: *Services, sink: LiveReplaySink) ServiceError!LiveReplaySummary {
         self.lock.lockShared();
         defer self.lock.unlockShared();
@@ -2536,6 +2588,36 @@ test "channel bad-words: add/match/remove persist across reopen" {
         var services = Services.init(&store, null);
         try std.testing.expect(!services.chanBadwordMatches("#chan", "buy this spam now")); // removed
         try std.testing.expect(services.chanBadwordMatches("#chan", "a scam here")); // survived
+    }
+}
+
+test "keeptopic: enable/save/get persist across reopen; save is a no-op when off" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "services-keeptopic.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var buf: [128]u8 = undefined;
+        // off by default; save does nothing while off
+        try std.testing.expect(services.chanKeepTopicGet("#chan", &buf) == null);
+        try services.chanKeepTopicSave("#chan", "ignored");
+        try std.testing.expect(services.chanKeepTopicGet("#chan", &buf) == null);
+        // enable then save
+        try services.chanKeepTopicEnable("#chan", true);
+        try services.chanKeepTopicSave("#chan", "the topic");
+        const got = services.chanKeepTopicGet("#CHAN", &buf) orelse return error.TestUnexpectedResult; // case-insensitive
+        try std.testing.expectEqualStrings("the topic", got);
+    }
+    {
+        var store = try openTestStore(tmp, "services-keeptopic.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var buf: [128]u8 = undefined;
+        const got = services.chanKeepTopicGet("#chan", &buf) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("the topic", got); // survived reopen
+        try services.chanKeepTopicEnable("#chan", false);
+        try std.testing.expect(services.chanKeepTopicGet("#chan", &buf) == null); // disabled -> gone
     }
 }
 

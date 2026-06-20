@@ -113,6 +113,7 @@ pub const SetField = enum {
     desc,
     url,
     mlock,
+    keeptopic,
 
     /// Parses a SET field token case-insensitively.
     pub fn parse(raw: []const u8) ?SetField {
@@ -122,6 +123,7 @@ pub const SetField = enum {
         if (std.ascii.eqlIgnoreCase(raw, "DESC")) return .desc;
         if (std.ascii.eqlIgnoreCase(raw, "URL")) return .url;
         if (std.ascii.eqlIgnoreCase(raw, "MLOCK")) return .mlock;
+        if (std.ascii.eqlIgnoreCase(raw, "KEEPTOPIC")) return .keeptopic;
         return null;
     }
 
@@ -134,6 +136,7 @@ pub const SetField = enum {
             .desc => "DESC",
             .url => "URL",
             .mlock => "MLOCK",
+            .keeptopic => "KEEPTOPIC",
         };
     }
 };
