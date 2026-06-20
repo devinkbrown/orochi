@@ -8836,7 +8836,9 @@ pub const LinuxServer = struct {
             if (self.props.getPropRaw(chan_entity, "OWNERKEY")) |ev| {
                 tkeys.setKey(self.allocator, .owner, ev.value) catch {};
             } else |_| {}
-            if (self.props.getProp(chan_entity, "FOUNDERKEY")) |ev| {
+            // FOUNDERKEY is a secret prop, so it must be read RAW (getProp hides
+            // secrets) — matching HOSTKEY/OWNERKEY above.
+            if (self.props.getPropRaw(chan_entity, "FOUNDERKEY")) |ev| {
                 tkeys.setKey(self.allocator, .founder, ev.value) catch {};
             } else |_| {}
             switch (tkeys.grantFor(presented)) {
@@ -14905,6 +14907,7 @@ pub const LinuxServer = struct {
     fn secretKeyMinRank(key: []const u8) u8 {
         const k = ircx_prop_store.channelPropKey(key) orelse return 0;
         return switch (k) {
+            .founderkey => chanmode.rankOfMode(.founder),
             .ownerkey => chanmode.rankOfMode(.owner),
             .hostkey => chanmode.rankOfMode(.op),
             .voicekey => chanmode.rankOfMode(.voice),
@@ -15010,9 +15013,9 @@ pub const LinuxServer = struct {
 
     /// Computed/linked IRCX channel built-in property reads. These reflect live
     /// channel state, not the generic PROP store: NAME (the channel), MEMBERCOUNT
-    /// (live count), MEMBERLIMIT (the +l limit). MEMBERKEY is the +k key and is
-    /// secret (write-only) so it is never returned here. Returns a value rendered
-    /// into `buf`, or null to fall through to the store.
+    /// (live count), MEMBERLIMIT (the +l limit), MEMBERKEY (the +k key). MEMBERKEY
+    /// is secret and reached only after the caller's per-tier read gate passes.
+    /// Returns a value rendered into `buf`, or null to fall through to the store.
     fn channelBuiltinGet(self: *LinuxServer, entity: ircx_prop_store.Entity, key: []const u8, buf: []u8) ?[]const u8 {
         if (entity.kind != .channel) return null;
         if (std.ascii.eqlIgnoreCase(key, "NAME")) return entity.id;
@@ -15033,6 +15036,17 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(key, "MEMBERLIMIT")) {
             const limit = self.world.channelLimit(entity.id) orelse return null;
             return std.fmt.bufPrint(buf, "{d}", .{limit}) catch null;
+        }
+        // MEMBERKEY is the live +k channel key (linked, not stored). It is secret,
+        // so this is only reached after the caller's maySeeSecretKey gate passes
+        // (the sole caller is the gated PROP GET path); a member-tier requester or
+        // oper may read it — matching `MODE #chan`, which shows +k to members.
+        if (std.ascii.eqlIgnoreCase(key, "MEMBERKEY")) {
+            const k = self.world.channelKey(entity.id) orelse return null;
+            if (k.len == 0) return null;
+            if (k.len > buf.len) return null;
+            @memcpy(buf[0..k.len], k);
+            return buf[0..k.len];
         }
         return null;
     }
@@ -15331,11 +15345,14 @@ pub const LinuxServer = struct {
         };
         switch (req) {
             .list => |entity| {
-                // Secret props (channel keys) use the per-tier read gate: each
-                // key is visible only to members at/above its tier (OWNERKEY→owner,
-                // HOSTKEY→op, VOICEKEY→voice, MEMBERKEY→any member; opers always).
+                // Secret props (channel keys) use the per-tier read gate: each key
+                // is visible only to members at/above its tier (FOUNDERKEY→founder,
+                // OWNERKEY→owner, HOSTKEY→op, VOICEKEY→voice, MEMBERKEY→member; opers
+                // always). The store's plain listProps hides ALL secrets, so list
+                // RAW and apply the daemon's per-tier gate per entry — an authorized
+                // requester sees their tier's keys, everyone else sees none.
                 var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
-                const rows = self.props.listProps(entity, &views) catch views[0..0];
+                const rows = self.props.listPropsRaw(entity, &views) catch views[0..0];
                 for (rows) |ev| {
                     if (propIsSecret(entity, ev.key) and !self.maySeeSecretKey(id, conn, entity, ev.key)) continue;
                     try propEmitEntry(conn, ev);
@@ -15346,9 +15363,11 @@ pub const LinuxServer = struct {
                 var it = std.mem.splitScalar(u8, q.keys, ',');
                 while (it.next()) |key| {
                     if (key.len == 0) continue;
-                    if (propIsSecret(q.entity, key) and !self.maySeeSecretKey(id, conn, q.entity, key)) continue;
-                    // Computed/linked built-ins (NAME/MEMBERCOUNT/MEMBERLIMIT)
-                    // reflect live channel state, ahead of the generic store.
+                    const is_secret = propIsSecret(q.entity, key);
+                    if (is_secret and !self.maySeeSecretKey(id, conn, q.entity, key)) continue;
+                    // Computed/linked built-ins (NAME/MEMBERCOUNT/MEMBERLIMIT and
+                    // the linked +k MEMBERKEY) reflect live channel state, ahead of
+                    // the generic store.
                     var bbuf: [64]u8 = undefined;
                     if (self.channelBuiltinGet(q.entity, key, &bbuf)) |val| {
                         try propEmitBuiltin(conn, q.entity, key, val);
@@ -15361,7 +15380,15 @@ pub const LinuxServer = struct {
                         try propEmitBuiltin(conn, q.entity, key, val);
                         continue;
                     }
-                    if (self.props.getProp(q.entity, key)) |ev| {
+                    // A secret key that passed the per-tier gate is read RAW: the
+                    // store's `getProp` hides secrets unconditionally, so the gated
+                    // value must come from `getPropRaw` (the gate is the daemon's,
+                    // not the store's).
+                    const stored = if (is_secret)
+                        self.props.getPropRaw(q.entity, key)
+                    else
+                        self.props.getProp(q.entity, key);
+                    if (stored) |ev| {
                         try propEmitEntry(conn, ev);
                     } else |_| {}
                 }
@@ -29747,6 +29774,76 @@ test "threaded server: PROP notify is IRCX-gated and per-tier secret" {
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "PROP #p") == null);
 }
 
+test "threaded server: PROP GET/LIST returns secret tier keys gated by rank (founder/owner/member), incl FOUNDERKEY + MEMBERKEY<->+k" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+
+    // A founds #k (founder, rank 4). B joins as a plain member (rank 0) BEFORE any
+    // +k is set, so it stays a member once the join key exists.
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IRCX\r\nJOIN #k\r\n");
+    try recvUntil(a, " 366 A #k ", 200);
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IRCX\r\nJOIN #k\r\n");
+    try recvUntil(b, " 366 B #k ", 200);
+
+    // Founder stores two secret tier keys and sets the live +k (==MEMBERKEY).
+    try writeAllFd(fd_a, "PROP #k OWNERKEY :ownsek\r\nPROP #k FOUNDERKEY :fndsek\r\nMODE #k +k joinpass\r\n");
+    try recvUntil(a, "MODE #k +k joinpass", 300);
+    a.reset();
+
+    // Founder GET each key: stored secrets read back RAW after the per-tier gate,
+    // and MEMBERKEY resolves to the live +k value. (Reply numeric 818.)
+    try writeAllFd(fd_a, "PROP #k OWNERKEY\r\nPROP #k FOUNDERKEY\r\nPROP #k MEMBERKEY\r\n");
+    try recvUntil(a, "818 A #k OWNERKEY :ownsek", 300);
+    try recvUntil(a, "818 A #k FOUNDERKEY :fndsek", 300);
+    try recvUntil(a, "818 A #k MEMBERKEY :joinpass", 300);
+
+    // Founder LIST (PROP #k) enumerates the now-visible secret tier keys.
+    a.reset();
+    try writeAllFd(fd_a, "PROP #k\r\n");
+    try recvUntil(a, "819 A #k :End of properties", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "OWNERKEY :ownsek") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "FOUNDERKEY :fndsek") != null);
+
+    // Plain member B: OWNERKEY/FOUNDERKEY are above its tier -> GET yields only the
+    // 819 end with NO value line. MEMBERKEY is member-tier -> B reads the +k value
+    // (matching MODE #k, which shows +k to members).
+    b.reset();
+    try writeAllFd(fd_b, "PROP #k OWNERKEY\r\n");
+    try recvUntil(b, "819 B #k :End of properties", 300);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "OWNERKEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "ownsek") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "fndsek") == null);
+    b.reset();
+    try writeAllFd(fd_b, "PROP #k MEMBERKEY\r\n");
+    try recvUntil(b, "818 B #k MEMBERKEY :joinpass", 300);
+}
+
 test "threaded server: oper SASL login auto-enables IRCX" {
     var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -30211,7 +30308,7 @@ test "threaded server: PROP user geo fields are self-or-oper only" {
     try recvUntil(&oper, " 819 Oper A ", 200);
 }
 
-test "threaded server: HOSTKEY PROP grants op on keyed join without client disclosure" {
+test "threaded server: HOSTKEY grants op on keyed join (not disclosed at join; op may read it per-tier)" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -30257,12 +30354,24 @@ test "threaded server: HOSTKEY PROP grants op on keyed join without client discl
     try writeAllFd(fd_b, "JOIN #hk s3cret\r\n");
     try recvUntil(b, " 366 B #hk ", 200);
     try expectContains(b.written(), "@B");
+    // The JOIN flow itself never echoes the key back to the joiner — keyed join
+    // grants the tier silently (the joiner supplied the key; it is not re-disclosed
+    // in the join burst).
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "s3cret") == null);
 
+    // B is now an op (rank 2), and HOSTKEY is the op-tier key, so a PROP GET DOES
+    // return it under the per-tier read model (op may read HOSTKEY/VOICEKEY/MEMBERKEY).
     b.reset();
     try writeAllFd(fd_b, "PROP #hk HOSTKEY\r\n");
+    try recvUntil(b, " 818 B #hk HOSTKEY :s3cret", 200);
+
+    // ...but an OWNER-tier key stays above an op: B cannot read OWNERKEY.
+    try writeAllFd(fd_a, "PROP #hk OWNERKEY :ownsek\r\n");
+    try recvUntil(a, " 818 A #hk OWNERKEY :ownsek", 200);
+    b.reset();
+    try writeAllFd(fd_b, "PROP #hk OWNERKEY\r\n");
     try recvUntil(b, " 819 B #hk ", 200);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), "s3cret") == null);
-    try std.testing.expect(std.mem.indexOf(u8, b.written(), " 818 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "ownsek") == null);
 }
 
 test "threaded server: ACCESS add/list/delete gated by channel-op" {

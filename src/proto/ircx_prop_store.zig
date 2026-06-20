@@ -112,6 +112,7 @@ pub const ChannelPropKey = enum {
     membercount,
     memberlimit,
     language,
+    founderkey,
     ownerkey,
     hostkey,
     voicekey,
@@ -135,6 +136,7 @@ pub const ChannelPropKey = enum {
             .membercount => "MEMBERCOUNT",
             .memberlimit => "MEMBERLIMIT",
             .language => "LANGUAGE",
+            .founderkey => "FOUNDERKEY",
             .ownerkey => "OWNERKEY",
             .hostkey => "HOSTKEY",
             .voicekey => "VOICEKEY",
@@ -179,6 +181,10 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
         // the write to the MODE change before the generic store is consulted).
         .memberlimit => .{ .key = key, .max_value = 20, .min_setter = .host },
         .language => .{ .key = key, .max_value = 31, .min_setter = .host },
+        // FOUNDERKEY grants the top FOUNDER tier on join; like OWNERKEY it is
+        // owner-set (the prop AccessLevel ladder tops out at owner — founder is a
+        // membership rank, not a setter tier) and its value is secret.
+        .founderkey => .{ .key = key, .max_value = 31, .min_setter = .owner, .secret = true },
         .ownerkey => .{ .key = key, .max_value = 31, .min_setter = .owner, .secret = true },
         .hostkey, .memberkey => .{ .key = key, .max_value = 31, .min_setter = .owner, .secret = true },
         // VOICEKEY is settable by operators and above (op-tier), unlike the
@@ -484,7 +490,20 @@ pub fn PropStore(comptime params: Params) type {
             if (self.entity_count > 0) self.entity_count -= 1;
         }
 
+        /// List an entity's props, OMITTING secret channel keys. Use this for any
+        /// untrusted/unauthenticated enumeration — secret values never appear.
         pub fn listProps(self: *const Self, entity: Entity, out: []EntryView) PropError![]EntryView {
+            return self.listPropsInternal(entity, out, false);
+        }
+
+        /// List an entity's props INCLUDING secret channel keys. Callers MUST apply
+        /// their own per-recipient visibility gate to each returned secret entry
+        /// (the daemon's `maySeeSecretKey`); the store cannot know membership rank.
+        pub fn listPropsRaw(self: *const Self, entity: Entity, out: []EntryView) PropError![]EntryView {
+            return self.listPropsInternal(entity, out, true);
+        }
+
+        fn listPropsInternal(self: *const Self, entity: Entity, out: []EntryView, include_secret: bool) PropError![]EntryView {
             try validateEntity(entity, params.max_entity_id);
 
             var entity_key_buf: [max_entity_key]u8 = undefined;
@@ -494,7 +513,7 @@ pub fn PropStore(comptime params: Params) type {
             var count: usize = 0;
             var it = state.props.iterator();
             while (it.next()) |entry| {
-                if (isSecretChannelProp(entity, entry.value_ptr.key)) continue;
+                if (!include_secret and isSecretChannelProp(entity, entry.value_ptr.key)) continue;
                 if (count >= out.len) return error.OutputTooSmall;
                 out[count] = view(state, entry.value_ptr);
                 count += 1;
@@ -853,6 +872,23 @@ test "secret channel props stay hidden except raw internal lookup" {
     const raw = try store.getPropRaw(entity, "HOSTKEY");
     try std.testing.expectEqualStrings("HOSTKEY", raw.key);
     try std.testing.expectEqualStrings("s3cret", raw.value);
+
+    // FOUNDERKEY is a secret tier key too — hidden from getProp, visible RAW.
+    _ = try store.setProp(entity, "FOUNDERKEY", "topkey", .{ .id = "owner", .access = .owner });
+    try std.testing.expect((channelPropInfo("FOUNDERKEY").?).secret);
+    try std.testing.expectError(error.PropMissing, store.getProp(entity, "FOUNDERKEY"));
+    try std.testing.expectEqualStrings("topkey", (try store.getPropRaw(entity, "FOUNDERKEY")).value);
+
+    // A plain LIST omits every secret key; listPropsRaw surfaces them for the
+    // caller to gate (here: a non-secret CUSTOM plus the two secret tier keys).
+    _ = try store.setProp(entity, "CUSTOM", "v", .{ .id = "owner", .access = .host });
+    var views: [8]EntryView = undefined;
+    const plain = try store.listProps(entity, &views);
+    try std.testing.expectEqual(@as(usize, 1), plain.len);
+    try std.testing.expectEqualStrings("CUSTOM", plain[0].key);
+    var raw_views: [8]EntryView = undefined;
+    const all = try store.listPropsRaw(entity, &raw_views);
+    try std.testing.expectEqual(@as(usize, 3), all.len); // CUSTOM + HOSTKEY + FOUNDERKEY
 }
 
 test "limits and built-in channel property metadata are enforced" {

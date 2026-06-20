@@ -226,7 +226,6 @@ pub const svc_chanbadwords = @import("svc_chanbadwords.zig");
 pub const svc_clonescan = @import("svc_clonescan.zig");
 pub const svc_enforce = @import("svc_enforce.zig");
 pub const svc_forceaction = @import("svc_forceaction.zig");
-pub const svc_getkey = @import("svc_getkey.zig");
 pub const svc_globops = @import("svc_globops.zig");
 pub const svc_jupe = @import("svc_jupe.zig");
 pub const svc_killpath = @import("svc_killpath.zig");
@@ -519,7 +518,6 @@ test {
     _ = svc_clonescan;
     _ = svc_enforce;
     _ = svc_forceaction;
-    _ = svc_getkey;
     _ = svc_globops;
     _ = svc_jupe;
     _ = svc_killpath;
