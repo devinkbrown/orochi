@@ -223,8 +223,6 @@ pub const store = @import("store.zig");
 pub const svc_acclist = @import("svc_acclist.zig");
 pub const svc_akick = @import("svc_akick.zig");
 pub const svc_chanbadwords = @import("svc_chanbadwords.zig");
-pub const svc_chanset = @import("svc_chanset.zig");
-pub const svc_chantransfer = @import("svc_chantransfer.zig");
 pub const svc_chanwelcome = @import("svc_chanwelcome.zig");
 pub const svc_clonescan = @import("svc_clonescan.zig");
 pub const svc_email = @import("svc_email.zig");
@@ -520,8 +518,6 @@ test {
     _ = svc_acclist;
     _ = svc_akick;
     _ = svc_chanbadwords;
-    _ = svc_chanset;
-    _ = svc_chantransfer;
     _ = svc_chanwelcome;
     _ = svc_clonescan;
     _ = svc_email;

@@ -18239,8 +18239,14 @@ pub const LinuxServer = struct {
                     },
                 }
             },
-            else => {
-                try channelNotice(conn, "{s} is not available yet", .{chanserv_cmd.fmtUsage(req.subcommand())});
+            .transfer => |r| {
+                const result = svc.transferChannel(r.channel, account, r.account, &scratch) catch |err| {
+                    try self.failReply(conn, "CHANNEL", channelFailCode(err), "Channel TRANSFER failed");
+                    return;
+                };
+                if (result == .registered_channel) {
+                    try channelNotice(conn, "Channel {s} founder transferred to {s}", .{ result.registered_channel.name.asSlice(), result.registered_channel.founder.asSlice() });
+                }
             },
         }
     }

@@ -916,6 +916,26 @@ pub const Services = struct {
         return .{ .dropped_channel = .{ .name = record.name } };
     }
 
+    /// Transfer founder ownership of a registered channel. Only the CURRENT founder
+    /// may transfer; the new founder must be a registered account. The new founder
+    /// also receives an explicit FOUNDER access grant.
+    pub fn transferChannel(self: *Services, channel: []const u8, actor: []const u8, new_founder: []const u8, scratch: []u8) ServiceError!CommandResult {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var record = try self.loadChannel(channel);
+        const actor_key = try accountKey(actor);
+        if (!std.ascii.eqlIgnoreCase(record.founder.asSlice(), actor_key.asSlice())) return error.Forbidden;
+        const nf_key = try accountKey(new_founder);
+        if (self.store.family(.accounts).get(nf_key.asSlice()) == null) return error.NotFound;
+
+        record.founder = nf_key;
+        const encoded = try encodeChannel(record, scratch);
+        try self.store.family(.chanregs).put(record.name.asSlice(), encoded);
+        _ = try self.putAccess(record, record.founder, .founder, scratch);
+        return .{ .registered_channel = record.info() };
+    }
+
     pub fn channelAccess(
         self: *Services,
         channel: []const u8,
@@ -2619,6 +2639,26 @@ test "keeptopic: enable/save/get persist across reopen; save is a no-op when off
         try services.chanKeepTopicEnable("#chan", false);
         try std.testing.expect(services.chanKeepTopicGet("#chan", &buf) == null); // disabled -> gone
     }
+}
+
+test "channel transfer: only the founder may hand ownership to a registered account" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-chantransfer.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    _ = try services.registerAccount("bob", "another good passphrase here", &scratch);
+    _ = try services.registerChannel("#orochi", "alice", &scratch);
+
+    try std.testing.expectError(error.Forbidden, services.transferChannel("#orochi", "bob", "bob", &scratch)); // not founder
+    try std.testing.expectError(error.NotFound, services.transferChannel("#orochi", "alice", "carol", &scratch)); // unknown target
+    const res = try services.transferChannel("#orochi", "alice", "bob", &scratch);
+    try std.testing.expectEqualStrings("bob", res.registered_channel.founder.asSlice());
+    // ownership moved: alice can no longer transfer
+    try std.testing.expectError(error.Forbidden, services.transferChannel("#orochi", "alice", "alice", &scratch));
 }
 
 test "account email verification persists across store reopen" {
