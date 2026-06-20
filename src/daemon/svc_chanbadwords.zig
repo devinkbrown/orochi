@@ -385,7 +385,7 @@ fn canonicalChannelInto(channel: []const u8, out: *[hard_max_channel_len]u8) ?[]
     return out[0..channel.len];
 }
 
-fn containsIgnoreCase(text: []const u8, pattern: []const u8) bool {
+pub fn containsIgnoreCase(text: []const u8, pattern: []const u8) bool {
     if (pattern.len == 0) return true;
     if (pattern.len > text.len) return false;
 

@@ -33,7 +33,7 @@ pub const AboutInfo = struct {
 /// in its own numeric). The architecture lines are deliberately editorial: this
 /// is the one place the daemon describes what it actually is.
 pub fn renderInfo(info: AboutInfo, writer: anytype) !void {
-    try writer.writeAll("Orochi — a clean-room, pure-Zig mesh IRC daemon.\n");
+    try writer.writeAll("Orochi - a clean-room, pure-Zig mesh IRC daemon.\n");
     try writer.print("Version {s}", .{info.version});
     if (info.zig_version.len != 0 or info.target.len != 0 or info.optimize.len != 0) {
         try writer.writeAll(" (");
@@ -55,12 +55,12 @@ pub fn renderInfo(info: AboutInfo, writer: anytype) !void {
     }
     try writer.writeAll("\n");
 
-    try writer.writeAll("100% Zig, zero C interop — substrate, crypto, and daemon are all native.\n");
+    try writer.writeAll("100% Zig, zero C interop - substrate, crypto, and daemon are all native.\n");
     try writer.writeAll("\n");
-    try writer.writeAll("Mesh:     Suimyaku CRDT world state · Sazanami gossip · Goryu membership\n");
-    try writer.writeAll("Security: Tsumugi PQ-hybrid handshake · MeshPass admission · VeilSafe key hygiene\n");
-    try writer.writeAll("Crypto:   Yoroi — a from-scratch pure-Zig TLS and primitive library\n");
-    try writer.writeAll("Media:    Kakehashi SFU · OPVOX/OPVIS codecs · QUIC/WebTransport transport\n");
+    try writer.writeAll("Mesh:     Suimyaku CRDT world state | Sazanami gossip | Goryu membership\n");
+    try writer.writeAll("Security: Tsumugi PQ-hybrid handshake | MeshPass admission | VeilSafe key hygiene\n");
+    try writer.writeAll("Crypto:   Yoroi - a from-scratch pure-Zig TLS and primitive library\n");
+    try writer.writeAll("Media:    Kakehashi SFU | OPVOX/OPVIS codecs | QUIC/WebTransport transport\n");
     try writer.writeAll("History:  Lotus event-DAG with verified-streaming backfill\n");
     try writer.writeAll("\n");
 

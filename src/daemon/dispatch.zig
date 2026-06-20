@@ -1944,7 +1944,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
     var welcome_buf: [512]u8 = undefined;
     const welcome_line = std.fmt.bufPrint(
         &welcome_buf,
-        "Welcome to the {s} network, {s} — you are {s}",
+        "Welcome to the {s} network, {s} - you are {s}",
         .{ replies.network_name, nick, mask },
     ) catch "Welcome to Orochi";
     try replies.numeric(session, .RPL_WELCOME, &.{}, welcome_line);
@@ -2023,29 +2023,29 @@ fn emitWelcomeNotices(session: *const ClientSession, replies: *ReplyCtx, host: [
 
     var security_buf: [512]u8 = undefined;
     const security_text = if (session.tls_cipher) |cipher|
-        std.fmt.bufPrint(&security_buf, "secured ({s} {s}) · you are {s} · {s}", .{
+        std.fmt.bufPrint(&security_buf, "secured ({s} {s}) | you are {s} | {s}", .{
             tlsVersionLabel(cipher),
             tlsCipherLabel(cipher),
             host,
             account_text,
-        }) catch "secured · account state unavailable"
+        }) catch "secured | account state unavailable"
     else
-        std.fmt.bufPrint(&security_buf, "plaintext — consider connecting over TLS · you are {s} · {s}", .{
+        std.fmt.bufPrint(&security_buf, "plaintext - consider connecting over TLS | you are {s} | {s}", .{
             host,
             account_text,
-        }) catch "plaintext — consider connecting over TLS";
+        }) catch "plaintext - consider connecting over TLS";
     try replies.message(replies.server_name, "NOTICE", &.{session.displayName()}, security_text);
 
     const peers = protocol_inventory.currentMeshPeerCount();
     const nodes: u32 = peers + 1;
     var mesh_buf: [128]u8 = undefined;
     const mesh_text = if (peers == 0)
-        std.fmt.bufPrint(&mesh_buf, "mesh: 1 node active · /HELP to get started", .{}) catch "mesh: 1 node active"
+        std.fmt.bufPrint(&mesh_buf, "mesh: 1 node active | /HELP to get started", .{}) catch "mesh: 1 node active"
     else
-        std.fmt.bufPrint(&mesh_buf, "mesh: {d} {s} linked · /HELP to get started", .{
+        std.fmt.bufPrint(&mesh_buf, "mesh: {d} {s} linked | /HELP to get started", .{
             nodes,
             if (nodes == 1) "node" else "nodes",
-        }) catch "mesh linked · /HELP to get started";
+        }) catch "mesh linked | /HELP to get started";
     try replies.message(replies.server_name, "NOTICE", &.{session.displayName()}, mesh_text);
 }
 

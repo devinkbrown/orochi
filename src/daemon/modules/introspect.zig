@@ -18,7 +18,7 @@ fn modules(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
         return;
     }
 
-    try core.reply(.RPL_INFOSTART, &.{}, "SerpentRegistry — loaded modules");
+    try core.reply(.RPL_INFOSTART, &.{}, "SerpentRegistry - loaded modules");
     var buf: [256]u8 = undefined;
     inline for (module_manifest.enabled) |m| {
         const line = std.fmt.bufPrint(&buf, "{s}: {d} cmds, {d} caps, {d} hooks", .{

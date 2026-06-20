@@ -266,7 +266,6 @@ pub const signed_object = @import("signed_object.zig");
 pub const silence = @import("silence.zig");
 pub const skiplist = @import("skiplist.zig");
 pub const sni = @import("sni.zig");
-pub const snomask = @import("snomask.zig");
 pub const snowflake_id = @import("snowflake_id.zig");
 pub const socks5 = @import("socks5.zig");
 pub const srtcp = @import("srtcp.zig");
@@ -603,7 +602,6 @@ test {
     _ = silence;
     _ = skiplist;
     _ = sni;
-    _ = snomask;
     _ = snowflake_id;
     _ = socks5;
     _ = srtcp;

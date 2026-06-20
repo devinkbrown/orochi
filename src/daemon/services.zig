@@ -8,6 +8,8 @@ const sasl = @import("../proto/sasl.zig");
 const certfp_bind_mod = @import("certfp_bind.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 const svc_enforce = @import("svc_enforce.zig");
+const svc_acclist = @import("svc_acclist.zig");
+const svc_chanbadwords = @import("svc_chanbadwords.zig");
 
 pub const OroStore = store_mod.OroStore;
 pub const ScramStore = scram_store_mod.ScramStore;
@@ -1210,6 +1212,391 @@ pub const Services = struct {
         }
     }
 
+    // ── Account recognition masks (svc_acclist feature; RECOGNIZE command) ───────
+    // Per-account hostmask list. Stored as ONE newline-joined value in the `.props`
+    // family — durable, restart-safe, and isolated from account/channel records
+    // (so it can never corrupt them). Matching uses `svc_acclist.globMatch`.
+    const recognize_prefix = "rcg\x00";
+    const recognize_max_masks: usize = svc_acclist.default_max_masks;
+    const recognize_mask_max: usize = 128;
+    const recognize_key_max: usize = recognize_prefix.len + account_max;
+    const recognize_value_max: usize = recognize_max_masks * (recognize_mask_max + 1);
+
+    pub const RecognizeAdd = enum { added, already_present, list_full, invalid_mask };
+
+    fn recognizeKey(buf: []u8, account: []const u8) ?[]const u8 {
+        if (account.len == 0 or account.len > account_max) return null;
+        if (buf.len < recognize_prefix.len + account.len) return null;
+        @memcpy(buf[0..recognize_prefix.len], recognize_prefix);
+        for (account, 0..) |c, i| buf[recognize_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. recognize_prefix.len + account.len];
+    }
+
+    fn validRecognizeMask(mask: []const u8) bool {
+        if (mask.len == 0 or mask.len > recognize_mask_max) return false;
+        for (mask) |c| {
+            if (c < 0x20 or c == '\n' or c == 0) return false;
+        }
+        return true;
+    }
+
+    /// True if `hostmask` (nick!user@host) matches any recognition mask owned by
+    /// `account`. Reads the durable mirror, so it is correct immediately after a
+    /// restart with no in-memory warm-up.
+    pub fn recognizeMatches(self: *Services, account: []const u8, hostmask: []const u8) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [recognize_key_max]u8 = undefined;
+        const key = recognizeKey(&kb, account) orelse return false;
+        const blob = self.store.family(.props).get(key) orelse return false;
+        var it = std.mem.splitScalar(u8, blob, '\n');
+        while (it.next()) |mask| {
+            if (mask.len != 0 and svc_acclist.globMatch(mask, hostmask)) return true;
+        }
+        return false;
+    }
+
+    /// Copy the newline-joined recognition mask blob for `account` into `out`,
+    /// returning the populated slice ("" when none). Used by RECOGNIZE LIST.
+    pub fn recognizeBlob(self: *Services, account: []const u8, out: []u8) []const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [recognize_key_max]u8 = undefined;
+        const key = recognizeKey(&kb, account) orelse return out[0..0];
+        const blob = self.store.family(.props).get(key) orelse return out[0..0];
+        const n = @min(blob.len, out.len);
+        @memcpy(out[0..n], blob[0..n]);
+        return out[0..n];
+    }
+
+    /// Add `mask` to `account`'s recognition list (durable). Idempotent; bounded
+    /// by `recognize_max_masks`.
+    pub fn recognizeAdd(self: *Services, account: []const u8, mask: []const u8) ServiceError!RecognizeAdd {
+        if (!validRecognizeMask(mask)) return .invalid_mask;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [recognize_key_max]u8 = undefined;
+        const key = recognizeKey(&kb, account) orelse return .invalid_mask;
+        const existing = self.store.family(.props).get(key) orelse "";
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |m| {
+            if (m.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(m, mask)) return .already_present;
+            count += 1;
+        }
+        if (count >= recognize_max_masks) return .list_full;
+        var vbuf: [recognize_value_max]u8 = undefined;
+        var w = std.Io.Writer.fixed(&vbuf);
+        if (existing.len != 0) {
+            w.writeAll(existing) catch return .list_full;
+            w.writeAll("\n") catch return .list_full;
+        }
+        w.writeAll(mask) catch return .list_full;
+        try self.store.family(.props).put(key, w.buffered());
+        return .added;
+    }
+
+    /// Remove `mask` from `account`'s recognition list (durable). Returns whether
+    /// a mask was actually removed.
+    pub fn recognizeDel(self: *Services, account: []const u8, mask: []const u8) ServiceError!bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [recognize_key_max]u8 = undefined;
+        const key = recognizeKey(&kb, account) orelse return false;
+        const existing = self.store.family(.props).get(key) orelse return false;
+        var vbuf: [recognize_value_max]u8 = undefined;
+        var w = std.Io.Writer.fixed(&vbuf);
+        var found = false;
+        var remaining: usize = 0;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |m| {
+            if (m.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(m, mask)) {
+                found = true;
+                continue;
+            }
+            if (remaining != 0) w.writeAll("\n") catch return found;
+            w.writeAll(m) catch return found;
+            remaining += 1;
+        }
+        if (!found) return false;
+        if (remaining == 0) {
+            try self.store.family(.props).delete(key);
+        } else {
+            try self.store.family(.props).put(key, w.buffered());
+        }
+        return true;
+    }
+
+    // ── Durable account-scoped IRCv3 METADATA (web-client profiles) ─────────────
+    // The live metadata store (server.metadata) is in-memory; these helpers mirror
+    // a logged-in user's OWN metadata into the durable `.props` family keyed by
+    // ACCOUNT, so a profile (avatar/display-name/…) survives a cold restart and is
+    // restored into the live store on next login. Value = "<vis-token>\x00<value>".
+    // Isolated key namespace ("mda\x00…") — never touches account/channel records.
+    const metadata_prefix = "mda\x00";
+    const metadata_key_max = 64;
+    const metadata_value_max = 512;
+    const metadata_full_key_max = metadata_prefix.len + account_max + 1 + metadata_key_max;
+
+    fn metadataAccountPrefix(buf: []u8, account: []const u8) ?[]const u8 {
+        if (account.len == 0 or account.len > account_max) return null;
+        if (buf.len < metadata_prefix.len + account.len + 1) return null;
+        @memcpy(buf[0..metadata_prefix.len], metadata_prefix);
+        for (account, 0..) |c, i| buf[metadata_prefix.len + i] = std.ascii.toLower(c);
+        buf[metadata_prefix.len + account.len] = 0;
+        return buf[0 .. metadata_prefix.len + account.len + 1];
+    }
+
+    fn metadataKey(buf: []u8, account: []const u8, key: []const u8) ?[]const u8 {
+        if (key.len == 0 or key.len > metadata_key_max) return null;
+        var pb: [metadata_full_key_max]u8 = undefined;
+        const prefix = metadataAccountPrefix(&pb, account) orelse return null;
+        if (buf.len < prefix.len + key.len) return null;
+        @memcpy(buf[0..prefix.len], prefix);
+        @memcpy(buf[prefix.len .. prefix.len + key.len], key);
+        return buf[0 .. prefix.len + key.len];
+    }
+
+    pub fn metadataPut(self: *Services, account: []const u8, key: []const u8, value: []const u8, vis_token: []const u8) ServiceError!void {
+        if (value.len > metadata_value_max or vis_token.len == 0 or vis_token.len > 16) return;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [metadata_full_key_max]u8 = undefined;
+        const k = metadataKey(&kb, account, key) orelse return;
+        var vb: [metadata_value_max + 24]u8 = undefined;
+        var w = std.Io.Writer.fixed(&vb);
+        w.writeAll(vis_token) catch return;
+        w.writeAll("\x00") catch return;
+        w.writeAll(value) catch return;
+        try self.store.family(.props).put(k, w.buffered());
+    }
+
+    pub fn metadataDelete(self: *Services, account: []const u8, key: []const u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [metadata_full_key_max]u8 = undefined;
+        const k = metadataKey(&kb, account, key) orelse return;
+        try self.store.family(.props).delete(k);
+    }
+
+    /// Invoke `cb(ctx, key, value, vis_token)` for every durable metadata entry
+    /// owned by `account`. Used to restore a user's profile metadata at login.
+    pub fn metadataForEach(self: *Services, account: []const u8, ctx: anytype, comptime cb: fn (@TypeOf(ctx), []const u8, []const u8, []const u8) void) void {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var pb: [metadata_full_key_max]u8 = undefined;
+        const prefix = metadataAccountPrefix(&pb, account) orelse return;
+        var it = self.store.maps[@intFromEnum(store_mod.Family.props)].map.iterator();
+        while (it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, k, prefix)) continue;
+            const blob = entry.value_ptr.*;
+            const sep = std.mem.indexOfScalar(u8, blob, 0) orelse continue;
+            cb(ctx, k[prefix.len..], blob[sep + 1 ..], blob[0..sep]);
+        }
+    }
+
+    // ── Durable account-scoped SILENCE (ignore list survives reconnect/restart) ──
+    // One newline-joined blob per account in `.props` ("sil\x00<account>"). The live
+    // per-nick `server.silence` store is restored from this at login.
+    const silence_prefix = "sil\x00";
+    const silence_max_masks: usize = 64;
+    const silence_mask_max: usize = 128;
+    const silence_key_max: usize = silence_prefix.len + account_max;
+    const silence_value_max: usize = silence_max_masks * (silence_mask_max + 1);
+
+    fn silenceKey(buf: []u8, account: []const u8) ?[]const u8 {
+        if (account.len == 0 or account.len > account_max) return null;
+        if (buf.len < silence_prefix.len + account.len) return null;
+        @memcpy(buf[0..silence_prefix.len], silence_prefix);
+        for (account, 0..) |c, i| buf[silence_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. silence_prefix.len + account.len];
+    }
+
+    pub fn silencePersistAdd(self: *Services, account: []const u8, mask: []const u8) ServiceError!void {
+        if (mask.len == 0 or mask.len > silence_mask_max) return;
+        for (mask) |c| if (c < 0x20 or c == '\n' or c == 0) return;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [silence_key_max]u8 = undefined;
+        const k = silenceKey(&kb, account) orelse return;
+        const existing = self.store.family(.props).get(k) orelse "";
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |m| {
+            if (m.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(m, mask)) return;
+            count += 1;
+        }
+        if (count >= silence_max_masks) return;
+        var vb: [silence_value_max]u8 = undefined;
+        var w = std.Io.Writer.fixed(&vb);
+        if (existing.len != 0) {
+            w.writeAll(existing) catch return;
+            w.writeAll("\n") catch return;
+        }
+        w.writeAll(mask) catch return;
+        try self.store.family(.props).put(k, w.buffered());
+    }
+
+    pub fn silencePersistDel(self: *Services, account: []const u8, mask: []const u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [silence_key_max]u8 = undefined;
+        const k = silenceKey(&kb, account) orelse return;
+        const existing = self.store.family(.props).get(k) orelse return;
+        var vb: [silence_value_max]u8 = undefined;
+        var w = std.Io.Writer.fixed(&vb);
+        var remaining: usize = 0;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |m| {
+            if (m.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(m, mask)) continue;
+            if (remaining != 0) w.writeAll("\n") catch return;
+            w.writeAll(m) catch return;
+            remaining += 1;
+        }
+        if (remaining == 0) {
+            try self.store.family(.props).delete(k);
+        } else {
+            try self.store.family(.props).put(k, w.buffered());
+        }
+    }
+
+    /// Invoke `cb(ctx, mask)` for each persisted SILENCE mask owned by `account`.
+    pub fn silenceForEach(self: *Services, account: []const u8, ctx: anytype, comptime cb: fn (@TypeOf(ctx), []const u8) void) void {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [silence_key_max]u8 = undefined;
+        const k = silenceKey(&kb, account) orelse return;
+        const blob = self.store.family(.props).get(k) orelse return;
+        var it = std.mem.splitScalar(u8, blob, '\n');
+        while (it.next()) |m| {
+            if (m.len != 0) cb(ctx, m);
+        }
+    }
+
+    /// Invoke `cb(ctx, channel, level)` for every channel where `account` holds a
+    /// live access grant — the durable reverse of `channelAccessList`, backing
+    /// LISTCHANS. Stale grants (channel dropped, or dropped+re-registered) are
+    /// skipped by re-checking the channel's current generation.
+    pub fn channelsForAccount(self: *Services, account: []const u8, ctx: anytype, comptime cb: fn (@TypeOf(ctx), []const u8, AccessLevel) void) void {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, access_prefix)) continue;
+            const access = decodeAccess(entry.value_ptr.*) catch continue;
+            if (!std.ascii.eqlIgnoreCase(access.account.asSlice(), account)) continue;
+            const record = self.loadChannel(access.channel.asSlice()) catch continue;
+            if (!sameBytes(generation_len, &access.generation, &record.generation)) continue;
+            cb(ctx, access.channel.asSlice(), access.level);
+        }
+    }
+
+    // ── Durable per-channel bad-word filter (svc_chanbadwords; CHANBADWORDS) ─────
+    // One newline-joined pattern blob per channel in `.props` ("cbw\x00<channel>"),
+    // channel-op managed. A non-op/non-oper channel message containing any pattern
+    // (case-insensitive substring, via svc_chanbadwords.containsIgnoreCase) is
+    // blocked. Read straight from the store, so it is correct across restarts.
+    const chanbadword_prefix = "cbw\x00";
+    const chanbadword_max: usize = 64;
+    const chanbadword_pattern_max: usize = 128;
+    const chanbadword_key_max: usize = chanbadword_prefix.len + channel_max;
+    const chanbadword_value_max: usize = chanbadword_max * (chanbadword_pattern_max + 1);
+
+    fn chanBadwordKey(buf: []u8, channel: []const u8) ?[]const u8 {
+        if (channel.len == 0 or channel.len > channel_max) return null;
+        if (buf.len < chanbadword_prefix.len + channel.len) return null;
+        @memcpy(buf[0..chanbadword_prefix.len], chanbadword_prefix);
+        for (channel, 0..) |c, i| buf[chanbadword_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. chanbadword_prefix.len + channel.len];
+    }
+
+    pub fn chanBadwordAdd(self: *Services, channel: []const u8, pattern: []const u8) ServiceError!bool {
+        if (pattern.len == 0 or pattern.len > chanbadword_pattern_max) return false;
+        for (pattern) |c| if (c < 0x20 or c == '\n' or c == 0) return false;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [chanbadword_key_max]u8 = undefined;
+        const k = chanBadwordKey(&kb, channel) orelse return false;
+        const existing = self.store.family(.props).get(k) orelse "";
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |p| {
+            if (p.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(p, pattern)) return false;
+            count += 1;
+        }
+        if (count >= chanbadword_max) return false;
+        var vb: [chanbadword_value_max]u8 = undefined;
+        var w = std.Io.Writer.fixed(&vb);
+        if (existing.len != 0) {
+            w.writeAll(existing) catch return false;
+            w.writeAll("\n") catch return false;
+        }
+        w.writeAll(pattern) catch return false;
+        try self.store.family(.props).put(k, w.buffered());
+        return true;
+    }
+
+    pub fn chanBadwordDel(self: *Services, channel: []const u8, pattern: []const u8) ServiceError!bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [chanbadword_key_max]u8 = undefined;
+        const k = chanBadwordKey(&kb, channel) orelse return false;
+        const existing = self.store.family(.props).get(k) orelse return false;
+        var vb: [chanbadword_value_max]u8 = undefined;
+        var w = std.Io.Writer.fixed(&vb);
+        var found = false;
+        var remaining: usize = 0;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |p| {
+            if (p.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(p, pattern)) {
+                found = true;
+                continue;
+            }
+            if (remaining != 0) w.writeAll("\n") catch return found;
+            w.writeAll(p) catch return found;
+            remaining += 1;
+        }
+        if (!found) return false;
+        if (remaining == 0) {
+            try self.store.family(.props).delete(k);
+        } else {
+            try self.store.family(.props).put(k, w.buffered());
+        }
+        return true;
+    }
+
+    pub fn chanBadwordForEach(self: *Services, channel: []const u8, ctx: anytype, comptime cb: fn (@TypeOf(ctx), []const u8) void) void {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [chanbadword_key_max]u8 = undefined;
+        const k = chanBadwordKey(&kb, channel) orelse return;
+        const blob = self.store.family(.props).get(k) orelse return;
+        var it = std.mem.splitScalar(u8, blob, '\n');
+        while (it.next()) |p| if (p.len != 0) cb(ctx, p);
+    }
+
+    /// True if `text` contains any of `channel`'s bad-word patterns. Read directly
+    /// from the durable store (correct across restarts, no warm-up).
+    pub fn chanBadwordMatches(self: *Services, channel: []const u8, text: []const u8) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [chanbadword_key_max]u8 = undefined;
+        const k = chanBadwordKey(&kb, channel) orelse return false;
+        const blob = self.store.family(.props).get(k) orelse return false;
+        var it = std.mem.splitScalar(u8, blob, '\n');
+        while (it.next()) |p| {
+            if (p.len != 0 and svc_chanbadwords.containsIgnoreCase(text, p)) return true;
+        }
+        return false;
+    }
+
     pub fn replayLiveState(self: *Services, sink: LiveReplaySink) ServiceError!LiveReplaySummary {
         self.lock.lockShared();
         defer self.lock.unlockShared();
@@ -2002,6 +2389,153 @@ test "account persists across store reopen" {
         const result = try services.accountInfo("ALICE");
         try std.testing.expectEqualStrings("alice@example.test", result.account_info.email.asSlice());
         _ = try services.identifyAccount("alice", "correct horse battery staple");
+    }
+}
+
+test "recognize masks: add/match/list/delete and persist across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-recognize.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+
+        try std.testing.expectEqual(Services.RecognizeAdd.added, try services.recognizeAdd("kain", "*!*@*.example.net"));
+        try std.testing.expectEqual(Services.RecognizeAdd.added, try services.recognizeAdd("kain", "kain!*@host"));
+        // case-insensitive account + mask dedupe
+        try std.testing.expectEqual(Services.RecognizeAdd.already_present, try services.recognizeAdd("KAIN", "*!*@*.EXAMPLE.net"));
+        try std.testing.expectEqual(Services.RecognizeAdd.invalid_mask, try services.recognizeAdd("kain", ""));
+
+        try std.testing.expect(services.recognizeMatches("kain", "kain!user@gw.example.net"));
+        try std.testing.expect(!services.recognizeMatches("kain", "kain!user@other.org"));
+        try std.testing.expect(!services.recognizeMatches("nobody", "kain!user@gw.example.net"));
+
+        try std.testing.expect(try services.recognizeDel("kain", "kain!*@host"));
+        try std.testing.expect(!try services.recognizeDel("kain", "kain!*@host"));
+    }
+    {
+        // reopen: the remaining mask survived durably; the deleted one did not.
+        var store = try openTestStore(tmp, "services-recognize.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try std.testing.expect(services.recognizeMatches("kain", "anyone!x@host.example.net"));
+        var lb: [512]u8 = undefined;
+        const blob = services.recognizeBlob("kain", &lb);
+        try std.testing.expect(std.mem.indexOf(u8, blob, "*!*@*.example.net") != null);
+        try std.testing.expect(std.mem.indexOf(u8, blob, "kain!*@host") == null);
+    }
+}
+
+test "account metadata: put/delete persist; restore via forEach across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-acctmeta.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try services.metadataPut("kain", "avatar", "https://x/a.png", "*");
+        try services.metadataPut("kain", "display-name", "Kain", "*");
+        try services.metadataDelete("kain", "avatar"); // remove one
+    }
+    {
+        var store = try openTestStore(tmp, "services-acctmeta.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+
+        var count: usize = 0;
+        var ok_display = false;
+        const Ctx = struct { count: *usize, ok: *bool };
+        services.metadataForEach("KAIN", Ctx{ .count = &count, .ok = &ok_display }, struct {
+            fn cb(c: Ctx, key: []const u8, value: []const u8, vis: []const u8) void {
+                c.count.* += 1;
+                if (std.mem.eql(u8, key, "display-name") and std.mem.eql(u8, value, "Kain") and std.mem.eql(u8, vis, "*")) c.ok.* = true;
+            }
+        }.cb);
+        // avatar was deleted; only display-name survives, with value + visibility intact.
+        try std.testing.expectEqual(@as(usize, 1), count);
+        try std.testing.expect(ok_display);
+    }
+}
+
+test "account silence: add/remove persist; restore via forEach across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "services-acctsilence.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try services.silencePersistAdd("kain", "*!*@spam.example");
+        try services.silencePersistAdd("kain", "troll!*@*");
+        try services.silencePersistAdd("KAIN", "*!*@SPAM.example"); // case-insensitive dup: no-op
+        try services.silencePersistDel("kain", "troll!*@*");
+    }
+    {
+        var store = try openTestStore(tmp, "services-acctsilence.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        var count: usize = 0;
+        var ok = false;
+        const Ctx = struct { count: *usize, ok: *bool };
+        services.silenceForEach("kain", Ctx{ .count = &count, .ok = &ok }, struct {
+            fn cb(c: Ctx, mask: []const u8) void {
+                c.count.* += 1;
+                if (std.mem.eql(u8, mask, "*!*@spam.example")) c.ok.* = true;
+            }
+        }.cb);
+        try std.testing.expectEqual(@as(usize, 1), count); // troll removed; one survives
+        try std.testing.expect(ok);
+    }
+}
+
+test "channelsForAccount: durable reverse access lookup (LISTCHANS)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-listchans.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    _ = try services.registerAccount("bob", "another good passphrase here", &scratch);
+    _ = try services.registerChannel("#orochi", "alice", &scratch);
+    _ = try services.channelAccess("#orochi", "alice", "bob", .grant, .op, &scratch);
+
+    var count: usize = 0;
+    var found_op = false;
+    const Ctx = struct { count: *usize, found: *bool };
+    services.channelsForAccount("BOB", Ctx{ .count = &count, .found = &found_op }, struct {
+        fn cb(c: Ctx, channel: []const u8, level: AccessLevel) void {
+            c.count.* += 1;
+            if (std.ascii.eqlIgnoreCase(channel, "#orochi") and level == .op) c.found.* = true;
+        }
+    }.cb);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expect(found_op);
+}
+
+test "channel bad-words: add/match/remove persist across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "services-chanbadwords.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try std.testing.expect(try services.chanBadwordAdd("#chan", "spam"));
+        try std.testing.expect(try services.chanBadwordAdd("#chan", "scam"));
+        try std.testing.expect(!try services.chanBadwordAdd("#CHAN", "SPAM")); // case-insensitive dup
+        try std.testing.expect(services.chanBadwordMatches("#chan", "buy this SpAm now"));
+        try std.testing.expect(!services.chanBadwordMatches("#chan", "a clean message"));
+        try std.testing.expect(try services.chanBadwordDel("#chan", "spam"));
+    }
+    {
+        var store = try openTestStore(tmp, "services-chanbadwords.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try std.testing.expect(!services.chanBadwordMatches("#chan", "buy this spam now")); // removed
+        try std.testing.expect(services.chanBadwordMatches("#chan", "a scam here")); // survived
     }
 }
 

@@ -58,6 +58,13 @@ pub const chanmodes_token = "CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVUFD";
 /// The static RPL_ISUPPORT (005) tokens, in advertisement order. Dynamic
 /// per-connection tokens (if any are added later) are appended by the emitter.
 pub const isupport_tokens = [_][]const u8{
+    // IRCX capability advertisement. A bare `IRCX` token in 005 is the standard
+    // signal that the server speaks the IRCX extension set (draft-pfenning); IRCX
+    // clients (mIRC, Pirch) key off it to decide whether to issue the `IRCX`
+    // command and switch into IRCX mode. Orochi already answers `IRCX`/`ISIRCX`/
+    // `MODE [nick] ISIRCX` with RPL_IRCX (800), but without this token mIRC never
+    // probes and so never detects IRCX. Advertised first, as IRCX servers do.
+    "IRCX",
     "NETWORK=" ++ network_name,
     "CHANTYPES=#&",
     "NICKLEN=64",

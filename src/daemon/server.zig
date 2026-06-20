@@ -1,7 +1,7 @@
 //! Ringlane-backed TCP server for the daemon M1 keystone.
 //!
 //! The socket path is intentionally small: accept a TCP client, receive IRC
-//! bytes through `Ring`, feed complete CRLF lines into the pure command core,
+//! bytes through `Ring`, feed complete (LF-terminated) lines into the pure command core,
 //! and send queued replies back through `Ring`. The IRC core is kept separate so
 //! registration and PING behavior test without sockets or io_uring.
 const std = @import("std");
@@ -388,14 +388,14 @@ const server_version = "orochi-" ++ build_info.git_commit;
 /// begin right after the prior line so an inactive branch leaves no blank line.
 const default_motd_template =
     "{greeting}, {nick}! Welcome to {network}.\n" ++
-    "You're on {server} ({version}) — {users} users online right now.{if:weather}\n" ++
-    "Weather — {weather}.{/if}{if:news}\n" ++
-    "Headlines — {news}.{/if}{if:account}\n" ++
+    "You're on {server} ({version}) - {users} users online right now.{if:weather}\n" ++
+    "Weather - {weather}.{/if}{if:news}\n" ++
+    "Headlines - {news}.{/if}{if:account}\n" ++
     "Signed in as {account}; your services and saved settings are active.{else}\n" ++
     "Tip: register your account to reserve your nick and unlock services.{/if}{if:oper}\n" ++
-    "Operator privileges are active on this connection — wield them with care.{/if}{if:secure}{else}\n" ++
-    "Note: this link is not encrypted — reconnect over TLS for privacy.{/if}\n" ++
-    "Orochi — a clean-room, Zig-native IRCX/IRCv3 daemon: Suimyaku CRDT mesh, forward-secret Tsumugi links.";
+    "Operator privileges are active on this connection - wield them with care.{/if}{if:secure}{else}\n" ++
+    "Note: this link is not encrypted - reconnect over TLS for privacy.{/if}\n" ++
+    "Orochi - a clean-room, Zig-native IRCX/IRCv3 daemon: Suimyaku CRDT mesh, forward-secret Tsumugi links.";
 
 /// Reserved pseudo-channel used to gossip per-user PRESENCE across the mesh.
 ///
@@ -1183,7 +1183,7 @@ pub const Config = struct {
     /// (312) trailing for local users, and advertised to S2S peers so remote
     /// WHOIS names the right per-server description. Configurable via
     /// `[network] description`; defaults to the generic daemon tagline.
-    server_description: []const u8 = "Orochi — pure-Zig mesh IRC daemon",
+    server_description: []const u8 = "Orochi - pure-Zig mesh IRC daemon",
     /// IRCv3 network icon URL, advertised as the `NETWORKICON=<url>` ISUPPORT
     /// token when non-empty. Configurable via `[network] icon_url`; empty omits
     /// the token (Ophion `n_url`/NETWORKICON parity).
@@ -3504,10 +3504,18 @@ pub const LinuxServer = struct {
                     svc.accountSecurity(owner_nick, grace_secs)
                 else
                     .{ .enforce = true, .enforce_seconds = grace_secs };
+                // Soft host-recognition (svc_acclist / RECOGNIZE): an unauthenticated
+                // holder whose nick!user@host matches the owner account's recognition
+                // list keeps the nick past the grace — but gains NO account privileges
+                // (session.account stays null; only SASL grants those).
+                const access_match = if (self.account_services) |svc| blk: {
+                    var mb: [320]u8 = undefined;
+                    const mask = std.fmt.bufPrint(&mb, "{s}!{s}@{s}", .{ owner_nick, c.session.username(), hostOf(c) }) catch break :blk false;
+                    break :blk svc.recognizeMatches(owner_nick, mask);
+                } else false;
                 switch (svc_enforce.decide(settings, .{
                     .identified = authed_owner,
-                    // An unauthenticated holder never satisfies the access list here.
-                    .access_match = false,
+                    .access_match = access_match,
                     .claimed_at_ms = c.nick_claimed_at_ms,
                     .now_ms = now,
                 })) {
@@ -7836,9 +7844,16 @@ pub const LinuxServer = struct {
             self.deliverChannelBatchGated(channel, batched, plain);
         }
         // Prefix modes for the joined members, after the batch (display-only;
-        // world roster was already updated on receive).
+        // world roster was already updated on receive). A locally-homed nick
+        // echoed back in a link-up burst never actually left, so diff against its
+        // REAL prev_status (mirroring emitRemoteMembership's single-join path) —
+        // an unchanged status is then a no-op, so a relink/upgrade re-burst no
+        // longer spams a spurious ":server MODE #chan +Q <nick>". A genuine remote
+        // join is still announced from 0 (full prefix modes).
         for (run) |*ch| {
-            if (ch.status != 0) self.emitRemoteModeDiff(channel, ch.nick, server_host, 0, ch.status, ch.setter);
+            if (ch.status == 0) continue;
+            const prev: u4 = if (self.nickIsLiveLocal(ch.nick)) ch.prev_status else 0;
+            self.emitRemoteModeDiff(channel, ch.nick, server_host, prev, ch.status, ch.setter);
         }
     }
 
@@ -10714,6 +10729,11 @@ pub const LinuxServer = struct {
             return;
         }
         const letter = parsed.paramSlice()[0];
+        // STATS is operator-only, except `p` (online operators), which stays public.
+        if (letter[0] != 'p' and letter[0] != 'P' and !conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{"STATS"}, "Permission denied - STATS is operator-only (except STATS p)");
+            return;
+        }
         switch (letter[0]) {
             'u' => {
                 const up_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(self.nowMs() - self.start_ms, 1000)));
@@ -10794,9 +10814,97 @@ pub const LinuxServer = struct {
                     }.emit);
                 }
             },
+            'p', 'P' => {
+                // Online operators (public exception). One RPL_STATSDEBUG line per
+                // currently-connected oper, mirroring the `l` slot iteration.
+                for (self.reactors) |*reactor| {
+                    for (reactor.clients.slots.items) |*slot| {
+                        if (!slot.occupied) continue;
+                        const c = &slot.value;
+                        if (c.closing or !c.session.registered() or !c.session.isOper()) continue;
+                        try queueNumeric(conn, .RPL_STATSDEBUG, &.{"p"}, c.session.displayName());
+                    }
+                }
+            },
             else => {}, // other letters not implemented yet
         }
         try queueNumeric(conn, .RPL_ENDOFSTATS, &.{letter}, "End of /STATS report");
+    }
+
+    /// RECOGNIZE ADD|DEL|LIST [mask] — manage YOUR account's host-recognition list
+    /// (svc_acclist). A later unauthenticated connection whose nick matches your
+    /// account and whose `nick!user@host` matches one of these masks is SOFT-
+    /// recognized (keeps the nick past the protection grace) but is granted NO
+    /// account privileges without SASL. Managing the list requires being identified.
+    pub fn handleRecognize(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const acct = conn.session.account() orelse {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{"RECOGNIZE"}, "You must be identified to manage your recognition list");
+            return;
+        };
+        const svc = self.account_services orelse {
+            try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{"RECOGNIZE"}, "Account services are unavailable");
+            return;
+        };
+        if (parsed.param_count < 1) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RECOGNIZE"}, "Usage: RECOGNIZE ADD|DEL|LIST [mask]");
+            return;
+        }
+        const params = parsed.paramSlice();
+        const sub = params[0];
+        const nick = conn.session.displayName();
+        var nb: [600]u8 = undefined;
+
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            var lb: [4096]u8 = undefined;
+            const blob = svc.recognizeBlob(acct, &lb);
+            if (blob.len == 0) {
+                const line = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Recognition list for {s} is empty\r\n", .{ self.serverName(), nick, acct }) catch return;
+                try appendToConn(conn, line);
+                return;
+            }
+            var it = std.mem.splitScalar(u8, blob, '\n');
+            while (it.next()) |m| {
+                if (m.len == 0) continue;
+                const line = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Recognize: {s}\r\n", .{ self.serverName(), nick, m }) catch continue;
+                try appendToConn(conn, line);
+            }
+            return;
+        }
+
+        if (params.len < 2 or params[1].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RECOGNIZE"}, "Usage: RECOGNIZE ADD|DEL <mask>");
+            return;
+        }
+        const mask = params[1];
+
+        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            const outcome = svc.recognizeAdd(acct, mask) catch {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{"RECOGNIZE"}, "Could not update recognition list");
+                return;
+            };
+            const msg = switch (outcome) {
+                .added => "added to your recognition list",
+                .already_present => "is already on your recognition list",
+                .list_full => "rejected: recognition list is full",
+                .invalid_mask => "rejected: invalid mask",
+            };
+            const line = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Recognize {s}: {s}\r\n", .{ self.serverName(), nick, mask, msg }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "REMOVE")) {
+            const removed = svc.recognizeDel(acct, mask) catch {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{"RECOGNIZE"}, "Could not update recognition list");
+                return;
+            };
+            const msg = if (removed) "removed from your recognition list" else "was not on your recognition list";
+            const line = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :Recognize {s}: {s}\r\n", .{ self.serverName(), nick, mask, msg }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+
+        try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RECOGNIZE"}, "Usage: RECOGNIZE ADD|DEL|LIST [mask]");
     }
 
     /// MARKREAD <target> [timestamp=…] — IRCv3 read-marker. GET returns the
@@ -10866,17 +10974,117 @@ pub const LinuxServer = struct {
             conn.class_policy.silence
         else
             self.silence.params.max_masks_per_owner;
+        const silence_acct = conn.session.account();
         for (req.slice()) |op| {
             const changed = switch (op.kind) {
                 .add => self.silence.addWithLimit(owner, op.mask, silence_cap) catch continue,
                 .remove => self.silence.remove(owner, op.mask) catch continue,
             };
             if (!changed) continue;
+            // Account-persist so the ignore list survives reconnect / cold restart.
+            if (silence_acct) |a| if (self.account_services) |svc| switch (op.kind) {
+                .add => svc.silencePersistAdd(a, op.mask) catch {},
+                .remove => svc.silencePersistDel(a, op.mask) catch {},
+            };
             var line_buf: [default_reply_bytes]u8 = undefined;
             const sign: u8 = if (op.kind == .add) '+' else '-';
             const line = std.fmt.bufPrint(&line_buf, ":{s} SILENCE {c}{s}\r\n", .{ prefix, sign, op.mask }) catch continue;
             try appendToConn(conn, line);
         }
+    }
+
+    /// LISTCHANS — list the registered channels where YOU (your account) hold an
+    /// access grant, with your level. The durable reverse of `CHANNEL ACCESS LIST`;
+    /// handy for a "my channels" view in web clients. Requires being identified.
+    pub fn handleListchans(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        _ = parsed;
+        const acct = conn.session.account() orelse {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{"LISTCHANS"}, "You must be identified to list your channels");
+            return;
+        };
+        const svc = self.account_services orelse {
+            try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{"LISTCHANS"}, "Account services are unavailable");
+            return;
+        };
+        var count: usize = 0;
+        const Ctx = struct { srv: *LinuxServer, conn: *ConnState, count: *usize };
+        svc.channelsForAccount(acct, Ctx{ .srv = self, .conn = conn, .count = &count }, struct {
+            fn cb(c: Ctx, channel: []const u8, level: services_mod.AccessLevel) void {
+                var nb: [600]u8 = undefined;
+                const line = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :LISTCHANS {s} {s}\r\n", .{ c.srv.serverName(), c.conn.session.displayName(), channel, @tagName(level) }) catch return;
+                appendToConn(c.conn, line) catch {};
+                c.count.* += 1;
+            }
+        }.cb);
+        var eb: [128]u8 = undefined;
+        const endl = std.fmt.bufPrint(&eb, ":{s} NOTICE {s} :End of LISTCHANS ({d})\r\n", .{ self.serverName(), conn.session.displayName(), count }) catch return;
+        try appendToConn(conn, endl);
+    }
+
+    /// CHANBADWORDS <#channel> <ADD|DEL|LIST> [pattern] — per-channel word filter
+    /// (svc_chanbadwords). Channel operators manage the list; a matching message
+    /// from a non-op/non-oper member is blocked. Patterns are case-insensitive
+    /// substrings; the list is durable (survives restart).
+    pub fn handleChanbadwords(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 2) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CHANBADWORDS"}, "Usage: CHANBADWORDS <#channel> <ADD|DEL|LIST> [pattern]");
+            return;
+        }
+        const params = parsed.paramSlice();
+        const channel = params[0];
+        const sub = params[1];
+        if (!self.world.channelExists(channel)) {
+            try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+            return;
+        }
+        const svc = self.account_services orelse {
+            try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{"CHANBADWORDS"}, "Account services are unavailable");
+            return;
+        };
+        const mm = self.world.memberModes(channel, worldIdFromClient(id)) orelse {
+            try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{channel}, "You're not on that channel");
+            return;
+        };
+        if (!mm.isOperator() and !conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
+            return;
+        }
+        const nick = conn.session.displayName();
+        var nb: [600]u8 = undefined;
+
+        if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+            const Ctx = struct { srv: *LinuxServer, conn: *ConnState, channel: []const u8 };
+            svc.chanBadwordForEach(channel, Ctx{ .srv = self, .conn = conn, .channel = channel }, struct {
+                fn cb(c: Ctx, pattern: []const u8) void {
+                    var b: [600]u8 = undefined;
+                    const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :CHANBADWORDS {s} :{s}\r\n", .{ c.srv.serverName(), c.conn.session.displayName(), c.channel, pattern }) catch return;
+                    appendToConn(c.conn, line) catch {};
+                }
+            }.cb);
+            const endl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :End of CHANBADWORDS for {s}\r\n", .{ self.serverName(), nick, channel }) catch return;
+            try appendToConn(conn, endl);
+            return;
+        }
+        if (params.len < 3 or params[2].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CHANBADWORDS"}, "Usage: CHANBADWORDS <#channel> <ADD|DEL> <pattern>");
+            return;
+        }
+        const pattern = params[2];
+        if (std.ascii.eqlIgnoreCase(sub, "ADD")) {
+            const ok = svc.chanBadwordAdd(channel, pattern) catch false;
+            const msg = if (ok) "added" else "rejected (duplicate, too long, or list full)";
+            const line = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :CHANBADWORDS {s} {s}: {s}\r\n", .{ self.serverName(), nick, channel, pattern, msg }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(sub, "DEL") or std.ascii.eqlIgnoreCase(sub, "REMOVE")) {
+            const ok = svc.chanBadwordDel(channel, pattern) catch false;
+            const msg = if (ok) "removed" else "not found";
+            const line = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :CHANBADWORDS {s} {s}: {s}\r\n", .{ self.serverName(), nick, channel, pattern, msg }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
+        try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"CHANBADWORDS"}, "Usage: CHANBADWORDS <#channel> <ADD|DEL|LIST> [pattern]");
     }
 
     fn lowerCopy(out: []u8, value: []const u8) ?[]const u8 {
@@ -14131,7 +14339,7 @@ pub const LinuxServer = struct {
             var line_buf: [160]u8 = undefined;
             const line = weather_units.renderLine(&line_buf, view.location, view.reading, sys);
             var out: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "Weather — {s}", .{line}) catch return;
+            const msg = std.fmt.bufPrint(&out, "Weather - {s}", .{line}) catch return;
             self.fantasyReply(chan, msg);
         } else {
             var out: [160]u8 = undefined;
@@ -14155,7 +14363,7 @@ pub const LinuxServer = struct {
         if (local) {
             const cc = if (arg.len >= 2) arg[0..2] else self.metaValue(conn.session.displayName(), "country");
             if (cc.len == 0) {
-                self.fantasyReply(chan, "Unknown country — try: !localnews <CC>  (e.g. !localnews JP)");
+                self.fantasyReply(chan, "Unknown country - try: !localnews <CC>  (e.g. !localnews JP)");
                 return;
             }
             const feed = news_sources.countryFeed(cc) orelse {
@@ -14180,7 +14388,7 @@ pub const LinuxServer = struct {
         var lines: [5][]const u8 = undefined;
         if (self.geo.getNews(key, &out, &lines)) |got| {
             var hb: [128]u8 = undefined;
-            self.fantasyReply(chan, std.fmt.bufPrint(&hb, "News — {s}:", .{name}) catch name);
+            self.fantasyReply(chan, std.fmt.bufPrint(&hb, "News - {s}:", .{name}) catch name);
             for (got, 1..) |headline, n| {
                 var lb: [320]u8 = undefined;
                 const line = std.fmt.bufPrint(&lb, "  {d}. {s}", .{ n, headline }) catch continue;
@@ -14848,7 +15056,7 @@ pub const LinuxServer = struct {
 
         var out: [default_reply_bytes]u8 = undefined;
         const line = (if (geo.len != 0 and asn.len != 0)
-            std.fmt.bufPrint(&out, ":{s} NOTICE {s} :connecting from {s} · {s}\r\n", .{ self.serverName(), conn.session.displayName(), geo, asn })
+            std.fmt.bufPrint(&out, ":{s} NOTICE {s} :connecting from {s} | {s}\r\n", .{ self.serverName(), conn.session.displayName(), geo, asn })
         else if (geo.len != 0)
             std.fmt.bufPrint(&out, ":{s} NOTICE {s} :connecting from {s}\r\n", .{ self.serverName(), conn.session.displayName(), geo })
         else
@@ -15310,6 +15518,8 @@ pub const LinuxServer = struct {
             }
             loginSession(conn, account);
             conn.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
+            self.restoreAccountMetadata(conn, account);
+            self.restoreAccountSilence(conn, account);
         }
         conn.session.client.registration.sasl = .succeeded;
         if (conn.session.account()) |acct| self.emitAccountChange(id, conn, acct);
@@ -15985,12 +16195,14 @@ pub const LinuxServer = struct {
                 };
                 try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, ev.ircv3VisibilityToken() }, value);
                 self.notifyMetadataWatchers(conn, store_target, key, value, ev.visibility);
+                self.persistMetadata(conn, store_target, key, value, ev.visibility);
             } else {
                 const old = self.metadata.get(store_target, key) catch null;
                 const visibility = if (old) |ev| ev.visibility else .public;
                 self.metadata.delete(store_target, key) catch {};
                 try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, visibility.token() }, "");
                 self.notifyMetadataWatchers(conn, store_target, key, null, visibility);
+                self.persistMetadataDelete(conn, store_target, key);
             }
         } else if (std.ascii.eqlIgnoreCase(sub, "CLEAR")) {
             if (!self.metadataCanWrite(id, conn, target)) {
@@ -16009,9 +16221,56 @@ pub const LinuxServer = struct {
                 self.metadata.delete(store_target, key) catch {};
                 try queueNumeric(conn, .RPL_KEYVALUE, &.{ target, key, visibility }, "");
                 self.notifyMetadataWatchers(conn, store_target, key, null, ev.visibility);
+                self.persistMetadataDelete(conn, store_target, key);
             }
         }
         try queueNumeric(conn, .RPL_METADATAEND, &.{}, "end of metadata");
+    }
+
+    /// Persist a logged-in user's OWN metadata to their account (durable profile),
+    /// so it survives a cold restart and is restored at next login. Channel and
+    /// other-target metadata are not account-scoped and are skipped here.
+    fn persistMetadata(self: *LinuxServer, conn: *ConnState, store_target: []const u8, key: []const u8, value: []const u8, visibility: metadata_store.Visibility) void {
+        if (store_target.len != 0 and (store_target[0] == '#' or store_target[0] == '&' or store_target[0] == '%')) return;
+        const acct = conn.session.account() orelse return;
+        if (!std.ascii.eqlIgnoreCase(store_target, conn.session.displayName())) return;
+        const svc = self.account_services orelse return;
+        svc.metadataPut(acct, key, value, visibility.token()) catch {};
+    }
+
+    fn persistMetadataDelete(self: *LinuxServer, conn: *ConnState, store_target: []const u8, key: []const u8) void {
+        if (store_target.len != 0 and (store_target[0] == '#' or store_target[0] == '&' or store_target[0] == '%')) return;
+        const acct = conn.session.account() orelse return;
+        if (!std.ascii.eqlIgnoreCase(store_target, conn.session.displayName())) return;
+        const svc = self.account_services orelse return;
+        svc.metadataDelete(acct, key) catch {};
+    }
+
+    /// Restore an account's durable metadata into the live store under the user's
+    /// current nick at login, so a reconnecting/identifying user (and clients that
+    /// query them) see their saved profile keys immediately.
+    fn restoreAccountMetadata(self: *LinuxServer, conn: *ConnState, account: []const u8) void {
+        if (self.account_services == null) return;
+        const Ctx = struct { srv: *LinuxServer, nick: []const u8 };
+        self.account_services.?.metadataForEach(account, Ctx{ .srv = self, .nick = conn.session.displayName() }, struct {
+            fn cb(c: Ctx, key: []const u8, value: []const u8, vis: []const u8) void {
+                const v = metadata_store.Visibility.fromToken(vis) orelse .public;
+                _ = c.srv.metadata.setWithVisibility(c.nick, key, value, v) catch {};
+            }
+        }.cb);
+    }
+
+    /// Restore an account's persisted SILENCE masks into the live per-nick store at
+    /// login, so a reconnecting user's ignore list is immediately back in effect.
+    fn restoreAccountSilence(self: *LinuxServer, conn: *ConnState, account: []const u8) void {
+        if (self.account_services == null) return;
+        const cap: usize = if (conn.class_policy.silence != 0) conn.class_policy.silence else self.silence.params.max_masks_per_owner;
+        const Ctx = struct { srv: *LinuxServer, owner: []const u8, cap: usize };
+        self.account_services.?.silenceForEach(account, Ctx{ .srv = self, .owner = conn.session.displayName(), .cap = cap }, struct {
+            fn cb(c: Ctx, mask: []const u8) void {
+                _ = c.srv.silence.addWithLimit(c.owner, mask, c.cap) catch {};
+            }
+        }.cb);
     }
 
     /// REDACT <channel> <msgid> [:reason] — IRCv3 message-redaction. Tombstones
@@ -16470,7 +16729,7 @@ pub const LinuxServer = struct {
         conn.nick_claimed_at_ms = self.nowMs();
         var b: [default_reply_bytes]u8 = undefined;
         const secs: u64 = @intCast(@divFloor(self.config.nick_grace_ms, 1000));
-        const note = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :Nick {s} is registered — IDENTIFY within {d}s or you'll be renamed to a Guest nick.\r\n", .{ self.serverName(), nick, nick, secs }) catch return;
+        const note = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :Nick {s} is registered - IDENTIFY within {d}s or you'll be renamed to a Guest nick.\r\n", .{ self.serverName(), nick, nick, secs }) catch return;
         appendToConn(conn, note) catch {};
     }
 
@@ -17270,6 +17529,8 @@ pub const LinuxServer = struct {
         }
         loginSession(conn, account);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
+        self.restoreAccountMetadata(conn, account);
+        self.restoreAccountSilence(conn, account);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
         try appendToConn(conn, line);
@@ -20174,7 +20435,7 @@ pub const LinuxServer = struct {
         }
         if (std.fmt.bufPrint(&b, "Mesh: {d} established S2S peer link(s) - Suimyaku CRDT routing over Tsumugi forward-secret transport", .{peers})) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
 
-        try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, opssl TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (OPVOX/OPVIS)");
+        try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, Yoroi TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (OPVOX/OPVIS)");
     }
 
     /// USERS — local user listing (RPL_USERSSTART/RPL_USERS/RPL_ENDOFUSERS).
@@ -20622,7 +20883,7 @@ pub const LinuxServer = struct {
         else if (has_quorum)
             "PARTITIONED (quorum held)"
         else
-            "PARTITIONED (NO QUORUM — minority island)";
+            "PARTITIONED (NO QUORUM - minority island)";
         const summary = std.fmt.bufPrint(&sb, "mesh {s}: {d}/{d} nodes reachable", .{ status, reachable_nodes, known_total }) catch return;
         try self.noticeTo(conn, summary);
     }
@@ -21216,6 +21477,19 @@ pub const LinuxServer = struct {
             if (filtered) {
                 if (!is_notice) try self.failReply(conn, command, "OROCHI_FILTERED", "Message blocked by the content filter");
                 return false;
+            }
+        }
+        // Per-channel bad-word filter (svc_chanbadwords): channel-op-managed list,
+        // channel targets only. Channel operators and server opers are exempt.
+        if (target.len != 0 and (target[0] == '#' or target[0] == '&' or target[0] == '%') and !conn.session.isOper()) {
+            const exempt = if (self.world.memberModes(target, worldIdFromClient(id))) |mm| mm.isOperator() else false;
+            if (!exempt) {
+                if (self.account_services) |svc| {
+                    if (svc.chanBadwordMatches(target, text)) {
+                        if (!is_notice) try self.failReply(conn, command, "OROCHI_FILTERED", "Message blocked by the channel word filter");
+                        return false;
+                    }
+                }
             }
         }
         return true;
@@ -22255,10 +22529,16 @@ fn pendingInbound(conn: *const ConnState) usize {
 }
 
 /// Accumulate one inbound byte into `conn`'s growable RecvQ. Returns the
-/// complete line (with CRLF) when `byte` terminates one, else null. Returns
-/// `error.LineTooLong` when the pending line would exceed the connection's
-/// `recvq_cap`. The caller dispatches the returned line and then calls
-/// `recvqReset`.
+/// complete line (including its terminator) when `byte` terminates one, else
+/// null. Returns `error.LineTooLong` when the pending line would exceed the
+/// connection's `recvq_cap`. The caller dispatches the returned line and then
+/// calls `recvqReset`.
+///
+/// A line is terminated by a bare LF (`\n`); an immediately preceding CR is
+/// part of the canonical `\r\n` but is NOT required. RFC 1459/2812 specify
+/// CRLF, but the robustness principle — and real clients (some mIRC builds and
+/// many bots/scripts) — send LF-only. `irc_line.stripLineEnding` then drops the
+/// optional trailing `\r`, so both `\r\n` and `\n` framings dispatch identically.
 fn recvqPush(conn: *ConnState, byte: u8) error{ LineTooLong, OutOfMemory }!?[]const u8 {
     const spilled = conn.recv_overflow.items.len != 0;
     if (pendingInbound(conn) >= conn.recvq_cap) return error.LineTooLong;
@@ -22266,8 +22546,7 @@ fn recvqPush(conn: *ConnState, byte: u8) error{ LineTooLong, OutOfMemory }!?[]co
     if (!spilled and conn.line_len < conn.line_buf.len) {
         conn.line_buf[conn.line_len] = byte;
         conn.line_len += 1;
-        if (conn.line_len >= 2 and
-            conn.line_buf[conn.line_len - 2] == '\r' and conn.line_buf[conn.line_len - 1] == '\n')
+        if (conn.line_buf[conn.line_len - 1] == '\n')
             return conn.line_buf[0..conn.line_len];
         return null;
     }
@@ -22278,7 +22557,7 @@ fn recvqPush(conn: *ConnState, byte: u8) error{ LineTooLong, OutOfMemory }!?[]co
     try conn.recv_overflow.append(conn.overflow_allocator, byte);
     const items = conn.recv_overflow.items;
     const n = items.len;
-    if (n >= 2 and items[n - 2] == '\r' and items[n - 1] == '\n') return items[0..n];
+    if (items[n - 1] == '\n') return items[0..n];
     return null;
 }
 
@@ -22395,6 +22674,43 @@ test "RecvQ: inline fast path, CRLF dispatch, and per-class cap drop" {
     conn.recvq_cap = 4;
     for ("abcd") |b| try std.testing.expectEqual(@as(?[]const u8, null), try recvqPush(&conn, b));
     try std.testing.expectError(error.LineTooLong, recvqPush(&conn, 'e'));
+    recvqReset(&conn);
+}
+
+test "RecvQ: a bare LF terminates a line (LF-only clients, e.g. some mIRC builds)" {
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = std.testing.allocator;
+    defer if (conn.recv_overflow.capacity > 0) conn.recv_overflow.deinit(conn.overflow_allocator);
+    conn.recvq_cap = default_recvq_cap;
+
+    // A line ending in a bare `\n` (no preceding `\r`) dispatches — this is the
+    // exact framing that left LF-only clients stuck pre-registration until they
+    // hit the registration timeout. The returned slice includes the LF; the
+    // command core strips it via stripLineEnding.
+    const lf_msg = "CAP LS 302\n";
+    var got: ?[]const u8 = null;
+    for (lf_msg) |b| got = try recvqPush(&conn, b);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings(lf_msg, got.?);
+    try std.testing.expectEqual(@as(usize, 0), conn.recv_overflow.items.len); // stayed inline
+    recvqReset(&conn);
+    try std.testing.expectEqual(@as(usize, 0), conn.line_len);
+
+    // The body parses cleanly once the bare-LF line ending is stripped.
+    const parsed = try irc_line.parseLine(got.?);
+    try std.testing.expectEqualStrings("CAP", parsed.command);
+
+    // CRLF framing still works (no regression): no premature flush on the CR,
+    // and the LF returns the whole line including both terminator bytes.
+    const crlf_msg = "NICK bob\r\n";
+    got = null;
+    for (crlf_msg, 0..) |b, i| {
+        got = try recvqPush(&conn, b);
+        // Only the final byte (the LF) completes the line.
+        if (i + 1 < crlf_msg.len) try std.testing.expectEqual(@as(?[]const u8, null), got);
+    }
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings(crlf_msg, got.?);
     recvqReset(&conn);
 }
 
@@ -22754,7 +23070,7 @@ fn buildGeoWhois(
         a.put("an unknown location");
     }
     if (asn) |n| {
-        a.put(" · AS");
+        a.put(" | AS");
         var nb: [12]u8 = undefined;
         a.put(std.fmt.bufPrint(&nb, "{d}", .{n}) catch "?");
         const org = ne(asn_org);
@@ -23467,8 +23783,8 @@ test "processLine registration sequence emits welcome numerics" {
     try expectContains(sink.written(), myinfo);
     try expectContains(sink.written(), " 005 kain ");
     try expectContains(sink.written(), ":are supported by this server\r\n");
-    try expectContains(sink.written(), " NOTICE kain :secured (TLS1.3 AES-256-GCM) · you are cloak-test.orochi · not logged in\r\n");
-    try expectContains(sink.written(), " NOTICE kain :mesh: 3 nodes linked · /HELP to get started\r\n");
+    try expectContains(sink.written(), " NOTICE kain :secured (TLS1.3 AES-256-GCM) | you are cloak-test.orochi | not logged in\r\n");
+    try expectContains(sink.written(), " NOTICE kain :mesh: 3 nodes linked | /HELP to get started\r\n");
 }
 
 test "processLine registration welcome warns plaintext sessions" {
@@ -23484,8 +23800,8 @@ test "processLine registration welcome warns plaintext sessions" {
 
     try std.testing.expect(conn.session.registered());
     try expectContains(sink.written(), "you are plain!plain@localhost");
-    try expectContains(sink.written(), " NOTICE plain :plaintext — consider connecting over TLS · you are localhost · not logged in\r\n");
-    try expectContains(sink.written(), " NOTICE plain :mesh: 1 node active · /HELP to get started\r\n");
+    try expectContains(sink.written(), " NOTICE plain :plaintext - consider connecting over TLS | you are localhost | not logged in\r\n");
+    try expectContains(sink.written(), " NOTICE plain :mesh: 1 node active | /HELP to get started\r\n");
 }
 
 test "processLine rejects malformed input without writing" {

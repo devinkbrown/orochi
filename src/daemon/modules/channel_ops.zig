@@ -45,6 +45,10 @@ fn rename(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleRename(x.id, x.conn, x.parsed);
 }
+fn chanbadwords(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleChanbadwords(x.id, x.conn, x.parsed);
+}
 
 pub const module = registry.Module{
     .id = "channel.ops",
@@ -59,5 +63,6 @@ pub const module = registry.Module{
         .{ .name = "KNOCK", .handler = knock },
         .{ .name = "CREATE", .handler = create },
         .{ .name = "RENAME", .handler = rename },
+        .{ .name = "CHANBADWORDS", .handler = chanbadwords },
     },
 };

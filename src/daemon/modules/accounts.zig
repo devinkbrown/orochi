@@ -78,6 +78,14 @@ fn certDel(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleCertDel(x.conn, x.parsed);
 }
+fn recognize(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleRecognize(x.conn, x.parsed);
+}
+fn listchans(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleListchans(x.conn, x.parsed);
+}
 
 pub const REGISTER_spec = registry.CommandSpec{ .name = "REGISTER", .feature = accounts_feature, .handler = register };
 pub const VERIFY_spec = registry.CommandSpec{ .name = "VERIFY", .feature = accounts_feature, .handler = verify };
@@ -98,6 +106,8 @@ pub const SESSIONTOKEN_spec = registry.CommandSpec{ .name = "SESSIONTOKEN", .fea
 pub const CERTADD_spec = registry.CommandSpec{ .name = "CERTADD", .feature = accounts_feature, .handler = certAdd };
 pub const CERTLIST_spec = registry.CommandSpec{ .name = "CERTLIST", .feature = accounts_feature, .handler = certList };
 pub const CERTDEL_spec = registry.CommandSpec{ .name = "CERTDEL", .feature = accounts_feature, .handler = certDel };
+pub const RECOGNIZE_spec = registry.CommandSpec{ .name = "RECOGNIZE", .feature = accounts_feature, .handler = recognize, .summary = "manage your account host-recognition list (ADD|DEL|LIST)" };
+pub const LISTCHANS_spec = registry.CommandSpec{ .name = "LISTCHANS", .feature = accounts_feature, .handler = listchans, .summary = "list registered channels where you hold access" };
 
 pub const module = registry.Module{
     .id = "accounts",
@@ -121,6 +131,8 @@ pub const module = registry.Module{
         CERTADD_spec,
         CERTLIST_spec,
         CERTDEL_spec,
+        RECOGNIZE_spec,
+        LISTCHANS_spec,
     },
 };
 
