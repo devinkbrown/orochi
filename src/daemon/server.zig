@@ -24,6 +24,7 @@ const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
 const svc_jupe = @import("svc_jupe.zig");
 const svc_login_throttle = @import("svc_login_throttle.zig");
+const svc_memo_forward = @import("svc_memo_forward.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
@@ -2284,6 +2285,9 @@ pub const LinuxServer = struct {
     media_bridges_mu: std.atomic.Mutex = .unlocked,
     /// Tegami: per-account offline messages, delivered on next login.
     tegami: tegami_mod.TegamiBox,
+    /// Tegami forward chains: an account may auto-forward its incoming memos to
+    /// another account (hop/cycle-bounded). In-memory, matching Tegami itself.
+    memo_forward: svc_memo_forward.MemoForwardStore,
     /// Per-channel live media transcript (speaker-tagged caption ring).
     transcript: transcript_mod.TranscriptLog,
     /// Server-owned config reloaded by the most recent REHASH. The live
@@ -2636,6 +2640,7 @@ pub const LinuxServer = struct {
             .media_plane = media_plane_mod.MediaPlane.init(allocator),
             .native_media = native_media_mod.NativeMediaTransport.initConfig(allocator, config.media_max_participants),
             .tegami = tegami_mod.TegamiBox.init(allocator),
+            .memo_forward = svc_memo_forward.MemoForwardStore.init(allocator),
             .transcript = transcript_mod.TranscriptLog.init(allocator),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
@@ -2920,6 +2925,7 @@ pub const LinuxServer = struct {
             self.media_bridges.deinit(self.allocator);
         }
         self.tegami.deinit();
+        self.memo_forward.deinit();
         self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
         if (self.reload_class_registry) |*r| r.deinit();
@@ -19186,10 +19192,11 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR>` — Orochi offline mail.
-    /// SEND stores a message for an account (delivered when it next logs in);
-    /// LIST shows the caller's own pending mail; CLEAR discards it. SEND requires
-    /// the sender to be logged in (so recipients can see who wrote).
+    /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR | FORWARD <account>|OFF>` —
+    /// Orochi offline mail. SEND stores a message for an account (delivered when it
+    /// next logs in, following the recipient's forward chain); LIST shows the
+    /// caller's own pending mail; CLEAR discards it; FORWARD sets/clears/queries the
+    /// caller's auto-forward target. SEND/FORWARD require the caller to be logged in.
     pub fn handleTegami(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
         const me = conn.session.account();
@@ -19213,6 +19220,48 @@ pub const LinuxServer = struct {
             try appendToConn(conn, line);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "FORWARD")) {
+            const acct = me orelse {
+                try self.failReply(conn, "TEGAMI", "ACCOUNT_REQUIRED", "Log in to manage tegami forwarding");
+                return;
+            };
+            // No target: report the current forward (or none).
+            if (parsed.param_count < 2 or parsed.paramSlice()[1].len == 0) {
+                var buf: [192]u8 = undefined;
+                const line = if (self.memo_forward.forwardTarget(acct) catch null) |t|
+                    std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Forwarding your tegami to {s}\r\n", .{ self.serverName(), t }) catch return
+                else
+                    std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :No forward set\r\n", .{self.serverName()}) catch return;
+                try appendToConn(conn, line);
+                return;
+            }
+            const target = parsed.paramSlice()[1];
+            if (std.ascii.eqlIgnoreCase(target, "OFF") or std.ascii.eqlIgnoreCase(target, "NONE")) {
+                _ = self.memo_forward.clearForward(acct) catch {};
+                try self.noticeTo(conn, "TEGAMI: forwarding disabled");
+                return;
+            }
+            // Set: the target must be a known account (and never the caller itself).
+            if (self.account_services) |svc| {
+                _ = svc.accountInfo(target) catch {
+                    try self.failReply(conn, "TEGAMI", "ACCOUNT_UNKNOWN", "No such account");
+                    return;
+                };
+            }
+            self.memo_forward.setForward(acct, target) catch |err| {
+                const code: []const u8 = switch (err) {
+                    error.ForwardCycle => "FORWARD_CYCLE",
+                    error.TooManyAccounts => "TEMPORARILY_UNAVAILABLE",
+                    else => "INVALID_ACCOUNT",
+                };
+                try self.failReply(conn, "TEGAMI", code, "Could not set forwarding");
+                return;
+            };
+            var buf: [192]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, ":{s} NOTE TEGAMI :Forwarding your tegami to {s}\r\n", .{ self.serverName(), target }) catch return;
+            try appendToConn(conn, line);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "SEND")) {
             const from = me orelse {
                 try self.failReply(conn, "TEGAMI", "ACCOUNT_REQUIRED", "Log in to send tegami");
@@ -19231,7 +19280,27 @@ pub const LinuxServer = struct {
                     return;
                 };
             }
-            _ = self.tegami.send(to, from, text, platform.realtimeMillis()) catch |err| {
+            // Resolve the recipient's forward chain (hop/cycle-bounded). A broken
+            // chain falls back to direct delivery rather than refusing the memo.
+            const decision = self.memo_forward.resolveDelivery(to) catch svc_memo_forward.ForwardDecision{
+                .original_account = to,
+                .delivery_account = to,
+                .forwarded = false,
+                .hops = 0,
+            };
+            // delivery_account only outlives the call when actually forwarded (it
+            // then points into the store); for the direct case use `to`.
+            const delivery = if (decision.forwarded) decision.delivery_account else to;
+            // A forward target must itself be a known account.
+            if (decision.forwarded) {
+                if (self.account_services) |svc| {
+                    _ = svc.accountInfo(delivery) catch {
+                        try self.failReply(conn, "TEGAMI", "ACCOUNT_UNKNOWN", "Forward target account is unknown");
+                        return;
+                    };
+                }
+            }
+            _ = self.tegami.send(delivery, from, text, platform.realtimeMillis()) catch |err| {
                 const code: []const u8 = switch (err) {
                     error.MailboxFull => "MAILBOX_FULL",
                     error.MessageInvalid => "INVALID_MESSAGE",
@@ -19240,10 +19309,16 @@ pub const LinuxServer = struct {
                 try self.failReply(conn, "TEGAMI", code, "Could not deliver tegami");
                 return;
             };
-            try self.noticeTo(conn, "TEGAMI: message stored for delivery");
+            if (decision.forwarded) {
+                var fb: [192]u8 = undefined;
+                const msg = std.fmt.bufPrint(&fb, "TEGAMI: message stored (forwarded to {s})", .{delivery}) catch "TEGAMI: message stored for delivery";
+                try self.noticeTo(conn, msg);
+            } else {
+                try self.noticeTo(conn, "TEGAMI: message stored for delivery");
+            }
             return;
         }
-        try self.failReply(conn, "TEGAMI", "INVALID_SUBCOMMAND", "Use SEND, LIST, or CLEAR");
+        try self.failReply(conn, "TEGAMI", "INVALID_SUBCOMMAND", "Use SEND, LIST, CLEAR, or FORWARD");
     }
 
     /// Emit the caller's pending tegami as NOTE lines (without clearing).
@@ -30279,6 +30354,81 @@ test "threaded server: IDENTIFY brute-force throttle locks after repeated failur
     c.reset();
     try writeAllFd(fd, "IDENTIFY bob correcthorse\r\n");
     try recvUntil(&c, "Too many failed login attempts", 300);
+}
+
+test "threaded server: TEGAMI FORWARD redirects an account's memos and rejects a self-cycle" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-memo-forward.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :A\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IDENTIFY alice correcthorse\r\n");
+    try recvUntil(&a, "You are now identified as alice", 300);
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&b, "You are now identified as bob", 300);
+
+    // alice forwards her tegami to bob.
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI FORWARD bob\r\n");
+    try recvUntil(&a, "Forwarding your tegami to bob", 300);
+
+    // A memo addressed to alice is delivered to bob (sender is told it forwarded).
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI SEND alice :hello there\r\n");
+    try recvUntil(&a, "forwarded to bob", 300);
+
+    // bob (already logged in) sees the forwarded memo; alice's own box is empty.
+    b.reset();
+    try writeAllFd(fd_b, "TEGAMI LIST\r\n");
+    try recvUntil(&b, "from alice :hello there", 300);
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI LIST\r\n");
+    try recvUntil(&a, "End of tegami (0)", 300);
+
+    // FORWARD with no arg reports the target; OFF clears it.
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI FORWARD\r\n");
+    try recvUntil(&a, "Forwarding your tegami to bob", 300);
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI FORWARD OFF\r\n");
+    try recvUntil(&a, "forwarding disabled", 300);
+
+    // Forwarding to yourself is a cycle and is refused.
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI FORWARD alice\r\n");
+    try recvUntil(&a, "FAIL TEGAMI FORWARD_CYCLE", 300);
 }
 
 test "threaded server: oper SASL login auto-enables IRCX" {
