@@ -13,6 +13,10 @@ fn resv(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleResv(x.conn, x.parsed);
 }
+fn jupe(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleJupe(x.conn, x.parsed);
+}
 fn forceAction(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleForceAction(x.id, x.conn, x.parsed);
@@ -45,6 +49,9 @@ pub const module = registry.Module{
         // to avoid a divergent second store.
         .{ .name = "RESV", .min_params = 1, .access = .oper, .handler = resv },
         .{ .name = "UNRESV", .min_params = 1, .access = .oper, .handler = resv },
+        // Server-name JUPE: forbid a server glob from linking into the mesh.
+        .{ .name = "JUPE", .min_params = 1, .access = .oper, .handler = jupe },
+        .{ .name = "UNJUPE", .min_params = 1, .access = .oper, .handler = jupe },
         .{ .name = "FORCEOP", .min_params = 2, .access = .oper, .handler = forceAction },
         .{ .name = "FORCEDEOP", .min_params = 2, .access = .oper, .handler = forceAction },
         .{ .name = "FORCEJOIN", .min_params = 2, .access = .oper, .handler = forceAction },

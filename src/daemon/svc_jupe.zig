@@ -1,27 +1,33 @@
-//! JUPE / forbid store.
+//! JUPE — server-name jupe store.
 //!
-//! An oper forbids a nick or channel name pattern (glob) from being used. Each
-//! entry carries a reason, the setter's name, and an optional absolute expiry.
-//! The store owns every string it holds and frees them on removal, sweep, and
-//! deinit. Matching is a pure case-insensitive glob, mirroring IRC name folding.
+//! The classic IRC JUPE: an operator forbids a SERVER name (glob) from linking
+//! into the network. A juped name is refused when a mesh peer presenting it
+//! reaches the established transition, so a rogue or decommissioned server can
+//! never join — the local enforcement counterpart to `svc_resv` (channels) and
+//! `ircx_saccess` (nicks), which forbid those namespaces respectively.
 //!
-//! This module is a pure policy store: it has no knowledge of clients, sockets,
-//! or numerics. Command handlers query `isJuped` before accepting a NICK or a
-//! channel JOIN and translate the result into the appropriate refusal.
+//! Each entry carries a reason, the setter's name, and an optional absolute
+//! expiry. The store owns every string it holds and frees them on removal,
+//! sweep, and deinit. Matching is a pure case-insensitive glob, mirroring IRC
+//! server-name folding.
+//!
+//! This module is a pure policy store + command parser: it has no knowledge of
+//! clients, links, sockets, or numerics. The mesh-link path queries `isJuped`
+//! with the peer's `remoteName()` and drops the link on a match.
 
 const std = @import("std");
 
-/// Which namespace an entry forbids. Nick and channel patterns never collide,
-/// so the two are stored and queried independently.
-pub const Kind = enum {
-    nick,
-    channel,
+/// Numerics a dispatcher may use when surfacing JUPE results/errors.
+pub const Numeric = enum(u16) {
+    /// Reject JUPE from a non-oper session.
+    ERR_NOPRIVILEGES = 481,
+    /// Reject a malformed JUPE command.
+    ERR_NEEDMOREPARAMS = 461,
 };
 
-/// A single forbid entry. String fields are owned by the `JupeStore` that
+/// A single server-name jupe. String fields are owned by the `JupeStore` that
 /// returns them; borrow them only for the lifetime of the store.
 pub const Entry = struct {
-    kind: Kind,
     /// Case-insensitive glob: `*` matches any run, `?` matches one byte.
     pattern: []const u8,
     reason: []const u8,
@@ -49,12 +55,37 @@ pub const Params = struct {
 pub const JupeError = error{
     EmptyPattern,
     PatternTooLong,
+    InvalidPattern,
     ReasonTooLong,
     SetterTooLong,
     TooManyEntries,
 };
 
-/// Owning registry for nick and channel forbids.
+/// Errors returned while parsing a JUPE/UNJUPE command line.
+pub const ParseError = error{
+    UnknownCommand,
+    MissingParameter,
+    InvalidDuration,
+    DurationOverflow,
+} || JupeError;
+
+/// Parsed real server command intent. Slices borrow from parser input.
+pub const Command = union(enum) {
+    add: AddRequest,
+    remove: []const u8,
+    list,
+    sweep,
+};
+
+/// Parsed `JUPE <pattern> <duration-ms> :<reason>` request.
+pub const AddRequest = struct {
+    pattern: []const u8,
+    reason: []const u8,
+    duration_ms: i64,
+    expires_ms: i64,
+};
+
+/// Owning registry for server-name jupes.
 pub const JupeStore = struct {
     allocator: std.mem.Allocator,
     params: Params,
@@ -72,12 +103,11 @@ pub const JupeStore = struct {
         self.* = undefined;
     }
 
-    /// Add a forbid, duplicating its strings. An existing entry with the same
-    /// kind and exact pattern is replaced in place (its prior strings freed).
-    /// `expires_ms` of 0 means permanent.
+    /// Add a jupe, duplicating its strings. An existing entry with the same exact
+    /// pattern is replaced in place (its prior strings freed). `expires_ms` of 0
+    /// means permanent.
     pub fn add(
         self: *JupeStore,
-        kind: Kind,
         pattern: []const u8,
         reason: []const u8,
         setter: []const u8,
@@ -86,10 +116,10 @@ pub const JupeStore = struct {
     ) (JupeError || std.mem.Allocator.Error)!void {
         try self.validate(pattern, reason, setter);
 
-        var owned = try self.clone(kind, pattern, reason, setter, created_ms, expires_ms);
+        var owned = try self.clone(pattern, reason, setter, created_ms, expires_ms);
         errdefer freeEntry(self.allocator, &owned);
 
-        if (self.indexOf(kind, pattern)) |idx| {
+        if (self.indexOf(pattern)) |idx| {
             freeEntry(self.allocator, &self.entries.items[idx]);
             self.entries.items[idx] = owned;
             return;
@@ -99,22 +129,30 @@ pub const JupeStore = struct {
         try self.entries.append(self.allocator, owned);
     }
 
-    /// Remove a forbid by exact kind and pattern. Returns true when an entry was
-    /// present and freed.
-    pub fn remove(self: *JupeStore, kind: Kind, pattern: []const u8) bool {
-        const idx = self.indexOf(kind, pattern) orelse return false;
+    /// Apply a parsed ADD request with a dispatcher-supplied setter + creation time.
+    pub fn addParsed(
+        self: *JupeStore,
+        request: AddRequest,
+        setter: []const u8,
+        created_ms: i64,
+    ) (JupeError || std.mem.Allocator.Error)!void {
+        try self.add(request.pattern, request.reason, setter, created_ms, request.expires_ms);
+    }
+
+    /// Remove a jupe by exact pattern. Returns true when an entry was present.
+    pub fn remove(self: *JupeStore, pattern: []const u8) bool {
+        const idx = self.indexOf(pattern) orelse return false;
         var removed = self.entries.orderedRemove(idx);
         freeEntry(self.allocator, &removed);
         return true;
     }
 
-    /// Copy every entry of `kind` into `out` and return the filled prefix.
-    /// Returned entries borrow owned strings from the store. Expired entries are
-    /// included; call `sweep` first to exclude them.
-    pub fn list(self: *const JupeStore, kind: Kind, out: []Entry) []Entry {
+    /// Copy every entry into `out` and return the filled prefix. Returned entries
+    /// borrow owned strings from the store. Expired entries are included; call
+    /// `sweep` first to exclude them.
+    pub fn list(self: *const JupeStore, out: []Entry) []Entry {
         var n: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.kind != kind) continue;
             if (n >= out.len) break;
             out[n] = entry;
             n += 1;
@@ -122,14 +160,13 @@ pub const JupeStore = struct {
         return out[0..n];
     }
 
-    /// Return the first active entry whose pattern matches `name` in `kind`, or
-    /// null. Expired entries are skipped but not removed; matching is a pure
+    /// Return the first active entry whose pattern matches `server_name`, or null.
+    /// Expired entries are skipped but not removed; matching is a pure
     /// case-insensitive glob.
-    pub fn isJuped(self: *const JupeStore, kind: Kind, name: []const u8, now_ms: i64) ?Entry {
+    pub fn isJuped(self: *const JupeStore, server_name: []const u8, now_ms: i64) ?Entry {
         for (self.entries.items) |entry| {
-            if (entry.kind != kind) continue;
             if (entry.isExpired(now_ms)) continue;
-            if (globMatch(entry.pattern, name)) return entry;
+            if (globMatch(entry.pattern, server_name)) return entry;
         }
         return null;
     }
@@ -151,7 +188,7 @@ pub const JupeStore = struct {
         return removed;
     }
 
-    /// Total number of stored entries across both namespaces.
+    /// Total number of stored entries.
     pub fn count(self: *const JupeStore) usize {
         return self.entries.items.len;
     }
@@ -162,15 +199,13 @@ pub const JupeStore = struct {
         reason: []const u8,
         setter: []const u8,
     ) JupeError!void {
-        if (pattern.len == 0) return error.EmptyPattern;
-        if (pattern.len > self.params.max_pattern) return error.PatternTooLong;
+        try validatePatternWithLimit(pattern, self.params.max_pattern);
         if (reason.len > self.params.max_reason) return error.ReasonTooLong;
         if (setter.len > self.params.max_setter) return error.SetterTooLong;
     }
 
     fn clone(
         self: *JupeStore,
-        kind: Kind,
         pattern: []const u8,
         reason: []const u8,
         setter: []const u8,
@@ -183,7 +218,6 @@ pub const JupeStore = struct {
         errdefer self.allocator.free(owned_reason);
         const owned_setter = try self.allocator.dupe(u8, setter);
         return .{
-            .kind = kind,
             .pattern = owned_pattern,
             .reason = owned_reason,
             .setter = owned_setter,
@@ -192,9 +226,8 @@ pub const JupeStore = struct {
         };
     }
 
-    fn indexOf(self: *const JupeStore, kind: Kind, pattern: []const u8) ?usize {
+    fn indexOf(self: *const JupeStore, pattern: []const u8) ?usize {
         for (self.entries.items, 0..) |entry, idx| {
-            if (entry.kind != kind) continue;
             if (std.mem.eql(u8, entry.pattern, pattern)) return idx;
         }
         return null;
@@ -206,6 +239,83 @@ fn freeEntry(allocator: std.mem.Allocator, entry: *Entry) void {
     allocator.free(entry.reason);
     allocator.free(entry.setter);
     entry.* = undefined;
+}
+
+/// Parse a `JUPE`/`UNJUPE` real server command.
+///
+/// Supported forms:
+/// * `JUPE <pattern> <duration-ms> :<reason>` (also `JUPE ADD …`)
+/// * `JUPE DEL <pattern>` / `JUPE REMOVE <pattern>`
+/// * `JUPE LIST`
+/// * `JUPE SWEEP`
+/// * `UNJUPE <pattern>`
+pub fn parseServerCommand(verb: []const u8, params: []const []const u8, now_ms: i64) ParseError!Command {
+    if (eqlFoldSlice(verb, "JUPE")) return parseJupeParams(params, now_ms);
+    if (eqlFoldSlice(verb, "UNJUPE")) {
+        if (params.len < 1) return error.MissingParameter;
+        try validatePattern(params[0]);
+        return .{ .remove = params[0] };
+    }
+    return error.UnknownCommand;
+}
+
+fn parseJupeParams(params: []const []const u8, now_ms: i64) ParseError!Command {
+    if (params.len < 1) return error.MissingParameter;
+
+    if (eqlFoldSlice(params[0], "LIST")) return .list;
+    if (eqlFoldSlice(params[0], "SWEEP")) return .sweep;
+
+    if (eqlFoldSlice(params[0], "DEL") or eqlFoldSlice(params[0], "REMOVE")) {
+        if (params.len < 2) return error.MissingParameter;
+        try validatePattern(params[1]);
+        return .{ .remove = params[1] };
+    }
+
+    const add_offset: usize = if (eqlFoldSlice(params[0], "ADD")) 1 else 0;
+    if (params.len < add_offset + 3) return error.MissingParameter;
+
+    const pattern = params[add_offset];
+    const duration_ms = try parseDurationMs(params[add_offset + 1]);
+    const expires_ms = try expiryFromDuration(now_ms, duration_ms);
+    const reason = params[add_offset + 2];
+
+    try validatePattern(pattern);
+    return .{ .add = .{
+        .pattern = pattern,
+        .reason = reason,
+        .duration_ms = duration_ms,
+        .expires_ms = expires_ms,
+    } };
+}
+
+/// Validate a server-name JUPE glob with default limits.
+pub fn validatePattern(pattern: []const u8) JupeError!void {
+    return validatePatternWithLimit(pattern, (Params{}).max_pattern);
+}
+
+fn validatePatternWithLimit(pattern: []const u8, max_pattern: usize) JupeError!void {
+    if (pattern.len == 0) return error.EmptyPattern;
+    if (pattern.len > max_pattern) return error.PatternTooLong;
+    // A server-name glob: letters, digits, dot, hyphen, underscore, and the glob
+    // metacharacters `*`/`?`. Anything else (space, ':', ',', control) is rejected
+    // so a pattern can never be confused with a multi-token command argument.
+    for (pattern) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or
+            byte == '_' or byte == '*' or byte == '?';
+        if (!ok) return error.InvalidPattern;
+    }
+}
+
+fn parseDurationMs(raw: []const u8) ParseError!i64 {
+    if (raw.len == 0) return error.InvalidDuration;
+    const value = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidDuration;
+    if (value < 0) return error.InvalidDuration;
+    return value;
+}
+
+fn expiryFromDuration(now_ms: i64, duration_ms: i64) ParseError!i64 {
+    if (duration_ms == 0) return 0;
+    return std.math.add(i64, now_ms, duration_ms) catch error.DurationOverflow;
 }
 
 /// Case-insensitive glob: `*` matches any run (including empty), `?` matches a
@@ -242,127 +352,89 @@ fn eqlFold(a: u8, b: u8) bool {
     return std.ascii.toLower(a) == std.ascii.toLower(b);
 }
 
+fn eqlFoldSlice(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!eqlFold(left, right)) return false;
+    }
+    return true;
+}
+
 const testing = std.testing;
 
-test "add stores owned copies and count tracks both namespaces" {
-    // Arrange.
+test "add stores owned copies and isJuped glob-matches case-insensitively" {
     var store = JupeStore.init(testing.allocator, .{});
     defer store.deinit();
 
-    // Act: mutate caller buffers after add to prove the store owns its copies.
-    var pat = [_]u8{ 'E', 'v', 'i', 'l', '*' };
-    try store.add(.nick, &pat, "impersonation", "oper", 100, 0);
+    // Mutate the caller buffer after add to prove the store owns its copy.
+    var pat = [_]u8{ 'e', 'v', 'i', 'l', '.', '*' };
+    try store.add(&pat, "rogue server", "oper", 100, 0);
     pat[0] = 'X';
-    try store.add(.channel, "#warez*", "piracy", "admin", 100, 0);
 
-    // Assert.
-    try testing.expectEqual(@as(usize, 2), store.count());
-    const hit = store.isJuped(.nick, "Evilbob", 200).?;
-    try testing.expectEqualStrings("Evil*", hit.pattern);
-    try testing.expectEqualStrings("impersonation", hit.reason);
-    try testing.expectEqualStrings("oper", hit.setter);
-}
-
-test "isJuped is a case-insensitive glob honoring star and question" {
-    // Arrange.
-    var store = JupeStore.init(testing.allocator, .{});
-    defer store.deinit();
-    try store.add(.nick, "Serv?ce*", "reserved", "oper", 0, 0);
-
-    // Act + Assert.
-    try testing.expect(store.isJuped(.nick, "service-bot", 0) != null);
-    try testing.expect(store.isJuped(.nick, "SERVICE", 0) != null);
-    try testing.expect(store.isJuped(.nick, "ServXce", 0) != null);
-    // `?` requires exactly one byte where the literal would sit.
-    try testing.expect(store.isJuped(.nick, "Serve", 0) == null);
-}
-
-test "namespaces are independent" {
-    // Arrange.
-    var store = JupeStore.init(testing.allocator, .{});
-    defer store.deinit();
-    try store.add(.nick, "#admin", "n", "o", 0, 0);
-
-    // Act + Assert: a nick pattern must not forbid a same-text channel.
-    try testing.expect(store.isJuped(.channel, "#admin", 0) == null);
-    try testing.expect(store.isJuped(.nick, "#admin", 0) != null);
-}
-
-test "add with same kind and pattern replaces in place without leaking" {
-    // Arrange.
-    var store = JupeStore.init(testing.allocator, .{});
-    defer store.deinit();
-
-    // Act.
-    try store.add(.channel, "#dup", "first", "alice", 100, 0);
-    try store.add(.channel, "#dup", "second", "bob", 200, 0);
-
-    // Assert: one entry, updated reason and setter.
     try testing.expectEqual(@as(usize, 1), store.count());
-    const hit = store.isJuped(.channel, "#dup", 300).?;
+    const hit = store.isJuped("EVIL.example.com", 200).?;
+    try testing.expectEqualStrings("evil.*", hit.pattern);
+    try testing.expectEqualStrings("rogue server", hit.reason);
+    try testing.expectEqualStrings("oper", hit.setter);
+    // A non-matching server name is allowed.
+    try testing.expect(store.isJuped("good.example.com", 200) == null);
+}
+
+test "add with same pattern replaces in place without leaking" {
+    var store = JupeStore.init(testing.allocator, .{});
+    defer store.deinit();
+    try store.add("hub.*", "first", "alice", 100, 0);
+    try store.add("hub.*", "second", "bob", 200, 0);
+    try testing.expectEqual(@as(usize, 1), store.count());
+    const hit = store.isJuped("hub.eu.net", 300).?;
     try testing.expectEqualStrings("second", hit.reason);
     try testing.expectEqualStrings("bob", hit.setter);
 }
 
-test "remove frees by exact kind and pattern only" {
-    // Arrange.
+test "remove and expiry sweep" {
     var store = JupeStore.init(testing.allocator, .{});
     defer store.deinit();
-    try store.add(.nick, "ghost*", "r", "o", 0, 0);
+    try store.add("temp.*", "r", "o", 0, 1000); // expires at t=1000
+    try store.add("perm.*", "r", "o", 0, 0); // permanent
 
-    // Act + Assert.
-    try testing.expect(!store.remove(.channel, "ghost*")); // wrong kind
-    try testing.expect(!store.remove(.nick, "ghost")); // wrong pattern
-    try testing.expect(store.remove(.nick, "ghost*"));
+    try testing.expect(store.isJuped("temp.x", 500) != null);
+    try testing.expect(store.isJuped("temp.x", 1000) == null); // expired, skipped
+    try testing.expectEqual(@as(usize, 1), store.sweep(1000));
+    try testing.expect(store.isJuped("perm.y", 9999) != null);
+    try testing.expect(store.remove("perm.*"));
+    try testing.expect(!store.remove("perm.*"));
     try testing.expectEqual(@as(usize, 0), store.count());
 }
 
-test "expired entries are skipped by isJuped and dropped by sweep" {
-    // Arrange.
-    var store = JupeStore.init(testing.allocator, .{});
+test "validation rejects bad patterns and enforces capacity" {
+    var store = JupeStore.init(testing.allocator, .{ .max_entries = 1, .max_pattern = 8 });
     defer store.deinit();
-    try store.add(.nick, "temp*", "r", "o", 0, 1000); // expires at t=1000
-    try store.add(.nick, "perm*", "r", "o", 0, 0); // permanent
-
-    // Act + Assert: before expiry both match.
-    try testing.expect(store.isJuped(.nick, "tempbot", 500) != null);
-    // After expiry the temp entry is skipped but still stored.
-    try testing.expect(store.isJuped(.nick, "tempbot", 1000) == null);
-    try testing.expectEqual(@as(usize, 2), store.count());
-
-    // Sweep removes only the expired one.
-    try testing.expectEqual(@as(usize, 1), store.sweep(1000));
-    try testing.expectEqual(@as(usize, 1), store.count());
-    try testing.expect(store.isJuped(.nick, "permanent", 9999) != null);
+    try testing.expectError(error.EmptyPattern, store.add("", "r", "o", 0, 0));
+    try testing.expectError(error.PatternTooLong, store.add("waytoolong.example", "r", "o", 0, 0));
+    try testing.expectError(error.InvalidPattern, store.add("bad name", "r", "o", 0, 0)); // space
+    try store.add("ok.*", "r", "o", 0, 0);
+    try testing.expectError(error.TooManyEntries, store.add("x.*", "r", "o", 0, 0));
 }
 
-test "list returns only the requested namespace" {
-    // Arrange.
-    var store = JupeStore.init(testing.allocator, .{});
-    defer store.deinit();
-    try store.add(.nick, "a*", "r", "o", 0, 0);
-    try store.add(.channel, "#b*", "r", "o", 0, 0);
-    try store.add(.nick, "c*", "r", "o", 0, 0);
+test "parseServerCommand handles JUPE/UNJUPE forms" {
+    // JUPE add (implicit and explicit ADD).
+    const add = try parseServerCommand("JUPE", &.{ "evil.net", "60000", "rogue" }, 1000);
+    try testing.expectEqualStrings("evil.net", add.add.pattern);
+    try testing.expectEqual(@as(i64, 61000), add.add.expires_ms);
+    const add2 = try parseServerCommand("JUPE", &.{ "ADD", "evil.net", "0", "perm" }, 1000);
+    try testing.expectEqual(@as(i64, 0), add2.add.expires_ms); // 0 duration = permanent
 
-    // Act.
-    var out: [8]Entry = undefined;
-    const nicks = store.list(.nick, &out);
-    const chans = store.list(.channel, &out);
+    // DEL / UNJUPE both remove.
+    try testing.expectEqualStrings("evil.net", (try parseServerCommand("JUPE", &.{ "DEL", "evil.net" }, 0)).remove);
+    try testing.expectEqualStrings("evil.net", (try parseServerCommand("UNJUPE", &.{"evil.net"}, 0)).remove);
 
-    // Assert.
-    try testing.expectEqual(@as(usize, 2), nicks.len);
-    try testing.expectEqual(@as(usize, 1), chans.len);
-    try testing.expectEqualStrings("#b*", chans[0].pattern);
-}
+    // LIST / SWEEP.
+    try testing.expect((try parseServerCommand("JUPE", &.{"LIST"}, 0)) == .list);
+    try testing.expect((try parseServerCommand("JUPE", &.{"SWEEP"}, 0)) == .sweep);
 
-test "validation rejects bad input and enforces capacity" {
-    // Arrange.
-    var store = JupeStore.init(testing.allocator, .{ .max_entries = 1, .max_pattern = 4 });
-    defer store.deinit();
-
-    // Act + Assert.
-    try testing.expectError(error.EmptyPattern, store.add(.nick, "", "r", "o", 0, 0));
-    try testing.expectError(error.PatternTooLong, store.add(.nick, "toolong", "r", "o", 0, 0));
-    try store.add(.nick, "ok*", "r", "o", 0, 0);
-    try testing.expectError(error.TooManyEntries, store.add(.channel, "#x*", "r", "o", 0, 0));
+    // Errors.
+    try testing.expectError(error.MissingParameter, parseServerCommand("JUPE", &.{}, 0));
+    try testing.expectError(error.UnknownCommand, parseServerCommand("WHAT", &.{"x"}, 0));
+    try testing.expectError(error.InvalidDuration, parseServerCommand("JUPE", &.{ "evil.net", "soon", "r" }, 0));
+    try testing.expectError(error.InvalidPattern, parseServerCommand("JUPE", &.{ "evil net", "0", "r" }, 0));
 }

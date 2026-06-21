@@ -22,6 +22,7 @@ const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
+const svc_jupe = @import("svc_jupe.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
@@ -2153,6 +2154,8 @@ pub const LinuxServer = struct {
     chan_akick: svc_akick.AkickStore,
     /// Channel-name RESV list — reserved channel globs blocked at JOIN.
     chan_resv: svc_resv.ChannelResv,
+    /// Server-name JUPE list — server globs refused at mesh link establishment.
+    server_jupe: svc_jupe.JupeStore,
     /// Concurrent-connection clone limiter (per exact IP and per /24|/64 prefix).
     /// Limits come from Config; a zero limit disables that dimension.
     clone_limit: clone_limit_mod.CloneLimiter,
@@ -2590,6 +2593,7 @@ pub const LinuxServer = struct {
             .saccess = ircx_saccess.ServerAccessStore.init(allocator),
             .chan_akick = svc_akick.AkickStore.init(allocator),
             .chan_resv = svc_resv.ChannelResv.init(allocator, .{}),
+            .server_jupe = svc_jupe.JupeStore.init(allocator, .{}),
             .clone_limit = clone_limit_mod.CloneLimiter.init(allocator, .{
                 .max_per_ip = config.max_clones_per_ip,
                 .max_per_net = config.max_clones_per_net,
@@ -2856,6 +2860,7 @@ pub const LinuxServer = struct {
         self.saccess.deinit();
         self.chan_akick.deinit();
         self.chan_resv.deinit();
+        self.server_jupe.deinit();
         self.clone_limit.deinit();
         if (self.conn_throttle) |*t| t.deinit();
         self.mesh_clones.deinit();
@@ -4267,6 +4272,11 @@ pub const LinuxServer = struct {
             };
             link.clearOutbound();
         }
+        // JUPE gate: refuse a peer whose server name is juped — checked on every
+        // established drive (not just the first), so a peer juped AFTER it linked
+        // is dropped on its next activity, on its own reactor thread (no
+        // cross-reactor mutation). Runs before the peer_up announcement.
+        if (link.established() and self.refuseJupedPeer(conn, link.remoteName())) return;
         if (!was and link.established()) {
             self.traceLog(.info, .s2s, "s2s secured link established");
             self.logMeshEvent(.peer_up, link.remoteName(), "secured link established");
@@ -4354,6 +4364,9 @@ pub const LinuxServer = struct {
             conn.closing = true;
             return;
         };
+        // JUPE gate: see driveS2sSecured — checked on every established drive so a
+        // peer juped after linking is dropped on its next activity (own thread).
+        if (link.established() and self.refuseJupedPeer(conn, link.remoteName())) return;
         if (!was and link.established()) {
             self.logMeshEvent(.peer_up, link.remoteName(), "link established");
             self.publishServerLink(link.remoteName(), true);
@@ -13902,6 +13915,97 @@ pub const LinuxServer = struct {
                 try appendToConn(conn, nl);
             },
         }
+    }
+
+    /// JUPE/UNJUPE — forbid a server-name glob from linking into the mesh
+    /// (oper-only). `JUPE <pattern> <duration-ms> :reason | JUPE DEL <pattern> |
+    /// JUPE LIST | JUPE SWEEP` and `UNJUPE <pattern>`. A juped name is refused
+    /// when a peer presenting it reaches the link-established transition; an
+    /// already-linked peer that becomes juped is dropped on its next drive.
+    pub fn handleJupe(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // Operator gate is enforced declaratively by the registry (access=.oper).
+        const nick = conn.session.displayName();
+        const srv = protocol_inventory.currentServerName();
+        const cmd = svc_jupe.parseServerCommand(parsed.command, parsed.paramSlice(), self.nowMs()) catch |err| {
+            const msg = switch (err) {
+                error.MissingParameter => "Usage: JUPE <server-glob> <duration-ms> :reason | JUPE DEL <glob> | JUPE LIST",
+                error.UnknownCommand => "Unknown JUPE command",
+                error.InvalidDuration, error.DurationOverflow => "JUPE: invalid duration",
+                error.EmptyPattern, error.PatternTooLong, error.InvalidPattern => "JUPE: pattern must be a server-name glob (e.g. *.evil.net)",
+                error.ReasonTooLong => "JUPE: reason too long",
+                error.SetterTooLong => "JUPE: setter too long",
+                error.TooManyEntries => "JUPE list is full",
+            };
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"JUPE"}, msg);
+            return;
+        };
+
+        switch (cmd) {
+            .add => |req| {
+                self.server_jupe.addParsed(req, nick, self.nowMs()) catch |err| {
+                    const msg = switch (err) {
+                        error.TooManyEntries => "JUPE list is full",
+                        error.PatternTooLong, error.InvalidPattern, error.EmptyPattern => "JUPE: invalid pattern",
+                        error.ReasonTooLong => "JUPE: reason too long",
+                        else => "JUPE add failed",
+                    };
+                    var nb: [256]u8 = undefined;
+                    const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ srv, nick, msg }) catch return;
+                    try appendToConn(conn, nl);
+                    return;
+                };
+                // Already-linked peers matching the new jupe are dropped on their
+                // next drive (each on its own reactor thread — see refuseJupedPeer),
+                // so a JUPE takes effect within a keepalive without a cross-reactor
+                // mutation here.
+                var nb: [384]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :JUPE added: {s} (takes effect on next peer activity)\r\n", .{ srv, nick, req.pattern }) catch return;
+                try appendToConn(conn, nl);
+            },
+            .remove => |pattern| {
+                const removed = self.server_jupe.remove(pattern);
+                var nb: [320]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :{s}\r\n", .{ srv, nick, if (removed) "JUPE removed" else "JUPE pattern not found" }) catch return;
+                try appendToConn(conn, nl);
+            },
+            .list => {
+                var buf: [256]svc_jupe.Entry = undefined;
+                for (self.server_jupe.list(&buf)) |e| {
+                    var line_buf: [896]u8 = undefined;
+                    const ln = std.fmt.bufPrint(&line_buf, ":{s} NOTICE {s} :JUPE {s} (by {s}) :{s}\r\n", .{ srv, nick, e.pattern, e.setter, e.reason }) catch continue;
+                    try appendToConn(conn, ln);
+                }
+                var eb: [128]u8 = undefined;
+                const endl = std.fmt.bufPrint(&eb, ":{s} NOTICE {s} :End of JUPE list\r\n", .{ srv, nick }) catch return;
+                try appendToConn(conn, endl);
+            },
+            .sweep => {
+                const n = self.server_jupe.sweep(self.nowMs());
+                var nb: [256]u8 = undefined;
+                const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :JUPE swept {d} expired\r\n", .{ srv, nick, n }) catch return;
+                try appendToConn(conn, nl);
+            },
+        }
+    }
+
+    /// Whether `server_name` is currently juped (forbidden from linking). Empty
+    /// names never match. Shared by both S2S drive paths.
+    fn serverNameJuped(self: *const LinuxServer, peer_name: []const u8) ?svc_jupe.Entry {
+        if (peer_name.len == 0) return null;
+        return self.server_jupe.isJuped(peer_name, self.nowMs());
+    }
+
+    /// Drop a peer link whose remote server name is juped. Logs the refusal and
+    /// marks the connection closing (mirroring the collision-loser path). Returns
+    /// true when the link was refused so the caller stops driving it. `s2s_dedup`
+    /// is set so the close does not emit a spurious netsplit.
+    fn refuseJupedPeer(self: *LinuxServer, conn: *ConnState, remote_name: []const u8) bool {
+        if (self.serverNameJuped(remote_name) == null) return false;
+        conn.s2s_dedup = true;
+        conn.closing = true;
+        self.logMeshEvent(.peer_down, remote_name, "link refused: server is juped");
+        self.publishOperEvent(.server_link, .warn, "JUPE refused server link") catch {};
+        return true;
     }
 
     /// FORCEOP / FORCEDEOP / FORCEJOIN / FORCEPART / FORCETOPIC — operator force
@@ -29842,6 +29946,55 @@ test "threaded server: PROP GET/LIST returns secret tier keys gated by rank (fou
     b.reset();
     try writeAllFd(fd_b, "PROP #k MEMBERKEY\r\n");
     try recvUntil(b, "818 B #k MEMBERKEY :joinpass", 300);
+}
+
+test "threaded server: JUPE command is oper-gated and manages the server-jupe list" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var o = LiveClient{ .fd = fd_o };
+    var b = LiveClient{ .fd = fd_b };
+
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(&o, " 381 O ", 300); // elevated to oper
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+
+    // A non-oper cannot JUPE (registry oper gate -> 481).
+    try writeAllFd(fd_b, "JUPE evil.net 0 :nope\r\n");
+    try recvUntil(&b, " 481 B ", 300);
+
+    // Oper adds a jupe, lists it, then removes it.
+    o.reset();
+    try writeAllFd(fd_o, "JUPE evil.example.net 0 :rogue server\r\n");
+    try recvUntil(&o, "JUPE added: evil.example.net", 300);
+    o.reset();
+    try writeAllFd(fd_o, "JUPE LIST\r\n");
+    try recvUntil(&o, "JUPE evil.example.net", 300);
+    try recvUntil(&o, "rogue server", 300);
+    o.reset();
+    try writeAllFd(fd_o, "UNJUPE evil.example.net\r\n");
+    try recvUntil(&o, "JUPE removed", 300);
+
+    // A malformed JUPE (missing duration + reason) is rejected with usage (461).
+    o.reset();
+    try writeAllFd(fd_o, "JUPE evil.example.net\r\n");
+    try recvUntil(&o, " 461 O JUPE ", 300);
 }
 
 test "threaded server: oper SASL login auto-enables IRCX" {
