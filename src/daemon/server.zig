@@ -39,6 +39,7 @@ const sdp = @import("../proto/sdp.zig");
 const event_spine = @import("event_spine.zig");
 const oper_event = @import("../proto/oper_event.zig");
 const observe_event = @import("../proto/observe_event.zig");
+const kill_relay = @import("../proto/kill_relay.zig");
 const observe_mod = @import("observe.zig");
 const client_model = @import("client.zig");
 const world_model = @import("world.zig");
@@ -4316,6 +4317,7 @@ pub const LinuxServer = struct {
         self.drainCloneCountsFrom(link);
         self.drainOperEvents(link);
         self.drainObserveEvents(link);
+        self.drainKills(link);
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
@@ -4413,6 +4415,7 @@ pub const LinuxServer = struct {
         self.drainCloneCountsFrom(link);
         self.drainOperEvents(link);
         self.drainObserveEvents(link);
+        self.drainKills(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
@@ -10480,24 +10483,91 @@ pub const LinuxServer = struct {
             return;
         }
         const target_nick = parsed.paramSlice()[0];
-        const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "Killed";
-        const target_wid = self.world.findNick(target_nick) orelse {
-            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
-            return;
-        };
-        const target_id = clientIdFromWorld(target_wid);
-        const tconn = self.connFor(target_id) orelse {
-            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
-            return;
-        };
+        // Sanitize the reason: strip control bytes so a KILL can never smuggle
+        // CR/LF (or other control bytes) into the local wire lines, and so the
+        // cross-mesh KILL codec (which rejects control bytes) always accepts it.
+        var reason_buf: [kill_relay.max_reason_len]u8 = undefined;
+        const raw_reason = if (parsed.param_count >= 2 and parsed.paramSlice()[1].len != 0) parsed.paramSlice()[1] else "Killed";
+        const reason = sanitizeKillReason(raw_reason, &reason_buf);
 
         var prefix_buf: [256]u8 = undefined;
-        var msg_buf: [default_reply_bytes]u8 = undefined;
         const active_override = overrideActive(conn);
         const real_killer = conn.session.displayName();
         const public_killer = if (active_override) "SYSTEM" else real_killer;
-        if (active_override) self.auditOverrideUse(conn, "KILL", target_nick, "anonymous SYSTEM attribution");
         const kill_prefix = if (active_override) "SYSTEM" else try clientPrefix(conn, &prefix_buf);
+
+        // Resolve the target: a LOCAL killable client (real connection, not a peer
+        // S2S link), or — failing that — a remote user owned by a mesh peer.
+        const local_tid: ?client_model.ClientId = blk: {
+            const wid = self.world.findNick(target_nick) orelse break :blk null;
+            const tid = clientIdFromWorld(wid);
+            const tconn = self.connFor(tid) orelse break :blk null;
+            if (tconn.s2s != null or tconn.s2s_secured != null) break :blk null;
+            break :blk tid;
+        };
+
+        if (local_tid) |tid| {
+            if (active_override) self.auditOverrideUse(conn, "KILL", target_nick, "anonymous SYSTEM attribution");
+            try self.publishKillEvent(real_killer, target_nick, reason, active_override);
+            try self.performKillDisconnect(tid, target_nick, kill_prefix, public_killer, reason);
+            return;
+        }
+
+        // Not local: route the KILL to the mesh peer whose route_table owns the
+        // nick. The owning node verifies the signed frame and disconnects its
+        // local target; the resulting QUIT propagates back normally.
+        if (self.sendKillToOwner(target_nick, kill_prefix, reason)) {
+            if (active_override) self.auditOverrideUse(conn, "KILL", target_nick, "anonymous SYSTEM attribution");
+            try self.publishKillEvent(real_killer, target_nick, reason, active_override);
+            var nb: [320]u8 = undefined;
+            const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :KILL: relayed across the mesh to the node owning {s}\r\n", .{ self.serverName(), conn.session.displayName(), target_nick }) catch return;
+            try appendToConn(conn, nl);
+            return;
+        }
+
+        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target_nick}, "No such nick");
+    }
+
+    /// Strip control bytes (CR/LF and any other <0x20, plus DEL) from a KILL reason
+    /// and clamp to the relay codec bound. Empty input (or a reason that was all
+    /// control bytes) falls back to "Killed". Incorporates the old svc_killpath
+    /// reason hardening into the live path.
+    fn sanitizeKillReason(raw: []const u8, out: []u8) []const u8 {
+        var n: usize = 0;
+        for (raw) |b| {
+            if (b < 0x20 or b == 0x7f) continue;
+            if (n >= out.len) break;
+            out[n] = b;
+            n += 1;
+        }
+        if (n == 0) {
+            const fallback = "Killed";
+            const m = @min(fallback.len, out.len);
+            @memcpy(out[0..m], fallback[0..m]);
+            return out[0..m];
+        }
+        return out[0..n];
+    }
+
+    /// Publish the oper-visible KILL Event-Spine alert (kill category), fanned
+    /// network-wide so opers everywhere see it. Issued ONCE on the killing node.
+    fn publishKillEvent(self: *LinuxServer, real_killer: []const u8, target_nick: []const u8, reason: []const u8, override: bool) !void {
+        var kev_buf: [512]u8 = undefined;
+        const kev = if (override)
+            (std.fmt.bufPrint(&kev_buf, "{s} killed {s} as SYSTEM ({s})", .{ real_killer, target_nick, reason }) catch "anonymous kill")
+        else
+            (std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s})", .{ real_killer, target_nick, reason }) catch reason);
+        try self.publishOperEvent(.kill, .warn, kev);
+    }
+
+    /// Disconnect a LOCAL client as a KILL: deliver its KILL line + an ERROR close,
+    /// then schedule the graceful close (the send-drain fires QUIT to channels).
+    /// `kill_prefix` sources the KILL line (`nick!user@host` or SYSTEM);
+    /// `public_killer` names the actor in the close reason. Cross-shard safe: a
+    /// target on another reactor is closed via enqueueDeliveryThenClose (never a
+    /// foreign-conn mutation); only a same-shard target is armed directly here.
+    fn performKillDisconnect(self: *LinuxServer, target_id: client_model.ClientId, target_nick: []const u8, kill_prefix: []const u8, public_killer: []const u8, reason: []const u8) !void {
+        var msg_buf: [default_reply_bytes]u8 = undefined;
         const kill_line = try formatMessage(&msg_buf, kill_prefix, "KILL", &.{target_nick}, reason);
         try self.deliver(target_id, kill_line);
 
@@ -10505,20 +10575,69 @@ pub const LinuxServer = struct {
         const err_line = std.fmt.bufPrint(&err_buf, "ERROR :Closing Link: {s} (Killed ({s} ({s})))\r\n", .{ target_nick, public_killer, reason }) catch return error.OutputTooSmall;
         try self.enqueueDeliveryThenClose(target_id, err_line, "Killed");
 
-        // Oper-visible KILL event through the Event Spine (kill category).
-        var kev_buf: [512]u8 = undefined;
-        const kev = if (active_override)
-            (std.fmt.bufPrint(&kev_buf, "{s} killed {s} as SYSTEM ({s})", .{ real_killer, target_nick, reason }) catch "anonymous kill")
-        else
-            (std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s})", .{ real_killer, target_nick, reason }) catch reason);
-        try self.publishOperEvent(.kill, .warn, kev);
-
-        // Graceful close: the send-drain path fires QUIT to channels and frees
-        // the slot once the buffer flushes (mirrors a self-QUIT).
         if (target_id.shard == self.rx().shard_id) {
-            tconn.closing = true;
-            try self.armSendIfNeeded(tconn);
+            if (self.connFor(target_id)) |tconn| {
+                tconn.closing = true;
+                try self.armSendIfNeeded(tconn);
+            }
         }
+    }
+
+    /// Send a signed KILL to the established mesh peer whose route_table owns
+    /// `target_nick`. Returns true once a matching peer was found and the frame
+    /// flushed. `killer` is the full mask (or SYSTEM); the owning node renders the
+    /// KILL line/close from it.
+    fn sendKillToOwner(self: *LinuxServer, target_nick: []const u8, killer: []const u8, reason: []const u8) bool {
+        const origin = self.serverName();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (slot.value.s2s_secured) |link| {
+                    if (!link.established()) continue;
+                    if (link.routeNickNode(target_nick) == null) continue;
+                    link.sendKill(origin, killer, target_nick, reason) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                    return true;
+                } else if (slot.value.s2s) |link| {
+                    if (!link.established()) continue;
+                    if (link.routeNickNode(target_nick) == null) continue;
+                    link.sendKill(origin, killer, target_nick, reason) catch continue;
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Decode + apply this peer's inbound KILL frames: disconnect the named LOCAL
+    /// target on behalf of the remote killer. No oper-event re-publish (the issuing
+    /// node already fanned it network-wide); the resulting QUIT propagates normally.
+    /// A target that is not (or no longer) local is a no-op; malformed payloads are
+    /// skipped. The frame was already signature-verified by the substrate link.
+    fn drainKills(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeKills() catch return;
+        defer {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+        }
+        for (payloads) |p| {
+            const ev = kill_relay.decode(p) catch continue;
+            self.applyRemoteKill(ev);
+        }
+    }
+
+    fn applyRemoteKill(self: *LinuxServer, ev: kill_relay.KillRelay) void {
+        const wid = self.world.findNick(ev.target) orelse return;
+        const tid = clientIdFromWorld(wid);
+        const tconn = self.connFor(tid) orelse return;
+        if (tconn.s2s != null or tconn.s2s_secured != null) return; // never a peer link
+        if (tconn.closing) return;
+        // The remote killer mask is both the KILL-line source and the close actor.
+        self.performKillDisconnect(tid, ev.target, ev.killer, ev.killer, ev.reason) catch {};
     }
 
     /// WHOWAS <nick> [count] — historical identities from the ring, most-recent
@@ -29995,6 +30114,55 @@ test "threaded server: JUPE command is oper-gated and manages the server-jupe li
     o.reset();
     try writeAllFd(fd_o, "JUPE evil.example.net\r\n");
     try recvUntil(&o, " 461 O JUPE ", 300);
+}
+
+test "sanitizeKillReason strips control bytes and falls back to Killed" {
+    var buf: [64]u8 = undefined;
+    // Embedded control bytes (BEL, and a stray CR) are stripped; printable kept.
+    try std.testing.expectEqualStrings("badreason", LinuxServer.sanitizeKillReason("bad\x07rea\rson", &buf));
+    try std.testing.expectEqualStrings("flood abuse", LinuxServer.sanitizeKillReason("flood abuse", &buf));
+    // An all-control (or empty) reason falls back to the default.
+    try std.testing.expectEqualStrings("Killed", LinuxServer.sanitizeKillReason("\x01\x02\x03", &buf));
+    try std.testing.expectEqualStrings("Killed", LinuxServer.sanitizeKillReason("", &buf));
+}
+
+test "threaded server: local KILL disconnects the victim; unknown nick is 401" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_v = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_v);
+    var o = LiveClient{ .fd = fd_o };
+    var v = LiveClient{ .fd = fd_v };
+
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(&o, " 381 O ", 300); // oper
+    try writeAllFd(fd_v, "NICK V\r\nUSER v 0 * :V\r\n");
+    try recvUntil(&v, " 001 V ", 200);
+
+    // Oper KILLs the local victim: the victim sees its KILL line and an ERROR
+    // close carrying the actor + reason.
+    try writeAllFd(fd_o, "KILL V :bye now\r\n");
+    try recvUntil(&v, "KILL V :bye now", 300);
+    try recvUntil(&v, "ERROR :Closing Link: V (Killed (", 300);
+
+    // KILL of a nonexistent nick (no local client, no peer owns it) -> 401.
+    o.reset();
+    try writeAllFd(fd_o, "KILL ghost :x\r\n");
+    try recvUntil(&o, " 401 O ghost ", 300);
 }
 
 test "threaded server: oper SASL login auto-enables IRCX" {

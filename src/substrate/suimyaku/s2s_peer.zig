@@ -44,6 +44,7 @@ const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
 const oper_event = @import("../../proto/oper_event.zig");
 const observe_event = @import("../../proto/observe_event.zig");
+const kill_relay = @import("../../proto/kill_relay.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
@@ -216,6 +217,10 @@ pub const S2sPeer = struct {
     /// to decode + match against its local OBSERVE registry. Substrate-pure: never
     /// decoded here.
     observe_events: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified KILL payloads received from this peer, awaiting the daemon to
+    /// decode + disconnect the named local target. Substrate-pure: never decoded
+    /// here.
+    kills: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -300,6 +305,8 @@ pub const S2sPeer = struct {
         self.oper_events.deinit(self.allocator);
         for (self.observe_events.items) |m| self.allocator.free(m);
         self.observe_events.deinit(self.allocator);
+        for (self.kills.items) |m| self.allocator.free(m);
+        self.kills.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -451,6 +458,7 @@ pub const S2sPeer = struct {
             .CLONE_COUNT => try self.recvCloneCounts(frame.payload),
             .OPER_EVENT => try self.recvOperEvent(frame.payload),
             .OBSERVE_EVENT => try self.recvObserveEvent(frame.payload),
+            .KILL => try self.recvKill(frame.payload),
         }
     }
 
@@ -564,6 +572,40 @@ pub const S2sPeer = struct {
     /// and the outer slice). Each decodes with `observe_event.decode`.
     pub fn takeObserveEvents(self: *S2sPeer) ![][]u8 {
         return self.observe_events.toOwnedSlice(self.allocator);
+    }
+
+    /// Queue a verified inbound KILL for the daemon to decode and apply (disconnect
+    /// the named local target). Substrate-pure: never decoded here.
+    fn recvKill(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.KILL, frame_payload) orelse return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.kills.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued inbound KILL payloads (caller owns + frees each slice and the
+    /// outer slice). Each decodes with `kill_relay.decode`.
+    pub fn takeKills(self: *S2sPeer) ![][]u8 {
+        return self.kills.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed KILL to this peer (targeted cross-mesh operator KILL).
+    pub fn sendKill(
+        self: *S2sPeer,
+        sink: ByteSink,
+        origin_server: []const u8,
+        killer: []const u8,
+        target: []const u8,
+        reason: []const u8,
+    ) !void {
+        const ev = kill_relay.KillRelay{
+            .origin_server = truncated(origin_server, kill_relay.max_name_len),
+            .killer = truncated(killer, kill_relay.max_name_len),
+            .target = truncated(target, kill_relay.max_name_len),
+            .reason = truncated(reason, kill_relay.max_reason_len),
+        };
+        var buf: [kill_relay.max_encoded_len]u8 = undefined;
+        const wire = try kill_relay.encode(ev, &buf);
+        try self.emitSignable(sink, .KILL, wire);
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).
@@ -2217,6 +2259,49 @@ test "signing peers round-trip a signed MEMBERSHIP frame" {
     }
     try std.testing.expectEqual(@as(usize, 1), changes.len);
     try std.testing.expectEqualStrings("alice", changes[0].nick);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "signing peers round-trip a signed KILL frame" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x41);
+    const kp_b = try signingKeyFor(0x42);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x4EE);
+
+    try a.sendKill(a_to_b.sink(), "a.test", "kain!~k@admin.example", "spammer", "flooding the network");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x4EF);
+
+    const kills = try b.takeKills();
+    defer {
+        for (kills) |k| allocator.free(k);
+        allocator.free(kills);
+    }
+    try std.testing.expectEqual(@as(usize, 1), kills.len);
+    const ev = try kill_relay.decode(kills[0]);
+    try std.testing.expectEqualStrings("a.test", ev.origin_server);
+    try std.testing.expectEqualStrings("kain!~k@admin.example", ev.killer);
+    try std.testing.expectEqualStrings("spammer", ev.target);
+    try std.testing.expectEqualStrings("flooding the network", ev.reason);
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 

@@ -426,6 +426,17 @@ pub const S2sLink = struct {
         return self.peer.takeObserveEvents();
     }
 
+    /// Emit a signed targeted KILL to this peer (cross-mesh operator KILL).
+    pub fn sendKill(self: *S2sLink, origin_server: []const u8, killer: []const u8, target: []const u8, reason: []const u8) !void {
+        try self.peer.sendKill(self.sink(), origin_server, killer, target, reason);
+    }
+
+    /// Drain queued inbound KILL payloads from this peer (caller owns + frees each
+    /// slice and the outer slice; decode with `kill_relay.decode`).
+    pub fn takeKills(self: *S2sLink) ![][]u8 {
+        return self.peer.takeKills();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis.
     pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
         return self.peer.collectTopology(out);

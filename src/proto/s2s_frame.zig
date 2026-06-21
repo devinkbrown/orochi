@@ -70,6 +70,12 @@ pub const FrameType = enum(u8) {
     /// Carries {action, origin_server, nick, user, host, account, detail}; signed
     /// (the subject's host is the REAL/uncloaked host — an operator-trust surface).
     OBSERVE_EVENT = 0x15,
+    /// Targeted cross-mesh operator KILL: the owning node disconnects its local
+    /// `target` on behalf of operator `killer` who issued it on `origin_server`.
+    /// A one-shot COMMAND (not stored); the killer's node already enforced the
+    /// `client_kill` privilege and signs the frame with its Tsumugi identity.
+    /// Carries {origin_server, killer, target, reason}.
+    KILL = 0x16,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -98,6 +104,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.CLONE_COUNT) => .CLONE_COUNT,
             @intFromEnum(FrameType.OPER_EVENT) => .OPER_EVENT,
             @intFromEnum(FrameType.OBSERVE_EVENT) => .OBSERVE_EVENT,
+            @intFromEnum(FrameType.KILL) => .KILL,
             else => null,
         };
     }
@@ -222,6 +229,7 @@ const all_frame_types = [_]FrameType{
     .CHANNEL_MODE_STATE,
     .SESSION_MIGRATE,
     .ENTITY_PROP,
+    .KILL,
 };
 
 test "encode/decode round-trip each type" {

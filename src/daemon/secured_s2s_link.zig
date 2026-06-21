@@ -506,6 +506,18 @@ pub const SecuredLink = struct {
         return link.takeObserveEvents();
     }
 
+    pub fn sendKill(self: *SecuredLink, origin_server: []const u8, killer: []const u8, target: []const u8, reason: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendKill(origin_server, killer, target, reason);
+        try self.drainInner();
+    }
+
+    /// Drain queued inbound KILL payloads decoded by the inner link.
+    pub fn takeKills(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeKills();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis
     /// (empty until the inner CRDT link is established).
     pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {
