@@ -119,7 +119,6 @@ pub const last_seen = @import("last_seen.zig");
 pub const leaderboard = @import("leaderboard.zig");
 pub const link_cache = @import("link_cache.zig");
 pub const link_health = @import("link_health.zig");
-pub const login_throttle = @import("login_throttle.zig");
 pub const mask_style = @import("mask_style.zig");
 pub const media_bridge = @import("media_bridge.zig");
 pub const media_pin = @import("media_pin.zig");
@@ -409,7 +408,6 @@ test {
     _ = leaderboard;
     _ = link_cache;
     _ = link_health;
-    _ = login_throttle;
     _ = mask_style;
     _ = media_bridge;
     _ = media_pin;

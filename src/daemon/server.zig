@@ -23,6 +23,7 @@ const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
 const svc_jupe = @import("svc_jupe.zig");
+const svc_login_throttle = @import("svc_login_throttle.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
@@ -2166,6 +2167,11 @@ pub const LinuxServer = struct {
     /// Connection-rate throttle (per source IP); null when disabled
     /// (`config.throttle_connects == 0`). Concurrent caps live in `clone_limit`.
     conn_throttle: ?clone_detect_mod.CloneDetector,
+    /// Failed-login brute-force guard for password auth (IDENTIFY/DROP): a
+    /// decaying failure score per account AND per source IP, with a flat lockout
+    /// once the threshold is crossed. Always on (security guard) with the module's
+    /// default policy (5 failures within the half-life → 60s cooldown).
+    login_throttle: svc_login_throttle.Throttle,
     /// Network-wide clone aggregate: local + per-peer connection counts keyed by
     /// salted-IP-hash, for the `max_clones_per_ip_net` cap. Inert when that cap is 0.
     mesh_clones: mesh_clones_mod.MeshClones,
@@ -2605,6 +2611,7 @@ pub const LinuxServer = struct {
                 .max_connects_per_window = config.throttle_connects,
                 .window_ms = @max(@as(u64, 1), config.throttle_window_ms),
             }) else null,
+            .login_throttle = svc_login_throttle.Throttle.init(allocator, .{}),
             .mesh_clones = mesh_clones_mod.MeshClones.init(allocator),
             .clone_key = deriveCloneKey(config.mesh_pass),
             .reputation = ip_reputation_mod.IpReputation.init(allocator, .{
@@ -2864,6 +2871,7 @@ pub const LinuxServer = struct {
         self.server_jupe.deinit();
         self.clone_limit.deinit();
         if (self.conn_throttle) |*t| t.deinit();
+        self.login_throttle.deinit();
         self.mesh_clones.deinit();
         self.nick_delay.deinit();
         self.reputation.deinit();
@@ -3111,6 +3119,8 @@ pub const LinuxServer = struct {
         // Prune the throttle's expired/empty per-IP state on the same cadence.
         if (self.rx() == &self.reactors[0]) {
             if (self.conn_throttle) |*t| t.prune(self.nowMs());
+            // Evict unlocked, decayed-to-floor login-throttle records too.
+            _ = self.login_throttle.sweep(self.nowMs());
         }
         self.sweepTempModes();
         // Re-dial any [mesh].connect peer whose link dropped (reactor-0 only;
@@ -17845,6 +17855,50 @@ pub const LinuxServer = struct {
         self.evaluateNickProtection(conn);
     }
 
+    /// Source-IP key for the login throttle, or null when the connection has no
+    /// real host or is the loopback/local default (local/trusted sources are
+    /// never throttled — same exemption as the connection-rate throttle).
+    fn loginThrottleIp(conn: *const ConnState) ?[]const u8 {
+        const ip = conn.session.realHost();
+        if (ip.len == 0 or std.mem.eql(u8, ip, default_host)) return null;
+        return ip;
+    }
+
+    /// Retry-after (ms) if password auth for `account` on `conn` is currently
+    /// locked out by the brute-force throttle (account OR source-IP namespace),
+    /// else null. Pure read — never records.
+    fn loginLockedFor(self: *LinuxServer, conn: *const ConnState, account: []const u8) ?i64 {
+        const now = self.nowMs();
+        if (self.login_throttle.isLocked(.account, account, now)) |ms| return ms;
+        if (loginThrottleIp(conn)) |ip| {
+            if (self.login_throttle.isLocked(.ip, ip, now)) |ms| return ms;
+        }
+        return null;
+    }
+
+    /// Record one failed password attempt against `account` + the source IP.
+    fn loginRecordFailure(self: *LinuxServer, conn: *const ConnState, account: []const u8) void {
+        const now = self.nowMs();
+        _ = self.login_throttle.recordFailure(.account, account, now);
+        if (loginThrottleIp(conn)) |ip| _ = self.login_throttle.recordFailure(.ip, ip, now);
+    }
+
+    /// Clear throttle state for `account` + the source IP after a success.
+    fn loginRecordSuccess(self: *LinuxServer, conn: *const ConnState, account: []const u8) void {
+        self.login_throttle.recordSuccess(.account, account);
+        if (loginThrottleIp(conn)) |ip| self.login_throttle.recordSuccess(.ip, ip);
+    }
+
+    /// Reject `cmd` (IDENTIFY/DROP) with ERR_PASSWDMISMATCH carrying the lockout
+    /// retry-after. Shared by the password-auth brute-force guard.
+    fn rejectLoginLocked(self: *LinuxServer, conn: *ConnState, retry_ms: i64) !void {
+        _ = self;
+        var rb: [192]u8 = undefined;
+        const secs = @divFloor(retry_ms + 999, 1000); // ceil to whole seconds
+        const msg = std.fmt.bufPrint(&rb, "Too many failed login attempts - retry in {d}s", .{secs}) catch "Too many failed login attempts";
+        try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, msg);
+    }
+
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
     pub fn handleIdentify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
@@ -17853,10 +17907,14 @@ pub const LinuxServer = struct {
             return;
         }
         const account = parsed.paramSlice()[0];
+        // Brute-force guard: refuse before attempting auth when locked out.
+        if (self.loginLockedFor(conn, account)) |retry_ms| return self.rejectLoginLocked(conn, retry_ms);
         _ = svc.identifyAccount(account, parsed.paramSlice()[1]) catch {
+            self.loginRecordFailure(conn, account);
             try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
             return;
         };
+        self.loginRecordSuccess(conn, account);
         // Re-IDENTIFY to a different account: drop the previous account's session
         // binding first (mirrors handleLogout), so a stale SessionStore entry can
         // never keep this connection in the old account's delivery/fan-out set.
@@ -17911,10 +17969,15 @@ pub const LinuxServer = struct {
             return;
         }
         const account = parsed.paramSlice()[0];
+        // Shared brute-force guard: DROP is the same password-auth surface as
+        // IDENTIFY, so failed DROP attempts accumulate on the same throttle keys.
+        if (self.loginLockedFor(conn, account)) |retry_ms| return self.rejectLoginLocked(conn, retry_ms);
         _ = svc.dropAccount(account, parsed.paramSlice()[1]) catch {
+            self.loginRecordFailure(conn, account);
             try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
             return;
         };
+        self.loginRecordSuccess(conn, account);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
         try appendToConn(conn, line);
@@ -30163,6 +30226,59 @@ test "threaded server: local KILL disconnects the victim; unknown nick is 401" {
     o.reset();
     try writeAllFd(fd_o, "KILL ghost :x\r\n");
     try recvUntil(&o, " 401 O ghost ", 300);
+}
+
+test "threaded server: IDENTIFY brute-force throttle locks after repeated failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-login-throttle.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+    try writeAllFd(fd, "NICK U\r\nUSER u 0 * :U\r\n");
+    try recvUntil(&c, " 001 U ", 200);
+
+    // The first wrong-password attempt gets the generic mismatch (throttle not yet
+    // engaged) — proving the guard does not reject before any failure. Loopback is
+    // IP-exempt, so this exercises the ACCOUNT-scope throttle.
+    try writeAllFd(fd, "IDENTIFY bob wrongpass\r\n");
+    try recvUntil(&c, "Invalid account or password", 300);
+    // Hammer past the lock threshold. Each attempt answers with a 464 (the generic
+    // mismatch, or the lockout once armed); the exact crossover beat is fuzzy
+    // because the failure score decays continuously, so just drive well past it.
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        c.reset();
+        try writeAllFd(fd, "IDENTIFY bob wrongpass\r\n");
+        try recvUntil(&c, " 464 ", 300);
+    }
+    // Now definitively locked: even the CORRECT password is refused before auth,
+    // with the retry-after lockout message.
+    c.reset();
+    try writeAllFd(fd, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&c, "Too many failed login attempts", 300);
 }
 
 test "threaded server: oper SASL login auto-enables IRCX" {
