@@ -25,6 +25,7 @@ const svc_resv = @import("svc_resv.zig");
 const svc_jupe = @import("svc_jupe.zig");
 const svc_login_throttle = @import("svc_login_throttle.zig");
 const svc_memo_forward = @import("svc_memo_forward.zig");
+const svc_memo_ignore = @import("svc_memo_ignore.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
@@ -2288,6 +2289,9 @@ pub const LinuxServer = struct {
     /// Tegami forward chains: an account may auto-forward its incoming memos to
     /// another account (hop/cycle-bounded). In-memory, matching Tegami itself.
     memo_forward: svc_memo_forward.MemoForwardStore,
+    /// Tegami per-recipient ignore list: a memo from a blocked sender account is
+    /// silently dropped at SEND. In-memory, matching Tegami itself.
+    memo_ignore: svc_memo_ignore.MemoIgnoreList,
     /// Per-channel live media transcript (speaker-tagged caption ring).
     transcript: transcript_mod.TranscriptLog,
     /// Server-owned config reloaded by the most recent REHASH. The live
@@ -2641,6 +2645,7 @@ pub const LinuxServer = struct {
             .native_media = native_media_mod.NativeMediaTransport.initConfig(allocator, config.media_max_participants),
             .tegami = tegami_mod.TegamiBox.init(allocator),
             .memo_forward = svc_memo_forward.MemoForwardStore.init(allocator),
+            .memo_ignore = svc_memo_ignore.MemoIgnoreList.init(allocator),
             .transcript = transcript_mod.TranscriptLog.init(allocator),
             .oper_registry = config.oper_registry,
             .account_services = config.account_services,
@@ -2926,6 +2931,7 @@ pub const LinuxServer = struct {
         }
         self.tegami.deinit();
         self.memo_forward.deinit();
+        self.memo_ignore.deinit();
         self.transcript.deinit();
         self.allocator.free(self.reload_bindings);
         if (self.reload_class_registry) |*r| r.deinit();
@@ -19192,11 +19198,13 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR | FORWARD <account>|OFF>` —
-    /// Orochi offline mail. SEND stores a message for an account (delivered when it
-    /// next logs in, following the recipient's forward chain); LIST shows the
-    /// caller's own pending mail; CLEAR discards it; FORWARD sets/clears/queries the
-    /// caller's auto-forward target. SEND/FORWARD require the caller to be logged in.
+    /// `TEGAMI <SEND <account> :<msg> | LIST | CLEAR | FORWARD <account>|OFF |
+    /// IGNORE ADD|DEL|LIST <account>>` — Orochi offline mail. SEND stores a message
+    /// for an account (delivered when it next logs in, following the recipient's
+    /// forward chain, unless that account ignores the sender — then it is silently
+    /// dropped); LIST shows the caller's own pending mail; CLEAR discards it;
+    /// FORWARD sets/clears/queries the caller's auto-forward target; IGNORE manages
+    /// the caller's blocked-sender list. SEND/FORWARD/IGNORE require login.
     pub fn handleTegami(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const sub = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "LIST";
         const me = conn.session.account();
@@ -19262,6 +19270,58 @@ pub const LinuxServer = struct {
             try appendToConn(conn, line);
             return;
         }
+        if (std.ascii.eqlIgnoreCase(sub, "IGNORE")) {
+            const acct = me orelse {
+                try self.failReply(conn, "TEGAMI", "ACCOUNT_REQUIRED", "Log in to manage tegami ignores");
+                return;
+            };
+            const action = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "LIST";
+            if (std.ascii.eqlIgnoreCase(action, "LIST")) {
+                var out: [svc_memo_ignore.DEFAULT_MAX_ENTRIES_PER_ACCOUNT]svc_memo_ignore.Entry = undefined;
+                const entries = self.memo_ignore.list(acct, &out) catch out[0..0];
+                for (entries) |e| {
+                    var lb: [192]u8 = undefined;
+                    const ln = std.fmt.bufPrint(&lb, ":{s} NOTE TEGAMI :ignoring {s}\r\n", .{ self.serverName(), e.sender }) catch continue;
+                    try appendToConn(conn, ln);
+                }
+                var eb: [128]u8 = undefined;
+                const end = std.fmt.bufPrint(&eb, ":{s} NOTE TEGAMI :End of ignore list ({d})\r\n", .{ self.serverName(), entries.len }) catch return;
+                try appendToConn(conn, end);
+                return;
+            }
+            const is_add = std.ascii.eqlIgnoreCase(action, "ADD");
+            const is_del = std.ascii.eqlIgnoreCase(action, "DEL") or std.ascii.eqlIgnoreCase(action, "REMOVE");
+            if (!is_add and !is_del) {
+                try self.failReply(conn, "TEGAMI", "INVALID_SUBCOMMAND", "Use TEGAMI IGNORE ADD|DEL|LIST <account>");
+                return;
+            }
+            if (parsed.param_count < 3 or parsed.paramSlice()[2].len == 0) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"TEGAMI"}, "Usage: TEGAMI IGNORE ADD|DEL <account>");
+                return;
+            }
+            const blocked_sender = parsed.paramSlice()[2];
+            if (is_add) {
+                const added = self.memo_ignore.add(acct, blocked_sender) catch {
+                    try self.failReply(conn, "TEGAMI", "INVALID_ACCOUNT", "Could not add ignore");
+                    return;
+                };
+                var nb: [192]u8 = undefined;
+                const msg = if (added)
+                    std.fmt.bufPrint(&nb, "TEGAMI: now ignoring memos from {s}", .{blocked_sender}) catch "TEGAMI: ignore updated"
+                else
+                    std.fmt.bufPrint(&nb, "TEGAMI: {s} was already ignored", .{blocked_sender}) catch "TEGAMI: ignore updated";
+                try self.noticeTo(conn, msg);
+            } else {
+                const removed = self.memo_ignore.remove(acct, blocked_sender) catch false;
+                var nb: [192]u8 = undefined;
+                const msg = if (removed)
+                    std.fmt.bufPrint(&nb, "TEGAMI: no longer ignoring {s}", .{blocked_sender}) catch "TEGAMI: ignore updated"
+                else
+                    std.fmt.bufPrint(&nb, "TEGAMI: {s} was not ignored", .{blocked_sender}) catch "TEGAMI: ignore updated";
+                try self.noticeTo(conn, msg);
+            }
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(sub, "SEND")) {
             const from = me orelse {
                 try self.failReply(conn, "TEGAMI", "ACCOUNT_REQUIRED", "Log in to send tegami");
@@ -19279,6 +19339,13 @@ pub const LinuxServer = struct {
                     try self.failReply(conn, "TEGAMI", "ACCOUNT_UNKNOWN", "No such account");
                     return;
                 };
+            }
+            // Recipient memo-ignore: if the addressed account blocks this sender,
+            // silently drop — the success reply is unchanged so the block cannot be
+            // probed (fail-open if the check itself errors).
+            if (!(self.memo_ignore.shouldAccept(to, from) catch true)) {
+                try self.noticeTo(conn, "TEGAMI: message stored for delivery");
+                return;
             }
             // Resolve the recipient's forward chain (hop/cycle-bounded). A broken
             // chain falls back to direct delivery rather than refusing the memo.
@@ -19318,7 +19385,7 @@ pub const LinuxServer = struct {
             }
             return;
         }
-        try self.failReply(conn, "TEGAMI", "INVALID_SUBCOMMAND", "Use SEND, LIST, CLEAR, or FORWARD");
+        try self.failReply(conn, "TEGAMI", "INVALID_SUBCOMMAND", "Use SEND, LIST, CLEAR, FORWARD, or IGNORE");
     }
 
     /// Emit the caller's pending tegami as NOTE lines (without clearing).
@@ -30429,6 +30496,80 @@ test "threaded server: TEGAMI FORWARD redirects an account's memos and rejects a
     a.reset();
     try writeAllFd(fd_a, "TEGAMI FORWARD alice\r\n");
     try recvUntil(&a, "FAIL TEGAMI FORWARD_CYCLE", 300);
+}
+
+test "threaded server: TEGAMI IGNORE silently drops a blocked sender's memo" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-memo-ignore.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :A\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IDENTIFY alice correcthorse\r\n");
+    try recvUntil(&a, "You are now identified as alice", 300);
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&b, "You are now identified as bob", 300);
+
+    // alice blocks bob.
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI IGNORE ADD bob\r\n");
+    try recvUntil(&a, "now ignoring memos from bob", 300);
+
+    // bob's memo is silently dropped: bob still sees the normal success reply
+    // (no leak), but alice's mailbox stays empty.
+    b.reset();
+    try writeAllFd(fd_b, "TEGAMI SEND alice :blocked text\r\n");
+    try recvUntil(&b, "TEGAMI: message stored for delivery", 300);
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI LIST\r\n");
+    try recvUntil(&a, "End of tegami (0)", 300);
+
+    // IGNORE LIST shows bob; DEL clears the block.
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI IGNORE LIST\r\n");
+    try recvUntil(&a, "ignoring bob", 300);
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI IGNORE DEL bob\r\n");
+    try recvUntil(&a, "no longer ignoring bob", 300);
+
+    // Now bob's memo is delivered.
+    b.reset();
+    try writeAllFd(fd_b, "TEGAMI SEND alice :now allowed\r\n");
+    try recvUntil(&b, "TEGAMI: message stored for delivery", 300);
+    a.reset();
+    try writeAllFd(fd_a, "TEGAMI LIST\r\n");
+    try recvUntil(&a, "from bob :now allowed", 300);
 }
 
 test "threaded server: oper SASL login auto-enables IRCX" {
