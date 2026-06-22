@@ -116,6 +116,10 @@ fn debug(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleDebug(x.conn);
 }
+fn audit(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleAudit(x.conn, x.parsed);
+}
 fn mesh(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMesh(x.conn, x.parsed);
@@ -164,6 +168,7 @@ pub const module = registry.Module{
         .{ .name = "TESTMASK", .access = .oper, .handler = testmask },
         .{ .name = "USERIP", .access = .oper, .handler = userip },
         .{ .name = "DEBUG", .access = .oper, .handler = debug },
+        .{ .name = "AUDIT", .access = .oper, .handler = audit },
         .{ .name = "MESH", .access = .oper, .handler = mesh, .summary = "mesh peer/link health (NETSTAT)" },
         .{ .name = "NETSTAT", .access = .oper, .handler = mesh, .summary = "alias of MESH" },
         .{ .name = "ROUTE", .access = .oper, .handler = route, .summary = "mesh routing table" },

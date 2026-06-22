@@ -26,6 +26,7 @@ const svc_jupe = @import("svc_jupe.zig");
 const svc_login_throttle = @import("svc_login_throttle.zig");
 const svc_memo_forward = @import("svc_memo_forward.zig");
 const svc_memo_ignore = @import("svc_memo_ignore.zig");
+const svc_operaudit = @import("svc_operaudit.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
@@ -2174,6 +2175,9 @@ pub const LinuxServer = struct {
     /// once the threshold is crossed. Always on (security guard) with the module's
     /// default policy (5 failures within the half-life → 60s cooldown).
     login_throttle: svc_login_throttle.Throttle,
+    /// Operator-action audit ring: a bounded, queryable log of privileged actions
+    /// (KILL, JUPE, WARD bans, override use) for accountability. Read via AUDIT.
+    oper_audit: svc_operaudit.OperAudit,
     /// Network-wide clone aggregate: local + per-peer connection counts keyed by
     /// salted-IP-hash, for the `max_clones_per_ip_net` cap. Inert when that cap is 0.
     mesh_clones: mesh_clones_mod.MeshClones,
@@ -2620,6 +2624,7 @@ pub const LinuxServer = struct {
                 .window_ms = @max(@as(u64, 1), config.throttle_window_ms),
             }) else null,
             .login_throttle = svc_login_throttle.Throttle.init(allocator, .{}),
+            .oper_audit = svc_operaudit.OperAudit.init(allocator),
             .mesh_clones = mesh_clones_mod.MeshClones.init(allocator),
             .clone_key = deriveCloneKey(config.mesh_pass),
             .reputation = ip_reputation_mod.IpReputation.init(allocator, .{
@@ -2882,6 +2887,7 @@ pub const LinuxServer = struct {
         self.clone_limit.deinit();
         if (self.conn_throttle) |*t| t.deinit();
         self.login_throttle.deinit();
+        self.oper_audit.deinit();
         self.mesh_clones.deinit();
         self.nick_delay.deinit();
         self.reputation.deinit();
@@ -10598,6 +10604,7 @@ pub const LinuxServer = struct {
         else
             (std.fmt.bufPrint(&kev_buf, "{s} killed {s} ({s})", .{ real_killer, target_nick, reason }) catch reason);
         try self.publishOperEvent(.kill, .warn, kev);
+        self.recordOperAudit(real_killer, .kill, target_nick, reason);
     }
 
     /// Disconnect a LOCAL client as a KILL: deliver its KILL line + an ERROR close,
@@ -12334,6 +12341,7 @@ pub const LinuxServer = struct {
         var b: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s}", .{ match.token(), pattern, scope.token(), action.token() }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
+        self.recordOperAudit(conn.session.displayName(), .kline, pattern, if (reason.len != 0) reason else note);
     }
 
     fn deleteWardLive(self: *LinuxServer, conn: *ConnState, match: warden.Match, pattern: []const u8) !void {
@@ -14120,6 +14128,7 @@ pub const LinuxServer = struct {
                 var nb: [384]u8 = undefined;
                 const nl = std.fmt.bufPrint(&nb, ":{s} NOTICE {s} :JUPE added: {s} (takes effect on next peer activity)\r\n", .{ srv, nick, req.pattern }) catch return;
                 try appendToConn(conn, nl);
+                self.recordOperAudit(nick, .jupe, req.pattern, req.reason);
             },
             .remove => |pattern| {
                 const removed = self.server_jupe.remove(pattern);
@@ -20405,6 +20414,49 @@ pub const LinuxServer = struct {
         }) catch return;
         self.publishOperEvent(.oper_action, .notice, msg) catch {};
         self.publishOperEvent(.security, .notice, msg) catch {};
+        self.recordOperAudit(conn.session.displayName(), .other, target, msg);
+    }
+
+    /// Append one privileged action to the oper-action audit ring. Best-effort:
+    /// an allocation failure drops the record rather than faulting the action's
+    /// hot path. `ts` is the daemon clock.
+    fn recordOperAudit(self: *LinuxServer, oper: []const u8, action: svc_operaudit.Action, target: []const u8, reason: []const u8) void {
+        _ = self.oper_audit.record(self.nowMs(), oper, action, target, reason) catch {};
+    }
+
+    /// `AUDIT [oper] [count]` — dump the oper-action audit ring, most recent first.
+    /// A leading non-numeric arg filters to one operator's actions. Gated on the
+    /// audit_read privilege (the same priv guarding the DEBUG flight recorder).
+    pub fn handleAudit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (!self.requirePriv(conn, .audit_read)) return;
+        const params = parsed.paramSlice();
+        var oper_filter: ?[]const u8 = null;
+        var count: usize = 20;
+        if (params.len >= 1) {
+            if (std.fmt.parseInt(usize, params[0], 10)) |n| {
+                count = std.math.clamp(n, 1, 200);
+            } else |_| {
+                oper_filter = params[0];
+                if (params.len >= 2) count = std.math.clamp(std.fmt.parseInt(usize, params[1], 10) catch 20, 1, 200);
+            }
+        }
+        const entries = (if (oper_filter) |o|
+            self.oper_audit.filterByOper(self.allocator, o, count)
+        else
+            self.oper_audit.recent(self.allocator, count)) catch {
+            try self.noticeTo(conn, "AUDIT: temporarily unavailable");
+            return;
+        };
+        defer self.allocator.free(entries);
+        for (entries) |e| {
+            var lb: [default_reply_bytes]u8 = undefined;
+            const tgt = if (e.target.len != 0) e.target else "-";
+            const ln = std.fmt.bufPrint(&lb, ":{s} NOTE AUDIT :#{d} {s} {s} {s} :{s}\r\n", .{ self.serverName(), e.seq, e.oper, e.action.label(), tgt, e.reason }) catch continue;
+            try appendToConn(conn, ln);
+        }
+        var eb: [128]u8 = undefined;
+        const end = std.fmt.bufPrint(&eb, ":{s} NOTE AUDIT :End of audit ({d})\r\n", .{ self.serverName(), entries.len }) catch return;
+        try appendToConn(conn, end);
     }
 
     /// Whether `session` should receive a `category` event with subject `subject`:
@@ -30448,6 +30500,52 @@ test "threaded server: local KILL disconnects the victim; unknown nick is 401" {
     o.reset();
     try writeAllFd(fd_o, "KILL ghost :x\r\n");
     try recvUntil(&o, " 401 O ghost ", 300);
+}
+
+test "threaded server: AUDIT logs privileged actions (KILL, JUPE)" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_v = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_v);
+    var o = LiveClient{ .fd = fd_o };
+    var v = LiveClient{ .fd = fd_v };
+
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(&o, " 381 O ", 300);
+    try writeAllFd(fd_v, "NICK V\r\nUSER v 0 * :V\r\n");
+    try recvUntil(&v, " 001 V ", 200);
+
+    // Two privileged actions: a KILL and a JUPE.
+    try writeAllFd(fd_o, "KILL V :spam\r\n");
+    try recvUntil(&v, "Killed", 300);
+    try writeAllFd(fd_o, "JUPE evil.example.net 0 :rogue\r\n");
+    try recvUntil(&o, "JUPE added: evil.example.net", 300);
+
+    // AUDIT (newest first) shows both actions with actor/target/reason.
+    o.reset();
+    try writeAllFd(fd_o, "AUDIT\r\n");
+    try recvUntil(&o, "O jupe evil.example.net :rogue", 300);
+    try recvUntil(&o, "End of audit", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "O kill V :spam") != null);
+
+    // Filtering by a different oper yields no entries.
+    o.reset();
+    try writeAllFd(fd_o, "AUDIT nobody\r\n");
+    try recvUntil(&o, "End of audit (0)", 300);
 }
 
 test "threaded server: IDENTIFY brute-force throttle locks after repeated failures" {
