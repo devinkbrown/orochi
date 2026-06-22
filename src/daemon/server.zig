@@ -27,6 +27,8 @@ const svc_login_throttle = @import("svc_login_throttle.zig");
 const svc_memo_forward = @import("svc_memo_forward.zig");
 const svc_memo_ignore = @import("svc_memo_ignore.zig");
 const svc_operaudit = @import("svc_operaudit.zig");
+const svc_sessionview = @import("svc_sessionview.zig");
+const svc_successor = @import("svc_successor.zig");
 const svc_forceaction = @import("svc_forceaction.zig");
 const svc_masskick = @import("svc_masskick.zig");
 const svc_tempmode = @import("svc_tempmode.zig");
@@ -13072,6 +13074,58 @@ pub const LinuxServer = struct {
         trace.emitTrace(ctx, &.{trace.TraceEntry{ .end = self.serverName() }}, &scratch, &sink) catch {};
     }
 
+    /// `SESSIONS [filter]` (oper) — a filtered, sorted connection view rendered as
+    /// RPL_TRACE* numerics. Richer than TRACE: filter tokens are `oper`/`user`,
+    /// `tls`/`clear`, a bare nick glob, or `key=value` (account=, ip=, sort=, limit=
+    /// …). Spans all reactor shards (read-only under the world lock).
+    pub fn handleSessions(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        // Operator gate enforced by the registry (access=.oper).
+        const query_raw = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "";
+        const query = svc_sessionview.parseFilter(query_raw) catch {
+            try self.noticeTo(conn, "SESSIONS: invalid filter (try: oper|user, tls|clear, account=<glob>, ip=<glob>, sort=connected, limit=N)");
+            return;
+        };
+
+        const max_facts = 1024;
+        var facts_buf: [max_facts]svc_sessionview.ConnectionFact = undefined;
+        var n: usize = 0;
+        const now = self.nowMs();
+        outer: for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                if (n >= max_facts) break :outer;
+                const c = entry.value;
+                if (c.s2s != null or c.s2s_secured != null) continue; // skip peer links
+                if (!c.session.registered()) continue;
+                const age: u64 = @intCast(@max(@as(i64, 0), now - c.connected_at_ms));
+                facts_buf[n] = .{
+                    .nick = c.session.displayName(),
+                    .account = c.session.account(),
+                    .ip = c.session.realHost(),
+                    .connected_ms = age,
+                    .is_oper = c.session.isOper(),
+                    .is_tls = c.is_tls,
+                };
+                n += 1;
+            }
+        }
+
+        var out_buf: [max_facts]svc_sessionview.ConnectionFact = undefined;
+        const view = svc_sessionview.buildView(facts_buf[0..n], query, &out_buf) catch {
+            try self.noticeTo(conn, "SESSIONS: too many matches; narrow the filter or add limit=N");
+            return;
+        };
+        const fmt = svc_sessionview.Formatter.init(self.serverName(), conn.session.displayName());
+        for (view.rows) |row| {
+            var lb: [default_reply_bytes]u8 = undefined;
+            const ln = fmt.traceLine(&lb, row) catch continue;
+            try appendToConn(conn, ln);
+        }
+        var eb: [128]u8 = undefined;
+        const end = fmt.endOfTrace(&eb, "") catch return;
+        try appendToConn(conn, end);
+    }
+
     /// `ETRACE` (oper) — extended TRACE: one RPL_ETRACE (709) line per local
     /// registered user with class, nick, user, visible+real host, account, and
     /// real name; terminated by RPL_TRACEEND (262). Read-only.
@@ -18021,6 +18075,8 @@ pub const LinuxServer = struct {
             return;
         };
         self.loginRecordSuccess(conn, account);
+        // Hand any channels this account founded to their configured successors.
+        self.promoteSuccessorsForDroppedFounder(account);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :Account {s} dropped\r\n", .{ self.serverName(), conn.session.displayName(), account }) catch return;
         try appendToConn(conn, line);
@@ -18056,6 +18112,119 @@ pub const LinuxServer = struct {
             return;
         };
         try self.noticeTo(conn, "SETPASS: your password has been changed");
+    }
+
+    /// `SUCCESSOR <#channel> SHOW|SET <account>|CLEAR` — a registered channel's
+    /// founder heir. If the founder's account is later dropped, the channel is
+    /// handed to its configured successor (see handleDrop). SET/CLEAR require the
+    /// caller to be the channel founder or an operator.
+    pub fn handleSuccessor(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "SUCCESSOR", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const params = parsed.paramSlice();
+        if (params.len < 1 or params[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SUCCESSOR"}, "Usage: SUCCESSOR <#channel> SHOW|SET <account>|CLEAR");
+            return;
+        }
+        const channel = params[0];
+        const action = if (params.len >= 2) params[1] else "SHOW";
+
+        if (std.ascii.eqlIgnoreCase(action, "SHOW")) {
+            var sb: [160]u8 = undefined;
+            var nb: [256]u8 = undefined;
+            const nl = if (svc.channelSuccessorGet(channel, &sb)) |acct|
+                std.fmt.bufPrint(&nb, ":{s} NOTE SUCCESSOR :{s} successor is {s}\r\n", .{ self.serverName(), channel, acct }) catch return
+            else
+                std.fmt.bufPrint(&nb, ":{s} NOTE SUCCESSOR :{s} has no successor\r\n", .{ self.serverName(), channel }) catch return;
+            try appendToConn(conn, nl);
+            return;
+        }
+
+        // SET/CLEAR are founder-gated (operators may always manage).
+        const is_founder = blk: {
+            const a = conn.session.account() orelse break :blk false;
+            const lvl = (svc.channelAccessLevelFor(channel, a) catch break :blk false) orelse break :blk false;
+            break :blk lvl == .founder;
+        };
+        if (!is_founder and !conn.session.isOper()) {
+            try self.failReply(conn, "SUCCESSOR", "NOT_FOUNDER", "Only the channel founder may set its successor");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(action, "CLEAR")) {
+            svc.channelSuccessorClear(channel) catch {};
+            try self.noticeTo(conn, "SUCCESSOR: cleared");
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(action, "SET")) {
+            if (params.len < 3 or params[2].len == 0) {
+                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SUCCESSOR"}, "Usage: SUCCESSOR <#channel> SET <account>");
+                return;
+            }
+            const account = params[2];
+            _ = svc.accountInfo(account) catch {
+                try self.failReply(conn, "SUCCESSOR", "ACCOUNT_UNKNOWN", "No such account");
+                return;
+            };
+            svc.channelSuccessorSet(channel, account) catch {
+                try self.failReply(conn, "SUCCESSOR", "INVALID_VALUE", "Could not set successor");
+                return;
+            };
+            var nb: [256]u8 = undefined;
+            const nl = std.fmt.bufPrint(&nb, ":{s} NOTE SUCCESSOR :{s} successor set to {s}\r\n", .{ self.serverName(), channel, account }) catch return;
+            try appendToConn(conn, nl);
+            return;
+        }
+        try self.failReply(conn, "SUCCESSOR", "INVALID_SUBCOMMAND", "Use SHOW, SET <account>, or CLEAR");
+    }
+
+    /// After an account is dropped, hand each channel it founded to that channel's
+    /// configured successor (svc_successor.decideFounderSuccession with the stored
+    /// successor). Channels with no successor are left as-is. Best-effort.
+    fn promoteSuccessorsForDroppedFounder(self: *LinuxServer, dropped_account: []const u8) void {
+        const svc = self.account_services orelse return;
+        // Collect channels founded by the dropped account (can't transfer inside
+        // the services-locked iteration, so snapshot names first).
+        var founded: [64][128]u8 = undefined;
+        var founded_len: [64]u8 = undefined;
+        var n: usize = 0;
+        const Ctx = struct {
+            founded: *[64][128]u8,
+            founded_len: *[64]u8,
+            n: *usize,
+        };
+        var ctx = Ctx{ .founded = &founded, .founded_len = &founded_len, .n = &n };
+        svc.channelsForAccount(dropped_account, &ctx, struct {
+            fn cb(c: *Ctx, channel: []const u8, level: services_mod.AccessLevel) void {
+                if (level != .founder) return;
+                if (c.n.* >= c.founded.len or channel.len > 128) return;
+                @memcpy(c.founded[c.n.*][0..channel.len], channel);
+                c.founded_len[c.n.*] = @intCast(channel.len);
+                c.n.* += 1;
+            }
+        }.cb);
+
+        var scratch: [1024]u8 = undefined;
+        for (0..n) |i| {
+            const channel = founded[i][0..founded_len[i]];
+            var sb: [160]u8 = undefined;
+            const successor = svc.channelSuccessorGet(channel, &sb) orelse continue;
+            const decision = svc_successor.decideFounderSuccession(.{
+                .channel = channel,
+                .founder = dropped_account,
+                .reason = .dropped,
+                .configured_successor = successor,
+            });
+            switch (decision) {
+                .transfer => |t| {
+                    _ = svc.transferChannel(channel, dropped_account, t.new_founder, &scratch) catch continue;
+                    svc.channelSuccessorClear(channel) catch {};
+                    var nb: [320]u8 = undefined;
+                    const note = std.fmt.bufPrint(&nb, "SUCCESSOR: {s} handed to {s} (founder {s} dropped)", .{ channel, t.new_founder, dropped_account }) catch continue;
+                    self.publishOperEvent(.oper_action, .notice, note) catch {};
+                },
+                .mark_for_deletion => {}, // no successor eligible; leave the channel as-is
+            }
+        }
     }
 
     /// `ACCOUNTINFO [account]` — report account name + flags (self if omitted).
@@ -30691,6 +30860,104 @@ test "threaded server: SETPASS changes an account password (verified by re-login
     try recvUntil(&c2, "Invalid account or password", 300);
     try writeAllFd(fd2, "IDENTIFY bob newpassword99\r\n");
     try recvUntil(&c2, "You are now identified as bob", 300);
+}
+
+test "threaded server: SUCCESSOR hands a dropped founder's channel to its successor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-successor.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+    _ = try services.registerAccount("carol", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :A\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IDENTIFY alice correcthorse\r\n");
+    try recvUntil(&a, "You are now identified as alice", 300);
+    // alice founds #ch and designates bob as successor.
+    try writeAllFd(fd_a, "CHANNEL REGISTER #ch\r\n");
+    try recvUntil(&a, "Channel #ch registered to alice", 300);
+    try writeAllFd(fd_a, "SUCCESSOR #ch SET bob\r\n");
+    try recvUntil(&a, "#ch successor set to bob", 300);
+    a.reset();
+    try writeAllFd(fd_a, "SUCCESSOR #ch SHOW\r\n");
+    try recvUntil(&a, "#ch successor is bob", 300);
+
+    // alice DROPs her account -> #ch is handed to bob.
+    try writeAllFd(fd_a, "DROP alice correcthorse\r\n");
+    try recvUntil(&a, "Account alice dropped", 300);
+
+    // bob is now the founder: he can manage #ch's successor (founder-gated), which
+    // a non-founder could not.
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&b, "You are now identified as bob", 300);
+    try writeAllFd(fd_b, "SUCCESSOR #ch SET carol\r\n");
+    try recvUntil(&b, "#ch successor set to carol", 300);
+}
+
+test "threaded server: SESSIONS lists connections and filters (oper)" {
+    var server = Server.init(std.testing.allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    const fd_u = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_u);
+    var o = LiveClient{ .fd = fd_o };
+    var u = LiveClient{ .fd = fd_u };
+
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK O\r\nUSER o 0 * :O\r\n");
+    try recvUntil(&o, " 381 O ", 300);
+    try writeAllFd(fd_u, "NICK Plainuser\r\nUSER p 0 * :P\r\n");
+    try recvUntil(&u, " 001 Plainuser ", 200);
+
+    // Unfiltered: both the oper and the plain user appear.
+    o.reset();
+    try writeAllFd(fd_o, "SESSIONS\r\n");
+    try recvUntil(&o, "End of SESSION view", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "Plainuser") != null);
+
+    // Filtered to opers: the plain user is excluded.
+    o.reset();
+    try writeAllFd(fd_o, "SESSIONS oper\r\n");
+    try recvUntil(&o, "End of SESSION view", 300);
+    try std.testing.expect(std.mem.indexOf(u8, o.written(), "Plainuser") == null);
 }
 
 test "threaded server: TEGAMI FORWARD redirects an account's memos and rejects a self-cycle" {

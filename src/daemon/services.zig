@@ -1708,6 +1708,52 @@ pub const Services = struct {
         return out[0..n];
     }
 
+    // ── Durable registered-channel founder successor (svc_successor; SUCCESSOR) ──
+    // One successor account per channel in `.props` ("suc\x00<channel>"). When the
+    // founder's account is dropped, the channel is handed to its successor.
+    const successor_prefix = "suc\x00";
+    const successor_key_max: usize = successor_prefix.len + channel_max;
+
+    fn successorKey(buf: []u8, channel: []const u8) ?[]const u8 {
+        if (channel.len == 0 or channel.len > channel_max) return null;
+        if (buf.len < successor_prefix.len + channel.len) return null;
+        @memcpy(buf[0..successor_prefix.len], successor_prefix);
+        for (channel, 0..) |c, i| buf[successor_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. successor_prefix.len + channel.len];
+    }
+
+    /// Set `account` (normalized) as `channel`'s configured successor.
+    pub fn channelSuccessorSet(self: *Services, channel: []const u8, account: []const u8) ServiceError!void {
+        const acc = try accountKey(account);
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [successor_key_max]u8 = undefined;
+        const k = successorKey(&kb, channel) orelse return error.InvalidChannel;
+        try self.store.family(.props).put(k, acc.asSlice());
+    }
+
+    /// Remove `channel`'s configured successor. No-op when unset.
+    pub fn channelSuccessorClear(self: *Services, channel: []const u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [successor_key_max]u8 = undefined;
+        const k = successorKey(&kb, channel) orelse return;
+        try self.store.family(.props).delete(k);
+    }
+
+    /// Copy `channel`'s configured successor account into `out`, or null if unset.
+    pub fn channelSuccessorGet(self: *Services, channel: []const u8, out: []u8) ?[]const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [successor_key_max]u8 = undefined;
+        const k = successorKey(&kb, channel) orelse return null;
+        const blob = self.store.family(.props).get(k) orelse return null;
+        if (blob.len == 0) return null;
+        const n = @min(blob.len, out.len);
+        @memcpy(out[0..n], blob[0..n]);
+        return out[0..n];
+    }
+
     pub fn replayLiveState(self: *Services, sink: LiveReplaySink) ServiceError!LiveReplaySummary {
         self.lock.lockShared();
         defer self.lock.unlockShared();

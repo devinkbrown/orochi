@@ -92,6 +92,10 @@ fn trace(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleTrace(x.conn);
 }
+fn sessions(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleSessions(x.conn, x.parsed);
+}
 fn etrace(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleEtrace(x.conn);
@@ -169,6 +173,7 @@ pub const module = registry.Module{
         .{ .name = "USERIP", .access = .oper, .handler = userip },
         .{ .name = "DEBUG", .access = .oper, .handler = debug },
         .{ .name = "AUDIT", .access = .oper, .handler = audit },
+        .{ .name = "SESSIONS", .access = .oper, .handler = sessions },
         .{ .name = "MESH", .access = .oper, .handler = mesh, .summary = "mesh peer/link health (NETSTAT)" },
         .{ .name = "NETSTAT", .access = .oper, .handler = mesh, .summary = "alias of MESH" },
         .{ .name = "ROUTE", .access = .oper, .handler = route, .summary = "mesh routing table" },

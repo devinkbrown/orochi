@@ -235,7 +235,6 @@ pub const svc_operaudit = @import("svc_operaudit.zig");
 pub const svc_recover = @import("svc_recover.zig");
 pub const svc_resv = @import("svc_resv.zig");
 pub const svc_sessionview = @import("svc_sessionview.zig");
-pub const svc_shun = @import("svc_shun.zig");
 pub const svc_successor = @import("svc_successor.zig");
 pub const svc_template = @import("svc_template.zig");
 pub const svc_tempmode = @import("svc_tempmode.zig");
@@ -516,7 +515,6 @@ test {
     _ = svc_recover;
     _ = svc_resv;
     _ = svc_sessionview;
-    _ = svc_shun;
     _ = svc_successor;
     _ = svc_template;
     _ = svc_tempmode;
