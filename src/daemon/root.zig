@@ -231,7 +231,6 @@ pub const svc_login_throttle = @import("svc_login_throttle.zig");
 pub const svc_masskick = @import("svc_masskick.zig");
 pub const svc_memo_forward = @import("svc_memo_forward.zig");
 pub const svc_memo_ignore = @import("svc_memo_ignore.zig");
-pub const svc_mlock = @import("svc_mlock.zig");
 pub const svc_nickhold = @import("svc_nickhold.zig");
 pub const svc_operaudit = @import("svc_operaudit.zig");
 pub const svc_operinfo = @import("svc_operinfo.zig");
@@ -519,7 +518,6 @@ test {
     _ = svc_masskick;
     _ = svc_memo_forward;
     _ = svc_memo_ignore;
-    _ = svc_mlock;
     _ = svc_nickhold;
     _ = svc_operaudit;
     _ = svc_operinfo;
