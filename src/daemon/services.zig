@@ -743,6 +743,45 @@ pub const Services = struct {
         return .{ .dropped_account = .{ .name = record.name } };
     }
 
+    /// Change an account's password after verifying the presented current one.
+    /// Errors: AuthFailed (wrong current password), InvalidPassword (new fails the
+    /// length policy or equals the current one). On success the new salt/hash are
+    /// persisted and the SCRAM mirror (if any) is re-derived so SCRAM logins track
+    /// the new password. All other account fields are preserved.
+    pub fn changeAccountPassword(
+        self: *Services,
+        name: []const u8,
+        old_password: []const u8,
+        new_password: []const u8,
+        scratch: []u8,
+    ) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var record = try self.loadAccount(name);
+        try verifyPassword(record, old_password, self.cfg.pbkdf2_rounds);
+        try validatePassword(new_password);
+        // A change must actually change the password.
+        if (std.mem.eql(u8, old_password, new_password)) return error.InvalidPassword;
+
+        var salt: [salt_len]u8 = undefined;
+        self.store.io.randomSecure(&salt) catch self.store.io.random(&salt);
+        var hash: [hash_len]u8 = undefined;
+        try hashPassword(&hash, new_password, &salt, self.cfg.pbkdf2_rounds);
+        record.salt = salt;
+        record.hash = hash;
+
+        const encoded = try encodeAccount(record, scratch);
+        try self.store.family(.accounts).put(record.name.asSlice(), encoded);
+
+        // Re-derive the SCRAM credential so a SCRAM-SHA-256 login uses the new
+        // password; a mirror failure must not roll back the persisted change.
+        if (self.scram) |scram| {
+            scram.deriveAndStore(record.name.asSlice(), new_password) catch return error.InvalidRecord;
+            self.persistScram(scram, record.name.asSlice());
+        }
+    }
+
     pub fn ghostAccount(self: *Services, name: []const u8, password: []const u8, nick: []const u8) ServiceError!CommandResult {
         self.lock.lockShared();
         defer self.lock.unlockShared();

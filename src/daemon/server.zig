@@ -18026,6 +18026,38 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// `SETPASS <current-password> <new-password>` — change the logged-in account's
+    /// password after verifying the current one. The new password must satisfy the
+    /// length policy (8-512) and differ from the current one. SCRAM credentials are
+    /// re-derived so SCRAM logins keep working.
+    pub fn handleSetpass(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "SETPASS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const account = conn.session.account() orelse {
+            try self.failReply(conn, "SETPASS", "ACCOUNT_REQUIRED", "Log in to change your password");
+            return;
+        };
+        if (parsed.param_count < 2 or parsed.paramSlice()[0].len == 0 or parsed.paramSlice()[1].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SETPASS"}, "Usage: SETPASS <current-password> <new-password>");
+            return;
+        }
+        var scratch: [1024]u8 = undefined;
+        svc.changeAccountPassword(account, parsed.paramSlice()[0], parsed.paramSlice()[1], &scratch) catch |err| {
+            const code: []const u8 = switch (err) {
+                error.AuthFailed => "WRONG_PASSWORD",
+                error.InvalidPassword => "INVALID_PASSWORD",
+                else => "TEMPORARILY_UNAVAILABLE",
+            };
+            const msg: []const u8 = switch (err) {
+                error.AuthFailed => "Current password is incorrect",
+                error.InvalidPassword => "New password rejected (8-512 chars, must differ from current)",
+                else => "Could not change password",
+            };
+            try self.failReply(conn, "SETPASS", code, msg);
+            return;
+        };
+        try self.noticeTo(conn, "SETPASS: your password has been changed");
+    }
+
     /// `ACCOUNTINFO [account]` — report account name + flags (self if omitted).
     pub fn handleAccountInfo(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "ACCOUNTINFO", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
@@ -30599,6 +30631,66 @@ test "threaded server: IDENTIFY brute-force throttle locks after repeated failur
     c.reset();
     try writeAllFd(fd, "IDENTIFY bob correcthorse\r\n");
     try recvUntil(&c, "Too many failed login attempts", 300);
+}
+
+test "threaded server: SETPASS changes an account password (verified by re-login)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-setpass.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+    try writeAllFd(fd, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&c, " 001 B ", 200);
+    try writeAllFd(fd, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&c, "You are now identified as bob", 300);
+
+    // Wrong current password is refused.
+    c.reset();
+    try writeAllFd(fd, "SETPASS wrongcurrent newpassword99\r\n");
+    try recvUntil(&c, "FAIL SETPASS WRONG_PASSWORD", 300);
+    // A too-short new password is refused by policy.
+    c.reset();
+    try writeAllFd(fd, "SETPASS correcthorse short\r\n");
+    try recvUntil(&c, "FAIL SETPASS INVALID_PASSWORD", 300);
+    // Valid change succeeds.
+    c.reset();
+    try writeAllFd(fd, "SETPASS correcthorse newpassword99\r\n");
+    try recvUntil(&c, "SETPASS: your password has been changed", 300);
+
+    // The change persisted: a fresh connection logs in with the NEW password and
+    // the old one no longer works.
+    const fd2 = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd2);
+    var c2 = LiveClient{ .fd = fd2 };
+    try writeAllFd(fd2, "NICK B2\r\nUSER b 0 * :B2\r\n");
+    try recvUntil(&c2, " 001 B2 ", 200);
+    try writeAllFd(fd2, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&c2, "Invalid account or password", 300);
+    try writeAllFd(fd2, "IDENTIFY bob newpassword99\r\n");
+    try recvUntil(&c2, "You are now identified as bob", 300);
 }
 
 test "threaded server: TEGAMI FORWARD redirects an account's memos and rejects a self-cycle" {
