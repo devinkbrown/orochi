@@ -74,6 +74,10 @@ pub const EntryType = enum {
     grant,
     nochannel,
     nonick,
+    // HOLDNICK reserves a nick glob: a matching nick is refused UNLESS the user is
+    // GRANT-exempt (a trusted hostmask) or an operator. Unlike NONICK (a flat
+    // forbid for everyone), a reservation holds the pattern for authorized use.
+    holdnick,
 
     pub fn token(self: EntryType) []const u8 {
         return switch (self) {
@@ -82,6 +86,7 @@ pub const EntryType = enum {
             .grant => "GRANT",
             .nochannel => "NOCHANNEL",
             .nonick => "NONICK",
+            .holdnick => "HOLDNICK",
         };
     }
 
@@ -91,6 +96,7 @@ pub const EntryType = enum {
         if (std.ascii.eqlIgnoreCase(raw, "GRANT")) return .grant;
         if (std.ascii.eqlIgnoreCase(raw, "NOCHANNEL")) return .nochannel;
         if (std.ascii.eqlIgnoreCase(raw, "NONICK")) return .nonick;
+        if (std.ascii.eqlIgnoreCase(raw, "HOLDNICK")) return .holdnick;
         return null;
     }
 };
@@ -235,6 +241,17 @@ pub const ServerAccessStore = struct {
     pub fn matchNick(self: *const ServerAccessStore, nick: []const u8) ?Entry {
         for (self.entries.items) |*entry| {
             if (entry.entry_type != .nonick) continue;
+            if (listx.globMatch(entry.mask, nick)) return entry.view();
+        }
+        return null;
+    }
+
+    /// First HOLDNICK reservation whose glob matches `nick`, or null. The caller
+    /// allows the nick anyway for GRANT-exempt / operator users (the reservation
+    /// holds the pattern for authorized use, unlike the flat NONICK forbid).
+    pub fn matchHoldNick(self: *const ServerAccessStore, nick: []const u8) ?Entry {
+        for (self.entries.items) |*entry| {
+            if (entry.entry_type != .holdnick) continue;
             if (listx.globMatch(entry.mask, nick)) return entry.view();
         }
         return null;
@@ -498,7 +515,7 @@ fn validateMaskWith(comptime limits: Params, entry_type: EntryType, mask: []cons
         .nochannel => {
             if (!validChannelMaskPrefix(mask)) return error.InvalidMask;
         },
-        .nonick => {
+        .nonick, .holdnick => {
             if (mask[0] == '#') return error.InvalidMask;
             for (mask) |byte| {
                 if (byte == '!' or byte == '@') return error.InvalidMask;

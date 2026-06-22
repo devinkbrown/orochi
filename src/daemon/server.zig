@@ -6107,11 +6107,29 @@ pub const LinuxServer = struct {
         _ = module_manifest.Live.callHook(.client_registered, self, &payload) catch {};
     }
 
+    /// A HOLDNICK reservation blocks `conn` from `nick` when the nick matches a
+    /// reservation glob AND the user is neither an operator nor GRANT-exempt (a
+    /// trusted hostmask). Returns the matched reservation when blocked. Fails
+    /// closed if the user's mask can't be built.
+    fn nickReservationBlocks(self: *LinuxServer, conn: *ConnState, nick: []const u8) ?ircx_saccess.Entry {
+        const entry = self.saccess.matchHoldNick(nick) orelse return null;
+        if (conn.session.isOper()) return null;
+        var mask_buf: [256]u8 = undefined;
+        const mask = clientPrefix(conn, &mask_buf) catch return entry;
+        if (self.saccess.matchHostmask(.grant, mask) != null) return null;
+        return entry;
+    }
+
     fn registerConnNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
         const nick = conn.session.displayName();
         if (std.mem.eql(u8, nick, "*")) return;
         if (self.saccess.matchNick(nick)) |entry| {
             try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{nick}, serverAccessReason(entry, "Nickname blocked by SACCESS"));
+            conn.closing = true;
+            return;
+        }
+        if (self.nickReservationBlocks(conn, nick)) |entry| {
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{nick}, serverAccessReason(entry, "Nickname is reserved"));
             conn.closing = true;
             return;
         }
@@ -17102,6 +17120,10 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{newnick}, serverAccessReason(entry, "Nickname blocked by SACCESS"));
             return;
         }
+        if (self.nickReservationBlocks(conn, newnick)) |entry| {
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{newnick}, serverAccessReason(entry, "Nickname is reserved"));
+            return;
+        }
         // Snapshot the old nick into a stack buffer: displayName() borrows the
         // session's inline nick buffer, which setNick() overwrites below — so the
         // post-setNick MONITOR transition must read this copy, not the alias.
@@ -26145,6 +26167,64 @@ test "threaded server: SACCESS GRANT overrides DENY at registration" {
     var denied = LiveClient{ .fd = fd_deny };
     try writeAllFd(fd_deny, "NICK Denied\r\nUSER d 0 * :Denied\r\n");
     try recvUntil(&denied, "ERROR :denied", 200);
+}
+
+test "threaded server: SACCESS HOLDNICK reserves a nick glob; opers bypass" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-saccess-holdnick.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // Admin opers up (gains service_admin), enables IRCX, reserves the Staff-* glob.
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    var admin = LiveClient{ .fd = fd_admin };
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try recvUntil(&admin, " 381 Oper ", 200);
+    try writeAllFd(fd_admin, "IRCX\r\n");
+    try recvUntil(&admin, " 800 Oper 1 0 ", 200);
+    admin.reset();
+    try writeAllFd(fd_admin, "SACCESS ADD HOLDNICK Staff-*\r\n");
+    try recvUntil(&admin, "801 Oper * HOLDNICK Staff-*", 200);
+
+    // A non-oper, non-GRANT client cannot take a reserved nick (nick-change path).
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    var c = LiveClient{ .fd = fd_c };
+    try writeAllFd(fd_c, "NICK Normaluser\r\nUSER n 0 * :N\r\n");
+    try recvUntil(&c, " 001 Normaluser ", 200);
+    c.reset();
+    try writeAllFd(fd_c, "NICK Staff-imposter\r\n");
+    try recvUntil(&c, " 432 Normaluser Staff-imposter :Nickname is reserved", 200);
+
+    // The operator bypasses the reservation and takes a reserved nick.
+    admin.reset();
+    try writeAllFd(fd_admin, "NICK Staff-Boss\r\n");
+    try recvUntil(&admin, "NICK", 200);
+    try recvUntil(&admin, "Staff-Boss", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " 432 ") == null);
 }
 
 test "threaded server: REGISTER star uses current nick and ACCOUNTSET rejects lifecycle flags" {
