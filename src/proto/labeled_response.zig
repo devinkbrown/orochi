@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 labeled-response framing helpers.
 //!
 //! Callers pass already-rendered IRC response lines and a caller-owned sink.

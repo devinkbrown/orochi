@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! T-digest: streaming quantile estimator with bounded centroids.
 //!
 //! Implements the t-digest algorithm described by Dunning & Ertl (2019).

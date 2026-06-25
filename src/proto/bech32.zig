@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bech32 (BIP-173) encode/decode for human-readable node-id and public-key
 //! display, e.g. rendering a 32-byte node key as `miz1...`.
 //!

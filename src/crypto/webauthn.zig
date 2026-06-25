@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! WebAuthn (FIDO2) assertion verification — server-side verify of a
 //! navigator.credentials.get() response for passkey login.
 //!

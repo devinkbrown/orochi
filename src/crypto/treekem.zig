@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! A small, self-contained TreeKEM-style ratchet tree.
 //!
 //! This module intentionally imports only Zig's standard library. It models an

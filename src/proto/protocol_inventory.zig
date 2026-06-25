@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Canonical protocol inventory — the single source of truth for the static
 //! RPL_ISUPPORT (005) tokens, the network name, and the channel-mode token the
 //! server advertises.

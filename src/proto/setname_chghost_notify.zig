@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-recipient identity-change notification fan-out helpers.
 //!
 //! Callers own channel membership and daemon state. This module only validates

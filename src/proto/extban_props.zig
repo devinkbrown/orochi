@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Property and fuzz-style tests for extended-ban parsing and matching.
 //!
 //! The generators are fixed-seed and bounded so direct `zig test` stays fast

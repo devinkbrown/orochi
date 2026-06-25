@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Orochi OBSERVE — operator observation subscriptions on the Event Spine.
 //!
 //! This is NOT a stateless "spy and dump" query. An operator declares a standing

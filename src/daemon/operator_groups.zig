@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Role-based operator groups for Orochi.
 //!
 //! Operator groups are named privilege bundles with optional parent links. They

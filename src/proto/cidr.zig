@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! CIDR / IP-range matching for D-lines and connection classes.
 //!
 //! Parses IPv4 and IPv6 networks in CIDR notation (`192.168.0.0/16`,

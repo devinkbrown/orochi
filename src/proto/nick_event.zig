@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! NICKCHANGE frame payload codec (S2S nick-change propagation).
 //!
 //! Carries one nick change for a remote user: the old and new nick plus the

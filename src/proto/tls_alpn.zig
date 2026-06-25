@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ALPN protocol-name-list codec (RFC 7301 §3.1).
 //!
 //! A pure, zero-allocation codec for the *inner* data of the ALPN extension:

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! End-to-end origin authentication for direct-owned S2S state frames.
 //!
 //! A node's identity is SELF-CERTIFYING: its 20-byte node id is

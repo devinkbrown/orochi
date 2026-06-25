@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure ACME HTTP-01 response helper.
 //!
 //! This module owns challenge tokens and key authorizations, parses a single

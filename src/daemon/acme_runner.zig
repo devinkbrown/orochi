@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Live ACME issuance orchestration: drives the `acme_client` state machine over
 //! real TLS 1.3 + HTTP/1.1 to a CA (e.g. Let's Encrypt), serving HTTP-01
 //! challenges from a `TokenStore` and writing the issued chain to disk.

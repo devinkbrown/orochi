@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! DTLS 1.2 handshake message layer (RFC 6347 §4.2.2).
 //!
 //! This is protocol framing only: 12-byte handshake headers, fragmentation

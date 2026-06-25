@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure, allocation-free email-address **syntax** validator.
 //!
 //! This module checks the lexical shape of an email address using a pragmatic,

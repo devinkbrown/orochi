@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Background weather/news cache for the `!weather`/`!news` fantasy commands.
 //!
 //! A single dedicated OS thread owns all outbound HTTP (via `http_fetch`, which

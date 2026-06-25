@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Read-Copy-Update (RCU) concurrent map — `RcuMap(K, V, Context)`.
 //!
 //! `RcuMap` is the lock-free-read concurrent map of Orochi's sharded reactor

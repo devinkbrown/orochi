@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-account SCRAM-SHA-256 + SCRAM-SHA-512 credential store for the Orochi
 //! IRC daemon.
 //!

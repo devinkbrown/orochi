@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QUIC v1 packet header coding and header-protection masking model.
 //!
 //! This module handles only RFC 9000 packet header structure. It deliberately

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QUIC-TLS (RFC 9001) initial secret derivation and header-protection.
 //!
 //! Implements:

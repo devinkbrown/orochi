@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Server-facing adapter for dispatching OroWasm plugins as IRC commands.
 //!
 //! The bridge keeps the daemon API small: load modules, find the plugin that

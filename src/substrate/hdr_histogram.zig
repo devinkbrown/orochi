@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! HDR (High Dynamic Range) histogram for latency recording with bounded relative error.
 //!
 //! Implements the HdrHistogram bucketing algorithm:

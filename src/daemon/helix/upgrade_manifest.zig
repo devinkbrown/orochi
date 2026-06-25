@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free wire codec for the Helix upgrade arena MANIFEST.
 //!
 //! The manifest is the table-of-contents written at the front of the handoff

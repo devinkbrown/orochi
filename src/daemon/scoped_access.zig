@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Unified scoped access-list storage for Orochi.
 //!
 //! A single ordered store carries both grants and restrictions. Entries own

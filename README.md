@@ -69,4 +69,19 @@ zig build run          # start the daemon (listens on 127.0.0.1:6680)
 ```
 
 ## License
-Clean-room — intentionally **not** inheriting ophion's GPL lineage. License TBD.
+**GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).**
+See [`LICENSE`](LICENSE) for the full text; every source file carries an SPDX header.
+
+Orochi is clean-room — it does **not** derive from ophion's code, so this license is
+chosen freely rather than inherited. AGPL is deliberate: Orochi is a network server, and
+§13 ("Remote Network Interaction") means **anyone who runs a modified Orochi as a
+network service — e.g. operating an IRC network — must offer that service's users the
+complete corresponding source of their modifications.** Running a private, unmodified
+copy carries no such obligation; the requirement attaches only to changes you put into
+service. The daemon advertises its source location (`INFO`/source URL) to satisfy §13's
+"prominent offer" for interactive network users.
+
+Copyright © 2026 Devin Brown. Orochi is free software: redistribute and/or modify it
+under the terms of the AGPL as published by the Free Software Foundation, either version
+3 or (at your option) any later version. Distributed WITHOUT ANY WARRANTY; see the
+license for details.

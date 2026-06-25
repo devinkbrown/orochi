@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Standalone LEB128 varint codec.
 //!
 //! This module is a self-contained, allocation-free LEB128 (Little Endian Base

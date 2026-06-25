@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Multi-session registry: account -> set of live client sessions (Phase 3).
 //!
 //! Orochi treats an *account* as the durable identity and each connection as a

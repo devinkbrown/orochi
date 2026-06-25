@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Compiled nick!user@host mask matching.
 //!
 //! Callers compile one full hostmask glob once, then reuse it against many

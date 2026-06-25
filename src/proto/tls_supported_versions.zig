@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.3 `supported_versions` extension inner codec (RFC 8446 §4.2.1).
 //!
 //! This module decodes and encodes the *inner data* of the

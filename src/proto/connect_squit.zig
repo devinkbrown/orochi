@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! CONNECT/SQUIT protocol parsing and reply builders.
 //!
 //! This module deliberately stops at typed requests and wire-line builders.

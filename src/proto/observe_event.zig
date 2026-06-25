@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! OBSERVE_EVENT frame payload codec (network-wide operator OBSERVE feed).
 //!
 //! Carries one OBSERVE lifecycle record between mesh peers: "on `origin_server`,

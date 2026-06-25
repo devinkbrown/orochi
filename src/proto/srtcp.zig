@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SRTCP packet protection (RFC 3711 §3.4): AES-128 Counter Mode encryption of
 //! the RTCP payload after the first 8 bytes, plus an HMAC-SHA1-80
 //! authentication tag over the encrypted packet and appended SRTCP index.

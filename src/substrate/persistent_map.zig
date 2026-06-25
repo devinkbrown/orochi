@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Persistent (immutable) hash array-mapped trie — PersistentMap(K, V, Context).
 //!
 //! This is a 32-way HAMT with **structural sharing** and **reference-counted

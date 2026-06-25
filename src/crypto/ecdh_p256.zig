@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Ephemeral ECDH over NIST P-256 (secp256r1) for TLS ECDHE key exchange.
 //!
 //! This module provides ephemeral Elliptic Curve Diffie-Hellman key agreement

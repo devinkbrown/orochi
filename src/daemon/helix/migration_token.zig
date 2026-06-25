@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! HMAC-signed migration token for Helix S2S session migration.
 //!
 //! The token is intentionally compact and canonical: all integer fields are

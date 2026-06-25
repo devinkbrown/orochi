@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 account-notify broadcast helpers.
 //!
 //! Channel membership and visibility are owned by the caller. This module

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Server-side IRCv3 STS policy builder/parser.
 //!
 //! This module is intentionally pure: callers provide config text and output

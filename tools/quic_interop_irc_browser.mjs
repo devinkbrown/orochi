@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Zero-dependency browser IRC-over-WebTransport interop harness (Node built-ins
 // only — no npm, no puppeteer).
 //

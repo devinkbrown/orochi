@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! WebTransport-over-QUIC datagram path over the Ryūsen transport seam.
 //!
 //! Composes the shipped wire codecs into the unreliable datagram pipeline a

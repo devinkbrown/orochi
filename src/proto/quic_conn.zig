@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Socketless QUIC v1 connection driver (RFC 9000 + RFC 9001) — layer 5.
 //!
 //! This ties the four tested layers below into a real connection. It is fully

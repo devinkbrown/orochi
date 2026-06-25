@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Nick-delay registry: holds a recently released nick for a configured window
 //! so it cannot be grabbed by a hijacker the instant its owner drops (the
 //! classic "nick camping" race, and services-bypass during netsplits/quits).

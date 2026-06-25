@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bounded cross-node route table for SUIMYAKU message fan-out.
 //!
 //! The table is pure state: callers own all I/O decisions and pass allocator

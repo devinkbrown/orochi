@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Reactor-independent buffering adapter around `s2s_peer.S2sPeer`.
 //!
 //! `s2s_peer` is a pure server-to-server connection driver that emits outbound

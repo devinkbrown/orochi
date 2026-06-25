@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! OPVIS video codec spike: lossless delta + run-length frames.
 //!
 //! A compact, deterministic, allocation-free building block for the OPVIS band,

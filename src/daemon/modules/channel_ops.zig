@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! channel.ops module — channel membership and moderation commands.
 //! Thin thunks delegating to existing LinuxServer handler bodies (behavior
 //! preserved; routing moved off the if-chain). See 17-module-system.md.

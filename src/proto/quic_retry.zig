@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QUIC v1 address validation: Retry, validation tokens, Version Negotiation,
 //! and the stateless-reset token derivation (RFC 9000 §8 / §17.2.1 / §17.2.5,
 //! RFC 9001 §5.8, RFC 9000 §10.3).

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Daemon-owned WebTransport listener (layer 7): the live UDP endpoint that
 //! turns the from-scratch QUIC (`quic_conn`) + HTTP/3 + WebTransport
 //! (`http3_conn`) stack into a real running server, and bridges each

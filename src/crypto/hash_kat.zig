@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Official known-answer tests for the typed hash, HMAC, and HKDF layer.
 //!
 //! Vectors are byte-exact from FIPS 180-4 SHA-2 examples, RFC 4231 HMAC-SHA256,

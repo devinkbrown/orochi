@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Fenwick tree / Binary Indexed Tree over i64 values.
 //!
 //! Public indexes are zero-based. `prefixSum(index)` and `rangeSum(left, right)`

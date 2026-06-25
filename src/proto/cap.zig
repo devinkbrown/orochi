@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 CAP negotiation state machine.
 //!
 //! Capabilities are represented as stable enum bits and advertised through a

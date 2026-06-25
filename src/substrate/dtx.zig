@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Discontinuous Transmission (DTX) and Comfort Noise Generation (CNG).
 //!
 //! DTX suppresses transmission during silence to save bandwidth. The sender

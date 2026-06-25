@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic self-test harness for the FULL Helix upgrade CHANNEL / WORLD
 //! state round-trip, exercised entirely in-process WITHOUT the real server.
 //!

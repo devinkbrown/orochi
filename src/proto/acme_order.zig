@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ACME (RFC 8555) order, authorization, and challenge JSON codecs.
 //!
 //! Parsers take an allocator and return owned structs. All string slices inside

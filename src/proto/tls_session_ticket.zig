@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.3 NewSessionTicket message codec (RFC 8446 section 4.6.1).
 //!
 //! This module is intentionally pure: it performs only byte-slice

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bridge: expose the in-process account `Services` as a SASL PLAIN verifier.
 //!
 //! The dispatch SASL handler (`dispatch.zig`) takes an injected

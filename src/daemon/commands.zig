@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Core IRC channel and message command handlers.
 //!
 //! `zig test src/daemon/commands.zig` makes `src/daemon` the module root, so

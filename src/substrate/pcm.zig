@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! PCM audio sample utilities.
 //!
 //! Provides i16<->f32 conversion, interleave/deinterleave for N channels,

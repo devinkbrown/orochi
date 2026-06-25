@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal FlexFEC-style XOR repair over a contiguous run of RTP payloads.
 //!
 //! This is deliberately smaller than RFC 8627: one FEC payload protects `L`

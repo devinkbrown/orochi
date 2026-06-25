@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.2 AEAD record layer.
 //!
 //! Implements the two modern AEAD record constructions used by TLS 1.2:

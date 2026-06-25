@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Dual-stack (IPv6 + IPv4-mapped) UDP socket for the WebTransport listener.
 //!
 //! A blocking `SOCK_DGRAM` socket opened on `AF_INET6` with `IPV6_V6ONLY=0`, so

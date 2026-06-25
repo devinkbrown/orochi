@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Ringlane io_uring reactor (skeleton).
 //!
 //! Ringlane is Orochi's Linux fast path (planning/05, "Ringlane I/O"): one

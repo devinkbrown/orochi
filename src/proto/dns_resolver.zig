@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Async DNS resolver core — the transaction multiplexer that sits between the
 //! pure wire codec (`dns.zig`) and a live datagram transport (io_uring UDP, the
 //! simulation reactor, or a test harness).

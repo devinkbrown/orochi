@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Helix health attestation and rollback policy.
 //!
 //! The old worker stays resumable until the replacement proves health. This file

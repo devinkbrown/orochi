@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Count-Min Sketch frequency estimation.
 //!
 //! The sketch stores a `depth x width` counter matrix and uses one

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure CRDT model for one IRC channel.
 //!
 //! Membership is an add-wins observed-remove set keyed by stable member id.

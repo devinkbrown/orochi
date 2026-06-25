@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Strict DNS response validation against cache-poisoning attacks.
 //!
 //! A forged or off-path DNS response can inject records the resolver never

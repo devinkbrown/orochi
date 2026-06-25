@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 #
 # Real WebTransport interop test for the Orochi from-scratch QUIC/HTTP3 stack,
 # driven by a REAL browser (headless Chromium) speaking the actual WebTransport

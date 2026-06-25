@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal age v1 binary format support for one X25519 recipient.
 //!
 //! This module is intentionally self-contained: it imports only Zig's standard

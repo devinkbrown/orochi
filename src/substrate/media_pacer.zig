@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free media send pacer.
 //!
 //! Callers supply a monotonic microsecond clock. The pacer never reads time

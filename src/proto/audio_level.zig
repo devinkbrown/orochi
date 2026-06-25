@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RFC 6464 / RFC 6465 audio-level header-extension value codec for Orochi.
 //!
 //! This module is a pure, allocation-free codec for the *typed value* layer of

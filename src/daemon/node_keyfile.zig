@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Persisted node identity seed: secured S2S on by default.
 //!
 //! When the operator configures no `[node] secret_key`, the daemon still turns

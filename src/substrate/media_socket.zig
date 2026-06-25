@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Live UDP media socket for the SFU transport plane (IPv4).
 //!
 //! A blocking `SOCK_DGRAM` socket that the media plane reads in a loop (on its

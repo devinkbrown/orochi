@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Socketless TLS 1.3 server handshake state machine for the inbound IRC-over-TLS
 //! listener. The daemon feeds raw bytes from the socket via `feed()` and writes
 //! back the returned flight; once `handshakeDone()` is true it streams

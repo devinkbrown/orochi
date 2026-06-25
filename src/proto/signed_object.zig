@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Canonically-signed structured objects.
 //!
 //! Composes the CoilPack canonical value layer (`coilpack_value`) with Ed25519

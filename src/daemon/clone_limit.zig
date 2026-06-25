@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure per-host connection-clone limiter.
 //!
 //! Tracks the number of concurrently live connections keyed by exact address,

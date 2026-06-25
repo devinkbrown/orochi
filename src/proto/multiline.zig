@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 draft/multiline batch assembler.
 //!
 //! Multiline batches are assembled into caller-owned storage. The hot path is

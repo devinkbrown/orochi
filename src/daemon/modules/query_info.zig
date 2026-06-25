@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! query.info module — stateless server-information query commands.
 //!
 //! First module migrated onto the SerpentRegistry live dispatch spine. Each

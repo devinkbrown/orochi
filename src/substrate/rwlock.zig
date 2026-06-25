@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Writer-preferring spin reader-writer lock.
 //!
 //! The daemon's world projection (channels, nicks, memberships) is read on every

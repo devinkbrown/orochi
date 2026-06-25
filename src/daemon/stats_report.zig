@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Web stats renderer — turns a server/channel statistics snapshot into a
 //! modern JSON document and a self-contained HTML dashboard for static hosting
 //! (e.g. an nginx `root` directory the daemon writes to periodically).

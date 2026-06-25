@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ACME (RFC 8555 §6.2) flattened JWS framing.
 //!
 //! This module assembles the on-the-wire JSON Web Signature objects that an

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! UTF-8 validation and IRC casemapping.
 //!
 //! This module is a small, allocation-free substrate helper for IRCv3

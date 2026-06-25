@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! OPER_EVENT frame payload codec (network-wide Event-Spine propagation).
 //!
 //! Carries one operator event between mesh peers: "on `origin_server`, a

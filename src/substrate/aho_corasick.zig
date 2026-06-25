@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Aho-Corasick multi-pattern byte-string matcher.
 //!
 //! The matcher is intended for filter-style scans over UTF-8 or raw byte

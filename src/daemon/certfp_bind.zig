@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Account ⇄ TLS client-certificate-fingerprint bindings for SASL EXTERNAL.
 //!
 //! A logged-in user binds the fingerprint of the client cert they presented

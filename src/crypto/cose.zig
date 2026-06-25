@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal COSE_Sign1 and COSE_Mac0 support for WebAuthn/attestation.
 //!
 //! This file is self-contained by design: it implements only the definite-length

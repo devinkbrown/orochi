@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! WASM browser transport shim export surface (#32).
 //!
 //! Compiled to `wasm32-freestanding` (`zig build wasm`), this exposes the

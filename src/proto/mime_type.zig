@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Static MIME type lookup for uploaded filenames.
 //!
 //! The table is intentionally fixed and allocation-free. Callers pass a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! MIC relay compatibility model for comic-prefixed chat text.
 //!
 //! The daemon still owns negotiation and delivery. This module only models the

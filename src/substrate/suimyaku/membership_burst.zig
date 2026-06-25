@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic local membership burst construction for fresh SUIMYAKU links.
 //!
 //! This module is a pure transform: callers provide a stable snapshot of this

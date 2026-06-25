@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Linux Helix handoff transport: sealed memfd arena and SCM_RIGHTS fd passing.
 //!
 //! The supervisor and workers exchange state through one sealed memfd and pass

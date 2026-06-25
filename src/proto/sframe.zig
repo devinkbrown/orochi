@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bounded SFrame media-frame protection for AES_128_GCM_SHA256.
 
 const std = @import("std");

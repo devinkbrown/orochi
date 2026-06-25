@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Regenerate the marker regions in each package root.zig from the files present.
 # Modules = sibling *.zig (except root.zig/main.zig) + subdirs containing root.zig.
 set -euo pipefail

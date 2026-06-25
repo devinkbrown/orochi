@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! CoilPack structured-value layer: a canonical, signature-stable document model.
 //!
 //! This is the higher layer above the atom primitives in `coilpack.zig`

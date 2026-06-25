@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic property and fuzz tests for IRC WHO and WHOX handling.
 const std = @import("std");
 const who = @import("who.zig");

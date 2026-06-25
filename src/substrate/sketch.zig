@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Probabilistic sketches for SUIMYAKU anti-entropy planning.
 //!
 //! Bloom filters and HyperLogLog counters are intentionally domain separated:

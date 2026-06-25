@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Fault Loom — deterministic fault injection for tests and simulation.
 //!
 //! The active path is compile-time gated. Debug and test builds can arm named

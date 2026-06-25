@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Tsumugi S2S secure-channel handshake.
 //!
 //! This is a compact Noise-IK-shaped AKE for Orochi S2S. Ed25519 is the

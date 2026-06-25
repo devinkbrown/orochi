@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Network-wide NICK claim MV-register.
 //!
 //! The register is pure state: every nick maps to active `{owner UID, HLC}`

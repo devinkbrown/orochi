@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! URL-safe Base64 (RFC 4648 §5) encode/decode helpers.
 //!
 //! This module exposes a small, stable convenience API around the standard

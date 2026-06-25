@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Oper-action audit ring.
 //!
 //! A bounded, fixed-capacity ring that records structured oper actions —

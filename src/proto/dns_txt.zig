@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure helpers for DNS TXT records (RR type 16, RFC 1035 §3.3.14).
 //!
 //! TXT rdata is one or more <character-string>s. Each character-string is a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Native kagura negative-ack helpers for Suimyaku media frames.
 //!
 //! This module keys retransmission and gap tracking by `kagura_frame`

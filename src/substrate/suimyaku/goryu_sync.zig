@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Verifiable rateless anti-entropy over origin-signed channel CRDT deltas.
 const std = @import("std");
 

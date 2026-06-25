@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Helix upgrade capsules: schema-versioned state records over CoilPack.
 //!
 //! A capsule is the only state shape that may cross a Orochi binary upgrade.

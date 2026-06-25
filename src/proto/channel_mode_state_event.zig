@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! CHANNEL_MODE_STATE frame payload codec (S2S parameter + IRCX flag sync).
 //!
 //! Carries the channel state that is not represented by the aggregate boolean

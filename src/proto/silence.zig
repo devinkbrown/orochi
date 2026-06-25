@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Server-side SILENCE ignore lists.
 //!
 //! Each owner has an allocator-owned list of nick!user@host masks. Incoming

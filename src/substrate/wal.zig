@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! In-memory write-ahead log and snapshot helpers for CRDT delta durability.
 //!
 //! The module deliberately avoids filesystem access. Callers own byte buffers,

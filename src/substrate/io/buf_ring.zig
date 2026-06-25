@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Ringlane provided-buffer ring bookkeeping.
 //!
 //! This module owns the pure, allocation-free state around io_uring

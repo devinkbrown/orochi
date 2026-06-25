@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 Strict Transport Security (STS).
 //!
 //! The module owns only STS value formatting/parsing and the client cache

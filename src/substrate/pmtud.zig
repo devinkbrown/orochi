@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Datagram Packetization Layer Path MTU Discovery (DPLPMTUD, RFC 8899).
 //!
 //! This module is transport-agnostic: it never opens sockets and never reads a

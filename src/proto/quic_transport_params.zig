@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QUIC transport parameters codec (RFC 9000 §18 / §18.2).
 //!
 //! QUIC carries its transport configuration as a TLS 1.3 extension

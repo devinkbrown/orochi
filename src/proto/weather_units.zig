@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Locale-correct weather unit formatting.
 //!
 //! Weather readings are stored canonically in metric (°C, km/h, mm) and rendered

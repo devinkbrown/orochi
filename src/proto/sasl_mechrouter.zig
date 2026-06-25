@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SASL mechanism router.
 //!
 //! This module is protocol-only. It consumes AUTHENTICATE base64 chunks and

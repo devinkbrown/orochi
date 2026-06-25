@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Spam trap registry for operator-designated nick and channel targets.
 //!
 //! The store is deliberately pure state: it tracks trap targets, records

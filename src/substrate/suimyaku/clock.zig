@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SUIMYAKU logical clock substrate.
 //!
 //! HLC gives mesh events a near-wall total order while dotted version vectors

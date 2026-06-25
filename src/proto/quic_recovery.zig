@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QUIC loss recovery + congestion control (RFC 9002) — layer 5b of the
 //! from-scratch QUIC stack. This is the controller `quic_conn.zig` drives:
 //! it records every ack-eliciting / in-flight packet on send, consumes the

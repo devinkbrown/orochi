@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Lock-free, RCU-backed core registries for the live IRC world.
 //!
 //! These are the hot-path lookup/delivery substrates. Readers traverse a

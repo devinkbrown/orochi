@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Tsumugi handshake session: drives the PQ-hybrid AKE to `Established` and
 //! bridges its authenticated 20-byte node id to the `u64` mesh routing handle a
 //! Suimyaku `s2s_peer` keys on.

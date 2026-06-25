@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure SASL EXTERNAL helpers.
 //!
 //! This module does no TLS, socket, or IRC session I/O. Callers provide the

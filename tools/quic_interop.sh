@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 #
 # Real QUIC/HTTP3 interop test for the Orochi from-scratch QUIC stack.
 #

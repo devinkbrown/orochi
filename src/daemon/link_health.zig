@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-peer S2S mesh link health tracker.
 //!
 //! Pure data structure + math: maintains live quality metrics for each mesh

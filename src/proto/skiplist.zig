@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Probabilistic ordered map from `u64` keys to caller-selected values.
 //!
 //! The structure owns every node it allocates. Values are copied into nodes and

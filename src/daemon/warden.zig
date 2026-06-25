@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Warden — the network ban registry. The network ban registry for admins and opers.
 //! checkpoints where travellers presented papers and were admitted or refused.
 //!

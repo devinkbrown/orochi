@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Generic PKCS#8 PrivateKeyInfo / OneAsymmetricKey outer wrapper.
 //!
 //! This module is algorithm-agnostic: it only parses and emits the DER wrapper

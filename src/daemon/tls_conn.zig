@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-connection TLS 1.3 adapter that drives `crypto/tls_server.Server` from the
 //! daemon's socket loop. The loop never touches the handshake state machine
 //! directly: it hands raw socket bytes to `onInbound()`, writes back the returned

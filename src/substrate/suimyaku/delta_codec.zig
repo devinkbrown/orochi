@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SUIMYAKU wire codec for Goryu CRDT deltas.
 //!
 //! The codec is intentionally a narrow wire layer: it canonicalizes and

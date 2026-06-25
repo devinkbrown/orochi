@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure observability spine: structured trace events, level/category filtering,
 //! sink dispatch, and a lock-free single-producer flight recorder.
 const std = @import("std");

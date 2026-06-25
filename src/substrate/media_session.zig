@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Media session: composes the shipped media primitives into a send/receive
 //! pipeline over the mesh's media bands (>=64).
 //!

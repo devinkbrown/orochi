@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! JUPE — server-name jupe store.
 //!
 //! The classic IRC JUPE: an operator forbids a SERVER name (glob) from linking

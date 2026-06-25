@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Daemon-owned media transport plane: ties the SFU endpoint registry
 //! (MediaTransport) to a live UDP MediaSocket and a background pump thread.
 //!

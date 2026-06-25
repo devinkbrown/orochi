@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free wire codec for a single channel's resumable world state.
 //!
 //! Companion to `conn_capsule.zig`: where that codec serializes per-connection

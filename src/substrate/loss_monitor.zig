@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Receiver-side RTP-style packet-loss statistics.
 //!
 //! This module computes RTCP receiver-report metrics from 16-bit sequence

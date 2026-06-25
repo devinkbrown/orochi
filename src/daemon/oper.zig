@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SASL-account operator privilege grants.
 //!
 //! This module is intentionally pure and allocation-free. The daemon's SASL

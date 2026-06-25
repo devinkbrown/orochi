@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! MaxMind DB (MMDB) GeoIP reader.
 //!
 //! Accepts a memory-mapped file or any caller-owned byte slice, parses the

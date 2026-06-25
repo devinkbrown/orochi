@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Clean-room RSA signature verification (public-key operations only).
 //!
 //! Implements RSASSA-PKCS1-v1_5 (RFC 8017 §8.2.2) and RSASSA-PSS (§8.1.2)

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 CHATHISTORY Lotus append log.
 //!
 //! Lotus stores per-target history as bounded append rings. Message content is

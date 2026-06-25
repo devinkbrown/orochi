@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure channel-forwarding logic (the classic `+f` forward target).
 //!
 //! When a JOIN is refused by `+i`/`+l`/`+b`/`+k`/`+r`, a channel may be

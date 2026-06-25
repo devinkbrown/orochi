@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Signed moderation proofs for Orochi policy decisions.
 //!
 //! A proof is a compact statement that an actor applied an action to a target

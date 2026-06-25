@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Server-side SCRAM-SHA-256 responder (RFC 5802 / RFC 7677).
 //!
 //! This file is intentionally a protocol library only. It consumes raw SCRAM

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Transport-wide congestion control feedback helpers.
 //!
 //! This module implements the RTP transport-wide sequence number extension and

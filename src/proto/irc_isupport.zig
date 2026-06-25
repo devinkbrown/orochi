@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 RPL_ISUPPORT (005) token building and parsing.
 //!
 //! This module is intentionally self-contained: it owns parsed keys and values,

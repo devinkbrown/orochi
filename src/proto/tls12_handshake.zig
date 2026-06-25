@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.2 handshake message body codecs (RFC 5246): pure byte-slice logic.
 
 const std = @import("std");

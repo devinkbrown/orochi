@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ENTITY_PROP frame payload codec (S2S IRCX user/member PROP convergence).
 //!
 //! Carries one last-writer-wins NON-CHANNEL property fact between mesh peers:

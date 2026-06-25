@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Sliding-window XOR FEC scheduler.
 //!
 //! This module groups equal-size source symbols into fixed generations of `K`

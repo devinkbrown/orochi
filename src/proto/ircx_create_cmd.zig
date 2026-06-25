@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCX CREATE command parser and reply builder.
 //!
 //! This command layer consumes the lower-level validation and initial JOIN/NAMES

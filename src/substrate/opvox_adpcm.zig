@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! OPVOX audio codec spike: IMA ADPCM (16-bit PCM <-> 4-bit).
 //!
 //! A compact, deterministic, allocation-free voice codec building block for the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free post-Helix-upgrade session resume planner.
 //!
 //! After an in-place Helix upgrade, the successor process is handed back two

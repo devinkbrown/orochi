@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure, allocation-free URL parser for a practical subset of RFC 3986.
 //!
 //! Targets the URL shapes the daemon actually handles: `http`, `https`,

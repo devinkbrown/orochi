@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! secure_fns — hardened, security-critical helper primitives for the daemon.
 //!
 //! This is the daemon's *stable* surface for the handful of low-level security

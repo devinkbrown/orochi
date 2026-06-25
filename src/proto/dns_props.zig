@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic property and fuzz-style tests for the DNS wire parser.
 const std = @import("std");
 const dns = @import("dns.zig");

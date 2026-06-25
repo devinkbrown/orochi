@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Monotonic server-time guard for the IRCv3 `server-time` message tag.
 //!
 //! The IRCv3 `server-time` tag carries a UTC timestamp so clients can render

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Fresh-boot runtime smoke test.
 
 Complements tools/upgrade_smoke.py (which exercises the SIGUSR2 hot upgrade).

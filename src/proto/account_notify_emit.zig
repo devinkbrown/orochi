@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Sink-oriented IRCv3 account-notify line emitters.
 //!
 //! `account_notify.zig` owns validation and the fixed-buffer ACCOUNT composer.

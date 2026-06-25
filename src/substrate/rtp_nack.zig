@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RTP Generic NACK helpers and a bounded sender retransmit buffer.
 //!
 //! Generic NACK is the RTP Feedback Control Information format from RFC 4585:

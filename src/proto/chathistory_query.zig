@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 draft/chathistory query model and selector parsing.
 //!
 //! This module handles the protocol-facing side of CHATHISTORY: parsing the

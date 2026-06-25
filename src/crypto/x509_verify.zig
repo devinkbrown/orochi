@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! X.509 verification helpers for TLS and CERTFP plumbing.
 //!
 //! This module consumes the local strict DER parser in x509.zig, computes

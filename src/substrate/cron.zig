@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! cron.zig — 5-field cron expression parser + next-fire calculator.
 //!
 //! Supports: ranges (1-5), steps (*/15, 10-30/5), lists (1,2,3),

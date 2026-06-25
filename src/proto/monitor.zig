@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 MONITOR state and reply emission.
 //!
 //! The module owns per-client monitor lists and a reverse index keyed by

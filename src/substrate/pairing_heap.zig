@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Addressable pairing heap — min-priority queue generic over a payload type.
 //!
 //! Supports O(log n) amortized extractMin, O(1) insert, O(log n) amortized

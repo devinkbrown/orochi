@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Identity bridge: canonical 20-byte node id  ->  u64 mesh routing handle.
 //!
 //! Orochi's SOLE identity is the 20-byte `BLAKE3-160(Ed25519 public key)` node

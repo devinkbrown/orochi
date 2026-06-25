@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RTCP Transport-Wide Congestion Control feedback packet codec.
 //!
 //! Implements the transport-cc feedback message from

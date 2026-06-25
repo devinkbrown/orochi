@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCX MODEX parsing and query reply builders.
 //!
 //! MODEX uses named channel/member modes instead of one-byte IRC mode letters:

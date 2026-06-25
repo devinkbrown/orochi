@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Known-answer tests for Orochi's TLS 1.3 SHA-256 key schedule.
 //!
 //! The vectors are from RFC 8448, Section 3, "Simple 1-RTT Handshake".  The

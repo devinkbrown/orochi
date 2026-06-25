@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic property tests for IRCv3 outbound message-tag composition.
 const std = @import("std");
 const msgtags = @import("msgtags.zig");

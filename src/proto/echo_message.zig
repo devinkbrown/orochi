@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 echo-message helpers.
 //!
 //! Delivery routing, message tag construction, and normal PRIVMSG/NOTICE/TAGMSG

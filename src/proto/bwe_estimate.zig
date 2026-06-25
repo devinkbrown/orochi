@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Delay-based bandwidth estimator for Orochi's SFU layer.
 //!
 //! This module turns transport-wide-congestion-control (TWCC) feedback into a

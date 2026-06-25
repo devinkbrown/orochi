@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure parser and lookup table for hosts-file-style text (no I/O).
 //!
 //! Callers pass the file contents as a byte slice; the parser builds in-memory

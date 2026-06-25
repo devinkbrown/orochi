@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.2 extension inner-data codecs for small RFC 5746 / RFC 8422 bodies.
 //!
 //! This module deliberately handles only extension_data payloads.  The outer

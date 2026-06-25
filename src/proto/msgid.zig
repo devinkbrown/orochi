@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 `msgid` tag generator — mints the unique per-message id the server
 //! stamps as `@msgid=...` on PRIVMSG/NOTICE/TAGMSG (and that message-redaction
 //! later references). Validation of received ids lives in `msgedit.isValidMsgid`;

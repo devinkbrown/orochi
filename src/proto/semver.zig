@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Semantic Versioning 2.0.0 parsing, precedence comparison, and minimal
 //! comparator ranges for client feature gates.
 //!

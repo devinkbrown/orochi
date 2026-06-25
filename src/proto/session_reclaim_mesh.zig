@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Cross-server session reclaim tokens (HMAC-sealed).
 //!
 //! Today a client's session-resume token is only honored by the node that

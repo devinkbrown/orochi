@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Framed secured S2S link: the live-path Tsumugi handshake over a byte stream.
 //!
 //! `tsumugi_session` drives the AKE message-at-a-time; on a real TCP stream the

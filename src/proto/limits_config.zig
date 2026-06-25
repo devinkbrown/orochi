@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Central, config-driven IRC protocol policy limits.
 //!
 //! This module is the SINGLE authoritative source for the IRC protocol layer's

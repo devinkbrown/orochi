@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Min-heap deadline queue for opaque numeric identifiers.
 //!
 //! The queue stores absolute millisecond deadlines supplied by the caller.  It

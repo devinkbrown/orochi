@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Augmented interval tree over integer [lo, hi] intervals carrying a value.
 //!
 //! Uses a left-leaning red-black BST (LLRB, Sedgewick 2008) keyed by

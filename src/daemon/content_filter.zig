@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Orochi content filter (Koshi) — operator-curated message screening.
 //!
 //! A Orochi-native moderation primitive (not a clone of any other daemon's

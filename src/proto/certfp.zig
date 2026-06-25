@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure client TLS certificate fingerprint support.
 //!
 //! Callers supply already-derived SHA-256 certificate fingerprints as lowercase

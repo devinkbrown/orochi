@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic S2S session-migration state machine for Helix.
 //!
 //! This module is deliberately pure: it performs no I/O, owns no resources, and

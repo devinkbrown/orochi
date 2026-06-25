@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TSUMUGI/TLS key exchange and key schedule.
 //!
 //! Zig 0.16 std was checked at `/usr/lib/zig/std/crypto`: ML-KEM is present

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Message-edit and redaction helpers for caller-owned message logs.
 //!
 //! This module intentionally does not own history storage. Callers pass the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure services alias resolution and routed-line builders.
 //!
 //! This mirrors the small, static shape of charybdis `m_alias`: service

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! WHOX (extended WHO) selector parsing and RPL_WHOSPCRPL emission.
 //!
 //! Plain WHO matching and RPL_WHOREPLY (352) live in `who.zig`. This module is

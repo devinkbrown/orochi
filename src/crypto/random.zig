@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! CSPRNG and per-instance ChaCha20 DRBG.
 //!
 //! Entropy enters through Linux `getrandom(2)` with EINTR retry and explicit

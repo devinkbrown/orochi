@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Scoped allocator toolkit for hot-path substrate memory.
 //!
 //! `BumpArena` owns a caller-sized byte region and exposes both explicit

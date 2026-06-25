@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.3 HKDF key schedule helpers (RFC 8446 section 7).
 //!
 //! This module is deliberately pure: callers provide transcript hashes and key

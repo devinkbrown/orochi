@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Client redirect / bounce line formatting for S2S session migration.
 //!
 //! This module is intentionally self-contained and allocation-free. Callers

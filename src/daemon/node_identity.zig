@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Daemon node identity: derive the Tsumugi handshake material from config.
 //!
 //! The sovereign identity is a 32-byte Ed25519 seed (config `node.secret_key`,

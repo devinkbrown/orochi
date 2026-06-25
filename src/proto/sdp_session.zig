@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Textual SDP parser and builder for WebRTC offer/answer metadata.
 //!
 //! This module handles the RFC 4566 / RFC 8866 text layer. It is intentionally

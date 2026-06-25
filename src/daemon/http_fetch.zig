@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Blocking, thread-safe outbound HTTP/1.1 GET (plain + TLS 1.3), for the
 //! geo_services background fetcher thread.
 //!

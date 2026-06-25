@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SUIMYAKU anti-entropy Merkle substrate.
 //!
 //! This module is pure state reconciliation logic: it stores `key -> value_hash`

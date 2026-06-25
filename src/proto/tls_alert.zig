@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.3 Alert protocol codec (RFC 8446 §6).
 //!
 //! Wire format is two bytes: a one-byte AlertLevel followed by a one-byte

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal HTTP/1.1 client request builder and response parser.
 //!
 //! Pure: depends only on `std`. No sockets, clock, or RNG; the caller owns all

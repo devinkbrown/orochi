@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Personalized MOTD template engine.
 //!
 //! The MOTD text (configured `[motd] text` or the built-in default) is treated

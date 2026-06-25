@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free wire codec for a single client's IRCv3 MONITOR watch list.
 //!
 //! Companion to `conn_capsule.zig`. Used by the Helix in-process upgrade

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Multi-hop mesh topology view for the Suimyaku peer graph.
 //!
 //! This module is pure graph state: callers provide the peer links, choose the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free wire codec for a detached session's BOUNCER backlog.
 //!
 //! When an account's session goes detached (`sessions.zig`: `Session.attached

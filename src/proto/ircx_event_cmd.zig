@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCX EVENT command parser and LIST reply builder.
 //!
 //! This module owns no command state. It parses EVENT requests into typed

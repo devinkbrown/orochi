@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free wire codec for a client's AWAY status across a Helix upgrade.
 //!
 //! Used by the Helix in-process upgrade (UPGRADE command) to migrate each

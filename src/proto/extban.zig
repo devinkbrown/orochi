@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Extended ban parser and matcher.
 //!
 //! Ban masks are parsed once into a small fixed-node matcher. Matching borrows

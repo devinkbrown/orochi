@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! `SO_REUSEPORT` listener creation for the sharded multi-reactor daemon.
 //!
 //! In the sharded model every reactor thread runs its own io_uring and accepts

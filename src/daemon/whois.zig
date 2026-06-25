@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRC WHOIS numeric reply builder.
 //!
 //! The daemon owns visibility and lookup policy; this module only validates the

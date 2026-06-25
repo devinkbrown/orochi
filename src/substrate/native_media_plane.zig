@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Native media plane — the Suimyaku-side SFU forwarding core, transport-neutral.
 //!
 //! Composes the existing native pieces into one forward decision: the

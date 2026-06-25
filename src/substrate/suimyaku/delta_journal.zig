@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Durable journal for signed CRDT deltas.
 //!
 //! Composes the write-ahead log (`wal`) with the canonical signed-delta wire

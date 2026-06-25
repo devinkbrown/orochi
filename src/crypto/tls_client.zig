@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Socketless TLS 1.3 client handshake state machine for outbound HTTPS.
 //!
 //! The caller owns transport I/O: call `start()` to get the ClientHello record,

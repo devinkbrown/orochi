@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Ordered, bounded sets of ASCII case-insensitive `*`/`?` glob patterns.
 //!
 //! Patterns are owned by the set. Matching uses a pre-folded pattern form with

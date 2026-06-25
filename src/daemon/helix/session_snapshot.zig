@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-client session snapshot — the wire format carried across a Helix UPGRADE
 //! so a registered client can be re-created on the successor.
 //!

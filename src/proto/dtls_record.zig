@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! DTLS 1.3 record layer (RFC 9147).
 //!
 //! Covers the DTLSCiphertext unified header (connection-id-less variant),

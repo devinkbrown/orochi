@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! STUN message framing and common RFC 5389 attributes.
 //!
 //! This module is intentionally transport-free: callers provide/consume whole

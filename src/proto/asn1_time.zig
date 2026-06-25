@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ASN.1 DER time codec for X.509 validity fields.
 //!
 //! Encoders write complete DER TLVs into caller-provided buffers. Returned

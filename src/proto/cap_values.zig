@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 CAP LS 302 value advertisement and value-aware CAP REQ parsing.
 //!
 //! This module deliberately builds complete wire lines into a caller-owned sink.

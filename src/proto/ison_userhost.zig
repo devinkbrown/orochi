@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ISON (303) and USERHOST (302) numeric reply builders.
 //!
 //! Both builders are allocator-free and write complete IRC numeric lines into

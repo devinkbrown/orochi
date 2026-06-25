@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Network-wide silent mute policy.
 //!
 //! A shunned user remains connected, but message paths can ask this pure store

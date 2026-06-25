@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! DTLS-SRTP keying (RFC 5764): the `use_srtp` extension profiles and the
 //! extraction of SRTP master key/salt material from a (D)TLS master secret via
 //! the TLS 1.2 PRF. This is the bridge between a DTLS handshake and the SRTP

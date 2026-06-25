@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Runtime-sized cross-shard delivery fabric for the multi-reactor daemon.
 //!
 //! This is the live, allocator-backed counterpart of the `cross_shard_smoke.zig`

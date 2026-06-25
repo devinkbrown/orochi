@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! GagSet — the persistent set of gagged IP addresses for IRCX +z GAG.
 //!
 //! GAG is set on a client (`MODE <nick> +z`), but it binds to that client's IP

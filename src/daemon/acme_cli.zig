@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! `orochi acme-issue` entry: assemble the clean-room ACME stack into a single
 //! out-of-band issuance run. Generates distinct ES256 (ECDSA P-256) account and
 //! certificate keys, loads trust anchors from a CA bundle, starts the loopback

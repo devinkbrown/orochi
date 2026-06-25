@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic host/IP cloaking (charybdis-grade hierarchical scheme).
 //!
 //! Every cloak segment is a keyed HMAC-SHA256 token over a *cumulative prefix*

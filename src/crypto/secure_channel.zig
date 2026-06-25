@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Secure channel: composes the shipped crypto primitives into an end-to-end
 //! encrypted session for the mesh.
 //!

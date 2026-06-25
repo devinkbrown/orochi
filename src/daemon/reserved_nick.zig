@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Reserved nickname registry for the Orochi IRC daemon.
 //!
 //! Maps a reserved nickname to the account that owns it. Nickname comparison

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure parser for resolv.conf-style configuration text.
 //!
 //! This module performs NO I/O: the caller supplies the file contents as a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TSUMUGI ratchet transport state.
 //!
 //! This module implements the protocol-level symmetric ratchet used after the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocator-backed IRCX PROP storage, parsing, and reply rendering.
 const std = @import("std");
 const irc_line = @import("irc_line.zig");

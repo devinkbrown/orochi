@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Key-free weather + news acquisition: HTTP/1.1 request builders and response
 //! parsers for two no-API-key sources.
 //!

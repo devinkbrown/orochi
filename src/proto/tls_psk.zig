@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.3 pre_shared_key extension codec (RFC 8446 section 4.2.11).
 //!
 //! This module handles only the extension_data payload for ClientHello and

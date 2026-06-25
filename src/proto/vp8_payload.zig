@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! VP8 RTP payload descriptor – RFC 7741.
 //!
 //! Covers parse and build of the VP8 payload descriptor that sits between the

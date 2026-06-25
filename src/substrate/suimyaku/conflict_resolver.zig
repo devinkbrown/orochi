@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic conflict-resolution helpers for concurrent channel CRDT ops.
 //!
 //! These functions are pure and total: equal clocks, equal replicas, and odd

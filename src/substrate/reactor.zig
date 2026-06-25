@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Ringlane reactor seam.
 //!
 //! DST-first principle (locked decision, planning/00): all time and I/O flow

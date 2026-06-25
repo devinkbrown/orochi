@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Mesh partition + quorum detector over the Suimyaku peer graph.
 //!
 //! Pure graph logic: callers supply the current mesh view (the set of known

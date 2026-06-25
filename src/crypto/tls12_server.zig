@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Socketless TLS 1.2 server handshake state machine.
 //!
 //! The server is intentionally fail-closed: TLS 1.2 only, null compression,

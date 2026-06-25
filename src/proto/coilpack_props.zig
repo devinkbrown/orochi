@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Property and fuzz tests for CoilPack wire primitives.
 //!
 //! These tests exercise attacker-controlled byte slices against the low-level

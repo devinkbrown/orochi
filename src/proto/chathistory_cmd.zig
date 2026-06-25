@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCv3 CHATHISTORY command parser and response builder.
 //!
 //! Parse results borrow slices from the input command line. Response builders

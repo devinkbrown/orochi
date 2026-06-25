@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Reed-Solomon erasure coding over GF(256) for packet shard recovery.
 //!
 //! The codec is systematic: shard indexes `0..k` are the original data shards,

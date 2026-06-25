@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TURN (RFC 5766) message framing and parsing — no sockets, no heap.
 //!
 //! Covers: STUN header (20-byte, magic cookie 0x2112A442, 96-bit txn id),

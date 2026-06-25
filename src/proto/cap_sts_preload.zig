@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! STS preload-list model for hostnames that are committed to TLS-only access.
 //!
 //! This module owns only the in-memory preload model. It does not perform

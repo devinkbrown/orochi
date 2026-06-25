@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Clean-room IRC user-mode codec.
 //!
 //! User modes are represented as stable enum bits and interpreted through a

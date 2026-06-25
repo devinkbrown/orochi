@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Client command dispatch and preregistration pipeline.
 //!
 //! Transport code feeds already parsed IRC lines into this module. Dispatch

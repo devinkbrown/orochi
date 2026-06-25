@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Opcodec media framing layer — container/packetization for Orochi media bands.
 //!
 //! NOT the audio/video codec itself: this is the wire container that carries

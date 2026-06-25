@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ULID: Universally Unique Lexicographically Sortable Identifier.
 //!
 //! A ULID is 16 bytes: a 48-bit millisecond timestamp followed by 80 bits of

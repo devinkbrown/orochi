@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Suimyaku mesh-native LINKS and MAP numeric builders.
 //!
 //! These replies keep the familiar IRC numeric surface while reporting the

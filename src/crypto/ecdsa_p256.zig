@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ECDSA over NIST P-256 with SHA-256 for Orochi's TLS and X.509 surfaces.
 //!
 //! This module wraps Zig 0.16's `std.crypto.sign.ecdsa.EcdsaP256Sha256`,

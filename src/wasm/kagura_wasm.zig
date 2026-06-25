@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! WASM browser export surface for the OPVOX/OPVIS codecs (#11/#32).
 //!
 //! Compiled to `wasm32-freestanding` (via `zig build wasm`), this exposes the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! user.query module — user-facing query + identity commands (WHOIS/WHO/LIST/
 //! NICK/AWAY/QUIT/…). Thin thunks over existing LinuxServer handlers.
 //! See 17-module-system.md.

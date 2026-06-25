@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Lotus: pure in-memory IRC message history rings.
 //!
 //! This module performs no I/O. It owns duplicated target keys and message

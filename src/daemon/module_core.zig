@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Module capability handle — the typed context every SerpentRegistry module
 //! receives. See `docs/planning/17-module-system.md`.
 //!

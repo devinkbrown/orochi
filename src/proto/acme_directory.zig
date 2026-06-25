@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ACME directory resource parser (RFC 8555 §7.1.1).
 //!
 //! The directory is the entry point of an ACME server: a JSON object that maps

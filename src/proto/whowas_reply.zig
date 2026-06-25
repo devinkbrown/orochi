@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRC WHOWAS numeric reply builder.
 //!
 //! History storage and lookup policy live elsewhere. This module validates the

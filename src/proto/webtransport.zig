@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! WebTransport-over-HTTP/3 framing helpers.
 //!
 //! This module intentionally covers framing only: QUIC-style variable-length

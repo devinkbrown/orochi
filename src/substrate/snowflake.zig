@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Snowflake: distributed, roughly-time-ordered 64-bit unique identifiers.
 //!
 //! Layout (most-significant bit first):

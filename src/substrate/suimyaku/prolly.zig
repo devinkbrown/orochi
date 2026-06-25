@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Blake3 = std.crypto.hash.Blake3;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRC numeric replies and errors.
 //!
 //! Orochi keeps numerics as compile-time protocol metadata: the enum is the

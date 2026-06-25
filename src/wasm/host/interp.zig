@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal pure-Zig wasm32 interpreter for OroWasm control-plane plugins.
 //!
 //! This is intentionally an MVP interpreter, not a general-purpose runtime. It

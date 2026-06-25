@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRC RPL_ISUPPORT (005) token builder.
 //!
 //! The module keeps ISUPPORT composition allocation-free: callers own token

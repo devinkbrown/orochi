@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRC MOTD numeric reply builder.
 //!
 //! This module is allocator-free: callers provide the output byte storage and

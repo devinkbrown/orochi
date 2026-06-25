@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Clean-room renderer for the oper `ROUTE` command — inspection of the mesh
 //! routing table: where nicks/channels live and the next hop to reach each
 //! node. Pure and std-only; takes plain input structs and writes newline-

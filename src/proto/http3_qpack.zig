@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QPACK header compression for HTTP/3 (RFC 9204).
 //!
 //! Self-contained, std-only implementation using only the STATIC TABLE

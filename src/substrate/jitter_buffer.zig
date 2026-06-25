@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Adaptive jitter buffer for RTP-like media packets.
 //!
 //! The buffer is deterministic: callers provide every timestamp and clock

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Cross-reactor wakeup primitive for the sharded multi-reactor model.
 //!
 //! In the sharded design each reactor owns its own io_uring and spends most of

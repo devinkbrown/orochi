@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Exponentially-weighted moving statistics and rate estimation.
 //!
 //! All three types are deterministic: callers supply timestamps (nanoseconds)

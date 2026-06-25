@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! messaging module — PRIVMSG/NOTICE/TAGMSG and IRCv3 message-layer commands.
 //! Thin thunks over existing LinuxServer handlers. See 17-module-system.md.
 const registry = @import("../registry.zig");

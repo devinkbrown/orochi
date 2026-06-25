@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QUIC connection frame engine (RFC 9000) — layer 3 of the from-scratch
 //! QUIC/WebTransport stack, sitting on top of packet protection
 //! (`quic_protect.zig`) and feeding the TLS handshake (`quic_tls.zig`) and the

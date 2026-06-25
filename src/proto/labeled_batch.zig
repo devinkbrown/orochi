@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCv3 labeled-response correlation policy.
 //!
 //! This layer decides whether a labeled command response is ACKed, tagged

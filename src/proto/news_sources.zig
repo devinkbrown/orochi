@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Working news/weather data sources — a curated set of proven, no-API-key
 //! feeds. This module is *data only*: the source URLs and their metadata.
 //! Fetching, caching, and parsing live elsewhere (`geo_fetch.zig` builds

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! KICK command parsing, privilege checks, and wire-line builders.
 //!
 //! Channel membership lookup, channel existence, and delivery fanout are owned

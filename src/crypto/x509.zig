@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal fail-closed X.509/DER reader for TLS and certfp.
 //!
 //! This is not a chain validator. It extracts only the certificate fields the

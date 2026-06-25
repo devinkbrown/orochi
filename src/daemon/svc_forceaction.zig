@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Real-server force channel action policy.
 //!
 //! This module is intentionally standalone: it imports only `std`, owns no

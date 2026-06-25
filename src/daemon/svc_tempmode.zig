@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Timed channel mode scheduler for daemon-owned service commands.
 //!
 //! This module is intentionally pure data structure, parser, and command logic.

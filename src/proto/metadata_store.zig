@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCv3 metadata-2 key/value store.
 //!
 //! This store deliberately avoids daemon, IRCX, subscription, and dispatch

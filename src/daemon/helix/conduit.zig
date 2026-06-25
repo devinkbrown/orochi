@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Helix conduit: arbitrary-fd + payload transfer over a SEQPACKET unix socket.
 //!
 //! Builds on the SCM_RIGHTS batch primitives in `handoff.zig` to move any number

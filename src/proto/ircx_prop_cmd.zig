@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCX PROP command parser and reply builder.
 //!
 //! This module is the command-surface layer over `ircx_prop_store`: it owns no

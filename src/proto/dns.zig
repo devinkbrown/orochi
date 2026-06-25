@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! DNS wire codec and resolver cache.
 //!
 //! The codec is intentionally transport-free: callers provide complete DNS

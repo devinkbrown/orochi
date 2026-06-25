@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Operator privilege class protocol helpers.
 //!
 //! This file is pure protocol glue: class names resolve to the privilege set

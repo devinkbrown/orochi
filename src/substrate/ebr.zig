@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Epoch-based reclamation (EBR), the classic 3-epoch scheme (Fraser/Harris).
 //!
 //! EBR is the memory-reclamation foundation of Orochi's lock-free world.

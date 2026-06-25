@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal signed-JWT verifier for SASL OAUTHBEARER.
 //!
 //! This module is daemon glue: it validates compact JWS tokens with locally

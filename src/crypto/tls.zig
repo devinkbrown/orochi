@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS record and handshake skeleton for Orochi.
 //!
 //! This is deliberately not a full wire-complete TLS stack. It provides the

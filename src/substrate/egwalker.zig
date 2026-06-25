@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Eg-walker: replay a lotus edit-event DAG into the convergent sequence CRDT (#14).
 //!
 //! Lotus stores edit events in a causal DAG; `seq_crdt` is the convergent

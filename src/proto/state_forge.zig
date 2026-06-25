@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! StateForge builds small protocol state-machine helpers from runtime tables.
 //!
 //! A machine is parameterized by exhaustive enum state and event types, then

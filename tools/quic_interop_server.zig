@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Standalone QUIC/HTTP3 interop test server.
 //!
 //! Stands up the real Orochi `WebTransportListener` (the same from-scratch QUIC

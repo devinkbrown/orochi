@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Host-name normalization and validation for IRC use.
 //!
 //! This module owns a single, self-contained concern: turning a host string

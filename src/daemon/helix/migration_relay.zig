@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! migration_relay — S2S session-migration relay API for the Helix subsystem.
 //!
 //! Cross-machine session migration moves a logged-in client's session from one

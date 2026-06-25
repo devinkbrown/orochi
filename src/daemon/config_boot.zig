@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Boot glue: map a parsed `config_format.Config` onto the runtime
 //! `server.Config`, and load it from a settings file at startup.
 //!

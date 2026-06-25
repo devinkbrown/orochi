@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Leetspeak and ASCII confusable normalizer for content-filter keys.
 //!
 //! The normalizer is intentionally byte-oriented and allocation-free. It

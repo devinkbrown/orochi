@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Network-level new-user onboarding pack.
 //!
 //! This module stores a single, ordered set of welcome lines (editable by

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Immutable xor filter for approximate membership over u64 keys.
 //!
 //! The builder uses a 3-wise segmented xor construction: each key maps into

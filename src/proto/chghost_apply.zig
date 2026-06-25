@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-recipient IRCv3 CHGHOST wire builder.
 //!
 //! This module has no daemon state. Callers decide which visible clients share

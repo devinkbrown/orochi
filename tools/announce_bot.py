@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Orochi announce bot — lives in #root on IRCXNet (eshmaki.me) and announces build
 stats, changelog, progress, and planning, with the feature set of a normal IRC bot:
 IRCv3 CAP negotiation + optional SASL PLAIN, nick recovery (433), CTCP, rich

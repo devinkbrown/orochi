@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-channel activity-stream subscriptions (#33 `ACTIVITY SUBSCRIBE`).
 //!
 //! Tracks which clients have opted in to the real-time activity stream for a

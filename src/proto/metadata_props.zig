@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic property tests for the unified IRCv3 metadata / IRCX PROP store.
 const std = @import("std");
 const metadata = @import("metadata.zig");

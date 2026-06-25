@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Rateless Invertible Bloom Lookup Table for 32-byte content IDs.
 //!
 //! The encoder emits an unbounded stream of coded symbols. Symbol `i` maps to a

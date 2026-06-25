@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Batch Ed25519 verification helpers.
 //!
 //! Zig 0.16 exposes `std.crypto.sign.Ed25519.verifyBatch` for compile-time

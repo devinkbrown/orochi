@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Minimal DER parser for OCSP response status (RFC 6960).
 //!
 //! Pure parsing only: no sockets, filesystem, clock, RNG, heap allocation, or

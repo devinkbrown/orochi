@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure parser and reply formatter for Orochi-native channel registration commands.
 //!
 //! `parse` accepts a tokenized IRC command where `args[0]` is `CHANNEL` or its

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCX LISTX parsing, filtering, and numeric reply builders.
 //!
 //! LISTX is the extended channel list command. This module is deliberately

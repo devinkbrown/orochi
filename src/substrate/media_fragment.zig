@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! MTU fragmentation and reassembly for opaque native media payloads.
 //!
 //! This layer is codec-agnostic: it splits and rebuilds payload bytes without

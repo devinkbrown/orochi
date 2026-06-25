@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Extended-ban evaluation over the parsed representation from extban.zig.
 //!
 //! This module deliberately does not parse extban syntax. Callers parse with

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RTCP Payload-Specific Feedback (PSFB, PT=206) keyframe-request codec for the
 //! SFU video path: Picture Loss Indication (PLI, FMT=1, RFC 4585 §6.3.1) and
 //! Full Intra Request (FIR, FMT=4, RFC 5104 §4.3.1).

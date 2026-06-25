@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Property and fuzz tests for the IRCv3 CHATHISTORY Lotus append log.
 //!
 //! These tests stress the content-addressed ring with deterministic, bounded

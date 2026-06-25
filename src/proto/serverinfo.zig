@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! VERSION, TIME, and ADMIN numeric reply builders.
 //!
 //! These helpers write complete IRC reply lines into caller-owned buffers.

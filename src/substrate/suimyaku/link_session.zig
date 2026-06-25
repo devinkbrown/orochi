@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure SUIMYAKU S2S link-session orchestrator.
 //!
 //! `peer_link` owns link sequencing, acknowledgements, and credit. This layer

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free bidirectional identity map for the Kakehashi SFU media bridge.
 //!
 //! Translates between the native media stream identity (`stream_id: u32` carried

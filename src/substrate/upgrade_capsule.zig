@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Typed Helix /UPGRADE migration capsule.
 //!
 //! The capsule is a pure byte format for handing minimal live-session state to a

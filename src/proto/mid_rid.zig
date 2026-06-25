@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Typed value helpers for RTP MID and RID header extension element data.
 //!
 //! RFC 8285 framing lives outside this module. The functions here validate and

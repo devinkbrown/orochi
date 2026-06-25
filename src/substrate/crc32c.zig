@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! CRC32C (Castagnoli) checksum for frame integrity checks.
 //!
 //! Implements the CRC-32/ISCSI variant: polynomial 0x1EDC6F41, used here in its

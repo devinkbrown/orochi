@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RTP Retransmission payload format (RTX), RFC 4588.
 const std = @import("std");
 const rtp_profile = @import("rtp_profile.zig");

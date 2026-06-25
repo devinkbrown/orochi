@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SerpentRegistry comptime daemon module registry.
 //!
 //! Orochi statically assembles daemon modules instead of runtime-loading

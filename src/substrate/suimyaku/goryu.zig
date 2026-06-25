@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Delta-state CRDT families for the SUIMYAKU mesh substrate.
 //!
 //! This file is self-contained for orchestrator integration: it defines the

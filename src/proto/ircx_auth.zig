@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCX AUTH package parser and reply builder.
 //!
 //! This module owns no authentication state. It parses caller-owned AUTH lines

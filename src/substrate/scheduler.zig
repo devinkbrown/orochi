@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Fair multi-class task scheduler for a thread-per-core runtime.
 //!
 //! Implements Deficit Round Robin (DRR) across N weighted classes, with a

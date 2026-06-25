@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RTP RED (RFC 2198) framing + ULPFEC (RFC 5109) XOR-based FEC.
 //!
 //! RED:

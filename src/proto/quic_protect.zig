@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! QUIC packet protection (RFC 9001 §5.3 + §5.4).
 //!
 //! This module turns the key material derived in `quic_tls.zig` and the header

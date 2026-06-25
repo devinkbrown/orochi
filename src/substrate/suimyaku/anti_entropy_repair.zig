@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Merkle-guided SUIMYAKU anti-entropy repair.
 const std = @import("std");
 const burst = @import("burst.zig");

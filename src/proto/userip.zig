@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! USERIP (340) command argument parser and numeric reply builder.
 //!
 //! USERIP is a charybdis oper command shaped like USERHOST, but the host

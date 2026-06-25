@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Decaying IP reputation / penalty table.
 //!
 //! A pure, allocator-backed map from client IP address to a floating-point

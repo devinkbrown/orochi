@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SDP-lite media band descriptors for Orochi media negotiation.
 //!
 //! This is not RFC SDP. It is a compact canonical descriptor with fixed field

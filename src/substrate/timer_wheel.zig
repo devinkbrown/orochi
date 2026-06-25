@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocator-owned hierarchical timing wheel for deterministic daemon timeouts.
 //!
 //! Callers provide absolute millisecond times.  The wheel never reads a clock,

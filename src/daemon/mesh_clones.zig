@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Network-wide clone aggregation, IP-keyed via a salted hash.
 //!
 //! Each node tracks its LOCAL concurrent-connection count per salted-IP-hash and

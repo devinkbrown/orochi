@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! CHANNEL_MODE_FLAGS frame payload codec (S2S channel flag propagation).
 //!
 //! Carries one convergent aggregate fact for a channel's boolean MODE flags:

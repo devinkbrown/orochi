@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! UTF-8 terminal display-width helpers.
 //!
 //! This module measures how many terminal columns a UTF-8 string occupies and

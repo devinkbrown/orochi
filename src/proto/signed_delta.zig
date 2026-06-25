@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Signed dotted delta envelopes for Goryu-Sync CRDT mutations.
 //!
 //! The relay is not part of the trust boundary: peers verify that the origin

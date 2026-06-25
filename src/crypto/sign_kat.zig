@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RFC 8032 Section 7.1 known-answer tests for Ed25519 signing.
 const std = @import("std");
 const sign = @import("sign.zig");

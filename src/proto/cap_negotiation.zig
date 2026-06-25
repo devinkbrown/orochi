@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 CAP 3.2 negotiation FSM.
 //!
 //! This module owns only per-session negotiation state. Capability identity,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Segmented STREAM-style AEAD over ChaCha20-Poly1305.
 //!
 //! Each plaintext chunk is encrypted independently with a nonce derived from a

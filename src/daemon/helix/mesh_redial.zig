@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Mesh re-dial hints carried across a Helix UPGRADE.
 //!
 //! S2S peer sockets are deliberately NOT preserved across the execve: the

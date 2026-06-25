@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ircx module — IRCX protocol command family (CREATE lives in channel.ops;
 //! this covers IRCX/ISIRCX/DATA/REQUEST/REPLY/WHISPER/PROP/ACCESS/EVENT/MODEX/
 //! LISTX). Thin thunks over existing LinuxServer handlers. See 17-module-system.md.

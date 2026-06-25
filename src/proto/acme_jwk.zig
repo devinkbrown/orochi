@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! JSON Web Key (JWK) encoding and RFC 7638 thumbprint computation.
 //!
 //! These helpers produce the canonical JWK JSON used by ACME (RFC 8555)

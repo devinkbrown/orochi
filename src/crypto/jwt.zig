@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Self-contained JWT (RFC 7519) signing and verification helpers.
 //!
 //! Supports compact JWS tokens with HS256 and EdDSA/Ed25519 only. The verifier

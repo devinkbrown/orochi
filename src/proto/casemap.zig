@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRC nickname and channel case mapping helpers.
 //!
 //! The helpers fold bytes into caller-owned output storage. They intentionally

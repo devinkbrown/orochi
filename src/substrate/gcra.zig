@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Generic Cell Rate Algorithm (GCRA) rate limiter.
 //!
 //! This is a deterministic virtual-scheduling limiter: callers provide time in

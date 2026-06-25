@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The single per-connection flood guard.
 //!
 //! This is the one flood rate-limiter in the daemon. Earlier the codebase carried

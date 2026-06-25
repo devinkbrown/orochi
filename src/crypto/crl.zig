@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Strict, allocation-free X.509 Certificate Revocation List parser.
 //!
 //! This module parses the RFC 5280 §5 `CertificateList` structure and exposes

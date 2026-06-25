@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Convenience emitters for IRCv3 standard-replies.
 //!
 //! The lower-level `standard_replies.zig` module owns the canonical catalog

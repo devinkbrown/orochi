@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Connection classes — named per-connection policy bundles, matched to each
 //! connection by IP (v4 + v6 CIDR), TLS, account, oper, and ident/host globs.
 //!

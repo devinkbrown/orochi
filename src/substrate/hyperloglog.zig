@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Standalone HyperLogLog cardinality estimator.
 //!
 //! The estimator accepts caller-provided 64-bit hashes. It does not hash byte

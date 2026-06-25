@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Fixed-capacity Algorithm R reservoir sampling.
 //!
 //! This module keeps `k` uniformly selected items from a stream whose final

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RSA private-key DER codec for daemon TLS certificate loading.
 //!
 //! Operators commonly receive RSA leaves with either a traditional PKCS#1

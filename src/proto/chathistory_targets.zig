@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 `CHATHISTORY TARGETS <a> <b> <limit>` model.
 //!
 //! The TARGETS subcommand answers a different question than the message-replay

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free runtime counters for the daemon hot path.
 //!
 //! The hot path (accept/recv/send/line dispatch) must never allocate or take a

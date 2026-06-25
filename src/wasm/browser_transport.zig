@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Browser transport shim core (#32).
 //!
 //! Ocean runs in the browser, where the only byte transport is a WebSocket — a

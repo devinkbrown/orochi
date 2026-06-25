@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! In-flight S2S migration journal.
 //!
 //! The journal records phase progress for migration tokens so repeated S2S

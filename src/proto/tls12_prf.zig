@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.2 Pseudo-Random Function (PRF) per RFC 5246 §5, plus the key
 //! derivations layered on top of it (master secret, key block, Finished
 //! verify_data).

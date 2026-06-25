@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! MinHash signatures and LSH banding for near-duplicate detection.
 //!
 //! Typical use-case is spam/flood similarity on IRC: shingle a message into an

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free wire codec for a single channel's resumable MASK LISTS.
 //!
 //! Companion to `world_capsule.zig` and `conn_capsule.zig`: where the world

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure memo-ignore policy for services-backed memos.
 //!
 //! This module intentionally imports only `std`. It models the data and parser

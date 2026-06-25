@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! RFC 3986 percent-encoding helpers.
 //!
 //! The codec writes into caller-owned buffers and never allocates. Decoding is

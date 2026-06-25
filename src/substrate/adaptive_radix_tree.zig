@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Adaptive Radix Tree (ART) for byte-slice keys.
 //!
 //! ART is an ordered map and prefix index that compresses unary paths while

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCv3 cap-notify line builders.
 //!
 //! The daemon supplies any server prefix separately, so emitted lines start at

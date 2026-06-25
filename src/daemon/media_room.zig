@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-channel media rooms — the daemon-side manager that maps an IRC channel
 //! to a Suimyaku media Session (the SFU participant model). This is the control
 //! plane only: it tracks who is in a call and what they publish (voice/video/

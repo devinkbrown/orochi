@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Token-bucket rate limiting.
 //!
 //! `Bucket` is a single allocation-free token bucket: callers supply the

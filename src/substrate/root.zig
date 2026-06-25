@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! orochi-substrate — reactor (Ringlane), allocators, lock-free queues,
 //! data structures, SUIMYAKU math (CRDT/HLC/vclock/Merkle), and the deterministic
 //! simulation runtime (Deterministic Ocean). Skeleton; see planning/01.

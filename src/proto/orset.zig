@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Observed-Remove Set (OR-Set) CRDT over UTF-8 string elements.
 //!
 //! An OR-Set is a state-based (CvRDT) set whose merge is a join over an

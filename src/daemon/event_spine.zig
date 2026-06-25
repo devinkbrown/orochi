@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Event Spine typed oper event bus.
 //!
 //! Daemon subsystems publish typed events here, while oper sessions subscribe

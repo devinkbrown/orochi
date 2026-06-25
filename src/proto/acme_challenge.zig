@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ACME (RFC 8555 §8) challenge key authorization helpers.
 //!
 //! This module computes the small, deterministic strings an ACME client needs

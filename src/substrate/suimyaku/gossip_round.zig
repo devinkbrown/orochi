@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure SUIMYAKU gossip round driver: no sockets, timers, or daemon coupling.
 const std = @import("std");
 

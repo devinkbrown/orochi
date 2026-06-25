@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-client TLS resume snapshot — the wire format carried across a Helix
 //! UPGRADE so an ESTABLISHED TLS connection keeps decrypting/encrypting on the
 //! successor (the socket fd survives execve; this carries the crypto state that

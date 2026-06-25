@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! IRCv3 message interactions: replies, reactions, typing, edits, and redaction.
 //!
 //! The module keeps all attacker-facing parsing zero-copy and all outbound

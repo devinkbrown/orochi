@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Tegami (手紙) — Orochi-native offline messaging keyed by account.
 //!
 //! The bouncer rewind replays *channel* history a session missed; Tegami covers

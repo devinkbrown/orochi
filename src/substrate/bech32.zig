@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bech32, Bech32m, and Base58Check helpers for human-readable identifiers.
 //!
 //! This module is deliberately self-contained so it can be tested in isolation:

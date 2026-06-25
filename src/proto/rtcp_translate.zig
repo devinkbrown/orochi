@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Kakehashi SFU control-plane feedback translator.
 //!
 //! The Kakehashi bridge fans media between a WebRTC leg and the transport-neutral

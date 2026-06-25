@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! OroWasm plugin store lifecycle and hostcall capability enforcement.
 //!
 //! The host owns every registration keyed by `PluginHandle`. Dropping a plugin

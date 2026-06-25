@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Systematic GF(256) fountain/FEC symbols for lossy media bursts.
 //!
 //! This is RaptorQ-style rather than a full RFC 6330 implementation: source

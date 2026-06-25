@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Zero-copy IRC client line parser.
 //!
 //! The parser returns views into the caller-owned input buffer. It strips one

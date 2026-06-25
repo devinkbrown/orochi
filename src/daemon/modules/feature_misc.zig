@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! feature.misc module — identity (VHOST/PRIVS), content FILTER, media surface,
 //! offline TEGAMI, and ACTIVITY presence. Thin thunks over existing LinuxServer
 //! handlers. See 17-module-system.md.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ACME account JSON codecs for RFC 8555 section 7.3.
 //!
 //! The ACME account URL is not part of the account JSON object. Servers return

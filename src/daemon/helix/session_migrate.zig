@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! S2S session migration — the capsule a node ships to a peer to hand off a live
 //! client session, plus the receiving node's holding area.
 //!

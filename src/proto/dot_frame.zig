@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Wire framing for DNS-over-TLS (RFC 7858) and DNS-over-TCP (RFC 1035 §4.2.2).
 //!
 //! Both transports prefix each DNS message with a two-octet, big-endian length

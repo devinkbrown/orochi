@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! MLS (RFC 9420) Key Schedule — per-epoch secret derivation.
 //!
 //! Implements the labeled KDF (`ExpandWithLabel`, `DeriveSecret`) and the full

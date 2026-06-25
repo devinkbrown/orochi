@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Convergent text sequence CRDT (RGA) — the eg-walker replay target (#14).
 //!
 //! Lotus gives a causal order over edit events (`Dag.causalOrder`); this is the

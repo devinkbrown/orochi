@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Native XOR FEC for Suimyaku media payloads.
 //!
 //! A repair frame protects one contiguous run of source media payloads. The

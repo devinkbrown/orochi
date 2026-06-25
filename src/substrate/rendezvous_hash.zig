@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Rendezvous hashing, also known as Highest-Random-Weight hashing.
 //!
 //! The module is self-contained and operates on caller-owned node identifiers.

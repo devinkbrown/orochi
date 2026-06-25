@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SUIMYAKU mesh server/node registry.
 //!
 //! This module tracks the bounded set of servers known to a mesh node. It is a

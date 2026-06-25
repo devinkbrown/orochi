@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SNI (Server Name Indication) extraction from a TLS ClientHello.
 //!
 //! Pure, zero-allocation parser for the RFC 6066 `server_name` extension

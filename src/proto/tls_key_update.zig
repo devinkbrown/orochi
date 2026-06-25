@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TLS 1.3 KeyUpdate handshake message codec (RFC 8446 §4.6.3).
 //!
 //! This module is pure: it only encodes/decodes the fixed-shape KeyUpdate

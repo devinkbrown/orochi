@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! INVITE command parsing, precondition checks, and wire-line builders.
 //!
 //! Channel lookup, target lookup, invite state mutation, and `invite-notify`

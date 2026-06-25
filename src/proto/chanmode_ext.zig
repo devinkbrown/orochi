@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure IRCX extended channel-mode data layer.
 //!
 //! This module intentionally owns no world state. It stores only IRCX channel

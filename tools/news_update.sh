@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # news_update.sh — key-free headline updater for Orochi's !news bot.
 #
 # Fetches the RSS feeds bundled in src/proto/news_sources.zig with curl (which

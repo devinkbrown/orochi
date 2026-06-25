@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SUIMYAKU frame layer.
 //!
 //! This module sits directly above CoilPack's fixed SUIMYAKU header codec. It

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Clean-room TOML v1.0.0 parser for the Orochi daemon.
 //!
 //! Bytes in, typed tree out. The parser is PURE: it performs no file, network,

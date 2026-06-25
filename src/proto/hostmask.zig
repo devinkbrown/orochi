@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Allocation-free IRC hostmask matching for bans, access lists, and extbans.
 //!
 //! Provides ASCII case-insensitive glob matching (`*` and `?`) with a strictly

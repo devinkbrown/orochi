@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SRTP packet protection (RFC 3711): AES-128 Counter Mode encryption of the
 //! RTP payload plus an HMAC-SHA1-80 authentication tag over the packet and the
 //! rollover counter. Includes the AES-CM key-derivation function that expands a

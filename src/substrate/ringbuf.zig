@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bounded single-producer/single-consumer ring buffer.
 //!
 //! The buffer stores items inline, requires a non-zero power-of-two capacity,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure PEM codec (RFC 7468) for loading TLS certificates and keys from text.
 //!
 //! This module performs no I/O of any kind: the caller supplies the PEM text and

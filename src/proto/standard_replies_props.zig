@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Deterministic property and fuzz-style tests for IRCv3 standard replies.
 //!
 //! These tests exercise the public FAIL/WARN/NOTE builder API with bounded,

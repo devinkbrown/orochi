@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SFU media-transport control plane: the per-call registry that ties each
 //! call participant to its ICE credentials and (once a connectivity check
 //! succeeds) its bound remote UDP media address, and computes the RTP forward

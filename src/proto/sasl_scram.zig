@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Self-contained server-side SCRAM-SHA-256 responder (RFC 5802 / RFC 7677).
 //!
 //! This module consumes and produces raw SCRAM messages. Callers own SASL

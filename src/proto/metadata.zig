@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Unified IRCv3 metadata and IRCX PROP property store.
 //! Metadata and IRCX properties are one key/value system here: IRCv3 exposes
 //! lower-case metadata keys, while IRCX PROP names are canonicalized onto those

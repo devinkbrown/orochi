@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Helix supervisor state machine.
 //!
 //! The real `--supervisor` mode owns listener descriptors, a sealed memfd arena,
