@@ -2791,13 +2791,20 @@ pub const LinuxServer = struct {
     /// Build the TLS 1.3 config for one accepted client. Certificate material is
     /// borrowed from `Config`; resumption state is process-wide and shared by all
     /// per-connection TLS engines so tickets survive reactor/thread boundaries.
-    fn tls13Config(self: *LinuxServer) tls_server.Config {
+    /// Build the TLS 1.3 listener config. `request_client_cert` is passed
+    /// explicitly rather than read straight from config because it MUST differ
+    /// per listener: the implicit-TLS IRC port may request a client cert (mTLS
+    /// for SASL EXTERNAL / CERTFP), but the browser WebSocket port must NEVER —
+    /// browsers cannot satisfy a CertificateRequest on a script-initiated WS and
+    /// abort the handshake (close 1006, "opening handshake was canceled"), which
+    /// silently breaks every browser client. See startAcceptedWs.
+    fn tls13Config(self: *LinuxServer, request_client_cert: bool) tls_server.Config {
         var cfg = tls_server.Config{
             .cert_chain = self.config.tls_cert_chain,
             .signing_key = self.config.tls_signing_key,
             .ecdsa_p256_signing_key = self.config.tls_ecdsa_signing_key,
             .rsa_signing_key = self.config.tls_rsa_signing_key,
-            .request_client_cert = self.config.tls_request_client_cert,
+            .request_client_cert = request_client_cert,
         };
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;
@@ -4086,14 +4093,18 @@ pub const LinuxServer = struct {
     fn startAcceptedTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, arm_recv: bool) !bool {
         if (self.refuseSilentClient(id, conn)) return false;
         const tls = try self.allocator.create(tls_conn.TlsConn);
+        // Implicit-TLS IRC listener: honour the configured client-cert request
+        // (mTLS for SASL EXTERNAL / CERTFP). Dedicated IRC clients can present a
+        // cert here; the browser WS path forces this off (startAcceptedWs).
+        const tls_cfg = self.tls13Config(self.config.tls_request_client_cert);
         if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
-            tls.* = tls_conn.TlsConn.initDual(self.allocator, self.tls13Config(), .{
+            tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, .{
                 .cert_chain = self.config.tls12_cert_chain,
                 .ecdsa_p256_signing_key = self.config.tls12_signing_key,
                 .rsa_signing_key = self.config.tls_rsa_signing_key,
             });
         } else {
-            tls.* = tls_conn.TlsConn.init(self.allocator, self.tls13Config()) catch {
+            tls.* = tls_conn.TlsConn.init(self.allocator, tls_cfg) catch {
                 self.allocator.destroy(tls);
                 closeFd(conn.fd);
                 _ = self.rx().clients.free(id);
@@ -4125,14 +4136,20 @@ pub const LinuxServer = struct {
         conn.ws = ws;
         if (certReady(self.config)) {
             const tls = try self.allocator.create(tls_conn.TlsConn);
+            // NEVER request a client cert on the browser WebSocket listener:
+            // browsers cannot satisfy a TLS CertificateRequest on a script-
+            // initiated WebSocket and abort the handshake (close 1006), which
+            // silently breaks every browser client. mTLS/CERTFP is unavailable
+            // to browser JS anyway, so forcing this off loses nothing.
+            const tls_cfg = self.tls13Config(false);
             if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
-                tls.* = tls_conn.TlsConn.initDual(self.allocator, self.tls13Config(), .{
+                tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, .{
                     .cert_chain = self.config.tls12_cert_chain,
                     .ecdsa_p256_signing_key = self.config.tls12_signing_key,
                     .rsa_signing_key = self.config.tls_rsa_signing_key,
                 });
             } else {
-                tls.* = tls_conn.TlsConn.init(self.allocator, self.tls13Config()) catch {
+                tls.* = tls_conn.TlsConn.init(self.allocator, tls_cfg) catch {
                     self.allocator.destroy(tls);
                     conn.ws = null;
                     self.allocator.destroy(ws);
@@ -12994,7 +13011,10 @@ pub const LinuxServer = struct {
             }
         else
             null;
-        t.* = tls_conn.TlsConn.resumeFrom(self.allocator, self.tls13Config(), cfg12, ts.state) catch {
+        // Connected-state resume: the handshake is already complete, so the
+        // client-cert request flag has no on-wire effect here. Pass the global
+        // setting to mirror the original config exactly.
+        t.* = tls_conn.TlsConn.resumeFrom(self.allocator, self.tls13Config(self.config.tls_request_client_cert), cfg12, ts.state) catch {
             self.allocator.destroy(t);
             return false;
         };
