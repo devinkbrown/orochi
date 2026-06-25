@@ -504,12 +504,12 @@ pub fn main(init: std.process.Init) !void {
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {
-        // io_uring unavailable (old kernel / sandbox): fall back to the DST boot banner.
-        std.debug.print("orochi: server unavailable ({s}); boot-only.\n", .{@errorName(err)});
-        var sys = orochi.substrate.SystemReactor.init();
-        var d = orochi.daemon.Daemon.init(sys.reactor());
-        d.boot();
-        return;
+        // The reactor requires io_uring on a 64-bit Linux kernel. If it is
+        // unavailable (old kernel / restricted sandbox) the daemon cannot serve,
+        // so fail loudly and exit non-zero rather than pretending to have started.
+        std.debug.print("orochi: fatal — cannot start server: {s}\n", .{@errorName(err)});
+        std.debug.print("orochi: the reactor requires io_uring on a 64-bit Linux kernel.\n", .{});
+        std.process.exit(1);
     };
     defer srv.deinit();
 
