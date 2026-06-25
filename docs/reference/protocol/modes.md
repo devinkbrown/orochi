@@ -1,10 +1,12 @@
-# Orochi Modes
+# Orochi modes
+
+*Current user, member-status, and channel modes Orochi recognizes, drawn from live source.*
 
 This page documents current source only. The advertised channel-mode token is `CHANMODES=beIZ,k,lfj,imnstCTNMSgWOAVUFD` from `src/proto/protocol_inventory.zig` (`chanmodes_token`); the advertised status-prefix token is `PREFIX=(YQqov)*!.@+` from `src/daemon/chanmode.zig` (`MemberModes.isupport_prefix`) — the `Y`/`*` network-operator tier sits above founder. (`V` = NOCOMICDATA, `U` = OPMODERATE, `F` = FREETARGET, and `D` = DISFORWARD are live IRCX flag modes; see below.)
 
-## User Modes
+## User modes
 
-`MODE <nick> [modes]` only allows a client to view or change its own modes; cross-user changes return `ERR_USERSDONTMATCH` except operator `+z` GAG handling (`src/daemon/server.zig:4151`, `src/daemon/server.zig:4531`). The live handler only applies catalog entries whose policy is `client_writable`; server-managed and unknown letters are ignored by the client path (`src/daemon/server.zig:4557`).
+`MODE <nick> [modes]` lets a client view or change only its own modes; cross-user changes return `ERR_USERSDONTMATCH`, except operator `+z` GAG handling (`src/daemon/server.zig:4151`, `src/daemon/server.zig:4531`). The live handler applies only catalog entries whose policy is `client_writable`; the client path ignores server-managed and unknown letters (`src/daemon/server.zig:4557`).
 
 | Letter | Name | Policy | Who Sets It | Meaning / Current Behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -21,11 +23,11 @@ This page documents current source only. The advertised channel-mode token is `C
 | `Q` | no-forward | client-writable | User. | User opt-out of channel forward behavior. | `src/proto/usermode.zig:150` |
 | `H` | hide-oper | client-writable | User. | Hides operator status from WHOIS/WHO for non-opers. | `src/proto/usermode.zig:151` |
 
-Orochi divergence: legacy wallops/snomask do not use user `+w`. Operator notifications ride the Event Spine as `NOTE EVENT ...`; the comment explicitly says this replaces legacy snote/wallops broadcast channels (`src/daemon/server.zig:10009`).
+Orochi divergence: legacy wallops and snomask do not use user `+w`. Operator notifications ride the Event Spine as `NOTE EVENT ...`; the source comment states explicitly that this replaces legacy snote/wallops broadcast channels (`src/daemon/server.zig:10009`).
 
-## Member Status Modes and Prefixes
+## Member status modes and prefixes
 
-The member-prefix rank order is founder `+Q` (`!`) > owner `+q` (`.`) > op `+o` (`@`) > voice `+v` (`+`) (`src/daemon/chanmode.zig:244`). The first member to join a newly-created channel receives founder (`src/daemon/world.zig:477`). Founder is creation-only and cannot be handed out through ordinary MODE (`src/daemon/server.zig:4275`).
+The member-prefix rank order is founder `+Q` (`!`) > owner `+q` (`.`) > op `+o` (`@`) > voice `+v` (`+`) (`src/daemon/chanmode.zig:244`). The first member to join a newly created channel receives founder (`src/daemon/world.zig:477`). Founder is creation-only and cannot be handed out through ordinary MODE (`src/daemon/server.zig:4275`).
 
 | Mode | Prefix | Rank | Param | Who Sets It | Notes | Evidence |
 | --- | --- | ---: | --- | --- | --- | --- |
@@ -34,13 +36,13 @@ The member-prefix rank order is founder `+Q` (`!`) > owner `+q` (`.`) > op `+o` 
 | `o` | `@` | 2 | target nick | Op or higher. | Grants channel operator authority. | `src/daemon/chanmode.zig:295`, `src/daemon/chanmode.zig:314`, `src/daemon/server.zig:4264` |
 | `v` | `+` | 1 | target nick | Op or higher. | May speak in `+m` moderated channels. | `src/daemon/chanmode.zig:297`, `src/daemon/chanmode.zig:319`, `src/daemon/server.zig:4264` |
 
-Rank gating: a member may only set/clear a tier whose rank is less than or equal to their own highest rank, and may not change modes of a higher-ranked member unless they are a server oper (`src/daemon/server.zig:4282`, `src/daemon/server.zig:4294`).
+Rank gating: a member may set or clear only a tier whose rank is at or below their own highest rank, and may not change the modes of a higher-ranked member unless they are a server oper (`src/daemon/server.zig:4282`, `src/daemon/server.zig:4294`).
 
-**Modes combined per line** are advertised through the `MODES` ISUPPORT token, sourced from `[limits] modes_per_line` (default `4`, range `1..20`; `buildIsupportTokens` in `src/daemon/server.zig`). Clients that honor it (mIRC, HexChat) emit one mode/target per `MODE` command when it is set to `1`. The token tunes how many changes a *client* should batch; the server itself always accepts a full multi-mode `MODE` line.
+**Modes combined per line** are advertised through the `MODES` ISUPPORT token, sourced from `[limits] modes_per_line` (default `4`, range `1..20`; `buildIsupportTokens` in `src/daemon/server.zig`). Clients that honor it (mIRC, HexChat) emit one mode and target per `MODE` command when it is set to `1`. The token tunes how many changes a *client* should batch; the server itself always accepts a full multi-mode `MODE` line.
 
-**Cross-node MODE attribution:** when a member-prefix MODE is applied to a user homed on another mesh node, the remote node renders the change under the **setter's** nick — `:<setter> MODE #chan +q nick` — not the origin server. The setter is carried as an optional field on the `MEMBERSHIP` frame (see [mesh-s2s.md](../../architecture/mesh-s2s.md)); a join/auto-status change with no explicit setter falls back to the origin server name.
+**Cross-node MODE attribution:** when a member-prefix MODE is applied to a user homed on another mesh node, the remote node renders the change under the **setter's** nick — `:<setter> MODE #chan +q nick` — not the origin server. The setter travels as an optional field on the `MEMBERSHIP` frame (see [mesh-s2s.md](../../architecture/mesh-s2s.md)); a join or auto-status change with no explicit setter falls back to the origin server name.
 
-## Advertised Channel Mode Classes
+## Advertised channel mode classes
 
 | Class | Advertised Letters | Param Rules | Source |
 | --- | --- | --- | --- |
@@ -49,7 +51,7 @@ Rank gating: a member may only set/clear a tier whose rank is less than or equal
 | C parameter-on-set modes | `l`, `f`, `j` | `+l` takes numeric limit; `+f` takes forward channel; `+j` takes `joins:seconds`; unset is bare. | `src/proto/protocol_inventory.zig:36`, `src/daemon/server.zig:4365`, `src/daemon/server.zig:4450`, `src/daemon/server.zig:4468` |
 | D flags | `i`, `m`, `n`, `s`, `t`, `C`, `T`, `N`, `M`, `S`, `g`, `W`, `O`, `A` | No parameter. | `src/proto/protocol_inventory.zig:36`, `src/daemon/chanmode.zig:98`, `src/daemon/server.zig:4320` |
 
-## Channel List Modes
+## Channel list modes
 
 | Letter | Name | Param | Who Sets It | Meaning | Evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -60,7 +62,7 @@ Rank gating: a member may only set/clear a tier whose rank is less than or equal
 
 List modes are capped by `World.max_list_entries`; exceeding the cap returns `ERR_BANLISTFULL` (`src/daemon/world.zig:195`, `src/daemon/world.zig:761`, `src/daemon/server.zig:4130`).
 
-## Channel Parameter Modes
+## Channel parameter modes
 
 | Letter | Name | Param | Who Sets It | Meaning | Evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -69,7 +71,7 @@ List modes are capped by `World.max_list_entries`; exceeding the cap returns `ER
 | `j` | join throttle | `joins:seconds` on set; no param on unset | Channel op or higher. | At most N joins per window; blocked JOIN returns `ERR_THROTTLE`. | `src/daemon/world.zig:135`, `src/daemon/world.zig:875`, `src/daemon/server.zig:4450`, `src/daemon/server.zig:3934` |
 | `f` | forward | target channel on set; no param on unset | Channel op or higher, with target-side permission unless oper. | Redirects refused JOINs to another channel; target must be valid and, unless `+F`, controlled by setter. | `src/daemon/world.zig:143`, `src/daemon/world.zig:863`, `src/daemon/server.zig:4468`, `src/daemon/server.zig:4475` |
 
-## Channel Flag Modes
+## Channel flag modes
 
 | Letter | Name | Param | Who Sets It | Meaning | Evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -88,9 +90,9 @@ List modes are capped by `World.max_list_entries`; exceeding the cap returns `ER
 | `O` | oper-only | none | Channel op or higher. | JOIN requires IRC operator status. | `src/daemon/chanmode.zig:110`, `src/daemon/server.zig:5718` |
 | `A` | admin-only | none | Channel op or higher. | JOIN requires server administrator privileges. | `src/daemon/chanmode.zig:111`, `src/daemon/server.zig:5722` |
 
-The generic `chanmode.zig` catalog includes `b e I k l i m n t s C T N g S M W O A` (`src/daemon/chanmode.zig:92`). The live server also implements `Z`, `j`, `f`, `p`, `h`, and IRCX extended flags in `server.zig` / `world.zig`.
+The generic `chanmode.zig` catalog includes `b e I k l i m n t s C T N g S M W O A` (`src/daemon/chanmode.zig:92`). The live server also implements `Z`, `j`, `f`, `p`, `h`, and IRCX extended flags in `server.zig` and `world.zig`.
 
-## IRCX Extended Channel Flags
+## IRCX extended channel flags
 
 The live MODE handler recognizes extended channel flags through `chanmode_ext.letterToFlag`; oper-only flags require server operator status (`src/daemon/server.zig:4500`, `src/proto/chanmode_ext.zig:234`, `src/proto/chanmode_ext.zig:252`).
 
@@ -112,4 +114,4 @@ The live MODE handler recognizes extended channel flags through `chanmode_ext.le
 | `F` | FREETARGET | No | Allows channels to be forward targets without target-side op check. | `src/proto/chanmode_ext.zig:67`, `src/daemon/server.zig:4484` |
 | `D` | DISFORWARD | No | Refuses use as a forward target. | `src/proto/chanmode_ext.zig:68`, `src/daemon/server.zig:3880` |
 
-Some IRCX names duplicate base flags (`PRIVATE`, `HIDDEN`, `SECRET`, `MODERATED`, `TOPICOP`, `INVITEONLY`, `NOEXTERN`). The live handler special-cases `p` and `h`, handles base letters through the base channel-mode path, and sends remaining recognized letters through `chanmode_ext` (`src/daemon/server.zig:4320`, `src/daemon/server.zig:4345`, `src/daemon/server.zig:4500`).
+Some IRCX names duplicate base flags (`PRIVATE`, `HIDDEN`, `SECRET`, `MODERATED`, `TOPICOP`, `INVITEONLY`, `NOEXTERN`). The live handler special-cases `p` and `h`, routes base letters through the base channel-mode path, and sends remaining recognized letters through `chanmode_ext` (`src/daemon/server.zig:4320`, `src/daemon/server.zig:4345`, `src/daemon/server.zig:4500`).

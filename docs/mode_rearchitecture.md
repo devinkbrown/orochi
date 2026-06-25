@@ -1,8 +1,7 @@
-# Mode Re-architecture: Legacy Channel & User Modes
+# Mode re-architecture: legacy channel and user modes
+*Historical design note: records legacy channel and user mode decisions for Orochi's mode re-architecture.*
 
-Decision document for the Orochi IRC daemon.
-
-Status: design decision record. Scope: deciding, for each channel/user mode found in
+Status: design decision record. Scope: decide, for each channel/user mode found in
 the legacy ircds (charybdis / UnrealIRCd / InspIRCd lineage) that Orochi does **not**
 yet implement, whether to **KEEP** (reimplement Orochi-native), **DROP** (obsolete,
 legacy, or redundant), or mark **ALREADY-COVERED** (Orochi achieves the effect by
@@ -10,11 +9,11 @@ another mechanism).
 
 ---
 
-## 1. Philosophy
+## Philosophy
 
-Orochi is a clean-room daemon, not a port. We are not obligated to carry forward the
-accreted single-letter mode flags that legacy ircds accumulated over twenty years. The
-guiding principles for this review:
+Orochi is a clean-room daemon, not a port. It does not carry forward every
+single-letter mode flag that legacy ircds accumulated over twenty years. The
+review follows these principles:
 
 1. **A mode letter is a bad API.** A cryptic one-byte flag is justified only when the
    effect is (a) per-channel or per-user state, (b) frequently toggled by ordinary
@@ -40,7 +39,7 @@ guiding principles for this review:
 5. **Cloaking is automatic.** Hostnames are cloaked at connect time for every user. There
    is no user-toggled cloak.
 
-6. **Don't duplicate what IRCX already names.** Orochi ships an IRCX-style named-mode
+6. **Do not duplicate what IRCX already names.** Orochi ships an IRCX-style named-mode
    layer (`MODEX`, `PROP`, `ACCESS`, `OWNER`). Several legacy letter-modes map directly
    onto existing IRCX named flags; those are ALREADY-COVERED and should not get a second,
    redundant letter.
@@ -64,9 +63,9 @@ to the implementing module.
 
 ---
 
-## 2. Channel Modes
+## Channel modes
 
-| Legacy | Meaning | Decision | Rationale & Orochi-native design |
+| Legacy | Meaning | Decision | Rationale and Orochi-native design |
 |--------|---------|----------|-----------------------------------|
 | `p` | private | **ALREADY-COVERED** | IRCX `PRIVATE(p)` exists in `chanmode_ext.zig`. The legacy `+p`/`+s` split is collapsed: `SECRET(s)` hides from `LIST`/`WHOIS`, `PRIVATE(p)` suppresses membership disclosure. No new letter. |
 | `c` | strip mIRC color/formatting | **ALREADY-COVERED** | IRCX `NOFORMAT(f)` already strips formatting/color. Keep the named form; do not add a second `c`. |
@@ -76,7 +75,7 @@ to the implementing module.
 | `T` | block channel NOTICEs | **KEEP** | Anti-spam staple. Orochi-native: flag `NONOTICE`, MODE letter **`T`**. Blocks `NOTICE` to the channel from non-ops. |
 | `N` | block nick changes while in channel | **KEEP** | Useful for moderated/event channels. Orochi-native: flag `NONICK`, MODE letter **`N`**. While set, members below op cannot change nick while joined. |
 | `S` | TLS-only channel | **KEEP** | Redefined for implicit-TLS: join is permitted only if the joining session was accepted over TLS (connection fact, no STARTTLS). Orochi-native: flag `TLSONLY`, MODE letter **`S`**. Non-TLS join → `ERR_SECUREONLYCHAN`. |
-| `O` | oper-only channel | **DROP / fold into IRCX** | The IRCX `ACCESS` list with a `DENY`/`GRANT` entry keyed on operator identity expresses this precisely and auditable-y. A blunt "opers only" bit is too coarse; use `ACCESS #chan ADD DENY *` + grant for opers. No new letter. |
+| `O` | oper-only channel | **DROP / fold into IRCX** | The IRCX `ACCESS` list with a `DENY`/`GRANT` entry keyed on operator identity expresses this precisely and in an auditable way. A blunt "opers only" bit is too coarse; use `ACCESS #chan ADD DENY *` + grant for opers. No new letter. |
 | `A` | admin-only channel | **DROP** | Same reasoning as `O`, and Orochi has no separate "admin" oper class to gate on. Express via `ACCESS`. |
 | `r` | registered-account-only join | **KEEP** | Common, distinct from registered-*channel*. Reuse the IRCX named flag **`AUTHONLY(a)`** which already gates join on an authenticated account — so this is effectively ALREADY-COVERED by `AUTHONLY`. No new `r` channel letter (our `r` already means REGISTERED-channel). |
 | `M` | mute unauthenticated users (may join, can't speak) | **KEEP** | Softer than `AUTHONLY`. Orochi-native: flag `MODREG` (moderate-unregistered), MODE letter **`M`**. Unauthenticated members are treated as un-voiced under `+m`-like rules; authenticated speak freely. Account-integrated. |
@@ -90,9 +89,9 @@ to the implementing module.
 
 ---
 
-## 3. User Modes
+## User modes
 
-| Legacy | Meaning | Decision | Rationale & Orochi-native design |
+| Legacy | Meaning | Decision | Rationale and Orochi-native design |
 |--------|---------|----------|-----------------------------------|
 | `i` | invisible (hidden from `WHO`/no-shared-channel `WHOIS`) | **ALREADY-COVERED** | Shipped as `invisible(i)` in `usermode.zig`. |
 | `B` | bot flag | **ALREADY-COVERED** | Shipped as `bot(B)` with IRCv3 `bot` tag in `usermode.zig`. |
@@ -108,11 +107,14 @@ to the implementing module.
 
 ---
 
-## 4. Recommended Implementation Order (KEEP items only)
+## Recommended implementation order (KEEP items only)
 
 Grouped by implementation effort. ALREADY-COVERED and DROP items are excluded.
 
-### Tier 1 — trivial boolean channel flags (a flag bit + a join/speak/notice gate)
+### Tier 1 — trivial boolean channel flags
+
+These require a flag bit plus a join/speak/notice gate.
+
 - `C` NOCTCP — block channel CTCP.
 - `T` NONOTICE — block channel notices.
 - `N` NONICK — block nick changes while joined.
@@ -120,24 +122,27 @@ Grouped by implementation effort. ALREADY-COVERED and DROP items are excluded.
 - `S` TLSONLY — gate join on the connection's TLS fact.
 
 ### Tier 2 — account-integrated user/channel toggles
+
 - user `R` regonly-pm — reject PMs from unauthenticated senders.
 - user `p` hide-chans — suppress own WHOIS channel list.
 - channel `M` MODREG — mute unauthenticated members (`+m`-like for non-accounts).
 - user `o` oper — server-managed, set on operator-class SASL only.
 - (channel `AUTHONLY(a)` already covers reg-only join — no new work beyond confirming the gate.)
 
-### Tier 3 — parameterized / list modes (need storage + matching)
+### Tier 3 — parameterized and list modes
+
+These require storage and matching.
+
 - `Z` MUTE — type-A quiet list (mute-only ban analog; letter chosen to avoid the owner `q` collision).
 - `j` THROTTLE — `joins:seconds` token-bucket on join.
 
-### Tier 4 — stateful / cross-subsystem features
+### Tier 4 — stateful and cross-subsystem features
+
 - `U` OPMODERATE — held-message moderation, surfaced to ops via the Event Spine.
 - `D` DELAYJOIN — deferred join reveal, integrates with the Event Spine and membership state.
 - `P` PERSIST — persistent channel via IRCX `PROP`, oper-gated, backed by the CRDT channel object in the substrate (read-only `P` display letter).
 
----
-
-## 5. Better as Account-Integrated Features or Event-Spine Signals
+## Account-integrated features and Event Spine signals
 
 Several KEEP items are explicitly **not** best modeled as cryptic letters and should lean
 on existing subsystems rather than expanding the letter namespace:
@@ -153,7 +158,7 @@ on existing subsystems rather than expanding the letter namespace:
   arms the behavior.
 
 - **`D` DELAYJOIN → Event-Spine reveal.** The deferred "now reveal this member" step is an
-  Event-Spine transition, keeping membership visibility logic in one place rather than
+  Event Spine transition, keeping membership visibility logic in one place rather than
   scattered through the JOIN path.
 
 - **`R` regonly-pm, `M` MODREG, channel `AUTHONLY` → account identity, not host masks.**
@@ -165,7 +170,7 @@ on existing subsystems rather than expanding the letter namespace:
   operator-class SASL authentication; the `+o` letter is a server-managed reflection of
   account state, not an independently togglable flag. There is no password `OPER`.
 
-### What we deliberately did *not* bring forward
+### Deliberately excluded legacy modes
 
 Channel forwarding (`F`/`f`/`Q`/`L`), oper/admin-only channel bits (`O`/`A`), the
 host-cloak toggle (`x`), and the WALLOPS/snomask user bits (`w`/`s`) are all DROPPED:

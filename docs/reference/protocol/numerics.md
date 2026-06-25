@@ -1,8 +1,10 @@
-# Orochi Numeric Replies
+# Orochi numeric replies
+
+*The numeric reply codes Orochi emits, where each originates, and the message text clients receive.*
 
 This reference documents current source only. Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C ophion, not a clone. Numeric values are drawn from the daemon-local enum in `src/daemon/server.zig:701` and the shared protocol enum in `src/proto/numeric.zig:9`; pre-registration numerics are also emitted by `src/daemon/dispatch.zig:141`.
 
-## Source Inventories
+## Source inventories
 
 | Source | Scope | Evidence |
 | --- | --- | --- |
@@ -12,7 +14,7 @@ This reference documents current source only. Orochi is a pure-Zig 0.16 clean-ro
 
 Current enum sizes are 113 daemon-local live handler codes, 15 pre-registration dispatch codes, and 215 shared protocol catalog codes. The shared catalog is intentionally broader than the set currently emitted by handlers.
 
-## Connection Registration
+## Connection registration
 
 | Value | Name | When Emitted | Message Text | Evidence |
 | ---: | --- | --- | --- | --- |
@@ -28,7 +30,7 @@ Current enum sizes are 113 daemon-local live handler codes, 15 pre-registration 
 | 461 | `ERR_NEEDMOREPARAMS` | Generic arity/usage failure across handlers. | Usually `Not enough parameters`; handlers also emit command-specific usage strings. | `src/daemon/server.zig:792`, `src/daemon/server.zig:3453`, `src/daemon/dispatch.zig:151`, `src/daemon/dispatch.zig:1514`, `src/proto/numeric.zig:185` |
 | 462 | `ERR_ALREADYREGISTRED` | USER/AUTHENTICATE after registration or duplicate registration attempt. | `You may not reregister` | `src/daemon/dispatch.zig:152`, `src/daemon/dispatch.zig:1285`, `src/daemon/dispatch.zig:1327`, `src/proto/numeric.zig:186` |
 
-## SASL and Account Registration
+## SASL and account registration
 
 | Value | Name | When Emitted | Message Text | Evidence |
 | ---: | --- | --- | --- | --- |
@@ -37,9 +39,9 @@ Current enum sizes are 113 daemon-local live handler codes, 15 pre-registration 
 | 904 | `ERR_SASLFAIL` | SASL not negotiated, unsupported mechanism, verifier failure, or router failure. | `SASL authentication failed`; `Unsupported SASL mechanism` | `src/daemon/dispatch.zig:155`, `src/daemon/dispatch.zig:1332`, `src/daemon/dispatch.zig:1460`, `src/proto/numeric.zig:228` |
 | 906 | `ERR_SASLABORTED` | Client sends `AUTHENTICATE *` or router reports abort. | `SASL authentication aborted` | `src/daemon/dispatch.zig:156`, `src/daemon/dispatch.zig:1346`, `src/daemon/dispatch.zig:1469`, `src/proto/numeric.zig:230` |
 
-Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `ERR_BADLEVEL` (`src/daemon/server.zig:801`, `src/daemon/server.zig:802`). Current emitted registration code uses the SASL meanings above.
+Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `ERR_BADLEVEL` (`src/daemon/server.zig:801`, `src/daemon/server.zig:802`). The registration code currently emitted uses the SASL meanings above.
 
-## Operator, Server, and Mesh
+## Operator, server, and mesh
 
 | Value | Name | When Emitted | Message Text | Evidence |
 | ---: | --- | --- | --- | --- |
@@ -59,7 +61,7 @@ Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `
 | 481 | `ERR_NOPRIVILEGES` | Operator-only command or plugin capability failure. | `Permission Denied- You're not an IRC operator`; other handler-specific privilege text. | `src/daemon/server.zig:796`, `src/daemon/server.zig:3458`, `src/daemon/server.zig:9652`, `src/proto/numeric.zig:204` |
 | 491 | `ERR_NOOPERHOST` | Legacy `OPER` command is disabled. | `OPER is disabled; authenticate via SASL (operator status is granted on login)` | `src/daemon/server.zig:798`, `src/daemon/server.zig:8305`, `src/proto/numeric.zig:211` |
 
-## Channel Membership, MODE, and Messaging
+## Channel membership, MODE, and messaging
 
 | Value | Name | When Emitted | Message Text | Evidence |
 | ---: | --- | --- | --- | --- |
@@ -100,7 +102,7 @@ Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `
 | 489 | `ERR_SECUREONLYCHAN` | JOIN blocked by channel `+S` over non-TLS session. | `Cannot join channel (+S) - TLS required` | `src/daemon/server.zig:706`, `src/daemon/server.zig:3770`, `src/proto/numeric.zig:210` |
 | 502 | `ERR_USERSDONTMATCH` | User MODE target is not the caller. | `Cannot change mode for other users` | `src/daemon/server.zig:795`, `src/daemon/server.zig:4537`, `src/proto/numeric.zig:215` |
 
-## Lists, Monitor, Silence, Knock, Metadata, IRCX
+## Lists, monitor, silence, knock, metadata, IRCX
 
 | Value | Name | When Emitted | Message Text | Evidence |
 | ---: | --- | --- | --- | --- |
@@ -133,9 +135,9 @@ Note: the daemon-local IRCX enum also names 900 as `ERR_BADCOMMAND` and 903 as `
 | 913 | `ERR_NOACCESS` | IRCX PROP/DATA access denied. | `Insufficient access to set property`; `Cannot set that property`; DATA reserved-tag denials. | `src/daemon/server.zig:746`, `src/daemon/server.zig:7656`, `src/daemon/server.zig:7740` |
 | 923 | `ERR_NOWHISPER` | WHISPER blocked by IRCX NOWHISPER (`+w`). | `Channel does not allow whispers (+w)` | `src/daemon/server.zig:749`, `src/daemon/server.zig:7790`, `src/daemon/server.zig:7792` |
 
-## Standard Replies: FAIL, WARN, NOTE
+## Standard replies: FAIL, WARN, NOTE
 
-Standard replies are not numeric replies. They are line types with a severity token, command token, reply-code token, optional context params, and a trailing description.
+Standard replies are not numeric replies. They are line types carrying a severity token, a command token, a reply-code token, optional context params, and a trailing description.
 
 | Token | Builder / Emitter | Shape | Current Uses | Evidence |
 | --- | --- | --- | --- | --- |
@@ -145,8 +147,8 @@ Standard replies are not numeric replies. They are line types with a severity to
 
 The shared standard-replies catalog currently contains these code tokens: `ACCOUNT_ALREADY_EXISTS`, `ACCOUNT_REQUIRED`, `ALREADY_AUTHENTICATED`, `ALREADY_REGISTERED`, `AUTHENTICATION_FAILED`, `BAD_ACCOUNT_NAME`, `BAD_CHANNEL_NAME`, `BAD_PASSWORD`, `BAD_TARGET`, `BANNED_FROM_CHANNEL`, `CANNOT_SEND_TO_CHANNEL`, `CHANNEL_DISABLED`, `CHANNEL_DOES_NOT_EXIST`, `CHANNEL_FULL`, `CHANNEL_RENAMED`, `CHANNEL_REQUIRED`, `COMMAND_DISABLED`, `COMMAND_RATE_LIMITED`, `EXPIRED_TOKEN`, `HOST_REQUIRED`, `INVALID_ACCOUNT_NAME`, `INVALID_CREDENTIALS`, `INVALID_KEY`, `INVALID_MODE`, `INVALID_PARAMS`, `INVALID_PROPERTY`, `INVALID_TARGET`, `INVALID_TOKEN`, `LIST_EMPTY`, `MESSAGE_RATE_LIMITED`, `MESSAGE_TOO_LONG`, `METADATA_LIMIT_REACHED`, `MONITOR_LIMIT_REACHED`, `NEED_MORE_PARAMS`, `NETWORK_ERROR`, `NICK_LOCKED`, `NO_MATCHING_KEY`, `NOT_AUTHENTICATED`, `NOT_CHANNEL_OPERATOR`, `NOT_ON_CHANNEL`, `NOT_REGISTERED`, `PERMISSION_DENIED`, `PRIVILEGES_REQUIRED`, `PROPERTY_REQUIRED`, `REGISTRATION_IS_DISABLED`, `SILENTLY_DROPPED`, `TARGET_REQUIRED`, `TOKEN_REQUIRED`, `TOO_MANY_CHANNELS`, `TOO_MANY_MATCHES`, `TOO_MANY_MONITOR_TARGETS`, `UNKNOWN_COMMAND`, `UNKNOWN_ERROR`, `UNKNOWN_PROPERTY`, and `UNSUPPORTED_MEDIA_TYPE` (`src/proto/standard_replies.zig:33`).
 
-## Cataloged but Not Currently Emitted by `server.zig`
+## Cataloged but not currently emitted by `server.zig`
 
-The daemon-local enum includes IRCX residual 9xx numerics that are intentionally inert until a handler emits them: `ERR_BADCOMMAND` 900, `ERR_BADLEVEL` 903, `ERR_BADPROPERTY` 905, `ERR_RESOURCE` 907, `ERR_SECURITY` 908, `ERR_UNKNOWNPACKAGE` 912, `ERR_DUPACCESS` 914, `ERR_MISACCESS` 915, `ERR_TOOMANYACCESSES` 916, `ERR_NOSUCHOBJECT` 924, `ERR_NOTSUPPORTED` 925, `ERR_CHANNELEXIST` 926, and `ERR_ALREADYONCHANNEL` 927 (`src/daemon/server.zig:799`).
+The daemon-local enum includes residual IRCX 9xx numerics that stay inert until a handler emits them: `ERR_BADCOMMAND` 900, `ERR_BADLEVEL` 903, `ERR_BADPROPERTY` 905, `ERR_RESOURCE` 907, `ERR_SECURITY` 908, `ERR_UNKNOWNPACKAGE` 912, `ERR_DUPACCESS` 914, `ERR_MISACCESS` 915, `ERR_TOOMANYACCESSES` 916, `ERR_NOSUCHOBJECT` 924, `ERR_NOTSUPPORTED` 925, `ERR_CHANNELEXIST` 926, and `ERR_ALREADYONCHANNEL` 927 (`src/daemon/server.zig:799`).
 
 The shared protocol enum is broader than the live daemon emission set. It catalogs additional 0xx, 2xx, 3xx, 4xx, 5xx, 6xx, and SASL/account numerics including `RPL_SAVENICK`, TRACE/STATS variants, WHOIS/WHOWAS variants, LIST/MOTD/ADMIN/TIME/USERS variants, `ERR_UNKNOWNMODE`, `ERR_UMODEUNKNOWNFLAG`, `ERR_DISABLED`, `ERR_INVALIDKEY`, `RPL_WHOISSECURE`, and `RPL_SASLMECHS` (`src/proto/numeric.zig:21`, `src/proto/numeric.zig:23`, `src/proto/numeric.zig:72`, `src/proto/numeric.zig:148`, `src/proto/numeric.zig:224`). Correct shared-catalog names for the historically conflicting 4xx slots are `ERR_NEEDREGGEDNICK` 477, `ERR_ISCHANSERVICE` 484, and `ERR_BANNEDNICK` 485 (`src/proto/numeric.zig:200`, `src/proto/numeric.zig:207`, `src/proto/numeric.zig:208`). Do not treat a catalog entry as live behavior unless a handler citation above or a future handler emission exists.

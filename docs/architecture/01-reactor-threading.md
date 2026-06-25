@@ -1,8 +1,10 @@
-# Reactor and Threading
+# Reactor and threading
+
+_The Ringlane io_uring reactor, per-reactor connection state, worker shards, cross-shard delivery, world locking, and the live multithreading status._
 
 Orochi's live Linux server is built around a Ringlane wrapper over `std.os.linux.IoUring`. The file comment defines the socket path: accept TCP clients, receive IRC bytes through `Ring`, feed complete CRLF lines into the pure command core, and send queued replies back through `Ring`. Evidence: `src/daemon/server.zig:1`, `src/daemon/server.zig:3`, `src/daemon/server.zig:4`.
 
-## Ringlane Reactor Core
+## Ringlane reactor core
 
 | Component | Current behavior | Evidence |
 | --- | --- | --- |
@@ -12,7 +14,7 @@ Orochi's live Linux server is built around a Ringlane wrapper over `std.os.linux
 | Completion demux | `reapCompletions` copies CQEs, decodes each completion, and calls the provided handler. | `src/daemon/server.zig:666`, `src/daemon/server.zig:669`, `src/daemon/server.zig:670` |
 | Deterministic seam | `src/substrate/reactor.zig` is a separate vtable seam for monotonic time; its header still says io_uring submit/poll/accept/recv/send are future work for that seam, while the live io_uring wrapper is inside `server.zig`. | `src/substrate/reactor.zig:1`, `src/substrate/reactor.zig:16`, `src/substrate/reactor.zig:26`, `src/daemon/server.zig:466` |
 
-## Per-Reactor State and Connection Classes
+## Per-reactor state and connection classes
 
 `LinuxServer` stores a heap slice of `Reactor` structs. Each `Reactor` owns its ring, connection table, listener fds, timer/wake state, and shard id. Evidence: `src/daemon/server.zig:1229`, `src/daemon/server.zig:1235`, `src/daemon/server.zig:1237`, `src/daemon/server.zig:1240`, `src/daemon/server.zig:1243`, `src/daemon/server.zig:1258`.
 
@@ -49,7 +51,7 @@ SendQ overflow is drained back into the inline buffer on send completions, so th
 | Server reactor slice | `LinuxServer.init` allocates `reactors` with length `shard_count` and initializes each. | `src/daemon/server.zig:1543`, `src/daemon/server.zig:1549`, `src/daemon/server.zig:1553` |
 | Shared world/stores | `LinuxServer` owns shared world and stores separately from per-reactor I/O. | `src/daemon/server.zig:1308`, `src/daemon/server.zig:1567` |
 
-## Run Loop
+## Run loop
 
 | Mode | Behavior | Evidence |
 | --- | --- | --- |
@@ -58,7 +60,7 @@ SendQ overflow is drained back into the inline buffer on send completions, so th
 | Multi reactor | For more than one reactor, `runThreaded` creates a cross-shard fabric, starts one worker thread per reactor, and joins the pool. | `src/daemon/server.zig:2278`, `src/daemon/server.zig:2283`, `src/daemon/server.zig:2295`, `src/daemon/server.zig:2296`, `src/daemon/server.zig:2311` |
 | Worker | Each worker sets `current_reactor` to its shard and loops `runOnce` while the run flag is true. | `src/daemon/server.zig:2314`, `src/daemon/server.zig:2318`, `src/daemon/server.zig:2319` |
 
-## Cross-Shard Delivery
+## Cross-shard delivery
 
 When a command needs to write to a connection, `enqueueDelivery` is the central shard-aware sink. Local writes append directly to the owning reactor's connection; cross-shard writes copy bytes into pooled buffers, enqueue them into the target shard mailbox, and wake the target reactor. Evidence: `src/daemon/server.zig:2800`, `src/daemon/server.zig:2819`, `src/daemon/server.zig:2826`, `src/daemon/server.zig:2860`.
 
@@ -71,18 +73,18 @@ When a command needs to write to a connection, `enqueueDelivery` is the central 
 | Drain | `drain(target, out)` is called by the owning reactor. | `src/daemon/reactor_fabric.zig:149`, `src/daemon/reactor_fabric.zig:151` |
 | Wake | `wake(target)` pokes the target shard's eventfd. | `src/daemon/reactor_fabric.zig:155`, `src/daemon/reactor_fabric.zig:157` |
 
-## World Locking
+## World locking
 
 The shared `World` owns an `RwLock`. Current comments say lookups take the read lock, mutations take the write lock, and every mutation/allocation happens under the exclusive lock. Evidence: `src/daemon/world.zig:218`, `src/daemon/world.zig:220`, `src/daemon/world.zig:225`, `src/daemon/world.zig:229`, `src/daemon/world.zig:235`.
 
 The world also has lazily activated RCU mirrors for nick lookup and channel existence/membership. The RCU model is implemented in `world_rcu.zig`: readers pin EBR and traverse immutable HAMT snapshots without locks or allocation; writers serialize, copy-on-write, publish a new root, and retire old state. Evidence: `src/daemon/world.zig:207`, `src/daemon/world.zig:213`, `src/daemon/world_rcu.zig:1`, `src/daemon/world_rcu.zig:26`, `src/daemon/world_rcu.zig:33`.
 
-## Is Multithreading Live?
+## Is multithreading live?
 
-Yes, conditionally. The default configuration is one shard, but current source creates multiple reactors when `config.num_shards > 1`, uses SO_REUSEPORT for multiple reactors, initializes the cross-shard fabric, and spawns one worker thread per reactor. Evidence: `src/daemon/server.zig:992`, `src/daemon/server.zig:1543`, `src/daemon/server.zig:1547`, `src/daemon/server.zig:2278`, `src/daemon/server.zig:2295`.
+Yes, conditionally. The default configuration is one shard, but the current source creates multiple reactors when `config.num_shards > 1`. In that case it binds with SO_REUSEPORT, initializes the cross-shard fabric, and spawns one worker thread per reactor. Evidence: `src/daemon/server.zig:992`, `src/daemon/server.zig:1543`, `src/daemon/server.zig:1547`, `src/daemon/server.zig:2278`, `src/daemon/server.zig:2295`.
 
 The test suite contains an end-to-end threaded server test using `num_shards = 2` and skips only if the server ended up with fewer than two reactors. Evidence: `src/daemon/server.zig:12068`, `src/daemon/server.zig:12077`, `src/daemon/server.zig:12084`.
 
-## Planning Notes and Divergences
+## Planning notes and divergences
 
 `docs/planning/06-threading.md`, `docs/planning/10-io-threading.md`, and `docs/planning/24-multithreading.md` describe the intended direction. Current code diverges in one important inline comment: `Config.num_shards` still says values greater than 1 are clamped to 1 at `runThreaded`, but the implementation starts the multi-reactor pool when `reactors.len > 1`. Evidence for the stale comment: `src/daemon/server.zig:987`; evidence for current behavior: `src/daemon/server.zig:2270`, `src/daemon/server.zig:2278`, `src/daemon/server.zig:2296`.

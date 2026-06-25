@@ -1,13 +1,15 @@
-# Connection Commands
+# Connection commands
 
-These commands are accepted through the lower command table used by `dispatchRegistered` for connection-level verbs (`src/daemon/server.zig:3502`, `src/daemon/dispatch.zig:1233`). `NICK`, `PONG`, and `QUIT` are also registered module commands (`src/daemon/modules/user_query.zig:80`, `src/daemon/modules/feature_misc.zig:57`).
+*Pre-registration handshake, capability negotiation, SASL, heartbeat, and session teardown.*
 
-Successful client registration assigns a connection class after SASL/oper state is known and before the welcome burst. The matched class applies per-connection SendQ/RecvQ ceilings and class policy, and class admission can close the connection before welcome if the policy refuses it.
+These commands are accepted through the lower command table that `dispatchRegistered` uses for connection-level verbs (`src/daemon/server.zig:3502`, `src/daemon/dispatch.zig:1233`). `NICK`, `PONG`, and `QUIT` are also registered as module commands (`src/daemon/modules/user_query.zig:80`, `src/daemon/modules/feature_misc.zig:57`).
+
+Successful registration assigns a connection class once SASL and oper state are known, before the welcome burst. The matched class applies per-connection SendQ and RecvQ ceilings and its class policy; class admission can close the connection before welcome when the policy refuses it.
 
 ## PASS
 
 - Syntax: `PASS <token>`
-- Description: Records that a pre-registration password was seen. The handler does not validate a server password; it only updates registration state.
+- Description: Records that a pre-registration password was supplied. The handler does not validate a server password; it only updates registration state.
 - Privileges: Any pre-registration client.
 - Parameters: `token` is required but not otherwise inspected by this handler.
 - Replies: None on success.
@@ -18,7 +20,7 @@ Successful client registration assigns a connection class after SASL/oper state 
 ## NICK
 
 - Syntax: `NICK <nick>`
-- Description: Before registration, stores the nick and checks control bytes and configured `NICKLEN`. After registration, `handleNickChange` changes the live nick and updates the world nick registry. When nick delay is enabled, a held nick is refused during initial registration or registered nick change unless reclaimed by its owning account or bypassed by an operator or `nick_delay_exempt` connection class.
+- Description: Before registration, stores the nick after validating control bytes and the configured `NICKLEN`. After registration, `handleNickChange` changes the live nick and updates the world nick registry. When nick delay is enabled, a held nick is refused during initial registration or a registered nick change unless its owning account reclaims it, or an operator or `nick_delay_exempt` connection class bypasses the hold.
 - Privileges: Any client before registration; registered client afterward.
 - Parameters: `nick` is required.
 - Replies: On registered nick change, broadcasts a `NICK` line to visible peers.
@@ -29,7 +31,7 @@ Successful client registration assigns a connection class after SASL/oper state 
 ## USER
 
 - Syntax: `USER <username> <mode> <unused> :<realname>`
-- Description: Pre-registration only. Stores username and realname after control-byte validation. When `NICK`, `USER`, and capability negotiation permit registration, the daemon matches the now-identified client to a connection class before welcome.
+- Description: Pre-registration only. Stores the username and realname after control-byte validation. Once `NICK`, `USER`, and capability negotiation permit registration, the daemon matches the now-identified client to a connection class before welcome.
 - Privileges: Any pre-registration client.
 - Parameters: Four parameters are required by the lower command table; the handler uses parameter 1 as username and parameter 4 as realname.
 - Replies: May complete registration and emit welcome numerics when `NICK`, `USER`, and capability negotiation permit it.
@@ -40,9 +42,9 @@ Successful client registration assigns a connection class after SASL/oper state 
 ## CAP
 
 - Syntax: `CAP <subcommand> [parameters...]`
-- Description: Dispatches capability negotiation to the session capability handler, then emits `CAP LS`, `CAP ACK`, or `CAP NAK` lines.
+- Description: Dispatches capability negotiation to the session capability handler, which emits `CAP LS`, `CAP ACK`, or `CAP NAK` lines.
 - Privileges: Any client, before or after registration.
-- Parameters: At least a subcommand is required; supported subcommands are determined by the capability handler, not by this command wrapper.
+- Parameters: A subcommand is required. The capability handler determines the supported subcommands, not this command wrapper.
 - Replies: Raw `CAP` replies; no numeric on normal success.
 - Errors: `ERR_INVALIDCAPCMD 410` for invalid subcommands; `ERR_NEEDMOREPARAMS 461` for missing parameters.
 - Example: `CAP LS 302`
@@ -51,8 +53,8 @@ Successful client registration assigns a connection class after SASL/oper state 
 ## AUTHENTICATE
 
 - Syntax: `AUTHENTICATE <mechanism-or-payload>`
-- Description: Runs SASL. Mechanism selection starts a router for `PLAIN`, `EXTERNAL`, or `SCRAM-SHA-256`; later lines feed mechanism payloads. A successful exchange lowercases and stores the account, emits login numerics, and lets registration finish.
-- Privileges: Any pre-registration client with the `sasl` capability negotiated. Already registered clients are rejected.
+- Description: Runs SASL. The mechanism token starts a router for `PLAIN`, `EXTERNAL`, or `SCRAM-SHA-256`; subsequent lines carry mechanism payloads. A successful exchange lowercases and stores the account, emits login numerics, and lets registration finish.
+- Privileges: Any pre-registration client that has negotiated the `sasl` capability. Already registered clients are rejected.
 - Parameters: One mechanism token or payload chunk is required. `*` aborts when used at the appropriate phase.
 - Replies: Raw `AUTHENTICATE <challenge>` lines, `RPL_LOGGEDIN 900`, `RPL_SASLSUCCESS 903`.
 - Errors: `ERR_ALREADYREGISTRED 462`, `ERR_SASLFAIL 904`, `ERR_SASLABORTED 906`, `ERR_NEEDMOREPARAMS 461`.
@@ -62,7 +64,7 @@ Successful client registration assigns a connection class after SASL/oper state 
 ## PING
 
 - Syntax: `PING <token>`
-- Description: The registered fast path routes `PING` to the lower command table. It replies with `PONG <server> :<token>`.
+- Description: The registered fast path routes `PING` to the lower command table, which replies with `PONG <server> :<token>`.
 - Privileges: Any client.
 - Parameters: `token` is required.
 - Replies: Raw `PONG`.
@@ -73,8 +75,8 @@ Successful client registration assigns a connection class after SASL/oper state 
 ## PONG
 
 - Syntax: `PONG <token>`
-- Description: A heartbeat acknowledgement. Both the lower table and registered module handler accept it and intentionally emit no reply.
-- Privileges: Any client in the lower table; any client in the registered module table.
+- Description: Acknowledges a heartbeat. Both the lower table and the registered module handler accept it and intentionally emit no reply.
+- Privileges: Any client, in either the lower table or the registered module table.
 - Parameters: Lower-table `PONG` requires one token; the registered module handler ignores invocation details.
 - Replies: None.
 - Errors: Lower table can emit `ERR_NEEDMOREPARAMS 461`.

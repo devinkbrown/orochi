@@ -1,22 +1,19 @@
-# 00 — Orochi Master Architecture (synthesis)
+# 00 — Orochi master architecture (synthesis)
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
 
-This document integrates the five research tracks (`01`–`05`) — produced by parallel
-Codex deep-dives into the real ophion/libop/opssl code + Suimyaku/Tsumugi specs, plus Claude
-synthesis — into one coherent design, and records the locked decisions and the
-**canonical vocabulary** (the tracks each coined overlapping names; this section is the
-authority).
+This planning document integrates the five research tracks (`01`–`05`) produced by parallel Codex deep-dives into real ophion/libop/opssl code, Suimyaku/Tsumugi specs, and Claude synthesis; it records locked decisions and the canonical vocabulary when tracks use overlapping names.
 
 > Sub-documents: [`01-substrate`](01-substrate.md) · [`02-crypto-tsumugi`](02-crypto-tsumugi.md)
 > · [`03-daemon-modules`](03-daemon-modules.md) · [`04-suimyaku-mesh`](04-suimyaku-mesh.md)
-> · [`05-innovation`](05-innovation.md). Raw worker output in [`_codex-raw/`](_codex-raw/).
+> · [`05-innovation`](05-innovation.md). Raw worker output in `_codex-raw/`.
 
 ## 0. Thesis
 
-ophion's S2S complexity is largely **TS6 compatibility scar tissue** (text S2S +
-`STARTMSGPACK` + `MSEQ`/`HASHCHECK`/`RESYNC` repair bolt-ons all coexisting). Orochi
-owes no backward compatibility, so the clean-slate Zig design is **smaller and more
-principled, not bigger**: one pure binary mesh protocol, one anti-entropy mechanism
-(Merkle delta sync), one language top-to-bottom.
+Ophion's S2S complexity comes largely from TS6 compatibility: text S2S,
+`STARTMSGPACK`, and `MSEQ`/`HASHCHECK`/`RESYNC` repair paths coexist. Orochi
+has no backward-compatibility requirement, so the clean-slate Zig design stays
+smaller and more principled: one pure binary mesh protocol, one anti-entropy
+mechanism (Merkle delta sync), and one language top-to-bottom.
 
 ## 1. Locked decisions (2026-06-02)
 
@@ -33,7 +30,7 @@ principled, not bigger**: one pure binary mesh protocol, one anti-entropy mechan
 
 ## 2. Workspace (multi-package Zig)
 
-```
+```text
 orochi-substrate   reactor (Ringlane), allocators/arenas, lock-free queues,
                     data structures, Suimyaku math (CRDT/HLC/vclock/Merkle/sketches),
                     simulation runtime (Deterministic Ocean), Fault Loom
@@ -49,7 +46,8 @@ orochi-tools       config validator, keygen, trace reader, capsule inspector,
 
 ## 3. Canonical invention glossary (authority — use these names)
 
-**Substrate / runtime**
+### Substrate and runtime
+
 - **Ringlane** — io_uring fast-path reactor (multishot accept/recv, buf_rings, send_zc,
   fixed files, DEFER_TASKRUN); one ring per shard; portable `Reactor` fallback
   (epoll/kqueue) for non-Linux. Connections are typed `ConnSlot` indices, not pointers.
@@ -58,9 +56,10 @@ orochi-tools       config validator, keygen, trace reader, capsule inspector,
 - **Sharded-actor model** — one writer per Client/Channel; cross-shard via typed
   mailboxes (MPMC), not shared mutation. Eliminates most locking.
 
-**Crypto / security**
+### Crypto and security
+
 - **Secret(T) / ctcheck** — secret-taint type system + build-time verifier; a
-  data-dependent branch/index on a secret is a **compile error**. Flagship safety tech.
+  data-dependent branch/index on a secret is a **compile error**. Core safety mechanism.
 - **Cipher Foundry** — comptime AEAD/hash/KEM generator emitting target-specialized
   variants (AES-NI / ARM PMULL / software) + KATs from one spec.
 - **Tsumugi v2 (PQ-hybrid)** — per-frame symmetric chain + scheduled X25519+ML-KEM-768 root
@@ -69,7 +68,8 @@ orochi-tools       config validator, keygen, trace reader, capsule inspector,
 - **Capability Keyring** — keys are unforgeable typed handles (purpose + export policy +
   zeroization in the type); mlocked/DONTDUMP arenas.
 
-**Protocol / mesh**
+### Protocol and mesh
+
 - **CoilPack** — canonical, self-describing, signature-stable binary wire format
   (varint schema id + field bitmap + canonical order). Replaces MessagePack on S2S.
 - **Codec Loom** — comptime schema→Zig codec generator: emits encoders, decoders,
@@ -83,7 +83,8 @@ orochi-tools       config validator, keygen, trace reader, capsule inspector,
 - **CausalTags** — compact causal trace IDs `{origin, hlc, span, parent}` on every
   mutation, surfaced to clients as cap-gated IRCv3 tags (`partition`, `conflict`, order).
 
-**Daemon / platform**
+### Daemon and platform
+
 - **SerpentRegistry** — comptime module graph → command tables, typed hook dispatch,
   cap bitsets, ISUPPORT, mode tables, config schema, inventory docs. Collisions
   (command/cap/mode/numeric/dep/conflict) are compile errors.
@@ -108,16 +109,18 @@ orochi-tools       config validator, keygen, trace reader, capsule inspector,
 - **Event Spine** — typed structured event bus; metrics/trace/IRCX-EVENT/audit/services
   subscribe without owning core state.
 
-**Testing / ops**
+### Testing and ops
+
 - **Deterministic Ocean** — TigerBeetle-style simulator: N virtual nodes in one process,
   deterministic clock/net/RNG/storage, partitions, crashes, mixed-version upgrade; every
   run reduces to a replayable 64-bit seed. (Subsumes the daemon track's `KawaReplay`.)
 - **Fault Loom** — deterministic injectable failure points at every alloc/syscall/codec/
   store/crypto-export/send boundary; seeded CI campaigns; panics print a replay seed.
 
-**Deferred transport inventions** (post-parity / media phases): **MeshQUIC**
-(Suimyaku-over-QUIC), **MASQUE Voice Bridge** (HTTP/3 relay for hard-NAT media),
-**XDP Gatekeeper** (eBPF flood rejection before accept).
+### Deferred transport inventions
+
+Post-parity / media phases: **MeshQUIC** (Suimyaku-over-QUIC), **MASQUE Voice Bridge**
+(HTTP/3 relay for hard-NAT media), and **XDP Gatekeeper** (eBPF flood rejection before accept).
 
 ## 4. The heart: IRC network state as CRDTs
 

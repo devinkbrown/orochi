@@ -1,50 +1,42 @@
-# 17 — SerpentRegistry Module System + Helix Upgrade (clean-room design)
+# 17 - SerpentRegistry module system + Helix Upgrade (clean-room design)
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
 
-Status: **design + active build**. This is the consolidated synthesis of six deep-research
-reports (Zig-native module idioms, IRCd module-system mistakes, in-process upgrades,
-cross-language plugin systems, upgrade engineering, WASM verdict) reconciled with the
-vocabulary already laid down in `05-innovation.md` (SerpentRegistry, Helix Upgrade, Event
-Spine, CoilPack, OroWasm, Codec Loom) and the code that already exists
-(`src/daemon/registry.zig`).
+This document defines the SerpentRegistry module model, typed hook layer, Helix Upgrade path, and optional OroWasm boundary.
 
-The thesis, in one line: **the core is compiled in (comptime registry, zero ABI boundary,
-typed hooks, compile-time graph validation); only untrusted third-party extensions get a
-sandbox (WASM); state moves between binary versions through typed, versioned capsules, not
-`void*` blobs.** Every decision below is justified against a concrete mistake the C lineage
-(ophion / Solanum / UnrealIRCd / InspIRCd) actually made.
+Status: **design + active build**. This is the consolidated synthesis of six deep-research reports (Zig-native module idioms, IRCd module-system mistakes, in-process upgrades, cross-language plugin systems, upgrade engineering, WASM verdict) reconciled with the vocabulary already laid down in `05-innovation.md` (SerpentRegistry, Helix Upgrade, Event Spine, CoilPack, OroWasm, Codec Loom) and the code that already exists (`src/daemon/registry.zig`).
+
+Design thesis: **the core is compiled in (comptime registry, zero ABI boundary, typed hooks, compile-time graph validation); only untrusted third-party extensions get a sandbox (WASM); state moves between binary versions through typed, versioned capsules, not `void*` blobs.** Every decision below is justified against a concrete mistake the C lineage (ophion / Solanum / UnrealIRCd / InspIRCd) actually made.
 
 ---
 
-## 0. What already exists (do not re-invent)
+## 0. What already exists
 
-- `src/daemon/registry.zig` — **SerpentRegistry**: a working comptime registry. `Module`
+- `src/daemon/registry.zig`: **SerpentRegistry**, a working comptime registry. `Module`
   struct literal carries `id/requires/conflicts/commands/hooks/caps/chanmodes/usermodes/
   numerics/isupport`; `Registry(mods)` validates at comptime (duplicate id/command/cap/mode/
   numeric, missing dep, conflict) and generates immutable command/hook/cap/mode/numeric/
   isupport tables + `dispatch()` + priority-ordered `callHook()`. 4 tests pass.
   The registry is now wired into the live server: `dispatchRegistered()` consults
   `module_manifest.Live.dispatchGated` before the non-command fallbacks.
-- `src/daemon/server.zig` — `dispatchRegistered()` now routes registered commands
+- `src/daemon/server.zig`: `dispatchRegistered()` now routes registered commands
   through the live SerpentRegistry module manifest, with smaller fallback branches
   for multiline, WASM plugins, and lower pre-registration dispatch.
-- `src/daemon/event_spine.zig` — typed event bus (Event Spine, already live).
-- `src/proto/coilpack*.zig` — canonical signature-stable wire format (capsule substrate).
+- `src/daemon/event_spine.zig`: typed event bus (Event Spine, already live).
+- `src/proto/coilpack*.zig`: canonical signature-stable wire format (capsule substrate).
 - `build.zig` builds OPVOX/OPVIS to **freestanding wasm32** already; the team owns the
   `wasm32-freestanding` toolchain. The daemon does **not** yet host/execute WASM.
 
-The module system is therefore no longer merely latent: the registry exists and
-the live dispatch seam is wired. This doc remains useful for the typed
-capability/hook layer, lifecycle, Helix Upgrade, and WASM boundary.
+The module system is therefore no longer merely latent: the registry exists and the live dispatch seam is wired. This document remains useful for the typed capability/hook layer, lifecycle, Helix Upgrade, and WASM boundary.
 
 ---
 
-## 1. Anti-pattern catalog → countermeasures (the design contract)
+## 1. Anti-pattern catalog and countermeasures
 
 From `ircd-mistakes-and-wasm.md`. Every line is a hard rule for this design.
 
 | # | Anti-pattern (seen in C lineage) | Orochi countermeasure |
 |---|---|---|
-| AP-1 | Cross-binary struct/vtable ABI as the load contract | **No ABI boundary for core** — modules are comptime-composed into one binary. Cross-version state uses a typed wire schema (CoilPack), never a memory layout. |
+| AP-1 | Cross-binary struct/vtable ABI as the load contract | **No ABI boundary for core**; modules are comptime-composed into one binary. Cross-version state uses a typed wire schema (CoilPack), never a memory layout. |
 | AP-2 | Coarse global version integer → fleet recompile | No global ABI integer. Cross-version negotiation is **per-capsule schema id + min/max**, and (for WASM) per-host-function. |
 | AP-3 | `RTLD_GLOBAL` symbol pollution, double-dlopen, DEEPBIND maze | No dynamic linker. Modules reference each other through the **typed registry + Services handle**, never global symbols. |
 | AP-4 | `void*` hook payloads, integer/alphabetized hook IDs | **Typed `HookId` enum + comptime `HookPayload(id) → type`**. Compiler rejects a handler that reads the wrong payload; adding a hook can't renumber anything. |
@@ -55,12 +47,7 @@ From `ircd-mistakes-and-wasm.md`. Every line is a hard rule for this design.
 | AP-9 | `void*` state blobs across reload | All cross-reload / cross-upgrade state is **typed + versioned** (CoilPack capsules with schema id, semantic validator, min/max). |
 | AP-10 | `.so`-per-command boilerplate sprawl | A module is a **typed registry value** (`Module{ .commands = …, .hooks = … }`); tables are generated, glue is deleted. |
 
-8 modern principles we adopt (from `zig-native.md`): embedded-interface +
-`@fieldParentPtr` for any runtime-heterogeneous interface; comptime manifest registry with
-DCE of disabled modules; capability injection via one typed `Services` struct (no globals);
-per-module comptime descriptor; `fn(comptime Deps) type` for sized subsystems; **unmanaged**
-std containers (allocator supplied at call site); build-every-feature-combo in CI; prefer a
-small fixed-set tagged union only for the always-on protocol core.
+Adopt these 8 modern principles from `zig-native.md`: embedded-interface + `@fieldParentPtr` for any runtime-heterogeneous interface; comptime manifest registry with DCE of disabled modules; capability injection via one typed `Services` struct (no globals); per-module comptime descriptor; `fn(comptime Deps) type` for sized subsystems; **unmanaged** std containers (allocator supplied at call site); build-every-feature-combo in CI; prefer a small fixed-set tagged union only for the always-on protocol core.
 
 ---
 
@@ -74,7 +61,7 @@ pub const Module = struct {
     version: Version = .{ .major = 0, .minor = 0, .patch = 0 }, // NEW: per-module, not global
     category: Category = .feature,                              // NEW: core | protocol | service | security | feature | media | diagnostic
     requires: []const []const u8 = &.{},
-    optional_requires: []const []const u8 = &.{},              // NEW: soft dep (one field, not two — fixes ophion's accreted alias)
+    optional_requires: []const []const u8 = &.{},              // NEW: soft dep (one field, not two; fixes ophion's accreted alias)
     conflicts: []const []const u8 = &.{},
     priority: Priority = .normal,                               // NEW: init/activate ordering within a category
 
@@ -98,14 +85,14 @@ pub const Module = struct {
 
 **Command handler signature is unified** to `*const fn (*Core) anyerror!void` (the registry's
 existing `*anyopaque` handler stays the erased ABI; `*Core` is what we pass as `ctx`). One
-signature replaces the ~90 heterogeneous `handleXxx(self, id, conn, parsed, line)` methods —
+signature replaces the ~90 heterogeneous `handleXxx(self, id, conn, parsed, line)` methods;
 all of that context now lives on `Core` (§4).
 
 The manifest is one tuple in `src/daemon/modules/manifest.zig`:
 
 ```zig
 pub const enabled = [_]registry.Module{
-    core_protocol.module,     // NICK/USER/PING/QUIT/PRIVMSG/NOTICE — always on
+    core_protocol.module,     // NICK/USER/PING/QUIT/PRIVMSG/NOTICE; always on
     channel_ops.module,       // JOIN/PART/MODE/KICK/TOPIC/INVITE/NAMES/KNOCK
     query_info.module,        // VERSION/TIME/ADMIN/INFO/MOTD/LUSERS/USERS/MAP/LINKS/STATS
     accounts.module,          // REGISTER/VERIFY/IDENTIFY/LOGOUT/DROP/ACCOUNTINFO/ACCOUNTSET
@@ -125,7 +112,7 @@ modules is a **compile error**, not a runtime surprise (AP-7/AP-10 dissolved).
 
 ---
 
-## 3. Typed hooks (AP-4 killer)
+## 3. Typed hooks (AP-4)
 
 Replace the stringly-typed `hook: []const u8` with a typed enum + a comptime payload map.
 This is the single most important upgrade to `registry.zig`.
@@ -158,12 +145,12 @@ an early hook can flip; the dispatcher honors it. This is how anti-spam/join-gat
 hooks say "no" without owning core state.
 
 Dispatch is **phase-based**: the generated hook table is grouped by `HookId` at comptime, so
-firing `channel_pre_join` only walks bindings for that id (no scan of unrelated hooks — fixes
+firing `channel_pre_join` only walks bindings for that id (no scan of unrelated hooks; fixes
 the per-call cost worry).
 
 ---
 
-## 4. Capability injection — the `Core` / `Services` handle (AP-3/AP-8 killer)
+## 4. Capability injection through the `Core` / `Services` handle (AP-3/AP-8)
 
 No module ever reaches for a global. Everything it may touch arrives through one typed
 handle. We split per-invocation context (`Core`) from long-lived capabilities (`Services`):
@@ -198,12 +185,7 @@ pub const Core = struct {                  // per-command-invocation context
 };
 ```
 
-Migration reality: `Core.server` is the escape hatch so a module handler can call the
-existing `LinuxServer.handleXxx` body verbatim on day one. As each family is extracted, its
-logic moves behind narrow `Core` helpers and the raw `server` reach-through shrinks. The
-end-state goal is that feature/service/security modules touch only `Services` + narrow `Core`
-helpers, never `*LinuxServer` directly. (Always-on protocol core keeps direct access — it
-*is* the core.)
+Migration reality: `Core.server` is the escape hatch so a module handler can call the existing `LinuxServer.handleXxx` body verbatim on day one. As each family is extracted, its logic moves behind narrow `Core` helpers and the raw `server` reach-through shrinks. The end-state goal is that feature/service/security modules touch only `Services` + narrow `Core` helpers, never `*LinuxServer` directly. (Always-on protocol core keeps direct access; it *is* the core.)
 
 Containers in module state are **unmanaged** (`ArrayListUnmanaged`, `AutoHashMapUnmanaged`),
 allocator supplied from `services.allocator` at the call site.
@@ -214,7 +196,7 @@ allocator supplied from `services.allocator` at the call site.
 
 Multi-phase, ordered by `(category, priority, manifest order)`, resolved at comptime:
 
-```
+```text
 register → init → ready → activate ──(running)── on_reload* → deactivate → drain → deinit
 ```
 
@@ -225,9 +207,9 @@ register → init → ready → activate ──(running)── on_reload* → de
 - **activate**: begin accepting traffic / arm timers.
 - **on_reload**: REHASH re-runs config; module re-reads its `config_blocks`. Pure;
   no teardown.
-- **drain**: Helix Upgrade quiesce — finish in-flight, refuse new, flush WAL. An atomic
+- **drain**: Helix Upgrade quiesce; finish in-flight, refuse new, flush WAL. An atomic
   in-flight counter gates the handoff (two-version coexistence window).
-- **deinit**: free state. (Never an `.so` unmap — AP-6.)
+- **deinit**: free state. (Never an `.so` unmap; AP-6.)
 
 The strangler-fig wiring keeps the legacy path alive throughout: the registry is consulted
 first; unmigrated commands fall through to the existing if-chain. The daemon is shippable at
@@ -235,7 +217,7 @@ every step.
 
 ---
 
-## 6. Live dispatch seam (the wiring)
+## 6. Live dispatch seam
 
 `dispatchRegistered` becomes:
 
@@ -258,7 +240,7 @@ handler call; passing `&core` as ctx is the whole integration. Module handlers
 
 ---
 
-## 7. Helix Upgrade (in-process upgrade) — `orochi --supervisor`
+## 7. Helix Upgrade (in-process upgrade): `orochi --supervisor`
 
 The clean-room replacement for ophion's externalized shim. Same binary, `--supervisor` mode.
 
@@ -271,22 +253,20 @@ arena, and speaks to the worker over an `AF_UNIX` `SOCK_SEQPACKET` control socke
    TLS/kTLS session state, VEIL ratchets, mesh CRDT Merkle checkpoints, raw send queues)
    into the **sealed memfd** (seals prevent post-handoff mutation).
 3. Client/peer **fds are dup'd to the new worker via `SCM_RIGHTS`** over the SEQPACKET socket
-   (respect the 253-fd/`sendmsg` batch limit — chunk it). kTLS sockets keep kernel crypto
+   (respect the 253-fd/`sendmsg` batch limit; chunk it). kTLS sockets keep kernel crypto
    continuity across exec; non-kTLS TLS rides session capsules; io_uring registered files do
    **not** survive exec, so the new worker re-`REGISTER_FILES` into a fresh ring.
 4. New worker reconstructs state from capsules, validates each (schema id + semantic
    validator + min/max), and sends a **health attestation** before the old worker exits.
 5. **Auto-rollback**: the supervisor still holds the listeners; if the new worker fails
-   attestation or times out, the old worker is told to un-freeze and resume — zero dropped
+   attestation or times out, the old worker is told to un-freeze and resume: zero dropped
    clients. The new worker is reaped.
 
 **Versioning (AP-2/AP-9).** Every capsule has `{schema_id, version, min_supported,
 max_supported}`. The simulator (`Deterministic Ocean`) runs mixed-version upgrade campaigns
-across the last N schemas. No global ABI integer anywhere — compatibility is per-capsule.
+across the last N schemas. No global ABI integer anywhere; compatibility is per-capsule.
 
-State-migration contracts use Cap'n-Proto-style **ordinal evolution** (add fields with new
-ordinals, never reorder) and expand-contract for CRDT shapes. This is the same typed-capsule
-discipline as `12-world-projection.md` / CoilPack, reused — not a second mechanism.
+State-migration contracts use Cap'n-Proto-style **ordinal evolution** (add fields with new ordinals, never reorder) and expand-contract for CRDT shapes. This reuses the same typed-capsule discipline as `12-world-projection.md` / CoilPack, not a second mechanism.
 
 Files (new, no `server.zig` contention): `src/daemon/helix/supervisor.zig`,
 `helix/handoff.zig` (memfd + SCM_RIGHTS), `helix/capsule.zig` (schema registry over
@@ -294,7 +274,7 @@ CoilPack), `helix/attest.zig`.
 
 ---
 
-## 8. OroWasm — sandboxed third-party control-plane plugins (optional layer)
+## 8. OroWasm: sandboxed third-party control-plane plugins
 
 **Verdict (from `ircd-mistakes-and-wasm.md`): worth it, but narrowly.** WASM is the right
 answer for *untrusted third-party extensions* and the wrong answer for *core*. It replaces
@@ -311,10 +291,10 @@ Hard boundaries:
   unacceptable on the hot path.
 - **No C interop** (project hard rule) ⇒ the runtime is a **pure-Zig wasm32 interpreter**
   (interpreter speed is fine for control-plane call rates), not Wasmtime/Extism (those are
-  Rust reachable only over a C ABI — which would re-introduce AP-1).
+  Rust reachable only over a C ABI, which would re-introduce AP-1).
 - **Design the host API first.** The host↔plugin contract is a **typed, versioned,
   permissioned wire schema** (WIT-like, expressed in CoilPack), per-host-function
-  capabilities — *not* a struct layout, *not* a global integer. This is the part that must be
+  capabilities, *not* a struct layout, *not* a global integer. This is the part that must be
   right from day one or it recreates the C API problem (AP-1/AP-2/AP-9 reborn).
 - Time + randomness flow through hostcalls ⇒ plugins are replayable under the deterministic
   simulator (an advantage no native `.so` model can offer).
@@ -334,14 +314,14 @@ The seam is the only serial, collision-prone step; everything after fans out.
 
 | Wave | Scope | Parallelizable? | Owner |
 |---|---|---|---|
-| **W0** | This design doc | — | done |
-| **W1** | Typed `HookId`+payload map + lifecycle fields in `registry.zig`; `module_core.zig` (`Core`/`Services`); wire `Live.dispatch` into `dispatchRegistered` (strangler-fig); migrate first batch (query/info: VERSION/TIME/ADMIN/INFO/MOTD/LUSERS/USERS/MAP/LINKS). Build green. | **No — serial (me)** | main |
-| **W2a** | Helix Upgrade supervisor skeleton (new files) | Yes — disjoint | agent/codex worktree |
-| **W2b** | OroWasm host API schema + interpreter MVP (new files) | Yes — disjoint | agent/codex worktree |
-| **W2c** | Migrate channel-ops family into `modules/channel_ops.zig` | Yes — disjoint manifest section | agent/codex worktree |
-| **W2d** | Migrate accounts/services family into `modules/accounts.zig` | Yes — disjoint | agent/codex worktree |
-| **W2e** | Migrate IRCX family into `modules/ircx.zig` | Yes — disjoint | agent/codex worktree |
-| **W2f** | Migrate security/operator family into `modules/security.zig` + `operator.zig` | Yes — disjoint | agent/codex worktree |
+| **W0** | This design doc | N/A | done |
+| **W1** | Typed `HookId`+payload map + lifecycle fields in `registry.zig`; `module_core.zig` (`Core`/`Services`); wire `Live.dispatch` into `dispatchRegistered` (strangler-fig); migrate first batch (query/info: VERSION/TIME/ADMIN/INFO/MOTD/LUSERS/USERS/MAP/LINKS). Build green. | **No; serial (me)** | main |
+| **W2a** | Helix Upgrade supervisor skeleton (new files) | Yes; disjoint | agent/codex worktree |
+| **W2b** | OroWasm host API schema + interpreter MVP (new files) | Yes; disjoint | agent/codex worktree |
+| **W2c** | Migrate channel-ops family into `modules/channel_ops.zig` | Yes; disjoint manifest section | agent/codex worktree |
+| **W2d** | Migrate accounts/services family into `modules/accounts.zig` | Yes; disjoint | agent/codex worktree |
+| **W2e** | Migrate IRCX family into `modules/ircx.zig` | Yes; disjoint | agent/codex worktree |
+| **W2f** | Migrate security/operator family into `modules/security.zig` + `operator.zig` | Yes; disjoint | agent/codex worktree |
 | **W3** | Integrate all worktrees, delete migrated if-chain arms, `zig build test` + `-Dtarget=x86_64-windows` green, live smoke | Serial (me) | main |
 
 Parallel-safety rule (per `workflow_claude_codex_parallel`): every parallel worker runs in
@@ -356,8 +336,8 @@ fold in by hand.
   missing dep, conflict, and (new) dependency cycle. Add a cycle test.
 - Unit: each module file ships `std.testing` tests for its handlers against a fake `Core`.
 - Golden: existing IRC/IRCv3/IRCX goldens must stay green through every wave (behavior is
-  preserved — handlers are *moved*, not rewritten).
+  preserved; handlers are *moved*, not rewritten).
 - Upgrade: Deterministic Ocean mixed-version capsule campaigns for Helix.
 - WASM: replay determinism + fuel/memory-limit enforcement tests for OroWasm.
-- CI: build every feature-combo manifest (Ghostty's lesson — unreferenced comptime branches
+- CI: build every feature-combo manifest (Ghostty's lesson: unreferenced comptime branches
   rot silently).

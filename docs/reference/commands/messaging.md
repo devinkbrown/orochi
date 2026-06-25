@@ -1,11 +1,13 @@
-# Messaging Commands
+# Messaging commands
+
+*Text delivery, tag-only messages, redaction, history playback, metadata, and caller-side filtering.*
 
 The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHISTORY`, `MARKREAD`, `METADATA`, `MONITOR`, and `SILENCE` (`src/daemon/modules/messaging.zig:46`). `ACCEPT` is registered by the user query module (`src/daemon/modules/user_query.zig:82`).
 
 ## PRIVMSG
 
 - Syntax: `PRIVMSG <target> :<text>`
-- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies UTF-8/content gates, channel mode gates, `SILENCE`, echo-message, history recording, away replies, mesh relay, and the caller's `MAXTARGETS` fan-out cap; a connection class can tighten that cap with `max_targets`.
+- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies UTF-8 and content gates, channel mode gates, `SILENCE`, echo-message, history recording, away replies, mesh relay, and the caller's `MAXTARGETS` fan-out cap. A connection class can tighten that cap with `max_targets`.
 - Privileges: Registered client.
 - Parameters: `target` and non-empty text.
 - Replies: Delivery line to recipients; `RPL_AWAY 301` when messaging an away user.
@@ -16,7 +18,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 ## NOTICE
 
 - Syntax: `NOTICE <target> :<text>`
-- Description: Same delivery engine as `PRIVMSG`, including the caller's `MAXTARGETS` fan-out cap and any tighter per-class `max_targets` cap, but delivery-failure numerics are suppressed for `NOTICE` to prevent automatic error loops.
+- Description: Uses the same delivery engine as `PRIVMSG`, including the caller's `MAXTARGETS` fan-out cap and any tighter per-class `max_targets` cap. Delivery-failure numerics are suppressed for `NOTICE` to prevent automatic error loops.
 - Privileges: Registered client.
 - Parameters: `target` and text.
 - Replies: Delivery line to recipients.
@@ -24,10 +26,10 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `CHATHIS
 - Example: `NOTICE suzu :heads up`
 - Sources: `src/daemon/modules/messaging.zig:48`, `src/daemon/server.zig:20164`, `src/daemon/server.zig:20169`
 
-## CTCP And DCC
+## CTCP and DCC
 
 - CTCP payloads are parsed for normal message policy, automatic replies, and `+C` no-CTCP enforcement.
-- DCC is intentionally parser-only in Orochi: the server does not provide DCC proxy, filehost, or relay behavior, and clients must not assume a server-mediated DCC surface.
+- DCC is intentionally parser-only in Orochi: the server provides no DCC proxy, filehost, or relay behavior, and clients must not assume a server-mediated DCC surface.
 - Sources: `src/proto/ctcp.zig`, `src/daemon/server.zig`
 
 ## TAGMSG

@@ -1,8 +1,10 @@
-# Orochi Command Reference
+# Command reference
 
-Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C Ophion, not a clone. This reference documents only the current registered-client source surface: the `dispatchRegistered` path in `src/daemon/server.zig:3413`, the lower connection command table it falls back to in `src/daemon/dispatch.zig:1233`, and the enabled `SerpentRegistry` modules in `src/daemon/modules/manifest.zig:23`.
+*The complete client command surface of the Orochi daemon, sourced from the live dispatch path.*
 
-Registry commands default to registered-client access unless the command table says `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:239`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:3450`). Numeric names and codes are verified against `src/proto/numeric.zig:9` and the server-local enum in `src/daemon/server.zig:701`.
+Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C Ophion, not a clone. This reference documents only the current registered-client source surface: the `dispatchRegistered` path (`src/daemon/server.zig:3413`), the lower connection command table it falls back to (`src/daemon/dispatch.zig:1233`), and the enabled `SerpentRegistry` modules (`src/daemon/modules/manifest.zig:23`).
+
+Registry commands default to registered-client access unless the command table sets `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:239`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:3450`). Numeric names and codes are verified against `src/proto/numeric.zig:9` and the server-local enum (`src/daemon/server.zig:701`).
 
 | Command | Summary | Reference |
 |---|---|---|
@@ -138,7 +140,4 @@ Registry commands default to registered-client access unless the command table s
 
 ## In-channel fantasy commands
 
-Not registry commands: a channel `PRIVMSG` beginning with `!` may invoke the
-server's weather/news bot (`!weather`/`!w`/`!wx`, `!news`/`!n`, `!localnews`),
-answered as a server `NOTICE`. See [fantasy-bot.md](fantasy-bot.md). `!news`/
-`!localnews` require the channel mode `+W` (news-wire).
+These are not registry commands. A channel `PRIVMSG` beginning with `!` can invoke the server's weather and news bot (`!weather`/`!w`/`!wx`, `!news`/`!n`, `!localnews`), which answers as a server `NOTICE`. See [fantasy-bot.md](fantasy-bot.md). The `!news` and `!localnews` commands require the channel mode `+W` (news-wire).

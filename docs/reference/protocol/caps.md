@@ -1,8 +1,10 @@
-# Orochi IRCv3 Capabilities
+# Orochi IRCv3 capabilities
 
-This reference documents the live capability registry in `src/daemon/dispatch.zig`. `src/proto/cap.zig` is not the live CAP registry. The live registry is `CapId` plus `cap_specs`; CAP LS emits those specs and appends `=<value>` for CAP LS 302 only when the spec/session supplies one (`src/daemon/dispatch.zig:223`, `src/daemon/dispatch.zig:293`, `src/daemon/dispatch.zig:504`).
+*Live CAP registry advertised during capability negotiation, sourced from `src/daemon/dispatch.zig`.*
 
-## CAP LS 302 Table
+This reference documents the live capability registry in `src/daemon/dispatch.zig`. `src/proto/cap.zig` is not the live CAP registry. The live registry is `CapId` plus `cap_specs`. CAP LS emits those specs and appends `=<value>` for CAP LS 302 only when the spec or session supplies a value (`src/daemon/dispatch.zig:223`, `src/daemon/dispatch.zig:293`, `src/daemon/dispatch.zig:504`).
+
+## CAP LS 302 table
 
 | Capability | CAP LS 302 Value | Notes | Evidence |
 | --- | --- | --- | --- |
@@ -44,7 +46,7 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `draft/multiline` | `max-bytes=4096,max-lines=24` | Accepts inbound multiline BATCH chunks and reassembles them within enforced limits. | `src/daemon/dispatch.zig:375` |
 | `sts` | runtime policy value | Config-gated; omitted unless a live STS policy is enabled for the session. | `src/daemon/dispatch.zig:383`, `src/daemon/dispatch.zig:504` |
 
-## Negotiation Behavior
+## Negotiation behavior
 
 | Operation | Behavior | Evidence |
 | --- | --- | --- |
@@ -53,6 +55,6 @@ This reference documents the live capability registry in `src/daemon/dispatch.zi
 | `CAP LIST` | Emits currently negotiated cap names. | `src/daemon/dispatch.zig:564` |
 | `CAP END` | Marks negotiation complete and releases registration hold. | `src/daemon/dispatch.zig:552` |
 
-## Vendor Caps
+## Vendor caps
 
 The live `src/daemon/dispatch.zig` vendor namespace is `orochi/*`: `orochi/session-sync` and `orochi/bouncer` (`src/daemon/dispatch.zig:308`, `src/daemon/dispatch.zig:312`). No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.

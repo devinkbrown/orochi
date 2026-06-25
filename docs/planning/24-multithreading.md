@@ -1,5 +1,9 @@
 # 24 — Multithreading the daemon (sharded reactors)
 
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
+
+This document records the planned sharded-reactor model for daemon multithreading.
+
 ## Goal
 
 Orochi must scale across cores: one io_uring reactor on a single thread cannot
@@ -22,30 +26,26 @@ This is a standing requirement (the user: "everything should be multithreaded").
 
 ## Foundation (landed — all support modules done + tested)
 
-- `src/daemon/shard.zig` — `assignShard` (round-robin connection→shard pinning),
-  `shardOf`/`isLocal` (lifetime pinning), `shardForChannel` (FNV-1a channel
-  home), `Mailboxes(Msg, num_shards, capacity)` — per-shard lock-free inboxes
-  over `BoundedMpmc` (`sendTo` any thread, `drain` by the owning reactor).
-- `src/substrate/rwlock.zig` — writer-preferring spin `RwLock` (contention-tested).
-- `world.zig` — `World` carries that lock + `lockRead`/`lockWrite` API
-  (contention-tested); uncontended single-reactor cost is a couple of atomics.
-- `src/daemon/sharded_table.zig` — `ShardedTable(Value)` over N `client.Table`
-  slabs routed by `ClientId.shard`; `allocOn`/`get`/`free`/`shardTable`.
-- `src/daemon/reactor_wake.zig` — eventfd cross-reactor wakeup; `WakeSet(N)`.
-- `src/daemon/deliver_handle.zig` — pooled refcounted `DeliverBuf`/`DeliverPool`
-  + `DeliverMsg{buf,target}` for cross-reactor outbound handoff.
-- `services`/`scram_store`/`certfp_bind`/`sessions` — each carries the `RwLock`
-  (mutators write-locked incl. allocation, readers read-locked); concurrency-tested.
+| Module | Role |
+| --- | --- |
+| `src/daemon/shard.zig` | `assignShard` (round-robin connection→shard pinning), `shardOf`/`isLocal` (lifetime pinning), `shardForChannel` (FNV-1a channel home), `Mailboxes(Msg, num_shards, capacity)` — per-shard lock-free inboxes over `BoundedMpmc` (`sendTo` any thread, `drain` by the owning reactor). |
+| `src/substrate/rwlock.zig` | Writer-preferring spin `RwLock` (contention-tested). |
+| `world.zig` | `World` carries that lock + `lockRead`/`lockWrite` API (contention-tested); uncontended single-reactor cost is a couple of atomics. |
+| `src/daemon/sharded_table.zig` | `ShardedTable(Value)` over N `client.Table` slabs routed by `ClientId.shard`; `allocOn`/`get`/`free`/`shardTable`. |
+| `src/daemon/reactor_wake.zig` | eventfd cross-reactor wakeup; `WakeSet(N)`. |
+| `src/daemon/deliver_handle.zig` | Pooled refcounted `DeliverBuf`/`DeliverPool` + `DeliverMsg{buf,target}` for cross-reactor outbound handoff. |
+| `services`/`scram_store`/`certfp_bind`/`sessions` | Each carries the `RwLock` (mutators write-locked including allocation, readers read-locked); concurrency-tested. |
 
-Every primitive the capstone needs now exists, green and tested. NOTE the
+Every primitive the capstone needs now exists, green and tested. Note the
 borrowed-slice caveat: read-locked getters that return store-owned slices
 (e.g. `accountForCertfp`) are valid only under the held lock — the reactor call
 sites must consume before releasing.
 
 ## Capstone (remaining — the one serial, coupled piece)
 
-The reactor rewire of `server.zig` cannot be parallelized (it IS the coupled
-core). Concrete steps, building on the modules above:
+The reactor rewire of `server.zig` cannot be parallelized because it is the coupled
+core. Concrete steps, building on the modules above:
+
 1. Restructure `LinuxServer` so each shard owns its own `RingCore` + a
    `ShardedTable` slice + a `ReactorWake`; `runThreaded` spawns one thread per
    shard running `runOnce` on its own ring. `num_shards = 1` stays the current
@@ -63,11 +63,12 @@ core). Concrete steps, building on the modules above:
    + `WakeSet.wake(member.shard)`; the target reactor drains, appends to the
    local conn send buffer, and `release`s the buffer. Local members stay direct.
 6. A two-reactor cross-shard smoke test: a channel spanning both shards, a
-   PRIVMSG crossing shards, assert delivery + no races (run under tsan if avail).
+   PRIVMSG crossing shards, assert delivery + no races (run under tsan if available).
 
-## Remaining arc (sequenced)
+## Sequenced remaining arc
 
 ### Phase A — per-shard reactors, independent connections
+
 - N listeners via `SO_REUSEPORT` (kernel load-balances accepts), or one accept
   thread that hands fds to shards by `assignShard`.
 - Each worker owns its own `RingCore` + a shard-local `ClientTable` slice, keyed
@@ -78,6 +79,7 @@ core). Concrete steps, building on the modules above:
 ### Phase B — thread-safe world projection (the gating sub-arc)
 The world (channels, nick registry, memberships) is global and read/written by
 every connection. Options:
+
 1. **Single shared world behind a lock** (RwLock): simplest; correctness first,
    then measure contention. Channel ops take the write lock; lookups take read.
 2. **Sharded world** keyed by `shardForChannel`: each channel lives on one
@@ -100,7 +102,8 @@ Account store, SCRAM/certfp bind stores, services, WAL: guard with their own
 locks or make them per-shard-with-merge. SASL/account ops are infrequent vs.
 message delivery, so a coarse lock is acceptable initially.
 
-## Constraints / invariants
+## Constraints and invariants
+
 - Keep the single-thread path working (num_shards = 1 must be a no-op fast path).
 - `ClientId.shard` is authoritative; never touch a connection from a non-owning
   reactor — route through a mailbox.
@@ -141,8 +144,7 @@ minority of structural mutations serialize behind the write lock.
 
 ### B. Shared world — lock-free RCU with epoch-based reclamation
 The world (channels, nick registry, memberships) is shared, but **reads never
-block and never take a lock** — the fastest possible hot path, since delivery is
-the hot path. This is the chosen model ("better everything", no settling).
+block and never take a lock**, so delivery stays on the hot path. This is the chosen model.
 
 - The world is an **immutable, structurally-shared snapshot** published behind a
   single atomic root pointer. Readers `load(.acquire)` the current root and

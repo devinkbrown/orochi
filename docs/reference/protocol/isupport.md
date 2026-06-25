@@ -1,10 +1,12 @@
 # Orochi ISUPPORT (005)
 
+*The `RPL_ISUPPORT` tokens Orochi advertises, their defaults, and their configuration override paths.*
+
 `src/proto/protocol_inventory.zig` is the source of truth for static `RPL_ISUPPORT` tokens (`src/proto/protocol_inventory.zig:1`, `src/proto/protocol_inventory.zig:40`). At boot, `main.zig` installs the configured network name, builds config-driven ISUPPORT tokens, and stores runtime limits before serving clients (`src/main.zig:129`, `src/main.zig:134`, `src/main.zig:139`).
 
-The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()` and trailing text `are supported by this server` (`src/daemon/server.zig:8105`). The pre-registration welcome burst also emits the same current token list (`src/daemon/dispatch.zig:1497`).
+The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()` and trailing text `are supported by this server` (`src/daemon/server.zig:8105`). The pre-registration welcome burst emits the same current token list (`src/daemon/dispatch.zig:1497`).
 
-## Token Table
+## Token table
 
 | Token | Default Value | Meaning | Config / Runtime Notes | Evidence |
 | --- | --- | --- | --- | --- |
@@ -29,7 +31,7 @@ The live server emits `RPL_ISUPPORT` with `protocol_inventory.currentIsupport()`
 | `WHOX` | present | WHOX extended WHO replies are supported. | WHOX uses `RPL_WHOSPCRPL` 354 and `RPL_ENDOFWHO` 315. | `src/proto/protocol_inventory.zig:61`, `src/daemon/server.zig:4660`, `src/daemon/server.zig:4750` |
 | `UTF8ONLY` | present | Clients must send UTF-8 message bodies. | Invalid PRIVMSG body gets `FAIL <command> INVALID_UTF8`; NOTICE stays silent. | `src/proto/protocol_inventory.zig:62`, `src/daemon/server.zig:10803` |
 
-## Override Path
+## Override path
 
 `buildIsupportTokens` copies the static token list and rewrites `NETWORK`, `TOPICLEN`, `AWAYLEN`, `KICKLEN`, `NICKLEN`, `CHANNELLEN`, `MAXLIST`, `CHANLIMIT`, `MAXTARGETS`, `MONITOR`, and `SILENCE` from `Config` (`src/daemon/server.zig:1101`, `src/daemon/server.zig:1123`). Tokens not matched by those prefixes are borrowed directly from the static inventory (`src/daemon/server.zig:1125`).
 

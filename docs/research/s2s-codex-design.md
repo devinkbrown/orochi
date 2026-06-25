@@ -1,10 +1,12 @@
-# Codex S2S Design: Suimyaku Link Protocol
+# Codex S2S design: Suimyaku link protocol
 
-> Clean-room Orochi S2S target. New design only; no source changes. This
-> document turns the current Suimyaku/Tsumugi/Goryu research into a byte-level,
-> implementable protocol. Current `u64` node ids in `src/substrate/suimyaku/*`
-> are treated as transitional replica lanes; the protocol identity is
-> `NodeId160 = BLAKE3-160(Ed25519 verify key)`.
+*Historical design/research notes for the clean-room Orochi S2S target and Suimyaku link protocol.*
+
+This document defines a new design only; it makes no source changes. It turns
+the current Suimyaku/Tsumugi/Goryu research into a byte-level, implementable
+protocol. Current `u64` node ids in `src/substrate/suimyaku/*` are treated as
+transitional replica lanes; the protocol identity is
+`NodeId160 = BLAKE3-160(Ed25519 verify key)`.
 
 ## 0. Position
 
@@ -22,7 +24,7 @@ This design keeps the ambition but narrows the risk:
 - Media gets reserved lanes now; implementation waits until core convergence
   and observability are solid.
 
-## 1. Critique of Claude's Proposal
+## 1. Critique of Claude's proposal
 
 Keep:
 
@@ -60,9 +62,9 @@ Cut for now:
 - Media data-plane before secure link, signed deltas, repair, and tracing.
 - Any bridge frame that reintroduces SIDs or transitive trust in uplinks.
 
-## 2. Layer Contract
+## 2. Layer contract
 
-```
+```text
 L5 world projection       users, channels, modes, accounts, history, media ctrl
 L4 mesh services          HyParView, Plumtree, witnessed SWIM, Goryu-Sync
 L3 link session           seq/ack/credit, bands, replay, scheduler
@@ -76,7 +78,7 @@ Current code anchors: `s2s_frame.zig` is the transitional 5-byte envelope;
 `link_session.zig`, `gossip_round.zig`, `anti_entropy_repair.zig`, and
 `daemon/s2s_link.zig` are the pure driver/session/repair/Reactor seams to evolve.
 
-## 3. Identity and Authority
+## 3. Identity and authority
 
 Stable target types:
 
@@ -91,7 +93,7 @@ pub const Cid = [32]u8;            // BLAKE3-256 canonical object id
 pub const ReplicaLane = u64;       // first 64 bits of NodeId160, collision-checked
 ```
 
-### 3.1 Signed Transport Prekey
+### 3.1 Signed transport prekey
 
 Ed25519 remains the only identity. X25519 and ML-KEM keys are signed transport
 prekeys:
@@ -138,67 +140,82 @@ pub const MeshPass = struct {
 Every delta includes `pass_id`, `revocation_epoch`, and family/scope authority.
 Verifiers reject deltas whose signer lacked capability at the delta HLC.
 
-## 4. CoilPack Frame Layout
+## 4. CoilPack frame layout
 
 CoilPack has a fixed outer frame plus canonical schema payloads:
 
-```
-offset size field
-0      4    magic = "SZCP"
-4      1    major = 1
-5      1    minor = 0
-6      1    frame_type
-7      1    band
-8      2    flags
-10     2    header_len = 96
-12     4    payload_len            // ciphertext length after Tsumugi
-16     4    stream_id
-20     4    generation             // AEAD ratchet generation
-24     8    seq
-32     8    ack
-40     4    credit                 // bytes granted
-44     4    reserved = 0
-48     8    hlc
-56     20   src_node_id            // zero while initiator is hidden
-76     20   dst_node_id_or_zero
-```
+| Offset | Size | Field | Notes |
+| --- | --- | --- | --- |
+| 0 | 4 | `magic = "SZCP"` | |
+| 4 | 1 | `major = 1` | |
+| 5 | 1 | `minor = 0` | |
+| 6 | 1 | `frame_type` | |
+| 7 | 1 | `band` | |
+| 8 | 2 | `flags` | |
+| 10 | 2 | `header_len = 96` | |
+| 12 | 4 | `payload_len` | ciphertext length after Tsumugi |
+| 16 | 4 | `stream_id` | |
+| 20 | 4 | `generation` | AEAD ratchet generation |
+| 24 | 8 | `seq` | |
+| 32 | 8 | `ack` | |
+| 40 | 4 | `credit` | bytes granted |
+| 44 | 4 | `reserved = 0` | |
+| 48 | 8 | `hlc` | |
+| 56 | 20 | `src_node_id` | zero while initiator is hidden |
+| 76 | 20 | `dst_node_id_or_zero` | |
 
 Header bytes `0..96` are AEAD associated data.
 
 Flags:
 
-```
-0 encrypted
-1 ack_eliciting
-2 has_signature_body
-3 critical_unknown_reject
-4 datagram_eligible
-5 retransmit
-6 compression_zstd
-7 repair_symbol
-8..15 reserved
-```
+| Bit | Flag |
+| --- | --- |
+| 0 | `encrypted` |
+| 1 | `ack_eliciting` |
+| 2 | `has_signature_body` |
+| 3 | `critical_unknown_reject` |
+| 4 | `datagram_eligible` |
+| 5 | `retransmit` |
+| 6 | `compression_zstd` |
+| 7 | `repair_symbol` |
+| 8..15 | `reserved` |
 
 Frame types:
 
-```
-0x01 HELLO          0x02 TSUMUGI_M1     0x03 TSUMUGI_M2
-0x04 TSUMUGI_REKEY  0x05 CONTROL        0x10 MEMBERSHIP
-0x11 PLUMTREE       0x12 DELTA          0x13 REPAIR
-0x14 CONVERGENCE    0x20 SERVICES       0x30 HISTORY
-0x40 MEDIA_CONTROL  0x80..0xff MEDIA_DATA
-```
+| Value | Type |
+| --- | --- |
+| `0x01` | `HELLO` |
+| `0x02` | `TSUMUGI_M1` |
+| `0x03` | `TSUMUGI_M2` |
+| `0x04` | `TSUMUGI_REKEY` |
+| `0x05` | `CONTROL` |
+| `0x10` | `MEMBERSHIP` |
+| `0x11` | `PLUMTREE` |
+| `0x12` | `DELTA` |
+| `0x13` | `REPAIR` |
+| `0x14` | `CONVERGENCE` |
+| `0x20` | `SERVICES` |
+| `0x30` | `HISTORY` |
+| `0x40` | `MEDIA_CONTROL` |
+| `0x80..0xff` | `MEDIA_DATA` |
 
 Bands:
 
-```
-0 control  1 membership  2 anti_entropy  3 events  4 services
-5 history  6 media_control  64..127 media reliable  128..255 media datagram
-```
+| Value | Band |
+| --- | --- |
+| 0 | `control` |
+| 1 | `membership` |
+| 2 | `anti_entropy` |
+| 3 | `events` |
+| 4 | `services` |
+| 5 | `history` |
+| 6 | `media_control` |
+| 64..127 | `media reliable` |
+| 128..255 | `media datagram` |
 
 Canonical schema payload:
 
-```
+```text
 varuint schema_id
 varuint field_bitmap_low
 [varuint field_bitmap_high...]       // only when extension bit is set
@@ -218,7 +235,7 @@ pub fn decodeOuter(bytes: []const u8, limits: FrameLimits) !FrameView;
 pub fn associatedData(frame: *const FrameView) []const u8;
 ```
 
-## 5. Tsumugi Handshake
+## 5. Tsumugi handshake
 
 Security goals:
 
@@ -240,7 +257,7 @@ pub const TsumugiState = enum {
 
 Lifecycle:
 
-```
+```text
 TcpConnected -> HelloSent/Recv -> M1Sent/Recv -> M2Sent/Recv
              -> Established -> Rekeying <-> Established -> Draining -> Closed
 ```
@@ -252,7 +269,7 @@ Before `Established`, accept only `HELLO`, `TSUMUGI_M1`, `TSUMUGI_M2`,
 
 Cleartext, no initiator identity. Schema `0x3001`:
 
-```
+```text
 0 u16   min_major
 1 u16   max_major
 2 bytes nonce_i[32]
@@ -265,7 +282,7 @@ Cleartext, no initiator identity. Schema `0x3001`:
 If the prekey is unknown, responder returns `CONTROL:error(prekey_unknown)` plus
 signed prekey bundle hints.
 
-### 5.2 M1 Initiator to Responder
+### 5.2 M1 initiator to responder
 
 The initiator encapsulates to the responder's signed transport prekey. The
 combined X-Wing ciphertext carries a 32-byte X25519 ephemeral public key and a
@@ -273,7 +290,7 @@ combined X-Wing ciphertext carries a 32-byte X25519 ephemeral public key and a
 
 Clear M1 fields:
 
-```
+```text
 0 u64   responder_prekey_id
 1 bytes xwing_ct_to_r              // 32 + 1088 bytes
 2 bytes initiator_mlkem768_epk     // 1184 bytes, one-time response KEM pub
@@ -282,7 +299,7 @@ Clear M1 fields:
 5 bytes tag_i[16]
 ```
 
-```
+```text
 secret_i_to_r = XWing.Encap(responder_x25519_static_pub,
                             responder_mlkem768_static_pub)
 m1_key = KDF("TSUMUGI-M1" || secret_i_to_r || xwing_ct_to_r ||
@@ -291,7 +308,7 @@ m1_key = KDF("TSUMUGI-M1" || secret_i_to_r || xwing_ct_to_r ||
 
 Encrypted M1 payload schema `0x3002`:
 
-```
+```text
 0 node_id  initiator_node_id
 1 bytes    initiator_node_key
 2 MeshPass meshpass
@@ -308,11 +325,11 @@ Encrypted M1 payload schema `0x3002`:
 Responder verifies node id derivation, MeshPass authority, prekey lifetime,
 version/features, and `sig_i`.
 
-### 5.3 M2 Responder to Initiator
+### 5.3 M2 responder to initiator
 
 Responder adds fresh response entropy:
 
-```
+```text
 0 bytes responder_x25519_ephemeral_pub[32]
 1 bytes mlkem_ct_to_i              // to initiator one-time ML-KEM epk
 2 bytes nonce_r[32]
@@ -320,7 +337,7 @@ Responder adds fresh response entropy:
 4 bytes tag_r[16]
 ```
 
-```
+```text
 ee_x25519 = X25519(responder_eph_secret, initiator_x25519_eph_pub)
 ss_r_to_i = MLKEM.Decap(initiator_mlkem_eph_secret, mlkem_ct_to_i)
 
@@ -332,7 +349,7 @@ handshake_secret = SHA3-XOF(
 
 Encrypted M2 payload schema `0x3003`:
 
-```
+```text
 0 node_id  responder_node_id
 1 bytes    responder_node_key
 2 MeshPass meshpass_or_realm_assertion
@@ -349,7 +366,7 @@ Encrypted M2 payload schema `0x3003`:
 
 Key schedule:
 
-```
+```text
 root_key    = HKDF-Extract("MZ root", handshake_secret)
 c2s_key_0   = HKDF-Expand(root_key, "c2s aead key gen0", 32)
 s2c_key_0   = HKDF-Expand(root_key, "s2c aead key gen0", 32)
@@ -363,11 +380,11 @@ constant-time review. Rekey at `2^32 - 1` frames, 1 GiB per direction,
 30 minutes, peer request, or replay pressure. Old generation drains for 256
 frames or 5 seconds. AEAD failure never advances receive counters.
 
-## 6. Signed Dotted Deltas
+## 6. Signed dotted deltas
 
 Delta envelope schema `0x4101`:
 
-```
+```text
 0  node_id origin
 1  u64     hlc
 2  u64     dot_counter
@@ -384,7 +401,7 @@ Delta envelope schema `0x4101`:
 
 Signature:
 
-```
+```text
 origin_sig = Ed25519.Sign(origin_secret,
   "MZ-DELTA-v1" || realm_id || op_cid || meshpass_id ||
   encode(fields 0..10))
@@ -410,11 +427,11 @@ Flow:
 6. `goryu_sync.zig` later repairs missing cids.
 7. Apply verifies cid, signature, capability, then joins the CRDT.
 
-## 7. Goryu-Sync Anti-Entropy
+## 7. Goryu-Sync anti-entropy
 
 Each family owns an independent cid set:
 
-```
+```text
 0 membership  1 channel_state  2 channel_modes  3 nick_claims
 4 accounts    5 history_events 6 services       7 media_control
 ```
@@ -443,7 +460,7 @@ Pipeline:
 
 Repair messages:
 
-```
+```text
 REPAIR_SUMMARY 0x5001: origin, hlc, list<FamilyRoot>, origin_sig
 REPAIR_DESCEND 0x5002: family, scope, parent_node, depth, differing_children
 RIBLT_OPEN     0x5003: nonce, family, scope, range_start, range_end,
@@ -454,13 +471,13 @@ DELTA_FILL     0x5006: list<DeltaEnvelope> deltas, more, batch_root
 
 RIBLT element:
 
-```
+```text
 element = BLAKE3-256("MZ-RIBLT-ELEM-v1" || family || scope || op_cid)
 ```
 
 RIBLT coded symbol schema `0x5004`:
 
-```
+```text
 0 u64   stream_nonce
 1 u64   symbol_index
 2 u64   degree_seed
@@ -475,11 +492,11 @@ RIBLT coded symbol schema `0x5004`:
 Peeling: degree-one if `abs(count) == 1` and
 `BLAKE3-128(key_xor) == hash_xor`; sign tells which side is missing the cid.
 
-## 8. Causal Order
+## 8. Causal order
 
 HLC packing:
 
-```
+```text
 bits 63..16 physical unix ms, monotonic-clamped
 bits 15..0  logical counter
 ```
@@ -496,7 +513,7 @@ Scoped event DAGs are for ordered history and media control, not global state.
 
 Event schema `0x4301`:
 
-```
+```text
 0 cid       event_id             // BLAKE3-256(canonical fields 1..11)
 1 cid       scope_id
 2 node_id   origin
@@ -537,7 +554,7 @@ Policy:
 
 Plumtree:
 
-```
+```text
 PLUM_EAGER 0x6001: full signed delta/event payloads
 PLUM_LAZY  0x6002: round, family, scope, list<cid> ids, riblt_seed_hint
 PLUM_GRAFT 0x6003: request eager delivery for ids/scope
@@ -551,7 +568,7 @@ repeated graft misses trigger RIBLT repair for that scope.
 
 Signed member delta schema `0x6101`:
 
-```
+```text
 0 node_id subject
 1 u8      state                 // alive, suspect, dead, left
 2 u64     incarnation
@@ -587,13 +604,13 @@ Acceptance:
 - Meshes with fewer than 3 live witnesses stay suspect-only; they do not
   hard-delete peers.
 
-## 11. Novel Orochi Additions
+## 11. Novel Orochi additions
 
-### 11.1 Kiri-Caps: Convergent Capabilities
+### 11.1 Kiri-Caps: convergent capabilities
 
 Static MeshPass is only the bootstrap. Realm/channel authority becomes a CRDT:
 
-```
+```text
 Grant  = {grant_id, issuer, subject, scope, rights, not_after, caveats, sig}
 Revoke = {grant_id_or_scope, issuer, subject, revocation_epoch, reason, sig}
 CapabilityState = OR-Map(scope -> add-wins grants) join RevocationFloor
@@ -616,11 +633,11 @@ pub fn mayEmit(
 This adapts Keyhive/BeeKEM-style convergent access control directly to S2S
 admission and channel authority.
 
-### 11.2 Shio-Rail: One Rateless Repair Pipe
+### 11.2 Shio-Rail: one rateless repair pipe
 
 Make one paced anti-entropy stream with typed lanes:
 
-```
+```text
 lane 0 RIBLT set reconciliation symbols
 lane 1 RaptorQ/FEC parity for DELTA_FILL batches
 lane 2 convergence receipts
@@ -631,7 +648,7 @@ Phase one implements lanes 0 and 2 only. The novelty is that reconciliation,
 loss recovery, and audit receipts share credit, pacing, congestion state, and
 DST traces instead of becoming competing protocols.
 
-### 11.3 Ame-Receipt: Proof-Carrying Convergence Receipts
+### 11.3 Ame-Receipt: proof-carrying convergence receipts
 
 After repair/apply, sign the root transition:
 
@@ -656,20 +673,20 @@ Receipts are not consensus. They are audit artifacts, replay anchors, and future
 IVC inputs: a Nova/folding prototype can later fold "verified delta applied to
 root" steps into compact verifiable-convergence proofs.
 
-### 11.4 Eg-Log for Ordered Content
+### 11.4 Eg-Log for ordered content
 
 Use eg-walker/Fugue-style operation DAGs for sequence-like data: collaborative
 topic history, threaded history views, future docs, and media annotations. Keep
 channel state in CRDT lattices; query ordered logs into display views.
 
-## 12. Observability and Debugging
+## 12. Observability and debugging
 
 Build this as core infra. S2S without flight recording will be impossible to
 debug under partitions.
 
 New modules:
 
-```
+```text
 src/substrate/trace.zig
 src/substrate/flight_recorder.zig
 src/substrate/suimyaku/s2s_trace.zig
@@ -735,7 +752,7 @@ CoilPack trace chunks. DST simulation uses the same event stream for replay.
 
 Oper surface:
 
-```
+```text
 DEBUG S2S STATUS
 DEBUG S2S PEER <node-id|server-name>
 DEBUG S2S TRACE <category> <on|off> [seconds]
@@ -750,7 +767,7 @@ Plumtree eager/lazy/graft/prune, SWIM witness quorum, RIBLT symbol count,
 delta verify/apply, root transitions, convergence receipts, scheduler credit,
 and per-band backlog.
 
-## 13. Ryusen Transport Policy
+## 13. Ryusen transport policy
 
 All platform acceleration sits behind Reactor capability probes.
 
@@ -770,9 +787,9 @@ Windows: IOCP first; RIO registered buffers; RIO UDP for QUIC/media.
 Multipath QUIC and L4S/ECN are future transport capabilities. They must not
 change L1-L5 semantics.
 
-## 14. Phased Plan
+## 14. Phased plan
 
-### Phase 0: NodeId160 and Frame Seam
+### Phase 0: NodeId160 and frame seam
 
 Modules: `server_registry.zig`, `route_table.zig`, `s2s_peer.zig`,
 `s2s_link.zig`, `proto/coilpack.zig`, new `proto/suimyaku_frame.zig`.
@@ -780,7 +797,7 @@ Modules: `server_registry.zig`, `route_table.zig`, `s2s_peer.zig`,
 Tasks: add `NodeId160` and lane helpers; implement outer frame codec; reject
 non-canonical schemas. Test partial frames and unknown-field behavior.
 
-### Phase 1: Tsumugi Handshake
+### Phase 1: Tsumugi handshake
 
 Modules: new `crypto/tsumugi.zig`, `proto/tsumugi.zig`, `s2s_peer.zig`,
 `peer_link.zig`.
@@ -789,7 +806,7 @@ Tasks: signed prekey bundle, MeshPass verify, M0/M1/M2, key schedule, AEAD
 replay window, app-frame gate. Test deterministic transcript vectors and tamper
 cases.
 
-### Phase 2: Signed Deltas
+### Phase 2: signed deltas
 
 Modules: `delta_codec.zig`, `channel_crdt.zig`, `state.zig`, new
 `signed_delta.zig`, new `capability.zig`.
@@ -798,14 +815,14 @@ Tasks: wrap current channel deltas, verify origin/cid/capability before merge,
 batch Ed25519 verification, trace failures. Test relay mutation rejection and
 duplicate/out-of-order convergence.
 
-### Phase 3: Prolly/MST Index
+### Phase 3: Prolly/MST index
 
 Modules: `merkle.zig`, `anti_entropy_repair.zig`, new `goryu_index.zig`.
 
 Tasks: index `(family, scope, cid)`, produce `FamilyRoot`, descend divergent
 subtrees. Test history-independent roots under shuffled insertion.
 
-### Phase 4: RIBLT Repair
+### Phase 4: RIBLT repair
 
 Modules: `anti_entropy_repair.zig`, new `riblt.zig`, `link_session.zig`.
 
@@ -820,7 +837,7 @@ Modules: `gossip_round.zig`, `membership_view.zig`, new `plumtree.zig`.
 Tasks: active/passive views, eager/lazy/graft/prune, repair on repeated graft
 misses, failure-domain peer choice. Test 50-node churn/loss convergence.
 
-### Phase 6: Witnessed SWIM Hardening
+### Phase 6: Witnessed SWIM hardening
 
 Modules: `gossip_round.zig`, `server_registry.zig`.
 
@@ -828,7 +845,7 @@ Tasks: signed member deltas, exact quorum rules, failure-domain accounting,
 LEFT tombstones, registry from membership state. Test malicious single-peer
 DEAD rejection and quorum recovery.
 
-### Phase 7: World Projection
+### Phase 7: world projection
 
 Modules: `state.zig`, `route_table.zig`, `daemon/world.zig`, `daemon/s2s_link.zig`.
 
@@ -843,7 +860,7 @@ Modules: `trace.zig`, `flight_recorder.zig`, oper debug.
 Tasks: structured sink, recorder, `DEBUG S2S`, DST record/replay. Test failed
 handshake replay reproduces the same transition and error code.
 
-### Phase 9: Transport Upgrades
+### Phase 9: transport upgrades
 
 Modules: `reactor.zig`, platform backends.
 
@@ -851,7 +868,7 @@ Tasks: multishot recv/accept, SEND_ZC, QUIC/WebTransport spike, UDP GSO/GRO
 media lane prototype. Test protocol suite unchanged across simulated, TCP, and
 QUIC backends.
 
-## 15. Open Questions and First Spikes
+## 15. Open questions and first spikes
 
 Open questions: which ML-KEM-768 provider is acceptable short-term; what text
 encoding `NodeId160` uses; which realm-governance facts need BFT ordering; how

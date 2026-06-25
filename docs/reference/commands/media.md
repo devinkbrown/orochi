@@ -1,11 +1,13 @@
-# Media And Presence Commands
+# Media and presence commands
 
-`MEDIA` is registered by `feature.misc` and feature-gated by the `media` config flag (`src/daemon/modules/feature_misc.zig:52`). `ACTIVITY` is registered in the same module (`src/daemon/modules/feature_misc.zig:54`).
+*Per-channel voice, video, and screen-share control plane plus presence updates.*
+
+The `feature.misc` module registers `MEDIA`, which the `media` config flag feature-gates (`src/daemon/modules/feature_misc.zig:52`). The same module registers `ACTIVITY` (`src/daemon/modules/feature_misc.zig:54`).
 
 ## MEDIA
 
 - Syntax: `MEDIA <subcommand> <#channel> [args...]`
-- Description: Orochi media control plane for per-channel SFU/call state. The exact implemented subcommands are `ROSTER`, `OFFER`, `ANSWER`, `PROFILE`, `STATS`, `LAYER`, `BREAKOUT`, `POS`, `CAPTION`, `TRANSCRIPT`, `HAND`, `REACT`, `LEAVE`, `JOIN`, `MUTE`, `UNMUTE`, and `SPEAKING`. Media bytes do not flow over the IRC control socket; replies are `NOTE MEDIA` lines and standard failures.
+- Description: Media control plane for per-channel SFU and call state. The implemented subcommands are `ROSTER`, `OFFER`, `ANSWER`, `PROFILE`, `STATS`, `LAYER`, `BREAKOUT`, `POS`, `CAPTION`, `TRANSCRIPT`, `HAND`, `REACT`, `LEAVE`, `JOIN`, `MUTE`, `UNMUTE`, and `SPEAKING`. Media bytes never flow over the IRC control socket; replies are `NOTE MEDIA` lines and standard failures.
 - Privileges: Registered client; caller must be a member of the target channel. The command is unavailable if the `media` feature is disabled.
 - Parameters: Subcommand and existing channel. `JOIN`/`MUTE`/`UNMUTE`/`SPEAKING` accept kind `voice`, `video`, or `screen` with `voice` default. `OFFER`/`ANSWER` use codec CSV values `opvox`, `opvis`, `raw`; `OFFER` optionally accepts `transport=webrtc` or `webrtc`.
 - Replies: `NOTE MEDIA` lines including `ROSTER`, `OFFER-ACK`, `ANSWER-ACK`, `PROFILE`, `TRANSPORT`, `NATIVE`, `STATS`, `LAYER`, `BREAKOUT`, `POS`, `CAPTION`, `TRANSCRIPT`, `HAND`, `REACT`, `JOIN`, `LEAVE`, `MUTE`, `UNMUTE`, `SPEAKING`/`SILENT`, or end lines.

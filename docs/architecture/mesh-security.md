@@ -1,4 +1,6 @@
-# Orochi Mesh Security Architecture
+# Orochi mesh security architecture
+
+*The security model for server-to-server (Suimyaku) traffic: what each layer guarantees, against which adversary, and how the wire enforces it.*
 
 This document describes how Orochi authenticates and protects server-to-server
 (Suimyaku) traffic as it exists in the current source tree. It complements
@@ -9,10 +11,10 @@ adversary, and how the wire enforces it.
 
 The headline property: a mesh peer — even a fully trusted, pinned peer that has
 been compromised — **cannot forge or alter a frame attributed to another node**.
-This is achieved without any key-distribution subsystem, because node identity
-is self-certifying.
+Orochi achieves this without any key-distribution subsystem, because node
+identity is self-certifying.
 
-## Threat Model
+## Threat model
 
 The mesh assumes a **homogeneous, operator-pinned** deployment (see
 `require_secured` and `[mesh].trust_roots`), but defends in depth against:
@@ -33,9 +35,9 @@ Per-frame origin signing closes it.
 Out of scope here: client↔server TLS (see [crypto.md](crypto.md)) and
 datagram-level media payload authentication (see "Media" below).
 
-## Layered Defense
+## Layered defense
 
-```
+```text
   ┌─────────────────────────────────────────────────────────────┐
   │ L4  Per-frame origin authentication (Ed25519, self-certifying)│
   │       direct frames: per-link signed envelope                 │
@@ -54,7 +56,7 @@ L2 authenticates *the peer* and derives keys. L3 makes the channel
 confidential + integrity-protected. L4 authenticates *the author of each fact*,
 end to end, which is the only layer that defends against adversary (3).
 
-### L2 — Tsumugi handshake, pinning, and fail-closed
+### L2 — Tsumugi handshake, pinning, and fail-closed behavior
 
 `src/daemon/secured_s2s_link.zig` frames a TOFU signed-prekey preamble and the
 two PQ-hybrid AKE messages, then establishes a `tsumugi_handshake.Established`
@@ -78,7 +80,7 @@ post-handshake CRDT byte stream was passed **in plaintext** to the inner
 (`src/daemon/secured_s2s_link.zig` `feedInner`/`drainInner`, with
 `Established.sealRecord`/`openRecord` in `src/crypto/tsumugi_handshake.zig`):
 
-```
+```text
 record := [u32 len LE][ ChaCha20-Poly1305 ciphertext ][ 16-byte tag ]
 ```
 
@@ -118,7 +120,7 @@ node-identity / oper-grant / migration-token signatures.
 
 L4 has two modes depending on whether a frame ever travels more than one hop.
 
-#### Direct-origin frames (per-link signed envelope)
+#### Direct-origin frames: per-link signed envelope
 
 The CRDT state frames whose origin is always the immediate sender — MEMBERSHIP,
 CHANNEL_MODE_STATE, CHANNEL_MODE_FLAGS, CHANNEL_LIST, TOPIC, NICKCHANGE, and the
@@ -133,7 +135,7 @@ signature **and** `originShortId(pubkey) == remote_node_id` — the cryptographi
 upgrade of `acceptsDirectOrigin` from link-trust to proof. This is gated by a
 handshake-negotiated capability (below).
 
-#### Multi-hop frames (self-contained signature, verified every hop)
+#### Multi-hop frames: self-contained signature, verified every hop
 
 Frames that are forwarded/re-broadcast carrying a *third node's* `origin_node`
 need the **original author's** signature preserved across hops — a per-link

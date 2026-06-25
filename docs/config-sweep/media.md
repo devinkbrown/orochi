@@ -1,6 +1,8 @@
-# Orochi media subsystem — hardcoded operational/tuning constant sweep
+# Orochi media subsystem operational constants
 
-READ-ONLY survey. Scope: substrate media primitives (`media_session.zig`,
+Read-only survey of operational and tuning constants in Orochi media-call code.
+
+Scope: substrate media primitives (`media_session.zig`,
 `audio_mix.zig`, `kagura_frame.zig`, `red_fec.zig`, `proto/rtp_profile.zig`,
 `proto/sdp_lite.zig`, `suimyaku/media.zig`) plus daemon media-control features
 (`media_room.zig`, `media_pin.zig`, `quality_hint.zig`, `spotlight.zig`,
@@ -20,16 +22,14 @@ Note: `audio_mix.Mixer` and `suimyaku/media` `Session`/`LayerDeclaration`/
 (no embedded literal), so the lift targets are the *call sites* and the
 documented defaults. Borderline entries are marked.
 
----
-
-## [media] — top-level media / reassembly
+## Top-level media and reassembly (`[media]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
 | src/substrate/kagura_frame.zig:190 | `ReassemblyConfig.window` | 64 | Out-of-order reorder/jitter window depth (frames); frames outside are late-dropped | media.reorder_window_frames | uint | 64 | 8..1024 |
 | src/substrate/media_session.zig:173,196 | `Receiver(256, 64)` / `.{ .window = 16 }` call sites | max_payload 256, window_cap 64, runtime window 16 | Receiver reassembly buffer payload cap + reorder window wiring (borderline: currently only in tests but is the canonical wiring) | media.max_payload_bytes / media.reorder_window_frames | uint | 256 / 16 | 64..65535 / 8..1024 |
 
-## [media.audio] — conference mixer / audio
+## Conference mixer and audio (`[media.audio]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -37,7 +37,7 @@ documented defaults. Borderline entries are marked.
 | src/substrate/audio_mix.zig:61 | `Mixer.init` `frame_size` (no embedded default; caller-supplied) | — (caller) | Samples per audio frame for the mixer; sets mix buffer length | media.audio.frame_size_samples | uint | 960 | 120..4096 |
 | src/substrate/audio_mix.zig:88 | default participant `gain` | 1.0 | Initial per-participant linear gain on join | media.audio.default_gain | float | 1.0 | 0.0..8.0 |
 
-## [media.video] — codec quality / simulcast geometry / ABR
+## Codec quality, simulcast geometry, and ABR (`[media.video]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -46,7 +46,9 @@ documented defaults. Borderline entries are marked.
 | src/substrate/suimyaku/media.zig:294 | `SimulcastLayer.init` max fps guard | 60 | Max accepted layer frame rate | media.video.max_layer_fps | uint | 60 | 1..240 |
 | src/substrate/suimyaku/media.zig:313 | `ReceiverConstraints.max_fps` default | 60 | Default receiver fps ceiling when unspecified | media.video.default_receiver_max_fps | uint | 60 | 1..240 |
 
-## [media.abr] — adaptive bitrate controller (suimyaku/media.zig `AbrConfig`/`abrHint`)
+## Adaptive bitrate controller (`[media.abr]`)
+
+This section covers `suimyaku/media.zig` `AbrConfig` and `abrHint`.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -63,7 +65,7 @@ documented defaults. Borderline entries are marked.
 | src/substrate/suimyaku/media.zig:641 | hold-state low-loss FEC gate (`<= 1` → fec 0 else 1) | 1 | Loss % at/below which steady-state runs with no FEC | media.abr.hold_no_fec_loss_percent | uint | 1 | 0..100 |
 | src/substrate/suimyaku/media.zig:608,624,612 | ABR `fec_level` values (0/1/2/3) | 0..3 | FEC redundancy level emitted per ABR state (borderline: derived ladder, not a single knob) | media.abr.max_fec_level | uint | 3 | 0..8 |
 
-## [media.sfu] — roster / capacity bounds
+## SFU roster and capacity bounds (`[media.sfu]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -74,7 +76,7 @@ documented defaults. Borderline entries are marked.
 | src/substrate/suimyaku/media.zig:11 | `max_codecs` | 8 | Max codecs per media capability set | media.sfu.max_codecs | uint | 8 | 1..32 |
 | src/substrate/suimyaku/media.zig:12 | `max_crypto_suites` | 4 | Max crypto suites per capability set | media.sfu.max_crypto_suites | uint | 4 | 1..16 |
 
-## [media.captions] — live transcript ring
+## Live transcript ring (`[media.captions]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -83,7 +85,7 @@ documented defaults. Borderline entries are marked.
 | src/daemon/transcript.zig:10 | `max_per_channel` | 128 | Retained caption ring depth per channel (FIFO eviction) | media.captions.ring_depth_per_channel | uint | 128 | 16..4096 |
 | src/daemon/transcript.zig:11 | `max_channels` | 4096 | Max channels holding live transcripts | media.captions.max_channels | uint | 4096 | 64..1048576 |
 
-## [media.spotlight]
+## Spotlight sets (`[media.spotlight]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -92,7 +94,7 @@ documented defaults. Borderline entries are marked.
 | src/daemon/spotlight.zig:7 | `max_channel_bytes` | 128 | Max channel-name length (spotlight) | media.spotlight.max_channel_bytes | uint | 128 | 16..512 |
 | src/daemon/spotlight.zig:8 | `max_participant_bytes` | 64 | Max participant-id length (spotlight) | media.spotlight.max_participant_bytes | uint | 64 | 16..256 |
 
-## [media.pins] — pinned media references (call assets)
+## Pinned media references (`[media.pins]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -102,7 +104,7 @@ documented defaults. Borderline entries are marked.
 | src/daemon/media_pin.zig:7 | `max_url_len` | 2048 | Max pinned media URL length | media.pins.max_url_bytes | uint | 2048 | 64..16384 |
 | src/daemon/media_pin.zig:8 | `max_actor_len` | 128 | Max actor (pinned-by) name length | media.pins.max_actor_bytes | uint | 128 | 16..512 |
 
-## [media.recording] — consent store + session index
+## Recording consent store and session index (`[media.recording]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -113,7 +115,7 @@ documented defaults. Borderline entries are marked.
 | src/daemon/recording_index.zig:8 | `max_sessions_per_channel` | 1024 | Max recording sessions tracked per channel | media.recording.max_sessions_per_channel | uint | 1024 | 16..65536 |
 | src/daemon/recording_index.zig:9 | `max_key_bytes` | 128 | Max channel/id/by key length (recording index) | media.recording.max_key_bytes | uint | 128 | 16..512 |
 
-## [media.reactions] — call reaction tally + leaderboard
+## Call reaction tally and leaderboard (`[media.reactions]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -124,7 +126,7 @@ documented defaults. Borderline entries are marked.
 | src/daemon/reaction_tally.zig:7 | `max_emojis_per_message` | 64 | Distinct emojis per message | media.reactions.max_emojis_per_message | uint | 64 | 1..1024 |
 | src/daemon/reaction_tally.zig:8 | `max_reactors_per_emoji` | 1024 | Max reactors per (message,emoji) bucket | media.reactions.max_reactors_per_emoji | uint | 1024 | 8..65536 |
 
-## Borderline / wire-adjacent (included per instructions, lift with caution)
+## Borderline and wire-adjacent constants (included per instructions, lift with caution)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|

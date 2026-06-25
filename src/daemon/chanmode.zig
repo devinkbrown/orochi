@@ -447,7 +447,7 @@ pub const TierOp = struct { mode: MemberMode, on: bool };
 
 /// Expand a single named status MODE change into the ordered set of concrete
 /// tier ops realizing Ophion's cumulative-authority hierarchy (modelled on
-/// `/home/kain/ophion/ircd/chmode.c` chm_owner/chm_op): the chain
+/// `ophion/ircd/chmode.c` chm_owner/chm_op): the chain
 /// founder > owner > op means a tier carries every authority below it, so a
 /// member occupies exactly ONE chain level (Orochi stores the single highest
 /// tier — the creator holds founder alone, `world.zig`). Voice is independent.

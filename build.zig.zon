@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 .{
     // This is the default name used by packages depending on this one. For
     // example, when a user runs `zig fetch --save <url>`, this field is used

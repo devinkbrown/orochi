@@ -1,12 +1,14 @@
 # Operators
 
-Orochi operators are SASL-only. `OPER` never accepts a password; it returns an error telling the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
+*Configure operator privileges, connection classes, flood control, and network-wide event subscriptions.*
 
-## Connection Classes
+Orochi operators are SASL-only. `OPER` never accepts a password; it returns an error instructing the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
 
-A connection class is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching the connection's source IP, TLS status, SASL authentication, operator status, and ident/host. The **first class (in file order) whose match criteria are ALL satisfied wins**; a class with no criteria is a catch-all fallback. Two built-in classes always exist: `user` (regular clients) and `server` (mesh links) (`src/daemon/conn_class.zig:8`).
+## Connection classes
 
-### Match Criteria
+A connection class is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching the connection's source IP, TLS status, SASL authentication, operator status, and ident/host. The **first class (in file order) whose match criteria are all satisfied wins**; a class with no criteria is a catch-all fallback. Two built-in classes always exist: `user` (regular clients) and `server` (mesh links) (`src/daemon/conn_class.zig:8`).
+
+### Match criteria
 
 | Criterion | Meaning | Examples |
 |---|---|---|
@@ -19,9 +21,9 @@ A connection class is a named bundle of per-connection resource, admission, and 
 
 All specified criteria must match for the class to apply. See `docs/reference/config.md` `[class.<name>]` for the complete configuration table.
 
-### Policy Knobs
+### Policy knobs
 
-Per-class policy fields override their `[limits]` global counterparts. A `0` value means "inherit the global limit" (unless noted otherwise).
+Per-class policy fields override their `[limits]` global counterparts. A `0` value means "inherit the global limit" unless noted otherwise.
 
 | Policy | Meaning | Default |
 |---|---|---|
@@ -74,23 +76,23 @@ flood_window = "10s"
 require_tls = true
 ```
 
-### Inspecting Classes Live
+### Inspecting classes live
 
-```
+```text
 /STATS Y
 ```
 
-Numeric **218 RPL_STATSYLINE** reports one line per registered connection class with its full policy, match summary, and live member count (`src/daemon/server.zig:10356`). Example output shows class name, policy fields (sendq, recvq, max_clients, max_per_ip, max_channels, max_targets, monitor, silence, timeouts, flood settings), match facets (match criteria, TLS-only, account-only, oper-only), CIDR count, and current member count (`src/daemon/server.zig:10343`).
+Numeric **218 RPL_STATSYLINE** reports one line per registered connection class with its full policy, match summary, and live member count (`src/daemon/server.zig:10356`). Output includes the class name, policy fields (sendq, recvq, max_clients, max_per_ip, max_channels, max_targets, monitor, silence, timeouts, flood settings), match facets (match criteria, TLS-only, account-only, oper-only), CIDR count, and current member count (`src/daemon/server.zig:10343`).
 
 ### SendQ and RecvQ
 
-**SendQ** (outbound): Each connection maintains an ~8 KiB inline send buffer plus a heap overflow, bounded by the per-class `sendq` ceiling. The buffer is io_uring zero-copy safe (the armed send buffer is never moved/freed during flight). Exceeding the ceiling drops appended data with "output too small" error (`src/daemon/conn_class.zig`).
+**SendQ (outbound):** each connection maintains an ~8 KiB inline send buffer plus a heap overflow, bounded by the per-class `sendq` ceiling. The buffer is io_uring zero-copy safe — the armed send buffer is never moved or freed during flight. Exceeding the ceiling drops appended data with an "output too small" error (`src/daemon/conn_class.zig`).
 
-**RecvQ** (inbound): Pending unterminated lines accumulate in an inline line buffer and spill to a heap overflow once they outgrow it, bounded by the per-class `recvq` ceiling. A `recvq` of `0` inherits the daemon's physical line-buffer default. A line exceeding the ceiling drops the connection (LineTooLong error).
+**RecvQ (inbound):** pending unterminated lines accumulate in an inline line buffer and spill to a heap overflow once they outgrow it, bounded by the per-class `recvq` ceiling. A `recvq` of `0` inherits the daemon's physical line-buffer default. A line exceeding the ceiling drops the connection (LineTooLong error).
 
-## Nick Delay
+## Nick delay
 
-Nick delay is an anti-camping protection: when a registered account's nick is released (by the owner disconnecting or QUITing), the daemon holds that nick against reuse for a configured window (`src/daemon/nick_delay.zig:1`).
+Nick delay is an anti-camping protection: when a registered account's nick is released (by the owner disconnecting or sending `QUIT`), the daemon holds that nick against reuse for a configured window (`src/daemon/nick_delay.zig:1`).
 
 ### Configuration
 
@@ -99,11 +101,11 @@ Nick delay is an anti-camping protection: when a registered account's nick is re
 nick_delay = "30s"  # or "0" to disable (the default)
 ```
 
-Set `[limits].nick_delay` to a duration string (`"30s"`, `"1m"`, etc.) to enable. `"0"` disables nick delay entirely (`src/daemon/config_format.zig:172`).
+Set `[limits].nick_delay` to a duration string (`"30s"`, `"1m"`, and so on) to enable it. `"0"` disables nick delay entirely (`src/daemon/config_format.zig:172`).
 
 ### Behavior
 
-- A nick is held **only when its owner exits** (disconnect or QUIT). Voluntary `NICK` changes do NOT apply nick delay.
+- A nick is held **only when its owner exits** (disconnect or `QUIT`). Voluntary `NICK` changes do not apply nick delay.
 - During the hold window:
   - The **owning account** (if the releaser was SASL-authenticated) may reclaim the nick immediately.
   - **Server operators** (any opered connection) bypass the hold entirely.
@@ -111,9 +113,9 @@ Set `[limits].nick_delay` to a duration string (`"30s"`, `"1m"`, etc.) to enable
   - **Everyone else** is refused with numeric **437 ERR_UNAVAILRESOURCE**: `"Nick is held (nick delay); try again shortly"` (`src/daemon/server.zig:5885`).
 - Once the window expires, the nick is free for anyone to claim.
 
-### Per-Class Exemption
+### Per-class exemption
 
-A connection class can exempt its members from nick delay holds via the `nick_delay_exempt` policy flag (`src/daemon/nick_delay.zig:8`):
+A connection class can exempt its members from nick-delay holds via the `nick_delay_exempt` policy flag (`src/daemon/nick_delay.zig:8`):
 
 ```toml
 [class.services]
@@ -123,17 +125,17 @@ nick_delay_exempt = true
 
 Members of this class may take a held nick without waiting, just like operators.
 
-### Live Status
+### Live status
 
 `INFO` reports nick-delay status when enabled:
 
-```
+```text
 /INFO
 ```
 
-Look for a line like: `"Nick delay: 30000ms hold on release - 5 nick(s) currently held"` (`src/daemon/server.zig:19219`).
+Look for a line such as `"Nick delay: 30000ms hold on release - 5 nick(s) currently held"` (`src/daemon/server.zig:19219`).
 
-## Per-Class Flood Control
+## Per-class flood control
 
 Each connection class drives a single runtime flood guard (`src/daemon/flood_guard.zig`) from its `flood_lines`/`flood_window` budget. The guard is more than a line counter: keep-alives (`PING`/`PONG`) are free, `PRIVMSG`/`NOTICE`/`JOIN` are weighted, a distinct-PRIVMSG-target spread check counters spray-spam, and sustained over-budget traffic accrues decaying excess strikes toward an `ERROR :Excess Flood` disconnect. It retunes live on `REHASH`.
 
@@ -162,9 +164,9 @@ flood_exempt = true   # Exempt from throttle/flood entirely
 - **S2S server links** are always exempt (the `server` class carries mesh traffic which may burst immediately after connection).
 - Only registered connections are subject to flood control; the registration handshake itself is not throttled by these limits.
 
-## Network Raid Guard
+## Network raid guard
 
-Beyond the per-channel `+j` join-throttle mode, `[limits].raid_joins` / `raid_window` apply a **default** join-throttle to every channel that has no explicit `+j`. When more than `raid_joins` clients join such a channel within `raid_window`, further joins are denied (`ERR_THROTTLE`) and a one-shot `FLOOD` raid alert is published to subscribed operators on the Event Spine. An explicit `+j` always overrides the default; operators and invited users bypass; `raid_joins = 0` disables it.
+Beyond the per-channel `+j` join-throttle mode, `[limits].raid_joins` and `raid_window` apply a **default** join-throttle to every channel that has no explicit `+j`. When more than `raid_joins` clients join such a channel within `raid_window`, further joins are denied (`ERR_THROTTLE`) and a one-shot `FLOOD` raid alert is published to subscribed operators on the Event Spine. An explicit `+j` always overrides the default; operators and invited users bypass it; `raid_joins = 0` disables it.
 
 ```toml
 [limits]
@@ -174,17 +176,17 @@ raid_window = "10s"
 
 Operators can also plant **spam-trap honeypots** with `SPAMTRAP ADD NICK <nick>` / `SPAMTRAP ADD CHAN <#channel>`: a non-oper that contacts a trap trips a `FLOOD` alert and is flagged for `WARD` follow-up. See [commands/oper-moderation.md](../reference/commands/oper-moderation.md).
 
-## Server Links and Peer Inspection
+## Server links and peer inspection
 
-### Per-Link Statistics
+### Per-link statistics
 
-```
+```text
 /STATS l
 ```
 
 Numeric **211 RPL_STATSLLINE** reports one line per established S2S peer link with `sendq_cap` (the `server` class SendQ ceiling), queued bytes currently pending, and link uptime (`src/daemon/server.zig:10378`). Use this to monitor mesh health and detect SendQ backlog on remote links.
 
-### Mesh Health Commands
+### Mesh health commands
 
 Operators with `mesh_admin` privilege can inspect and manage the mesh:
 
@@ -196,12 +198,12 @@ Operators with `mesh_admin` privilege can inspect and manage the mesh:
 | `CONNECT <host> <port>` | Open outbound S2S to a peer (`src/daemon/server.zig:6304`). |
 | `SQUIT <server>` | Tear down an S2S link by server name (`src/daemon/server.zig:6371`). |
 
-## Network-Wide Operator Events
+## Network-wide operator events
 
-Operator-facing events are delivered over the **Event Spine**, and an event raised
-on any node is fanned to every mesh node — rendered with the **originating** server
-name, so opers see the whole network from a single node. Two opt-in subscription
-models ride it:
+Operator-facing events are delivered over the **Event Spine**: an event raised on
+any node is fanned out to every mesh node and rendered with the **originating**
+server name, so operators see the whole network from a single node. Two opt-in
+subscription models ride it:
 
 - **Category feed** — `EVENT ADD <category>` (e.g. `CONNECT`, `DISCONNECT`,
   `FLOOD`, `KILL`, `SERVER_LINK`, `OPER_ACTION`) subscribes to a snomask-style
@@ -221,7 +223,7 @@ models ride it:
 the WALLOPS path — there is no `+w` user mode). See
 [reference/commands/ircx.md](../reference/commands/ircx.md) for full `EVENT` syntax.
 
-## Account Binding
+## Account binding
 
 ```toml
 [sasl]
@@ -233,9 +235,9 @@ class = "netadmin"
 title = "Network Guardian"
 ```
 
-`account_db` opens a OroStore account backend and wires PLAIN, SCRAM-SHA-256, and EXTERNAL into the live server (`src/main.zig:177`, `src/main.zig:193`). `[[opers]].account` is required and must be non-empty (`src/daemon/config_format.zig:433`, `src/daemon/config_format.zig:481`). `class` names an operator group, and `title` is optional WHOIS/operator display text (`src/daemon/config_format.zig:436`, `src/daemon/config_format.zig:441`).
+`account_db` opens an OroStore account backend and wires PLAIN, SCRAM-SHA-256, and EXTERNAL into the live server (`src/main.zig:177`, `src/main.zig:193`). `[[opers]].account` is required and must be non-empty (`src/daemon/config_format.zig:433`, `src/daemon/config_format.zig:481`). `class` names an operator group, and `title` is optional WHOIS/operator display text (`src/daemon/config_format.zig:436`, `src/daemon/config_format.zig:441`).
 
-## Privilege Classes
+## Privilege classes
 
 Define privilege bundles with `[[oper_groups]]`:
 
@@ -270,10 +272,10 @@ Privilege strings must match the `oper.Privilege` enum names exactly (`src/daemo
 | `oper_override` | Force/SA-style override authority. |
 | `limit_exempt` | Bypass all per-class connection caps (clone limits by IP/account/host). |
 
-Unknown privilege strings are ignored during config boot conversion (`src/daemon/config_boot.zig:159`). If an oper class is missing, or its effective privileges are empty, current boot skips that oper binding (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). Use explicit, non-empty groups.
+Unknown privilege strings are ignored during config-boot conversion (`src/daemon/config_boot.zig:159`). If an operator class is missing, or its effective privileges are empty, boot skips that operator binding (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). Use explicit, non-empty groups.
 
-Group inheritance is bounded to 32 parent links (`src/daemon/operator_groups.zig:11`). Effective privileges are the union of the group and ancestors (`src/daemon/operator_groups.zig:88`).
+Group inheritance is bounded to 32 parent links (`src/daemon/operator_groups.zig:11`). Effective privileges are the union of the group and its ancestors (`src/daemon/operator_groups.zig:88`).
 
-## Reload Behavior
+## Reload behavior
 
-When booted with a config file, `REHASH` re-reads the same path (`src/main.zig:112`, `src/daemon/server.zig:10031`). Current `REHASH` rebuilds account-to-oper bindings but assigns full privileges rather than recomputing `[[oper_groups]]` (`src/daemon/server.zig:10052`, `src/daemon/server.zig:10062`). Existing sessions keep their current oper state (`src/daemon/server.zig:10028`).
+When booted with a config file, `REHASH` re-reads the same path (`src/main.zig:112`, `src/daemon/server.zig:10031`). `REHASH` rebuilds account-to-operator bindings but assigns full privileges rather than recomputing `[[oper_groups]]` (`src/daemon/server.zig:10052`, `src/daemon/server.zig:10062`). Existing sessions keep their current operator state (`src/daemon/server.zig:10028`).

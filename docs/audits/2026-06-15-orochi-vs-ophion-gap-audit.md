@@ -1,22 +1,21 @@
-# Orochi Versus Ophion Gap Audit - 2026-06-15
+# Orochi versus Ophion gap audit - 2026-06-15
+*Historical research note: records source-verified parity findings for comparing Orochi against Ophion.*
 
-This is the current source-verified gap document for comparing Orochi against
-Ophion. It replaces the older overlapping gap/planning notes and should be
-updated in the same commit as any future parity fix.
+This current gap document replaces older overlapping gap/planning notes and should be updated in the same commit as any future parity fix.
 
 ## Scope
 
-- Orochi source: `/home/kain/orochi` at `c471a06`.
-- Ophion reference: `/home/kain/ophion` at `15040367`.
+- Orochi source: `orochi` at `c471a06`.
+- Ophion reference: `ophion` at `15040367`.
 - Method: compare current source and tests first, then use docs as navigation.
 - Exclusions: STARTTLS, WEBIRC, ident, password/hostmask `OPER`, TS6/SJOIN,
   DCC proxy/filehost, and CPython/MAPI module parity are not Orochi product
   targets unless that decision changes.
 
-## Do Not Reopen These Fixed Items
+## Do not reopen these fixed items
 
-These were stale findings in older docs. Current Orochi source has live wiring
-and tests for them:
+These findings were stale in older docs. Current Orochi source has live wiring
+and tests for each item:
 
 - Config/runtime: `listen.webtransport`, `listen.proxy_protocol`,
   `listen.trusted_proxies`, `mesh.trust_roots`, `mesh.connect`,
@@ -65,12 +64,12 @@ and tests for them:
   renewal** (atomic flag + reactor-0 hot-swap); and secured-link **`SQUIT`**
   confirmed symmetric + tested.
 
-## Real Missing Or Incomplete Features
+## Real missing or incomplete features
 
 Only genuinely-open, deferred, or by-design-excluded items remain below; the
 fixed-items list above covers everything implemented.
 
-### IRCv3 and SASL Parity
+### IRCv3 and SASL parity
 
 - **`draft/file-upload` / `FILEHOST` is missing by design.** Ophion has
   `m_filehost`. Orochi currently documents DCC/filehost as intentionally absent.
@@ -81,7 +80,7 @@ fixed-items list above covers everything implemented.
   exists. (`network-icon` is implemented as the `NETWORKICON` ISUPPORT token — see
   the fixed items above.)
 
-### Ophion-Specific Capability Names
+### Ophion-specific capability names
 
 Orochi sometimes implements the behavior under Orochi-native names instead of
 the Ophion CAP names:
@@ -99,7 +98,7 @@ the Ophion CAP names:
 - `tls`: Ophion exposes STARTTLS through `m_starttls`; Orochi intentionally uses
   implicit TLS listeners only.
 
-### IRCX Parity
+### IRCX parity
 
 - **EVENT numeric fidelity is intentionally different today.** Orochi uses the
   `NOTE EVENT` wire form and subject globs; Ophion has the 808/809/810 and
@@ -144,7 +143,7 @@ the Ophion CAP names:
   The Ophion command names themselves are not aliased — same custom-not-clone
   stance as the Ophion-Specific Capability Names section above.
 
-### Media And LADON
+### Media and LADON
 
 - **LADON media compatibility is not implemented.** Orochi media is not a LADON
   module port. It does not expose Ophion's `MEDIAFRAME`, `LADONADMIN`,
@@ -163,7 +162,7 @@ the Ophion CAP names:
   implemented (see fixed items + `docs/reference/native-media-mac.md`); full
   coverage still needs the matching Nexus/Ocean client to compute the tag.
 
-### Mesh, Ops, And Runtime
+### Mesh, ops, and runtime
 
 - **Web admin/dashboard is absent.** Orochi has static stats export and live
   Prometheus `/metrics`; it does not ship Ophion-style optional webadmin/Python
@@ -173,7 +172,7 @@ the Ophion CAP names:
   needed, document the intended native/WASM surface separately and track it as an
   Orochi feature, not as C MAPI parity.
 
-## Documentation Rules
+## Documentation rules
 
 - Do not list a key as parser-only unless `config_format.zig`, `config_boot.zig`,
   `main.zig`, and `server.zig` all confirm it is not projected or consumed.

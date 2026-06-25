@@ -1,6 +1,8 @@
 # Mesh and S2S
 
-Orochi S2S uses the Suimyaku mesh runtime. Configure identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
+*Configure server-to-server linking over the Suimyaku mesh, including secured and plaintext links and operator inspection views.*
+
+Orochi server-to-server (S2S) linking runs on the Suimyaku mesh runtime. Configure node identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
 
 ```toml
 [node]
@@ -16,17 +18,17 @@ realm = "example"
 mesh_pass = "env:OROCHI_MESH_PASS"
 ```
 
-`[listen].s2s` maps to `server.Config.s2s_port`; `0` disables the inbound S2S listener (`src/daemon/config_boot.zig:26`, `src/daemon/server.zig:1046`). The server binds it alongside the IRC listener when non-zero (`src/daemon/server.zig:1490`).
+`[listen].s2s` maps to `server.Config.s2s_port`; `0` disables the inbound S2S listener (`src/daemon/config_boot.zig:26`, `src/daemon/server.zig:1046`). The server binds it alongside the IRC listener when the value is non-zero (`src/daemon/server.zig:1490`).
 
-## Secured vs Plaintext Links
+## Secured vs. plaintext links
 
-When `[node].secret_key` is configured, `main.zig` derives a node identity using `[mesh].realm`, sets `server.Config.node_identity`, copies `mesh_pass` if configured, and enables PQ-secured S2S (`src/main.zig:147`, `src/main.zig:149`, `src/main.zig:152`, `src/main.zig:153`). Without a node identity, S2S stays plaintext (`src/main.zig:141`).
+When `[node].secret_key` is configured, `main.zig` derives a node identity using `[mesh].realm`, sets `server.Config.node_identity`, copies `mesh_pass` if configured, and enables post-quantum-secured S2S (`src/main.zig:147`, `src/main.zig:149`, `src/main.zig:152`, `src/main.zig:153`). Without a node identity, S2S stays plaintext (`src/main.zig:141`).
 
-Outbound `CONNECT <host> <port>` is an oper command requiring `mesh_admin` (`src/daemon/server.zig:6304`, `src/daemon/server.zig:6308`). If the local server has secured S2S enabled, CONNECT starts a secured handshake; otherwise it starts a plaintext S2S link (`src/daemon/server.zig:6339`, `src/daemon/server.zig:6354`). `SQUIT <server>` tears down a peer link and also requires `mesh_admin` (`src/daemon/server.zig:6371`, `src/daemon/server.zig:6374`).
+Outbound `CONNECT <host> <port>` is an operator command that requires `mesh_admin` (`src/daemon/server.zig:6304`, `src/daemon/server.zig:6308`). If the local server has secured S2S enabled, `CONNECT` starts a secured handshake; otherwise it starts a plaintext S2S link (`src/daemon/server.zig:6339`, `src/daemon/server.zig:6354`). `SQUIT <server>` tears down a peer link and also requires `mesh_admin` (`src/daemon/server.zig:6371`, `src/daemon/server.zig:6374`).
 
-## Oper Views
+## Operator views
 
-The oper security module exposes the current mesh inspection commands (`src/daemon/modules/oper_security.zig:123`, `src/daemon/modules/oper_security.zig:132`):
+The operator security module exposes the current mesh inspection commands (`src/daemon/modules/oper_security.zig:123`, `src/daemon/modules/oper_security.zig:132`):
 
 | Command | View |
 |---|---|

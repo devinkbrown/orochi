@@ -1,15 +1,18 @@
-# Orochi services / daemon-state config sweep
+# Orochi services and daemon-state config sweep
 
-READ-ONLY inventory of hardcoded operational/tuning constants in the services and
-daemon-state area, scoped to: services.zig, sessions.zig, oper.zig, store.zig,
+This read-only inventory maps services and daemon-state constants to proposed TOML controls.
+
+Scope: hardcoded operational/tuning constants in the services and daemon-state
+area. Files surveyed: services.zig, sessions.zig, oper.zig, store.zig,
 sasl_bridge.zig, announce_board.zig, announcement_mode.zig, focus_mode.zig,
 tegami.zig, content_filter.zig (Koshi), duplicate_filter.zig.
 
-EXCLUDED per brief: server.zig, dispatch.zig, client.zig, acme_*.zig, config*.zig.
+Excludes per brief: server.zig, dispatch.zig, client.zig, acme_*.zig, config*.zig.
 Also excluded: crypto domain constants (hash/salt/token byte lengths mandated by an
 algorithm), enum discriminants, fixed wire/record-format constants, and test values.
-NOTE: substrate/wal.zig (the CRDT delta WAL) holds only magic/version/header-length
-wire constants and is NOT included; the operational store tunables live in store.zig.
+
+Note: substrate/wal.zig (the CRDT delta WAL) holds only magic/version/header-length
+wire constants and is not included; the operational store tunables live in store.zig.
 
 ---
 
@@ -39,7 +42,8 @@ wire constants and is NOT included; the operational store tunables live in store
 | sessions.zig:21 | `Config.max_sessions_per_account` | `64` | max concurrent live+ghost sessions per account (multi-device cap) | `sessions.max_per_account` | uint | 64 | 1..256 |
 
 ## [bouncer]
-(Tegami offline-mail + announcement board fan-out are the per-account buffer/retention surfaces in this scope.)
+
+Tegami offline-mail and announcement board fan-out are the per-account buffer/retention surfaces in this scope.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
@@ -53,7 +57,8 @@ wire constants and is NOT included; the operational store tunables live in store
 | announce_board.zig:16 | `max_body_len` | `1000` | max announcement body length | `bouncer.announce_body_max_len` | uint | 1000 | 128..8192 |
 
 ## [storage]
-(OroStore append-only log + snapshot + changefeed.)
+
+OroStore append-only log, snapshot, and changefeed.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
@@ -62,8 +67,9 @@ wire constants and is NOT included; the operational store tunables live in store
 | store.zig:98 | `ChangeFeed.init(allocator, 64)` | `64` | bounded recent-mutation changefeed ring size (service-sync feed) | `storage.changefeed_capacity` | uint | 64 | 8..4096 |
 
 ## [filter]
-(Koshi content filter + duplicate suppression. announcement_mode and focus_mode are
-per-channel/per-account posting gates — grouped here as moderation limits.)
+
+Koshi content filter and duplicate suppression. announcement_mode and focus_mode are
+per-channel/per-account posting gates, grouped here as moderation limits.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
@@ -75,7 +81,7 @@ per-channel/per-account posting gates — grouped here as moderation limits.)
 | announcement_mode.zig:9 | `max_account_bytes` | `128` | max account-name length on the announcement allowlist | `filter.announce_mode_account_max_len` | uint | 128 | 8..256 |
 | announcement_mode.zig:10 | `max_accounts_per_channel` | `1024` | max allowlisted posters per announcement-only channel | `filter.announce_mode_allowlist_max` | uint | 1024 | 16..16384 |
 
-## Borderline / notes
+## Borderline notes
 
 | file:line | symbol / context | current value | note |
 |-----------|------------------|---------------|------|

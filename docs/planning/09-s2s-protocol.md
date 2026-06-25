@@ -1,21 +1,22 @@
-# 09 — Suimyaku S2S Linking Protocol (modern, clean-room design)
+# 09 — Suimyaku S2S linking protocol
 
-> **Mandate (user, 2026-06-05):** clean-room, no technical debt, "go our own
-> way." Extremely modern S2S. Secure, **verifiable**, optimized, and shaped so
-> voice/media/video can ride it later — but **core infrastructure first**. The
-> sovereign `node_id` is the *single* mesh identity; there is **no TS6 server-id
-> (SID)** anywhere (purged in `aaa3cb2`).
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
 
-This document is the deep-research design for Orochi's server-to-server linking
-protocol. It supersedes the S2S portions of [04-suimyaku-mesh.md](04-suimyaku-mesh.md)
-where they conflict, and is grounded in current (2025–2026) distributed-systems
-prior art rather than legacy IRC server linking.
+This document defines Orochi's clean-room server-to-server linking protocol and supersedes the conflicting S2S portions of [04-suimyaku-mesh.md](04-suimyaku-mesh.md).
 
----
+**Mandate (user, 2026-06-05):** clean-room, no technical debt, "go our own
+way." Extremely modern S2S. Secure, **verifiable**, optimized, and shaped so
+voice/media/video can ride it later — but **core infrastructure first**. The
+sovereign `node_id` is the *single* mesh identity; there is **no TS6 server-id
+(SID)** anywhere (purged in `aaa3cb2`).
 
-## 1. Design goals & non-goals
+The design is grounded in current (2025–2026) distributed-systems prior art
+rather than legacy IRC server linking.
 
-**Goals**
+## 1. Design goals and non-goals
+
+### Goals
+
 1. **One sovereign identity.** A node is `NodeId = BLAKE3-160(Ed25519 verify key)`.
    No SIDs, no TS6, no human-name-as-identity. The Ed25519 key *is* the node.
 2. **Verifiable by construction.** Every admission, every membership claim, every
@@ -29,10 +30,11 @@ prior art rather than legacy IRC server linking.
    views) so the mesh is `O(log n)` fanout, not full-mesh flooding.
 6. **Media-ready spine.** A stream/band model that maps cleanly onto QUIC / Media-
    over-QUIC so realtime audio/video is a *new band*, not a redesign.
-7. **Deterministic & testable.** Every layer behind the `Reactor`/clock/rng seam
+7. **Deterministic and testable.** Every layer behind the `Reactor`/clock/rng seam
    so the whole protocol runs in the Deterministic Ocean simulator.
 
-**Non-goals**
+### Non-goals
+
 - TS6 / legacy server linking compatibility (explicitly out — clean break).
 - A global total order (we use causal order + per-entity resolution instead).
 - Trusting transitive relays (no "my uplink said so" — see §6 verifiability).
@@ -54,17 +56,17 @@ Sources are listed in §11.
 
 ---
 
-## 3. Identity & trust model (no SIDs)
+## 3. Identity and trust model
 
-```
+```text
 node secret      = Ed25519 signing key (sovereign, long-term, per node)
-NodeId           = BLAKE3-160(Ed25519 verify key)   // 20 bytes, the ONLY id
+NodeId           = BLAKE3-160(Ed25519 verify key)   // 20 bytes, the only id
 display name     = metadata (a server label; never an identity, never unique)
 replica lane     = NodeId  (CRDT ReplicaId is the node id — already u64-wide;
                             full 160-bit NodeId on admission, abbreviated on hot paths)
 ```
 
-- The registry (`server_registry`) is keyed by `NodeId`. ✅ done (`aaa3cb2`).
+- The registry (`server_registry`) is keyed by `NodeId`; done (`aaa3cb2`).
 - **MeshPass** admission token (Ed25519-signed capability): `{node_key, realm,
   roles, expiry, allowed_frame_families, max_fanout, media_rights, revocation_epoch}`.
   Admission requires a configured trust root **or** a quorum-signed invite from
@@ -77,7 +79,7 @@ replica lane     = NodeId  (CRDT ReplicaId is the node id — already u64-wide;
 
 ## 4. Layered architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │ L5  Application state   Goryu δ-CRDT world (users/chans/modes)│  channel_crdt, world
 │ L4  Mesh services       membership, gossip, anti-entropy, route│ link_session, gossip_round,
@@ -96,11 +98,11 @@ build; L5 world-projection is the user-visible payoff; media is a later L1 band.
 
 ---
 
-## 5. Connection lifecycle & framing
+## 5. Connection lifecycle and framing
 
 State machine (one io_uring actor owns the socket, crypto, credit, schedulers):
 
-```
+```text
 TcpConnected → HelloSent/Recv → HandshakeProved → SessionUp
             → Established → Rekeying ⇄ Established → Draining → Closed
 ```
@@ -134,7 +136,7 @@ lesson, pre-baked into the band model so the TCP→QUIC swap is transport-only.
 
 ---
 
-## 6. Security & verifiability (Tsumugi)
+## 6. Security and verifiability (Tsumugi)
 
 **Handshake (PQ-hybrid Noise-IK-shaped):**
 - Static keys = the node Ed25519 identity (bound into the transcript).
@@ -164,7 +166,7 @@ state is a gap-aware bitmap + bounded skipped-key cache).
 
 ---
 
-## 7. Membership & dissemination
+## 7. Membership and dissemination
 
 - **HyParView** partial views: a small **active view** (live links, symmetric,
   TCP-backed) and a larger **passive view** (reserve peers, refreshed by periodic
@@ -209,7 +211,7 @@ state is a gap-aware bitmap + bounded skipped-key cache).
 
 ---
 
-## 10. Mapping to current code + migration
+## 10. Mapping to current code and migration
 
 **Already done (clean core):**
 - `node_id`-only identity across `server_registry`/`s2s_peer`/`s2s_link`/`channel_crdt`; SID purged.
@@ -235,10 +237,10 @@ negotiation prevents silent downgrades.
 
 ## 11. Sources
 
-- Matrix room DAG & state resolution: [room-dag], [spec], [stateres]
+- Matrix room DAG and state resolution: [room-dag], [spec], [stateres]
 - Veilid private routing / RPC: [veilid-routing], [veilid-rpc]
-- Noise & PQNoise: [noise], [pqnoise]
-- δ-CRDTs & set reconciliation: [delta-crdt], [rbsr], [conflictsync]
+- Noise and PQNoise: [noise], [pqnoise]
+- δ-CRDTs and set reconciliation: [delta-crdt], [rbsr], [conflictsync]
 - Plumtree / HyParView: [plumtree], [hyparview]
 - Media over QUIC: [moq], [quic-dc]
 

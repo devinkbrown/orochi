@@ -1,12 +1,16 @@
-# 19 — Media Client Implementation Guide
+# 19 — Media client implementation guide
+
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
+
+This document defines the byte-level client contract for Orochi SFU voice/video calls.
 
 Status: **reference**. This is the complete, self-contained contract for implementing a
 client that makes a voice/video call through the Orochi SFU. Everything here is the
-*server's* observed behaviour — you can implement a client in any language against it
-without reading the Zig source. Companion to [18-media-transport.md](18-media-transport.md)
-(architecture) — this doc is the byte-level "how".
+*server's* observed behavior; you can implement a client in any language against it without
+reading the Zig source. It is the byte-level companion to
+[18-media-transport.md](18-media-transport.md), which covers architecture.
 
-The whole call is three layers:
+The call has three layers:
 
 1. **Signaling** over your existing TLS IRC connection — negotiate codecs, get ICE creds +
    the SRTP key. Plain IRC lines.
@@ -19,7 +23,7 @@ The whole call is three layers:
 
 ## 1. End-to-end sequence
 
-```
+```text
   (already connected + registered over TLS IRC)
   C: JOIN #call
   C: MEDIA JOIN #call voice            ; (optional roster presence; see §7)
@@ -43,50 +47,57 @@ Keep the UDP socket you used for the STUN check; **send media from the same loca
 
 ---
 
-## 2. Signaling (IRC lines)
+## 2. Signaling
 
 All server→client media lines have the form `:<server> NOTE MEDIA <#chan> <VERB> <args>`.
 
-### MEDIA OFFER (you → server)
+### MEDIA OFFER
 `MEDIA OFFER <#chan> <codec[,codec...]>` — codecs from `{opvox, opvis, raw}` (opvox = audio,
 opvis = video). The server intersects your list with its SFU set (`opvox,opvis`) and replies:
 
-- `OFFER-ACK codecs=<agreed,...> fec=<none|rateless_lt|rs_block>` — to you.
-- `PROFILE codecs=... fec=...` — broadcast to the rest of the call (so everyone converges).
-- `TRANSPORT ufrag=<U> pwd=<P> candidate=<IP>:<PORT> srtp=<B64>` — to you (see §3, §4).
+| Reply | Recipient | Meaning |
+| --- | --- | --- |
+| `OFFER-ACK codecs=<agreed,...> fec=<none|rateless_lt|rs_block>` | You | Negotiated codec set and FEC. |
+| `PROFILE codecs=... fec=...` | Rest of the call | Broadcast profile so everyone converges. |
+| `TRANSPORT ufrag=<U> pwd=<P> candidate=<IP>:<PORT> srtp=<B64>` | You | ICE credentials, UDP candidate, and SRTP key (see §3, §4). |
 
 Failure replies are IRCv3 standard replies: `FAIL MEDIA NO_CODECS|NEGOTIATE_FAILED|
 NO_COMMON_CODEC :<reason>`.
 
-### MEDIA ANSWER (a later joiner)
+### MEDIA ANSWER
 `MEDIA ANSWER <#chan> <codec,...>` — reconcile your codecs against the call's active
 profile (set by the first OFFER). Reply `ANSWER-ACK codecs=<intersection> fec=...`, or
 `FAIL MEDIA NO_OFFER` if no call profile exists yet.
 
-### MEDIA PROFILE / STATS (query)
+### MEDIA PROFILE and MEDIA STATS
 - `MEDIA PROFILE <#chan>` → `PROFILE codecs=... fec=...` or `FAIL MEDIA NO_OFFER`.
 - `MEDIA STATS <#chan>` → one line per participant:
   `STATS <nick> ice=<connected|pending> ssrc=<hex> rx_pkts=<n> rx_bytes=<n>`, then
   `:<server> NOTE MEDIA <#chan> :End of media stats (<count>)`.
 
-### The TRANSPORT line — parse this
-```
+### TRANSPORT fields
+
+Parse this line:
+
+```text
 :orochi.local NOTE MEDIA #call TRANSPORT ufrag=dHD3gY59 pwd=LsaRAE0Yzxz1xYSd9++9E+u6 candidate=127.0.0.1:37190 srtp=14K23wcnM2X9VEfpw3tvX+RQs7rRzb7Y/qbezPQI
 ```
-- `ufrag` — 8 chars. Your STUN USERNAME is `"<ufrag>:<anything>"` (server reads only the
-  part before `:`; put your own ICE ufrag after it, any value works today).
-- `pwd` — 24 chars. The **STUN MESSAGE-INTEGRITY key** for requests you send.
-- `candidate` — `IP:PORT`, the server's media UDP endpoint to send to.
-- `srtp` — base64 of the 30-byte SRTP master key+salt (see §4).
+
+| Field | Meaning |
+| --- | --- |
+| `ufrag` | 8 chars. Your STUN USERNAME is `"<ufrag>:<anything>"`; the server reads only the part before `:`. Put your own ICE ufrag after it; any value works today. |
+| `pwd` | 24 chars. The **STUN MESSAGE-INTEGRITY key** for requests you send. |
+| `candidate` | `IP:PORT`, the server's media UDP endpoint to send to. |
+| `srtp` | Base64 of the 30-byte SRTP master key+salt (see §4). |
 
 ---
 
-## 3. ICE / STUN (RFC 5389/8445, short-term credentials)
+## 3. ICE/STUN
 
 You only need STUN Binding requests with USERNAME + MESSAGE-INTEGRITY + FINGERPRINT.
 
 **STUN message layout (big-endian):**
-```
+```text
 0               2               4
 +-------+-------+---------------+
 | type (2)      | length (2)    |   length = byte count of all attributes
@@ -100,6 +111,7 @@ You only need STUN Binding requests with USERNAME + MESSAGE-INTEGRITY + FINGERPR
 Binding Request `type = 0x0001`. Each attribute: `type(2) len(2) value(len) + zero-pad to 4`.
 
 Attributes to send, in this order:
+
 1. `USERNAME` (`0x0006`): value = ASCII `"<server-ufrag>:<your-ufrag>"`.
 2. `MESSAGE-INTEGRITY` (`0x0008`): 20-byte HMAC-SHA1 — see below.
 3. `FINGERPRINT` (`0x8028`): 4-byte CRC32 — see below. **Must be last.**
@@ -141,15 +153,15 @@ your media and you are not a forward target.
 
 ---
 
-## 4. SRTP (RFC 3711, AES-CM + HMAC-SHA1-80)
+## 4. SRTP
 
 `srtp` from the TRANSPORT line is `base64( master_key[16] || master_salt[14] )` (30 bytes).
 **Every participant in the call gets the same key**; you encrypt with it and decrypt peers'
 packets with it. The server never decrypts — it relays ciphertext.
 
-### 4.1 Key derivation (KDF)
+### 4.1 Key derivation
 Derive three session values from the master key/salt. For label `L`:
-```
+```text
 iv = master_salt (14 bytes) || 0x00 0x00       ; 16 bytes
 iv[7] ^= L
 output = AES-128-CTR keystream(master_key, iv) truncated to the needed length
@@ -167,7 +179,7 @@ cipher key `C61E7A93…A087`, auth key `CEBE321F…BAA4`, salt `30CBBC08…9AE1`
 ### 4.2 Per-packet encryption
 For an RTP packet with 12-byte header (SSRC at bytes [8..12], sequence at [2..4]) and a
 per-stream 32-bit rollover counter `ROC` (starts 0, ++ each time the 16-bit seq wraps):
-```
+```text
 index = (ROC << 16) | seq                        ; 48-bit packet index
 iv = session_salt (14) || 0x00 0x00              ; 16 bytes
 iv[4..8]  ^= SSRC      (4 bytes, big-endian)
@@ -176,14 +188,17 @@ keystream = AES-128-CTR(session_cipher_key, iv)  ; low-16-bit counter, as in §4
 ciphertext_payload = rtp_payload XOR keystream   ; header stays in clear
 ```
 
-### 4.3 Authentication tag (appended, 10 bytes)
-```
+### 4.3 Authentication tag
+
+The authentication tag is appended as 10 bytes.
+
+```text
 auth_input = (rtp_header || ciphertext_payload) || ROC (4 bytes, big-endian)
 tag        = HMAC_SHA1(session_auth_key, auth_input)[0..10]
 srtp_packet = rtp_header || ciphertext_payload || tag
 ```
 
-### 4.4 Decryption (peers' packets)
+### 4.4 Decryption
 Recompute the tag over `srtp_packet[0 .. len-10] || ROC` and compare (constant time) to the
 last 10 bytes; reject on mismatch. Then run the identical AES-CM transform on the payload
 (CTR is symmetric) to recover plaintext.
@@ -194,8 +209,8 @@ last 10 bytes; reject on mismatch. Then run the identical AES-CM transform on th
 
 Standard RTP (RFC 3550). The server requires version-2 framing on the media port —
 `byte0 & 0xC0 == 0x80` and at least a 12-byte header — or it drops the datagram (so the
-port can't be abused as a reflector). Minimum header:
-```
+port cannot be abused as a reflector). Minimum header:
+```text
 byte0 = 0x80               ; version 2, no padding/extension/CSRC
 byte1 = payload_type       ; set marker bit 0x80 as usual
 [2..4]  sequence (u16 BE)
@@ -217,7 +232,7 @@ the payload to your opvox/opvis decoder.
 
 ---
 
-## 7. Roster / UX side-channel (optional, all over IRC)
+## 7. Roster and UX side-channel
 
 Independent of transport; render the call UI from these. `MEDIA JOIN|LEAVE|MUTE|UNMUTE|
 SPEAKING <#chan> [voice|video|screen]` change your state and broadcast

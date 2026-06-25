@@ -1,24 +1,26 @@
-# 08 — The Orochi Vision (design brief)
+# 08 — Orochi vision design brief
 
-> Synthesized 2026-06-04 from a codex design consultation + the owner's directive
-> to "make the IRC vision amazing." This is the north star the parity work
-> (`07-parity-100.md`) is substrate FOR — parity is not the product, the mesh is.
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
+
+This brief records the 2026-06-04 vision synthesized from a codex design consultation and the owner's directive to "make the IRC vision amazing."
+
+The parity work in `07-parity-100.md` is substrate for the mesh; parity is not the product.
 
 ## The five differentiators
 
-1. **Partition-Proof Rooms.** No netsplit drama, no split-side takeovers, no mass
+1. **Partition-proof rooms.** No netsplit drama, no split-side takeovers, no mass
    kills. Channels (members, modes, bans, topic, history) are delta-CRDTs with
    HLC + dotted causality + Merkle repair + Sazanami membership. Channel
    authority is *signed grants*, not "which server won the split." Risk: users
    see causality artifacts unless partition/conflict tags are exposed honestly.
 
-2. **Sovereign Identity, not platform identity.** An account multi-homes across
+2. **Sovereign identity, not platform identity.** An account multi-homes across
    nodes, survives server loss, carries certfp/PQ credentials with no single
    central service. Server + account assertions are signed objects; **nicks are
    claims in an MV-register — losers rename to UID, never die.** Risk: services
    authority must be crisp, or it's "Discord with worse consistency."
 
-3. **Secure Federation by default.** S2S is harvest-now-decrypt-later resistant,
+3. **Secure federation by default.** S2S is harvest-now-decrypt-later resistant,
    forward-secret, replay-aware, auditable — never bolted on. Suimyaku peer auth
    → hybrid X25519+ML-KEM root; Tsumugi per-frame ratchet + scheduled hybrid
    rekeys; MeshPass gates admission. Risk: clean-room crypto/TLS is the highest
@@ -31,7 +33,7 @@
 
 5. **Deterministic operations.** Replay seeds, causal traces, zero-disconnect
    upgrades. Deterministic Ocean + Fault Loom + typed Helix upgrade capsules +
-   share-nothing Ringlane shards. Risk: simulator drift — prod and sim MUST link
+   share-nothing Ringlane shards. Risk: simulator drift — prod and sim must link
    the same protocol/state code.
 
 ## Where the CRDT genuinely changes IRC semantics
@@ -71,6 +73,6 @@ collision→rename-to-UID rule.
 9. Integrate Tsumugi around established Suimyaku frames (restart/reorder vectors).
 10. Event Spine + operator causal-trace view before media.
 
-> The through-line: every parity command we wire now should be designed so its
-> state is **CRDT-portable** later — modes, bans, topic, membership, account.
-> Build the single-node truth so the mesh can replicate it without a rewrite.
+Every parity command wired now should keep its state **CRDT-portable** later:
+modes, bans, topic, membership, account. Build the single-node truth so the mesh
+can replicate it without a rewrite.

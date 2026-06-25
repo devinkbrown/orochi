@@ -1,13 +1,15 @@
-# Build Guide
+# Build guide
 
-Orochi is built with Zig's build system and has no package dependencies in `build.zig.zon` (`build.zig.zon:34`). Linux builds do not link libc; macOS and BSD targets link libc only for platform syscalls that require it (`build.zig:40`, `build.zig:43`).
+*Build, test, and cross-compile the Orochi daemon with Zig.*
+
+Orochi builds with Zig's build system and has no package dependencies in `build.zig.zon` (`build.zig.zon:34`). Linux builds do not link libc; macOS and BSD targets link libc only for the platform syscalls that require it (`build.zig:40`, `build.zig:43`).
 
 ## Requirements
 
 - Zig `0.16.0` or newer as declared by `build.zig.zon` (`build.zig.zon:28`).
 - A 64-bit daemon target. `build.zig` rejects 32-bit daemon builds at configure time (`build.zig:20`, `build.zig:24`).
 
-## Common Targets
+## Common targets
 
 | Command | What it does | Source |
 |---|---|---|
@@ -19,11 +21,11 @@ Orochi is built with Zig's build system and has no package dependencies in `buil
 | `zig build wasm` | Builds browser-facing OPVOX/OPVIS codec and transport WASM modules. | `build.zig:176`, `build.zig:196`, `build.zig:202` |
 | `zig build release` | Builds an optimized stripped daemon with `ReleaseFast`. | `build.zig:230`, `build.zig:244` |
 
-## Cross Targets
+## Cross targets
 
 Pass `-Dtarget=<triple>` to choose a target; the build script uses standard target options (`build.zig:10`, `build.zig:14`).
 
-Examples:
+For example:
 
 ```sh
 zig build -Dtarget=x86_64-linux
@@ -31,7 +33,7 @@ zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
 zig build check -Dtarget=x86_64-linux
 ```
 
-The daemon target must be 64-bit. The `wasm` step is the deliberate `wasm32-freestanding` exception for browser codec/transport artifacts, not for the daemon (`build.zig:176`, `build.zig:179`).
+The daemon target must be 64-bit. The `wasm` step is the deliberate `wasm32-freestanding` exception for browser codec and transport artifacts, not for the daemon (`build.zig:176`, `build.zig:179`).
 
 ## Optimization
 

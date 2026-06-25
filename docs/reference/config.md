@@ -1,20 +1,22 @@
-# Orochi Configuration Reference
+# Orochi configuration reference
 
-This is the complete operator-facing reference for the current daemon TOML format. It is verified against `Config` and `parseToml` in `src/daemon/config_format.zig:29`, `src/daemon/config_format.zig:310`, and the live boot projection in `src/daemon/config_boot.zig:18`.
+*Complete operator-facing reference for the daemon TOML format.*
 
-Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C Ophion, not a clone. The daemon target is 64-bit only (`build.zig:20`, `build.zig:24`), uses implicit TLS rather than STARTTLS (`src/main.zig:216`, `src/main.zig:219`), and uses Zig-native OroStore persistence rather than LMDB (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
+This reference is verified against `Config` and `parseToml` in `src/daemon/config_format.zig:29`, `src/daemon/config_format.zig:310`, and the live boot projection in `src/daemon/config_boot.zig:18`.
 
-Use `etc/orochi.reference.toml` as the runnable example and copy from it when building an instance config. The two required parsed keys are `[node].id >= 1` and `[listen].irc != 0`; missing either makes `parseToml` fail (`src/daemon/config_format.zig:478`).
+Orochi is a pure-Zig 0.16 clean-room IRC daemon and a bespoke successor to C ophion, not a clone. The daemon target is 64-bit only (`build.zig:20`, `build.zig:24`), uses implicit TLS rather than STARTTLS (`src/main.zig:216`, `src/main.zig:219`), and uses Zig-native OroStore persistence rather than LMDB (`src/daemon/store.zig:1`, `src/daemon/store.zig:3`).
 
-## Format Rules
+Use `etc/orochi.reference.toml` as the runnable example and copy from it when building an instance config. Two keys are required: `[node].id >= 1` and `[listen].irc != 0`. Missing either makes `parseToml` fail (`src/daemon/config_format.zig:478`).
+
+## Format rules
 
 The config file is TOML v1.0 (`src/daemon/config_format.zig:3`). Missing keys keep typed defaults (`src/daemon/config_format.zig:4`, `src/daemon/config_format.zig:9`). Integer fields use the ranges in `parseToml`; out-of-range values return `ParseError` (`src/daemon/config_format.zig:542`). Durations are quoted strings using `ms`, `s`, `m`, or `h`, must be non-zero, and are converted to milliseconds (`src/daemon/config_format.zig:556`).
 
-The config parser supports string indirection for any string value: `env:NAME` and `@file:path` (`src/daemon/config_format.zig:486`). The CLI boot path wires both resolvers through `ResolverCtx`, so config strings can pull from the process environment or from files relative to the daemon working directory (`src/main.zig:8`, `src/main.zig:23`, `src/main.zig:64`).
+The parser supports string indirection for any string value: `env:NAME` and `@file:path` (`src/daemon/config_format.zig:486`). The CLI boot path wires both resolvers through `ResolverCtx`, so config strings can pull from the process environment or from files relative to the daemon working directory (`src/main.zig:8`, `src/main.zig:23`, `src/main.zig:64`).
 
-The live mapping is conservative: only non-empty or non-zero values are overlaid onto `server.Config` (`src/daemon/config_boot.zig:15`). TLS and STS are projected separately because `server.Config` does not own those parser structs (`src/daemon/config_boot.zig:92`, `src/daemon/config_boot.zig:119`).
+The live mapping is conservative: only non-empty or non-zero values overlay onto `server.Config` (`src/daemon/config_boot.zig:15`). TLS and STS are projected separately because `server.Config` does not own those parser structs (`src/daemon/config_boot.zig:92`, `src/daemon/config_boot.zig:119`).
 
-## Required Keys
+## Required keys
 
 | Key | Requirement | Source |
 |---|---:|---|
@@ -54,14 +56,16 @@ The MOTD is a **per-connection template** expanded by `src/proto/motd_template.z
 before being split into lines. When omitted or empty, the server serves a
 personalized built-in default.
 
-Substitutions (`{key}`; unknown keys left verbatim; `{{`/`}}` emit literal braces):
-`{nick}` `{account}` `{host}` `{network}` `{server}` `{version}` `{time}` `{date}`
-`{users}` `{opers}` `{channels}`, plus `{greeting}` (a time-of-day greeting) and
-`{weather}` / `{news}` (see `[weather]` / `[news]`).
+Substitutions use `{key}`; unknown keys are left verbatim, and `{{` / `}}` emit
+literal braces. The available keys are `{nick}`, `{account}`, `{host}`,
+`{network}`, `{server}`, `{version}`, `{time}`, `{date}`, `{users}`, `{opers}`,
+and `{channels}`, plus `{greeting}` (a time-of-day greeting) and `{weather}` /
+`{news}` (see `[weather]` / `[news]`).
 
-Conditionals: `{if:COND}…{else}…{/if}` where `COND` is `oper`, `account`, `secure`,
-`weather`, or `news` (the last two true when that line is available); conditionals
-nest. Example: `{if:account}Welcome back, {account}!{else}Please register.{/if}`
+Conditionals take the form `{if:COND}…{else}…{/if}`, where `COND` is `oper`,
+`account`, `secure`, `weather`, or `news` (the last two are true when that line is
+available); conditionals nest. For example:
+`{if:account}Welcome back, {account}!{else}Please register.{/if}`
 
 ## `[admin]`
 
@@ -77,6 +81,7 @@ Source: struct at `src/daemon/config_format.zig:69`, parsing at `src/daemon/conf
 Localized weather for the MOTD `{weather}` placeholder. The daemon reads `source`
 (a `key=value` file refreshed by an external updater) and renders it in the units
 the region uses (`src/proto/weather_units.zig`; `src/daemon/server.zig` `handleMotd`).
+
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -99,7 +104,7 @@ Headlines for the MOTD `{news}` placeholder.
 ## `[geo]`
 
 The live in-channel `!weather`/`!news` bot (see
-[commands/fantasy-bot.md](commands/fantasy-bot.md)). When enabled the daemon
+[commands/fantasy-bot.md](commands/fantasy-bot.md)). When enabled, the daemon
 fetches `wttr.in` (weather) and the bundled RSS feeds (news) on a background
 thread and serves them to channel fantasy commands. All sources are key-free.
 
@@ -143,7 +148,7 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; IPv6 hosts must be bracketed (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:2249`). |
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 
-Plaintext S2S is used when no node identity is configured and `require_secured` is false; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`).
+Plaintext S2S applies when no node identity is configured and `require_secured` is false; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`).
 
 ## `[limits]`
 
@@ -184,11 +189,11 @@ Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/con
 
 Source: `Policy`/`ClassDef` at `src/daemon/conn_class.zig` and `src/daemon/config_format.zig:247`, parsing at `src/daemon/config_format.zig:780`, registry built at `src/daemon/config_boot.zig`.
 
-A **connection class** is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching its IP, TLS, account, oper status, and ident/host. The first class (in file order) whose `match_*` criteria are all satisfied wins; a class with no criteria is a catch-all. Two built-ins always exist as fallbacks: `user` and `server`. Per-class limits **override** the matching `[limits]` / `nick_delay` globals; a `0` value means "inherit the global". Inspect live classes and per-class member counts with `STATS Y`.
+A **connection class** is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching its IP, TLS, account, oper status, and ident/host. The first class in file order whose `match_*` criteria are all satisfied wins; a class with no criteria is a catch-all. Two built-ins always exist as fallbacks: `user` and `server`. Per-class limits **override** the matching `[limits]` / `nick_delay` globals; a `0` value means "inherit the global". Inspect live classes and per-class member counts with `STATS Y`.
 
 Sizes accept `K`/`M`/`G` suffixes (`"1M"` = 1048576). Durations are strings (`"30s"`).
 
-The source-keyed clone caps (`max_per_ip` / `max_per_host` / `max_per_account`) are enforced at registration, so they see the real post-PROXY source IP, account, and host (WebSocket/proxy-safe). Authenticated accounts get a **+2 bonus** above the configured value on those dimensions; operators holding the `limit_exempt` privilege bypass every per-class cap.
+The source-keyed clone caps (`max_per_ip` / `max_per_host` / `max_per_account`) are enforced at registration, so they see the real post-PROXY source IP, account, and host (WebSocket- and proxy-safe). Authenticated accounts receive a **+2 bonus** above the configured value on those dimensions; operators holding the `limit_exempt` privilege bypass every per-class cap.
 
 | Key | Type | Default | What it controls |
 |---|---|---:|---|
@@ -305,7 +310,7 @@ Source: struct at `src/daemon/config_format.zig:193`, parsing at `src/daemon/con
 
 Source: struct `Acme` at `src/daemon/config_format.zig:351`, parsing at `src/daemon/config_format.zig:625`, scheduler at `src/daemon/acme_renewal.zig`, reactor-0 hot-swap at `src/daemon/server.zig` (`maybeReloadAcmeTls`).
 
-Automatic in-daemon TLS certificate renewal (Linux only). A background thread checks the `[tls].cert_path` leaf expiry every `check_interval`; within `renew_before_days` it issues a new certificate off the reactor and signals reactor 0 to hot-swap it (no restart). Requires `[tls]` with `cert_path`/`key_path`. Changing those paths via live REHASH while `[acme]` is enabled is unsupported.
+Automatic in-daemon TLS certificate renewal (Linux only). A background thread checks the `[tls].cert_path` leaf expiry every `check_interval`; within `renew_before_days` of `notAfter` it issues a new certificate off the reactor and signals reactor 0 to hot-swap it without a restart. This requires `[tls]` with `cert_path` and `key_path`. Changing those paths via live REHASH while `[acme]` is enabled is unsupported.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -359,8 +364,8 @@ STS is omitted entirely unless a policy is present; this prevents clients from b
 ## `[oper]`
 
 Operator subsystem settings, distinct from the per-operator `[[opers]]` bindings
-below. Source: struct at `src/daemon/config_format.zig` (`OperSection`), mapping
-at `src/daemon/config_boot.zig`.
+below. Source: struct `OperSection` at `src/daemon/config_format.zig`, mapping at
+`src/daemon/config_boot.zig`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -369,7 +374,7 @@ at `src/daemon/config_boot.zig`.
 
 ## `[wasm]`
 
-OroWasm plugin module system. Source: `src/daemon/config_format.zig` (`Wasm`), mapping at `src/daemon/config_boot.zig`, loaded by `src/daemon/server.zig` `loadWasmPlugins` (boot + REHASH), dispatched via `src/wasm/host/bridge.zig`.
+OroWasm plugin module system. Source: struct `Wasm` at `src/daemon/config_format.zig`, mapping at `src/daemon/config_boot.zig`, loaded by `src/daemon/server.zig` `loadWasmPlugins` (boot and REHASH), dispatched via `src/wasm/host/bridge.zig`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -385,7 +390,7 @@ Source: struct at `src/daemon/config_format.zig:101`, parsing at `src/daemon/con
 | `class` | string | `""` | registry validation max 64 bytes | Operator privilege group name. It must name a non-empty configured group with effective privileges; otherwise the oper binding is skipped (`src/daemon/config_boot.zig:183`). |
 | `title` | string | `""` | any string | Optional WHOIS/operator title (`src/daemon/config_format.zig:441`, `src/daemon/oper.zig:139`). |
 
-There is no oper password. `OPER` is disabled and tells users to authenticate through SASL (`src/daemon/server.zig:8300`). Operator status is granted after SASL when the account matches a configured binding (`src/daemon/server.zig:8308`).
+There is no oper password. `OPER` is disabled and directs users to authenticate through SASL (`src/daemon/server.zig:8300`). Operator status is granted after SASL when the account matches a configured binding (`src/daemon/server.zig:8308`).
 
 ## `[[oper_groups]]`
 
@@ -399,15 +404,15 @@ Source: struct at `src/daemon/config_format.zig:95`, parsing at `src/daemon/conf
 
 Valid privilege strings are the exact enum names from `src/daemon/oper.zig:36`: `server_rehash`, `server_restart`, `server_shutdown`, `client_moderate`, `channel_moderate`, `client_kill`, `mesh_admin`, `service_admin`, `server_admin`, `oper_grant`, `oper_spy`, `event_subscribe`, `audit_read`, and `oper_override`.
 
-Important current behavior: if an oper names a class that has no group, or resolves to an empty effective privilege set, boot skips that oper binding (`src/daemon/config_boot.zig:250`, `src/daemon/config_boot.zig:255`). REHASH rebuilds configured operator bindings through the same group resolver and has coverage for preserving group privileges (`src/daemon/server.zig:20008`, `src/daemon/server.zig:20546`).
+Note one current behavior: if an oper names a class that has no group, or that resolves to an empty effective privilege set, boot skips that oper binding (`src/daemon/config_boot.zig:250`, `src/daemon/config_boot.zig:255`). REHASH rebuilds configured operator bindings through the same group resolver and has coverage for preserving group privileges (`src/daemon/server.zig:20008`, `src/daemon/server.zig:20546`).
 
-## Parsed But Not Yet Wired
+## Parsed but not yet wired
 
 No top-level key in this reference is currently known to be parser-only in the
-`main.zig` / `config_boot.zig` / `server.zig` path as of `c471a06`. If a future
+`main.zig` / `config_boot.zig` / `server.zig` path as of `c471a06`. When a future
 key is accepted before it changes live behavior, add it here in the same change.
 
-## Comptime-Bound Values Not Yet Configurable
+## Comptime-bound values not yet configurable
 
 | Value | Bound | Source |
 |---|---:|---|
@@ -420,4 +425,4 @@ key is accepted before it changes live behavior, add it here in the same change.
 | OroStore default max WAL bytes | `256 MiB` | `src/daemon/store.zig:12` |
 | OroStore default changefeed capacity | `64` | `src/daemon/store.zig:13` |
 
-OroStore has its own internal `Config.applyToml` helper for `[storage]`, but `[storage]` is not part of the current daemon `config_format.Config` sections requested here (`src/daemon/store.zig:26`, `src/daemon/store.zig:37`).
+OroStore has its own internal `Config.applyToml` helper for `[storage]`, but `[storage]` is not part of the current daemon `config_format.Config` sections covered here (`src/daemon/store.zig:26`, `src/daemon/store.zig:37`).

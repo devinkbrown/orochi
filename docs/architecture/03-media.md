@@ -1,8 +1,10 @@
-# Media Architecture
+# Media architecture
 
-Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN UDP plane, a native OPVOX/OPVIS UDP leg, header-only cross-leg rewrap, a congestion/loss transport stack substrate, and browser/WASM codec exports. This document covers current source only.
+*Orochi's media stack: a control-plane SFU, a WebRTC-compatible RTP/STUN UDP plane, a native OPVOX/OPVIS UDP leg, header-only cross-leg rewrap, a congestion/loss transport substrate, and browser/WASM codec exports.*
 
-## SFU Control Plane
+This document covers the current source tree only.
+
+## SFU control plane
 
 `src/substrate/suimyaku/media.zig` is the pure media control substrate. Its header states it owns bounded roster state, SFU forwarding decisions, simulcast layer choice, ABR hints, and codec offer/answer negotiation, with hot paths using inline storage. Evidence: `src/substrate/suimyaku/media.zig:1`, `src/substrate/suimyaku/media.zig:3`, `src/substrate/suimyaku/media.zig:4`.
 
@@ -16,9 +18,9 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 
 `forwardSet` verifies the source participant exists, verifies the source can publish the requested kind, optionally requires the source to be speaking, and returns receivers that can receive the kind while excluding the source. Evidence: `src/substrate/suimyaku/media.zig:207`, `src/substrate/suimyaku/media.zig:208`, `src/substrate/suimyaku/media.zig:210`, `src/substrate/suimyaku/media.zig:211`, `src/substrate/suimyaku/media.zig:216`, `src/substrate/suimyaku/media.zig:217`, `src/substrate/suimyaku/media.zig:218`.
 
-## Daemon Media Rooms
+## Daemon media rooms
 
-`src/daemon/media_room.zig` maps an IRC channel to a Suimyaku `Session`. Its header says this is control plane only: who is in a call, what they publish, mute/speaking state, while media bytes flow over the transport substrate. Evidence: `src/daemon/media_room.zig:1`, `src/daemon/media_room.zig:2`, `src/daemon/media_room.zig:3`, `src/daemon/media_room.zig:4`.
+`src/daemon/media_room.zig` maps an IRC channel to a Suimyaku `Session`. Its header says this is control plane only — who is in a call, what they publish, and mute/speaking state — while media bytes flow over the transport substrate. Evidence: `src/daemon/media_room.zig:1`, `src/daemon/media_room.zig:2`, `src/daemon/media_room.zig:3`, `src/daemon/media_room.zig:4`.
 
 | Concern | Current behavior | Evidence |
 | --- | --- | --- |
@@ -28,9 +30,9 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 | Codec/FEC profile | `MEDIA OFFER` establishes a per-channel `CallProfile`; `MEDIA ANSWER` consults it. | `src/daemon/media_room.zig:66`, `src/daemon/media_room.zig:93`, `src/daemon/media_room.zig:241`, `src/daemon/media_room.zig:258` |
 | Room lifecycle | Join creates the room on first join; leave prunes when empty. | `src/daemon/media_room.zig:267`, `src/daemon/media_room.zig:269`, `src/daemon/media_room.zig:275` |
 
-## RTP/STUN Media Plane
+## RTP/STUN media plane
 
-`src/daemon/media_plane.zig` ties `MediaTransport` endpoint registry to a live UDP socket and pump thread. The pump demuxes datagrams, answers STUN checks, and relays RTP/RTCP under a mutex. Evidence: `src/daemon/media_plane.zig:1`, `src/daemon/media_plane.zig:4`, `src/daemon/media_plane.zig:5`, `src/daemon/media_plane.zig:6`, `src/daemon/media_plane.zig:7`.
+`src/daemon/media_plane.zig` ties the `MediaTransport` endpoint registry to a live UDP socket and pump thread. The pump demuxes datagrams, answers STUN checks, and relays RTP/RTCP under a mutex. Evidence: `src/daemon/media_plane.zig:1`, `src/daemon/media_plane.zig:4`, `src/daemon/media_plane.zig:5`, `src/daemon/media_plane.zig:6`, `src/daemon/media_plane.zig:7`.
 
 | Path | Behavior | Evidence |
 | --- | --- | --- |
@@ -42,7 +44,7 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 | Cross-leg bridge | After RTP relay, the plane can call an installed `RtpCrossSink` to reach native participants. | `src/daemon/media_plane.zig:82`, `src/daemon/media_plane.zig:103`, `src/daemon/media_plane.zig:209`, `src/daemon/media_plane.zig:211` |
 | Signaling support | `allocate` returns ICE credentials; `groupKey` returns the per-call SRTP group key; `remoteFor` resolves live WebRTC peer address. | `src/daemon/media_plane.zig:229`, `src/daemon/media_plane.zig:231`, `src/daemon/media_plane.zig:247`, `src/daemon/media_plane.zig:278` |
 
-## Native OPVOX/OPVIS Transport
+## Native OPVOX/OPVIS transport
 
 `src/daemon/native_media_transport.zig` is the daemon-owned native UDP leg for Orochi's OPVOX/OPVIS codec framing. It forwards `kagura_frame` datagrams, not RTP, and never transcodes. Evidence: `src/daemon/native_media_transport.zig:1`, `src/daemon/native_media_transport.zig:2`, `src/daemon/native_media_transport.zig:3`, `src/daemon/native_media_transport.zig:15`.
 
@@ -55,7 +57,7 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 | Registration | `register` records channel, participant id, media kind, stream id, and address, then indexes stream id to channel. | `src/daemon/native_media_transport.zig:160`, `src/daemon/native_media_transport.zig:164`, `src/daemon/native_media_transport.zig:175`, `src/daemon/native_media_transport.zig:178` |
 | Cross-leg bridge | After native forwarding, a native frame can be handed to a cross-leg sink for WebRTC participants. | `src/daemon/native_media_transport.zig:54`, `src/daemon/native_media_transport.zig:63`, `src/daemon/native_media_transport.zig:138`, `src/daemon/native_media_transport.zig:140` |
 
-## OPCodec Frame Container
+## OPCodec frame container
 
 `src/substrate/kagura_frame.zig` is a wire container, not the audio/video codec itself. It carries encoded payloads over media bands. Evidence: `src/substrate/kagura_frame.zig:1`, `src/substrate/kagura_frame.zig:3`, `src/substrate/kagura_frame.zig:4`.
 
@@ -67,9 +69,9 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 | Decode rejects truncation, control band ids, trailing bytes, and unknown codec tags. | `src/substrate/kagura_frame.zig:153`, `src/substrate/kagura_frame.zig:155`, `src/substrate/kagura_frame.zig:161`, `src/substrate/kagura_frame.zig:165`, `src/substrate/kagura_frame.zig:175` |
 | ReassemblyBuffer is a bounded jitter/reorder buffer with compile-time payload/window bounds and runtime window config. | `src/substrate/kagura_frame.zig:211`, `src/substrate/kagura_frame.zig:233`, `src/substrate/kagura_frame.zig:236`, `src/substrate/kagura_frame.zig:255` |
 
-## Cross-Leg Bridge
+## Cross-leg bridge
 
-`src/daemon/media_bridge.zig` bridges participants on the native leg and WebRTC leg by header rewrap only. Its header states that payload bytes stay opaque and are shared verbatim; there is no encoding, decoding, or transcoding. Evidence: `src/daemon/media_bridge.zig:1`, `src/daemon/media_bridge.zig:3`, `src/daemon/media_bridge.zig:7`, `src/daemon/media_bridge.zig:16`.
+`src/daemon/media_bridge.zig` bridges participants on the native leg and the WebRTC leg by header rewrap only. Its header states that payload bytes stay opaque and are shared verbatim; there is no encoding, decoding, or transcoding. Evidence: `src/daemon/media_bridge.zig:1`, `src/daemon/media_bridge.zig:3`, `src/daemon/media_bridge.zig:7`, `src/daemon/media_bridge.zig:16`.
 
 | Direction | Behavior | Evidence |
 | --- | --- | --- |
@@ -79,9 +81,9 @@ Orochi's media stack has a control-plane SFU model, a WebRTC-compatible RTP/STUN
 
 The live server installs bridge callbacks around `LinuxServer.media_bridges`, `media_plane`, and `native_media`. Evidence: `src/daemon/server.zig:114`, `src/daemon/server.zig:131`, `src/daemon/server.zig:139`, `src/daemon/server.zig:158`.
 
-## Transport Stack Substrate
+## Transport stack substrate
 
-`src/substrate/transport_stack.zig` composes a datagram transport with congestion control, pacing, rate cap, loss recovery, and qlog. It is deterministic and consumes ACKs supplied by the peer/application. Evidence: `src/substrate/transport_stack.zig:1`, `src/substrate/transport_stack.zig:5`, `src/substrate/transport_stack.zig:11`, `src/substrate/transport_stack.zig:13`, `src/substrate/transport_stack.zig:14`.
+`src/substrate/transport_stack.zig` composes a datagram transport with congestion control, pacing, rate cap, loss recovery, and qlog. It is deterministic and consumes ACKs supplied by the peer or application. Evidence: `src/substrate/transport_stack.zig:1`, `src/substrate/transport_stack.zig:5`, `src/substrate/transport_stack.zig:11`, `src/substrate/transport_stack.zig:13`, `src/substrate/transport_stack.zig:14`.
 
 | Component | Behavior | Evidence |
 | --- | --- | --- |
@@ -90,18 +92,18 @@ The live server installs bridge callbacks around `LinuxServer.media_bridges`, `m
 | Recv | Supplies a receive buffer and polls receive completions. | `src/substrate/transport_stack.zig:228`, `src/substrate/transport_stack.zig:230`, `src/substrate/transport_stack.zig:232` |
 | ACK/loss | `onAck` updates loss recovery, congestion control, pacer, and qlog; `tick` detects loss for retransmit. | `src/substrate/transport_stack.zig:237`, `src/substrate/transport_stack.zig:247`, `src/substrate/transport_stack.zig:251`, `src/substrate/transport_stack.zig:252`, `src/substrate/transport_stack.zig:256` |
 
-## WASM Shims
+## WASM shims
 
-Browser/client WASM exports are separate from the daemon plugin host:
+Browser and client WASM exports are separate from the daemon plugin host.
 
 | File | Export surface | Evidence |
 | --- | --- | --- |
 | `src/wasm/kagura_wasm.zig` | OPVOX audio encode/decode and OPVIS video intra/inter encode/decode for `wasm32-freestanding`. | `src/wasm/kagura_wasm.zig:1`, `src/wasm/kagura_wasm.zig:3`, `src/wasm/kagura_wasm.zig:17`, `src/wasm/kagura_wasm.zig:21`, `src/wasm/kagura_wasm.zig:35`, `src/wasm/kagura_wasm.zig:39`, `src/wasm/kagura_wasm.zig:49` |
 | `src/wasm/browser_transport.zig` | Browser transport shim core is re-exported from the package root; the wasm32 export wrapper lives in `src/wasm/transport_shim.zig`. | `src/root.zig:18`, `src/root.zig:21` |
 
-## Planning Notes and Divergences
+## Planning notes and divergences
 
-`docs/planning/18-media-transport.md`, `docs/planning/19-media-client-implementation.md`, and `docs/planning/20-media-interop.md` are design-intent references. Current code verifies these concrete pieces:
+`docs/planning/18-media-transport.md`, `docs/planning/19-media-client-implementation.md`, and `docs/planning/20-media-interop.md` are design-intent references. The current code verifies these concrete pieces:
 
 | Planning topic | Current status | Evidence |
 | --- | --- | --- |

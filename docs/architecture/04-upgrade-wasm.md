@@ -1,14 +1,16 @@
 # Upgrade and OroWasm
 
-This document covers Helix in-place upgrade and the OroWasm control-plane plugin host. Cryptographic details are out of scope; see [crypto.md](crypto.md).
+*Helix in-place upgrade and the OroWasm control-plane plugin host.*
 
-## Helix UPGRADE Command
+Cryptographic details are out of scope; see [crypto.md](crypto.md).
+
+## Helix UPGRADE command
 
 The `UPGRADE` command is a SerpentRegistry module command in `ops.upgrade`. The module is a thin wrapper: it recovers `module_core.Core` and calls `LinuxServer.handleUpgrade`. Evidence: `src/daemon/modules/upgrade.zig:1`, `src/daemon/modules/upgrade.zig:13`, `src/daemon/modules/upgrade.zig:15`, `src/daemon/modules/upgrade.zig:18`, `src/daemon/modules/upgrade.zig:22`.
 
-`handleUpgrade` is Linux-only and oper-only at runtime. It publishes an oper event, serializes registered sessions into snapshot blobs, seals a Helix arena, clears `FD_CLOEXEC` on listener and arena fds, builds an exec plan for `/proc/self/exe --supervisor`, and commits via `execve`. Evidence: `src/daemon/server.zig:6070`, `src/daemon/server.zig:6076`, `src/daemon/server.zig:6077`, `src/daemon/server.zig:6081`, `src/daemon/server.zig:6086`, `src/daemon/server.zig:6090`, `src/daemon/server.zig:6127`, `src/daemon/server.zig:6146`, `src/daemon/server.zig:6148`, `src/daemon/server.zig:6155`.
+`handleUpgrade` is Linux-only and oper-only at runtime. It publishes an oper event, serializes registered sessions into snapshot blobs, seals a Helix arena, clears `FD_CLOEXEC` on the listener and arena fds, builds an exec plan for `/proc/self/exe --supervisor`, and commits via `execve`. Evidence: `src/daemon/server.zig:6070`, `src/daemon/server.zig:6076`, `src/daemon/server.zig:6077`, `src/daemon/server.zig:6081`, `src/daemon/server.zig:6086`, `src/daemon/server.zig:6090`, `src/daemon/server.zig:6127`, `src/daemon/server.zig:6146`, `src/daemon/server.zig:6148`, `src/daemon/server.zig:6155`.
 
-## State and FD Handoff
+## State and fd handoff
 
 | Piece | Current source behavior | Evidence |
 | --- | --- | --- |
@@ -19,9 +21,9 @@ The `UPGRADE` command is a SerpentRegistry module command in `ops.upgrade`. The 
 | Listener and arena exec plan | Current `handleUpgrade` uses `buildArenaListenerExecPlan`, carrying the sealed arena and listener fd via environment variables to `--supervisor`. | `src/daemon/server.zig:6148`, `src/daemon/helix/live.zig:242`, `src/daemon/helix/live.zig:260`, `src/daemon/helix/live.zig:262` |
 | Listener-only fallback | If state sealing fails or planning fails, `upgradeListenerOnly` re-execs while preserving only the listening socket. | `src/daemon/server.zig:6134`, `src/daemon/server.zig:6137`, `src/daemon/server.zig:6233`, `src/daemon/server.zig:6237` |
 
-## Successor Adoption
+## Successor adoption
 
-The successor path is driven by `orochi --supervisor`. `main.zig` checks Helix handoff environment fds, adopts the inherited listener fd into server config, stores the arena fd for later session adoption, then boots normally. Evidence: `src/main.zig:51`, `src/main.zig:57`, `src/main.zig:58`, `src/main.zig:61`, `src/main.zig:68`, `src/main.zig:75`.
+The successor path is driven by `orochi --supervisor`. `main.zig` checks the Helix handoff environment fds, adopts the inherited listener fd into server config, stores the arena fd for later session adoption, then boots normally. Evidence: `src/main.zig:51`, `src/main.zig:57`, `src/main.zig:58`, `src/main.zig:61`, `src/main.zig:68`, `src/main.zig:75`.
 
 After the server starts and its ring exists, `main.zig` calls `srv.adoptInheritedSessions()`. Evidence: `src/main.zig:280`, `src/main.zig:292`, `src/main.zig:294`.
 
@@ -32,19 +34,19 @@ After the server starts and its ring exists, `main.zig` calls `srv.adoptInherite
 | Arena read | `adoptInheritedSessions` reads capsules from `resume_arena_fd`, decodes each first field as a session snapshot, and closes the arena when consumed. | `src/daemon/server.zig:6167`, `src/daemon/server.zig:6169`, `src/daemon/server.zig:6170`, `src/daemon/server.zig:6181`, `src/daemon/server.zig:6186` |
 | Client reattach | `adoptInheritedClient` allocates a connection slot around inherited fd, restores session, injects session state, re-registers nick, restores channel memberships, and arms recv. | `src/daemon/server.zig:6193`, `src/daemon/server.zig:6198`, `src/daemon/server.zig:6210`, `src/daemon/server.zig:6211`, `src/daemon/server.zig:6217`, `src/daemon/server.zig:6220`, `src/daemon/server.zig:6224` |
 
-## Helix Supervisor Model
+## Helix supervisor model
 
-`src/daemon/helix/supervisor.zig` holds the pure state machine. It exposes states from `idle` through `committed`/`rolled_back`, events such as request, freeze, drain, serialized, fd handoff, attestation, timeout, worker exit, and operator abort, plus actions such as freeze, drain, serialize, pass fds, await attestation, commit, and rollback. Evidence: `src/daemon/helix/supervisor.zig:1`, `src/daemon/helix/supervisor.zig:22`, `src/daemon/helix/supervisor.zig:33`, `src/daemon/helix/supervisor.zig:46`.
+`src/daemon/helix/supervisor.zig` holds the pure state machine. It exposes states from `idle` through `committed`/`rolled_back`; events such as request, freeze, drain, serialized, fd handoff, attestation, timeout, worker exit, and operator abort; plus actions such as freeze, drain, serialize, pass fds, await attestation, commit, and rollback. Evidence: `src/daemon/helix/supervisor.zig:1`, `src/daemon/helix/supervisor.zig:22`, `src/daemon/helix/supervisor.zig:33`, `src/daemon/helix/supervisor.zig:46`.
 
 `prepare` currently advances through request, accept frozen, drain complete, and capsules serialized. Evidence: `src/daemon/helix/live.zig:74`, `src/daemon/helix/live.zig:75`, `src/daemon/helix/live.zig:77`, `src/daemon/helix/live.zig:79`, `src/daemon/helix/live.zig:81`.
 
 `handOff` can pass fds over the control socket and advance to `awaiting_attestation`, but the live `handleUpgrade` path currently uses the environment-based arena/listener exec plan rather than `handOff`. Evidence for `handOff`: `src/daemon/helix/live.zig:92`, `src/daemon/helix/live.zig:99`, `src/daemon/helix/live.zig:113`; evidence for live path: `src/daemon/server.zig:6148`.
 
-## OroWasm Host
+## OroWasm host
 
 OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/root.zig`, and the server owns a `wasm_bridge.Bridge` in `LinuxServer`. Evidence: `src/root.zig:14`, `src/root.zig:16`, `src/daemon/server.zig:1288`, `src/daemon/server.zig:1291`, `src/daemon/server.zig:1563`.
 
-## Plugin Dispatch Path
+## Plugin dispatch path
 
 | Stage | Behavior | Evidence |
 | --- | --- | --- |
@@ -53,7 +55,7 @@ OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/roo
 | Bridge dispatch | `Bridge.dispatch` finds the owning plugin command, builds a hostcall callback, calls the exported function with default fuel, maps denied/trap outcomes, and returns handled. | `src/wasm/host/bridge.zig:79`, `src/wasm/host/bridge.zig:82`, `src/wasm/host/bridge.zig:84`, `src/wasm/host/bridge.zig:85`, `src/wasm/host/bridge.zig:86`, `src/wasm/host/bridge.zig:89` |
 | Server error mapping | Denied hostcalls and traps become numeric errors to the client. | `src/daemon/server.zig:3488`, `src/daemon/server.zig:3490`, `src/daemon/server.zig:3494` |
 
-## Plugin Loading and Capabilities
+## Plugin loading and capabilities
 
 | Source | Behavior | Evidence |
 | --- | --- | --- |
@@ -66,7 +68,7 @@ OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/roo
 
 ## Interpreter
 
-`src/wasm/host/interp.zig` is a minimal pure-Zig wasm32 interpreter, not a general-purpose runtime. It parses a small wasm32 subset, executes integer/local/control/memory instructions, counts fuel per instruction, and traps unsupported opcodes. Evidence: `src/wasm/host/interp.zig:1`, `src/wasm/host/interp.zig:3`, `src/wasm/host/interp.zig:4`, `src/wasm/host/interp.zig:5`, `src/wasm/host/interp.zig:6`.
+`src/wasm/host/interp.zig` is a minimal pure-Zig wasm32 interpreter, not a general-purpose runtime. It parses a small wasm32 subset, executes integer, local, control, and memory instructions, counts fuel per instruction, and traps unsupported opcodes. Evidence: `src/wasm/host/interp.zig:1`, `src/wasm/host/interp.zig:3`, `src/wasm/host/interp.zig:4`, `src/wasm/host/interp.zig:5`, `src/wasm/host/interp.zig:6`.
 
 | Interpreter guard | Evidence |
 | --- | --- |
@@ -77,11 +79,11 @@ OroWasm is a pure-Zig control-plane plugin host. It is re-exported from `src/roo
 | Memory slices are bounds-checked | `src/wasm/host/interp.zig:119`, `src/wasm/host/interp.zig:122` |
 | Imports require a host callback and type matching | `src/wasm/host/interp.zig:212`, `src/wasm/host/interp.zig:216`, `src/wasm/host/interp.zig:218` |
 
-## Browser WASM Is Separate
+## Browser WASM is separate
 
-`src/wasm/kagura_wasm.zig` exports browser/client codec functions for OPVOX and OPVIS. It is a `wasm32-freestanding` codec surface and should not be confused with the daemon's OroWasm plugin host. Evidence: `src/wasm/kagura_wasm.zig:1`, `src/wasm/kagura_wasm.zig:3`, `src/wasm/kagura_wasm.zig:17`, `src/wasm/kagura_wasm.zig:35`.
+`src/wasm/kagura_wasm.zig` exports browser and client codec functions for OPVOX and OPVIS. It is a `wasm32-freestanding` codec surface and should not be confused with the daemon's OroWasm plugin host. Evidence: `src/wasm/kagura_wasm.zig:1`, `src/wasm/kagura_wasm.zig:3`, `src/wasm/kagura_wasm.zig:17`, `src/wasm/kagura_wasm.zig:35`.
 
-## Planning Notes and Divergences
+## Planning notes and divergences
 
 | Topic | Current-code finding | Evidence |
 | --- | --- | --- |

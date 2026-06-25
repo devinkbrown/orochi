@@ -1,16 +1,18 @@
-# Weather / News Fantasy Bot
+# Weather and news fantasy bot
 
-Orochi answers a small set of in-channel `!` "fantasy" commands directly from the
-server — there are no pseudo-clients (`src/daemon/server.zig:11150`,
-`handleFantasy`). The triggering message is still delivered to the channel
-normally; the server posts the answer as a `NOTICE` sourced from this node's
-`server_name` and relays it once across the mesh, so members on every node see a
-single reply from the replying server (`src/daemon/server.zig:fantasyReply`).
+*Server-answered in-channel `!` commands for weather and news, with no pseudo-clients.*
 
-All data sources are **key-free**: weather from `wttr.in` (plain HTTP), news from
-the RSS feeds bundled in `src/proto/news_sources.zig` (ported from ophion).
-Fetching runs on a dedicated background thread (`src/daemon/geo_services.zig`) so
-the reactor never blocks; the first request for a new location/feed replies
+Orochi answers a small set of in-channel `!` fantasy commands directly from the
+server, with no pseudo-clients (`src/daemon/server.zig:11150`, `handleFantasy`).
+The triggering message reaches the channel normally; the server posts the answer
+as a `NOTICE` sourced from this node's `server_name` and relays it once across the
+mesh, so members on every node see a single reply from the replying server
+(`src/daemon/server.zig:fantasyReply`).
+
+All data sources are key-free: weather comes from `wttr.in` over plain HTTP, and
+news comes from the RSS feeds bundled in `src/proto/news_sources.zig`. Fetching
+runs on a dedicated background thread (`src/daemon/geo_services.zig`) so the
+reactor never blocks; the first request for a new location or feed replies
 "fetching… try again in a moment", then serves from a TTL cache. Enable the bot
 with `[geo] enabled = true` (see [config.md](../config.md#geo)).
 
@@ -69,14 +71,14 @@ or per-call with `!weather <place>`.
 
 ## News updater (full feed coverage)
 
-The in-daemon TLS (clean-room, TLS 1.3) verifies ECDSA and RSA leaf certs, so it
-reaches the great majority of feeds directly; a TLS-1.2-only host is the main
-exception. For guaranteed full coverage regardless, set
-`[geo] news_cache_dir` and run the bundled key-free updater from cron — it uses
-`curl` (system CA bundle) to fetch every feed and writes one-headline-per-line
-files the daemon reads:
+The in-daemon TLS 1.3 stack (Yoroi) verifies ECDSA and RSA leaf certificates, so
+it reaches the great majority of feeds directly; a TLS-1.2-only host is the main
+exception. For guaranteed full coverage regardless, set `[geo] news_cache_dir`
+and run the bundled key-free updater from cron. The updater uses `curl` with the
+system CA bundle to fetch every feed and writes one-headline-per-line files the
+daemon reads:
 
-```
+```text
 */5 * * * * /path/to/orochi/tools/news_update.sh /var/lib/orochi/news 10
 ```
 

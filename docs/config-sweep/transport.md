@@ -1,14 +1,16 @@
-# Orochi Transport Subsystem — Hardcoded Config Sweep
+# Orochi transport subsystem hardcoded config sweep
 
-READ-ONLY survey of `/home/kain/orochi/src/substrate/` transport files. Lists operationally/performance-meaningful hardcoded literals to be lifted into a TOML config. Excludes wire-format/spec constants, crypto, enum discriminants, type widths, and pure test values.
+This read-only survey lists transport constants that may need TOML-backed operational or performance controls.
+
+Scope: `orochi/src/substrate/` transport files. Excludes wire-format/spec constants, crypto, enum discriminants, type widths, and pure test values.
 
 Files surveyed: ryusen.zig, bbr.zig, l4s.zig, twcc.zig, transport_stack.zig, sim_net.zig, pacing.zig, pmtud.zig, cc_cubic.zig, loss_recovery.zig, backoff.zig, multipath.zig, flow.zig, gcra.zig.
 
-Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are caller-supplied with no embedded operational defaults, so nothing to lift. backoff.zig Policy has only structural defaults (factor=2). multipath.zig Scheduler has no numeric tuning defaults.
+Note: flow.zig and gcra.zig are generic limiter primitives. All parameters are caller-supplied with no embedded operational defaults, so nothing is available to lift. backoff.zig Policy has only structural defaults (factor=2). multipath.zig Scheduler has no numeric tuning defaults.
 
 ---
 
-## [transport]  (stack-level / general)
+## [transport]: Stack-level and general
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -20,7 +22,7 @@ Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are c
 | transport_stack.zig:227 | `onAck` RTT fallback `self.loss.smoothedRtt() orelse 10_000` | 10_000 us | RTT used for cc/pacing when no SRTT yet | transport.fallback_rtt_us | duration(us) | 10000 | 1000..1000000 |
 | transport_stack.zig:129 | `Recorder = qlog.Recorder(1024)` | 1024 | qlog ring-buffer event capacity | transport.qlog_capacity | uint | 1024 | 64..65536 |
 
-## [transport.pmtud]  (path MTU discovery, RFC 8899)
+## [transport.pmtud]: Path MTU discovery (RFC 8899)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -29,12 +31,12 @@ Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are c
 | pmtud.zig:29 | `Config.min_probe_delta` | 1 | Smallest useful MTU increase per probe | transport.pmtud.min_probe_delta | uint | 1 | 1..256 |
 | pmtud.zig:32 | `Config.blackhole_loss_threshold` | 3 | Consecutive losses at current MTU before blackhole fallback | transport.pmtud.blackhole_loss_threshold | uint | 3 | 1..16 |
 
-## [transport.congestion]  (cross-CC / generic)
+## [transport.congestion]: Cross-CC and generic
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
 
-## [transport.congestion.l4s]  (DCTCP / TCP-Prague-lite, l4s.zig)
+## [transport.congestion.l4s]: DCTCP and TCP-Prague-lite (`l4s.zig`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -49,7 +51,7 @@ Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are c
 | l4s.zig:31 | `Config.loss_backoff_num` | 1 | Classic loss multiplicative-decrease numerator (halving) | transport.congestion.l4s.loss_backoff_num | uint | 1 | 1..– |
 | l4s.zig:33 | `Config.loss_backoff_den` | 2 | Classic loss multiplicative-decrease denominator | transport.congestion.l4s.loss_backoff_den | uint | 2 | 1..1024 |
 
-## [transport.congestion.bbr]  (bandwidth+RTT model, bbr.zig)
+## [transport.congestion.bbr]: Bandwidth+RTT model (`bbr.zig`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -69,7 +71,7 @@ Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are c
 | bbr.zig:389 | Startup exit `rounds_without_gain >= 3` | 3 | Consecutive flat rounds before exiting Startup | transport.congestion.bbr.startup_full_bw_rounds | uint | 3 | 1..8 |
 | bbr.zig:412 | Drain exit `drain_rounds >= 1` | 1 | Rounds spent in Drain before ProbeBW | transport.congestion.bbr.drain_rounds | uint | 1 | 1..4 |
 
-## [transport.congestion.cubic]  (CUBIC, cc_cubic.zig)
+## [transport.congestion.cubic]: CUBIC (`cc_cubic.zig`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -80,7 +82,7 @@ Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are c
 | cc_cubic.zig:13 | `Config.max_cwnd` | maxInt(u64) | Max cwnd in packets (effectively unbounded) | transport.congestion.cubic.max_cwnd_packets | uint | 0 (=unbounded) | 0..– |
 | cc_cubic.zig:14 | `Config.initial_ssthresh` | maxInt(u64) | Initial slow-start threshold (packets) | transport.congestion.cubic.initial_ssthresh_packets | uint | 0 (=unbounded) | 0..– |
 
-## [transport.recovery]  (loss detection / RTO / RACK / TLP, loss_recovery.zig)
+## [transport.recovery]: Loss detection, RTO, RACK, and TLP (`loss_recovery.zig`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -96,7 +98,7 @@ Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are c
 | loss_recovery.zig:144 | tlpTimeout `srtt * 2` | 2 | TLP delay multiplier on SRTT | transport.recovery.tlp_srtt_multiplier | uint | 2 | 1..4 |
 | loss_recovery.zig:127 | rto `rttvar * 4` | 4 | RTTVAR multiplier in RTO formula (RFC6298 K; borderline) | transport.recovery.rto_rttvar_multiplier | uint | 4 | 1..8 |
 
-## [transport.twcc]  (transport-wide congestion control feedback, twcc.zig)
+## [transport.twcc]: Transport-wide congestion control feedback (`twcc.zig`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -109,24 +111,30 @@ Note: flow.zig, gcra.zig are generic limiter primitives — all parameters are c
 **Total liftable constants: 49**
 
 Per-section counts:
-- `[transport]` (stack-level): 7
-- `[transport.pmtud]`: 4
-- `[transport.congestion.l4s]`: 10
-- `[transport.congestion.bbr]`: 16
-- `[transport.congestion.cubic]`: 6
-- `[transport.recovery]`: 12
-- `[transport.twcc]`: 0 (all spec/wire constants)
 
-**Excluded (no operational literals to lift):** twcc.zig (all wire-format), flow.zig, gcra.zig, multipath.zig, sim_net.zig NetworkModel (test-harness, all 0/false), ryusen.zig (loopback sim only — SimulationConfig is a DST test fixture, not production tuning), pacing.zig Pacer/GsoLimits (no embedded defaults; values are caller/stack-supplied).
+| Section | Count |
+|---|---:|
+| `[transport]` (stack-level) | 7 |
+| `[transport.pmtud]` | 4 |
+| `[transport.congestion.l4s]` | 10 |
+| `[transport.congestion.bbr]` | 16 |
+| `[transport.congestion.cubic]` | 6 |
+| `[transport.recovery]` | 12 |
+| `[transport.twcc]` (all spec/wire constants) | 0 |
+
+**Excluded (no operational literals to lift):** twcc.zig (all wire-format), flow.zig, gcra.zig, multipath.zig, sim_net.zig NetworkModel (test-harness, all 0/false), ryusen.zig (loopback sim only; SimulationConfig is a DST test fixture, not production tuning), pacing.zig Pacer/GsoLimits (no embedded defaults; values are caller/stack-supplied).
 
 **Top 10 highest-value lifts:**
-1. `transport.congestion.l4s.initial_cwnd_bytes` (12000) — primary CC ramp behavior, l4s.zig:15
-2. `transport.congestion.l4s.max_cwnd_bytes` (16 MiB) — caps throughput ceiling, l4s.zig:19
-3. `transport.recovery.initial_rto_us` (1 s) — dominates startup/handshake retransmit latency, loss_recovery.zig:25
-4. `transport.recovery.min_rto_us` (1 s) — hard floor on all RTO; very impactful on recovery responsiveness, loss_recovery.zig:26
-5. `transport.congestion.bbr.min_rtt_window_us` (10 s) — governs ProbeRTT cadence and fairness, bbr.zig:119
-6. `transport.fallback_rtt_us` / `transport.seed_rtt_us` (10 ms) — RTT assumed before first sample; biases initial pacing for every flow, transport_stack.zig:150,227
-7. `transport.recovery.packet_threshold` (3) — directly controls loss-detection sensitivity/spurious retransmits, loss_recovery.zig:31
-8. `transport.pmtud.max_mtu` (1500) — upper bound on path MTU probing; gates large-datagram throughput, pmtud.zig:27
-9. `transport.congestion.bbr.startup_pacing_gain` (2.885) — Startup aggressiveness, bbr.zig:39
-10. `transport.congestion.cubic.beta` (0.7) — CUBIC backoff depth; throughput-vs-fairness knob, cc_cubic.zig:4
+
+| Rank | Key | Impact |
+|---:|---|---|
+| 1 | `transport.congestion.l4s.initial_cwnd_bytes` (12000) | primary CC ramp behavior, l4s.zig:15 |
+| 2 | `transport.congestion.l4s.max_cwnd_bytes` (16 MiB) | caps throughput ceiling, l4s.zig:19 |
+| 3 | `transport.recovery.initial_rto_us` (1 s) | dominates startup/handshake retransmit latency, loss_recovery.zig:25 |
+| 4 | `transport.recovery.min_rto_us` (1 s) | hard floor on all RTO; very impactful on recovery responsiveness, loss_recovery.zig:26 |
+| 5 | `transport.congestion.bbr.min_rtt_window_us` (10 s) | governs ProbeRTT cadence and fairness, bbr.zig:119 |
+| 6 | `transport.fallback_rtt_us` / `transport.seed_rtt_us` (10 ms) | RTT assumed before first sample; biases initial pacing for every flow, transport_stack.zig:150,227 |
+| 7 | `transport.recovery.packet_threshold` (3) | directly controls loss-detection sensitivity/spurious retransmits, loss_recovery.zig:31 |
+| 8 | `transport.pmtud.max_mtu` (1500) | upper bound on path MTU probing; gates large-datagram throughput, pmtud.zig:27 |
+| 9 | `transport.congestion.bbr.startup_pacing_gain` (2.885) | Startup aggressiveness, bbr.zig:39 |
+| 10 | `transport.congestion.cubic.beta` (0.7) | CUBIC backoff depth; throughput-vs-fairness knob, cc_cubic.zig:4 |

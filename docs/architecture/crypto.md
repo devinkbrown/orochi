@@ -1,40 +1,42 @@
-# Cryptography and Secure-Channel Architecture
+# Cryptography and secure-channel architecture
+
+*The cryptography implemented in the current Orochi source tree: primitives, TLS, the Tsumugi AKE, and the signed-object formats that protect mesh traffic.*
 
 This document describes the cryptography that exists in the current Orochi
 source tree. Intent notes from `docs/planning/02-crypto-tsumugi.md` and the
-opssl design inventory are included only where they match current code or where
-they clarify direction; current behavior is cited to `src/`.
+opssl design inventory appear only where they match current code or clarify
+direction; current behavior is cited to `src/`.
 
-## Scope and Stance
+## Scope and stance
 
-Orochi is a clean-slate Zig-native successor to ophion; the brief explicitly
-states that the daemon, substrate, and opssl crypto/TLS library are rewritten
-from scratch in Zig and that ophion/libop/opssl are reference material only
-(`docs/BRIEF.md:3`, `docs/BRIEF.md:4`, `docs/BRIEF.md:5`,
-`docs/BRIEF.md:6`). The pinned toolchain target is Zig 0.16.0
-(`build.zig.zon:28`). The crypto/TLS paths covered here are Zig modules built
-from `std.crypto` and local code. For example, X-Wing is built from
-`std.crypto.kem.ml_kem.MLKem768` and `std.crypto.dh.X25519`
-(`src/crypto/xwing.zig:15`, `src/crypto/xwing.zig:17`,
+Orochi is a clean-slate Zig-native successor to ophion. The brief states that
+the daemon, substrate, and opssl crypto/TLS library are rewritten from scratch
+in Zig, and that ophion, libop, and opssl are reference material only
+(`docs/BRIEF.md:3`, `docs/BRIEF.md:4`, `docs/BRIEF.md:5`, `docs/BRIEF.md:6`).
+The pinned toolchain target is Zig 0.16.0 (`build.zig.zon:28`).
+
+The crypto and TLS paths covered here are Zig modules built from `std.crypto`
+and local code. For example, X-Wing builds on `std.crypto.kem.ml_kem.MLKem768`
+and `std.crypto.dh.X25519` (`src/crypto/xwing.zig:15`, `src/crypto/xwing.zig:17`,
 `src/crypto/xwing.zig:18`), TLS server AEADs come from `std.crypto`
 (`src/crypto/tls_server.zig:29`, `src/crypto/tls_server.zig:30`,
-`src/crypto/tls_server.zig:31`), and MeshPass uses
-`std.crypto.sign.Ed25519` (`src/proto/meshpass.zig:9`).
+`src/crypto/tls_server.zig:31`), and MeshPass uses `std.crypto.sign.Ed25519`
+(`src/proto/meshpass.zig:9`).
 
-The deployed client TLS stance is modern-only for the daemon listener:
-`main.zig` configures an implicit TLS port and says "No STARTTLS" explicitly
+The deployed client TLS stance is modern-only for the daemon listener.
+`main.zig` configures an implicit TLS port and states "No STARTTLS" explicitly
 (`src/main.zig:213`, `src/main.zig:216`). `server.Config` repeats the policy:
 the TLS listener wraps ordinary IRC clients in TLS 1.3 and is "no STARTTLS"
 (`src/daemon/server.zig:1037`, `src/daemon/server.zig:1038`). The TLS server
-state machine itself is scoped to TLS 1.3, X25519, Ed25519 leaf certificates,
-and AES-128-GCM / ChaCha20-Poly1305 (`src/crypto/tls_server.zig:1`,
+state machine is scoped to TLS 1.3, X25519, Ed25519 leaf certificates, and
+AES-128-GCM / ChaCha20-Poly1305 (`src/crypto/tls_server.zig:1`,
 `src/crypto/tls_server.zig:6`, `src/crypto/tls_server.zig:7`,
-`src/crypto/tls_server.zig:8`). The planning note also states the desired core
-TLS direction as TLS 1.3 only (`docs/planning/02-crypto-tsumugi.md:124`,
+`src/crypto/tls_server.zig:8`). The planning note states the desired core TLS
+direction as TLS 1.3 only (`docs/planning/02-crypto-tsumugi.md:124`,
 `docs/planning/02-crypto-tsumugi.md:126`); the source above is the authority for
 what is implemented.
 
-## Primitive Inventory
+## Primitive inventory
 
 | Surface | Implemented primitive / format | Source evidence |
 | --- | --- | --- |
@@ -47,7 +49,7 @@ what is implemented.
 | Session reclaim | Canonical length-prefixed fields with trailing HMAC-SHA256 tag. | `src/proto/session_reclaim_mesh.zig:1`, `src/proto/session_reclaim_mesh.zig:8`, `src/proto/session_reclaim_mesh.zig:9`, `src/proto/session_reclaim_mesh.zig:19` |
 | CoilPack | Canonical self-describing binary atoms and a canonical value layer for stable signing. | `src/proto/coilpack.zig:1`, `src/proto/coilpack.zig:3`, `src/proto/coilpack.zig:5`, `src/proto/coilpack_value.zig:1`, `src/proto/coilpack_value.zig:10`, `src/proto/coilpack_value.zig:11` |
 
-## Node Identity
+## Node identity
 
 `src/daemon/node_identity.zig` derives all live Tsumugi identity material from
 the configured `node.secret_key` and `mesh.realm`. The sovereign seed is a
@@ -83,7 +85,7 @@ identity; without it, S2S stays plaintext for compatibility
 `src/main.zig:145`, `src/main.zig:146`, `src/main.zig:148`,
 `src/main.zig:150`, `src/main.zig:152`).
 
-## Tsumugi PQ-Hybrid S2S Handshake
+## Tsumugi PQ-hybrid S2S handshake
 
 The Tsumugi handshake is implemented in `src/crypto/tsumugi_handshake.zig` and
 wrapped by `src/crypto/tsumugi_session.zig`. The module comment describes it as
@@ -94,7 +96,7 @@ MeshPass bytes appear only inside encrypted M1
 `src/crypto/tsumugi_handshake.zig:4`, `src/crypto/tsumugi_handshake.zig:5`,
 `src/crypto/tsumugi_handshake.zig:6`).
 
-### Wire Constants and Limits
+### Wire constants and limits
 
 | Item | Value / behavior | Source |
 | --- | --- | --- |
@@ -174,8 +176,8 @@ bands/features, and M1 signature (`src/crypto/tsumugi_handshake.zig:299`,
 `src/crypto/tsumugi_handshake.zig:311`, `src/crypto/tsumugi_handshake.zig:312`,
 `src/crypto/tsumugi_handshake.zig:313`).
 
-Important current-state note: `cfg.mesh_pass` is included in encrypted M1 and
-is not cleartext in the M1 test (`src/crypto/tsumugi_handshake.zig:799`,
+Current-state note: `cfg.mesh_pass` is included in encrypted M1 and is not
+cleartext in the M1 test (`src/crypto/tsumugi_handshake.zig:799`,
 `src/crypto/tsumugi_handshake.zig:807`, `src/crypto/tsumugi_handshake.zig:809`),
 but the decoder currently reads and discards the MeshPass bytes rather than
 comparing or verifying them (`src/crypto/tsumugi_handshake.zig:642`,
@@ -211,7 +213,7 @@ derives `Established` (`src/crypto/tsumugi_handshake.zig:224`,
 `src/crypto/tsumugi_handshake.zig:239`, `src/crypto/tsumugi_handshake.zig:240`,
 `src/crypto/tsumugi_handshake.zig:241`, `src/crypto/tsumugi_handshake.zig:244`).
 
-### Established Keys
+### Established keys
 
 `Established` contains a root key, directional send/receive keys and nonces,
 authenticated peer node id, authenticated peer Ed25519 public key, and accepted
@@ -249,7 +251,7 @@ Evidence: `src/crypto/tsumugi_handshake.zig:418`,
 `src/crypto/tsumugi_session.zig:105`, `src/crypto/tsumugi_session.zig:111`,
 `src/crypto/tsumugi_session.zig:112`, `src/crypto/tsumugi_session.zig:146`).
 
-### Current S2S Wiring Boundary
+### Current S2S wiring boundary
 
 `src/daemon/secured_s2s_link.zig` frames only the TOFU prekey preamble, M1, and
 M2 with a u32 little-endian length. Once the AKE establishes, trailing and
@@ -276,14 +278,14 @@ configured (`src/daemon/server.zig:2582`, `src/daemon/server.zig:2583`,
 `src/daemon/server.zig:6327`, `src/daemon/server.zig:6330`,
 `src/daemon/server.zig:6335`, `src/daemon/server.zig:6338`).
 
-## opssl TLS Library and Daemon Use
+## opssl TLS library and daemon use
 
 In Orochi naming, "opssl" refers to the pure-Zig successor library in
 `src/crypto` and `src/proto/tls_*`; it is not the old C library. The user-facing
 ABOUT text names "opssl" as "a from-scratch pure-Zig TLS and primitive library"
 (`src/proto/server_about.zig:62`).
 
-### TLS Server
+### TLS server
 
 | Topic | Current behavior | Source |
 | --- | --- | --- |
@@ -315,7 +317,7 @@ bytes into the normal IRC parser (`src/daemon/server.zig:1487`,
 `src/daemon/server.zig:3263`, `src/daemon/server.zig:3268`,
 `src/daemon/server.zig:3287`, `src/daemon/server.zig:3288`).
 
-### TLS Client and Protocol Codecs
+### TLS client and protocol codecs
 
 `src/crypto/tls_client.zig` is a socketless TLS 1.3 client used by ACME/HTTPS
 code. It offers TLS 1.3, SNI, X25519 and P-256 shares, and signature algorithms
@@ -345,9 +347,9 @@ structures. Examples:
 | `tls_key_update.zig` | KeyUpdate codec plus `"traffic upd"` application-secret ratchet helper. | `src/proto/tls_key_update.zig:1`, `src/proto/tls_key_update.zig:4`, `src/proto/tls_key_update.zig:5`, `src/proto/tls_key_update.zig:10`, `src/proto/tls_key_update.zig:91` |
 | `tls_session_ticket.zig` / `tls_psk.zig` | NewSessionTicket and PSK extension codecs. Presence of codecs does not mean early data is wired into daemon policy. | `src/proto/tls_session_ticket.zig:1`, `src/proto/tls_session_ticket.zig:3`, `src/proto/tls_psk.zig:1`, `src/proto/tls_psk.zig:3` |
 
-## MeshPass Admission and Capability Envelope
+## MeshPass admission and capability envelope
 
-There are two similarly named surfaces:
+Two similarly named surfaces share the MeshPass name:
 
 1. `tsumugi_handshake.Config.mesh_pass`: arbitrary bytes inserted into encrypted
    M1 with a length cap, currently read and discarded by the responder as noted
@@ -385,7 +387,7 @@ separate consensus protocol (`src/proto/meshpass.zig:216`,
 `src/proto/coilpack.zig:25`, `src/proto/coilpack.zig:26`,
 `src/proto/coilpack.zig:29`).
 
-## Oper Credential Signing
+## Oper credential signing
 
 `src/proto/oper_cred_share.zig` implements cross-mesh operator authorization
 grants. Passwords never cross the mesh; a home node signs an expiring grant
@@ -426,7 +428,7 @@ can confer operator authority (`src/daemon/secured_s2s_link.zig:127`,
 `src/daemon/server.zig:2651`, `src/daemon/server.zig:2654`,
 `src/daemon/server.zig:2657`).
 
-## Session Reclaim Sealing
+## Session reclaim sealing
 
 `src/proto/session_reclaim_mesh.zig` implements portable session reclaim tokens
 that any mesh node with the shared mesh key can verify
@@ -465,12 +467,12 @@ records/evicts (`src/proto/session_reclaim_mesh.zig:236`,
 `src/proto/session_reclaim_mesh.zig:251`, `src/proto/session_reclaim_mesh.zig:254`,
 `src/proto/session_reclaim_mesh.zig:256`, `src/proto/session_reclaim_mesh.zig:258`).
 
-## Secure Channel and Group Key Material
+## Secure channel and group key material
 
 Current source has several secure-channel building blocks. They are distinct
 from the live `secured_s2s_link` behavior described above.
 
-### `crypto/secure_channel.zig`
+### crypto/secure_channel.zig
 
 `secure_channel.zig` composes two surfaces:
 
@@ -536,7 +538,7 @@ for them (`src/crypto/treekem.zig:376`, `src/crypto/treekem.zig:384`,
 `src/crypto/treekem.zig:401`, `src/crypto/treekem.zig:405`,
 `src/crypto/treekem.zig:421`).
 
-### `proto/tsumugi.zig` Frame Ratchet
+### proto/tsumugi.zig frame ratchet
 
 `src/proto/tsumugi.zig` is a symmetric ratchet for post-kx SUIMYAKU frames. It
 does not perform X25519, ML-KEM, or identity work; it expects an authenticated
@@ -569,7 +571,7 @@ does not debit credit (`src/proto/frame.zig:131`, `src/proto/frame.zig:132`,
 `src/proto/frame.zig:355`, `src/proto/frame.zig:360`,
 `src/proto/frame.zig:363`, `src/proto/frame.zig:365`).
 
-## CoilPack Canonical Signing
+## CoilPack canonical signing
 
 CoilPack has two layers:
 
@@ -599,7 +601,7 @@ same signed fields before Ed25519 verification (`src/proto/meshpass.zig:216`,
 `src/proto/meshpass.zig:153`, `src/proto/meshpass.zig:154`,
 `src/proto/meshpass.zig:159`).
 
-## Current Gaps and Non-Claims
+## Current gaps and non-claims
 
 | Do not claim | Current source evidence |
 | --- | --- |

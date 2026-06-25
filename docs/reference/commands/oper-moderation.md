@@ -1,6 +1,8 @@
-# Operator And Moderation Commands
+# Operator and moderation commands
 
-The operator/security module registers oper and moderation commands (`src/daemon/modules/oper_security.zig:104`). Most are registry-gated with `.access = .oper`; `OPER`, `STATS`, and `USERIP` are exceptions in the command table (`src/daemon/modules/oper_security.zig:107`). Fine-grained operator privileges are checked inside handlers with `requirePriv` (`src/daemon/server.zig:9700`).
+*Operator authority, network bans, force actions, and server-to-server link control.*
+
+The operator/security module registers the oper and moderation commands (`src/daemon/modules/oper_security.zig:104`). Most are registry-gated with `.access = .oper`; `OPER`, `STATS`, and `USERIP` are exceptions in the command table (`src/daemon/modules/oper_security.zig:107`). Handlers check fine-grained operator privileges with `requirePriv` (`src/daemon/server.zig:9700`).
 
 ## OPER
 
@@ -113,7 +115,7 @@ The operator/security module registers oper and moderation commands (`src/daemon
 ## WARD
 
 - Syntax: `WARD ADD <match> <pattern> [scope] [action] [secs] [:reason] | WARD DEL <match> <pattern> | WARD LIST [match] | WARD TEST <match> <value>`
-- Description: Unified Warden network-ban registry. A Ward is `Match x Scope x Action`; match facets are `address`, `host`, `mask`, `account`, `realname`, `certfp`, `country`, `asn`; scopes are `node` or `mesh`; actions are `refuse`, `expel`, `quarantine`, or `require_auth`. There are no K/D/G/Z-line commands in the current registered surface.
+- Description: Unified Warden network-ban registry. A Ward is `Match x Scope x Action`: match facets are `address`, `host`, `mask`, `account`, `realname`, `certfp`, `country`, and `asn`; scopes are `node` or `mesh`; actions are `refuse`, `expel`, `quarantine`, or `require_auth`. The registered surface has no K/D/G/Z-line commands.
 - Privileges: Oper plus `client_moderate` privilege.
 - Parameters: Subcommand-specific Warden axes and optional duration/reason.
 - Replies: Server notices and oper events. `WARD TEST` reports match/no-match by notice.
@@ -124,7 +126,7 @@ The operator/security module registers oper and moderation commands (`src/daemon
 ## SPAMTRAP
 
 - Syntax: `SPAMTRAP ADD <NICK|CHAN> <target> | SPAMTRAP DEL <NICK|CHAN> <target> | SPAMTRAP LIST`
-- Description: Operator-designated spam-trap (honeypot) registry. A trap nick or channel is one a legitimate user has no reason to contact; a non-operator that PRIVMSGs a trap nick or JOINs a trap channel trips the trap, which raises a one-shot `FLOOD` Event-Spine alert and flags the offender for follow-up (e.g. `WARD`). The hot path is lock-free when no traps are configured. `LIST` reports trap and offender counts.
+- Description: Operator-designated spam-trap (honeypot) registry. A trap nick or channel is one a legitimate user has no reason to contact. A non-operator that PRIVMSGs a trap nick or JOINs a trap channel trips the trap, which raises a one-shot `FLOOD` Event Spine alert and flags the offender for follow-up (for example, with `WARD`). The hot path is lock-free when no traps are configured. `LIST` reports trap and offender counts.
 - Privileges: Oper plus `client_moderate` privilege.
 - Parameters: Subcommand, target kind (`NICK`/`CHAN`), and target.
 - Replies: Server notice + oper event; offenders are flagged in the registry.

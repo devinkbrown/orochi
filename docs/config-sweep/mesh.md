@@ -1,15 +1,13 @@
-# Orochi Mesh (Suimyaku) — Hardcoded Operational/Tuning Constants
+# Orochi mesh (Suimyaku) operational constants
 
-Survey of `src/substrate/suimyaku/*.zig` (excluding `media.zig`).
-Scope: CRDT mesh, s2s_peer, gossip/plumtree/hyparview dissemination, SWIM membership,
-delta journal, anti-entropy, state projection. Read-only.
+Read-only survey of operational and tuning constants in the Orochi Suimyaku mesh.
+
+Scope: `src/substrate/suimyaku/*.zig` (excluding `media.zig`): CRDT mesh, s2s_peer, gossip/plumtree/hyparview dissemination, SWIM membership, delta journal, anti-entropy, state projection.
 
 Excluded: protocol/wire constants, crypto domain constants, enum discriminants, compile-time
 type widths, test-only values. Borderline entries are marked.
 
----
-
-## [mesh.gossip] — HyParView overlay + Plumtree dissemination
+## HyParView overlay and Plumtree dissemination (`[mesh.gossip]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -29,7 +27,7 @@ type widths, test-only values. Borderline entries are marked.
 | membership_view.zig:47 | `Config.shuffle_active_count` | 2 | Active entries sampled per shuffle (bounded view) | mesh.gossip.view_shuffle_active | uint | 2 | 0..active_capacity |
 | membership_view.zig:49 | `Config.shuffle_passive_count` | 4 | Passive entries sampled per shuffle (bounded view) | mesh.gossip.view_shuffle_passive | uint | 4 | 0..passive_capacity |
 
-## [mesh.swim] — Witnessed SWIM failure detector
+## Witnessed SWIM failure detector (`[mesh.swim]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -42,7 +40,7 @@ type widths, test-only values. Borderline entries are marked.
 | gossip_round.zig:15 | `SazanamiConfig.witness_quorum` | 2 | Sazanami witness quorum for dead declaration | mesh.swim.sazanami_witness_quorum | uint | 2 | 1..16 |
 | gossip_round.zig:11 | `max_tracked_witnesses` (borderline) | 16 | Max witnesses tracked per Sazanami member | mesh.swim.sazanami_max_witnesses | uint | 16 | 4..64 |
 
-## [mesh.antientropy] — Anti-entropy reconciliation / repair planner
+## Anti-entropy reconciliation and repair planner (`[mesh.antientropy]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -54,7 +52,7 @@ type widths, test-only values. Borderline entries are marked.
 | goryu_sync.zig:21 | `max_fills` (borderline) | 512 | Max fill records in one sync message | mesh.antientropy.max_fills | uint | 512 | 32..8192 |
 | goryu_sync.zig:22 | `max_scope_len` (borderline) | 4096 | Max op-scope byte length accepted | mesh.antientropy.max_scope_len | uint | 4096 | 256..65536 |
 
-## [mesh.link] — Peer link transport (heartbeat/idle/credit/replay)
+## Peer-link transport (`[mesh.link]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -72,7 +70,7 @@ type widths, test-only values. Borderline entries are marked.
 | burst.zig:21 | `Limits.max_burst_bytes` | 65536 (64*1024) | Max bytes for a serialized state burst | mesh.link.burst_max_bytes | uint | 65536 | 4096..16777216 |
 | burst.zig:21 | `Limits.max_records` | 512 | Max records per state burst | mesh.link.burst_max_records | uint | 512 | 16..65536 |
 
-## [mesh.routing] — Route table & server registry capacities
+## Route table and server registry capacities (`[mesh.routing]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -84,7 +82,7 @@ type widths, test-only values. Borderline entries are marked.
 | server_registry.zig:15 | `Config.max_name_len` (borderline) | 63 | Max server name byte length | mesh.routing.max_server_name_len | uint | 63 | 16..255 |
 | server_registry.zig:16 | `Config.max_description_len` (borderline) | 255 | Max server description byte length | mesh.routing.max_server_desc_len | uint | 255 | 32..1024 |
 
-## [mesh] — CRDT clock / misc
+## CRDT clock and miscellaneous mesh settings (`[mesh]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|

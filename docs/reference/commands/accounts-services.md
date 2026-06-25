@@ -1,11 +1,13 @@
-# Accounts And Services Commands
+# Accounts and services commands
 
-Account and service commands are registered by the `accounts` module (`src/daemon/modules/accounts.zig:59`) and feature/service modules. Orochi services are real server commands and server notices; there are no pseudo-clients in these handlers (`src/daemon/server.zig:8698`, `src/daemon/server.zig:8709`).
+*Account, service, and persona commands exposed as real server commands — Orochi has no pseudo-clients.*
+
+The `accounts` module registers the account and service commands (`src/daemon/modules/accounts.zig:59`), with additional commands from feature and service modules. Orochi services are real server commands that reply through server notices; no pseudo-clients exist in these handlers (`src/daemon/server.zig:8698`, `src/daemon/server.zig:8709`).
 
 ## REGISTER
 
 - Syntax: `REGISTER <account> <email|*> <password>`
-- Description: Registers an account immediately, logs the session in, optionally issues an email verification token, applies SASL-account oper elevation if configured, tracks the session, delivers tegami, applies autojoin, and emits welcome/client-registration side effects.
+- Description: Registers an account immediately and logs the session in. Optionally issues an email verification token, applies SASL-account oper elevation when configured, tracks the session, delivers tegami, applies autojoin, and emits welcome and client-registration side effects.
 - Privileges: Registered client.
 - Parameters: Account, email or `*`, password.
 - Replies: Raw `REGISTER SUCCESS <account> :Account registered`, optional `VERIFY <token>` notice, welcome/account side effects.
@@ -27,7 +29,7 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## IDENTIFY
 
 - Syntax: `IDENTIFY <account> <password>`
-- Description: Authenticates to an existing account, logs the session in, performs derived oper elevation, tracks the session, delivers tegami, autojoins, and emits login side effects.
+- Description: Authenticates to an existing account and logs the session in. Performs derived oper elevation, tracks the session, delivers tegami, applies autojoin, and emits login side effects.
 - Privileges: Registered client.
 - Parameters: Account and password.
 - Replies: Server `NOTICE` confirming login plus account-notify/welcome side effects.
@@ -82,7 +84,7 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## ACCOUNTSET
 
 - Syntax: `ACCOUNTSET <account> <password> <email|flags|secure|enforce> <value>`
-- Description: Updates account settings after password verification. `email` sets the address; `flags` sets the non-privileged numeric flag bits; `secure on|off` recognizes the account only via identify (never an access-list match alone); `enforce on|off` controls nick protection on the account's registered nick (on by default — `off` opts the account out of the auto force-rename sweep).
+- Description: Updates account settings after password verification. `email` sets the address; `flags` sets the non-privileged numeric flag bits; `secure on|off` recognizes the account only via identify, never an access-list match alone; `enforce on|off` controls nick protection on the account's registered nick (on by default — `off` opts the account out of the automatic force-rename sweep).
 - Privileges: Registered client (the account owner).
 - Parameters: Account, password, field, value.
 - Replies: Server `NOTICE` confirming update.
@@ -93,8 +95,9 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## RECOVER
 
 - Syntax: `RECOVER <nick>`
-- Description: The account owner forces an unauthenticated holder off their registered nick immediately — instead of waiting out the protection grace — then briefly holds the nick (nick-delay) so the owner can reclaim it. The requester MUST be identified to the account that owns the nick. A holder that is the owner's own authenticated session is never ejected. Decision logic is the pure `svc_recover`.
+- Description: Forces an unauthenticated holder off the account owner's registered nick immediately, rather than waiting out the protection grace, then briefly holds the nick (nick-delay) so the owner can reclaim it. The requester must be identified to the account that owns the nick. A holder that is the owner's own authenticated session is never ejected. The pure `svc_recover` module owns the decision logic.
 - Privileges: Registered client identified to the owning account.
+- Parameters: Target nick.
 - Replies: Server `NOTICE`; the holder is force-renamed to a `Guest…` nick.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL RECOVER NICK_NOT_REGISTERED`, `FAIL RECOVER ACCESS_DENIED`, `FAIL RECOVER TEMPORARILY_UNAVAILABLE`.
 - Example: `RECOVER alice`
@@ -103,8 +106,9 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## RELEASE
 
 - Syntax: `RELEASE <nick>`
-- Description: The account owner drops a server-held nick reservation (nick-delay) on their own registered nick ahead of its window, making the nick immediately available again. Requires identification to the account.
+- Description: Drops a server-held nick reservation (nick-delay) on the account owner's registered nick ahead of its window, making the nick available again. Requires identification to the account.
 - Privileges: Registered client identified to the owning account.
+- Parameters: Target nick.
 - Replies: Server `NOTICE`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL RELEASE NICK_NOT_REGISTERED`, `FAIL RELEASE ACCESS_DENIED`, `FAIL RELEASE TEMPORARILY_UNAVAILABLE`.
 - Example: `RELEASE alice`
@@ -124,7 +128,7 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## CHANNEL
 
 - Syntax: `CHANNEL <REGISTER|DROP|INFO|ACCESS|AKICK|SET|TRANSFER> <#channel> ...`
-- Description: Real server command for channel services. Current implemented switch handles `REGISTER`, `DROP`, `INFO`, `ACCESS`, `AKICK`, and `SET MLOCK`; `TRANSFER` and non-MLOCK `SET` fields are parsed surfaces that still reply as unavailable.
+- Description: Real server command for channel services. The implemented switch handles `REGISTER`, `DROP`, `INFO`, `ACCESS`, `AKICK`, and `SET MLOCK`; `TRANSFER` and non-MLOCK `SET` fields are parsed but still reply as unavailable.
 - Privileges: Registered client logged in to an account.
 - Parameters: Subcommand and channel-specific arguments.
 - Replies: Server notices; `REGISTER`/`DROP` also reflect live registered-channel state.
@@ -190,7 +194,7 @@ Account and service commands are registered by the `accounts` module (`src/daemo
 ## TEGAMI
 
 - Syntax: `TEGAMI [LIST|CLEAR|SEND <account> :message]` (alias: `MEMO`)
-- Description: Offline account messages (手紙 — "letter"). `MEMO` is an alias for the same command. `LIST` is default and does not clear; login delivery clears pending messages.
+- Description: Offline account messages (手紙 — "letter"); `MEMO` is an alias for the same command. `LIST` is the default and does not clear; login delivery clears pending messages.
 - Privileges: Registered client; account login required for list/clear/send.
 - Parameters: Optional subcommand; `SEND` target account and message.
 - Replies: `NOTE TEGAMI` lines, clear count, or delivery notice.

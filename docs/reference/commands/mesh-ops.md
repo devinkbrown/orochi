@@ -1,6 +1,8 @@
-# Mesh Operations Commands
+# Mesh operations commands
 
-Mesh commands are real registered oper commands in `oper.security`: `MESH`, `NETSTAT`, `ROUTE`, and `NETHEALTH` (`src/daemon/modules/oper_security.zig:132`). `LINKS` and `MAP` are registered server information commands (`src/daemon/modules/query_info.zig:68`). `UPGRADE` is a registered command in the upgrade module and checks oper status inside its handler (`src/daemon/modules/upgrade.zig:21`, `src/daemon/server.zig:6076`).
+*Suimyaku mesh introspection, routing, health, and Helix in-place upgrade.*
+
+The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `ROUTE`, and `NETHEALTH` (`src/daemon/modules/oper_security.zig:132`). The `query.info` module registers `LINKS` and `MAP` as server-information commands (`src/daemon/modules/query_info.zig:68`). The upgrade module registers `UPGRADE`, which checks oper status inside its handler (`src/daemon/modules/upgrade.zig:21`, `src/daemon/server.zig:6076`).
 
 ## MESH
 

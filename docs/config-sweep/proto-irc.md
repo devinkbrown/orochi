@@ -1,13 +1,16 @@
 # Orochi IRC protocol-layer hardcoded constant sweep (`src/proto/*.zig`)
 
-READ-ONLY survey. Scope: IRC protocol layer only. Excludes `tls_*`, `tls12_*`, `dtls_*`, `acme_*`, `toml.zig` (owned by other agents) and the non-IRC crypto/codec/transport modules (asn1/der/pem/pkcs8/csr/ocsp/x509/ed25519/cbor/merkle/gcounter/orset/quorum/skiplist/reservoir/rendezvous/snowflake/uuid/varint/punycode/idna/base32/base64url/percent/mime/levenshtein/semver/glob/hostmask/wildcard/word_wrap/utf8_width/numeric_range/humanize/color_strip/casemap/quic/http*/stun/ice/sdp/rtp/opus/vp8/webtransport/socks5/proxy_protocol/happy_eyeballs/secure_fns/meshpass/cidr_match etc.).
-Excludes IRC numerics, RFC wire constants, enum discriminants, type widths, fuzz/test iteration counts.
+This read-only survey identifies IRC protocol-layer constants that may need TOML-backed policy controls.
 
-Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply builders are *defaults* of comptime `Params` structs and repeat the same policy values across many files (NICKLEN=64, hostlen=255, etc.). Where a value is purely a wire-framing buffer (e.g. `MAX_IRC_LINE_BYTES=512`, `MAX_WIRE_LINE`) it is marked borderline. The canonical policy source for ISUPPORT-advertised limits is `isupport.zig:default_tokens` — those should be the single source of truth, with per-module `Params` derived from config.
+Scope: IRC protocol layer only. Excludes `tls_*`, `tls12_*`, `dtls_*`, `acme_*`, `toml.zig` (owned by other agents) and the non-IRC crypto/codec/transport modules (asn1/der/pem/pkcs8/csr/ocsp/x509/ed25519/cbor/merkle/gcounter/orset/quorum/skiplist/reservoir/rendezvous/snowflake/uuid/varint/punycode/idna/base32/base64url/percent/mime/levenshtein/semver/glob/hostmask/wildcard/word_wrap/utf8_width/numeric_range/humanize/color_strip/casemap/quic/http*/stun/ice/sdp/rtp/opus/vp8/webtransport/socks5/proxy_protocol/happy_eyeballs/secure_fns/meshpass/cidr_match etc.).
+
+Also excludes IRC numerics, RFC wire constants, enum discriminants, type widths, and fuzz/test iteration counts.
+
+Note: most `MAX_*_BYTES` values for nick/user/host/server/channel in per-feature reply builders are defaults of comptime `Params` structs and repeat the same policy values across many files (NICKLEN=64, hostlen=255, etc.). Where a value is purely a wire-framing buffer (e.g. `MAX_IRC_LINE_BYTES=512`, `MAX_WIRE_LINE`), it is marked borderline. The canonical policy source for ISUPPORT-advertised limits is `isupport.zig:default_tokens`; use it as the single source of truth, with per-module `Params` derived from config.
 
 ---
 
-## [limits] — ISUPPORT-advertised policy (canonical source: isupport.zig default_tokens)
+## [limits]: ISUPPORT-advertised policy (canonical source: `isupport.zig:default_tokens`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -40,7 +43,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | isupport.zig:10 / irc_isupport.zig:7 | MAX_TOKENS_PER_LINE | 13 | ISUPPORT tokens per 005 line | borderline limits.isupport_tokens_per_line | uint | 13 | 1..20 |
 | isupport.zig:11 | MAX_IRC_LINE_BYTES | 512 | IRC line octet budget incl CRLF | borderline (RFC wire) | uint | 512 | – |
 
-## [limits] — per-feature identifier/length caps (policy, repeated across modules)
+## [limits]: Per-feature identifier and length caps (policy, repeated across modules)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -72,7 +75,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | services_alias.zig:11 | DEFAULT_MAX_TEXT_BYTES | 8191 | Alias relayed text cap | borderline (multiline wire) | uint | 8191 | – |
 | nickdelay.zig:242 | maxNickBufLen | 64 | NickDelay nick buffer cap | limits.nick_len (reuse) | uint | 64 | 9..255 |
 
-## [history] — chathistory / read-marker / msgedit sizing
+## [history]: CHATHISTORY, read-marker, and msgedit sizing
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -93,7 +96,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | msgtags.zig:10 | MSGID_LEN | 22 | Generated msgid length | borderline ircv3.msgid_len | uint | 22 | 16..64 |
 | msgtags.zig:11 / server_time_skew.zig:34 | SERVER_TIME_LEN | 24 | server-time tag length | borderline (fixed format) | uint | 24 | – |
 
-## [ircv3] — caps, multiline, monitor, metadata, labeled-response, SASL
+## [ircv3]: Caps, multiline, monitor, metadata, labeled-response, and SASL
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -128,7 +131,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | sasl_external.zig:10 | max_authenticate_payload | 400 | EXTERNAL payload cap | ircv3.sasl_external_payload | uint | 400 | 1..512 |
 | sasl_anonymous.zig:12 | default_max_trace_bytes | 255 | ANONYMOUS trace string cap | ircv3.sasl_anonymous_trace_len | uint | 255 | 1..512 |
 
-## [ircv3] — STS / SNI / cloak / chghost
+## [ircv3]: STS, SNI, cloak, and chghost
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -139,7 +142,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | cloak.zig:12 | key_len | 32 | Cloak HMAC secret-key length | ircv3.cloak_key_len | uint | 32 | borderline (crypto) |
 | cloak.zig:14 | max_hostname_len | 253 | Cloak input hostname cap | ircv3.cloak_hostname_len | uint | 253 | 1..253 |
 
-## [ircv3] — IRCX (PROP / ACCESS / MODEX / SACCESS)
+## [ircv3]: IRCX (PROP, ACCESS, MODEX, SACCESS)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -159,7 +162,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | ircx_modex.zig:22 | DEFAULT_MAX_TARGET_BYTES | 160 | MODEX target cap | ircv3.ircx_modex_target_len | uint | 160 | 8..255 |
 | ircx_saccess.zig:16 | DEFAULT_MAX_REASON_BYTES | 256 | SACCESS reason cap | ircv3.ircx_saccess_reason_len | uint | 256 | 1..512 |
 
-## [dns] — resolver tuning (resolv_conf defaults + dns sizing)
+## [dns]: Resolver tuning (resolv_conf defaults and DNS sizing)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -174,7 +177,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | dns.zig:10 | max_cache_addrs | 8 | Max cached A/AAAA addresses | dns.max_cache_addrs | uint | 8 | 1..64 |
 | dns_resolver.zig:108 | max_answers | 8 | Max answers parsed per response | dns.max_answers | uint | 8 | 1..64 |
 
-## [server] — clock skew / motd / lists
+## [server]: Clock skew, MOTD, and lists
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -187,7 +190,7 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 | who.zig:10 / who_props (16) | MAX_SELECTOR_FIELDS | 16 | Max WHO selector fields | limits.who_selector_fields | uint | 16 | 1..32 |
 | whox.zig:8 | MAX_TOKEN_BYTES | 32 | WHOX field-token cap | limits.whox_token_len | uint | 32 | 1..64 |
 
-## [flood] — nick reservation / accept lists (no message-rate flood throttles found in proto layer)
+## [flood]: Nick reservation and accept lists (no message-rate flood throttles found in proto layer)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -202,9 +205,9 @@ Note: most `MAX_*_BYTES` for nick/user/host/server/channel in per-feature reply 
 
 ---
 
-## Notes / gaps
-- **No message-rate flood/throttle windows** (sendq/recvq, per-command rate, penalty timers) exist in the proto layer — those live elsewhere (likely the core/net layer, out of this scope). `[flood]` here is reservation/list sizing only.
-- **SCRAM iteration count** is *not* hardcoded in proto: `recordFromPassword`/`deriveScramKeys` take `iterations: u32` from the caller (sasl.zig:302, :288). The default belongs in whatever credential-creation/config layer calls it — flag for the config author as `ircv3.sasl_scram_iterations` (e.g. 4096+).
+## Notes and gaps
+- **No message-rate flood/throttle windows** (sendq/recvq, per-command rate, penalty timers) exist in the proto layer. Those live elsewhere (likely the core/net layer, out of this scope). `[flood]` here is reservation/list sizing only.
+- **SCRAM iteration count** is *not* hardcoded in proto: `recordFromPassword`/`deriveScramKeys` take `iterations: u32` from the caller (sasl.zig:302, :288). The default belongs in whatever credential-creation/config layer calls it. Flag it for the config author as `ircv3.sasl_scram_iterations` (e.g. 4096+).
 - **STS max-age/duration** is caller-supplied (`sts_policy.zig` ServerConfig.duration_seconds is `?u64`, no hardcoded default). Doc comment shows `2592000` (30d) as example only. Add `ircv3.sts_max_age_secs` default in config.
-- Many `MAX_*_BYTES` (nick/user/host/server/channel) repeat the same policy values across ~12 reply-builder modules. Strongly recommend a single `[limits]` block feeding all module `Params` rather than per-module keys.
+- Many `MAX_*_BYTES` values (nick/user/host/server/channel) repeat the same policy values across ~12 reply-builder modules. Prefer a single `[limits]` block feeding all module `Params` rather than per-module keys.
 - `default_tokens` in `isupport.zig` is the authoritative ISUPPORT policy table and should drive the config, not the scattered per-module defaults.

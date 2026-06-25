@@ -1,39 +1,42 @@
-# 18 — Media Transport Plane (SFU): ICE/STUN + SRTP over UDP
+# 18 — Media transport plane (SFU): ICE/STUN + SRTP over UDP
+
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
+
+This document defines the SFU media transport architecture and wire contract.
 
 Status: **live**. The signaling plane, the UDP transport plane, ICE connectivity,
 SDES SRTP keying, and the selective-forwarding relay are all implemented, wired into the
 daemon, and verified end-to-end (real UDP sockets, real STUN crypto, RFC-vectored SRTP).
-This document consolidates the architecture and the on-the-wire contract so the browser /
-Ocean client can be built against it and the remaining arcs (DTLS-SRTP, RTCP/NACK) have a
+This document consolidates the architecture and the on-the-wire contract so the browser/Ocean
+client can be built against it and the remaining arcs (DTLS-SRTP, RTCP/NACK) have a
 stable base to extend.
 
-The thesis, in one line: **Orochi is its own selective-forwarding unit — a participant
-runs ICE to the server, the server distributes one SRTP key per call over the
-TLS-protected IRC link, and the server relays opaque ciphertext between participants
-without ever seeing plaintext.** Everything is clean-room pure Zig on the existing
+Core model: **Orochi is its own selective-forwarding unit — a participant runs ICE to the
+server, the server distributes one SRTP key per call over the TLS-protected IRC link, and
+the server relays opaque ciphertext between participants without ever seeing plaintext.**
+Everything is clean-room pure Zig on the existing
 `stun` / `ice` / `rtp_profile` / `srtp` substrate; no libwebrtc, no C.
 
 ---
 
-## 0. What already exists (do not re-invent)
+## 0. Existing substrate
 
-- `src/proto/stun.zig` — RFC 5389 STUN framing: decode, MESSAGE-INTEGRITY (HMAC-SHA1),
-  FINGERPRINT (CRC32), XOR-MAPPED-ADDRESS, `buildBindingSuccessResponse`.
-- `src/proto/ice.zig` — `TransportAddress`, `Candidate`, `Agent`, candidate pairing /
-  priority / checklist ordering (RFC 8445).
-- `src/proto/rtp_profile.zig` — RTP/RTCP header encode/decode, jitter + receiver-stats.
-- `src/proto/srtp.zig` — RFC 3711 transform: AES-CM KDF + AES-128-CTR encryption +
-  HMAC-SHA1-80 auth. **KDF validated against RFC 3711 Appendix B.3 vectors.**
-- `src/substrate/media_transport.zig` — the SFU control core (registry + routing).
-- `src/substrate/media_socket.zig` — live IPv4 `SOCK_DGRAM` socket + STUN/RTP demux.
-- `src/daemon/media_plane.zig` — threaded owner: socket + registry + pump thread + mutex.
-- `src/daemon/server.zig` — `MEDIA` command surface and the daemon wiring.
+| File | Role |
+| --- | --- |
+| `src/proto/stun.zig` | RFC 5389 STUN framing: decode, MESSAGE-INTEGRITY (HMAC-SHA1), FINGERPRINT (CRC32), XOR-MAPPED-ADDRESS, `buildBindingSuccessResponse`. |
+| `src/proto/ice.zig` | `TransportAddress`, `Candidate`, `Agent`, candidate pairing, priority, and checklist ordering (RFC 8445). |
+| `src/proto/rtp_profile.zig` | RTP/RTCP header encode/decode, jitter, and receiver-stats. |
+| `src/proto/srtp.zig` | RFC 3711 transform: AES-CM KDF, AES-128-CTR encryption, and HMAC-SHA1-80 auth. **KDF validated against RFC 3711 Appendix B.3 vectors.** |
+| `src/substrate/media_transport.zig` | SFU control core (registry + routing). |
+| `src/substrate/media_socket.zig` | Live IPv4 `SOCK_DGRAM` socket + STUN/RTP demux. |
+| `src/daemon/media_plane.zig` | Threaded owner: socket + registry + pump thread + mutex. |
+| `src/daemon/server.zig` | `MEDIA` command surface and daemon wiring. |
 
 ---
 
 ## 1. Architecture
 
-```
+```text
   IRC client (TLS)                         Orochi daemon
   ─────────────────                        ─────────────────────────────────
   MEDIA OFFER  ───────────────────────▶    mediaOffer:
@@ -63,14 +66,16 @@ Two planes, deliberately separate:
   off the client/S2S event loop. The two threads share `MediaTransport` under one coarse
   `std.atomic.Mutex` (STUN/keying are low-rate; the relay does one map lookup per packet).
 
-## 2. The endpoint registry (`MediaTransport`)
+## 2. Endpoint registry
 
-Per call participant, keyed by `"channel\x00participant"`:
+`MediaTransport` stores one endpoint per call participant, keyed by `"channel\x00participant"`:
 
-- `ufrag`/`pwd` — ICE short-term credentials (RFC 8445 §5.3) the server offers.
-- `remote` — the peer's bound UDP address, set once a STUN check authenticates.
-- `ssrc` — learned from the first RTP packet.
-- `rx_packets`/`rx_bytes` — relay metering.
+| Field | Meaning |
+| --- | --- |
+| `ufrag`/`pwd` | ICE short-term credentials (RFC 8445 §5.3) the server offers. |
+| `remote` | The peer's bound UDP address, set once a STUN check authenticates. |
+| `ssrc` | Learned from the first RTP packet. |
+| `rx_packets`/`rx_bytes` | Relay metering. |
 
 Three indexes: `by_ufrag` (STUN USERNAME demux), `by_addr` (RTP source → participant), and
 `group_keys` (channel → 30-byte SRTP master key+salt, one per call, dropped when empty).
@@ -78,7 +83,7 @@ Three indexes: `by_ufrag` (STUN USERNAME demux), `by_addr` (RTP source → parti
 Key operations: `allocate` (issue creds), `byServerUfrag` + `handleStunBinding` (auth +
 bind), `forwardFromSource` (RTP source → SFU relay set), `ensureGroupKey`, `statsForChannel`.
 
-## 3. ICE / STUN flow
+## 3. ICE/STUN flow
 
 1. `MEDIA OFFER` → server `allocate`s an endpoint and advertises `ufrag`/`pwd` + a host
    candidate (`media_host:media_port`) in the `TRANSPORT` line.
@@ -89,7 +94,7 @@ bind), `forwardFromSource` (RTP source → SFU relay set), `ensureGroupKey`, `st
    success response (XOR-MAPPED-ADDRESS = source, integrity, fingerprint).
 4. The bound address becomes the SFU forward target for that participant.
 
-## 4. SRTP (SDES keying)
+## 4. SRTP keying
 
 - The server generates **one SRTP master key+salt per call** (30 bytes, CSPRNG) on first
   `OFFER` and distributes it to every participant as `srtp=<base64>` in `TRANSPORT`. Safe
@@ -99,7 +104,7 @@ bind), `forwardFromSource` (RTP source → SFU relay set), `ensureGroupKey`, `st
   beyond distribution, and never sees plaintext.** This is the privacy-preserving model.
 - The key is released when the last participant leaves the call.
 
-## 5. RTP relay (the SFU)
+## 5. RTP relay
 
 The pump, for a non-STUN datagram:
 
@@ -110,7 +115,7 @@ The pump, for a non-STUN datagram:
 3. `forwardFromSource(source, len, ssrc)` → meters the sender and returns the bound remotes
    of every **other** connected participant in the call; `sendTo` each.
 
-## 6. Wire protocol (signaling)
+## 6. Signaling wire protocol
 
 All server→client lines: `:<server> NOTE MEDIA <#chan> <verb> …`.
 
@@ -123,15 +128,15 @@ All server→client lines: `:<server> NOTE MEDIA <#chan> <verb> …`.
 | `STATS` | →caller | `<nick> ice=<connected\|pending> ssrc=<hex> rx_pkts=<n> rx_bytes=<n>` |
 | `ROSTER`/`JOIN`/`LEAVE`/`MUTE`/… | →room | media-room presence (see `media_room.zig`) |
 
-Client commands: `MEDIA OFFER|ANSWER|PROFILE|STATS|JOIN|LEAVE|ROSTER|MUTE|UNMUTE|SPEAKING
+Clients send `MEDIA OFFER|ANSWER|PROFILE|STATS|JOIN|LEAVE|ROSTER|MUTE|UNMUTE|SPEAKING
 |BREAKOUT|POS|HAND|REACT|CAPTION|TRANSCRIPT <#chan> …`.
 
 ## 7. Config
 
-- `server.Config.media_port` — UDP port for the media plane (0 = ephemeral). The boot
-  path calls `media_plane.start`; a bind failure is non-fatal (IRC keeps serving).
-- `server.Config.media_host` — the IP advertised to clients as the server candidate.
-  (Not yet surfaced in the `config_format` TOML schema — wire it there when deploying.)
+| Key | Meaning |
+| --- | --- |
+| `server.Config.media_port` | UDP port for the media plane (0 = ephemeral). The boot path calls `media_plane.start`; a bind failure is non-fatal (IRC keeps serving). |
+| `server.Config.media_host` | The IP advertised to clients as the server candidate. Not yet surfaced in the `config_format` TOML schema — wire it there when deploying. |
 
 ## 8. Verified end-to-end
 
@@ -141,7 +146,7 @@ Client commands: `MEDIA OFFER|ANSWER|PROFILE|STATS|JOIN|LEAVE|ROSTER|MUTE|UNMUTE
 - SRTP: both participants receive the identical 30-byte `srtp` key; `srtp.zig` protect/
   unprotect round-trips and rejects tamper; KDF matches RFC 3711 B.3.
 
-## 9. Remaining arcs (each separately scoped)
+## 9. Remaining arcs
 
 - **DTLS-SRTP** — per-hop key agreement (a DTLS handshake on the media socket) as an
   alternative to SDES, for deployments that want forward secrecy on the media leg.

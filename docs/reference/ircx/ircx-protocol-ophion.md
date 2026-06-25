@@ -1,5 +1,6 @@
 # IRCX
-> IRCX adds opt-in extended IRC commands, channel modes, properties, access lists, events, and media policy integration.
+
+_Opt-in extended IRC commands, channel modes, properties, access lists, events, and media policy integration._
 
 > Historical reference only: this page describes the legacy Ophion C implementation
 > (`modules/m_ircx_*.c`). It is not the Orochi Zig implementation source of truth.
@@ -8,7 +9,7 @@
 
 ## Overview
 
-Ophion's IRCX support is implemented by `modules/m_ircx_*.c`. The base module registers the `IRCX` server capability, `IRCX` and `ISIRCX` client commands, and ISUPPORT tokens `IRCX`, `MAXCODEPAGE`, and `MAXLANGUAGE`.
+Ophion's IRCX support is implemented by `modules/m_ircx_*.c`. The base module registers the `IRCX` server capability, the `IRCX` and `ISIRCX` client commands, and the ISUPPORT tokens `IRCX`, `MAXCODEPAGE`, and `MAXLANGUAGE`.
 
 IRCX is explicit opt-in for clients. A client enters IRCX mode by sending `IRCX` or `ISIRCX`; the server sets IRCX/NAMESX state and replies with `RPL_IRCX`. Current source does not force IRCX mode merely because a client becomes an IRC operator.
 
@@ -36,7 +37,7 @@ IRCX is explicit opt-in for clients. A client enters IRCX mode by sending `IRCX`
 
 Server-only sync commands include `TACCESS`, `BTACCESS`, `TPROP`, `BTPROP`, `NOCHAN_*`, `NONICK_*`, `GRANT_*`, and `GAG_*`.
 
-## AUTH Syntax
+## AUTH syntax
 
 ```irc
 AUTH PLAIN I :AGFsaWNlAHNlY3JldA==
@@ -45,9 +46,9 @@ AUTH SCRAM-SHA-256 S :<client-final>
 AUTH *
 ```
 
-The sequence token must be `I` for an initial step or `S` for a continuation step, except abort accepts `AUTH *`.
+The sequence token must be `I` for an initial step or `S` for a continuation step. Abort uses `AUTH *`.
 
-## Channel Modes
+## Channel modes
 
 | Mode | Default | Description |
 | --- | --- | --- |
@@ -72,7 +73,7 @@ The sequence token must be `I` for an initial step or `S` for a continuation ste
 
 Built-in non-IRCX channel modes still exist, including `+c` no color, `+C` no CTCP, `+S` TLS-only, `+O` oper-only, and `+A` admin-only.
 
-## Member Modes
+## Member modes
 
 | MODEX Name | Default | Description |
 | --- | --- | --- |
@@ -88,7 +89,7 @@ MODEX #team,alice +OWNER
 
 ## Properties
 
-`PROP` supports legacy positional syntax and explicit verbs:
+`PROP` supports both legacy positional syntax and explicit verbs:
 
 ```irc
 PROP #team
@@ -111,7 +112,7 @@ PROP #team SET CLIENT :ophion-web
 
 ## Access
 
-Channel `ACCESS` levels are:
+Channel `ACCESS` levels:
 
 | Level | Default | Description |
 | --- | --- | --- |
@@ -143,7 +144,7 @@ ACCESS * CLEAR GAG
 
 ## Events
 
-`EVENT` is oper-oriented. Supported event types are:
+`EVENT` is oper-oriented. Supported event types:
 
 | Type | Default | Description |
 | --- | --- | --- |
@@ -163,7 +164,7 @@ EVENT DELETE CHANNEL
 EVENT CLEAR
 ```
 
-## LISTX Filters
+## LISTX filters
 
 ```irc
 LISTX >5,TOPICONLY,#dev*
@@ -177,9 +178,9 @@ LISTX >5,TOPICONLY,#dev*
 | `TOPICONLY` | Optional | Only channels with topics. |
 | `#pattern` | Optional | Glob against channel name. |
 
-## Media Integration
+## Media integration
 
-LADON media policy uses IRCX properties and access entries. Use properties for the current unambiguous policy path:
+LADON media policy uses IRCX properties and access entries. Use properties for the current, unambiguous policy path:
 
 ```irc
 PROP #team LADON.MEDIA.VOICE :members
@@ -188,10 +189,10 @@ PROP #team LADON.MEDIA.SCREEN :owner
 ACCESS #team ADD alice!*@* VOICE
 ```
 
-See [LADON Media](ladon/media.md) for frame-level details.
+See `LADON Media` for frame-level details.
 
-## Related Pages
+## Related pages
 
-- [LADON Overview](ladon/overview.md)
-- [LADON Media](ladon/media.md)
-- [VEIL Security](veil-security.md)
+- `LADON Overview`
+- `LADON Media`
+- `VEIL Security`

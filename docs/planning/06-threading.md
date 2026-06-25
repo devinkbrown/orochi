@@ -1,22 +1,16 @@
-# 06 — Threading & Concurrency (Orochi)
+# 06 — Threading and concurrency
 
-> Studied ophion/libop's model, then designed a better one for an io_uring-native,
-> DST-first, mesh-native daemon. This is the plan the M1→M3 server builds toward.
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
 
-## What ophion/libop does (the reference)
+This document records the threading model derived from ophion/libop and the io_uring-native, DST-first, mesh-native design the M1→M3 server builds toward.
 
-1. **Dedicated epoll poll-thread** (`op_iothread.h`): because `epoll_wait()` blocks,
-   ophion runs it on its own thread that pushes ready events into a lock-free SPSC
-   ring and wakes the main thread via eventfd. The main thread dispatches handlers
-   and fires timers concurrently with the next `epoll_wait`. This is a *workaround
-   for epoll's blocking nature*.
-2. **Work-stealing thread pool** (`op_thread_pool.h`): N workers, each a chase-lev
-   deque + a per-worker MPSC Treiber-stack inbox; lock-free submit, affinity submit
-   (`key → worker`), steal from random peers, eventfd wake. CPU-heavy work is
-   offloaded here off the main dispatch thread.
-3. Net effect: one central protocol/dispatch thread + a poll thread + an offload
-   pool. The single dispatch thread is the structural bottleneck; sharing of client
-   state is guarded by per-fd `pflags_lock`.
+## What ophion/libop does
+
+| Area | Reference behavior |
+| --- | --- |
+| Dedicated epoll poll-thread (`op_iothread.h`) | Because `epoll_wait()` blocks, ophion runs it on its own thread that pushes ready events into a lock-free SPSC ring and wakes the main thread via eventfd. The main thread dispatches handlers and fires timers concurrently with the next `epoll_wait`. This is a *workaround for epoll's blocking nature*. |
+| Work-stealing thread pool (`op_thread_pool.h`) | N workers, each a chase-lev deque + a per-worker MPSC Treiber-stack inbox; lock-free submit, affinity submit (`key → worker`), steal from random peers, eventfd wake. CPU-heavy work is offloaded here off the main dispatch thread. |
+| Net effect | One central protocol/dispatch thread + a poll thread + an offload pool. The single dispatch thread is the structural bottleneck; sharing of client state is guarded by per-fd `pflags_lock`. |
 
 ## Why Orochi can do better
 
@@ -25,20 +19,20 @@
   does. So Orochi **needs no separate poll-thread** — that whole layer disappears.
 - **Share-nothing sharding beats a central dispatch thread + locks.** One central
   protocol thread is a bottleneck and forces `pflags_lock`. Instead, partition the
-  world: each shard owns a disjoint set of connections AND the channels/state for
+  world: each shard owns a disjoint set of connections and the channels/state for
   those connections, so the hot path takes **zero locks**.
 - **Mesh-native cross-shard.** A channel whose members span shards is the same
   problem as a channel spanning servers — Orochi already has the Suimyaku CRDT +
-  Sazanami gossip. Shards can be treated as in-process mesh peers, so ONE model
+  Sazanami gossip. Shards can be treated as in-process mesh peers, so one model
   covers intra-process and S2S. (Aspirational end-state; the message-passing
   primitive is the immediate win.)
 - **DST-first must survive.** All of this stays behind the `Reactor` seam: tests run
-  the whole daemon on ONE deterministic thread via `SimReactor`; production uses the
+  the whole daemon on one deterministic thread via `SimReactor`; production uses the
   threaded io_uring backend. Determinism is not sacrificed for parallelism.
 
 ## Orochi design: share-nothing sharded reactors
 
-```
+```text
             ┌──────── Shard 0 ────────┐   ┌──────── Shard 1 ────────┐
  thread 0   │ io_uring  +  owned conns│   │ io_uring  +  owned conns│   thread 1
             │ owned channels/world    │   │ owned channels/world    │
@@ -59,9 +53,9 @@
    the wake path). The target shard drains its inbox in its own loop and writes to
    its conn. Inbox is a bounded MPMC ring (substrate/queue.zig lineage).
 4. **Shared channel state across shards** uses the Suimyaku delta-CRDT + Sazanami
-   membership — the SAME code as S2S. A shard is, conceptually, a mesh node.
+  membership — the same code as S2S. A shard is, conceptually, a mesh node.
 5. **No background "offload pool" by default.** CPU-heavy one-offs (PBKDF2 on SASL,
-   ML-KEM keygen) run on a small bounded helper pool ONLY for genuinely blocking/
+   ML-KEM keygen) run on a small bounded helper pool only for genuinely blocking/
    expensive work, kept off the reactor threads; everything else stays on-shard.
 6. **Backpressure**: per-conn send credit (already in the frame layer) + bounded
    inbox rings; a slow consumer cannot stall a producer shard (drop-to-close policy).
@@ -70,9 +64,9 @@
 
 - `Reactor` already abstracts `nowMillis`; extend it to the full submit/poll surface
   (accept/recv/send/timeout/msg_ring) so daemon logic never touches a syscall.
-- `SimReactor`: single-thread, deterministic, injected clock/RNG/network — runs ALL
+- `SimReactor`: single-thread, deterministic, injected clock/RNG/network — runs all
   shards cooperatively in one thread for tests (seed-replayable). This is how the
-  end-to-end command tests run WITHOUT real threads or sockets, fixing today's
+  end-to-end command tests run without real threads or sockets, fixing today's
   single-thread blocking-io_uring deadlock in the in-process tests.
 - `SystemReactor`: the threaded io_uring backend above.
 - One shard count of **1** must behave identically to N (just slower) — invariant

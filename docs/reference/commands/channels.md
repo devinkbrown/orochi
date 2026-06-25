@@ -1,11 +1,13 @@
-# Channel Commands
+# Channel commands
 
-The channel command module registers the base membership and moderation commands (`src/daemon/modules/channel_ops.zig:51`). Extended service commands for channel administration are registered in `services.ext` (`src/daemon/modules/services_ext.zig:47`).
+*Membership, moderation, topic and mode control, plus extended channel-administration services.*
+
+The channel command module registers the base membership and moderation commands (`src/daemon/modules/channel_ops.zig:51`). Extended channel-administration service commands are registered in `services.ext` (`src/daemon/modules/services_ext.zig:47`).
 
 ## JOIN
 
 - Syntax: `JOIN <#chan[,#chan...]> [key[,key...]]`
-- Description: Joins channels from positional comma lists. `joinOne` enforces channel name length, `CHANLIMIT`, Warden quarantine, TLS/account/invite/key/bans, join throttle, limit forwarding, IRCX tier keys, automatic topic/NAMES, bouncer rewind, and mesh membership propagation.
+- Description: Joins channels from positional comma lists. `joinOne` enforces channel-name length, `CHANLIMIT`, Warden quarantine, TLS/account/invite/key/ban gates, join throttle, limit forwarding, IRCX tier keys, automatic topic and NAMES, bouncer rewind, and mesh membership propagation.
 - Privileges: Registered client.
 - Parameters: Channel list; optional key list.
 - Replies: `JOIN` broadcast, `RPL_TOPIC 332` or `RPL_NOTOPIC 331`, `RPL_NAMREPLY 353`, `RPL_ENDOFNAMES 366`; may emit `ERR_LINKCHANNEL 470` for forward.
@@ -38,7 +40,7 @@ The channel command module registers the base membership and moderation commands
 ## MODE
 
 - Syntax: `MODE <#channel|nick|ISIRCX> [modes [args...]]`
-- Description: Channel mode query/set, own user-mode query/set, IRCX `MODE ISIRCX` discovery, and oper-only user `+z` gag control. Channel mode query returns mode letters and hides `+k/+l` values from non-members. Channel setting supports member tiers, list modes, boolean flags, key/limit, throttle, forward, and IRCX extension flags.
+- Description: Handles channel mode query and set, own user-mode query and set, IRCX `MODE ISIRCX` discovery, and oper-only user `+z` gag control. A channel mode query returns mode letters and hides `+k` and `+l` values from non-members. Channel setting supports member tiers, list modes, boolean flags, key and limit, throttle, forward, and IRCX extension flags.
 - Privileges: Registered client; channel mutations require channel privilege; some extension flags and user `+z` require oper.
 - Parameters: Target plus optional mode string and arguments.
 - Replies: `RPL_CHANNELMODEIS 324`, `RPL_UMODEIS 221`, list numerics (`367/368`, `346/347`, `348/349`, `728/729`), `RPL_IRCX 800`, or `MODE` broadcasts.
@@ -115,7 +117,7 @@ The channel command module registers the base membership and moderation commands
 ## AKICK
 
 - Syntax: `CHANNEL AKICK <#channel> <ADD|DEL|LIST> [mask] [reason...]`
-- Description: Registered-channel auto-kick list, managed via the services `CHANNEL` command. Entries are persisted to the services store and mirrored into the in-memory join gate; a matching mask (or `account:<name>` mask) is denied entry at JOIN — even when re-creating an empty registered channel. There is no longer a separate top-level `AKICK` command; the old in-memory-only variant was removed to avoid a divergent second store.
+- Description: Manages the registered-channel auto-kick list through the services `CHANNEL` command. Entries are persisted to the services store and mirrored into the in-memory join gate; a matching mask (or `account:<name>` mask) is denied entry at JOIN, even when re-creating an empty registered channel. There is no separate top-level `AKICK` command: the earlier in-memory-only variant was removed to avoid a divergent second store.
 - Privileges: Logged-in services account with AKICK-management access (founder/admin) on the registered channel.
 - Parameters: Channel, subcommand, optional mask/reason.
 - Replies: Server `NOTICE` list/add/delete responses.

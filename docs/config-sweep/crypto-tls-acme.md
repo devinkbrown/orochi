@@ -1,13 +1,14 @@
-# Orochi config sweep — crypto / TLS / ACME (READ-ONLY survey)
+# Orochi crypto, TLS, and ACME config sweep
+
+Read-only survey of operational and performance-relevant constants in Orochi crypto, TLS, and ACME code.
 
 Scope: `src/crypto/*` (named files), `src/daemon/acme_*.zig`, `src/proto/tls_*.zig`, `src/proto/acme_*.zig`.
-Only operationally/perf-meaningful hardcoded literals are listed. Cryptographic domain constants are excluded (see note at bottom).
 
-Proposed sections: `[acme]`, `[tls]`.
+The survey lists only operationally meaningful or performance-meaningful hardcoded literals. Cryptographic domain constants are excluded; see "Constants left in code."
 
----
+Proposed config sections: `[acme]`, `[tls]`.
 
-## `[acme]`
+## ACME settings (`[acme]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
@@ -41,7 +42,7 @@ Proposed sections: `[acme]`, `[tls]`.
 
 ---
 
-## `[tls]`
+## TLS settings (`[tls]`)
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |-----------|------------------|---------------|------------------|-------------------|------|---------|----------|
@@ -54,9 +55,9 @@ Proposed sections: `[acme]`, `[tls]`.
 
 Note: Tsumugi prekey validity is driven by caller-supplied `ttl_ms`/`now_ms` (SignedPrekey.generate, tsumugi_handshake.zig:98/109-110) — no hardcoded default; route through `tls.tsumugi_prekey_ttl_ms` (duration) when a default is introduced. Currently NOT hardcoded.
 
----
+## Constants left in code
 
-## Left in code (cryptographic / protocol domain constants — intentionally NOT lifted)
+The following cryptographic and protocol-domain constants stay in code intentionally.
 
 - TLS record framing maxima: `max_plaintext_len = 16*1024`, `max_ciphertext_len = +256`, `record_header_len = 5` (tls_record.zig:12-14) — RFC 8446 record-layer constants.
 - TLS wire-format field maxima sized to field width: `tls_psk.zig` (`maxInt(u16)`/`maxInt(u8)`), `tls_cookie.zig` (`maxInt(u16)`), `tls_session_ticket.zig` (`0xff`/`0xffff`), `tls_cert_message.zig` (`max_u24`/`max_u16`), `tls_alpn.max_name_len`, `tls_key_update.zig` (`secret_len=32`, `encoded_len=5`) — protocol-bound, must stay in code.

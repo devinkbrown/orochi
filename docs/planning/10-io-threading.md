@@ -1,31 +1,26 @@
-# 10 — I/O & threading model (single- and multi-threaded, awesome at both)
+# 10 — I/O and threading model
 
-> Deepens [06-threading.md](06-threading.md) with current (2025–26) prior art.
-> Mandate: redesign now to avoid bad decisions; one code path that is excellent
-> **single-threaded** (deterministic sim, small/edge deployments) AND scales
-> **share-nothing thread-per-core** to many cores — no rewrite between them.
-> Everything behind the DST `Reactor` seam.
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
 
-## 0. Prior art (what we adopt)
+Extends [06-threading.md](06-threading.md) with current (2025–26) prior art and defines one `Reactor`-backed path for deterministic single-threaded operation and share-nothing thread-per-core scaling.
 
-- **Thread-per-core, share-nothing** (Seastar → ScyllaDB/Redpanda; Glommio): pin
-  one thread per core, partition state by shard, **no shared mutable state on the
-  hot path**, communicate by message passing. Wins cache locality + tail latency;
-  cross-core access is a ~100× penalty vs local cache. ([seastar], [glommio])
-- **Glommio's 3-ring-per-thread**: a *main* ring, a *latency* ring, and a *poll*
-  ring per executor → QoS separation without locks. ([glommio])
-- **Work-stealing vs TPC debate (2025):** TPC is best for homogeneous I/O-bound
-  work and predictable tails; work-stealing wins for *heterogeneous, CPU-heavy*
-  tasks where a shard can be stuck behind one fat task. The right answer is
-  **both, layered** (below). ([tpc-debate], [tpc-tail])
-- **LMAX Disruptor / single-writer principle / mechanical sympathy**: array-backed
-  ring buffers, lock-free, **single writer per datum** to avoid cache-line
-  contention; "any serializable domain = one writer with an MPSC queue in front."
-  ~3 orders of magnitude lower latency than locked queues. ([disruptor], [single-writer])
+Mandate: redesign now to avoid bad decisions; keep one code path that is excellent
+**single-threaded** (deterministic sim, small/edge deployments) and scales
+**share-nothing thread-per-core** to many cores. Do not require a rewrite between
+modes; keep everything behind the DST `Reactor` seam.
+
+## 0. Prior art adopted
+
+| Prior art | Design point |
+|---|---|
+| **Thread-per-core, share-nothing** (Seastar → ScyllaDB/Redpanda; Glommio) | Pin one thread per core, partition state by shard, keep **no shared mutable state on the hot path**, and communicate by message passing. This wins cache locality + tail latency; cross-core access is a ~100× penalty vs local cache. ([seastar], [glommio]) |
+| **Glommio's 3-ring-per-thread** | Use a *main* ring, a *latency* ring, and a *poll* ring per executor for QoS separation without locks. ([glommio]) |
+| **Work-stealing vs TPC debate (2025)** | TPC is best for homogeneous I/O-bound work and predictable tails; work-stealing wins for *heterogeneous, CPU-heavy* tasks where a shard can be stuck behind one fat task. Use **both, layered**. ([tpc-debate], [tpc-tail]) |
+| **LMAX Disruptor / single-writer principle / mechanical sympathy** | Use array-backed ring buffers, lock-free queues, and **single writer per datum** to avoid cache-line contention; "any serializable domain = one writer with an MPSC queue in front." This is ~3 orders of magnitude lower latency than locked queues. ([disruptor], [single-writer]) |
 
 ## 1. The model: shards over a Reactor seam
 
-```
+```text
 Server = N Shards.   N=1 ⇒ single-threaded.   N=cores ⇒ thread-per-core.
 Each Shard owns:  one Reactor (io_uring set) · its connections · its slice of
                   world state · its CRDT replica view · its timers.
@@ -37,15 +32,20 @@ Shards never touch each other's memory. They exchange MESSAGES only.
   mode — it is N=1 with the message bus short-circuited to direct calls.
 - **`Reactor` is the seam.** Production = `IoUringReactor` (Linux) / `KqueueReactor`
   (BSD) / `IocpReactor` (Windows). Tests/sim = `SimReactor` (cooperative, virtual
-  clock, deterministic) — see [Ryūsen transport](09-s2s-protocol.md §Ryūsen).
+  clock, deterministic) — see `Ryūsen transport`.
   Single-thread + SimReactor = fully deterministic record/replay.
 
-## 2. Per-shard reactor (the hot path) — zero locks
+## 2. Per-shard reactor hot path
 
-- One io_uring per shard, **Glommio-style multi-ring** mapped to our bands:
-  - *control ring* — accept, control/membership frames, timers (lowest latency).
-  - *bulk ring* — IRC events, anti-entropy, regular send/recv.
-  - *poll ring* — NAPI busy-poll / SQPOLL for the latency-critical sockets.
+One io_uring per shard uses a **Glommio-style multi-ring** layout mapped to Orochi
+bands:
+
+| Ring | Role |
+|---|---|
+| *control ring* | accept, control/membership frames, timers (lowest latency). |
+| *bulk ring* | IRC events, anti-entropy, regular send/recv. |
+| *poll ring* | NAPI busy-poll / SQPOLL for the latency-critical sockets. |
+
 - **io_uring features**: multishot accept/recv (fewer syscalls), registered
   files + buffers, **SEND_ZC** + ZC-Rx (zero copy), batched `submit()`,
   optional SQPOLL. Already partly live (accept/recv/send); ZC is the upgrade.
@@ -54,7 +54,7 @@ Shards never touch each other's memory. They exchange MESSAGES only.
   no false sharing. Per-shard structs are **cache-line aligned**; the conn table
   is pre-reserved (already done — prevents realloc moving in-flight buffers).
 
-## 3. Cross-shard communication — messages, not memory
+## 3. Cross-shard communication
 
 - **Linux fast path: `IORING_OP_MSG_RING`** — post a completion directly into
   another shard's ring (kernel ring→ring), no eventfd, no shared queue, no lock.
@@ -62,22 +62,20 @@ Shards never touch each other's memory. They exchange MESSAGES only.
 - **Portable path / fallback: bounded MPSC ring per shard** (Disruptor discipline:
   array-backed, single-consumer = the owning shard, producers are other shards),
   with a futex/eventfd wake only when the consumer is parked.
-- **State ownership rule** (single-writer at the system level):
-  - **Connections** → owned by the shard that accepted them (SO_REUSEPORT fans
-    accepts across shards; or accept-on-one + handoff via MSG_RING).
-  - **Channels/world entities** → a **home shard** = `hash(channel) % N`. A
-    PRIVMSG to a non-local channel is a message to its home shard, which fans out
-    to local members and forwards to other shards holding members. No shared
-    channel struct, ever.
-  - **CRDT** → each shard is a Suimyaku replica lane; cross-shard convergence uses
-    the *same* δ-CRDT/Goryu-Sync machinery as cross-node (one model, intra- and
-    inter-process). Shards are in-process mesh peers.
+
+State follows a single-writer rule at the system level:
+
+| State | Ownership rule |
+|---|---|
+| **Connections** | Owned by the shard that accepted them. SO_REUSEPORT fans accepts across shards; accept-on-one + handoff via MSG_RING is also valid. |
+| **Channels/world entities** | A **home shard** owns each entity: `hash(channel) % N`. A PRIVMSG to a non-local channel becomes a message to its home shard, which fans out to local members and forwards to other shards holding members. No shared channel struct, ever. |
+| **CRDT** | Each shard is a Suimyaku replica lane; cross-shard convergence uses the *same* δ-CRDT/Goryu-Sync machinery as cross-node (one model, intra- and inter-process). Shards are in-process mesh peers. |
 
 ## 4. The hybrid: TPC hot path + work-stealing offload pool
 
 The 2025 critique of pure TPC is real: a single fat task (TLS/X-Wing handshake,
 RIBLT decode, media transcode, BLAKE3 over a large object) can stall a shard and
-spike tail latency. Orochi answer:
+spike tail latency. Orochi's answer:
 
 - **Hot reactors stay strictly thread-per-core** (I/O, parsing, routing, CRDT
   joins — all short, homogeneous, cache-local).

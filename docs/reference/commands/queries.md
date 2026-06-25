@@ -1,6 +1,8 @@
-# User Query Commands
+# User query commands
 
-These commands are registered by `user.query` (`src/daemon/modules/user_query.zig:71`) plus disabled/heartbeat helpers from `feature.misc` (`src/daemon/modules/feature_misc.zig:56`).
+*Presence, identity, and channel lookups, plus away state, realname changes, and built-in help.*
+
+These commands are registered by `user.query` (`src/daemon/modules/user_query.zig:71`), along with disabled and heartbeat helpers from `feature.misc` (`src/daemon/modules/feature_misc.zig:56`).
 
 ## ISON
 
@@ -27,7 +29,7 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 ## WHOIS
 
 - Syntax: `WHOIS [server] <nick>`
-- Description: Emits a local WHOIS sequence. It includes account, away, channels, oper/admin visibility, bot mode, certificate fingerprint, TLS status, actual host for opers/self, and optional GeoIP text for opers/self.
+- Description: Emits a local WHOIS sequence covering account, away state, channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP text (for opers and self).
 - Privileges: Registered client.
 - Parameters: Target nick is the last parameter.
 - Replies: `RPL_WHOISUSER 311`, `RPL_WHOISSERVER 312`, `RPL_WHOISOPERATOR 313`, `RPL_WHOISIDLE 317`, `RPL_ENDOFWHOIS 318`, `RPL_WHOISCHANNELS 319`, `RPL_WHOISSPECIAL 320`, `RPL_WHOISLOGGEDIN 330`, `RPL_WHOISCERTFP 276`, `RPL_WHOISSECURE 671`, `RPL_WHOISACTUALLY 338`, plus other WHOIS numerics produced by the writer.
@@ -49,7 +51,7 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 ## WHO
 
 - Syntax: `WHO <channel|nick> [%fields[,token]]`
-- Description: Plain WHO emits channel or nick rows. If the second parameter starts with `%` and parses as WHOX, the handler emits WHOX rows instead.
+- Description: Plain WHO emits channel or nick rows. When the second parameter starts with `%` and parses as WHOX, the handler emits WHOX rows instead.
 - Privileges: Registered client.
 - Parameters: Target; optional WHOX selector.
 - Replies: Plain `RPL_WHOREPLY 352` and `RPL_ENDOFWHO 315`; WHOX `RPL_WHOSPCRPL 354` and `RPL_ENDOFWHO 315`.
@@ -71,7 +73,7 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 ## AWAY
 
 - Syntax: `AWAY [:message]`
-- Description: Sets or clears the caller's away message. It is also accepted before registration only when the `pre-away` capability is present.
+- Description: Sets or clears the caller's away message. It is accepted before registration only when the `pre-away` capability is present.
 - Privileges: Registered client, or pre-registration client with `pre-away`.
 - Parameters: Optional away message; no parameter clears away.
 - Replies: `RPL_NOWAWAY 306`, `RPL_UNAWAY 305`; away-notify fanout to capable peers.
@@ -115,7 +117,7 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 ## AUTOJOIN
 
 - Syntax: `AUTOJOIN <LIST|ADD|DEL|CLEAR> [#channel]`
-- Description: Manages the logged-in account's configured autojoin list; it is applied after account login.
+- Description: Manages the logged-in account's autojoin list, which the daemon applies after account login.
 - Privileges: Registered client; account login required inside handler.
 - Parameters: Subcommand and optional channel.
 - Replies: Server `NOTICE` responses.
@@ -126,7 +128,7 @@ These commands are registered by `user.query` (`src/daemon/modules/user_query.zi
 ## GROUP
 
 - Syntax: `GROUP ...`
-- Description: Account grouping command surface. Current handler delegates to the group implementation and emits its current responses.
+- Description: Account-grouping command surface. The handler delegates to the group implementation and emits its responses.
 - Privileges: Registered client.
 - Parameters: Parsed by handler.
 - Replies: Server `NOTICE` or failure replies from handler.

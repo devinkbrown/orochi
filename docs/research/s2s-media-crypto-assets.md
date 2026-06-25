@@ -1,4 +1,6 @@
-# S2S Media/Crypto Asset Study: opssl and kagura
+# S2S media/crypto asset study: opssl and kagura
+
+*Historical design/research notes mapping opssl and kagura assets to Orochi crypto, transport, and media work.*
 
 This is a design mapping, not an import plan. `opssl` and `kagura` are
 owner-built C reference libraries from the Ophion ecosystem. Orochi remains
@@ -18,15 +20,15 @@ The relevant Orochi context is:
 - Client surfaces remain IRC and web. Media is a later band, but the core frame
   and transport seams must not preclude it.
 
-## Source Inventory Read
+## Source inventory read
 
 ### opssl
 
 Read scope:
 
-- `/home/kain/opssl/README.md`
-- `/home/kain/opssl/include/opssl/*.h`
-- `/home/kain/opssl/doc/*.txt`
+- `opssl/README.md`
+- `opssl/include/opssl/*.h`
+- `opssl/doc/*.txt`
 - targeted source inventory for `src/crypto/*`, `src/tls/*`, and `src/x509/*`
 
 Important actual module names and capabilities:
@@ -61,13 +63,13 @@ Notable APIs:
 
 Read scope:
 
-- `/home/kain/ophion/subprojects/kagura/README.md`
-- `/home/kain/ophion/subprojects/kagura/OPCODEC.md`
-- `/home/kain/ophion/subprojects/kagura/BWE_INTEGRATION.md`
-- `/home/kain/ophion/subprojects/kagura/include/kagura/*.h`
-- active Ophion LADON module references under `/home/kain/ophion/docs/reference/modules/`
+- `ophion/subprojects/kagura/README.md`
+- `ophion/subprojects/kagura/OPCODEC.md`
+- `ophion/subprojects/kagura/BWE_INTEGRATION.md`
+- `ophion/subprojects/kagura/include/kagura/*.h`
+- active Ophion LADON module references under `ophion/docs/reference/modules/`
 - historical LADON media wire doc found only in
-  `/home/kain/ophion/.claude/worktrees/.../doc/technical/ladon-media-wire.md`
+  `ophion/.claude/worktrees/.../doc/technical/ladon-media-wire.md`
 
 The active Ophion tree has LADON source and module references, but the
 `doc/technical/ladon-media-wire.md` path named by kagura is not present in the
@@ -104,9 +106,9 @@ Notable APIs and wire facts:
 - `netadapt` tracks RTT/loss/jitter, Kalman-like BWE, stable/probing/draining/
   recovery, codec quality and FEC recommendations
 
-## opssl -> Orochi Crypto and Transport
+## opssl -> Orochi crypto and transport
 
-### What To Port To Zig
+### What to port to Zig
 
 Port algorithms and discipline, not the C API shape.
 
@@ -179,7 +181,7 @@ Port algorithms and discipline, not the C API shape.
   channel. TLS exists for client IRC TLS, HTTPS/WebSocket/WebTransport
   termination, and optional outer carrier deployments.
 
-### Tsumugi Wire/State To Carry
+### Tsumugi wire/state to carry
 
 The Tsumugi handshake needs to carry:
 
@@ -219,7 +221,7 @@ The snapshot itself must be encrypted with a daemon-local upgrade key, include a
 monotonic snapshot id, and be single-use. Do not move raw key blobs through
 normal logs, crash dumps, or unpinned heap memory.
 
-### kTLS In Ryusen
+### kTLS in Ryusen
 
 `opssl_ktls_promote`, `opssl_ktls_promote_late`, `opssl_ktls_adopt`, and
 `opssl_ktls_extract_keys` are the exact operational blueprint.
@@ -253,7 +255,7 @@ traffic secrets, IVs, sequence numbers, pending records, and handshake state.
 In Orochi this should be `Tls13SessionSnapshot`, sealed and versioned like
 `TsumugiLinkSnapshot`.
 
-### Session Export/Import And `/UPGRADE`
+### Session export/import and `/UPGRADE`
 
 opssl's `session_export` option and `opssl_conn_export`/`opssl_conn_import`
 show the right live-migration story:
@@ -272,19 +274,21 @@ migration: Tsumugi ratchet, Ryusen transport, Goryu anti-entropy work, and media
 track control state must move as one coherent object. The invariant is "no
 re-handshake, no replay window reset, no lost causal position."
 
-## kagura -> Orochi Media Bands
+## kagura -> Orochi media bands
 
-### Band Layout
+### Band layout
 
 Keep the S2S band model from the current design:
 
-- band 0: control
-- band 1: membership
-- band 2: anti-entropy
-- band 3: IRC/events
-- band 4: services
-- band 5: media control
-- bands >=64: media tracks
+| Band | Purpose |
+| --- | --- |
+| 0 | control |
+| 1 | membership |
+| 2 | anti-entropy |
+| 3 | IRC/events |
+| 4 | services |
+| 5 | media control |
+| >=64 | media tracks |
 
 Map kagura/LADON as follows:
 
@@ -299,7 +303,7 @@ Map kagura/LADON as follows:
 Do not preserve LADON's 8-bit media frame type registry as Orochi's identity
 model. Treat those type bytes as source taxonomy only.
 
-### SID-Free, NodeId-Based Media Identity
+### SID-free, node_id-based media identity
 
 LADON data frames carry nick, channel, `sender_id`, seq, FEC info, and encrypted
 payload. Orochi should separate identity from hot-path compact handles:
@@ -339,7 +343,7 @@ Nick and channel names should not be repeated in every media data frame. Band 5
 announces bind track to user/channel. Bands >=64 carry compact track ids,
 sequence, timestamps, and payload.
 
-### OPVOX Audio Mapping
+### OPVOX audio mapping
 
 OPVOX is a strong fit for a later media band:
 
@@ -368,7 +372,7 @@ Spatial audio (`opfield`) is a reason to keep band 5 extensible. Position,
 mixing intent, HOA/binaural mode, and listener capability changes are control
 updates. Audio samples stay on media bands.
 
-### OPVIS Video Mapping
+### OPVIS video mapping
 
 OPVIS maps cleanly to media bands:
 
@@ -394,7 +398,7 @@ VideoFrameTiming {
 }
 ```
 
-### Browser Path
+### Browser path
 
 Keep both browser paths:
 
@@ -420,7 +424,7 @@ Server path:
 - Mixing, recording, moderation preview, transcription, and transcoding are
   separate services. Those can run in OroWasm sandboxes or external workers.
 
-### Does kagura `secure` Compose With Tsumugi?
+### Does kagura `secure` compose with Tsumugi?
 
 For normal S2S relay, kagura `secure` is redundant with Tsumugi link AEAD.
 Double-encrypting every frame adds overhead and failure modes without improving
@@ -457,7 +461,7 @@ If `opsec` is used, it must be domain-separated from Tsumugi:
 But do not let `opsec` drive the core S2S ratchet. Tsumugi is the mesh security
 authority.
 
-### FEC And RaptorQ
+### FEC and RaptorQ
 
 kagura `fec` is useful as a first local-recovery tool:
 
@@ -484,7 +488,7 @@ Interplay:
   packet loss.
 - Band 5 should negotiate `fec = none | xor_low | xor_med | raptorq` per track.
 
-### BWE Feeding L4S/ECN Congestion Control
+### BWE feeding L4S/ECN congestion control
 
 kagura `netadapt` provides useful input signals: RTT, jitter, loss, acked bytes,
 bandwidth estimate, burst-loss flag, and target bitrate recommendation.
@@ -513,9 +517,9 @@ For QUIC/WebTransport media bands:
 The mesh scheduler must protect bands 0-4. Media congestion must never starve
 control, membership, anti-entropy, IRC events, or services.
 
-## Clean-Room Reuse Policy
+## Clean-room reuse policy
 
-### Pure-Zig Port
+### Pure-Zig port
 
 Core infrastructure must be pure Zig:
 
@@ -534,7 +538,7 @@ Reason: these pieces own trust boundaries, key material, admission, live
 migration, and mesh correctness. They must be inspectable, testable, and
 deterministic inside Orochi.
 
-### OroWasm Sandbox
+### OroWasm sandbox
 
 Candidate WASM components:
 
@@ -564,7 +568,7 @@ no access to Tsumugi root keys
 The server should not require codec WASM to relay media. Decode only when a
 policy-authorized service needs it.
 
-### Historical/Reference Only
+### Historical/reference only
 
 Do not port directly:
 
@@ -576,16 +580,16 @@ Do not port directly:
 - TLS 1.2 state machine unless a later compatibility decision explicitly adds it
 - kagura's `secure` as the default S2S encryption layer
 
-## Phased Plan
+## Phased plan
 
-### Phase 0: Documentation And Tests
+### Phase 0: documentation and tests
 
 - Keep this document as the asset map.
 - Add future KAT/test inventory for ML-KEM, X25519, X-Wing combiner, X.509
   fingerprints, Tsumugi snapshot import/export, media control schemas.
 - Confirm license policy before any line-level porting from GPL C sources.
 
-### Phase 1: Crypto Foundation
+### Phase 1: crypto foundation
 
 - Implement `crypto/mlkem.zig` with ML-KEM-768 KATs.
 - Implement `crypto/xwing.zig` combiner and transcript tests.
@@ -595,28 +599,28 @@ Do not port directly:
 - Add exporter labels for `media_e2ee`, SASL channel binding, and upgrade
   snapshots.
 
-### Phase 2: Tsumugi Handshake And Migration
+### Phase 2: Tsumugi handshake and migration
 
 - Add Tsumugi handshake wire schemas over current `s2s_frame`.
 - Bind MeshPass, `node_id`, realm root, negotiated bands, and media rights.
 - Implement `TsumugiLinkSnapshot` and import/export tests.
 - Add `/UPGRADE` resume control frames and fail-closed peer validation.
 
-### Phase 3: X.509 And Client Auth Surface
+### Phase 3: X.509 and client auth surface
 
 - Port X.509 DER/PEM/SPKI/fingerprint handling in Zig.
 - Wire CERTFP and SASL-EXTERNAL to TLS exporter/channel binding.
 - Keep S2S node identity Ed25519/MeshPass-based; do not make X.509 the mesh
   identity.
 
-### Phase 4: Ryusen Transport Backends
+### Phase 4: Ryusen transport backends
 
 - Model `CryptoOwner` and transport snapshots.
 - Add kTLS backend for TLS-record links and upgrade fd adoption.
 - Keep Tsumugi userland crypto as default S2S.
 - Add congestion telemetry interface for future QUIC/WebTransport media bands.
 
-### Phase 5: Media Control Seam
+### Phase 5: media control seam
 
 - Add band 5 media-control schemas:
   track announce, subscribe, unsubscribe, stats, nack, keyframe request,
@@ -626,14 +630,14 @@ Do not port directly:
 - Ensure the scheduler treats media as drop/degrade-able and never blocks
   control or Goryu-Sync.
 
-### Phase 6: Browser And WASM Prototype
+### Phase 6: browser and WASM prototype
 
 - Define OroWasm ABI for OPVOX/OPVIS-style codecs.
 - Prototype browser WebSocket media fallback and WebTransport preferred path.
 - Keep browser codec keying separate: short-lived track keys only, no Tsumugi
   root exposure.
 
-### Phase 7: Media FEC And BWE
+### Phase 7: media FEC and BWE
 
 - Start with XOR/interleaved FEC for OPVOX-like audio.
 - Add RaptorQ for video/keyframes/high-loss media.
@@ -667,7 +671,7 @@ Do not port directly:
   other. Ryusen should own the final policy and feed recommendations back to
   codecs.
 
-## Bottom Line
+## Bottom line
 
 Port opssl's crypto primitives and operational patterns into pure Zig where they
 touch trust: ML-KEM, X-Wing, constant-time discipline, X.509/CERTFP, TLS
@@ -677,5 +681,5 @@ Do not port kagura into core. Use its OPVOX/OPVIS module taxonomy, frame
 timing, `secure` concepts, `fec`, `jitter`, and `netadapt` as the design
 blueprint for media bands. Relay media by default; decode only in OroWasm or an
 authorized worker. Keep Tsumugi as the S2S security authority, reserve inner
-kagura-style AEAD for optional media E2EE, and make media congestion/feed-back
+kagura-style AEAD for optional media E2EE, and make media congestion/feedback
 serve Ryusen without ever blocking core IRC and CRDT convergence.

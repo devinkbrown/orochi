@@ -1,29 +1,30 @@
-# Orochi Command And Mode Scan Against Ophion - 2026-06-16
+# Orochi command and mode scan against Ophion - 2026-06-16
+*Historical research note: records a source-only command, mode, and hierarchy scan against the local Ophion checkout.*
 
-This is a source-only scan of Orochi's live command, mode, and hierarchy
-surface against the local Ophion checkout. It is a command-focused companion to
-`docs/audits/2026-06-15-orochi-vs-ophion-gap-audit.md`.
+This command-focused companion to `docs/audits/2026-06-15-orochi-vs-ophion-gap-audit.md` compares Orochi's live surface against the local Ophion checkout.
 
-## Scope And Method
+## Scope and method
 
-- Orochi source: `/home/kain/orochi`.
-- Ophion reference: `/home/kain/ophion`.
+- Orochi source: `orochi`.
+- Ophion reference: `ophion`.
 - Orochi accepted commands were taken from the enabled SerpentRegistry modules
   in `src/daemon/modules/manifest.zig` plus the lower registration dispatcher
   in `src/daemon/dispatch.zig`.
 - Ophion accepted commands were taken mechanically from `struct Message`
-  registrations in `/home/kain/ophion/modules` and
-  `/home/kain/ophion/extensions`.
+  registrations in `ophion/modules` and
+  `ophion/extensions`.
 - Mode behavior was checked from Orochi's live `MODE` handlers and mode
   catalogs, then compared with Ophion's C mode registration tables.
 
 Mechanical counts from this scan:
 
-- Orochi registered/lower-dispatch command names: 137.
-- Ophion `struct Message` command names: 273.
-- Ophion command names not accepted by Orochi under the same name: 154.
+| Metric | Count |
+| --- | ---: |
+| Orochi registered/lower-dispatch command names | 137 |
+| Ophion `struct Message` command names | 273 |
+| Ophion command names not accepted by Orochi under the same name | 154 |
 
-## Main Findings
+## Main findings
 
 Orochi is not a command-compatible clone of Ophion. Many Ophion-only commands
 are intentionally outside Orochi's product target: TS/server-burst verbs, C
@@ -65,7 +66,7 @@ unchanged, are mostly aliases and wire vocabulary:
   `SUSPEND`, `UNSUSPEND`, `FORBID`, `UNFORBID`, `NOEXPIRE`, `CHANNOEXPIRE`,
   `LOGIN`, `SU`, `RSFNC`, `NICKDELAY`, `SETPASS`, `SETEMAIL`, or `SET`.
 
-## Orochi Live Command Evidence
+## Orochi live command evidence
 
 The enabled module list is the source of truth for post-registration commands:
 `query_info`, `channel_ops`, `messaging`, `accounts`, `ircx`,
@@ -91,9 +92,9 @@ Orochi accepted command names from this scan:
 
 `ACCEPT ACCESS ACCOUNT ACCOUNTINFO ACCOUNTSET ACTIVITY ADMIN AUTH AUTHENTICATE AUTOJOIN AWAY CAP CERTADD CERTDEL CERTLIST CHANNEL CHATHISTORY CLEAR CLONES CLOSE COMMANDS CONNECT CREATE CS DATA DEBUG DIE DLINE DRAIN DROP EDIT ETRACE EVENT FILTER FORCEDEOP FORCEJOIN FORCEOP FORCEPART FORCETOPIC GEOIP GHOST GLOBAL GRANT GRANTS GROUP HELP HELPOP IDENTIFY INFO INVITE IRCX ISIRCX ISON JOIN KICK KILL KLINE KNOCK LINKS LIST LISTX LOGOUT LUSERS MAP MARKREAD MEDIA MESH METADATA MODE MODEX MODLIST MODULES MONITOR MOTD NAMES NETHEALTH NETSTAT NICK NOTICE OPER OPERMOTD PART PASS PING PONG PRIVMSG PRIVS PROP QUIT REDACT REGISTER REHASH RENAME REPLY REQUEST RESTART RESV REVOKE ROUTE SACCESS SASLINFO SEARCH SEEN SESSION SESSIONTOKEN SETNAME SHUN SILENCE SQUIT STATS SUMMON TAGMSG TEGAMI TEMPMODE TESTLINE TESTMASK TIME TOPIC TRACE UNREJECT UNRESV UNSHUN UPGRADE USER USERHOST USERIP USERS VERIFY VERSION VHOST WARD WELCOME WHISPER WHO WHOIS WHOWAS XLINE`
 
-## Command Gaps By Category
+## Command gaps by category
 
-### Accepted But Intentionally Limited In Orochi
+### Accepted but intentionally limited in Orochi
 
 | Command | Status | Evidence |
 | --- | --- | --- |
@@ -103,7 +104,7 @@ Orochi accepted command names from this scan:
 | `MEDIA` | Native Orochi media control exists, but LADON command compatibility does not. | `src/daemon/server.zig:17233` |
 | `MODLIST` / `MODULES` | Lists Orochi's compile-time SerpentRegistry modules, not Ophion's load/unload module control surface. | `src/daemon/modules/introspect.zig:1` |
 
-### Ophion User/Client Commands Missing By Name
+### Ophion user/client commands missing by name
 
 These are client-visible or common-oper names accepted by Ophion but not by
 Orochi under the same command name:
@@ -121,7 +122,7 @@ Notes:
 - `STARTTLS`, `WEBIRC`, `FILEHOST`, and DCC/filehost-style transfer are not
   Orochi targets in the current audit baseline.
 
-### Ophion Oper/Admin/Diagnostics Missing By Name
+### Ophion oper/admin/diagnostics missing by name
 
 `ACMERELOAD ADMINWALL CHANTRACE DEBUGCORR DEBUGINFO DEBUGLEVEL DEBUGLOG DEBUGROTATE DEBUGSTATS DEBUGSUBSYS DEBUGWATCH DEHELPER EXTENDCHANS FINDFORWARDS GOPER HEAL HURT JUPE JUPELIST LINKSTATS LOCOPS MASKTRACE MKPASSWD MODINFO MODSTATS OPERSPY REBURST RESYNC SCAN SENDBANS SENDPASS SERVSET SNOTE SOPER SPAMFILTER TESTGECOS TGINFO UNJUPE`
 
@@ -134,7 +135,7 @@ Orochi has partial native equivalents for some of this class:
 - `WARD`, `KLINE`, `DLINE`, `XLINE`, `RESV`, and `UNRESV` cover some network
   policy operations, but not every Ophion alias.
 
-### Ophion Account/Services Commands Missing By Name
+### Ophion account/services commands missing by name
 
 `ACCOUNTOPER ACREATE CHANNOEXPIRE FORBID NICKDELAY NOEXPIRE RSFNC SETACCOUNT SUSPEND SVCPAUSE SVCRESUME SVCRESYNC SVCSPAUSE UNFORBID UNSUSPEND`
 
@@ -150,7 +151,7 @@ Orochi has native account/service surfaces instead:
 If Ophion oper scripts must be reused unchanged, this is an alias-compatibility
 gap even where the underlying operation exists natively.
 
-### Ophion IRCX Commands Missing By Name
+### Ophion IRCX commands missing by name
 
 `BTACCESS BTPROP CHARENME GAG GAG_ADD GAG_CLEAR GAG_DEL GRANT_ADD GRANT_CLR GRANT_DEL NOCHAN_ADD NOCHAN_CLR NOCHAN_DEL NONICK_ADD NONICK_CLR NONICK_DEL OPFORCE SVSJOIN TACCESS TPROP`
 
@@ -167,7 +168,7 @@ Orochi's current IRCX surface is live but narrower by name:
 - Ophion `EVENT` numeric families are not wire-compatible; Orochi uses its
   Event Spine and `NOTE EVENT` style delivery.
 
-### Ophion LADON/Media Commands Missing By Name
+### Ophion LADON/media commands missing by name
 
 `ANNOTATE BREAKOUT BWREPORT DATASTAT LADON LADONADMIN LADONKEY LADONLIST LADONMIXER LADONPOLL LADONVIDEO LADONVOICE MEDIASTATUS VOICELIST WHITEBOARD`
 
@@ -176,7 +177,7 @@ media plane, but it is not a LADON module port. This is a compatibility gap for
 clients expecting Ophion command names, LADON CAP values, or LADON media mode
 vocabulary.
 
-### Ophion Module-System Commands Missing By Name
+### Ophion module-system commands missing by name
 
 `MODBLACKLIST MODCHECK MODCONFIG MODDEPS MODGRAPH MODGROUP MODLOAD MODPIN MODRELOAD MODRESET MODRESTART MODUNLOAD MODUNPIN`
 
@@ -184,7 +185,7 @@ Orochi intentionally does not implement Ophion's runtime C module loader or
 CPython/MAPI module ecosystem. It has compile-time SerpentRegistry modules and a
 WASM plugin control plane, so these names are not equivalent.
 
-### Ophion Server/TS/Burst Commands Missing By Name
+### Ophion server/TS/burst commands missing by name
 
 `BMASK ENCAP ERROR ETB EUID HASHCHECK MRESYNC MSEQ MSYNC SAVE SERVER SID SIGNON SJOIN SVCSACCESS SVCSBURST SVCSCDROP SVCSCERT SVCSCHAN SVCSDROP SVCSID SVCSMODE SVCSNICK SVCSOPER SVCSPWD SVCSREG SVSLOGIN SVSSID TMODE UID`
 
@@ -193,7 +194,7 @@ mesh/S2S path uses native signed state frames and mesh events, so accepting
 these raw Ophion commands would be a deliberate compatibility layer, not a
 missing handler in the current architecture.
 
-### Ophion Ban/Reservation Aliases Missing By Name
+### Ophion ban/reservation aliases missing by name
 
 `UNDLINE UNKLINE UNXLINE`
 
@@ -201,16 +202,16 @@ Orochi accepts `DLINE`, `KLINE`, `XLINE`, `WARD`, `RESV`, and `UNRESV`, but does
 not accept every Ophion un* alias. This is an oper-script compatibility gap if
 old scripts are expected to work unchanged.
 
-## Raw Ophion-Only Command Diff
+## Raw Ophion-only command diff
 
 This is the full mechanical list of Ophion `struct Message` command names that
 were not found in Orochi's live command registry/lower dispatch:
 
 `ACCOUNTOPER ACMERELOAD ACREATE ADMINWALL ANNOTATE BAN BATCH BMASK BOUNCER BREAKOUT BTACCESS BTPROP BWREPORT CERTFP CHALLENGE CHANNOEXPIRE CHANSET CHANTRACE CHARENME CHGHOST DATASTAT DEBUGCORR DEBUGINFO DEBUGLEVEL DEBUGLOG DEBUGROTATE DEBUGSTATS DEBUGSUBSYS DEBUGWATCH DEHELPER ENCAP ERROR ETB EUID EXTENDCHANS FILEHOST FINDFORWARDS FORBID GAG GAG_ADD GAG_CLEAR GAG_DEL GET GOPER GRANT_ADD GRANT_CLR GRANT_DEL HASHCHECK HEAL HURT INVITED JUPE JUPELIST LADON LADONADMIN LADONKEY LADONLIST LADONMIXER LADONPOLL LADONVIDEO LADONVOICE LINKSTATS LOCOPS LOGIN MASKTRACE MEDIAFRAME MEDIASTATUS MEMO MKPASSWD MLOCK MODBLACKLIST MODCHECK MODCONFIG MODDEPS MODGRAPH MODGROUP MODINFO MODLOAD MODPIN MODRELOAD MODRESET MODRESTART MODSTATS MODUNLOAD MODUNPIN MRESYNC MSEQ MSYNC NAMESX NICKDELAY NOCHAN_ADD NOCHAN_CLR NOCHAN_DEL NOEXPIRE NONICK_ADD NONICK_CLR NONICK_DEL OPERSPY OPERWALL OPFORCE POLL POST PROTOCTL PUT RAID REALHOST REBURST REGAIN RESYNC REWIND RSFNC SASLTHROTTLE SAVE SCAN SENDBANS SENDPASS SERVER SERVSET SET SETACCOUNT SETEMAIL SETFILTER SETPASS SID SIGNON SJOIN SNOTE SOPER SPAMFILTER STARTMSGPACK STARTTLS STREAM SU SUSPEND SVCPAUSE SVCRESUME SVCRESYNC SVCSACCESS SVCSBURST SVCSCDROP SVCSCERT SVCSCHAN SVCSDROP SVCSID SVCSMODE SVCSNICK SVCSOPER SVCSPAUSE SVCSPWD SVCSREG SVSJOIN SVSLOGIN SVSSID TACCESS TB TESTGECOS TGINFO TMODE TPROP UHELP UID UNDLINE UNFORBID UNGROUP UNJUPE UNKLINE UNSUSPEND UNXLINE VHOFFER VHOFFERLIST VOICELIST WALLOPS WEBIRC WHITEBOARD WHOX`
 
-## Mode Behavior
+## Mode behavior
 
-### Orochi Channel Modes
+### Orochi channel modes
 
 Orochi advertises:
 
@@ -233,32 +234,29 @@ The live `MODE` handler also implements `Z` quiet/mute list, `j` join throttle,
 `src/daemon/server.zig:8663`, `src/daemon/server.zig:8697`,
 `src/proto/chanmode_ext.zig:48`).
 
-### Ophion Channel Modes And Letter Mismatches
+### Ophion channel modes and letter mismatches
 
 Ophion's core channel table registers `b`, `e`, `I`, `Z`, `o`, `q`, `v`, `k`,
 `l`, `j`, `y`, `L`, `F`, `M`, `Q`, `g`, `i`, `m`, `n`, `p`, `s`, and `t`
-(`/home/kain/ophion/ircd/chmode.c:1724`). Built-ins add `c`, `C`, `O`, `A`,
-and `S` (`/home/kain/ophion/ircd/chm_builtin.c:149`). IRCX adds `u`, `h`, `a`,
+(`ophion/ircd/chmode.c:1724`). Built-ins add `c`, `C`, `O`, `A`,
+and `S` (`ophion/ircd/chm_builtin.c:149`). IRCX adds `u`, `h`, `a`,
 `d`, `E`, `f`, `z`, and `r`
-(`/home/kain/ophion/modules/m_ircx_modes.c:300`). LADON adds `B`, `G`, `R`,
-`V`, and `W` (`/home/kain/ophion/modules/m_ladon_modes.c:40`).
+(`ophion/modules/m_ircx_modes.c:300`). LADON adds `B`, `G`, `R`,
+`V`, and `W` (`ophion/modules/m_ladon_modes.c:40`).
 
 Important letter differences:
 
-- Ophion `M` is op-moderation. Orochi `M` is moderate-unregistered; Orochi
-  op-moderation is `U`.
-- Ophion `Q` is disforward. Orochi `Q` is a founder member status mode; Orochi
-  disforward is `D`.
-- Ophion `y` is channel forward. Orochi forward is `f`.
-- Ophion `L` is staff/exlimit-style behavior. Orochi does not implement that
-  exact letter.
-- Ophion `c` is no-color. Orochi uses IRCX `NOFORMAT` as `f`.
-- Ophion/LADON `B`, `G`, `R`, `V`, and `W` are not LADON-compatible in Orochi.
-  Orochi uses `W` for news-wire and `V` for NOCOMICDATA.
-- Ophion IRCX comic `Y` is not Orochi's NOCOMICDATA letter. Orochi moved
-  NOCOMICDATA to `V` because `Y` is the derived network-operator prefix mode.
+| Ophion letter or set | Orochi behavior |
+| --- | --- |
+| `M` | Ophion `M` is op-moderation. Orochi `M` is moderate-unregistered; Orochi op-moderation is `U`. |
+| `Q` | Ophion `Q` is disforward. Orochi `Q` is a founder member status mode; Orochi disforward is `D`. |
+| `y` | Ophion `y` is channel forward. Orochi forward is `f`. |
+| `L` | Ophion `L` is staff/exlimit-style behavior. Orochi does not implement that exact letter. |
+| `c` | Ophion `c` is no-color. Orochi uses IRCX `NOFORMAT` as `f`. |
+| `B`, `G`, `R`, `V`, `W` | Ophion/LADON `B`, `G`, `R`, `V`, and `W` are not LADON-compatible in Orochi. Orochi uses `W` for news-wire and `V` for NOCOMICDATA. |
+| `Y` | Ophion IRCX comic `Y` is not Orochi's NOCOMICDATA letter. Orochi moved NOCOMICDATA to `V` because `Y` is the derived network-operator prefix mode. |
 
-### Member Hierarchy
+### Member hierarchy
 
 Orochi's member status order is:
 
@@ -280,7 +278,7 @@ implicit owner/op bits — each member occupies a single chain level
 (`src/daemon/world.zig:612`).
 
 The four tiers form a **cumulative authority chain** modelled on Ophion's
-`chm_owner`/`chm_op` (`/home/kain/ophion/ircd/chmode.c:1136-1384`): founder
+`chm_owner`/`chm_op` (`ophion/ircd/chmode.c:1136-1384`): founder
 carries owner-and-op authority, owner carries op authority, and a member holds
 exactly one chain tier (voice is independent). Each named status change is
 expanded into the concrete tier ops it implies by
@@ -312,7 +310,7 @@ Rank rules are stricter than classic op-only models:
 This means an Ophion client expecting only `q/o/v` hierarchy will see one extra
 grantable tier (`Q/!`) and one derived display tier (`Y/*`).
 
-### Orochi User Modes
+### Orochi user modes
 
 Orochi's user-mode catalog is:
 
@@ -326,28 +324,27 @@ The user `MODE` path applies only client-writable modes. Server-managed and
 unknown letters are ignored on the client path; `+j` requires `oper_override`
 (`src/daemon/server.zig:8744`).
 
-### Ophion User Mode Differences
+### Ophion user mode differences
 
 Ophion has core user modes such as `B`, `D`, `H`, `Q`, `S`, `Z`, `a`, `i`,
 `l`, and `o` in `s_user.c`, and dynamic built-ins `f`, `J`, `R`, `r`, `C`,
-`M`, and `P` in `um_builtin.c` (`/home/kain/ophion/ircd/um_builtin.c:317`).
+`M`, and `P` in `um_builtin.c` (`ophion/ircd/um_builtin.c:317`).
 Extensions/modules add more, such as `K` for anonkill, `g` for IRCX oper gag,
 `G` for godmode, `u` for filter, `p` for override, and `x` for IP cloaking.
 
 Compatibility-impacting differences:
 
-- Ophion `+f`/`+J` callerid maps to Orochi `+g`.
-- Ophion uppercase `+Z` TLS maps to Orochi lowercase server-managed `+z`.
-- Ophion `+l` locops and `+S` service do not have the same user-settable
-  Orochi equivalents.
-- Ophion `+g` IRCX oper gag is not Orochi `+g`; Orochi `+g` is callerid.
-- Ophion `+G` godmode and `+K` anonkill have no Orochi equivalent.
-- Ophion `+p` override does not match Orochi `+p`; Orochi `+p` hides channel
-  lists in WHOIS. Orochi override is `+j`.
-- Orochi `+M` and `+P` are media-related, but they are not a LADON command
-  compatibility layer.
+| Ophion mode | Orochi behavior |
+| --- | --- |
+| `+f`/`+J` | Ophion `+f`/`+J` callerid maps to Orochi `+g`. |
+| `+Z` | Ophion uppercase `+Z` TLS maps to Orochi lowercase server-managed `+z`. |
+| `+l` / `+S` | Ophion `+l` locops and `+S` service do not have the same user-settable Orochi equivalents. |
+| `+g` | Ophion `+g` IRCX oper gag is not Orochi `+g`; Orochi `+g` is callerid. |
+| `+G` / `+K` | Ophion `+G` godmode and `+K` anonkill have no Orochi equivalent. |
+| `+p` | Ophion `+p` override does not match Orochi `+p`; Orochi `+p` hides channel lists in WHOIS. Orochi override is `+j`. |
+| `+M` / `+P` | Orochi `+M` and `+P` are media-related, but they are not a LADON command compatibility layer. |
 
-## Implementation Priority If Ophion Wire Compatibility Is Desired
+## Implementation priority if Ophion wire compatibility is desired
 
 1. Add harmless aliases for already-native behavior: `WHOX`, `CHARENME`,
    `TACCESS`, `BTACCESS`, `TPROP`, `BTPROP`, selected account aliases, and

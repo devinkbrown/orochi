@@ -1,16 +1,20 @@
-# 20 — Media: our codec everywhere, WebRTC as transport + opt-in fallback (pure-SFU)
+# 20 — Media interop: our codec everywhere, WebRTC as transport and opt-in fallback (pure-SFU)
+
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
+
+This document records the planned media interop model and server-side non-goals.
 
 Status: **architecture decided + building blocks landed; live daemon wiring pending.**
 This supersedes the framing in [18-media-transport.md](18-media-transport.md). The earlier
 draft of this note framed WebRTC as a *forced mobile gateway with standard codecs*; that
-was wrong. The corrected model below is recorded so it doesn't drift again.
+framing was incorrect. The corrected model below is recorded so it does not drift again.
 
 ## Decision
 
 **One codec for everyone — ours (OPVOX/OPVIS).** Mobile and desktop have *identical*
-functionality; WebRTC is a **transport**, not a codec choice. There is exactly one optional
-escape hatch (the opt-in standard-codec fallback). The server never touches codec bytes in
-any mode.
+functionality. WebRTC is a **transport**, not a codec choice. The opt-in standard-codec
+fallback is the only optional escape hatch. The server never touches codec bytes in any
+mode.
 
 1. **Primary — our codec, all platforms.** `kagura` (OPVOX audio / OPVIS video) frames in
    `kagura_frame` containers, with `secure_channel` (TreeKEM/HPKE) for E2E. Desktop runs
@@ -25,7 +29,7 @@ any mode.
    *transport only*; its media-track codecs are not used on this path.
 
 3. **Opt-in standard-codec fallback.** A user **having trouble with our custom codec** (e.g.
-   a low-end phone that can't WASM-decode OPVIS at framerate, or battery constraints) can
+   a low-end phone that cannot WASM-decode OPVIS at framerate, or battery constraints) can
    **choose** to use standard WebRTC with the device's hardware codecs (Opus/H.264/VP8).
    This is a deliberate per-user choice, not the default and not forced by platform.
 
@@ -33,10 +37,10 @@ any mode.
 
 Orochi is a **selective-forwarding unit**, not an MCU. The SFU only ever **forwards opaque
 codec payloads** and **rewraps transport headers**. No media encode/decode/transcode runs
-on the server — ever. Consequences:
+on the server. Consequences:
 
-- An **all-default call** uses OPVOX/OPVIS for everyone (incl. mobile via WASM); the SFU
-  forwards one opaque stream — zero codec work, perfect parity.
+- An **all-default call** uses OPVOX/OPVIS for everyone (including mobile via WASM); the SFU
+  forwards one opaque stream — zero codec work, platform parity.
 - If a participant **opts into** the standard-codec fallback, the call **converges on one
   codec every participant supports** (`kakehashi.selectCommon`). Every Orochi client can
   also speak the standard stack, so a shared codec always exists; the forwarded stream is
@@ -47,7 +51,8 @@ on the server — ever. Consequences:
 ## Kakehashi — the bridge (`src/substrate/kakehashi.zig`)
 
 A transport-neutral `BridgeFrame { codec, timestamp, sequence, keyframe, payload }` the SFU
-forwards. Adapters **only rewrap headers around the borrowed, already-encoded payload**:
+forwards. Adapters **only rewrap headers around the borrowed, already-encoded payload**.
+
 - `fromNative`/`toNative` ↔ `kagura_frame.MediaFrame` (normalizes the `kagura raw=0` vs
   `sdp raw=3` tag mismatch via its own canonical `Codec`).
 - `fromRtp`/`toRtp` ↔ RTP via a dynamic-PT↔Codec `PtMap`.
@@ -58,20 +63,12 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 
 ## Module inventory (built, unit-tested, in the unified build)
 
-- **Bridge:** `kakehashi`, `kakehashi_session`, `ssrc_map`, `rtcp_translate` (control-plane
-  NACK/PLI/FIR ↔ neutral feedback).
-- **Native resilience (Suimyaku plane):** `kagura_nack` (retransmit cache + gap tracker),
-  `kagura_fec` (XOR FEC), `kagura_reassembly` (reorder/jitter), `simulcast_select` +
-  `kagura_layer` + `frame_marking` (layer forwarding without decode), `bwe_estimate`
-  (delay-based target bitrate), `media_pacer` (egress pacing), `native_feedback`.
-- **WebRTC stack (transport carrier + opt-in standard-codec fallback):** `srtp`/`srtcp`,
-  `dtls_srtp`/`dtls_handshake`/`dtls_keyexchange`/`dtls_fingerprint`, `rtp_ext`/`rtp_red`/
-  `audio_level`/`mid_rid`/`playout_delay`, `rtcp_compound`/`rtcp_xr`/`remb`/`pli_fir`/
-  `twcc_feedback`/`rtx`, `sdp_session`/`ice_candidate`/`stun_ice_attrs`, `dcep`/`sctp_chunk`,
-  `sframe`, `flexfec`. `dcep`/`sctp_chunk` are what let a WebRTC DataChannel carry our opaque
-  kagura frames (transport role); the RTP/codec pieces serve the opt-in standard fallback.
-- **Live WebRTC transport (already wired):** `media_transport`/`media_socket`/`media_plane`
-  (UDP + ICE/STUN/SRTP-SDES relay + NACK).
+| Area | Modules |
+| --- | --- |
+| Bridge | `kakehashi`, `kakehashi_session`, `ssrc_map`, `rtcp_translate` (control-plane NACK/PLI/FIR ↔ neutral feedback). |
+| Native resilience (Suimyaku plane) | `kagura_nack` (retransmit cache + gap tracker), `kagura_fec` (XOR FEC), `kagura_reassembly` (reorder/jitter), `simulcast_select` + `kagura_layer` + `frame_marking` (layer forwarding without decode), `bwe_estimate` (delay-based target bitrate), `media_pacer` (egress pacing), `native_feedback`. |
+| WebRTC stack (transport carrier + opt-in standard-codec fallback) | `srtp`/`srtcp`, `dtls_srtp`/`dtls_handshake`/`dtls_keyexchange`/`dtls_fingerprint`, `rtp_ext`/`rtp_red`/`audio_level`/`mid_rid`/`playout_delay`, `rtcp_compound`/`rtcp_xr`/`remb`/`pli_fir`/`twcc_feedback`/`rtx`, `sdp_session`/`ice_candidate`/`stun_ice_attrs`, `dcep`/`sctp_chunk`, `sframe`, `flexfec`. `dcep`/`sctp_chunk` are what let a WebRTC DataChannel carry our opaque kagura frames (transport role); the RTP/codec pieces serve the opt-in standard fallback. |
+| Live WebRTC transport (already wired) | `media_transport`/`media_socket`/`media_plane` (UDP + ICE/STUN/SRTP-SDES relay + NACK). |
 
 ## Remaining live wiring (serial; not yet done)
 
@@ -91,6 +88,6 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 
 - Server-side transcoding / MCU mixing. Never.
 - Replacing our codec with WebRTC's. Our codec (OPVOX/OPVIS) is the default on **every**
-  platform incl. mobile (via WASM). WebRTC is a **transport carrier** for our codec, plus an
+  platform including mobile (via WASM). WebRTC is a **transport carrier** for our codec, plus an
   **opt-in standard-codec fallback** for users who choose it — never the forced default.
 - Per-platform feature divergence. Mobile and desktop have the same functionality.

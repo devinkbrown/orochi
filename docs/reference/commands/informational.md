@@ -1,6 +1,8 @@
-# Informational Commands
+# Informational commands
 
-Stateless server information commands are registered by `query.info` (`src/daemon/modules/query_info.zig:60`). Registry introspection is provided by `diag.introspect` (`src/daemon/modules/introspect.zig:95`).
+*Stateless server-information queries and registry introspection.*
+
+The `query.info` module registers the stateless server-information commands (`src/daemon/modules/query_info.zig:60`). The `diag.introspect` module provides registry introspection (`src/daemon/modules/introspect.zig:95`).
 
 ## VERSION
 
@@ -41,7 +43,7 @@ Stateless server information commands are registered by `query.info` (`src/daemo
 ## INFO
 
 - Syntax: `INFO`
-- Description: Returns implementation information lines, then runtime `RPL_INFO` lines for advertised limits, active connection-class count, nick-delay window and held-nick count when nick delay is enabled, established mesh peer count, subsystem inventory, and an end marker.
+- Description: Returns implementation information lines, then runtime `RPL_INFO` lines covering advertised limits, the active connection-class count, the nick-delay window and held-nick count when nick delay is enabled, the established mesh-peer count, and a subsystem inventory, followed by an end marker.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
@@ -85,7 +87,7 @@ Stateless server information commands are registered by `query.info` (`src/daemo
 ## STATS
 
 - Syntax: `STATS <letter>`
-- Description: Returns selected server stats. `u` reports uptime, `o` configured oper bindings, `k/K` and `d/D` report Warden-derived line views, `Y/y` reports connection classes, `l/L` reports established S2S peer links, and `z/Z` reports runtime debug counters but is oper-only inside the handler.
+- Description: Returns selected server stats by letter. `u` reports uptime; `o` reports configured oper bindings; `k/K` and `d/D` report Warden-derived line views; `Y/y` reports connection classes; `l/L` reports established S2S peer links; and `z/Z` reports runtime debug counters and is oper-only inside the handler.
 - Privileges: Registered client; `STATS z` requires oper.
 - Parameters: One stats letter.
 - Replies: `RPL_STATSUPTIME 242`, `RPL_STATSOLINE 243`, `RPL_STATSKLINE 216`, `RPL_STATSDLINE 225`, `RPL_STATSYLINE 218`, `RPL_STATSLLINE 211`, `RPL_STATSDEBUG 249`, terminated by `RPL_ENDOFSTATS 219`.

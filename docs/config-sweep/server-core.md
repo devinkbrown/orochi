@@ -1,16 +1,18 @@
-# Orochi daemon core — hardcoded operational/tuning constant sweep
+# Orochi daemon core hardcoded operational/tuning constant sweep
+
+This read-only survey maps daemon-core operational constants to existing or proposed TOML controls.
 
 Scope: `src/daemon/server.zig`, `src/daemon/dispatch.zig`, `src/daemon/client.zig`
 (accept-loop, timeout sweep, and listener logic all live in `server.zig`).
-READ-ONLY survey. Excludes IRC numerics, wire/protocol-fixed sizes, enum
-discriminants, struct-layout array widths, and pure test literals.
+Excludes IRC numerics, wire/protocol-fixed sizes, enum discriminants,
+struct-layout array widths, and pure test literals.
 
 Existing schema sections (`config_format.zig` Schema): `[node] [listen] [oper]
 [mesh] [limits] [media] [sasl] [cloak]`.
 
-Legend: rows whose proposed key **already exists** in the schema are tagged
-*(schema-backed)* — the literal is the hardcoded default in `Config`/code and is
-mapped through `config_boot.zig`. Other rows are NOT yet liftable via TOML.
+Legend: rows whose proposed key already exists in the schema are tagged
+*(schema-backed)*. The literal is the hardcoded default in `Config`/code and is
+mapped through `config_boot.zig`. Other rows are not yet liftable via TOML.
 
 ---
 
@@ -40,7 +42,7 @@ mapped through `config_boot.zig`. Other rows are NOT yet liftable via TOML.
 | dispatch.zig:956 | `sasl_decode_cap` | `8192` | max decoded SASL AUTHENTICATE payload bytes (oversize fails closed) — borderline (security cap) | `limits.sasl_decode_max_bytes` (NEW) | uint | 8192 | 256..65536 |
 | config_format.zig:239 | `Config.nick_delay_ms` | `0` (disabled) | hold window for released nicks after owner exits; prevents nick-camping; `0` = disabled | `limits.nick_delay` *(schema-backed)* | duration | 0 | 0..– |
 
-## [io] (NEW — io_uring / transport tuning)
+## [io] (new): io_uring and transport tuning
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -56,14 +58,16 @@ mapped through `config_boot.zig`. Other rows are NOT yet liftable via TOML.
 | server.zig:728 | `Config.node_id` | `1` (placeholder) | sovereign mesh identity; keys registry/CRDT/gossip; seeds snowflake generator | `node.id` *(schema-backed; required, min 1)* | uint | 1 | 1..(u64 max) |
 | server.zig:739 | `Config.mesh_pass` | `""` | shared mesh auth password for plaintext S2S | `mesh.mesh_pass` *(schema-backed)* | string | "" | – |
 
-## [reputation] (NEW — IP-reputation penalty weights)
+## [reputation] (new): IP-reputation penalty weights
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
 | server.zig:534 | `reg_timeout_penalty` | `50.0` | reputation penalty added when a conn never completes registration (scan signature) | `reputation.registration_timeout_penalty` (NEW) | float | 50.0 | 0..1000 |
 | server.zig:536 | `clone_refuse_penalty` | `25.0` | reputation penalty added when accept refused by clone limiter | `reputation.clone_refuse_penalty` (NEW) | float | 25.0 | 0..1000 |
 
-## Borderline / informational (hardcoded identity strings — likely belong in config but are placeholders today)
+## Borderline and informational hardcoded identity strings
+
+These values likely belong in config but are placeholders today.
 
 | file:line | symbol / context | current value | what it controls | proposed TOML key | type | default | min..max |
 |---|---|---|---|---|---|---|---|
@@ -71,11 +75,11 @@ mapped through `config_boot.zig`. Other rows are NOT yet liftable via TOML.
 | dispatch.zig:20 | `SERVER_NAME` | `"orochi.local"` | server name in dispatch-layer replies (isolation/test path mirror) — borderline | `node.server_name` (reuse) | string | orochi.local | – |
 | dispatch.zig:21 | `NETWORK_NAME` | `"Orochi"` | network name advertised in ISUPPORT — borderline (identity) | `node.network_name` (NEW) | string | Orochi | – |
 
-## [class.<name>] (NEW — per-connection policy classes)
+## [class.<name>] (new): Per-connection policy classes
 
 Source: `Policy`/`ClassDef` at `src/daemon/conn_class.zig`, config parsing at `src/daemon/config_format.zig:247`, registry bootstrap at `src/daemon/config_boot.zig`, live inspection at `STATS Y` (numeric 218 RPL_STATSYLINE).
 
-A **connection class** is a named bundle of per-connection resource, admission, and flood policy, matched at client registration by IP/CIDR, TLS status, account auth, oper status, ident/host globs. The first class in file order whose match criteria are all satisfied wins; a catch-all (no criteria) is fallback. Two built-in classes always exist: `user` (regular clients) and `server` (mesh S2S links). Per-class limits override the matching `[limits]` global values; `0` means "inherit global". Size parameters accept `K`/`M`/`G` suffixes; durations are strings (`"30s"`).
+A **connection class** is a named bundle of per-connection resource, admission, and flood policy. It matches at client registration by IP/CIDR, TLS status, account auth, oper status, and ident/host globs. The first class in file order whose match criteria are all satisfied wins; a catch-all (no criteria) is fallback. Two built-in classes always exist: `user` (regular clients) and `server` (mesh S2S links). Per-class limits override the matching `[limits]` global values; `0` means "inherit global". Size parameters accept `K`/`M`/`G` suffixes; durations are strings (`"30s"`).
 
 | Concept | What it controls |
 |---------|------------------|
@@ -90,7 +94,7 @@ See `docs/reference/config.md` (`[class.<name>]` section) and `etc/orochi.refere
 
 ---
 
-## Excluded (noted, intentionally NOT lifted)
+## Excluded constants (intentionally not lifted)
 
 - `client.zig` MAX_*_BYTES (nick/uid/host/topic/mask/realname/account/label/oper-class)
   and `dispatch.zig` MAX_* + MAX_PARAMS=15 — protocol/struct-layout fixed sizes.

@@ -1,10 +1,12 @@
-# Orochi Architecture Overview
+# Orochi architecture overview
 
-Orochi is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.16.0"` and has no package dependencies listed under `.dependencies`, so the current tree is built from the checked-in Zig source. Evidence: `build.zig.zon:28`, `build.zig.zon:34`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, and adds the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:8`, `src/root.zig:16`, `src/root.zig:21`.
+_System overview of the client-facing daemon, request flow, source map, and the architecture document index._
 
-This overview covers the client-facing daemon, local world, module dispatch, reactor model, media, Helix upgrade, and OroWasm. Mesh/S2S and cryptography are intentionally out of scope here; use [mesh-s2s.md](mesh-s2s.md) and [crypto.md](crypto.md).
+Orochi is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.16.0"` and lists no dependencies under `.dependencies`, so the current tree builds entirely from checked-in Zig source. Evidence: `build.zig.zon:28`, `build.zig.zon:34`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, and adds the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:8`, `src/root.zig:16`, `src/root.zig:21`.
 
-## Major Subsystems
+This overview covers the client-facing daemon, local world, module dispatch, reactor model, media, Helix upgrade, and OroWasm. Mesh/server-to-server (S2S) and cryptography are out of scope here; see [mesh-s2s.md](mesh-s2s.md) and [crypto.md](crypto.md).
+
+## Major subsystems
 
 | Area | Current source of truth | What it owns | Evidence |
 | --- | --- | --- | --- |
@@ -21,12 +23,12 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | Helix upgrade | `src/daemon/modules/upgrade.zig`, `src/daemon/server.zig`, `src/daemon/helix/live.zig`, `src/daemon/helix/handoff.zig` | UPGRADE command, sealed memfd arena, listener/session fd inheritance, successor adoption | `src/daemon/modules/upgrade.zig:1`, `src/daemon/server.zig:6070`, `src/daemon/helix/live.zig:1`, `src/daemon/helix/handoff.zig:1` |
 | OroWasm | `src/wasm/host/*`, `src/wasm/kagura_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser OPVOX/OPVIS exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/kagura_wasm.zig:1` |
 
-## End-to-End Client Request Flow
+## End-to-end client request flow
 
 | Step | Flow | Evidence |
 | --- | --- | --- |
 | 1 | `runOnce` arms accept, wake, and timer operations, waits for at least one io_uring completion, reaps completions, drains cross-shard fabric if present, then submits pending work. | `src/daemon/server.zig:2231`, `src/daemon/server.zig:2237`, `src/daemon/server.zig:2240`, `src/daemon/server.zig:2252` |
-| 2 | A recv completion calls `handleRecv`; plaintext client bytes go to `feedBytes`, TLS bytes go to `driveTls`, and S2S bytes go to the S2S drivers, which are documented separately. | `src/daemon/server.zig:2749`, `src/daemon/server.zig:2760`, `src/daemon/server.zig:2764`, `src/daemon/server.zig:2767` |
+| 2 | A recv completion calls `handleRecv`: plaintext client bytes go to `feedBytes`, TLS bytes go to `driveTls`, and S2S bytes go to the S2S drivers (documented separately). | `src/daemon/server.zig:2749`, `src/daemon/server.zig:2760`, `src/daemon/server.zig:2764`, `src/daemon/server.zig:2767` |
 | 3 | Complete client lines are parsed by the daemon-local IRC line parser before dispatch. The parser strips CRLF, rejects embedded NUL/line breaks, supports tags and prefixes, and caps params. | `src/daemon/server.zig:380`, `src/daemon/server.zig:385`, `src/daemon/server.zig:395`, `src/daemon/server.zig:415` |
 | 4 | Before registration, the server handles IRCX enable/query and pre-away locally, then calls `processLine`, which adapts into `dispatch.dispatchLine`. | `src/daemon/server.zig:3340`, `src/daemon/server.zig:3349`, `src/daemon/server.zig:3354`, `src/daemon/server.zig:1194`, `src/daemon/server.zig:1213` |
 | 5 | When `dispatchLine` completes registration, the server assigns the connection class (matching CIDR, TLS, auth, oper, ident/host; first match wins), sets SendQ/RecvQ ceilings per policy, registers the nick in `World`, enforces Warden/gag/session/seen hooks, autojoins, sends the welcome burst, fires the registry `client_registered` hook, and evaluates nick protection. | `src/daemon/server.zig:3355`, `src/daemon/server.zig:7073`, `src/daemon/server.zig:3356`, `src/daemon/server.zig:3360`, `src/daemon/server.zig:3376`, `src/daemon/server.zig:3383`, `src/daemon/server.zig:3384`, `src/daemon/server.zig:3385` |
@@ -34,7 +36,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | 7 | `dispatchRegistered` first refreshes the world's wall-clock, routes multiline batches if negotiated, dispatches through SerpentRegistry, then through OroWasm plugins, then falls back to the lower preregistration dispatcher for handshake verbs. | `src/daemon/server.zig:3423`, `src/daemon/server.zig:3429`, `src/daemon/server.zig:3450`, `src/daemon/server.zig:3473`, `src/daemon/server.zig:3508` |
 | 8 | Finished output is queued to a connection-local send buffer (inline ~8 KiB plus heap overflow, bounded by per-class `sendq`) or handed to the owning shard through `enqueueDelivery`; send completions drain the buffer and close when needed. Exceeding the SendQ ceiling fails the append. | `src/daemon/server.zig:2800`, `src/daemon/server.zig:2819`, `src/daemon/server.zig:2826`, `src/daemon/server.zig:2779`, `src/daemon/server.zig:1601` |
 
-## Source Tree Map
+## Source tree map
 
 | Path | Role | Evidence |
 | --- | --- | --- |
@@ -46,7 +48,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | `src/crypto/` | Cryptography namespace; not covered here | `src/root.zig:8` |
 | `src/wasm/` | OroWasm host, browser transport shim, and OPVOX/OPVIS browser exports | `src/root.zig:16`, `src/root.zig:21`, `src/wasm/kagura_wasm.zig:1` |
 
-## Architecture Index
+## Architecture index
 
 | Document | Scope |
 | --- | --- |
@@ -58,7 +60,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | [mesh-s2s.md](mesh-s2s.md) | Mesh/S2S architecture; separate document |
 | [crypto.md](crypto.md) | Cryptography architecture; separate document |
 
-## Planning Notes and Divergences
+## Planning notes and divergences
 
 The planning docs remain useful design intent, especially `docs/planning/00-architecture.md`, `docs/planning/17-module-system.md`, `docs/planning/18-media-transport.md`, and `docs/planning/24-multithreading.md`. This architecture set treats current source as authoritative.
 

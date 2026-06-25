@@ -1,25 +1,27 @@
-# S2S Deep Research — algorithms, math, crypto, transport (reference)
+# S2S deep research: algorithms, math, crypto, and transport
 
-> Captured 2026-06-05. Reference corpus for Orochi's clean-room S2S linking
-> protocol ([../planning/09-s2s-protocol.md](../planning/09-s2s-protocol.md)).
-> Mandate: extremely state-of-the-art, verifiable, secure, media-ready,
-> no technical debt, sovereign `node_id` identity (no SID). Every technique below
-> is evaluated for "do we adopt, adapt, or reject," and Part V synthesizes them
-> into a novel Orochi design.
+*Historical design/research notes for Orochi's clean-room S2S protocol research corpus.*
+
+Captured 2026-06-05. This file is the reference corpus for Orochi's clean-room
+S2S linking protocol ([../planning/09-s2s-protocol.md](../planning/09-s2s-protocol.md)).
+Mandate: advanced, verifiable, secure, media-ready, no technical debt,
+sovereign `node_id` identity (no SID). Every technique below is evaluated for
+"do we adopt, adapt, or reject," and Part V synthesizes them into a novel
+Orochi design.
 
 ---
 
-## Part I — Reconciliation & CRDT algorithms (the convergence math)
+## Part I: reconciliation and CRDT algorithms
 
-### I.1 Set reconciliation — the core anti-entropy problem
+### I.1 Set reconciliation: the core anti-entropy problem
 Two replicas hold sets A, B of fixed-length keys; compute the symmetric
 difference A△B with communication ∝ |A△B|, *not* |A| or |B|.
 
-**Rateless IBLT (RIBLT) — Yang/Gilad/Alizadeh, SIGCOMM 2024 — ADOPT (headline).**
+**Rateless IBLT (RIBLT): Yang/Gilad/Alizadeh, SIGCOMM 2024; ADOPT (headline).**
 - A *rateless* encoder maps the set difference into an **infinite stream of coded
   symbols** (like a fountain/rateless erasure code). The receiver pulls symbols
   until it can **peel** the IBLT and recover A△B.
-- **No prior estimate** of the difference size is required (the killer property:
+- **No prior estimate** of the difference size is required (the key property:
   classic IBLT needs you to size the table to the expected diff; RIBLT does not).
 - Near-optimal communication across diffs from 1 to millions, element sizes from
   bytes to MB, and adversarial workloads. Low CPU. Go/Rust impls exist (riblt,
@@ -31,7 +33,7 @@ difference A△B with communication ∝ |A△B|, *not* |A| or |B|.
 - 2025 follow-on: **Rateless Bloom Filters (RBF)** for divergent replicas with
   variable-sized elements (no parametrization, matches an optimally-tuned BF).
 
-**Range-Based Set Reconciliation (RBSR) / ConflictSync — ADAPT (coarse pass).**
+**Range-Based Set Reconciliation (RBSR) / ConflictSync: ADAPT (coarse pass).**
 - Recursively compare **fingerprints of contiguous ranges** of an ordered set;
   matching ranges are skipped, mismatching ranges split until the actual missing
   items fall out. Bandwidth ∝ difference. Used by anti-entropy/p2p sync.
@@ -43,7 +45,7 @@ difference A△B with communication ∝ |A△B|, *not* |A| or |B|.
 no size oracle); a prolly/Merkle-search index (I.3) gives the coarse "where do we
 differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root.
 
-### I.2 Delta-state CRDTs (δ-CRDT) — ADOPT
+### I.2 Delta-state CRDTs (δ-CRDT): ADOPT
 - Almeida/Shoker/Baquero. δ-mutators emit **small delta-states** (not full state);
   join (⊔) is a **commutative, associative, idempotent** semilattice operation →
   convergence regardless of order, loss, or duplication.
@@ -52,7 +54,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 - Lattice discipline = our correctness proof obligation: every entity is a
   bounded join-semilattice; resolution is its join.
 
-### I.3 Prolly trees / Merkle Search Trees (MST) — ADOPT (the index)
+### I.3 Prolly trees / Merkle Search Trees (MST): ADOPT as the index
 - **Prolly tree** = B-tree ⊕ Merkle tree: node fan-out chosen **probabilistically
   from a rolling hash of content** (content-defined chunking) → the tree shape is
   a deterministic function of the *set*, **history-independent**: two replicas with
@@ -63,7 +65,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
   deterministic balanced Merkle B-tree (used by ATProto/BlueSky; prolly by Dolt).
 - Content-addressed nodes → structural sharing + dedup across versions (Git-like).
 
-### I.4 Hybrid Logical Clocks (HLC) — ADOPT (causal stamping)
+### I.4 Hybrid Logical Clocks (HLC): ADOPT for causal stamping
 - Kulkarni/Demirbas. Timestamp = `(l, c)`: `l` tracks max(physical time, max
   received `l`); `c` is a bounded counter incremented only when `l` is ambiguous,
   reset when `l` advances.
@@ -73,7 +75,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 - Use: every CRDT delta carries `(origin node_id, hlc)`; LWW/MV resolution orders
   by `(hlc, node_id)`; never trust raw sender wall-clock (Matrix's lesson).
 
-### I.5 Causal stability & tombstone GC (the math we must not get wrong)
+### I.5 Causal stability and tombstone GC
 - An update is **causally stable** once every live peer has observed it →
   observed-remove tombstones can be GC'd only after stability across the live set.
 - Track per-peer "stability frontier" (min over peers of their version vector);
@@ -81,9 +83,9 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 
 ---
 
-## Part II — Cryptography (verifiable + post-quantum)
+## Part II: cryptography
 
-### II.1 Hybrid KEM combiner — ADOPT **X-Wing pattern**
+### II.1 Hybrid KEM combiner: ADOPT the X-Wing pattern
 - Goal: a session key secure if *either* X25519 *or* ML-KEM-768 holds (PQ +
   classical belt-and-suspenders).
 - **Naive `KDF(k1‖k2)` is NOT IND-CCA in general.** The fix (KEM-combiner result):
@@ -95,7 +97,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
   strong-DH assumption (classical) and under ML-KEM-768 IND-CCA (PQ). This is the
   construction to copy. (IETF also: composite ML-KEM, TLS ecdhe-mlkem draft.)
 
-### II.2 PQ-hybrid Noise handshake — ADOPT pattern, ADAPT mechanism
+### II.2 PQ-hybrid Noise handshake: ADOPT the pattern, ADAPT the mechanism
 - Noise Framework (Perrin): predefined DH-based handshake patterns; **IK** =
   responder static key known to initiator, mutual auth, 1-RTT, initiator identity
   hidden until authenticated.
@@ -106,7 +108,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
   KEX primitive; static identity = the node Ed25519 key; transcript binds both
   `node_id`s + MeshPasses + realm root + negotiated bands (downgrade-resistant).
 
-### II.3 Signatures & verifiability — ADOPT
+### II.3 Signatures and verifiability: ADOPT
 - **Ed25519** for node identity, signed deltas, MeshPass tokens.
 - **Batch verification** (Bos-Coster / Pippenger multi-scalar multiplication):
   ~2× throughput at batch 64; ~134k cyc/sig at 64, ~114k at large batches. Use for
@@ -114,7 +116,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 - Signing every delta makes relays untrusted: a peer verifies the **origin**
   signature, not the relay path (the verifiability invariant).
 
-### II.4 Verifiable hashing & streaming — ADOPT **BLAKE3 + Bao**
+### II.4 Verifiable hashing and streaming: ADOPT BLAKE3 + Bao
 - BLAKE3 is itself a Merkle tree (chunk leaves → parent compressions) → **verified
   streaming / random access**: with the root hash you can verify *any byte range*
   without rehashing the whole object (Bao / bao-tree encoding interleaves the file
@@ -125,15 +127,15 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 
 ---
 
-## Part III — Dissemination & membership
+## Part III: dissemination and membership
 
-### III.1 HyParView (Leitão et al., DSN'07) — ADOPT
+### III.1 HyParView (Leitão et al., DSN'07): ADOPT
 - Two partial views: a small symmetric **active view** (size ~`log(n)+c`, the live
   links used for broadcast) and a larger **passive view** (reserve, refreshed by
   periodic shuffles). On failure, promote from passive → active in O(1).
 - Robust to high churn; degree distribution + clustering give reliable coverage.
 
-### III.2 Plumtree (Leitão et al., SRDS'07) — ADOPT
+### III.2 Plumtree (Leitão et al., SRDS'07): ADOPT
 - Epidemic **broadcast tree** over the active view: **eager push** = full payload
   along tree edges; **lazy push** = gossip of message-id *digests* on non-tree
   edges. Missing id → `GRAFT` (heal/add tree edge); redundant eager delivery →
@@ -141,7 +143,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 - Orochi: lazy-push carries **RIBLT digests / dot ids**; eager-push carries the
   signed δ-CRDT deltas.
 
-### III.3 Witnessed SWIM — ADOPT (our hardening)
+### III.3 Witnessed SWIM: ADOPT
 - SWIM: direct ping → indirect `PING_REQ` to k random witnesses → SUSPECT
   (incarnation) → DEAD; piggybacked membership gossip.
 - **Witnessed** variant (Orochi vision invariant): suspicion carries a **signed
@@ -150,9 +152,9 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 
 ---
 
-## Part IV — Transport & OS technologies (state-of-the-art, per-OS)
+## Part IV: transport and OS technologies
 
-### IV.1 Linux — io_uring data plane (primary)
+### IV.1 Linux: io_uring data plane
 - **IORING_OP_SEND_ZC** (zero-copy send): data goes user-mem → NIC, no CPU copy,
   with **registered buffers**; completion + notification (`F_NOTIF`) signal when the
   buffer is reusable. (Orochi already arms sends; ZC is the upgrade.)
@@ -166,7 +168,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 - **AF_XDP** hybrid: kernel control plane + zero-copy Rx fast path; XDP/eBPF can
   pre-filter/steer before the stack. For extreme cases, full kernel bypass.
 
-### IV.2 Linux — UDP/QUIC acceleration (for the datagram/media + QUIC future)
+### IV.2 Linux: UDP/QUIC acceleration
 - **UDP GSO** (≥4.18): app hands one "super-buffer" of N×`gso_size` packets; kernel
   (or NIC) segments → up to 64 segments/batch, big syscall amortization. **UDP GRO**
   on Rx coalesces. Essential for QUIC throughput (Cloudflare/Tailscale: multi-×).
@@ -177,7 +179,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 - **In-kernel QUIC** (lxin/quic, kernel TLS handshake offload) is emerging; we ride
   userspace QUIC first, kernel later.
 
-### IV.3 Linux — eBPF/XDP socket fast paths
+### IV.3 Linux: eBPF/XDP socket fast paths
 - **SOCKMAP / SOCKHASH** + `sk_msg` / `bpf_msg_redirect_map`: **TCP splicing in the
   kernel** — redirect bytes socket→socket without userspace bounce (proxy/relay
   fast path). `bpf_sk_redirect_map` for skb steering. (Mind CVE-2025-39913 SOCKMAP
@@ -194,7 +196,7 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
   polled / event / IOCP completion retrieval; polled mode for HFT-grade UDP.
 - IOCP is the portable Reactor backend on Windows.
 
-### IV.6 Alternative / future transports (evaluated)
+### IV.6 Alternative and future transports
 - **Multipath QUIC** (draft-ietf-quic-multipath): multiple paths per connection,
   `PATH_ACK`, `initial_max_path_id`; resilience + aggregation; connection migration
   + 0-RTT. ADOPT as the eventual primary peer transport.
@@ -210,11 +212,11 @@ differ" in O(log n) and content-addressed dedup. Merkle stays the integrity root
 
 ---
 
-## Part V — Synthesis: the invented Orochi design
+## Part V: synthesis into the Orochi design
 
 Two new named subsystems, each a deliberate fusion of the above:
 
-### V.1 **Goryu-Sync** — verifiable rateless CRDT anti-entropy (novel combination)
+### V.1 Goryu-Sync: verifiable rateless CRDT anti-entropy
 The convergence engine = δ-CRDT ⊕ HLC ⊕ prolly-tree index ⊕ RIBLT ⊕ Ed25519:
 1. **Dot model.** Every mutation is a signed dotted delta
    `dot = (node_id, hlc, op)`, content id `cid = BLAKE3(canonical CoilPack(op))`.
@@ -235,11 +237,11 @@ The convergence engine = δ-CRDT ⊕ HLC ⊕ prolly-tree index ⊕ RIBLT ⊕ Ed2
 
 *Why novel:* RIBLT (2024) gives rateless near-optimal diff; prolly trees give
 content-addressed O(log n) location + dedup; δ-CRDT+HLC give order-free
-convergence; Ed25519-signed cids make every byte independently verifiable. No IRC
-daemon — and few systems anywhere — combine all five. Bandwidth ∝ actual change,
-verification is end-to-end, and equal replicas cost a single hash compare.
+convergence; Ed25519-signed cids make every byte independently verifiable. The
+design combines all five for Orochi. Bandwidth ∝ actual change, verification is
+end-to-end, and equal replicas cost a single hash compare.
 
-### V.2 **Ryūsen** — the adaptive transport seam (OS-harnessing)
+### V.2 Ryūsen: the adaptive transport seam
 A single `Transport` interface behind the DST `Reactor` seam, picking the best
 mechanism per platform/link at runtime:
 
@@ -257,8 +259,8 @@ events > media-ctrl > bulk media). Media bands borrow **Homa** (receiver-driven
 priority) / **Aeron** (reliable-UDP) ideas; loss on a media band never blocks
 control (the MoQ/QUIC head-of-line lesson, pre-baked).
 
-### V.3 Identity & security spine (already partly built)
-- `node_id = BLAKE3-160(Ed25519 pubkey)` — single sovereign id (no SID). ✅
+### V.3 Identity and security spine
+- `node_id = BLAKE3-160(Ed25519 pubkey)` — single sovereign id (no SID).
 - **Tsumugi handshake** = Noise-IK shape + **X-Wing** hybrid KEM (X25519+ML-KEM-768,
   SHA3 dual-PRF combiner mixing ciphertexts) + MeshPass capability verify +
   downgrade-resistant signed transcript.
@@ -267,7 +269,7 @@ control (the MoQ/QUIC head-of-line lesson, pre-baked).
 - **MeshPass** object-capability admission + revocation epoch.
 - **Witnessed SWIM** quorum liveness; **signed deltas** end-to-end.
 
-### V.4 Build order (core infra first, per mandate)
+### V.4 Build order
 1. Tsumugi handshake (X-Wing + Noise-IK + MeshPass) wrapping the live `s2s_peer`
    byte path → secure+verifiable transport.  *(crypto primitives exist in `crypto/`.)*
 2. Signed dotted deltas + cid content-addressing; batch-verify on apply.
@@ -278,7 +280,7 @@ control (the MoQ/QUIC head-of-line lesson, pre-baked).
 
 ---
 
-## Part VI — Other pathways (directions not in the first pass)
+## Part VI: other pathways
 
 - **Eg-walker** (EuroSys'25) — op-based CRDT for **sequences/text** that stores a
   DAG of ops and computes state as a *query over the log* (≈ FugueMax; RGA/Fugue
@@ -305,7 +307,7 @@ control (the MoQ/QUIC head-of-line lesson, pre-baked).
   trace. → **ADOPT as the model for Orochi's debug/log spine** (§Part VIII): an
   in-process flight recorder + structured trace, DST-replayable.
 
-## Part VII — Frontier tech (invention fuel)
+## Part VII: frontier technology
 
 - **Vector commitments / KZG / Verkle trees** — commit a vector via a degree-(n−1)
   polynomial; **openings are O(1)-sized** regardless of n; Verkle = Merkle with
@@ -341,16 +343,16 @@ control (the MoQ/QUIC head-of-line lesson, pre-baked).
   deployment is a backend swap, not a redesign. Not core, but the seam must not
   preclude it.
 
-**Cross-cutting invention thread — "everything rateless."** RIBLT (reconcile),
+**Cross-cutting invention thread: "everything rateless."** RIBLT (reconcile),
 RaptorQ (transmit), Nova-style folding (verify): three rateless/streamed
-primitives. A Orochi-original synthesis is a **single rateless pipe**: a peer
+primitives. An Orochi-original synthesis is a **single rateless pipe**: a peer
 emits one coded stream that simultaneously (a) reconciles set difference, (b) is
 FEC-protected against loss, and (c) carries a running convergence proof — the
 receiver pulls until it has converged *and* verified, with bandwidth ∝ actual
 divergence and zero round-trip negotiation. That unification is novel and worth a
 design spike.
 
-## Part VIII — Client surface & observability (per mandate)
+## Part VIII: client surface and observability
 
 **Keep IRC + web; groundwork for expansion.**
 - **IRC line protocol** stays the primary client surface (IRCv3 + IRCX).
@@ -363,7 +365,7 @@ design spike.
   CRDT-portable, signed entity, so a new surface is a *renderer*, never a protocol
   fork.
 
-**Heavy debugging + logging system (build now — see implementation).** Model =
+**Debugging and logging system (build now; see implementation).** Model =
 eBPF flight-recorder + structured tracing + DST replay:
 1. **Structured, leveled, categorized logging** (`debug`/`info`/`notice`/`warn`/
    `error`/`fatal` × subsystem category), key-value fields, monotonic + HLC

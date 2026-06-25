@@ -1,13 +1,18 @@
-# 07 — Ophion Parity: the 100-item campaign
+# 07 — Ophion parity: the 100-item campaign
 
-> Grounded in a full survey of `/home/kain/ophion` (ircd/core + modules/). This
-> is the parity backlog for the live single-node daemon, ordered roughly by
-> value and by dependency (state-bearing items grouped so a session can land a
-> whole world-model change at once). Each item is a discrete, testable unit.
->
-> Status legend: `[x]` done & e2e-tested · `[~]` builder exists, not wired ·
-> `[ ]` not started. Keep the run-verified cadence: wire → threaded loopback
-> test → fmt → native test → cross-compile exe → commit.
+*Design note from the planning phase — records design intent; shipped behavior is documented under docs/guide/ and docs/reference/.*
+
+This document records the parity backlog for the live single-node daemon, grounded in a full survey of `ophion` (ircd/core + modules/).
+
+Items are ordered roughly by value and dependency. State-bearing items are grouped so a session can land a whole world-model change at once. Each item is a discrete, testable unit.
+
+| Status | Meaning |
+| --- | --- |
+| `[x]` | done & e2e-tested |
+| `[~]` | builder exists, not wired |
+| `[ ]` | not started |
+
+Keep the run-verified cadence: wire → threaded loopback test → fmt → native test → cross-compile exe → commit.
 
 ## A. Core user commands (live dispatch)
 
@@ -52,7 +57,7 @@
 33. [x] KNOCK (713/711/ERR_CHANOPEN; needs +i) `[~]` proto/knock.zig
 34. [x] Channel +p private (distinct from +s secret) in LIST/WHOIS
 
-## C. Membership status & multi-target
+## C. Membership status and multi-target
 
 35. [x] MODE multi-target/multi-flag batching (`+ov nick1 nick2`)
 36. [x] JOIN comma-list of channels (`JOIN #a,#b key1,key2`)
@@ -101,7 +106,7 @@
 73. [~] standard-replies (FAIL/WARN/NOTE) used on new error paths
 74. [x] chathistory (needs msgstore) `[~]` proto/chathistory.zig
 
-## F. SASL & accounts
+## F. SASL and accounts
 
 75. [~] SASL EXTERNAL (cert-based) — sasl.Dispatcher consolidation
 76. [x] SASL SCRAM-SHA-256 `[~]` proto/sasl.zig
@@ -111,7 +116,7 @@
 80. [~] CERTFP (m_certfp / m_certadd)
 81. [x] WHOIS RPL_WHOISLOGGEDIN 330 / certfp 276
 
-## G. Oper & server management
+## G. Oper and server management
 
 82. [x] STATS (l/o/u/c/i/k subset) — multiple RPL_STATS*
 83. [~] CONNECT / SQUIT (S2S) — CONNECT [x] live (oper, io_uring connect op → outbound S2sLink handshake); live S2S listener [x] (inbound accept → S2sLink); SQUIT + already-linked guard + oper-visible CONNECT broadcast remain
@@ -126,7 +131,7 @@
 92. [x] WALLOPS via Event Spine announce/BROADCAST (oper-visible event, not +w umode)
 93. [~] GRANT / privilege sets (oper.zig Privilege wiring)
 
-## H. Mesh / S2S (Suimyaku — later milestones)
+## H. Mesh and S2S (Suimyaku — later milestones)
 
 94. [x] LINKS/MAP reflect real mesh peers `[x]` live — LINKS (364) lists each established S2S peer by remoteName as a 1-hop neighbour; MAP (015) shows them as child nodes. (Multi-hop topology arrives with route-table propagation.)
 95. [~] Server burst / state sync (Suimyaku CRDT)
