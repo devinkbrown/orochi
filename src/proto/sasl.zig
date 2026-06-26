@@ -132,6 +132,30 @@ pub const ExternalChecker = struct {
     }
 };
 
+/// Injected predicate: does `account` have active TOTP two-factor auth? Backed
+/// by the daemon's persisted enrollment store. Used to refuse a knowledge-factor
+/// SASL success (PLAIN/SCRAM) that carries no second factor.
+pub const TotpGate = struct {
+    ptr: *anyopaque,
+    activeFn: *const fn (ptr: *anyopaque, account: []const u8) bool,
+
+    pub fn active(self: TotpGate, account: []const u8) bool {
+        return self.activeFn(self.ptr, account);
+    }
+};
+
+/// Whether `mechanism` authenticates purely by a knowledge factor (a password or
+/// password-derived secret) and therefore requires a TOTP second factor when the
+/// account has 2FA. EXTERNAL (client cert) and OAUTHBEARER (external IdP) are
+/// other/possession factors; SESSION-TOKEN is a prior-auth continuation (scoped
+/// by token revocation on a 2FA change); ANONYMOUS is a guest (no account).
+pub fn mechanismIsKnowledgeFactor(mechanism: Mechanism) bool {
+    return switch (mechanism) {
+        .plain, .scram_sha_256, .scram_sha_512, .scram_sha_512_plus => true,
+        .external, .oauthbearer, .session_token, .anonymous => false,
+    };
+}
+
 pub const ScramRecord = struct {
     salt: []const u8,
     iterations: u32,
@@ -612,6 +636,19 @@ fn b64(comptime text: []const u8) [std.base64.standard.Encoder.calcSize(text.len
     var out: [std.base64.standard.Encoder.calcSize(text.len)]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&out, text);
     return out;
+}
+
+test "mechanismIsKnowledgeFactor classifies every SASL mechanism" {
+    // Knowledge factors (need a TOTP second factor when 2FA is active).
+    try std.testing.expect(mechanismIsKnowledgeFactor(.plain));
+    try std.testing.expect(mechanismIsKnowledgeFactor(.scram_sha_256));
+    try std.testing.expect(mechanismIsKnowledgeFactor(.scram_sha_512));
+    try std.testing.expect(mechanismIsKnowledgeFactor(.scram_sha_512_plus));
+    // Other/possession/continuation factors (not gated by TOTP).
+    try std.testing.expect(!mechanismIsKnowledgeFactor(.external));
+    try std.testing.expect(!mechanismIsKnowledgeFactor(.oauthbearer));
+    try std.testing.expect(!mechanismIsKnowledgeFactor(.session_token));
+    try std.testing.expect(!mechanismIsKnowledgeFactor(.anonymous));
 }
 
 test "PLAIN parses credentials and dispatcher accepts or rejects" {

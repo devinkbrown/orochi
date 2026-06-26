@@ -612,6 +612,25 @@ pub const Services = struct {
         return account_out[0..acct_record.name.asSlice().len];
     }
 
+    /// Revoke any active SASL session token for `account`. A session token is a
+    /// password-equivalent re-entry credential, so it must not outlive a change
+    /// to the account's second factor — call this when TOTP is enabled or
+    /// disabled so a token minted under the old policy cannot bypass the new one.
+    /// Best-effort and idempotent.
+    pub fn revokeSessionTokens(self: *Services, account: []const u8) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const key = accountKey(account) catch return;
+        var acct_key_buf: [session_token_account_key_max]u8 = undefined;
+        const acct_key = sessionTokenAccountKey(&acct_key_buf, key.asSlice()) orelse return;
+        const old_hash = self.store.family(.props).get(acct_key) orelse return;
+        if (old_hash.len == hash_hex_len) {
+            var token_key_buf: [session_token_key_max]u8 = undefined;
+            if (sessionTokenKey(&token_key_buf, old_hash)) |tk| self.store.family(.props).delete(tk) catch {};
+        }
+        self.store.family(.props).delete(acct_key) catch {};
+    }
+
     fn accountForCertfpUnlocked(self: *Services, fingerprint: []const u8) ServiceError![]const u8 {
         const acct = try self.certfpOwnerUnlocked(fingerprint);
         if (try self.accountSuspendedUnlocked(acct)) return error.AuthFailed;

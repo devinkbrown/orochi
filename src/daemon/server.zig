@@ -5703,6 +5703,9 @@ pub const LinuxServer = struct {
             return;
         }
         if (self.config.sasl_checker) |chk| conn.session.sasl_plain = chk;
+        // TOTP second-factor gate: lets the SASL completion path refuse a
+        // knowledge-factor login (PLAIN/SCRAM) for a 2FA-active account.
+        conn.session.sasl_totp_gate = .{ .ptr = self, .activeFn = totpGateActive };
         // SCRAM (both digests) needs a per-connection server nonce. Generate it
         // once if either SCRAM lookup is configured, then attach whichever
         // lookups are present so SCRAM-SHA-256 and SCRAM-SHA-512 share the nonce.
@@ -12554,9 +12557,27 @@ pub const LinuxServer = struct {
         return @divFloor(platform.realtimeMillis(), 1000);
     }
 
-    /// Whether `account` has ACTIVE TOTP 2FA. Checks the live store first, then
-    /// lazily restores a persisted secret (e.g. after a restart) into the store
-    /// so login enforcement and the replay guard work across reboots.
+    /// Whether `account` has active TOTP 2FA — the ENFORCEMENT source of truth.
+    /// Reads the persisted enrollment (only a CONFIRMed secret is stored), which
+    /// is thread-safe (services lock) and never mutates the in-memory store, so
+    /// it is safe to call from any login path (incl. the SASL gate). A pending,
+    /// unpersisted enrollment correctly does not require a second factor.
+    fn totpRequired(self: *LinuxServer, account: []const u8) bool {
+        const svc = self.account_services orelse return false;
+        return svc.totpEnrolled(account);
+    }
+
+    /// `sasl.TotpGate` adapter: lets the SASL completion path (which has only the
+    /// session, not the server) query 2FA status through an installed fat pointer.
+    fn totpGateActive(ptr: *anyopaque, account: []const u8) bool {
+        const self: *LinuxServer = @ptrCast(@alignCast(ptr));
+        return self.totpRequired(account);
+    }
+
+    /// Whether `account` has ACTIVE TOTP 2FA, ensuring the secret is loaded into
+    /// the live store (lazily restoring a persisted secret after a restart) so a
+    /// subsequent `self.totp.verify` can check a code with the replay guard. Use
+    /// `totpRequired` for a pure read-only gate check.
     fn totpActiveForAccount(self: *LinuxServer, account: []const u8) bool {
         if (self.totp.isEnrolled(account)) return true;
         // A pending (unconfirmed) in-memory enrollment is authoritative — never
@@ -12596,10 +12617,15 @@ pub const LinuxServer = struct {
             const was = self.totpActiveForAccount(account) or self.totp.isPending(account);
             _ = self.totp.disable(account);
             svc.totpSecretDelete(account) catch {};
+            // Disabling 2FA also drops any session token minted under it.
+            svc.revokeSessionTokens(account);
             return channelNotice(conn, "TOTP: two-factor authentication {s}", .{if (was) "disabled" else "was not enabled"});
         }
 
         if (std.ascii.eqlIgnoreCase(sub, "ENROLL")) {
+            // The shared secret must never cross a plaintext link.
+            if (!conn.is_tls)
+                return self.failReply(conn, "TOTP", "INSECURE_TRANSPORT", "Enroll TOTP over a secure (TLS) connection; the secret must not cross plaintext");
             if (self.totpActiveForAccount(account))
                 return self.failReply(conn, "TOTP", "ALREADY_ENROLLED", "TOTP is already active; DISABLE it first to re-enroll");
             const io = self.config.crypto_io orelse
@@ -12630,7 +12656,11 @@ pub const LinuxServer = struct {
                     if (self.totp.secretB32(account)) |b32| svc.totpSecretPut(account, b32) catch {
                         return channelNotice(conn, "TOTP: confirmed, but the secret could not be persisted; re-enroll after restart", .{});
                     };
-                    return channelNotice(conn, "TOTP: two-factor enrollment confirmed and saved", .{});
+                    // Enabling 2FA revokes any existing session token (a password-
+                    // equivalent re-entry credential that must not bypass the new
+                    // second factor).
+                    svc.revokeSessionTokens(account);
+                    return channelNotice(conn, "TOTP: two-factor authentication is now ACTIVE — future logins require a code", .{});
                 },
                 .bad_code => return self.failReply(conn, "TOTP", "INVALID_CODE", "Incorrect code; try the current one from your authenticator"),
                 .not_enrolled => return self.failReply(conn, "TOTP", "NO_PENDING", "Nothing to confirm — run TOTP ENROLL first"),
@@ -16534,6 +16564,17 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// Whether an IRCX AUTH package authenticates by a knowledge factor (password
+    /// or password-derived) and so requires a TOTP second factor for a 2FA
+    /// account. EXTERNAL (cert), OAUTHBEARER (IdP), SESSION-TOKEN (continuation),
+    /// and ANON(YMOUS) are not knowledge factors.
+    fn ircxAuthIsKnowledgeFactor(package: ircx_auth.Package) bool {
+        return switch (package) {
+            .plain, .scram_sha_256, .scram_sha_512, .scram_sha_512_plus, .gatekeeper, .gatekeeper_passport => true,
+            .external, .oauthbearer, .session_token, .anon, .anonymous => false,
+        };
+    }
+
     fn completeIrcxAuth(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -16547,6 +16588,20 @@ pub const LinuxServer = struct {
         }
         var account_buf: [account_register.MAX_ACCOUNT_BYTES]u8 = undefined;
         const account = std.ascii.lowerString(account_buf[0..result.account.len], result.account);
+
+        // TOTP second factor over IRCX AUTH: a knowledge-factor package (PLAIN,
+        // SCRAM-*, GateKeeper) for a 2FA-active account is refused — IRCX AUTH
+        // carries no second factor, so the user must complete 2FA via IDENTIFY.
+        // EXTERNAL/OAUTHBEARER/SESSION-TOKEN/ANON(YMOUS) are other/continuation
+        // factors and pass.
+        if (!result.guest and ircxAuthIsKnowledgeFactor(package) and self.totpRequired(account)) {
+            conn.session.sasl_router = null;
+            conn.session.sasl_pending = null;
+            self.noticeTo(conn, "Two-factor authentication required: log in with IDENTIFY <account> <password> <code>") catch {};
+            try self.ircxAuthFailed(conn, package.token());
+            return;
+        }
+
         var final_buf: [sasl_mechrouter.MAX_B64_MESSAGE]u8 = undefined;
         const final_copy: ?[]const u8 = if (result.final_data) |final| blk: {
             if (final.len > final_buf.len) break :blk null;
@@ -18702,7 +18757,7 @@ pub const LinuxServer = struct {
     pub fn handleIdentify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         if (parsed.param_count < 2) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"IDENTIFY"}, "Usage: IDENTIFY <account> <password>");
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"IDENTIFY"}, "Usage: IDENTIFY <account> <password> [<2fa-code>]");
             return;
         }
         const account = parsed.paramSlice()[0];
@@ -18713,6 +18768,19 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, "Invalid account or password");
             return;
         };
+        // TOTP second factor: a 2FA-active account must also supply a valid code
+        // as the 3rd parameter. A correct password with a missing/incorrect code
+        // is a FAILED login (an attacker may hold the password) — it counts
+        // against the brute-force throttle and never logs in.
+        if (self.totpRequired(account)) {
+            _ = self.totpActiveForAccount(account); // load the secret into the live store
+            const code = if (parsed.param_count >= 3) parsed.paramSlice()[2] else "";
+            const ok = code.len != 0 and (self.totp.verify(account, code, totpUnixSeconds()) catch .bad_code) == .ok;
+            if (!ok) {
+                self.loginRecordFailure(conn, account);
+                return self.failReply(conn, "IDENTIFY", "TOTP_REQUIRED", "Two-factor code required: IDENTIFY <account> <password> <6-digit-code>");
+            }
+        }
         self.loginRecordSuccess(conn, account);
         // Re-IDENTIFY to a different account: drop the previous account's session
         // binding first (mirrors handleLogout), so a stale SessionStore entry can
@@ -25657,6 +25725,7 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
 
     const id = try addTestLocalClient(&server, "kain", "kain"); // logged in to account "kain"
     const conn = server.connFor(id).?;
+    conn.is_tls = true; // ENROLL requires a secure link (the secret crosses it)
 
     const totp = struct {
         fn call(s: *Server, c: *ConnState, sub: []const u8, arg: ?[]const u8) !void {
@@ -25693,7 +25762,7 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
     var codebuf: [6]u8 = undefined;
     _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
     try totp.call(&server, conn, "CONFIRM", &codebuf);
-    try expectContains(conn.send_buf[0..conn.send_len], "confirmed and saved");
+    try expectContains(conn.send_buf[0..conn.send_len], "now ACTIVE");
     try std.testing.expect(services.totpEnrolled("kain")); // confirmed secret IS persisted
 
     // Lazy reload: clear the in-memory store (simulating a restart) — the
@@ -25708,6 +25777,88 @@ test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABL
     try expectContains(conn.send_buf[0..conn.send_len], "disabled");
     try std.testing.expect(!services.totpEnrolled("kain"));
     try std.testing.expect(!server.totpActiveForAccount("kain"));
+}
+
+test "TOTP enforcement: IDENTIFY + SASL gated for a 2FA account; tokens revoked on enable" {
+    const ct = @import("../crypto/totp.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-totp-enf.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+    const secret_b32 = "MZXW6YTBOI======";
+    try services.totpSecretPut("kain", secret_b32); // 2FA active
+    const raw = try ct.decodeBase32(std.testing.allocator, secret_b32);
+    defer std.testing.allocator.free(raw);
+
+    const id = try addTestLocalClient(&server, "guest", null);
+    const conn = server.connFor(id).?;
+
+    // IDENTIFY without a code → refused; conn stays logged out.
+    conn.send_len = 0;
+    var lv = irc_line.LineView{ .raw = "", .command = "IDENTIFY" };
+    lv.params[0] = "kain";
+    lv.params[1] = "correct horse battery staple";
+    lv.param_count = 2;
+    try server.handleIdentify(conn, &lv);
+    try std.testing.expect(conn.session.account() == null);
+    try expectContains(conn.send_buf[0..conn.send_len], "TOTP_REQUIRED");
+
+    // IDENTIFY with the correct code → logged in.
+    const now_s = @divFloor(platform.realtimeMillis(), 1000);
+    const val = try ct.totp(raw, now_s, 30, 0, 6, .sha1);
+    var codebuf: [6]u8 = undefined;
+    _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
+    lv.params[2] = &codebuf;
+    lv.param_count = 3;
+    try server.handleIdentify(conn, &lv);
+    try std.testing.expectEqualStrings("kain", conn.session.account().?);
+
+    // SASL via IRCX AUTH: every knowledge-factor package is refused (PLAIN AND
+    // SCRAM — the SCRAM case is the bypass a prior review caught). A fresh,
+    // logged-out connection stays logged out.
+    for ([_]ircx_auth.Package{ .plain, .scram_sha_256, .scram_sha_512_plus }, 0..) |pkg, i| {
+        var nick_buf: [8]u8 = undefined;
+        const nick = std.fmt.bufPrint(&nick_buf, "g{d}", .{i}) catch unreachable;
+        const cid = try addTestLocalClient(&server, nick, null);
+        const c = server.connFor(cid).?;
+        try server.completeIrcxAuth(cid, c, pkg, .{ .account = "kain" });
+        try std.testing.expect(c.session.account() == null);
+    }
+
+    // EXTERNAL/SESSION-TOKEN are not knowledge factors — not gated.
+    try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.external));
+    try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.session_token));
+    try std.testing.expect(!Server.ircxAuthIsKnowledgeFactor(.oauthbearer));
+    try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.plain));
+    try std.testing.expect(Server.ircxAuthIsKnowledgeFactor(.scram_sha_256));
+}
+
+test "TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-totp-tok.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "correct horse battery staple", &scratch);
+
+    // Issue a session token, confirm it validates, then revoke and confirm it no
+    // longer validates — the exact behaviour TOTP enable invokes.
+    const issued = try services.issueSessionToken("kain", 1000);
+    var acct_out: [64]u8 = undefined;
+    try std.testing.expect(services.validateSessionToken("kain", &issued.token, 1001, &acct_out) != null);
+    services.revokeSessionTokens("kain");
+    try std.testing.expect(services.validateSessionToken("kain", &issued.token, 1001, &acct_out) == null);
 }
 
 

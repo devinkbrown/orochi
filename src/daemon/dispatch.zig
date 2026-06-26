@@ -808,6 +808,12 @@ pub const ClientSession = struct {
     sasl_session_token: ?sasl_mechrouter.SessionTokenLookup = null,
     /// Injected OAUTHBEARER verifier. Null fails closed.
     sasl_oauthbearer: ?sasl_mechrouter.OAuthBearerLookup = null,
+    /// Injected TOTP second-factor gate: reports whether an account has active
+    /// 2FA. The live server backs it with the persisted enrollment store; null
+    /// means no gate (2FA never required, e.g. no account store). A knowledge-
+    /// factor SASL success (PLAIN/SCRAM) for a 2FA-active account is refused —
+    /// the user must complete the second factor via IDENTIFY.
+    sasl_totp_gate: ?sasl.TotpGate = null,
     /// Config gate for SASL ANONYMOUS. Default false.
     sasl_allow_anonymous: bool = false,
     /// Per-session SASL mechanism router. Lazily initialized on the first
@@ -1832,12 +1838,26 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             } else null;
 
             const oper_elevation_allowed = saslMechanismAllowsOperElevation(ctx.session.sasl_pending);
+            const mechanism = ctx.session.sasl_pending;
             ctx.session.sasl_router = null;
             ctx.session.sasl_pending = null;
 
             if (result.guest) {
                 ctx.session.loginGuest(account);
             } else {
+                // TOTP second factor: a knowledge-factor SASL success (PLAIN/
+                // SCRAM) for a 2FA-active account is refused here — SASL carries
+                // no second factor, so the user must complete 2FA via IDENTIFY.
+                // EXTERNAL/OAUTHBEARER (other factors) and SESSION-TOKEN (a prior-
+                // auth continuation, revoked on a 2FA change) are not gated.
+                if (mechanism) |mech| {
+                    if (sasl.mechanismIsKnowledgeFactor(mech)) {
+                        if (ctx.session.sasl_totp_gate) |gate| {
+                            if (gate.active(account))
+                                return saslFail(ctx, "Two-factor authentication required: log in with IDENTIFY <account> <password> <code>");
+                        }
+                    }
+                }
                 ctx.session.loginAs(account);
                 ctx.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
                 ctx.session.sasl_issue_session_token = result.issue_session_token;
