@@ -253,6 +253,28 @@ enabled = false
 # action = "refuse"
 
 
+# --- [mail] — outbound SMTP submission relay ---------------------------------
+# When enabled with a relay host + sender, account email-verification codes are
+# delivered OUT-OF-BAND through the relay (on a background thread), so REGISTER
+# can actually verify email ownership. Disabled (default) = no mail: REGISTER
+# records emails as unverified. This is a submission CLIENT to an existing relay,
+# never the daemon's own MTA.
+[mail]
+enabled = false
+# relay_host = "localhost"
+# relay_port = 587            # 587 = STARTTLS (default); 465 = implicit TLS
+# starttls = true             # false => port 465 implicit TLS
+# from = "orochi@example.org" # envelope sender + From: address
+# AUTH credentials for the relay (optional; omit for an open/local relay).
+# user = "env:MAIL_USER"
+# pass = "env:MAIL_PASS"
+# SECURITY: the relay's TLS certificate is NOT verified yet. Submitting AUTH
+# credentials to a NON-loopback relay is therefore REFUSED unless you explicitly
+# accept the risk here (a MITM could capture the credentials). Prefer a relay on
+# localhost / a trusted path. Set true only if you understand the exposure.
+# insecure_skip_verify = false
+
+
 # --- [limits] — capacity, timeouts, and advertised protocol limits -----------
 [limits]
 backlog = 128          # listen() backlog (1..32767)

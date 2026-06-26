@@ -47,6 +47,7 @@ pub const host_request = @import("host_request.zig");
 pub const http_fetch = @import("http_fetch.zig");
 pub const ip_reputation = @import("ip_reputation.zig");
 pub const link_health = @import("link_health.zig");
+pub const mail_sender = @import("mail_sender.zig");
 pub const media_bridge = @import("media_bridge.zig");
 pub const media_plane = @import("media_plane.zig");
 pub const media_room = @import("media_room.zig");
@@ -173,6 +174,7 @@ test {
     _ = http_fetch;
     _ = ip_reputation;
     _ = link_health;
+    _ = mail_sender;
     _ = media_bridge;
     _ = media_plane;
     _ = media_room;

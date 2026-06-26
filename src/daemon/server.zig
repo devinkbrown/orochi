@@ -129,6 +129,7 @@ const geoip = @import("../substrate/geoip.zig");
 const geo_services = @import("geo_services.zig");
 const rdns = @import("rdns.zig");
 const dnsbl_resolver = @import("dnsbl_resolver.zig");
+const mail_sender = @import("mail_sender.zig");
 const news_sources = @import("../proto/news_sources.zig");
 const build_info = @import("build_info");
 const stats_report = @import("stats_report.zig");
@@ -1572,6 +1573,10 @@ pub const Config = struct {
     /// DNSBL enforcement action: false = refuse the connection, true = add a
     /// Warden ban for the listed IP (which also closes it). From `[dnsbl] action`.
     dnsbl_ward: bool = false,
+    /// Background SMTP submission sender (owned by main). When set, account
+    /// email-verification codes are delivered out-of-band through the configured
+    /// relay. Null = no mail transport (emails recorded unverified). From `[mail]`.
+    mail_sender: ?*mail_sender.Sender = null,
     /// Config file path + resolver for live REHASH. When set (by main), REHASH
     /// re-reads and re-parses this file and swaps in the new oper registry. Null
     /// = REHASH acknowledges without reloading (e.g. defaults-only boot, tests).
@@ -18684,16 +18689,30 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ self.serverName(), account }) catch return;
         try appendToConn(conn, line);
-        // The account's email is recorded by registerAccountWithEmail above but
-        // stays UNVERIFIED: this build has no out-of-band (mail) delivery, so the
-        // address cannot be proven to belong to the registrant. We deliberately do
-        // NOT issue an in-band "verification" code — showing the code on the SAME
-        // connection proves nothing about email ownership (the user verifying
-        // themselves), so claiming "email verified" would be security theater.
-        // Real verification arrives with a mail transport; the VERIFY command and
-        // its token store remain wired for that future delivery path.
+        // Email verification. With a configured mail transport, issue a token and
+        // deliver it OUT-OF-BAND to the address (proving ownership); the user
+        // confirms with VERIFY. Without a transport, the address is recorded but
+        // stays UNVERIFIED and we say so plainly — we never show an in-band code
+        // (the user verifying themselves on the same connection proves nothing).
         if (has_email) {
-            try channelNotice(conn, "Email {s} recorded (unverified — this server cannot verify email ownership yet)", .{email});
+            if (self.config.mail_sender) |ms| {
+                if (self.config.crypto_io) |io| {
+                    var tok_bytes: [16]u8 = undefined;
+                    io.random(&tok_bytes);
+                    const now_u: u64 = @intCast(@max(0, self.nowMs()));
+                    if (self.account_verifies.issue(account, email, &tok_bytes, now_u)) |token| {
+                        svc.setAccountEmailPending(account, email, token, now_u, &scratch) catch {};
+                        var body_buf: [512]u8 = undefined;
+                        const body = std.fmt.bufPrint(&body_buf, "Hello {s},\r\n\r\nYour verification code for {s} is: {s}\r\n\r\nConfirm it on IRC with:  VERIFY {s}\r\n\r\nIf you did not request this, ignore this message.\r\n", .{ account, self.serverName(), token, token }) catch "";
+                        if (body.len != 0) ms.enqueue(email, "Verify your account", body);
+                        try channelNotice(conn, "A verification code was emailed to {s}; confirm it with: VERIFY <code>", .{email});
+                    } else |_| {
+                        try channelNotice(conn, "Email {s} recorded (unverified — a verification code could not be issued)", .{email});
+                    }
+                }
+            } else {
+                try channelNotice(conn, "Email {s} recorded (unverified — this server cannot verify email ownership yet)", .{email});
+            }
         }
         if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);

@@ -162,6 +162,22 @@ Connect-time DNS blocklist. Each non-loopback client IP is checked against the c
 | `zones` | array of strings | `[]` | DNSBL zone hostnames | Blocklist zones queried per IP (A-record `127.0.0.x` = listed). The first zone that lists the IP wins, e.g. `["zen.spamhaus.org", "dnsbl.dronebl.org"]`. |
 | `action` | string | `"refuse"` | `refuse` / `ward` | Enforcement for a listed IP: `refuse` closes the connection; `ward` additionally records a node-scope Warden ban so the block persists across the IP's reconnects. |
 
+## `[mail]`
+
+Source: `Mail` struct + parsing in `src/daemon/config_format.zig`; sender in `src/daemon/mail_sender.zig`; construction in `src/main.zig`; REGISTER delivery in `src/daemon/server.zig`.
+
+Outbound SMTP submission relay. When enabled with a relay host + sender, account email-verification codes are delivered out-of-band through the relay on a background thread, so REGISTER can verify email ownership. Disabled (default) = no mail (REGISTER records emails as unverified). A submission CLIENT to an existing relay, never the daemon's own MTA.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `enabled` | bool | `false` | `true`/`false` | Master switch; the sender is built only when enabled with `relay_host` + `from`. |
+| `relay_host` | string | unset | hostname | Submission relay (resolved via DNS A record). |
+| `relay_port` | integer | `587` | `1..65535` | `587` = STARTTLS; `465` = implicit TLS. |
+| `starttls` | bool | `true` | `true`/`false` | `false` selects port-465 implicit TLS (TLS from connect). |
+| `from` | string | unset | email address | Envelope sender + `From:` header. |
+| `user` / `pass` | string or null | unset | relay credentials | Optional AUTH PLAIN credentials. |
+| `insecure_skip_verify` | bool | `false` | `true`/`false` | Skip TLS cert verification. **Security:** cert verification is not yet wired, so AUTH to a NON-loopback relay is REFUSED unless this is explicitly set true (a MITM could otherwise capture the submission credentials). Prefer a relay on localhost / a trusted path. |
+
 ## `[limits]`
 
 Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/config_format.zig:354`, mapping at `src/daemon/config_boot.zig:35`.

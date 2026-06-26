@@ -401,6 +401,33 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Background SMTP submission sender: built only when `[mail]` is enabled with
+    // a relay host + sender address. Delivers account email-verification codes
+    // out-of-band. Inert otherwise (emails are recorded unverified).
+    var mail_send: ?orochi.daemon.mail_sender.Sender = null;
+    defer if (mail_send) |*m| m.deinit();
+    if (held) |h| {
+        const m = h.parsed.mail;
+        if (m.enabled) {
+            if (m.relay_host) |relay| if (m.from) |from| {
+                mail_send = orochi.daemon.mail_sender.Sender.init(allocator, .{
+                    .relay_host = relay,
+                    .relay_port = m.relay_port,
+                    .starttls = m.starttls,
+                    .insecure_skip_verify = m.insecure_skip_verify,
+                    .ehlo_domain = srv_cfg.server_name,
+                    .from = from,
+                    .user = m.user,
+                    .pass = m.pass,
+                }) catch null;
+                if (mail_send) |*s| {
+                    s.start();
+                    srv_cfg.mail_sender = s;
+                }
+            };
+        }
+    }
+
     // Implicit-TLS client listener: when `[tls] enabled`, load the configured
     // cert/key (or mint a self-signed bootstrap leaf) and stand up the TLS
     // listener. The chain bytes + signing key live for the server's lifetime

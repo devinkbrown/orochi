@@ -92,6 +92,11 @@ pub const Config = struct {
         relay_port: u16 = 587,
         /// false = port 465 implicit TLS (TLS from connect); true = STARTTLS on 587.
         starttls: bool = true,
+        /// Skip TLS certificate verification of the relay. Default false. Required
+        /// (set true) to use AUTH with a NON-loopback relay until trust-anchor
+        /// verification is wired — otherwise AUTH to a remote relay is refused, so
+        /// submission credentials are never sent over an unverified TLS session.
+        insecure_skip_verify: bool = false,
         /// Envelope sender + `From:` address (e.g. "orochi@example.org").
         from: ?[]const u8 = null,
         /// AUTH credentials for the relay (optional; omitted = no AUTH).
@@ -684,6 +689,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("mail.relay_host"), &cfg.mail.relay_host);
     cfg.mail.relay_port = @intCast(try uintField(doc, "mail.relay_port", cfg.mail.relay_port, 1, 65535));
     if (doc.getBool("mail.starttls")) |b| cfg.mail.starttls = b;
+    if (doc.getBool("mail.insecure_skip_verify")) |b| cfg.mail.insecure_skip_verify = b;
     try setOpt(allocator, resolver, doc.getString("mail.from"), &cfg.mail.from);
     try setOpt(allocator, resolver, doc.getString("mail.user"), &cfg.mail.user);
     try setOpt(allocator, resolver, doc.getString("mail.pass"), &cfg.mail.pass);
