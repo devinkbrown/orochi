@@ -18869,18 +18869,47 @@ pub const LinuxServer = struct {
     /// password after verifying the current one. The new password must satisfy the
     /// length policy (8-512) and differ from the current one. SCRAM credentials are
     /// re-derived so SCRAM logins keep working.
+    /// Whether `conn` has proven its identity for `account` by a CLIENT
+    /// CERTIFICATE bound to that account — a possession factor. Lets a user who
+    /// forgot their password recover it (set a new one without the current one)
+    /// after authenticating with their bound cert (e.g. via SASL EXTERNAL).
+    fn sessionCertVerifiedFor(self: *LinuxServer, conn: *const ConnState, account: []const u8) bool {
+        const svc = self.account_services orelse return false;
+        const fp = conn.session.tls_certfp orelse return false;
+        if (fp.len == 0) return false;
+        const bound = svc.accountForCertfp(fp) orelse return false;
+        return std.ascii.eqlIgnoreCase(bound, account);
+    }
+
     pub fn handleSetpass(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "SETPASS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
         const account = conn.session.account() orelse {
             try self.failReply(conn, "SETPASS", "ACCOUNT_REQUIRED", "Log in to change your password");
             return;
         };
-        if (parsed.param_count < 2 or parsed.paramSlice()[0].len == 0 or parsed.paramSlice()[1].len == 0) {
-            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SETPASS"}, "Usage: SETPASS <current-password> <new-password>");
+        const p = parsed.paramSlice();
+        var scratch: [1024]u8 = undefined;
+
+        // Recovery form: SETPASS <new-password> (one argument) sets a new password
+        // WITHOUT the current one — allowed only when the connection proved its
+        // identity by a client certificate bound to this account (a possession
+        // factor), so a forgotten password can be reset after a SASL EXTERNAL login.
+        if (p.len == 1 and p[0].len != 0) {
+            if (!self.sessionCertVerifiedFor(conn, account))
+                return self.failReply(conn, "SETPASS", "RESET_NOT_AUTHORIZED", "One-argument SETPASS (reset without the current password) requires a connection authenticated by a client certificate bound to this account");
+            svc.setAccountPasswordForced(account, p[0], &scratch) catch |err| {
+                const code: []const u8 = if (err == error.InvalidPassword) "INVALID_PASSWORD" else "TEMPORARILY_UNAVAILABLE";
+                return self.failReply(conn, "SETPASS", code, "New password rejected");
+            };
+            try self.noticeTo(conn, "SETPASS: your password has been reset (verified by client certificate)");
             return;
         }
-        var scratch: [1024]u8 = undefined;
-        svc.changeAccountPassword(account, parsed.paramSlice()[0], parsed.paramSlice()[1], &scratch) catch |err| {
+
+        if (p.len < 2 or p[0].len == 0 or p[1].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"SETPASS"}, "Usage: SETPASS <current-password> <new-password>  (or, on a cert-verified connection, SETPASS <new-password>)");
+            return;
+        }
+        svc.changeAccountPassword(account, p[0], p[1], &scratch) catch |err| {
             const code: []const u8 = switch (err) {
                 error.AuthFailed => "WRONG_PASSWORD",
                 error.InvalidPassword => "INVALID_PASSWORD",
@@ -25856,6 +25885,49 @@ test "TOTP CONFIRM revokes an existing session token (no 2FA-free re-entry)" {
     try std.testing.expect(services.validateSessionToken("kain", &issued.token, 1001, &acct_out) == null);
 }
 
+test "SETPASS cert recovery: 1-arg reset only on a cert-verified connection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-setpass-cert.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    services.attachCertfpBinds(&binds);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "old-password-123", &scratch);
+    const fp = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"; // 64 hex
+    try services.bindCertfp("kain", fp);
+
+    const id = try addTestLocalClient(&server, "kain", "kain"); // logged in
+    const conn = server.connFor(id).?;
+    var lv = irc_line.LineView{ .raw = "", .command = "SETPASS" };
+    lv.params[0] = "new-password-456";
+    lv.param_count = 1;
+
+    // No client cert on the connection → the 1-arg reset is refused, and the old
+    // password still works.
+    conn.send_len = 0;
+    try server.handleSetpass(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "RESET_NOT_AUTHORIZED");
+    _ = services.identifyAccount("kain", "old-password-123") catch return error.TestUnexpectedResult;
+
+    // With the bound cert presented → the reset succeeds; the new password works
+    // and the old one no longer does.
+    conn.session.tls_certfp = fp;
+    conn.send_len = 0;
+    try server.handleSetpass(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "verified by client certificate");
+    _ = services.identifyAccount("kain", "new-password-456") catch return error.TestUnexpectedResult;
+    if (services.identifyAccount("kain", "old-password-123")) |_| return error.TestUnexpectedResult else |_| {}
+}
 
 test "session-sync unit: two sessions same account both session-sync get the DM" {
     const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };

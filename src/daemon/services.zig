@@ -816,6 +816,41 @@ pub const Services = struct {
         }
     }
 
+    /// Set an account's password WITHOUT verifying the current one — for an
+    /// authenticated RECOVERY flow where the requester has already proven their
+    /// identity by a non-knowledge factor (e.g. a connection authenticated by a
+    /// client certificate bound to the account). Authorization is the CALLER's
+    /// responsibility; this only validates + stores the new password and
+    /// re-derives the SCRAM credential. Never expose it on a path that has not
+    /// independently verified the requester.
+    pub fn setAccountPasswordForced(
+        self: *Services,
+        name: []const u8,
+        new_password: []const u8,
+        scratch: []u8,
+    ) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var record = try self.loadAccount(name);
+        try validatePassword(new_password);
+
+        var salt: [salt_len]u8 = undefined;
+        self.store.io.randomSecure(&salt) catch self.store.io.random(&salt);
+        var hash: [hash_len]u8 = undefined;
+        try hashPassword(&hash, new_password, &salt, self.cfg.pbkdf2_rounds);
+        record.salt = salt;
+        record.hash = hash;
+
+        const encoded = try encodeAccount(record, scratch);
+        try self.store.family(.accounts).put(record.name.asSlice(), encoded);
+
+        if (self.scram) |scram| {
+            scram.deriveAndStore(record.name.asSlice(), new_password) catch return error.InvalidRecord;
+            self.persistScram(scram, record.name.asSlice());
+        }
+    }
+
     pub fn ghostAccount(self: *Services, name: []const u8, password: []const u8, nick: []const u8) ServiceError!CommandResult {
         self.lock.lockShared();
         defer self.lock.unlockShared();
