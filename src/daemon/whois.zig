@@ -253,6 +253,32 @@ pub fn writeNoSuchNickWith(
     try sink.commitLine(&b);
 }
 
+/// Emit only the trailing `RPL_ENDOFWHOIS` (318) line. Used to close a WHOIS
+/// that produced no subject body (e.g. after `writeNoSuchNick`), so every WHOIS
+/// terminates with 318 per RFC 1459/2812 regardless of whether the nick existed.
+pub fn writeEndOfWhois(
+    sink: *WhoisLineSink,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    target_nick: []const u8,
+) WhoisError!void {
+    return writeEndOfWhoisWith(.{}, sink, server_name, requester_nick, target_nick);
+}
+
+/// Emit `RPL_ENDOFWHOIS` (318) using caller-selected limits.
+pub fn writeEndOfWhoisWith(
+    comptime params: Params,
+    sink: *WhoisLineSink,
+    server_name: []const u8,
+    requester_nick: []const u8,
+    target_nick: []const u8,
+) WhoisError!void {
+    try validateServerNameWith(params, server_name);
+    try validateNickWith(params, requester_nick);
+    try validateNickWith(params, target_nick);
+    try writeEndOfWhoisLine(params, sink, server_name, requester_nick, target_nick);
+}
+
 pub fn validateSubject(subject: WhoisSubject) WhoisError!void {
     return validateSubjectWith(.{}, subject);
 }
@@ -997,6 +1023,20 @@ test "ERR_NOSUCHNICK builder emits 401" {
 
     try std.testing.expectEqual(@as(usize, 1), sink.slice().len);
     try std.testing.expectEqualStrings(":irc.example 401 dan missing :No such nick/channel\r\n", sink.slice()[0].bytes);
+}
+
+test "failed WHOIS closes with RPL_ENDOFWHOIS 318" {
+    var storage: [256]u8 = undefined;
+    var lines_storage: [2]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    try writeNoSuchNick(&sink, "irc.example", "dan", "missing");
+    try writeEndOfWhois(&sink, "irc.example", "dan", "missing");
+
+    const lines = sink.slice();
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings(":irc.example 401 dan missing :No such nick/channel\r\n", lines[0].bytes);
+    try std.testing.expectEqualStrings(":irc.example 318 dan missing :End of /WHOIS list\r\n", lines[1].bytes);
 }
 
 test "channel list folds across multiple 319 lines" {

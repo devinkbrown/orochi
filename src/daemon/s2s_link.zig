@@ -161,6 +161,13 @@ pub const S2sLink = struct {
         return self.peer.linkState() == .established;
     }
 
+    /// Install (or clear) the borrowed local-world nick predicate used for
+    /// cross-namespace NICK collision resolution (a remote nick that matches a
+    /// LOCAL one is renamed to its mesh UID rather than overwriting the holder).
+    pub fn setLocalNickResolver(self: *S2sLink, resolver: ?LocalNickResolver) void {
+        self.peer.routes.setLocalNickResolver(resolver);
+    }
+
     /// Which remote node currently owns `nick`, per the route table.
     pub fn routeNickNode(self: *const S2sLink, nick: []const u8) ?NodeId {
         return self.peer.routeNickNode(nick);
@@ -198,6 +205,7 @@ pub const S2sLink = struct {
     }
 
     pub const MemberIdentity = s2s_peer.MemberIdentity;
+    pub const LocalNickResolver = s2s_peer.LocalNickResolver;
 
     /// Announce a local member's presence/departure in `channel` to the peer,
     /// carrying the member's real username/realname/visible-host identity.
@@ -949,6 +957,130 @@ test "NICKCHANGE renames a remote member and yields a delta" {
     // The roster now resolves the new nick and no longer the old one.
     try std.testing.expect(b.findRemoteMember("kain") != null);
     try std.testing.expect(b.findRemoteMember("Guest1") == null);
+}
+
+const LocalNickStub = struct {
+    held: []const u8,
+    fn isHeld(ctx: *anyopaque, nick: []const u8) bool {
+        const self: *LocalNickStub = @ptrCast(@alignCast(ctx));
+        return std.ascii.eqlIgnoreCase(self.held, nick);
+    }
+    fn resolver(self: *LocalNickStub) S2sLink.LocalNickResolver {
+        return .{ .ctx = self, .held_fn = isHeld };
+    }
+};
+
+fn pumpLinks(a: *S2sLink, b: *S2sLink, allocator: std.mem.Allocator, start_now: u64) !void {
+    var now = start_now;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        const a_out = a.outbound();
+        const b_out = b.outbound();
+        if (a_out.len == 0 and b_out.len == 0) break;
+        const a_copy = try allocator.dupe(u8, a_out);
+        defer allocator.free(a_copy);
+        const b_copy = try allocator.dupe(u8, b_out);
+        defer allocator.free(b_copy);
+        a.clearOutbound();
+        b.clearOutbound();
+        if (a_copy.len != 0) try b.feed(a_copy, now, 7);
+        if (b_copy.len != 0) try a.feed(b_copy, now, 9);
+        now += 1;
+    }
+}
+
+test "a remote nick colliding with a LOCAL nick is renamed to its UID, not overwritten" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    // b's local world already holds "kain". An incoming remote "kain" from a
+    // must lose (local is authoritative) and be stored under its mesh UID.
+    var stub = LocalNickStub{ .held = "kain" };
+    b.setLocalNickResolver(stub.resolver());
+
+    try a.start(10);
+    try a.sendMembership("#chat", "kain", 0, 100, true, .{ .username = "k", .realname = "K", .host = "a.host" }, "");
+    try pumpLinks(&a, &b, allocator, 11);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*d| d.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(@as(usize, 16), changes[0].nick.len); // forced UID
+    try std.testing.expect(!std.ascii.eqlIgnoreCase(changes[0].nick, "kain"));
+
+    // The route table never stored the contested nick verbatim; it resolves the
+    // UID instead, so a local "kain" and the remote member never both answer.
+    try std.testing.expect(b.findRemoteMember("kain") == null);
+    try std.testing.expect(b.findRemoteMember(changes[0].nick) != null);
+}
+
+test "a remote RENAME into a locally-held nick redirects the renamer to its UID" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+
+    // b's local world holds "kain". A remote user announces under Guest1, then
+    // tries to rename to "kain": the renamer loses and lands on its mesh UID.
+    var stub = LocalNickStub{ .held = "kain" };
+    b.setLocalNickResolver(stub.resolver());
+
+    try a.start(10);
+    try a.sendMembership("#chat", "Guest1", 0, 100, true, .{ .username = "g", .realname = "G", .host = "a.host" }, "");
+    try a.sendNickChange("Guest1", "kain", .{ .username = "g", .realname = "G", .host = "a.host" }, 200);
+    try pumpLinks(&a, &b, allocator, 11);
+
+    const changes = try b.takeNickChanges();
+    defer {
+        for (changes) |*d| d.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("Guest1", changes[0].old_nick);
+    try std.testing.expectEqual(@as(usize, 16), changes[0].new_nick.len); // UID, not "kain"
+    try std.testing.expect(!std.ascii.eqlIgnoreCase(changes[0].new_nick, "kain"));
+
+    // The contested local nick was never taken by the remote member.
+    try std.testing.expect(b.findRemoteMember("kain") == null);
+    try std.testing.expect(b.findRemoteMember(changes[0].new_nick) != null);
+}
+
+test "a same-node re-affirmation keeps the nick (no spurious collision rename)" {
+    const allocator = std.testing.allocator;
+
+    var a: S2sLink = undefined;
+    try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.orochi" });
+    defer a.deinit();
+    var b: S2sLink = undefined;
+    try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.orochi" });
+    defer b.deinit();
+    // No local holder; "mei" is uncontested.
+    var stub = LocalNickStub{ .held = "someone-else" };
+    b.setLocalNickResolver(stub.resolver());
+
+    try a.start(10);
+    try a.sendMembership("#chat", "mei", 0, 100, true, .{ .username = "m", .realname = "M", .host = "a.host" }, "");
+    try a.sendMembership("#other", "mei", 0, 200, true, .{ .username = "m", .realname = "M", .host = "a.host" }, "");
+    try pumpLinks(&a, &b, allocator, 11);
+
+    // The member is stored under its real nick on both channels — the second
+    // (same-node) claim is an ordinary join, never a self-collision rename.
+    const member = b.findRemoteMember("mei") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("mei", member.nick);
+    try std.testing.expectEqual(@as(?NodeId, 1), b.routeNickNode("mei"));
 }
 
 test "OPER_GRANT payload round-trips across the link into takeOperGrants" {

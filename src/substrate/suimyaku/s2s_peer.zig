@@ -12,6 +12,7 @@ const link_session = @import("link_session.zig");
 const burst = @import("burst.zig");
 const server_registry = @import("server_registry.zig");
 const route_table = @import("route_table.zig");
+const nick_collision = @import("nick_collision.zig");
 const channel_crdt = @import("channel_crdt.zig");
 const gossip_round = @import("gossip_round.zig");
 const anti_entropy_repair = @import("anti_entropy_repair.zig");
@@ -30,6 +31,11 @@ pub const RelayMessage = message_relay.RelayMessage;
 pub const InboundMessage = message_relay.Owned;
 pub const RelayVerb = message_relay.Verb;
 pub const ChannelModeStateEvent = channel_mode_state_event.ChannelModeStateEvent;
+pub const LocalNickResolver = route_table.LocalNickResolver;
+
+/// Length of a mesh UID, sized for the stack scratch the collision paths use to
+/// hold a forced-rename fallback nick.
+const nick_collision_uid_len = @import("uid_alloc.zig").encoded_len;
 
 const handshake_magic = [_]u8{ 'S', '2', 'P', 'H' };
 /// Wire version of the S2S handshake. v1 carried no capability byte; v2 appends a
@@ -980,7 +986,30 @@ pub const S2sPeer = struct {
         const payload = self.verifiedPayload(.MEMBERSHIP, frame_payload) orelse return;
         const ev = membership_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
-        const res = self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
+
+        // Resolve a cross-namespace (local) or cross-node (remote) NICK collision
+        // BEFORE applying, so the loser is renamed to its stable mesh UID rather
+        // than silently overwriting an existing holder. Only present (join/status)
+        // events introduce a claim; a part can never collide.
+        var apply_nick: []const u8 = ev.nick;
+        var surfaced_nick: ?[]const u8 = null;
+        var uid_buf: [nick_collision_uid_len]u8 = undefined;
+        if (ev.present) {
+            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc)) {
+                .keep => {},
+                .rename_to_uid => |uid| {
+                    // Newcomer lost: store + surface this member under its UID.
+                    @memcpy(uid_buf[0..uid.len], uid[0..]);
+                    apply_nick = uid_buf[0..uid.len];
+                    surfaced_nick = apply_nick;
+                },
+            }
+            // Newcomer wins over a different-node incumbent: displace the
+            // incumbent to ITS uid first so two holders never coexist.
+            if (surfaced_nick == null) self.displaceIncumbent(&ev);
+        }
+
+        const res = self.routes.applyMembership(ev.channel, apply_nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
@@ -991,20 +1020,83 @@ pub const S2sPeer = struct {
             .status_changed => .status,
             .unchanged => return,
         };
-        self.queueMembershipDelta(&ev, kind, res.prev_status) catch return; // best-effort
+        self.queueMembershipDelta(&ev, kind, res.prev_status, surfaced_nick) catch return; // best-effort
+    }
+
+    /// When an incoming higher-priority claim wins a contested nick over a
+    /// DIFFERENT-node incumbent, rename that incumbent to its own mesh UID across
+    /// the route table and surface a `:contested NICK <incumbentUID>` line, so
+    /// local clients never see the same nick held by two mesh users at once. No-op
+    /// when there is no incumbent or the incumbent is the SAME node (own update).
+    fn displaceIncumbent(self: *S2sPeer, ev: *const membership_event.MembershipEvent) void {
+        self.displaceIncumbentForRename(ev.nick, ev.origin_node);
+    }
+
+    /// Shared incumbent-displacement: when a winning newcomer from `winner_node`
+    /// takes `nick` from a DIFFERENT-node incumbent, rename that incumbent to its
+    /// own mesh UID across the route table and surface a `:nick NICK <incumbentUID>`
+    /// line, so local clients never see two mesh users holding one nick. No-op when
+    /// there is no incumbent or it is the same node (an own update, not a contest).
+    fn displaceIncumbentForRename(self: *S2sPeer, nick: []const u8, winner_node: NodeId) void {
+        const incumbent_node = self.routes.nickNode(nick) orelse return;
+        if (incumbent_node == winner_node) return;
+        const uid = self.routes.incumbentLoserUid(nick) orelse return;
+        var uid_buf: [nick_collision_uid_len]u8 = undefined;
+        @memcpy(uid_buf[0..uid.len], uid[0..]);
+        const new_nick = uid_buf[0..uid.len];
+        // Pull the incumbent's stored identity so the NICK line renders its real
+        // user@host (falls back to empties when the member is route-only).
+        var ident = MemberIdentity{};
+        if (self.routes.findMember(nick)) |m| {
+            ident = .{ .username = m.username, .realname = m.realname, .host = m.host };
+        }
+        const renamed = self.routes.renameNick(nick, new_nick, incumbent_node, ident) catch return;
+        if (!renamed) return;
+        self.queueForcedNickRename(nick, new_nick, ident) catch {}; // best-effort surface
+    }
+
+    /// Queue a NickDelta for a forced collision rename so the daemon emits the
+    /// live `:old NICK new` line. Mirrors `recvNickChange`'s queueing, factored
+    /// out so the displacement path reuses it.
+    fn queueForcedNickRename(
+        self: *S2sPeer,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        ident: MemberIdentity,
+    ) !void {
+        const on = try self.allocator.dupe(u8, old_nick);
+        errdefer self.allocator.free(on);
+        const nn = try self.allocator.dupe(u8, new_nick);
+        errdefer self.allocator.free(nn);
+        const un = try self.allocator.dupe(u8, ident.username);
+        errdefer self.allocator.free(un);
+        const rn = try self.allocator.dupe(u8, ident.realname);
+        errdefer self.allocator.free(rn);
+        const ho = try self.allocator.dupe(u8, ident.host);
+        errdefer self.allocator.free(ho);
+        try self.nick_changes.append(self.allocator, .{
+            .old_nick = on,
+            .new_nick = nn,
+            .username = un,
+            .realname = rn,
+            .host = ho,
+        });
     }
 
     /// Dupe an event's strings into an owned `MembershipDelta` and queue it.
     /// Any allocation failure unwinds the partial copies (errdefer chain).
+    /// `nick_override`, when non-null, replaces `ev.nick` so a collision loser
+    /// surfaces under its forced mesh UID instead of the contested wire nick.
     fn queueMembershipDelta(
         self: *S2sPeer,
         ev: *const membership_event.MembershipEvent,
         kind: MembershipDelta.Kind,
         prev_status: u4,
+        nick_override: ?[]const u8,
     ) !void {
         const ch = try self.allocator.dupe(u8, ev.channel);
         errdefer self.allocator.free(ch);
-        const nk = try self.allocator.dupe(u8, ev.nick);
+        const nk = try self.allocator.dupe(u8, nick_override orelse ev.nick);
         errdefer self.allocator.free(nk);
         const un = try self.allocator.dupe(u8, ev.username);
         errdefer self.allocator.free(un);
@@ -1432,15 +1524,31 @@ pub const S2sPeer = struct {
         const payload = self.verifiedPayload(.NICKCHANGE, frame_payload) orelse return;
         const ev = nick_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
-        const renamed = self.routes.renameNick(ev.old_nick, ev.new_nick, ev.origin_node, .{
+
+        // A remote rename into a nick already held (locally, or by a different
+        // mesh node) makes the RENAMER the loser: redirect it to its mesh UID
+        // instead of clobbering the holder. A same-node incumbent is the user's
+        // own prior nick, never a collision (resolveIncomingNick handles both).
+        const ident = MemberIdentity{
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
-        }) catch return;
+        };
+        var target_nick: []const u8 = ev.new_nick;
+        var uid_buf: [nick_collision_uid_len]u8 = undefined;
+        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc)) {
+            .keep => self.displaceIncumbentForRename(ev.new_nick, ev.origin_node),
+            .rename_to_uid => |uid| {
+                @memcpy(uid_buf[0..uid.len], uid[0..]);
+                target_nick = uid_buf[0..uid.len];
+            },
+        }
+
+        const renamed = self.routes.renameNick(ev.old_nick, target_nick, ev.origin_node, ident) catch return;
         if (!renamed) return;
 
         const old_nick = self.allocator.dupe(u8, ev.old_nick) catch return;
-        const new_nick = self.allocator.dupe(u8, ev.new_nick) catch {
+        const new_nick = self.allocator.dupe(u8, target_nick) catch {
             self.allocator.free(old_nick);
             return;
         };

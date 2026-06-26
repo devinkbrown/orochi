@@ -223,6 +223,7 @@ const ircx_saccess = @import("../proto/ircx_saccess.zig");
 const elist = @import("../proto/elist.zig");
 const userip = @import("../proto/userip.zig");
 const server_stats = @import("server_stats.zig");
+const command_usage = @import("command_usage.zig");
 const metrics_http = @import("metrics_http.zig");
 const activity = @import("../proto/activity.zig");
 const activity_subscriptions = @import("activity_subscriptions.zig");
@@ -997,6 +998,9 @@ const Numeric = enum(u16) {
     RPL_STATSDLINE = 225,
     RPL_STATSYLINE = 218, // connection class (Y line)
     RPL_STATSLLINE = 211, // server-link / peer stats (STATS l)
+    RPL_STATSCLINE = 213, // connect block / mesh peer (STATS c)
+    RPL_STATSILINE = 215, // allow block / connection class (STATS i)
+    RPL_STATSCOMMANDS = 212, // per-command usage counts (STATS m)
     RPL_ENDOFSTATS = 219,
     // EVENT command replies follow draft-pfenning-04: 806 ADD, 807 DEL,
     // 808 START, 809 LIST, 810 END. CHANGE (825) is a non-draft extension.
@@ -2216,6 +2220,10 @@ pub const LinuxServer = struct {
     /// Observability: allocation-free runtime counters (totals + gauges), bumped
     /// inline on the hot path and rendered on demand (STATS z / Prometheus).
     stats: server_stats.Stats = .{},
+    /// Per-command dispatch counters backing `STATS m` (RPL_STATSCOMMANDS, 212).
+    /// Bumped once per complete line on the dispatch path; lock-free for verbs
+    /// already seen.
+    command_usage: command_usage.CommandUsage = .{},
     /// Mutex-guarded latest Prometheus exposition text, refreshed on the stats
     /// cadence (see maybeWriteStats) and served verbatim by the optional live
     /// `/metrics` HTTP listener thread. Initialized in `init`.
@@ -3830,6 +3838,7 @@ pub const LinuxServer = struct {
                 .server_name = self.serverName(),
             });
             errdefer link.deinit();
+            link.setLocalNickResolver(self.localNickResolver());
             conn.s2s = link;
             // Clear the dangling pointer before the slot is freed if submitRecv
             // fails, so deinit can never observe a freed link.
@@ -4289,6 +4298,10 @@ pub const LinuxServer = struct {
             .expected_remotes = pins[0..pin_count],
             .trusted_node_keys = self.mesh_trusted_node_keys,
         });
+        // Cross-namespace NICK collision resolution: the local world is
+        // authoritative, so the route table renames a colliding remote nick to its
+        // mesh UID. Retained through the lazy inner stand-up (post-AKE).
+        link.setLocalNickResolver(self.localNickResolver());
         return link;
     }
 
@@ -5805,6 +5818,11 @@ pub const LinuxServer = struct {
             },
         };
         const was_registered = conn.session.registered();
+
+        // STATS m (RPL_STATSCOMMANDS): record this verb's usage. Counts every
+        // well-formed line (registered or not); the byte total is the raw line
+        // length. Lock-free for verbs already in the table.
+        self.command_usage.record(parsed.command, line.len);
 
         // The single per-connection flood guard. Set up from the matched class in
         // `assignConnClass` (null when exempt / no limit / S2S). Keep-alives are
@@ -8373,6 +8391,23 @@ pub const LinuxServer = struct {
 
     /// Announce a local user's nick change to every established mesh peer so their
     /// rosters rename the user and their members see a live NICK line.
+    /// Predicate for the mesh route table's cross-namespace NICK collision check:
+    /// true iff a LOCAL client currently holds `nick` (RFC-1459 case-insensitive,
+    /// lock-free via the world's RCU nick mirror). Local nicks are authoritative,
+    /// so an incoming remote nick that matches one is renamed to its mesh UID.
+    /// S2S runs reactor-0-only, so this read never races a concurrent reactor's
+    /// nick mutation in a way the RCU mirror does not already serialize.
+    fn localNickHeld(ctx: *anyopaque, nick: []const u8) bool {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        return self.world.findNick(nick) != null;
+    }
+
+    /// Build the borrowed `LocalNickResolver` the mesh links consult; `self` must
+    /// outlive every link (it does — links are torn down before server shutdown).
+    fn localNickResolver(self: *LinuxServer) s2s_link.S2sLink.LocalNickResolver {
+        return .{ .ctx = self, .held_fn = localNickHeld };
+    }
+
     fn announceNickChange(self: *LinuxServer, old_nick: []const u8, new_nick: []const u8, ident: s2s_link.S2sLink.MemberIdentity) void {
         const hlc = self.nextMeshHlc();
         for (self.reactors) |*reactor| {
@@ -8757,6 +8792,13 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"JOIN"}, "Not enough parameters");
             return;
         }
+        // `JOIN 0` (RFC 2812 §3.2.1): the special channel name "0" is a request to
+        // PART from ALL channels the client is currently in. It is NOT a real
+        // channel, so handle it before the comma-split / channel-name path.
+        if (std.mem.eql(u8, parsed.paramSlice()[0], "0")) {
+            try self.partAllChannels(id, conn);
+            return;
+        }
         // `JOIN #a,#b key1,key2`: channels and keys are positional comma lists.
         var channels = std.mem.splitScalar(u8, parsed.paramSlice()[0], ',');
         var keys = std.mem.splitScalar(u8, if (parsed.param_count >= 2) parsed.paramSlice()[1] else "", ',');
@@ -8765,6 +8807,34 @@ pub const LinuxServer = struct {
             const key_part = keys.next() orelse "";
             const key: ?[]const u8 = if (key_part.len != 0) key_part else null;
             try self.joinOne(id, conn, channel, key, 0);
+        }
+    }
+
+    /// `JOIN 0` — PART the client from every channel it is in. Snapshots the
+    /// membership list first (partOne mutates the world's per-client channel set,
+    /// so iterating it live would be unsound) and parts each with no reason.
+    fn partAllChannels(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+        var chan_names: [256][]const u8 = undefined;
+        const nchan = self.world.channelsOf(worldIdFromClient(id), &chan_names);
+        if (nchan == 0) return;
+        // channelsOf returns slices borrowed from world storage that partOne may
+        // free as a channel empties; copy each name into a heap snapshot so every
+        // PART operates on stable bytes. Heap (not a large stack buffer) keeps this
+        // frame small since it sits on the deep JOIN/PART dispatch chain.
+        var total: usize = 0;
+        for (chan_names[0..nchan]) |cn| total += cn.len;
+        const backing = try self.allocator.alloc(u8, total);
+        defer self.allocator.free(backing);
+        const copies = try self.allocator.alloc([]const u8, nchan);
+        defer self.allocator.free(copies);
+        var off: usize = 0;
+        for (chan_names[0..nchan], 0..) |cn, i| {
+            @memcpy(backing[off .. off + cn.len], cn);
+            copies[i] = backing[off .. off + cn.len];
+            off += cn.len;
+        }
+        for (copies) |cn| {
+            try self.partOne(id, conn, cn, null);
         }
     }
 
@@ -8903,6 +8973,11 @@ pub const LinuxServer = struct {
                     if (self.world.topic(join_target) == null) {
                         self.world.setTopic(join_target, saved, self.serverName(), @divFloor(platform.realtimeMillis(), 1000)) catch {};
                     }
+                }
+                // PRIVATE (CHANNEL SET): a registered channel marked private comes
+                // back hidden from public LIST/NAMES, so apply +s on recreation.
+                if (kt.channelFlagSet(join_target, services_mod.channel_flag_private)) {
+                    _ = self.world.setChannelFlag(join_target, .secret, true) catch {};
                 }
             }
         }
@@ -10204,6 +10279,10 @@ pub const LinuxServer = struct {
                 return;
             }
             whois.writeNoSuchNick(&sink, self.serverName(), conn.session.displayName(), target_nick) catch return;
+            // Always close the WHOIS with RPL_ENDOFWHOIS (318) so clients that
+            // wait for the terminator don't hang on a failed lookup. Best-effort:
+            // a malformed nick that 401 already reported is simply not closed.
+            whois.writeEndOfWhois(&sink, self.serverName(), conn.session.displayName(), target_nick) catch {};
             for (sink.slice()) |line| try appendToConn(conn, line.bytes);
             return;
         }
@@ -10981,7 +11060,9 @@ pub const LinuxServer = struct {
     /// STATS <letter> — server statistics. Supports u (uptime, 242), o (oper
     /// blocks, 243), k/d (WARD ban masks/addresses, 216/225), y (connection
     /// classes + per-class policy/match/live, 218), l (established S2S peer links,
-    /// 211), and z (runtime counters, 249, oper-only). Terminates with 219.
+    /// 211), c (connect blocks / mesh peers, 213), i (allow blocks / connection
+    /// classes, 215), m (command usage counts, 212), p (online opers, public), and
+    /// z (runtime counters, 249, oper-only). Terminates with 219.
     pub fn handleStats(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"STATS"}, "Not enough parameters");
@@ -11084,6 +11165,49 @@ pub const LinuxServer = struct {
                         try queueNumeric(conn, .RPL_STATSDEBUG, &.{"p"}, c.session.displayName());
                     }
                 }
+            },
+            'c', 'C' => {
+                // Connect blocks (C-lines, RPL_STATSCLINE 213): the configured
+                // `[mesh].connect` auto-dial peers this node links out to. Each is
+                // a "host:port" string; report it as `C <host> * <host> <port>`.
+                for (self.config.mesh_connect) |spec| {
+                    if (parseHostPort(spec)) |hp| {
+                        var port_buf: [8]u8 = undefined;
+                        const port = std.fmt.bufPrint(&port_buf, "{d}", .{hp.port}) catch "*";
+                        try queueNumeric(conn, .RPL_STATSCLINE, &.{ "C", hp.host, "*", hp.host, port, "mesh" }, "");
+                    } else {
+                        // Unsplittable spec: report it verbatim as the host.
+                        try queueNumeric(conn, .RPL_STATSCLINE, &.{ "C", spec, "*", spec, "*", "mesh" }, "");
+                    }
+                }
+            },
+            'i', 'I' => {
+                // Allow blocks (I-lines, RPL_STATSILINE 215): the connection
+                // classes that gate who may connect. One line per class with its
+                // accepted-CIDR count and active match criteria (an I-line is an
+                // allow rule, so the class's constraints are its allow conditions).
+                if (self.config.class_registry) |*reg| {
+                    for (reg.classes) |*cls| {
+                        var crit_buf: [160]u8 = undefined;
+                        const crit = std.fmt.bufPrint(&crit_buf, "cidrs={d} tls_only={} account_only={} oper_only={}", .{
+                            cls.cidrs.len, cls.tls_only, cls.account_only, cls.oper_only,
+                        }) catch continue;
+                        try queueNumeric(conn, .RPL_STATSILINE, &.{ "I", "*", "*", cls.name }, crit);
+                    }
+                }
+            },
+            'm', 'M' => {
+                // Command usage (RPL_STATSCOMMANDS 212): one line per dispatched
+                // verb with its hit count, total bytes, and remote count (always 0
+                // here — these are local-client command totals).
+                const Ctx = struct { c: *ConnState };
+                try self.command_usage.forEach(Ctx{ .c = conn }, struct {
+                    fn emit(cx: Ctx, row: command_usage.CommandUsage.Row) anyerror!void {
+                        var buf: [48]u8 = undefined;
+                        const counts = std.fmt.bufPrint(&buf, "{d} {d} 0", .{ row.count, row.bytes }) catch return;
+                        try queueNumeric(cx.c, .RPL_STATSCOMMANDS, &.{ row.name, counts }, "");
+                    }
+                }.emit);
             },
             else => {}, // other letters not implemented yet
         }
@@ -13287,6 +13411,7 @@ pub const LinuxServer = struct {
             .server_name = self.serverName(),
         });
         errdefer link.deinit();
+        link.setLocalNickResolver(self.localNickResolver());
         peer.s2s = link;
         errdefer peer.s2s = null;
 
@@ -16920,9 +17045,13 @@ pub const LinuxServer = struct {
             .unknown = unknown,
             .channels = @intCast(self.world.channelCount()),
             .local_clients = users,
-            .local_max = users,
+            .local_max = @max(users, self.stats_peak_clients),
             .global_clients = users,
-            .global_max = users,
+            .global_max = @max(users, self.stats_peak_clients),
+            // RPL_STATSCONN (250): the running peak client count and the
+            // cumulative number of connections this node has accepted.
+            .highest_connections = @max(users, self.stats_peak_clients),
+            .total_connections = self.stats.connections_total.load(.monotonic),
         };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSink{ .conn = conn };
@@ -18065,10 +18194,28 @@ pub const LinuxServer = struct {
         // Drop this connection's live session before clearing the account binding
         // (the session is keyed by account; logout fully ends it, no reclaim).
         if (conn.session.account()) |acct| _ = self.sessions.remove(acct, monitorIdFromClient(id));
+        // Whether an account session is actually being cleared decides if we emit
+        // 901 RPL_LOGGEDOUT below (a no-op LOGOUT on an unauthenticated session
+        // must not claim a logout happened).
+        const was_logged_in = conn.session.account() != null;
         // account-notify: tell common channels this user is no longer logged in
         // (emit BEFORE clearing the account so the prefix/state is still valid).
         self.emitAccountChange(id, conn, "*");
         const was_oper = conn.session.isOper();
+        // RPL_LOGGEDOUT (901): emit the IRCv3 logout numeric with the user's full
+        // mask BEFORE clearing the binding, so the mask still reflects the
+        // logged-in identity. Emitted as a raw line because this daemon's local
+        // numeric enum repurposes the 9xx range for IRCX errors; 901 is the
+        // standard SASL logout numeric and must use the spec code. Only fires when
+        // a session was actually cleared.
+        if (was_logged_in) {
+            var mask_buf: [256]u8 = undefined;
+            const mask = clientPrefix(conn, &mask_buf) catch conn.session.displayName();
+            var l901: [default_reply_bytes]u8 = undefined;
+            if (std.fmt.bufPrint(&l901, ":{s} 901 {s} {s} :You are now logged out\r\n", .{ self.serverName(), conn.session.displayName(), mask })) |line| {
+                try appendToConn(conn, line);
+            } else |_| {}
+        }
         conn.session.logout();
         var buf: [default_reply_bytes]u8 = undefined;
         if (was_oper) {
@@ -18753,7 +18900,17 @@ pub const LinuxServer = struct {
                 };
                 const ci = result.channel_info;
                 const mlock = ci.mlock.asSlice();
-                try channelNotice(conn, "channel={s} founder={s} flags={d} mlock={s}", .{ ci.name.asSlice(), ci.founder.asSlice(), ci.flags, mlock });
+                const topiclock = (ci.flags & services_mod.channel_flag_topiclock) != 0;
+                const guard = (ci.flags & services_mod.channel_flag_guard) != 0;
+                const private = (ci.flags & services_mod.channel_flag_private) != 0;
+                try channelNotice(conn, "channel={s} founder={s} flags={d} mlock={s} topiclock={} guard={} private={}", .{ ci.name.asSlice(), ci.founder.asSlice(), ci.flags, mlock, topiclock, guard, private });
+                var meta_buf: [512]u8 = undefined;
+                if (svc.chanDescGet(r.channel, &meta_buf)) |desc| {
+                    try channelNotice(conn, "  desc: {s}", .{desc});
+                }
+                if (svc.chanUrlGet(r.channel, &meta_buf)) |url| {
+                    try channelNotice(conn, "  url: {s}", .{url});
+                }
             },
             .set => |r| {
                 // Only the registered founder may SET channel properties.
@@ -18792,6 +18949,46 @@ pub const LinuxServer = struct {
                         }
                     }
                     try channelNotice(conn, "Channel {s} KEEPTOPIC {s}", .{ r.channel, if (on) "on" else "off" });
+                } else if (r.field == .topiclock or r.field == .guard or r.field == .private) {
+                    // Boolean settings persisted as channel-record flags. GUARD and
+                    // PRIVATE also take immediate live effect (see below).
+                    const on = setFieldBoolOn(r.value);
+                    const flag: u32 = switch (r.field) {
+                        .topiclock => services_mod.channel_flag_topiclock,
+                        .guard => services_mod.channel_flag_guard,
+                        .private => services_mod.channel_flag_private,
+                        else => unreachable,
+                    };
+                    svc.setChannelFlag(r.channel, account, flag, on, &scratch) catch |err| {
+                        try self.failReply(conn, "CHANNEL", channelFailCode(err), "Could not store channel setting");
+                        return;
+                    };
+                    // PRIVATE flips the live channel's secret flag so it drops out of
+                    // public LIST/NAMES enumeration immediately, not just on recreate.
+                    if (r.field == .private and self.world.channelExists(r.channel)) {
+                        _ = self.world.setChannelFlag(r.channel, .secret, on) catch {};
+                    }
+                    try channelNotice(conn, "Channel {s} {s} {s}", .{ r.channel, @tagName(r.field), if (on) "on" else "off" });
+                } else if (r.field == .desc) {
+                    svc.chanDescSet(r.channel, r.value) catch |err| {
+                        try self.failReply(conn, "CHANNEL", channelFailCode(err), "Could not store DESC");
+                        return;
+                    };
+                    if (r.value.len == 0) {
+                        try channelNotice(conn, "Channel {s} DESC cleared", .{r.channel});
+                    } else {
+                        try channelNotice(conn, "Channel {s} DESC set", .{r.channel});
+                    }
+                } else if (r.field == .url) {
+                    svc.chanUrlSet(r.channel, r.value) catch |err| {
+                        try self.failReply(conn, "CHANNEL", channelFailCode(err), "Could not store URL");
+                        return;
+                    };
+                    if (r.value.len == 0) {
+                        try channelNotice(conn, "Channel {s} URL cleared", .{r.channel});
+                    } else {
+                        try channelNotice(conn, "Channel {s} URL set to {s}", .{ r.channel, r.value });
+                    }
                 } else {
                     try channelNotice(conn, "CHANNEL SET {s} is not available yet", .{@tagName(r.field)});
                 }
@@ -18931,6 +19128,17 @@ pub const LinuxServer = struct {
             error.InvalidValue => "INVALID_PARAMS",
             else => "TEMPORARILY_UNAVAILABLE",
         };
+    }
+
+    /// Interpret a CHANNEL SET boolean value. Truthy: on/true/yes/1/enable/+.
+    /// Everything else (including empty) is "off", so `SET <flag> off` clears it.
+    fn setFieldBoolOn(value: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(value, "on") or
+            std.ascii.eqlIgnoreCase(value, "true") or
+            std.ascii.eqlIgnoreCase(value, "yes") or
+            std.ascii.eqlIgnoreCase(value, "enable") or
+            std.mem.eql(u8, value, "1") or
+            std.mem.eql(u8, value, "+");
     }
 
     /// Generate a 16-byte session reclaim token from the daemon CSPRNG (zeroed
@@ -22767,7 +22975,16 @@ pub const LinuxServer = struct {
         };
         // +t: only channel operators (op or higher) may change the topic — unless
         // the actor holds the oper_override privilege (network admin override).
-        if (self.world.channelHasFlag(channel, .topic_ops) and !topic_setter.isOperator() and !conn.session.hasPriv(.oper_override)) {
+        // TOPICLOCK (CHANNEL SET): a registered channel's persistent topic lock
+        // gates the topic exactly like +t even when +t is not set live, so the
+        // lock holds across recreation. The oper-override still bypasses it.
+        const topic_locked = if (self.account_services) |svc|
+            svc.channelFlagSet(channel, services_mod.channel_flag_topiclock)
+        else
+            false;
+        if ((self.world.channelHasFlag(channel, .topic_ops) or topic_locked) and
+            !topic_setter.isOperator() and !conn.session.hasPriv(.oper_override))
+        {
             try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{channel}, "You're not channel operator");
             return;
         }
@@ -26153,6 +26370,178 @@ test "threaded server: CHANNEL AKICK add mirrors to live join gate and kicks cur
     bad.reset();
     try writeAllFd(fd_bad, "JOIN #c\r\n");
     try recvUntil(&bad, " 474 Bad #c ", 200);
+}
+
+test "threaded server: JOIN 0 parts the client from all channels" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #one,#two,#three\r\n");
+    try recvUntil(&a, " 366 A #one ", 200);
+    try recvUntil(&a, " 366 A #two ", 200);
+    try recvUntil(&a, " 366 A #three ", 200);
+
+    // JOIN 0 must PART every joined channel (one PART line per channel back to A).
+    a.reset();
+    try writeAllFd(fd_a, "JOIN 0\r\n");
+    try recvUntil(&a, "PART #one", 200);
+    try recvUntil(&a, "PART #two", 200);
+    try recvUntil(&a, "PART #three", 200);
+}
+
+test "threaded server: CHANNEL SET TOPICLOCK DESC URL PRIVATE persist and take effect" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-channel-set.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("admin", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    var admin = LiveClient{ .fd = fd_admin };
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Founder\r\nUSER founder 0 * :Founder\r\n");
+    try recvUntil(&admin, " 381 Founder ", 200);
+
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL REGISTER #c\r\n");
+    try recvUntil(&admin, "Channel #c registered to admin", 200);
+
+    // Founder joins first so they hold channel ops; a later joiner is a plain
+    // member (otherwise the first joiner of the empty channel would be op and
+    // TOPICLOCK enforcement below would not apply to them).
+    admin.reset();
+    try writeAllFd(fd_admin, "JOIN #c\r\n");
+    try recvUntil(&admin, " 366 Founder #c ", 200);
+
+    // DESC / URL persist and echo back.
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL SET #c DESC :Our cool room\r\n");
+    try recvUntil(&admin, "Channel #c DESC set", 200);
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL SET #c URL https://example.test\r\n");
+    try recvUntil(&admin, "Channel #c URL set to https://example.test", 200);
+
+    // Boolean flags persist.
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL SET #c TOPICLOCK on\r\n");
+    try recvUntil(&admin, "Channel #c topiclock on", 200);
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL SET #c PRIVATE on\r\n");
+    try recvUntil(&admin, "Channel #c private on", 200);
+
+    // INFO surfaces the persisted metadata + flags.
+    admin.reset();
+    try writeAllFd(fd_admin, "CHANNEL INFO #c\r\n");
+    try recvUntil(&admin, "topiclock=true", 200);
+    try recvUntil(&admin, "private=true", 200);
+
+    // TOPICLOCK gates TOPIC for a non-op member even when +t isn't set live.
+    const fd_bob = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_bob);
+    var bob = LiveClient{ .fd = fd_bob };
+    try writeAllFd(fd_bob, "NICK Bob\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&bob, " 001 Bob ", 200);
+    bob.reset();
+    try writeAllFd(fd_bob, "JOIN #c\r\n");
+    try recvUntil(&bob, " 366 Bob #c ", 200);
+    bob.reset();
+    try writeAllFd(fd_bob, "TOPIC #c :hijack\r\n");
+    try recvUntil(&bob, " 482 Bob #c ", 200); // ERR_CHANOPRIVSNEEDED
+}
+
+test "threaded server: STATS m reports per-command usage to an oper" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-stats-m.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("admin", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_admin = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_admin);
+    var admin = LiveClient{ .fd = fd_admin };
+    try saslAdminPrelude(fd_admin);
+    try writeAllFd(fd_admin, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try recvUntil(&admin, " 381 Oper ", 200);
+
+    // STATS m: 212 RPL_STATSCOMMANDS rows, terminated by 219; NICK was dispatched
+    // during registration so it appears in the table.
+    admin.reset();
+    try writeAllFd(fd_admin, "STATS m\r\n");
+    try recvUntil(&admin, " 212 Oper NICK ", 200);
+    try recvUntil(&admin, " 219 Oper m ", 200);
+
+    // STATS i: 215 allow blocks (connection classes) for the configured registry.
+    admin.reset();
+    try writeAllFd(fd_admin, "STATS i\r\n");
+    try recvUntil(&admin, " 219 Oper i ", 200);
 }
 
 test "server services replay restores registered channels mlocks akicks and wards" {

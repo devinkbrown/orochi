@@ -158,6 +158,7 @@ const Numeric = enum(u16) {
     RPL_CREATED = 3,
     RPL_MYINFO = 4,
     RPL_ISUPPORT = 5,
+    ERR_NOORIGIN = 409,
     ERR_INVALIDCAPCMD = 410,
     ERR_UNKNOWNCOMMAND = 421,
     ERR_ERRONEUSNICKNAME = 432,
@@ -165,6 +166,7 @@ const Numeric = enum(u16) {
     ERR_NEEDMOREPARAMS = 461,
     ERR_ALREADYREGISTRED = 462,
     RPL_LOGGEDIN = 900,
+    RPL_LOGGEDOUT = 901,
     RPL_SASLSUCCESS = 903,
     ERR_SASLFAIL = 904,
     ERR_SASLTOOLONG = 905,
@@ -341,8 +343,12 @@ const cap_specs = [_]CapSpec{
     // (VHOST). Clients without it see the new host on the user's next message.
     .{ .id = .chghost, .name = "chghost" },
     // no-implicit-names: a capable client suppresses the automatic NAMES burst
-    // sent on JOIN (it can still issue NAMES explicitly).
+    // sent on JOIN (it can still issue NAMES explicitly). Dual-advertised: the
+    // spec token is `draft/no-implicit-names`, so list both names (same id) — a
+    // spec client REQ-ing the draft token engages the same capability and CAP
+    // ACK echoes back whichever token the client requested.
     .{ .id = .no_implicit_names, .name = "no-implicit-names" },
+    .{ .id = .no_implicit_names, .name = "draft/no-implicit-names" },
     // The following expose already-live command/relay paths to clients that
     // negotiate them. Each is backed by a verified handler or the client-only
     // message-tag relay, so advertising them cannot strand a client:
@@ -1625,8 +1631,11 @@ const command_table = [_]CommandEntry{
     .{ .name = "USER", .min_params = 4, .prereg_allowed = true, .handler = handleUser },
     .{ .name = "CAP", .min_params = 1, .prereg_allowed = true, .handler = handleCap },
     .{ .name = "AUTHENTICATE", .min_params = 1, .prereg_allowed = true, .handler = handleAuthenticate },
-    .{ .name = "PING", .min_params = 1, .prereg_allowed = true, .handler = handlePing },
-    .{ .name = "PONG", .min_params = 1, .prereg_allowed = true, .handler = handleNoop },
+    // PING/PONG accept zero params so a bare `PING`/`PONG` yields 409
+    // ERR_NOORIGIN (the RFC error for a missing origin) instead of the generic
+    // 461 ERR_NEEDMOREPARAMS.
+    .{ .name = "PING", .min_params = 0, .prereg_allowed = true, .handler = handlePing },
+    .{ .name = "PONG", .min_params = 0, .prereg_allowed = true, .handler = handlePong },
     .{ .name = "QUIT", .min_params = 0, .prereg_allowed = true, .handler = handleQuit },
 };
 
@@ -1889,6 +1898,18 @@ fn saslTooLong(ctx: DispatchCtx) DispatchError!void {
 }
 
 fn saslAbort(ctx: DispatchCtx) DispatchError!void {
+    // If the connection had already authenticated (a re-auth that is now being
+    // aborted), the abort clears that account session — announce it with 901
+    // RPL_LOGGEDOUT before tearing the binding down, so the client learns its
+    // login no longer holds.
+    const was_logged_in = ctx.session.logged_in and ctx.session.account_store.len != 0;
+    var mask_buf: [MAX_ACCOUNT_BYTES]u8 = undefined;
+    const account_copy: []const u8 = if (was_logged_in) blk: {
+        const acct = ctx.session.account_store.slice();
+        const n = @min(acct.len, mask_buf.len);
+        @memcpy(mask_buf[0..n], acct[0..n]);
+        break :blk mask_buf[0..n];
+    } else "";
     ctx.session.sasl_pending = null;
     ctx.session.sasl_router = null;
     ctx.session.logged_in = false;
@@ -1897,6 +1918,9 @@ fn saslAbort(ctx: DispatchCtx) DispatchError!void {
     ctx.session.sasl_issue_session_token = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
+    if (was_logged_in) {
+        try ctx.replies.numeric(ctx.session, .RPL_LOGGEDOUT, &.{account_copy}, "You are now logged out");
+    }
     try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
 }
 
@@ -1917,10 +1941,21 @@ fn saslUnsupportedMechanism(ctx: DispatchCtx) DispatchError!void {
 }
 
 fn handlePing(ctx: DispatchCtx) DispatchError!void {
+    // A bare `PING` with no origin token is 409 ERR_NOORIGIN, not 461.
+    if (ctx.params().len == 0) {
+        try ctx.replies.numeric(ctx.session, .ERR_NOORIGIN, &.{}, "No origin specified");
+        return;
+    }
     try ctx.replies.message(ctx.replies.server_name, "PONG", &.{ctx.replies.server_name}, ctx.params()[0]);
 }
 
-fn handleNoop(_: DispatchCtx) DispatchError!void {}
+fn handlePong(ctx: DispatchCtx) DispatchError!void {
+    // `PONG` is otherwise a no-op, but a bare `PONG` (no origin) is 409.
+    if (ctx.params().len == 0) {
+        try ctx.replies.numeric(ctx.session, .ERR_NOORIGIN, &.{}, "No origin specified");
+        return;
+    }
+}
 
 fn handleQuit(ctx: DispatchCtx) DispatchError!void {
     ctx.session.client.registration.prereg = .closing;
@@ -2670,6 +2705,58 @@ test "parseLine ignores other tags and reports no label when absent" {
     const line = try parseLine("@time=2026-06-08T00:00:00.000Z PING :tok");
     try std.testing.expectEqualStrings("PING", line.command);
     try std.testing.expect(line.label() == null);
+}
+
+test "bare PING with no origin returns 409 ERR_NOORIGIN" {
+    var session = ClientSession.init();
+    var storage: [256]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "PING");
+    try expectContains(replies.written(), " 409 ");
+    try expectContains(replies.written(), "No origin specified");
+    try expectNotContains(replies.written(), " 461 ");
+}
+
+test "bare PONG with no origin returns 409 ERR_NOORIGIN" {
+    var session = ClientSession.init();
+    var storage: [256]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "PONG");
+    try expectContains(replies.written(), " 409 ");
+    try expectNotContains(replies.written(), " 461 ");
+}
+
+test "PING with origin still answers PONG (no 409)" {
+    var session = ClientSession.init();
+    var storage: [256]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "PING :tok");
+    try expectContains(replies.written(), "PONG orochi.local :tok\r\n");
+    try expectNotContains(replies.written(), " 409 ");
+}
+
+test "no-implicit-names is dual-advertised under the draft token" {
+    var session = ClientSession.init();
+    var storage: [4096]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP LS 302");
+    const out = replies.written();
+    try expectContains(out, "draft/no-implicit-names");
+    try expectContains(out, "no-implicit-names");
+}
+
+test "REQ of draft/no-implicit-names is ACKed" {
+    var session = ClientSession.init();
+    var storage: [1024]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+
+    try dispatchText(&session, &replies, "CAP REQ :draft/no-implicit-names");
+    try expectContains(replies.written(), "ACK :draft/no-implicit-names\r\n");
+    try std.testing.expect(session.cap.negotiated.contains(.no_implicit_names));
 }
 
 test "labeled single-line reply echoes @label on the one line" {

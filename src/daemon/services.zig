@@ -164,6 +164,18 @@ pub const AkickAction = enum { add, remove, query };
 pub const AccountRef = struct { name: AccountName };
 pub const ChannelRef = struct { name: ChannelName };
 
+// ── Registered-channel boolean settings (CHANNEL SET) ───────────────────────
+// Stored in the channel record's `flags` so they survive recreation. A fresh
+// record has flags 0 (all off), which preserves the prior "unset" behavior.
+/// TOPICLOCK: only channel ops / those with channel ACCESS may change the topic
+/// (a registration-backed +t that holds even after the channel empties).
+pub const channel_flag_topiclock: u32 = 1 << 0;
+/// GUARD: keep the registered channel "open" — services hold it so its modes and
+/// topic persist while empty (surfaced to the daemon to recreate/secure it).
+pub const channel_flag_guard: u32 = 1 << 1;
+/// PRIVATE: hide the channel from public listings (LIST / NAMES enumeration).
+pub const channel_flag_private: u32 = 1 << 2;
+
 pub const account_flag_suspended: u32 = 1 << 0;
 pub const account_flag_forbidden: u32 = 1 << 1;
 pub const account_flag_noexpire: u32 = 1 << 2;
@@ -1176,6 +1188,40 @@ pub const Services = struct {
         return .{ .set_channel = record.info() };
     }
 
+    /// Set or clear a single registered-channel boolean flag bit (TOPICLOCK /
+    /// GUARD / PRIVATE) while preserving the others. Requires founder-or-admin
+    /// ACCESS on the channel. Persists the record so the flag survives recreation.
+    pub fn setChannelFlag(
+        self: *Services,
+        channel: []const u8,
+        actor: []const u8,
+        flag: u32,
+        on: bool,
+        scratch: []u8,
+    ) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var record = try self.loadChannel(channel);
+        try self.requireAccess(record, actor, .admin);
+        if (on) {
+            record.flags |= flag;
+        } else {
+            record.flags &= ~flag;
+        }
+        const encoded = try encodeChannel(record, scratch);
+        try self.store.family(.chanregs).put(record.name.asSlice(), encoded);
+    }
+
+    /// True when `flag` is set on `channel`'s registration record. False for an
+    /// unregistered channel (read-only, no lock contention on the live path).
+    pub fn channelFlagSet(self: *Services, channel: []const u8, flag: u32) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const record = self.loadChannel(channel) catch return false;
+        return (record.flags & flag) != 0;
+    }
+
     pub fn channelInfo(self: *Services, channel: []const u8) ServiceError!CommandResult {
         self.lock.lockShared();
         defer self.lock.unlockShared();
@@ -1755,6 +1801,64 @@ pub const Services = struct {
         const n = @min(blob.len, out.len);
         @memcpy(out[0..n], blob[0..n]);
         return out[0..n];
+    }
+
+    // ── Durable registered-channel metadata (CHANNEL SET DESC / URL) ────────────
+    // Free-text channel metadata in `.props` keyed by "<tag>\x00<channel>". DESC
+    // is a human description; URL is a homepage link. Empty value clears the key.
+    const meta_value_max: usize = 400;
+
+    fn metaKey(buf: []u8, tag: []const u8, channel: []const u8) ?[]const u8 {
+        if (channel.len == 0 or channel.len > channel_max) return null;
+        if (buf.len < tag.len + channel.len) return null;
+        @memcpy(buf[0..tag.len], tag);
+        for (channel, 0..) |c, i| buf[tag.len + i] = std.ascii.toLower(c);
+        return buf[0 .. tag.len + channel.len];
+    }
+
+    fn chanMetaSet(self: *Services, tag: []const u8, channel: []const u8, value: []const u8) ServiceError!void {
+        if (value.len > meta_value_max) return error.InvalidChannel;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [16 + channel_max]u8 = undefined;
+        const k = metaKey(&kb, tag, channel) orelse return error.InvalidChannel;
+        if (value.len == 0) {
+            try self.store.family(.props).delete(k);
+        } else {
+            try self.store.family(.props).put(k, value);
+        }
+    }
+
+    fn chanMetaGet(self: *Services, tag: []const u8, channel: []const u8, out: []u8) ?[]const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [16 + channel_max]u8 = undefined;
+        const k = metaKey(&kb, tag, channel) orelse return null;
+        const blob = self.store.family(.props).get(k) orelse return null;
+        if (blob.len == 0) return null;
+        const n = @min(blob.len, out.len);
+        @memcpy(out[0..n], blob[0..n]);
+        return out[0..n];
+    }
+
+    /// Set (or clear, when empty) `channel`'s human description (CHANNEL SET DESC).
+    pub fn chanDescSet(self: *Services, channel: []const u8, value: []const u8) ServiceError!void {
+        return self.chanMetaSet("desc\x00", channel, value);
+    }
+
+    /// Copy `channel`'s description into `out`, or null if unset.
+    pub fn chanDescGet(self: *Services, channel: []const u8, out: []u8) ?[]const u8 {
+        return self.chanMetaGet("desc\x00", channel, out);
+    }
+
+    /// Set (or clear, when empty) `channel`'s homepage URL (CHANNEL SET URL).
+    pub fn chanUrlSet(self: *Services, channel: []const u8, value: []const u8) ServiceError!void {
+        return self.chanMetaSet("url\x00", channel, value);
+    }
+
+    /// Copy `channel`'s URL into `out`, or null if unset.
+    pub fn chanUrlGet(self: *Services, channel: []const u8, out: []u8) ?[]const u8 {
+        return self.chanMetaGet("url\x00", channel, out);
     }
 
     pub fn replayLiveState(self: *Services, sink: LiveReplaySink) ServiceError!LiveReplaySummary {
@@ -2470,6 +2574,46 @@ test "register and identify account" {
 
     const identified = try services.identifyAccount("ALICE", "correct horse battery staple");
     try std.testing.expectEqualStrings("alice", identified.identified.name.asSlice());
+}
+
+test "channel SET flags and DESC/URL persist and round-trip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-channel-set.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    var scratch: [record_max]u8 = undefined;
+
+    _ = try services.registerAccount("admin", "correct horse battery staple", &scratch);
+    _ = try services.registerChannel("#room", "admin", &scratch);
+
+    // Flags start clear, set independently, and persist without clobbering siblings.
+    try std.testing.expect(!services.channelFlagSet("#room", channel_flag_topiclock));
+    try services.setChannelFlag("#room", "admin", channel_flag_topiclock, true, &scratch);
+    try services.setChannelFlag("#room", "admin", channel_flag_private, true, &scratch);
+    try std.testing.expect(services.channelFlagSet("#room", channel_flag_topiclock));
+    try std.testing.expect(services.channelFlagSet("#room", channel_flag_private));
+    try std.testing.expect(!services.channelFlagSet("#room", channel_flag_guard));
+
+    // Clearing one leaves the other intact.
+    try services.setChannelFlag("#room", "admin", channel_flag_topiclock, false, &scratch);
+    try std.testing.expect(!services.channelFlagSet("#room", channel_flag_topiclock));
+    try std.testing.expect(services.channelFlagSet("#room", channel_flag_private));
+
+    // DESC / URL round-trip and clear on empty.
+    var out: [512]u8 = undefined;
+    try std.testing.expect(services.chanDescGet("#room", &out) == null);
+    try services.chanDescSet("#room", "Our room");
+    try std.testing.expectEqualStrings("Our room", services.chanDescGet("#room", &out).?);
+    try services.chanUrlSet("#room", "https://example.test");
+    try std.testing.expectEqualStrings("https://example.test", services.chanUrlGet("#room", &out).?);
+    try services.chanDescSet("#room", "");
+    try std.testing.expect(services.chanDescGet("#room", &out) == null);
+
+    // A non-founder/non-admin actor cannot set flags.
+    _ = try services.registerAccount("mallory", "another correct horse battery", &scratch);
+    try std.testing.expectError(error.Forbidden, services.setChannelFlag("#room", "mallory", channel_flag_guard, true, &scratch));
 }
 
 test "wrong password is rejected" {

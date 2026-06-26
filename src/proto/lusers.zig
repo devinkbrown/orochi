@@ -48,6 +48,13 @@ pub const Counts = struct {
     local_max: u64,
     global_clients: u64,
     global_max: u64,
+    /// RPL_STATSCONN (250): highest simultaneous local connection count and the
+    /// cumulative connections received. Many clients (mIRC, HexChat) render the
+    /// 250 "highest connection count" line; reporting both keeps the tail
+    /// informative. Defaults preserve the old behavior for callers that don't set
+    /// them: emit() simply reports the peak/total it is given.
+    highest_connections: u64 = 0,
+    total_connections: u64 = 0,
 };
 
 /// Emit the complete LUSERS numeric sequence to `sink.send(line)`.
@@ -75,6 +82,7 @@ pub fn emitWith(
     try sink.send(try writeLuserUnknownWith(params, scratch, ctx, counts));
     try sink.send(try writeLuserChannelsWith(params, scratch, ctx, counts));
     try sink.send(try writeLuserMeWith(params, scratch, ctx, counts));
+    try sink.send(try writeStatsConnWith(params, scratch, ctx, counts));
     try sink.send(try writeLocalUsersWith(params, scratch, ctx, counts));
     try sink.send(try writeGlobalUsersWith(params, scratch, ctx, counts));
 }
@@ -196,6 +204,38 @@ pub fn writeLuserMeWith(
     try b.appendBytes(" clients and ");
     try b.appendUnsigned(counts.servers);
     try b.appendBytes(" servers");
+    try b.crlf();
+    return b.slice();
+}
+
+/// Build RPL_STATSCONN (250).
+pub fn writeStatsConn(out: []u8, ctx: ReplyContext, counts: Counts) LusersError![]const u8 {
+    return writeStatsConnWith(.{}, out, ctx, counts);
+}
+
+/// Build RPL_STATSCONN (250) using caller-selected validation limits.
+///
+/// Renders the "highest connection count" line many clients expect in the LUSERS
+/// tail: `Highest connection count: <peak> (<peak> clients) (<total> connections
+/// received)`. `peak` is the highest simultaneous local connection count;
+/// `total` is the cumulative number of connections accepted.
+pub fn writeStatsConnWith(
+    comptime params: Params,
+    out: []u8,
+    ctx: ReplyContext,
+    counts: Counts,
+) LusersError![]const u8 {
+    try validateContextWith(params, ctx);
+
+    var b = LineBuilder.init(out, params.max_line_bytes);
+    try b.numericPrefix(.RPL_STATSCONN, ctx);
+    try b.appendBytes(" :Highest connection count: ");
+    try b.appendUnsigned(counts.highest_connections);
+    try b.appendBytes(" (");
+    try b.appendUnsigned(counts.highest_connections);
+    try b.appendBytes(" clients) (");
+    try b.appendUnsigned(counts.total_connections);
+    try b.appendBytes(" connections received)");
     try b.crlf();
     return b.slice();
 }
@@ -396,18 +436,20 @@ fn sampleCounts() Counts {
         .local_max = 21,
         .global_clients = 49,
         .global_max = 88,
+        .highest_connections = 21,
+        .total_connections = 100,
     };
 }
 
 test "full LUSERS sequence uses RFC2812 reply text" {
     var scratch: [160]u8 = undefined;
-    var slots: [7][]const u8 = undefined;
+    var slots: [8][]const u8 = undefined;
     var storage: [1024]u8 = undefined;
     var sink = TestSink{ .lines = &slots, .storage = &storage };
 
     try emit(sampleContext(), sampleCounts(), &scratch, &sink);
 
-    try std.testing.expectEqual(@as(usize, 7), sink.slice().len);
+    try std.testing.expectEqual(@as(usize, 8), sink.slice().len);
     try std.testing.expectEqualStrings(
         ":irc.local 251 alice :There are 42 users and 7 invisible on 3 servers\r\n",
         sink.slice()[0],
@@ -429,12 +471,16 @@ test "full LUSERS sequence uses RFC2812 reply text" {
         sink.slice()[4],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 265 alice :Current local users 13, max 21\r\n",
+        ":irc.local 250 alice :Highest connection count: 21 (21 clients) (100 connections received)\r\n",
         sink.slice()[5],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 266 alice :Current global users 49, max 88\r\n",
+        ":irc.local 265 alice :Current local users 13, max 21\r\n",
         sink.slice()[6],
+    );
+    try std.testing.expectEqualStrings(
+        ":irc.local 266 alice :Current global users 49, max 88\r\n",
+        sink.slice()[7],
     );
 }
 
@@ -453,13 +499,13 @@ test "zero counts still emit the complete sequence" {
     };
 
     var scratch: [160]u8 = undefined;
-    var slots: [7][]const u8 = undefined;
+    var slots: [8][]const u8 = undefined;
     var storage: [1024]u8 = undefined;
     var sink = TestSink{ .lines = &slots, .storage = &storage };
 
     try emit(sampleContext(), zeros, &scratch, &sink);
 
-    try std.testing.expectEqual(@as(usize, 7), sink.slice().len);
+    try std.testing.expectEqual(@as(usize, 8), sink.slice().len);
     try std.testing.expectEqualStrings(
         ":irc.local 251 alice :There are 0 users and 0 invisible on 0 servers\r\n",
         sink.slice()[0],
@@ -498,7 +544,7 @@ test "u64 bounds render without overflow" {
     };
 
     var scratch: [260]u8 = undefined;
-    var slots: [7][]const u8 = undefined;
+    var slots: [8][]const u8 = undefined;
     var storage: [2048]u8 = undefined;
     var sink = TestSink{ .lines = &slots, .storage = &storage };
 
@@ -510,11 +556,26 @@ test "u64 bounds render without overflow" {
     );
     try std.testing.expectEqualStrings(
         ":irc.local 265 alice :Current local users 18446744073709551615, max 18446744073709551615\r\n",
-        sink.slice()[5],
+        sink.slice()[6],
     );
     try std.testing.expectEqualStrings(
         ":irc.local 266 alice :Current global users 18446744073709551615, max 18446744073709551615\r\n",
-        sink.slice()[6],
+        sink.slice()[7],
+    );
+}
+
+test "RPL_STATSCONN 250 renders peak and total in the tail" {
+    var scratch: [200]u8 = undefined;
+    var slots: [8][]const u8 = undefined;
+    var storage: [1024]u8 = undefined;
+    var sink = TestSink{ .lines = &slots, .storage = &storage };
+
+    try emit(sampleContext(), sampleCounts(), &scratch, &sink);
+
+    // 250 sits between RPL_LUSERME (255, index 4) and RPL_LOCALUSERS (265, index 6).
+    try std.testing.expectEqualStrings(
+        ":irc.local 250 alice :Highest connection count: 21 (21 clients) (100 connections received)\r\n",
+        sink.slice()[5],
     );
 }
 

@@ -121,6 +121,11 @@ pub const SecuredLink = struct {
     phase: Phase,
     session: ?tsumugi_session.Session = null,
     inner: ?*s2s_link.S2sLink = null,
+    /// Borrowed local-world nick predicate for cross-namespace NICK collision
+    /// resolution, retained so it survives the lazy `inner` stand-up (the inner
+    /// S2sLink does not exist until the AKE completes). Re-applied to `inner` on
+    /// creation. Null until the daemon installs it.
+    local_nicks: ?s2s_link.S2sLink.LocalNickResolver = null,
     inbuf: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     feed_seq: u64 = 0,
@@ -198,6 +203,13 @@ pub const SecuredLink = struct {
     }
     pub fn established(self: *const SecuredLink) bool {
         return if (self.inner) |l| l.established() else false;
+    }
+    /// Install (or clear) the borrowed local-world nick predicate for
+    /// cross-namespace NICK collision resolution. Retained across the lazy inner
+    /// stand-up and applied immediately when `inner` already exists.
+    pub fn setLocalNickResolver(self: *SecuredLink, resolver: ?s2s_link.S2sLink.LocalNickResolver) void {
+        self.local_nicks = resolver;
+        if (self.inner) |l| l.setLocalNickResolver(resolver);
     }
     pub fn peerShortId(self: *const SecuredLink) ?u64 {
         return if (self.session) |s| s.peerShortId() else null;
@@ -640,6 +652,7 @@ pub const SecuredLink = struct {
             // deinit; `self.identity.sign_kp` is unaffected.
             .signing_key = self.identity.sign_kp,
         });
+        if (self.local_nicks) |resolver| link.setLocalNickResolver(resolver);
         self.inner = link;
         self.phase = .established;
         if (self.role == .initiator) {

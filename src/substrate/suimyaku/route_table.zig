@@ -9,8 +9,36 @@
 const std = @import("std");
 const toml = @import("../../proto/toml.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
+const nick_collision = @import("nick_collision.zig");
+const uid_alloc = @import("uid_alloc.zig");
 
 pub const NodeId = u64;
+
+/// Borrowed predicate the daemon installs so the route table can ask "is `nick`
+/// currently held in the LOCAL world?" without depending on the daemon. Local
+/// nicks are authoritative on a cross-namespace collision: an incoming REMOTE
+/// nick that matches a local one loses and is renamed to its mesh UID. The
+/// `ctx` pointer is opaque to the route table; the daemon owns its lifetime and
+/// MUST outlive the table (it is cleared on peer drop / deinit anyway).
+pub const LocalNickResolver = struct {
+    ctx: *anyopaque,
+    /// Case-insensitive (the daemon's world is RFC-1459 case-folded); returns
+    /// true iff a LOCAL client currently holds `nick`.
+    held_fn: *const fn (*anyopaque, []const u8) bool,
+
+    pub fn held(self: LocalNickResolver, nick: []const u8) bool {
+        return self.held_fn(self.ctx, nick);
+    }
+};
+
+/// Outcome of `resolveIncomingNick`: either keep the wire nick verbatim, or
+/// rename the incoming remote member to `uid` because it lost a cross-namespace
+/// (local) or cross-node (remote) collision. We NEVER signal a kill — a loser is
+/// always renamed to its stable mesh UID.
+pub const NickDecision = union(enum) {
+    keep,
+    rename_to_uid: nick_collision.Uid,
+};
 
 pub const Error = std.mem.Allocator.Error || error{
     BufferTooSmall,
@@ -232,6 +260,10 @@ pub const RouteTable = struct {
     /// channel name -> LWW clock for the channel topic (text lives in the daemon
     /// world; this only orders writes so a re-burst never clobbers a newer topic).
     channel_topics: std.StringHashMap(TopicClock),
+    /// Borrowed local-world nick predicate for cross-namespace collision checks
+    /// (null until the daemon installs it; null behaves like "no local nicks",
+    /// preserving the substrate-pure unit-test path). See `setLocalNickResolver`.
+    local_nicks: ?LocalNickResolver = null,
     nick_count: usize = 0,
     channel_count: usize = 0,
     list_channel_count: usize = 0,
@@ -325,6 +357,76 @@ pub const RouteTable = struct {
 
     pub fn nickNode(self: *const Self, nick: []const u8) ?NodeId {
         return self.nick_to_node.get(nick);
+    }
+
+    /// Install (or clear) the borrowed local-world nick predicate. The daemon
+    /// calls this once per link so cross-namespace collisions (a remote nick
+    /// matching a LOCAL one) resolve in the local nick's favor.
+    pub fn setLocalNickResolver(self: *Self, resolver: ?LocalNickResolver) void {
+        self.local_nicks = resolver;
+    }
+
+    /// The current best (highest-priority) claim the table holds for `nick`
+    /// across all channel rosters (ASCII case-insensitive), or null when no
+    /// remote member holds it. "Best" uses the same `(hlc, node)` ordering the
+    /// collision resolver does, so the incumbent we compare against is the one
+    /// that actually won the nick on prior applies.
+    fn nickClaim(self: *const Self, nick: []const u8) ?nick_collision.Claim {
+        var best: ?nick_collision.Claim = null;
+        var it = self.channel_members.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.entries.items) |m| {
+                if (!std.ascii.eqlIgnoreCase(m.nick, nick)) continue;
+                const cand = nick_collision.Claim{ .node_id = m.node, .hlc = m.hlc };
+                if (best == null or nick_collision.candidateWins(cand, best.?)) best = cand;
+            }
+        }
+        return best;
+    }
+
+    /// Decide how to apply an incoming REMOTE nick claim `(nick, node, hlc)`,
+    /// resolving collisions deterministically and never killing:
+    ///   * a LOCAL nick of the same name (per `local_nicks`) is authoritative —
+    ///     the incoming remote member loses and is renamed to its mesh UID;
+    ///   * an existing REMOTE nick owned by a DIFFERENT node is contested by the
+    ///     CRDT-identical `(hlc, node)` tiebreak — the loser (which may be the
+    ///     incumbent, handled by the caller's re-apply, or the newcomer) renames
+    ///     to its UID;
+    ///   * otherwise the wire nick is kept verbatim.
+    /// `node`/`hlc` are the incoming claim's owner + logical clock. Returns the
+    /// stable fallback UID when the NEWCOMER must rename.
+    pub fn resolveIncomingNick(self: *const Self, nick: []const u8, node: NodeId, hlc: u64) NickDecision {
+        // Cross-namespace: local world wins. A remote member can never take a
+        // nick a local client currently holds.
+        if (self.local_nicks) |resolver| {
+            if (resolver.held(nick)) {
+                return .{ .rename_to_uid = nick_collision.loserUid(node, nick) };
+            }
+        }
+
+        // Cross-node remote contest. An incumbent from the SAME node is the same
+        // owner (ordinary update, keep). A different node only displaces the
+        // newcomer when the newcomer does NOT win the deterministic tiebreak.
+        if (self.nickClaim(nick)) |incumbent| {
+            if (incumbent.node_id == node) return .keep;
+            const newcomer = nick_collision.Claim{ .node_id = node, .hlc = hlc };
+            if (!nick_collision.candidateWins(newcomer, incumbent)) {
+                return .{ .rename_to_uid = nick_collision.loserUid(node, nick) };
+            }
+            // Newcomer wins: the incumbent is the loser. The caller renames the
+            // incumbent (see s2s_peer.displaceIncumbent) so it converges to ITS
+            // own UID; the newcomer keeps the contested nick.
+        }
+        return .keep;
+    }
+
+    /// The stable mesh UID the EXISTING holder of `nick` (an incumbent that just
+    /// lost a contest to a higher-priority newcomer) must be renamed to. Derived
+    /// from the incumbent's owning node, so every node computes the same loser
+    /// name. Returns null when no remote member currently holds `nick`.
+    pub fn incumbentLoserUid(self: *const Self, nick: []const u8) ?nick_collision.Uid {
+        const incumbent = self.nickClaim(nick) orelse return null;
+        return nick_collision.loserUid(incumbent.node_id, nick);
     }
 
     pub fn channelNodes(self: *const Self, chan: []const u8, out: []NodeId) Error!usize {
@@ -1052,4 +1154,87 @@ test "Config.applyToml overlays mesh.routing route-table keys" {
     try std.testing.expectEqual(@as(usize, 8192), cfg.max_nicks);
     try std.testing.expectEqual(@as(usize, 128), cfg.max_nodes_per_channel);
     try std.testing.expectEqual(@as(usize, 1024), cfg.max_channels); // default
+}
+
+// --- Cross-node / cross-namespace NICK collision resolution --------------
+
+fn expectRename(decision: NickDecision) !nick_collision.Uid {
+    return switch (decision) {
+        .keep => error.TestUnexpectedResult,
+        .rename_to_uid => |uid| uid,
+    };
+}
+
+const LocalNickStub = struct {
+    held: []const u8,
+    fn isHeld(ctx: *anyopaque, nick: []const u8) bool {
+        const self: *LocalNickStub = @ptrCast(@alignCast(ctx));
+        return std.ascii.eqlIgnoreCase(self.held, nick);
+    }
+    fn resolver(self: *LocalNickStub) LocalNickResolver {
+        return .{ .ctx = self, .held_fn = isHeld };
+    }
+};
+
+test "resolveIncomingNick keeps an uncontested nick" {
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100));
+}
+
+test "resolveIncomingNick renames a remote nick that collides with a LOCAL one" {
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    var stub = LocalNickStub{ .held = "Alice" };
+    table.setLocalNickResolver(stub.resolver());
+
+    // Local world is authoritative (case-insensitive) — the incoming remote
+    // member loses and is forced to its mesh UID.
+    const uid = try expectRename(table.resolveIncomingNick("alice", 10, 100));
+    try std.testing.expect(uid_alloc.validate(uid[0..]));
+    const parts = try uid_alloc.parse(uid[0..]);
+    try std.testing.expectEqual(@as(u16, 10), parts.node); // owner-node scoped
+
+    // Clearing the resolver removes the cross-namespace contest.
+    table.setLocalNickResolver(null);
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100));
+}
+
+test "resolveIncomingNick renames a newcomer that loses a cross-node remote contest" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // Node 20 holds "kain" with a high HLC. A newcomer from node 10 with a lower
+    // HLC must lose and rename to its UID; the SAME node re-asserting keeps it.
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{});
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 20, 999));
+
+    // A higher-HLC newcomer from node 10 WINS: the table reports keep (the caller
+    // then displaces the incumbent to its UID).
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 10, 600));
+}
+
+test "resolveIncomingNick breaks an HLC tie by higher node id" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 300, true, .{});
+    // Same HLC, lower node id => newcomer loses.
+    _ = try expectRename(table.resolveIncomingNick("kain", 5, 300));
+    // Same HLC, higher node id => newcomer wins (keep; caller displaces).
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 99, 300));
+}
+
+test "incumbentLoserUid derives a stable, owner-scoped fallback" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    try std.testing.expect(table.incumbentLoserUid("ghost") == null);
+    _ = try table.applyMembership("#chat", "kain", 42, 0, 1, true, .{});
+    const uid = table.incumbentLoserUid("kain").?;
+    try std.testing.expect(uid_alloc.validate(uid[0..]));
+    try std.testing.expectEqual(@as(u16, 42), (try uid_alloc.parse(uid[0..])).node);
+    // Stable across calls.
+    try std.testing.expectEqualSlices(u8, uid[0..], table.incumbentLoserUid("kain").?[0..]);
 }

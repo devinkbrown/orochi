@@ -394,6 +394,11 @@ const default_specs = [_]CapSpec{
     .{ .id = .tls, .name = "tls" },
     .{ .id = .utf8_only, .name = "utf8-only" },
     .{ .id = .no_implicit_names, .name = "no-implicit-names" },
+    // Dual-advertise the spec-conformant draft token so IRCv3 clients that only
+    // recognize `draft/no-implicit-names` actually engage the feature. Same id,
+    // so REQ of either name toggles one capability; CAP ACK echoes the client's
+    // requested token verbatim, so a client never sees a name it didn't ask for.
+    .{ .id = .no_implicit_names, .name = "draft/no-implicit-names" },
     .{ .id = .event_playback, .name = "event-playback" },
     .{ .id = .read_marker, .name = "read-marker" },
     .{ .id = .channel_rename, .name = "channel-rename" },
