@@ -341,7 +341,7 @@ structures. Examples:
 | Codec | Role | Source |
 | --- | --- | --- |
 | `tls_extension.zig` | Zero-allocation extension-list envelope codec; contents parsed by sibling modules. | `src/proto/tls_extension.zig:1`, `src/proto/tls_extension.zig:3`, `src/proto/tls_extension.zig:9`, `src/proto/tls_extension.zig:14` |
-| `tls_keyshare.zig` | TLS 1.3 key_share inner codec. Defines X25519 and X25519MLKEM768 group ids, but the current TLS server selects only X25519. | `src/proto/tls_keyshare.zig:1`, `src/proto/tls_keyshare.zig:7`, `src/proto/tls_keyshare.zig:12`, `src/proto/tls_keyshare.zig:42`, `src/proto/tls_keyshare.zig:45`, `src/crypto/tls_server.zig:415` |
+| `tls_keyshare.zig` | TLS 1.3 key_share inner codec. Defines X25519 and X25519MLKEM768 group ids; the TLS server selects either — classical X25519/secp256r1 when offered, or the X25519MLKEM768 PQ hybrid when a client (e.g. modern Chrome) offers only the PQ share (`tls_server.zig` performs the real X25519 ECDH + ML-KEM decapsulation for the hybrid). | `src/proto/tls_keyshare.zig:1`, `src/proto/tls_keyshare.zig:7`, `src/proto/tls_keyshare.zig:12`, `src/proto/tls_keyshare.zig:42`, `src/proto/tls_keyshare.zig:45`, `src/crypto/tls_server.zig` (`x25519mlkem768` group selection) |
 | `tls_signature_scheme.zig` | SignatureAlgorithms codec including Ed25519. | `src/proto/tls_signature_scheme.zig:1`, `src/proto/tls_signature_scheme.zig:26`, `src/proto/tls_signature_scheme.zig:32` |
 | `tls_finished.zig` | TLS 1.3 Finished MAC using HKDF-Expand-Label and HMAC over transcript hash. | `src/proto/tls_finished.zig:1`, `src/proto/tls_finished.zig:4`, `src/proto/tls_finished.zig:6`, `src/proto/tls_finished.zig:7`, `src/proto/tls_finished.zig:10`, `src/proto/tls_finished.zig:13` |
 | `tls_key_update.zig` | KeyUpdate codec plus `"traffic upd"` application-secret ratchet helper. | `src/proto/tls_key_update.zig:1`, `src/proto/tls_key_update.zig:4`, `src/proto/tls_key_update.zig:5`, `src/proto/tls_key_update.zig:10`, `src/proto/tls_key_update.zig:91` |
@@ -605,8 +605,11 @@ same signed fields before Ed25519 verification (`src/proto/meshpass.zig:216`,
 
 | Do not claim | Current source evidence |
 | --- | --- |
-| Do not claim STARTTLS support. | Main and server config explicitly say implicit TLS and no STARTTLS (`src/main.zig:213`, `src/main.zig:216`, `src/daemon/server.zig:1037`, `src/daemon/server.zig:1038`). |
-| Do not claim TLS server uses PQ/hybrid groups today. | The key-share codec defines `x25519mlkem768`, but `tls_server` only accepts/selects X25519 (`src/proto/tls_keyshare.zig:45`, `src/crypto/tls_server.zig:415`, `src/crypto/tls_server.zig:469`). |
-| Do not claim the live `secured_s2s_link` encrypts CRDT frames with Tsumugi `Established` keys. | The adapter passes post-AKE bytes raw into `S2sLink` and initializes it with node ids, not key material (`src/daemon/secured_s2s_link.zig:7`, `src/daemon/secured_s2s_link.zig:8`, `src/daemon/secured_s2s_link.zig:264`, `src/daemon/secured_s2s_link.zig:271`, `src/daemon/secured_s2s_link.zig:285`, `src/daemon/secured_s2s_link.zig:288`). |
-| Do not claim `Config.mesh_pass` is enforced by the Tsumugi responder. | M1 carries the bytes encrypted, but decode reads and discards them (`src/crypto/tsumugi_handshake.zig:260`, `src/crypto/tsumugi_handshake.zig:642`, `src/crypto/tsumugi_handshake.zig:643`, `src/crypto/tsumugi_handshake.zig:644`). |
-| Do not claim `secure_channel.zig` is live S2S wiring. | Its own comment says live wiring waits on Tsumugi and the module is transport-agnostic (`src/crypto/secure_channel.zig:10`, `src/crypto/secure_channel.zig:11`, `src/crypto/secure_channel.zig:12`, `src/crypto/secure_channel.zig:13`). |
+| Do not claim STARTTLS support. | The daemon's TLS is implicit only; `dispatch.zig` notes STARTTLS is "deliberately never implement[ed]". |
+| Do not claim `secure_channel.zig` is live S2S wiring. | Its own header comment says live wiring waits on Tsumugi and the module is transport-agnostic. |
+
+The following former guardrails are now OBSOLETE — the capabilities they cautioned against ARE implemented as of this writing, so claiming them is correct:
+
+- **TLS server PQ/hybrid groups:** `tls_server.zig` selects `x25519mlkem768` and performs the real X25519 ECDH + ML-KEM decapsulation when a client offers the hybrid share (the modern-Chrome PQ-only path).
+- **`secured_s2s_link` encrypts CRDT frames:** a Post-AKE AEAD record layer (ChaCha20-Poly1305) seals every byte with the Tsumugi `Established` `send_key`/`recv_key` and opens with per-record counters.
+- **`Config.mesh_pass` enforced by the Tsumugi responder:** M1 carries it encrypted and the responder constant-time-compares it, returning `MeshPassMismatch` on a mismatch (`tsumugi_handshake.zig` ~line 360).

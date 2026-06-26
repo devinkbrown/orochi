@@ -6,9 +6,11 @@
 //!
 //! This is the *content* of a per-client capsule field: the identity/state needed
 //! to reconstruct a recognizable registered session (nick, realname, account,
-//! visible + real host, away, oper + the full oper grant). The client's socket fd
-//! is carried separately (SCM_RIGHTS / inherited fd); this is only the session
-//! state that pairs with it. Client-settable umodes are a later increment.
+//! visible + real host, away, oper + the full oper grant) plus the client's
+//! channel memberships (name + member-mode prefixes), which the successor
+//! re-joins so the user stays in their channels across the upgrade. The client's
+//! socket fd is carried separately (SCM_RIGHTS / inherited fd); this is only the
+//! session state that pairs with it. Client-settable umodes are a later increment.
 //!
 //! Wire format (all integers little-endian):
 //!   [u16 len][nick][u16 len][realname][u16 len][account]

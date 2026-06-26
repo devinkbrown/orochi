@@ -2521,12 +2521,21 @@ pub const LinuxServer = struct {
         return current_reactor orelse &self.reactors[0];
     }
 
-    /// Clamp the configured shard count to `[1, max_shards]`; callers choose the
-    /// default before init, while direct tests that leave it unset get one shard.
+    /// Effective worker-reactor count. CLAMPED TO 1 for now, regardless of
+    /// `[limits].num_shards`: the in-memory stores shared across reactors
+    /// (account_verifies, warden, totp, sessions, …) have no internal locks yet,
+    /// so allocating multiple reactors and spawning a worker per shard would race
+    /// them. `num_shards` > 1 is accepted and carried in the config but is not yet
+    /// honored — running more than one reactor is unsafe until those stores get
+    /// internal synchronization and RCU world adoption lands (see
+    /// docs/planning/24-multithreading.md). Restore the `[1, max_shards]` clamp
+    /// (commented below) only once that work is complete.
     fn clampShards(config: Config) u12 {
-        const requested: usize = if (config.num_shards == 0) 1 else config.num_shards;
-        const capped = @min(requested, shard_mod.max_shards);
-        return @intCast(@max(@as(usize, 1), capped));
+        // const requested: usize = if (config.num_shards == 0) 1 else config.num_shards;
+        // const capped = @min(requested, shard_mod.max_shards);
+        // return @intCast(@max(@as(usize, 1), capped));
+        _ = config;
+        return 1;
     }
 
     /// Cert presence is the "TLS configured" signal (main.zig only supplies a
