@@ -18684,21 +18684,16 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ self.serverName(), account }) catch return;
         try appendToConn(conn, line);
-        // Optional email verification: when a real contact is supplied (not "*"),
-        // issue a token the user confirms with VERIFY. The account is usable
-        // immediately; verification status is tracked for features that gate on it.
+        // The account's email is recorded by registerAccountWithEmail above but
+        // stays UNVERIFIED: this build has no out-of-band (mail) delivery, so the
+        // address cannot be proven to belong to the registrant. We deliberately do
+        // NOT issue an in-band "verification" code — showing the code on the SAME
+        // connection proves nothing about email ownership (the user verifying
+        // themselves), so claiming "email verified" would be security theater.
+        // Real verification arrives with a mail transport; the VERIFY command and
+        // its token store remain wired for that future delivery path.
         if (has_email) {
-            if (self.config.crypto_io) |io| {
-                var tok_bytes: [16]u8 = undefined;
-                io.random(&tok_bytes);
-                const now_u: u64 = @intCast(@max(0, self.nowMs()));
-                if (self.account_verifies.issue(account, email, &tok_bytes, now_u)) |token| {
-                    svc.setAccountEmailPending(account, email, token, now_u, &scratch) catch {
-                        try channelNotice(conn, "VERIFY token issued but could not be persisted; request a fresh code after restart", .{});
-                    };
-                    try channelNotice(conn, "VERIFY {s} to confirm your email {s}", .{ token, email });
-                } else |_| {}
-            }
+            try channelNotice(conn, "Email {s} recorded (unverified — this server cannot verify email ownership yet)", .{email});
         }
         if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);

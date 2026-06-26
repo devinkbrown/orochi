@@ -267,6 +267,7 @@ pub const signed_delta = @import("signed_delta.zig");
 pub const signed_object = @import("signed_object.zig");
 pub const silence = @import("silence.zig");
 pub const skiplist = @import("skiplist.zig");
+pub const smtp_client = @import("smtp_client.zig");
 pub const sni = @import("sni.zig");
 pub const snowflake_id = @import("snowflake_id.zig");
 pub const socks5 = @import("socks5.zig");
@@ -602,6 +603,7 @@ test {
     _ = signed_object;
     _ = silence;
     _ = skiplist;
+    _ = smtp_client;
     _ = sni;
     _ = snowflake_id;
     _ = socks5;

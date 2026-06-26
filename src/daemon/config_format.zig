@@ -65,6 +65,7 @@ pub const Config = struct {
     acme: Acme = .{},
     sts: Sts = .{},
     dnsbl: Dnsbl = .{},
+    mail: Mail = .{},
 
     /// `[dnsbl]` connect-time DNS blocklist. When enabled with one or more zones,
     /// each non-loopback client IP is checked against the zones off the hot path;
@@ -75,6 +76,27 @@ pub const Config = struct {
         zones: []const []const u8 = &.{},
         /// false = refuse the connection; true = add a Warden ban for the IP.
         ward: bool = false,
+    };
+
+    /// `[mail]` outbound SMTP submission relay. When enabled with a relay host +
+    /// sender, the daemon delivers account email-verification and password-reset
+    /// codes out-of-band via the relay (off the hot path, on a background thread).
+    /// Disabled (default) = no mail: REGISTER records emails as unverified and the
+    /// reset flow is unavailable. Never log in the daemon's own MTA; this is a
+    /// submission CLIENT to an existing relay.
+    pub const Mail = struct {
+        enabled: bool = false,
+        /// Submission relay hostname (resolved via DNS A record).
+        relay_host: ?[]const u8 = null,
+        /// Submission port. 587 = STARTTLS (default); 465 = implicit TLS.
+        relay_port: u16 = 587,
+        /// false = port 465 implicit TLS (TLS from connect); true = STARTTLS on 587.
+        starttls: bool = true,
+        /// Envelope sender + `From:` address (e.g. "orochi@example.org").
+        from: ?[]const u8 = null,
+        /// AUTH credentials for the relay (optional; omitted = no AUTH).
+        user: ?[]const u8 = null,
+        pass: ?[]const u8 = null,
     };
 
     pub const Node = struct {
@@ -535,6 +557,10 @@ pub const Config = struct {
         freeStringList(allocator, self.mesh.trust_roots);
         freeStringList(allocator, self.mesh.connect);
         freeStringList(allocator, self.dnsbl.zones);
+        if (self.mail.relay_host) |value| allocator.free(value);
+        if (self.mail.from) |value| allocator.free(value);
+        if (self.mail.user) |value| allocator.free(value);
+        if (self.mail.pass) |value| allocator.free(value);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
@@ -652,6 +678,15 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         cfg.dnsbl.zones = try ownStringArray(allocator, resolver, arr);
     }
     if (doc.getString("dnsbl.action")) |a| cfg.dnsbl.ward = std.ascii.eqlIgnoreCase(a, "ward");
+
+    // [mail]
+    if (doc.getBool("mail.enabled")) |b| cfg.mail.enabled = b;
+    try setOpt(allocator, resolver, doc.getString("mail.relay_host"), &cfg.mail.relay_host);
+    cfg.mail.relay_port = @intCast(try uintField(doc, "mail.relay_port", cfg.mail.relay_port, 1, 65535));
+    if (doc.getBool("mail.starttls")) |b| cfg.mail.starttls = b;
+    try setOpt(allocator, resolver, doc.getString("mail.from"), &cfg.mail.from);
+    try setOpt(allocator, resolver, doc.getString("mail.user"), &cfg.mail.user);
+    try setOpt(allocator, resolver, doc.getString("mail.pass"), &cfg.mail.pass);
 
     // [limits]
     cfg.limits.backlog = @intCast(try uintField(doc, "limits.backlog", cfg.limits.backlog, 1, 32767));
