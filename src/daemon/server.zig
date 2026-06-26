@@ -98,6 +98,7 @@ const memo_group_mod = @import("memo_group.zig");
 const welcome_pack_mod = @import("welcome_pack.zig");
 const mode_lock_mod = @import("../proto/mode_lock.zig");
 const account_verify_mod = @import("account_verify.zig");
+const totp_auth = @import("totp_auth.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const color_strip = @import("../proto/color_strip.zig");
 const snowflake_id = @import("../proto/snowflake_id.zig");
@@ -2260,6 +2261,10 @@ pub const LinuxServer = struct {
     stats_hist_head: usize = 0,
     /// Pending account email/token verifications (REGISTER -> VERIFY).
     account_verifies: account_verify_mod.VerifyStore,
+    /// In-memory TOTP (2FA) enrollment + verification engine. Pending enrollments
+    /// live only here; a CONFIRMed secret is mirrored to the account-services
+    /// `.props` store for durability and lazily reloaded here at login.
+    totp: totp_auth.TotpStore,
     history: HistoryStore,
     /// IRCv3 `draft/search` inverted index (word -> msgids), populated forward as
     /// PRIVMSG/NOTICE messages are recorded into `history`. Bounded by its Config;
@@ -2750,6 +2755,7 @@ pub const LinuxServer = struct {
             .nick_groups = memo_group_mod.NickGroup.init(allocator),
             .welcome = welcome_pack_mod.WelcomePack.init(allocator),
             .account_verifies = account_verify_mod.VerifyStore.init(allocator, .{ .token_bytes = 16 }),
+            .totp = totp_auth.TotpStore.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .search_index = search_index_mod.SearchIndex.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
@@ -3075,6 +3081,7 @@ pub const LinuxServer = struct {
         if (self.geoip_bytes) |b| self.allocator.free(b);
         if (self.geoip_asn_bytes) |b| self.allocator.free(b);
         self.account_verifies.deinit();
+        self.totp.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
         if (self.pending_migrations) |*pm| pm.deinit();
@@ -12533,6 +12540,104 @@ pub const LinuxServer = struct {
             .bad_token => try self.failReply(conn, "VERIFY", "INVALID_CODE", "Incorrect verification code"),
             .locked => try self.failReply(conn, "VERIFY", "TOO_MANY_ATTEMPTS", "Too many attempts; verification locked"),
         }
+    }
+
+    /// RFC 4648 base32 alphabet (no padding) — a TOTP shared secret is a string of
+    /// these symbols; 256 = 8*32, so masking a uniform random byte is unbiased.
+    const totp_b32_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    /// Secret length in base32 symbols (32 symbols = 160 bits = 20 bytes).
+    const totp_secret_symbols = 32;
+
+    /// Current Unix time in SECONDS for TOTP — the wall clock the authenticator
+    /// app uses, never the daemon's monotonic `nowMs`.
+    fn totpUnixSeconds() i64 {
+        return @divFloor(platform.realtimeMillis(), 1000);
+    }
+
+    /// Whether `account` has ACTIVE TOTP 2FA. Checks the live store first, then
+    /// lazily restores a persisted secret (e.g. after a restart) into the store
+    /// so login enforcement and the replay guard work across reboots.
+    fn totpActiveForAccount(self: *LinuxServer, account: []const u8) bool {
+        if (self.totp.isEnrolled(account)) return true;
+        // A pending (unconfirmed) in-memory enrollment is authoritative — never
+        // overwrite it with a persisted load (which would discard the pending
+        // secret the user is mid-enrolling).
+        if (self.totp.isPending(account)) return false;
+        const svc = self.account_services orelse return false;
+        var buf: [services_mod.Services.totp_secret_max]u8 = undefined;
+        const b32 = svc.totpSecretGet(account, &buf) orelse return false;
+        self.totp.loadActive(account, b32) catch return false;
+        return self.totp.isEnrolled(account);
+    }
+
+    /// `TOTP <ENROLL | CONFIRM <code> | DISABLE | STATUS>` — manage the logged-in
+    /// account's TOTP two-factor authentication. ENROLL mints a secret (shown in
+    /// band + as an otpauth:// URI for the authenticator app); CONFIRM activates
+    /// it (and durably persists it); login then requires a code (handleIdentify /
+    /// SASL). Requires being logged in.
+    pub fn handleTotp(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "TOTP", "ACCOUNT_REQUIRED", "Log in to an account before managing TOTP");
+        const svc = self.account_services orelse
+            return self.failReply(conn, "TOTP", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        const sub = parsed.paramSlice()[0];
+
+        if (std.ascii.eqlIgnoreCase(sub, "STATUS")) {
+            const state = if (self.totpActiveForAccount(account))
+                "active"
+            else if (self.totp.isPending(account))
+                "pending — run TOTP CONFIRM <code> to activate"
+            else
+                "disabled";
+            return channelNotice(conn, "TOTP: two-factor authentication is {s}", .{state});
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "DISABLE")) {
+            const was = self.totpActiveForAccount(account) or self.totp.isPending(account);
+            _ = self.totp.disable(account);
+            svc.totpSecretDelete(account) catch {};
+            return channelNotice(conn, "TOTP: two-factor authentication {s}", .{if (was) "disabled" else "was not enabled"});
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "ENROLL")) {
+            if (self.totpActiveForAccount(account))
+                return self.failReply(conn, "TOTP", "ALREADY_ENROLLED", "TOTP is already active; DISABLE it first to re-enroll");
+            const io = self.config.crypto_io orelse
+                return self.failReply(conn, "TOTP", "TEMPORARILY_UNAVAILABLE", "No randomness source configured");
+            var rnd: [totp_secret_symbols]u8 = undefined;
+            io.random(&rnd);
+            var secret: [totp_secret_symbols]u8 = undefined;
+            for (rnd, 0..) |b, i| secret[i] = totp_b32_alphabet[b & 0x1f];
+            self.totp.enroll(account, &secret) catch
+                return self.failReply(conn, "TOTP", "INTERNAL_ERROR", "Could not start enrollment");
+            const issuer = self.serverName();
+            var uri: [320]u8 = undefined;
+            const otpauth = std.fmt.bufPrint(&uri, "otpauth://totp/{s}:{s}?secret={s}&issuer={s}&algorithm=SHA1&digits=6&period=30", .{ issuer, account, &secret, issuer }) catch "";
+            try channelNotice(conn, "TOTP: add this to your authenticator, then run TOTP CONFIRM <code>", .{});
+            try channelNotice(conn, "TOTP: secret {s}", .{&secret});
+            if (otpauth.len != 0) try channelNotice(conn, "TOTP: {s}", .{otpauth});
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(sub, "CONFIRM")) {
+            if (parsed.param_count < 2)
+                return self.failReply(conn, "TOTP", "NEED_MORE_PARAMS", "Usage: TOTP CONFIRM <code>");
+            const code = parsed.paramSlice()[1];
+            const outcome = self.totp.confirm(account, code, totpUnixSeconds()) catch
+                return self.failReply(conn, "TOTP", "INTERNAL_ERROR", "Verification failed");
+            switch (outcome) {
+                .ok => {
+                    if (self.totp.secretB32(account)) |b32| svc.totpSecretPut(account, b32) catch {
+                        return channelNotice(conn, "TOTP: confirmed, but the secret could not be persisted; re-enroll after restart", .{});
+                    };
+                    return channelNotice(conn, "TOTP: two-factor enrollment confirmed and saved", .{});
+                },
+                .bad_code => return self.failReply(conn, "TOTP", "INVALID_CODE", "Incorrect code; try the current one from your authenticator"),
+                .not_enrolled => return self.failReply(conn, "TOTP", "NO_PENDING", "Nothing to confirm — run TOTP ENROLL first"),
+            }
+        }
+
+        return self.failReply(conn, "TOTP", "INVALID_SUBCOMMAND", "Usage: TOTP <ENROLL|CONFIRM <code>|DISABLE|STATUS>");
     }
 
     /// `WELCOME <ADD :line | CLEAR | SHOW>` — oper-managed network onboarding
@@ -25535,6 +25640,76 @@ test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass
     conn.session.setOperGrant(oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
     try std.testing.expect(!server.enforceDnsbl(conn));
 }
+
+test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE" {
+    const ct = @import("../crypto/totp.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-totp-life.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "kain", "kain"); // logged in to account "kain"
+    const conn = server.connFor(id).?;
+
+    const totp = struct {
+        fn call(s: *Server, c: *ConnState, sub: []const u8, arg: ?[]const u8) !void {
+            c.send_len = 0;
+            var lv = irc_line.LineView{ .raw = "", .command = "TOTP" };
+            lv.params[0] = sub;
+            lv.param_count = 1;
+            if (arg) |a| {
+                lv.params[1] = a;
+                lv.param_count = 2;
+            }
+            try s.handleTotp(c, &lv);
+        }
+    };
+
+    // STATUS: disabled initially.
+    try totp.call(&server, conn, "STATUS", null);
+    try expectContains(conn.send_buf[0..conn.send_len], "is disabled");
+
+    // ENROLL mints a secret + otpauth URI; the enrollment is now pending.
+    try totp.call(&server, conn, "ENROLL", null);
+    try expectContains(conn.send_buf[0..conn.send_len], "TOTP: secret ");
+    try expectContains(conn.send_buf[0..conn.send_len], "otpauth://totp/");
+    try totp.call(&server, conn, "STATUS", null);
+    try expectContains(conn.send_buf[0..conn.send_len], "pending");
+    try std.testing.expect(!services.totpEnrolled("kain")); // pending is NOT persisted
+
+    // Compute the live code for the minted secret and CONFIRM.
+    const b32 = server.totp.secretB32("kain").?;
+    const raw = try ct.decodeBase32(std.testing.allocator, b32);
+    defer std.testing.allocator.free(raw);
+    const now_s = @divFloor(platform.realtimeMillis(), 1000);
+    const val = try ct.totp(raw, now_s, 30, 0, 6, .sha1);
+    var codebuf: [6]u8 = undefined;
+    _ = std.fmt.bufPrint(&codebuf, "{d:0>6}", .{val}) catch unreachable;
+    try totp.call(&server, conn, "CONFIRM", &codebuf);
+    try expectContains(conn.send_buf[0..conn.send_len], "confirmed and saved");
+    try std.testing.expect(services.totpEnrolled("kain")); // confirmed secret IS persisted
+
+    // Lazy reload: clear the in-memory store (simulating a restart) — the
+    // persisted secret is restored on the next active check.
+    _ = server.totp.disable("kain");
+    try std.testing.expect(!server.totp.isEnrolled("kain")); // gone from memory
+    try std.testing.expect(server.totpActiveForAccount("kain")); // reloaded from .props
+    try std.testing.expect(server.totp.isEnrolled("kain"));
+
+    // DISABLE clears both memory and persistence.
+    try totp.call(&server, conn, "DISABLE", null);
+    try expectContains(conn.send_buf[0..conn.send_len], "disabled");
+    try std.testing.expect(!services.totpEnrolled("kain"));
+    try std.testing.expect(!server.totpActiveForAccount("kain"));
+}
+
 
 test "session-sync unit: two sessions same account both session-sync get the DM" {
     const target_id = client_model.ClientId{ .shard = 0, .slot = 1, .gen = 1 };

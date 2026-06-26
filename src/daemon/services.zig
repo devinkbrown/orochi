@@ -1586,6 +1586,67 @@ pub const Services = struct {
         }
     }
 
+    // ── Durable account-scoped TOTP secret (2FA enrollment survives restart) ────
+    // The base32 shared secret for an account's ACTIVE TOTP enrollment, stored in
+    // the private `.props` family under "tot\x00<account>". This namespace is
+    // NEVER exposed via the IRCv3 METADATA command (which reads only the "mda\x00"
+    // prefix), so the secret is not client-readable — it is server-side state used
+    // solely to verify a login second factor. Only a confirmed enrollment is
+    // persisted; a pending (unconfirmed) secret lives only in the in-memory store.
+    pub const totp_secret_max: usize = 64; // base32 of up to ~40 raw bytes
+    const totp_prefix = "tot\x00";
+    const totp_key_max: usize = totp_prefix.len + account_max;
+
+    fn totpKey(buf: []u8, account: []const u8) ?[]const u8 {
+        if (account.len == 0 or account.len > account_max) return null;
+        if (buf.len < totp_prefix.len + account.len) return null;
+        @memcpy(buf[0..totp_prefix.len], totp_prefix);
+        for (account, 0..) |c, i| buf[totp_prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. totp_prefix.len + account.len];
+    }
+
+    /// Persist `secret_b32` as the account's active TOTP secret (overwrites any
+    /// prior). No-op on an empty / over-long secret.
+    pub fn totpSecretPut(self: *Services, account: []const u8, secret_b32: []const u8) ServiceError!void {
+        if (secret_b32.len == 0 or secret_b32.len > totp_secret_max) return;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [totp_key_max]u8 = undefined;
+        const k = totpKey(&kb, account) orelse return;
+        try self.store.family(.props).put(k, secret_b32);
+    }
+
+    /// Copy the account's persisted TOTP secret into `out`, or null when none is
+    /// stored (or it does not fit `out`). The returned slice aliases `out`.
+    pub fn totpSecretGet(self: *Services, account: []const u8, out: []u8) ?[]const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [totp_key_max]u8 = undefined;
+        const k = totpKey(&kb, account) orelse return null;
+        const v = self.store.family(.props).get(k) orelse return null;
+        if (v.len == 0 or v.len > out.len) return null;
+        @memcpy(out[0..v.len], v);
+        return out[0..v.len];
+    }
+
+    /// Remove the account's persisted TOTP secret (disable 2FA). Idempotent.
+    pub fn totpSecretDelete(self: *Services, account: []const u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        var kb: [totp_key_max]u8 = undefined;
+        const k = totpKey(&kb, account) orelse return;
+        try self.store.family(.props).delete(k);
+    }
+
+    /// True when the account has a persisted (active) TOTP secret.
+    pub fn totpEnrolled(self: *Services, account: []const u8) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var kb: [totp_key_max]u8 = undefined;
+        const k = totpKey(&kb, account) orelse return false;
+        return self.store.family(.props).get(k) != null;
+    }
+
     /// Invoke `cb(ctx, channel, level)` for every channel where `account` holds a
     /// live access grant — the durable reverse of `channelAccessList`, backing
     /// LISTCHANS. Stale grants (channel dropped, or dropped+re-registered) are
@@ -2791,6 +2852,33 @@ test "account silence: add/remove persist; restore via forEach across reopen" {
         }.cb);
         try std.testing.expectEqual(@as(usize, 1), count); // troll removed; one survives
         try std.testing.expect(ok);
+    }
+}
+
+test "account TOTP secret: put/get/delete persist across reopen; case-insensitive" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const secret_b32 = "MZXW6YTBOI======";
+
+    {
+        var store = try openTestStore(tmp, "services-accttotp.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        try std.testing.expect(!services.totpEnrolled("kain"));
+        try services.totpSecretPut("kain", secret_b32);
+        try std.testing.expect(services.totpEnrolled("KAIN")); // case-insensitive key
+    }
+    {
+        var store = try openTestStore(tmp, "services-accttotp.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        // Secret survives a cold reopen and is readable by the verifier.
+        var buf: [Services.totp_secret_max]u8 = undefined;
+        try std.testing.expectEqualStrings(secret_b32, services.totpSecretGet("kain", &buf).?);
+        // Disable removes it.
+        try services.totpSecretDelete("KAIN");
+        try std.testing.expect(!services.totpEnrolled("kain"));
+        try std.testing.expect(services.totpSecretGet("kain", &buf) == null);
     }
 }
 

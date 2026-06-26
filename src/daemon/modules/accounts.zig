@@ -21,6 +21,10 @@ fn identify(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleIdentify(x.conn, x.parsed);
 }
+fn totp(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleTotp(x.conn, x.parsed);
+}
 fn logout(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleLogout(x.id, x.conn);
@@ -101,6 +105,7 @@ fn listchans(c: *anyopaque, _: I) anyerror!void {
 pub const REGISTER_spec = registry.CommandSpec{ .name = "REGISTER", .feature = accounts_feature, .handler = register };
 pub const VERIFY_spec = registry.CommandSpec{ .name = "VERIFY", .feature = accounts_feature, .handler = verify };
 pub const IDENTIFY_spec = registry.CommandSpec{ .name = "IDENTIFY", .feature = accounts_feature, .handler = identify };
+pub const TOTP_spec = registry.CommandSpec{ .name = "TOTP", .min_params = 1, .feature = accounts_feature, .handler = totp, .summary = "manage two-factor auth (ENROLL|CONFIRM|DISABLE|STATUS)" };
 pub const LOGOUT_spec = registry.CommandSpec{ .name = "LOGOUT", .feature = accounts_feature, .handler = logout };
 pub const DROP_spec = registry.CommandSpec{ .name = "DROP", .feature = accounts_feature, .handler = drop };
 pub const SETPASS_spec = registry.CommandSpec{ .name = "SETPASS", .feature = accounts_feature, .handler = setpass, .summary = "change your account password (current + new)" };
@@ -128,6 +133,7 @@ pub const module = registry.Module{
         REGISTER_spec,
         VERIFY_spec,
         IDENTIFY_spec,
+        TOTP_spec,
         LOGOUT_spec,
         DROP_spec,
         SETPASS_spec,

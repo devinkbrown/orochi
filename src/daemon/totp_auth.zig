@@ -23,13 +23,17 @@ const Phase = enum {
 const Enrollment = struct {
     /// Lifecycle phase: pending awaits confirmation, active is login-ready.
     phase: Phase,
-    /// Raw decoded shared secret bytes owned by the store.
+    /// Raw decoded shared secret bytes owned by the store (verification).
     secret: []const u8,
+    /// Original base32 secret owned by the store (so the daemon can persist a
+    /// confirmed enrollment without re-encoding the raw bytes).
+    secret_b32: []const u8,
     /// Highest accepted time-step counter, or null before first acceptance.
     last_step: ?i64,
 
     fn deinit(self: *Enrollment, allocator: std.mem.Allocator) void {
         allocator.free(self.secret);
+        allocator.free(self.secret_b32);
         self.* = undefined;
     }
 };
@@ -83,10 +87,24 @@ pub const TotpStore = struct {
     }
 
     /// Stores a pending enrollment, decoding and validating the base32 secret.
+    /// A subsequent `confirm` with a valid code promotes it to active.
     pub fn enroll(self: *TotpStore, account: []const u8, secret_b32: []const u8) Error!void {
+        return self.insert(account, secret_b32, .pending);
+    }
+
+    /// Insert an already-confirmed (active) enrollment directly — used to restore
+    /// a persisted secret into the live store at login, bypassing the pending →
+    /// confirm handshake. Replaces any existing entry for the account.
+    pub fn loadActive(self: *TotpStore, account: []const u8, secret_b32: []const u8) Error!void {
+        return self.insert(account, secret_b32, .active);
+    }
+
+    fn insert(self: *TotpStore, account: []const u8, secret_b32: []const u8, phase: Phase) Error!void {
         const secret = try self.decodeSecret(secret_b32);
         errdefer self.allocator.free(secret);
-        const next: Enrollment = .{ .phase = .pending, .secret = secret, .last_step = null };
+        const owned_b32 = try self.allocator.dupe(u8, secret_b32);
+        errdefer self.allocator.free(owned_b32);
+        const next: Enrollment = .{ .phase = phase, .secret = secret, .secret_b32 = owned_b32, .last_step = null };
 
         if (self.findEntry(account)) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -97,6 +115,15 @@ pub const TotpStore = struct {
         const owned_key = try self.normalizedAccount(account);
         errdefer self.allocator.free(owned_key);
         try self.entries.putNoClobber(owned_key, next);
+    }
+
+    /// The base32 secret for the account's enrollment (any phase), or null. The
+    /// returned slice is store-owned and valid until the next mutation for this
+    /// account — copy it (e.g. persist it) before the next store call. Used to
+    /// durably store a freshly confirmed enrollment.
+    pub fn secretB32(self: *const TotpStore, account: []const u8) ?[]const u8 {
+        const entry = self.findEntry(account) orelse return null;
+        return entry.value_ptr.secret_b32;
     }
 
     /// Confirms a pending enrollment and promotes it to active on success.
@@ -336,6 +363,21 @@ test "disable removes the enrollment" {
     try testing.expect(store.disable("FRANK"));
     try testing.expect(!store.isEnrolled("frank"));
     try testing.expect(!store.disable("frank"));
+}
+
+test "loadActive restores a persisted secret as immediately verifiable" {
+    var store = TotpStore.init(testing.allocator, .{});
+    defer store.deinit();
+    const secret_b32 = "MZXW6YTBOI======";
+    const secret = try crypto_totp.decodeBase32(testing.allocator, secret_b32);
+    defer testing.allocator.free(secret);
+
+    // No pending/confirm handshake: a restored secret verifies a login directly.
+    try store.loadActive("kev", secret_b32);
+    try testing.expect(store.isEnrolled("KEV"));
+    try testing.expect(!store.isPending("kev"));
+    var buf: [6]u8 = undefined;
+    try testing.expectEqual(VerifyOutcome.ok, try store.verify("kev", try codeFor(&buf, secret, 2000000000), 2000000000));
 }
 
 test "invalid base32 secret is rejected on enroll" {
