@@ -843,6 +843,39 @@ test "native media MAC constant-time compare covers full tag" {
     try testing.expect(!constantTimeTagEql(a[0..], a[0 .. MAC_TAG_BYTES - 1]));
 }
 
+test "ws-media MAC cross-repo KAT (shared with Onyx JS)" {
+    // Canonical known-answer vectors shared byte-for-byte with the Onyx client's
+    // mediaMac Vitest (test/vectors/ws_media_mac.json in both repos). Any change
+    // to the derivation or tag MUST update both sides in lockstep.
+    var root: [16]u8 = undefined;
+    for (&root, 0..) |*b, i| b.* = @intCast(i); // 00 01 02 … 0f
+    const channel = "#call";
+    const participant = "alice";
+    const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .opvox_audio, "voice");
+
+    var frame_buf: [128]u8 = undefined;
+    const frame_len = try encode(frame, &frame_buf);
+    try testing.expectEqualSlices(u8, &hexBytes(
+        "0500000040443322110700000028230000000000000101766f696365",
+    ), frame_buf[0..frame_len]);
+
+    var k32: [MAC_KEY_BYTES]u8 = undefined;
+    deriveNativeMediaMacKey(&root, channel, participant, &k32);
+    try testing.expectEqualSlices(u8, &hexBytes(
+        "0061a45986adfe168b5b661106ef8a41acb923c35b24c0825a021e3b979fe85e",
+    ), &k32);
+
+    const tag = nativeMediaMacTag(&root, channel, participant, frame_buf[0..frame_len]);
+    try testing.expectEqualSlices(u8, &hexBytes("9f9e752df2696d9c3f2997f2113bd9dd"), &tag);
+}
+
+/// Decode a compile-time hex literal to a fixed byte array (test helper).
+fn hexBytes(comptime h: []const u8) [h.len / 2]u8 {
+    var out: [h.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    return out;
+}
+
 test "decode unknown codec tag rejected" {
     var buf: [MIN_FRAME_WIRE_BYTES]u8 = undefined;
     @memset(&buf, 0);
