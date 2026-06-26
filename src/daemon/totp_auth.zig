@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const crypto_totp = @import("../crypto/totp.zig");
+const rwlock = @import("../substrate/rwlock.zig");
 
 /// Seconds in a single RFC 6238 time step; used to derive the replay counter.
 const step_seconds: i64 = 30;
@@ -65,6 +66,12 @@ pub const TotpStore = struct {
     allocator: std.mem.Allocator,
     params: Params,
     entries: std.StringHashMap(Enrollment),
+    /// Internal lock making the store self-synchronizing: it is shared across
+    /// reactor shards (login verify, enroll, disable all touch it). Uncontended
+    /// today since the reactor count is clamped to 1, but a real prerequisite for
+    /// lifting that clamp. Every public method takes it; private helpers
+    /// (`insert`/`findEntry`/`matchStep`) run under the caller's hold.
+    lock: rwlock.RwLock = .{},
 
     /// Creates an empty TOTP store using caller-provided policy.
     pub fn init(allocator: std.mem.Allocator, params: Params) TotpStore {
@@ -89,6 +96,8 @@ pub const TotpStore = struct {
     /// Stores a pending enrollment, decoding and validating the base32 secret.
     /// A subsequent `confirm` with a valid code promotes it to active.
     pub fn enroll(self: *TotpStore, account: []const u8, secret_b32: []const u8) Error!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         return self.insert(account, secret_b32, .pending);
     }
 
@@ -96,6 +105,8 @@ pub const TotpStore = struct {
     /// a persisted secret into the live store at login, bypassing the pending →
     /// confirm handshake. Replaces any existing entry for the account.
     pub fn loadActive(self: *TotpStore, account: []const u8, secret_b32: []const u8) Error!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         return self.insert(account, secret_b32, .active);
     }
 
@@ -121,13 +132,17 @@ pub const TotpStore = struct {
     /// returned slice is store-owned and valid until the next mutation for this
     /// account — copy it (e.g. persist it) before the next store call. Used to
     /// durably store a freshly confirmed enrollment.
-    pub fn secretB32(self: *const TotpStore, account: []const u8) ?[]const u8 {
+    pub fn secretB32(self: *TotpStore, account: []const u8) ?[]const u8 {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         const entry = self.findEntry(account) orelse return null;
         return entry.value_ptr.secret_b32;
     }
 
     /// Confirms a pending enrollment and promotes it to active on success.
     pub fn confirm(self: *TotpStore, account: []const u8, code: []const u8, now: i64) Error!VerifyOutcome {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         const entry = self.findEntry(account) orelse return .not_enrolled;
         if (entry.value_ptr.phase != .pending) return .not_enrolled;
 
@@ -138,6 +153,8 @@ pub const TotpStore = struct {
 
     /// Verifies a login second factor against the active secret with replay guard.
     pub fn verify(self: *TotpStore, account: []const u8, code: []const u8, now: i64) Error!VerifyOutcome {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         const entry = self.findEntry(account) orelse return .not_enrolled;
         if (entry.value_ptr.phase != .active) return .not_enrolled;
 
@@ -150,19 +167,25 @@ pub const TotpStore = struct {
     }
 
     /// Returns true when the account has an active enrollment.
-    pub fn isEnrolled(self: *const TotpStore, account: []const u8) bool {
+    pub fn isEnrolled(self: *TotpStore, account: []const u8) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         const entry = self.findEntry(account) orelse return false;
         return entry.value_ptr.phase == .active;
     }
 
     /// Returns true when the account has a pending (unconfirmed) enrollment.
-    pub fn isPending(self: *const TotpStore, account: []const u8) bool {
+    pub fn isPending(self: *TotpStore, account: []const u8) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         const entry = self.findEntry(account) orelse return false;
         return entry.value_ptr.phase == .pending;
     }
 
     /// Removes any enrollment for the account and reports whether one existed.
     pub fn disable(self: *TotpStore, account: []const u8) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
         const entry = self.findEntry(account) orelse return false;
         const owned_key = entry.key_ptr.*;
         entry.value_ptr.deinit(self.allocator);
