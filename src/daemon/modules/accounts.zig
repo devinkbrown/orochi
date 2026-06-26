@@ -37,6 +37,10 @@ fn setpass(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleSetpass(x.conn, x.parsed);
 }
+fn resetpass(c: *anyopaque, _: I) anyerror!void {
+    const x = Core.from(c);
+    try x.server.handleResetpass(x.conn, x.parsed);
+}
 fn successor(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleSuccessor(x.conn, x.parsed);
@@ -109,6 +113,7 @@ pub const TOTP_spec = registry.CommandSpec{ .name = "TOTP", .min_params = 1, .fe
 pub const LOGOUT_spec = registry.CommandSpec{ .name = "LOGOUT", .feature = accounts_feature, .handler = logout };
 pub const DROP_spec = registry.CommandSpec{ .name = "DROP", .feature = accounts_feature, .handler = drop };
 pub const SETPASS_spec = registry.CommandSpec{ .name = "SETPASS", .feature = accounts_feature, .handler = setpass, .summary = "change your account password (current + new)" };
+pub const RESETPASS_spec = registry.CommandSpec{ .name = "RESETPASS", .min_params = 1, .feature = accounts_feature, .handler = resetpass, .summary = "reset a forgotten password via an emailed code" };
 pub const SUCCESSOR_spec = registry.CommandSpec{ .name = "SUCCESSOR", .feature = accounts_feature, .handler = successor, .summary = "set a registered channel's founder successor (SHOW|SET|CLEAR)" };
 pub const ACCOUNTINFO_spec = registry.CommandSpec{ .name = "ACCOUNTINFO", .feature = accounts_feature, .handler = accountInfo };
 pub const ACCOUNT_spec = registry.CommandSpec{ .name = "ACCOUNT", .access = .oper, .feature = accounts_feature, .handler = account, .summary = "administer account lifecycle flags" };
@@ -137,6 +142,7 @@ pub const module = registry.Module{
         LOGOUT_spec,
         DROP_spec,
         SETPASS_spec,
+        RESETPASS_spec,
         SUCCESSOR_spec,
         ACCOUNTINFO_spec,
         ACCOUNT_spec,

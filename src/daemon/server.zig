@@ -98,6 +98,7 @@ const memo_group_mod = @import("memo_group.zig");
 const welcome_pack_mod = @import("welcome_pack.zig");
 const mode_lock_mod = @import("../proto/mode_lock.zig");
 const account_verify_mod = @import("account_verify.zig");
+const password_reset = @import("password_reset.zig");
 const totp_auth = @import("totp_auth.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const color_strip = @import("../proto/color_strip.zig");
@@ -2320,6 +2321,10 @@ pub const LinuxServer = struct {
     stats_hist_head: usize = 0,
     /// Pending account email/token verifications (REGISTER -> VERIFY).
     account_verifies: account_verify_mod.VerifyStore,
+    /// Pending email-token password resets (RESETPASS request -> confirm). Tokens
+    /// are 32-char hex (16 random bytes) delivered out-of-band to the account's
+    /// verified email; in-memory only, like `account_verifies`.
+    reset_store: password_reset.ResetStore,
     /// In-memory TOTP (2FA) enrollment + verification engine. Pending enrollments
     /// live only here; a CONFIRMed secret is mirrored to the account-services
     /// `.props` store for durability and lazily reloaded here at login.
@@ -2821,6 +2826,7 @@ pub const LinuxServer = struct {
             .nick_groups = memo_group_mod.NickGroup.init(allocator),
             .welcome = welcome_pack_mod.WelcomePack.init(allocator),
             .account_verifies = account_verify_mod.VerifyStore.init(allocator, .{ .token_bytes = 16 }),
+            .reset_store = password_reset.ResetStore.init(allocator, .{ .token_bytes = reset_token_hex_len }),
             .totp = totp_auth.TotpStore.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .search_index = search_index_mod.SearchIndex.init(allocator),
@@ -3147,6 +3153,7 @@ pub const LinuxServer = struct {
         if (self.geoip_bytes) |b| self.allocator.free(b);
         if (self.geoip_asn_bytes) |b| self.allocator.free(b);
         self.account_verifies.deinit();
+        self.reset_store.deinit();
         self.totp.deinit();
         self.activity_subs.deinit();
         self.sessions.deinit();
@@ -19015,6 +19022,94 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, "SETPASS: your password has been changed");
     }
 
+    /// Reset token: 16 random bytes rendered as 32 lowercase-hex chars (matches
+    /// the email-verification token style).
+    const reset_token_hex_len: usize = 32;
+    /// Don't re-send a reset email while a token issued within this window is
+    /// still pending — an anti-bombing cooldown.
+    const reset_resend_cooldown_ms: u64 = 60 * 1000;
+
+    /// Non-committal reply for the RESETPASS REQUEST form. Sent identically
+    /// whether or not the account exists / has a verified email, so the command
+    /// cannot be used to enumerate accounts.
+    fn resetGenericReply(self: *LinuxServer, conn: *ConnState) !void {
+        try self.noticeTo(conn, "RESETPASS: if that account has a verified email, a reset code has been sent.");
+    }
+
+    /// `RESETPASS <account>` — request an emailed reset code; or
+    /// `RESETPASS <account> <code> <new-password>` — set a new password with the
+    /// code. The "other method" companion to the cert-verified SETPASS recovery:
+    /// a forgotten password is reset by proving ownership of the account's
+    /// verified email. Usable while logged out. Requires a configured mail
+    /// transport ([mail]); the code is delivered out-of-band only.
+    pub fn handleResetpass(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const svc = self.account_services orelse return self.failReply(conn, "RESETPASS", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count == 0 or parsed.paramSlice()[0].len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"RESETPASS"}, "Usage: RESETPASS <account>  (request a code)  or  RESETPASS <account> <code> <new-password>  (set it)");
+            return;
+        }
+        const p = parsed.paramSlice();
+        const account = p[0];
+        const now_u: u64 = @intCast(@max(0, self.nowMs()));
+
+        // Confirm form: RESETPASS <account> <code> <new-password>.
+        if (p.len >= 3 and p[1].len != 0 and p[2].len != 0) {
+            switch (self.reset_store.confirm(account, p[1], now_u)) {
+                .ok => {
+                    var scratch: [1024]u8 = undefined;
+                    svc.setAccountPasswordForced(account, p[2], &scratch) catch |err| {
+                        const code: []const u8 = if (err == error.InvalidPassword) "INVALID_PASSWORD" else "TEMPORARILY_UNAVAILABLE";
+                        return self.failReply(conn, "RESETPASS", code, "New password rejected (8-512 chars)");
+                    };
+                    svc.revokeSessionTokens(account);
+                    var buf: [default_reply_bytes]u8 = undefined;
+                    const line = std.fmt.bufPrint(&buf, ":{s} RESETPASS SUCCESS {s} :Password reset; log in with your new password\r\n", .{ self.serverName(), account }) catch return;
+                    try appendToConn(conn, line);
+                },
+                .no_request => try self.failReply(conn, "RESETPASS", "NO_REQUEST", "No password reset is pending for that account"),
+                .expired => try self.failReply(conn, "RESETPASS", "EXPIRED", "That reset code has expired; request a new one"),
+                .bad_token => try self.failReply(conn, "RESETPASS", "BAD_CODE", "Incorrect reset code"),
+                .too_many_attempts => try self.failReply(conn, "RESETPASS", "TOO_MANY_ATTEMPTS", "Too many incorrect codes; request a new reset"),
+            }
+            return;
+        }
+
+        // Request form: RESETPASS <account>. Email transport is mandatory.
+        const ms = self.config.mail_sender orelse
+            return self.failReply(conn, "RESETPASS", "UNAVAILABLE", "Email password reset is not configured on this server");
+        const io = self.config.crypto_io orelse return self.resetGenericReply(conn);
+
+        // Look up the account's VERIFIED email; respond generically on any miss so
+        // the command never reveals whether an account exists.
+        const info = svc.accountInfo(account) catch return self.resetGenericReply(conn);
+        const ai = info.account_info;
+        const email = ai.email.asSlice();
+        if (!ai.email_verified or email.len == 0) return self.resetGenericReply(conn);
+
+        // Anti-bomb cooldown: skip re-sending while a fresh token is still pending.
+        if (self.reset_store.pending(account)) |pend| {
+            if (now_u >= pend.issued_ms and now_u - pend.issued_ms < reset_resend_cooldown_ms)
+                return self.resetGenericReply(conn);
+        }
+
+        var rand_bytes: [reset_token_hex_len / 2]u8 = undefined;
+        io.random(&rand_bytes);
+        var token_buf: [reset_token_hex_len]u8 = undefined;
+        const hex = "0123456789abcdef";
+        for (rand_bytes, 0..) |b, i| {
+            token_buf[i * 2] = hex[b >> 4];
+            token_buf[i * 2 + 1] = hex[b & 0x0f];
+        }
+        self.reset_store.issue(account, token_buf[0..], now_u) catch return self.resetGenericReply(conn);
+
+        // `email` borrows `ai`, which lives until this function returns; enqueue
+        // dupes it, so no separate copy is needed.
+        var body_buf: [640]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "Hello {s},\r\n\r\nA password reset was requested for your account on {s}.\r\n\r\nReset code: {s}\r\n\r\nSet a new password on IRC with:\r\n  RESETPASS {s} {s} <new-password>\r\n\r\nThis code expires in 15 minutes. If you did not request this, ignore this message.\r\n", .{ account, self.serverName(), token_buf[0..], account, token_buf[0..] }) catch "";
+        if (body.len != 0) ms.enqueue(email, "Password reset code", body);
+        try self.resetGenericReply(conn);
+    }
+
     /// `SUCCESSOR <#channel> SHOW|SET <account>|CLEAR` — a registered channel's
     /// founder heir. If the founder's account is later dropped, the channel is
     /// handed to its configured successor (see handleDrop). SET/CLEAR require the
@@ -26161,6 +26256,58 @@ test "SETPASS cert recovery: 1-arg reset only on a cert-verified connection" {
     try expectContains(conn.send_buf[0..conn.send_len], "verified by client certificate");
     _ = services.identifyAccount("kain", "new-password-456") catch return error.TestUnexpectedResult;
     if (services.identifyAccount("kain", "old-password-123")) |_| return error.TestUnexpectedResult else |_| {}
+}
+
+test "RESETPASS confirm: valid emailed code sets a new password; wrong code is rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-resetpass.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("kain", "old-password-123", &scratch);
+
+    // The token is normally emailed; the request path is exercised separately. Here
+    // we seed a known 32-hex code straight into the store and drive the confirm path.
+    const code = "0123456789abcdef0123456789abcdef";
+    const now_u: u64 = @intCast(@max(0, server.nowMs()));
+    try server.reset_store.issue("kain", code, now_u);
+
+    const id = try addTestLocalClient(&server, "guest", null); // logged OUT — forgot password
+    const conn = server.connFor(id).?;
+
+    // Wrong code: rejected, password unchanged, the pending request survives.
+    var lv = irc_line.LineView{ .raw = "", .command = "RESETPASS" };
+    lv.params[0] = "kain";
+    lv.params[1] = "ffffffffffffffffffffffffffffffff";
+    lv.params[2] = "new-password-456";
+    lv.param_count = 3;
+    conn.send_len = 0;
+    try server.handleResetpass(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "BAD_CODE");
+    _ = services.identifyAccount("kain", "old-password-123") catch return error.TestUnexpectedResult;
+    try std.testing.expect(server.reset_store.isPending("kain"));
+
+    // Correct code: succeeds, new password works, old one does not, code consumed.
+    lv.params[1] = code;
+    conn.send_len = 0;
+    try server.handleResetpass(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "RESETPASS SUCCESS");
+    _ = services.identifyAccount("kain", "new-password-456") catch return error.TestUnexpectedResult;
+    if (services.identifyAccount("kain", "old-password-123")) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.expect(!server.reset_store.isPending("kain"));
+
+    // Code is single-use: replaying it now reports no pending request.
+    conn.send_len = 0;
+    try server.handleResetpass(conn, &lv);
+    try expectContains(conn.send_buf[0..conn.send_len], "NO_REQUEST");
 }
 
 test "session-sync unit: two sessions same account both session-sync get the DM" {

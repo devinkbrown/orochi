@@ -70,6 +70,18 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Example: `DROP alice correct-horse`
 - Sources: `src/daemon/modules/accounts.zig:64`, `src/daemon/server.zig:8568`
 
+## RESETPASS
+
+- Syntax: `RESETPASS <account>` (request) or `RESETPASS <account> <code> <new-password>` (set).
+- Description: Reset a forgotten password by proving ownership of the account's verified email — the "other method" companion to the cert-verified one-argument `SETPASS`. The request form emails a one-time code (32 hex chars, 15-minute TTL) to the account's verified address; the set form consumes the code, sets the new password, and revokes existing session tokens. Usable while logged out.
+- Privileges: Any registered connection (no login required).
+- Requirements: A configured mail transport (`[mail]`); the account must have a **verified** email. Without `[mail]`, the request form replies `FAIL RESETPASS UNAVAILABLE`.
+- Anti-abuse: The request form replies identically whether or not the account exists or has a verified email (no account enumeration), and will not re-send while a code issued within the last 60s is still pending.
+- Replies: Request → `NOTICE` "if that account has a verified email, a reset code has been sent."; set → raw `RESETPASS SUCCESS <account> :Password reset; log in with your new password`.
+- Errors: `ERR_NEEDMOREPARAMS 461`; IRCv3 `FAIL RESETPASS` with `TEMPORARILY_UNAVAILABLE`, `UNAVAILABLE`, `NO_REQUEST`, `EXPIRED`, `BAD_CODE`, `TOO_MANY_ATTEMPTS`, `INVALID_PASSWORD`.
+- Example: `RESETPASS alice` then `RESETPASS alice 0123456789abcdef0123456789abcdef new-correct-horse`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleResetpass`, `src/daemon/password_reset.zig`
+
 ## ACCOUNTINFO
 
 - Syntax: `ACCOUNTINFO [account]`
