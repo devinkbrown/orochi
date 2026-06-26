@@ -235,6 +235,24 @@ realm = "local"
 # require_secured = true
 
 
+# --- [dnsbl] — connect-time DNS blocklist ------------------------------------
+# Each non-loopback client IP is checked against the listed DNSBL zones off the
+# accept path (on a background resolver thread); a listed IP is enforced at
+# registration. Fail-open: a client whose lookup has not resolved by then — or
+# whose IP is not listed — is always admitted (a blocklist never refuses an IP
+# it has not confirmed as listed). Operators are exempt. Uses the system
+# resolver (/etc/resolv.conf); inert if that yields no nameservers or no zones.
+[dnsbl]
+enabled = false
+# Blocklist zones queried per IP (A-record 127.0.0.x = listed). Order matters:
+# the first zone that lists the IP wins.
+# zones = ["zen.spamhaus.org", "dnsbl.dronebl.org"]
+# Enforcement action for a listed IP: "refuse" closes the connection; "ward"
+# additionally records a node-scope Warden ban so the block persists across the
+# IP's reconnects. Default: refuse.
+# action = "refuse"
+
+
 # --- [limits] — capacity, timeouts, and advertised protocol limits -----------
 [limits]
 backlog = 128          # listen() backlog (1..32767)

@@ -150,6 +150,18 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 
 Plaintext S2S applies when no node identity is configured and `require_secured` is false; secured S2S is enabled by `[node].secret_key` (`src/main.zig:141`, `src/main.zig:153`).
 
+## `[dnsbl]`
+
+Source: `Dnsbl` struct + parsing in `src/daemon/config_format.zig`; resolver in `src/daemon/dnsbl_resolver.zig`; construction in `src/main.zig`; enforcement in `src/daemon/server.zig` (`enforceDnsbl`).
+
+Connect-time DNS blocklist. Each non-loopback client IP is checked against the configured zones on a background resolver thread (off the accept path), and a listed IP is enforced at registration. **Fail-open**: an IP whose lookup has not resolved by registration — or that no zone lists — is always admitted (a blocklist never refuses an IP it has not confirmed as listed). Operators and loopback are exempt. Uses the system resolver (`/etc/resolv.conf`); inert when that yields no nameservers or no zones are configured.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `enabled` | bool | `false` | `true`/`false` | Master switch; the resolver is built only when enabled with at least one zone. |
+| `zones` | array of strings | `[]` | DNSBL zone hostnames | Blocklist zones queried per IP (A-record `127.0.0.x` = listed). The first zone that lists the IP wins, e.g. `["zen.spamhaus.org", "dnsbl.dronebl.org"]`. |
+| `action` | string | `"refuse"` | `refuse` / `ward` | Enforcement for a listed IP: `refuse` closes the connection; `ward` additionally records a node-scope Warden ban so the block persists across the IP's reconnects. |
+
 ## `[limits]`
 
 Source: struct at `src/daemon/config_format.zig:115`, parsing at `src/daemon/config_format.zig:354`, mapping at `src/daemon/config_boot.zig:35`.
