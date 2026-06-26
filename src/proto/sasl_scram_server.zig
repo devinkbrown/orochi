@@ -9,6 +9,7 @@
 const std = @import("std");
 
 const sasl = @import("sasl.zig");
+const secure_fns = @import("secure_fns.zig");
 
 const crypto_hash = struct {
     const Sha256 = struct {
@@ -40,6 +41,7 @@ pub const MAX_USERNAME = sasl.MAX_SCRAM_USERNAME;
 pub const MAX_NONCE = sasl.MAX_SCRAM_NONCE;
 pub const MAX_SALT = sasl.MAX_SCRAM_SALT;
 const MAX_GS2_HEADER: usize = 256;
+pub const tls_exporter_len: usize = 32;
 
 pub const AuthError = error{
     UnexpectedMessage,
@@ -77,9 +79,16 @@ pub const FinalResponse = struct {
 
 pub const ClientFirst = struct {
     gs2_header: []const u8,
+    channel_binding: ChannelBinding,
     client_first_bare: []const u8,
     username: []const u8,
     nonce: []const u8,
+};
+
+pub const ChannelBinding = enum {
+    none,
+    client_supported,
+    tls_exporter,
 };
 
 pub const ClientFinal = struct {
@@ -114,9 +123,14 @@ pub const Server = struct {
     nonce_len: usize = 0,
     stored_key: [digest_len]u8 = undefined,
     server_key: [digest_len]u8 = undefined,
+    tls_exporter: ?[tls_exporter_len]u8 = null,
 
     pub fn init() Server {
         return .{};
+    }
+
+    pub fn initTlsExporter(exporter: [tls_exporter_len]u8) Server {
+        return .{ .tls_exporter = exporter };
     }
 
     pub fn username(self: *const Server) []const u8 {
@@ -145,7 +159,12 @@ pub const Server = struct {
             return error.InvalidCredential;
         }
 
-        const parsed = try parseClientFirst(client_first_message, &self.username_buf);
+        const parsed = try parseClientFirstWithOptions(client_first_message, &self.username_buf, .{
+            .allow_tls_exporter = self.tls_exporter != null,
+        });
+        if (self.tls_exporter != null and parsed.channel_binding != .tls_exporter) {
+            return error.UnsupportedChannelBinding;
+        }
         if (parsed.gs2_header.len > self.gs2_header_buf.len) return error.MessageTooLarge;
         if (parsed.client_first_bare.len > self.client_first_bare_buf.len) return error.MessageTooLarge;
         if (parsed.nonce.len + server_nonce.len > self.nonce_buf.len) return error.InvalidNonce;
@@ -193,9 +212,15 @@ pub const Server = struct {
         const parsed = try parseClientFinal(client_final_message);
         if (!std.mem.eql(u8, parsed.nonce, self.combinedNonce())) return error.InvalidNonce;
 
-        var cb_buf: [MAX_GS2_HEADER]u8 = undefined;
+        var cb_buf: [MAX_GS2_HEADER + tls_exporter_len]u8 = undefined;
         const cb = decodeBase64(parsed.channel_binding, &cb_buf) catch return error.InvalidBase64;
-        if (!std.mem.eql(u8, cb, self.gs2_header_buf[0..self.gs2_header_len])) {
+        var expected_cb_buf: [MAX_GS2_HEADER + tls_exporter_len]u8 = undefined;
+        const expected_cb = if (self.tls_exporter) |exporter| blk: {
+            @memcpy(expected_cb_buf[0..self.gs2_header_len], self.gs2_header_buf[0..self.gs2_header_len]);
+            @memcpy(expected_cb_buf[self.gs2_header_len..][0..exporter.len], &exporter);
+            break :blk expected_cb_buf[0 .. self.gs2_header_len + exporter.len];
+        } else self.gs2_header_buf[0..self.gs2_header_len];
+        if (!secure_fns.ctEq(cb, expected_cb)) {
             return error.InvalidAttribute;
         }
 
@@ -237,8 +262,21 @@ pub const Server = struct {
     }
 };
 
+const ParseOptions = struct {
+    allow_tls_exporter: bool = false,
+};
+
 pub fn parseClientFirst(raw: []const u8, username_out: []u8) AuthError!ClientFirst {
-    const header_len = try gs2HeaderLen(raw);
+    return parseClientFirstWithOptions(raw, username_out, .{});
+}
+
+pub fn parseClientFirstTlsExporter(raw: []const u8, username_out: []u8) AuthError!ClientFirst {
+    return parseClientFirstWithOptions(raw, username_out, .{ .allow_tls_exporter = true });
+}
+
+fn parseClientFirstWithOptions(raw: []const u8, username_out: []u8, options: ParseOptions) AuthError!ClientFirst {
+    const header = try gs2Header(raw, options);
+    const header_len = header.len;
     const bare = raw[header_len..];
     if (bare.len == 0) return error.MalformedMessage;
 
@@ -271,6 +309,7 @@ pub fn parseClientFirst(raw: []const u8, username_out: []u8) AuthError!ClientFir
 
     return .{
         .gs2_header = raw[0..header_len],
+        .channel_binding = header.channel_binding,
         .client_first_bare = bare,
         .username = username orelse return error.MissingAttribute,
         .nonce = nonce orelse return error.MissingAttribute,
@@ -417,21 +456,36 @@ fn splitAttr(attr: []const u8) AuthError!Attr {
     return .{ .name = attr[0], .value = attr[2..] };
 }
 
-fn gs2HeaderLen(raw: []const u8) AuthError!usize {
+const Gs2Header = struct {
+    len: usize,
+    channel_binding: ChannelBinding,
+};
+
+fn gs2Header(raw: []const u8, options: ParseOptions) AuthError!Gs2Header {
     if (raw.len < 3) return error.MalformedMessage;
-    switch (raw[0]) {
-        'n', 'y' => {},
-        'p' => return error.UnsupportedChannelBinding,
-        else => return error.MalformedMessage,
+    if (raw[0] == 'n' or raw[0] == 'y') {
+        if (raw[1] != ',') return error.MalformedMessage;
+        return finishGs2Header(raw, 2, if (raw[0] == 'y') .client_supported else .none);
     }
-    if (raw[1] != ',') return error.MalformedMessage;
-    if (raw[2] == ',') return 3;
-    if (!std.mem.startsWith(u8, raw[2..], "a=")) return error.MalformedMessage;
-    const comma_rel = std.mem.indexOfScalar(u8, raw[2..], ',') orelse return error.MalformedMessage;
-    const authzid = raw[4 .. 2 + comma_rel];
-    var decoded: [MAX_USERNAME]u8 = undefined;
-    if (try decodeSaslName(authzid, &decoded) == 0) return error.InvalidUsername;
-    return 2 + comma_rel + 1;
+    if (raw[0] == 'p') {
+        const prefix = "p=tls-exporter,";
+        if (!std.mem.startsWith(u8, raw, prefix)) return error.UnsupportedChannelBinding;
+        if (!options.allow_tls_exporter) return error.UnsupportedChannelBinding;
+        return finishGs2Header(raw, prefix.len, .tls_exporter);
+    }
+    return error.MalformedMessage;
+}
+
+fn finishGs2Header(raw: []const u8, authzid_start: usize, channel_binding: ChannelBinding) AuthError!Gs2Header {
+    if (authzid_start >= raw.len) return error.MalformedMessage;
+    const comma_rel = std.mem.indexOfScalar(u8, raw[authzid_start..], ',') orelse return error.MalformedMessage;
+    const authzid_field = raw[authzid_start .. authzid_start + comma_rel];
+    if (authzid_field.len != 0) {
+        if (!std.mem.startsWith(u8, authzid_field, "a=")) return error.MalformedMessage;
+        var decoded: [MAX_USERNAME]u8 = undefined;
+        if (try decodeSaslName(authzid_field["a=".len..], &decoded) == 0) return error.InvalidUsername;
+    }
+    return .{ .len = authzid_start + comma_rel + 1, .channel_binding = channel_binding };
 }
 
 fn decodeSaslName(raw: []const u8, out: []u8) AuthError!usize {
@@ -539,6 +593,84 @@ test "RFC 7677 SCRAM-SHA-256 vector accepts proof and computes server signature"
 
     const parsed_final = try parseServerFinal(final.server_final);
     try std.testing.expectEqualStrings(expected_server_final["v=".len..], parsed_final.verifier);
+}
+
+test "SCRAM-SHA-256-PLUS requires tls-exporter channel binding" {
+    const allocator = std.testing.allocator;
+    const salt = try allocator.dupe(u8, "known-scram-sha-256-plus-salt");
+    defer allocator.free(salt);
+
+    var keys = try sasl.deriveScramKeys("pencil", salt, 4096);
+    defer keys.wipe();
+    const credential = Credential{
+        .salt = salt,
+        .iterations = 4096,
+        .stored_key = keys.stored_key,
+        .server_key = keys.server_key,
+    };
+
+    var exporter: [tls_exporter_len]u8 = undefined;
+    for (&exporter, 0..) |*byte, idx| byte.* = @intCast(idx);
+
+    var username_buf: [MAX_USERNAME]u8 = undefined;
+    try std.testing.expectError(
+        error.UnsupportedChannelBinding,
+        parseClientFirst("p=tls-exporter,,n=user,r=clientNonce256", &username_buf),
+    );
+    const parsed = try parseClientFirstTlsExporter("p=tls-exporter,,n=user,r=clientNonce256", &username_buf);
+    try std.testing.expectEqual(ChannelBinding.tls_exporter, parsed.channel_binding);
+
+    var server = Server.initTlsExporter(exporter);
+    var first_buf: [MAX_MESSAGE]u8 = undefined;
+    const first = try server.receiveClientFirst(
+        "p=tls-exporter,,n=user,r=clientNonce256",
+        credential,
+        "serverNonce256",
+        &first_buf,
+    );
+
+    var cb_input: [MAX_GS2_HEADER + tls_exporter_len]u8 = undefined;
+    const gs2_header = "p=tls-exporter,,";
+    @memcpy(cb_input[0..gs2_header.len], gs2_header);
+    @memcpy(cb_input[gs2_header.len..][0..exporter.len], &exporter);
+    var cb_b64_buf: [std.base64.standard.Encoder.calcSize(MAX_GS2_HEADER + tls_exporter_len)]u8 = undefined;
+    const cb_b64 = std.base64.standard.Encoder.encode(&cb_b64_buf, cb_input[0 .. gs2_header.len + exporter.len]);
+    const without_proof = try std.fmt.allocPrint(allocator, "c={s},r={s}", .{ cb_b64, first.combined_nonce });
+    defer allocator.free(without_proof);
+    const auth_message = try std.fmt.allocPrint(
+        allocator,
+        "n=user,r=clientNonce256,{s},{s}",
+        .{ first.server_first, without_proof },
+    );
+    defer allocator.free(auth_message);
+    var client_sig = crypto_hash.HmacSha256.create(&keys.stored_key, auth_message);
+    defer secureZero(&client_sig);
+    var client_proof: [digest_len]u8 = undefined;
+    defer secureZero(&client_proof);
+    for (&client_proof, keys.client_key, client_sig) |*dst, key_byte, sig_byte| dst.* = key_byte ^ sig_byte;
+    var proof_b64_buf: [std.base64.standard.Encoder.calcSize(digest_len)]u8 = undefined;
+    const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &client_proof);
+    const client_final = try std.fmt.allocPrint(allocator, "{s},p={s}", .{ without_proof, proof_b64 });
+    defer allocator.free(client_final);
+    var final_buf: [MAX_MESSAGE]u8 = undefined;
+    _ = try server.receiveClientFinal(client_final, &final_buf);
+
+    var wrong_exporter = exporter;
+    wrong_exporter[0] ^= 1;
+    @memcpy(cb_input[gs2_header.len..][0..wrong_exporter.len], &wrong_exporter);
+    const wrong_cb_b64 = std.base64.standard.Encoder.encode(&cb_b64_buf, cb_input[0 .. gs2_header.len + wrong_exporter.len]);
+    const wrong_without_proof = try std.fmt.allocPrint(allocator, "c={s},r={s}", .{ wrong_cb_b64, first.combined_nonce });
+    defer allocator.free(wrong_without_proof);
+    const wrong_client_final = try std.fmt.allocPrint(allocator, "{s},p={s}", .{ wrong_without_proof, proof_b64 });
+    defer allocator.free(wrong_client_final);
+    var rejecting_server = Server.initTlsExporter(exporter);
+    _ = try rejecting_server.receiveClientFirst(
+        "p=tls-exporter,,n=user,r=clientNonce256",
+        credential,
+        "serverNonce256",
+        &first_buf,
+    );
+    try std.testing.expectError(error.InvalidAttribute, rejecting_server.receiveClientFinal(wrong_client_final, &final_buf));
 }
 
 test "RFC 7677 SCRAM-SHA-256 vector rejects a tampered proof" {

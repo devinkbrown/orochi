@@ -18,8 +18,9 @@
 //! cost nothing, `PRIVMSG`/`NOTICE`/`JOIN` carry weight — plus a distinct-target
 //! spread throttle that counters spray-spam without a repeated target.
 //!
-//! The companion `flood_score.zig` is a different axis: a per-*account* abuse
-//! score that survives reconnects. This guard is strictly per-connection.
+//! This guard is strictly per-connection (token-bucket state lives on the
+//! connection and dies with it). A per-*account* abuse score that survived
+//! reconnects would be a separate axis; this module does not model it.
 const std = @import("std");
 
 /// Result of a rate-control observation.

@@ -13,7 +13,7 @@ const scram512 = @import("sasl_scram512_server.zig");
 const oauthbearer = @import("sasl_oauthbearer.zig");
 const anonymous = @import("sasl_anonymous.zig");
 
-pub const SUPPORTED_MECHANISMS = "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512 SCRAM-SHA-512-PLUS SESSION-TOKEN OAUTHBEARER ANONYMOUS";
+pub const SUPPORTED_MECHANISMS = "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-256-PLUS SCRAM-SHA-512 SCRAM-SHA-512-PLUS SESSION-TOKEN OAUTHBEARER ANONYMOUS";
 pub const MAX_AUTHENTICATE_CHUNK: usize = 400;
 pub const MAX_RAW_MESSAGE: usize = sasl.MAX_SCRAM_MESSAGE;
 pub const MAX_B64_MESSAGE: usize = std.base64.standard.Encoder.calcSize(MAX_RAW_MESSAGE);
@@ -23,6 +23,7 @@ pub const Mechanism = enum {
     plain,
     external,
     scram_sha_256,
+    scram_sha_256_plus,
     scram_sha_512,
     scram_sha_512_plus,
     session_token,
@@ -33,6 +34,7 @@ pub const Mechanism = enum {
         if (std.ascii.eqlIgnoreCase(name_text, "PLAIN")) return .plain;
         if (std.ascii.eqlIgnoreCase(name_text, "EXTERNAL")) return .external;
         if (std.ascii.eqlIgnoreCase(name_text, "SCRAM-SHA-256")) return .scram_sha_256;
+        if (std.ascii.eqlIgnoreCase(name_text, "SCRAM-SHA-256-PLUS")) return .scram_sha_256_plus;
         if (std.ascii.eqlIgnoreCase(name_text, "SCRAM-SHA-512")) return .scram_sha_512;
         if (std.ascii.eqlIgnoreCase(name_text, "SCRAM-SHA-512-PLUS")) return .scram_sha_512_plus;
         if (std.ascii.eqlIgnoreCase(name_text, "SESSION-TOKEN")) return .session_token;
@@ -46,6 +48,7 @@ pub const Mechanism = enum {
             .plain => "PLAIN",
             .external => "EXTERNAL",
             .scram_sha_256 => "SCRAM-SHA-256",
+            .scram_sha_256_plus => "SCRAM-SHA-256-PLUS",
             .scram_sha_512 => "SCRAM-SHA-512",
             .scram_sha_512_plus => "SCRAM-SHA-512-PLUS",
             .session_token => "SESSION-TOKEN",
@@ -203,6 +206,7 @@ pub const Router = struct {
             .oauthbearer => .oauthbearer,
             .anonymous => .anonymous,
             .scram_sha_256 => .{ .scram256 = scram256.Server.init() },
+            .scram_sha_256_plus => .{ .scram256 = scram256.Server.initTlsExporter(self.tls_exporter.?) },
             .scram_sha_512 => .{ .scram512 = scram512.Server.init() },
             .scram_sha_512_plus => .{ .scram512 = scram512.Server.initTlsExporter(self.tls_exporter.?) },
         };
@@ -244,6 +248,7 @@ pub const Router = struct {
             .plain => self.callbacks.plain != null,
             .external => self.callbacks.external != null and self.tls_certfp != null,
             .scram_sha_256 => self.callbacks.scram256 != null and self.server_nonce.len != 0,
+            .scram_sha_256_plus => self.callbacks.scram256 != null and self.server_nonce.len != 0 and self.tls_exporter != null,
             .scram_sha_512 => self.callbacks.scram512 != null and self.server_nonce.len != 0,
             .scram_sha_512_plus => self.callbacks.scram512 != null and self.server_nonce.len != 0 and self.tls_exporter != null,
             .session_token => self.callbacks.session_token != null,
@@ -622,6 +627,30 @@ test "ANONYMOUS is default gated and succeeds as guest when enabled" {
     try std.testing.expect(!accepted.success.issue_session_token);
 }
 
+test "SCRAM PLUS mechanisms require tls exporter through router" {
+    const Db = struct {
+        fn lookup256(_: *anyopaque, _: []const u8) ?scram256.Credential {
+            return null;
+        }
+
+        fn lookup512(_: *anyopaque, _: []const u8) ?scram512.Credential {
+            return null;
+        }
+    };
+
+    var token: u8 = 0;
+    var router = Router.init(.{
+        .scram256 = .{ .ptr = &token, .lookupFn = Db.lookup256 },
+        .scram512 = .{ .ptr = &token, .lookupFn = Db.lookup512 },
+    }, "serverNonce");
+    try std.testing.expectEqual(Failure.unavailable, router.start("SCRAM-SHA-256-PLUS").fail);
+    try std.testing.expectEqual(Failure.unavailable, router.start("SCRAM-SHA-512-PLUS").fail);
+
+    router.tls_exporter = [_]u8{0x42} ** scram512.tls_exporter_len;
+    try std.testing.expectEqualStrings("+", router.start("SCRAM-SHA-256-PLUS").continue_);
+    try std.testing.expectEqualStrings("+", router.start("SCRAM-SHA-512-PLUS").continue_);
+}
+
 test "unknown mechanism rejects" {
     var router = Router.init(.{}, "serverNonce");
     const rejected = router.start("NOT-A-MECH");
@@ -630,7 +659,7 @@ test "unknown mechanism rejects" {
 
 test "mechanism list string advertises supported mechanisms" {
     try std.testing.expectEqualStrings(
-        "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-512 SCRAM-SHA-512-PLUS SESSION-TOKEN OAUTHBEARER ANONYMOUS",
+        "PLAIN EXTERNAL SCRAM-SHA-256 SCRAM-SHA-256-PLUS SCRAM-SHA-512 SCRAM-SHA-512-PLUS SESSION-TOKEN OAUTHBEARER ANONYMOUS",
         Router.mechanismList(),
     );
     try std.testing.expectEqualStrings(SUPPORTED_MECHANISMS, Router.mechanismList());

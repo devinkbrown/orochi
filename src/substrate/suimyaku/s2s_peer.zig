@@ -230,6 +230,10 @@ pub const S2sPeer = struct {
     /// decode + disconnect the named local target. Substrate-pure: never decoded
     /// here.
     kills: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified WARD payloads received from this peer, awaiting the daemon to
+    /// decode + apply (add/remove) into its local Warden store. Substrate-pure:
+    /// never decoded here.
+    wards: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
 
     pub fn init(options: Options) !S2sPeer {
@@ -316,6 +320,8 @@ pub const S2sPeer = struct {
         self.observe_events.deinit(self.allocator);
         for (self.kills.items) |m| self.allocator.free(m);
         self.kills.deinit(self.allocator);
+        for (self.wards.items) |m| self.allocator.free(m);
+        self.wards.deinit(self.allocator);
         self.seen.deinit();
         self.allocator.free(self.remote_name);
         self.allocator.free(self.channel_name);
@@ -468,6 +474,7 @@ pub const S2sPeer = struct {
             .OPER_EVENT => try self.recvOperEvent(frame.payload),
             .OBSERVE_EVENT => try self.recvObserveEvent(frame.payload),
             .KILL => try self.recvKill(frame.payload),
+            .WARD => try self.recvWard(frame.payload),
         }
     }
 
@@ -615,6 +622,29 @@ pub const S2sPeer = struct {
         var buf: [kill_relay.max_encoded_len]u8 = undefined;
         const wire = try kill_relay.encode(ev, &buf);
         try self.emitSignable(sink, .KILL, wire);
+    }
+
+    /// Queue a verified inbound WARD for the daemon to decode + apply (add/remove
+    /// a mesh-scope network ban). Signed-frame gated (setting a network ban is
+    /// operator authority); a copy is taken, oversize/alloc failures drop it.
+    /// Substrate-pure: never decoded here.
+    fn recvWard(self: *S2sPeer, frame_payload: []const u8) !void {
+        const payload = self.verifiedPayload(.WARD, frame_payload) orelse return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.wards.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// Drain queued inbound WARD payloads (caller owns + frees each slice and the
+    /// outer slice). Each decodes with `warden.decodeWire`.
+    pub fn takeWards(self: *S2sPeer) ![][]u8 {
+        return self.wards.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed WARD to this peer (network-wide mesh-scope ban convergence).
+    /// `wire` is a `warden.encodeWire` record. Best-effort; only meaningful once
+    /// established.
+    pub fn sendWard(self: *S2sPeer, sink: ByteSink, wire: []const u8) !void {
+        try self.emitSignable(sink, .WARD, wire);
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).
@@ -2413,6 +2443,48 @@ test "signing peers round-trip a signed KILL frame" {
     try std.testing.expectEqualStrings("kain!~k@admin.example", ev.killer);
     try std.testing.expectEqualStrings("spammer", ev.target);
     try std.testing.expectEqualStrings("flooding the network", ev.reason);
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "signing peers round-trip a signed WARD frame" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x41);
+    const kp_b = try signingKeyFor(0x42);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5EE);
+
+    // The substrate never decodes a WARD record (the daemon's `warden` codec does);
+    // here we send an opaque payload and assert the verified bytes arrive intact.
+    const ward_wire = "mesh-ward-wire-record-bytes";
+    try a.sendWard(a_to_b.sink(), ward_wire);
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5EF);
+
+    const wards = try b.takeWards();
+    defer {
+        for (wards) |wd| allocator.free(wd);
+        allocator.free(wards);
+    }
+    try std.testing.expectEqual(@as(usize, 1), wards.len);
+    try std.testing.expectEqualStrings(ward_wire, wards[0]);
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 

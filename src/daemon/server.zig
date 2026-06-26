@@ -2267,6 +2267,18 @@ pub const LinuxServer = struct {
     /// Whether the local node was partitioned at the last transition check, so a
     /// crossing emits exactly one .split / .heal mesh event.
     partition_split: bool = false,
+    /// Whether the local node's reachable component holds mesh quorum (a strict
+    /// majority of live known nodes) at the last transition check. A node that
+    /// loses quorum is in a MINORITY partition: it is degraded — it can still
+    /// serve its local component, but it knows it is not the authoritative side.
+    /// Surfaced to opers (NETHEALTH / split mesh-event) and read by `meshHasQuorum`
+    /// so the signal is live, not dead. Starts true (a lone node trivially has
+    /// quorum of itself).
+    partition_quorum: bool = true,
+    /// Connected-component count among live known nodes at the last check (1 =
+    /// whole mesh). Exposed in the MESH/NETHEALTH oper view so a partition's shape
+    /// is visible, consuming `Detector.componentCount` rather than discarding it.
+    partition_components: usize = 1,
     /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
     /// keyed by remote server name, surfaced in the MESH peer table.
     peer_health: link_health_mod.Registry = .{},
@@ -4381,6 +4393,7 @@ pub const LinuxServer = struct {
         self.drainOperEvents(link);
         self.drainObserveEvents(link);
         self.drainKills(link);
+        self.drainWards(link);
         // Drain inbound live-session migration capsules: verify each against the
         // peer's authenticated node key (MigrationTarget.accept) and stage it in
         // pending_migrations for the client's eventual reconnect+reclaim. Only the
@@ -4403,7 +4416,44 @@ pub const LinuxServer = struct {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
             self.rebroadcastLocalOpers(); // propagate this node's opers to the new peer
+            self.sendMeshWardsTo(conn); // converge this node's mesh-scope bans on the new peer
             self.sendCloneAntiEntropy(conn, link); // converge clone counts on the new peer
+        }
+    }
+
+    /// Ship every `mesh`-scope WARD this node currently holds to a freshly
+    /// established secured peer, so a node that links after a ban was set still
+    /// enforces it (mesh-ban anti-entropy, paralleling `rebroadcastLocalOpers`).
+    /// Best-effort; node-scope wards are local and never shipped.
+    fn sendMeshWardsTo(self: *LinuxServer, conn: *ConnState) void {
+        const link = conn.s2s_secured orelse return;
+        if (!link.established()) return;
+        var rows: [256]warden.Ward = undefined;
+        const wards = self.warden.list(null, &rows);
+        for (wards) |w| {
+            if (w.scope != .mesh) continue;
+            var wire_buf: [warden.max_wire_len]u8 = undefined;
+            const wire = warden.encodeWire(.{
+                .op = .add,
+                .match = w.match,
+                .pattern = w.pattern,
+                .action = w.action,
+                .reason = w.reason,
+                .set_by = w.set_by,
+                .created_ms = w.created_ms,
+                .expires_ms = w.expires_ms,
+            }, &wire_buf) catch continue;
+            link.sendWard(wire) catch continue;
+        }
+        // The caller (`driveS2sSecured`) owns this conn; flush the accumulated
+        // ciphertext directly onto it, matching how that path flushes outbound.
+        const out = link.outbound();
+        if (out.len != 0) {
+            appendToConn(conn, out) catch {
+                conn.closing = true;
+                return;
+            };
+            link.clearOutbound();
         }
     }
 
@@ -4479,6 +4529,7 @@ pub const LinuxServer = struct {
         self.drainOperEvents(link);
         self.drainObserveEvents(link);
         self.drainKills(link);
+        self.drainWards(link);
         if (!conn.s2s_burst_done and link.established()) {
             conn.s2s_burst_done = true;
             self.sendMeshStateBurstTo(conn); // #65: anti-entropy burst (roster + mode flags + props) to the new peer
@@ -5416,6 +5467,22 @@ pub const LinuxServer = struct {
                     while (members.next()) |member| {
                         self.deliverTagged(clientIdFromWorld(member.*), relay_tags, channel_line) catch {};
                     }
+                }
+            }
+            // Record the incoming relayed channel message into the CHATHISTORY
+            // ring so cross-node CHATHISTORY works: a member reading back on THIS
+            // node sees messages authored on a peer, not just locally-originated
+            // ones. Gated exactly like the locally-originated record path
+            // (`min_rank == 0`, general delivery only): opmoderate / status-
+            // prefixed messages are not recorded, and TAGMSG / data-family ride
+            // their own history mechanisms (TAGMSG via `recordHistoryTagmsg`,
+            // never the message ring here). Locally-originated messages never
+            // reach here — the relay seen-set drops our own origin_node above.
+            if (clean_msg.min_rank == 0 and speech != .opmoderate and
+                (clean_msg.verb == .privmsg or clean_msg.verb == .notice))
+            {
+                if (relay_tags.msgid) |rid| {
+                    self.recordHistoryRelay(clean_msg.target, clean_msg.source_prefix, rid, verb, eff_text, if (clean_msg.tags.len != 0) clean_msg.tags else null);
                 }
             }
         } else if (self.world.findNick(clean_msg.target)) |wid| {
@@ -11562,6 +11629,34 @@ pub const LinuxServer = struct {
             findTagValue(tags, "+draft/unreact") != null;
     }
 
+    /// Record an INCOMING relayed channel message into the CHATHISTORY ring, so
+    /// cross-node CHATHISTORY works (a member who reads back history on THIS node
+    /// sees messages authored on a peer). Unlike `recordHistory` the sender is a
+    /// ready-made prefix string (the relay carries `source_prefix`, not a local
+    /// `ConnState`). Mirrors the locally-originated record: same forward-index for
+    /// draft/search. Locally-originated messages never reach here — `deliverRelay`
+    /// drops our own `origin_node` via the relay seen-set before delivery.
+    fn recordHistoryRelay(
+        self: *LinuxServer,
+        store_target: []const u8,
+        sender_prefix: []const u8,
+        msgid: []const u8,
+        command: []const u8,
+        text: []const u8,
+        client_tags: ?[]const u8,
+    ) void {
+        const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+        _ = self.history.append(store_target, .{
+            .msgid = msgid,
+            .sender = sender_prefix,
+            .text = text,
+            .timestamp = ts,
+            .command = command,
+            .client_tags = client_tags,
+        }) catch {};
+        self.search_index.index(msgid, text) catch {};
+    }
+
     fn recordHistoryTagmsg(self: *LinuxServer, store_target: []const u8, conn: *ConnState, msgid: []const u8, tags: []const u8) void {
         if (!tagmsgHistoryEligible(tags)) return;
         const ts: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
@@ -12159,7 +12254,7 @@ pub const LinuxServer = struct {
 
     /// `GROUP <ADD|DEL|LIST|PRIMARY> [nick]` — group multiple nicks under the
     /// caller's account, with a primary. Backed by memo_group.NickGroup. Requires
-    /// login. (Distinct from single-nick reservation in reserved_nick.)
+    /// login. (Distinct from single-nick registration ownership.)
     pub fn handleGroup(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const account = conn.session.account() orelse {
             try self.failReply(conn, "GROUP", "ACCOUNT_REQUIRED", "Log in to manage your nick group");
@@ -12484,6 +12579,9 @@ pub const LinuxServer = struct {
             return;
         };
         self.persistWardMirror(conn, ward);
+        // A `mesh`-scope ward propagates to every secured peer so already-running
+        // nodes enforce it live. A `node`-scope ward stays local.
+        if (scope == .mesh) self.broadcastMeshWard(ward, .add);
         var b: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s}", .{ match.token(), pattern, scope.token(), action.token() }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
@@ -12492,8 +12590,26 @@ pub const LinuxServer = struct {
 
     fn deleteWardLive(self: *LinuxServer, conn: *ConnState, match: warden.Match, pattern: []const u8) !void {
         _ = conn;
+        // Capture the entry's scope BEFORE removal so a mesh-scope removal can be
+        // propagated to peers (the `remove` itself only returns a bool). Resolve it
+        // by a direct registry lookup so the scope read is correct regardless of how
+        // many Wards share `match` (a bounded `list` copy could miss the entry).
+        const was_mesh = if (self.warden.find(match, pattern)) |w| w.scope == .mesh else false;
         const removed = self.warden.remove(match, pattern);
-        if (removed) self.deleteWardMirror(match, pattern);
+        if (removed) {
+            self.deleteWardMirror(match, pattern);
+            if (was_mesh) {
+                // Propagate the removal so peers forget the network ban too. Only
+                // (op, match, pattern) are load-bearing for a remove; the rest are
+                // filler the receiver ignores.
+                self.broadcastMeshWard(.{
+                    .match = match,
+                    .pattern = pattern,
+                    .scope = .mesh,
+                    .action = .expel,
+                }, .remove);
+            }
+        }
         var b: [default_reply_bytes]u8 = undefined;
         const note = std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s}", .{ match.token(), pattern, if (removed) "removed" else "not found" }) catch return;
         try self.publishOperEvent(.oper_action, .notice, note);
@@ -12714,15 +12830,31 @@ pub const LinuxServer = struct {
         if (!std.mem.endsWith(u8, line, "\n")) try appendToConn(conn, "\r\n");
     }
 
-    /// DIE / RESTART — oper-only server shutdown. Clears the reactor run flag so
-    /// runThreaded exits after the current iteration.
+    /// DIE / RESTART — oper-only server lifecycle.
+    ///   * DIE     — shut the server down (clear the run flag; the process exits
+    ///               and stays down — no re-exec, no service-manager restart).
+    ///   * RESTART — re-exec the on-disk binary IN PLACE: a clean restart that
+    ///               re-reads config and rebinds, dropping all client state (unlike
+    ///               the session-preserving USR2 UPGRADE). The listener fd is
+    ///               carried across execve so the port stays bound through the
+    ///               swap. Re-exec is Linux-only; on other platforms (or if the
+    ///               re-exec machinery fails) RESTART falls back to clearing the
+    ///               run flag so a supervising service manager can relaunch.
     pub fn handleDie(self: *LinuxServer, conn: *ConnState, cmd: []const u8) !void {
         // Registry enforces access=.oper; refine per the specific lifecycle priv.
-        const needed: oper_mod.Privilege = if (std.ascii.eqlIgnoreCase(cmd, "RESTART")) .server_restart else .server_shutdown;
+        const restarting = std.ascii.eqlIgnoreCase(cmd, "RESTART");
+        const needed: oper_mod.Privilege = if (restarting) .server_restart else .server_shutdown;
         if (!self.requirePriv(conn, needed)) return;
         var nbuf: [128]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "{s} requested by {s}", .{ cmd, conn.session.displayName() }) catch cmd;
         try self.publishOperEvent(.oper_action, .critical, note);
+        if (restarting and comptime builtin.os.tag == .linux) {
+            // Clean in-place re-exec: re-reads config + rebinds, drops sessions.
+            // Reuses the listener-only re-exec path (no state arena). On success
+            // this never returns (execve replaces the image); on failure it logs
+            // and falls through to clearing the run flag below as a fail-safe.
+            self.upgradeListenerOnly(conn) catch {};
+        }
         if (self.shutdown) |flag| flag.store(false, .release);
     }
 
@@ -17679,6 +17811,93 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// Broadcast a `mesh`-scope WARD (add or remove) to every established secured
+    /// peer so already-running nodes enforce (or forget) the network ban live.
+    /// Like `broadcastOperGrant`, the plaintext S2S path is skipped: a network ban
+    /// is operator authority and only rides a Tsumugi-authenticated link. The
+    /// `ward` strings are encoded into `wire` once and signed per-peer.
+    fn broadcastMeshWard(self: *LinuxServer, ward: warden.Ward, op: warden.WireOp) void {
+        var wire_buf: [warden.max_wire_len]u8 = undefined;
+        const wire = warden.encodeWire(.{
+            .op = op,
+            .match = ward.match,
+            .pattern = ward.pattern,
+            .action = ward.action,
+            .reason = ward.reason,
+            .set_by = ward.set_by,
+            .created_ms = ward.created_ms,
+            .expires_ms = ward.expires_ms,
+        }, &wire_buf) catch return;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established()) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                link.sendWard(wire) catch continue;
+                self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                link.clearOutbound();
+            }
+        }
+    }
+
+    /// Decode + apply this peer's inbound WARD frames into the local Warden store:
+    /// an `add` upserts the mesh ban so this node enforces it live; a `remove`
+    /// drops it. The frame was already signature-verified by the substrate link
+    /// (a network ban is operator authority). A received mesh ward is NOT re-
+    /// broadcast here — each setting node fans it to all secured peers directly,
+    /// and re-fanning would loop in a cyclic mesh. Malformed payloads are skipped.
+    fn drainWards(self: *LinuxServer, link: anytype) void {
+        const payloads = link.takeWards() catch return;
+        defer {
+            for (payloads) |p| self.allocator.free(p);
+            self.allocator.free(payloads);
+        }
+        for (payloads) |p| {
+            const wire = warden.decodeWire(p) catch {
+                // A malformed mesh-WARD frame from a (signature-)trusted peer is a
+                // security-relevant drop: the network ban it carried will not
+                // converge here. Never silent — leave an oper-visible trace.
+                self.traceLog(.warn, .s2s, "dropped malformed mesh-WARD frame from peer");
+                continue;
+            };
+            self.applyRemoteWard(wire);
+        }
+    }
+
+    fn applyRemoteWard(self: *LinuxServer, wire: warden.WireWard) void {
+        switch (wire.op) {
+            .remove => {
+                _ = self.warden.remove(wire.match, wire.pattern);
+            },
+            .add => {
+                // Force mesh scope locally: the entry only reached us because the
+                // setting node propagated a mesh ward.
+                self.warden.add(.{
+                    .match = wire.match,
+                    .pattern = wire.pattern,
+                    .scope = .mesh,
+                    .action = wire.action,
+                    .reason = wire.reason,
+                    .set_by = wire.set_by,
+                    .created_ms = wire.created_ms,
+                    .expires_ms = wire.expires_ms,
+                }) catch |err| {
+                    // Apply failure (OOM / TooManyWards / oversized field) means a
+                    // propagated network ban silently fails to install — surface it
+                    // rather than diverge from the mesh without a trace.
+                    var buf: [256]u8 = undefined;
+                    const note = std.fmt.bufPrint(
+                        &buf,
+                        "failed to apply mesh-WARD {s} {s}: {s}",
+                        .{ wire.match.token(), wire.pattern, @errorName(err) },
+                    ) catch "failed to apply mesh-WARD from peer";
+                    self.traceLog(.warn, .s2s, note);
+                };
+            },
+        }
+    }
+
     fn elevateOperFromAccount(self: *LinuxServer, conn: *ConnState) !void {
         if (conn.session.isOper()) return;
         const account = conn.session.account() orelse return;
@@ -20284,8 +20503,15 @@ pub const LinuxServer = struct {
             self.native_media.register(channel, nick, .voice, stream_id, .{}) catch {};
             var nbuf: [256]u8 = undefined;
             const mac_token = if (self.config.native_media_require_mac) " mac=hmac-sha256-128" else "";
+            // Advertise the STUN-discovered reflexive candidate (the public NAT
+            // address), falling back to the configured host — same as the WebRTC
+            // plane above. The native UDP socket sits behind the same NAT as the
+            // WebRTC socket, so the reflexive IP is identical; without this a
+            // remote native client would be told 127.0.0.1 and never reach the SFU.
+            var native_host_buf: [16]u8 = undefined;
+            const native_cand = self.media_plane.candidateIp(&native_host_buf) orelse self.config.media_host;
             const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=OPVOX/OPVIS{s}\r\n", .{
-                protocol_inventory.currentServerName(), channel, self.config.media_host, self.native_media.port, stream_id, mac_token,
+                protocol_inventory.currentServerName(), channel, native_cand, self.native_media.port, stream_id, mac_token,
             }) catch return;
             try appendToConn(conn, nline);
         }
@@ -21830,10 +22056,39 @@ pub const LinuxServer = struct {
         var det = partition_detector.Detector.init();
         det.update(ids[0..idn], live[0..idn], edges[0..en]) catch return;
         const now_split = det.isPartitioned(local_id);
+        // Consume the quorum + component signals (previously computed-and-dropped).
+        // Quorum = local's reachable component holds a strict majority of all live
+        // known nodes; losing it means this node is in a MINORITY partition.
+        const now_quorum = det.hasQuorum(local_id);
+        self.partition_components = det.componentCount();
+
         if (now_split != self.partition_split) {
             self.partition_split = now_split;
             self.logMeshEvent(if (now_split) .split else .heal, self.serverName(), if (now_split) "lost reachability to part of the mesh" else "regained full mesh reachability");
         }
+
+        // Quorum transition: surface a minority-partition (degraded) state to opers
+        // when it crosses, and clear it when quorum returns. Distinct from the
+        // split signal — a node can be partitioned yet still hold the majority.
+        if (now_quorum != self.partition_quorum) {
+            self.partition_quorum = now_quorum;
+            if (now_quorum) {
+                self.logMeshEvent(.heal, self.serverName(), "regained mesh quorum (majority partition)");
+                self.publishOperEvent(.server_link, .notice, "NETHEALTH: mesh quorum regained — node is on the majority side") catch {};
+            } else {
+                self.logMeshEvent(.split, self.serverName(), "lost mesh quorum (minority partition — degraded)");
+                self.publishOperEvent(.server_link, .warn, "NETHEALTH: mesh quorum LOST — node is in a minority partition (degraded)") catch {};
+            }
+        }
+    }
+
+    /// True when the local node currently holds mesh quorum (its reachable
+    /// component is a strict majority of live known nodes). A node WITHOUT quorum
+    /// is in a minority partition and should treat itself as degraded. Read from
+    /// the live `partition_quorum` flag maintained by `updatePartitionTransitions`,
+    /// so the quorum signal is observable, not dead.
+    pub fn meshHasQuorum(self: *const LinuxServer) bool {
+        return self.partition_quorum;
     }
 
     pub fn handleMesh(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -22029,6 +22284,16 @@ pub const LinuxServer = struct {
             if (line.len == 0) continue;
             try self.noticeTo(conn, line);
         }
+        // Quorum/partition summary from the live transition tracker (consumes the
+        // persistent `partition_quorum` / `partition_components` signals so opers
+        // can tell a healthy mesh from a minority island this node sits in).
+        var qb: [default_reply_bytes]u8 = undefined;
+        const quorum_status = if (self.partition_split)
+            (if (self.meshHasQuorum()) "PARTITIONED (quorum held — majority side)" else "PARTITIONED (NO QUORUM — minority partition, degraded)")
+        else
+            "intact (quorum held)";
+        const qline = std.fmt.bufPrint(&qb, "quorum: {s}; {d} mesh component(s)", .{ quorum_status, self.partition_components }) catch return;
+        try self.noticeTo(conn, qline);
     }
 
     /// Fan a pre-built message out to every member of every channel `id` shares,
@@ -25188,6 +25453,104 @@ test "relay channel speech gate mirrors local +C +T +U and status sender policy"
         false,
         2,
     ));
+}
+
+test "relayed channel message is recorded into CHATHISTORY for cross-node read-back" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const member_id = try addTestLocalClient(&server, "Local", null);
+    _ = try server.world.join("#hist", worldIdFromClient(member_id));
+    // A new channel defaults to +nt; clear +n so the relayed EXTERNAL sender (a
+    // peer member not present in this unit's local/remote roster) is not dropped
+    // by the no-external speech gate. The +n gate has its own dedicated test
+    // ("relayed channel message is gated by +n …"); here we isolate the
+    // CHATHISTORY-on-relay path.
+    _ = try server.world.setChannelFlag("#hist", .no_external, false);
+
+    // A message authored on a peer (origin_node != ours) is relayed in. It must
+    // both deliver to the local member AND land in this node's history ring so a
+    // later CHATHISTORY read returns it.
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#hist",
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "",
+        .text = "hello from a peer",
+        .origin_node = 4242,
+        .hlc = 7,
+    });
+    const member = server.connFor(member_id).?;
+    try expectContains(member.send_buf[0..member.send_len], ":Remote!r@peer PRIVMSG #hist :hello from a peer\r\n");
+
+    var hbuf: [8]lotus.Message = undefined;
+    const recorded = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqualStrings("Remote!r@peer", recorded[0].sender);
+    try std.testing.expectEqualStrings("hello from a peer", recorded[0].text);
+    try std.testing.expectEqualStrings("PRIVMSG", recorded[0].command);
+
+    // A status-prefixed (min_rank > 0) relayed message is delivered but NOT
+    // recorded — mirroring the locally-originated gate (`min_rank == 0`).
+    server.deliverRelay(.{
+        .verb = .privmsg,
+        .target = "#hist",
+        .min_rank = 2,
+        .source_nick = "Remote",
+        .source_prefix = "Remote!r@peer",
+        .account = "",
+        .tags = "",
+        .text = "ops only",
+        .origin_node = 4242,
+        .hlc = 8,
+    });
+    const after = server.history.latest("#hist", hbuf.len, &hbuf) catch &.{};
+    try std.testing.expectEqual(@as(usize, 1), after.len); // still just the first
+}
+
+test "mesh WARD applies and removes via applyRemoteWard" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), server.warden.count());
+
+    // A received mesh-WARD add is enforced locally as a mesh-scope ward.
+    server.applyRemoteWard(.{
+        .op = .add,
+        .match = .mask,
+        .pattern = "*!*@*.evil.example",
+        .action = .expel,
+        .reason = "spam ring",
+        .set_by = "oper!~o@peer",
+        .created_ms = 1,
+        .expires_ms = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), server.warden.count());
+    const hit = server.warden.check(.{ .mask = "bob!~b@host.evil.example" }, 100).?;
+    try std.testing.expectEqual(warden.Scope.mesh, hit.scope);
+    try std.testing.expectEqual(warden.Action.expel, hit.action);
+
+    // A received mesh-WARD remove forgets it (only op/match/pattern load-bearing).
+    server.applyRemoteWard(.{
+        .op = .remove,
+        .match = .mask,
+        .pattern = "*!*@*.evil.example",
+        .action = .expel,
+        .reason = "",
+        .set_by = "",
+        .created_ms = 0,
+        .expires_ms = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 0), server.warden.count());
+    try std.testing.expect(server.warden.check(.{ .mask = "bob!~b@host.evil.example" }, 100) == null);
 }
 
 // Build a relay PRIVMSG signed by `kp`, stamping the carried pubkey/sig into the

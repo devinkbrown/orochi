@@ -4,8 +4,8 @@
 //! DNS wire codec and resolver cache.
 //!
 //! The codec is intentionally transport-free: callers provide complete DNS
-//! messages and output buffers. Live UDP resolution belongs behind the reactor
-//! I/O seam and is left as a documented TODO below.
+//! messages and output buffers. The resolver below uses the same codec for
+//! blocking UDP lookups on the dedicated resolver path.
 const std = @import("std");
 
 pub const max_message_len: usize = 512;
@@ -20,6 +20,7 @@ pub const EncodeError = error{
     TooManyQuestions,
     TooManyAnswers,
     UnsupportedType,
+    TxtStringTooLong,
 };
 
 pub const DecodeError = error{
@@ -41,19 +42,17 @@ pub const CacheError = error{
     TooManyAddresses,
 } || std.mem.Allocator.Error;
 
-pub const LiveUdpError = error{
-    LiveUdpResolverTodo,
-};
-
 pub const RecordType = enum(u16) {
     a = 1,
     ptr = 12,
+    txt = 16,
     aaaa = 28,
 
     pub fn fromInt(value: u16) DecodeError!RecordType {
         return switch (value) {
             1 => .a,
             12 => .ptr,
+            16 => .txt,
             28 => .aaaa,
             else => error.UnsupportedType,
         };
@@ -132,6 +131,12 @@ pub const ResourceRecord = struct {
     class: u16,
     ttl: u32,
     data: RData,
+    txt: Txt = .{},
+
+    pub fn txtData(self: *const ResourceRecord) ?*const Txt {
+        if (self.rr_type != .txt) return null;
+        return &self.txt;
+    }
 };
 
 pub const Query = struct {
@@ -144,6 +149,7 @@ pub const AnswerData = union(enum) {
     a: [4]u8,
     aaaa: [16]u8,
     ptr: []const u8,
+    txt: []const []const u8,
 };
 
 pub const Answer = struct {
@@ -162,6 +168,52 @@ pub const BuildMessage = struct {
     rcode: u4 = 0,
     questions: []const Query = &[_]Query{},
     answers: []const Answer = &[_]Answer{},
+};
+
+pub const max_txt_rdata_len: usize = max_message_len;
+pub const max_txt_character_string_len: usize = 255;
+
+pub const Txt = struct {
+    bytes: [max_txt_rdata_len]u8 = [_]u8{0} ** max_txt_rdata_len,
+    len: usize = 0,
+    string_count: usize = 0,
+
+    pub fn rdata(self: *const Txt) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn iterator(self: *const Txt) TxtIterator {
+        return .{ .rdata = self.rdata() };
+    }
+
+    pub fn stringCount(self: *const Txt) usize {
+        return self.string_count;
+    }
+
+    pub fn stringAt(self: *const Txt, index: usize) ?[]const u8 {
+        var it = self.iterator();
+        var i: usize = 0;
+        while (it.next()) |part| {
+            if (i == index) return part;
+            i += 1;
+        }
+        return null;
+    }
+};
+
+pub const TxtIterator = struct {
+    rdata: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *TxtIterator) ?[]const u8 {
+        if (self.pos >= self.rdata.len) return null;
+        const len: usize = self.rdata[self.pos];
+        const start = self.pos + 1;
+        const end = start + len;
+        if (end > self.rdata.len) return null;
+        self.pos = end;
+        return self.rdata[start..end];
+    }
 };
 
 pub fn Message(comptime max_questions: usize, comptime max_answers: usize) type {
@@ -226,6 +278,10 @@ pub fn encodeMessage(out: []u8, msg: BuildMessage) EncodeError![]const u8 {
                 if (answer.rr_type != .ptr) return error.UnsupportedType;
                 try encodeName(&w, ptr);
             },
+            .txt => |strings| {
+                if (answer.rr_type != .txt) return error.UnsupportedType;
+                try encodeTxtRData(&w, strings);
+            },
         }
         std.mem.writeInt(u16, out[rdlen_at..][0..2], @intCast(w.pos - rdata_start), .big);
     }
@@ -237,6 +293,11 @@ pub fn encodeMessage(out: []u8, msg: BuildMessage) EncodeError![]const u8 {
 pub fn encodeQuery(out: []u8, id: u16, name: []const u8, qtype: RecordType) EncodeError![]const u8 {
     const question = Query{ .name = name, .qtype = qtype };
     return encodeMessage(out, .{ .id = id, .questions = (&question)[0..1] });
+}
+
+/// Encode a TXT query.
+pub fn encodeTxtQuery(out: []u8, id: u16, name: []const u8) EncodeError![]const u8 {
+    return encodeQuery(out, id, name, .txt);
 }
 
 /// Encode a PTR query for an IPv4 or IPv6 reverse-DNS name.
@@ -291,7 +352,7 @@ pub fn parseMessage(
     }
 
     // Walk every answer record to keep `pos` correct, but only STORE the record
-    // types we model (A/AAAA/PTR). Unknown types (e.g. CNAME) are skipped, so a
+    // types we model (A/AAAA/PTR/TXT). Unknown types (e.g. CNAME) are skipped, so a
     // CNAME chain still yields its terminal address records.
     var stored: usize = 0;
     var ai: usize = 0;
@@ -314,6 +375,7 @@ pub fn parseMessage(
         if (class != class_in) continue;
         if (max_answers == 0 or stored >= max_answers) continue;
 
+        var txt = Txt{};
         const data = switch (rr_type) {
             .a => blk: {
                 if (rdlen != 4) return error.MalformedRData;
@@ -329,6 +391,10 @@ pub fn parseMessage(
                 if (ptr_next != rdata_end) return error.MalformedRData;
                 break :blk RData{ .ptr = ptr_name };
             },
+            .txt => blk: {
+                try decodeTxtRData(packet[rdata_start..rdata_end], &txt);
+                break :blk RData{ .ptr = .{} };
+            },
         };
 
         msg.answers[stored] = .{
@@ -337,6 +403,7 @@ pub fn parseMessage(
             .class = class,
             .ttl = ttl,
             .data = data,
+            .txt = txt,
         };
         stored += 1;
     }
@@ -367,15 +434,6 @@ pub fn reverseName(out: []u8, address: Address) EncodeError![]const u8 {
         },
     }
     return out[0..w.pos];
-}
-
-/// Placeholder for the real resolver transport.
-///
-/// TODO: send encoded queries through the reactor UDP backend once Ringlane
-/// exposes datagram I/O. Tests intentionally exercise only pure build/parse and
-/// cache behavior.
-pub fn sendUdpQueryTodo(_: []const u8, _: []u8) LiveUdpError![]const u8 {
-    return error.LiveUdpResolverTodo;
 }
 
 pub const HostCacheEntry = struct {
@@ -670,6 +728,33 @@ fn findByte(bytes: []const u8, start: usize, needle: u8) ?usize {
         if (bytes[cursor] == needle) return cursor;
     }
     return null;
+}
+
+fn encodeTxtRData(w: *Writer, strings: []const []const u8) EncodeError!void {
+    for (strings) |s| {
+        if (s.len > max_txt_character_string_len) return error.TxtStringTooLong;
+        try w.putByte(@intCast(s.len));
+        try w.putBytes(s);
+    }
+}
+
+fn decodeTxtRData(rdata: []const u8, out: *Txt) DecodeError!void {
+    if (rdata.len > out.bytes.len) return error.MalformedRData;
+
+    var pos: usize = 0;
+    var count: usize = 0;
+    while (pos < rdata.len) {
+        const len: usize = rdata[pos];
+        const start = pos + 1;
+        const end = start + len;
+        if (end > rdata.len) return error.MalformedRData;
+        count += 1;
+        pos = end;
+    }
+
+    @memcpy(out.bytes[0..rdata.len], rdata);
+    out.len = rdata.len;
+    out.string_count = count;
 }
 
 fn readU16(bytes: []const u8, offset: usize) u16 {
@@ -1070,6 +1155,45 @@ test "encodes and parses PTR query and response round trip" {
     });
     const parsed_response = try parseMessage(1, 1, response);
     try std.testing.expectEqualStrings("localhost", parsed_response.answers[0].data.ptr.slice());
+}
+
+test "encodes and parses TXT query and response round trip" {
+    var buf: [max_message_len]u8 = undefined;
+    const query = try encodeTxtQuery(&buf, 0xbeef, "2.0.0.127.dnsbl.example");
+    const parsed_query = try parseMessage(1, 0, query);
+    try std.testing.expectEqual(@as(u16, 0xbeef), parsed_query.header.id);
+    try std.testing.expectEqualStrings("2.0.0.127.dnsbl.example", parsed_query.questions[0].name.slice());
+    try std.testing.expectEqual(RecordType.txt, parsed_query.questions[0].qtype);
+
+    const q = Query{ .name = "2.0.0.127.dnsbl.example", .qtype = .txt };
+    const txt_strings = [_][]const u8{ "listed", "policy reason" };
+    const answer = Answer{
+        .name = "2.0.0.127.dnsbl.example",
+        .rr_type = .txt,
+        .ttl = 120,
+        .data = .{ .txt = &txt_strings },
+    };
+    const response = try encodeMessage(&buf, .{
+        .id = 0xbeef,
+        .response = true,
+        .questions = (&q)[0..1],
+        .answers = (&answer)[0..1],
+    });
+
+    const parsed_response = try parseMessage(1, 1, response);
+    try std.testing.expect(parsed_response.header.isResponse());
+    try std.testing.expectEqual(@as(u32, 120), parsed_response.answers[0].ttl);
+    try std.testing.expectEqual(RecordType.txt, parsed_response.answers[0].rr_type);
+    const txt = parsed_response.answers[0].txtData().?;
+    try std.testing.expectEqual(@as(usize, 2), txt.stringCount());
+    try std.testing.expectEqualStrings("listed", txt.stringAt(0).?);
+    try std.testing.expectEqualStrings("policy reason", txt.stringAt(1).?);
+    try std.testing.expect(txt.stringAt(2) == null);
+
+    var it = txt.iterator();
+    try std.testing.expectEqualStrings("listed", it.next().?);
+    try std.testing.expectEqualStrings("policy reason", it.next().?);
+    try std.testing.expect(it.next() == null);
 }
 
 test "parses compressed answer name and rejects compression loops" {

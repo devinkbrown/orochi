@@ -24,8 +24,8 @@
 //!              snatch it. RELEASE lets the verified owner end that hold ahead of
 //!              time, making the nick immediately available again.
 //!
-//! PURITY: this module is a complement to the storage primitive in
-//! `reserved_nick.zig` (which owns the nick->account map) and the grace-timer
+//! PURITY: this module is a complement to the account-registration store (which
+//! owns the registered nick->account ownership map) and the grace-timer
 //! enforcement policy in `nick_enforcement.zig` (allow/warn/enforce against an
 //! unauthenticated holder). Neither of those decides the RECOVER-vs-RELEASE
 //! command outcome; this file does. All inputs, including time, are supplied by

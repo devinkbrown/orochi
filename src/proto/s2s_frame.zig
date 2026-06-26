@@ -79,6 +79,12 @@ pub const FrameType = enum(u8) {
     /// `client_kill` privilege and signs the frame with its Tsumugi identity.
     /// Carries {origin_server, killer, target, reason}.
     KILL = 0x16,
+    /// Network-wide `mesh`-scope WARD (network-ban) convergence: an add or remove
+    /// of a Warden entry, fanned to every secured peer so an already-running node
+    /// enforces (or forgets) the ban live. Carries a `warden` wire record
+    /// {op, match, pattern, action, reason, set_by, created_ms, expires_ms};
+    /// signed like other oper-trust facts (the setter is operator authority).
+    WARD = 0x17,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -108,6 +114,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.OPER_EVENT) => .OPER_EVENT,
             @intFromEnum(FrameType.OBSERVE_EVENT) => .OBSERVE_EVENT,
             @intFromEnum(FrameType.KILL) => .KILL,
+            @intFromEnum(FrameType.WARD) => .WARD,
             else => null,
         };
     }
@@ -233,6 +240,7 @@ const all_frame_types = [_]FrameType{
     .SESSION_MIGRATE,
     .ENTITY_PROP,
     .KILL,
+    .WARD,
 };
 
 test "encode/decode round-trip each type" {

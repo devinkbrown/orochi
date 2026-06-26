@@ -533,6 +533,21 @@ pub const SecuredLink = struct {
         return link.takeKills();
     }
 
+    /// Emit a signed WARD (mesh-scope network-ban add/remove) over the encrypted
+    /// leg, then flush ciphertext. `wire` is a `warden.encodeWire` record.
+    pub fn sendWard(self: *SecuredLink, wire: []const u8) anyerror!void {
+        const link = self.inner orelse return;
+        try link.sendWard(wire);
+        try self.drainInner();
+    }
+
+    /// Drain queued inbound WARD payloads decoded by the inner link. Caller owns +
+    /// frees each slice and the outer slice; decode each with `warden.decodeWire`.
+    pub fn takeWards(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeWards();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis
     /// (empty until the inner CRDT link is established).
     pub fn collectTopology(self: *const SecuredLink, out: []partition_detector.TopoNode) usize {

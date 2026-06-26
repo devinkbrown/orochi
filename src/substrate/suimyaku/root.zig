@@ -30,6 +30,7 @@ pub const mesh = @import("mesh.zig");
 pub const mesh_topology = @import("mesh_topology.zig");
 pub const message_relay = @import("message_relay.zig");
 pub const nick_claim = @import("nick_claim.zig");
+pub const nick_collision = @import("nick_collision.zig");
 pub const partition_detector = @import("partition_detector.zig");
 pub const peer_link = @import("peer_link.zig");
 pub const prolly = @import("prolly.zig");
@@ -72,6 +73,7 @@ test {
     _ = mesh_topology;
     _ = message_relay;
     _ = nick_claim;
+    _ = nick_collision;
     _ = partition_detector;
     _ = peer_link;
     _ = prolly;

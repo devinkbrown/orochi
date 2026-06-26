@@ -448,6 +448,18 @@ pub const S2sLink = struct {
         return self.peer.takeKills();
     }
 
+    /// Emit a signed WARD to this peer (network-wide mesh-scope ban convergence).
+    /// `wire` is a `warden.encodeWire` record (add or remove).
+    pub fn sendWard(self: *S2sLink, wire: []const u8) !void {
+        try self.peer.sendWard(self.sink(), wire);
+    }
+
+    /// Drain queued inbound WARD payloads from this peer (caller owns + frees each
+    /// slice and the outer slice; decode with `warden.decodeWire`).
+    pub fn takeWards(self: *S2sLink) ![][]u8 {
+        return self.peer.takeWards();
+    }
+
     /// Copy this peer's known-server topology into `out` for partition analysis.
     pub fn collectTopology(self: *const S2sLink, out: []partition_detector.TopoNode) usize {
         return self.peer.collectTopology(out);

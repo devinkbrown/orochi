@@ -221,6 +221,14 @@ pub const Registry = struct {
         return out[0..n];
     }
 
+    /// The active Ward identified by (match, pattern), or null. A direct registry
+    /// lookup (no bounded copy) so a caller can read an entry's `scope`/`action`
+    /// regardless of how many Wards share the same `match`.
+    pub fn find(self: *const Registry, match: Match, pattern: []const u8) ?*const Ward {
+        const idx = self.indexOf(match, pattern) orelse return null;
+        return &self.wards.items[idx];
+    }
+
     pub fn count(self: *const Registry) usize {
         return self.wards.items.len;
     }
@@ -273,6 +281,130 @@ fn freeWard(allocator: std.mem.Allocator, w: *Ward) void {
     allocator.free(w.reason);
     allocator.free(w.set_by);
     w.* = undefined;
+}
+
+// ── mesh WARD wire codec ───────────────────────────────────────────────────
+//
+// A `mesh`-scope Ward is propagated to peers so already-running nodes enforce a
+// network ban live (and forget it on removal/expiry). The wire form is a flat,
+// length-prefixed record — no allocation on decode (the strings borrow the
+// payload), pure, and independent of the daemon. Numeric axes (match/action/op)
+// ride as single bytes; every string field is u16-length-prefixed.
+
+pub const WireOp = enum(u8) {
+    /// Add (or replace) the mesh ward on the receiving node.
+    add = 0,
+    /// Remove the mesh ward identified by (match, pattern) on the receiving node.
+    remove = 1,
+};
+
+/// A decoded mesh-WARD record. String fields borrow the source payload.
+pub const WireWard = struct {
+    op: WireOp,
+    match: Match,
+    pattern: []const u8,
+    action: Action,
+    reason: []const u8,
+    set_by: []const u8,
+    created_ms: i64,
+    expires_ms: i64,
+};
+
+pub const WireError = error{ ShortBuffer, Truncated, BadField };
+
+/// Upper bound on an encoded record given the registry's string limits, so a
+/// caller can size a stack buffer. (op + match + action) + 3 × (u16 len) +
+/// 2 × i64 + the three max strings.
+pub const max_wire_len: usize = 3 + 6 + 16 + 256 + 512 + 64;
+
+fn putU16(buf: []u8, off: *usize, v: u16) WireError!void {
+    if (off.* + 2 > buf.len) return error.ShortBuffer;
+    std.mem.writeInt(u16, buf[off.*..][0..2], v, .little);
+    off.* += 2;
+}
+
+fn putI64(buf: []u8, off: *usize, v: i64) WireError!void {
+    if (off.* + 8 > buf.len) return error.ShortBuffer;
+    std.mem.writeInt(i64, buf[off.*..][0..8], v, .little);
+    off.* += 8;
+}
+
+fn putStr(buf: []u8, off: *usize, s: []const u8) WireError!void {
+    if (s.len > std.math.maxInt(u16)) return error.BadField;
+    try putU16(buf, off, @intCast(s.len));
+    if (off.* + s.len > buf.len) return error.ShortBuffer;
+    @memcpy(buf[off.* .. off.* + s.len], s);
+    off.* += s.len;
+}
+
+/// Encode a mesh-WARD record into `out`, returning the written prefix.
+pub fn encodeWire(w: WireWard, out: []u8) WireError![]const u8 {
+    var off: usize = 0;
+    if (off + 3 > out.len) return error.ShortBuffer;
+    out[off] = @intFromEnum(w.op);
+    out[off + 1] = @intFromEnum(w.match);
+    out[off + 2] = @intFromEnum(w.action);
+    off += 3;
+    try putStr(out, &off, w.pattern);
+    try putStr(out, &off, w.reason);
+    try putStr(out, &off, w.set_by);
+    try putI64(out, &off, w.created_ms);
+    try putI64(out, &off, w.expires_ms);
+    return out[0..off];
+}
+
+fn takeU16(buf: []const u8, off: *usize) WireError!u16 {
+    if (off.* + 2 > buf.len) return error.Truncated;
+    const v = std.mem.readInt(u16, buf[off.*..][0..2], .little);
+    off.* += 2;
+    return v;
+}
+
+fn takeI64(buf: []const u8, off: *usize) WireError!i64 {
+    if (off.* + 8 > buf.len) return error.Truncated;
+    const v = std.mem.readInt(i64, buf[off.*..][0..8], .little);
+    off.* += 8;
+    return v;
+}
+
+fn takeStr(buf: []const u8, off: *usize) WireError![]const u8 {
+    const n = try takeU16(buf, off);
+    if (off.* + n > buf.len) return error.Truncated;
+    const s = buf[off.* .. off.* + n];
+    off.* += n;
+    return s;
+}
+
+fn enumFromByte(comptime E: type, raw: u8) WireError!E {
+    inline for (@typeInfo(E).@"enum".fields) |f| {
+        if (f.value == raw) return @enumFromInt(f.value);
+    }
+    return error.BadField;
+}
+
+/// Decode a mesh-WARD record. Returned string slices borrow `bytes`.
+pub fn decodeWire(bytes: []const u8) WireError!WireWard {
+    if (bytes.len < 3) return error.Truncated;
+    const op = try enumFromByte(WireOp, bytes[0]);
+    const match = try enumFromByte(Match, bytes[1]);
+    const action = try enumFromByte(Action, bytes[2]);
+    var off: usize = 3;
+    const pattern = try takeStr(bytes, &off);
+    const reason = try takeStr(bytes, &off);
+    const set_by = try takeStr(bytes, &off);
+    const created_ms = try takeI64(bytes, &off);
+    const expires_ms = try takeI64(bytes, &off);
+    if (pattern.len == 0) return error.BadField;
+    return .{
+        .op = op,
+        .match = match,
+        .pattern = pattern,
+        .action = action,
+        .reason = reason,
+        .set_by = set_by,
+        .created_ms = created_ms,
+        .expires_ms = expires_ms,
+    };
 }
 
 /// Match a facet value against a Ward pattern. `.address` understands IPv4 CIDR
@@ -439,6 +571,60 @@ test "limits and validation" {
     try std.testing.expectError(error.ReasonTooLong, reg.add(longr));
     try reg.add(mkWard(.host, "a.b", .expel));
     try std.testing.expectError(error.TooManyWards, reg.add(mkWard(.host, "c.d", .expel)));
+}
+
+test "mesh ward wire round-trips add and remove" {
+    var buf: [max_wire_len]u8 = undefined;
+    const add = WireWard{
+        .op = .add,
+        .match = .mask,
+        .pattern = "*!*@*.evil.example",
+        .action = .quarantine,
+        .reason = "spam ring",
+        .set_by = "oper!~o@admin",
+        .created_ms = 1234,
+        .expires_ms = 5678,
+    };
+    const wire = try encodeWire(add, &buf);
+    const back = try decodeWire(wire);
+    try std.testing.expectEqual(WireOp.add, back.op);
+    try std.testing.expectEqual(Match.mask, back.match);
+    try std.testing.expectEqual(Action.quarantine, back.action);
+    try std.testing.expectEqualStrings("*!*@*.evil.example", back.pattern);
+    try std.testing.expectEqualStrings("spam ring", back.reason);
+    try std.testing.expectEqualStrings("oper!~o@admin", back.set_by);
+    try std.testing.expectEqual(@as(i64, 1234), back.created_ms);
+    try std.testing.expectEqual(@as(i64, 5678), back.expires_ms);
+
+    const del = WireWard{
+        .op = .remove,
+        .match = .address,
+        .pattern = "192.0.2.0/24",
+        .action = .refuse,
+        .reason = "",
+        .set_by = "",
+        .created_ms = 0,
+        .expires_ms = 0,
+    };
+    const dwire = try encodeWire(del, &buf);
+    const dback = try decodeWire(dwire);
+    try std.testing.expectEqual(WireOp.remove, dback.op);
+    try std.testing.expectEqual(Match.address, dback.match);
+    try std.testing.expectEqualStrings("192.0.2.0/24", dback.pattern);
+    try std.testing.expectEqual(@as(usize, 0), dback.reason.len);
+}
+
+test "mesh ward wire rejects truncated, empty pattern, and bad enum" {
+    try std.testing.expectError(error.Truncated, decodeWire(&.{ 0, 0 }));
+    // op=add(0), match=mask, action=expel, then a u16 length of 0 (empty pattern).
+    var empty: [5]u8 = .{ 0, @intFromEnum(Match.mask), @intFromEnum(Action.expel), 0, 0 };
+    try std.testing.expectError(error.Truncated, decodeWire(&empty));
+    // A bad op byte (0xff) is rejected.
+    var badop: [3]u8 = .{ 0xff, 0, 0 };
+    try std.testing.expectError(error.BadField, decodeWire(&badop));
+    // A pattern length that runs past the buffer is truncated.
+    var short_pat: [5]u8 = .{ 0, @intFromEnum(Match.host), @intFromEnum(Action.expel), 10, 0 };
+    try std.testing.expectError(error.Truncated, decodeWire(&short_pat));
 }
 
 test "no leak under churn" {
