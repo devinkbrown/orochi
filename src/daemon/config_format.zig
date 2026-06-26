@@ -356,6 +356,14 @@ pub const Config = struct {
         /// Require HMAC-tagged native OPVOX/OPVIS datagrams. Defaults off until
         /// clients implement the matching Kagura-frame tag contract.
         native_media_require_mac: bool = false,
+        /// Relay browser media datagrams (binary WebSocket frames) between a
+        /// channel's call participants. Off by default; the WS media plane is
+        /// opt-in (the browser must encode Kagura frames and append the MAC).
+        ws_media_relay: bool = false,
+        /// Require a valid per-stream MAC tag on every browser media datagram.
+        /// When false (default) untagged datagrams still relay, but a present tag
+        /// must verify.
+        ws_media_require_mac: bool = false,
         /// STUN server (IPv4 literal) queried at boot for the reflexive media
         /// candidate; with stun_port set, overrides listen.media_host on success.
         stun_host: ?[]const u8 = null,
@@ -742,6 +750,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.media.reorder_window_frames = @intCast(try uintField(doc, "media.reorder_window_frames", cfg.media.reorder_window_frames, 1, kagura_frame.window_cap));
     cfg.media.max_participants = @intCast(try uintField(doc, "media.max_participants", cfg.media.max_participants, 1, media_room.max_participants));
     if (doc.getBool("media.native_media_require_mac")) |b| cfg.media.native_media_require_mac = b;
+    if (doc.getBool("media.ws_media_relay")) |b| cfg.media.ws_media_relay = b;
+    if (doc.getBool("media.ws_media_require_mac")) |b| cfg.media.ws_media_require_mac = b;
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);

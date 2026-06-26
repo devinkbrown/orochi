@@ -1311,6 +1311,14 @@ pub const Config = struct {
     /// Require the native OPVOX/OPVIS UDP leg to carry a per-datagram MAC tag.
     /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
     native_media_require_mac: bool = false,
+    /// Relay browser media datagrams (binary WebSocket frames) between a
+    /// channel's call participants. Off by default; the WS media plane is opt-in.
+    ws_media_relay: bool = false,
+    /// Require a valid per-stream MAC tag on every browser media datagram. When
+    /// false (default), untagged datagrams still relay but a present tag must
+    /// verify; the per-stream key is the same `native_stream_key`-derived
+    /// `(channel, participant)` key the native UDP leg uses.
+    ws_media_require_mac: bool = false,
     /// Path to a MaxMind GeoIP database (.mmdb); empty = no GeoIP. Loaded lazily
     /// on first GEOIP use via Config.crypto_io. Borrowed; outlives the server.
     geoip_db_path: []const u8 = "",
@@ -1791,11 +1799,57 @@ pub const ConnState = struct {
     /// Header + possible coalesced first application bytes.
     proxy_buf: [default_recv_bytes]u8 = undefined,
     proxy_len: usize = 0,
+    /// Active WS media call: the channel this connection publishes browser media
+    /// datagrams to (set on MEDIA JOIN over a WS transport, cleared on LEAVE /
+    /// disconnect). Empty len = not in a WS call. `participant` snapshots the nick
+    /// at JOIN so the per-stream MAC key stays stable across a mid-call NICK
+    /// change.
+    media_call_channel: [media_call_chan_max]u8 = undefined,
+    media_call_channel_len: usize = 0,
+    media_call_participant: [media_call_part_max]u8 = undefined,
+    media_call_participant_len: usize = 0,
 
     pub fn init(fd: linux.fd_t) ConnState {
         return .{ .fd = fd };
     }
+
+    /// The channel this connection publishes WS media to, or null when not in a
+    /// WS call.
+    pub fn mediaCallChannel(self: *const ConnState) ?[]const u8 {
+        if (self.media_call_channel_len == 0) return null;
+        return self.media_call_channel[0..self.media_call_channel_len];
+    }
+
+    /// The nick snapshot taken at MEDIA JOIN (the MAC-key participant context).
+    pub fn mediaCallParticipant(self: *const ConnState) []const u8 {
+        return self.media_call_participant[0..self.media_call_participant_len];
+    }
+
+    /// Bind this connection to a WS call. Over-long names clear the binding (the
+    /// relay then simply skips this connection — media is best-effort).
+    pub fn setMediaCall(self: *ConnState, channel: []const u8, participant: []const u8) void {
+        if (channel.len == 0 or channel.len > self.media_call_channel.len or
+            participant.len == 0 or participant.len > self.media_call_participant.len)
+        {
+            self.clearMediaCall();
+            return;
+        }
+        @memcpy(self.media_call_channel[0..channel.len], channel);
+        self.media_call_channel_len = channel.len;
+        @memcpy(self.media_call_participant[0..participant.len], participant);
+        self.media_call_participant_len = participant.len;
+    }
+
+    pub fn clearMediaCall(self: *ConnState) void {
+        self.media_call_channel_len = 0;
+        self.media_call_participant_len = 0;
+    }
 };
+
+/// WS-call binding caps on `ConnState`: channel name and the participant nick
+/// snapshot used as the per-stream MAC-key context.
+const media_call_chan_max: usize = 128;
+const media_call_part_max: usize = 64;
 
 const ClientTable = client_model.Table(ConnState, client_model.ClientId);
 
@@ -5986,14 +6040,23 @@ pub const LinuxServer = struct {
             } orelse break;
             switch (event) {
                 .data => |d| {
-                    try self.feedBytes(id, conn, d.payload);
-                    if (conn.closing) return;
-                    // IRCv3 WebSocket convention: the frame boundary terminates
-                    // the IRC message even without a trailing CRLF. Synthesize
-                    // one so both frame-per-message clients and CRLF-framing
-                    // clients parse identically.
-                    if (d.fin and pendingInbound(conn) != 0) try self.feedBytes(id, conn, "\r\n");
-                    if (conn.closing) return;
+                    if (d.binary) {
+                        // Binary frames carry browser media datagrams, not IRC
+                        // lines. Relay only complete (FIN) single-frame datagrams;
+                        // a bad/fragmented one is dropped, never fatal to the IRC
+                        // session.
+                        if (d.fin) self.handleWsMediaDatagram(id, conn, d.payload);
+                        if (conn.closing) return;
+                    } else {
+                        try self.feedBytes(id, conn, d.payload);
+                        if (conn.closing) return;
+                        // IRCv3 WebSocket convention: the frame boundary terminates
+                        // the IRC message even without a trailing CRLF. Synthesize
+                        // one so both frame-per-message clients and CRLF-framing
+                        // clients parse identically.
+                        if (d.fin and pendingInbound(conn) != 0) try self.feedBytes(id, conn, "\r\n");
+                        if (conn.closing) return;
+                    }
                 },
                 .ping => |payload| wsQueueControl(conn, .pong, payload),
                 .pong => {},
@@ -20737,6 +20800,10 @@ pub const LinuxServer = struct {
                 try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
                 if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel); // call ended
             } else try self.noticeTo(conn, "MEDIA: you are not in this call");
+            // Drop the WS media binding so stray binary frames stop relaying.
+            if (conn.mediaCallChannel()) |bound| {
+                if (std.ascii.eqlIgnoreCase(bound, channel)) conn.clearMediaCall();
+            }
             return;
         }
 
@@ -20758,6 +20825,12 @@ pub const LinuxServer = struct {
                 return;
             };
             try self.broadcastMediaEvent(channel, "JOIN", nick, kname);
+            // WS media plane: bind this connection to the call and hand it the
+            // per-stream MAC key so its browser can authenticate each datagram.
+            if (self.config.ws_media_relay and conn.ws != null) {
+                conn.setMediaCall(channel, nick);
+                if (conn.mediaCallChannel() != null) self.issueMediaMacKey(conn, channel, nick);
+            }
         } else if (std.ascii.eqlIgnoreCase(sub, "MUTE")) {
             if (self.media_rooms.setMuted(channel, nick, kind, true))
                 try self.broadcastMediaEvent(channel, "MUTE", nick, kname)
@@ -20798,6 +20871,80 @@ pub const LinuxServer = struct {
         else
             std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s}\r\n", .{ self.serverName(), channel, verb, nick }) catch return;
         try self.broadcastChannel(channel, line, null);
+    }
+
+    /// Ingest one binary-WebSocket media datagram from a registered call
+    /// participant: validate the Kagura frame shape, lenient-verify the per-stream
+    /// MAC, and fan it out to the channel's other on-node call members. Media is
+    /// loss-tolerant — any problem drops this datagram, never the IRC session.
+    fn handleWsMediaDatagram(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, datagram: []const u8) void {
+        if (!self.config.ws_media_relay) return;
+        if (!conn.session.registered()) return;
+        if (conn.session.hasUmode(.media_tx_deny)) return;
+        const channel = conn.mediaCallChannel() orelse return;
+        const participant = conn.mediaCallParticipant();
+
+        // One call validates the frame shape AND lenient-verifies a present tag,
+        // using the same `native_stream_key`-derived `(channel, participant)` key
+        // the native UDP leg uses. On any error the datagram is dropped.
+        _ = kagura_frame.acceptNativeMediaMac(
+            &self.native_stream_key,
+            channel,
+            participant,
+            datagram,
+            self.config.ws_media_require_mac,
+        ) catch return;
+
+        self.relayWsMediaDatagram(id, channel, datagram);
+    }
+
+    /// Fan a validated media datagram out to the channel's other call participants
+    /// that are local to THIS reactor (same-shard) over a binary WS frame. The
+    /// frame is encoded once and reused for every recipient. Cross-shard (opt-in
+    /// multi-reactor) and cross-node (mesh) media relay are out of scope for v1;
+    /// the default single-reactor deployment reaches every member here.
+    fn relayWsMediaDatagram(self: *LinuxServer, sender: client_model.ClientId, channel: []const u8, datagram: []const u8) void {
+        if (datagram.len > WsState.max_frame) return; // would not fit one WS frame
+        var frame_buf: [WsState.max_frame + 10]u8 = undefined;
+        const ws_frame = websocket.encodeFrame(WsState.max_frame, .{ .opcode = .binary }, datagram, &frame_buf) catch return;
+
+        var members = self.world.memberIterator(channel) orelse return;
+        while (members.next()) |member| {
+            const mid = clientIdFromWorld(member.*);
+            if (mid.eql(sender)) continue;
+            if (mid.shard != self.rx().shard_id) continue; // same-shard only (v1)
+            const mconn = self.connFor(mid) orelse continue;
+            if (mconn.closing) continue;
+            if (mconn.ws == null) continue; // browser media only goes to WS peers
+            // Deliver to actual call participants, not every channel member.
+            if (!self.media_rooms.isParticipant(channel, mconn.session.displayName())) continue;
+            appendSecuredToConn(mconn, ws_frame) catch {
+                mconn.closing = true;
+                continue;
+            };
+            self.armSendIfNeeded(mconn) catch {};
+        }
+    }
+
+    /// Derive this participant's per-stream MAC key and hand it to them over the
+    /// authenticated WS as `:server NOTE MEDIA <#chan> MACKEY <base64 K32>`. Only
+    /// the owning participant ever receives its own key; the server re-derives to
+    /// verify (stateless).
+    fn issueMediaMacKey(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant: []const u8) void {
+        var k32: [kagura_frame.MAC_KEY_BYTES]u8 = undefined;
+        kagura_frame.deriveNativeMediaMacKey(&self.native_stream_key, channel, participant, &k32);
+        defer std.crypto.secureZero(u8, k32[0..]);
+
+        var b64: [std.base64.standard.Encoder.calcSize(kagura_frame.MAC_KEY_BYTES)]u8 = undefined;
+        const enc = std.base64.standard.Encoder.encode(&b64, &k32);
+
+        var line: [default_reply_bytes]u8 = undefined;
+        const out = std.fmt.bufPrint(&line, ":{s} NOTE MEDIA {s} MACKEY {s}\r\n", .{ self.serverName(), channel, enc }) catch return;
+        appendToConn(conn, out) catch {
+            conn.closing = true;
+            return;
+        };
+        self.armSendIfNeeded(conn) catch {};
     }
 
     fn mediaPresencePrivate(self: *LinuxServer, nick: []const u8) bool {

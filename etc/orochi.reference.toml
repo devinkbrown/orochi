@@ -516,6 +516,17 @@ reorder_window_frames = 64
 # are dropped before the SFU learns the sender. Requires matching client support
 # (the server advertises mac=hmac-sha256-128 on the native media line).
 native_media_require_mac = false
+# Relay browser media datagrams (binary WebSocket frames) between a channel's call
+# participants. Off by default; the WS media plane is opt-in. When on, MEDIA JOIN
+# hands each participant a per-stream MAC key over the authenticated WS
+# (NOTE MEDIA <#chan> MACKEY <base64>) and each browser datagram is verified
+# before fan-out. v1 fans out to same-node (same-shard) call members.
+ws_media_relay = false
+# Require a valid per-stream MAC tag on every browser media datagram. Default false
+# (untagged datagrams still relay, but a present tag must verify). The per-stream
+# key is the same native_stream_key-derived (channel, participant) key the native
+# UDP leg uses.
+ws_media_require_mac = false
 # STUN server (IPv4 literal) queried at boot for the reflexive media candidate;
 # with stun_port set, overrides listen.media_host on success.
 # stun_host = "stun.example.net"

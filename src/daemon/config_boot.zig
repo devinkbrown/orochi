@@ -75,6 +75,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.media_reorder_window_frames = cfg.media.reorder_window_frames;
     out.media_max_participants = cfg.media.max_participants;
     out.native_media_require_mac = cfg.media.native_media_require_mac;
+    out.ws_media_relay = cfg.media.ws_media_relay;
+    out.ws_media_require_mac = cfg.media.ws_media_require_mac;
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;

@@ -324,7 +324,10 @@ pub const DeframeEvent = union(enum) {
     /// Unmasked payload of one text/binary/continuation DATA frame. `fin` marks
     /// the end of the WebSocket message (so a line-oriented consumer can treat
     /// the frame boundary as a message terminator even without a trailing CRLF).
-    data: struct { payload: []const u8, fin: bool },
+    /// `binary` reflects the message's opcode (set by its opening frame and
+    /// inherited by continuations) so a consumer can route binary media datagrams
+    /// away from the line-oriented text path.
+    data: struct { payload: []const u8, fin: bool, binary: bool },
     /// Client ping; the caller should answer with a pong echoing the payload.
     ping: []const u8,
     /// Client pong (unsolicited or answering a server ping); informational.
@@ -363,6 +366,10 @@ pub fn Deframer(comptime max_frame_size: usize) type {
         /// True while a fragmented DATA message is open (a non-FIN text/binary
         /// frame was seen and its closing FIN continuation has not arrived yet).
         fragmented: bool = false,
+        /// Opcode of the in-flight DATA message: set when its opening text/binary
+        /// frame is seen and inherited by continuation frames (RFC 6455 §5.4).
+        /// Surfaced on each `.data` event so binary media is routed apart from text.
+        msg_binary: bool = false,
 
         /// Buffer inbound wire bytes. `error.BufferFull` only when a frame's wire
         /// size exceeds capacity (oversize *declared* lengths are rejected earlier
@@ -451,6 +458,7 @@ pub fn Deframer(comptime max_frame_size: usize) type {
                 .text, .binary => {
                     if (self.fragmented) return error.NestedFragmentation;
                     self.fragmented = !frame.fin;
+                    self.msg_binary = frame.opcode == .binary;
                     self.pending = .{ .data = .{ .len = frame.payload.len, .fin = frame.fin } };
                 },
                 .continuation => {
@@ -469,12 +477,13 @@ pub fn Deframer(comptime max_frame_size: usize) type {
                 .text, .binary => {
                     if (self.fragmented) return error.NestedFragmentation;
                     self.fragmented = !frame.fin;
-                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin } };
+                    self.msg_binary = frame.opcode == .binary;
+                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin, .binary = self.msg_binary } };
                 },
                 .continuation => {
                     if (!self.fragmented) return error.UnexpectedContinuation;
                     if (frame.fin) self.fragmented = false;
-                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin } };
+                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin, .binary = self.msg_binary } };
                 },
                 .ping => return .{ .ping = frame.payload },
                 .pong => return .pong,
@@ -484,7 +493,7 @@ pub fn Deframer(comptime max_frame_size: usize) type {
 
         fn eventFromPending(self: *Self, pending: PendingEvent) DeframeEvent {
             return switch (pending) {
-                .data => |data| .{ .data = .{ .payload = self.payload_buf[0..data.len], .fin = data.fin } },
+                .data => |data| .{ .data = .{ .payload = self.payload_buf[0..data.len], .fin = data.fin, .binary = self.msg_binary } },
                 .ping => |len| .{ .ping = self.payload_buf[0..len] },
                 .pong => .pong,
                 .close => |len| .{ .close = self.payload_buf[0..len] },
