@@ -70,6 +70,25 @@ const Sha384 = hkdf.Sha384;
 const max_hash_len = Sha384.hash_len;
 
 const Ed25519 = std.crypto.sign.Ed25519;
+const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
+
+// ── X25519MLKEM768 (TLS named group 0x11ec) wire sizes ──────────────────────
+// Per the spec the ML-KEM-768 part comes first, then X25519, in the client
+// share, the server share, and the combined shared secret. Chrome/Edge offer
+// this as their sole QUIC key_share, so the server must accept it.
+const mlkem_ek_len = MlKem768.PublicKey.encoded_length; // 1184 — client encapsulation key
+const mlkem_ct_len = MlKem768.ciphertext_length; // 1088 — server ciphertext
+const x25519_pub_len = kx.X25519Kx.public_len; // 32
+const hybrid_client_share_len = mlkem_ek_len + x25519_pub_len; // 1216
+const hybrid_server_share_len = mlkem_ct_len + x25519_pub_len; // 1120
+
+/// Result of the QUIC/TLS 1.3 (EC)DHE / hybrid key exchange: 32 bytes for a
+/// classical group (x25519) or 64 bytes for X25519MLKEM768 (mlkem_ss ‖ x25519_ss).
+const KexShared = struct { buf: [64]u8 = undefined, len: usize = 0 };
+
+/// Selected key-exchange group for this handshake, determining the ServerHello
+/// key_share wire format.
+const SelectedGroup = enum { x25519, x25519mlkem768 };
 
 pub const EncryptionLevel = quic_protect.EncryptionLevel;
 pub const KeySet = quic_protect.KeySet;
@@ -210,6 +229,12 @@ pub const Server = struct {
 
     x25519_pair: kx.X25519Kx.KeyPair,
     server_random: [32]u8,
+
+    /// Key-exchange group negotiated from the ClientHello key_share.
+    selected_group: SelectedGroup = .x25519,
+    /// Server X25519MLKEM768 key_share (ml-kem_ct(1088) ‖ x25519_pk(32)),
+    /// populated only when `selected_group == .x25519mlkem768`.
+    hybrid_keyshare: [hybrid_server_share_len]u8 = undefined,
 
     /// Running transcript of raw handshake messages (RFC 8446 §4.4.1).
     transcript: std.ArrayList(u8) = .empty,
@@ -369,8 +394,9 @@ pub const Server = struct {
         // ServerHello (Initial level), folded into the transcript.
         try self.writeServerHello(&self.out_initial);
 
-        // Handshake keys derive over CH + SH.
-        try self.deriveAndInstallHandshakeKeys(shared, suite);
+        // Handshake keys derive over CH + SH. The (EC)DHE secret is 32 bytes for
+        // a classical group or 64 for the X25519MLKEM768 hybrid.
+        try self.deriveAndInstallHandshakeKeys(shared.buf[0..shared.len], suite);
 
         // The encrypted flight (Handshake level): EncryptedExtensions,
         // Certificate, CertificateVerify, Finished — concatenated raw.
@@ -383,7 +409,7 @@ pub const Server = struct {
         try self.deriveAndInstallApplicationKeys(suite);
     }
 
-    fn processClientHello(self: *Server, body: []const u8) Error![32]u8 {
+    fn processClientHello(self: *Server, body: []const u8) Error!KexShared {
         var c = Cursor.init(body);
         if (try c.readU16() != legacy_version) return error.ProtocolVersion;
         _ = try c.take(32); // client random (unused by the key schedule)
@@ -404,6 +430,7 @@ pub const Server = struct {
 
         var offered_tls13 = false;
         var x25519_share: ?[]const u8 = null;
+        var hybrid_share: ?[]const u8 = null; // X25519MLKEM768 (post-quantum)
         var have_params = false;
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
@@ -416,6 +443,8 @@ pub const Server = struct {
                     while (shares.next() catch null) |entry| {
                         if (entry.group == .x25519 and entry.key_exchange.len == kx.X25519Kx.public_len) {
                             if (x25519_share == null) x25519_share = entry.key_exchange;
+                        } else if (entry.group == .x25519mlkem768 and entry.key_exchange.len == hybrid_client_share_len) {
+                            if (hybrid_share == null) hybrid_share = entry.key_exchange;
                         }
                     }
                 },
@@ -432,12 +461,51 @@ pub const Server = struct {
         if (!have_params) return error.MissingExtension;
         self.suite = suite;
 
-        const peer = x25519_share orelse return error.UnsupportedGroup;
-        var peer_pub: kx.PublicKey = undefined;
-        @memcpy(&peer_pub, peer);
-        var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
-        defer secret.wipe();
-        return secret.declassify();
+        // Prefer classical X25519; fall back to the X25519MLKEM768 hybrid (offered
+        // as the sole QUIC key_share by modern Chrome/Edge).
+        if (x25519_share) |peer| {
+            self.selected_group = .x25519;
+            var peer_pub: kx.PublicKey = undefined;
+            @memcpy(&peer_pub, peer);
+            var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
+            defer secret.wipe();
+            var out = KexShared{ .len = 32 };
+            const ss = secret.declassify();
+            @memcpy(out.buf[0..32], &ss);
+            return out;
+        }
+        if (hybrid_share) |peer| {
+            // X25519MLKEM768 (0x11ec): client share = ml-kem_ek(1184) ‖ x25519_pk(32).
+            self.selected_group = .x25519mlkem768;
+
+            // X25519 ECDH against the classical half of the client share.
+            var x_peer: kx.PublicKey = undefined;
+            @memcpy(&x_peer, peer[mlkem_ek_len .. mlkem_ek_len + x25519_pub_len]);
+            var x_secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, x_peer) catch return error.BadHandshake;
+            defer x_secret.wipe();
+
+            // ML-KEM-768 encapsulate against the PQ half, with fresh entropy.
+            var ek: [mlkem_ek_len]u8 = undefined;
+            @memcpy(&ek, peer[0..mlkem_ek_len]);
+            const mlkem_pk = MlKem768.PublicKey.fromBytes(&ek) catch return error.BadHandshake;
+            var seed: [MlKem768.encaps_seed_length]u8 = undefined;
+            try osEntropy(&seed);
+            var enc = mlkem_pk.encapsDeterministic(&seed);
+            secureZero(&seed);
+            defer secureZero(&enc.shared_secret);
+
+            // Server share (emitted in ServerHello): ml-kem_ct(1088) ‖ x25519_pk(32).
+            @memcpy(self.hybrid_keyshare[0..mlkem_ct_len], &enc.ciphertext);
+            @memcpy(self.hybrid_keyshare[mlkem_ct_len..], &self.x25519_pair.public_key);
+
+            // Combined (EC)DHE secret fed to the key schedule: ml-kem_ss ‖ x25519_ss.
+            var out = KexShared{ .len = 64 };
+            @memcpy(out.buf[0..32], &enc.shared_secret);
+            const x_ss = x_secret.declassify();
+            @memcpy(out.buf[32..64], &x_ss);
+            return out;
+        }
+        return error.UnsupportedGroup;
     }
 
     /// Decode + copy the peer's transport parameters so the cids outlive the
@@ -477,12 +545,17 @@ pub const Server = struct {
         try appendU16(self.allocator, &body, @intFromEnum(suite));
         try body.append(self.allocator, 0); // null compression
 
-        var ext_storage: [256]u8 = undefined;
+        // Sized to hold the X25519MLKEM768 server key_share (1120 bytes) plus the
+        // supported_versions extension.
+        var ext_storage: [hybrid_server_share_len + 256]u8 = undefined;
         var ext_builder = try tls_extension.Builder.begin(&ext_storage);
         var ver_buf: [2]u8 = undefined;
         try ext_builder.addTyped(.supported_versions, try tls_supported_versions.buildServer(&ver_buf, tls_supported_versions.tls13));
-        var ks_buf: [64]u8 = undefined;
-        const ks = try tls_keyshare.buildServerShare(&ks_buf, .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key });
+        var ks_buf: [hybrid_server_share_len + 8]u8 = undefined;
+        const ks = switch (self.selected_group) {
+            .x25519mlkem768 => try tls_keyshare.buildServerShare(&ks_buf, .{ .group = .x25519mlkem768, .key_exchange = &self.hybrid_keyshare }),
+            .x25519 => try tls_keyshare.buildServerShare(&ks_buf, .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key }),
+        };
         try ext_builder.addTyped(.key_share, ks);
         try body.appendSlice(self.allocator, try ext_builder.finish());
 
@@ -586,17 +659,17 @@ pub const Server = struct {
 
     // --- key schedule + transcript ---------------------------------------
 
-    fn deriveAndInstallHandshakeKeys(self: *Server, shared_secret: [32]u8, suite: CipherSuite) Error!void {
+    fn deriveAndInstallHandshakeKeys(self: *Server, shared_secret: []const u8, suite: CipherSuite) Error!void {
         switch (suite) {
             .tls_aes_256_gcm_sha384 => try self.deriveHandshakeKeysT(Sha384, suite, shared_secret),
             else => try self.deriveHandshakeKeysT(Sha256, suite, shared_secret),
         }
     }
 
-    fn deriveHandshakeKeysT(self: *Server, comptime KS: type, suite: CipherSuite, shared_secret: [32]u8) Error!void {
+    fn deriveHandshakeKeysT(self: *Server, comptime KS: type, suite: CipherSuite, shared_secret: []const u8) Error!void {
         var early = KS.earlySecret("");
         defer early.wipe();
-        var handshake = try KS.handshakeSecret(&early, &shared_secret);
+        var handshake = try KS.handshakeSecret(&early, shared_secret);
         defer handshake.wipe();
         // Retain the handshake secret so the master secret (and the application
         // traffic secrets) can be derived after the server flight is folded in.
@@ -1840,6 +1913,101 @@ test "quic handshake feeds a ClientHello split across two CRYPTO chunks" {
         break :blk true;
     };
     try testing.expect(r);
+}
+
+test "quic handshake accepts an X25519MLKEM768 hybrid key_share and emits a hybrid server share" {
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x5a} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try mintEd25519Cert(&cert_buf, kp);
+    const alloc = testing.allocator;
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = .{ .ed25519 = kp },
+        .alpn_protocols = &.{"h3"},
+        .transport_params = test_server_params,
+    });
+    defer server.deinit();
+
+    // Build a ClientHello that offers ONLY an X25519MLKEM768 key_share, exactly
+    // as modern Chrome/Edge do for WebTransport. Client share = ek(1184) ‖ pk(32).
+    var x_seed = [_]u8{0x63} ** kx.X25519Kx.seed_len;
+    var x_pair = try kx.X25519Kx.generateDeterministic(x_seed);
+    defer x_pair.wipe();
+    x_seed = undefined;
+    const mlkem_kp = try MlKem768.KeyPair.generateDeterministic([_]u8{0x29} ** MlKem768.seed_length);
+    var client_share: [hybrid_client_share_len]u8 = undefined;
+    client_share[0..mlkem_ek_len].* = mlkem_kp.public_key.toBytes();
+    client_share[mlkem_ek_len..].* = x_pair.public_key;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try appendU16(alloc, &body, legacy_version);
+    try body.appendSlice(alloc, &([_]u8{0x11} ** 32));
+    try body.append(alloc, 0); // empty legacy_session_id
+    try appendU16(alloc, &body, 2);
+    try appendU16(alloc, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+    try body.append(alloc, 1);
+    try body.append(alloc, 0); // null compression
+
+    var ext_storage: [hybrid_client_share_len + 512]u8 = undefined;
+    var ext_builder = try tls_extension.Builder.begin(&ext_storage);
+    var sv_buf: [8]u8 = undefined;
+    try ext_builder.addTyped(.supported_versions, try tls_supported_versions.buildClient(&sv_buf, &.{tls_supported_versions.tls13}));
+    var ks_inner: [hybrid_client_share_len + 16]u8 = undefined;
+    const ks = try tls_keyshare.buildClientShares(&ks_inner, &.{.{ .group = .x25519mlkem768, .key_exchange = &client_share }});
+    try ext_builder.addTyped(.key_share, ks);
+    var alpn_buf: [16]u8 = undefined;
+    var alpn_builder = try tls_alpn.Builder.begin(&alpn_buf);
+    try alpn_builder.add("h3");
+    try ext_builder.addTyped(.alpn, try alpn_builder.finish());
+    var tp_body: std.ArrayList(u8) = .empty;
+    defer tp_body.deinit(alloc);
+    try quic_transport_params.encode(&tp_body, alloc, test_client_params);
+    try ext_builder.add(quic_transport_parameters_ext, tp_body.items);
+    try body.appendSlice(alloc, try ext_builder.finish());
+
+    var hello: std.ArrayList(u8) = .empty;
+    defer hello.deinit(alloc);
+    try writeHandshake(alloc, &hello, .client_hello, body.items);
+
+    try server.feedCrypto(.initial, hello.items);
+
+    // The server selected the hybrid group and produced its flight.
+    try testing.expect(server.suite != null);
+    try testing.expectEqual(SelectedGroup.x25519mlkem768, server.selected_group);
+    try testing.expect(server.handshakeKeys() != null);
+    try testing.expect(server.applicationKeys() != null);
+
+    const s_initial = try server.takeFlight(.initial);
+    defer alloc.free(s_initial);
+    const s_handshake = try server.takeFlight(.handshake);
+    defer alloc.free(s_handshake);
+    try testing.expect(s_initial.len != 0);
+    try testing.expect(s_handshake.len != 0);
+
+    // The ServerHello key_share must echo the hybrid group with a 1120-byte share
+    // (ml-kem_ct(1088) ‖ x25519_pk(32)) so the client can complete the exchange.
+    var off: usize = 0;
+    const sh = parseHandshakeMaybe(s_initial, &off) orelse return error.BadHandshake;
+    try testing.expectEqual(HandshakeType.server_hello, sh.typ);
+    var sc = Cursor.init(sh.body);
+    _ = try sc.readU16(); // legacy_version
+    _ = try sc.take(32); // server random
+    _ = try sc.take(try sc.readU8()); // legacy_session_id_echo
+    _ = try sc.readU16(); // cipher suite
+    _ = try sc.take(1); // compression
+    const sh_exts = try sc.take(try sc.readU16());
+    var found_hybrid = false;
+    var sh_it = tls_extension.Iterator.init(sh_exts);
+    while (try sh_it.next()) |ext| {
+        if (ext.ext_type == @intFromEnum(tls_extension.ExtensionType.key_share)) {
+            const entry = try tls_keyshare.parseServerShare(ext.data);
+            try testing.expectEqual(tls_keyshare.NamedGroup.x25519mlkem768, entry.group);
+            try testing.expectEqual(@as(usize, hybrid_server_share_len), entry.key_exchange.len);
+            found_hybrid = true;
+        }
+    }
+    try testing.expect(found_hybrid);
 }
 
 test {
