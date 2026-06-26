@@ -103,6 +103,7 @@ const color_strip = @import("../proto/color_strip.zig");
 const snowflake_id = @import("../proto/snowflake_id.zig");
 const msgid_mod = @import("../proto/msgid.zig");
 const multiline = @import("../proto/multiline.zig");
+const labeled_response = @import("../proto/labeled_response.zig");
 const secure_fns = @import("../proto/secure_fns.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
@@ -1649,6 +1650,12 @@ pub const ConnState = struct {
     send_len: usize = 0,
     send_offset: usize = 0,
     send_armed: bool = false,
+    /// labeled-response capture: when non-null, plaintext replies destined for
+    /// THIS connection are diverted into the buffer (BEFORE the WS/TLS framing
+    /// seam) instead of the wire, so the dispatcher can reframe a labeled
+    /// command's whole reply set under its `@label` and re-emit it. Set+cleared
+    /// strictly around one SerpentRegistry dispatch; always null on the wire path.
+    reply_capture: ?*ReplyCapture = null,
     /// SendQ overflow heap queue: bytes that did not fit the inline `send_buf`
     /// while it was full/armed. Drained back into `send_buf` on send-completion.
     /// The kernel never reads this directly (only the fixed inline `send_buf`),
@@ -1819,6 +1826,115 @@ const QueueSink = struct {
         return appendToConn(self.conn, bytes);
     }
 };
+
+/// labeled-response batch ref. Per-dispatch uniqueness is unnecessary: the
+/// open/close brackets a single label's own lines on one connection.
+const labeled_batch_ref = "suzu-label";
+
+/// Bounded sink for one labeled command's plaintext replies. `appendToConn`
+/// diverts here (before the WS/TLS seam) when a connection has `reply_capture`
+/// set, so the whole reply set can be reframed under the command's `@label`.
+/// Overflow is tracked, not faulted: a reply larger than the buffer falls back
+/// to unwrapped delivery rather than dropping or corrupting the batch.
+const ReplyCapture = struct {
+    buf: []u8,
+    len: usize = 0,
+    overflowed: bool = false,
+
+    fn append(self: *ReplyCapture, bytes: []const u8) void {
+        const room = self.buf.len - self.len;
+        if (bytes.len > room) {
+            @memcpy(self.buf[self.len..][0..room], bytes[0..room]);
+            self.len += room;
+            self.overflowed = true;
+            return;
+        }
+        @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn captured(self: *const ReplyCapture) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Iterates CRLF-terminated lines (each yielded WITH its terminator) over a
+/// captured reply buffer, for `labeled_response.emitIterator`.
+const CrlfReplyIterator = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    pub fn next(self: *CrlfReplyIterator) ?[]const u8 {
+        if (self.index >= self.bytes.len) return null;
+        const rest = self.bytes[self.index..];
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse {
+            self.index = self.bytes.len;
+            return rest;
+        };
+        const line = rest[0 .. nl + 1];
+        self.index += nl + 1;
+        return line;
+    }
+};
+
+/// `labeled_response` sink that concatenates framed lines into a bounded buffer.
+const FrameBufSink = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    pub fn appendLine(self: *FrameBufSink, line: []const u8) error{OutputTooSmall}!void {
+        if (line.len > self.buf.len - self.len) return error.OutputTooSmall;
+        @memcpy(self.buf[self.len..][0..line.len], line);
+        self.len += line.len;
+    }
+
+    fn written(self: *const FrameBufSink) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Extract a command's unescaped `@label` tag value, or null when absent/empty/
+/// over-long. `out` backs the unescaped slice. Used to drive labeled-response.
+fn labelTagValue(parsed: *const irc_line.LineView, out: []u8) ?[]const u8 {
+    const raw = parsed.tags_raw orelse return null;
+    var it = std.mem.splitScalar(u8, raw, ';');
+    while (it.next()) |tag| {
+        if (!std.mem.startsWith(u8, tag, "label=")) continue;
+        const escaped = tag["label=".len..];
+        if (escaped.len == 0) return null;
+        const value = unescapeTagInto(escaped, out) orelse return null;
+        if (value.len == 0 or value.len > labeled_response.MAX_LABEL_LEN) return null;
+        return value;
+    }
+    return null;
+}
+
+/// IRCv3 message-tag value unescape (`\:`;` \s`space `\r` `\n` `\\`) into `out`.
+/// Returns null only when the result would not fit `out`.
+fn unescapeTagInto(escaped: []const u8, out: []u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < escaped.len) : (i += 1) {
+        var ch = escaped[i];
+        if (ch == '\\' and i + 1 < escaped.len) {
+            i += 1;
+            ch = switch (escaped[i]) {
+                ':' => ';',
+                's' => ' ',
+                'r' => '\r',
+                'n' => '\n',
+                '\\' => '\\',
+                else => escaped[i],
+            };
+        } else if (ch == '\\') {
+            break; // trailing lone backslash: drop
+        }
+        if (n >= out.len) return null;
+        out[n] = ch;
+        n += 1;
+    }
+    return out[0..n];
+}
 
 /// Per-reactor I/O resources: everything one reactor thread owns privately and
 /// touches without a lock. The shared world + stores stay on `LinuxServer`; this
@@ -6093,9 +6209,62 @@ pub const LinuxServer = struct {
             if (try self.routeMultiline(id, conn, parsed, line)) return;
         }
 
+        // Resolve via the module spine (SerpentRegistry + OroWasm). When the
+        // client tagged this command with `@label` and negotiated the
+        // labeled-response cap, its whole reply set is captured at the plaintext
+        // seam and reframed under the label — a single tagged line, a
+        // labeled-response BATCH, or a bare ACK for a command that replies
+        // nothing — before it reaches the wire.
+        var label_buf: [labeled_response.MAX_LABEL_LEN]u8 = undefined;
+        const want_label: ?[]const u8 =
+            if (conn.session.hasCap(.labeled_response)) labelTagValue(parsed, &label_buf) else null;
+
+        if (want_label) |label| {
+            var cap_buf: [default_reply_bytes]u8 = undefined;
+            var capture = ReplyCapture{ .buf = &cap_buf };
+            conn.reply_capture = &capture;
+            const outcome = self.dispatchModules(id, conn, parsed, line) catch |err| {
+                conn.reply_capture = null;
+                return err;
+            };
+            conn.reply_capture = null; // restore the wire path before re-emitting
+            if (outcome == .handled) {
+                try emitLabeledIssuer(conn, label, &capture);
+                return;
+            }
+            // not_found: the spine emitted nothing into the capture; fall through
+            // to the registration-handshake processor (unlabeled — those verbs
+            // are not part of the post-registration labeled command set).
+        } else if (try self.dispatchModules(id, conn, parsed, line) == .handled) {
+            return;
+        }
+
+        // Everything daemon-owned is a SerpentRegistry command (resolved above).
+        // The only remaining direct path is the registration-handshake processor
+        // (dispatch.zig command_table: PASS/NICK/USER/CAP/AUTHENTICATE/PING/QUIT)
+        // — those verbs must work both before and after registration, so they
+        // live in the lower layer rather than the post-registration registry.
+        var sink = QueueSink{ .conn = conn };
+        try processLine(conn, line, &sink);
+    }
+
+    const ModuleOutcome = enum { handled, not_found };
+
+    /// Consult the module spine — the comptime SerpentRegistry first, then any
+    /// loaded OroWasm control-plane plugin — for `parsed.command`. Emits the
+    /// command's replies (and any gate-failure numeric) to `conn`, returning
+    /// `.handled` when a spine owned the command (including a denied/disabled
+    /// gate) and `.not_found` when neither claimed it. Output routes through
+    /// `appendToConn`, so an active `reply_capture` diverts it for labeling.
+    fn dispatchModules(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        parsed: *const irc_line.LineView,
+        line: []const u8,
+    ) !ModuleOutcome {
         // SerpentRegistry module spine (strangler-fig): consult the comptime
-        // module registry first. A migrated command is handled here and returns;
-        // anything not yet migrated falls through to the legacy chain below.
+        // module registry first. A migrated command is handled here.
         {
             var core = module_core.Core{
                 .services = .{ .allocator = self.allocator, .config = &self.config },
@@ -6112,10 +6281,10 @@ pub const LinuxServer = struct {
                 .disabled_features = self.config.disabled_features,
             };
             switch (try module_manifest.Live.dispatchGated(&core, parsed.command, parsed.paramSlice(), caps)) {
-                .handled => return,
+                .handled => return .handled,
                 .too_few_params => {
                     try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{parsed.command}, "Not enough parameters");
-                    return;
+                    return .handled;
                 },
                 .denied => |reason| {
                     switch (reason) {
@@ -6123,11 +6292,11 @@ pub const LinuxServer = struct {
                         .needs_registered => try queueNumeric(conn, .ERR_NOTREGISTERED, &.{}, "You have not registered"),
                         .needs_ircx => try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{parsed.command}, "IRCX command requires ISIRCX"),
                     }
-                    return;
+                    return .handled;
                 },
                 .disabled => {
                     try queueNumeric(conn, .ERR_UNKNOWNCOMMAND, &.{parsed.command}, "Command disabled by configuration");
-                    return;
+                    return .handled;
                 },
                 .not_found => {},
             }
@@ -6151,27 +6320,20 @@ pub const LinuxServer = struct {
                 .now_ms = wasmNowCb,
             };
             switch (self.wasm.dispatch(parsed.command, parsed.paramSlice(), host)) {
-                .handled => return,
+                .handled => return .handled,
                 .denied => {
                     try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{parsed.command}, "Plugin lacks the required capability");
-                    return;
+                    return .handled;
                 },
                 .trap => {
                     try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{parsed.command}, "Plugin execution trapped");
-                    return;
+                    return .handled;
                 },
                 .not_found => {},
             }
         }
 
-        // Everything daemon-owned is now a SerpentRegistry command, resolved by
-        // the registry block at the top of this function. The only remaining
-        // direct path is the registration-handshake processor (dispatch.zig
-        // command_table: PASS/NICK/USER/CAP/AUTHENTICATE/PING/QUIT) — those
-        // verbs must work both before and after registration, so they live in
-        // the lower layer rather than the post-registration registry.
-        var sink = QueueSink{ .conn = conn };
-        try processLine(conn, line, &sink);
+        return .not_found;
     }
 
     /// Module-facing numeric reply: lets a SerpentRegistry module emit a numeric
@@ -23734,7 +23896,32 @@ fn restoreCloexec(fds: []const linux.fd_t) void {
     for (fds) |fd| _ = linux.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
 }
 
+/// Reframe a captured labeled command's plaintext replies under `label` and
+/// emit them on the wire (through the normal WS/TLS seam). A capture overflow,
+/// or framing that will not fit the scratch buffer, degrades to delivering the
+/// captured reply unwrapped rather than dropping it — only reachable when a
+/// single command emits more than one full inline buffer to the issuer.
+fn emitLabeledIssuer(conn: *ConnState, label: []const u8, capture: *const ReplyCapture) ServerError!void {
+    if (capture.overflowed) return appendToConn(conn, capture.captured());
+    var frame_buf: [default_reply_bytes]u8 = undefined;
+    var sink = FrameBufSink{ .buf = &frame_buf };
+    var it = CrlfReplyIterator{ .bytes = capture.captured() };
+    labeled_response.emitIterator(&sink, label, labeled_batch_ref, &it) catch {
+        return appendToConn(conn, capture.captured());
+    };
+    return appendToConn(conn, sink.written());
+}
+
 fn appendToConn(conn: *ConnState, bytes: []const u8) ServerError!void {
+    // labeled-response: divert this connection's own plaintext replies into the
+    // active capture buffer (before WS framing / TLS encryption) so the caller
+    // can reframe them under the command's `@label`. Other connections' buffers
+    // (channel fan-out to peers) are untouched — only the issuer's conn carries
+    // a capture, and only for the duration of one dispatch.
+    if (conn.reply_capture) |cap| {
+        cap.append(bytes);
+        return;
+    }
     // WebSocket clients: once upgraded, outbound IRC bytes are cut on CRLF
     // boundaries and wrapped one-line-per-text-frame before the TLS seam. The
     // HTTP 101/refusal responses themselves bypass this (phase != .open yet).
@@ -25155,6 +25342,107 @@ test "processLine rejects malformed input without writing" {
 
     try std.testing.expectError(error.EmbeddedLineBreak, processLine(&conn, "PING :abc\nWHOIS kain", &sink));
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+}
+
+test "labelTagValue extracts and unescapes the @label tag" {
+    var buf: [labeled_response.MAX_LABEL_LEN]u8 = undefined;
+    var with = irc_line.LineView{ .raw = "", .command = "WHOIS", .tags_raw = "time=x;label=ab\\sc\\:d" };
+    try std.testing.expectEqualStrings("ab c;d", labelTagValue(&with, &buf).?);
+    var none = irc_line.LineView{ .raw = "", .command = "WHOIS", .tags_raw = "time=x" };
+    try std.testing.expect(labelTagValue(&none, &buf) == null);
+    var empty = irc_line.LineView{ .raw = "", .command = "WHOIS", .tags_raw = "label=" };
+    try std.testing.expect(labelTagValue(&empty, &buf) == null);
+    var absent = irc_line.LineView{ .raw = "", .command = "WHOIS" };
+    try std.testing.expect(labelTagValue(&absent, &buf) == null);
+}
+
+test "ReplyCapture tracks overflow without faulting" {
+    var small: [8]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &small };
+    cap.append("hello");
+    try std.testing.expect(!cap.overflowed);
+    cap.append("world!!"); // 5 + 7 = 12 > 8 → truncates, flags overflow
+    try std.testing.expect(cap.overflowed);
+    try std.testing.expectEqual(@as(usize, 8), cap.captured().len);
+}
+
+test "emitLabeledIssuer: single captured line is tagged with the label" {
+    var conn = ConnState.init(-1);
+    var cb: [256]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(":orochi 351 me v :info\r\n");
+    try emitLabeledIssuer(&conn, "lbl1", &cap);
+    try std.testing.expectEqualStrings("@label=lbl1 :orochi 351 me v :info\r\n", conn.send_buf[0..conn.send_len]);
+}
+
+test "emitLabeledIssuer: multi-line response is a labeled BATCH" {
+    var conn = ConnState.init(-1);
+    var cb: [256]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(":orochi 311 me nick u h * :n\r\n");
+    cap.append(":orochi 318 me nick :End\r\n");
+    try emitLabeledIssuer(&conn, "w1", &cap);
+    const out = conn.send_buf[0..conn.send_len];
+    try expectContains(out, "@label=w1 BATCH +suzu-label labeled-response\r\n");
+    try expectContains(out, "@batch=suzu-label :orochi 311 me nick u h * :n\r\n");
+    try expectContains(out, "@batch=suzu-label :orochi 318 me nick :End\r\n");
+    try expectContains(out, "BATCH -suzu-label\r\n");
+}
+
+test "emitLabeledIssuer: a command that replies nothing yields a bare ACK" {
+    var conn = ConnState.init(-1);
+    var cb: [64]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    try emitLabeledIssuer(&conn, "pong7", &cap);
+    try std.testing.expectEqualStrings("@label=pong7 ACK\r\n", conn.send_buf[0..conn.send_len]);
+}
+
+test "emitLabeledIssuer: capture overflow delivers the reply unwrapped" {
+    var conn = ConnState.init(-1);
+    var cb: [16]u8 = undefined;
+    var cap = ReplyCapture{ .buf = &cb };
+    cap.append(":orochi 351 me v :a really long info line that overflows\r\n");
+    try std.testing.expect(cap.overflowed);
+    try emitLabeledIssuer(&conn, "x", &cap);
+    const out = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, out, "@label=") == null);
+    try std.testing.expectEqualStrings(cap.captured(), out);
+}
+
+test "threaded server: a labeled WHOIS is reframed under the @label via SerpentRegistry" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var c = LiveClient{ .fd = fd };
+
+    // Negotiate labeled-response, then register.
+    try writeAllFd(fd, "CAP REQ :labeled-response\r\n");
+    try recvUntil(&c, "ACK", 200);
+    try writeAllFd(fd, "NICK L\r\nUSER l 0 * :L\r\nCAP END\r\n");
+    try recvUntil(&c, " 001 L ", 200);
+
+    // A labeled WHOIS (multi-line numeric set) comes back as a labeled-response
+    // BATCH bracketed by the label — proving the SerpentRegistry command path
+    // (not just the registration-handshake path) is framed.
+    c.reset();
+    try writeAllFd(fd, "@label=zed WHOIS L\r\n");
+    try recvUntil(&c, "@label=zed BATCH +", 200);
+    try recvUntil(&c, "@batch=", 200);
+    try recvUntil(&c, "BATCH -", 200);
 }
 
 test "session-sync unit: two sessions same account both session-sync get the DM" {
