@@ -28,14 +28,25 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 
 ## IDENTIFY
 
-- Syntax: `IDENTIFY <account> <password>`
-- Description: Authenticates to an existing account and logs the session in. Performs derived oper elevation, tracks the session, delivers tegami, applies autojoin, and emits login side effects.
+- Syntax: `IDENTIFY <account> <password> [<2fa-code>]`
+- Description: Authenticates to an existing account and logs the session in. Performs derived oper elevation, tracks the session, delivers tegami, applies autojoin, and emits login side effects. When the account has TOTP two-factor auth active (see `TOTP`), a valid 6-digit code is required as the third parameter; a correct password with a missing or wrong code is a failed login (and counts against the brute-force throttle).
 - Privileges: Registered client.
-- Parameters: Account and password.
+- Parameters: Account, password, and — for 2FA accounts — the current TOTP code.
 - Replies: Server `NOTICE` confirming login plus account-notify/welcome side effects.
-- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, IRCv3 `FAIL IDENTIFY TEMPORARILY_UNAVAILABLE`.
-- Example: `IDENTIFY alice correct-horse`
+- Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, IRCv3 `FAIL IDENTIFY TEMPORARILY_UNAVAILABLE`, `FAIL IDENTIFY TOTP_REQUIRED` (2FA code missing/incorrect).
+- Example: `IDENTIFY alice correct-horse 492817`
 - Sources: `src/daemon/modules/accounts.zig:62`, `src/daemon/server.zig:8519`
+
+## TOTP
+
+- Syntax: `TOTP <ENROLL | CONFIRM <code> | DISABLE | STATUS>`
+- Description: Manages the logged-in account's TOTP (RFC 6238) two-factor authentication. `ENROLL` mints a 160-bit shared secret and returns it plus an `otpauth://` URI for an authenticator app (requires a TLS link — the secret must not cross plaintext). `CONFIRM <code>` activates the enrollment after verifying a code and durably saves the secret. `DISABLE` removes it. `STATUS` reports active/pending/disabled. Enabling or disabling 2FA revokes any existing SASL session token. Once active, every login path enforces the second factor: `IDENTIFY` requires the code; knowledge-factor SASL (PLAIN/SCRAM, over both IRCv3 `AUTHENTICATE` and IRCX `AUTH`) is refused with a pointer to use `IDENTIFY`. EXTERNAL (client cert) and OAUTHBEARER are not gated.
+- Privileges: Registered client logged in to an account.
+- Parameters: A subcommand; `CONFIRM` additionally takes the current 6-digit code.
+- Replies: Server `NOTICE` lines (secret + otpauth URI on `ENROLL`; status/confirmation otherwise).
+- Errors: IRCv3 `FAIL TOTP` with `ACCOUNT_REQUIRED`, `TEMPORARILY_UNAVAILABLE`, `INSECURE_TRANSPORT` (ENROLL off TLS), `ALREADY_ENROLLED`, `NEED_MORE_PARAMS`, `INVALID_CODE`, `NO_PENDING`, `INVALID_SUBCOMMAND`.
+- Example: `TOTP ENROLL` then `TOTP CONFIRM 492817`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleTotp`), `src/daemon/totp_auth.zig`
 
 ## LOGOUT
 
