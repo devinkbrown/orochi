@@ -127,6 +127,7 @@ const tracelog = @import("../substrate/trace.zig");
 const geoip = @import("../substrate/geoip.zig");
 const geo_services = @import("geo_services.zig");
 const rdns = @import("rdns.zig");
+const dnsbl_resolver = @import("dnsbl_resolver.zig");
 const news_sources = @import("../proto/news_sources.zig");
 const build_info = @import("build_info");
 const stats_report = @import("stats_report.zig");
@@ -1563,6 +1564,13 @@ pub const Config = struct {
     /// confirmed hostname becomes the cloak base (so hosts show a cloaked
     /// hostname rather than a cloaked IP). Null = reverse DNS disabled.
     rdns: ?*rdns.Resolver = null,
+    /// Background connect-time DNS blocklist resolver (owned by main). When set,
+    /// each non-loopback client IP is checked against the configured zones off
+    /// the hot path; a listed IP is enforced at registration. Null = disabled.
+    dnsbl: ?*dnsbl_resolver.Resolver = null,
+    /// DNSBL enforcement action: false = refuse the connection, true = add a
+    /// Warden ban for the listed IP (which also closes it). From `[dnsbl] action`.
+    dnsbl_ward: bool = false,
     /// Config file path + resolver for live REHASH. When set (by main), REHASH
     /// re-reads and re-parses this file and swaps in the new oper registry. Null
     /// = REHASH acknowledges without reloading (e.g. defaults-only boot, tests).
@@ -4047,6 +4055,12 @@ pub const LinuxServer = struct {
         if (self.config.rdns) |res| {
             res.request(addr);
         }
+        // Kick off the DNS blocklist check off the hot path too; the verdict is
+        // read at registration (enforceDnsbl), by which point the lookup has had
+        // the handshake window to resolve. Fail-open if it has not.
+        if (self.config.dnsbl) |bl| {
+            bl.request(addr);
+        }
         self.applyVisibleHost(conn);
     }
 
@@ -6112,6 +6126,10 @@ pub const LinuxServer = struct {
                 // enforced against the freshly registered client's facets,
                 // before oper elevation/welcome.
                 if (self.enforceWard(conn)) return;
+                // Connect-time DNS blocklist: refuse (or network-ban) a client
+                // whose IP is listed by a configured zone. Best-effort — a lookup
+                // not yet resolved by now lets the client through (fail-open).
+                if (self.enforceDnsbl(conn)) return;
                 if (try self.enforceServerAccess(conn)) return;
                 // Persistent +z GAG: a client reconnecting from a gagged IP is
                 // re-flagged so its messages stay silenced and +z displays.
@@ -14511,6 +14529,52 @@ pub const LinuxServer = struct {
         const el = std.fmt.bufPrint(&eb, ":{s} ERROR :Closing Link: {s} (Banned: {s})\r\n", .{ protocol_inventory.currentServerName(), conn.session.displayName(), reason }) catch null;
         if (el) |line| appendToConn(conn, line) catch {};
         conn.close_reason = "Banned (WARD)";
+        conn.closing = true;
+        self.armSendIfNeeded(conn) catch {};
+        return true;
+    }
+
+    /// Connect-time DNS blocklist enforcement, run at registration. Returns true
+    /// when it refused (closed) the connection. Reads the cached verdict for the
+    /// client's IP (requested at accept); a not-yet-resolved OR not-listed IP
+    /// passes (fail-open). Operators and loopback (never requested) are exempt.
+    fn enforceDnsbl(self: *LinuxServer, conn: *ConnState) bool {
+        const bl = self.config.dnsbl orelse return false;
+        if (conn.session.isOper()) return false;
+        const addr = conn.peer_addr orelse return false;
+        const verdict = bl.lookup(addr) orelse return false; // pending/unknown → pass
+        if (!verdict.listed) return false;
+
+        if (self.config.dnsbl_ward) {
+            // action = ward: record a node-scope Warden ban for the IP so the
+            // block persists across this IP's reconnects, then close this one.
+            const ip = conn.session.realHost();
+            if (ip.len != 0) {
+                self.warden.add(.{
+                    .match = .address,
+                    .pattern = ip,
+                    .scope = .node,
+                    .action = .expel,
+                    .reason = "DNSBL listed",
+                    .set_by = "dnsbl",
+                    .created_ms = self.nowMs(),
+                    .expires_ms = 0,
+                }) catch {};
+            }
+        }
+        return self.closeDnsbl(conn, verdict.code);
+    }
+
+    /// Emit a DNSBL close ERROR and mark the connection for teardown.
+    fn closeDnsbl(self: *LinuxServer, conn: *ConnState, code: u8) bool {
+        var eb: [256]u8 = undefined;
+        const el = std.fmt.bufPrint(
+            &eb,
+            ":{s} ERROR :Closing Link: {s} (Connection refused: your address is listed on a DNS blocklist [{d}])\r\n",
+            .{ protocol_inventory.currentServerName(), conn.session.displayName(), code },
+        ) catch null;
+        if (el) |line| appendToConn(conn, line) catch {};
+        conn.close_reason = "DNSBL listed";
         conn.closing = true;
         self.armSendIfNeeded(conn) catch {};
         return true;
@@ -25443,6 +25507,33 @@ test "threaded server: a labeled WHOIS is reframed under the @label via SerpentR
     try recvUntil(&c, "@label=zed BATCH +", 200);
     try recvUntil(&c, "@batch=", 200);
     try recvUntil(&c, "BATCH -", 200);
+}
+
+test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "user", null);
+    const conn = server.connFor(id).?;
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+
+    // No resolver configured → never refuses.
+    try std.testing.expect(!server.enforceDnsbl(conn));
+
+    // Resolver configured, but the IP has no stored verdict yet (pending/absent):
+    // a blocklist must FAIL OPEN — never refuse a client we have not confirmed
+    // as listed.
+    var res = try dnsbl_resolver.Resolver.init(std.testing.allocator, &.{"zen.example.org"});
+    defer res.deinit();
+    server.config.dnsbl = &res;
+    try std.testing.expect(!server.enforceDnsbl(conn));
+
+    // Operators are exempt even if a verdict existed.
+    conn.session.setOperGrant(oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
+    try std.testing.expect(!server.enforceDnsbl(conn));
 }
 
 test "session-sync unit: two sessions same account both session-sync get the DM" {

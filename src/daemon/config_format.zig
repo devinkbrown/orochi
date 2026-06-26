@@ -64,6 +64,18 @@ pub const Config = struct {
     tls: Tls = .{},
     acme: Acme = .{},
     sts: Sts = .{},
+    dnsbl: Dnsbl = .{},
+
+    /// `[dnsbl]` connect-time DNS blocklist. When enabled with one or more zones,
+    /// each non-loopback client IP is checked against the zones off the hot path;
+    /// a listed IP is refused (or network-banned) at registration.
+    pub const Dnsbl = struct {
+        enabled: bool = false,
+        /// Blocklist zones, e.g. ["zen.spamhaus.org", "dnsbl.dronebl.org"].
+        zones: []const []const u8 = &.{},
+        /// false = refuse the connection; true = add a Warden ban for the IP.
+        ward: bool = false,
+    };
 
     pub const Node = struct {
         id: u64 = 0,
@@ -522,6 +534,7 @@ pub const Config = struct {
         allocator.free(self.mesh.realm);
         freeStringList(allocator, self.mesh.trust_roots);
         freeStringList(allocator, self.mesh.connect);
+        freeStringList(allocator, self.dnsbl.zones);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
@@ -631,6 +644,14 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         cfg.mesh.connect = try ownStringArray(allocator, resolver, arr);
     }
     if (doc.getBool("mesh.require_secured")) |b| cfg.mesh.require_secured = b;
+
+    // [dnsbl]
+    if (doc.getBool("dnsbl.enabled")) |b| cfg.dnsbl.enabled = b;
+    if (doc.getArray("dnsbl.zones")) |arr| {
+        freeStringList(allocator, cfg.dnsbl.zones);
+        cfg.dnsbl.zones = try ownStringArray(allocator, resolver, arr);
+    }
+    if (doc.getString("dnsbl.action")) |a| cfg.dnsbl.ward = std.ascii.eqlIgnoreCase(a, "ward");
 
     // [limits]
     cfg.limits.backlog = @intCast(try uintField(doc, "limits.backlog", cfg.limits.backlog, 1, 32767));
@@ -1074,6 +1095,37 @@ test "parseToml: [[opers]] array-of-tables + trust_roots list" {
     try testing.expectEqualStrings("netadmin", cfg.opers[0].class);
     try testing.expectEqualStrings("helper", cfg.opers[1].account);
     try testing.expectEqualStrings("", cfg.opers[1].class);
+}
+
+test "parseToml: [dnsbl] enabled + zones + action project onto Config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[dnsbl]
+        \\enabled = true
+        \\zones = ["zen.spamhaus.org", "dnsbl.dronebl.org"]
+        \\action = "ward"
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.dnsbl.enabled);
+    try testing.expectEqual(@as(usize, 2), cfg.dnsbl.zones.len);
+    try testing.expectEqualStrings("zen.spamhaus.org", cfg.dnsbl.zones[0]);
+    try testing.expectEqualStrings("dnsbl.dronebl.org", cfg.dnsbl.zones[1]);
+    try testing.expect(cfg.dnsbl.ward); // action = "ward"
+}
+
+test "parseToml: [dnsbl] defaults are disabled, no zones, refuse" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(!cfg.dnsbl.enabled);
+    try testing.expectEqual(@as(usize, 0), cfg.dnsbl.zones.len);
+    try testing.expect(!cfg.dnsbl.ward);
 }
 
 test "parseToml: listen proxy protocol and SASL enabled gate project" {

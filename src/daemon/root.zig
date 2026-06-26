@@ -35,6 +35,7 @@ pub const cross_shard_smoke = @import("cross_shard_smoke.zig");
 pub const deliver_handle = @import("deliver_handle.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const dnsbl = @import("dnsbl.zig");
+pub const dnsbl_resolver = @import("dnsbl_resolver.zig");
 pub const dualstack_udp = @import("dualstack_udp.zig");
 pub const event_spine = @import("event_spine.zig");
 pub const flood_guard = @import("flood_guard.zig");
@@ -160,6 +161,7 @@ test {
     _ = deliver_handle;
     _ = dispatch;
     _ = dnsbl;
+    _ = dnsbl_resolver;
     _ = dualstack_udp;
     _ = event_spine;
     _ = flood_guard;

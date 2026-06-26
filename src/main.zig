@@ -385,6 +385,22 @@ pub fn main(init: std.process.Init) !void {
         srv_cfg.rdns = r;
     }
 
+    // Connect-time DNS blocklist: built only when `[dnsbl]` is enabled with at
+    // least one zone. Each client IP is checked off the accept path and a listed
+    // IP is refused (or network-banned) at registration. Inert otherwise.
+    var dnsbl_res: ?orochi.daemon.dnsbl_resolver.Resolver = null;
+    defer if (dnsbl_res) |*r| r.deinit();
+    if (held) |h| {
+        if (h.parsed.dnsbl.enabled and h.parsed.dnsbl.zones.len != 0) {
+            dnsbl_res = orochi.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch null;
+            if (dnsbl_res) |*r| {
+                r.start();
+                srv_cfg.dnsbl = r;
+                srv_cfg.dnsbl_ward = h.parsed.dnsbl.ward;
+            }
+        }
+    }
+
     // Implicit-TLS client listener: when `[tls] enabled`, load the configured
     // cert/key (or mint a self-signed bootstrap leaf) and stand up the TLS
     // listener. The chain bytes + signing key live for the server's lifetime
