@@ -2521,21 +2521,19 @@ pub const LinuxServer = struct {
         return current_reactor orelse &self.reactors[0];
     }
 
-    /// Effective worker-reactor count. CLAMPED TO 1 for now, regardless of
-    /// `[limits].num_shards`: the in-memory stores shared across reactors
-    /// (account_verifies, warden, totp, sessions, …) have no internal locks yet,
-    /// so allocating multiple reactors and spawning a worker per shard would race
-    /// them. `num_shards` > 1 is accepted and carried in the config but is not yet
-    /// honored — running more than one reactor is unsafe until those stores get
-    /// internal synchronization and RCU world adoption lands (see
-    /// docs/planning/24-multithreading.md). Restore the `[1, max_shards]` clamp
-    /// (commented below) only once that work is complete.
+    /// Effective worker-reactor count, clamped to `[1, max_shards]`. Multi-reactor
+    /// is correct under the multithreading "Phase B" coarse lock: `onCompletion`
+    /// takes `world.lockWrite` once around the WHOLE completion, so every reactor
+    /// serializes all shared-state reads/mutations + the delivery they drive (the
+    /// per-reactor clients table + send buffers are reactor-local and need no
+    /// lock). Reactors still parallelize the io_uring I/O; command processing
+    /// serializes. `[limits].num_shards` defaults to 1 (single reactor); operators
+    /// opt into more. Finer-grained (Phase C / RCU lock-free reads) is future work
+    /// (docs/planning/24-multithreading.md) — it improves throughput, not safety.
     fn clampShards(config: Config) u12 {
-        // const requested: usize = if (config.num_shards == 0) 1 else config.num_shards;
-        // const capped = @min(requested, shard_mod.max_shards);
-        // return @intCast(@max(@as(usize, 1), capped));
-        _ = config;
-        return 1;
+        const requested: usize = if (config.num_shards == 0) 1 else config.num_shards;
+        const capped = @min(requested, shard_mod.max_shards);
+        return @intCast(@max(@as(usize, 1), capped));
     }
 
     /// Cert presence is the "TLS configured" signal (main.zig only supplies a
@@ -25759,6 +25757,67 @@ test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass
     // Operators are exempt even if a verdict existed.
     conn.session.setOperGrant(oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
     try std.testing.expect(!server.enforceDnsbl(conn));
+}
+
+test "threaded server: multi-reactor (num_shards=4) survives concurrent clients" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 4 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    // The clamp must actually honor num_shards now (coarse-lock Phase B).
+    try std.testing.expectEqual(@as(usize, 4), server.reactors.len);
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        // Nudge every reactor (SO_REUSEPORT spreads these) so each observes the stop.
+        var k: usize = 0;
+        while (k < 8) : (k += 1) {
+            if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        }
+        thr.join();
+    }
+
+    const Worker = struct {
+        fn client(p: u16, idx: usize, ok: *std.atomic.Value(u32)) void {
+            const fd = connectLoopback(p) catch return;
+            defer closeFd(fd);
+            var c = LiveClient{ .fd = fd };
+            var nbuf: [24]u8 = undefined;
+            const nick = std.fmt.bufPrint(&nbuf, "stress{d}", .{idx}) catch return;
+            var reg: [96]u8 = undefined;
+            const regl = std.fmt.bufPrint(&reg, "NICK {s}\r\nUSER {s} 0 * :S\r\n", .{ nick, nick }) catch return;
+            writeAllFd(fd, regl) catch return;
+            recvUntil(&c, " 001 ", 3000) catch return;
+            // Concurrent world mutation: every client joins the SAME channel, so the
+            // 4 reactors race membership inserts + cross-shard JOIN fan-out, all
+            // serialized under the single world.lockWrite. A race corrupts the
+            // roster (NAMES never ends) or crashes; a deadlock starves the reply.
+            writeAllFd(fd, "JOIN #stress\r\n") catch return;
+            recvUntil(&c, " 366 ", 3000) catch return; // RPL_ENDOFNAMES
+            var pm: [96]u8 = undefined;
+            const pml = std.fmt.bufPrint(&pm, "PRIVMSG #stress :hi from {s}\r\n", .{nick}) catch return;
+            writeAllFd(fd, pml) catch return;
+            _ = ok.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var ok = std.atomic.Value(u32).init(0);
+    var threads: [16]std.Thread = undefined;
+    var spawned: usize = 0;
+    for (&threads, 0..) |*t, i| {
+        t.* = std.Thread.spawn(.{}, Worker.client, .{ port, i, &ok }) catch break;
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+
+    // Every client completed register + join-same-channel + send across 4
+    // concurrent reactors without the server deadlocking or corrupting state.
+    try std.testing.expectEqual(@as(u32, @intCast(spawned)), ok.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 16), spawned);
 }
 
 test "TOTP enrollment lifecycle: ENROLL -> CONFIRM persists, lazy-reload, DISABLE" {

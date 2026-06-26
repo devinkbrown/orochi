@@ -527,23 +527,24 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Sharded reactor pool across cores (SO_REUSEPORT clients; S2S pinned to
-    // reactor 0). Default on: one reactor per core, capped at 4. Override via
-    // [server] num_shards (set >1 to pin an exact count).
+    // reactor 0). OPT-IN: default 1 (single in-line reactor). Set [limits]
+    // num_shards > 1 to run that many reactor threads. Multi-reactor is correct
+    // under the Phase-B coarse lock (`onCompletion` brackets every completion in
+    // world.lockWrite, serializing all shared-state work; the per-reactor clients
+    // table + send buffers are reactor-local) and is exercised by the
+    // "multi-reactor (num_shards=4) survives concurrent clients" test. It stays
+    // opt-in rather than CPU-defaulted because the live mesh deployment should
+    // adopt it deliberately, and under the coarse lock the win is parallel I/O,
+    // not parallel command processing.
     //
-    // The "flap" that kept this off was THREE bugs, now all fixed: (1) the
+    // The earlier multi-reactor "flap" was THREE bugs, all fixed: (1) the
     // reciprocal-dial collision/redial loop; (2) accepted sockets not being
-    // CLOEXEC, so every USR2 deploy stranded the mesh (d06b8f4); and (3) — the
-    // one that actually presented as a live "flap" — LUSERS/MAP counted peers
-    // and users from the QUERYING shard's own connection set. S2S links live
-    // only on reactor 0, so a LUSERS answered by shards 1..N reported "1 server"
-    // (and a fraction of the users); a reconnecting probe (SO_REUSEPORT spreads
-    // it across shards) sampled that as 1<->2 oscillation. The mesh link was
-    // stable the whole time. Fixed: servers come from a reactor-0-published
+    // CLOEXEC, so every USR2 deploy stranded the mesh (d06b8f4); and (3) the one
+    // that presented as a live "flap" — LUSERS/MAP counted peers + users from the
+    // QUERYING shard's own connection set (S2S links live only on reactor 0, so a
+    // LUSERS answered by shards 1..N under-reported, and a reconnecting probe
+    // sampled that as 1<->2 oscillation). Fixed: servers come from a reactor-0
     // atomic, users from the shared world nick registry.
-    if (srv_cfg.num_shards <= 1) {
-        const cpus = std.Thread.getCpuCount() catch 1;
-        srv_cfg.num_shards = @intCast(@max(@as(usize, 1), @min(cpus, 4)));
-    }
 
     const Server = orochi.daemon.server.Server;
     var srv = Server.init(allocator, srv_cfg) catch |err| {

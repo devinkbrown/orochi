@@ -279,7 +279,9 @@ enabled = false
 [limits]
 backlog = 128          # listen() backlog (1..32767)
 max_clients = 1024     # max concurrent clients (1..32767)
-num_shards = 1         # worker reactor shards (1..max_shards)
+num_shards = 1         # worker reactor shards (1..max_shards). 1 = single reactor
+                       # (default). >1 runs that many reactor threads (parallel
+                       # io_uring I/O; command processing serializes under one lock).
 # Connection timeouts (duration strings, e.g. "30s", "2m"):
 handshake_timeout = "30s"   # registration must complete within this
 ping_interval = "2m"        # idle interval before a PING is sent
