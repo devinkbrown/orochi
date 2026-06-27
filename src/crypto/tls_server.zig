@@ -3075,8 +3075,10 @@ fn gnutlsRsaLeafHandshake(priority: ?[]const u8, verbose: bool) !bool {
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-    }) catch |err| {
-        std.debug.print("gnutls interop: gnutls-cli unavailable ({t}); skipping\n", .{err});
+    }) catch {
+        // gnutls-cli not installed (CI/sandbox): skip silently. A stray stderr
+        // line here would make `zig build test` print a spurious "failed command"
+        // (see daemon/dlog.zig); the skip is already surfaced by the test runner.
         return error.SkipZigTest;
     };
 
