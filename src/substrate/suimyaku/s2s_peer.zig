@@ -2480,6 +2480,119 @@ test "signing peers round-trip a signed MEMBERSHIP frame" {
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 
+/// A local resolver stub for the account-aware collision tests: it reports one
+/// held nick with a fixed account and last-claim HLC.
+const ReclaimResolverStub = struct {
+    held_nick: []const u8,
+    acct: []const u8,
+    hlc: u64,
+    fn isHeld(ctx: *anyopaque, nick: []const u8) bool {
+        const self: *ReclaimResolverStub = @ptrCast(@alignCast(ctx));
+        return std.ascii.eqlIgnoreCase(self.held_nick, nick);
+    }
+    fn acctOf(ctx: *anyopaque, nick: []const u8) ?[]const u8 {
+        const self: *ReclaimResolverStub = @ptrCast(@alignCast(ctx));
+        if (!std.ascii.eqlIgnoreCase(self.held_nick, nick)) return null;
+        return if (self.acct.len != 0) self.acct else null;
+    }
+    fn hlcOf(ctx: *anyopaque, nick: []const u8) u64 {
+        const self: *ReclaimResolverStub = @ptrCast(@alignCast(ctx));
+        if (!std.ascii.eqlIgnoreCase(self.held_nick, nick)) return 0;
+        return self.hlc;
+    }
+    fn resolver(self: *ReclaimResolverStub) LocalNickResolver {
+        return .{ .ctx = self, .held_fn = isHeld, .account_fn = acctOf, .hlc_fn = hlcOf };
+    }
+};
+
+test "a strictly-newer same-account MEMBERSHIP surfaces a ghost_reclaim for the stale local session" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x51);
+    const kp_b = try signingKeyFor(0x52);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5EE);
+
+    // b holds "kain" locally, logged in to account "kain", with a STALE claim (50).
+    var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 50 };
+    b.routes.setLocalNickResolver(stub.resolver());
+
+    // a (the live node) announces kain on the SAME account with a NEWER claim (200).
+    try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x5EF);
+
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.ghost_reclaim, changes[0].kind);
+    try std.testing.expectEqualStrings("kain", changes[0].nick);
+    try std.testing.expectEqualStrings("kain", changes[0].account); // carried for the daemon's re-check
+}
+
+test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (no reclaim)" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+
+    const kp_a = try signingKeyFor(0x61);
+    const kp_b = try signingKeyFor(0x62);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EE);
+
+    // b's local "kain" is the LIVE one (newer claim, 300) than a's claim (200).
+    var stub = ReclaimResolverStub{ .held_nick = "kain", .acct = "kain", .hlc = 300 };
+    b.routes.setLocalNickResolver(stub.resolver());
+
+    try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EF);
+
+    // The remote duplicate is dropped (local_same_account): no delta, no reclaim,
+    // and crucially no UID rename of the live local user.
+    const changes = try b.takeMembershipChanges();
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+}
+
 test "signing peers round-trip a signed KILL frame" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
