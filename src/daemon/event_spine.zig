@@ -148,12 +148,18 @@ pub const IrcxEventType = enum(u3) {
     channel,
     member,
     user,
+    /// In-channel real-time media (voice/video) presence + state: a call
+    /// participant joins/leaves/mutes/speaks. Channel-scoped like CHANNEL/MEMBER;
+    /// unlike them it is subscribable by ordinary (non-oper) clients for channels
+    /// they are in, since it is the call-presence feed the chat client renders.
+    media,
 
     pub fn wireName(self: IrcxEventType) []const u8 {
         return switch (self) {
             .channel => "CHANNEL",
             .member => "MEMBER",
             .user => "USER",
+            .media => "MEDIA",
         };
     }
 
@@ -183,7 +189,7 @@ pub const IrcxEventType = enum(u3) {
     }
 };
 
-pub const ircx_event_types = [_]IrcxEventType{ .channel, .member, .user };
+pub const ircx_event_types = [_]IrcxEventType{ .channel, .member, .user, .media };
 
 pub const IrcxEventMask = struct {
     bits: u8 = 0,

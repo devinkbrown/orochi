@@ -3374,6 +3374,8 @@ pub const LinuxServer = struct {
                         // type-routing key (its leading TYPE token), so the
                         // receiving shard classifies exactly as the origin shard.
                         if (!sessionWantsEvent(&c.session, category, bytes, subject)) continue;
+                        // MEDIA events stay member-scoped on this shard too.
+                        if (!self.mediaEventAllowed(entry.id, &c.session, bytes)) continue;
                         var line_buf: [default_reply_bytes]u8 = undefined;
                         const line = event_spine.renderEvent(origin, c.session.displayName(), bytes, &line_buf) catch continue;
                         appendToConn(c, line) catch continue;
@@ -14337,16 +14339,22 @@ pub const LinuxServer = struct {
     /// per-type subject masks; delivery maps those IRCX types onto Event Spine
     /// categories while replies stay on the IRCX numeric surface.
     pub fn handleEvent(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        if (!conn.session.isOper()) {
-            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT is for operators");
-            return;
-        }
-        if (!self.requirePriv(conn, .event_subscribe)) return;
         const params = parsed.paramSlice();
+        const is_oper = conn.session.isOper();
+        // Operators retain the full Event Spine command (gated by the
+        // `event_subscribe` privilege). Ordinary clients may use ONLY the IRCX
+        // subscription subcommands (LIST/ADD/CHANGE/DELETE/CLEAR), and ONLY for the
+        // channel-scoped MEDIA type — the call-presence feed for the channels they
+        // are in. BROADCAST and OBSERVE stay operator-only.
+        if (is_oper and !self.requirePriv(conn, .event_subscribe)) return;
         // EVENT BROADCAST :<message> — send an oper announce (the former WALLOPS,
         // now folded into the Event Spine): delivered as a chatsvc `:<srv> EVENT
         // <oper> <message>` line to every announce-subscribed operator.
         if (params.len > 0 and std.ascii.eqlIgnoreCase(params[0], "BROADCAST")) {
+            if (!is_oper) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT BROADCAST is for operators");
+                return;
+            }
             if (params.len < 2 or params[1].len == 0) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
                 return;
@@ -14364,6 +14372,10 @@ pub const LinuxServer = struct {
         // of matching client lifecycle events (with real hosts); subscribing also
         // emits an immediate snapshot of the currently-matching population.
         if (params.len > 0 and std.ascii.eqlIgnoreCase(params[0], "OBSERVE")) {
+            if (!is_oper) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT OBSERVE is for operators");
+                return;
+            }
             try self.handleObserve(conn, params);
             return;
         }
@@ -14399,6 +14411,10 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
                 return;
             };
+            if (!is_oper and typ != .media) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+                return;
+            }
             if (conn.session.subscribesToIrcxEvent(typ)) {
                 try queueNumeric(conn, .ERR_EVENTDUP, &.{params[1]}, "Event already subscribed");
                 return;
@@ -14424,6 +14440,10 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
                 return;
             };
+            if (!is_oper and typ != .media) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+                return;
+            }
             if (!conn.session.subscribesToIrcxEvent(typ)) {
                 try queueNumeric(conn, .ERR_EVENTMIS, &.{params[1]}, "Not subscribed to event");
                 return;
@@ -14446,6 +14466,10 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
                 return;
             };
+            if (!is_oper and typ != .media) {
+                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+                return;
+            }
             if (!conn.session.clearIrcxEventSubscription(typ)) {
                 try queueNumeric(conn, .ERR_EVENTMIS, &.{params[1]}, "Not subscribed to event");
                 return;
@@ -14473,7 +14497,7 @@ pub const LinuxServer = struct {
         }
 
         var notice_buf: [256]u8 = undefined;
-        const notice = std.fmt.bufPrint(&notice_buf, "Unknown EVENT subcommand '{s}'. Usage: EVENT ADD|CHANGE|DELETE|CLEAR|LIST <CHANNEL|MEMBER|USER> [mask]", .{params[0]}) catch "Unknown EVENT subcommand";
+        const notice = std.fmt.bufPrint(&notice_buf, "Unknown EVENT subcommand '{s}'. Usage: EVENT ADD|CHANGE|DELETE|CLEAR|LIST <CHANNEL|MEMBER|USER|MEDIA> [mask]", .{params[0]}) catch "Unknown EVENT subcommand";
         try self.noticeTo(conn, notice);
     }
 
@@ -14520,6 +14544,44 @@ pub const LinuxServer = struct {
         else
             std.fmt.bufPrint(&msg_buf, "MEMBER {s} {s} {s}", .{ action, channel, nick }) catch return error.OutputTooSmall;
         try self.publishOperEventSubject(.oper_action, .notice, message, channel);
+    }
+
+    /// Publish a MEDIA (voice/video) presence/state transition as a first-class
+    /// IRCX EVENT: `"MEDIA <action> <channel> <nick> [detail]"`. Routes through the
+    /// Event Spine — local subscribers across all shards + every mesh peer — so
+    /// call presence converges network-wide (the old local-only `NOTE MEDIA`
+    /// broadcast did not). Subject is the channel so MEDIA subscribers' channel-glob
+    /// masks match; delivery to a NON-oper additionally requires channel membership
+    /// (see `mediaEventAllowed`), preserving the member-only visibility the NOTE had.
+    fn publishMediaEvent(self: *LinuxServer, action: []const u8, channel: []const u8, nick: []const u8, detail: []const u8) !void {
+        var msg_buf: [512]u8 = undefined;
+        const message = if (detail.len != 0)
+            std.fmt.bufPrint(&msg_buf, "MEDIA {s} {s} {s} {s}", .{ action, channel, nick, detail }) catch return error.OutputTooSmall
+        else
+            std.fmt.bufPrint(&msg_buf, "MEDIA {s} {s} {s}", .{ action, channel, nick }) catch return error.OutputTooSmall;
+        try self.publishOperEventSubject(.service, .notice, message, channel);
+    }
+
+    /// The channel of a `"MEDIA <action> <channel> …"` event body (the 3rd token),
+    /// or null if the body is not a well-formed media event.
+    fn mediaEventChannel(message: []const u8) ?[]const u8 {
+        var it = std.mem.tokenizeScalar(u8, message, ' ');
+        _ = it.next() orelse return null; // "MEDIA"
+        _ = it.next() orelse return null; // action
+        return it.next(); // channel
+    }
+
+    /// Whether `message` may be delivered to the recipient identified by `id` /
+    /// `session`. MEDIA events are channel-scoped call presence: a non-oper must be
+    /// a member of the event's channel to receive it (mirrors the old member-only
+    /// NOTE MEDIA broadcast, so a non-member can't snoop calls in a channel they are
+    /// not in — including a +s/private channel). Every non-media event, and every
+    /// oper, passes unconditionally.
+    fn mediaEventAllowed(self: *LinuxServer, id: client_model.ClientId, session: *const dispatch.ClientSession, message: []const u8) bool {
+        if (event_spine.IrcxEventType.fromMessage(message) != .media) return true;
+        if (session.isOper()) return true;
+        const chan = mediaEventChannel(message) orelse return false;
+        return self.world.isMember(chan, worldIdFromClient(id));
     }
 
     fn userEventSubject(conn: *const ConnState, storage: []u8) ServerError![]const u8 {
@@ -20961,10 +21023,9 @@ pub const LinuxServer = struct {
             }
             const text = parsed.paramSlice()[2];
             _ = self.transcript.push(channel, nick, text, platform.realtimeMillis()) catch {}; // retention is best-effort
-            // Live fan-out (text may contain spaces, so use a trailing `:` param).
-            var buf: [default_reply_bytes]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} CAPTION {s} :{s}\r\n", .{ self.serverName(), channel, nick, text }) catch return;
-            try self.broadcastChannel(channel, line, null);
+            // Live fan-out via the MEDIA event plane (text is the trailing detail,
+            // so spaces are preserved as the rest of the event body).
+            try self.publishMediaEvent("CAPTION", channel, nick, text);
             return;
         }
         if (std.ascii.eqlIgnoreCase(sub, "TRANSCRIPT")) {
@@ -21075,16 +21136,14 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Broadcast a `:server NOTE MEDIA <#chan> <verb> <nick> [kind]` presence
-    /// event to every member of `channel` (including the actor).
+    /// Surface a media (voice/video) presence/state transition through the IRCX
+    /// EVENT plane: `MEDIA <verb> <#chan> <nick> [kind]`, delivered as
+    /// `:server EVENT <member> MEDIA …` to MEDIA-subscribed members across all
+    /// shards AND every mesh peer (call presence now converges network-wide). The
+    /// old local-only `NOTE MEDIA` broadcast is gone; clients consume EVENT MEDIA.
     fn broadcastMediaEvent(self: *LinuxServer, channel: []const u8, verb: []const u8, nick: []const u8, kind: []const u8) !void {
         if (self.mediaPresencePrivate(nick)) return;
-        var buf: [default_reply_bytes]u8 = undefined;
-        const line = if (kind.len != 0)
-            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s} {s}\r\n", .{ self.serverName(), channel, verb, nick, kind }) catch return
-        else
-            std.fmt.bufPrint(&buf, ":{s} NOTE MEDIA {s} {s} {s}\r\n", .{ self.serverName(), channel, verb, nick }) catch return;
-        try self.broadcastChannel(channel, line, null);
+        try self.publishMediaEvent(verb, channel, nick, kind);
     }
 
     /// Ingest one binary-WebSocket media datagram from a registered call
@@ -22087,6 +22146,9 @@ pub const LinuxServer = struct {
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
             if (!sessionWantsEvent(&entry.value.session, category, message, subject)) continue;
+            // MEDIA events are member-scoped: a non-oper only sees call presence for
+            // channels they are in (no snooping calls in channels they've not joined).
+            if (!self.mediaEventAllowed(entry.id, &entry.value.session, message)) continue;
             var line_buf: [default_reply_bytes]u8 = undefined;
             const line = event_spine.renderEvent(origin_server, entry.value.session.displayName(), message, &line_buf) catch continue;
             self.deliver(entry.id, line) catch continue;
@@ -34133,8 +34195,17 @@ test "threaded server: IRCX EVENT subscription numerics match Ophion" {
     try recvUntil(&b, " 001 B ", 200);
     try writeAllFd(fd_b, "IRCX\r\n");
     try recvUntil(&b, " 800 B 1 0 ", 200);
-    try writeAllFd(fd_b, "EVENT LIST\r\n");
+    // A non-oper may NOT subscribe to operator event types (CHANNEL/MEMBER/USER)
+    // nor BROADCAST/OBSERVE …
+    try writeAllFd(fd_b, "EVENT ADD CHANNEL #x*\r\n");
     try recvUntil(&b, " 481 ", 200);
+    b.reset();
+    try writeAllFd(fd_b, "EVENT BROADCAST :nope\r\n");
+    try recvUntil(&b, " 481 ", 200);
+    // … but MAY subscribe to MEDIA — the channel call-presence feed.
+    b.reset();
+    try writeAllFd(fd_b, "EVENT ADD MEDIA #root\r\n");
+    try recvUntil(&b, " 806 B MEDIA #root :Event added", 200);
 
     // OPER status reflects +o in the user mode query (RPL_UMODEIS 221).
     a.reset();
