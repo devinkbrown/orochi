@@ -11,6 +11,7 @@
 //! REHASH uses.
 
 const std = @import("std");
+const dlog = @import("dlog.zig");
 const linux = std.os.linux;
 
 const acme_cli = @import("acme_cli.zig");
@@ -65,10 +66,10 @@ pub const Service = struct {
         if (self.thread != null) return;
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, worker, .{self}) catch |err| {
-            std.debug.print("orochi: acme scheduler start failed ({s}); renewal disabled\n", .{@errorName(err)});
+            dlog.log("orochi: acme scheduler start failed ({s}); renewal disabled\n", .{@errorName(err)});
             return;
         };
-        std.debug.print("orochi: acme renewal scheduler enabled (interval {d}ms, threshold {d}d)\n", .{
+        dlog.log("orochi: acme renewal scheduler enabled (interval {d}ms, threshold {d}d)\n", .{
             self.acme.check_interval_ms,
             self.acme.renew_before_days,
         });
@@ -91,45 +92,45 @@ pub const Service = struct {
 
     fn checkOnce(self: *Service) void {
         const domain = self.acme.domain orelse {
-            std.debug.print("orochi: acme renewal skipped: [acme].domain is not configured\n", .{});
+            dlog.log("orochi: acme renewal skipped: [acme].domain is not configured\n", .{});
             return;
         };
         if (domain.len == 0) {
-            std.debug.print("orochi: acme renewal skipped: [acme].domain is empty\n", .{});
+            dlog.log("orochi: acme renewal skipped: [acme].domain is empty\n", .{});
             return;
         }
         const cert_path = self.tls.cert_path orelse {
-            std.debug.print("orochi: acme renewal skipped: [tls].cert_path is required\n", .{});
+            dlog.log("orochi: acme renewal skipped: [tls].cert_path is required\n", .{});
             return;
         };
         const key_path = self.tls.key_path orelse {
-            std.debug.print("orochi: acme renewal skipped: [tls].key_path is required\n", .{});
+            dlog.log("orochi: acme renewal skipped: [tls].key_path is required\n", .{});
             return;
         };
 
         const now = @divTrunc(platform.realtimeMillis(), 1000);
         const not_after = certFileLeafNotAfterUnix(self.allocator, self.io, cert_path) catch |err| {
-            std.debug.print("orochi: acme renewal skipped: cannot read TLS cert file {s} ({s})\n", .{ cert_path, @errorName(err) });
+            dlog.log("orochi: acme renewal skipped: cannot read TLS cert file {s} ({s})\n", .{ cert_path, @errorName(err) });
             return;
         };
         const remaining_days: i64 = if (not_after > now) @divTrunc(not_after - now, seconds_per_day) else 0;
         if (!shouldRenew(not_after, now, self.acme.renew_before_days)) {
-            std.debug.print("orochi: acme renewal not due for {s}: leaf expires in {d}d\n", .{ domain, remaining_days });
+            dlog.log("orochi: acme renewal not due for {s}: leaf expires in {d}d\n", .{ domain, remaining_days });
             return;
         }
 
-        std.debug.print("orochi: acme renewal due for {s}: leaf expires in {d}d\n", .{ domain, remaining_days });
+        dlog.log("orochi: acme renewal due for {s}: leaf expires in {d}d\n", .{ domain, remaining_days });
         const wrote = self.runIssue(domain, cert_path, key_path) catch |err| {
-            std.debug.print("orochi: acme renewal failed for {s} ({s})\n", .{ domain, @errorName(err) });
+            dlog.log("orochi: acme renewal failed for {s} ({s})\n", .{ domain, @errorName(err) });
             return;
         };
         if (!wrote) {
-            std.debug.print("orochi: acme renewal completed for {s} without writing a certificate\n", .{domain});
+            dlog.log("orochi: acme renewal completed for {s} without writing a certificate\n", .{domain});
             return;
         }
 
         self.server.requestAcmeTlsReload();
-        std.debug.print("orochi: acme renewal wrote certs for {s}; TLS reload requested on reactor 0\n", .{domain});
+        dlog.log("orochi: acme renewal wrote certs for {s}; TLS reload requested on reactor 0\n", .{domain});
     }
 
     fn runIssue(self: *Service, domain: []const u8, cert_path: []const u8, key_path: []const u8) !bool {
@@ -139,7 +140,7 @@ pub const Service = struct {
         var anchors = try acme_cli.loadTrustAnchors(self.allocator, bundle_text);
         defer freeTrustAnchors(self.allocator, &anchors);
         if (anchors.items.len == 0) return error.NoTrustAnchors;
-        std.debug.print("orochi: acme loaded {d} trust anchors from {s}\n", .{ anchors.items.len, acme_cli.default_ca_bundle });
+        dlog.log("orochi: acme loaded {d} trust anchors from {s}\n", .{ anchors.items.len, acme_cli.default_ca_bundle });
 
         const account_key = ecdsa_p256.KeyPair.generate(self.io);
         const cert_key = ecdsa_p256.KeyPair.generate(self.io);
@@ -149,7 +150,7 @@ pub const Service = struct {
         var challenge = try listener.ChallengeServer.init(&store, acme_cli.default_challenge_port);
         try challenge.spawn();
         defer challenge.shutdown();
-        std.debug.print("orochi: acme HTTP-01 listener on 127.0.0.1:{d}\n", .{challenge.port});
+        dlog.log("orochi: acme HTTP-01 listener on 127.0.0.1:{d}\n", .{challenge.port});
 
         const domains = [_][]const u8{domain};
         var contacts_storage: [1][]const u8 = undefined;

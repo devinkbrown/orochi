@@ -8,6 +8,7 @@
 //! handlers, and writes replies into caller-owned storage for deterministic
 //! tests and reactor integration.
 const std = @import("std");
+const dlog = @import("dlog.zig");
 const sasl = @import("../proto/sasl.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const scram_server = @import("../proto/sasl_scram_server.zig");
@@ -2686,7 +2687,7 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     const enum_letters = "beIklimnstCTNMSgWOA";
     for (enum_letters) |letter| {
         const spec = chanmode.specFromLetter(letter) orelse {
-            std.debug.print("CHANMODES advertises '{c}' but chanmode has no spec\n", .{letter});
+            dlog.log("CHANMODES advertises '{c}' but chanmode has no spec\n", .{letter});
             return error.TestUnexpectedResult;
         };
         try std.testing.expectEqual(letter, spec.letter);

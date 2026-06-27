@@ -99,6 +99,7 @@ const welcome_pack_mod = @import("welcome_pack.zig");
 const mode_lock_mod = @import("../proto/mode_lock.zig");
 const account_verify_mod = @import("account_verify.zig");
 const password_reset = @import("password_reset.zig");
+const dlog = @import("dlog.zig");
 const totp_auth = @import("totp_auth.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
 const color_strip = @import("../proto/color_strip.zig");
@@ -913,6 +914,21 @@ fn ignoreSigpipe() void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.PIPE, &act, null);
+}
+
+/// Operational server log line (boot banners, mesh/media/upgrade notices). Routes
+/// to stderr in a real daemon, but is SILENT under `zig test`.
+///
+/// Why silent in tests: zig 0.16's `--listen=-` test runner reads the test
+/// binary's stderr, and ANY stderr output from a test (even one line) makes the
+/// build emit a spurious "failed command" line — the step and the whole build
+/// still succeed (verified: `--summary all` reports success, all tests pass, the
+/// process exits 0), but the noise is misleading. The threaded-server tests boot
+/// real servers and these banners flooded stderr, so the default `zig build test`
+/// always printed it. Suppressing operational logs in test builds keeps the
+/// output clean without changing production behavior or gating any test.
+fn srvLog(comptime fmt: []const u8, args: anytype) void {
+    dlog.log(fmt, args);
 }
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
@@ -2647,7 +2663,7 @@ pub const LinuxServer = struct {
         // (no bind gap, no leak); sibling shards and fresh boots create their own.
         const listener_fd = if (shard_id == 0 and config.inherited_listener_fd != null) blk: {
             const fd = config.inherited_listener_fd.?;
-            std.debug.print("orochi: adopting inherited listener fd {d}\n", .{fd});
+            srvLog("orochi: adopting inherited listener fd {d}\n", .{fd});
             break :blk fd;
         } else try reuseport.createReusePortListener(config.host, config.port, config.backlog);
         errdefer closeFd(listener_fd);
@@ -2763,7 +2779,7 @@ pub const LinuxServer = struct {
                 if (parseHostPort(spec) != null) {
                     valid += 1;
                 } else {
-                    std.debug.print("orochi: mesh auto-connect: bad peer spec '{s}' (want host:port); ignored\n", .{spec});
+                    srvLog("orochi: mesh auto-connect: bad peer spec '{s}' (want host:port); ignored\n", .{spec});
                 }
             }
             if (valid != 0) {
@@ -2786,7 +2802,7 @@ pub const LinuxServer = struct {
                 if (decodeMeshTrustRoot(root) != null) {
                     valid_roots += 1;
                 } else {
-                    std.debug.print("orochi: mesh trust root '{s}' is not a 32-byte hex/base64 key; ignored\n", .{root});
+                    srvLog("orochi: mesh trust root '{s}' is not a 32-byte hex/base64 key; ignored\n", .{root});
                 }
             }
             if (valid_roots != 0) {
@@ -2943,10 +2959,10 @@ pub const LinuxServer = struct {
             // leg). Independent of the WebRTC plane below; a bind failure logs and
             // the daemon keeps serving IRC.
             self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
-                std.debug.print("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
+                srvLog("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
             };
             if (self.native_media.port != 0) {
-                std.debug.print("orochi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
+                srvLog("orochi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
                 // Bridge native frames to any opt-in WebRTC members of each channel.
                 self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
             }
@@ -2954,12 +2970,12 @@ pub const LinuxServer = struct {
             // Bring the media transport plane online (bind UDP + pump thread). Media
             // is optional: a bind failure logs and the daemon keeps serving IRC.
             self.media_plane.start(media_plane_mod.any_be, self.config.media_port) catch |e| {
-                std.debug.print("orochi: media plane disabled ({s})\n", .{@errorName(e)});
+                srvLog("orochi: media plane disabled ({s})\n", .{@errorName(e)});
                 return;
             };
             var host_buf: [16]u8 = undefined;
             const cand = self.media_plane.candidateIp(&host_buf) orelse self.config.media_host;
-            std.debug.print("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
+            srvLog("orochi: media plane on UDP :{d} (candidate host {s})\n", .{ self.media_plane.port, cand });
             // Bridge WebRTC RTP frames to any native members of each channel.
             self.media_plane.setCrossLegSink(.{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame });
         }
@@ -2979,18 +2995,18 @@ pub const LinuxServer = struct {
             self.config.metrics_port,
             .{ .bind_addr = self.config.metrics_bind_addr },
         ) catch |e| {
-            std.debug.print("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
+            srvLog("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
             return;
         };
         // Spawn on the stored field so the accept loop's `self` pointer is stable
         // for the listener thread's lifetime.
         self.metrics_server.?.spawn() catch |e| {
-            std.debug.print("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
+            srvLog("orochi: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
             self.metrics_server.?.shutdown();
             self.metrics_server = null;
             return;
         };
-        std.debug.print("orochi: /metrics on TCP :{d}\n", .{self.metrics_server.?.port});
+        srvLog("orochi: /metrics on TCP :{d}\n", .{self.metrics_server.?.port});
     }
 
     /// Render the current Prometheus exposition text and publish it into the
@@ -3396,7 +3412,7 @@ pub const LinuxServer = struct {
         // failure is logged and the daemon keeps serving.
         if (self.rx() == &self.reactors[0] and upgrade_signal_requested.swap(false, .seq_cst)) {
             self.performUpgrade(null) catch |e| {
-                std.debug.print("orochi: SIGUSR2 UPGRADE failed: {s}\n", .{@errorName(e)});
+                srvLog("orochi: SIGUSR2 UPGRADE failed: {s}\n", .{@errorName(e)});
             };
         }
         if (self.rx() == &self.reactors[0]) self.maybeReloadAcmeTls();
@@ -3888,7 +3904,7 @@ pub const LinuxServer = struct {
         if (self.rx() == &self.reactors[0] and !self.mesh_dials_booted) {
             self.mesh_dials_booted = true;
             for (self.mesh_dials) |dial| {
-                std.debug.print("orochi: mesh auto-connect -> {s}:{d}\n", .{ dial.host, dial.port });
+                srvLog("orochi: mesh auto-connect -> {s}:{d}\n", .{ dial.host, dial.port });
             }
             self.sweepMeshAutoConnect(true);
         }
@@ -3937,7 +3953,7 @@ pub const LinuxServer = struct {
         // If the fabric cannot be created (no eventfd, OOM) fall back to a single
         // in-line reactor rather than running without cross-shard delivery.
         self.fabric = reactor_fabric.ReactorFabric.init(self.allocator, self.reactors.len) catch |err| {
-            std.debug.print(
+            srvLog(
                 "orochi: cross-shard fabric init failed ({s}); running 1 reactor\n",
                 .{@errorName(err)},
             );
@@ -3946,9 +3962,9 @@ pub const LinuxServer = struct {
             return;
         };
 
-        std.debug.print("orochi: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
+        srvLog("orochi: starting {d} reactor threads (SO_REUSEPORT)\n", .{self.reactors.len});
         self.pool.start(self.reactors.len, self, run, reactorWorker) catch |err| {
-            std.debug.print(
+            srvLog(
                 "orochi: reactor pool spawn failed ({s}); running 1 reactor\n",
                 .{@errorName(err)},
             );
@@ -3985,12 +4001,12 @@ pub const LinuxServer = struct {
                 consecutive_failures = 0;
             } else |err| {
                 consecutive_failures += 1;
-                std.debug.print(
+                srvLog(
                     "orochi: reactor loop error {s} ({d} consecutive)\n",
                     .{ @errorName(err), consecutive_failures },
                 );
                 if (consecutive_failures >= 64) {
-                    std.debug.print("orochi: reactor giving up after persistent errors\n", .{});
+                    srvLog("orochi: reactor giving up after persistent errors\n", .{});
                     return;
                 }
             }
@@ -6504,7 +6520,7 @@ pub const LinuxServer = struct {
                 .ready => m.on_ready,
             };
             if (fn_opt) |f| f(self) catch |err| {
-                std.debug.print("orochi: module {s} on_{s} failed: {s}\n", .{ m.id, @tagName(phase), @errorName(err) });
+                srvLog("orochi: module {s} on_{s} failed: {s}\n", .{ m.id, @tagName(phase), @errorName(err) });
             };
         }
     }
@@ -13316,7 +13332,7 @@ pub const LinuxServer = struct {
         if (requester) |c| {
             self.noticeTo(c, msg) catch {};
         } else {
-            std.debug.print("orochi: {s}\n", .{msg});
+            srvLog("orochi: {s}\n", .{msg});
         }
     }
 
@@ -13539,7 +13555,7 @@ pub const LinuxServer = struct {
         // adopted below.
         current_reactor = &self.reactors[0];
         const caps = helix_live.readArena(self.allocator, arena_fd) catch |e| {
-            std.debug.print("orochi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
+            srvLog("orochi: UPGRADE resume — arena read failed ({s})\n", .{@errorName(e)});
             return;
         };
         defer {
@@ -13596,7 +13612,7 @@ pub const LinuxServer = struct {
                 .scope_id = 0,
             };
             _ = self.initiateS2sConnectToAddr(addr) catch |e| {
-                std.debug.print("orochi: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(e)});
+                srvLog("orochi: UPGRADE resume — mesh re-dial failed ({s})\n", .{@errorName(e)});
                 continue;
             };
             redialed += 1;
@@ -13605,7 +13621,7 @@ pub const LinuxServer = struct {
         // The arena is fully consumed; close the inherited memfd.
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
-        std.debug.print(
+        srvLog(
             "orochi: UPGRADE resume — re-attached {d} client connection(s) ({d} TLS), {d} mesh re-dial(s)\n",
             .{ adopted, adopted_tls, redialed },
         );
@@ -14010,15 +14026,15 @@ pub const LinuxServer = struct {
             if (!force and now - dial.last_attempt_ms < mesh_redial_interval_ms) continue;
             dial.last_attempt_ms = now;
             const addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
-                std.debug.print("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
                 continue;
             };
             dial.addr = addr;
             if (self.initiateS2sConnectToAddr(addr)) |tok| {
                 dial.token = tok;
-                std.debug.print("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
+                srvLog("orochi: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
             } else |err| {
-                std.debug.print("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                srvLog("orochi: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
             }
         }
     }
@@ -18670,7 +18686,7 @@ pub const LinuxServer = struct {
             self.mintOperGrant(account, oper_mod.OperPrivileges.fromBits(bits), class, title);
             restored += 1;
         }
-        if (restored != 0) std.debug.print("orochi: restored {d} runtime operator grant(s)\n", .{restored});
+        if (restored != 0) srvLog("orochi: restored {d} runtime operator grant(s)\n", .{restored});
     }
 
     // --- Account command family (Phase 2) ----------------------------------
@@ -18757,11 +18773,11 @@ pub const LinuxServer = struct {
             .ward = ReplayCtx.onWard,
             .saccess = ReplayCtx.onSaccess,
         }) catch |err| {
-            std.debug.print("orochi: services live-state replay failed ({s})\n", .{@errorName(err)});
+            srvLog("orochi: services live-state replay failed ({s})\n", .{@errorName(err)});
             return;
         };
         if (summary.channels != 0 or summary.akicks != 0 or summary.wards != 0 or summary.saccesses != 0) {
-            std.debug.print(
+            srvLog(
                 "orochi: services replay restored {d} channel(s), {d} MLOCK(s), {d} AKICK(s), {d} WARD(s), {d} SACCESS(es)\n",
                 .{ summary.channels, summary.mlocks, summary.akicks, summary.wards, summary.saccesses },
             );
@@ -22268,10 +22284,10 @@ pub const LinuxServer = struct {
     pub fn loadWasmPlugins(self: *LinuxServer) void {
         if (self.config.wasm_plugin_dir.len == 0) return;
         const n = self.wasm.loadFromDir(self.config.wasm_plugin_dir) catch |err| {
-            std.debug.print("orochi: wasm plugin load from {s} failed: {s}\n", .{ self.config.wasm_plugin_dir, @errorName(err) });
+            srvLog("orochi: wasm plugin load from {s} failed: {s}\n", .{ self.config.wasm_plugin_dir, @errorName(err) });
             return;
         };
-        if (n > 0) std.debug.print("orochi: loaded {d} OroWasm plugin(s) from {s}\n", .{ n, self.config.wasm_plugin_dir });
+        if (n > 0) srvLog("orochi: loaded {d} OroWasm plugin(s) from {s}\n", .{ n, self.config.wasm_plugin_dir });
     }
 
     /// Outcome of the REHASH cert hot-reload, folded into the RPL_REHASHING note.
@@ -22304,18 +22320,18 @@ pub const LinuxServer = struct {
     fn maybeReloadAcmeTls(self: *LinuxServer) void {
         if (!self.acme_reload_requested.swap(false, .acq_rel)) return;
         const tls = self.acme_reload_tls orelse {
-            std.debug.print("orochi: acme TLS reload requested but no [tls] config is registered\n", .{});
+            srvLog("orochi: acme TLS reload requested but no [tls] config is registered\n", .{});
             return;
         };
         const io = self.config.crypto_io orelse {
-            std.debug.print("orochi: acme TLS reload requested but no I/O handle is available\n", .{});
+            srvLog("orochi: acme TLS reload requested but no I/O handle is available\n", .{});
             return;
         };
         const outcome = self.reloadTlsCerts(io, tls) catch |err| {
-            std.debug.print("orochi: acme TLS reload failed ({s}); keeping current certificates\n", .{@errorName(err)});
+            srvLog("orochi: acme TLS reload failed ({s}); keeping current certificates\n", .{@errorName(err)});
             return;
         };
-        std.debug.print("orochi: acme TLS reload on reactor 0: {s}\n", .{outcome.note()});
+        srvLog("orochi: acme TLS reload on reactor 0: {s}\n", .{outcome.note()});
     }
 
     /// Re-read the TLS cert chain + signing key from the reloaded config's paths
@@ -24397,7 +24413,7 @@ fn wasmReplyCb(ctx: *anyopaque, text: []const u8) void {
     appendToConn(core.conn, line) catch {};
 }
 fn wasmLogCb(_: *anyopaque, text: []const u8) void {
-    std.debug.print("orochi: wasm-plugin: {s}\n", .{text});
+    srvLog("orochi: wasm-plugin: {s}\n", .{text});
 }
 fn wasmNowCb(_: *anyopaque) i64 {
     return platform.monotonicMillis();
@@ -25207,12 +25223,12 @@ fn buildOperBindingsFromConfig(allocator: std.mem.Allocator, parsed: config_form
     errdefer bindings.deinit(allocator);
     for (parsed.opers) |o| {
         if (o.class.len == 0 or groups.get(o.class) == null) {
-            std.debug.print("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
+            srvLog("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
             continue;
         }
         const privileges = groups.effectivePrivileges(o.class);
         if (privileges.count() == 0) {
-            std.debug.print("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
+            srvLog("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
             continue;
         }
         try bindings.append(allocator, .{
@@ -37142,7 +37158,7 @@ fn runLusersCrossShardConsistencyTest(shards1: u16, shards2: u16) !void {
         try recvUntil(&clients[i], " 255 ", 200);
         const out = clients[i].written();
         if (std.mem.indexOf(u8, out, "2 servers") == null) {
-            std.debug.print("conn {d} LUSERS missing '2 servers': {s}\n", .{ i, out });
+            srvLog("conn {d} LUSERS missing '2 servers': {s}\n", .{ i, out });
             return error.TestUnexpectedResult;
         }
         const uc = parseLusersUserCount(out) orelse return error.TestUnexpectedResult;

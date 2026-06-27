@@ -80,6 +80,7 @@
 //!     prepend a PROXY v1 line carrying the QUIC peer's address.
 
 const std = @import("std");
+const dlog = @import("dlog.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
@@ -1180,7 +1181,7 @@ fn dbg(comptime fmt: []const u8, args: anytype) void {
         break :blk enabled;
     };
     if (!on) return;
-    std.debug.print("[quic-dbg] " ++ fmt ++ "\n", args);
+    dlog.log("[quic-dbg] " ++ fmt ++ "\n", args);
 }
 
 /// Whether environment variable `name` is present and non-empty. Reads
@@ -1972,7 +1973,7 @@ test "interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener" {
     defer lst.deinit();
     lst.start(loopback_be, 0) catch |err| {
         // A sandbox that forbids binding a UDP socket cannot run this test.
-        std.debug.print("interop: bind failed ({s}); skipping\n", .{@errorName(err)});
+        dlog.log("interop: bind failed ({s}); skipping\n", .{@errorName(err)});
         return error.SkipZigTest;
     };
     const port = lst.port;
@@ -1986,7 +1987,7 @@ test "interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener" {
     const res = std.process.run(allocator, io, .{
         .argv = &.{ "curl", "--http3-only", "-k", "-sS", "--max-time", "8", url },
     }) catch |err| {
-        std.debug.print("interop: failed to spawn curl ({s})\n", .{@errorName(err)});
+        dlog.log("interop: failed to spawn curl ({s})\n", .{@errorName(err)});
         return error.SkipZigTest;
     };
     defer allocator.free(res.stdout);
@@ -1996,12 +1997,12 @@ test "interop: curl --http3 GET / gets 200 from the live QUIC/HTTP3 listener" {
     switch (res.term) {
         .exited => |code| {
             if (code != 0) {
-                std.debug.print("interop: curl exited {d}; stderr: {s}\n", .{ code, res.stderr });
+                dlog.log("interop: curl exited {d}; stderr: {s}\n", .{ code, res.stderr });
                 return error.CurlFailed;
             }
         },
         else => {
-            std.debug.print("interop: curl terminated abnormally; stderr: {s}\n", .{res.stderr});
+            dlog.log("interop: curl terminated abnormally; stderr: {s}\n", .{res.stderr});
             return error.CurlFailed;
         },
     }
@@ -2036,7 +2037,7 @@ test "interop: curl --http3 large transfer + multi-request + Retry round-trip (d
         }, 0);
         defer lst.deinit();
         lst.start(loopback_be, 0) catch |err| {
-            std.debug.print("interop-deep: bind failed ({s}); skipping\n", .{@errorName(err)});
+            dlog.log("interop-deep: bind failed ({s}); skipping\n", .{@errorName(err)});
             return error.SkipZigTest;
         };
         const port = lst.port;
@@ -2051,14 +2052,14 @@ test "interop: curl --http3 large transfer + multi-request + Retry round-trip (d
         const big = std.process.run(allocator, io, .{
             .argv = &.{ "curl", "--http3-only", "-k", "-sS", "--max-time", "30", big_url },
         }) catch |err| {
-            std.debug.print("interop-deep: curl spawn failed ({s})\n", .{@errorName(err)});
+            dlog.log("interop-deep: curl spawn failed ({s})\n", .{@errorName(err)});
             return error.SkipZigTest;
         };
         defer allocator.free(big.stdout);
         defer allocator.free(big.stderr);
         switch (big.term) {
             .exited => |c| if (c != 0) {
-                std.debug.print("interop-deep: curl /big exited {d}; stderr: {s}\n", .{ c, big.stderr });
+                dlog.log("interop-deep: curl /big exited {d}; stderr: {s}\n", .{ c, big.stderr });
                 return error.CurlFailed;
             },
             else => return error.CurlFailed,
@@ -2092,7 +2093,7 @@ test "interop: curl --http3 large transfer + multi-request + Retry round-trip (d
         defer allocator.free(multi.stderr);
         switch (multi.term) {
             .exited => |c| if (c != 0) {
-                std.debug.print("interop-deep: curl multi exited {d}; stderr: {s}\n", .{ c, multi.stderr });
+                dlog.log("interop-deep: curl multi exited {d}; stderr: {s}\n", .{ c, multi.stderr });
                 return error.CurlFailed;
             },
             else => return error.CurlFailed,
@@ -2128,7 +2129,7 @@ test "interop: curl --http3 large transfer + multi-request + Retry round-trip (d
         defer allocator.free(res.stderr);
         switch (res.term) {
             .exited => |c| if (c != 0) {
-                std.debug.print("interop-deep: Retry curl exited {d}; stderr: {s}\n", .{ c, res.stderr });
+                dlog.log("interop-deep: Retry curl exited {d}; stderr: {s}\n", .{ c, res.stderr });
                 return error.CurlFailed;
             },
             else => return error.CurlFailed,

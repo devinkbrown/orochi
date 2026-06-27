@@ -17,6 +17,7 @@
 //! certificate) are supplied by the caller — this module pins nothing implicitly.
 
 const std = @import("std");
+const dlog = @import("dlog.zig");
 
 const tls_client = @import("../crypto/tls_client.zig");
 const http1 = @import("../proto/http1_client.zig");
@@ -249,7 +250,7 @@ pub const HttpsTransport = struct {
     ) anyerror!acme.HttpResponse {
         const url = try Url.parse(url_str);
         const raw = httpsRequest(self.allocator, self.resolver, self.trust_anchors, method, url, extra, body, self.max_response_bytes) catch |err| {
-            if (self.debug) std.debug.print("acme!! {s} {s} transport error: {s}\n", .{ method, url_str, @errorName(err) });
+            if (self.debug) dlog.log("acme!! {s} {s} transport error: {s}\n", .{ method, url_str, @errorName(err) });
             return err;
         };
         if (self.last_response) |r| self.allocator.free(r);
@@ -259,7 +260,7 @@ pub const HttpsTransport = struct {
         // RFC 7807 problem document) so failures are diagnosable without --debug.
         if (self.debug or resp.status >= 300) {
             const preview = resp.body[0..@min(resp.body.len, self.error_body_preview_bytes)];
-            std.debug.print("acme<- {s} {s} -> {d} (body {d}B)\n  {s}\n", .{ method, url_str, resp.status, resp.body.len, preview });
+            dlog.log("acme<- {s} {s} -> {d} (body {d}B)\n  {s}\n", .{ method, url_str, resp.status, resp.body.len, preview });
         }
         return .{
             .status = resp.status,

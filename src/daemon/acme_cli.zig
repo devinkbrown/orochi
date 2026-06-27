@@ -11,6 +11,7 @@
 //! touches certbot or /etc/letsencrypt; the chain is written to a kain-owned path.
 
 const std = @import("std");
+const dlog = @import("dlog.zig");
 
 const acme_runner = @import("acme_runner.zig");
 const http01 = @import("acme_http01_server.zig");
@@ -72,7 +73,7 @@ pub fn applyToml(opts: *Options, doc: *const toml.Document) void {
 
 /// Print a one-line usage summary for the acme-issue subcommand.
 pub fn usage() void {
-    std.debug.print(
+    dlog.log(
         \\usage: orochi acme-issue --domain <fqdn> --out <path> [options]
         \\  --domain <fqdn>        domain to issue for (required)
         \\  --out <path>           cert chain output path (required; kain-owned dir)
@@ -149,7 +150,7 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
     var anchors = try loadTrustAnchors(allocator, bundle_text);
     defer freeTrustAnchors(allocator, &anchors);
     if (anchors.items.len == 0) return error.NoTrustAnchors;
-    std.debug.print("acme: loaded {d} trust anchors from {s}\n", .{ anchors.items.len, opts.ca_bundle_path });
+    dlog.log("acme: loaded {d} trust anchors from {s}\n", .{ anchors.items.len, opts.ca_bundle_path });
 
     // --- Keys: ES256 / ECDSA P-256 (the alg Let's Encrypt accepts). The account
     // and certificate keys MUST differ (LE rejects a CSR keyed to the account).
@@ -163,7 +164,7 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
     var server = try listener.ChallengeServer.init(&store, opts.challenge_port);
     try server.spawn();
     defer server.shutdown();
-    std.debug.print("acme: HTTP-01 listener on 127.0.0.1:{d}\n", .{server.port});
+    dlog.log("acme: HTTP-01 listener on 127.0.0.1:{d}\n", .{server.port});
 
     // --- Drive issuance ---
     const domains = [_][]const u8{opts.domain};
@@ -189,9 +190,9 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
     }, account_key, cert_key, &store, null);
 
     if (result.cert_written) {
-        std.debug.print("acme: SUCCESS — wrote chain {s}\n              and key {s}\n", .{ opts.cert_out_path, key_out });
+        dlog.log("acme: SUCCESS — wrote chain {s}\n              and key {s}\n", .{ opts.cert_out_path, key_out });
     } else {
-        std.debug.print("acme: finished in state {s} without a cert\n", .{@tagName(result.state)});
+        dlog.log("acme: finished in state {s} without a cert\n", .{@tagName(result.state)});
     }
     return result.cert_written;
 }

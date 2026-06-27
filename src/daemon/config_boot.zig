@@ -9,6 +9,7 @@
 //! conservative — a field is overridden only when the config supplies a
 //! meaningful value, otherwise the caller's defaults stand.
 const std = @import("std");
+const dlog = @import("dlog.zig");
 
 const config_format = @import("config_format.zig");
 const server = @import("server.zig");
@@ -299,12 +300,12 @@ pub fn loadFromText(
     errdefer bindings.deinit(allocator);
     for (parsed.opers) |o| {
         if (o.class.len == 0 or groups.get(o.class) == null) {
-            std.debug.print("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
+            dlog.log("orochi: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
             continue;
         }
         const privileges = groups.effectivePrivileges(o.class);
         if (privileges.count() == 0) {
-            std.debug.print("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
+            dlog.log("orochi: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
             continue;
         }
         try bindings.append(allocator, .{
@@ -339,7 +340,7 @@ pub fn loadFromText(
                 .oper_only = c.match_oper,
                 .ident_glob = c.ident_glob,
                 .host_glob = c.host_glob,
-            }) catch |e| std.debug.print("orochi: skipping connection class '{s}': {s}\n", .{ c.name, @errorName(e) });
+            }) catch |e| dlog.log("orochi: skipping connection class '{s}': {s}\n", .{ c.name, @errorName(e) });
         }
         config.class_registry = try cb.finish();
     }
