@@ -25,9 +25,31 @@ pub const LocalNickResolver = struct {
     /// Case-insensitive (the daemon's world is RFC-1459 case-folded); returns
     /// true iff a LOCAL client currently holds `nick`.
     held_fn: *const fn (*anyopaque, []const u8) bool,
+    /// The authenticated ACCOUNT of the LOCAL client holding `nick`, or null when
+    /// no local client holds it or the holder is not logged in. Borrowed for the
+    /// duration of the synchronous resolve call. Optional: when absent, collision
+    /// resolution falls back to the account-blind path (no same-identity reconcile).
+    account_fn: ?*const fn (*anyopaque, []const u8) ?[]const u8 = null,
+    /// The mesh HLC at which the LOCAL holder of `nick` last asserted its claim, or
+    /// 0 when unknown/not held. Lets the resolver decide which of two same-account
+    /// sessions is the stale one. Optional: when absent, a same-account local
+    /// collision is never escalated to a reclaim (the holder is always kept).
+    hlc_fn: ?*const fn (*anyopaque, []const u8) u64 = null,
 
     pub fn held(self: LocalNickResolver, nick: []const u8) bool {
         return self.held_fn(self.ctx, nick);
+    }
+
+    /// The local holder's authenticated account, or null (not held / not logged in).
+    pub fn account(self: LocalNickResolver, nick: []const u8) ?[]const u8 {
+        const f = self.account_fn orelse return null;
+        return f(self.ctx, nick);
+    }
+
+    /// The local holder's last mesh-claim HLC (0 = unknown / never asserted).
+    pub fn holderHlc(self: LocalNickResolver, nick: []const u8) u64 {
+        const f = self.hlc_fn orelse return 0;
+        return f(self.ctx, nick);
     }
 };
 
@@ -38,6 +60,22 @@ pub const LocalNickResolver = struct {
 pub const NickDecision = union(enum) {
     keep,
     rename_to_uid: nick_collision.Uid,
+    /// An incoming REMOTE claim matches a nick a LOCAL client holds AND both bear
+    /// the SAME authenticated account, but the LOCAL holder's mesh claim is NOT
+    /// strictly older — keep the live local session and drop the remote duplicate.
+    /// Never mints a UID for a logged-in user.
+    local_same_account,
+    /// Same as `local_same_account`, but the LOCAL holder's mesh claim is strictly
+    /// OLDER than the incoming one (a known, non-zero holder HLC) — the local
+    /// session is the stale ghost and the remote is the live one. The daemon should
+    /// retire (ghost-kill) the local session in favour of the remote.
+    reclaim_local,
+    /// An incoming REMOTE claim matches a REMOTE incumbent on a DIFFERENT node, but
+    /// both bear the SAME authenticated account — the same identity duplicated
+    /// across the mesh. Accept the wire nick and let `applyMembership`'s hlc LWW
+    /// collapse the two claims onto the newer one; the caller must NOT displace the
+    /// incumbent to a UID (that would mint a phantom for a real logged-in user).
+    remote_same_account,
 };
 
 pub const Error = std.mem.Allocator.Error || error{
@@ -155,6 +193,9 @@ pub const Member = struct {
     realname: []u8,
     /// The member's VISIBLE (cloaked) host ("" = unknown).
     host: []u8,
+    /// The member's authenticated ACCOUNT ("" = not logged in / unknown). Drives
+    /// account-aware collision reconcile (see resolveIncomingNick).
+    account: []u8,
     node: NodeId,
     status: u4,
     hlc: u64,
@@ -164,6 +205,7 @@ pub const Member = struct {
         allocator.free(self.username);
         allocator.free(self.realname);
         allocator.free(self.host);
+        allocator.free(self.account);
     }
 };
 
@@ -173,7 +215,20 @@ pub const MemberIdentity = struct {
     username: []const u8 = "",
     realname: []const u8 = "",
     host: []const u8 = "",
+    account: []const u8 = "",
 };
+
+/// Two accounts identify the SAME authenticated user iff both are present and
+/// byte-equal. Account names are canonical (the daemon emits each account in one
+/// fixed spelling), so an exact compare avoids false-positive merges between
+/// distinct accounts a looser casemap might conflate. An empty/absent account on
+/// either side is "unknown" and never matches — which preserves the prior
+/// account-blind collision behaviour for legacy peers that carry no account.
+fn sameAccount(incoming: []const u8, holder: ?[]const u8) bool {
+    const h = holder orelse return false;
+    if (incoming.len == 0 or h.len == 0) return false;
+    return std.mem.eql(u8, incoming, h);
+}
 
 pub const ChannelListKind = channel_list_event.ListKind;
 
@@ -377,29 +432,46 @@ pub const RouteTable = struct {
         while (it.next()) |entry| {
             for (entry.value_ptr.entries.items) |m| {
                 if (!std.ascii.eqlIgnoreCase(m.nick, nick)) continue;
-                const cand = nick_collision.Claim{ .node_id = m.node, .hlc = m.hlc };
+                const cand = nick_collision.Claim{ .node_id = m.node, .hlc = m.hlc, .account = m.account };
                 if (best == null or nick_collision.candidateWins(cand, best.?)) best = cand;
             }
         }
         return best;
     }
 
-    /// Decide how to apply an incoming REMOTE nick claim `(nick, node, hlc)`,
-    /// resolving collisions deterministically and never killing:
+    /// Decide how to apply an incoming REMOTE nick claim `(nick, node, hlc,
+    /// account)`, resolving collisions deterministically and never killing:
     ///   * a LOCAL nick of the same name (per `local_nicks`) is authoritative —
-    ///     the incoming remote member loses and is renamed to its mesh UID;
+    ///     the incoming remote member loses and is renamed to its mesh UID,
+    ///     UNLESS both bear the same authenticated account, in which case they are
+    ///     the SAME identity and we return `.local_same_account` so the daemon
+    ///     reconciles by liveness instead of UID-renaming a logged-in user;
     ///   * an existing REMOTE nick owned by a DIFFERENT node is contested by the
     ///     CRDT-identical `(hlc, node)` tiebreak — the loser (which may be the
     ///     incumbent, handled by the caller's re-apply, or the newcomer) renames
-    ///     to its UID;
+    ///     to its UID; EXCEPT when both bear the same account, where we `.keep`
+    ///     and let the `hlc` LWW in `applyMembership` collapse them to one entry;
     ///   * otherwise the wire nick is kept verbatim.
-    /// `node`/`hlc` are the incoming claim's owner + logical clock. Returns the
-    /// stable fallback UID when the NEWCOMER must rename.
-    pub fn resolveIncomingNick(self: *const Self, nick: []const u8, node: NodeId, hlc: u64) NickDecision {
-        // Cross-namespace: local world wins. A remote member can never take a
-        // nick a local client currently holds.
+    /// `account` is the incoming claim's authenticated account ("" = none/unknown,
+    /// which disables every same-identity short-circuit and preserves the prior
+    /// account-blind behaviour for legacy peers).
+    pub fn resolveIncomingNick(self: *const Self, nick: []const u8, node: NodeId, hlc: u64, account: []const u8) NickDecision {
+        // Cross-namespace: local world wins. A remote member can never take a nick
+        // a local client currently holds — but if the remote bears the SAME
+        // authenticated account as the local holder, it is the same logged-in
+        // identity (a duplicate session across the mesh), not a stranger. Defer to
+        // the daemon rather than minting a UID for a real user.
         if (self.local_nicks) |resolver| {
             if (resolver.held(nick)) {
+                if (sameAccount(account, resolver.account(nick))) {
+                    // Same identity. If the local holder's claim is KNOWN and
+                    // strictly older than this one, the local session is the stale
+                    // ghost → ask the daemon to retire it. Otherwise (newer, equal,
+                    // or unknown=0) keep the live local session and drop the remote.
+                    const local_hlc = resolver.holderHlc(nick);
+                    if (local_hlc != 0 and hlc > local_hlc) return .reclaim_local;
+                    return .local_same_account;
+                }
                 return .{ .rename_to_uid = nick_collision.loserUid(node, nick) };
             }
         }
@@ -409,7 +481,13 @@ pub const RouteTable = struct {
         // newcomer when the newcomer does NOT win the deterministic tiebreak.
         if (self.nickClaim(nick)) |incumbent| {
             if (incumbent.node_id == node) return .keep;
-            const newcomer = nick_collision.Claim{ .node_id = node, .hlc = hlc };
+            // Same authenticated account on a different node = the SAME identity
+            // moved/duplicated across the mesh, not two strangers. Accept the wire
+            // nick and let `applyMembership`'s hlc LWW collapse the two claims onto
+            // the newer one — and signal the caller NOT to displace the incumbent
+            // (a UID phantom for a logged-in user is exactly what we avoid).
+            if (sameAccount(account, if (incumbent.account.len != 0) incumbent.account else null)) return .remote_same_account;
+            const newcomer = nick_collision.Claim{ .node_id = node, .hlc = hlc, .account = account };
             if (!nick_collision.candidateWins(newcomer, incumbent)) {
                 return .{ .rename_to_uid = nick_collision.loserUid(node, nick) };
             }
@@ -531,6 +609,7 @@ pub const RouteTable = struct {
                 try replaceOwned(self.allocator, &cur.username, ident.username);
                 try replaceOwned(self.allocator, &cur.realname, ident.realname);
                 try replaceOwned(self.allocator, &cur.host, ident.host);
+                try replaceOwned(self.allocator, &cur.account, ident.account);
                 cur.node = node;
                 cur.status = status;
                 cur.hlc = hlc;
@@ -561,11 +640,14 @@ pub const RouteTable = struct {
         errdefer self.allocator.free(owned_real);
         const owned_host = try self.allocator.dupe(u8, ident.host);
         errdefer self.allocator.free(owned_host);
+        const owned_account = try self.allocator.dupe(u8, ident.account);
+        errdefer self.allocator.free(owned_account);
         try list.entries.append(self.allocator, .{
             .nick = owned,
             .username = owned_user,
             .realname = owned_real,
             .host = owned_host,
+            .account = owned_account,
             .node = node,
             .status = status,
             .hlc = hlc,
@@ -1160,26 +1242,40 @@ test "Config.applyToml overlays mesh.routing route-table keys" {
 
 fn expectRename(decision: NickDecision) !nick_collision.Uid {
     return switch (decision) {
-        .keep => error.TestUnexpectedResult,
+        .keep, .local_same_account, .remote_same_account, .reclaim_local => error.TestUnexpectedResult,
         .rename_to_uid => |uid| uid,
     };
 }
 
 const LocalNickStub = struct {
     held: []const u8,
+    /// The local holder's authenticated account ("" = not logged in).
+    acct: []const u8 = "",
+    /// The local holder's last mesh-claim HLC (0 = unknown).
+    hlc: u64 = 0,
     fn isHeld(ctx: *anyopaque, nick: []const u8) bool {
         const self: *LocalNickStub = @ptrCast(@alignCast(ctx));
         return std.ascii.eqlIgnoreCase(self.held, nick);
     }
+    fn accountOf(ctx: *anyopaque, nick: []const u8) ?[]const u8 {
+        const self: *LocalNickStub = @ptrCast(@alignCast(ctx));
+        if (!std.ascii.eqlIgnoreCase(self.held, nick)) return null;
+        return if (self.acct.len != 0) self.acct else null;
+    }
+    fn hlcOf(ctx: *anyopaque, nick: []const u8) u64 {
+        const self: *LocalNickStub = @ptrCast(@alignCast(ctx));
+        if (!std.ascii.eqlIgnoreCase(self.held, nick)) return 0;
+        return self.hlc;
+    }
     fn resolver(self: *LocalNickStub) LocalNickResolver {
-        return .{ .ctx = self, .held_fn = isHeld };
+        return .{ .ctx = self, .held_fn = isHeld, .account_fn = accountOf, .hlc_fn = hlcOf };
     }
 };
 
 test "resolveIncomingNick keeps an uncontested nick" {
     var table = try RouteTable.init(std.testing.allocator, .{});
     defer table.deinit();
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100, ""));
 }
 
 test "resolveIncomingNick renames a remote nick that collides with a LOCAL one" {
@@ -1190,14 +1286,46 @@ test "resolveIncomingNick renames a remote nick that collides with a LOCAL one" 
 
     // Local world is authoritative (case-insensitive) — the incoming remote
     // member loses and is forced to its mesh UID.
-    const uid = try expectRename(table.resolveIncomingNick("alice", 10, 100));
+    const uid = try expectRename(table.resolveIncomingNick("alice", 10, 100, ""));
     try std.testing.expect(uid_alloc.validate(uid[0..]));
     const parts = try uid_alloc.parse(uid[0..]);
     try std.testing.expectEqual(@as(u16, 10), parts.node); // owner-node scoped
 
     // Clearing the resolver removes the cross-namespace contest.
     table.setLocalNickResolver(null);
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("alice", 10, 100, ""));
+}
+
+test "resolveIncomingNick reconciles a same-account remote collision with a LOCAL holder" {
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    // The local holder of "kain" is logged in to account "kain". An incoming
+    // remote claim for "kain" bearing the SAME account is the same identity, not a
+    // stranger: the table must NOT mint a UID — it defers to the daemon.
+    var stub = LocalNickStub{ .held = "kain", .acct = "kain" };
+    table.setLocalNickResolver(stub.resolver());
+    // Unknown local holder HLC (0) → fail-safe: keep local, never reclaim.
+    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 100, "kain"));
+
+    // A DIFFERENT account on the incoming claim is a genuine collision → UID.
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory"));
+    // An empty incoming account falls back to the account-blind path → UID.
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, ""));
+}
+
+test "resolveIncomingNick retires a STALE local session for a strictly-newer same-account claim" {
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    // Local "kain" asserted its claim at HLC 100. A same-account remote claim at a
+    // strictly-newer HLC means the local session is the stale ghost → reclaim it.
+    var stub = LocalNickStub{ .held = "kain", .acct = "kain", .hlc = 100 };
+    table.setLocalNickResolver(stub.resolver());
+    try std.testing.expectEqual(NickDecision.reclaim_local, table.resolveIncomingNick("kain", 10, 200, "kain"));
+    // An EQUAL or OLDER incoming HLC keeps the live local session (no reclaim).
+    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 100, "kain"));
+    try std.testing.expectEqual(NickDecision.local_same_account, table.resolveIncomingNick("kain", 10, 50, "kain"));
+    // A different account is still a genuine collision regardless of HLC → UID.
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 999, "mallory"));
 }
 
 test "resolveIncomingNick renames a newcomer that loses a cross-node remote contest" {
@@ -1207,12 +1335,26 @@ test "resolveIncomingNick renames a newcomer that loses a cross-node remote cont
     // Node 20 holds "kain" with a high HLC. A newcomer from node 10 with a lower
     // HLC must lose and rename to its UID; the SAME node re-asserting keeps it.
     _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{});
-    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100));
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 20, 999));
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, ""));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 20, 999, ""));
 
     // A higher-HLC newcomer from node 10 WINS: the table reports keep (the caller
     // then displaces the incumbent to its UID).
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 10, 600));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 10, 600, ""));
+}
+
+test "resolveIncomingNick collapses a same-account cross-node collision via keep (no UID)" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // Node 20 holds "kain" logged in to account "kain". A LOWER-hlc newcomer from
+    // node 10 on the SAME account would normally lose and get a UID — but because
+    // it is the same identity, the table reports `remote_same_account` (no UID, no
+    // incumbent displacement) and lets hlc LWW in applyMembership converge.
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain" });
+    try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain"));
+    // A different account still contests normally (lower hlc loser → UID).
+    _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory"));
 }
 
 test "resolveIncomingNick breaks an HLC tie by higher node id" {
@@ -1221,9 +1363,9 @@ test "resolveIncomingNick breaks an HLC tie by higher node id" {
 
     _ = try table.applyMembership("#chat", "kain", 20, 0, 300, true, .{});
     // Same HLC, lower node id => newcomer loses.
-    _ = try expectRename(table.resolveIncomingNick("kain", 5, 300));
+    _ = try expectRename(table.resolveIncomingNick("kain", 5, 300, ""));
     // Same HLC, higher node id => newcomer wins (keep; caller displaces).
-    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 99, 300));
+    try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 99, 300, ""));
 }
 
 test "incumbentLoserUid derives a stable, owner-scoped fallback" {

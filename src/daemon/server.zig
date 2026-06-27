@@ -1749,6 +1749,12 @@ pub const ConnState = struct {
     /// silence since the last message — NOT since the last PING/PONG or query, so
     /// it is intentionally separate from `last_activity_ms`. Seeded at signon.
     last_message_ms: i64 = 0,
+    /// Mesh HLC stamped when this session last asserted its nick claim to the mesh
+    /// (registration, nick change, or USR2 re-adoption). Comparable to a remote
+    /// claim's HLC so a same-account cross-mesh collision retires the OLDER (stale
+    /// ghost) session. 0 = unknown → fail-safe "never reclaim" (a live session is
+    /// never wrongly killed by a stale remote claim).
+    mesh_nick_hlc: u64 = 0,
     /// Monotonic ms of the last `SEARCH` (draft/search) this client issued, or 0
     /// if never. The handler rate-limits searches against it (anti-abuse): a
     /// second SEARCH within `search_rate_limit_ms` is rejected with a FAIL.
@@ -6609,6 +6615,9 @@ pub const LinuxServer = struct {
         // `broadcastQuit`. The same-account-share path returned above, so a second
         // session sharing the nick doesn't re-announce (the primary already did).
         self.announceMembership(presence_channel, nick, 0, true, membershipIdentityOf(conn), "");
+        // Stamp the mesh-claim HLC for this session so a same-account cross-mesh
+        // collision can tell the live session from a stale ghost (newest wins).
+        conn.mesh_nick_hlc = self.nextMeshHlc();
     }
 
     /// Whether `nick` is currently held in the world by a LOCAL connection that
@@ -7723,6 +7732,10 @@ pub const LinuxServer = struct {
             .username = conn.session.username(),
             .realname = conn.session.realname(),
             .host = hostOf(conn),
+            // The authenticated account ("" = not logged in) so a remote peer can
+            // recognize a colliding nick as the SAME identity (account-aware
+            // reconcile) instead of UID-renaming a logged-in user.
+            .account = conn.session.account() orelse "",
         };
     }
 
@@ -8198,6 +8211,9 @@ pub const LinuxServer = struct {
                 self.broadcastChannel(ch.channel, line, null) catch {};
             },
             .status => self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, ch.prev_status, ch.status, ch.setter),
+            // Not a roster transition — handled in drainMembershipChanges, never
+            // surfaced as an IRC line here.
+            .ghost_reclaim => {},
         }
     }
 
@@ -8296,12 +8312,37 @@ pub const LinuxServer = struct {
                 }
                 for (changes[i..j]) |*ch| ch.deinit(self.allocator);
                 i = j;
+            } else if (changes[i].kind == .ghost_reclaim) {
+                // Not a roster line: retire the stale local session holding this nick
+                // in favour of the live remote one (same account, strictly-newer
+                // mesh claim — already gated by the route table).
+                self.reclaimGhostSession(&changes[i]);
+                changes[i].deinit(self.allocator);
+                i += 1;
             } else {
                 if (!isPresenceChannel(changes[i].channel)) self.emitRemoteMembership(&changes[i], remote);
                 changes[i].deinit(self.allocator);
                 i += 1;
             }
         }
+    }
+
+    /// Retire ("ghost-kill") the stale LOCAL session named by a `ghost_reclaim`
+    /// delta: the same authenticated account is live on another mesh node with a
+    /// strictly-newer claim, so this older local session is the ghost. Defence in
+    /// depth before disconnecting anyone: the local holder must still exist, be
+    /// authenticated, and match the remote claim's account (case-insensitive). A
+    /// missing/changed/anonymous holder is left untouched.
+    fn reclaimGhostSession(self: *LinuxServer, d: anytype) void {
+        if (d.account.len == 0) return; // never reclaim against an anonymous claim
+        const wid = self.world.findNick(d.nick) orelse return;
+        const victim_id = clientIdFromWorld(wid);
+        const victim = self.connFor(victim_id) orelse return;
+        const victim_account = victim.session.account() orelse return;
+        if (!std.ascii.eqlIgnoreCase(victim_account, d.account)) return;
+        var buf: [default_reply_bytes]u8 = undefined;
+        const ln = std.fmt.bufPrint(&buf, ":{s} ERROR :Session reclaimed (newer login for {s} elsewhere)\r\n", .{ self.serverName(), victim_account }) catch return;
+        self.enqueueDeliveryThenClose(victim_id, ln, "Session reclaimed") catch {};
     }
 
     /// Emit a run of remote joins to one channel as a cap-gated IRCv3 `netjoin`
@@ -8791,10 +8832,31 @@ pub const LinuxServer = struct {
         return self.world.findNick(nick) != null;
     }
 
+    /// The authenticated account of the LOCAL client currently holding `nick`, or
+    /// null when no local client holds it or the holder is not logged in. Borrowed
+    /// for the duration of the synchronous resolve call. Lets the route table tell
+    /// a same-identity duplicate (account-aware reconcile) from a genuine collision.
+    fn localNickAccount(ctx: *anyopaque, nick: []const u8) ?[]const u8 {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        const wid = self.world.findNick(nick) orelse return null;
+        const conn = self.connFor(clientIdFromWorld(wid)) orelse return null;
+        const acct = conn.session.account() orelse return null;
+        return if (acct.len != 0) acct else null;
+    }
+
+    /// The mesh-claim HLC of the LOCAL client holding `nick` (0 = unknown / not
+    /// held), so the route table can tell a stale ghost from the live session.
+    fn localNickHlc(ctx: *anyopaque, nick: []const u8) u64 {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        const wid = self.world.findNick(nick) orelse return 0;
+        const conn = self.connFor(clientIdFromWorld(wid)) orelse return 0;
+        return conn.mesh_nick_hlc;
+    }
+
     /// Build the borrowed `LocalNickResolver` the mesh links consult; `self` must
     /// outlive every link (it does — links are torn down before server shutdown).
     fn localNickResolver(self: *LinuxServer) s2s_link.S2sLink.LocalNickResolver {
-        return .{ .ctx = self, .held_fn = localNickHeld };
+        return .{ .ctx = self, .held_fn = localNickHeld, .account_fn = localNickAccount, .hlc_fn = localNickHlc };
     }
 
     fn announceNickChange(self: *LinuxServer, old_nick: []const u8, new_nick: []const u8, ident: s2s_link.S2sLink.MemberIdentity) void {
@@ -13654,6 +13716,10 @@ pub const LinuxServer = struct {
         conn.connected_at_ms = if (snap.connected_at_ms != 0) snap.connected_at_ms else now;
         conn.last_message_ms = if (snap.last_message_ms != 0) snap.last_message_ms else now;
         conn.last_activity_ms = now;
+        // A carried-over session is, by definition, live across the USR2. Stamp a
+        // FRESH mesh-claim HLC so that on relink it out-ranks any stale same-account
+        // ghost a peer may still hold, and is never itself mistaken for the ghost.
+        conn.mesh_nick_hlc = self.nextMeshHlc();
         conn.session.restore(snap);
         self.applyOperAutoOverride(conn); // re-affirm +j across USR2 for auto_override admins
         self.injectSessionState(conn);
@@ -18082,6 +18148,9 @@ pub const LinuxServer = struct {
         // Propagate the nick change across the mesh so remote members rename the
         // user and see a live NICK line (identity is nick-independent).
         self.announceNickChange(old, newnick, membershipIdentityOf(conn));
+        // Re-stamp the mesh-claim HLC: changing nick is a fresh claim assertion, so
+        // a same-account ghost on another node loses to this newer claim.
+        conn.mesh_nick_hlc = self.nextMeshHlc();
 
         // MONITOR: old nick went away, new nick appeared.
         self.monitorTransition(old, newnick) catch {};

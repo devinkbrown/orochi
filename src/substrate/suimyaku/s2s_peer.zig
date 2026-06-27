@@ -48,6 +48,11 @@ const handshake_version: u8 = 2;
 /// Handshake capability bits (forward-compatible bitfield). Unknown bits are
 /// ignored on decode, so future capabilities never break an older peer.
 const cap_frame_signing: u8 = 1 << 0;
+/// The peer understands the optional `account` block on MEMBERSHIP/NICKCHANGE
+/// events (account-aware collision reconcile). Gated so we only ever append the
+/// extra wire bytes to a peer that advertised support — an older peer (which
+/// strictly rejects trailing bytes) never receives them.
+const cap_member_account: u8 = 1 << 1;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
@@ -168,6 +173,11 @@ pub const S2sPeer = struct {
     /// wrap for a signing-capable peer) and inbound enforcement (a signing-capable
     /// peer's in-scope frames MUST be signed, else they are rejected).
     peer_supports_signing: bool = false,
+    /// Whether the remote peer advertised the `member_account` capability. Gates
+    /// emission of the optional `account` block on MEMBERSHIP/NICKCHANGE events so
+    /// an older peer (strict trailing-byte rejection) never receives the extra
+    /// bytes. Learned on `recvHandshake`.
+    peer_supports_account: bool = false,
     /// In-scope frames rejected because their signed-envelope verification failed
     /// or the self-certified origin did not match the claimed origin. Folded into
     /// the same audit drain as `rejected_origin_frames` (see `acceptsDirectOrigin`).
@@ -709,7 +719,11 @@ pub const S2sPeer = struct {
     /// after emitting the JOIN/PART. `username`/`realname`/`host` carry the
     /// member's propagated identity ("" = unknown; render the placeholder).
     pub const MembershipDelta = struct {
-        pub const Kind = enum { joined, parted, status };
+        /// `ghost_reclaim` is NOT a roster transition — it asks the daemon to retire
+        /// the LOCAL session holding `nick` (same authenticated account, strictly
+        /// older mesh claim) in favour of the live remote one. `account` carries the
+        /// remote claim's account for a daemon-side safety re-check before any kill.
+        pub const Kind = enum { joined, parted, status, ghost_reclaim };
 
         channel: []u8,
         nick: []u8,
@@ -719,6 +733,9 @@ pub const S2sPeer = struct {
         /// The nick that set this status (explicit `/MODE`), so the daemon renders
         /// `:setter MODE …` instead of the origin server. "" = none.
         setter: []u8,
+        /// The remote claim's authenticated account ("" = none); used by the daemon
+        /// to re-verify a `ghost_reclaim` before retiring a local session.
+        account: []u8,
         kind: Kind,
         /// New status bits (for joined/status); the member's prefix modes.
         status: u4,
@@ -732,6 +749,7 @@ pub const S2sPeer = struct {
             allocator.free(self.realname);
             allocator.free(self.host);
             allocator.free(self.setter);
+            allocator.free(self.account);
             self.* = undefined;
         }
     };
@@ -1023,9 +1041,10 @@ pub const S2sPeer = struct {
         // events introduce a claim; a part can never collide.
         var apply_nick: []const u8 = ev.nick;
         var surfaced_nick: ?[]const u8 = null;
+        var skip_displace = false;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
         if (ev.present) {
-            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc)) {
+            switch (self.routes.resolveIncomingNick(ev.nick, ev.origin_node, ev.hlc, ev.account)) {
                 .keep => {},
                 .rename_to_uid => |uid| {
                     // Newcomer lost: store + surface this member under its UID.
@@ -1033,16 +1052,51 @@ pub const S2sPeer = struct {
                     apply_nick = uid_buf[0..uid.len];
                     surfaced_nick = apply_nick;
                 },
+                .remote_same_account => {
+                    // Same identity duplicated across nodes: apply via hlc LWW but
+                    // never displace the incumbent to a UID.
+                    skip_displace = true;
+                },
+                .reclaim_local => {
+                    // The LOCAL holder is the STALE session (strictly-older mesh
+                    // claim, checked by the resolver) and this remote claim is the
+                    // live one. Store the remote claim so it is addressable, and ask
+                    // the daemon to retire the local ghost. Suppress the normal JOIN
+                    // delta — the ghost's QUIT surfaces the transition, and emitting
+                    // a JOIN for a still-present local nick would be a duplicate.
+                    _ = self.routes.applyMembership(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, true, .{
+                        .username = ev.username,
+                        .realname = ev.realname,
+                        .host = ev.host,
+                        .account = ev.account,
+                    }) catch {};
+                    self.queueMembershipDelta(&ev, .ghost_reclaim, 0, null) catch {};
+                    return;
+                },
+                .local_same_account => {
+                    // The remote claim is the SAME authenticated identity as a
+                    // LOCAL holder (a duplicate session of a logged-in user across
+                    // the mesh), not a stranger. NEVER rename a logged-in user to a
+                    // UID, and do not store a duplicate remote claim that would
+                    // shadow the live local holder — drop this event. The node that
+                    // actually hosts the live session keeps the nick; the stale side
+                    // converges when it sees the live claim. (Active retirement of
+                    // the stale ghost session is the daemon's account-keyed reclaim,
+                    // gated on a strictly-newer mesh HLC.)
+                    return;
+                },
             }
             // Newcomer wins over a different-node incumbent: displace the
-            // incumbent to ITS uid first so two holders never coexist.
-            if (surfaced_nick == null) self.displaceIncumbent(&ev);
+            // incumbent to ITS uid first so two holders never coexist. Skipped for
+            // a same-account reconcile, where LWW collapses the duplicate instead.
+            if (surfaced_nick == null and !skip_displace) self.displaceIncumbent(&ev);
         }
 
         const res = self.routes.applyMembership(ev.channel, apply_nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
+            .account = ev.account,
         }) catch return;
         const kind: MembershipDelta.Kind = switch (res.outcome) {
             .joined => .joined,
@@ -1078,7 +1132,7 @@ pub const S2sPeer = struct {
         // user@host (falls back to empties when the member is route-only).
         var ident = MemberIdentity{};
         if (self.routes.findMember(nick)) |m| {
-            ident = .{ .username = m.username, .realname = m.realname, .host = m.host };
+            ident = .{ .username = m.username, .realname = m.realname, .host = m.host, .account = m.account };
         }
         const renamed = self.routes.renameNick(nick, new_nick, incumbent_node, ident) catch return;
         if (!renamed) return;
@@ -1136,6 +1190,8 @@ pub const S2sPeer = struct {
         errdefer self.allocator.free(ho);
         const st = try self.allocator.dupe(u8, ev.setter);
         errdefer self.allocator.free(st);
+        const ac = try self.allocator.dupe(u8, ev.account);
+        errdefer self.allocator.free(ac);
         try self.membership_changes.append(self.allocator, .{
             .channel = ch,
             .nick = nk,
@@ -1143,6 +1199,7 @@ pub const S2sPeer = struct {
             .realname = rn,
             .host = ho,
             .setter = st,
+            .account = ac,
             .kind = kind,
             .status = ev.status,
             .prev_status = prev_status,
@@ -1226,6 +1283,9 @@ pub const S2sPeer = struct {
             .realname = truncated(ident.realname, membership_event.max_realname_len),
             .host = truncated(ident.host, membership_event.max_host_len),
             .setter = truncated(setter, membership_event.max_setter_len),
+            // Only append the account block to a peer that negotiated support, so an
+            // older peer never sees the extra trailing bytes (which it would reject).
+            .account = if (self.peer_supports_account) truncated(ident.account, membership_event.max_account_len) else "",
         };
         var buf: [membership_event.max_encoded_len]u8 = undefined;
         const wire = try membership_event.encode(ev, &buf);
@@ -1563,15 +1623,26 @@ pub const S2sPeer = struct {
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
+            .account = ev.account,
         };
         var target_nick: []const u8 = ev.new_nick;
         var uid_buf: [nick_collision_uid_len]u8 = undefined;
-        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc)) {
+        switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account)) {
             .keep => self.displaceIncumbentForRename(ev.new_nick, ev.origin_node),
             .rename_to_uid => |uid| {
                 @memcpy(uid_buf[0..uid.len], uid[0..]);
                 target_nick = uid_buf[0..uid.len];
             },
+            // Same logged-in identity renaming into a nick a LOCAL client holds:
+            // never UID-rename the live user. Keep the wire nick and let the
+            // holders' nodes reconcile (the account-keyed reclaim retires the ghost).
+            // The reclaim itself is driven by the MEMBERSHIP path (a nick-change
+            // collision is rarer and the same burst re-announces memberships), so
+            // both same-account outcomes are a no-op here.
+            .local_same_account, .reclaim_local => {},
+            // Same identity as a different-node incumbent: accept the rename and let
+            // LWW converge; do NOT displace the incumbent to a UID.
+            .remote_same_account => {},
         }
 
         const renamed = self.routes.renameNick(ev.old_nick, target_nick, ev.origin_node, ident) catch return;
@@ -1632,8 +1703,10 @@ pub const S2sPeer = struct {
             .username = ident.username,
             .realname = ident.realname,
             .host = ident.host,
+            // Gated like MEMBERSHIP: only a member-account-capable peer gets it.
+            .account = if (self.peer_supports_account) truncated(ident.account, nick_event.max_account_len) else "",
         };
-        var buf: [nick_event.max_nick_len * 2 + nick_event.max_user_len + nick_event.max_real_len + nick_event.max_host_len + 32]u8 = undefined;
+        var buf: [nick_event.max_nick_len * 2 + nick_event.max_user_len + nick_event.max_real_len + nick_event.max_host_len + nick_event.max_account_len + 32]u8 = undefined;
         const wire = try nick_event.encode(ev, &buf);
         try self.emitSignable(sink, .NICKCHANGE, wire);
     }
@@ -1662,6 +1735,7 @@ pub const S2sPeer = struct {
         // to/from a signing-capable peer travel inside a `signed_frame` envelope,
         // and an UNSIGNED in-scope frame from such a peer is rejected.
         self.peer_supports_signing = (hs.caps & cap_frame_signing) != 0;
+        self.peer_supports_account = (hs.caps & cap_member_account) != 0;
 
         try self.rememberRemote(hs, now_ms);
         if (!self.handshake_sent) try self.emitHandshake(sink);
@@ -1699,7 +1773,10 @@ pub const S2sPeer = struct {
         // Advertise frame signing only when we actually hold a signing key (i.e.
         // a secured link supplied the node identity). Plaintext links have no key,
         // so they never advertise it and stay on the legacy unsigned path.
-        const caps: u8 = if (self.signing_key != null) cap_frame_signing else 0;
+        // We always understand the optional member-account block, so advertise it
+        // unconditionally; emission still only happens to a peer that does too.
+        var caps: u8 = cap_member_account;
+        if (self.signing_key != null) caps |= cap_frame_signing;
         const payload = try encodeHandshake(self.allocator, .{
             .node_id = self.local_node_id,
             .epoch_ms = self.local_epoch_ms,

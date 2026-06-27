@@ -14,6 +14,7 @@ pub const max_nick_len = 64;
 pub const max_user_len = 32;
 pub const max_real_len = 256;
 pub const max_host_len = 255;
+pub const max_account_len = 64;
 const fixed_prefix = 8 + 8; // origin_node, hlc
 
 pub const Error = error{
@@ -30,17 +31,24 @@ pub const NickEvent = struct {
     username: []const u8,
     realname: []const u8,
     host: []const u8,
+    /// The user's authenticated ACCOUNT name ("" = not logged in / unknown), so a
+    /// remote node can recognize a colliding nick as the SAME identity. OPTIONAL
+    /// trailing block: emitted only when non-empty AND the peer negotiated the
+    /// member-account feature, so an older peer never sees the extra bytes.
+    account: []const u8 = "",
 };
 
 pub fn encodedLen(ev: NickEvent) Error!usize {
     if (ev.old_nick.len > max_nick_len or ev.new_nick.len > max_nick_len or
         ev.username.len > max_user_len or ev.realname.len > max_real_len or
-        ev.host.len > max_host_len)
+        ev.host.len > max_host_len or ev.account.len > max_account_len)
     {
         return error.FieldTooLong;
     }
     return fixed_prefix + 2 + ev.old_nick.len + 2 + ev.new_nick.len +
-        2 + ev.username.len + 2 + ev.realname.len + 2 + ev.host.len;
+        2 + ev.username.len + 2 + ev.realname.len + 2 + ev.host.len +
+        // Optional trailing account — omitted when empty (pre-account wire format).
+        (if (ev.account.len != 0) @as(usize, 2 + ev.account.len) else 0);
 }
 
 fn putBytes16(out: []u8, i: *usize, bytes: []const u8) void {
@@ -64,6 +72,8 @@ pub fn encode(ev: NickEvent, out: []u8) Error![]const u8 {
     putBytes16(out, &i, ev.username);
     putBytes16(out, &i, ev.realname);
     putBytes16(out, &i, ev.host);
+    // Optional trailing account — omitted when empty (backward-compatible).
+    if (ev.account.len != 0) putBytes16(out, &i, ev.account);
     return out[0..i];
 }
 
@@ -105,12 +115,17 @@ pub fn decode(bytes: []const u8) Error!NickEvent {
     const username = try takeBytes16(bytes, &i, max_user_len);
     const realname = try takeBytes16(bytes, &i, max_real_len);
     const host = try takeBytes16(bytes, &i, max_host_len);
+    // Optional trailing account (newer peers that negotiated member-account); its
+    // absence (i == bytes.len) is the pre-account wire format.
+    var account: []const u8 = "";
+    if (i < bytes.len) account = try takeBytes16(bytes, &i, max_account_len);
 
     if (i != bytes.len) return error.TrailingBytes;
     try validateNick(old_nick);
     try validateNick(new_nick);
     try validateLineIdentity(username);
     try validateLineIdentity(host);
+    try validateLineIdentity(account);
     return .{
         .origin_node = origin_node,
         .hlc = hlc,
@@ -119,6 +134,7 @@ pub fn decode(bytes: []const u8) Error!NickEvent {
         .username = username,
         .realname = realname,
         .host = host,
+        .account = account,
     };
 }
 
@@ -166,7 +182,9 @@ test "nick event round-trips with empty identity" {
 }
 
 test "nick event rejects malformed input" {
-    const ev = NickEvent{ .origin_node = 1, .hlc = 2, .old_nick = "old", .new_nick = "new", .username = "u", .realname = "r", .host = "h" };
+    // Encode WITH an account so the optional-account read consumes it; the pad byte
+    // after the full event is then the genuine trailing-bytes case.
+    const ev = NickEvent{ .origin_node = 1, .hlc = 2, .old_nick = "old", .new_nick = "new", .username = "u", .realname = "r", .host = "h", .account = "acct" };
     var buf: [256]u8 = undefined;
     const wire = try encode(ev, &buf);
     try testing.expectError(error.Truncated, decode(wire[0 .. wire.len - 1]));
@@ -175,6 +193,20 @@ test "nick event rejects malformed input" {
     @memcpy(padded[0..wire.len], wire);
     padded[wire.len] = 0xaa;
     try testing.expectError(error.TrailingBytes, decode(padded[0 .. wire.len + 1]));
+}
+
+test "nick event round-trips an account, and omits it when empty (old-peer compat)" {
+    const with = NickEvent{ .origin_node = 7, .hlc = 3, .old_nick = "Guest9", .new_nick = "kain", .username = "kain", .realname = "Devin", .host = "h", .account = "kain" };
+    var b1: [256]u8 = undefined;
+    try testing.expectEqualStrings("kain", (try decode(try encode(with, &b1))).account);
+
+    // Empty account => omitted => byte-identical to a struct built without account.
+    const none = NickEvent{ .origin_node = 7, .hlc = 3, .old_nick = "Guest9", .new_nick = "kain", .username = "kain", .realname = "Devin", .host = "h" };
+    const empty = NickEvent{ .origin_node = 7, .hlc = 3, .old_nick = "Guest9", .new_nick = "kain", .username = "kain", .realname = "Devin", .host = "h", .account = "" };
+    var b2: [256]u8 = undefined;
+    var b3: [256]u8 = undefined;
+    try testing.expectEqualSlices(u8, try encode(none, &b2), try encode(empty, &b3));
+    try testing.expectEqualStrings("", (try decode(try encode(none, &b2))).account);
 }
 
 test "nick event enforces bounds" {

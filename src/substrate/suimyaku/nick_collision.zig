@@ -29,10 +29,14 @@ pub const Uid = uid_alloc.Uid;
 
 /// One side of a nick contest: the claimant's owning node and the logical clock
 /// of its claim. `node_id` 0 is reserved (the route table rejects it upstream),
-/// so a zero node never wins a contest here either.
+/// so a zero node never wins a contest here either. `account` is the claimant's
+/// authenticated account ("" = none); it is NOT part of the deterministic
+/// `(hlc, node)` tiebreak — it lets a caller detect that two claims are the SAME
+/// identity BEFORE deciding to contest at all (account-aware reconcile).
 pub const Claim = struct {
     node_id: NodeId,
     hlc: u64,
+    account: []const u8 = "",
 };
 
 /// Whether `candidate` beats `incumbent` for the same nick. A candidate from the

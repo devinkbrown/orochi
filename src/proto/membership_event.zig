@@ -14,7 +14,17 @@
 //!
 //!   present:u8 | status:u8 | origin_node:u64 | hlc:u64 |
 //!   chan_len:u16 | chan… | nick_len:u16 | nick… |
-//!   user_len:u16 | user… | real_len:u16 | real… | host_len:u16 | host…
+//!   user_len:u16 | user… | real_len:u16 | real… | host_len:u16 | host… |
+//!   [setter_len:u16 | setter…] [account_len:u16 | account…]
+//!
+//! The trailing `setter` and `account` blocks are OPTIONAL and disambiguated by
+//! COUNT, not by a tag: zero trailing blocks = neither; one = `setter` only (the
+//! pre-account wire format, what older peers emit); two = `setter` (possibly
+//! empty) then `account`. Because a lone trailing block is always `setter`, the
+//! encoder FORCES an (empty) setter slot whenever it appends an account, so the
+//! account is unambiguously the second block. The daemon only sets `account` for
+//! a peer that negotiated the member-account handshake feature, so an older peer
+//! (strict `TrailingBytes`) never receives the second block.
 //!
 //! Bounded by the per-field limits so a hostile peer cannot pin large buffers;
 //! decode borrows the input (no allocation). Identity fields may be empty
@@ -27,6 +37,7 @@ pub const max_username_len = 32;
 pub const max_realname_len = 256;
 pub const max_host_len = 255;
 pub const max_setter_len = 64;
+pub const max_account_len = 64;
 const fixed_prefix = 1 + 1 + 8 + 8; // present, status, origin_node, hlc
 
 /// Upper bound on one encoded event (all fields at their limits) — size the
@@ -37,7 +48,8 @@ pub const max_encoded_len = fixed_prefix +
     2 + max_username_len +
     2 + max_realname_len +
     2 + max_host_len +
-    2 + max_setter_len;
+    2 + max_setter_len +
+    2 + max_account_len;
 
 pub const Error = error{
     Truncated,
@@ -64,6 +76,13 @@ pub const MembershipEvent = struct {
     /// the wire so an empty-setter event stays byte-identical to the pre-setter
     /// format — backward-compatible for every membership event except a MODE.
     setter: []const u8 = "",
+    /// The member's authenticated ACCOUNT name ("" = not logged in / unknown).
+    /// Lets a remote node recognize that a colliding nick is the SAME identity
+    /// (account-aware reconcile) instead of running an account-blind contest that
+    /// would rename a logged-in user to its mesh UID. OPTIONAL trailing block:
+    /// emitted only when non-empty AND the peer negotiated the member-account
+    /// feature; when emitted it always follows a (possibly empty) setter block.
+    account: []const u8 = "",
 };
 
 pub fn encodedLen(ev: MembershipEvent) Error!usize {
@@ -72,15 +91,20 @@ pub fn encodedLen(ev: MembershipEvent) Error!usize {
     if (ev.realname.len > max_realname_len) return error.NameTooLong;
     if (ev.host.len > max_host_len) return error.NameTooLong;
     if (ev.setter.len > max_setter_len) return error.NameTooLong;
+    if (ev.account.len > max_account_len) return error.NameTooLong;
+    // Account forces a (possibly empty) setter slot ahead of it so a lone trailing
+    // block is unambiguously the setter; without an account, an empty setter stays
+    // omitted (byte-identical to the pre-setter / pre-account wire format).
+    const want_account = ev.account.len != 0;
+    const setter_slot = ev.setter.len != 0 or want_account;
     return fixed_prefix +
         2 + ev.channel.len +
         2 + ev.nick.len +
         2 + ev.username.len +
         2 + ev.realname.len +
         2 + ev.host.len +
-        // Setter is appended ONLY when present; an empty setter keeps the encoding
-        // byte-identical to the pre-setter wire format.
-        (if (ev.setter.len != 0) @as(usize, 2 + ev.setter.len) else 0);
+        (if (setter_slot) @as(usize, 2 + ev.setter.len) else 0) +
+        (if (want_account) @as(usize, 2 + ev.account.len) else 0);
 }
 
 fn putBytes16(out: []u8, i: *usize, bytes: []const u8) void {
@@ -108,8 +132,12 @@ pub fn encode(ev: MembershipEvent, out: []u8) Error![]const u8 {
     putBytes16(out, &i, ev.username);
     putBytes16(out, &i, ev.realname);
     putBytes16(out, &i, ev.host);
-    // Optional trailing setter — omitted when empty (backward-compatible).
-    if (ev.setter.len != 0) putBytes16(out, &i, ev.setter);
+    // Optional trailing setter — omitted when empty UNLESS an account follows, in
+    // which case the (possibly empty) setter slot is forced so the account is
+    // unambiguously the second trailing block.
+    const want_account = ev.account.len != 0;
+    if (ev.setter.len != 0 or want_account) putBytes16(out, &i, ev.setter);
+    if (want_account) putBytes16(out, &i, ev.account);
     return out[0..i];
 }
 
@@ -151,10 +179,14 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     const username = try takeBytes16(bytes, &i, max_username_len);
     const realname = try takeBytes16(bytes, &i, max_realname_len);
     const host = try takeBytes16(bytes, &i, max_host_len);
-    // Optional trailing setter: present only on a MODE event (newer peers). Its
-    // absence (i == bytes.len) is the common, pre-setter wire format.
+    // Optional trailing blocks, disambiguated by count: the FIRST is always the
+    // setter (present on a MODE event or whenever an account follows), the SECOND
+    // is the account (newer peers that negotiated the member-account feature).
+    // Zero trailing blocks is the common pre-setter wire format.
     var setter: []const u8 = "";
+    var account: []const u8 = "";
     if (i < bytes.len) setter = try takeBytes16(bytes, &i, max_setter_len);
+    if (i < bytes.len) account = try takeBytes16(bytes, &i, max_account_len);
 
     if (i != bytes.len) return error.TrailingBytes;
     if (channel.len == 0 or nick.len == 0) return error.NameTooLong;
@@ -164,6 +196,7 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     try validateLineField(realname, false);
     try validateLineField(host, false);
     try validateLineField(setter, true);
+    try validateLineField(account, true);
     return .{
         .present = present,
         .status = @intCast(status_raw),
@@ -175,6 +208,7 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
         .realname = realname,
         .host = host,
         .setter = setter,
+        .account = account,
     };
 }
 
@@ -276,15 +310,50 @@ test "truncated input is rejected" {
 }
 
 test "trailing bytes are rejected" {
-    // Encode WITH a setter so the optional-setter read consumes it; the pad byte
-    // after the full event is then the genuine trailing-bytes case.
-    const ev = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .setter = "kain" };
+    // Encode WITH both optional blocks (setter + account) so both reads consume
+    // their fields; the pad byte after the full event is then the genuine
+    // trailing-bytes case (not a truncated optional block).
+    const ev = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .setter = "kain", .account = "kacct" };
     var buf: [max_encoded_len]u8 = undefined;
     const wire = try encode(ev, &buf);
     var padded: [max_encoded_len + 1]u8 = undefined;
     @memcpy(padded[0..wire.len], wire);
     padded[wire.len] = 0xAA;
     try testing.expectError(error.TrailingBytes, decode(padded[0 .. wire.len + 1]));
+}
+
+test "account round-trips alongside a setter" {
+    const ev = MembershipEvent{ .present = true, .status = 0b0100, .origin_node = 2, .hlc = 9, .channel = "#root", .nick = "kain", .setter = "trev", .account = "kain" };
+    var buf: [max_encoded_len]u8 = undefined;
+    const got = try decode(try encode(ev, &buf));
+    try testing.expectEqualStrings("trev", got.setter);
+    try testing.expectEqualStrings("kain", got.account);
+}
+
+test "account forces an empty setter slot so it stays the second trailing block" {
+    // No setter, but an account: the encoder must emit an EMPTY setter block first
+    // so the account is unambiguously the second block on decode.
+    const ev = MembershipEvent{ .present = true, .status = 0, .origin_node = 2, .hlc = 9, .channel = "#root", .nick = "kain", .account = "kain" };
+    var buf: [max_encoded_len]u8 = undefined;
+    const got = try decode(try encode(ev, &buf));
+    try testing.expectEqualStrings("", got.setter);
+    try testing.expectEqualStrings("kain", got.account);
+}
+
+test "a lone trailing block decodes as setter, never account (old-peer compat)" {
+    // What an older (pre-account) peer emits for a MODE: a single trailing setter,
+    // no account. The new decoder must read it as the setter and leave account "".
+    const ev = MembershipEvent{ .present = true, .status = 0b0100, .origin_node = 2, .hlc = 9, .channel = "#root", .nick = "kain", .setter = "trev" };
+    var buf: [max_encoded_len]u8 = undefined;
+    const got = try decode(try encode(ev, &buf));
+    try testing.expectEqualStrings("trev", got.setter);
+    try testing.expectEqualStrings("", got.account);
+}
+
+test "an over-long account is rejected by encode" {
+    const big = "a" ** (max_account_len + 1);
+    const ev = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .account = big };
+    try testing.expectError(error.NameTooLong, encodedLen(ev));
 }
 
 test "setter round-trips and an empty setter stays old-format compatible" {
