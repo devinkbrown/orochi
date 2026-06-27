@@ -900,6 +900,20 @@ pub fn installUpgradeSignalHandler() void {
     };
     posix.sigaction(posix.SIG.USR2, &act, null);
 }
+
+/// Set SIGPIPE's disposition to ignore (process-global, idempotent). A
+/// peer-closed raw socket write then returns EPIPE instead of killing the
+/// process. Called from Server.init so both the daemon and test binaries are
+/// covered.
+fn ignoreSigpipe() void {
+    if (comptime builtin.os.tag != .linux) return;
+    const act = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &act, null);
+}
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
@@ -2704,6 +2718,15 @@ pub const LinuxServer = struct {
     pub fn init(allocator: std.mem.Allocator, raw_config: Config) !LinuxServer {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
+        // Ignore SIGPIPE process-wide. The reactors do socket I/O through io_uring
+        // (which reports -EPIPE in the completion, never a signal), but raw
+        // `write()`/`send()` on a peer-closed socket — done by the test harness
+        // and any non-uring path — would otherwise deliver SIGPIPE, whose default
+        // disposition silently terminates the process (no core, exit 141). Setting
+        // it here covers both the daemon and the test binaries (which build a
+        // Server but never call installUpgradeSignalHandler). Idempotent + global.
+        ignoreSigpipe();
+
         const runtime_features = try runtimeDisabledFeatures(allocator, raw_config);
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
         const config = runtime_features.config;
@@ -3163,6 +3186,17 @@ pub const LinuxServer = struct {
         self.migration_origin_policy.deinit(self.allocator);
         self.migration_origin_journal.deinit(self.allocator);
         self.content_filter.deinit();
+        // Stop BOTH media pump threads before freeing either transport or the
+        // bridge registry. Each pump's cross-leg sink reaches into the OTHER
+        // transport (native pump -> media_plane.sendTo, RTP pump ->
+        // native_media.sendTo) via media_bridges, so deiniting one transport (or
+        // the bridges) while the other pump is still live is a use-after-free —
+        // a teardown race that crashes a background thread shortly after a test
+        // passes (surfacing as a spurious "failed command" under `zig build
+        // test`'s `--listen=-` runner). shutdown() is idempotent, so the later
+        // deinit() calls (which call it again) are safe.
+        self.media_plane.shutdown();
+        self.native_media.shutdown();
         self.media_rooms.deinit();
         self.media_plane.deinit();
         self.native_media.deinit();
