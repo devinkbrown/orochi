@@ -1052,9 +1052,17 @@ pub const S2sPeer = struct {
                     apply_nick = uid_buf[0..uid.len];
                     surfaced_nick = apply_nick;
                 },
-                .remote_same_account => {
-                    // Same identity duplicated across nodes: apply via hlc LWW but
-                    // never displace the incumbent to a UID.
+                .remote_same_account, .local_same_account => {
+                    // Same authenticated identity duplicated across the mesh — a
+                    // logged-in user present on more than one node, or a same-account
+                    // remote incumbent. Apply the membership under the REAL nick
+                    // (never a UID, never dropped): the cross-node channel relay gate
+                    // is `channelMembers(channel) > 0`, so if this remote member is
+                    // dropped and they are the ONLY member of the channel on their
+                    // node, this node never relays channel messages to them. hlc LWW
+                    // collapses the duplicate; the daemon's nickIsLiveLocal echo-
+                    // suppression hides the duplicate JOIN/PART for a locally-homed
+                    // nick. Never displace the holder to a UID.
                     skip_displace = true;
                 },
                 .reclaim_local => {
@@ -1071,18 +1079,6 @@ pub const S2sPeer = struct {
                         .account = ev.account,
                     }) catch {};
                     self.queueMembershipDelta(&ev, .ghost_reclaim, 0, null) catch {};
-                    return;
-                },
-                .local_same_account => {
-                    // The remote claim is the SAME authenticated identity as a
-                    // LOCAL holder (a duplicate session of a logged-in user across
-                    // the mesh), not a stranger. NEVER rename a logged-in user to a
-                    // UID, and do not store a duplicate remote claim that would
-                    // shadow the live local holder — drop this event. The node that
-                    // actually hosts the live session keeps the nick; the stale side
-                    // converges when it sees the live claim. (Active retirement of
-                    // the stale ghost session is the daemon's account-keyed reclaim,
-                    // gated on a strictly-newer mesh HLC.)
                     return;
                 },
             }
@@ -2583,14 +2579,19 @@ test "a same-account MEMBERSHIP that is NOT newer keeps the live local session (
     try a.sendMembership(a_to_b.sink(), "#room", "kain", 0, 200, true, .{ .username = "u", .realname = "r", .host = "h", .account = "kain" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EF);
 
-    // The remote duplicate is dropped (local_same_account): no delta, no reclaim,
-    // and crucially no UID rename of the live local user.
+    // local_same_account APPLIES the membership under the REAL nick (no UID, no
+    // reclaim): the channel→node relay gate is `channelMembers > 0`, so dropping it
+    // would isolate a user who is the only channel member on their node from
+    // cross-node messages. The daemon's nickIsLiveLocal suppression hides the
+    // duplicate JOIN display for the locally-homed nick.
     const changes = try b.takeMembershipChanges();
     defer {
         for (changes) |*c| c.deinit(allocator);
         allocator.free(changes);
     }
-    try std.testing.expectEqual(@as(usize, 0), changes.len);
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.joined, changes[0].kind);
+    try std.testing.expectEqualStrings("kain", changes[0].nick); // real nick, NOT a UID
 }
 
 test "signing peers round-trip a signed KILL frame" {
