@@ -17788,6 +17788,28 @@ pub const LinuxServer = struct {
         return @intCast(self.world.localNickCount());
     }
 
+    /// Mesh-wide user total: this node's local nicks plus the distinct remote
+    /// nicks each established S2S peer has announced into its route table. S2S
+    /// links live only on reactor 0, so iterate every reactor (matching
+    /// sendNames / findRemoteWhois); the whole completion runs under
+    /// `world.lockWrite`, so the cross-reactor read is race-free. Each link's
+    /// route table holds the nicks homed on that peer, so summing stays correct
+    /// as long as a nick is homed on exactly one node (the mesh invariant).
+    fn meshUserCount(self: *LinuxServer) u64 {
+        var total: u64 = self.world.localNickCount();
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s_secured) |link| {
+                    if (link.established()) total += @intCast(link.remoteNickCount());
+                } else if (slot.value.s2s) |link| {
+                    if (link.established()) total += @intCast(link.remoteNickCount());
+                }
+            }
+        }
+        return total;
+    }
+
     pub fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         // Classify connections: registered local users vs unknown (still in
         // registration) vs established S2S peers (counted as servers, never
@@ -17819,8 +17841,11 @@ pub const LinuxServer = struct {
         // Distinct peers + this node. Dedup collapses a transient duplicate link
         // to the same peer so the count never double-reports a neighbour.
         const servers: u64 = 1 + self.distinctPeerCount();
+        // Network-wide user total for the global (251/266) figures. `users` stays
+        // local for the 255/265 "Current local users" lines.
+        const mesh: u64 = self.meshUserCount();
         const counts = lusers.Counts{
-            .users = users,
+            .users = mesh,
             .invisible = invisible,
             .servers = servers,
             .opers = opers,
@@ -17828,8 +17853,8 @@ pub const LinuxServer = struct {
             .channels = @intCast(self.world.channelCount()),
             .local_clients = users,
             .local_max = @max(users, self.stats_peak_clients),
-            .global_clients = users,
-            .global_max = @max(users, self.stats_peak_clients),
+            .global_clients = mesh,
+            .global_max = @max(mesh, self.stats_peak_clients),
             // RPL_STATSCONN (250): the running peak client count and the
             // cumulative number of connections this node has accepted.
             .highest_connections = @max(users, self.stats_peak_clients),
@@ -17980,7 +18005,9 @@ pub const LinuxServer = struct {
             .server = self.serverName(),
             .version = server_version,
             .time = formatServerTime(&time_buf),
-            .users = self.countRegisteredUsers(),
+            // Network-wide total so a MOTD that says "users online" / "across the
+            // mesh" reflects the whole mesh, not just this node's local clients.
+            .users = self.meshUserCount(),
             .is_oper = conn.session.isOper(),
             .secure = conn.is_tls,
             .hour = @intCast(@mod(@divFloor(epoch_s, 3600), 24)),

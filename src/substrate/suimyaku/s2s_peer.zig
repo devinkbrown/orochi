@@ -1712,6 +1712,13 @@ pub const S2sPeer = struct {
         return self.routes.channelMembers(channel);
     }
 
+    /// Count of distinct remote nicks this peer has announced into the route
+    /// table — i.e. users homed on the node across this link. Used to compute a
+    /// mesh-wide user total (local nicks + remote nicks).
+    pub fn remoteNickCount(self: *const S2sPeer) usize {
+        return self.routes.nickCount();
+    }
+
     pub fn channelModeFlags(self: *const S2sPeer, channel: []const u8) ?route_table.ChannelModeFlags {
         return self.routes.channelModeFlags(channel);
     }

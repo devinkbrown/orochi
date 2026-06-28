@@ -298,6 +298,11 @@ pub const S2sLink = struct {
         return self.peer.channelMembers(channel);
     }
 
+    /// Distinct remote nicks announced across this link (mesh user-count input).
+    pub fn remoteNickCount(self: *const S2sLink) usize {
+        return self.peer.remoteNickCount();
+    }
+
     pub const RelayMessage = s2s_peer.RelayMessage;
     pub const RelayVerb = s2s_peer.RelayVerb;
 

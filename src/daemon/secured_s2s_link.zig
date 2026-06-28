@@ -242,6 +242,11 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.channelMembers(channel) else &.{};
     }
 
+    /// Distinct remote nicks announced across this link (mesh user-count input).
+    pub fn remoteNickCount(self: *const SecuredLink) usize {
+        return if (self.inner) |l| l.remoteNickCount() else 0;
+    }
+
     pub fn remoteName(self: *const SecuredLink) []const u8 {
         return if (self.inner) |l| l.remoteName() else "";
     }
