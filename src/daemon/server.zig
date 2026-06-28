@@ -20919,7 +20919,6 @@ pub const LinuxServer = struct {
                 return;
             }
             try self.mediaOffer(
-                id,
                 conn,
                 channel,
                 if (parsed.param_count >= 3) parsed.paramSlice()[2] else "",
@@ -21309,6 +21308,20 @@ pub const LinuxServer = struct {
         return w.written();
     }
 
+    /// Format just `codecs=<list> fec=<scheme>` (no wire prefix) — the detail body
+    /// of a MEDIA PROFILE event. Returns the written slice, or null if it overflows.
+    fn formatMediaCodecDetail(buf: []u8, codecs: []const sdp.Codec, fec: sdp.Fec) ?[]const u8 {
+        var w = Buf{ .storage = buf };
+        w.append("codecs=") catch return null;
+        for (codecs, 0..) |c, i| {
+            if (i != 0) w.appendByte(',') catch return null;
+            w.append(codecTagName(c.tag)) catch return null;
+        }
+        w.append(" fec=") catch return null;
+        w.append(fecSchemeName(fec.scheme)) catch return null;
+        return w.written();
+    }
+
     /// Emit `:server NOTE MEDIA <#chan> <label> codecs=<list> fec=<scheme>`.
     fn mediaNegotiatedReply(conn: *ConnState, channel: []const u8, label: []const u8, codecs: []const sdp.Codec, fec: sdp.Fec) !void {
         var buf: [320]u8 = undefined;
@@ -21321,7 +21334,7 @@ pub const LinuxServer = struct {
     /// persist it as the channel's active call profile, and reply with the agreed
     /// set. The UDP transport plane (ICE/STUN/TURN/jitter) is a separate layer;
     /// this is the live signaling/negotiation half.
-    fn mediaOffer(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, codec_csv: []const u8, transport_arg: []const u8) !void {
+    fn mediaOffer(self: *LinuxServer, conn: *ConnState, channel: []const u8, codec_csv: []const u8, transport_arg: []const u8) !void {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
@@ -21346,10 +21359,14 @@ pub const LinuxServer = struct {
         // Persist the agreed set as the call profile a later ANSWER negotiates against.
         self.media_rooms.setProfile(channel, negotiated.codecs, negotiated.fec) catch {};
         try mediaNegotiatedReply(conn, channel, "OFFER-ACK", negotiated.codecs, negotiated.fec);
-        // Push the new profile to the rest of the channel so everyone converges.
-        var pbuf: [320]u8 = undefined;
-        if (formatMediaCodecLine(&pbuf, channel, "PROFILE", negotiated.codecs, negotiated.fec)) |line|
-            self.broadcastChannel(channel, line, id) catch {};
+        // Converge the negotiated codec profile across the whole channel via the
+        // MEDIA EVENT plane (typed, mesh-propagated, member-gated) — same path as
+        // call presence. The old local-only NOTE MEDIA broadcast (broadcastChannel)
+        // never reached members on other mesh nodes, so they never learned the
+        // call's codec set. The offerer still gets its point-to-point OFFER-ACK above.
+        var pbuf: [256]u8 = undefined;
+        if (formatMediaCodecDetail(&pbuf, negotiated.codecs, negotiated.fec)) |detail|
+            self.publishMediaEvent("PROFILE", channel, conn.session.displayName(), detail) catch {};
         // Allocate this caller's ICE endpoint and advertise the server transport
         // (ufrag/pwd + media candidate) so the client can run STUN to the SFU.
         const nick = conn.session.displayName();
