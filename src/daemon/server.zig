@@ -4511,6 +4511,10 @@ pub const LinuxServer = struct {
     }
 
     fn startAcceptedClient(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, kind: AcceptKind, arm_recv: bool) !bool {
+        // Kernel-level dead-connection detection for every client transport
+        // (plain/TLS/WS share the same underlying TCP fd). Keeps channel rosters
+        // honest when a client disappears without a clean close.
+        applyClientKeepalive(conn.fd);
         return switch (kind) {
             .plain => try self.startAcceptedPlain(conn, arm_recv),
             .tls => try self.startAcceptedTls(id, conn, arm_recv),
@@ -25612,6 +25616,27 @@ fn setsockopt(fd: linux.fd_t, level: i32, optname: u32, opt: []const u8) ServerE
         .ACCES, .PERM => return error.PermissionDenied,
         else => return error.Unexpected,
     }
+}
+
+/// Enable TCP keepalive (+ NODELAY) on an accepted client socket so a peer that
+/// vanished without a clean close — laptop sleep, network change, crash, killed
+/// tab with no FIN — is reaped by the kernel in ~60s instead of lingering as a
+/// channel "ghost" until the much slower app-level PING timeout (interval +
+/// timeout). Idle-but-alive clients are unaffected: the kernel answers keepalive
+/// probes itself, regardless of whether the client app is doing anything, so a
+/// quiet-but-connected session is never dropped. NODELAY also flushes small IRC
+/// lines immediately. Best-effort — setsockopt failures are non-fatal (the PING
+/// timeout remains the backstop).
+fn applyClientKeepalive(fd: linux.fd_t) void {
+    const on: u32 = 1;
+    const idle: u32 = 30; // seconds idle before the first probe
+    const intvl: u32 = 10; // seconds between probes
+    const cnt: u32 = 3; // failed probes before the socket is declared dead
+    setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&on)) catch {};
+    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
+    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
+    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT, std.mem.asBytes(&cnt)) catch {};
+    setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
 }
 
 fn socketPort(fd: linux.fd_t) ServerError!u16 {
