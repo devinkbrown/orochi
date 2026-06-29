@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 
 const tls12 = @import("tls12.zig");
 const tls12_client = @import("tls12_client.zig");
+const tls_resumption = @import("tls_resumption.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_sign = @import("rsa_sign.zig");
@@ -21,10 +22,14 @@ const rsa_verify = @import("rsa_verify.zig");
 const x509_selfsign = @import("../proto/x509_selfsign.zig");
 
 const Allocator = std.mem.Allocator;
+const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 const named_group_secp256r1: u16 = 0x0017;
 const sig_ecdsa_secp256r1_sha256: u16 = 0x0403;
 const sig_rsa_pkcs1_sha256: u16 = 0x0401;
+
+/// RFC 5077 SessionTicket extension type.
+const ext_session_ticket: u16 = 0x0023;
 
 pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     Allocator.Error || error{
@@ -51,6 +56,30 @@ pub const Config = struct {
     rsa_signing_key: ?rsa_sign.PrivateKey = null,
     /// ALPN protocols in server preference order.
     alpn_protocols: []const []const u8 = &.{},
+
+    // ---- RFC 5077 stateless session resumption (opt-in) ----
+    //
+    // OFF by default: when `enable_session_tickets` is false the server never
+    // echoes a SessionTicket extension, never emits a NewSessionTicket, and
+    // only ever runs a full handshake — byte-identical to a build without this
+    // feature. On ANY ticket problem (absent, malformed, bad AEAD tag, expired,
+    // replayed, or tickets disabled) the server silently falls back to a full
+    // handshake; a ticket never fails the connection.
+
+    /// Issue a NewSessionTicket on full handshakes (when the client offered an
+    /// empty SessionTicket extension) and accept presented tickets for an
+    /// abbreviated handshake. Requires `ticket_key`.
+    enable_session_tickets: bool = false,
+    /// AEAD key sealing/opening ticket blobs. Shared with the TLS 1.3 leg so a
+    /// successor process resumes either. Required when tickets are enabled.
+    ticket_key: ?tls_resumption.TicketKey = null,
+    /// Single-use guard against ticket replay. Shared with the TLS 1.3 leg.
+    replay_guard: ?*tls_resumption.ReplayGuard = null,
+    /// Wall-clock seconds at handshake time (the crypto layer takes no clock).
+    /// Stamps issued tickets and bounds the accepted-ticket lifetime window.
+    now_unix_seconds: i64 = 0,
+    /// Lifetime advertised in NewSessionTicket and enforced on resume.
+    ticket_lifetime_seconds: u32 = 7200,
 };
 
 pub const FeedResult = union(enum) {
@@ -60,9 +89,14 @@ pub const FeedResult = union(enum) {
 
 const State = enum {
     wait_client_hello,
+    // Full handshake: ClientKeyExchange, then client CCS + Finished.
     wait_client_key_exchange,
     wait_client_ccs,
     wait_client_finished,
+    // Abbreviated (RFC 5077 resumed) handshake: no ClientKeyExchange. The
+    // server sends its flight first, then waits for the client CCS + Finished.
+    wait_resumed_client_ccs,
+    wait_resumed_client_finished,
     connected,
 };
 
@@ -93,6 +127,23 @@ pub const Server = struct {
     selected_suite: ?tls12.CipherSuite = null,
     selected_alpn: ?[]u8 = null,
 
+    // ---- RFC 5077 ticket negotiation (only meaningful when tickets enabled) ----
+    /// The client sent an EMPTY SessionTicket extension: it supports tickets and
+    /// wants the server to issue one on a full handshake.
+    client_offered_empty_ticket: bool = false,
+    /// Copy of a non-empty SessionTicket the client presented to resume. Owned;
+    /// freed on deinit. Held across `parseClientHello` so the resume decision can
+    /// be made after extension parsing completes.
+    presented_ticket: ?[]u8 = null,
+    /// True once a presented ticket opened, validated, and was accepted: the
+    /// handshake takes the abbreviated path and the master_secret/suite come
+    /// from the ticket rather than a fresh ECDHE exchange.
+    resuming: bool = false,
+    /// Raw offered cipher-suite octets from the ClientHello (aliases the live
+    /// recv buffer for the duration of the ClientHello processing only). Used by
+    /// the resume path to confirm the ticket's suite was actually offered.
+    offered_suites: []const u8 = &.{},
+
     master_secret: [tls12.master_secret_len]u8 = [_]u8{0} ** tls12.master_secret_len,
     keys: tls12.KeyMaterial = .{},
     app_read_seq: u64 = 0,
@@ -117,6 +168,7 @@ pub const Server = struct {
         self.recv_buf.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
         if (self.selected_alpn) |p| self.allocator.free(p);
+        if (self.presented_ticket) |t| self.allocator.free(t);
         std.crypto.secureZero(u8, &self.key_pair.secret);
         std.crypto.secureZero(u8, &self.master_secret);
         self.keys.wipe();
@@ -150,6 +202,16 @@ pub const Server = struct {
                     if (off != rec.fragment.len or msg.typ != .client_hello) return error.BadHandshake;
                     try self.parseClientHello(msg.body);
                     try self.transcript.appendSlice(self.allocator, msg.raw);
+                    // A presented ticket that opens, validates, and is not
+                    // replayed switches to the abbreviated flow; any failure
+                    // (handled inside tryResume) falls back to a full handshake.
+                    self.resuming = self.tryResume();
+                    if (self.resuming) {
+                        const reply = try self.buildResumedServerFlight();
+                        consumePrefix(&self.recv_buf, rec.wire_len);
+                        self.state = .wait_resumed_client_ccs;
+                        return .{ .bytes_to_send = reply };
+                    }
                     const reply = try self.buildServerFlight();
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_client_key_exchange;
@@ -195,6 +257,34 @@ pub const Server = struct {
                     self.app_write_seq = self.hs_write_seq;
                     self.state = .connected;
                     return .{ .bytes_to_send = reply };
+                },
+                .wait_resumed_client_ccs => {
+                    if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    self.state = .wait_resumed_client_finished;
+                },
+                .wait_resumed_client_finished => {
+                    // Abbreviated handshake: the server already sent CCS +
+                    // Finished, so the only thing left is the client's encrypted
+                    // Finished. Verify it over the abbreviated transcript
+                    // (ClientHello, ServerHello[, NewSessionTicket], server
+                    // Finished) and then the connection is established.
+                    const suite = self.selected_suite orelse return error.BadState;
+                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
+                    self.hs_read_seq += 1;
+                    defer self.allocator.free(opened.plaintext);
+                    if (opened.content_type != .handshake) return error.BadHandshake;
+                    var off: usize = 0;
+                    const msg = try parseHandshake(opened.plaintext, &off);
+                    if (off != opened.plaintext.len or msg.typ != .finished) return error.BadHandshake;
+                    const expected = try tls12.finishedVerifyData(suite, &self.master_secret, "client finished", self.transcript.items);
+                    if (!tls12.constantTimeEq(&expected, msg.body)) return error.FinishedMismatch;
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    // Same single-sequence-per-epoch carry as the full path.
+                    self.app_read_seq = self.hs_read_seq;
+                    self.app_write_seq = self.hs_write_seq;
+                    self.state = .connected;
                 },
                 .connected => return error.BadState,
             }
@@ -267,6 +357,7 @@ pub const Server = struct {
         if (self.session_id_len > self.session_id.len) return error.BadHandshake;
         @memcpy(self.session_id[0..self.session_id_len], try c.take(self.session_id_len));
         const suites_bytes = try c.take(try c.readU16());
+        self.offered_suites = suites_bytes;
         const comp = try c.take(try c.readU8());
         if (comp.len != 1 or comp[0] != 0) return error.BadHandshake;
 
@@ -305,6 +396,24 @@ pub const Server = struct {
                     try g.expectEmpty();
                 },
                 0x0010 => try self.selectAlpn(body),
+                ext_session_ticket => {
+                    // RFC 5077: only honour the SessionTicket extension when the
+                    // feature is enabled and a ticket key is configured. An empty
+                    // body means "issue me a ticket"; a non-empty body is the
+                    // ticket to resume — copy it so it outlives the ClientHello
+                    // buffer (the resume decision runs after parsing).
+                    if (self.config.enable_session_tickets and self.config.ticket_key != null) {
+                        if (body.len == 0) {
+                            self.client_offered_empty_ticket = true;
+                        } else {
+                            if (self.presented_ticket) |old| self.allocator.free(old);
+                            self.presented_ticket = try self.allocator.dupe(u8, body);
+                            // A client presenting a ticket also implicitly wants a
+                            // fresh one issued if we fall back to a full handshake.
+                            self.client_offered_empty_ticket = true;
+                        }
+                    }
+                },
                 0x002b => {
                     // supported_versions: real TLS 1.2 clients (OpenSSL, browsers)
                     // include this even when offering 1.2, since they also support
@@ -375,6 +484,9 @@ pub const Server = struct {
             @memcpy(alpn_body[3 .. 3 + proto.len], proto);
             try writeExtension(self.allocator, &exts, 0x0010, alpn_body[0 .. 3 + proto.len]);
         }
+        // RFC 5077: when we will issue a ticket, echo an EMPTY SessionTicket
+        // extension in ServerHello to announce the upcoming NewSessionTicket.
+        if (self.issuingTicket()) try writeExtension(self.allocator, &exts, ext_session_ticket, "");
         try appendU16(self.allocator, &sh_body, @intCast(exts.items.len));
         try sh_body.appendSlice(self.allocator, exts.items);
         try writeHandshake(self.allocator, &hs, .server_hello, sh_body.items);
@@ -453,14 +565,208 @@ pub const Server = struct {
 
     fn buildServerFinishedFlight(self: *Server) Error![]u8 {
         const suite = self.selected_suite orelse return error.BadState;
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        // RFC 5077 (full handshake + issue): NewSessionTicket is the FIRST
+        // message of the server's final flight — a plaintext handshake message
+        // before the server CCS. It is hashed into the transcript ahead of the
+        // server Finished.
+        if (self.issuingTicket()) {
+            const nst = try self.buildNewSessionTicket();
+            defer self.allocator.free(nst);
+            try self.transcript.appendSlice(self.allocator, nst);
+            const nst_rec = try tls12.writePlainRecord(self.allocator, .handshake, nst);
+            defer self.allocator.free(nst_rec);
+            try out.appendSlice(self.allocator, nst_rec);
+        }
+
         const verify = try tls12.finishedVerifyData(suite, &self.master_secret, "server finished", self.transcript.items);
         var fin: std.ArrayList(u8) = .empty;
         defer fin.deinit(self.allocator);
         try writeHandshake(self.allocator, &fin, .finished, &verify);
         try self.transcript.appendSlice(self.allocator, fin.items);
 
+        const ccs = try tls12.writePlainRecord(self.allocator, .change_cipher_spec, &.{1});
+        defer self.allocator.free(ccs);
+        try out.appendSlice(self.allocator, ccs);
+        const fin_rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.server_write, self.hs_write_seq, .handshake, fin.items);
+        self.hs_write_seq += 1;
+        defer self.allocator.free(fin_rec);
+        try out.appendSlice(self.allocator, fin_rec);
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    /// True when this connection should issue a NewSessionTicket on the current
+    /// (full) handshake: tickets are enabled with a key, the client advertised
+    /// SessionTicket support, and we are not on the abbreviated (resumed) path
+    /// (a resumed connection already has the client's ticket).
+    fn issuingTicket(self: *const Server) bool {
+        return self.config.enable_session_tickets and
+            self.config.ticket_key != null and
+            self.client_offered_empty_ticket and
+            !self.resuming;
+    }
+
+    /// Seal the current session into an RFC 5077 NewSessionTicket message body.
+    /// The sealed blob carries the negotiated suite and the 48-byte
+    /// master_secret as its PSK; on resume the server recovers both.
+    fn buildNewSessionTicket(self: *Server) Error![]u8 {
+        const suite = self.selected_suite orelse return error.BadState;
+        const key = self.config.ticket_key orelse return error.BadState;
+
+        var aead_nonce: [ChaCha20Poly1305.nonce_length]u8 = undefined;
+        try osEntropy(&aead_nonce);
+        var ticket_nonce: [tls_resumption.ticket_nonce_len]u8 = undefined;
+        try osEntropy(&ticket_nonce);
+
+        const sealed = tls_resumption.sealTicket(
+            self.allocator,
+            key,
+            aead_nonce,
+            @intFromEnum(suite),
+            &self.master_secret,
+            &ticket_nonce,
+            self.config.now_unix_seconds * 1000,
+            0, // no 0-RTT in TLS 1.2
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // sealTicket only rejects oversized inputs, which cannot occur with
+            // the fixed 48-byte master_secret + 8-byte nonce above.
+            else => return error.BadState,
+        };
+        defer self.allocator.free(sealed);
+
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try appendU32(self.allocator, &body, self.config.ticket_lifetime_seconds);
+        try appendU16(self.allocator, &body, @intCast(sealed.len));
+        try body.appendSlice(self.allocator, sealed);
+
+        var hs: std.ArrayList(u8) = .empty;
+        errdefer hs.deinit(self.allocator);
+        try writeHandshake(self.allocator, &hs, .new_session_ticket, body.items);
+        return hs.toOwnedSlice(self.allocator);
+    }
+
+    /// Decide whether a presented ticket lets us resume. Opens and validates the
+    /// ticket, enforces the lifetime window, runs the replay guard, recovers the
+    /// master_secret + suite, and derives key material from a FRESH server_random
+    /// (generated in `init`). Returns false on ANY problem so the caller falls
+    /// back to a full handshake; it never fails the connection.
+    fn tryResume(self: *Server) bool {
+        if (!self.config.enable_session_tickets) return false;
+        const key = self.config.ticket_key orelse return false;
+        const ticket = self.presented_ticket orelse return false;
+
+        const opened = tls_resumption.openTicket(self.allocator, key, ticket) catch return false;
+        // opened.plain holds the cleartext session (incl. the 48-byte master_secret);
+        // wipe it before returning the allocation.
+        defer {
+            std.crypto.secureZero(u8, opened.plain);
+            self.allocator.free(opened.plain);
+        }
+
+        const suite = tls12.CipherSuite.fromWire(opened.opened.suite) catch return false;
+        // The resumed suite must be one the client offered in this ClientHello,
+        // and its certificate-auth must match our configured key.
+        const auth = activeCertificateAuth(self.config) orelse return false;
+        if (!suiteMatchesAuth(suite, auth)) return false;
+        if (!clientOfferedSuite(self.offered_suites, suite)) return false;
+        // The recovered PSK must be exactly the 48-byte master_secret.
+        if (opened.opened.psk.len != tls12.master_secret_len) return false;
+
+        // Lifetime enforcement (when a real clock and issue time are present):
+        // reject expired or future tickets.
+        if (self.config.now_unix_seconds != 0) {
+            const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
+            if (issued_s != 0) {
+                if (self.config.now_unix_seconds < issued_s) return false;
+                if (self.config.now_unix_seconds - issued_s > @as(i64, self.config.ticket_lifetime_seconds)) return false;
+            }
+        }
+
+        // Replay defence: a ticket presented twice must NOT take the abbreviated
+        // path again. The replay guard caps binders at SHA-384 size (48 bytes),
+        // so we bind on the ticket's 16-byte ChaCha20-Poly1305 AEAD tag (the
+        // trailing bytes of the sealed blob), which uniquely identifies it. A
+        // repeat falls through to a fresh full handshake (new ECDHE, replay-safe)
+        // rather than failing. This mirrors the TLS 1.3 path's intent — a replay
+        // still connects, it just loses the resumption fast path. (TLS 1.2 has no
+        // 0-RTT, so there is no early-data window to refuse separately.)
+        if (self.config.replay_guard) |g| {
+            const tag = ticket[ticket.len - ChaCha20Poly1305.tag_length ..];
+            if (!g.checkAndRecord(tag)) return false;
+        }
+
+        self.selected_suite = suite;
+        @memcpy(&self.master_secret, opened.opened.psk[0..tls12.master_secret_len]);
+        self.keys = tls12.deriveKeyMaterial(suite, &self.master_secret, &self.client_random, &self.server_random) catch return false;
+        return true;
+    }
+
+    /// Abbreviated (resumed) server flight (RFC 5077):
+    ///   ServerHello(+empty SessionTicket ext), [NewSessionTicket], CCS, Finished.
+    /// No Certificate / ServerKeyExchange. The server Finished is computed over
+    /// the abbreviated transcript (ClientHello, ServerHello[, NewSessionTicket]).
+    fn buildResumedServerFlight(self: *Server) Error![]u8 {
+        const suite = self.selected_suite orelse return error.BadState;
+
+        var hs: std.ArrayList(u8) = .empty;
+        defer hs.deinit(self.allocator);
+
+        var sh_body: std.ArrayList(u8) = .empty;
+        defer sh_body.deinit(self.allocator);
+        try appendU16(self.allocator, &sh_body, tls12.tls_version);
+        try sh_body.appendSlice(self.allocator, &self.server_random);
+        try sh_body.append(self.allocator, @intCast(self.session_id_len));
+        try sh_body.appendSlice(self.allocator, self.session_id[0..self.session_id_len]);
+        try appendU16(self.allocator, &sh_body, @intFromEnum(suite));
+        try sh_body.append(self.allocator, 0);
+        var exts: std.ArrayList(u8) = .empty;
+        defer exts.deinit(self.allocator);
+        try writeExtension(self.allocator, &exts, 0xff01, &.{0x00});
+        if (self.selected_alpn) |proto| {
+            var alpn_body: [3 + 255]u8 = undefined;
+            std.mem.writeInt(u16, alpn_body[0..2], @intCast(1 + proto.len), .big);
+            alpn_body[2] = @intCast(proto.len);
+            @memcpy(alpn_body[3 .. 3 + proto.len], proto);
+            try writeExtension(self.allocator, &exts, 0x0010, alpn_body[0 .. 3 + proto.len]);
+        }
+        // RFC 5077: the resumed ServerHello carries an empty SessionTicket ext
+        // when the server will issue a (new) NewSessionTicket.
+        const reissue = self.config.ticket_key != null;
+        if (reissue) try writeExtension(self.allocator, &exts, ext_session_ticket, "");
+        try appendU16(self.allocator, &sh_body, @intCast(exts.items.len));
+        try sh_body.appendSlice(self.allocator, exts.items);
+        try writeHandshake(self.allocator, &hs, .server_hello, sh_body.items);
+        try self.transcript.appendSlice(self.allocator, hs.items);
+
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
+        // ServerHello goes out as one plaintext record; then optionally the
+        // NewSessionTicket (also plaintext, hashed into the transcript), then
+        // CCS, then the encrypted server Finished.
+        const sh_rec = try tls12.writePlainRecord(self.allocator, .handshake, hs.items);
+        defer self.allocator.free(sh_rec);
+        try out.appendSlice(self.allocator, sh_rec);
+
+        if (reissue) {
+            const nst = try self.buildNewSessionTicket();
+            defer self.allocator.free(nst);
+            try self.transcript.appendSlice(self.allocator, nst);
+            const nst_rec = try tls12.writePlainRecord(self.allocator, .handshake, nst);
+            defer self.allocator.free(nst_rec);
+            try out.appendSlice(self.allocator, nst_rec);
+        }
+
+        const verify = try tls12.finishedVerifyData(suite, &self.master_secret, "server finished", self.transcript.items);
+        var fin: std.ArrayList(u8) = .empty;
+        defer fin.deinit(self.allocator);
+        try writeHandshake(self.allocator, &fin, .finished, &verify);
+        try self.transcript.appendSlice(self.allocator, fin.items);
+
         const ccs = try tls12.writePlainRecord(self.allocator, .change_cipher_spec, &.{1});
         defer self.allocator.free(ccs);
         try out.appendSlice(self.allocator, ccs);
@@ -552,6 +858,25 @@ fn appendU24(allocator: Allocator, out: *std.ArrayList(u8), v: u32) Allocator.Er
     try out.append(allocator, @intCast((v >> 16) & 0xff));
     try out.append(allocator, @intCast((v >> 8) & 0xff));
     try out.append(allocator, @intCast(v & 0xff));
+}
+
+fn appendU32(allocator: Allocator, out: *std.ArrayList(u8), v: u32) Allocator.Error!void {
+    try out.append(allocator, @intCast((v >> 24) & 0xff));
+    try out.append(allocator, @intCast((v >> 16) & 0xff));
+    try out.append(allocator, @intCast((v >> 8) & 0xff));
+    try out.append(allocator, @intCast(v & 0xff));
+}
+
+/// True when the raw offered cipher-suite octets (u16 big-endian, back to back)
+/// include `suite`.
+fn clientOfferedSuite(offered: []const u8, suite: tls12.CipherSuite) bool {
+    const want = @intFromEnum(suite);
+    var i: usize = 0;
+    while (i + 2 <= offered.len) : (i += 2) {
+        const v = (@as(u16, offered[i]) << 8) | offered[i + 1];
+        if (v == want) return true;
+    }
+    return false;
 }
 
 fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
@@ -882,4 +1207,445 @@ test "TLS 1.2 tampered encrypted Finished is rejected" {
     defer allocator.free(cf);
     cf[cf.len - 1] ^= 0x01;
     try std.testing.expectError(error.AeadAuthFailed, server.feed(cf));
+}
+
+// ---- RFC 5077 session-ticket resumption tests ----
+
+const test_ticket_key = [_]u8{0x5c} ** @sizeOf(tls_resumption.TicketKey);
+
+/// Drive one full TLS 1.2 handshake with tickets enabled, asserting the server
+/// issued a NewSessionTicket, and return the serialized resumable session the
+/// client captured. The caller owns the returned bytes.
+fn fullHandshakeIssuingTicket(
+    allocator: Allocator,
+    chain: []const []const u8,
+    anchors: []const []const u8,
+    key: ecdsa_p256.KeyPair,
+    guard: *tls_resumption.ReplayGuard,
+    now_unix_seconds: i64,
+) ![]u8 {
+    var server = try Server.init(allocator, .{
+        .cert_chain = chain,
+        .ecdsa_p256_signing_key = key,
+        .enable_session_tickets = true,
+        .ticket_key = test_ticket_key,
+        .replay_guard = guard,
+        .now_unix_seconds = now_unix_seconds,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    try client.requestSessionTicket();
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // The ServerHello flight echoes an empty SessionTicket extension (00 23 00 00).
+    try std.testing.expect(std.mem.indexOf(u8, sf, &[_]u8{ 0x00, 0x23, 0x00, 0x00 }) != null);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(client.handshakeDone());
+    try std.testing.expect(server.handshakeDone());
+
+    const stored = client.takeSessionTicket() orelse return error.BadHandshake;
+    return stored;
+}
+
+test "TLS 1.2 full handshake with tickets enabled issues a NewSessionTicket" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+    // The captured ticket decodes as a stored session carrying the 48-byte
+    // master_secret and the negotiated suite.
+    const decoded = try tls_resumption.decodeStoredSession(stored);
+    try std.testing.expectEqual(@as(usize, tls12.master_secret_len), decoded.psk.len);
+    _ = try tls12.CipherSuite.fromWire(decoded.suite);
+}
+
+test "TLS 1.2 presenting a ticket performs the abbreviated handshake and exchanges app data" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+
+    // Second connection presents the ticket and resumes.
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .enable_session_tickets = true,
+        .ticket_key = test_ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_001,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    try client.setSessionTicket(stored);
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    // Abbreviated server flight: ServerHello[, NewSessionTicket], CCS, Finished.
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // The server must NOT send a Certificate on resume (abbreviated handshake).
+    try std.testing.expect(!serverHelloFlightHasCertificate(sf));
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    // The client's resumed flight (CCS + Finished) completes the server.
+    const after = try server.feed(cf);
+    try std.testing.expect(after == .need_more or after == .bytes_to_send);
+    switch (after) {
+        .bytes_to_send => |b| allocator.free(b),
+        .need_more => {},
+    }
+
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+
+    // Both peers derived identical traffic keys: app data round-trips.
+    const c_app = try client.encrypt("resumed client to server");
+    defer allocator.free(c_app);
+    const s_plain = try server.decrypt(c_app);
+    defer allocator.free(s_plain);
+    try std.testing.expectEqualSlices(u8, "resumed client to server", s_plain);
+
+    const s_app = try server.encrypt("resumed server to client");
+    defer allocator.free(s_app);
+    const c_plain = try client.decrypt(s_app);
+    defer allocator.free(c_plain);
+    try std.testing.expectEqualSlices(u8, "resumed server to client", c_plain);
+}
+
+test "TLS 1.2 tampered ticket falls back to a full handshake and still connects" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+
+    // Flip a byte inside the opaque ticket so its AEAD tag fails to open. The
+    // stored session format is OTS1 magic(4) | suite(2) | lifetime(4) |
+    // age_add(4) | ticket_len(2) | ticket | ... — corrupt the LAST byte of the
+    // ticket field (its ChaCha20-Poly1305 tag), which guarantees openTicket
+    // fails while leaving the client's recovered master_secret intact.
+    const tampered = try allocator.dupe(u8, stored);
+    defer allocator.free(tampered);
+    const decoded_for_offset = try tls_resumption.decodeStoredSession(stored);
+    const ticket_offset = 4 + 2 + 4 + 4 + 2; // magic + suite + lifetime + age_add + ticket_len
+    tampered[ticket_offset + decoded_for_offset.ticket.len - 1] ^= 0x01;
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .enable_session_tickets = true,
+        .ticket_key = test_ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_001,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    try client.setSessionTicket(tampered);
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    // The server cannot open the ticket → full handshake: the flight carries a
+    // Certificate, so a ClientKeyExchange round-trip is required.
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+
+    const c_app = try client.encrypt("fallback works");
+    defer allocator.free(c_app);
+    const s_plain = try server.decrypt(c_app);
+    defer allocator.free(s_plain);
+    try std.testing.expectEqualSlices(u8, "fallback works", s_plain);
+}
+
+test "TLS 1.2 expired ticket falls back to a full handshake" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    // Issue at t=1_700_000_000 with the default 7200s lifetime.
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+
+    // Present it well past issued + lifetime; the server must NOT resume.
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .enable_session_tickets = true,
+        .ticket_key = test_ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_000 + 7200 + 60,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    try client.setSessionTicket(stored);
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // A full handshake flight carries a Certificate message; resume would not.
+    try std.testing.expect(serverHelloFlightHasCertificate(sf));
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+}
+
+test "TLS 1.2 replayed ticket falls back to a full handshake (replay guard refuses fast path)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+
+    // First resume records the ticket in the replay guard and takes the
+    // abbreviated path (no Certificate in the flight).
+    {
+        var server = try Server.init(allocator, .{
+            .cert_chain = &chain,
+            .ecdsa_p256_signing_key = fixture.key,
+            .enable_session_tickets = true,
+            .ticket_key = test_ticket_key,
+            .replay_guard = &guard,
+            .now_unix_seconds = 1_700_000_001,
+        });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{
+            .server_name = "localhost",
+            .trust_anchors = &anchors,
+            .now_unix_seconds = 1_735_689_600,
+        });
+        defer client.deinit();
+        try client.setSessionTicket(stored);
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const sf = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sf);
+        try std.testing.expect(!serverHelloFlightHasCertificate(sf)); // abbreviated
+    }
+
+    // Second presentation of the SAME ticket: the replay guard refuses the fast
+    // path, so the server falls back to a full handshake (Certificate present).
+    {
+        var server = try Server.init(allocator, .{
+            .cert_chain = &chain,
+            .ecdsa_p256_signing_key = fixture.key,
+            .enable_session_tickets = true,
+            .ticket_key = test_ticket_key,
+            .replay_guard = &guard,
+            .now_unix_seconds = 1_700_000_002,
+        });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{
+            .server_name = "localhost",
+            .trust_anchors = &anchors,
+            .now_unix_seconds = 1_735_689_600,
+        });
+        defer client.deinit();
+        try client.setSessionTicket(stored);
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const sf = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sf);
+        try std.testing.expect(serverHelloFlightHasCertificate(sf)); // full fallback
+
+        // The full handshake still completes end to end.
+        const cf = switch (try client.feed(sf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(cf);
+        const sfin = switch (try server.feed(cf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sfin);
+        _ = try client.feed(sfin);
+        try std.testing.expect(server.handshakeDone());
+        try std.testing.expect(client.handshakeDone());
+    }
+}
+
+test "TLS 1.2 tickets disabled issues no ticket and leaves the transcript unchanged" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    // Default config: enable_session_tickets = false.
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{
+        .server_name = "localhost",
+        .trust_anchors = &anchors,
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+    // Even though the client asks for a ticket, a tickets-disabled server must
+    // not echo a SessionTicket extension nor emit a NewSessionTicket.
+    try client.requestSessionTicket();
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    // No empty SessionTicket extension in the ServerHello flight.
+    try std.testing.expect(std.mem.indexOf(u8, sf, &[_]u8{ 0x00, 0x23, 0x00, 0x00 }) == null);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    // No NewSessionTicket (handshake type 4) in the server's final flight.
+    try std.testing.expect(!finalFlightHasNewSessionTicket(sfin));
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+    try std.testing.expect(client.takeSessionTicket() == null);
+}
+
+/// True when a plaintext ServerHello flight contains a Certificate handshake
+/// message (type 11). Used to distinguish full (Certificate present) from
+/// abbreviated (no Certificate) handshakes by inspecting the wire.
+fn serverHelloFlightHasCertificate(flight: []const u8) bool {
+    return handshakeFlightContainsType(flight, @intFromEnum(tls12.HandshakeType.certificate));
+}
+
+/// True when the server's final plaintext flight contains a NewSessionTicket
+/// handshake message (type 4) before the CCS.
+fn finalFlightHasNewSessionTicket(flight: []const u8) bool {
+    return handshakeFlightContainsType(flight, @intFromEnum(tls12.HandshakeType.new_session_ticket));
+}
+
+/// Walk the TLS records in a plaintext flight and report whether any PLAINTEXT
+/// handshake record (those preceding the ChangeCipherSpec) carries a handshake
+/// message of `want_type`. We stop at the first CCS because everything after it
+/// (the encrypted Finished) is opaque ciphertext that must not be misparsed.
+fn handshakeFlightContainsType(flight: []const u8, want_type: u8) bool {
+    var i: usize = 0;
+    while (i + 5 <= flight.len) {
+        const ct = flight[i];
+        const len = (@as(usize, flight[i + 3]) << 8) | flight[i + 4];
+        const body_start = i + 5;
+        if (body_start + len > flight.len) return false;
+        if (ct == @intFromEnum(tls12.ContentType.change_cipher_spec)) return false;
+        if (ct == @intFromEnum(tls12.ContentType.handshake)) {
+            var off = body_start;
+            while (off + 4 <= body_start + len) {
+                const mt = flight[off];
+                const mlen = (@as(usize, flight[off + 1]) << 16) | (@as(usize, flight[off + 2]) << 8) | flight[off + 3];
+                if (mt == want_type) return true;
+                if (body_start + len - off < 4 + mlen) break;
+                off += 4 + mlen;
+            }
+        }
+        i = body_start + len;
+    }
+    return false;
 }
