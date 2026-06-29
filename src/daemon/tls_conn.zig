@@ -874,6 +874,102 @@ test "version-dispatch: a TLS 1.2 client completes through a dual TlsConn" {
     try std.testing.expectEqualStrings("reply 1.2", got);
 }
 
+test "TLS 1.2 session ticket resumes across dual TlsConn instances (RFC 5077)" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x57} ** Ed25519.KeyPair.seed_length);
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp); // 1.3 leg (unused here)
+
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var ec_buf: [2048]u8 = undefined;
+    const ec_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ec_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_893_456_000,
+        .serial = &.{ 1, 2, 3, 4 },
+        .key_pair = ec_key,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    const ticket_key = [_]u8{0x42} ** @sizeOf(tls_resumption.TicketKey);
+    var guard = tls_resumption.ReplayGuard{};
+    const cfg13 = tls_server.Config{ .cert_chain = &.{der}, .signing_key = kp };
+    const cfg12 = tls12_server.Config{
+        .cert_chain = &.{ec_der},
+        .ecdsa_p256_signing_key = ec_key,
+        .enable_session_tickets = true,
+        .ticket_key = ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_000,
+    };
+
+    // First connection: full handshake that issues a ticket.
+    var stored: []u8 = undefined;
+    {
+        var conn = TlsConn.initDual(alloc, cfg13, cfg12);
+        defer conn.deinit();
+        var client = try tls12_client.Client.init(alloc, .{
+            .server_name = "irc.test",
+            .trust_anchors = &.{ec_der},
+            .now_unix_seconds = 1_735_689_600,
+        });
+        defer client.deinit();
+        try client.requestSessionTicket();
+
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const sf = try conn.onInbound(ch);
+        try std.testing.expectEqual(Version.tls12, conn.negotiatedVersion().?);
+        const cf = switch (try client.feed(sf.handshake_bytes)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(cf);
+        const sfin = try conn.onInbound(cf);
+        _ = try client.feed(sfin.handshake_bytes);
+        try std.testing.expect(conn.handshakeDone());
+        try std.testing.expect(client.handshakeDone());
+        stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    }
+    defer alloc.free(stored);
+
+    // Second connection presents the ticket and resumes (abbreviated handshake).
+    var conn2 = TlsConn.initDual(alloc, cfg13, cfg12);
+    defer conn2.deinit();
+    var client2 = try tls12_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{ec_der},
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client2.deinit();
+    try client2.setSessionTicket(stored);
+
+    const ch2 = try client2.start();
+    defer alloc.free(ch2);
+    const sf2 = try conn2.onInbound(ch2);
+    try std.testing.expectEqual(Version.tls12, conn2.negotiatedVersion().?);
+    const cf2 = switch (try client2.feed(sf2.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cf2);
+    const fin2 = try conn2.onInbound(cf2);
+    _ = fin2;
+    try std.testing.expect(conn2.handshakeDone());
+    try std.testing.expect(client2.handshakeDone());
+
+    // Resumed peers share traffic keys: app data flows both ways.
+    const c2s = try client2.encrypt("resumed 1.2");
+    defer alloc.free(c2s);
+    const out = try conn2.onInbound(c2s);
+    try std.testing.expectEqualStrings("resumed 1.2", out.plaintext);
+    const cipher = try conn2.write("reply resumed");
+    const got = try client2.decrypt(cipher);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("reply resumed", got);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

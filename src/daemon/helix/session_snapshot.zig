@@ -441,8 +441,10 @@ test "decode tolerates a pre-signon snapshot (no trailing blocks)" {
 
 test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
     const allocator = testing.allocator;
-    // A capsule from the signon-carry build: it has the 16-byte signon block but no
-    // 2-byte caps block. Strip only the caps block; signon must still restore.
+    // A capsule from the signon-carry build: it has the 16-byte signon block but
+    // none of the optional blocks that came after it. Strip every trailing block
+    // (caps, oper-grant, username) so the buffer ends right after signon; the
+    // decoder must still restore signon and default caps to empty.
     const bytes = try encode(allocator, .{
         .nick = "carol",
         .fd = 9,
@@ -451,7 +453,10 @@ test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
         .caps = "echo-message",
     });
     defer allocator.free(bytes);
-    const old = bytes[0 .. bytes.len - ("echo-message".len + 2)];
+    const caps_block = "echo-message".len + 2; // u16 len + bytes
+    const oper_block = 8 + 2 + 2; // priv bits + empty class + empty title
+    const username_block = 2; // empty username len prefix
+    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block];
 
     const got = try decode(old);
     try testing.expectEqualStrings("carol", got.nick);

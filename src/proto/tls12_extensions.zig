@@ -10,10 +10,18 @@
 //! Implemented payloads:
 //!   * `ec_point_formats` (RFC 8422): `<1-byte list length><format bytes>`.
 //!   * `renegotiation_info` (RFC 5746): `<1-byte length><verify bytes>`.
+//!   * `SessionTicket` (RFC 5077, type 0x0023): the extension_data IS the
+//!     opaque ticket with no inner length prefix.  An empty body in a
+//!     ClientHello means "I support tickets, send me one"; a non-empty body
+//!     is the ticket the client wishes to resume.  An empty body in a
+//!     ServerHello means "I will issue a NewSessionTicket".
 //!
 //! Pure logic: no I/O, no clock, no RNG, and no allocation.  All output writes
 //! go to caller-owned buffers and every length is checked before indexing.
 const std = @import("std");
+
+/// TLS extension type for the RFC 5077 SessionTicket extension.
+pub const session_ticket_ext_type: u16 = 0x0023;
 
 /// Wire value for the only EC point format TLS 1.2 clients and servers need
 /// for the named curves in RFC 8422.
@@ -111,6 +119,24 @@ pub fn buildRenegotiationInfo(out: []u8, verify_bytes: []const u8) Error![]const
     out[0] = @intCast(verify_bytes.len);
     @memcpy(out[1..total], verify_bytes);
     return out[0..total];
+}
+
+/// Parse a `SessionTicket` (RFC 5077) extension_data block.  The whole body is
+/// the opaque ticket; there is no inner length field.  The returned slice
+/// aliases `block` and may be empty (the "send me a ticket" / "I will issue a
+/// ticket" signalling form).
+pub fn parseSessionTicket(block: []const u8) []const u8 {
+    return block;
+}
+
+/// Encode a `SessionTicket` extension_data block into `out`, returning the
+/// written prefix.  `ticket` may be empty: an empty ClientHello body asks the
+/// server for a ticket, and an empty ServerHello body promises a
+/// NewSessionTicket.  A non-empty body carries the ticket to resume.
+pub fn buildSessionTicket(out: []u8, ticket: []const u8) Error![]const u8 {
+    if (out.len < ticket.len) return error.NoSpaceLeft;
+    @memcpy(out[0..ticket.len], ticket);
+    return out[0..ticket.len];
 }
 
 const testing = std.testing;
@@ -248,4 +274,43 @@ test "renegotiation_info rejects truncation, trailing data, oversize, and short 
     try testing.expectError(error.InvalidLength, trailing_result);
     try testing.expectError(error.NoSpaceLeft, no_space_result);
     try testing.expectError(error.Oversize, oversize_result);
+}
+
+test "SessionTicket round-trips an opaque ticket body" {
+    // Arrange
+    var out: [8]u8 = undefined;
+    const ticket = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+
+    // Act
+    const block = try buildSessionTicket(&out, &ticket);
+    const parsed = parseSessionTicket(block);
+
+    // Assert
+    try testing.expectEqualSlices(u8, &ticket, block);
+    try testing.expectEqualSlices(u8, &ticket, parsed);
+}
+
+test "SessionTicket encodes and parses the empty signalling body" {
+    // Arrange
+    var out: [0]u8 = undefined;
+
+    // Act: an empty ClientHello body asks for a ticket; an empty ServerHello
+    // body promises one. Both encode to a zero-length extension_data block.
+    const block = try buildSessionTicket(&out, "");
+    const parsed = parseSessionTicket(block);
+
+    // Assert
+    try testing.expectEqual(@as(usize, 0), block.len);
+    try testing.expectEqual(@as(usize, 0), parsed.len);
+}
+
+test "SessionTicket build reports NoSpaceLeft when the output is too small" {
+    // Arrange
+    var small: [2]u8 = undefined;
+
+    // Act
+    const result = buildSessionTicket(&small, &[_]u8{ 1, 2, 3 });
+
+    // Assert
+    try testing.expectError(error.NoSpaceLeft, result);
 }

@@ -14,6 +14,7 @@ comptime {
 
 pub const client_hello_msg_type: u8 = 1;
 pub const server_hello_msg_type: u8 = 2;
+pub const new_session_ticket_msg_type: u8 = 4;
 pub const certificate_msg_type: u8 = 11;
 pub const server_hello_done_msg_type: u8 = 14;
 pub const finished_msg_type: u8 = 20;
@@ -81,6 +82,15 @@ pub const HandshakeHeader = struct {
     msg_type: u8,
     length: usize,
     body: []const u8,
+};
+
+/// RFC 5077 NewSessionTicket message body:
+///   `uint32 ticket_lifetime_hint; opaque ticket<0..2^16-1>;`
+/// `ticket` is the server's opaque sealed-state blob.  The returned slice
+/// aliases the parent message body.
+pub const NewSessionTicket = struct {
+    ticket_lifetime_hint: u32,
+    ticket: []const u8,
 };
 
 pub const Extension = struct {
@@ -230,6 +240,29 @@ pub fn parseFinished(body: []const u8) ParseError![]const u8 {
     if (body.len < finished_verify_data_len) return error.BufferTooShort;
     if (body.len != finished_verify_data_len) return error.TrailingBytes;
     return body;
+}
+
+/// Parse a NewSessionTicket message body (RFC 5077).  The `ticket` field of the
+/// result aliases `body`.
+pub fn parseNewSessionTicket(body: []const u8) ParseError!NewSessionTicket {
+    if (body.len < 4 + 2) return error.BufferTooShort;
+    const lifetime = mem.readInt(u32, body[0..4], .big);
+    const ticket_len = mem.readInt(u16, body[4..6], .big);
+    if (body.len - 6 < ticket_len) return error.BufferTooShort;
+    if (body.len - 6 != ticket_len) return error.TrailingBytes;
+    return .{ .ticket_lifetime_hint = lifetime, .ticket = body[6 .. 6 + ticket_len] };
+}
+
+/// Encode a NewSessionTicket message body (RFC 5077) into `out`, returning the
+/// written prefix.  `ticket` must fit a two-octet length field.
+pub fn encodeNewSessionTicket(out: []u8, ticket_lifetime_hint: u32, ticket: []const u8) EncodeError![]const u8 {
+    if (ticket.len > max_u16) return error.VectorTooLarge;
+    const body_len = 4 + 2 + ticket.len;
+    if (out.len < body_len) return error.NoSpaceLeft;
+    mem.writeInt(u32, out[0..4], ticket_lifetime_hint, .big);
+    mem.writeInt(u16, out[4..6], @intCast(ticket.len), .big);
+    @memcpy(out[6 .. 6 + ticket.len], ticket);
+    return out[0..body_len];
 }
 
 pub fn encodeServerHello(
@@ -443,6 +476,34 @@ test "server hello done and finished encode known message bodies" {
     try testing.expectEqual(@as(usize, 0), done.len);
     try parseServerHelloDone(done);
     try testing.expectEqualSlices(u8, &verify_data, parsed_verify_data);
+}
+
+test "new_session_ticket round-trips lifetime and opaque ticket" {
+    // Arrange.
+    const ticket = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+    var out: [32]u8 = undefined;
+
+    // Act.
+    const body = try encodeNewSessionTicket(&out, 7200, &ticket);
+    const parsed = try parseNewSessionTicket(body);
+
+    // Assert.
+    const expected = [_]u8{ 0x00, 0x00, 0x1c, 0x20, 0x00, 0x05, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+    try testing.expectEqualSlices(u8, &expected, body);
+    try testing.expectEqual(@as(u32, 7200), parsed.ticket_lifetime_hint);
+    try testing.expectEqualSlices(u8, &ticket, parsed.ticket);
+}
+
+test "new_session_ticket parser rejects truncation and trailing bytes" {
+    // Arrange.
+    const truncated = [_]u8{ 0x00, 0x00, 0x1c, 0x20, 0x00, 0x05, 0xaa };
+    const trailing = [_]u8{ 0x00, 0x00, 0x1c, 0x20, 0x00, 0x01, 0xaa, 0xbb };
+    var short_out: [4]u8 = undefined;
+
+    // Act / Assert.
+    try testing.expectError(error.BufferTooShort, parseNewSessionTicket(&truncated));
+    try testing.expectError(error.TrailingBytes, parseNewSessionTicket(&trailing));
+    try testing.expectError(error.NoSpaceLeft, encodeNewSessionTicket(&short_out, 0, &[_]u8{ 1, 2 }));
 }
 
 test "wrapHandshake and parseHandshakeHeader round trip known vector" {

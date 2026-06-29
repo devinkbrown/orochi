@@ -3086,6 +3086,27 @@ pub const LinuxServer = struct {
         return cfg;
     }
 
+    /// Build the hardened TLS 1.2 engine config, mirroring `tls13Config`. RFC
+    /// 5077 session tickets are gated on the SAME `tls_enable_resumption` flag
+    /// and reuse the SAME ticket key + replay guard as the TLS 1.3 leg, so a
+    /// successor process resumes connections that started on either protocol.
+    /// When resumption is off these fields stay at their defaults and the 1.2
+    /// engine behaves exactly as before (full handshakes only).
+    fn tls12Config(self: *LinuxServer) tls12_server.Config {
+        var cfg = tls12_server.Config{
+            .cert_chain = self.config.tls12_cert_chain,
+            .ecdsa_p256_signing_key = self.config.tls12_signing_key,
+            .rsa_signing_key = self.config.tls_rsa_signing_key,
+        };
+        if (self.config.tls_enable_resumption) {
+            cfg.enable_session_tickets = true;
+            cfg.ticket_key = self.tls_ticket_key;
+            cfg.replay_guard = &self.tls_replay_guard;
+            cfg.now_unix_seconds = @divTrunc(platform.realtimeMillis(), 1000);
+        }
+        return cfg;
+    }
+
     pub fn deinit(self: *LinuxServer) void {
         // Stop + join the /metrics listener thread FIRST, before freeing the
         // snapshot it reads. shutdown() signals the stop flag, closes the
@@ -4390,11 +4411,7 @@ pub const LinuxServer = struct {
         // cert here; the browser WS path forces this off (startAcceptedWs).
         const tls_cfg = self.tls13Config(self.config.tls_request_client_cert);
         if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
-            tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, .{
-                .cert_chain = self.config.tls12_cert_chain,
-                .ecdsa_p256_signing_key = self.config.tls12_signing_key,
-                .rsa_signing_key = self.config.tls_rsa_signing_key,
-            });
+            tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, self.tls12Config());
         } else {
             tls.* = tls_conn.TlsConn.init(self.allocator, tls_cfg) catch {
                 self.allocator.destroy(tls);
@@ -4435,11 +4452,7 @@ pub const LinuxServer = struct {
             // to browser JS anyway, so forcing this off loses nothing.
             const tls_cfg = self.tls13Config(false);
             if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
-                tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, .{
-                    .cert_chain = self.config.tls12_cert_chain,
-                    .ecdsa_p256_signing_key = self.config.tls12_signing_key,
-                    .rsa_signing_key = self.config.tls_rsa_signing_key,
-                });
+                tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, self.tls12Config());
             } else {
                 tls.* = tls_conn.TlsConn.init(self.allocator, tls_cfg) catch {
                     self.allocator.destroy(tls);
@@ -13782,11 +13795,7 @@ pub const LinuxServer = struct {
         // connection with no 1.2 config fails resume and is dropped.
         const cfg12: ?tls12_server.Config = if (self.config.tls12_cert_chain.len != 0 and
             (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null))
-            .{
-                .cert_chain = self.config.tls12_cert_chain,
-                .ecdsa_p256_signing_key = self.config.tls12_signing_key,
-                .rsa_signing_key = self.config.tls_rsa_signing_key,
-            }
+            self.tls12Config()
         else
             null;
         // Connected-state resume: the handshake is already complete, so the

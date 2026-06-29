@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const tls12 = @import("tls12.zig");
+const tls_resumption = @import("tls_resumption.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_verify = @import("rsa_verify.zig");
@@ -26,9 +27,12 @@ const sig_ecdsa_secp256r1_sha256: u16 = 0x0403;
 const sig_rsa_pkcs1_sha256: u16 = 0x0401;
 const sig_rsa_pkcs1_sha384: u16 = 0x0501;
 
+/// RFC 5077 SessionTicket extension type.
+const ext_session_ticket: u16 = 0x0023;
+
 pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     ecdsa_p256.Sec1Error || rsa_verify.Error || x509.Error || x509_verify.Error ||
-    Allocator.Error || error{
+    tls_resumption.Error || Allocator.Error || error{
     BadCertificate,
     BadHandshake,
     BadSignature,
@@ -62,9 +66,16 @@ pub const FeedResult = union(enum) {
 
 const State = enum {
     idle,
+    // Full handshake: server flight, then client sends its flight, then server
+    // CCS + Finished.
     wait_server_flight,
     wait_server_ccs,
     wait_server_finished,
+    // Abbreviated (RFC 5077 resumed) handshake: the server sends its whole
+    // flight first (ServerHello[, NewSessionTicket], CCS, Finished); the client
+    // verifies it and only then sends its own CCS + Finished.
+    wait_resumed_server_ccs,
+    wait_resumed_server_finished,
     connected,
 };
 
@@ -119,6 +130,31 @@ pub const Client = struct {
     app_write_seq: u64 = 0,
     hs_read_seq: u64 = 0,
     hs_write_seq: u64 = 0,
+
+    // ---- RFC 5077 stateless session resumption (opt-in) ----
+    /// When true the ClientHello advertises an (empty) SessionTicket extension so
+    /// the server may issue one. Enabled by `requestSessionTicket` or implied by
+    /// `setSessionTicket` (presenting a ticket to resume).
+    request_session_ticket: bool = false,
+    /// A ticket loaded via `setSessionTicket` to present in the ClientHello.
+    /// Owned; freed on deinit / replacement.
+    resume_ticket: ?[]u8 = null,
+    /// master_secret + suite recovered from the loaded session, used to derive
+    /// key material on the abbreviated handshake instead of a fresh ECDHE run.
+    resume_master_secret: [tls12.master_secret_len]u8 = [_]u8{0} ** tls12.master_secret_len,
+    resume_suite: ?tls12.CipherSuite = null,
+    /// True once the ServerHello echoed an empty SessionTicket extension. This
+    /// is sent on both resumed and fresh-issue full handshakes, so it only means
+    /// "a NewSessionTicket will follow" — not "abbreviated handshake".
+    server_signaled_ticket: bool = false,
+    /// True once we have committed to the abbreviated (resumed) path: we
+    /// presented a ticket and the ServerHello was the lone handshake message in
+    /// its record (no Certificate follows).
+    resuming: bool = false,
+    /// The server promised/sent a NewSessionTicket: capture the latest serialized
+    /// session for the caller. Owned; freed on deinit / replacement.
+    captured_session_ticket: ?[]u8 = null,
+
     force_chacha_only_for_test: bool = false,
     force_aes128_only_for_test: bool = false,
     force_aes256_only_for_test: bool = false,
@@ -143,10 +179,13 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         self.allocator.free(self.server_name);
         if (self.selected_alpn) |p| self.allocator.free(p);
+        if (self.resume_ticket) |t| self.allocator.free(t);
+        if (self.captured_session_ticket) |t| self.allocator.free(t);
         self.recv_buf.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
         std.crypto.secureZero(u8, &self.key_pair.secret);
         std.crypto.secureZero(u8, &self.master_secret);
+        std.crypto.secureZero(u8, &self.resume_master_secret);
         self.keys.wipe();
     }
 
@@ -182,14 +221,79 @@ pub const Client = struct {
                             const reply = try self.buildClientFlight();
                             return .{ .bytes_to_send = reply };
                         }
+                        // After ServerHello, decide abbreviated vs full. Our
+                        // server frames a full first flight (ServerHello +
+                        // Certificate + ...) in ONE record but a resumed
+                        // ServerHello ALONE; so if we presented a ticket, the
+                        // server signaled one, and ServerHello is the lone
+                        // message in this record, take the abbreviated path.
+                        if (msg.typ == .server_hello and self.resume_ticket != null and
+                            self.server_signaled_ticket and off == rec.fragment.len)
+                        {
+                            self.resuming = true;
+                            try self.beginResumedHandshake();
+                            consumePrefix(&self.recv_buf, rec.wire_len);
+                            break;
+                        }
                     }
-                    if (off != rec.fragment.len) return .need_more;
-                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    if (!self.resuming and off != rec.fragment.len) return .need_more;
+                    if (!self.resuming) consumePrefix(&self.recv_buf, rec.wire_len);
                 },
                 .wait_server_ccs => {
+                    // RFC 5077 (full handshake + issue): the server's final
+                    // flight is NewSessionTicket, CCS, Finished — the ticket is a
+                    // plaintext handshake record that precedes the CCS.
+                    if (rec.content_type == .handshake) {
+                        var off: usize = 0;
+                        while (parseHandshakeMaybe(rec.fragment, &off)) |msg| {
+                            if (msg.typ != .new_session_ticket) return error.BadHandshake;
+                            try self.handleServerHandshake(msg);
+                        }
+                        if (off != rec.fragment.len) return .need_more;
+                        consumePrefix(&self.recv_buf, rec.wire_len);
+                        continue;
+                    }
                     if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_server_finished;
+                },
+                .wait_resumed_server_ccs => {
+                    // A NewSessionTicket may still arrive as a plaintext
+                    // handshake record before the server CCS.
+                    if (rec.content_type == .handshake) {
+                        var off: usize = 0;
+                        while (parseHandshakeMaybe(rec.fragment, &off)) |msg| {
+                            try self.handleServerHandshake(msg);
+                        }
+                        if (off != rec.fragment.len) return .need_more;
+                        consumePrefix(&self.recv_buf, rec.wire_len);
+                        continue;
+                    }
+                    if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    self.state = .wait_resumed_server_finished;
+                },
+                .wait_resumed_server_finished => {
+                    // Verify the server Finished over the abbreviated transcript,
+                    // then send our CCS + Finished as the final flight.
+                    const suite = self.selected_suite orelse return error.BadState;
+                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.server_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
+                    self.hs_read_seq += 1;
+                    defer self.allocator.free(opened.plaintext);
+                    if (opened.content_type != .handshake) return error.BadHandshake;
+                    var off: usize = 0;
+                    const msg = try parseHandshake(opened.plaintext, &off);
+                    if (off != opened.plaintext.len or msg.typ != .finished) return error.BadHandshake;
+                    const expected = try tls12.finishedVerifyData(suite, &self.master_secret, "server finished", self.transcript.items);
+                    if (!tls12.constantTimeEq(&expected, msg.body)) return error.FinishedMismatch;
+                    try self.transcript.appendSlice(self.allocator, msg.raw);
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    const reply = try self.buildResumedClientFlight();
+                    self.app_read_seq = self.hs_read_seq;
+                    self.app_write_seq = self.hs_write_seq;
+                    self.state = .connected;
+                    return .{ .bytes_to_send = reply };
                 },
                 .wait_server_finished => {
                     const suite = self.selected_suite orelse return error.BadState;
@@ -229,6 +333,39 @@ pub const Client = struct {
 
     pub fn selectedAlpn(self: *const Client) ?[]const u8 {
         return if (self.selected_alpn) |p| p else null;
+    }
+
+    /// Advertise RFC 5077 SessionTicket support in the next `start()` so the
+    /// server may issue a NewSessionTicket. Valid only before the handshake.
+    pub fn requestSessionTicket(self: *Client) Error!void {
+        if (self.state != .idle) return error.BadState;
+        self.request_session_ticket = true;
+    }
+
+    /// Load a serialized session (from a prior `takeSessionTicket`) to present in
+    /// the next `start()` for an abbreviated handshake. Valid only before the
+    /// handshake. Falls back to a full handshake if the server declines.
+    pub fn setSessionTicket(self: *Client, serialized: []const u8) Error!void {
+        if (self.state != .idle) return error.BadState;
+        const decoded = try tls_resumption.decodeStoredSession(serialized);
+        const suite = try tls12.CipherSuite.fromWire(decoded.suite);
+        if (decoded.psk.len != tls12.master_secret_len) return error.BadHandshake;
+        const ticket = try self.allocator.dupe(u8, decoded.ticket);
+        errdefer self.allocator.free(ticket);
+        if (self.resume_ticket) |old| self.allocator.free(old);
+        self.resume_ticket = ticket;
+        @memcpy(&self.resume_master_secret, decoded.psk[0..tls12.master_secret_len]);
+        self.resume_suite = suite;
+        self.request_session_ticket = true;
+    }
+
+    /// Take ownership of the newest serialized resumable session captured from a
+    /// server NewSessionTicket, or null if none was received. The returned bytes
+    /// are suitable for a later `setSessionTicket`.
+    pub fn takeSessionTicket(self: *Client) ?[]u8 {
+        const t = self.captured_session_ticket orelse return null;
+        self.captured_session_ticket = null;
+        return t;
     }
 
     pub fn offerOnlyChaChaForTest(self: *Client) void {
@@ -299,8 +436,17 @@ pub const Client = struct {
         try writeSignatureAlgorithmsExtension(self.allocator, &exts);
         try writeSupportedVersionsExtension(self.allocator, &exts);
         try self.writeAlpnExtension(&exts);
+        try self.writeSessionTicketExtension(&exts);
         try appendU16(self.allocator, out, @intCast(exts.items.len));
         try out.appendSlice(self.allocator, exts.items);
+    }
+
+    /// RFC 5077 SessionTicket extension: an empty body asks the server for a
+    /// ticket; a non-empty body is the ticket we wish to resume.
+    fn writeSessionTicketExtension(self: *Client, out: *std.ArrayList(u8)) Error!void {
+        if (!self.request_session_ticket) return;
+        const ticket: []const u8 = if (self.resume_ticket) |t| t else "";
+        try writeExtension(self.allocator, out, ext_session_ticket, ticket);
     }
 
     fn writeSniExtension(self: *Client, out: *std.ArrayList(u8)) Error!void {
@@ -335,22 +481,68 @@ pub const Client = struct {
             .server_hello => {
                 try self.parseServerHello(msg.body);
                 try self.transcript.appendSlice(self.allocator, msg.raw);
+                // The resume-vs-full decision is made by the feed loop after
+                // ServerHello (abbreviated iff we presented a ticket and no
+                // Certificate follows in the record).
+            },
+            .new_session_ticket => {
+                try self.captureNewSessionTicket(msg.body);
+                try self.transcript.appendSlice(self.allocator, msg.raw);
             },
             .certificate => {
+                if (self.resuming) return error.BadHandshake;
                 try self.parseCertificate(msg.body);
                 try self.transcript.appendSlice(self.allocator, msg.raw);
             },
             .server_key_exchange => {
+                if (self.resuming) return error.BadHandshake;
                 try self.verifyServerKeyExchange(msg.body);
                 try self.transcript.appendSlice(self.allocator, msg.raw);
             },
             .server_hello_done => {
+                if (self.resuming) return error.BadHandshake;
                 if (msg.body.len != 0) return error.BadHandshake;
                 try self.transcript.appendSlice(self.allocator, msg.raw);
                 self.state = .wait_server_ccs;
             },
             else => return error.BadHandshake,
         }
+    }
+
+    /// Abbreviated-path setup once the ServerHello confirmed resumption: adopt
+    /// the recovered suite/master_secret and derive directional keys from the
+    /// fresh server_random the server just sent.
+    fn beginResumedHandshake(self: *Client) Error!void {
+        const suite = self.selected_suite orelse return error.BadState;
+        // The server must resume the same suite the ticket was issued under.
+        if (self.resume_suite) |rs| {
+            if (rs != suite) return error.UnsupportedCipherSuite;
+        }
+        @memcpy(&self.master_secret, &self.resume_master_secret);
+        self.keys = try tls12.deriveKeyMaterial(suite, &self.master_secret, &self.client_random, &self.server_random);
+        self.state = .wait_resumed_server_ccs;
+    }
+
+    /// Parse a NewSessionTicket and serialize the resumable session (opaque
+    /// ticket + current master_secret + suite) for `takeSessionTicket`.
+    fn captureNewSessionTicket(self: *Client, body: []const u8) Error!void {
+        var c = Cursor.init(body);
+        const lifetime = try c.readU32();
+        const ticket = try c.take(try c.readU16());
+        try c.expectEmpty();
+        if (ticket.len == 0) return; // a server may send an empty placeholder.
+        const suite = self.selected_suite orelse return error.BadState;
+        const serialized = try tls_resumption.encodeStoredSession(self.allocator, .{
+            .suite = @intFromEnum(suite),
+            .ticket_lifetime = lifetime,
+            .ticket_age_add = 0,
+            .ticket = ticket,
+            .psk = &self.master_secret,
+            .max_early_data_size = 0,
+        });
+        errdefer self.allocator.free(serialized);
+        if (self.captured_session_ticket) |old| self.allocator.free(old);
+        self.captured_session_ticket = serialized;
     }
 
     fn parseServerHello(self: *Client, body: []const u8) Error!void {
@@ -387,6 +579,14 @@ pub const Client = struct {
                 errdefer self.allocator.free(copy);
                 if (self.selected_alpn) |old| self.allocator.free(old);
                 self.selected_alpn = copy;
+            } else if (typ == ext_session_ticket) {
+                // RFC 5077: an (empty) SessionTicket extension in ServerHello
+                // means the server will issue a NewSessionTicket. It is sent BOTH
+                // when resuming AND when issuing a fresh ticket on a full
+                // handshake, so it does NOT by itself imply the abbreviated path
+                // — that is decided by whether a Certificate follows.
+                if (body.len != 0) return error.BadHandshake;
+                self.server_signaled_ticket = true;
             } else if (typ == 0x002b) {
                 return error.ProtocolVersion; // supported_versions would select TLS 1.3.
             }
@@ -466,6 +666,30 @@ pub const Client = struct {
         const cke_rec = try tls12.writePlainRecord(self.allocator, .handshake, cke.items);
         defer self.allocator.free(cke_rec);
         try out.appendSlice(self.allocator, cke_rec);
+        const ccs = try tls12.writePlainRecord(self.allocator, .change_cipher_spec, &.{1});
+        defer self.allocator.free(ccs);
+        try out.appendSlice(self.allocator, ccs);
+        const fin_rec = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_write_seq, .handshake, fin.items);
+        self.hs_write_seq += 1;
+        defer self.allocator.free(fin_rec);
+        try out.appendSlice(self.allocator, fin_rec);
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    /// Abbreviated-path client flight (RFC 5077): CCS + Finished only. There is
+    /// no ClientKeyExchange — keys came from the recovered master_secret. The
+    /// client Finished is computed over the abbreviated transcript (ClientHello,
+    /// ServerHello[, NewSessionTicket], server Finished).
+    fn buildResumedClientFlight(self: *Client) Error![]u8 {
+        const suite = self.selected_suite orelse return error.BadState;
+        const verify = try tls12.finishedVerifyData(suite, &self.master_secret, "client finished", self.transcript.items);
+        var fin: std.ArrayList(u8) = .empty;
+        defer fin.deinit(self.allocator);
+        try writeHandshake(self.allocator, &fin, .finished, &verify);
+        try self.transcript.appendSlice(self.allocator, fin.items);
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
         const ccs = try tls12.writePlainRecord(self.allocator, .change_cipher_spec, &.{1});
         defer self.allocator.free(ccs);
         try out.appendSlice(self.allocator, ccs);
@@ -794,6 +1018,11 @@ const Cursor = struct {
     fn readU24(self: *Cursor) Error!usize {
         const b = try self.take(3);
         return (@as(usize, b[0]) << 16) | (@as(usize, b[1]) << 8) | b[2];
+    }
+
+    fn readU32(self: *Cursor) Error!u32 {
+        const b = try self.take(4);
+        return (@as(u32, b[0]) << 24) | (@as(u32, b[1]) << 16) | (@as(u32, b[2]) << 8) | b[3];
     }
 
     fn expectEmpty(self: Cursor) Error!void {

@@ -57,6 +57,7 @@ pub const ContentType = enum(u8) {
 pub const HandshakeType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
+    new_session_ticket = 4,
     certificate = 11,
     server_key_exchange = 12,
     server_hello_done = 14,
