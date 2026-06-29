@@ -4344,6 +4344,19 @@ pub const LinuxServer = struct {
         return @intCast(@max(0, self.nowMs()));
     }
 
+    /// WALL-CLOCK ms (u64) for the cross-node oper-grant domain. A grant carries an
+    /// ABSOLUTE `issued_ms`/`expiry_ms` that two different hosts must compare against
+    /// their own clocks, so it MUST use the NTP-synced real-time clock — NOT `nowMs()`
+    /// (CLOCK_MONOTONIC = time-since-boot, which differs between hosts by their uptime
+    /// skew). With monotonic stamps a grant issued by a lower-uptime node looked
+    /// already-expired to a higher-uptime peer (`now_ms >= expiry_ms`) and was
+    /// silently rejected, so its operator never gained the `*` prefix across the mesh.
+    /// Same clock-domain lesson as the mesh zombie-GC (monotonic clocks are per-node).
+    fn grantNowU64(self: *const LinuxServer) u64 {
+        _ = self;
+        return @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
+    }
+
     /// Whether IP reputation is active (a non-zero refuse threshold configured).
     fn reputationOn(self: *const LinuxServer) bool {
         return self.config.reputation_refuse_threshold != 0;
@@ -11078,7 +11091,7 @@ pub const LinuxServer = struct {
         var oper_title: ?[]const u8 = null;
         // Cross-mesh oper grants are keyed by account and matched to the nick
         // (same convention as isOverrideOper / the `*` status prefix).
-        if (self.oper_grants.lookup(remote.nick, self.nowU64())) |g| {
+        if (self.oper_grants.lookup(remote.nick, self.grantNowU64())) |g| {
             const status = remoteGrantWhoisStatus(g.privilege_bits);
             is_oper = status.is_oper;
             is_admin = status.is_admin;
@@ -18594,7 +18607,7 @@ pub const LinuxServer = struct {
     /// The S2S layer calls this when a grant frame arrives from a trusted peer.
     pub fn applyMeshGrant(self: *LinuxServer, bytes: []const u8, peer_pubkey: [32]u8) bool {
         const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer_pubkey) catch return false;
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const now: u64 = self.grantNowU64();
         const fields = oper_cred_share.verify(pk, bytes, now) catch return false;
         const accepted = self.oper_grants.upsert(fields) != .stale_ignored;
         if (accepted) {
@@ -18616,7 +18629,7 @@ pub const LinuxServer = struct {
     /// using the live grant registry. Same-shard only (the multi-reactor model
     /// keeps each client on one worker); peer/link connections are skipped.
     fn elevateGrantedSessions(self: *LinuxServer, account: []const u8) void {
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const now: u64 = self.grantNowU64();
         const grant = self.oper_grants.lookup(account, now) orelse return;
         if (grant.privilege_bits == 0) return;
         const privileges = oper_mod.OperPrivileges.fromBits(grant.privilege_bits);
@@ -18664,7 +18677,7 @@ pub const LinuxServer = struct {
     /// can recognize them. Stored locally too (self-trust); the S2S layer
     /// broadcasts it to peers. Best-effort: silently no-ops without a node key.
     fn mintOperGrant(self: *LinuxServer, account: []const u8, privileges: oper_mod.OperPrivileges, class_name: []const u8, title: []const u8) void {
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const now: u64 = self.grantNowU64();
         // Strictly-increasing incarnation so a later GRANT/REVOKE always wins,
         // even when issued within the same millisecond.
         self.grant_incarnation = @max(now, self.grant_incarnation + 1);
@@ -18818,7 +18831,7 @@ pub const LinuxServer = struct {
             } else |_| {}
         }
         if (!from_local) {
-            const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+            const now: u64 = self.grantNowU64();
             const g = self.oper_grants.lookup(account, now) orelse return; // not an operator anywhere
             if (g.privilege_bits == 0) return; // zero-privilege grant = revocation tombstone
             privileges = oper_mod.OperPrivileges.fromBits(g.privilege_bits);
@@ -19006,7 +19019,7 @@ pub const LinuxServer = struct {
     /// GRANTS — list the live runtime operator grants (account, class, scope).
     pub fn handleGrants(self: *LinuxServer, conn: *ConnState) !void {
         try self.noticeTo(conn, "Runtime operator grants:");
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const now: u64 = self.grantNowU64();
         var it = self.oper_grants.liveIterator(now);
         var count: usize = 0;
         while (it.next()) |g| {
@@ -19028,7 +19041,7 @@ pub const LinuxServer = struct {
         if (self.config.oper_grants_path.len == 0) return;
         var buf: [16 * 1024]u8 = undefined;
         var len: usize = 0;
-        const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+        const now: u64 = self.grantNowU64();
         var it = self.oper_grants.liveIterator(now);
         while (it.next()) |g| {
             if (g.privilege_bits == 0) continue;
@@ -23244,7 +23257,7 @@ pub const LinuxServer = struct {
         // `MESH GRANTS` lists the cross-mesh operator grants this node currently
         // recognizes (account, class, title, issuer, remaining TTL).
         if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "GRANTS")) {
-            const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
+            const now: u64 = self.grantNowU64();
             var it = self.oper_grants.liveIterator(now);
             var any = false;
             var lb: [default_reply_bytes]u8 = undefined;
@@ -24507,7 +24520,7 @@ pub const LinuxServer = struct {
             if (c.session.hasPriv(.oper_override) and std.ascii.eqlIgnoreCase(c.session.displayName(), nick)) return true;
         }
         // Propagated cross-mesh grant (account == nick) carrying oper_override.
-        if (self.oper_grants.lookup(nick, self.nowU64())) |g| {
+        if (self.oper_grants.lookup(nick, self.grantNowU64())) |g| {
             if (g.privilege_bits != 0 and oper_mod.OperPrivileges.fromBits(g.privilege_bits).has(.oper_override)) return true;
         }
         return false;
