@@ -469,7 +469,7 @@ pub const S2sPeer = struct {
             },
             .PONG => self.pong_rx_count += 1,
             .QUIT => self.closeRemote(),
-            .MEMBERSHIP => try self.recvMembership(frame.payload),
+            .MEMBERSHIP => try self.recvMembership(frame.payload, now_ms),
             .CHANNEL_MODE_FLAGS => try self.recvChannelModeFlags(frame.payload),
             .CHANNEL_LIST => try self.recvChannelList(frame.payload),
             .TOPIC => try self.recvTopic(frame.payload),
@@ -1030,10 +1030,14 @@ pub const S2sPeer = struct {
     /// Apply an inbound MEMBERSHIP event to the route table (LWW by hlc). A
     /// malformed payload is dropped, never fatal to the link. A real add/remove/
     /// status-change is queued so the daemon can emit the matching live IRC line.
-    fn recvMembership(self: *S2sPeer, frame_payload: []const u8) !void {
+    fn recvMembership(self: *S2sPeer, frame_payload: []const u8, now_ms: u64) !void {
         const payload = self.verifiedPayload(.MEMBERSHIP, frame_payload) orelse return;
         const ev = membership_event.decode(payload) catch return;
         if (!self.acceptsDirectOrigin(ev.origin_node)) return;
+        // The RECEIVER's local clock at apply time; stamped onto each present
+        // member so the local-clock staleness GC (RouteTable.pruneStale) ages
+        // members against this node's clock, never the announcer's wire hlc.
+        const local_now: i64 = i64Ms(now_ms) catch 0;
 
         // Resolve a cross-namespace (local) or cross-node (remote) NICK collision
         // BEFORE applying, so the loser is renamed to its stable mesh UID rather
@@ -1077,7 +1081,7 @@ pub const S2sPeer = struct {
                         .realname = ev.realname,
                         .host = ev.host,
                         .account = ev.account,
-                    }) catch {};
+                    }, local_now) catch {};
                     self.queueMembershipDelta(&ev, .ghost_reclaim, 0, null) catch {};
                     return;
                 },
@@ -1093,7 +1097,7 @@ pub const S2sPeer = struct {
             .realname = ev.realname,
             .host = ev.host,
             .account = ev.account,
-        }) catch return;
+        }, local_now) catch return;
         const kind: MembershipDelta.Kind = switch (res.outcome) {
             .joined => .joined,
             .parted => .parted,

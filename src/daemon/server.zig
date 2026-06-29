@@ -851,6 +851,13 @@ const timer_token: RingFdToken = .{ .slot = 2, .gen = 0 };
 /// Cadence for the periodic membership anti-entropy re-burst to S2S peers. Coarse
 /// (relative to the 2s sweep) so it converges split-window gaps without churn.
 const membership_resync_interval_ms: i64 = 30_000;
+/// Staleness window for reaping never-retracted remote member projections from
+/// each peer's RouteTable. The resync re-burst refreshes every PRESENT member's
+/// local last-seen stamp to ~now every `membership_resync_interval_ms`; this window
+/// is 3x that, so a live member (refreshed every 30s) is never pruned and only a
+/// truly-departed member whose PART/QUIT was lost (collision-rename, USR2 churn,
+/// abrupt drop) ages out instead of lingering as a zombie in NAMES/WHOIS forever.
+const stale_member_ttl_ms: i64 = 90_000;
 /// Max members per netsplit/netjoin IRCv3 BATCH chunk; a larger channel splits
 /// across multiple batches so members past a fixed cap are never silently lost.
 const mesh_batch_chunk: usize = 32;
@@ -3473,6 +3480,16 @@ pub const LinuxServer = struct {
         if (now - self.last_membership_resync_ms >= membership_resync_interval_ms) {
             self.last_membership_resync_ms = now;
             self.resyncMeshStateToPeers();
+            // Anti-entropy is additive (the re-burst only re-affirms PRESENT
+            // members), so a remote member whose PART/QUIT was never propagated
+            // would linger forever. Reap such stale projections from each peer's
+            // RouteTable on the same cadence: their local last-seen stamp froze
+            // when they departed, so they age past `stale_member_ttl_ms` while live
+            // members keep being refreshed. Runs under the completion-wide
+            // `world.lockWrite` (see
+            // onCompletion) on whichever reactor's timer fired; S2S links live on
+            // reactor 0, so it only does work there — exactly like resync.
+            self.pruneStaleMeshMembers(now);
         }
         self.maybeWriteStats();
     }
@@ -3494,6 +3511,32 @@ pub const LinuxServer = struct {
                 false;
             if (!established) continue;
             self.sendMeshStateBurstTo(&slot.value);
+        }
+    }
+
+    /// Reap stale (never-retracted) remote member projections from every
+    /// established peer's RouteTable. The membership re-burst is additive, so a
+    /// remote PART/QUIT lost during a split, USR2 churn, or an abrupt drop would
+    /// otherwise leave a permanent zombie in the peer's roster. Members whose local
+    /// last-seen stamp was not refreshed within `stale_member_ttl_ms` of `now_ms`
+    /// are pruned. `now_ms` is this node's monotonic `nowMs()`, the SAME clock the
+    /// feed path stamps onto each member (`applyMembership`'s `now_ms`), so the
+    /// staleness compare stays in one clock domain (see `RouteTable.pruneStale`).
+    /// Walks the same `self.rx().clients.slots` as `resyncMeshStateToPeers` (peer
+    /// links live on reactor 0) and reaches `routes` directly. Like
+    /// `resyncMeshStateToPeers`, it gates on `link.established()`; the simpler
+    /// `clearDroppedPeerRouteOrigin` does not.
+    fn pruneStaleMeshMembers(self: *LinuxServer, now_ms: i64) void {
+        const window: i64 = stale_member_ttl_ms;
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.value.s2s_secured) |link| {
+                if (!link.established()) continue;
+                if (link.inner) |inner| _ = inner.peer.routes.pruneStale(now_ms, window);
+            } else if (slot.value.s2s) |link| {
+                if (!link.established()) continue;
+                _ = link.peer.routes.pruneStale(now_ms, window);
+            }
         }
     }
 

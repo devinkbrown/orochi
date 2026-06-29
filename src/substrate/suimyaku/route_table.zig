@@ -199,6 +199,13 @@ pub const Member = struct {
     node: NodeId,
     status: u4,
     hlc: u64,
+    /// The RECEIVER's local monotonic clock (ms) at the most recent PRESENT apply
+    /// for this member. Distinct from `hlc`, which is the *announcing* node's
+    /// monotonic clock and is comparable across hosts ONLY for last-writer-wins
+    /// ordering — never against this node's clock. `pruneStale` ages a member out
+    /// against THIS field so the staleness window is measured entirely in the
+    /// receiver's clock domain (see pruneStale).
+    last_refreshed_ms: i64 = 0,
 
     fn freeStrings(self: *const Member, allocator: std.mem.Allocator) void {
         allocator.free(self.nick);
@@ -585,6 +592,10 @@ pub const RouteTable = struct {
     /// Also maintains the `nick_to_node` routing index (so `nickNode` resolves the
     /// remote nick for PRIVMSG relay): a present apply upserts the location, a part
     /// drops it once the nick is absent from every channel roster.
+    /// `now_ms` is the RECEIVER's local monotonic clock at apply time; on every
+    /// PRESENT apply (join/status/re-affirm) it stamps the member's
+    /// `last_refreshed_ms` so `pruneStale` can age the member out against this
+    /// node's own clock. It does NOT participate in LWW ordering (that stays `hlc`).
     pub fn applyMembership(
         self: *Self,
         chan: []const u8,
@@ -594,6 +605,7 @@ pub const RouteTable = struct {
         hlc: u64,
         present: bool,
         ident: MemberIdentity,
+        now_ms: i64,
     ) Error!ApplyResult {
         try self.validateName(chan);
         try self.validateName(nick);
@@ -603,6 +615,14 @@ pub const RouteTable = struct {
         if (list.find(nick)) |idx| {
             const cur = &list.entries.items[idx];
             const prev = cur.status;
+            // A PRESENT event for an already-known member is itself the liveness
+            // signal we prune against, so refresh the local last-seen stamp
+            // unconditionally — even for a stale-hlc re-affirmation that the LWW
+            // guard below collapses to `unchanged`. This is the anti-entropy
+            // re-burst keeping a still-present member alive; it must not depend on
+            // the hlc advancing. Stamped before the LWW early-return; never touched
+            // for a part (present=false), whose retraction is what we want to age.
+            if (present) cur.last_refreshed_ms = now_ms;
             if (hlc <= cur.hlc) return .{ .outcome = .unchanged, .prev_status = prev }; // stale
             if (present) {
                 const changed = cur.status != status or cur.node != node;
@@ -651,11 +671,87 @@ pub const RouteTable = struct {
             .node = node,
             .status = status,
             .hlc = hlc,
+            .last_refreshed_ms = now_ms,
         });
         // Index this newly-learned remote nick for PRIVMSG relay routing
         // (best-effort, see the upsert branch above).
         self.setNickLocation(nick, node) catch {};
         return .{ .outcome = .joined };
+    }
+
+    /// Staleness-GC reconciliation: drop every remote member whose local last-seen
+    /// stamp (`last_refreshed_ms`) was not refreshed within `window_ms` of `now_ms`
+    /// (i.e. `now_ms - last_refreshed_ms > window_ms`), returning the total count
+    /// pruned. The mesh anti-entropy re-burst refreshes each PRESENT member's
+    /// `last_refreshed_ms` to ~`now` on its cadence, so a member whose stamp is
+    /// older than the window is one whose departure (PART/QUIT) never cleanly
+    /// propagated — a stale "zombie" projection. This reaps it.
+    ///
+    /// CLOCK DOMAIN: both `now_ms` and `last_refreshed_ms` are the SAME receiver's
+    /// local monotonic clock (server `nowMs()`), so the difference is meaningful.
+    /// The member's `hlc` is deliberately NOT used here: it is the *announcing*
+    /// node's monotonic clock (time-since-boot, per-machine) and is comparable
+    /// across hosts only for last-writer-wins ordering — never against this node's
+    /// clock. Comparing the two clock domains would, on a real multi-host mesh with
+    /// differing uptimes, either reap every live remote member every cadence or
+    /// never reap at all. Stamp and prune both live in the local domain instead.
+    ///
+    /// Each removed member mirrors the `present=false` (part) branch of
+    /// `applyMembership` exactly: free its strings, swapRemove it from the roster,
+    /// prune the channel if it emptied, and drop the nick→node route once the nick
+    /// is absent from every channel. Removal happens in two passes so the route
+    /// drop and channel prune see fully-swept rosters and never invalidate the
+    /// channel iterator mid-walk (mirrors `removeNodeMembers`).
+    pub fn pruneStale(self: *Self, now_ms: i64, window_ms: i64) usize {
+        // Pass 1: strip stale members from every roster in place (no map mutation),
+        // collecting emptied channel keys to prune and the nicks whose routes may
+        // now be orphaned. Removed nicks are duped because their owned strings are
+        // freed here but the route-drop check in pass 2 still needs the name.
+        var empties: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer empties.deinit(self.allocator);
+        var orphan_nicks: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (orphan_nicks.items) |n| self.allocator.free(n);
+            orphan_nicks.deinit(self.allocator);
+        }
+
+        var pruned: usize = 0;
+        var it = self.channel_members.iterator();
+        while (it.next()) |entry| {
+            const list = entry.value_ptr;
+            var i: usize = 0;
+            while (i < list.entries.items.len) {
+                const m = &list.entries.items[i];
+                // Local-clock staleness: a member refreshed within the window (or
+                // stamped in the future relative to now) survives; only a frozen,
+                // aged local stamp ages out. Both operands are this node's monotonic
+                // clock (see the clock-domain note above), so a plain signed
+                // difference is correct and overflow-safe for realistic ms values.
+                if (now_ms - m.last_refreshed_ms > window_ms) {
+                    // Capture the nick before freeStrings invalidates the slice.
+                    if (self.allocator.dupe(u8, m.nick)) |owned| {
+                        orphan_nicks.append(self.allocator, owned) catch self.allocator.free(owned);
+                    } else |_| {}
+                    m.freeStrings(self.allocator);
+                    _ = list.entries.swapRemove(i);
+                    pruned += 1;
+                } else i += 1;
+            }
+            if (list.entries.items.len == 0) empties.append(self.allocator, entry.key_ptr.*) catch {};
+        }
+
+        // Pass 2: drop the nick→node route for any orphaned nick now absent from
+        // EVERY channel roster (the only mesh-wide nick replication), exactly like
+        // the part branch. `findMember` reflects the fully-swept rosters here.
+        for (orphan_nicks.items) |nick| {
+            if (self.findMember(nick) == null) _ = self.removeNick(nick);
+        }
+
+        // Pass 3: prune channels emptied by the sweep (mutates the channels map, so
+        // it runs after the outer iteration completes).
+        for (empties.items) |chan| self.pruneIfEmpty(chan);
+
+        return pruned;
     }
 
     /// Borrowed roster of remote members for `chan` (empty if none). Valid until
@@ -1068,13 +1164,13 @@ test "applyMembership tracks remote channel members with last-writer-wins" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#chat", "alice", 10, 0b0100, 1, true, .{}); // op
-    _ = try table.applyMembership("#chat", "bob", 20, 0b0000, 1, true, .{});
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0100, 1, true, .{}, 0); // op
+    _ = try table.applyMembership("#chat", "bob", 20, 0b0000, 1, true, .{}, 0);
     try std.testing.expectEqual(@as(usize, 2), table.channelMembers("#chat").len);
 
     // A stale event (lower hlc) is ignored; a newer one updates status.
-    _ = try table.applyMembership("#chat", "alice", 10, 0b0000, 0, true, .{});
-    _ = try table.applyMembership("#chat", "alice", 10, 0b0010, 5, true, .{}); // now voice
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0000, 0, true, .{}, 0);
+    _ = try table.applyMembership("#chat", "alice", 10, 0b0010, 5, true, .{}, 0); // now voice
     var alice_status: ?u4 = null;
     for (table.channelMembers("#chat")) |m| {
         if (std.mem.eql(u8, m.nick, "alice")) alice_status = m.status;
@@ -1090,14 +1186,14 @@ test "applyMembership stores and LWW-updates the propagated identity" {
         .username = "alice",
         .realname = "Alice Liddell",
         .host = "cloak-1a2b.users",
-    });
+    }, 0);
     var alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("alice", alice.username);
     try std.testing.expectEqualStrings("Alice Liddell", alice.realname);
     try std.testing.expectEqualStrings("cloak-1a2b.users", alice.host);
 
     // A stale event must NOT clobber the stored identity.
-    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{ .username = "stale" });
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{ .username = "stale" }, 0);
     alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("alice", alice.username);
 
@@ -1106,12 +1202,12 @@ test "applyMembership stores and LWW-updates the propagated identity" {
         .username = "alice",
         .realname = "Alice Liddell",
         .host = "vanity.example",
-    });
+    }, 0);
     alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("vanity.example", alice.host);
 
     // Part frees the identity strings (leak-checked by testing.allocator).
-    _ = try table.applyMembership("#chat", "alice", 10, 0, 10, false, .{});
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 10, false, .{}, 0);
     try std.testing.expect(table.findMember("alice") == null);
 }
 
@@ -1119,8 +1215,8 @@ test "findMember locates a roster member case-insensitively with its node" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#chat", "Alice", 10, 0b0100, 1, true, .{});
-    _ = try table.applyMembership("#ops", "bob", 20, 0, 1, true, .{});
+    _ = try table.applyMembership("#chat", "Alice", 10, 0b0100, 1, true, .{}, 0);
+    _ = try table.applyMembership("#ops", "bob", 20, 0, 1, true, .{}, 0);
 
     const alice = table.findMember("alice") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("Alice", alice.nick);
@@ -1136,12 +1232,12 @@ test "applyMembership part removes a member and prunes an empty channel" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#x", "alice", 10, 0, 1, true, .{});
+    _ = try table.applyMembership("#x", "alice", 10, 0, 1, true, .{}, 0);
     // Stale part (hlc <= current) does not remove.
-    _ = try table.applyMembership("#x", "alice", 10, 0, 1, false, .{});
+    _ = try table.applyMembership("#x", "alice", 10, 0, 1, false, .{}, 0);
     try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#x").len);
     // Newer part removes; the now-empty channel is pruned.
-    _ = try table.applyMembership("#x", "alice", 10, 0, 2, false, .{});
+    _ = try table.applyMembership("#x", "alice", 10, 0, 2, false, .{}, 0);
     try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#x").len);
 }
 
@@ -1153,19 +1249,93 @@ test "applyMembership maintains the nick->node routing index for PRIVMSG relay" 
     // index the cross-node PRIVMSG relay consults (`nickNode`). Before the fix it
     // stayed empty (only NAMES/WHOIS, which scan the roster, worked) so every
     // cross-node PM fell through to ERR_NOSUCHNICK.
-    _ = try table.applyMembership("#a", "alice", 10, 0, 1, true, .{});
+    _ = try table.applyMembership("#a", "alice", 10, 0, 1, true, .{}, 0);
     try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
 
     // The same nick in a second channel must keep one location; parting ONE
     // channel must NOT drop the route while another membership remains.
-    _ = try table.applyMembership("#b", "alice", 10, 0, 1, true, .{});
-    _ = try table.applyMembership("#a", "alice", 10, 0, 2, false, .{}); // part #a
+    _ = try table.applyMembership("#b", "alice", 10, 0, 1, true, .{}, 0);
+    _ = try table.applyMembership("#a", "alice", 10, 0, 2, false, .{}, 0); // part #a
     try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
 
     // Parting the LAST channel drops the route (channel membership is the only
     // mesh-wide nick replication, so a no-channel remote user is unroutable).
-    _ = try table.applyMembership("#b", "alice", 10, 0, 3, false, .{}); // part #b
+    _ = try table.applyMembership("#b", "alice", 10, 0, 3, false, .{}, 0); // part #b
     try std.testing.expect(table.nickNode("alice") == null);
+}
+
+test "pruneStale reaps members whose local last-seen aged past the window" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const T: i64 = 1_000_000;
+    const window: i64 = 90_000;
+
+    // A member last refreshed at LOCAL T is still within the window at T+50_000 and
+    // must survive; the same member ages out once now passes T+window. The wire hlc
+    // is deliberately a different magnitude (5) to prove pruning keys off the local
+    // stamp (now_ms=T), not the announcer's hlc.
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 5, true, .{ .username = "alice" }, T);
+    try std.testing.expectEqual(@as(usize, 0), table.pruneStale(T + 50_000, window));
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#chat").len);
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
+
+    // Now strictly past the window: the member is reaped, its emptied channel is
+    // pruned, and its nick→node route is dropped (last channel gone).
+    try std.testing.expectEqual(@as(usize, 1), table.pruneStale(T + 100_000, window));
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#chat").len);
+    try std.testing.expect(table.nickNode("alice") == null);
+    try std.testing.expect(table.findMember("alice") == null);
+}
+
+test "pruneStale keeps a route while the nick remains fresh in another channel" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    const window: i64 = 90_000;
+
+    // "alice" was last refreshed long ago in #old (local now=1) but recently in
+    // #new (local now=1_000_000); "bob" is fresh in #new only. Each channel holds a
+    // SEPARATE Member entry, so they carry independent last-seen stamps. Pruning at
+    // now=1_050_000 reaps only the stale #old projection, keeps #new untouched, and
+    // RETAINS alice's route because she is still present in #new.
+    _ = try table.applyMembership("#old", "alice", 10, 0, 1, true, .{}, 1);
+    _ = try table.applyMembership("#new", "alice", 10, 0, 1_000_000, true, .{}, 1_000_000);
+    _ = try table.applyMembership("#new", "bob", 20, 0, 1_000_000, true, .{}, 1_000_000);
+
+    try std.testing.expectEqual(@as(usize, 1), table.pruneStale(1_050_000, window));
+    // #old emptied and pruned; #new intact with both members.
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#old").len);
+    try std.testing.expectEqual(@as(usize, 2), table.channelMembers("#new").len);
+    // alice's route survives (still in #new); bob untouched.
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
+    try std.testing.expectEqual(@as(?NodeId, 20), table.nickNode("bob"));
+    try std.testing.expect(table.findMember("alice") != null);
+
+    // A second prune well past every stamp reaps both, empties #new, drops routes.
+    try std.testing.expectEqual(@as(usize, 2), table.pruneStale(2_000_000, window));
+    try std.testing.expectEqual(@as(usize, 0), table.channelMembers("#new").len);
+    try std.testing.expect(table.nickNode("alice") == null);
+    try std.testing.expect(table.nickNode("bob") == null);
+}
+
+test "pruneStale uses the local last-seen stamp, not the announcer's wire hlc (cross-skew regression)" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // Simulate a peer with a wildly different uptime: its monotonic clock (the wire
+    // hlc) reads 5 while THIS node's local clock reads 1_000_000 at apply time. The
+    // two are different clock domains and must never be compared. Apply the member
+    // with hlc=5 but stamp it with local now_ms=1_000_000.
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 5, true, .{ .username = "alice" }, 1_000_000);
+
+    // Prune 10_000ms later in the LOCAL domain, well inside the 90s window. The
+    // member SURVIVES because last_refreshed_ms (1_000_000) is fresh. Under the old
+    // hlc-based logic this would compute 1_010_000 - 5 = 1_009_995 > 90_000 and
+    // wrongly reap a live remote member — exactly the cross-host flapping bug.
+    try std.testing.expectEqual(@as(usize, 0), table.pruneStale(1_010_000, 90_000));
+    try std.testing.expectEqual(@as(usize, 1), table.channelMembers("#chat").len);
+    try std.testing.expectEqual(@as(?NodeId, 10), table.nickNode("alice"));
 }
 
 test "applyChannelList tracks list masks with last-writer-wins tombstones" {
@@ -1196,8 +1366,8 @@ test "removeNode evicts that node's remote members (netsplit hygiene)" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{});
-    _ = try table.applyMembership("#chat", "bob", 20, 0, 1, true, .{});
+    _ = try table.applyMembership("#chat", "alice", 10, 0, 1, true, .{}, 0);
+    _ = try table.applyMembership("#chat", "bob", 20, 0, 1, true, .{}, 0);
     table.removeNode(10);
     const members = table.channelMembers("#chat");
     try std.testing.expectEqual(@as(usize, 1), members.len);
@@ -1334,7 +1504,7 @@ test "resolveIncomingNick renames a newcomer that loses a cross-node remote cont
 
     // Node 20 holds "kain" with a high HLC. A newcomer from node 10 with a lower
     // HLC must lose and rename to its UID; the SAME node re-asserting keeps it.
-    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{});
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{}, 0);
     _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, ""));
     try std.testing.expectEqual(NickDecision.keep, table.resolveIncomingNick("kain", 20, 999, ""));
 
@@ -1351,7 +1521,7 @@ test "resolveIncomingNick collapses a same-account cross-node collision via keep
     // node 10 on the SAME account would normally lose and get a UID — but because
     // it is the same identity, the table reports `remote_same_account` (no UID, no
     // incumbent displacement) and lets hlc LWW in applyMembership converge.
-    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain" });
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 500, true, .{ .account = "kain" }, 0);
     try std.testing.expectEqual(NickDecision.remote_same_account, table.resolveIncomingNick("kain", 10, 100, "kain"));
     // A different account still contests normally (lower hlc loser → UID).
     _ = try expectRename(table.resolveIncomingNick("kain", 10, 100, "mallory"));
@@ -1361,7 +1531,7 @@ test "resolveIncomingNick breaks an HLC tie by higher node id" {
     var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
 
-    _ = try table.applyMembership("#chat", "kain", 20, 0, 300, true, .{});
+    _ = try table.applyMembership("#chat", "kain", 20, 0, 300, true, .{}, 0);
     // Same HLC, lower node id => newcomer loses.
     _ = try expectRename(table.resolveIncomingNick("kain", 5, 300, ""));
     // Same HLC, higher node id => newcomer wins (keep; caller displaces).
@@ -1373,7 +1543,7 @@ test "incumbentLoserUid derives a stable, owner-scoped fallback" {
     defer table.deinit();
 
     try std.testing.expect(table.incumbentLoserUid("ghost") == null);
-    _ = try table.applyMembership("#chat", "kain", 42, 0, 1, true, .{});
+    _ = try table.applyMembership("#chat", "kain", 42, 0, 1, true, .{}, 0);
     const uid = table.incumbentLoserUid("kain").?;
     try std.testing.expect(uid_alloc.validate(uid[0..]));
     try std.testing.expectEqual(@as(u16, 42), (try uid_alloc.parse(uid[0..])).node);
