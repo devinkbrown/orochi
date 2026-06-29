@@ -9015,6 +9015,58 @@ pub const LinuxServer = struct {
         return count;
     }
 
+    /// Total members of `channel` across the WHOLE mesh: the local member count plus
+    /// every distinct remote member an established S2S peer announced for it, deduped
+    /// by nick against locals and across links — the same membership set the NAMES
+    /// world-projection merges (auditorium `+x` may hide some from NAMES *visibility*,
+    /// but the channel's true population is what a LIST count should report). LIST
+    /// otherwise reported only the LOCAL count, so a channel with members on a peer
+    /// node was undercounted (and a channel whose locals all live on a peer could
+    /// read as smaller than its own NAMES). Iterates ALL reactors because S2S links
+    /// live only on reactor 0; safe because `onCompletion` holds `world.lockWrite`
+    /// around the whole completion (the same guarantee `sendNames` relies on).
+    fn globalMemberCount(self: *LinuxServer, channel: []const u8, local_count: usize) usize {
+        var total = local_count;
+        // Bounded scratch of remote nicks already counted (dedup across links and
+        // against locals); beyond the cap the count saturates rather than growing the
+        // stack frame. 256 keeps this ~4 KiB on the live completion stack — realistic
+        // per-channel sizes are far smaller, and the saturation handles the rest.
+        const max_seen = 256;
+        var seen_buf: [max_seen][]const u8 = undefined;
+        var seen: usize = 0;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const members = blk: {
+                    if (slot.value.s2s_secured) |link| {
+                        if (link.established()) break :blk link.channelMembers(channel);
+                    } else if (slot.value.s2s) |link| {
+                        if (link.established()) break :blk link.channelMembers(channel);
+                    }
+                    continue;
+                };
+                for (members) |rm| {
+                    if (self.world.isMemberByNick(channel, rm.nick)) continue; // echo of a local member
+                    var dup = false;
+                    var i: usize = 0;
+                    while (i < seen) : (i += 1) {
+                        if (std.ascii.eqlIgnoreCase(seen_buf[i], rm.nick)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+                    if (seen < max_seen) {
+                        seen_buf[seen] = rm.nick;
+                        seen += 1;
+                    }
+                    total += 1;
+                }
+            }
+        }
+        return total;
+    }
+
     fn broadcastJoin(self: *LinuxServer, channel: []const u8, conn: *ConnState) !void {
         var prefix_buf: [256]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
@@ -10707,6 +10759,7 @@ pub const LinuxServer = struct {
         };
         defer filters.deinit(self.allocator);
         const Adapter = struct {
+            server: *LinuxServer,
             it: world_model.World.ChannelViewIterator,
             filters: *const elist.FilterSet,
             now_seconds: i64,
@@ -10717,12 +10770,15 @@ pub const LinuxServer = struct {
             pub fn next(s: *@This()) ?list.ChannelInfo {
                 while (s.it.next()) |v| {
                     if (v.secret or v.hidden) continue;
+                    // Count members mesh-wide (local + remote peer roster), so the
+                    // displayed count — and the >N/<N ELIST filter — match NAMES.
+                    const users = s.server.globalMemberCount(v.name, v.members);
                     const created_ago = ageSeconds(s.now_seconds, v.created_unix);
                     const topic_age = ageSeconds(s.now_seconds, v.topic_time);
-                    if (!s.filters.matches(.{ .name = v.name, .users = @intCast(v.members), .created_ago = created_ago, .topic_age = topic_age })) continue;
+                    if (!s.filters.matches(.{ .name = v.name, .users = @intCast(users), .created_ago = created_ago, .topic_age = topic_age })) continue;
                     return .{
                         .name = v.name,
-                        .users = @intCast(v.members),
+                        .users = @intCast(users),
                         .topic = v.topic,
                         .created_at = v.created_unix,
                         .topic_set_at = if (v.topic_time > 0) v.topic_time else null,
@@ -10732,7 +10788,7 @@ pub const LinuxServer = struct {
             }
         };
         const now_seconds = @divFloor(platform.realtimeMillis(), 1000);
-        var adapter = Adapter{ .it = self.world.channelIterator(), .filters = &filters, .now_seconds = now_seconds };
+        var adapter = Adapter{ .server = self, .it = self.world.channelIterator(), .filters = &filters, .now_seconds = now_seconds };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSinkCRLF{ .conn = conn };
         list.emitList(Adapter, &adapter, request, .{ .server_name = self.serverName(), .requester = conn.session.displayName(), .now_seconds = now_seconds }, &scratch, &sink) catch return;
@@ -10768,7 +10824,8 @@ pub const LinuxServer = struct {
             const language = if (self.props.getProp(entity, "LANGUAGE")) |ev| ev.value else |_| "";
             const info = listx.ChannelInfo{
                 .name = v.name,
-                .members = @intCast(v.members),
+                // Mesh-wide member count (local + remote roster), matching NAMES/LIST.
+                .members = @intCast(self.globalMemberCount(v.name, v.members)),
                 .topic = v.topic,
                 .created_ms = if (v.created_unix > 0) @as(u64, @intCast(v.created_unix)) * 1000 else 0,
                 .topic_ms = if (v.topic_time > 0) @as(u64, @intCast(v.topic_time)) * 1000 else null,
