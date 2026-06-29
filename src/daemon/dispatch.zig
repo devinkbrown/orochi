@@ -1230,10 +1230,17 @@ pub const ClientSession = struct {
         return if (nick.len == 0) "*" else nick;
     }
 
-    /// The client's username (from USER), or "user" before registration.
+    /// The client's username (from USER). When absent — e.g. a session reclaimed
+    /// across the mesh, whose transfer snapshot doesn't carry the USER ident —
+    /// surface the account name for a logged-in client (a meaningful ident)
+    /// instead of the bare "user" default; only a true guest shows "user".
     pub fn username(self: *const ClientSession) []const u8 {
         const u = self.client.identity.uid.slice();
-        return if (u.len == 0) "user" else u;
+        if (u.len != 0) return u;
+        if (self.account()) |acct| {
+            if (acct.len != 0) return acct;
+        }
+        return "user";
     }
 
     /// The client's realname (from USER), or the nick if unset.
