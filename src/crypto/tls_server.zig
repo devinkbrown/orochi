@@ -23,6 +23,7 @@ const hkdf = @import("hkdf_tls13.zig");
 const tls_resumption = @import("tls_resumption.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_sign = @import("rsa_sign.zig");
+const rsa_verify = @import("rsa_verify.zig");
 const Sha256 = hkdf.Sha256;
 const Sha384 = hkdf.Sha384;
 /// Largest transcript-hash / traffic-secret length handled (SHA-384).
@@ -550,6 +551,14 @@ pub const Server = struct {
                 const decoded = ecdsa_p256.signatureFromDer(sig) catch return self.failClientCert();
                 if (!ecdsa_p256.verify(decoded, input, pk)) return self.failClientCert();
             },
+            .rsa => |pk| {
+                // TLS 1.3 client CertificateVerify with an RSA key is always
+                // RSASSA-PSS (rsae); salt length equals the hash length.
+                if (scheme != @intFromEnum(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256)) return self.failClientCert();
+                var msg_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(input, &msg_hash, .{});
+                if (!rsa_verify.verifyPss(pk, .sha256, &msg_hash, sig, msg_hash.len)) return self.failClientCert();
+            },
         }
     }
 
@@ -1024,6 +1033,10 @@ pub const Server = struct {
     const client_cert_schemes = [_]tls_signature_scheme.SignatureScheme{
         .ed25519,
         .ecdsa_secp256r1_sha256,
+        // RSA-PSS (rsae) — TLS 1.3 forbids PKCS#1 v1.5 for CertificateVerify, so
+        // only the PSS variant is offered. Lets RSA-2048 client certs (e.g. an
+        // ACME-issued leaf reused as a certfp client cert) bind via CERTADD.
+        .rsa_pss_rsae_sha256,
     };
 
     /// CertificateRequest (mTLS, RFC 8446 §4.3.2): empty request context + a
@@ -1447,11 +1460,16 @@ fn buildCertVerifyInput(out: *[cert_verify_input_max]u8, context: []const u8, tr
 const ClientLeafKey = union(enum) {
     ed25519: Ed25519.PublicKey,
     ecdsa_p256: ecdsa_p256.PublicKey,
+    // `n`/`e` borrow the leaf DER, which the caller keeps owned in
+    // `client_cert_der` for the connection's lifetime — valid through the
+    // CertificateVerify check that immediately follows.
+    rsa: rsa_verify.PublicKey,
 };
 
 const oid_ed25519_spki = [_]u8{ 0x2B, 0x65, 0x70 }; // 1.3.101.112
 const oid_ec_public_key_spki = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 }; // 1.2.840.10045.2.1
 const oid_prime256v1_spki = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 }; // 1.2.840.10045.3.1.7
+const oid_rsa_encryption_spki = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 }; // 1.2.840.113549.1.1.1
 
 /// Extract the public key from a leaf certificate's DER SPKI. CertFP/EXTERNAL
 /// target Ed25519 and ECDSA P-256 client certs; any other SPKI yields an error
@@ -1482,7 +1500,36 @@ fn clientKeyFromCert(der: []const u8) Error!ClientLeafKey {
         const pk = ecdsa_p256.parsePublicKeySec1(key_bytes) catch return error.BadHandshake;
         return .{ .ecdsa_p256 = pk };
     }
+    if (std.mem.eql(u8, alg_oid.value, &oid_rsa_encryption_spki)) {
+        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }.
+        var r = x509.DerReader.init(key_bytes);
+        const rsa_seq = r.readExpected(x509.Tag.sequence) catch return error.BadHandshake;
+        r.expectEmpty() catch return error.BadHandshake;
+        var body = r.child(rsa_seq) catch return error.BadHandshake;
+        const n_tlv = body.readExpected(x509.Tag.integer) catch return error.BadHandshake;
+        const e_tlv = body.readExpected(x509.Tag.integer) catch return error.BadHandshake;
+        body.expectEmpty() catch return error.BadHandshake;
+        const n = rsaUnsignedInt(n_tlv) orelse return error.BadHandshake;
+        const e = rsaUnsignedInt(e_tlv) orelse return error.BadHandshake;
+        if (n.len > rsa_verify.max_bytes) return error.BadHandshake;
+        return .{ .rsa = .{ .n = n, .e = e } };
+    }
     return error.BadHandshake;
+}
+
+/// A DER INTEGER's content as an unsigned big-endian magnitude: rejects a set
+/// sign bit and strips the single leading 0x00 byte DER requires when the
+/// magnitude's MSB is set. Returns null on a malformed/empty/negative integer.
+fn rsaUnsignedInt(tlv: x509.Tlv) ?[]const u8 {
+    if (tlv.value.len == 0) return null;
+    if ((tlv.value[0] & 0x80) != 0) return null; // negative
+    // Reject non-canonical DER: a leading 0x00 is only legal when the next byte's
+    // MSB is set (otherwise the padding is redundant). Matches x509.unsignedInteger.
+    if (tlv.value.len > 1 and tlv.value[0] == 0 and (tlv.value[1] & 0x80) == 0) return null;
+    var v = tlv.value;
+    if (v.len > 1 and v[0] == 0) v = v[1..];
+    if (v.len == 0) return null;
+    return v;
 }
 
 fn pickSuite(block: []const u8) ?CipherSuite {
@@ -2900,23 +2947,47 @@ test "mTLS: CertificateRequest wire encoding is exact (RFC 8446 §4.3.2)" {
     defer out.deinit(alloc);
     try server.writeCertificateRequest(&out);
 
-    // certificate_request(13), u24 body length 13, then:
+    // certificate_request(13), u24 body length 15, then:
     //   0x00                empty certificate_request_context
-    //   0x00 0x0a           extensions vector total length (10)
-    //   0x00 0x0d 0x00 0x06 signature_algorithms(13), extension_data length 6
-    //   0x00 0x04           supported_signature_algorithms list length (4)
+    //   0x00 0x0c           extensions vector total length (12)
+    //   0x00 0x0d 0x00 0x08 signature_algorithms(13), extension_data length 8
+    //   0x00 0x06           supported_signature_algorithms list length (6)
     //   0x08 0x07           ed25519
     //   0x04 0x03           ecdsa_secp256r1_sha256
+    //   0x08 0x04           rsa_pss_rsae_sha256
     // Every length prefix must be internally consistent — a doubled extensions
     // length here is exactly what broke gnutls/openssl mTLS clients.
     const expected = [_]u8{
-        0x0d, 0x00, 0x00, 0x0d,
-        0x00, 0x00, 0x0a, 0x00,
-        0x0d, 0x00, 0x06, 0x00,
-        0x04, 0x08, 0x07, 0x04,
-        0x03,
+        0x0d, 0x00, 0x00, 0x0f,
+        0x00, 0x00, 0x0c, 0x00,
+        0x0d, 0x00, 0x08, 0x00,
+        0x06, 0x08, 0x07, 0x04,
+        0x03, 0x08, 0x04,
     };
     try std.testing.expectEqualSlices(u8, &expected, out.items);
+}
+
+test "clientKeyFromCert parses an RSA-2048 leaf SPKI into modulus/exponent" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const rsa_key = rsaTestPrivateKey();
+    var cert_buf: [2048]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedRsa(&cert_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x10, 0x01 },
+        .public_modulus = rsa_key.n,
+        .public_exponent = rsa_key.e,
+        .private_key = rsa_key,
+        .dns_names = &.{"client.test"},
+        .is_ca = false,
+    });
+    const key = try clientKeyFromCert(der);
+    try std.testing.expect(key == .rsa);
+    // n/e must round-trip the DER INTEGER encoding exactly (the leading 0x00 DER
+    // adds for a set MSB is stripped back off by rsaUnsignedInt).
+    try std.testing.expectEqualSlices(u8, rsa_key.n, key.rsa.n);
+    try std.testing.expectEqualSlices(u8, rsa_key.e, key.rsa.e);
 }
 
 test "mTLS: ECDSA P-256 client cert completes and exposes leaf + CertFP" {
