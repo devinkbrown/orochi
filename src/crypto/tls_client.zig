@@ -18,6 +18,7 @@ const x509_verify = @import("x509_verify.zig");
 const ocsp = @import("ocsp.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_verify = @import("rsa_verify.zig");
+const rsa_sign = @import("rsa_sign.zig");
 const sign = @import("sign.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const kx = @import("kx.zig");
@@ -213,6 +214,7 @@ const HandshakeMsg = struct {
 const ClientCertKey = union(enum) {
     ed25519: sign.KeyPair,
     ecdsa_p256: ecdsa_p256.KeyPair,
+    rsa: rsa_sign.PrivateKey,
 };
 
 const LeafPublicKey = union(enum) {
@@ -584,6 +586,14 @@ pub const Client = struct {
     pub fn setClientCertEcdsaP256ForTest(self: *Client, der: []const u8, key_pair: ecdsa_p256.KeyPair) void {
         self.client_cert_der = der;
         self.client_key_pair = .{ .ecdsa_p256 = key_pair };
+    }
+
+    /// Test-only: like `setClientCertForTest` but for an RSA client certificate;
+    /// CertificateVerify is signed with rsa_pss_rsae_sha256 (TLS 1.3's only
+    /// RSA scheme). `der` and `key` are borrowed.
+    pub fn setClientCertRsaForTest(self: *Client, der: []const u8, key: rsa_sign.PrivateKey) void {
+        self.client_cert_der = der;
+        self.client_key_pair = .{ .rsa = key };
     }
 
     /// Test-only: respond to a server CertificateRequest with an empty
@@ -1379,6 +1389,18 @@ pub const Client = struct {
                 try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256));
                 try appendU16(self.allocator, &body, @intCast(der.len));
                 try body.appendSlice(self.allocator, der);
+            },
+            .rsa => |key| {
+                var mhash: [Sha256.hash_len]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(input, &mhash, .{});
+                var salt: [Sha256.hash_len]u8 = undefined;
+                try osEntropy(&salt);
+                defer secureZero(&salt);
+                var sig_buf: [rsa_verify.max_bytes]u8 = undefined;
+                const sig = rsa_sign.signPss(key, .sha256, &mhash, &salt, &sig_buf) catch return error.BadSignature;
+                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256));
+                try appendU16(self.allocator, &body, @intCast(sig.len));
+                try body.appendSlice(self.allocator, sig);
             },
         }
         try self.appendClientHandshakeRecord(out, suite, .certificate_verify, body.items);

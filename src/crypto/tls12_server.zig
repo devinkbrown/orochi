@@ -19,6 +19,7 @@ const ecdh_p256 = @import("ecdh_p256.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_sign = @import("rsa_sign.zig");
 const rsa_verify = @import("rsa_verify.zig");
+const x509 = @import("x509.zig");
 const x509_selfsign = @import("../proto/x509_selfsign.zig");
 
 const Allocator = std.mem.Allocator;
@@ -56,6 +57,13 @@ pub const Config = struct {
     rsa_signing_key: ?rsa_sign.PrivateKey = null,
     /// ALPN protocols in server preference order.
     alpn_protocols: []const []const u8 = &.{},
+    /// Mutual TLS: when true the server sends a CertificateRequest and, if the
+    /// client presents a cert, verifies its CertificateVerify possession proof
+    /// and exposes the leaf via `clientCertDer()` (for certfp / SASL EXTERNAL).
+    /// A client that declines (empty Certificate) still completes the handshake;
+    /// `clientCertDer()` stays null. Only rsa_pkcs1_sha256 and
+    /// ecdsa_secp256r1_sha256 client signatures are accepted (RFC 5246 §7.4.8).
+    request_client_cert: bool = false,
 
     // ---- RFC 5077 stateless session resumption (opt-in) ----
     //
@@ -89,6 +97,11 @@ pub const FeedResult = union(enum) {
 
 const State = enum {
     wait_client_hello,
+    // Full handshake with mTLS: the client's Certificate precedes its
+    // ClientKeyExchange, and (when a cert was presented) a CertificateVerify
+    // follows it. These two states are only entered when request_client_cert.
+    wait_client_certificate,
+    wait_client_certificate_verify,
     // Full handshake: ClientKeyExchange, then client CCS + Finished.
     wait_client_key_exchange,
     wait_client_ccs,
@@ -103,6 +116,14 @@ const State = enum {
 const CertificateAuth = enum {
     ecdsa_p256,
     rsa,
+};
+
+/// Public key parsed from a presented client leaf, used to verify the TLS 1.2
+/// CertificateVerify possession proof. The rsa `n`/`e` slices borrow the owned
+/// `client_cert_der`, which is held for the connection's lifetime.
+const ClientLeafKey = union(enum) {
+    ecdsa_p256: ecdsa_p256.PublicKey,
+    rsa: rsa_verify.PublicKey,
 };
 
 const HandshakeMsg = struct {
@@ -126,6 +147,14 @@ pub const Server = struct {
     session_id_len: usize = 0,
     selected_suite: ?tls12.CipherSuite = null,
     selected_alpn: ?[]u8 = null,
+
+    // ---- mTLS (only meaningful when config.request_client_cert) ----
+    /// Owned copy of the presented client leaf DER, or null if the client
+    /// declined or no cert was requested. Set only AFTER its CertificateVerify
+    /// possession proof verifies; a failed proof clears it.
+    client_cert_der: ?[]u8 = null,
+    /// Public key parsed from `client_cert_der`, used to verify CertificateVerify.
+    client_leaf_key: ?ClientLeafKey = null,
 
     // ---- RFC 5077 ticket negotiation (only meaningful when tickets enabled) ----
     /// The client sent an EMPTY SessionTicket extension: it supports tickets and
@@ -169,6 +198,7 @@ pub const Server = struct {
         self.transcript.deinit(self.allocator);
         if (self.selected_alpn) |p| self.allocator.free(p);
         if (self.presented_ticket) |t| self.allocator.free(t);
+        if (self.client_cert_der) |d| self.allocator.free(d);
         std.crypto.secureZero(u8, &self.key_pair.secret);
         std.crypto.secureZero(u8, &self.master_secret);
         self.keys.wipe();
@@ -176,6 +206,12 @@ pub const Server = struct {
 
     pub fn handshakeDone(self: *const Server) bool {
         return self.state == .connected;
+    }
+
+    /// The presented client leaf DER whose CertificateVerify possession proof
+    /// verified (mTLS), or null. Mirrors the TLS 1.3 engine's accessor.
+    pub fn clientCertDer(self: *const Server) ?[]const u8 {
+        return self.client_cert_der;
     }
 
     pub fn selectedAlpn(self: *const Server) ?[]const u8 {
@@ -214,8 +250,19 @@ pub const Server = struct {
                     }
                     const reply = try self.buildServerFlight();
                     consumePrefix(&self.recv_buf, rec.wire_len);
-                    self.state = .wait_client_key_exchange;
+                    self.state = if (self.config.request_client_cert) .wait_client_certificate else .wait_client_key_exchange;
                     return .{ .bytes_to_send = reply };
+                },
+                .wait_client_certificate => {
+                    // mTLS: the client's Certificate precedes its ClientKeyExchange.
+                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    var off: usize = 0;
+                    const msg = try parseHandshake(rec.fragment, &off);
+                    if (off != rec.fragment.len or msg.typ != .certificate) return error.BadHandshake;
+                    try self.parseClientCertificate(msg.body);
+                    try self.transcript.appendSlice(self.allocator, msg.raw);
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    self.state = .wait_client_key_exchange;
                 },
                 .wait_client_key_exchange => {
                     if (rec.content_type != .handshake) return error.BadHandshake;
@@ -223,6 +270,18 @@ pub const Server = struct {
                     const msg = try parseHandshake(rec.fragment, &off);
                     if (off != rec.fragment.len or msg.typ != .client_key_exchange) return error.BadHandshake;
                     try self.parseClientKeyExchange(msg.body);
+                    try self.transcript.appendSlice(self.allocator, msg.raw);
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    // A presented client cert must prove key possession via
+                    // CertificateVerify before CCS; a declined cert skips it.
+                    self.state = if (self.client_leaf_key != null) .wait_client_certificate_verify else .wait_client_ccs;
+                },
+                .wait_client_certificate_verify => {
+                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    var off: usize = 0;
+                    const msg = try parseHandshake(rec.fragment, &off);
+                    if (off != rec.fragment.len or msg.typ != .certificate_verify) return error.BadHandshake;
+                    try self.verifyClientCertificateVerify(msg.body);
                     try self.transcript.appendSlice(self.allocator, msg.raw);
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_client_ccs;
@@ -506,10 +565,85 @@ pub const Server = struct {
         const ske_body = try self.buildServerKeyExchange();
         defer self.allocator.free(ske_body);
         try writeHandshake(self.allocator, &hs, .server_key_exchange, ske_body);
+        if (self.config.request_client_cert) {
+            const cr_body = try self.buildCertificateRequest();
+            defer self.allocator.free(cr_body);
+            try writeHandshake(self.allocator, &hs, .certificate_request, cr_body);
+        }
         try writeHandshake(self.allocator, &hs, .server_hello_done, "");
 
         try self.transcript.appendSlice(self.allocator, hs.items);
         return tls12.writePlainRecord(self.allocator, .handshake, hs.items);
+    }
+
+    /// CertificateRequest (RFC 5246 §7.4.4): certificate_types (rsa_sign +
+    /// ecdsa_sign), supported_signature_algorithms (rsa_pkcs1_sha256 +
+    /// ecdsa_secp256r1_sha256 — the only client proofs we verify), and an empty
+    /// certificate_authorities list.
+    fn buildCertificateRequest(self: *Server) Error![]u8 {
+        var body: std.ArrayList(u8) = .empty;
+        errdefer body.deinit(self.allocator);
+        // certificate_types<1..2^8-1>: 0x40 ecdsa_sign, 0x01 rsa_sign.
+        try body.append(self.allocator, 2);
+        try body.append(self.allocator, 0x40);
+        try body.append(self.allocator, 0x01);
+        // supported_signature_algorithms<2..2^16-1>: two 2-byte entries.
+        try appendU16(self.allocator, &body, 4);
+        try appendU16(self.allocator, &body, sig_ecdsa_secp256r1_sha256);
+        try appendU16(self.allocator, &body, sig_rsa_pkcs1_sha256);
+        // certificate_authorities<0..2^16-1>: empty.
+        try appendU16(self.allocator, &body, 0);
+        return body.toOwnedSlice(self.allocator);
+    }
+
+    /// Capture the presented client leaf (certfp pins the leaf only). An empty
+    /// certificate_list = the client declined; `client_leaf_key` stays null and
+    /// the handshake proceeds without client auth.
+    fn parseClientCertificate(self: *Server, body: []const u8) Error!void {
+        var c = Cursor.init(body);
+        const list = try c.take(try c.readU24());
+        try c.expectEmpty();
+        var certs = Cursor.init(list);
+        if (certs.remaining() == 0) return; // declined
+        const der = try certs.take(try certs.readU24());
+        const leaf = try self.allocator.dupe(u8, der);
+        errdefer self.allocator.free(leaf);
+        self.client_leaf_key = try clientKeyFromCert(leaf);
+        self.client_cert_der = leaf;
+    }
+
+    /// Verify the client's CertificateVerify (RFC 5246 §7.4.8): the signature
+    /// covers all handshake messages exchanged so far (ClientHello through
+    /// ClientKeyExchange — exactly `self.transcript` at this point). A failed
+    /// proof clears the captured leaf so no untrusted fingerprint is exposed.
+    fn verifyClientCertificateVerify(self: *Server, body: []const u8) Error!void {
+        if (body.len < 4) return error.BadHandshake;
+        const scheme = std.mem.readInt(u16, body[0..2], .big);
+        const sig_len = std.mem.readInt(u16, body[2..4], .big);
+        if (body.len != 4 + @as(usize, sig_len)) return error.BadHandshake;
+        const sig = body[4..];
+        const key = self.client_leaf_key orelse return error.BadHandshake;
+        const signed = self.transcript.items;
+        switch (key) {
+            .ecdsa_p256 => |pk| {
+                if (scheme != sig_ecdsa_secp256r1_sha256) return self.failClientCert();
+                const decoded = ecdsa_p256.signatureFromDer(sig) catch return self.failClientCert();
+                if (!ecdsa_p256.verify(decoded, signed, pk)) return self.failClientCert();
+            },
+            .rsa => |pk| {
+                if (scheme != sig_rsa_pkcs1_sha256) return self.failClientCert();
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
+                if (!rsa_verify.verifyPkcs1v15(pk, .sha256, &digest, sig)) return self.failClientCert();
+            },
+        }
+    }
+
+    fn failClientCert(self: *Server) Error {
+        if (self.client_cert_der) |d| self.allocator.free(d);
+        self.client_cert_der = null;
+        self.client_leaf_key = null;
+        return error.BadHandshake;
     }
 
     fn buildServerKeyExchange(self: *Server) Error![]u8 {
@@ -784,6 +918,21 @@ fn activeCertificateAuth(config: Config) ?CertificateAuth {
     return null;
 }
 
+/// Extract the client leaf's public key for the CertificateVerify possession
+/// proof. Only RSA and ECDSA P-256 are accepted — the cert types and signature
+/// algorithms the CertificateRequest advertised; any other key fails the
+/// handshake. For RSA the n/e slices borrow `der`, which the caller keeps owned
+/// in `client_cert_der` for the connection's lifetime.
+fn clientKeyFromCert(der: []const u8) Error!ClientLeafKey {
+    const cert = x509.parse(der) catch return error.BadHandshake;
+    const spk = x509.extractPublicKey(cert.spki_der) catch return error.BadHandshake;
+    return switch (spk) {
+        .rsa => |r| .{ .rsa = .{ .n = r.modulus, .e = r.exponent } },
+        .ecdsa_p256 => |sec1| .{ .ecdsa_p256 = ecdsa_p256.parsePublicKeySec1(sec1) catch return error.BadHandshake },
+        else => error.BadHandshake,
+    };
+}
+
 fn suiteMatchesAuth(suite: tls12.CipherSuite, auth: CertificateAuth) bool {
     return switch (auth) {
         .ecdsa_p256 => suite.isEcdsa(),
@@ -842,6 +991,11 @@ const Cursor = struct {
     fn readU16(self: *Cursor) Error!u16 {
         const b = try self.take(2);
         return (@as(u16, b[0]) << 8) | b[1];
+    }
+
+    fn readU24(self: *Cursor) Error!u32 {
+        const b = try self.take(3);
+        return (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | b[2];
     }
 
     fn expectEmpty(self: Cursor) Error!void {
@@ -1020,6 +1174,226 @@ fn runLoopback(comptime suite_kind: LoopbackSuite) !void {
     const c_plain = try client.decrypt(s_app);
     defer allocator.free(c_plain);
     try std.testing.expectEqualSlices(u8, "server to client", c_plain);
+}
+
+test "TLS 1.2 CertificateRequest wire format (mTLS)" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .request_client_cert = true,
+    });
+    defer server.deinit();
+    const body = try server.buildCertificateRequest();
+    defer allocator.free(body);
+    // certificate_types<2>: 0x40 ecdsa_sign, 0x01 rsa_sign.
+    // supported_signature_algorithms<4>: 0x0403, 0x0401. Empty CA list <0>.
+    const expected = [_]u8{ 0x02, 0x40, 0x01, 0x00, 0x04, 0x04, 0x03, 0x04, 0x01, 0x00, 0x00 };
+    try std.testing.expectEqualSlices(u8, &expected, body);
+}
+
+test "TLS 1.2 clientKeyFromCert parses RSA and ECDSA P-256 leaves" {
+    const allocator = std.testing.allocator;
+    const rsa_key = rsaTestPrivateKey();
+    var rsa_buf: [2048]u8 = undefined;
+    const rsa_der = try x509_selfsign.buildSelfSignedRsa(&rsa_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x20, 0x01 },
+        .public_modulus = rsa_key.n,
+        .public_exponent = rsa_key.e,
+        .private_key = rsa_key,
+        .dns_names = &.{"client.test"},
+        .is_ca = false,
+    });
+    const rk = try clientKeyFromCert(rsa_der);
+    try std.testing.expect(rk == .rsa);
+    try std.testing.expectEqualSlices(u8, rsa_key.n, rk.rsa.n);
+    try std.testing.expectEqualSlices(u8, rsa_key.e, rk.rsa.e);
+
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const ek = try clientKeyFromCert(fixture.cert);
+    try std.testing.expect(ek == .ecdsa_p256);
+}
+
+/// Drive a full TLS 1.2 mTLS handshake between the in-repo server and client
+/// (no external tools) and assert the server captured the presented leaf + its
+/// certfp, then exchanges application data on the mutually-authed channel.
+fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }) !void {
+    const certfp = @import("../proto/certfp.zig");
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const server_chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    const client_cert_buf = try allocator.alloc(u8, 2048);
+    defer allocator.free(client_cert_buf);
+    const client_ecdsa = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const client_rsa = rsaTestPrivateKey();
+    const client_der = switch (client_cert) {
+        .ecdsa => try x509_selfsign.buildSelfSignedEcdsaP256(client_cert_buf, .{
+            .common_name = "client.test",
+            .not_before = 1_704_067_200,
+            .not_after = 1_893_456_000,
+            .serial = &.{ 9, 9, 9, 1 },
+            .key_pair = client_ecdsa,
+        }),
+        .rsa => try x509_selfsign.buildSelfSignedRsa(client_cert_buf, .{
+            .common_name = "client.test",
+            .not_before = 1_704_067_200,
+            .not_after = 1_893_456_000,
+            .serial = &.{ 9, 9, 9, 2 },
+            .public_modulus = client_rsa.n,
+            .public_exponent = client_rsa.e,
+            .private_key = client_rsa,
+            .dns_names = &.{"client.test"},
+            .is_ca = false,
+        }),
+    };
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &server_chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .request_client_cert = true,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors });
+    defer client.deinit();
+    switch (client_cert) {
+        .ecdsa => client.setClientCertEcdsaP256ForTest(client_der, client_ecdsa),
+        .rsa => client.setClientCertRsaForTest(client_der, client_rsa),
+    }
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+
+    try std.testing.expect(client.handshakeDone());
+    try std.testing.expect(server.handshakeDone());
+
+    const presented = server.clientCertDer() orelse return error.BadHandshake;
+    try std.testing.expectEqualSlices(u8, client_der, presented);
+    var fp: certfp.Fingerprint = undefined;
+    certfp.computeHex(presented, &fp);
+    var expected: certfp.Fingerprint = undefined;
+    certfp.computeHex(client_der, &expected);
+    try std.testing.expectEqualSlices(u8, &expected, &fp);
+
+    const c_app = try client.encrypt("AUTHENTICATE EXTERNAL\r\n");
+    defer allocator.free(c_app);
+    const s_plain = try server.decrypt(c_app);
+    defer allocator.free(s_plain);
+    try std.testing.expectEqualStrings("AUTHENTICATE EXTERNAL\r\n", s_plain);
+}
+
+test "TLS 1.2 mTLS: ECDSA P-256 client cert completes and exposes leaf + CertFP" {
+    try runMtlsLoopback(.ecdsa);
+}
+
+test "TLS 1.2 mTLS: RSA client cert completes and exposes leaf + CertFP" {
+    try runMtlsLoopback(.rsa);
+}
+
+test "TLS 1.2 mTLS: client may decline (empty Certificate) and still connect" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const server_chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &server_chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .request_client_cert = true,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors });
+    defer client.deinit();
+    // No client cert configured: the client declines with an empty Certificate.
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+
+    try std.testing.expect(server.handshakeDone());
+    try std.testing.expect(server.clientCertDer() == null);
+}
+
+test "TLS 1.2 mTLS: tampered client CertificateVerify is rejected, no certfp exposed" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const server_chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    const client_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const client_cert_buf = try allocator.alloc(u8, 2048);
+    defer allocator.free(client_cert_buf);
+    const client_der = try x509_selfsign.buildSelfSignedEcdsaP256(client_cert_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_893_456_000,
+        .serial = &.{ 9, 9, 9, 3 },
+        .key_pair = client_kp,
+    });
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &server_chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .request_client_cert = true,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors });
+    defer client.deinit();
+    client.setClientCertEcdsaP256ForTest(client_der, client_kp);
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) { .bytes_to_send => |b| b, .need_more => return error.BadHandshake };
+    defer allocator.free(cf);
+
+    // The client flight is [Certificate][ClientKeyExchange][CertificateVerify]
+    // as plaintext handshake records, then CCS + encrypted Finished. Flip the
+    // last byte of the 3rd record's payload — the tail of the CV signature.
+    var idx: usize = 0;
+    var rec_count: usize = 0;
+    var cv_last: ?usize = null;
+    while (idx + 5 <= cf.len) {
+        const rec_len = (@as(usize, cf[idx + 3]) << 8) | cf[idx + 4];
+        const payload_end = idx + 5 + rec_len;
+        if (payload_end > cf.len) break;
+        rec_count += 1;
+        if (rec_count == 3) {
+            cv_last = payload_end - 1;
+            break;
+        }
+        idx = payload_end;
+    }
+    cf[cv_last orelse return error.BadHandshake] ^= 0xff;
+
+    try std.testing.expectError(error.BadHandshake, server.feed(cf));
+    try std.testing.expect(!server.handshakeDone());
+    try std.testing.expect(server.clientCertDer() == null);
 }
 
 test "TLS 1.2 loopback ECDHE ECDSA AES-128-GCM" {

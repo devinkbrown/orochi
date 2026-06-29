@@ -17,6 +17,7 @@ const tls_resumption = @import("tls_resumption.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const ecdsa_p256 = @import("ecdsa_p256.zig");
 const rsa_verify = @import("rsa_verify.zig");
+const rsa_sign = @import("rsa_sign.zig");
 const x509 = @import("x509.zig");
 const x509_verify = @import("x509_verify.zig");
 
@@ -90,6 +91,14 @@ const LeafPublicKey = union(enum) {
     rsa: rsa_verify.PublicKey,
 };
 
+/// A private key for signing the client CertificateVerify (mTLS). ECDSA P-256
+/// signs with ecdsa_secp256r1_sha256; RSA with rsa_pkcs1_sha256 (the schemes
+/// the CertificateRequest advertises, RFC 5246 §7.4.8).
+const ClientCertKey = union(enum) {
+    ecdsa_p256: ecdsa_p256.KeyPair,
+    rsa: rsa_sign.PrivateKey,
+};
+
 const CertParts = struct {
     tbs_der: []const u8,
     signature_algorithm_oid: []const u8,
@@ -159,6 +168,15 @@ pub const Client = struct {
     force_aes128_only_for_test: bool = false,
     force_aes256_only_for_test: bool = false,
     skip_cert_verify_for_test: bool = false,
+
+    // ---- mTLS client auth ----
+    /// True once the server's CertificateRequest is seen; the full-handshake
+    /// client flight then leads with a Certificate (empty if we have none).
+    cert_requested: bool = false,
+    /// Configured client leaf DER + matching key, or null to decline (send an
+    /// empty Certificate). Borrowed.
+    client_cert_der: ?[]const u8 = null,
+    client_key: ?ClientCertKey = null,
 
     pub fn init(allocator: Allocator, options: Options) Error!Client {
         var random: [32]u8 = undefined;
@@ -389,6 +407,20 @@ pub const Client = struct {
         self.skip_cert_verify_for_test = true;
     }
 
+    /// Test-only: present an ECDSA P-256 client certificate in response to the
+    /// server's CertificateRequest. `der` and `key_pair` are borrowed.
+    pub fn setClientCertEcdsaP256ForTest(self: *Client, der: []const u8, key_pair: ecdsa_p256.KeyPair) void {
+        self.client_cert_der = der;
+        self.client_key = .{ .ecdsa_p256 = key_pair };
+    }
+
+    /// Test-only: present an RSA client certificate; CertificateVerify is signed
+    /// with rsa_pkcs1_sha256. `der` and `key` are borrowed.
+    pub fn setClientCertRsaForTest(self: *Client, der: []const u8, key: rsa_sign.PrivateKey) void {
+        self.client_cert_der = der;
+        self.client_key = .{ .rsa = key };
+    }
+
     pub fn encrypt(self: *Client, appdata: []const u8) Error![]u8 {
         if (self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
@@ -497,6 +529,14 @@ pub const Client = struct {
             .server_key_exchange => {
                 if (self.resuming) return error.BadHandshake;
                 try self.verifyServerKeyExchange(msg.body);
+                try self.transcript.appendSlice(self.allocator, msg.raw);
+            },
+            .certificate_request => {
+                // mTLS: the server asks for a client cert. We don't need the body
+                // (our cert/scheme is fixed); record that a Certificate +
+                // CertificateVerify must lead the client flight.
+                if (self.resuming) return error.BadHandshake;
+                self.cert_requested = true;
                 try self.transcript.appendSlice(self.allocator, msg.raw);
             },
             .server_hello_done => {
@@ -645,27 +685,48 @@ pub const Client = struct {
     }
 
     fn buildClientFlight(self: *Client) Error![]u8 {
+        const suite = self.selected_suite orelse return error.BadState;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        // mTLS: a CertificateRequest makes the client flight lead with a
+        // Certificate (empty when declining), and a presented cert is proven
+        // with a CertificateVerify after ClientKeyExchange.
+        if (self.cert_requested) {
+            const cert_msg = try self.buildClientCertificate();
+            defer self.allocator.free(cert_msg);
+            try self.transcript.appendSlice(self.allocator, cert_msg);
+            const rec = try tls12.writePlainRecord(self.allocator, .handshake, cert_msg);
+            defer self.allocator.free(rec);
+            try out.appendSlice(self.allocator, rec);
+        }
+
         var point_body: [1 + ecdh_p256.public_length]u8 = undefined;
         point_body[0] = ecdh_p256.public_length;
         @memcpy(point_body[1..], &self.key_pair.public_sec1);
-
         var cke: std.ArrayList(u8) = .empty;
         defer cke.deinit(self.allocator);
         try writeHandshake(self.allocator, &cke, .client_key_exchange, &point_body);
         try self.transcript.appendSlice(self.allocator, cke.items);
+        const cke_rec = try tls12.writePlainRecord(self.allocator, .handshake, cke.items);
+        defer self.allocator.free(cke_rec);
+        try out.appendSlice(self.allocator, cke_rec);
 
-        const suite = self.selected_suite orelse return error.BadState;
+        if (self.cert_requested and self.client_cert_der != null) {
+            const cv_msg = try self.buildClientCertificateVerify();
+            defer self.allocator.free(cv_msg);
+            try self.transcript.appendSlice(self.allocator, cv_msg);
+            const rec = try tls12.writePlainRecord(self.allocator, .handshake, cv_msg);
+            defer self.allocator.free(rec);
+            try out.appendSlice(self.allocator, rec);
+        }
+
         const verify = try tls12.finishedVerifyData(suite, &self.master_secret, "client finished", self.transcript.items);
         var fin: std.ArrayList(u8) = .empty;
         defer fin.deinit(self.allocator);
         try writeHandshake(self.allocator, &fin, .finished, &verify);
         try self.transcript.appendSlice(self.allocator, fin.items);
 
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(self.allocator);
-        const cke_rec = try tls12.writePlainRecord(self.allocator, .handshake, cke.items);
-        defer self.allocator.free(cke_rec);
-        try out.appendSlice(self.allocator, cke_rec);
         const ccs = try tls12.writePlainRecord(self.allocator, .change_cipher_spec, &.{1});
         defer self.allocator.free(ccs);
         try out.appendSlice(self.allocator, ccs);
@@ -674,6 +735,58 @@ pub const Client = struct {
         defer self.allocator.free(fin_rec);
         try out.appendSlice(self.allocator, fin_rec);
         return out.toOwnedSlice(self.allocator);
+    }
+
+    /// Client Certificate (RFC 5246 §7.4.6): certificate_list<0..2^24-1>, each
+    /// cert a 3-byte-length-prefixed DER. An empty list declines client auth.
+    fn buildClientCertificate(self: *Client) Error![]u8 {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.allocator);
+        if (self.client_cert_der) |der| {
+            try appendU24(self.allocator, &list, @intCast(der.len));
+            try list.appendSlice(self.allocator, der);
+        }
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try appendU24(self.allocator, &body, @intCast(list.items.len));
+        try body.appendSlice(self.allocator, list.items);
+        var msg: std.ArrayList(u8) = .empty;
+        errdefer msg.deinit(self.allocator);
+        try writeHandshake(self.allocator, &msg, .certificate, body.items);
+        return msg.toOwnedSlice(self.allocator);
+    }
+
+    /// Client CertificateVerify (RFC 5246 §7.4.8): a SignatureAndHashAlgorithm +
+    /// signature over all handshake messages so far (ClientHello through
+    /// ClientKeyExchange — exactly `self.transcript` at this point).
+    fn buildClientCertificateVerify(self: *Client) Error![]u8 {
+        const key = self.client_key orelse return error.BadState;
+        const signed = self.transcript.items;
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.allocator);
+        switch (key) {
+            .ecdsa_p256 => |kp| {
+                const sig = ecdsa_p256.sign(signed, kp) catch return error.BadSignature;
+                var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
+                const der = ecdsa_p256.signatureToDer(sig, &der_buf) catch return error.BadSignature;
+                try appendU16(self.allocator, &body, sig_ecdsa_secp256r1_sha256);
+                try appendU16(self.allocator, &body, @intCast(der.len));
+                try body.appendSlice(self.allocator, der);
+            },
+            .rsa => |k| {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
+                var sig_buf: [rsa_verify.max_bytes]u8 = undefined;
+                const sig = rsa_sign.signPkcs1v15(k, .sha256, &digest, &sig_buf) catch return error.BadSignature;
+                try appendU16(self.allocator, &body, sig_rsa_pkcs1_sha256);
+                try appendU16(self.allocator, &body, @intCast(sig.len));
+                try body.appendSlice(self.allocator, sig);
+            },
+        }
+        var msg: std.ArrayList(u8) = .empty;
+        errdefer msg.deinit(self.allocator);
+        try writeHandshake(self.allocator, &msg, .certificate_verify, body.items);
+        return msg.toOwnedSlice(self.allocator);
     }
 
     /// Abbreviated-path client flight (RFC 5077): CCS + Finished only. There is

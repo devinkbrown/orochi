@@ -3097,6 +3097,7 @@ pub const LinuxServer = struct {
             .cert_chain = self.config.tls12_cert_chain,
             .ecdsa_p256_signing_key = self.config.tls12_signing_key,
             .rsa_signing_key = self.config.tls_rsa_signing_key,
+            .request_client_cert = self.config.tls_request_client_cert,
         };
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;

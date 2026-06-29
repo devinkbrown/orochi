@@ -144,12 +144,14 @@ pub const TlsConn = struct {
         };
     }
 
-    /// The verified client leaf DER (mTLS), or null. mTLS client auth is a
-    /// TLS 1.3-only path here; the hardened 1.2 engine never requests a cert.
+    /// The verified client leaf DER (mTLS), or null. Both the TLS 1.3 and the
+    /// hardened TLS 1.2 engines capture the client leaf once its CertificateVerify
+    /// possession proof verifies; resumed handshakes never carry a client cert.
     pub fn clientCertDer(self: *const TlsConn) ?[]const u8 {
         return switch (self.engine) {
             .tls13 => |*s| s.clientCertDer(),
-            else => null,
+            .tls12 => |*s| s.clientCertDer(),
+            .undecided => null,
         };
     }
 

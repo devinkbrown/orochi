@@ -523,10 +523,10 @@ pub const Server = struct {
     }
 
     /// Verify the client's CertificateVerify over the transcript with the client
-    /// context, using the scheme matching the presented leaf key (Ed25519 or
-    /// ECDSA P-256 — the schemes the CertificateRequest advertised). A failed
-    /// possession proof clears the captured cert so no untrusted fingerprint is
-    /// exposed.
+    /// context, using the scheme matching the presented leaf key (Ed25519,
+    /// ECDSA P-256, or RSA-PSS — the schemes the CertificateRequest advertised).
+    /// A failed possession proof clears the captured cert so no untrusted
+    /// fingerprint is exposed.
     fn verifyClientCertificateVerify(self: *Server, body: []const u8) Error!void {
         if (body.len < 4) return error.BadHandshake;
         const scheme = std.mem.readInt(u16, body[0..2], .big);
@@ -3052,6 +3052,76 @@ test "mTLS: ECDSA P-256 client cert completes and exposes leaf + CertFP" {
     try std.testing.expectEqualSlices(u8, &expected_fp, &fp);
 
     // Application data flows both ways on the mutually-authenticated channel.
+    const c2s = try client.encrypt("AUTHENTICATE EXTERNAL\r\n");
+    defer alloc.free(c2s);
+    const got = try server.decrypt(c2s);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("AUTHENTICATE EXTERNAL\r\n", got);
+}
+
+test "mTLS: RSA client cert completes and exposes leaf + CertFP" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const certfp = @import("../proto/certfp.zig");
+    const alloc = std.testing.allocator;
+
+    const server_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x78} ** Ed25519.KeyPair.seed_length);
+    const client_rsa = rsaTestPrivateKey();
+
+    var server_cert_buf: [1024]u8 = undefined;
+    const server_der = try x509_selfsign.buildSelfSigned(&server_cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x78, 0x01 },
+        .key_pair = server_kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var client_cert_buf: [2048]u8 = undefined;
+    const client_der = try x509_selfsign.buildSelfSignedRsa(&client_cert_buf, .{
+        .common_name = "client.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x78, 0x02 },
+        .public_modulus = client_rsa.n,
+        .public_exponent = client_rsa.e,
+        .private_key = client_rsa,
+        .dns_names = &.{"client.test"},
+        .is_ca = false,
+    });
+
+    var server = try Server.init(alloc, .{ .cert_chain = &.{server_der}, .signing_key = server_kp, .request_client_cert = true });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{server_der} });
+    defer client.deinit();
+    client.setClientCertRsaForTest(client_der, client_rsa);
+
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cflight = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cflight);
+    try std.testing.expect(client.handshakeDone());
+
+    _ = try server.feed(cflight);
+    try std.testing.expect(server.handshakeDone());
+
+    const presented = server.clientCertDer() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, client_der, presented);
+    var fp: certfp.Fingerprint = undefined;
+    certfp.computeHex(presented, &fp);
+    var expected_fp: certfp.Fingerprint = undefined;
+    certfp.computeHex(client_der, &expected_fp);
+    try std.testing.expectEqualSlices(u8, &expected_fp, &fp);
+
     const c2s = try client.encrypt("AUTHENTICATE EXTERNAL\r\n");
     defer alloc.free(c2s);
     const got = try server.decrypt(c2s);
