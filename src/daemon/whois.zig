@@ -93,6 +93,11 @@ pub const WhoisSubject = struct {
     server_info: ?[]const u8 = null,
     idle_secs: u64 = 0,
     signon_ts: u64 = 0,
+    /// Emit RPL_WHOISIDLE (317). Local users always carry real idle/signon; a
+    /// remote mesh user does NOT (idle/signon are per-connection state the origin
+    /// node doesn't replicate), so the remote WHOIS path clears this to suppress
+    /// a misleading "idle 0 secs, signed on <epoch>" line rather than render zeros.
+    show_idle: bool = true,
     is_bot: bool = false,
     is_oper: bool = false,
     /// Network administrator (server_admin privilege): surfaced in the operator
@@ -196,7 +201,9 @@ pub fn writeWhoisWith(
             try writeWhoisActuallyLine(params, sink, server_name, requester_nick, subject.nick, host);
         }
     }
-    try writeWhoisIdleLine(params, sink, server_name, requester_nick, subject);
+    if (subject.show_idle) {
+        try writeWhoisIdleLine(params, sink, server_name, requester_nick, subject);
+    }
     try writeWhoisChannelLines(params, sink, server_name, requester_nick, subject.nick, subject.channels);
     if (subject.account) |account| {
         try writeWhoisLoggedInLine(params, sink, server_name, requester_nick, subject.nick, account);
@@ -886,6 +893,26 @@ test "full WHOIS sequence emits every supported numeric in order" {
     try std.testing.expectEqualStrings(":irc.example 335 dan alice :is a bot\r\n", lines[5].bytes);
     try std.testing.expectEqualStrings(":irc.example 301 dan alice :writing tests\r\n", lines[6].bytes);
     try std.testing.expectEqualStrings(":irc.example 318 dan alice :End of /WHOIS list\r\n", lines[7].bytes);
+}
+
+test "show_idle=false suppresses RPL_WHOISIDLE (remote mesh user) but keeps the rest" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [8]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.show_idle = false;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    const lines = sink.slice();
+    // One fewer line than the full sequence: the 317 idle line is gone, and the
+    // 319 channel line now follows the 312 server line directly.
+    try std.testing.expectEqual(@as(usize, 7), lines.len);
+    for (lines) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line.bytes, " 317 ") == null);
+    }
+    try std.testing.expectEqualStrings(":irc.example 312 dan alice leaf.example :Orochi IRC daemon\r\n", lines[1].bytes);
+    try std.testing.expectEqualStrings(":irc.example 319 dan alice :@#zig +#chat\r\n", lines[2].bytes);
 }
 
 test "secure connection emits RPL_WHOISSECURE 671 before end" {

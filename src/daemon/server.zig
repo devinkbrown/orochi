@@ -10891,19 +10891,29 @@ pub const LinuxServer = struct {
         var chan_names: [32][]const u8 = undefined;
         const nchan = self.world.channelsOf(target_wid.?, &chan_names);
         var memberships: [32]whois.ChannelMembership = undefined;
-        var prefix_store: [32][1]u8 = undefined;
+        // Two bytes per channel: an optional `*` network-operator prefix plus the
+        // stored highest channel prefix (e.g. "*@").
+        var prefix_store: [32][2]u8 = undefined;
         const requester_wid = self.world.findNick(conn.session.displayName()) orelse world_model.ClientId.invalid;
+        // Network operators (oper_override) render with the derived `*` prefix on
+        // every channel in WHOIS too, mirroring NAMES — it is live oper status, not
+        // a stored channel mode, so it shows even where they hold no member status.
+        const target_is_oper = self.isOverrideOper(target_conn.?.session.displayName());
         var visible_nchan: usize = 0;
         for (chan_names[0..nchan]) |cn| {
             if (self.channelHiddenFromWhois(cn, requester_wid)) continue;
             const modes = self.world.memberModes(cn, target_wid.?) orelse world_model.MemberModes.empty();
-            const hp = modes.highestPrefix();
-            var pfx: []const u8 = "";
-            if (hp != 0) {
-                prefix_store[visible_nchan][0] = hp;
-                pfx = prefix_store[visible_nchan][0..1];
+            var plen: usize = 0;
+            if (target_is_oper) {
+                prefix_store[visible_nchan][plen] = '*';
+                plen += 1;
             }
-            memberships[visible_nchan] = .{ .prefix = pfx, .channel = cn };
+            const hp = modes.highestPrefix();
+            if (hp != 0) {
+                prefix_store[visible_nchan][plen] = hp;
+                plen += 1;
+            }
+            memberships[visible_nchan] = .{ .prefix = prefix_store[visible_nchan][0..plen], .channel = cn };
             visible_nchan += 1;
         }
 
@@ -11074,6 +11084,12 @@ pub const LinuxServer = struct {
             is_admin = status.is_admin;
             if (is_oper and g.title.len > 0) oper_title = g.title;
         }
+        // Channels the remote user is in, resolved from the mesh rosters (they are
+        // not in the local world member set). Gives the 319 line that was missing.
+        var memberships: [32]whois.ChannelMembership = undefined;
+        var prefix_store: [32][2]u8 = undefined;
+        const requester_wid = self.world.findNick(conn.session.displayName()) orelse world_model.ClientId.invalid;
+        const nchan = self.remoteMemberChannels(remote.nick, requester_wid, memberships[0..], prefix_store[0..]);
         const subject = whois.WhoisSubject{
             .nick = remote.nick,
             .user = if (remote.username.len != 0) remote.username else world_projection.remote_user_placeholder,
@@ -11084,9 +11100,69 @@ pub const LinuxServer = struct {
             .is_oper = is_oper,
             .is_admin = is_admin,
             .oper_title = oper_title,
+            // Idle/signon are per-connection state the origin node doesn't replicate,
+            // so suppress RPL_WHOISIDLE rather than render a bogus "idle 0, epoch".
+            .show_idle = false,
+            .channels = memberships[0..nchan],
         };
         whois.writeWhois(sink, self.serverName(), conn.session.displayName(), subject) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
+    }
+
+    /// Enumerate the channels a REMOTE mesh `nick` belongs to, for its WHOIS 319.
+    /// Remote members live in per-link rosters (not the world member set), so scan
+    /// every known channel's established-peer roster for the nick. WHOIS is rare and
+    /// the whole completion holds `world.lockWrite`, so the cross-reactor read is
+    /// race-free (the guarantee `sendNames` relies on). Honors WHOIS channel
+    /// visibility exactly like the local path and prepends the derived `*`
+    /// network-operator prefix for an override oper, mirroring NAMES. Each
+    /// `prefix_store` slot holds up to two bytes ("*" + the stored highest prefix).
+    /// Returns the count written into `out`.
+    fn remoteMemberChannels(
+        self: *LinuxServer,
+        nick: []const u8,
+        requester_wid: world_model.ClientId,
+        out: []whois.ChannelMembership,
+        prefix_store: [][2]u8,
+    ) usize {
+        var n: usize = 0;
+        const is_oper = self.isOverrideOper(nick);
+        var cit = self.world.channelIterator();
+        outer: while (cit.next()) |cv| {
+            if (n >= out.len) break;
+            if (self.channelHiddenFromWhois(cv.name, requester_wid)) continue;
+            for (self.reactors) |*reactor| {
+                for (reactor.clients.slots.items) |*slot| {
+                    if (!slot.occupied) continue;
+                    const members = blk: {
+                        if (slot.value.s2s_secured) |link| {
+                            if (link.established()) break :blk link.channelMembers(cv.name);
+                        } else if (slot.value.s2s) |link| {
+                            if (link.established()) break :blk link.channelMembers(cv.name);
+                        }
+                        continue;
+                    };
+                    for (members) |rm| {
+                        if (!std.ascii.eqlIgnoreCase(rm.nick, nick)) continue;
+                        const modes = world_model.MemberModes{ .bits = @as(u8, rm.status) };
+                        var plen: usize = 0;
+                        if (is_oper) {
+                            prefix_store[n][plen] = '*';
+                            plen += 1;
+                        }
+                        const hp = modes.highestPrefix();
+                        if (hp != 0) {
+                            prefix_store[n][plen] = hp;
+                            plen += 1;
+                        }
+                        out[n] = .{ .prefix = prefix_store[n][0..plen], .channel = cv.name };
+                        n += 1;
+                        continue :outer; // found in this channel; move to the next
+                    }
+                }
+            }
+        }
+        return n;
     }
 
     /// INVITE <nick> <channel> — invite a user; +i channels require op (no +g
