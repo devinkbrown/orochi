@@ -9496,6 +9496,20 @@ pub const LinuxServer = struct {
             }
         }
 
+        // An admin who already wields full channel authority via the +j override
+        // umode must NOT also seize founder-by-creation. World.join grants the
+        // first member of a freshly-(re)created channel the founder tier (+Q), but
+        // such an admin renders with the `*` oper prefix and can manage the channel
+        // via +j — they neither need nor should hold a stored founder status just
+        // for being first into an empty channel (e.g. autojoining after a restart
+        // wiped channel state). Gate on the +j umode (not the bare oper_override
+        // privilege): an oper WITHOUT +j has no override authority and still needs
+        // founder-by-creation to manage what they create. A genuine
+        // registered/ACCESS founder is re-applied by the grant paths below.
+        if (creating and conn.session.hasUmode(.override)) {
+            _ = self.world.setMemberMode(join_target, wid, .founder, false) catch {};
+        }
+
         // IRCX tiered keys: a presented key matching the channel's HOSTKEY/OWNERKEY
         // property grants graduated status (op / owner) on join — additive, so a
         // founder keeps founder. Member-tier (+k) is already enforced as the gate.
