@@ -53,6 +53,12 @@ const cap_frame_signing: u8 = 1 << 0;
 /// extra wire bytes to a peer that advertised support — an older peer (which
 /// strictly rejects trailing bytes) never receives them.
 const cap_member_account: u8 = 1 << 1;
+/// The peer understands the optional `real_host` + `certfp` blocks on MEMBERSHIP
+/// events (oper-visible identity for remote-user WHOIS). Advertised ONLY by a
+/// SECURED link (one that holds a node signing key) — these fields are sensitive,
+/// so they must never traverse a plaintext S2S leg. Gated like `member_account`:
+/// the extra trailing bytes are appended only to a peer that advertised support.
+const cap_member_oper_info: u8 = 1 << 2;
 
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 const membership_event = @import("../../proto/membership_event.zig");
@@ -178,6 +184,10 @@ pub const S2sPeer = struct {
     /// an older peer (strict trailing-byte rejection) never receives the extra
     /// bytes. Learned on `recvHandshake`.
     peer_supports_account: bool = false,
+    /// Whether the remote peer advertised `member_oper_info` (a SECURED, oper-info
+    /// capable link). Gates emission of the optional real_host/certfp blocks on
+    /// MEMBERSHIP events so they only ever ride a secured leg to a capable peer.
+    peer_supports_oper_info: bool = false,
     /// In-scope frames rejected because their signed-envelope verification failed
     /// or the self-certified origin did not match the claimed origin. Folded into
     /// the same audit drain as `rejected_origin_frames` (see `acceptsDirectOrigin`).
@@ -1081,6 +1091,8 @@ pub const S2sPeer = struct {
                         .realname = ev.realname,
                         .host = ev.host,
                         .account = ev.account,
+                        .real_host = ev.real_host,
+                        .certfp = ev.certfp,
                     }, local_now) catch {};
                     self.queueMembershipDelta(&ev, .ghost_reclaim, 0, null) catch {};
                     return;
@@ -1097,6 +1109,8 @@ pub const S2sPeer = struct {
             .realname = ev.realname,
             .host = ev.host,
             .account = ev.account,
+            .real_host = ev.real_host,
+            .certfp = ev.certfp,
         }, local_now) catch return;
         const kind: MembershipDelta.Kind = switch (res.outcome) {
             .joined => .joined,
@@ -1286,6 +1300,11 @@ pub const S2sPeer = struct {
             // Only append the account block to a peer that negotiated support, so an
             // older peer never sees the extra trailing bytes (which it would reject).
             .account = if (self.peer_supports_account) truncated(ident.account, membership_event.max_account_len) else "",
+            // SENSITIVE: real_host/certfp ride ONLY a secured, oper-info-capable peer
+            // (peer_supports_oper_info is set only when a signing-keyed link advertised
+            // cap_member_oper_info), so they never traverse a plaintext leg.
+            .real_host = if (self.peer_supports_oper_info) truncated(ident.real_host, membership_event.max_real_host_len) else "",
+            .certfp = if (self.peer_supports_oper_info) truncated(ident.certfp, membership_event.max_certfp_len) else "",
         };
         var buf: [membership_event.max_encoded_len]u8 = undefined;
         const wire = try membership_event.encode(ev, &buf);
@@ -1743,6 +1762,7 @@ pub const S2sPeer = struct {
         // and an UNSIGNED in-scope frame from such a peer is rejected.
         self.peer_supports_signing = (hs.caps & cap_frame_signing) != 0;
         self.peer_supports_account = (hs.caps & cap_member_account) != 0;
+        self.peer_supports_oper_info = (hs.caps & cap_member_oper_info) != 0;
 
         try self.rememberRemote(hs, now_ms);
         if (!self.handshake_sent) try self.emitHandshake(sink);
@@ -1783,7 +1803,10 @@ pub const S2sPeer = struct {
         // We always understand the optional member-account block, so advertise it
         // unconditionally; emission still only happens to a peer that does too.
         var caps: u8 = cap_member_account;
-        if (self.signing_key != null) caps |= cap_frame_signing;
+        // Frame signing AND oper-info ride ONLY a secured link (one holding a node
+        // signing key). real_host/certfp are sensitive, so a plaintext leg never
+        // advertises — and thus never receives — them.
+        if (self.signing_key != null) caps |= cap_frame_signing | cap_member_oper_info;
         const payload = try encodeHandshake(self.allocator, .{
             .node_id = self.local_node_id,
             .epoch_ms = self.local_epoch_ms,

@@ -196,6 +196,13 @@ pub const Member = struct {
     /// The member's authenticated ACCOUNT ("" = not logged in / unknown). Drives
     /// account-aware collision reconcile (see resolveIncomingNick).
     account: []u8,
+    /// The member's REAL (uncloaked) host/IP ("" = unknown/withheld). SENSITIVE:
+    /// only ever populated from an oper-info-capable SECURED link, and surfaced
+    /// only to operators (remote WHOIS 338/320). See [proto/membership_event].
+    real_host: []u8,
+    /// The member's TLS client-cert fingerprint ("" = none). Same sensitivity and
+    /// gating as `real_host` (remote WHOIS 276).
+    certfp: []u8,
     node: NodeId,
     status: u4,
     hlc: u64,
@@ -213,6 +220,8 @@ pub const Member = struct {
         allocator.free(self.realname);
         allocator.free(self.host);
         allocator.free(self.account);
+        allocator.free(self.real_host);
+        allocator.free(self.certfp);
     }
 };
 
@@ -223,6 +232,11 @@ pub const MemberIdentity = struct {
     realname: []const u8 = "",
     host: []const u8 = "",
     account: []const u8 = "",
+    /// REAL (uncloaked) host/IP — sensitive; only set/propagated over a secured,
+    /// oper-info-capable link and only ever shown to operators. "" = unknown.
+    real_host: []const u8 = "",
+    /// TLS client-cert fingerprint — same sensitivity/gating as real_host. "" = none.
+    certfp: []const u8 = "",
 };
 
 /// Two accounts identify the SAME authenticated user iff both are present and
@@ -630,6 +644,8 @@ pub const RouteTable = struct {
                 try replaceOwned(self.allocator, &cur.realname, ident.realname);
                 try replaceOwned(self.allocator, &cur.host, ident.host);
                 try replaceOwned(self.allocator, &cur.account, ident.account);
+                try replaceOwned(self.allocator, &cur.real_host, ident.real_host);
+                try replaceOwned(self.allocator, &cur.certfp, ident.certfp);
                 cur.node = node;
                 cur.status = status;
                 cur.hlc = hlc;
@@ -662,12 +678,18 @@ pub const RouteTable = struct {
         errdefer self.allocator.free(owned_host);
         const owned_account = try self.allocator.dupe(u8, ident.account);
         errdefer self.allocator.free(owned_account);
+        const owned_real_host = try self.allocator.dupe(u8, ident.real_host);
+        errdefer self.allocator.free(owned_real_host);
+        const owned_certfp = try self.allocator.dupe(u8, ident.certfp);
+        errdefer self.allocator.free(owned_certfp);
         try list.entries.append(self.allocator, .{
             .nick = owned,
             .username = owned_user,
             .realname = owned_real,
             .host = owned_host,
             .account = owned_account,
+            .real_host = owned_real_host,
+            .certfp = owned_certfp,
             .node = node,
             .status = status,
             .hlc = hlc,
@@ -1209,6 +1231,37 @@ test "applyMembership stores and LWW-updates the propagated identity" {
     // Part frees the identity strings (leak-checked by testing.allocator).
     _ = try table.applyMembership("#chat", "alice", 10, 0, 10, false, .{}, 0);
     try std.testing.expect(table.findMember("alice") == null);
+}
+
+test "applyMembership stores the oper-info real_host + certfp (remote WHOIS 338/276/320)" {
+    var table = try RouteTable.init(std.testing.allocator, .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
+    defer table.deinit();
+
+    // A secured oper-info link propagates the real IP + certfp; they must reach the
+    // roster Member so the receiver's remote WHOIS can surface them to operators.
+    _ = try table.applyMembership("#root", "trev", 20, 0, 1, true, .{
+        .host = "cloak.users",
+        .account = "trev",
+        .real_host = "203.0.113.42",
+        .certfp = "409db4958a2bb069fe4f2f7541bb25918bd0dd1b25612baae430ec761365732e",
+    }, 0);
+    var m = table.findMember("trev") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("203.0.113.42", m.real_host);
+    try std.testing.expectEqualStrings("409db4958a2bb069fe4f2f7541bb25918bd0dd1b25612baae430ec761365732e", m.certfp);
+
+    // A newer event LWW-replaces them (re-announce from a new connection/IP).
+    _ = try table.applyMembership("#root", "trev", 20, 0, 9, true, .{
+        .account = "trev",
+        .real_host = "198.51.100.7",
+        .certfp = "",
+    }, 0);
+    m = table.findMember("trev") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("198.51.100.7", m.real_host);
+    try std.testing.expectEqualStrings("", m.certfp);
+
+    // Part frees the oper-info strings too (leak-checked by testing.allocator).
+    _ = try table.applyMembership("#root", "trev", 20, 0, 10, false, .{}, 0);
+    try std.testing.expect(table.findMember("trev") == null);
 }
 
 test "findMember locates a roster member case-insensitively with its node" {

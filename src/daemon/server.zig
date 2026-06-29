@@ -7812,6 +7812,12 @@ pub const LinuxServer = struct {
             // recognize a colliding nick as the SAME identity (account-aware
             // reconcile) instead of UID-renaming a logged-in user.
             .account = conn.session.account() orelse "",
+            // Oper-visible identity for a peer's remote-user WHOIS (338/276/320).
+            // SENSITIVE: the s2s layer emits these ONLY over a secured, oper-info
+            // capable link (see cap_member_oper_info) and the peer shows them only
+            // to operators — so populating them here is safe.
+            .real_host = conn.session.realHost(),
+            .certfp = conn.session.tls_certfp orelse "",
         };
     }
 
@@ -11028,6 +11034,11 @@ pub const LinuxServer = struct {
         /// The member's authenticated account ("" = not logged in / unknown),
         /// propagated via cap_member_account — drives the 330 "logged in as" line.
         account: []const u8,
+        /// REAL (uncloaked) host/IP, propagated only over a secured oper-info link
+        /// ("" = withheld) — oper-only 338 + GeoIP/ASN 320 for the remote user.
+        real_host: []const u8,
+        /// TLS client-cert fingerprint ("" = none) — oper-only 276.
+        certfp: []const u8,
     };
 
     /// Resolve `nick` as a remote mesh member via any established S2S peer
@@ -11064,6 +11075,8 @@ pub const LinuxServer = struct {
                 .server = name,
                 .server_info = link.nodeDescription(member.node),
                 .account = member.account,
+                .real_host = member.real_host,
+                .certfp = member.certfp,
             };
         }
         const direct = link.remoteName();
@@ -11075,6 +11088,8 @@ pub const LinuxServer = struct {
             .server = if (direct.len != 0) direct else default_host,
             .server_info = null,
             .account = member.account,
+            .real_host = member.real_host,
+            .certfp = member.certfp,
         };
     }
 
@@ -11084,8 +11099,11 @@ pub const LinuxServer = struct {
     /// when the origin never supplied identity), 312 with the actual home
     /// server, RPL_WHOISCHANNELS (319) from the mesh roster, RPL_WHOISACCOUNT
     /// (330) when the member's account propagated, RPL_WHOISOPERATOR (313) when a
-    /// live propagated oper grant covers the nick, and 318. Idle/away/671/276 need
-    /// per-connection state remote nodes don't replicate, so they are omitted.
+    /// live propagated oper grant covers the nick, and 318. To an OPERATOR requester
+    /// it ALSO surfaces the deanonymized identity a secured oper-info link propagated:
+    /// the real host/IP (338), GeoIP/ASN (320, computed locally from that IP), and
+    /// the TLS cert fingerprint (276). Idle/away/671 are per-connection state remote
+    /// nodes don't replicate, so they are omitted.
     fn sendRemoteWhois(
         self: *LinuxServer,
         conn: *ConnState,
@@ -11109,6 +11127,28 @@ pub const LinuxServer = struct {
         var prefix_store: [32][2]u8 = undefined;
         const requester_wid = self.world.findNick(conn.session.displayName()) orelse world_model.ClientId.invalid;
         const nchan = self.remoteMemberChannels(remote.nick, requester_wid, memberships[0..], prefix_store[0..]);
+        // Oper-only deanonymized identity: the real IP (338) + GeoIP/ASN (320,
+        // resolved locally from that IP via the same MaxMind path the local WHOIS
+        // uses) + TLS cert fingerprint (276). real_host/certfp are non-empty ONLY
+        // when a secured oper-info link propagated them; additionally gate display
+        // on the REQUESTER being an operator so a regular user never sees them.
+        const requester_is_oper = conn.session.isOper();
+        var geo_buf: [256]u8 = undefined;
+        var geo_text: ?[]const u8 = null;
+        if (requester_is_oper and remote.real_host.len != 0) {
+            if (parseGeoIp(remote.real_host)) |gip| {
+                var city: ?[]const u8 = null;
+                var region: ?[]const u8 = null;
+                var country: ?[]const u8 = null;
+                if (self.ensureGeoip()) |db| {
+                    if (db.lookupInfo(gip) catch null) |gi| country = gi.country_iso;
+                    city = db.lookupName(gip, "city", "en") catch null;
+                    region = db.lookupString(gip, &.{ "subdivisions", "0", "names", "en" }) catch null;
+                }
+                const asn_info = self.lookupGeoAsn(gip);
+                geo_text = buildGeoWhois(&geo_buf, city, region, country, asn_info.asn, asn_info.asorg);
+            }
+        }
         const subject = whois.WhoisSubject{
             .nick = remote.nick,
             .user = if (remote.username.len != 0) remote.username else world_projection.remote_user_placeholder,
@@ -11126,6 +11166,10 @@ pub const LinuxServer = struct {
             // so suppress RPL_WHOISIDLE rather than render a bogus "idle 0, epoch".
             .show_idle = false,
             .channels = memberships[0..nchan],
+            // Oper-only deanonymized identity (see the geo block above).
+            .actual_host = if (requester_is_oper and remote.real_host.len != 0) remote.real_host else null,
+            .certfp = if (requester_is_oper and remote.certfp.len != 0) remote.certfp else null,
+            .geo = geo_text,
         };
         whois.writeWhois(sink, self.serverName(), conn.session.displayName(), subject) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);

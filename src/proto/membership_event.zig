@@ -38,6 +38,11 @@ pub const max_realname_len = 256;
 pub const max_host_len = 255;
 pub const max_setter_len = 64;
 pub const max_account_len = 64;
+/// Real (uncloaked) host/IP — only ever emitted over a SECURED link to an
+/// oper-info-capable peer, and shown only to operators on the receiving node.
+pub const max_real_host_len = 255;
+/// TLS client-certificate fingerprint (lowercase SHA-256 hex = 64 chars).
+pub const max_certfp_len = 64;
 const fixed_prefix = 1 + 1 + 8 + 8; // present, status, origin_node, hlc
 
 /// Upper bound on one encoded event (all fields at their limits) — size the
@@ -49,7 +54,9 @@ pub const max_encoded_len = fixed_prefix +
     2 + max_realname_len +
     2 + max_host_len +
     2 + max_setter_len +
-    2 + max_account_len;
+    2 + max_account_len +
+    2 + max_real_host_len +
+    2 + max_certfp_len;
 
 pub const Error = error{
     Truncated,
@@ -83,6 +90,14 @@ pub const MembershipEvent = struct {
     /// emitted only when non-empty AND the peer negotiated the member-account
     /// feature; when emitted it always follows a (possibly empty) setter block.
     account: []const u8 = "",
+    /// The member's REAL (uncloaked) host/IP ("" = unknown/withheld). SENSITIVE:
+    /// emitted only over a SECURED link to a peer that negotiated `member-oper-info`
+    /// (see cap_member_oper_info), and surfaced only to operators on the receiver.
+    /// OPTIONAL trailing block #3 — follows a (possibly empty) setter+account.
+    real_host: []const u8 = "",
+    /// The member's TLS client-cert fingerprint ("" = none). Same sensitivity and
+    /// gating as `real_host`. OPTIONAL trailing block #4 — follows real_host.
+    certfp: []const u8 = "",
 };
 
 pub fn encodedLen(ev: MembershipEvent) Error!usize {
@@ -92,10 +107,15 @@ pub fn encodedLen(ev: MembershipEvent) Error!usize {
     if (ev.host.len > max_host_len) return error.NameTooLong;
     if (ev.setter.len > max_setter_len) return error.NameTooLong;
     if (ev.account.len > max_account_len) return error.NameTooLong;
-    // Account forces a (possibly empty) setter slot ahead of it so a lone trailing
-    // block is unambiguously the setter; without an account, an empty setter stays
-    // omitted (byte-identical to the pre-setter / pre-account wire format).
-    const want_account = ev.account.len != 0;
+    if (ev.real_host.len > max_real_host_len) return error.NameTooLong;
+    if (ev.certfp.len > max_certfp_len) return error.NameTooLong;
+    // Optional trailing blocks are positional and disambiguated by COUNT, so any
+    // present block forces (possibly empty) slots for every earlier optional block:
+    // setter(1) < account(2) < real_host(3) < certfp(4). An event with none stays
+    // byte-identical to the pre-setter wire format.
+    const want_certfp = ev.certfp.len != 0;
+    const want_real_host = ev.real_host.len != 0 or want_certfp;
+    const want_account = ev.account.len != 0 or want_real_host;
     const setter_slot = ev.setter.len != 0 or want_account;
     return fixed_prefix +
         2 + ev.channel.len +
@@ -104,7 +124,9 @@ pub fn encodedLen(ev: MembershipEvent) Error!usize {
         2 + ev.realname.len +
         2 + ev.host.len +
         (if (setter_slot) @as(usize, 2 + ev.setter.len) else 0) +
-        (if (want_account) @as(usize, 2 + ev.account.len) else 0);
+        (if (want_account) @as(usize, 2 + ev.account.len) else 0) +
+        (if (want_real_host) @as(usize, 2 + ev.real_host.len) else 0) +
+        (if (want_certfp) @as(usize, 2 + ev.certfp.len) else 0);
 }
 
 fn putBytes16(out: []u8, i: *usize, bytes: []const u8) void {
@@ -132,12 +154,16 @@ pub fn encode(ev: MembershipEvent, out: []u8) Error![]const u8 {
     putBytes16(out, &i, ev.username);
     putBytes16(out, &i, ev.realname);
     putBytes16(out, &i, ev.host);
-    // Optional trailing setter — omitted when empty UNLESS an account follows, in
-    // which case the (possibly empty) setter slot is forced so the account is
-    // unambiguously the second trailing block.
-    const want_account = ev.account.len != 0;
+    // Optional trailing blocks, positional + count-disambiguated. Any present
+    // block forces (possibly empty) slots for every earlier one:
+    // setter(1) < account(2) < real_host(3) < certfp(4).
+    const want_certfp = ev.certfp.len != 0;
+    const want_real_host = ev.real_host.len != 0 or want_certfp;
+    const want_account = ev.account.len != 0 or want_real_host;
     if (ev.setter.len != 0 or want_account) putBytes16(out, &i, ev.setter);
     if (want_account) putBytes16(out, &i, ev.account);
+    if (want_real_host) putBytes16(out, &i, ev.real_host);
+    if (want_certfp) putBytes16(out, &i, ev.certfp);
     return out[0..i];
 }
 
@@ -183,10 +209,16 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     // setter (present on a MODE event or whenever an account follows), the SECOND
     // is the account (newer peers that negotiated the member-account feature).
     // Zero trailing blocks is the common pre-setter wire format.
+    // The THIRD trailing block is real_host (oper-info-capable peers), the FOURTH
+    // is certfp. An older/plaintext peer never emits them, so they stay "".
     var setter: []const u8 = "";
     var account: []const u8 = "";
+    var real_host: []const u8 = "";
+    var certfp: []const u8 = "";
     if (i < bytes.len) setter = try takeBytes16(bytes, &i, max_setter_len);
     if (i < bytes.len) account = try takeBytes16(bytes, &i, max_account_len);
+    if (i < bytes.len) real_host = try takeBytes16(bytes, &i, max_real_host_len);
+    if (i < bytes.len) certfp = try takeBytes16(bytes, &i, max_certfp_len);
 
     if (i != bytes.len) return error.TrailingBytes;
     if (channel.len == 0 or nick.len == 0) return error.NameTooLong;
@@ -197,6 +229,8 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     try validateLineField(host, false);
     try validateLineField(setter, true);
     try validateLineField(account, true);
+    try validateLineField(real_host, true);
+    try validateLineField(certfp, true);
     return .{
         .present = present,
         .status = @intCast(status_raw),
@@ -209,6 +243,8 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
         .host = host,
         .setter = setter,
         .account = account,
+        .real_host = real_host,
+        .certfp = certfp,
     };
 }
 
@@ -310,10 +346,11 @@ test "truncated input is rejected" {
 }
 
 test "trailing bytes are rejected" {
-    // Encode WITH both optional blocks (setter + account) so both reads consume
-    // their fields; the pad byte after the full event is then the genuine
-    // trailing-bytes case (not a truncated optional block).
-    const ev = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .setter = "kain", .account = "kacct" };
+    // Encode WITH ALL FOUR optional blocks (setter + account + real_host + certfp)
+    // so every read consumes its field; the pad byte after the full event is then
+    // the genuine trailing-bytes case (not a truncated optional block — a lone byte
+    // would otherwise look like a truncated real_host/certfp length prefix).
+    const ev = MembershipEvent{ .present = true, .status = 1, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .setter = "kain", .account = "kacct", .real_host = "203.0.113.9", .certfp = "ab" };
     var buf: [max_encoded_len]u8 = undefined;
     const wire = try encode(ev, &buf);
     var padded: [max_encoded_len + 1]u8 = undefined;
@@ -348,6 +385,53 @@ test "a lone trailing block decodes as setter, never account (old-peer compat)" 
     const got = try decode(try encode(ev, &buf));
     try testing.expectEqualStrings("trev", got.setter);
     try testing.expectEqualStrings("", got.account);
+}
+
+test "real_host + certfp round-trip and force the earlier optional slots" {
+    // certfp present with no setter/account/real_host: the encoder forces empty
+    // setter+account+real_host slots so certfp is unambiguously the 4th block.
+    const ev = MembershipEvent{
+        .present = true,
+        .status = 0b0100,
+        .origin_node = 2,
+        .hlc = 9,
+        .channel = "#root",
+        .nick = "kain",
+        .real_host = "fe80::921b:eff:fefe:8a87",
+        .certfp = "495bfcdfe3a66f6781f41a4e27ba56bc7e347d36aab02f6bde2576bc31846dcb",
+    };
+    var buf: [max_encoded_len]u8 = undefined;
+    const got = try decode(try encode(ev, &buf));
+    try testing.expectEqualStrings("", got.setter);
+    try testing.expectEqualStrings("", got.account);
+    try testing.expectEqualStrings("fe80::921b:eff:fefe:8a87", got.real_host);
+    try testing.expectEqualStrings("495bfcdfe3a66f6781f41a4e27ba56bc7e347d36aab02f6bde2576bc31846dcb", got.certfp);
+}
+
+test "real_host without certfp leaves certfp empty; absent both stays old-format" {
+    const with = MembershipEvent{ .present = true, .status = 0, .origin_node = 2, .hlc = 9, .channel = "#c", .nick = "n", .account = "acct", .real_host = "203.0.113.7" };
+    var buf: [max_encoded_len]u8 = undefined;
+    const got = try decode(try encode(with, &buf));
+    try testing.expectEqualStrings("acct", got.account);
+    try testing.expectEqualStrings("203.0.113.7", got.real_host);
+    try testing.expectEqualStrings("", got.certfp);
+
+    // No oper-info fields → byte-identical to the pre-oper-info wire (account only).
+    const without = MembershipEvent{ .present = true, .status = 0, .origin_node = 2, .hlc = 9, .channel = "#c", .nick = "n", .account = "acct" };
+    var buf2: [max_encoded_len]u8 = undefined;
+    const got2 = try decode(try encode(without, &buf2));
+    try testing.expectEqualStrings("", got2.real_host);
+    try testing.expectEqualStrings("", got2.certfp);
+}
+
+test "an over-long real_host / certfp is rejected by encode" {
+    const big_host = "a" ** (max_real_host_len + 1);
+    const ev_h = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .real_host = big_host };
+    var buf: [max_encoded_len]u8 = undefined;
+    try testing.expectError(error.NameTooLong, encode(ev_h, &buf));
+    const big_fp = "a" ** (max_certfp_len + 1);
+    const ev_f = MembershipEvent{ .present = true, .status = 0, .origin_node = 1, .hlc = 1, .channel = "#c", .nick = "n", .certfp = big_fp };
+    try testing.expectError(error.NameTooLong, encode(ev_f, &buf));
 }
 
 test "an over-long account is rejected by encode" {
