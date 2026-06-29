@@ -20486,6 +20486,7 @@ pub const LinuxServer = struct {
             .host = conn.session.host(),
             .account = conn.session.account() orelse "",
             .away = conn.session.awayMessage() orelse "",
+            .username = conn.session.username(),
             .is_oper = conn.session.isOper(),
         };
     }
@@ -20656,6 +20657,7 @@ pub const LinuxServer = struct {
             .account = if (snap.account.len != 0) snap.account else account,
             .host = snap.host,
             .away = snap.away,
+            .username = snap.username,
             .logged_in = snap.account.len != 0,
             .away_active = snap.away.len != 0,
             .is_oper = snap.is_oper,

@@ -21,6 +21,7 @@
 //!   [i64 connected_at_ms][i64 last_message_ms]   OPTIONAL trailing block
 //!   [u16 len][caps]   OPTIONAL trailing CAP list (space-separated names)
 //!   [u64 oper_priv_bits][u16 len][oper_class][u16 len][oper_title]  OPTIONAL
+//!   [u16 len][username]   OPTIONAL trailing USER ident (past the oper grant)
 //!
 //! The oper-grant block (OPTIONAL, written after the caps block) carries the
 //! operator's privilege bits (OperPrivileges.toBits — append-only ordinals) plus
@@ -62,6 +63,10 @@ pub const Snapshot = struct {
     real_host: []const u8 = "",
     host: []const u8 = "",
     away: []const u8 = "",
+    /// The client's USER ident. Carried as an OPTIONAL trailing block so a
+    /// capsule from a pre-username build decodes it as "" (→ the daemon's
+    /// account/"user" fallback in ClientSession.username).
+    username: []const u8 = "",
     logged_in: bool = false,
     away_active: bool = false,
     is_oper: bool = false,
@@ -153,6 +158,14 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
         try out.appendSlice(allocator, &len_le);
         try out.appendSlice(allocator, s);
     }
+    // Trailing username block (see header): the client's USER ident, so a migrated
+    // session keeps its real ident. Sits past the oper grant; omitting it (pre-
+    // username build) decodes to "".
+    if (snap.username.len > std.math.maxInt(u16)) return error.TooLong;
+    var uname_len_le: [2]u8 = undefined;
+    std.mem.writeInt(u16, &uname_len_le, @intCast(snap.username.len), .little);
+    try out.appendSlice(allocator, &uname_len_le);
+    try out.appendSlice(allocator, snap.username);
     return out.toOwnedSlice(allocator);
 }
 
@@ -180,10 +193,12 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     var oper_priv_bits: u64 = 0;
     var oper_class: []const u8 = "";
     var oper_title: []const u8 = "";
+    var username: []const u8 = "";
     // Walk the optional trailing blocks with a running cursor `p`: signon (16) →
-    // caps ([u16][bytes]) → oper grant ([u64][u16][class][u16][title]). Each is
-    // gated on enough bytes remaining, so a capsule from a build predating any
-    // block decodes cleanly with that block (and everything after it) defaulted.
+    // caps ([u16][bytes]) → oper grant ([u64][u16][class][u16][title]) → username
+    // ([u16][bytes]). Each is gated on enough bytes remaining, so a capsule from a
+    // build predating any block decodes cleanly with that block (and everything
+    // after it) defaulted.
     if (channelRegionEnd(r.buf, r.pos)) |chan_end| {
         var p = chan_end;
         if (r.buf.len - p >= 16) {
@@ -211,6 +226,15 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                         }
                     }
                 }
+                // Trailing username block (past the oper grant).
+                if (r.buf.len - p >= 2) {
+                    const ul = std.mem.readInt(u16, r.buf[p..][0..2], .little);
+                    p += 2;
+                    if (p + ul <= r.buf.len) {
+                        username = r.buf[p .. p + ul];
+                        p += ul;
+                    }
+                }
             }
         }
     }
@@ -232,6 +256,7 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .oper_priv_bits = oper_priv_bits,
         .oper_class = oper_class,
         .oper_title = oper_title,
+        .username = username,
     };
 }
 
@@ -340,11 +365,13 @@ test "snapshot encode/decode round-trips identity + flags" {
         .connected_at_ms = 1_700_000_000_123,
         .last_message_ms = 1_700_000_500_456,
         .caps = "echo-message server-time sasl",
+        .username = "webchat",
     };
     const bytes = try encode(allocator, snap);
     defer allocator.free(bytes);
 
     const got = try decode(bytes);
+    try testing.expectEqualStrings("webchat", got.username);
     try testing.expectEqual(@as(i32, 42), got.fd);
     try testing.expectEqual(@as(i64, 1_700_000_000_123), got.connected_at_ms);
     try testing.expectEqual(@as(i64, 1_700_000_500_456), got.last_message_ms);

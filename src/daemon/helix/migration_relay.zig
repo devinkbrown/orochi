@@ -160,6 +160,9 @@ pub const Snapshot = struct {
     account: []const u8 = "",
     /// Away message ("" = not away; any non-empty value = away with that text).
     away: []const u8 = "",
+    /// The client's USER ident, carried so a reclaimed session keeps its real
+    /// ident instead of falling back to "user". "" when unknown.
+    username: []const u8 = "",
     /// Whether the migrating session held operator status.
     is_oper: bool = false,
 
@@ -181,6 +184,7 @@ pub const Snapshot = struct {
             .{ .key = "nick", .value = .{ .string = self.nick } },
             .{ .key = "realname", .value = .{ .string = self.realname } },
             .{ .key = "umodes", .value = .{ .string = self.umodes } },
+            .{ .key = "username", .value = .{ .string = self.username } },
         };
         return canonicalEncode(allocator, .{ .map = entries[0..] });
     }
@@ -202,6 +206,7 @@ pub const Snapshot = struct {
         const host_src = mapString(value.map, "host") orelse "";
         const account_src = mapString(value.map, "account") orelse "";
         const away_src = mapString(value.map, "away") orelse "";
+        const username_src = mapString(value.map, "username") orelse "";
         const is_oper = (mapUnsigned(value.map, "is_oper") orelse 0) != 0;
 
         const nick = try allocator.dupe(u8, nick_src);
@@ -216,6 +221,8 @@ pub const Snapshot = struct {
         errdefer allocator.free(account);
         const away = try allocator.dupe(u8, away_src);
         errdefer allocator.free(away);
+        const username = try allocator.dupe(u8, username_src);
+        errdefer allocator.free(username);
 
         var channels = try allocator.alloc([]const u8, chans_src.len);
         var filled: usize = 0;
@@ -237,6 +244,7 @@ pub const Snapshot = struct {
             .host = host,
             .account = account,
             .away = away,
+            .username = username,
             .is_oper = is_oper,
         };
     }
@@ -250,6 +258,7 @@ pub const Snapshot = struct {
         allocator.free(self.host);
         allocator.free(self.account);
         allocator.free(self.away);
+        allocator.free(self.username);
         for (self.channels) |chan| allocator.free(chan);
         allocator.free(self.channels);
         self.* = undefined;
@@ -1005,6 +1014,7 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
         .host = "cloak-ab12.orochi",
         .account = "kain",
         .away = "biab",
+        .username = "webchat",
         .is_oper = true,
     };
 
@@ -1026,6 +1036,7 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     try testing.expectEqualStrings("cloak-ab12.orochi", capsule.snapshot.host);
     try testing.expectEqualStrings("kain", capsule.snapshot.account);
     try testing.expectEqualStrings("biab", capsule.snapshot.away);
+    try testing.expectEqualStrings("webchat", capsule.snapshot.username);
     try testing.expect(capsule.snapshot.is_oper);
     try testing.expectEqualStrings("kain", capsule.account);
     try testing.expectEqual(@as(u64, 0xABCD), capsule.token.nonce);

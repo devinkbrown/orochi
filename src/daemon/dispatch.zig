@@ -1181,6 +1181,9 @@ pub const ClientSession = struct {
             .real_host = self.real_host_store.slice(),
             .host = self.host_store.slice(),
             .away = self.away_store.slice(),
+            // The USER ident (or account/"user" fallback), so it survives a
+            // Helix UPGRADE instead of resetting to "user" on the successor.
+            .username = self.username(),
             .logged_in = self.logged_in,
             .away_active = self.away_active,
             .is_oper = self.is_oper,
@@ -1201,6 +1204,12 @@ pub const ClientSession = struct {
         };
         self.client.identity.realname.set(snap.realname) catch {
             self.client.identity.realname.len = 0;
+        };
+        // Restore the USER ident so a migrated/reclaimed session keeps it instead
+        // of falling back to the account/"user" default. Empty for a pre-username
+        // snapshot, which leaves the fallback in place.
+        self.client.identity.uid.set(snap.username) catch {
+            self.client.identity.uid.len = 0;
         };
         self.real_host_store.set(snap.real_host) catch {
             self.real_host_store.len = 0;
