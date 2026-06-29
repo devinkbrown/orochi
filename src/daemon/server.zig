@@ -9476,7 +9476,7 @@ pub const LinuxServer = struct {
             _ = self.access.clear(.{ .channel = join_target }) catch {};
         }
 
-        _ = try self.world.join(join_target, wid);
+        const newly_joined = try self.world.join(join_target, wid);
         if (creating) {
             try self.publishChannelEvent("CREATE", join_target);
             // KEEPTOPIC: restore a registered channel's saved topic on recreation,
@@ -9498,16 +9498,31 @@ pub const LinuxServer = struct {
 
         // An admin who already wields full channel authority via the +j override
         // umode must NOT also seize founder-by-creation. World.join grants the
-        // first member of a freshly-(re)created channel the founder tier (+Q), but
-        // such an admin renders with the `*` oper prefix and can manage the channel
+        // founder tier (+Q) to the first member of a channel with no LOCAL members,
+        // and such an admin renders with the `*` oper prefix and manages the channel
         // via +j — they neither need nor should hold a stored founder status just
         // for being first into an empty channel (e.g. autojoining after a restart
-        // wiped channel state). Gate on the +j umode (not the bare oper_override
-        // privilege): an oper WITHOUT +j has no override authority and still needs
-        // founder-by-creation to manage what they create. A genuine
-        // registered/ACCESS founder is re-applied by the grant paths below.
-        if (creating and conn.session.hasUmode(.override)) {
-            _ = self.world.setMemberMode(join_target, wid, .founder, false) catch {};
+        // wiped channel state).
+        //
+        // Gate on the join having ACTUALLY granted founder, NOT on `creating`
+        // (= !channelExists). Those two disagree across the mesh: after a node
+        // restart the relink re-creates the channel ENTITY from a peer's membership
+        // burst (remote members live in the link roster, not the local member set),
+        // so `channelExists` is true while the LOCAL member count is still zero —
+        // the admin then autojoins, world.join founds them (zero local members), but
+        // a `creating`-gated strip was skipped. A freshly-joined member can hold
+        // founder ONLY via founder-by-creation here (no ACCESS/services grant has run
+        // yet — those re-apply a genuine registered/ACCESS founder below), so the
+        // newly-joined + holds-founder pair detects exactly founder-by-creation.
+        //
+        // Gate on the +j umode (not the bare oper_override privilege): an oper
+        // WITHOUT +j has no override authority and still needs founder-by-creation to
+        // manage what it creates.
+        if (newly_joined and conn.session.hasUmode(.override)) {
+            if (self.world.memberModes(join_target, wid)) |mm| {
+                if (mm.contains(.founder))
+                    _ = self.world.setMemberMode(join_target, wid, .founder, false) catch {};
+            }
         }
 
         // IRCX tiered keys: a presented key matching the channel's HOSTKEY/OWNERKEY

@@ -1779,6 +1779,32 @@ test "first joiner founds the channel as operator; later joiners have no status"
     try std.testing.expectEqual(@as(u8, 0), world.memberModes("#x", second).?.highestPrefix());
 }
 
+test "an existing (mesh-projected) channel entity with no local members still founds the first local joiner" {
+    // Regression: founder-by-creation keys on the LOCAL member count, not on
+    // channel existence. A mesh relink re-materializes the channel ENTITY from a
+    // peer's roster (remote members live in the link roster, not the local member
+    // set), so `channelExists` is already true while the local member set is empty.
+    // The first LOCAL joiner is therefore still founded — which is why the JOIN
+    // handler must strip an override admin's founder based on the grant actually
+    // happening, NOT on a `creating = !channelExists` gate (that gate is false here
+    // and silently let the admin keep +Q after a restart).
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    try world.ensureRemoteListChannel("#root");
+    try std.testing.expect(world.channelExists("#root")); // entity exists ...
+    try std.testing.expectEqual(@as(usize, 0), world.memberCount("#root")); // ... but 0 local members
+
+    const admin = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    try std.testing.expect(try world.join("#root", admin)); // newly joined
+    // Despite the pre-existing entity, the empty local member set founds the joiner.
+    try std.testing.expect(world.memberModes("#root", admin).?.contains(.founder));
+
+    // And the handler's remedy — clearing founder — works on this member.
+    try std.testing.expect(try world.setMemberMode("#root", admin, .founder, false));
+    try std.testing.expect(!world.memberModes("#root", admin).?.contains(.founder));
+}
+
 test "setMemberMode adds and removes status and reports change" {
     var world = World.init(std.testing.allocator);
     defer world.deinit();
