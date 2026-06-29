@@ -11025,6 +11025,9 @@ pub const LinuxServer = struct {
         host: []const u8,
         server: []const u8,
         server_info: ?[]const u8,
+        /// The member's authenticated account ("" = not logged in / unknown),
+        /// propagated via cap_member_account — drives the 330 "logged in as" line.
+        account: []const u8,
     };
 
     /// Resolve `nick` as a remote mesh member via any established S2S peer
@@ -11060,6 +11063,7 @@ pub const LinuxServer = struct {
                 .host = member.host,
                 .server = name,
                 .server_info = link.nodeDescription(member.node),
+                .account = member.account,
             };
         }
         const direct = link.remoteName();
@@ -11070,6 +11074,7 @@ pub const LinuxServer = struct {
             .host = member.host,
             .server = if (direct.len != 0) direct else default_host,
             .server_info = null,
+            .account = member.account,
         };
     }
 
@@ -11077,9 +11082,10 @@ pub const LinuxServer = struct {
     /// member's PROPAGATED identity (real username, realname, and cloaked/
     /// visible host — falling back to the placeholder/origin-server forms only
     /// when the origin never supplied identity), 312 with the actual home
-    /// server, RPL_WHOISOPERATOR (313) when a live propagated oper grant covers
-    /// the nick, and 318. Idle/away/671/276 need per-user state remote nodes
-    /// don't replicate, so they are omitted.
+    /// server, RPL_WHOISCHANNELS (319) from the mesh roster, RPL_WHOISACCOUNT
+    /// (330) when the member's account propagated, RPL_WHOISOPERATOR (313) when a
+    /// live propagated oper grant covers the nick, and 318. Idle/away/671/276 need
+    /// per-connection state remote nodes don't replicate, so they are omitted.
     fn sendRemoteWhois(
         self: *LinuxServer,
         conn: *ConnState,
@@ -11110,6 +11116,9 @@ pub const LinuxServer = struct {
             .realname = if (remote.realname.len != 0) remote.realname else "Remote mesh user",
             .server = remote.server,
             .server_info = remote.server_info,
+            // 330 "is logged in as <account>" for a remote member whose account the
+            // mesh propagated (cap_member_account) — matches a local user's WHOIS.
+            .account = if (remote.account.len != 0) remote.account else null,
             .is_oper = is_oper,
             .is_admin = is_admin,
             .oper_title = oper_title,
