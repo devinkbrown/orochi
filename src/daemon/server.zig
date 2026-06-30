@@ -112,6 +112,7 @@ const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
 const lotus = @import("../proto/lotus.zig");
 const search_index_mod = @import("search_index.zig");
+const chanstats_mod = @import("chanstats.zig");
 const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const chathistory_targets = @import("../proto/chathistory_targets.zig");
 const msgedit = @import("../proto/msgedit.zig");
@@ -1366,6 +1367,10 @@ pub const Config = struct {
     /// Directory to publish web stats into (stats.json + index.html), e.g. an
     /// nginx `root`. Empty = disabled. Written periodically via Config.crypto_io.
     stats_web_dir: []const u8 = "",
+    /// Directory to publish per-CHANNEL statistics JSON (index.json + one
+    /// <slug>.json per channel) for the channel-stats dashboard; nginx serves it
+    /// at `/stats/data/`. Empty = channel stats off (no recording, no I/O).
+    chanstats_dir: []const u8 = "",
     /// Minimum interval between web-stats writes, in ms.
     stats_interval_ms: i64 = 30_000,
     /// TCP port for the live Prometheus `/metrics` HTTP listener. 0 = disabled.
@@ -2377,6 +2382,11 @@ pub const LinuxServer = struct {
     /// PRIVMSG/NOTICE messages are recorded into `history`. Bounded by its Config;
     /// queried by `handleSearch`, which scopes hits back to a target's history.
     search_index: search_index_mod.SearchIndex,
+    /// Per-channel statistics aggregator (the ophion m_chanstats replacement).
+    /// Fed from the recordHistory* chokepoints; flushed to `chanstats_dir` as JSON
+    /// on the stats interval. Only active when `config.chanstats_dir` is set.
+    chanstats: chanstats_mod.ChanStats,
+    chanstats_last_write_ms: i64 = 0,
     warden: warden.Registry,
     /// Operator-designated spam-trap (honeypot) registry: nicks/channels a
     /// legitimate user has no reason to contact. A non-oper that touches one
@@ -2882,6 +2892,7 @@ pub const LinuxServer = struct {
             .totp = totp_auth.TotpStore.init(allocator, .{}),
             .history = HistoryStore.init(allocator),
             .search_index = search_index_mod.SearchIndex.init(allocator),
+            .chanstats = chanstats_mod.ChanStats.init(allocator),
             .warden = warden.Registry.init(allocator, .{}),
             .spamtrap = spamtrap_mod.DefaultSpamtrap.init(allocator),
             .metadata = metadata_store.DefaultStore.init(allocator),
@@ -3167,6 +3178,7 @@ pub const LinuxServer = struct {
         }
         self.history.deinit();
         self.search_index.deinit();
+        self.chanstats.deinit();
         self.warden.deinit();
         self.spamtrap.deinit();
         self.metadata.deinit();
@@ -3599,6 +3611,21 @@ pub const LinuxServer = struct {
     }
 
     fn maybeWriteStats(self: *LinuxServer) void {
+        // Per-channel statistics: flush index.json + <slug>.json into the
+        // channel-stats dir on the stats cadence. Runs under the completion-wide
+        // world.lockWrite (the timer completion holds it), so it is serialized
+        // against the recordHistory* feed even on a multi-reactor node; the
+        // throttle ensures exactly one flush per interval.
+        if (self.config.chanstats_dir.len != 0) {
+            const cnow = self.nowMs();
+            if (self.chanstats_last_write_ms == 0 or cnow - self.chanstats_last_write_ms >= self.config.stats_interval_ms) {
+                self.chanstats_last_write_ms = cnow;
+                if (self.config.crypto_io) |io| {
+                    self.chanstats.writeJson(io, self.config.chanstats_dir, self.config.network_name, self.serverName(), platform.realtimeMillis());
+                }
+            }
+        }
+
         // Refresh the live Prometheus snapshot on the same throttled cadence as
         // the web-stats files, even when web stats are disabled — the /metrics
         // endpoint only needs the counters, not the GeoIP/web rendering below.
@@ -12295,6 +12322,7 @@ pub const LinuxServer = struct {
         // best-effort drop, never an error to the sender. msgid uniquely keys the
         // entry; `handleSearch` re-scopes a hit to a target's own history.
         self.search_index.index(msgid, text) catch {};
+        self.chanstatsMessage(store_target, sender, command, text);
     }
 
     fn tagmsgHistoryEligible(tags: []const u8) bool {
@@ -12330,6 +12358,7 @@ pub const LinuxServer = struct {
             .client_tags = client_tags,
         }) catch {};
         self.search_index.index(msgid, text) catch {};
+        self.chanstatsMessage(store_target, sender_prefix, command, text);
     }
 
     fn recordHistoryTagmsg(self: *LinuxServer, store_target: []const u8, conn: *ConnState, msgid: []const u8, tags: []const u8) void {
@@ -12366,6 +12395,48 @@ pub const LinuxServer = struct {
         var msgid_buf: [msgid_mod.id_len]u8 = undefined;
         const msgid = self.msgid_gen.next(&msgid_buf);
         _ = self.history.append(store_target, .{ .msgid = msgid, .sender = sender, .text = text, .timestamp = ts, .command = command }) catch {};
+        self.chanstatsEvent(store_target, sender, command, text);
+    }
+
+    // ── channel-stats feed (the ophion m_chanstats replacement) ──────────────
+
+    /// Bare nick from a `[:]nick!user@host` prefix; "" for a server source.
+    fn nickFromPrefix(prefix: []const u8) []const u8 {
+        var p = prefix;
+        if (p.len != 0 and p[0] == ':') p = p[1..];
+        if (std.mem.indexOfScalar(u8, p, '!')) |i| return p[0..i];
+        // A bare server name (has a dot, no user@) is not a nick.
+        if (std.mem.indexOfScalar(u8, p, '@') == null and std.mem.indexOfScalar(u8, p, '.') != null) return "";
+        return p;
+    }
+
+    /// Feed a channel PRIVMSG into the per-channel stats aggregator. No-op unless
+    /// channel stats are enabled and the target is a channel.
+    fn chanstatsMessage(self: *LinuxServer, target: []const u8, sender_prefix: []const u8, command: []const u8, text: []const u8) void {
+        if (self.config.chanstats_dir.len == 0) return;
+        if (!world_model.isChannelName(target)) return;
+        if (!std.ascii.eqlIgnoreCase(command, "PRIVMSG")) return;
+        const nick = nickFromPrefix(sender_prefix);
+        if (nick.len == 0) return;
+        self.chanstats.recordMessage(target, nick, text, platform.realtimeMillis());
+    }
+
+    /// Feed a channel membership/topic EVENT into the aggregator.
+    fn chanstatsEvent(self: *LinuxServer, target: []const u8, sender_prefix: []const u8, command: []const u8, text: []const u8) void {
+        if (self.config.chanstats_dir.len == 0) return;
+        if (!world_model.isChannelName(target)) return;
+        const now = platform.realtimeMillis();
+        if (std.ascii.eqlIgnoreCase(command, "JOIN")) {
+            self.chanstats.recordEvent(target, .join, now);
+        } else if (std.ascii.eqlIgnoreCase(command, "PART")) {
+            self.chanstats.recordEvent(target, .part, now);
+        } else if (std.ascii.eqlIgnoreCase(command, "QUIT")) {
+            self.chanstats.recordEvent(target, .quit, now);
+        } else if (std.ascii.eqlIgnoreCase(command, "KICK")) {
+            self.chanstats.recordEvent(target, .kick, now);
+        } else if (std.ascii.eqlIgnoreCase(command, "TOPIC")) {
+            self.chanstats.recordTopic(target, nickFromPrefix(sender_prefix), text, now);
+        }
     }
 
     fn latestActivityInWindow(

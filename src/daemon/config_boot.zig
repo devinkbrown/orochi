@@ -81,6 +81,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.media.stun_host) |h| out.media_stun_host = h;
     if (cfg.media.stun_port != 0) out.media_stun_port = cfg.media.stun_port;
     if (cfg.stats.dir.len != 0) out.stats_web_dir = cfg.stats.dir;
+    if (cfg.stats.channel_dir.len != 0) out.chanstats_dir = cfg.stats.channel_dir;
     if (cfg.stats.interval_ms != 0) out.stats_interval_ms = cfg.stats.interval_ms;
     // [metrics] — live Prometheus /metrics endpoint. Off unless a port is set;
     // the bind defaults to loopback and is only widened by an explicit address.

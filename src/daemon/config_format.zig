@@ -374,6 +374,10 @@ pub const Config = struct {
         /// Directory to publish web stats into (stats.json + index.html), e.g. an
         /// nginx `root`. Empty = disabled.
         dir: []const u8 = "",
+        /// Directory to publish per-CHANNEL statistics JSON into (index.json +
+        /// one <slug>.json per channel) for the channel-stats dashboard. nginx
+        /// serves it at `/stats/data/`. Empty = channel stats disabled.
+        channel_dir: []const u8 = "",
         /// Minimum interval between stats writes, in ms (parsed from a duration).
         interval_ms: i64 = 30_000,
     };
@@ -500,6 +504,8 @@ pub const Config = struct {
         errdefer allocator.free(media_host);
         const stats_dir = try allocator.dupe(u8, "");
         errdefer allocator.free(stats_dir);
+        const stats_channel_dir = try allocator.dupe(u8, "");
+        errdefer allocator.free(stats_channel_dir);
         const metrics_bind = try allocator.dupe(u8, "127.0.0.1");
         errdefer allocator.free(metrics_bind);
         const geoip_db = try allocator.dupe(u8, "");
@@ -517,7 +523,7 @@ pub const Config = struct {
             .listen = .{ .host = host, .media_host = media_host },
             .mesh = .{ .realm = try allocator.dupe(u8, "local") },
             .tls = .{ .dns_name = try allocator.dupe(u8, "localhost") },
-            .stats = .{ .dir = stats_dir },
+            .stats = .{ .dir = stats_dir, .channel_dir = stats_channel_dir },
             .metrics = .{ .bind = metrics_bind },
             .geoip = .{ .database = geoip_db, .asn_database = geoip_asn_db },
             .acme = .{ .directory_url = acme_directory_url },
@@ -585,6 +591,7 @@ pub const Config = struct {
         if (self.sasl.oauth_pubkey) |value| allocator.free(value);
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
+        allocator.free(self.stats.channel_dir);
         allocator.free(self.metrics.bind);
         allocator.free(self.geoip.database);
         allocator.free(self.geoip.asn_database);
@@ -755,6 +762,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
+    try setStr(allocator, resolver, doc.getString("stats.channel_dir"), &cfg.stats.channel_dir);
     if (doc.getString("stats.interval")) |s| cfg.stats.interval_ms = @intCast(try durationMs(s));
 
     // [metrics] — live Prometheus /metrics endpoint. `listen` = 0/absent off;
