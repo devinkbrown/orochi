@@ -2964,6 +2964,9 @@ pub const LinuxServer = struct {
         }
         // Restore runtime operator grants persisted by a previous run.
         self.loadGrants();
+        // Restore per-channel statistics persisted by a previous run so they
+        // survive a restart or USR2 hot-upgrade.
+        self.loadChanstats();
         if (self.config.media_enabled) {
             const frame_cap: usize = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram)));
             self.media_plane.max_frame_bytes = frame_cap;
@@ -19201,6 +19204,14 @@ pub const LinuxServer = struct {
             restored += 1;
         }
         if (restored != 0) srvLog("orochi: restored {d} runtime operator grant(s)\n", .{restored});
+    }
+
+    /// Restore the per-channel statistics snapshot persisted by a previous run,
+    /// invoked once from `start`. No-op without a configured dir / readable file.
+    fn loadChanstats(self: *LinuxServer) void {
+        if (self.config.chanstats_dir.len == 0) return;
+        const io = self.config.crypto_io orelse return;
+        chanstats_mod.loadSnapshot(&self.chanstats, io, self.config.chanstats_dir);
     }
 
     // --- Account command family (Phase 2) ----------------------------------

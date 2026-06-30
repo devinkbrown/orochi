@@ -299,6 +299,10 @@ pub const ChanStats = struct {
         }
         iw.writeAll("]}") catch return;
         writeFileAtomicIo(io, dir_path, "index.json", iaw.written());
+
+        // Persist the full-fidelity binary snapshot alongside the served JSON so
+        // per-channel stats survive a restart or USR2 hot-upgrade.
+        saveSnapshot(self, io, dir_path);
     }
 
     fn writeChannelFile(self: *ChanStats, io: std.Io, dir_path: []const u8, agg: *ChannelAgg, now_ms: i64) void {
@@ -309,8 +313,14 @@ pub const ChanStats = struct {
 
         var aw = std.Io.Writer.Allocating.init(self.allocator);
         defer aw.deinit();
-        const w = &aw.writer;
+        self.renderChannel(&aw.writer, agg, now_ms);
+        writeFileAtomicIo(io, dir_path, fname, aw.written());
+    }
 
+    /// Render one channel's full statistics JSON into `w`. Separated from the file
+    /// write so it can be unit-tested (parse the output back) and reused as the
+    /// persistence snapshot.
+    fn renderChannel(self: *ChanStats, w: *std.Io.Writer, agg: *ChannelAgg, now_ms: i64) void {
         w.writeAll("{\"channel\":") catch return;
         writeJsonString(w, agg.name) catch return;
         w.print(",\"generated_at\":{d},\"first_seen\":{d},\"last_active\":{d},", .{
@@ -380,8 +390,6 @@ pub const ChanStats = struct {
             bd.date, bd.messages, peakHour(agg),
         }) catch return;
         w.writeByte('}') catch return;
-
-        writeFileAtomicIo(io, dir_path, fname, aw.written());
     }
 
     fn writeTopUsers(self: *ChanStats, w: anytype, agg: *ChannelAgg) !void {
@@ -589,6 +597,195 @@ fn writeFileAtomicIo(io: std.Io, dir: []const u8, name: []const u8, bytes: []con
     };
 }
 
+// ── persistence (binary snapshot, full fidelity) ─────────────────────────────
+//
+// The emitted JSON is top-N capped (lossy), so it can't be the persistence
+// source. Instead a compact versioned binary snapshot of the WHOLE aggregate is
+// written alongside the JSON on every flush and loaded once at boot, so stats
+// survive a restart or USR2 hot-upgrade. Dotfile name → distinguishable from the
+// served data; harmless if nginx serves it (same public aggregate, binary form).
+
+const snapshot_name = ".chanstats.snapshot";
+const snapshot_magic = "OCS1";
+
+fn putInt(w: *std.Io.Writer, comptime T: type, v: T) std.Io.Writer.Error!void {
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &b, v, .little);
+    try w.writeAll(&b);
+}
+
+fn putBytes(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    const n: u16 = @intCast(@min(s.len, std.math.maxInt(u16)));
+    try putInt(w, u16, n);
+    try w.writeAll(s[0..n]);
+}
+
+const Cursor = struct {
+    b: []const u8,
+    i: usize = 0,
+    fn int(c: *Cursor, comptime T: type) ?T {
+        const n = @sizeOf(T);
+        if (c.i + n > c.b.len) return null;
+        const v = std.mem.readInt(T, c.b[c.i..][0..n], .little);
+        c.i += n;
+        return v;
+    }
+    fn bytes(c: *Cursor) ?[]const u8 {
+        const len = c.int(u16) orelse return null;
+        if (c.i + len > c.b.len) return null;
+        const s = c.b[c.i .. c.i + len];
+        c.i += len;
+        return s;
+    }
+};
+
+/// Persist the whole aggregate to `<dir>/.chanstats.snapshot`. Best-effort.
+pub fn saveSnapshot(self: *ChanStats, io: std.Io, dir_path: []const u8) void {
+    var aw = std.Io.Writer.Allocating.init(self.allocator);
+    defer aw.deinit();
+    serialize(self, &aw.writer) catch return;
+    writeFileAtomicIo(io, dir_path, snapshot_name, aw.written());
+}
+
+/// Serialize the whole aggregate (magic + channel count + channels) into `w`.
+/// Split from the file write so the round-trip can be unit-tested in memory.
+fn serialize(self: *ChanStats, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll(snapshot_magic);
+    try putInt(w, u32, @intCast(self.channels.count()));
+    var it = self.channels.iterator();
+    while (it.next()) |e| try snapChannel(w, e.value_ptr.*);
+}
+
+fn snapChannel(w: *std.Io.Writer, agg: *ChannelAgg) std.Io.Writer.Error!void {
+    try putBytes(w, agg.name);
+    try putInt(w, i64, agg.first_seen);
+    try putInt(w, i64, agg.last_active);
+    inline for (.{ agg.messages, agg.words, agg.joins, agg.parts, agg.quits, agg.kicks, agg.topic_changes }) |v| try putInt(w, u64, v);
+    for (agg.hours) |h| try putInt(w, u64, h);
+    for (agg.heatmap) |row| for (row) |cell| try putInt(w, u64, cell);
+    try putInt(w, u32, @intCast(agg.days.items.len));
+    for (agg.days.items) |d| {
+        try putInt(w, i64, d.day);
+        try putInt(w, u64, d.messages);
+    }
+    try putInt(w, u32, @intCast(agg.users.count()));
+    var uit = agg.users.valueIterator();
+    while (uit.next()) |v| {
+        const u = v.*;
+        try putBytes(w, u.nick);
+        inline for (.{ u.messages, u.words, u.questions, u.exclamations, u.urls }) |x| try putInt(w, u64, x);
+        try putInt(w, i64, u.last_active);
+        try putInt(w, u32, u.monologue);
+    }
+    try putInt(w, u32, @intCast(agg.word_freq.count()));
+    var wit = agg.word_freq.iterator();
+    while (wit.next()) |e| {
+        try putBytes(w, e.key_ptr.*);
+        try putInt(w, u64, e.value_ptr.*);
+    }
+    try putInt(w, u32, @intCast(agg.topics.items.len));
+    for (agg.topics.items) |t| {
+        try putInt(w, i64, t.ts);
+        try putBytes(w, t.setter);
+        try putBytes(w, t.topic);
+    }
+}
+
+/// Reload a snapshot written by `saveSnapshot` (called once at boot). Best-effort:
+/// a missing/short/corrupt file leaves the aggregate empty. Partial parse stops
+/// cleanly (already-loaded channels are kept).
+pub fn loadSnapshot(self: *ChanStats, io: std.Io, dir_path: []const u8) void {
+    var path_buf: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, snapshot_name }) catch return;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(256 << 20)) catch return;
+    defer self.allocator.free(data);
+    _ = deserialize(self, data);
+}
+
+/// Restore channels from an in-memory snapshot blob. Returns false on a
+/// missing/short/corrupt blob; a partial parse keeps already-restored channels.
+fn deserialize(self: *ChanStats, data: []const u8) bool {
+    if (data.len < 8 or !std.mem.eql(u8, data[0..4], snapshot_magic)) return false;
+    var c = Cursor{ .b = data, .i = 4 };
+    const ccount = c.int(u32) orelse return false;
+    var i: u32 = 0;
+    while (i < ccount) : (i += 1) {
+        if (!loadChannel(self, &c)) return false;
+    }
+    return true;
+}
+
+fn loadChannel(self: *ChanStats, c: *Cursor) bool {
+    const name = c.bytes() orelse return false;
+    const agg = self.channel(name, 0) orelse return false;
+    agg.first_seen = c.int(i64) orelse return false;
+    agg.last_active = c.int(i64) orelse return false;
+    agg.messages = c.int(u64) orelse return false;
+    agg.words = c.int(u64) orelse return false;
+    agg.joins = c.int(u64) orelse return false;
+    agg.parts = c.int(u64) orelse return false;
+    agg.quits = c.int(u64) orelse return false;
+    agg.kicks = c.int(u64) orelse return false;
+    agg.topic_changes = c.int(u64) orelse return false;
+    for (&agg.hours) |*h| h.* = c.int(u64) orelse return false;
+    for (&agg.heatmap) |*row| for (row) |*cell| {
+        cell.* = c.int(u64) orelse return false;
+    };
+    const days_len = c.int(u32) orelse return false;
+    var d: u32 = 0;
+    while (d < days_len) : (d += 1) {
+        const day = c.int(i64) orelse return false;
+        const msgs = c.int(u64) orelse return false;
+        agg.days.append(self.allocator, .{ .day = day, .messages = msgs }) catch return false;
+    }
+    const users_len = c.int(u32) orelse return false;
+    var u: u32 = 0;
+    while (u < users_len) : (u += 1) {
+        const nick = c.bytes() orelse return false;
+        const messages = c.int(u64) orelse return false;
+        const words = c.int(u64) orelse return false;
+        const questions = c.int(u64) orelse return false;
+        const exclamations = c.int(u64) orelse return false;
+        const urls = c.int(u64) orelse return false;
+        const last_active = c.int(i64) orelse return false;
+        const monologue = c.int(u32) orelse return false;
+        if (self.userOf(agg, nick)) |usr| {
+            usr.messages = messages;
+            usr.words = words;
+            usr.questions = questions;
+            usr.exclamations = exclamations;
+            usr.urls = urls;
+            usr.last_active = last_active;
+            usr.monologue = monologue;
+        }
+    }
+    const words_len = c.int(u32) orelse return false;
+    var wi: u32 = 0;
+    while (wi < words_len) : (wi += 1) {
+        const word = c.bytes() orelse return false;
+        const cnt = c.int(u64) orelse return false;
+        const key = self.allocator.dupe(u8, word) catch return false;
+        agg.word_freq.put(self.allocator, key, cnt) catch self.allocator.free(key);
+    }
+    const topics_len = c.int(u32) orelse return false;
+    var ti: u32 = 0;
+    while (ti < topics_len) : (ti += 1) {
+        const ts = c.int(i64) orelse return false;
+        const setter = c.bytes() orelse return false;
+        const topic = c.bytes() orelse return false;
+        const s = self.allocator.dupe(u8, setter) catch return false;
+        const t = self.allocator.dupe(u8, topic) catch {
+            self.allocator.free(s);
+            return false;
+        };
+        agg.topics.append(self.allocator, .{ .ts = ts, .setter = s, .topic = t }) catch {
+            self.allocator.free(s);
+            self.allocator.free(t);
+        };
+    }
+    return true;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 test "records messages, words, hour buckets, and per-user behaviour metrics" {
@@ -653,4 +850,88 @@ test "writeJsonString escapes control + quote characters" {
     defer aw.deinit();
     try writeJsonString(&aw.writer, "a\"b\n\t<\\>");
     try std.testing.expectEqualStrings("\"a\\\"b\\n\\t<\\\\>\"", aw.written());
+}
+
+test "renderChannel emits valid JSON matching the dashboard contract" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    const ts: i64 = 1_700_000_000_000;
+    s.recordMessage("#root", "kain", "orochi mesh build channel", ts);
+    s.recordMessage("#root", "trev", "voice and video work", ts);
+    s.recordEvent("#root", .join, ts);
+    s.recordTopic("#root", "kain", "build channel", ts);
+
+    const agg = s.channels.get("#root").?;
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    s.renderChannel(&aw.writer, agg, ts);
+
+    // Must parse as JSON and carry the shape the SolidJS app expects.
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("#root", root.get("channel").?.string);
+    const totals = root.get("totals").?.object;
+    try std.testing.expectEqual(@as(i64, 2), totals.get("messages").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), totals.get("joins").?.integer);
+    try std.testing.expectEqual(@as(usize, 24), root.get("hours").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 7), root.get("heatmap").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 24), root.get("heatmap").?.array.items[0].array.items.len);
+    try std.testing.expectEqual(@as(usize, 2), root.get("top_users").?.array.items.len);
+    try std.testing.expect(root.get("top_words").?.array.items.len > 0);
+    try std.testing.expect(root.get("records").?.object.get("peak_hour") != null);
+    try std.testing.expectEqual(@as(usize, 1), root.get("topics").?.array.items.len);
+}
+
+test "snapshot serialize/deserialize round-trips the full aggregate" {
+    var s = ChanStats.init(std.testing.allocator);
+    defer s.deinit();
+    const ts: i64 = 1_700_000_000_000;
+    s.recordMessage("#root", "kain", "orochi mesh build channel?", ts);
+    s.recordMessage("#root", "kain", "shipping it!!", ts);
+    s.recordMessage("#root", "trev", "voice and video http://example.com", ts);
+    s.recordEvent("#root", .join, ts);
+    s.recordEvent("#root", .part, ts);
+    s.recordTopic("#root", "kain", "build channel", ts);
+    s.recordMessage("#ops", "trev", "second channel here", ts);
+
+    // Serialize in memory, then load into a fresh instance.
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    try serialize(&s, &aw.writer);
+
+    var restored = ChanStats.init(std.testing.allocator);
+    defer restored.deinit();
+    try std.testing.expect(deserialize(&restored, aw.written()));
+
+    try std.testing.expectEqual(s.channels.count(), restored.channels.count());
+    const a = restored.channels.get("#root").?;
+    const b = s.channels.get("#root").?;
+    try std.testing.expectEqual(b.messages, a.messages);
+    try std.testing.expectEqual(b.words, a.words);
+    try std.testing.expectEqual(b.joins, a.joins);
+    try std.testing.expectEqual(b.parts, a.parts);
+    try std.testing.expectEqual(b.topic_changes, a.topic_changes);
+    try std.testing.expectEqual(b.first_seen, a.first_seen);
+    try std.testing.expectEqual(b.last_active, a.last_active);
+    try std.testing.expectEqual(b.users.count(), a.users.count());
+
+    const k = a.users.get("kain").?;
+    try std.testing.expectEqual(@as(u64, 2), k.messages);
+    try std.testing.expectEqual(@as(u64, 1), k.questions);
+    try std.testing.expectEqual(@as(u64, 2), k.exclamations);
+    const tr = a.users.get("trev").?;
+    try std.testing.expectEqual(@as(u64, 1), tr.urls);
+
+    try std.testing.expect(a.word_freq.get("orochi") != null);
+    try std.testing.expectEqual(@as(usize, 1), a.topics.items.len);
+    try std.testing.expectEqualStrings("build channel", a.topics.items[0].topic);
+    try std.testing.expectEqualStrings("kain", a.topics.items[0].setter);
+    try std.testing.expect(restored.channels.get("#ops") != null);
+
+    // A truncated/garbage blob must be rejected without corrupting state.
+    var empty = ChanStats.init(std.testing.allocator);
+    defer empty.deinit();
+    try std.testing.expect(!deserialize(&empty, "OCS1"));
+    try std.testing.expect(!deserialize(&empty, "XXXXXXXX"));
 }
