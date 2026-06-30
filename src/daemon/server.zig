@@ -8314,6 +8314,11 @@ pub const LinuxServer = struct {
                 const line = std.fmt.bufPrint(&buf, ":{s}!{s}@{s} JOIN :{s}\r\n", .{ ch.nick, user, host, ch.channel }) catch return;
                 self.broadcastChannel(ch.channel, line, null) catch return;
                 if (ch.status != 0) self.emitRemoteModeDiff(ch.channel, ch.nick, server_host, 0, ch.status, ch.setter);
+                // A remote oper carries no grantable channel status, so the diff
+                // above won't show its `*`. Announce the derived +Y when the grant
+                // is already known at join time (the grant-apply path covers the
+                // reverse order, where the grant lands after the JOIN).
+                if (self.isOverrideOper(ch.nick)) self.emitOperPrefixMode(ch.channel, ch.nick, true);
             },
             .parted => {
                 // Echo artifact: the user is still connected here — a fabricated
@@ -8367,6 +8372,62 @@ pub const LinuxServer = struct {
         var line_buf: [600]u8 = undefined;
         const line = std.fmt.bufPrint(&line_buf, ":{s} MODE {s} {s}{s}\r\n", .{ source, channel, modes_buf[0..ml], params_buf[0..pl] }) catch return;
         self.broadcastChannel(channel, line, null) catch {};
+    }
+
+    /// Announce the derived network-operator `*` prefix to a channel's LOCAL
+    /// members as a synthetic `:server MODE #chan +Y <nick>` (or `-Y`). The `*`
+    /// (+Y) is render-derived from oper status — it is never a stored channel
+    /// mode and never rides a JOIN — so already-present clients otherwise only
+    /// learn it on a fresh NAMES. This pushes the change live the instant oper
+    /// status appears/disappears. Only this node's local members are notified;
+    /// peers converge independently when they apply the same oper grant.
+    fn emitOperPrefixMode(self: *LinuxServer, channel: []const u8, nick: []const u8, add: bool) void {
+        var buf: [600]u8 = undefined;
+        const sign: u8 = if (add) '+' else '-';
+        const line = std.fmt.bufPrint(&buf, ":{s} MODE {s} {c}{c} {s}\r\n", .{
+            self.serverName(), channel, sign, chanmode.oper_mode_letter, nick,
+        }) catch return;
+        self.broadcastChannel(channel, line, null) catch {};
+    }
+
+    /// True if `nick` is a member of `channel` — whether as a local-world member
+    /// or a remote member projected from an established peer roster. Mirrors the
+    /// dual lookup `remoteMemberChannels` relies on; caller holds world.lockWrite.
+    fn nickInChannelAnywhere(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
+        if (self.world.findNick(nick)) |wid| {
+            if (self.world.isMember(channel, wid)) return true;
+        }
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const members = blk: {
+                    if (slot.value.s2s_secured) |link| {
+                        if (link.established()) break :blk link.channelMembers(channel);
+                    } else if (slot.value.s2s) |link| {
+                        if (link.established()) break :blk link.channelMembers(channel);
+                    }
+                    continue;
+                };
+                for (members) |rm| {
+                    if (std.ascii.eqlIgnoreCase(rm.nick, nick)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Push the network-operator `*` prefix change for `nick` to every channel it
+    /// belongs to, so nicklists update the moment an oper grant is applied or
+    /// revoked rather than only on the next NAMES — the gap that left a remote
+    /// oper showing un-starred after a mesh relink re-projected it. Caller holds
+    /// world.lockWrite (cross-reactor roster read). Best-effort.
+    fn announceOperPrefixAllChannels(self: *LinuxServer, nick: []const u8, add: bool) void {
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            if (self.nickInChannelAnywhere(cv.name, nick)) {
+                self.emitOperPrefixMode(cv.name, nick, add);
+            }
+        }
     }
 
     fn emitRemoteChannelModeFlags(self: *LinuxServer, channel: []const u8, remote_name: []const u8, prev: u16, now: u16) void {
@@ -9155,6 +9216,12 @@ pub const LinuxServer = struct {
             const mconn = self.connFor(mid) orelse continue;
             const body = if (mconn.session.hasCap(.extended_join)) ext else plain;
             try self.deliverTimed(mid, tag, body);
+        }
+        // A joining network operator carries the derived `*` prefix, which the
+        // bare JOIN above cannot convey. Announce the synthetic +Y so existing
+        // members' nicklists show the star immediately, not only on next NAMES.
+        if (conn.session.hasPriv(.oper_override)) {
+            self.emitOperPrefixMode(channel, conn.session.displayName(), true);
         }
     }
 
@@ -18742,10 +18809,19 @@ pub const LinuxServer = struct {
             if (fields.privilege_bits == 0) {
                 // Revocation tombstone: drop oper from any connected sessions.
                 self.deElevateSessions(fields.account);
+                // Clear the derived `*` prefix from this nick's channels.
+                self.announceOperPrefixAllChannels(fields.account, false);
             } else {
                 // Retroactively elevate any already-connected sessions of this
                 // account so recognition is immediate, not deferred to next login.
                 self.elevateGrantedSessions(fields.account);
+                // Push the derived `*` (+Y) prefix to every channel this nick is
+                // in — local OR remote-projected — so a relink that re-applies a
+                // remote oper's grant restores the star without a fresh NAMES.
+                // Gated on the privilege that actually confers the `*`.
+                if (oper_mod.OperPrivileges.fromBits(fields.privilege_bits).has(.oper_override)) {
+                    self.announceOperPrefixAllChannels(fields.account, true);
+                }
             }
         }
         return accepted;
@@ -19015,6 +19091,10 @@ pub const LinuxServer = struct {
         }
         const msg = try formatMessage(&msg_buf, prefix, "MODE", &.{ nick, modes_buf[0..ml] }, null);
         try appendToConn(conn, msg);
+        // Surface the derived network-operator `*` to other members of this
+        // oper's channels (the `*`/+Y never rides the user MODE above, which only
+        // carries umodes). Skipped for opers without the override privilege.
+        if (conn.session.hasPriv(.oper_override)) self.announceOperPrefixAllChannels(nick, true);
     }
 
     /// When `[oper] auto_override` is set, auto-enable the +j override umode for an
@@ -28673,6 +28753,61 @@ test "threaded server: STATS m reports per-command usage to an oper" {
     admin.reset();
     try writeAllFd(fd_admin, "STATS i\r\n");
     try recvUntil(&admin, " 219 Oper i ", 200);
+}
+
+test "threaded server: a joining network operator announces the derived +Y prefix to existing members" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-opery-join.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("admin", "correcthorse", &scratch);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    // A regular member joins first (and so founds the channel).
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var alice = LiveClient{ .fd = fd_a };
+    try writeAllFd(fd_a, "NICK Alice\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&alice, " 001 Alice ", 200);
+    try writeAllFd(fd_a, "JOIN #ops\r\n");
+    try recvUntil(&alice, "JOIN", 200);
+
+    // A network operator (oper_override via the admin grant) joins second.
+    const fd_o = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_o);
+    var oper = LiveClient{ .fd = fd_o };
+    try saslAdminPrelude(fd_o);
+    try writeAllFd(fd_o, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try recvUntil(&oper, " 381 Oper ", 200);
+
+    // The bare JOIN cannot carry the derived `*`; the server must follow it with a
+    // synthetic MODE +Y so Alice's nicklist shows the star without a fresh NAMES.
+    alice.reset();
+    try writeAllFd(fd_o, "JOIN #ops\r\n");
+    try recvUntil(&alice, "MODE #ops +Y Oper", 200);
 }
 
 test "server services replay restores registered channels mlocks akicks and wards" {
