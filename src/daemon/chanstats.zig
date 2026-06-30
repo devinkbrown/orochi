@@ -21,6 +21,7 @@ const max_days_kept: usize = 60;
 const max_topics_kept: usize = 40;
 const top_users_emitted: usize = 30;
 const top_words_emitted: usize = 40;
+const spark_days: usize = 14; // recent-daily sparkline length in index.json
 const min_word_len: usize = 4;
 const max_word_len: usize = 32;
 
@@ -295,7 +296,20 @@ pub const ChanStats = struct {
                 agg.messages, agg.users.count(), @divFloor(agg.last_active, 1000),
             }) catch return;
             writeJsonString(iw, currentTopic(agg)) catch return;
-            iw.writeByte('}') catch return;
+            // Compact recent-activity sparkline: the last up-to-14 daily message
+            // counts (oldest→newest). Lets the index render per-card trends with
+            // no extra fetches. days.items is chronological (see bumpDay).
+            iw.writeAll(",\"spark\":[") catch return;
+            {
+                const days = agg.days.items;
+                const start = if (days.len > spark_days) days.len - spark_days else 0;
+                var di = start;
+                while (di < days.len) : (di += 1) {
+                    if (di != start) iw.writeByte(',') catch return;
+                    iw.print("{d}", .{days[di].messages}) catch return;
+                }
+            }
+            iw.writeAll("]}") catch return;
         }
         iw.writeAll("]}") catch return;
         writeFileAtomicIo(io, dir_path, "index.json", iaw.written());
