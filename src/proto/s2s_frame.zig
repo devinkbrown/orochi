@@ -180,27 +180,41 @@ pub const Decoder = struct {
     /// The returned payload is owned by the decoder and remains valid until the
     /// next successful `next`, `decode`, `reset`, or `deinit` call.
     pub fn next(self: *Decoder) DecodeError!?Frame {
-        if (self.accumulator.items.len < header_len) return null;
+        // Loop so an unknown/newer frame tag is skipped (not fatal) and we go
+        // on to return the next KNOWN frame in the buffer.
+        while (true) {
+            if (self.accumulator.items.len < header_len) return null;
 
-        const frame_type = FrameType.fromTag(self.accumulator.items[0]) orelse {
-            return error.MalformedFrame;
-        };
-        const payload_len_u32 = std.mem.readInt(u32, self.accumulator.items[1..][0..length_len], endian);
-        const payload_len: usize = @intCast(payload_len_u32);
-        if (payload_len > std.math.maxInt(usize) - header_len) return error.OversizeFrame;
+            const tag_byte = self.accumulator.items[0];
+            const payload_len_u32 = std.mem.readInt(u32, self.accumulator.items[1..][0..length_len], endian);
+            const payload_len: usize = @intCast(payload_len_u32);
+            if (payload_len > std.math.maxInt(usize) - header_len) return error.OversizeFrame;
 
-        const total = header_len + payload_len;
-        if (total > self.max_frame_size) return error.OversizeFrame;
-        if (self.accumulator.items.len < total) return null;
+            const total = header_len + payload_len;
+            if (total > self.max_frame_size) return error.OversizeFrame;
+            if (self.accumulator.items.len < total) return null;
 
-        try self.payload_buf.resize(self.allocator, payload_len);
-        @memcpy(self.payload_buf.items, self.accumulator.items[header_len..total]);
-        self.discardPrefix(total);
+            const frame_type = FrameType.fromTag(tag_byte) orelse {
+                // Unknown/newer frame tag. The frame is still length-delimited
+                // (and bounded by max_frame_size above), so skip it cleanly
+                // instead of tearing the whole secured link down — that
+                // teardown is what flaps the mesh during a rolling upgrade.
+                // Emitting any new frame type stays handshake-cap-gated, so a
+                // peer only sends a type it knows the far side understands;
+                // this just makes the receiver forward-tolerant.
+                self.discardPrefix(total);
+                continue;
+            };
 
-        return .{
-            .frame_type = frame_type,
-            .payload = self.payload_buf.items,
-        };
+            try self.payload_buf.resize(self.allocator, payload_len);
+            @memcpy(self.payload_buf.items, self.accumulator.items[header_len..total]);
+            self.discardPrefix(total);
+
+            return .{
+                .frame_type = frame_type,
+                .payload = self.payload_buf.items,
+            };
+        }
     }
 
     /// Call at EOF when no more bytes are expected.
@@ -364,15 +378,53 @@ test "truncated handled" {
     try testing.expectError(error.Truncated, decoder.finish());
 }
 
-test "malformed type rejected" {
+test "unknown frame type is skipped, not fatal (forward compatibility)" {
     const allocator = testing.allocator;
-    var encoded = [_]u8{ 0xff, 0, 0, 0, 0 };
 
-    var decoder = Decoder.init(allocator, default_max_frame_size);
-    defer decoder.deinit();
+    // A lone unknown tag (0xff, zero payload) is skipped: next() drains it and
+    // reports "no complete known frame" rather than tearing the link down.
+    {
+        var lone = [_]u8{ 0xff, 0, 0, 0, 0 };
+        var decoder = Decoder.init(allocator, default_max_frame_size);
+        defer decoder.deinit();
+        try decoder.feed(&lone);
+        try testing.expect((try decoder.next()) == null);
+    }
 
-    try decoder.feed(&encoded);
-    try testing.expectError(error.MalformedFrame, decoder.next());
+    // An unknown frame WITH a payload, sandwiched between two known frames:
+    // both known frames must still decode in order, the unknown one skipped.
+    {
+        var buf: [256]u8 = undefined;
+        var decoder = Decoder.init(allocator, default_max_frame_size);
+        defer decoder.deinit();
+
+        const a = try encode(.PING, "first", &buf);
+        try decoder.feed(a);
+        // Unknown tag 0xF0 with a 3-byte payload, hand-framed.
+        var unknown = [_]u8{ 0xF0, 3, 0, 0, 0, 'x', 'y', 'z' };
+        try decoder.feed(&unknown);
+        var buf2: [256]u8 = undefined;
+        const c = try encode(.PONG, "third", &buf2);
+        try decoder.feed(c);
+
+        const f1 = (try decoder.next()).?;
+        try testing.expectEqual(FrameType.PING, f1.frame_type);
+        try testing.expectEqualSlices(u8, "first", f1.payload);
+        const f2 = (try decoder.next()).?;
+        try testing.expectEqual(FrameType.PONG, f2.frame_type);
+        try testing.expectEqualSlices(u8, "third", f2.payload);
+        try testing.expect((try decoder.next()) == null);
+    }
+
+    // An unknown frame whose length exceeds max_frame_size is still rejected as
+    // oversize (the bound is enforced before the skip).
+    {
+        var oversize = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff };
+        var decoder = Decoder.init(allocator, 64);
+        defer decoder.deinit();
+        try decoder.feed(&oversize);
+        try testing.expectError(error.OversizeFrame, decoder.next());
+    }
 }
 
 test "encode rejects undersized output buffer" {

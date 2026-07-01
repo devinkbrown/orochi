@@ -620,7 +620,13 @@ fn writeFileAtomicIo(io: std.Io, dir: []const u8, name: []const u8, bytes: []con
 // served data; harmless if nginx serves it (same public aggregate, binary form).
 
 const snapshot_name = ".chanstats.snapshot";
-const snapshot_magic = "OCS1";
+// Bumped OCS1 → OCS2 to add an explicit format-version byte after the magic.
+// Old OCS1 files fail the magic check and load as empty (analytics-only, so a
+// one-time reset is harmless). Future in-place layout changes bump
+// `snapshot_version`, not the magic — a reader can then distinguish "wrong
+// file" (bad magic) from "newer format" (good magic, higher version).
+const snapshot_magic = "OCS2";
+const snapshot_version: u8 = 1;
 
 fn putInt(w: *std.Io.Writer, comptime T: type, v: T) std.Io.Writer.Error!void {
     var b: [@sizeOf(T)]u8 = undefined;
@@ -665,6 +671,7 @@ pub fn saveSnapshot(self: *ChanStats, io: std.Io, dir_path: []const u8) void {
 /// Split from the file write so the round-trip can be unit-tested in memory.
 fn serialize(self: *ChanStats, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(snapshot_magic);
+    try putInt(w, u8, snapshot_version);
     try putInt(w, u32, @intCast(self.channels.count()));
     var it = self.channels.iterator();
     while (it.next()) |e| try snapChannel(w, e.value_ptr.*);
@@ -719,8 +726,10 @@ pub fn loadSnapshot(self: *ChanStats, io: std.Io, dir_path: []const u8) void {
 /// Restore channels from an in-memory snapshot blob. Returns false on a
 /// missing/short/corrupt blob; a partial parse keeps already-restored channels.
 fn deserialize(self: *ChanStats, data: []const u8) bool {
-    if (data.len < 8 or !std.mem.eql(u8, data[0..4], snapshot_magic)) return false;
+    if (data.len < 4 or !std.mem.eql(u8, data[0..4], snapshot_magic)) return false;
     var c = Cursor{ .b = data, .i = 4 };
+    const version = c.int(u8) orelse return false;
+    if (version != snapshot_version) return false; // unknown format → start empty
     const ccount = c.int(u32) orelse return false;
     var i: u32 = 0;
     while (i < ccount) : (i += 1) {
@@ -968,6 +977,12 @@ test "snapshot serialize/deserialize round-trips the full aggregate" {
     // A truncated/garbage blob must be rejected without corrupting state.
     var empty = ChanStats.init(std.testing.allocator);
     defer empty.deinit();
-    try std.testing.expect(!deserialize(&empty, "OCS1"));
-    try std.testing.expect(!deserialize(&empty, "XXXXXXXX"));
+    try std.testing.expect(!deserialize(&empty, snapshot_magic)); // magic only, no version/count
+    try std.testing.expect(!deserialize(&empty, "XXXXXXXX")); // wrong magic
+    try std.testing.expect(!deserialize(&empty, "OCS1\x01\x00\x00\x00\x00")); // superseded magic
+    // Good magic but an unknown version byte → cleanly rejected (start empty).
+    try std.testing.expect(!deserialize(&empty, "OCS2\x02\x00\x00\x00\x00"));
+    // Good magic + correct version + zero channels → valid empty snapshot.
+    try std.testing.expect(deserialize(&empty, "OCS2\x01\x00\x00\x00\x00"));
+    try std.testing.expectEqual(@as(usize, 0), empty.channels.count());
 }

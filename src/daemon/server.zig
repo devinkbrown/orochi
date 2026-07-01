@@ -19391,8 +19391,11 @@ pub const LinuxServer = struct {
     /// and is not restored. No-op when no path is configured.
     fn persistGrants(self: *LinuxServer) void {
         if (self.config.oper_grants_path.len == 0) return;
-        var buf: [16 * 1024]u8 = undefined;
-        var len: usize = 0;
+        // Accumulate into a growable buffer: a fixed buffer silently dropped
+        // grants past its size, so a large network would fail to persist (and
+        // thus restore) the tail of its grant set.
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
         const now: u64 = self.grantNowU64();
         var it = self.oper_grants.liveIterator(now);
         while (it.next()) |g| {
@@ -19403,10 +19406,9 @@ pub const LinuxServer = struct {
             if (!std.mem.eql(u8, g.issuer_node, protocol_inventory.currentServerName())) continue;
             // Skip any field carrying a separator byte (keeps the format simple).
             if (hasSep(g.account) or hasSep(g.class) or hasSep(g.title)) continue;
-            const line = std.fmt.bufPrint(buf[len..], "{s}\t{d}\t{s}\t{s}\n", .{ g.account, g.privilege_bits, g.class, g.title }) catch break;
-            len += line.len;
+            out.print(self.allocator, "{s}\t{d}\t{s}\t{s}\n", .{ g.account, g.privilege_bits, g.class, g.title }) catch return;
         }
-        writeFileAbs(self.allocator, self.config.oper_grants_path, buf[0..len]);
+        writeFileAbs(self.allocator, self.config.oper_grants_path, out.items);
     }
 
     /// Reload persisted runtime grants at boot: re-mint each into the registry so
