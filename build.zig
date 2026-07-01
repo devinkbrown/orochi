@@ -82,7 +82,8 @@ pub fn build(b: *std.Build) void {
     // module source as `@import("build_info").git_commit`.
     const build_info = b.addOptions();
     build_info.addOption([]const u8, "git_commit", gitCommit(b));
-    mod.addImport("build_info", build_info.createModule());
+    const build_info_mod = build_info.createModule();
+    mod.addImport("build_info", build_info_mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -189,9 +190,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
-    // `zig build wasm` — compile the OPVOX/OPVIS codecs to a freestanding WASM
-    // module for the in-browser client (#11/#32). Pure-integer + allocation-free,
-    // so it needs no WASI/libc; the JS side drives it through linear memory.
+    // `zig build wasm` — compile the KaguraVox/KaguraVis codecs to a freestanding
+    // WASM module for the in-browser client (#11/#32). Pure-integer +
+    // allocation-free, so it needs no WASI/libc; the JS side drives it through
+    // linear memory.
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_mod = b.createModule(.{
         .root_source_file = b.path("src/wasm/kagura_wasm.zig"),
@@ -202,10 +204,10 @@ pub fn build(b: *std.Build) void {
     // The codecs depend only on std, so expose them as standalone wasm-targeted
     // modules (the full orochi root pulls in io_uring/sockets and won't build
     // freestanding).
-    const wasm_adpcm = b.createModule(.{ .root_source_file = b.path("src/substrate/opvox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
-    const wasm_opvis = b.createModule(.{ .root_source_file = b.path("src/substrate/opvis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
-    wasm_mod.addImport("opvox_adpcm", wasm_adpcm);
-    wasm_mod.addImport("opvis_delta", wasm_opvis);
+    const wasm_kaguravox = b.createModule(.{ .root_source_file = b.path("src/substrate/kaguravox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
+    const wasm_kaguravis = b.createModule(.{ .root_source_file = b.path("src/substrate/kaguravis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
+    wasm_mod.addImport("kaguravox_adpcm", wasm_kaguravox);
+    wasm_mod.addImport("kaguravis_delta", wasm_kaguravis);
     const wasm = b.addExecutable(.{ .name = "kagura", .root_module = wasm_mod });
     wasm.entry = .disabled; // a library of exports, not an entry-point program
     wasm.rdynamic = true; // keep the `export fn`s in the final module
@@ -281,6 +283,20 @@ pub fn build(b: *std.Build) void {
 
     // `zig build release` — one-shot optimized, stripped daemon (ReleaseFast)
     // installed to zig-out/bin, independent of the default step's optimize mode.
+    //
+    // The daemon CORE gets its own ReleaseFast module here. Importing the shared
+    // `mod` would inherit the default -Doptimize (Debug when unset) — the shim
+    // main.zig would be ReleaseFast wrapping a Debug daemon core, which is
+    // exactly the silent mis-deploy this step exists to prevent. (Shipped that
+    // way twice before this was caught: the 351 VERSION line said `,Debug`.)
+    const release_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = needs_libc,
+        .strip = true,
+    });
+    release_mod.addImport("build_info", build_info_mod);
     const release_step = b.step("release", "Build an optimized, stripped daemon (ReleaseFast)");
     const release_exe = b.addExecutable(.{
         .name = "orochi",
@@ -290,7 +306,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .link_libc = needs_libc,
             .strip = true,
-            .imports = &.{.{ .name = "orochi", .module = mod }},
+            .imports = &.{.{ .name = "orochi", .module = release_mod }},
         }),
     });
     release_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
