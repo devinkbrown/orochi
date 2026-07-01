@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  check:
+    name: type-check (fast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig version
+      # `zig build check` semantically analyses the daemon without emitting a
+      # binary — the fastest signal that the tree still compiles.
+      - name: Semantic check
+        run: zig build check
+
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig version
+      - name: Build (debug)
+        run: zig build
+      # Threaded server tests need loopback sockets + io_uring; when a runner
+      # lacks either the tests SkipZigTest rather than fail, so this stays green
+      # on any hosted runner while exercising everything available.
+      - name: Run test suite
+        run: zig build test
+
+  release:
+    name: release build (x86_64-linux-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # The static-musl ReleaseFast binary is the production artifact — verify it
+      # links and produces a stripped executable on every change.
+      - name: Build static musl release
+        run: zig build release -Dtarget=x86_64-linux-musl
+      - name: Verify artifact
+        run: |
+          file zig-out/bin/orochi
+          test -x zig-out/bin/orochi
+      - name: Upload daemon binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: orochi-x86_64-linux-musl
+          path: zig-out/bin/orochi
+          if-no-files-found: error
+          retention-days: 14

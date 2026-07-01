@@ -11090,6 +11090,26 @@ pub const LinuxServer = struct {
             }
         }
 
+        // "make rDNS live" — fold the forward-confirmed reverse-DNS name (from the
+        // resolver cache; opers/self only) into the free-form RPL_WHOISSPECIAL (320)
+        // line. 320 is a trailing param so the space-bearing text is safe, and the
+        // name NEVER feeds the privacy-preserving public cloak.
+        var special_buf: [560]u8 = undefined;
+        var rdns_buf: [cloak.max_cloak_len]u8 = undefined;
+        var special: ?[]const u8 = geo_text;
+        if (conn.session.isOper() or conn == tconn) {
+            if (self.config.rdns) |res| {
+                if (tconn.peer_addr) |paddr| {
+                    if (res.lookup(paddr, &rdns_buf)) |name| {
+                        special = if (geo_text) |g|
+                            (std.fmt.bufPrint(&special_buf, "rDNS {s} · {s}", .{ name, g }) catch geo_text)
+                        else
+                            (std.fmt.bufPrint(&special_buf, "rDNS {s}", .{name}) catch null);
+                    }
+                }
+            }
+        }
+
         const subject = whois.WhoisSubject{
             // Show the target's nick in the exact case they registered, not the
             // case the requester happened to type in the WHOIS command.
@@ -11109,7 +11129,7 @@ pub const LinuxServer = struct {
                 const signon_unix_ms = platform.realtimeMillis() - age_ms;
                 break :blk @intCast(@max(@as(i64, 0), @divTrunc(signon_unix_ms, 1000)));
             },
-            .geo = geo_text,
+            .geo = special,
             // RPL_WHOISSERVER (312) trailing: this node's configured description
             // (`[network] description`), mirroring the per-server description a
             // remote node gossips for its own users.
