@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Daemon-owned native media transport: the live UDP leg for Orochi's own
-//! codec (OPVOX/OPVIS). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
+//! codec (KaguraVox/KaguraVis). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
 //! carries `kagura_frame` datagrams instead of RTP, and forwards them through a
 //! per-channel `NativeMediaLink` (stream_id → publisher → recipients).
 //!
@@ -33,7 +33,7 @@ pub const max_datagram = media_socket.max_datagram;
 
 /// Max participants per native call (inline forward fan-out bound).
 ///
-/// The native (OPVOX/OPVIS) leg is for point-to-point / small calls; group
+/// The native (KaguraVox/KaguraVis) leg is for point-to-point / small calls; group
 /// sessions go through the SFU `Room` (ceiling 256, pointer-indirected per room).
 /// This `Link` is stored BY VALUE in a rehashing map, so its inline ceiling stays
 /// at 64 to keep the per-entry size (and rehash memcpy cost) bounded; the
@@ -382,7 +382,7 @@ fn opframe(stream_id: u32, buf: []u8) []const u8 {
         .sequence = 1,
         .timestamp = 0,
         .keyframe = true,
-        .codec = .opvox_audio,
+        .codec = .kaguravox_audio,
         .payload = &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF },
     }, buf) catch unreachable;
     return buf[0..n];
@@ -523,7 +523,7 @@ test "NativeMediaTransport: setSelection drops higher layers over the wire" {
         .sequence = 1,
         .timestamp = 0,
         .keyframe = false,
-        .codec = .opvis_video,
+        .codec = .kaguravis_video,
         .payload = &[_]u8{ 1, 2, 3 },
     }, &fbuf) catch unreachable;
     src.sendTo(server_addr, fbuf[0..hi]);

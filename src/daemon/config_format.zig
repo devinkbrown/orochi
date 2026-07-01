@@ -214,7 +214,7 @@ pub const Config = struct {
         s2s: u16 = 0,
         /// UDP port for the media (SFU) transport plane; 0 = ephemeral.
         media: u16 = 0,
-        /// UDP port for the native media transport (our OPVOX/OPVIS codec leg);
+        /// UDP port for the native media transport (our KaguraVox/KaguraVis codec leg);
         /// 0 = ephemeral.
         native_media: u16 = 0,
         /// IP advertised to clients as the server media (ICE) candidate.
@@ -353,7 +353,7 @@ pub const Config = struct {
         max_frame_bytes: u64 = 64 * 1024,
         reorder_window_frames: u32 = kagura_frame.default_reorder_window_frames,
         max_participants: u32 = @intCast(media_room.default_max_participants),
-        /// Require HMAC-tagged native OPVOX/OPVIS datagrams. Defaults off until
+        /// Require HMAC-tagged native KaguraVox/KaguraVis datagrams. Defaults off until
         /// clients implement the matching Kagura-frame tag contract.
         native_media_require_mac: bool = false,
         /// Relay browser media datagrams (binary WebSocket frames) between a

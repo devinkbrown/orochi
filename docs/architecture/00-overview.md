@@ -19,9 +19,9 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | Local world | `src/daemon/world.zig` | Nick ownership, channel membership, topics, modes, bans, invitations, RCU mirrors, local-only state | `src/daemon/world.zig:1`, `src/daemon/world.zig:193`, `src/daemon/world.zig:218` |
 | SerpentRegistry modules | `src/daemon/registry.zig`, `src/daemon/modules/manifest.zig`, `src/daemon/modules/*.zig` | Comptime module metadata, validated command/hook/cap tables, gated command dispatch, MODULES/COMMANDS introspection | `src/daemon/registry.zig:1`, `src/daemon/modules/manifest.zig:22`, `src/daemon/registry.zig:554` |
 | Reactor/threading | `src/daemon/server.zig`, `src/daemon/reactor_pool.zig`, `src/daemon/reactor_fabric.zig`, `src/substrate/reactor.zig` | io_uring completion loop, per-reactor connection slabs, optional worker pool, cross-shard delivery fabric, deterministic time seam | `src/daemon/server.zig:1229`, `src/daemon/reactor_pool.zig:1`, `src/daemon/reactor_fabric.zig:1`, `src/substrate/reactor.zig:1` |
-| Media | `src/substrate/suimyaku/media.zig`, `src/daemon/media_room.zig`, `src/daemon/media_plane.zig`, `src/daemon/native_media_transport.zig`, `src/daemon/media_bridge.zig` | SFU participant model, per-channel rooms, RTP/STUN media plane, native OPVOX/OPVIS UDP leg, cross-leg rewrap | `src/substrate/suimyaku/media.zig:1`, `src/daemon/media_room.zig:1`, `src/daemon/media_plane.zig:1`, `src/daemon/native_media_transport.zig:1`, `src/daemon/media_bridge.zig:1` |
+| Media | `src/substrate/suimyaku/media.zig`, `src/daemon/media_room.zig`, `src/daemon/media_plane.zig`, `src/daemon/native_media_transport.zig`, `src/daemon/media_bridge.zig` | SFU participant model, per-channel rooms, RTP/STUN media plane, native KaguraVox/KaguraVis UDP leg, cross-leg rewrap | `src/substrate/suimyaku/media.zig:1`, `src/daemon/media_room.zig:1`, `src/daemon/media_plane.zig:1`, `src/daemon/native_media_transport.zig:1`, `src/daemon/media_bridge.zig:1` |
 | Helix upgrade | `src/daemon/modules/upgrade.zig`, `src/daemon/server.zig`, `src/daemon/helix/live.zig`, `src/daemon/helix/handoff.zig` | UPGRADE command, sealed memfd arena, listener/session fd inheritance, successor adoption | `src/daemon/modules/upgrade.zig:1`, `src/daemon/server.zig:6070`, `src/daemon/helix/live.zig:1`, `src/daemon/helix/handoff.zig:1` |
-| OroWasm | `src/wasm/host/*`, `src/wasm/kagura_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser OPVOX/OPVIS exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/kagura_wasm.zig:1` |
+| OroWasm | `src/wasm/host/*`, `src/wasm/kagura_wasm.zig`, `src/wasm/browser_transport.zig` | Control-plane plugin interpreter/bridge/capabilities and browser KaguraVox/KaguraVis exports | `src/wasm/host/interp.zig:1`, `src/wasm/host/bridge.zig:1`, `src/wasm/kagura_wasm.zig:1` |
 
 ## End-to-end client request flow
 
@@ -46,7 +46,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | `src/proto/` | Protocol codecs/builders/inventory used by daemon and modules | `src/proto/protocol_inventory.zig:1`, `src/proto/protocol_inventory.zig:40` |
 | `src/substrate/` | Lower-level runtime primitives: reactor seam, transport stack, queues, EBR/HAMT, media transport helpers | `src/substrate/reactor.zig:1`, `src/substrate/transport_stack.zig:1`, `src/daemon/world_rcu.zig:9` |
 | `src/crypto/` | Cryptography namespace; not covered here | `src/root.zig:8` |
-| `src/wasm/` | OroWasm host, browser transport shim, and OPVOX/OPVIS browser exports | `src/root.zig:16`, `src/root.zig:21`, `src/wasm/kagura_wasm.zig:1` |
+| `src/wasm/` | OroWasm host, browser transport shim, and KaguraVox/KaguraVis browser exports | `src/root.zig:16`, `src/root.zig:21`, `src/wasm/kagura_wasm.zig:1` |
 
 ## Architecture index
 
@@ -55,7 +55,7 @@ This overview covers the client-facing daemon, local world, module dispatch, rea
 | [00-overview.md](00-overview.md) | System overview, request flow, source map, architecture index |
 | [01-reactor-threading.md](01-reactor-threading.md) | Ringlane/io_uring reactor, worker shards, world locking, live multithreading status |
 | [02-world-dispatch-modules.md](02-world-dispatch-modules.md) | `World`, preregistration dispatch, SerpentRegistry modules, hooks, introspection |
-| [03-media.md](03-media.md) | SFU/session model, media rooms, RTP/STUN plane, native OPVOX/OPVIS transport, WASM shims |
+| [03-media.md](03-media.md) | SFU/session model, media rooms, RTP/STUN plane, native KaguraVox/KaguraVis transport, WASM shims |
 | [04-upgrade-wasm.md](04-upgrade-wasm.md) | Helix UPGRADE handoff and OroWasm plugin host |
 | [mesh-s2s.md](mesh-s2s.md) | Mesh/S2S architecture; separate document |
 | [crypto.md](crypto.md) | Cryptography architecture; separate document |

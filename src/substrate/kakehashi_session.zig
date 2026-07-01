@@ -116,11 +116,11 @@ const testing = std.testing;
 
 test "session selects the shared codec and forwards to other legs" {
     var s = Session(8){};
-    // native client (opvox+opvis), webrtc/mobile client (opvox only) -> opvox common
-    try s.join(.{ .id = 1, .leg = .native, .codecs = &.{ .opvox, .opvis }, .stream_id = 100 });
-    try s.join(.{ .id = 2, .leg = .webrtc, .codecs = &.{.opvox}, .ssrc = 0xAAAA });
+    // native client (kaguravox+kaguravis), webrtc/mobile client (kaguravox only) -> kaguravox common
+    try s.join(.{ .id = 1, .leg = .native, .codecs = &.{ .kaguravox, .kaguravis }, .stream_id = 100 });
+    try s.join(.{ .id = 2, .leg = .webrtc, .codecs = &.{.kaguravox}, .ssrc = 0xAAAA });
     try testing.expect(s.transcodeFree());
-    try testing.expectEqual(Codec.opvox, s.codec.?);
+    try testing.expectEqual(Codec.kaguravox, s.codec.?);
 
     var out: [8]Egress = undefined;
     const n = s.forwardTargets(1, &out);
@@ -131,19 +131,19 @@ test "session selects the shared codec and forwards to other legs" {
 
 test "no shared codec => not transcode-free (server never transcodes)" {
     var s = Session(8){};
-    try s.join(.{ .id = 1, .leg = .native, .codecs = &.{.opvis} }); // video only
-    try s.join(.{ .id = 2, .leg = .webrtc, .codecs = &.{.opvox} }); // audio only
+    try s.join(.{ .id = 1, .leg = .native, .codecs = &.{.kaguravis} }); // video only
+    try s.join(.{ .id = 2, .leg = .webrtc, .codecs = &.{.kaguravox} }); // audio only
     try testing.expect(!s.transcodeFree());
     try testing.expect(s.codec == null);
 }
 
 test "leave recomputes the shared codec; Full at capacity" {
     var s = Session(2){};
-    try s.join(.{ .id = 1, .leg = .native, .codecs = &.{ .opvox, .opvis } });
-    try s.join(.{ .id = 2, .leg = .webrtc, .codecs = &.{.opvis} });
-    try testing.expectEqual(Codec.opvis, s.codec.?);
-    try testing.expectError(error.Full, s.join(.{ .id = 3, .leg = .native, .codecs = &.{.opvox} }));
+    try s.join(.{ .id = 1, .leg = .native, .codecs = &.{ .kaguravox, .kaguravis } });
+    try s.join(.{ .id = 2, .leg = .webrtc, .codecs = &.{.kaguravis} });
+    try testing.expectEqual(Codec.kaguravis, s.codec.?);
+    try testing.expectError(error.Full, s.join(.{ .id = 3, .leg = .native, .codecs = &.{.kaguravox} }));
     try testing.expect(s.leave(2));
-    try testing.expectEqual(Codec.opvox, s.codec.?); // only the native client's first shared codec remains
+    try testing.expectEqual(Codec.kaguravox, s.codec.?); // only the native client's first shared codec remains
     try testing.expect(!s.leave(99));
 }

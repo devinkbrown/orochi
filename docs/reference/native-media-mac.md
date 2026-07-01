@@ -2,7 +2,7 @@
 
 *The client contract Nexus and Ocean implement to authenticate each native media datagram end to end.*
 
-Orochi can authenticate each native (OPVOX/OPVIS) media datagram with a keyed MAC,
+Orochi can authenticate each native (KaguraVox/KaguraVis) media datagram with a keyed MAC,
 so a forged or tampered datagram is dropped before the SFU learns the sender,
 meters it, or forwards it. This document is the client contract that Nexus and Ocean
 implement for end-to-end coverage. Source of truth: `src/substrate/kagura_frame.zig`

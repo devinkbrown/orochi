@@ -27,8 +27,8 @@ The call has three layers:
   (already connected + registered over TLS IRC)
   C: JOIN #call
   C: MEDIA JOIN #call voice            ; (optional roster presence; see §7)
-  C: MEDIA OFFER #call opvox,opvis     ; codec list you support, comma-separated
-  S: :server NOTE MEDIA #call OFFER-ACK codecs=opvox,opvis fec=rs_block
+  C: MEDIA OFFER #call kaguravox,kaguravis     ; codec list you support, comma-separated
+  S: :server NOTE MEDIA #call OFFER-ACK codecs=kaguravox,kaguravis fec=rs_block
   S: :server NOTE MEDIA #call TRANSPORT ufrag=<U> pwd=<P> candidate=<IP>:<PORT> srtp=<B64>
      (other members also receive: NOTE MEDIA #call PROFILE codecs=... fec=...)
 
@@ -52,8 +52,8 @@ Keep the UDP socket you used for the STUN check; **send media from the same loca
 All server→client media lines have the form `:<server> NOTE MEDIA <#chan> <VERB> <args>`.
 
 ### MEDIA OFFER
-`MEDIA OFFER <#chan> <codec[,codec...]>` — codecs from `{opvox, opvis, raw}` (opvox = audio,
-opvis = video). The server intersects your list with its SFU set (`opvox,opvis`) and replies:
+`MEDIA OFFER <#chan> <codec[,codec...]>` — codecs from `{kaguravox, kaguravis, raw}` (kaguravox = audio,
+kaguravis = video). The server intersects your list with its SFU set (`kaguravox,kaguravis`) and replies:
 
 | Reply | Recipient | Meaning |
 | --- | --- | --- |
@@ -228,7 +228,7 @@ the SSRC the peers see is yours — demux incoming media by SSRC.
 Read datagrams on your UDP socket. They are SRTP packets from other participants (relayed
 verbatim), plus your STUN keepalive responses. Demux: `byte0 & 0xC0 == 0` ⇒ STUN, else
 SRTP. For SRTP, look at the SSRC ([8..12]) to pick the sending peer, decrypt with §4.4, feed
-the payload to your opvox/opvis decoder.
+the payload to your kaguravox/kaguravis decoder.
 
 ---
 
@@ -249,7 +249,7 @@ SPEAKING <#chan> [voice|video|screen]` change your state and broadcast
 - [ ] Open a UDP socket; send a STUN Binding Request (USERNAME `ufrag:you`, integrity = pwd,
       fingerprint); confirm `0x0101` response. Repeat every ~15 s as keepalive.
 - [ ] KDF the srtp key → cipher/auth/salt session keys (§4.1).
-- [ ] Capture audio → opvox encode → RTP header (random SSRC, ++seq, ts) → SRTP protect
+- [ ] Capture audio → kaguravox encode → RTP header (random SSRC, ++seq, ts) → SRTP protect
       (§4.2–4.3) → sendto the candidate from the **same** UDP local port.
 - [ ] On recv: demux STUN vs SRTP; SRTP → verify+decrypt (§4.4) → decode by SSRC → play.
 - [ ] On hang-up: `MEDIA LEAVE #call` (frees your endpoint + the call's key when last out).

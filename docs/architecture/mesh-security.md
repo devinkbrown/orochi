@@ -182,7 +182,7 @@ re-forwarded.
 ## Media
 
 The WebRTC media plane (`media_plane.zig`) is authenticated by STUN
-MESSAGE-INTEGRITY over the negotiated ICE credentials. The native OPVOX/OPVIS
+MESSAGE-INTEGRITY over the negotiated ICE credentials. The native KaguraVox/KaguraVis
 plane (`kagura` codec over UDP) uses trust-on-first-use address binding: the
 first datagram for a `stream_id` binds the publisher's source address, and later
 datagrams from a different address are dropped.

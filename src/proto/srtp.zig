@@ -161,7 +161,7 @@ test "protect then unprotect round-trips the RTP packet" {
         hexBytes("0EC675AD498AFEEBB6960B3AABE6"),
     );
     // RTP: version2, PT96, seq=0x1234, ts, ssrc=0xCAFEBABE, then payload.
-    const rtp = hexBytes("8060123400000064CAFEBABE") ++ "opvox-audio-frame".*;
+    const rtp = hexBytes("8060123400000064CAFEBABE") ++ "kaguravox-audio-frame".*;
     var protected: [rtp.len + auth_tag_len]u8 = undefined;
     const srtp = try protect(keys, 0, &rtp, &protected);
     try testing.expectEqual(@as(usize, rtp.len + auth_tag_len), srtp.len);

@@ -78,19 +78,19 @@ prefer the active kagura headers/source plus active LADON module inventory.
 
 Important actual module names and capabilities:
 
-- OPVOX audio: `audio`, `psych`, `bwe`, `tns`, `pns`, `pvq`, `pitch`, `ns2`,
+- KaguraVox audio: `audio`, `psych`, `bwe`, `tns`, `pns`, `pvq`, `pitch`, `ns2`,
   `dtx`, `aec2`, `epsc`, `sam`, `separator`, `opfield`
-- OPVIS video: `video`, `saliency`, `tfi`, `gbs`, `hdr`, `screen`, `svf`,
+- KaguraVis video: `video`, `saliency`, `tfi`, `gbs`, `hdr`, `screen`, `svf`,
   `lvc`, `cdef`, `tnr`, `vplc`, `vidutil`
 - session/transport: `avsession`, `secure`, `fec`, `jitter`, `netadapt`
 - browser target: `build-wasm.sh`, `cross/emscripten.ini`, `src/wasm_api.c`
 
 Notable APIs and wire facts:
 
-- `opvox_encoder_init`, `opvox_encode`, `opvox_decode`; 20 ms frames at
-  8/16/32/48 kHz; `OPVOX_MAX_ENCODED = 512`
-- `opvis_encoder_create`, `opvis_encode`, `opvis_decode`; I/P/B/SKIP/INTERP,
-  OPVIS v1 header with frame type, quality, dimensions, frame number, color
+- `kaguravox_encoder_init`, `kaguravox_encode`, `kaguravox_decode`; 20 ms frames at
+  8/16/32/48 kHz; `KaguraVox_MAX_ENCODED = 512`
+- `kaguravis_encoder_create`, `kaguravis_encode`, `kaguravis_decode`; I/P/B/SKIP/INTERP,
+  KaguraVis v1 header with frame type, quality, dimensions, frame number, color
   flags, payload length
 - `opav` packet format: type, sequence number, timestamp, payload length,
   payload
@@ -295,8 +295,8 @@ Map kagura/LADON as follows:
 - LADON `VOICE_JOIN`, `VIDEO_JOIN`, `MEDIA_OFFER`, `MEDIA_ANSWER`,
   `MEDIA_STATS`, `MEDIA_NACK`, `MEDIA_BYE`, `VIDEO_KEYREQ`, `SPATIAL_*`,
   `SIMULCAST_*`, `ABR_REPORT`, `QUALITY_HINT` become band 5 control schemas.
-- OPVOX audio frames ride one media band per audio track.
-- OPVIS camera/screen frames ride one media band per video or screen track.
+- KaguraVox audio frames ride one media band per audio track.
+- KaguraVis camera/screen frames ride one media band per video or screen track.
 - Data-channel/whiteboard/annotation style payloads can use separate media-data
   bands only after core media control exists.
 
@@ -315,7 +315,7 @@ MediaTrackAnnounce {
   owner_user: UserId or account assertion,
   channel_cid: ChannelId,
   kind: audio | video | screen | data,
-  codec: opvox | opvis | external,
+  codec: kaguravox | kaguravis | external,
   clock_rate: u32,
   rights: speak | publish | relay | mix,
   fec: none | xor | raptorq,
@@ -343,9 +343,9 @@ Nick and channel names should not be repeated in every media data frame. Band 5
 announces bind track to user/channel. Bands >=64 carry compact track ids,
 sequence, timestamps, and payload.
 
-### OPVOX audio mapping
+### KaguraVox audio mapping
 
-OPVOX is a strong fit for a later media band:
+KaguraVox is a strong fit for a later media band:
 
 - 20 ms frames align with jitter buffer and voice scheduling.
 - 8/16/32/48 kHz modes let Ryusen shift bitrate without changing transport.
@@ -359,8 +359,8 @@ OPVOX is a strong fit for a later media band:
 Suggested band payload:
 
 ```text
-OPVOXFramePayload {
-  opvox_header: bytes,     // codec bitstream header from OPVOX
+KaguraVoxFramePayload {
+  kaguravox_header: bytes,     // codec bitstream header from KaguraVox
   codec_frame: bytes,
   optional epsc: bytes,
   optional aec2: bytes,
@@ -372,11 +372,11 @@ Spatial audio (`opfield`) is a reason to keep band 5 extensible. Position,
 mixing intent, HOA/binaural mode, and listener capability changes are control
 updates. Audio samples stay on media bands.
 
-### OPVIS video mapping
+### KaguraVis video mapping
 
-OPVIS maps cleanly to media bands:
+KaguraVis maps cleanly to media bands:
 
-- OPVIS frame types I/P/B/SKIP/INTERP map to `frame_kind`.
+- KaguraVis frame types I/P/B/SKIP/INTERP map to `frame_kind`.
 - `saliency` and SARDO become encoder-side quality decisions; the mesh does not
   need to parse saliency maps unless a mixer/transcoder is active.
 - `tfi` means the sender may omit INTERP frames; receivers synthesize them.
@@ -409,8 +409,8 @@ Keep both browser paths:
 
 Browser codec path:
 
-- Use kagura's WASM build shape as the blueprint: OPVOX/OPVIS in a single WASM
-  module with `_opvox_wasm_*` and `_opvis_wasm_*` style entry points.
+- Use kagura's WASM build shape as the blueprint: KaguraVox/KaguraVis in a single WASM
+  module with `_kaguravox_wasm_*` and `_kaguravis_wasm_*` style entry points.
 - In browsers, use WebCodecs/WebAudio where useful, but keep kagura/WASM as the
   custom IRC-tuned codec path.
 - Browser AEAD should use WebCrypto or Tsumugi-derived keys exposed through a
@@ -479,9 +479,9 @@ Orochi's long-term media FEC should be RaptorQ-style rateless FEC for bands >=64
 
 Interplay:
 
-- OPVOX low-latency audio can start with XOR interleaving because the group sizes
+- KaguraVox low-latency audio can start with XOR interleaving because the group sizes
   are tiny and latency cost is bounded.
-- OPVIS video, keyframes, screen frames, and high-loss WAN links should prefer
+- KaguraVis video, keyframes, screen frames, and high-loss WAN links should prefer
   RaptorQ repair symbols.
 - Goryu-Sync anti-entropy and RaptorQ share the "rateless" design direction but
   solve different problems: RIBLT reconciles set difference; RaptorQ repairs
@@ -507,12 +507,12 @@ For QUIC/WebTransport media bands:
 - ECN CE marks and L4S signals feed scalable congestion control.
 - Loss without ECN means recovery/FEC adjustment.
 - Rising RTT with low loss means queue buildup; reduce video first, then FEC,
-  preserve OPVOX audio.
+  preserve KaguraVox audio.
 - Burst-loss flag from `jitter` increases interleaving or RaptorQ repair before
   dropping bitrate.
 - `netadapt` state transitions map to Ryusen policy:
   `STABLE` permits probing, `PROBING` raises video/simulcast layer, `DRAINING`
-  drops B-frames and lowers OPVIS quality, `RECOVERY` restores additively.
+  drops B-frames and lowers KaguraVis quality, `RECOVERY` restores additively.
 
 The mesh scheduler must protect bands 0-4. Media congestion must never starve
 control, membership, anti-entropy, IRC events, or services.
@@ -542,8 +542,8 @@ deterministic inside Orochi.
 
 Candidate WASM components:
 
-- OPVOX encode/decode
-- OPVIS encode/decode
+- KaguraVox encode/decode
+- KaguraVis encode/decode
 - `psych`, `bwe`, `tns`, `pns`, `pvq`, `sam`, `opfield`
 - `saliency`, `tfi`, `screen`, `lvc`, `cdef`, `tnr`, `vplc`, `vidutil`
 - optional server-side mixer/transcoder/recorder workers
@@ -632,14 +632,14 @@ Do not port directly:
 
 ### Phase 6: browser and WASM prototype
 
-- Define OroWasm ABI for OPVOX/OPVIS-style codecs.
+- Define OroWasm ABI for KaguraVox/KaguraVis-style codecs.
 - Prototype browser WebSocket media fallback and WebTransport preferred path.
 - Keep browser codec keying separate: short-lived track keys only, no Tsumugi
   root exposure.
 
 ### Phase 7: media FEC and BWE
 
-- Start with XOR/interleaved FEC for OPVOX-like audio.
+- Start with XOR/interleaved FEC for KaguraVox-like audio.
 - Add RaptorQ for video/keyframes/high-loss media.
 - Connect `TrackBwe` to Ryusen L4S/ECN congestion decisions.
 - Add policy: audio preserved first, video quality/simulcast/B-frames reduced
@@ -677,7 +677,7 @@ Port opssl's crypto primitives and operational patterns into pure Zig where they
 touch trust: ML-KEM, X-Wing, constant-time discipline, X.509/CERTFP, TLS
 exporters, kTLS-aware migration, and session snapshot design.
 
-Do not port kagura into core. Use its OPVOX/OPVIS module taxonomy, frame
+Do not port kagura into core. Use its KaguraVox/KaguraVis module taxonomy, frame
 timing, `secure` concepts, `fec`, `jitter`, and `netadapt` as the design
 blueprint for media bands. Relay media by default; decode only in OroWasm or an
 authorized worker. Keep Tsumugi as the S2S security authority, reserve inner

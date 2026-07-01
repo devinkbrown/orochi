@@ -1347,7 +1347,7 @@ pub const Config = struct {
     /// Runtime SFU participant cap per room, bounded by the inline roster
     /// ceiling in media_room/native media link.
     media_max_participants: usize = media_room.default_max_participants,
-    /// Require the native OPVOX/OPVIS UDP leg to carry a per-datagram MAC tag.
+    /// Require the native KaguraVox/KaguraVis UDP leg to carry a per-datagram MAC tag.
     /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
     native_media_require_mac: bool = false,
     /// Relay browser media datagrams (binary WebSocket frames) between a
@@ -1388,7 +1388,7 @@ pub const Config = struct {
     /// reflexive media candidate behind NAT; overrides media_host when it works.
     media_stun_host: []const u8 = "",
     media_stun_port: u16 = 0,
-    /// UDP port for the native media transport (our own OPVOX/OPVIS codec leg);
+    /// UDP port for the native media transport (our own KaguraVox/KaguraVis codec leg);
     /// 0 = ephemeral. Bound on boot alongside the WebRTC/UDP media plane.
     native_media_port: u16 = 0,
     /// An already-bound+listening socket fd to ADOPT instead of binding fresh
@@ -2562,7 +2562,7 @@ pub const LinuxServer = struct {
     /// Media transport plane: UDP socket + ICE/STUN endpoint registry + pump
     /// thread. Started on boot (`start`), torn down on `deinit`.
     media_plane: media_plane_mod.MediaPlane,
-    /// Native media transport: UDP leg for our own OPVOX/OPVIS codec
+    /// Native media transport: UDP leg for our own KaguraVox/KaguraVis codec
     /// (kagura_frame datagrams). Started on boot, torn down on `deinit`.
     native_media: native_media_mod.NativeMediaTransport,
     /// Per-channel cross-leg bridge roster (native ↔ opt-in WebRTC). Consulted by
@@ -2992,14 +2992,14 @@ pub const LinuxServer = struct {
                 }
             }
 
-            // Bring the native media transport online (our own OPVOX/OPVIS codec
+            // Bring the native media transport online (our own KaguraVox/KaguraVis codec
             // leg). Independent of the WebRTC plane below; a bind failure logs and
             // the daemon keeps serving IRC.
             self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
                 srvLog("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
             };
             if (self.native_media.port != 0) {
-                srvLog("orochi: native media on UDP :{d} (codec OPVOX/OPVIS)\n", .{self.native_media.port});
+                srvLog("orochi: native media on UDP :{d} (codec KaguraVox/KaguraVis)\n", .{self.native_media.port});
                 // Bridge native frames to any opt-in WebRTC members of each channel.
                 self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame });
             }
@@ -21793,8 +21793,8 @@ pub const LinuxServer = struct {
     /// `NOTE MEDIA <#chan> ROSTER <nick> <kinds>` line per participant.
     fn codecTagName(tag: sdp.CodecTag) []const u8 {
         return switch (tag) {
-            .opvox => "opvox",
-            .opvis => "opvis",
+            .kaguravox => "kaguravox",
+            .kaguravis => "kaguravis",
             .raw => "raw",
         };
     }
@@ -21814,15 +21814,15 @@ pub const LinuxServer = struct {
         var it = std.mem.splitScalar(u8, codec_csv, ',');
         while (it.next()) |name| {
             if (name.len == 0 or n >= out.len) continue;
-            const tag: sdp.CodecTag = if (std.ascii.eqlIgnoreCase(name, "opvox"))
-                .opvox
-            else if (std.ascii.eqlIgnoreCase(name, "opvis"))
-                .opvis
+            const tag: sdp.CodecTag = if (std.ascii.eqlIgnoreCase(name, "kaguravox"))
+                .kaguravox
+            else if (std.ascii.eqlIgnoreCase(name, "kaguravis"))
+                .kaguravis
             else if (std.ascii.eqlIgnoreCase(name, "raw"))
                 .raw
             else
                 continue;
-            out[n] = .{ .tag = tag, .clock_rate = if (tag == .opvis) 90000 else 48000, .params = 0 };
+            out[n] = .{ .tag = tag, .clock_rate = if (tag == .kaguravis) 90000 else 48000, .params = 0 };
             n += 1;
         }
         return n;
@@ -21879,13 +21879,13 @@ pub const LinuxServer = struct {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
-            try self.failReply(conn, "MEDIA", "NO_CODECS", "Offer at least one codec: opvox,opvis,raw");
+            try self.failReply(conn, "MEDIA", "NO_CODECS", "Offer at least one codec: kaguravox,kaguravis,raw");
             return;
         }
         const remote = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
         const server_codecs = [_]sdp.Codec{
-            .{ .tag = .opvox, .clock_rate = 48000, .params = 0 },
-            .{ .tag = .opvis, .clock_rate = 90000, .params = 0 },
+            .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
+            .{ .tag = .kaguravis, .clock_rate = 90000, .params = 0 },
         };
         const local = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = &server_codecs, .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
         var negotiated = media_session.negotiate(self.allocator, local, remote) catch {
@@ -21925,7 +21925,7 @@ pub const LinuxServer = struct {
             }) catch return;
             try appendToConn(conn, tline);
         }
-        // Native transport (our own OPVOX/OPVIS codec leg): register this caller
+        // Native transport (our own KaguraVox/KaguraVis codec leg): register this caller
         // for the channel's native call and advertise the candidate + the
         // stream_id the client must stamp into its kagura frames. Independent of
         // the WebRTC plane above; best-effort (media is optional).
@@ -21941,7 +21941,7 @@ pub const LinuxServer = struct {
             // remote native client would be told 127.0.0.1 and never reach the SFU.
             var native_host_buf: [16]u8 = undefined;
             const native_cand = self.media_plane.candidateIp(&native_host_buf) orelse self.config.media_host;
-            const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=OPVOX/OPVIS{s}\r\n", .{
+            const nline = std.fmt.bufPrint(&nbuf, ":{s} NOTE MEDIA {s} NATIVE candidate={s}:{d} stream={d} codec=KaguraVox/KaguraVis{s}\r\n", .{
                 protocol_inventory.currentServerName(), channel, native_cand, self.native_media.port, stream_id, mac_token,
             }) catch return;
             try appendToConn(conn, nline);
@@ -22042,7 +22042,7 @@ pub const LinuxServer = struct {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
-            try self.failReply(conn, "MEDIA", "NO_CODECS", "Answer at least one codec: opvox,opvis,raw");
+            try self.failReply(conn, "MEDIA", "NO_CODECS", "Answer at least one codec: kaguravox,kaguravis,raw");
             return;
         }
         const answerer = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
@@ -22071,7 +22071,7 @@ pub const LinuxServer = struct {
             }) catch continue;
             try appendToConn(conn, line);
         }
-        // Native leg (our own OPVOX/OPVIS codec) stats.
+        // Native leg (our own KaguraVox/KaguraVis codec) stats.
         var native_stats: [native_media_mod.max_call_participants]native_media_mod.NativeMediaTransport.Stat = undefined;
         const nn = self.native_media.statsForChannel(channel, &native_stats);
         for (native_stats[0..nn]) |s| {
@@ -23163,7 +23163,7 @@ pub const LinuxServer = struct {
         }
         if (std.fmt.bufPrint(&b, "Mesh: {d} established S2S peer link(s) - Suimyaku CRDT routing over Tsumugi forward-secret transport", .{peers})) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
 
-        try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, Yoroi TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (OPVOX/OPVIS)");
+        try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, Yoroi TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (KaguraVox/KaguraVis)");
     }
 
     /// USERS — local user listing (RPL_USERSSTART/RPL_USERS/RPL_ENDOFUSERS).

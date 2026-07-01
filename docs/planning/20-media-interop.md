@@ -11,12 +11,12 @@ framing was incorrect. The corrected model below is recorded so it does not drif
 
 ## Decision
 
-**One codec for everyone — ours (OPVOX/OPVIS).** Mobile and desktop have *identical*
+**One codec for everyone — ours (KaguraVox/KaguraVis).** Mobile and desktop have *identical*
 functionality. WebRTC is a **transport**, not a codec choice. The opt-in standard-codec
 fallback is the only optional escape hatch. The server never touches codec bytes in any
 mode.
 
-1. **Primary — our codec, all platforms.** `kagura` (OPVOX audio / OPVIS video) frames in
+1. **Primary — our codec, all platforms.** `kagura` (KaguraVox audio / KaguraVis video) frames in
    `kagura_frame` containers, with `secure_channel` (TreeKEM/HPKE) for E2E. Desktop runs
    it natively; **browser and mobile run the same codec in WASM** (SIMD+threads). The SFU
    forwards the *identical opaque kagura frame* to every participant — so a phone and a
@@ -29,7 +29,7 @@ mode.
    *transport only*; its media-track codecs are not used on this path.
 
 3. **Opt-in standard-codec fallback.** A user **having trouble with our custom codec** (e.g.
-   a low-end phone that cannot WASM-decode OPVIS at framerate, or battery constraints) can
+   a low-end phone that cannot WASM-decode KaguraVis at framerate, or battery constraints) can
    **choose** to use standard WebRTC with the device's hardware codecs (Opus/H.264/VP8).
    This is a deliberate per-user choice, not the default and not forced by platform.
 
@@ -39,7 +39,7 @@ Orochi is a **selective-forwarding unit**, not an MCU. The SFU only ever **forwa
 codec payloads** and **rewraps transport headers**. No media encode/decode/transcode runs
 on the server. Consequences:
 
-- An **all-default call** uses OPVOX/OPVIS for everyone (including mobile via WASM); the SFU
+- An **all-default call** uses KaguraVox/KaguraVis for everyone (including mobile via WASM); the SFU
   forwards one opaque stream — zero codec work, platform parity.
 - If a participant **opts into** the standard-codec fallback, the call **converges on one
   codec every participant supports** (`kakehashi.selectCommon`). Every Orochi client can
@@ -87,7 +87,7 @@ forwards. Adapters **only rewrap headers around the borrowed, already-encoded pa
 ## Non-goals
 
 - Server-side transcoding / MCU mixing. Never.
-- Replacing our codec with WebRTC's. Our codec (OPVOX/OPVIS) is the default on **every**
+- Replacing our codec with WebRTC's. Our codec (KaguraVox/KaguraVis) is the default on **every**
   platform including mobile (via WASM). WebRTC is a **transport carrier** for our codec, plus an
   **opt-in standard-codec fallback** for users who choose it — never the forced default.
 - Per-platform feature divergence. Mobile and desktop have the same functionality.

@@ -77,15 +77,15 @@ pub const MAC_KEY_DERIVE_LABEL = "orochi native-media datagram mac v1";
 
 /// Codec family that produced the payload bytes.
 pub const CodecTag = enum(u8) {
-    opvox_audio = 0x01,
-    opvis_video = 0x02,
+    kaguravox_audio = 0x01,
+    kaguravis_video = 0x02,
     raw = 0x00,
 
     pub fn fromByte(b: u8) DecodeError!CodecTag {
         return switch (b) {
             0x00 => .raw,
-            0x01 => .opvox_audio,
-            0x02 => .opvis_video,
+            0x01 => .kaguravox_audio,
+            0x02 => .kaguravis_video,
             else => error.UnknownCodecTag,
         };
     }
@@ -686,9 +686,9 @@ test "applyToml overlays media.reorder_window_frames" {
     try testing.expectEqual(@as(u32, 32), reassemblyConfig(cfg).window);
 }
 
-test "encode/decode round-trip: opvox_audio" {
+test "encode/decode round-trip: kaguravox_audio" {
     const payload = "audiobytes";
-    const frame = testFrame(64, 1, 10, 48000, false, .opvox_audio, payload);
+    const frame = testFrame(64, 1, 10, 48000, false, .kaguravox_audio, payload);
 
     var buf: [256]u8 = undefined;
     const written = try encode(frame, &buf);
@@ -700,19 +700,19 @@ test "encode/decode round-trip: opvox_audio" {
     try testing.expectEqual(@as(u32, 10), view.sequence);
     try testing.expectEqual(@as(u64, 48000), view.timestamp);
     try testing.expect(!view.keyframe);
-    try testing.expectEqual(CodecTag.opvox_audio, view.codec);
+    try testing.expectEqual(CodecTag.kaguravox_audio, view.codec);
     try testing.expectEqualSlices(u8, payload, view.payload);
 }
 
-test "encode/decode round-trip: opvis_video keyframe" {
+test "encode/decode round-trip: kaguravis_video keyframe" {
     const payload = "videoframe";
-    const frame = testFrame(128, 2, 0, 90000, true, .opvis_video, payload);
+    const frame = testFrame(128, 2, 0, 90000, true, .kaguravis_video, payload);
 
     var buf: [256]u8 = undefined;
     const written = try encode(frame, &buf);
     const view = try decode(buf[0..written]);
 
-    try testing.expectEqual(CodecTag.opvis_video, view.codec);
+    try testing.expectEqual(CodecTag.kaguravis_video, view.codec);
     try testing.expect(view.keyframe);
     try testing.expectEqual(@as(u64, 90000), view.timestamp);
 }
@@ -764,7 +764,7 @@ test "decode truncated: declared payload exceeds buffer" {
     var buf: [MIN_FRAME_WIRE_BYTES + 4]u8 = undefined;
     @memset(&buf, 0);
     buf[4] = 64; // valid band_id
-    buf[22] = 0x01; // codec = opvox_audio (at fixed offset 22)
+    buf[22] = 0x01; // codec = kaguravox_audio (at fixed offset 22)
     // payload_len = 10 but buf only has space for 4 extra bytes
     writeU32Le(buf[0..4], 10);
     try testing.expectError(error.Truncated, decode(&buf));
@@ -783,7 +783,7 @@ test "decode trailing bytes rejected" {
 
 test "native media MAC compute and verify accepts a tagged datagram" {
     const key = [_]u8{0x42} ** 16;
-    const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .opvox_audio, "voice");
+    const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .kaguravox_audio, "voice");
 
     var frame_buf: [128]u8 = undefined;
     const frame_len = try encode(frame, &frame_buf);
@@ -799,7 +799,7 @@ test "native media MAC compute and verify accepts a tagged datagram" {
 
 test "native media MAC rejects tampered payload and tag" {
     const key = [_]u8{0x24} ** 16;
-    const frame = testFrame(64, 0x0102_0304, 8, 123, false, .opvis_video, "video");
+    const frame = testFrame(64, 0x0102_0304, 8, 123, false, .kaguravis_video, "video");
 
     var frame_buf: [128]u8 = undefined;
     const frame_len = try encode(frame, &frame_buf);
@@ -851,7 +851,7 @@ test "ws-media MAC cross-repo KAT (shared with Onyx JS)" {
     for (&root, 0..) |*b, i| b.* = @intCast(i); // 00 01 02 … 0f
     const channel = "#call";
     const participant = "alice";
-    const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .opvox_audio, "voice");
+    const frame = testFrame(64, 0x1122_3344, 7, 9000, true, .kaguravox_audio, "voice");
 
     var frame_buf: [128]u8 = undefined;
     const frame_len = try encode(frame, &frame_buf);
@@ -890,7 +890,7 @@ test "decode unknown codec tag rejected" {
 test "encodeAlloc produces correct bytes" {
     const allocator = testing.allocator;
     const payload = "alloctest";
-    const frame = testFrame(100, 7, 3, 1234, true, .opvox_audio, payload);
+    const frame = testFrame(100, 7, 3, 1234, true, .kaguravox_audio, payload);
 
     const owned = try encodeAlloc(frame, allocator);
     defer allocator.free(owned);

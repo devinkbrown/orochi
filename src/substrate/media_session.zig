@@ -186,12 +186,12 @@ const MEDIA_BAND: u8 = 64;
 test "negotiate intersects codecs and FEC via sdp" {
     const allocator = testing.allocator;
     const local_codecs = [_]sdp.Codec{
-        .{ .tag = .opvox, .clock_rate = 48000, .params = 0 },
+        .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
         .{ .tag = .raw, .clock_rate = 8000, .params = 0 },
     };
     const remote_codecs = [_]sdp.Codec{
         .{ .tag = .raw, .clock_rate = 8000, .params = 0 },
-        .{ .tag = .opvox, .clock_rate = 48000, .params = 0 },
+        .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
     };
     const local = MediaDescription{ .band_id = MEDIA_BAND, .kind = .audio, .codecs = &local_codecs, .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
     const remote = MediaDescription{ .band_id = MEDIA_BAND, .kind = .audio, .codecs = &remote_codecs, .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
@@ -202,7 +202,7 @@ test "negotiate intersects codecs and FEC via sdp" {
 }
 
 test "packetize -> reorder -> in-order delivery" {
-    var pk = Packetizer.init(MEDIA_BAND, 7, .opvox_audio);
+    var pk = Packetizer.init(MEDIA_BAND, 7, .kaguravox_audio);
     var rx = Receiver(256, 64).init(.{ .window = 16 });
 
     // Produce 4 frames, deliver them out of order (2,0,3,1).
@@ -225,7 +225,7 @@ test "packetize -> reorder -> in-order delivery" {
 
 test "FEC recovers a single dropped frame and delivery completes in order" {
     const allocator = testing.allocator;
-    var pk = Packetizer.init(MEDIA_BAND, 9, .opvox_audio);
+    var pk = Packetizer.init(MEDIA_BAND, 9, .kaguravox_audio);
     var rx = Receiver(256, 64).init(.{ .window = 16 });
 
     // Build a generation of 4 frames (kept for FEC), encode each to the wire.
@@ -289,7 +289,7 @@ test "applyToml overlays media keys and drives a Receiver window" {
     // Comptime bounds must cover the configured runtime window; the runtime
     // window is taken from config.
     var rx = Receiver(256, 64).init(reassemblyConfig(cfg));
-    var pk = Packetizer.init(MEDIA_BAND, 1, .opvox_audio);
+    var pk = Packetizer.init(MEDIA_BAND, 1, .kaguravox_audio);
     var wire: [64]u8 = undefined;
     const len = try pk.packetize("hi", true, 0, &wire);
     try testing.expectEqual(PushResult.buffered, try rx.ingest(wire[0..len]));

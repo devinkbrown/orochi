@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! OPVIS video codec spike: lossless delta + run-length frames.
+//! KaguraVis video codec spike: lossless delta + run-length frames.
 //!
-//! A compact, deterministic, allocation-free building block for the OPVIS band,
+//! A compact, deterministic, allocation-free building block for the KaguraVis band,
 //! tuned for the low-motion video the mesh carries most (talking-head, screen
 //! share, comic-chat panels): an inter-frame is XORed against the previous frame
 //! and the (mostly-zero) residual run-length coded, so a static background costs

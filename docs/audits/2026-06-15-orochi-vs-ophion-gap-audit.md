@@ -87,7 +87,7 @@ the Ophion CAP names:
 
 - `ophion/session-sync`: Orochi has `SESSION` and `SESSION_MIGRATE`, but does
   not advertise this Ophion-specific client capability.
-- `ophion/ladon-media`: Orochi has media, native OPVOX/OPVIS UDP, and
+- `ophion/ladon-media`: Orochi has media, native KaguraVox/KaguraVis UDP, and
   WebTransport, but not the Ophion LADON client capability value or
   `LADONMEDIA=1` compatibility surface.
 - `ophion/prop-notify`: Orochi delivers PROP-change notifications gated on IRCX

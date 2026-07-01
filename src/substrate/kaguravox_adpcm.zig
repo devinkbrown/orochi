@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! OPVOX audio codec spike: IMA ADPCM (16-bit PCM <-> 4-bit).
+//! KaguraVox audio codec spike: IMA ADPCM (16-bit PCM <-> 4-bit).
 //!
 //! A compact, deterministic, allocation-free voice codec building block for the
-//! OPVOX band: each 16-bit PCM sample is coded to a 4-bit nibble against an
+//! KaguraVox band: each 16-bit PCM sample is coded to a 4-bit nibble against an
 //! adaptive step size, giving ~4:1 compression at voice quality. Lossy but
 //! bounded — the adaptive predictor tracks the signal, so reconstruction error
 //! stays small for the smooth, band-limited signals voice produces.
 //!
 //! Pure integer math (no float, no allocation), so it runs identically on the
 //! native daemon and a future WASM browser build (#32). State is explicit so a
-//! caller can checkpoint/reset per packet (each OPVOX frame is independently
+//! caller can checkpoint/reset per packet (each KaguraVox frame is independently
 //! decodable when it carries its starting predictor+index).
 const std = @import("std");
 

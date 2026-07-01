@@ -361,14 +361,14 @@ test "call profile persists then clears when the call ends" {
     defer m.deinit();
     try testing.expect(m.profileOf("#c") == null);
     try m.join("#c", "alice", .voice);
-    const codecs = [_]sdp.Codec{.{ .tag = .opvox, .clock_rate = 48000, .params = 0 }};
+    const codecs = [_]sdp.Codec{.{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 }};
     try m.setProfile("#c", &codecs, .{ .scheme = .rs_block, .redundancy = 1 });
     const prof = m.profileOf("#c").?;
     try testing.expectEqual(@as(usize, 1), prof.slice().len);
-    try testing.expectEqual(sdp.CodecTag.opvox, prof.slice()[0].tag);
+    try testing.expectEqual(sdp.CodecTag.kaguravox, prof.slice()[0].tag);
     try testing.expectEqual(sdp.FecScheme.rs_block, prof.fec.scheme);
     // reassigning overwrites in place (no leak)
-    const codecs2 = [_]sdp.Codec{ .{ .tag = .opvox, .clock_rate = 48000, .params = 0 }, .{ .tag = .opvis, .clock_rate = 90000, .params = 0 } };
+    const codecs2 = [_]sdp.Codec{ .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 }, .{ .tag = .kaguravis, .clock_rate = 90000, .params = 0 } };
     try m.setProfile("#c", &codecs2, .{ .scheme = .none, .redundancy = 0 });
     try testing.expectEqual(@as(usize, 2), m.profileOf("#c").?.slice().len);
     try testing.expect(m.leaveAll("#c", "alice"));

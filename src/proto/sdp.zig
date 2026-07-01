@@ -42,14 +42,14 @@ pub const MediaKind = enum(u8) {
 };
 
 pub const CodecTag = enum(u8) {
-    opvox = 1,
-    opvis = 2,
+    kaguravox = 1,
+    kaguravis = 2,
     raw = 3,
 
     fn fromInt(value: u64) Error!CodecTag {
         return switch (value) {
-            @intFromEnum(CodecTag.opvox) => .opvox,
-            @intFromEnum(CodecTag.opvis) => .opvis,
+            @intFromEnum(CodecTag.kaguravox) => .kaguravox,
+            @intFromEnum(CodecTag.kaguravis) => .kaguravis,
             @intFromEnum(CodecTag.raw) => .raw,
             else => error.UnknownCodec,
         };
@@ -396,7 +396,7 @@ const testing = std.testing;
 test "descriptor encode/decode round-trip" {
     const allocator = testing.allocator;
     const codecs = [_]Codec{
-        .{ .tag = .opvox, .clock_rate = 48_000, .params = 2 },
+        .{ .tag = .kaguravox, .clock_rate = 48_000, .params = 2 },
         .{ .tag = .raw, .clock_rate = 48_000, .params = 1 },
     };
     const desc = MediaDescription{
@@ -424,13 +424,13 @@ test "descriptor encode/decode round-trip" {
 test "offer/answer intersects codecs in offerer order and picks common FEC" {
     const allocator = testing.allocator;
     const offer_codecs = [_]Codec{
-        .{ .tag = .opvis, .clock_rate = 90_000, .params = 1 },
+        .{ .tag = .kaguravis, .clock_rate = 90_000, .params = 1 },
         .{ .tag = .raw, .clock_rate = 48_000, .params = 2 },
-        .{ .tag = .opvox, .clock_rate = 48_000, .params = 2 },
+        .{ .tag = .kaguravox, .clock_rate = 48_000, .params = 2 },
     };
     const answer_codecs = [_]Codec{
-        .{ .tag = .opvox, .clock_rate = 48_000, .params = 1 },
-        .{ .tag = .opvis, .clock_rate = 90_000, .params = 3 },
+        .{ .tag = .kaguravox, .clock_rate = 48_000, .params = 1 },
+        .{ .tag = .kaguravis, .clock_rate = 90_000, .params = 3 },
     };
     const offer = MediaDescription{
         .band_id = 72,
@@ -451,15 +451,15 @@ test "offer/answer intersects codecs in offerer order and picks common FEC" {
     defer negotiated.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 2), negotiated.codecs.len);
-    try testing.expectEqual(CodecTag.opvis, negotiated.codecs[0].tag);
-    try testing.expectEqual(CodecTag.opvox, negotiated.codecs[1].tag);
+    try testing.expectEqual(CodecTag.kaguravis, negotiated.codecs[0].tag);
+    try testing.expectEqual(CodecTag.kaguravox, negotiated.codecs[1].tag);
     try testing.expectEqual(FecScheme.rateless_lt, negotiated.fec.scheme);
     try testing.expectEqual(@as(u8, 8), negotiated.fec.redundancy);
 }
 
 test "direction reconciliation matches sendonly with recvonly" {
     const allocator = testing.allocator;
-    const codecs = [_]Codec{.{ .tag = .opvox, .clock_rate = 48_000, .params = 2 }};
+    const codecs = [_]Codec{.{ .tag = .kaguravox, .clock_rate = 48_000, .params = 2 }};
     const offer = MediaDescription{
         .band_id = 80,
         .kind = .audio,
@@ -483,8 +483,8 @@ test "direction reconciliation matches sendonly with recvonly" {
 
 test "offer/answer rejects no common codec" {
     const allocator = testing.allocator;
-    const offer_codecs = [_]Codec{.{ .tag = .opvox, .clock_rate = 48_000, .params = 2 }};
-    const answer_codecs = [_]Codec{.{ .tag = .opvis, .clock_rate = 90_000, .params = 1 }};
+    const offer_codecs = [_]Codec{.{ .tag = .kaguravox, .clock_rate = 48_000, .params = 2 }};
+    const answer_codecs = [_]Codec{.{ .tag = .kaguravis, .clock_rate = 90_000, .params = 1 }};
     const offer = MediaDescription{
         .band_id = 90,
         .kind = .video,
@@ -505,7 +505,7 @@ test "offer/answer rejects no common codec" {
 
 test "band below 64 rejected by encoder and decoder" {
     const allocator = testing.allocator;
-    const codecs = [_]Codec{.{ .tag = .opvox, .clock_rate = 48_000, .params = 2 }};
+    const codecs = [_]Codec{.{ .tag = .kaguravox, .clock_rate = 48_000, .params = 2 }};
     const desc = MediaDescription{
         .band_id = 63,
         .kind = .audio,
@@ -531,7 +531,7 @@ test "band below 64 rejected by encoder and decoder" {
 
 test "truncated descriptor returns truncation error" {
     const allocator = testing.allocator;
-    const codecs = [_]Codec{.{ .tag = .opvox, .clock_rate = 48_000, .params = 2 }};
+    const codecs = [_]Codec{.{ .tag = .kaguravox, .clock_rate = 48_000, .params = 2 }};
     const desc = MediaDescription{
         .band_id = 100,
         .kind = .audio,

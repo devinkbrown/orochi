@@ -1,6 +1,6 @@
 # Media architecture
 
-*Orochi's media stack: a control-plane SFU, a WebRTC-compatible RTP/STUN UDP plane, a native OPVOX/OPVIS UDP leg, header-only cross-leg rewrap, a congestion/loss transport substrate, and browser/WASM codec exports.*
+*Orochi's media stack: a control-plane SFU, a WebRTC-compatible RTP/STUN UDP plane, a native KaguraVox/KaguraVis UDP leg, header-only cross-leg rewrap, a congestion/loss transport substrate, and browser/WASM codec exports.*
 
 This document covers the current source tree only.
 
@@ -44,9 +44,9 @@ This document covers the current source tree only.
 | Cross-leg bridge | After RTP relay, the plane can call an installed `RtpCrossSink` to reach native participants. | `src/daemon/media_plane.zig:82`, `src/daemon/media_plane.zig:103`, `src/daemon/media_plane.zig:209`, `src/daemon/media_plane.zig:211` |
 | Signaling support | `allocate` returns ICE credentials; `groupKey` returns the per-call SRTP group key; `remoteFor` resolves live WebRTC peer address. | `src/daemon/media_plane.zig:229`, `src/daemon/media_plane.zig:231`, `src/daemon/media_plane.zig:247`, `src/daemon/media_plane.zig:278` |
 
-## Native OPVOX/OPVIS transport
+## Native KaguraVox/KaguraVis transport
 
-`src/daemon/native_media_transport.zig` is the daemon-owned native UDP leg for Orochi's OPVOX/OPVIS codec framing. It forwards `kagura_frame` datagrams, not RTP, and never transcodes. Evidence: `src/daemon/native_media_transport.zig:1`, `src/daemon/native_media_transport.zig:2`, `src/daemon/native_media_transport.zig:3`, `src/daemon/native_media_transport.zig:15`.
+`src/daemon/native_media_transport.zig` is the daemon-owned native UDP leg for Orochi's KaguraVox/KaguraVis codec framing. It forwards `kagura_frame` datagrams, not RTP, and never transcodes. Evidence: `src/daemon/native_media_transport.zig:1`, `src/daemon/native_media_transport.zig:2`, `src/daemon/native_media_transport.zig:3`, `src/daemon/native_media_transport.zig:15`.
 
 | Path | Behavior | Evidence |
 | --- | --- | --- |
@@ -65,7 +65,7 @@ This document covers the current source tree only.
 | --- | --- |
 | Media bands are `band_id >= 64`; control bands are below 64. | `src/substrate/kagura_frame.zig:6`, `src/substrate/kagura_frame.zig:56`, `src/substrate/kagura_frame.zig:119` |
 | Wire format includes payload length, band id, stream id, sequence, timestamp, keyframe flag, codec tag, and payload. | `src/substrate/kagura_frame.zig:9`, `src/substrate/kagura_frame.zig:11`, `src/substrate/kagura_frame.zig:18` |
-| `CodecTag` supports `raw`, `opvox_audio`, and `opvis_video`. | `src/substrate/kagura_frame.zig:66`, `src/substrate/kagura_frame.zig:67` |
+| `CodecTag` supports `raw`, `kaguravox_audio`, and `kaguravis_video`. | `src/substrate/kagura_frame.zig:66`, `src/substrate/kagura_frame.zig:67` |
 | Decode rejects truncation, control band ids, trailing bytes, and unknown codec tags. | `src/substrate/kagura_frame.zig:153`, `src/substrate/kagura_frame.zig:155`, `src/substrate/kagura_frame.zig:161`, `src/substrate/kagura_frame.zig:165`, `src/substrate/kagura_frame.zig:175` |
 | ReassemblyBuffer is a bounded jitter/reorder buffer with compile-time payload/window bounds and runtime window config. | `src/substrate/kagura_frame.zig:211`, `src/substrate/kagura_frame.zig:233`, `src/substrate/kagura_frame.zig:236`, `src/substrate/kagura_frame.zig:255` |
 
@@ -98,7 +98,7 @@ Browser and client WASM exports are separate from the daemon plugin host.
 
 | File | Export surface | Evidence |
 | --- | --- | --- |
-| `src/wasm/kagura_wasm.zig` | OPVOX audio encode/decode and OPVIS video intra/inter encode/decode for `wasm32-freestanding`. | `src/wasm/kagura_wasm.zig:1`, `src/wasm/kagura_wasm.zig:3`, `src/wasm/kagura_wasm.zig:17`, `src/wasm/kagura_wasm.zig:21`, `src/wasm/kagura_wasm.zig:35`, `src/wasm/kagura_wasm.zig:39`, `src/wasm/kagura_wasm.zig:49` |
+| `src/wasm/kagura_wasm.zig` | KaguraVox audio encode/decode and KaguraVis video intra/inter encode/decode for `wasm32-freestanding`. | `src/wasm/kagura_wasm.zig:1`, `src/wasm/kagura_wasm.zig:3`, `src/wasm/kagura_wasm.zig:17`, `src/wasm/kagura_wasm.zig:21`, `src/wasm/kagura_wasm.zig:35`, `src/wasm/kagura_wasm.zig:39`, `src/wasm/kagura_wasm.zig:49` |
 | `src/wasm/browser_transport.zig` | Browser transport shim core is re-exported from the package root; the wasm32 export wrapper lives in `src/wasm/transport_shim.zig`. | `src/root.zig:18`, `src/root.zig:21` |
 
 ## Planning notes and divergences

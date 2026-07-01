@@ -18,7 +18,7 @@ Orochi builds with Zig's build system and has no package dependencies in `build.
 | `zig build test` | Runs module tests and executable-root tests. | `build.zig:150`, `build.zig:161`, `build.zig:172` |
 | `zig build test -Dtest-filter=<text>` | Runs tests whose names contain the filter. | `build.zig:36`, `build.zig:38` |
 | `zig build check` | Type-checks the daemon without emitting a binary. | `build.zig:213`, `build.zig:227` |
-| `zig build wasm` | Builds browser-facing OPVOX/OPVIS codec and transport WASM modules. | `build.zig:176`, `build.zig:196`, `build.zig:202` |
+| `zig build wasm` | Builds browser-facing KaguraVox/KaguraVis codec and transport WASM modules. | `build.zig:176`, `build.zig:196`, `build.zig:202` |
 | `zig build release` | Builds an optimized stripped daemon with `ReleaseFast`. | `build.zig:230`, `build.zig:244` |
 
 ## Cross targets

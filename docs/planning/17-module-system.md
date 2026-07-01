@@ -23,7 +23,7 @@ Design thesis: **the core is compiled in (comptime registry, zero ABI boundary, 
   for multiline, WASM plugins, and lower pre-registration dispatch.
 - `src/daemon/event_spine.zig`: typed event bus (Event Spine, already live).
 - `src/proto/coilpack*.zig`: canonical signature-stable wire format (capsule substrate).
-- `build.zig` builds OPVOX/OPVIS to **freestanding wasm32** already; the team owns the
+- `build.zig` builds KaguraVox/KaguraVis to **freestanding wasm32** already; the team owns the
   `wasm32-freestanding` toolchain. The daemon does **not** yet host/execute WASM.
 
 The module system is therefore no longer merely latent: the registry exists and the live dispatch seam is wired. This document remains useful for the typed capability/hook layer, lifecycle, Helix Upgrade, and WASM boundary.
@@ -286,7 +286,7 @@ Hard boundaries:
 - **Allowed (control plane only):** command handlers, hook/event reactions, timers, outbound
   replies, read-only client/channel lookup, a namespaced store slice, services/moderation
   logic.
-- **Forbidden:** per-frame media (OPVOX/OPVIS stay native), the io_uring completion path,
+- **Forbidden:** per-frame media (KaguraVox/KaguraVis stay native), the io_uring completion path,
   per-byte parsing. The copy-in/out + per-call tax is negligible on the control plane and
   unacceptable on the hot path.
 - **No C interop** (project hard rule) ⇒ the runtime is a **pure-Zig wasm32 interpreter**

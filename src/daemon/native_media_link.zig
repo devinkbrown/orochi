@@ -280,7 +280,7 @@ fn frame(stream_id: u32, band: u8, seq: u32, keyframe: bool, buf: []u8) []const 
         .sequence = seq,
         .timestamp = 0,
         .keyframe = keyframe,
-        .codec = .opvox_audio,
+        .codec = .kaguravox_audio,
         .payload = &[_]u8{ 0xAA, 0xBB, 0xCC },
     }, buf) catch unreachable;
     return buf[0..n];

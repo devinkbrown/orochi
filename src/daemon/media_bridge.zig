@@ -4,7 +4,7 @@
 //! Media bridge spine — per-channel cross-leg roster + datagram rewrap.
 //!
 //! A media call can mix participants on two transports: the native leg
-//! (kagura_frame over UDP, our OPVOX/OPVIS codec) and the WebRTC leg (RTP/SRTP).
+//! (kagura_frame over UDP, our KaguraVox/KaguraVis codec) and the WebRTC leg (RTP/SRTP).
 //! Within a leg the respective plane already forwards. This module is the spine
 //! that lets a frame ingressing on ONE leg reach participants on the OTHER leg —
 //! by header-rewrap only, never transcoding. The codec payload is opaque and
@@ -68,8 +68,8 @@ pub const RtpCrossSink = struct {
 /// when a call hasn't negotiated a custom mapping.
 pub fn defaultPtMap() PtMap {
     var m = PtMap{};
-    m.add(111, .opvox); // audio
-    m.add(96, .opvis); // video
+    m.add(111, .kaguravox); // audio
+    m.add(96, .kaguravis); // video
     return m;
 }
 
@@ -264,7 +264,7 @@ test "unregister drops a member; register updates in place" {
 test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {
     var map = defaultPtMap();
 
-    // Encode an opvis (video) native frame.
+    // Encode an kaguravis (video) native frame.
     var src: [128]u8 = undefined;
     const slen = try kagura_frame.encode(.{
         .band_id = kagura_frame.MEDIA_BAND_FLOOR + 2,
@@ -272,7 +272,7 @@ test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" 
         .sequence = 1234,
         .timestamp = 90000,
         .keyframe = true,
-        .codec = .opvis_video,
+        .codec = .kaguravis_video,
         .payload = "video-payload",
     }, &src);
 
@@ -285,7 +285,7 @@ test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" 
     const blen = try rtpToNativeDatagram(rtp, &map, kagura_frame.MEDIA_BAND_FLOOR + 2, 7, true, &back);
     const view = try kagura_frame.decode(back[0..blen]);
 
-    try testing.expectEqual(kagura_frame.CodecTag.opvis_video, view.codec);
+    try testing.expectEqual(kagura_frame.CodecTag.kaguravis_video, view.codec);
     try testing.expectEqualStrings("video-payload", view.payload);
     try testing.expect(view.keyframe);
     try testing.expectEqual(@as(u32, 1234 & 0xFFFF), view.sequence); // RTP seq is 16-bit
@@ -300,7 +300,7 @@ test "rewrap rejects an unknown payload type" {
         .sequence = 1,
         .timestamp = 1,
         .keyframe = false,
-        .codec = .opvox_audio,
+        .codec = .kaguravox_audio,
         .payload = "x",
     }, &src);
     var out: [128]u8 = undefined;

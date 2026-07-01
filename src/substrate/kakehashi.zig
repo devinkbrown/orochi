@@ -29,8 +29,8 @@ const rtp_profile = @import("../proto/rtp_profile.zig");
 
 /// Canonical codec identity for the bridge (matches sdp.CodecTag ordinals).
 pub const Codec = enum(u8) {
-    opvox = 1, // audio (native)
-    opvis = 2, // video (native)
+    kaguravox = 1, // audio (native)
+    kaguravis = 2, // video (native)
     raw = 3, // uncompressed / passthrough
     _, // reserved for gateway codecs (Opus/H.264/VP8) we don't own yet
 };
@@ -60,16 +60,16 @@ pub const Error = error{ BufferTooSmall, UnknownPayloadType, Truncated };
 
 fn nativeToCodec(t: kagura_frame.CodecTag) Codec {
     return switch (t) {
-        .opvox_audio => .opvox,
-        .opvis_video => .opvis,
+        .kaguravox_audio => .kaguravox,
+        .kaguravis_video => .kaguravis,
         .raw => .raw,
     };
 }
 
 fn codecToNative(c: Codec) kagura_frame.CodecTag {
     return switch (c) {
-        .opvox => .opvox_audio,
-        .opvis => .opvis_video,
+        .kaguravox => .kaguravox_audio,
+        .kaguravis => .kaguravis_video,
         else => .raw, // raw + any unknown gateway codec degrade to raw container
     };
 }
@@ -168,8 +168,8 @@ pub const Plan = enum {
 
 fn codecKind(c: Codec) ?MediaKind {
     return switch (c) {
-        .opvox => .audio,
-        .opvis => .video,
+        .kaguravox => .audio,
+        .kaguravis => .video,
         .raw => null, // raw is kind-agnostic
         else => null,
     };
@@ -231,16 +231,16 @@ test "native <-> bridge frame mapping (raw ordinal differs across tag sets)" {
         .sequence = 1234,
         .timestamp = 0xDEADBEEF12,
         .keyframe = true,
-        .codec = .opvox_audio,
+        .codec = .kaguravox_audio,
         .payload = "audio-bytes",
     };
     const bf = fromNative(nf);
-    try testing.expectEqual(Codec.opvox, bf.codec);
+    try testing.expectEqual(Codec.kaguravox, bf.codec);
     try testing.expectEqual(@as(u64, 0xDEADBEEF12), bf.timestamp);
     try testing.expect(bf.keyframe);
 
     const back = toNative(bf, 70, 9);
-    try testing.expectEqual(kagura_frame.CodecTag.opvox_audio, back.codec);
+    try testing.expectEqual(kagura_frame.CodecTag.kaguravox_audio, back.codec);
     try testing.expectEqualStrings("audio-bytes", back.payload);
 
     // raw maps native(0) <-> kakehashi(3) correctly
@@ -251,19 +251,19 @@ test "native <-> bridge frame mapping (raw ordinal differs across tag sets)" {
 
 test "RTP <-> bridge round-trips through a PT map" {
     var map = PtMap{};
-    map.add(111, .opvox);
-    map.add(96, .opvis);
+    map.add(111, .kaguravox);
+    map.add(96, .kaguravis);
 
-    const bf = BridgeFrame{ .codec = .opvox, .timestamp = 0x1_0000_0040, .sequence = 0x1_0005, .keyframe = true, .payload = "opvox-frame" };
+    const bf = BridgeFrame{ .codec = .kaguravox, .timestamp = 0x1_0000_0040, .sequence = 0x1_0005, .keyframe = true, .payload = "kaguravox-frame" };
     var buf: [128]u8 = undefined;
     const rtp = try toRtp(bf, &map, 0xCAFEBABE, &buf);
 
     const got = try fromRtp(rtp, &map, false);
-    try testing.expectEqual(Codec.opvox, got.codec);
+    try testing.expectEqual(Codec.kaguravox, got.codec);
     try testing.expectEqual(@as(u32, 0x0005), got.sequence); // truncated to 16 bits
     try testing.expectEqual(@as(u64, 0x0000_0040), got.timestamp); // truncated to 32 bits
     try testing.expect(got.keyframe); // marker set from keyframe
-    try testing.expectEqualStrings("opvox-frame", got.payload);
+    try testing.expectEqualStrings("kaguravox-frame", got.payload);
 
     // unknown PT is rejected
     var empty = PtMap{};
@@ -272,8 +272,8 @@ test "RTP <-> bridge round-trips through a PT map" {
 
 test "full native->webrtc->native bridge preserves codec/payload/keyframe" {
     var map = PtMap{};
-    map.add(100, .opvis);
-    const nf = kagura_frame.MediaFrame{ .band_id = 71, .stream_id = 2, .sequence = 42, .timestamp = 9000, .keyframe = true, .codec = .opvis_video, .payload = "frame-payload" };
+    map.add(100, .kaguravis);
+    const nf = kagura_frame.MediaFrame{ .band_id = 71, .stream_id = 2, .sequence = 42, .timestamp = 9000, .keyframe = true, .codec = .kaguravis_video, .payload = "frame-payload" };
 
     const bf = fromNative(nf);
     var buf: [128]u8 = undefined;
@@ -281,31 +281,31 @@ test "full native->webrtc->native bridge preserves codec/payload/keyframe" {
     const bf2 = try fromRtp(rtp, &map, true);
     const nf2 = toNative(bf2, 71, 2);
 
-    try testing.expectEqual(kagura_frame.CodecTag.opvis_video, nf2.codec);
+    try testing.expectEqual(kagura_frame.CodecTag.kaguravis_video, nf2.codec);
     try testing.expectEqualStrings("frame-payload", nf2.payload);
     try testing.expect(nf2.keyframe);
     try testing.expectEqual(@as(u32, 42), nf2.sequence);
 }
 
 test "negotiate is repackage-only: direct_relay or incompatible (never transcode)" {
-    try testing.expectEqual(Plan.direct_relay, negotiate(&.{.opvox}, &.{ .opvox, .raw }));
-    try testing.expectEqual(Plan.incompatible, negotiate(&.{.opvox}, &.{.raw})); // no shared codec -> no transcode
-    try testing.expectEqual(Plan.incompatible, negotiate(&.{.opvox}, &.{.opvis}));
-    try testing.expectEqual(Plan.incompatible, negotiate(&.{.opvox}, &.{}));
+    try testing.expectEqual(Plan.direct_relay, negotiate(&.{.kaguravox}, &.{ .kaguravox, .raw }));
+    try testing.expectEqual(Plan.incompatible, negotiate(&.{.kaguravox}, &.{.raw})); // no shared codec -> no transcode
+    try testing.expectEqual(Plan.incompatible, negotiate(&.{.kaguravox}, &.{.kaguravis}));
+    try testing.expectEqual(Plan.incompatible, negotiate(&.{.kaguravox}, &.{}));
     // commonCodec returns the first match in the first list's order:
-    try testing.expectEqual(Codec.raw, commonCodec(&.{ .raw, .opvox }, &.{ .opvox, .raw }).?);
-    try testing.expectEqual(Codec.opvox, commonCodec(&.{ .opvox, .raw }, &.{ .opvox, .raw }).?);
+    try testing.expectEqual(Codec.raw, commonCodec(&.{ .raw, .kaguravox }, &.{ .kaguravox, .raw }).?);
+    try testing.expectEqual(Codec.kaguravox, commonCodec(&.{ .kaguravox, .raw }, &.{ .kaguravox, .raw }).?);
 }
 
 test "selectCommon finds the codec all participants share (transcode-free call)" {
-    // native(opvox,raw) + native(opvox,opvis) + webrtc(opvox) -> opvox common
-    const a = [_]Codec{ .opvox, .raw };
-    const b = [_]Codec{ .opvox, .opvis };
-    const c = [_]Codec{.opvox};
-    try testing.expectEqual(Codec.opvox, selectCommon(&.{ &a, &b, &c }).?);
+    // native(kaguravox,raw) + native(kaguravox,kaguravis) + webrtc(kaguravox) -> kaguravox common
+    const a = [_]Codec{ .kaguravox, .raw };
+    const b = [_]Codec{ .kaguravox, .kaguravis };
+    const c = [_]Codec{.kaguravox};
+    try testing.expectEqual(Codec.kaguravox, selectCommon(&.{ &a, &b, &c }).?);
     // a participant with no shared codec -> null (cannot run transcode-free)
     const d = [_]Codec{.raw};
     try testing.expect(selectCommon(&.{ &a, &b, &c, &d }) == null);
     // single participant -> its first codec
-    try testing.expectEqual(Codec.opvox, selectCommon(&.{&c}).?);
+    try testing.expectEqual(Codec.kaguravox, selectCommon(&.{&c}).?);
 }
