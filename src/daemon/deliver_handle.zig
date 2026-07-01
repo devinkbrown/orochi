@@ -41,6 +41,11 @@ pub const DeliverMsg = struct {
     /// handle layer; the server casts to/from `EventCategory`). Keeps cross-reactor
     /// client iteration on each reactor's own thread.
     broadcast_category: ?u6 = null,
+    /// Event severity (raw ordinal of `EventSeverity`) carried alongside
+    /// `broadcast_category` so the receiving reactor applies each subscriber's
+    /// minimum-severity filter identically to the publishing reactor. Only
+    /// meaningful when `broadcast_category != null`.
+    broadcast_severity: u8 = 0,
     /// Cross-shard oper-event subject (inline POD copy): the event's subject text,
     /// carried alongside `broadcast_category` so the receiving reactor can apply
     /// each local subscriber's per-category subject glob exactly as the publishing

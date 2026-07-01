@@ -882,6 +882,11 @@ pub const ClientSession = struct {
     /// delivered as typed events to sessions subscribed to the matching category
     /// (replacing the legacy +w umode). Opers are subscribed on OPER.
     event_mask: event_spine.CategoryMask = .{},
+    /// Minimum Event Spine severity this session wants delivered. Events whose
+    /// severity ranks below this are filtered out (the severity enum is ordered
+    /// low→high: debug<info<notice<warn<error<critical). Default `.debug` shows
+    /// everything, so this is a pure opt-in narrowing on top of the category mask.
+    event_min_severity: event_spine.EventSeverity = .debug,
     /// Per-category Event Spine subject-glob scope, indexed by
     /// `@intFromEnum(EventCategory)`. An empty mask (`len == 0`) means the wildcard
     /// `*` — match every subject for that category, which is the default and keeps
@@ -1024,6 +1029,21 @@ pub const ClientSession = struct {
     /// Replace the session's Event Spine subscription mask.
     pub fn setEventMask(self: *ClientSession, mask: event_spine.CategoryMask) void {
         self.event_mask = mask;
+    }
+
+    /// The session's minimum wanted Event Spine severity (default `.debug`).
+    pub fn eventMinSeverity(self: *const ClientSession) event_spine.EventSeverity {
+        return self.event_min_severity;
+    }
+
+    /// Set the minimum Event Spine severity delivered to this session.
+    pub fn setEventMinSeverity(self: *ClientSession, sev: event_spine.EventSeverity) void {
+        self.event_min_severity = sev;
+    }
+
+    /// True when `sev` meets the session's minimum-severity threshold.
+    pub fn severityWanted(self: *const ClientSession, sev: event_spine.EventSeverity) bool {
+        return @intFromEnum(sev) >= @intFromEnum(self.event_min_severity);
     }
 
     /// The subject-glob scope for `category`, or `*` when none is set. Returns

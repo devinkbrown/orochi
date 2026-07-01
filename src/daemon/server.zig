@@ -71,6 +71,7 @@ const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
 const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
+const event_history_mod = @import("event_history.zig");
 const route_report = @import("../proto/route_report.zig");
 const swim_report = @import("../proto/swim_report.zig");
 const link_health_mod = @import("link_health.zig");
@@ -2531,6 +2532,12 @@ pub const LinuxServer = struct {
     /// Recent mesh events (peer up/down, oper grant, …) for the `MESH LOG` oper
     /// audit view. Bounded ring; oldest entries roll off.
     mesh_log: mesh_event_log.MeshEventLog(128) = .{},
+    /// Node-wide ring of recent Event Spine events for `EVENT REPLAY`. Shared
+    /// across reactors (internally RwLock-guarded) and fed by both the local
+    /// publish path and the mesh drain, so an oper who just connected can see
+    /// what they missed. The ring can serialize to a snapshot (persistence
+    /// wiring is a follow-up); today it is per-process-lifetime.
+    event_history: event_history_mod.EventHistory(512) = .{},
     /// Persistent expected-membership set for split/heal transition detection:
     /// remembers every node id observed so a vanished node still registers as a
     /// split until it ages out (see updatePartitionTransitions).
@@ -3422,6 +3429,7 @@ pub const LinuxServer = struct {
                 // only touch our own shard's client table, on our own thread).
                 if (msg.broadcast_category) |cat_raw| {
                     const category: event_spine.EventCategory = @enumFromInt(cat_raw);
+                    const severity: event_spine.EventSeverity = @enumFromInt(@min(msg.broadcast_severity, @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".fields.len - 1)));
                     // The publishing reactor carried the event subject inline so this
                     // reactor applies each local subscriber's per-category subject
                     // glob exactly as the origin did. An empty carried subject means
@@ -3442,7 +3450,7 @@ pub const LinuxServer = struct {
                         // `bytes` is the raw event BODY, which is also the IRCX
                         // type-routing key (its leading TYPE token), so the
                         // receiving shard classifies exactly as the origin shard.
-                        if (!sessionWantsEvent(&c.session, category, bytes, subject)) continue;
+                        if (!sessionWantsEvent(&c.session, category, severity, bytes, subject)) continue;
                         // MEDIA events stay member-scoped on this shard too.
                         if (!self.mediaEventAllowed(entry.id, &c.session, bytes)) continue;
                         var line_buf: [default_reply_bytes]u8 = undefined;
@@ -14948,7 +14956,18 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .RPL_EVENTLIST, &.{ typ.wireName(), conn.session.ircxEventSubjectMask(typ) }, "Event subscription");
             }
             try queueNumeric(conn, .RPL_EVENTEND, &.{}, "End of event list");
+            // Opers also see their Event Spine category subscriptions + severity
+            // floor (the KILL/FLOOD/… plane, separate from the IRCX list above).
+            if (is_oper) try self.replyEventCategories(conn, conn.session.event_mask);
             return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(params[0], "SEVERITY")) {
+            return self.handleEventSeverity(conn, is_oper, params);
+        }
+
+        if (std.ascii.eqlIgnoreCase(params[0], "REPLAY")) {
+            return self.handleEventReplay(conn, is_oper, params);
         }
 
         if (std.ascii.eqlIgnoreCase(params[0], "ADD")) {
@@ -14956,28 +14975,29 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT ADD"}, "Not enough parameters");
                 return;
             }
-            const typ = event_spine.IrcxEventType.parse(params[1]) orelse {
-                try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
-                return;
-            };
-            if (!is_oper and typ != .media) {
-                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+            // IRCX plane (CHANNEL/MEMBER/USER/MEDIA) first; a token that is not an
+            // IRCX type falls through to the Event Spine CATEGORY plane below.
+            if (event_spine.IrcxEventType.parse(params[1])) |typ| {
+                if (!is_oper and typ != .media) {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+                    return;
+                }
+                if (conn.session.subscribesToIrcxEvent(typ)) {
+                    try queueNumeric(conn, .ERR_EVENTDUP, &.{params[1]}, "Event already subscribed");
+                    return;
+                }
+                const mask = if (params.len >= 3 and params[2].len != 0) params[2] else "*";
+                conn.session.setIrcxEventSubscription(typ, mask) catch {
+                    try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT ADD"}, "EVENT subject mask too long");
+                    return;
+                };
+                // IRCX EVENT lives on its own subscription plane (token-routed by
+                // type); it deliberately does NOT pollute the legacy oper category
+                // mask, so a USER subscriber receives only USER events.
+                try queueNumeric(conn, .RPL_EVENTADD, &.{ params[1], conn.session.ircxEventSubjectMask(typ) }, "Event added");
                 return;
             }
-            if (conn.session.subscribesToIrcxEvent(typ)) {
-                try queueNumeric(conn, .ERR_EVENTDUP, &.{params[1]}, "Event already subscribed");
-                return;
-            }
-            const mask = if (params.len >= 3 and params[2].len != 0) params[2] else "*";
-            conn.session.setIrcxEventSubscription(typ, mask) catch {
-                try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT ADD"}, "EVENT subject mask too long");
-                return;
-            };
-            // IRCX EVENT lives on its own subscription plane (token-routed by
-            // type); it deliberately does NOT pollute the legacy oper category
-            // mask, so a USER subscriber receives only USER events.
-            try queueNumeric(conn, .RPL_EVENTADD, &.{ params[1], conn.session.ircxEventSubjectMask(typ) }, "Event added");
-            return;
+            return self.handleEventCategoryOp(conn, is_oper, .add, params[1..]);
         }
 
         if (std.ascii.eqlIgnoreCase(params[0], "CHANGE")) {
@@ -15006,25 +15026,24 @@ pub const LinuxServer = struct {
             return;
         }
 
-        if (std.ascii.eqlIgnoreCase(params[0], "DELETE")) {
+        if (std.ascii.eqlIgnoreCase(params[0], "DELETE") or std.ascii.eqlIgnoreCase(params[0], "DEL")) {
             if (params.len < 2) {
                 try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT DELETE"}, "Not enough parameters");
                 return;
             }
-            const typ = event_spine.IrcxEventType.parse(params[1]) orelse {
-                try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[1]}, "No such event");
-                return;
-            };
-            if (!is_oper and typ != .media) {
-                try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+            if (event_spine.IrcxEventType.parse(params[1])) |typ| {
+                if (!is_oper and typ != .media) {
+                    try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; only MEDIA events are client-subscribable");
+                    return;
+                }
+                if (!conn.session.clearIrcxEventSubscription(typ)) {
+                    try queueNumeric(conn, .ERR_EVENTMIS, &.{params[1]}, "Not subscribed to event");
+                    return;
+                }
+                try queueNumeric(conn, .RPL_EVENTDELETE, &.{params[1]}, "Event removed");
                 return;
             }
-            if (!conn.session.clearIrcxEventSubscription(typ)) {
-                try queueNumeric(conn, .ERR_EVENTMIS, &.{params[1]}, "Not subscribed to event");
-                return;
-            }
-            try queueNumeric(conn, .RPL_EVENTDELETE, &.{params[1]}, "Event removed");
-            return;
+            return self.handleEventCategoryOp(conn, is_oper, .del, params[1..]);
         }
 
         if (std.ascii.eqlIgnoreCase(params[0], "CLEAR")) {
@@ -15040,14 +15059,147 @@ pub const LinuxServer = struct {
                 try queueNumeric(conn, .RPL_EVENTDELETE, &.{params[1]}, "Event removed");
             } else {
                 conn.session.clearIrcxEventSubscriptions();
+                // Also drop the Event Spine category subscriptions + severity floor.
+                conn.session.setEventMask(event_spine.CategoryMask.empty());
+                conn.session.clearEventSubjectMasks();
+                conn.session.setEventMinSeverity(.debug);
                 try self.noticeTo(conn, "All event subscriptions cleared");
             }
             return;
         }
 
         var notice_buf: [256]u8 = undefined;
-        const notice = std.fmt.bufPrint(&notice_buf, "Unknown EVENT subcommand '{s}'. Usage: EVENT ADD|CHANGE|DELETE|CLEAR|LIST <CHANNEL|MEMBER|USER|MEDIA> [mask]", .{params[0]}) catch "Unknown EVENT subcommand";
+        const notice = std.fmt.bufPrint(&notice_buf, "Unknown EVENT subcommand '{s}'. Usage: EVENT ADD|DEL|CLEAR|LIST|SEVERITY <CHANNEL|MEMBER|USER|MEDIA | category | ALL> [mask]", .{params[0]}) catch "Unknown EVENT subcommand";
         try self.noticeTo(conn, notice);
+    }
+
+    /// Live Event Spine CATEGORY subscription (oper-only): toggle bits on the
+    /// session's category mask for the KILL/FLOOD/SECURITY/… taxonomy — the plane
+    /// that was previously settable ONLY via `[[opers]] presubscribe` config.
+    /// `EVENT ADD|DEL <cat...>`; "ALL" resolves to every category. Distinct from
+    /// the token-routed IRCX plane (handled by the caller for known IRCX types).
+    fn handleEventCategoryOp(self: *LinuxServer, conn: *ConnState, is_oper: bool, op: enum { add, del }, tokens: []const []const u8) !void {
+        if (!is_oper) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; category events are for operators");
+            return;
+        }
+        if (tokens.len == 0) {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"EVENT"}, "Not enough parameters");
+            return;
+        }
+        var delta = event_spine.CategoryMask.empty();
+        for (tokens) |tok| {
+            if (std.ascii.eqlIgnoreCase(tok, "ALL")) {
+                delta = delta.include(event_spine.CategoryMask.all());
+                continue;
+            }
+            const cat = event_spine.EventCategory.parse(tok) orelse {
+                try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{tok}, "No such event category");
+                return;
+            };
+            delta.add(cat);
+        }
+        const cur = conn.session.event_mask;
+        const next = switch (op) {
+            .add => cur.include(delta),
+            .del => cur.exclude(delta),
+        };
+        conn.session.setEventMask(next);
+        try self.replyEventCategories(conn, next);
+    }
+
+    /// `EVENT SEVERITY [level]` (oper-only): set — or, with no arg, report — the
+    /// minimum Event Spine severity delivered to this session's category feed.
+    fn handleEventSeverity(self: *LinuxServer, conn: *ConnState, is_oper: bool, params: []const []const u8) !void {
+        if (!is_oper) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT SEVERITY is for operators");
+            return;
+        }
+        if (params.len < 2 or params[1].len == 0) {
+            var b: [96]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&b, "Event minimum severity: {s} (debug|info|notice|warn|error|critical)", .{conn.session.eventMinSeverity().token()}) catch "Event minimum severity");
+            return;
+        }
+        const sev = event_spine.EventSeverity.parse(params[1]) orelse {
+            try self.noticeTo(conn, "Unknown severity; use debug|info|notice|warn|error|critical");
+            return;
+        };
+        conn.session.setEventMinSeverity(sev);
+        var b: [96]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&b, "Event minimum severity set to {s}", .{sev.token()}) catch "Event minimum severity set");
+    }
+
+    /// `EVENT REPLAY [category|ALL] [count]` (oper-only): re-send recent Event
+    /// Spine events from the node-wide history ring — what happened before this
+    /// oper connected/subscribed. Filtered by the optional category and the
+    /// session's minimum-severity floor; delivered oldest→newest as NOTICEs with
+    /// a relative-age prefix so they're unmistakably historical, not live.
+    fn handleEventReplay(self: *LinuxServer, conn: *ConnState, is_oper: bool, params: []const []const u8) !void {
+        if (!is_oper) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied; EVENT REPLAY is for operators");
+            return;
+        }
+        var filter_cat: ?u8 = null;
+        var count: usize = 30;
+        var argi: usize = 1;
+        // A leading non-numeric arg is a category (or ALL); then an optional count.
+        if (params.len > argi and params[argi].len != 0 and !isAsciiDigits(params[argi])) {
+            if (!std.ascii.eqlIgnoreCase(params[argi], "ALL")) {
+                filter_cat = @intFromEnum(event_spine.EventCategory.parse(params[argi]) orelse {
+                    try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[argi]}, "No such event category");
+                    return;
+                });
+            }
+            argi += 1;
+        }
+        if (params.len > argi and isAsciiDigits(params[argi])) {
+            count = std.fmt.parseInt(usize, params[argi], 10) catch 30;
+        }
+        count = std.math.clamp(count, 1, 200);
+
+        var buf: [200]event_history_mod.StoredEvent = undefined;
+        const got = self.event_history.collect(filter_cat, @intFromEnum(conn.session.eventMinSeverity()), buf[0..count]);
+
+        var hb: [96]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&hb, "Event replay: {d} event(s){s}", .{ got, if (got == 0) " (history empty or nothing matched)" else "" }) catch "Event replay");
+        const now = platform.realtimeMillis();
+        // `collect` returned newest-first; walk backwards to render chronologically.
+        var i = got;
+        while (i > 0) {
+            i -= 1;
+            const ev = &buf[i];
+            const cat = ev.categoryEnum() orelse continue;
+            var age_buf: [16]u8 = undefined;
+            const age = formatRelativeAge(&age_buf, now - ev.ts_unix_ms);
+            var line_buf: [default_reply_bytes]u8 = undefined;
+            const text = std.fmt.bufPrint(&line_buf, "[{s} ago] {s}/{s} <{s}> {s}", .{
+                age, cat.code(), ev.severityEnum().token(), ev.origin(), ev.message(),
+            }) catch continue;
+            try self.noticeTo(conn, text);
+        }
+        if (got != 0) try self.noticeTo(conn, "End of event replay.");
+    }
+
+    /// NOTICE the session's current Event Spine category subscriptions + severity.
+    fn replyEventCategories(self: *LinuxServer, conn: *ConnState, mask: event_spine.CategoryMask) !void {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.writeAll("Event categories:") catch {};
+        if (mask.isEmpty()) {
+            w.writeAll(" (none)") catch {};
+        } else {
+            inline for (@typeInfo(event_spine.EventCategory).@"enum".fields) |field| {
+                const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field.name);
+                if (mask.contains(cat)) {
+                    w.writeAll(" ") catch {};
+                    w.writeAll(cat.code()) catch {};
+                }
+            }
+        }
+        var sb: [48]u8 = undefined;
+        const sev_note = std.fmt.bufPrint(&sb, " (min severity: {s})", .{conn.session.eventMinSeverity().token()}) catch "";
+        w.writeAll(sev_note) catch {};
+        try self.noticeTo(conn, w.buffered());
     }
 
     /// Stable observer key for a connection (bitcast ClientId, matching the
@@ -22670,9 +22822,14 @@ pub const LinuxServer = struct {
     /// an IRCX EVENT mask can add delivery for mapped CHANNEL/MEMBER/USER events,
     /// and the native Event Spine subscription still delivers all category matches
     /// allowed by its own subject scope.
-    fn sessionWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, message: []const u8, subject: []const u8) bool {
+    fn sessionWantsEvent(session: *const dispatch.ClientSession, category: event_spine.EventCategory, severity: event_spine.EventSeverity, message: []const u8, subject: []const u8) bool {
+        // The IRCX plane (CHANNEL/MEMBER/USER/MEDIA) is token-routed and has no
+        // severity semantics, so it is unaffected by the category severity filter.
         if (sessionIrcxWantsEvent(session, message, subject)) return true;
         if (!session.subscribesTo(category)) return false;
+        // Category-plane severity gate: opt-in narrowing (default min = .debug
+        // shows everything), so a plain category subscription is unchanged.
+        if (!session.severityWanted(severity)) return false;
         const scope = session.eventSubjectMask(category);
         if (std.mem.eql(u8, scope, "*")) return true;
         return observe_mod.globMatch(scope, subject);
@@ -22805,7 +22962,8 @@ pub const LinuxServer = struct {
         // name as the origin), then fan the same event to every mesh peer so opers
         // on OTHER nodes see it too — network-wide Event Spine. A peer renders it
         // with THIS node's name as the origin (carried on the wire).
-        self.deliverOperEventLocal(self.serverName(), category, subject, message);
+        self.event_history.record(@intFromEnum(category), @intFromEnum(severity), platform.realtimeMillis(), self.serverName(), message);
+        self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
         self.meshBroadcastOperEvent(category, severity, message);
     }
 
@@ -22817,6 +22975,7 @@ pub const LinuxServer = struct {
         self: *LinuxServer,
         origin_server: []const u8,
         category: event_spine.EventCategory,
+        severity: event_spine.EventSeverity,
         subject: []const u8,
         message: []const u8,
     ) void {
@@ -22825,7 +22984,7 @@ pub const LinuxServer = struct {
         // gates delivery; the TYPE leads the body (e.g. "USER CONNECT …").
         var it = self.rx().clients.iterator();
         while (it.next()) |entry| {
-            if (!sessionWantsEvent(&entry.value.session, category, message, subject)) continue;
+            if (!sessionWantsEvent(&entry.value.session, category, severity, message, subject)) continue;
             // MEDIA events are member-scoped: a non-oper only sees call presence for
             // channels they are in (no snooping calls in channels they've not joined).
             if (!self.mediaEventAllowed(entry.id, &entry.value.session, message)) continue;
@@ -22848,6 +23007,7 @@ pub const LinuxServer = struct {
                     .to = client_model.ClientId.invalid,
                     .buf = buf,
                     .broadcast_category = @intFromEnum(category),
+                    .broadcast_severity = @intFromEnum(severity),
                 };
                 const sn = @min(subject.len, deliver_handle.broadcast_subject_max);
                 @memcpy(fan.broadcast_subject[0..sn], subject[0..sn]);
@@ -22909,9 +23069,15 @@ pub const LinuxServer = struct {
                 if (f.value == ev.category) category_opt = @enumFromInt(ev.category);
             }
             const category = category_opt orelse continue;
+            // Severity rides the wire (u8); clamp an out-of-range value from a
+            // hostile/newer peer to the top defined level rather than @enumFromInt blind.
+            const sev_max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".fields.len - 1);
+            const severity: event_spine.EventSeverity = @enumFromInt(@min(ev.severity, sev_max));
             // Subject == message (callers that publish locally use the same).
             // Origin is the authenticated peer, not the spoofable wire field.
-            self.deliverOperEventLocal(trustedOrigin(link, ev.origin_server), category, ev.message, ev.message);
+            const origin = trustedOrigin(link, ev.origin_server);
+            self.event_history.record(ev.category, ev.severity, platform.realtimeMillis(), origin, ev.message);
+            self.deliverOperEventLocal(origin, category, severity, ev.message, ev.message);
         }
     }
 
@@ -25817,6 +25983,24 @@ fn emitPing(conn: *ConnState) void {
     var buf: [128]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "PING :{s}\r\n", .{protocol_inventory.currentServerName()}) catch return;
     appendToConn(conn, line) catch {};
+}
+
+/// True when `s` is non-empty and all ASCII digits (a count vs. category token
+/// discriminator for EVENT REPLAY).
+fn isAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// Format a millisecond age as a compact relative string ("5s", "3m", "2h",
+/// "4d") into `buf`. Negative ages (clock skew) render as "0s".
+fn formatRelativeAge(buf: []u8, age_ms: i64) []const u8 {
+    const secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(age_ms, 1000)));
+    if (secs < 60) return std.fmt.bufPrint(buf, "{d}s", .{secs}) catch "?";
+    if (secs < 3600) return std.fmt.bufPrint(buf, "{d}m", .{secs / 60}) catch "?";
+    if (secs < 86400) return std.fmt.bufPrint(buf, "{d}h", .{secs / 3600}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}d", .{secs / 86400}) catch "?";
 }
 
 /// Resolve the trustworthy origin-server name for a peer-drained kill/event.
@@ -29821,29 +30005,42 @@ test "event routing: IRCX type subscriptions are token-routed with no category c
     try user_sub.setIrcxEventSubscription(.user, "*");
     // USER-typed events match (even though they publish under different
     // categories: CONNECT under .connect, NICK under .oper_action).
-    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .connect, "USER CONNECT n!u@h", "n!u@h"));
-    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .oper_action, "USER NICK old!u@h -> new", "old!u@h"));
-    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .oper_action, "USER OPER n!u@h :Net Admin", "n!u@h"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .connect, .notice, "USER CONNECT n!u@h", "n!u@h"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .oper_action, .notice, "USER NICK old!u@h -> new", "old!u@h"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&user_sub, .oper_action, .notice, "USER OPER n!u@h :Net Admin", "n!u@h"));
     // The regression guard: a USER subscriber must NOT receive MEMBER or CHANNEL
     // lines, nor non-IRCX oper prose, despite shared categories.
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .oper_action, "MEMBER JOIN #c nick", "#c"));
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .announce, "CHANNEL MODE #c +nt", "#c"));
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .kill, "k killed s (flood)", "k killed s (flood)"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .oper_action, .notice, "MEMBER JOIN #c nick", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .announce, .notice, "CHANNEL MODE #c +nt", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&user_sub, .kill, .notice, "k killed s (flood)", "k killed s (flood)"));
+
+    // Category-plane severity filter: a KILL subscriber with a min-severity of
+    // .warn receives .warn/.error/.critical kills but drops .notice/.info ones,
+    // while the IRCX plane is unaffected by severity.
+    var cat_sub = dispatch.ClientSession.init();
+    cat_sub.setEventMask(event_spine.CategoryMask.only(.kill));
+    // Default min severity (.debug) delivers everything.
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&cat_sub, .kill, .notice, "k killed s", "k killed s"));
+    cat_sub.setEventMinSeverity(.warn);
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&cat_sub, .kill, .warn, "k killed s", "k killed s"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&cat_sub, .kill, .critical, "k killed s", "k killed s"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&cat_sub, .kill, .notice, "k killed s", "k killed s"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&cat_sub, .kill, .info, "k killed s", "k killed s"));
 
     // A MEMBER subscriber receives only MEMBER-typed events — not USER NICK,
     // which previously leaked because both used OPER_ACTION.
     var member_sub = dispatch.ClientSession.init();
     try member_sub.setIrcxEventSubscription(.member, "*");
-    try std.testing.expect(LinuxServer.sessionWantsEvent(&member_sub, .oper_action, "MEMBER JOIN #c nick", "#c"));
-    try std.testing.expect(LinuxServer.sessionWantsEvent(&member_sub, .oper_action, "MEMBER KNOCK #c nick :let me in", "#c"));
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&member_sub, .oper_action, "USER NICK old!u@h -> new", "old!u@h"));
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&member_sub, .connect, "USER CONNECT n!u@h", "n!u@h"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&member_sub, .oper_action, .notice, "MEMBER JOIN #c nick", "#c"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&member_sub, .oper_action, .notice, "MEMBER KNOCK #c nick :let me in", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&member_sub, .oper_action, .notice, "USER NICK old!u@h -> new", "old!u@h"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&member_sub, .connect, .notice, "USER CONNECT n!u@h", "n!u@h"));
 
     // Subject globs still scope IRCX matches by channel/mask.
     var scoped = dispatch.ClientSession.init();
     try scoped.setIrcxEventSubscription(.channel, "#ops*");
-    try std.testing.expect(LinuxServer.sessionWantsEvent(&scoped, .announce, "CHANNEL MODE #ops-eu +i", "#ops-eu"));
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&scoped, .announce, "CHANNEL MODE #lobby +i", "#lobby"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&scoped, .announce, .notice, "CHANNEL MODE #ops-eu +i", "#ops-eu"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&scoped, .announce, .notice, "CHANNEL MODE #lobby +i", "#lobby"));
 }
 
 test "event routing: legacy oper category subscriptions are independent of the IRCX plane" {
@@ -29852,16 +30049,16 @@ test "event routing: legacy oper category subscriptions are independent of the I
     // subscription never bleeds into the legacy category mask.
     var oper = dispatch.ClientSession.init();
     oper.setEventMask(event_spine.CategoryMask.only(.kill));
-    try std.testing.expect(LinuxServer.sessionWantsEvent(&oper, .kill, "k killed s (flood)", "k killed s (flood)"));
+    try std.testing.expect(LinuxServer.sessionWantsEvent(&oper, .kill, .notice, "k killed s (flood)", "k killed s (flood)"));
     // Categories it did not subscribe to are filtered, IRCX-typed body or not.
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&oper, .announce, "CHANNEL MODE #c +nt", "#c"));
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&oper, .connect, "USER CONNECT n!u@h", "n!u@h"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&oper, .announce, .notice, "CHANNEL MODE #c +nt", "#c"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&oper, .connect, .notice, "USER CONNECT n!u@h", "n!u@h"));
 
     // An IRCX USER subscription must not grant legacy-category delivery: a USER
     // subscriber receives a KILL-category event only if its body is USER-typed.
     var ircx = dispatch.ClientSession.init();
     try ircx.setIrcxEventSubscription(.user, "*");
-    try std.testing.expect(!LinuxServer.sessionWantsEvent(&ircx, .kill, "k killed s (flood)", "k killed s (flood)"));
+    try std.testing.expect(!LinuxServer.sessionWantsEvent(&ircx, .kill, .notice, "k killed s (flood)", "k killed s (flood)"));
 }
 
 test "threaded server: founder/MODE/KICK/NAMES/WHOIS/LIST/WHO/ISON/LUSERS end-to-end" {

@@ -28,6 +28,19 @@ pub const EventCategory = enum(u6) {
         return @tagName(self);
     }
 
+    /// Resolve a live-command token to a REAL category by `code()`/`token()`
+    /// only — deliberately NOT the IRCX draft aliases (CHANNEL/MEMBER/USER),
+    /// which are the separate token-routed IRCX plane and must not fold back
+    /// into the category mask. Returns null for an unknown token.
+    pub fn parse(raw: []const u8) ?EventCategory {
+        inline for (@typeInfo(EventCategory).@"enum".fields) |field| {
+            const cat: EventCategory = @field(EventCategory, field.name);
+            if (std.ascii.eqlIgnoreCase(raw, cat.code()) or std.ascii.eqlIgnoreCase(raw, cat.token()))
+                return cat;
+        }
+        return null;
+    }
+
     pub fn code(self: EventCategory) []const u8 {
         return switch (self) {
             .connect => "CONNECT",
@@ -58,6 +71,16 @@ pub const EventSeverity = enum {
 
     pub fn token(self: EventSeverity) []const u8 {
         return @tagName(self);
+    }
+
+    /// Parse a severity token (case-insensitive `@tagName`, plus the common
+    /// alias "warning"→warn). Returns null for an unknown token.
+    pub fn parse(raw: []const u8) ?EventSeverity {
+        if (std.ascii.eqlIgnoreCase(raw, "warning")) return .warn;
+        inline for (@typeInfo(EventSeverity).@"enum".fields) |field| {
+            if (std.ascii.eqlIgnoreCase(raw, field.name)) return @field(EventSeverity, field.name);
+        }
+        return null;
     }
 };
 
@@ -465,6 +488,32 @@ test "category masks add remove and combine categories" {
     try std.testing.expect(combined.contains(.flood));
     try std.testing.expect(combined.contains(.debug));
     try std.testing.expect(combined.contains(.@"error"));
+}
+
+test "EventCategory.parse resolves real categories but NOT IRCX draft aliases" {
+    try std.testing.expectEqual(EventCategory.kill, EventCategory.parse("KILL").?);
+    try std.testing.expectEqual(EventCategory.kill, EventCategory.parse("kill").?);
+    try std.testing.expectEqual(EventCategory.security, EventCategory.parse("SECURITY").?);
+    try std.testing.expectEqual(EventCategory.oper_action, EventCategory.parse("OPER_ACTION").?);
+    // The IRCX draft aliases (CHANNEL/MEMBER/USER) must NOT fold into a category
+    // here — that plane is token-routed separately and this parser is alias-free.
+    try std.testing.expectEqual(@as(?EventCategory, null), EventCategory.parse("CHANNEL"));
+    try std.testing.expectEqual(@as(?EventCategory, null), EventCategory.parse("MEMBER"));
+    try std.testing.expectEqual(@as(?EventCategory, null), EventCategory.parse("USER"));
+    try std.testing.expectEqual(@as(?EventCategory, null), EventCategory.parse("nonsense"));
+}
+
+test "EventSeverity.parse and ordering supports a min-severity filter" {
+    try std.testing.expectEqual(EventSeverity.warn, EventSeverity.parse("warn").?);
+    try std.testing.expectEqual(EventSeverity.warn, EventSeverity.parse("WARNING").?);
+    try std.testing.expectEqual(EventSeverity.critical, EventSeverity.parse("Critical").?);
+    try std.testing.expectEqual(@as(?EventSeverity, null), EventSeverity.parse("loud"));
+    // Ordered low→high, so `@intFromEnum(sev) >= min` is a valid threshold test.
+    try std.testing.expect(@intFromEnum(EventSeverity.debug) < @intFromEnum(EventSeverity.info));
+    try std.testing.expect(@intFromEnum(EventSeverity.info) < @intFromEnum(EventSeverity.notice));
+    try std.testing.expect(@intFromEnum(EventSeverity.notice) < @intFromEnum(EventSeverity.warn));
+    try std.testing.expect(@intFromEnum(EventSeverity.warn) < @intFromEnum(EventSeverity.@"error"));
+    try std.testing.expect(@intFromEnum(EventSeverity.@"error") < @intFromEnum(EventSeverity.critical));
 }
 
 test "IRCX event types parse from a bare token" {
