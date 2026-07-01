@@ -1,24 +1,33 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Deterministic host/IP cloaking (charybdis-grade hierarchical scheme).
+//! Deterministic host/IP cloaking (charybdis-grade hierarchical scheme, v2).
 //!
 //! Every cloak segment is a keyed HMAC-SHA256 token over a *cumulative prefix*
-//! of the real address, truncated to 32 bits and rendered as 8 lowercase hex
-//! digits. Because each segment depends only on the prefix up to that point:
+//! of the real address. The FULL-address token is 64 bits (16 hex) so two
+//! distinct addresses never collide to the same cloak in practice; the coarser
+//! subnet-prefix tokens are 32 bits (8 hex). Because each segment depends only
+//! on the prefix up to that point:
 //!
 //!   * the SAME real input + key always yields the SAME cloak (deterministic),
 //!   * a different key yields a completely different cloak (unlinkable),
 //!   * two addresses in the same subnet SHARE the broad-prefix segments and
-//!     differ in the specific ones, so subnet bans (`*.<t24>.<t16>.ip.net`)
-//!     keep working without ever exposing the raw address.
+//!     differ in the specific ones, so subnet bans keep working without ever
+//!     exposing the raw address.
+//!
+//! GeoIP context (ISO country + origin AS number) is MIXED IN as two visible,
+//! ban-able labels (`a<asn>.<cc>`) between the masked IP tokens and the `ip`
+//! marker — so an oper can `*.us.ip.<net>` (ban a country) or `*.a13335.*.ip.<net>`
+//! (ban an ASN) while the exact address stays masked. Unknown geo renders the
+//! placeholders `a0` / `xx`, keeping a stable shape.
 //!
 //! Shapes produced (with the default `ircxnet` suffix):
 //!
-//!   IPv4  `a.b.c.d`            -> `<t/32>.<t/24>.<t/16>.ip.ircxnet`
-//!   IPv6  `2001:db8::1`        -> `<t/128>.<t/64>.<t/48>.<t/32>.ip6.ircxnet`
-//!   rDNS  `dsl-1.pool.isp.com` -> `ircxnet-<token>.isp.com`
-//!   acct  `Kain` @ `IRCXNet`   -> `kain.users.ircxnet` (no key needed)
+//!   IPv4  `a.b.c.d`      -> `<f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.ircxnet`
+//!   IPv6  `2001:db8::1`  -> `<f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.ircxnet`
+//!   opaque (max privacy) -> `<f>.opq.ircxnet`  (one token, no subnet/geo leak)
+//!   rDNS  `dsl-1.isp.com`-> `ircxnet-<token>.isp.com`
+//!   acct  `Kain`@`IRCXNet`-> `kain.users.ircxnet` (no key needed)
 //!
 //! The most specific token comes FIRST (leftmost), matching DNS semantics
 //! where the rightmost labels are the broadest: masking the leading labels
@@ -33,8 +42,13 @@ pub const tag_len = std.crypto.hash.sha2.Sha256.digest_length;
 pub const max_hostname_len = 253;
 pub const max_cloak_len = max_hostname_len;
 
-/// Hex digits per HMAC-derived cloak token (32 bits of keyed output).
+/// Hex digits per 32-bit subnet-prefix cloak token.
 pub const token_hex_len = 8;
+/// Hex digits for the wide, collision-resistant full-address token (64 bits).
+/// A 32-bit token birthday-collides around 65k distinct addresses; 64 bits
+/// pushes that past 4 billion, so two real addresses effectively never share a
+/// cloak.
+pub const full_token_hex_len = 16;
 
 /// Default network-identifying suffix carried by every cloaked host so users
 /// and opers can tell at a glance that a host is cloaked. Configurable via
@@ -44,6 +58,13 @@ pub const default_suffix = "ircxnet";
 /// Label between the account name and the network in account cloaks
 /// (`<account>.users.<network>`).
 pub const account_subdomain = "users";
+
+/// Marker label placed before the suffix in an opaque (max-privacy) cloak.
+pub const opaque_marker = "opq";
+
+/// Placeholder country label when GeoIP has no answer (ISO reserves `xx` for
+/// private use, so it never collides with a real code).
+pub const unknown_country = "xx";
 
 pub const CloakError = error{
     InvalidKey,
@@ -77,6 +98,18 @@ pub const SecretKey = struct {
     }
 };
 
+/// GeoIP context mixed into an IP cloak as visible, ban-able labels. Both fields
+/// are optional; missing values render the stable `a0` / `xx` placeholders.
+pub const Geo = struct {
+    /// ISO-3166-1 alpha-2 country code (any case); non-letters are dropped and
+    /// anything that is not exactly two letters renders as `xx`.
+    country: []const u8 = "",
+    /// Origin Autonomous System number; 0 means unknown (renders `a0`).
+    asn: u32 = 0,
+
+    pub const none: Geo = .{};
+};
+
 /// Formatting options for cloak output.
 pub const Options = struct {
     /// Network-identifying suffix appended to IP cloaks (`....ip.<suffix>`)
@@ -101,70 +134,118 @@ pub fn classify(address: []const u8) AddressKind {
     };
 }
 
-/// Cloak an IPv4, IPv6, or resolved hostname into caller-provided storage.
+/// Cloak an IPv4, IPv6, or resolved hostname into caller-provided storage,
+/// mixing in `geo` for IP addresses (ignored for hostnames).
 pub fn cloak(
     out: []u8,
     key: *const SecretKey,
     address: []const u8,
+    geo: Geo,
     options: Options,
 ) CloakError![]const u8 {
     if (Net.IpAddress.parse(address, 0)) |parsed| {
         return switch (parsed) {
-            .ip4 => |ip4| cloakIPv4(out, key, ip4.bytes, options),
-            .ip6 => |ip6| cloakIPv6(out, key, ip6.bytes, options),
+            .ip4 => |ip4| cloakIPv4(out, key, ip4.bytes, geo, options),
+            .ip6 => |ip6| cloakIPv6(out, key, ip6.bytes, geo, options),
         };
     } else |_| {
         return cloakHostname(out, key, address, options);
     }
 }
 
-/// Cloak raw IPv4 bytes hierarchically: one token per cumulative prefix
-/// (/32 full address, /24, /16), most specific first, then the `ip` marker
-/// and the network suffix. Two addresses in the same /24 share everything
-/// after the first label; two in the same /16 share everything after the
-/// second.
+/// Cloak an IP address into an OPAQUE (max-privacy) cloak: a single 64-bit token
+/// over the full address plus the `opq` marker — no subnet hierarchy and no geo,
+/// so nothing about the address (not even country/ASN or which users share a
+/// subnet) leaks. The cost is that opaque cloaks cannot be subnet-banned.
+pub fn cloakOpaque(
+    out: []u8,
+    key: *const SecretKey,
+    address: []const u8,
+    options: Options,
+) CloakError![]const u8 {
+    var full: [full_token_hex_len]u8 = undefined;
+    if (Net.IpAddress.parse(address, 0)) |parsed| {
+        switch (parsed) {
+            .ip4 => |ip4| token64(&full, key, "ip4/v2/opq|", ip4.bytes[0..4]),
+            .ip6 => |ip6| token64(&full, key, "ip6/v2/opq|", ip6.bytes[0..16]),
+        }
+    } else |_| return error.InvalidHostname;
+    return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ &full, opaque_marker, options.suffix }) catch error.OutputTooSmall;
+}
+
+/// Cloak raw IPv4 bytes hierarchically: a 64-bit token over the full address,
+/// then 32-bit tokens per cumulative prefix (/24, /16, /8), most specific
+/// first, then the mixed-in `a<asn>.<cc>` geo labels, the `ip` marker, and the
+/// network suffix.
 pub fn cloakIPv4(
     out: []u8,
     key: *const SecretKey,
     address: [4]u8,
+    geo: Geo,
     options: Options,
 ) CloakError![]const u8 {
-    var t_full: [token_hex_len]u8 = undefined;
+    var t_full: [full_token_hex_len]u8 = undefined;
     var t_24: [token_hex_len]u8 = undefined;
     var t_16: [token_hex_len]u8 = undefined;
-    token(&t_full, key, "ip4/32|", address[0..4]);
-    token(&t_24, key, "ip4/24|", address[0..3]);
-    token(&t_16, key, "ip4/16|", address[0..2]);
-    return std.fmt.bufPrint(
-        out,
-        "{s}.{s}.{s}.ip.{s}",
-        .{ &t_full, &t_24, &t_16, options.suffix },
-    ) catch error.OutputTooSmall;
+    var t_8: [token_hex_len]u8 = undefined;
+    token64(&t_full, key, "ip4/v2/32|", address[0..4]);
+    token32(&t_24, key, "ip4/v2/24|", address[0..3]);
+    token32(&t_16, key, "ip4/v2/16|", address[0..2]);
+    token32(&t_8, key, "ip4/v2/8|", address[0..1]);
+
+    var n: usize = 0;
+    try append(out, &n, &t_full);
+    try appendByte(out, &n, '.');
+    try append(out, &n, &t_24);
+    try appendByte(out, &n, '.');
+    try append(out, &n, &t_16);
+    try appendByte(out, &n, '.');
+    try append(out, &n, &t_8);
+    try appendByte(out, &n, '.');
+    try appendGeo(out, &n, geo);
+    try append(out, &n, "ip.");
+    try append(out, &n, options.suffix);
+    return out[0..n];
 }
 
-/// Cloak raw IPv6 bytes hierarchically at routing-structure granularity:
-/// one token per cumulative prefix (/128 full address, /64, /48, /32), most
-/// specific first, then the `ip6` marker and the network suffix. Two
-/// addresses in the same /64 share everything after the first label.
+/// Cloak raw IPv6 bytes hierarchically at routing-structure granularity: a
+/// 64-bit token over the full address, then 32-bit tokens per cumulative prefix
+/// (/64, /56, /48, /32), most specific first, then the mixed-in `a<asn>.<cc>`
+/// geo labels, the `ip6` marker, and the network suffix. Two addresses in the
+/// same /64 share everything after the first label.
 pub fn cloakIPv6(
     out: []u8,
     key: *const SecretKey,
     address: [16]u8,
+    geo: Geo,
     options: Options,
 ) CloakError![]const u8 {
-    var t_full: [token_hex_len]u8 = undefined;
+    var t_full: [full_token_hex_len]u8 = undefined;
     var t_64: [token_hex_len]u8 = undefined;
+    var t_56: [token_hex_len]u8 = undefined;
     var t_48: [token_hex_len]u8 = undefined;
     var t_32: [token_hex_len]u8 = undefined;
-    token(&t_full, key, "ip6/128|", address[0..16]);
-    token(&t_64, key, "ip6/64|", address[0..8]);
-    token(&t_48, key, "ip6/48|", address[0..6]);
-    token(&t_32, key, "ip6/32|", address[0..4]);
-    return std.fmt.bufPrint(
-        out,
-        "{s}.{s}.{s}.{s}.ip6.{s}",
-        .{ &t_full, &t_64, &t_48, &t_32, options.suffix },
-    ) catch error.OutputTooSmall;
+    token64(&t_full, key, "ip6/v2/128|", address[0..16]);
+    token32(&t_64, key, "ip6/v2/64|", address[0..8]);
+    token32(&t_56, key, "ip6/v2/56|", address[0..7]);
+    token32(&t_48, key, "ip6/v2/48|", address[0..6]);
+    token32(&t_32, key, "ip6/v2/32|", address[0..4]);
+
+    var n: usize = 0;
+    try append(out, &n, &t_full);
+    try appendByte(out, &n, '.');
+    try append(out, &n, &t_64);
+    try appendByte(out, &n, '.');
+    try append(out, &n, &t_56);
+    try appendByte(out, &n, '.');
+    try append(out, &n, &t_48);
+    try appendByte(out, &n, '.');
+    try append(out, &n, &t_32);
+    try appendByte(out, &n, '.');
+    try appendGeo(out, &n, geo);
+    try append(out, &n, "ip6.");
+    try append(out, &n, options.suffix);
+    return out[0..n];
 }
 
 /// Cloak a resolved hostname: replace every label left of the registrable
@@ -187,7 +268,7 @@ pub fn cloakHostname(
     const normalized = try normalizeHostname(&normalized_buf, hostname);
 
     var tok: [token_hex_len]u8 = undefined;
-    token(&tok, key, "host|", normalized);
+    token32(&tok, key, "host|", normalized);
 
     var n: usize = 0;
     try append(out, &n, options.suffix);
@@ -226,27 +307,65 @@ pub fn cloakAccount(
     return out[0..n];
 }
 
-/// Derive one 32-bit cloak token: HMAC-SHA256(key, domain || data) truncated
-/// to 4 bytes and rendered as 8 lowercase hex digits. The domain string
-/// separates token families so e.g. an IPv4 /16 prefix and an IPv6 /32 prefix
-/// over the same bytes can never produce related tokens.
-fn token(
-    out: *[token_hex_len]u8,
-    key: *const SecretKey,
-    domain: []const u8,
-    data: []const u8,
-) void {
+/// Append the mixed-in geo labels `a<asn>.<cc>.` (with a trailing dot). Both
+/// render stable placeholders when unknown so the cloak shape never varies:
+/// `a0` for an unknown ASN, `xx` for an unknown/invalid country.
+fn appendGeo(out: []u8, n: *usize, geo: Geo) CloakError!void {
+    try appendByte(out, n, 'a');
+    var asn_buf: [10]u8 = undefined;
+    const asn_str = std.fmt.bufPrint(&asn_buf, "{d}", .{geo.asn}) catch return error.OutputTooSmall;
+    try append(out, n, asn_str);
+    try appendByte(out, n, '.');
+    try appendCountry(out, n, geo.country);
+    try appendByte(out, n, '.');
+}
+
+/// Append a 2-letter lowercase country code, or `xx` when the input is not
+/// exactly two ASCII letters (covers empty, private-range, and junk input).
+fn appendCountry(out: []u8, n: *usize, country: []const u8) CloakError!void {
+    if (country.len == 2 and isAsciiLetter(country[0]) and isAsciiLetter(country[1])) {
+        try appendByte(out, n, std.ascii.toLower(country[0]));
+        try appendByte(out, n, std.ascii.toLower(country[1]));
+    } else {
+        try append(out, n, unknown_country);
+    }
+}
+
+fn isAsciiLetter(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+}
+
+/// Derive one 32-bit cloak token: HMAC-SHA256(key, domain || data) truncated to
+/// 4 bytes and rendered as 8 lowercase hex digits. The versioned domain string
+/// separates token families so tokens over the same bytes for different scopes
+/// (or scheme versions) can never be related.
+fn token32(out: *[token_hex_len]u8, key: *const SecretKey, domain: []const u8, data: []const u8) void {
+    var tag = macTag(key, domain, data);
+    defer secureZero(&tag);
+    hexEncode(out, tag[0 .. token_hex_len / 2]);
+}
+
+/// Derive one 64-bit collision-resistant token (16 hex) for the full address.
+fn token64(out: *[full_token_hex_len]u8, key: *const SecretKey, domain: []const u8, data: []const u8) void {
+    var tag = macTag(key, domain, data);
+    defer secureZero(&tag);
+    hexEncode(out, tag[0 .. full_token_hex_len / 2]);
+}
+
+/// HMAC-SHA256(key, domain || data). Key bytes are wiped after use.
+fn macTag(key: *const SecretKey, domain: []const u8, data: []const u8) [tag_len]u8 {
     var key_bytes = key.declassify();
     defer secureZero(&key_bytes);
-
     var tag: [tag_len]u8 = undefined;
-    defer secureZero(&tag);
     var mac = HmacSha256.init(&key_bytes);
     mac.update(domain);
     mac.update(data);
     mac.final(&tag);
+    return tag;
+}
 
-    for (tag[0 .. token_hex_len / 2], 0..) |byte, i| {
+fn hexEncode(out: []u8, bytes: []const u8) void {
+    for (bytes, 0..) |byte, i| {
         out[i * 2] = hex_digit[byte >> 4];
         out[i * 2 + 1] = hex_digit[byte & 0x0f];
     }
@@ -383,6 +502,8 @@ const test_key = SecretKey.init([_]u8{
 
 const other_key = SecretKey.init([_]u8{0xa5} ** key_len);
 
+const geo_us = Geo{ .country = "US", .asn = 13335 };
+
 /// Split a dotted cloak into its labels (test helper).
 fn splitLabels(buf: *[16][]const u8, host: []const u8) [][]const u8 {
     var it = std.mem.splitScalar(u8, host, '.');
@@ -394,8 +515,8 @@ fn splitLabels(buf: *[16][]const u8, host: []const u8) [][]const u8 {
     return buf[0..n];
 }
 
-fn isHexToken(label: []const u8) bool {
-    if (label.len != token_hex_len) return false;
+fn isHexToken(label: []const u8, expect_len: usize) bool {
+    if (label.len != expect_len) return false;
     for (label) |c| {
         switch (c) {
             '0'...'9', 'a'...'f' => {},
@@ -408,50 +529,48 @@ fn isHexToken(label: []const u8) bool {
 test "same IP gets the same stable cloak" {
     var a: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
-
-    const ca = try cloak(&a, &test_key, "203.0.113.99", .{});
-    const cb = try cloak(&b, &test_key, "203.0.113.99", .{});
-
+    const ca = try cloak(&a, &test_key, "203.0.113.99", geo_us, .{});
+    const cb = try cloak(&b, &test_key, "203.0.113.99", geo_us, .{});
     try testing.expectEqualSlices(u8, ca, cb);
 }
 
 test "different IPs get different cloaks" {
     var a: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
-
-    const ca = try cloak(&a, &test_key, "203.0.113.99", .{});
-    const cb = try cloak(&b, &test_key, "203.0.113.100", .{});
-
+    const ca = try cloak(&a, &test_key, "203.0.113.99", geo_us, .{});
+    const cb = try cloak(&b, &test_key, "203.0.113.100", geo_us, .{});
     try testing.expect(!std.mem.eql(u8, ca, cb));
 }
 
-test "IPv4 cloak has token.token.token.ip.suffix shape and leaks no octet" {
+test "IPv4 cloak shape: 64-bit full token, geo labels, no raw octet" {
     var out: [max_cloak_len]u8 = undefined;
-    const c = try cloak(&out, &test_key, "203.0.113.99", .{});
+    const c = try cloak(&out, &test_key, "203.0.113.99", geo_us, .{});
 
     var lbuf: [16][]const u8 = undefined;
     const labels = splitLabels(&lbuf, c);
-    try testing.expectEqual(@as(usize, 5), labels.len);
-    try testing.expect(isHexToken(labels[0]));
-    try testing.expect(isHexToken(labels[1]));
-    try testing.expect(isHexToken(labels[2]));
-    try testing.expectEqualStrings("ip", labels[3]);
-    try testing.expectEqualStrings(default_suffix, labels[4]);
+    // <full16>.<t24>.<t16>.<t8>.a13335.us.ip.ircxnet
+    try testing.expectEqual(@as(usize, 8), labels.len);
+    try testing.expect(isHexToken(labels[0], full_token_hex_len));
+    try testing.expect(isHexToken(labels[1], token_hex_len));
+    try testing.expect(isHexToken(labels[2], token_hex_len));
+    try testing.expect(isHexToken(labels[3], token_hex_len));
+    try testing.expectEqualStrings("a13335", labels[4]);
+    try testing.expectEqualStrings("us", labels[5]);
+    try testing.expectEqualStrings("ip", labels[6]);
+    try testing.expectEqualStrings(default_suffix, labels[7]);
 
-    // No label is a raw octet of the real address.
     for (labels) |label| {
         try testing.expect(!std.mem.eql(u8, label, "203"));
-        try testing.expect(!std.mem.eql(u8, label, "0"));
         try testing.expect(!std.mem.eql(u8, label, "113"));
         try testing.expect(!std.mem.eql(u8, label, "99"));
     }
 }
 
-test "IPv4 same /24 shares upper segments, differs in the most-specific one" {
+test "IPv4 subnet coherence: same /24 shares upper segments" {
     var a: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
-    const ca = try cloak(&a, &test_key, "203.0.113.5", .{});
-    const cb = try cloak(&b, &test_key, "203.0.113.77", .{});
+    const ca = try cloak(&a, &test_key, "203.0.113.5", geo_us, .{});
+    const cb = try cloak(&b, &test_key, "203.0.113.77", geo_us, .{});
 
     var la_buf: [16][]const u8 = undefined;
     var lb_buf: [16][]const u8 = undefined;
@@ -461,232 +580,188 @@ test "IPv4 same /24 shares upper segments, differs in the most-specific one" {
     try testing.expect(!std.mem.eql(u8, la[0], lb[0])); // /32 differs
     try testing.expectEqualStrings(la[1], lb[1]); // shared /24
     try testing.expectEqualStrings(la[2], lb[2]); // shared /16
+    try testing.expectEqualStrings(la[3], lb[3]); // shared /8
 }
 
-test "IPv4 same /16 different /24 shares only the /16 segment" {
+test "IPv4 /16 shared but /24 differs" {
     var a: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
-    const ca = try cloak(&a, &test_key, "203.0.113.5", .{});
-    const cb = try cloak(&b, &test_key, "203.0.200.5", .{});
-
+    const ca = try cloak(&a, &test_key, "203.0.113.5", geo_us, .{});
+    const cb = try cloak(&b, &test_key, "203.0.200.5", geo_us, .{});
     var la_buf: [16][]const u8 = undefined;
     var lb_buf: [16][]const u8 = undefined;
     const la = splitLabels(&la_buf, ca);
     const lb = splitLabels(&lb_buf, cb);
-
-    try testing.expect(!std.mem.eql(u8, la[0], lb[0]));
-    try testing.expect(!std.mem.eql(u8, la[1], lb[1]));
+    try testing.expect(!std.mem.eql(u8, la[1], lb[1])); // /24 differs
     try testing.expectEqualStrings(la[2], lb[2]); // shared /16
+    try testing.expectEqualStrings(la[3], lb[3]); // shared /8
 }
 
-test "IPv4 unrelated networks share no segments" {
+test "geo labels ban a country and an ASN via wildcards" {
+    var out: [max_cloak_len]u8 = undefined;
+    const c = try cloak(&out, &test_key, "203.0.113.99", geo_us, .{});
+    // Country ban `*.us.ip.ircxnet`
+    try testing.expect(std.mem.endsWith(u8, c, ".us.ip.ircxnet"));
+    // ASN label present for `*.a13335.*.ip.ircxnet`
+    try testing.expect(std.mem.containsAtLeast(u8, c, 1, ".a13335."));
+}
+
+test "unknown geo renders stable a0.xx placeholders" {
+    var out: [max_cloak_len]u8 = undefined;
+    const c = try cloak(&out, &test_key, "203.0.113.99", Geo.none, .{});
+    try testing.expect(std.mem.containsAtLeast(u8, c, 1, ".a0.xx.ip."));
+
+    // Junk / wrong-length country also falls back to xx.
+    var out2: [max_cloak_len]u8 = undefined;
+    const c2 = try cloak(&out2, &test_key, "203.0.113.99", .{ .country = "USA", .asn = 1 }, .{});
+    try testing.expect(std.mem.containsAtLeast(u8, c2, 1, ".a1.xx.ip."));
+}
+
+test "geo labels do not affect the IP tokens (subnet bans stay geo-independent)" {
     var a: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
-    const ca = try cloak(&a, &test_key, "203.0.113.5", .{});
-    const cb = try cloak(&b, &test_key, "9.8.7.6", .{});
-
+    const ca = try cloak(&a, &test_key, "203.0.113.99", geo_us, .{});
+    const cb = try cloak(&b, &test_key, "203.0.113.99", Geo.none, .{});
     var la_buf: [16][]const u8 = undefined;
     var lb_buf: [16][]const u8 = undefined;
     const la = splitLabels(&la_buf, ca);
     const lb = splitLabels(&lb_buf, cb);
-
-    try testing.expect(!std.mem.eql(u8, la[0], lb[0]));
-    try testing.expect(!std.mem.eql(u8, la[1], lb[1]));
-    try testing.expect(!std.mem.eql(u8, la[2], lb[2]));
+    // The four IP tokens are identical regardless of geo.
+    try testing.expectEqualStrings(la[0], lb[0]);
+    try testing.expectEqualStrings(la[1], lb[1]);
+    try testing.expectEqualStrings(la[2], lb[2]);
+    try testing.expectEqualStrings(la[3], lb[3]);
 }
 
-test "IPv6 cloak shape, determinism, and /64 / /48 coherence" {
+test "IPv6 cloak shape, determinism, and /64 / /56 / /48 coherence" {
     var a: [max_cloak_len]u8 = undefined;
     var a2: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
     var c: [max_cloak_len]u8 = undefined;
-    var d: [max_cloak_len]u8 = undefined;
 
-    // Same /64, different interface IDs.
-    const ca = try cloak(&a, &test_key, "2001:db8:85a3:1:8a2e:370:7334:1234", .{});
-    const ca2 = try cloak(&a2, &test_key, "2001:db8:85a3:1:8a2e:370:7334:1234", .{});
-    const cb = try cloak(&b, &test_key, "2001:db8:85a3:1:dead:beef:cafe:1", .{});
-    // Same /48, different /64.
-    const cc = try cloak(&c, &test_key, "2001:db8:85a3:ffff:1:2:3:4", .{});
-    // Unrelated network.
-    const cd = try cloak(&d, &test_key, "fd00:1:2:3:4:5:6:7", .{});
+    const ca = try cloak(&a, &test_key, "2001:db8:85a3:1:8a2e:370:7334:1234", geo_us, .{});
+    const ca2 = try cloak(&a2, &test_key, "2001:db8:85a3:1:8a2e:370:7334:1234", geo_us, .{});
+    const cb = try cloak(&b, &test_key, "2001:db8:85a3:1:dead:beef:cafe:1", geo_us, .{}); // same /64
+    const cc = try cloak(&c, &test_key, "2001:db8:85a3:ffff:1:2:3:4", geo_us, .{}); // same /48, diff /56/64
 
     try testing.expectEqualSlices(u8, ca, ca2);
 
     var la_buf: [16][]const u8 = undefined;
     var lb_buf: [16][]const u8 = undefined;
     var lc_buf: [16][]const u8 = undefined;
-    var ld_buf: [16][]const u8 = undefined;
     const la = splitLabels(&la_buf, ca);
     const lb = splitLabels(&lb_buf, cb);
     const lc = splitLabels(&lc_buf, cc);
-    const ld = splitLabels(&ld_buf, cd);
 
-    try testing.expectEqual(@as(usize, 6), la.len);
-    try testing.expect(isHexToken(la[0]));
-    try testing.expect(isHexToken(la[1]));
-    try testing.expect(isHexToken(la[2]));
-    try testing.expect(isHexToken(la[3]));
-    try testing.expectEqualStrings("ip6", la[4]);
-    try testing.expectEqualStrings(default_suffix, la[5]);
+    // <full16>.<t64>.<t56>.<t48>.<t32>.a13335.us.ip6.ircxnet = 9 labels
+    try testing.expectEqual(@as(usize, 9), la.len);
+    try testing.expect(isHexToken(la[0], full_token_hex_len));
+    try testing.expect(isHexToken(la[1], token_hex_len));
+    try testing.expectEqualStrings("a13335", la[5]);
+    try testing.expectEqualStrings("us", la[6]);
+    try testing.expectEqualStrings("ip6", la[7]);
+    try testing.expectEqualStrings(default_suffix, la[8]);
 
-    // Same /64: only the full-address token differs.
+    // Same /64: only the full token differs; /64, /56, /48, /32 shared.
     try testing.expect(!std.mem.eql(u8, la[0], lb[0]));
     try testing.expectEqualStrings(la[1], lb[1]);
     try testing.expectEqualStrings(la[2], lb[2]);
     try testing.expectEqualStrings(la[3], lb[3]);
+    try testing.expectEqualStrings(la[4], lb[4]);
 
-    // Same /48: /64 token differs too, /48 and /32 shared.
-    try testing.expect(!std.mem.eql(u8, la[0], lc[0]));
+    // Same /48: /64 and /56 differ, /48 and /32 shared.
     try testing.expect(!std.mem.eql(u8, la[1], lc[1]));
-    try testing.expectEqualStrings(la[2], lc[2]);
+    try testing.expect(!std.mem.eql(u8, la[2], lc[2]));
     try testing.expectEqualStrings(la[3], lc[3]);
-
-    // Unrelated: nothing shared.
-    try testing.expect(!std.mem.eql(u8, la[0], ld[0]));
-    try testing.expect(!std.mem.eql(u8, la[1], ld[1]));
-    try testing.expect(!std.mem.eql(u8, la[2], ld[2]));
-    try testing.expect(!std.mem.eql(u8, la[3], ld[3]));
+    try testing.expectEqualStrings(la[4], lc[4]);
 }
 
-test "IPv6 cloak leaks no raw hextet labels" {
-    var out: [max_cloak_len]u8 = undefined;
-    const c = try cloak(&out, &test_key, "2001:db8:85a3:1:8a2e:370:7334:1234", .{});
-
-    var lbuf: [16][]const u8 = undefined;
-    const labels = splitLabels(&lbuf, c);
-    const raw = [_][]const u8{ "2001", "db8", "85a3", "8a2e", "370", "7334", "1234" };
-    for (labels[0..4]) |label| {
-        for (raw) |r| try testing.expect(!std.mem.eql(u8, label, r));
-    }
-}
-
-test "hostnames mask all dynamic labels and preserve the registrable domain" {
-    var out: [max_cloak_len]u8 = undefined;
-    const c = try cloak(&out, &test_key, "Client-123.POOL.Example.Net", .{});
-
-    try testing.expect(std.mem.endsWith(u8, c, ".example.net"));
-    try testing.expect(std.mem.startsWith(u8, c, default_suffix ++ "-"));
-    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "client-123"));
-    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "pool"));
-
-    // Exactly one masked label: <suffix>-<8 hex>.
-    const dot = std.mem.indexOfScalar(u8, c, '.').?;
-    const masked = c[0..dot];
-    try testing.expectEqual(default_suffix.len + 1 + token_hex_len, masked.len);
-    try testing.expect(isHexToken(masked[default_suffix.len + 1 ..]));
-}
-
-test "hostname cloak is deterministic and unlinkable across sibling hosts" {
+test "opaque cloak is one token, no subnet or geo structure" {
     var a: [max_cloak_len]u8 = undefined;
     var a2: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
 
-    const ca = try cloak(&a, &test_key, "alpha.example.com", .{});
-    const ca2 = try cloak(&a2, &test_key, "alpha.example.com", .{});
-    const cb = try cloak(&b, &test_key, "beta.example.com", .{});
+    const ca = try cloakOpaque(&a, &test_key, "203.0.113.5", .{});
+    const ca2 = try cloakOpaque(&a2, &test_key, "203.0.113.5", .{});
+    const cb = try cloakOpaque(&b, &test_key, "203.0.113.77", .{}); // same /24
 
-    try testing.expectEqualSlices(u8, ca, ca2);
-    try testing.expect(!std.mem.eql(u8, ca, cb)); // siblings get distinct tokens
-    try testing.expect(std.mem.endsWith(u8, ca, ".example.com"));
-    try testing.expect(std.mem.endsWith(u8, cb, ".example.com"));
-}
-
-test "two-label hostnames still mask the registrable label" {
-    var out: [max_cloak_len]u8 = undefined;
-    const c = try cloak(&out, &test_key, "example.com", .{});
-
-    try testing.expect(std.mem.endsWith(u8, c, ".com"));
-    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "example"));
-    try testing.expect(std.mem.startsWith(u8, c, default_suffix ++ "-"));
-}
-
-test "multi-part TLDs keep three labels" {
-    var out: [max_cloak_len]u8 = undefined;
-    const c = try cloak(&out, &test_key, "dsl-99.cust.foo.co.uk", .{});
-
-    try testing.expect(std.mem.endsWith(u8, c, ".foo.co.uk"));
-    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "dsl-99"));
-    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "cust"));
-}
-
-test "host that IS a multi-part-TLD domain still masks one label" {
-    var out: [max_cloak_len]u8 = undefined;
-    const c = try cloak(&out, &test_key, "foo.co.uk", .{});
-
-    try testing.expect(std.mem.endsWith(u8, c, ".co.uk"));
-    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "foo."));
-}
-
-test "single-label hostnames fall back to the cloak suffix" {
-    var out: [max_cloak_len]u8 = undefined;
-    const c = try cloak(&out, &test_key, "localhost", .{});
-
-    try testing.expect(std.mem.startsWith(u8, c, default_suffix ++ "-"));
-    try testing.expect(std.mem.endsWith(u8, c, "." ++ default_suffix));
-    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "localhost"));
-}
-
-test "custom suffix flows through every cloak form" {
-    const opts: Options = .{ .suffix = "mynet" };
-    var a: [max_cloak_len]u8 = undefined;
-    var b: [max_cloak_len]u8 = undefined;
-    var c: [max_cloak_len]u8 = undefined;
-
-    const ca = try cloak(&a, &test_key, "203.0.113.99", opts);
-    const cb = try cloak(&b, &test_key, "2001:db8::1", opts);
-    const cc = try cloak(&c, &test_key, "node.example.org", opts);
-
-    try testing.expect(std.mem.endsWith(u8, ca, ".ip.mynet"));
-    try testing.expect(std.mem.endsWith(u8, cb, ".ip6.mynet"));
-    try testing.expect(std.mem.startsWith(u8, cc, "mynet-"));
-}
-
-test "suffix does not affect token values (segments stay ban-compatible)" {
-    var a: [max_cloak_len]u8 = undefined;
-    var b: [max_cloak_len]u8 = undefined;
-    const ca = try cloak(&a, &test_key, "203.0.113.99", .{});
-    const cb = try cloak(&b, &test_key, "203.0.113.99", .{ .suffix = "mynet" });
+    try testing.expectEqualSlices(u8, ca, ca2); // deterministic
 
     var la_buf: [16][]const u8 = undefined;
-    var lb_buf: [16][]const u8 = undefined;
     const la = splitLabels(&la_buf, ca);
-    const lb = splitLabels(&lb_buf, cb);
-    try testing.expectEqualStrings(la[0], lb[0]);
-    try testing.expectEqualStrings(la[1], lb[1]);
-    try testing.expectEqualStrings(la[2], lb[2]);
+    try testing.expectEqual(@as(usize, 3), la.len); // <full>.opq.suffix
+    try testing.expect(isHexToken(la[0], full_token_hex_len));
+    try testing.expectEqualStrings(opaque_marker, la[1]);
+    try testing.expectEqualStrings(default_suffix, la[2]);
+
+    // Same /24 shares NOTHING under opaque (no subnet leak).
+    try testing.expect(!std.mem.eql(u8, ca, cb));
+
+    // Opaque cloak differs from the structured cloak of the same IP.
+    var s: [max_cloak_len]u8 = undefined;
+    const structured = try cloak(&s, &test_key, "203.0.113.5", geo_us, .{});
+    try testing.expect(!std.mem.eql(u8, ca, structured));
 }
 
 test "different secret produces a completely different cloak" {
     var a: [max_cloak_len]u8 = undefined;
     var b: [max_cloak_len]u8 = undefined;
-
-    inline for (.{ "203.0.113.99", "2001:db8::1", "node.example.org" }) |addr| {
-        const ca = try cloak(&a, &test_key, addr, .{});
-        const cb = try cloak(&b, &other_key, addr, .{});
+    inline for (.{ "203.0.113.99", "2001:db8::1" }) |addr| {
+        const ca = try cloak(&a, &test_key, addr, geo_us, .{});
+        const cb = try cloak(&b, &other_key, addr, geo_us, .{});
         try testing.expect(!std.mem.eql(u8, ca, cb));
-
-        // Even the leading segment must differ (full unlinkability per key).
         var la_buf: [16][]const u8 = undefined;
         var lb_buf: [16][]const u8 = undefined;
         const la = splitLabels(&la_buf, ca);
         const lb = splitLabels(&lb_buf, cb);
-        try testing.expect(!std.mem.eql(u8, la[0], lb[0]));
+        try testing.expect(!std.mem.eql(u8, la[0], lb[0])); // per-key unlinkable
     }
+}
+
+test "custom suffix flows through IP + opaque forms" {
+    const opts: Options = .{ .suffix = "mynet" };
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    var c: [max_cloak_len]u8 = undefined;
+    const ca = try cloak(&a, &test_key, "203.0.113.99", geo_us, opts);
+    const cb = try cloak(&b, &test_key, "2001:db8::1", geo_us, opts);
+    const cc = try cloakOpaque(&c, &test_key, "203.0.113.99", opts);
+    try testing.expect(std.mem.endsWith(u8, ca, ".ip.mynet"));
+    try testing.expect(std.mem.endsWith(u8, cb, ".ip6.mynet"));
+    try testing.expect(std.mem.endsWith(u8, cc, ".opq.mynet"));
+}
+
+test "hostnames mask all dynamic labels and preserve the registrable domain" {
+    var out: [max_cloak_len]u8 = undefined;
+    const c = try cloak(&out, &test_key, "Client-123.POOL.Example.Net", Geo.none, .{});
+    try testing.expect(std.mem.endsWith(u8, c, ".example.net"));
+    try testing.expect(std.mem.startsWith(u8, c, default_suffix ++ "-"));
+    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "client-123"));
+    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "pool"));
+}
+
+test "hostname cloak is deterministic and unlinkable across siblings" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const ca = try cloak(&a, &test_key, "alpha.example.com", Geo.none, .{});
+    const cb = try cloak(&b, &test_key, "beta.example.com", Geo.none, .{});
+    try testing.expect(!std.mem.eql(u8, ca, cb));
+    try testing.expect(std.mem.endsWith(u8, ca, ".example.com"));
+}
+
+test "multi-part TLDs keep three labels" {
+    var out: [max_cloak_len]u8 = undefined;
+    const c = try cloak(&out, &test_key, "dsl-99.cust.foo.co.uk", Geo.none, .{});
+    try testing.expect(std.mem.endsWith(u8, c, ".foo.co.uk"));
+    try testing.expect(!std.mem.containsAtLeast(u8, c, 1, "dsl-99"));
 }
 
 test "account cloak is friendly, sanitized, and key-free" {
     var out: [max_cloak_len]u8 = undefined;
-
     const c = try cloakAccount(&out, "Kain", "IRCXNet");
     try testing.expectEqualStrings("kain.users.ircxnet", c);
-
     const c2 = try cloakAccount(&out, "Some_User!", "IRCXNet");
     try testing.expectEqualStrings("some-user.users.ircxnet", c2);
-
-    // Empty network falls back to the default suffix.
-    const c3 = try cloakAccount(&out, "kain", "");
-    try testing.expectEqualStrings("kain.users." ++ default_suffix, c3);
 }
 
 test "account cloak rejects unusable account names" {
@@ -696,9 +771,9 @@ test "account cloak rejects unusable account names" {
 }
 
 test "small output buffers fail cleanly" {
-    var out: [4]u8 = undefined;
-    try testing.expectError(error.OutputTooSmall, cloak(&out, &test_key, "203.0.113.99", .{}));
-    try testing.expectError(error.OutputTooSmall, cloak(&out, &test_key, "host.example.com", .{}));
+    var out: [8]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, cloak(&out, &test_key, "203.0.113.99", geo_us, .{}));
+    try testing.expectError(error.OutputTooSmall, cloakOpaque(&out, &test_key, "203.0.113.99", .{}));
     try testing.expectError(error.OutputTooSmall, cloakAccount(&out, "kain", "ircxnet"));
 }
 

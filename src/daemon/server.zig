@@ -4324,21 +4324,46 @@ pub const LinuxServer = struct {
             conn.session.setVisibleHost(default_host);
             return;
         }
-        var hostbuf: [cloak.max_cloak_len]u8 = undefined;
-        var base: []const u8 = ip_text;
-        if (self.config.rdns) |res| {
-            if (res.lookup(addr, &hostbuf)) |name| base = name;
-        }
         if (self.config.cloak_key) |key| {
+            // Cloak the IP ITSELF — never the reverse-DNS name, which would leak
+            // the ISP's registrable domain (`....comcast.net`). rDNS still resolves
+            // (for the oper-only real-host WHOIS line); it just never feeds the
+            // public cloak. GeoIP country + ASN are mixed in as ban-able labels.
+            const geo = self.cloakGeo(ip_text);
             var cbuf: [cloak.max_cloak_len]u8 = undefined;
-            const cloaked = cloak.cloak(&cbuf, &key, base, .{ .suffix = self.config.cloak_suffix }) catch {
-                conn.session.setVisibleHost(base);
+            const cloaked = cloak.cloak(&cbuf, &key, ip_text, geo, .{ .suffix = self.config.cloak_suffix }) catch {
+                conn.session.setVisibleHost(ip_text);
                 return;
             };
             conn.session.setVisibleHost(cloaked);
         } else {
+            // No cloak key configured: show the reverse-DNS name when the operator
+            // enabled rDNS, else the raw IP (their explicit non-cloaking choice).
+            var hostbuf: [cloak.max_cloak_len]u8 = undefined;
+            var base: []const u8 = ip_text;
+            if (self.config.rdns) |res| {
+                if (res.lookup(addr, &hostbuf)) |name| base = name;
+            }
             conn.session.setVisibleHost(base);
         }
+    }
+
+    /// Look up the GeoIP country + origin ASN for a client IP so the cloak can
+    /// carry ban-able `a<asn>.<cc>` labels. Best-effort: any miss (no DB, private
+    /// range, unresolved) leaves the field zero/empty and the cloak renders the
+    /// stable `a0`/`xx` placeholders. The country slice borrows the GeoIP mmap,
+    /// which stays mapped for the process lifetime, so it is valid until the
+    /// immediately-following `cloak.cloak` copies it out.
+    fn cloakGeo(self: *LinuxServer, ip_text: []const u8) cloak.Geo {
+        const gip = parseGeoIp(ip_text) orelse return cloak.Geo.none;
+        var geo = cloak.Geo{};
+        if (self.ensureGeoip()) |db| {
+            if (db.lookupInfo(gip) catch null) |gi| {
+                if (gi.country_iso) |iso| geo.country = iso;
+            }
+        }
+        if (self.lookupGeoAsn(gip).asn) |asn| geo.asn = asn;
+        return geo;
     }
 
     /// Derive the 16-byte network-wide IP-salt from the shared mesh secret. A
