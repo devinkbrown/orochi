@@ -831,6 +831,39 @@ test "deframer surfaces close and pong and rejects oversize declared frames" {
     try std.testing.expectError(error.PayloadTooLarge, d3.next());
 }
 
+test "deframer accepts a large binary media frame above the IRC-line limit" {
+    // A browser media datagram (e.g. a 1080p video keyframe) dwarfs any IRC line.
+    // With a media-sized capacity the deframer must admit it as ONE binary DATA
+    // frame — the regression being that rejecting it (PayloadTooLarge) tore the
+    // WebSocket session down mid-call. The deframer buffers are media-sized, so
+    // heap-allocate it rather than put ~2 MiB on the test stack (mirrors the
+    // daemon, where WsState is `*WsState`).
+    const cap = 1 << 20; // 1 MiB, media-sized
+    const payload_len = 100_000; // far above the 8 KiB IRC-line ceiling
+    const alloc = std.testing.allocator;
+
+    const payload = try alloc.alloc(u8, payload_len);
+    defer alloc.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i);
+
+    const framed = try alloc.alloc(u8, payload_len + 14); // 10-byte header + 4-byte mask + payload
+    defer alloc.free(framed);
+    const frame = try encodeFrame(cap, .{ .opcode = .binary, .mask_key = .{ 1, 2, 3, 4 } }, payload, framed);
+
+    const D = Deframer(cap);
+    const d = try alloc.create(D);
+    defer alloc.destroy(d);
+    d.* = .{};
+
+    try d.feed(frame);
+    const ev = (try d.next()).?;
+    try std.testing.expect(std.meta.activeTag(ev) == .data);
+    try std.testing.expect(ev.data.binary);
+    try std.testing.expect(ev.data.fin);
+    try std.testing.expectEqual(@as(usize, payload_len), ev.data.payload.len);
+    try std.testing.expectEqualSlices(u8, payload, ev.data.payload);
+}
+
 test "irc line helper extracts complete lines only" {
     const first = nextIrcLine("NICK example\r\nUSER m 0 * :Orochi\r\n").?;
     try std.testing.expectEqualStrings("NICK example", first.line);

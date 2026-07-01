@@ -1673,18 +1673,28 @@ const MultilineState = struct {
 /// convention — no trailing CRLF inside a frame). Heap-owned (the reassembly
 /// buffers are large); freed in closeConn/deinit, exactly like `tls`.
 const WsState = struct {
-    /// Largest single inbound frame accepted (declared lengths above this are
-    /// rejected from the header alone). Comfortably above the max tagged IRC
-    /// line; a browser IRC client sends one line per frame.
+    /// Largest outbound TEXT frame this connection builds (one tagged IRC line);
+    /// browser IRC clients send one line per frame. Kept small — it sizes stack
+    /// buffers on the per-line send path.
     const max_frame = default_reply_bytes;
+    /// Largest single inbound frame the deframer accepts. The SAME WebSocket
+    /// carries both IRC text lines AND binary browser-media datagrams (a 1080p
+    /// video keyframe is ~1.3 MB), so the deframer must admit the larger of the
+    /// two or it rejects the media frame from the header alone and tears the
+    /// session down. Sized for media; heap-owned (WsState is `*WsState`), so the
+    /// large reassembly buffers never touch the connection's stack. 4 MiB gives
+    /// real-camera headroom: a low-detail fake-camera 1080p keyframe already
+    /// measured ~1.3 MB, and a real high-entropy 1080p keyframe runs larger —
+    /// exceeding this would re-trigger the fatal drop, so keep ample slack.
+    const max_media_frame = 4 * 1024 * 1024;
     const Phase = enum { handshake, open };
 
     phase: Phase = .handshake,
     /// HTTP Upgrade request head accumulator (request line + headers only).
     http_buf: [2048]u8 = undefined,
     http_len: usize = 0,
-    /// Incremental RFC 6455 client-to-server frame decoder.
-    deframer: websocket.Deframer(max_frame) = .{},
+    /// Incremental RFC 6455 client-to-server frame decoder (media-sized).
+    deframer: websocket.Deframer(max_media_frame) = .{},
     /// Outbound line accumulator: a single IRC line may arrive at the send seam
     /// in several appendToConn calls (tag prefix + body), so frames are cut on
     /// CRLF boundaries here rather than per append.
@@ -21652,9 +21662,13 @@ pub const LinuxServer = struct {
     /// multi-reactor) and cross-node (mesh) media relay are out of scope for v1;
     /// the default single-reactor deployment reaches every member here.
     fn relayWsMediaDatagram(self: *LinuxServer, sender: client_model.ClientId, channel: []const u8, datagram: []const u8) void {
-        if (datagram.len > WsState.max_frame) return; // would not fit one WS frame
-        var frame_buf: [WsState.max_frame + 10]u8 = undefined;
-        const ws_frame = websocket.encodeFrame(WsState.max_frame, .{ .opcode = .binary }, datagram, &frame_buf) catch return;
+        if (datagram.len > WsState.max_media_frame) return; // exceeds the media frame ceiling
+        // A media datagram (video keyframe) can be ~1.3 MB — far too large for a
+        // stack buffer — so encode the binary WS frame once on the heap and reuse
+        // it for every recipient. Best-effort: an OOM just drops this datagram.
+        const frame_buf = self.allocator.alloc(u8, datagram.len + 10) catch return;
+        defer self.allocator.free(frame_buf);
+        const ws_frame = websocket.encodeFrame(WsState.max_media_frame, .{ .opcode = .binary }, datagram, frame_buf) catch return;
 
         var members = self.world.memberIterator(channel) orelse return;
         while (members.next()) |member| {
