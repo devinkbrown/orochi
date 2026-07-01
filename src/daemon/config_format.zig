@@ -426,6 +426,12 @@ pub const Config = struct {
         /// boot; when set, every client's real IP is HMAC-cloaked. When absent,
         /// the daemon generates a random per-boot key (privacy on by default).
         secret: ?[]const u8 = null,
+        /// Prior cloak secret kept live for ban continuity across a key rotation.
+        /// New cloaks always use `secret`; WARD host/mask matching ALSO tests the
+        /// cloak computed under this previous key, so bans written before the
+        /// rotation keep matching during the grace window. Drop it once the old
+        /// bans have aged out. Null = single-key (no rotation in progress).
+        previous_secret: ?[]const u8 = null,
         /// Network-identifying suffix carried by cloaked hosts (IP cloaks end
         /// in `.ip.<suffix>` / `.ip6.<suffix>`; hostname cloaks prefix their
         /// token label with `<suffix>-`). Null = the cloak module's default.
@@ -605,6 +611,7 @@ pub const Config = struct {
         allocator.free(self.geoip.database);
         allocator.free(self.geoip.asn_database);
         if (self.cloak.secret) |value| allocator.free(value);
+        if (self.cloak.previous_secret) |value| allocator.free(value);
         if (self.cloak.suffix) |value| allocator.free(value);
         if (self.cloak.mode) |value| allocator.free(value);
         allocator.free(self.tls.dns_name);
@@ -806,6 +813,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [cloak]
     try setOpt(allocator, resolver, doc.getString("cloak.secret"), &cfg.cloak.secret);
+    try setOpt(allocator, resolver, doc.getString("cloak.previous_secret"), &cfg.cloak.previous_secret);
     try setOpt(allocator, resolver, doc.getString("cloak.suffix"), &cfg.cloak.suffix);
     try setOpt(allocator, resolver, doc.getString("cloak.mode"), &cfg.cloak.mode);
     if (doc.getBool("cloak.account_cloak")) |b| cfg.cloak.account_cloak = b;
@@ -1333,6 +1341,7 @@ test "parseToml: [cloak] mode and account_cloak parse" {
         \\irc = 6680
         \\[cloak]
         \\secret = "s3kr3t"
+        \\previous_secret = "old-s3kr3t"
         \\mode = "opaque"
         \\account_cloak = true
         \\
@@ -1341,6 +1350,7 @@ test "parseToml: [cloak] mode and account_cloak parse" {
     defer cfg.deinit(allocator);
     try testing.expectEqualStrings("opaque", cfg.cloak.mode.?);
     try testing.expect(cfg.cloak.account_cloak == true);
+    try testing.expectEqualStrings("old-s3kr3t", cfg.cloak.previous_secret.?);
 }
 
 test "parseToml: required fields and ranges are enforced" {

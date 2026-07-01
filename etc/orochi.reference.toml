@@ -482,8 +482,22 @@ allow_anonymous = false
 # absent, a random per-boot key is used (privacy on by default, but cloaks
 # change each restart).
 # secret = "env:OROCHI_CLOAK_SECRET"
+# Prior cloak key kept live across a `secret` rotation. New cloaks use `secret`,
+# but WARD host/mask bans are also matched against the cloak computed under this
+# previous key — so bans written before the rotation keep working during a grace
+# window. Remove it once the old bans have aged out.
+# previous_secret = "env:OROCHI_CLOAK_SECRET_PREV"
 # Optional network-identifying suffix used in generated cloak hostnames.
 # suffix = "ircxnet"
+# IP cloak granularity:
+#   "hierarchical" (default) — subnet-bannable prefix tokens + a<asn>.<cc> geo labels.
+#   "opaque"                 — one token over the whole address; nothing leaks (not
+#                              even country/ASN or subnet membership), but it cannot
+#                              be subnet-banned.
+# mode = "hierarchical"
+# When true, a logged-in client's visible host becomes <account>.users.<suffix> —
+# stable across IPs/devices. Explicit VHOST personas still override it.
+# account_cloak = false
 
 
 # --- [acme] — automatic TLS certificate renewal (Linux only) -----------------

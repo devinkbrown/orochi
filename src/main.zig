@@ -365,6 +365,13 @@ pub fn main(init: std.process.Init) !void {
             std.crypto.hash.sha2.Sha256.hash(secret, &cloak_key_bytes, .{});
             srv_cfg.cloak_key = orochi.proto.cloak.SecretKey.init(cloak_key_bytes);
         }
+        // Previous cloak key (`[cloak] previous_secret`): kept live across a key
+        // rotation so WARD host/mask bans written under the old key keep matching.
+        if (h.parsed.cloak.previous_secret) |prev| {
+            var prev_bytes: [orochi.proto.cloak.key_len]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(prev, &prev_bytes, .{});
+            srv_cfg.cloak_prev_key = orochi.proto.cloak.SecretKey.init(prev_bytes);
+        }
         // Network-identifying cloak suffix (`[cloak] suffix`); borrowed from
         // the held config, which outlives the server.
         if (h.parsed.cloak.suffix) |suffix| srv_cfg.cloak_suffix = suffix;

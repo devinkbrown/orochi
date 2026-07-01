@@ -358,7 +358,10 @@ Source: struct at `src/daemon/config_format.zig:201`, parsing at `src/daemon/con
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
 | `secret` | string or null | unset | any string | Hash-derived stable hostname cloak key. If absent, `main.zig` generates a per-boot key (`src/main.zig:205`, `src/main.zig:210`). |
+| `previous_secret` | string or null | unset | any string | Prior cloak key kept live across a `secret` rotation. New cloaks use `secret`; WARD host/mask matching additionally tests the cloak under this key, so bans written before the rotation keep matching during a grace window. Drop once old bans have aged out. |
 | `suffix` | string or null | unset | any string | Optional network-identifying suffix for generated cloak hosts (`src/daemon/config_format.zig:299`, `src/daemon/config_boot.zig:40`). |
+| `mode` | string or null | `hierarchical` | `hierarchical` \| `opaque` | IP cloak granularity. `hierarchical` emits subnet-bannable prefix tokens plus `a<asn>.<cc>` geo labels; `opaque` emits a single token over the whole address (nothing leaks — not even country/ASN or subnet membership — but it cannot be subnet-banned). |
+| `account_cloak` | bool | `false` | `true` \| `false` | When true, a logged-in client's visible host becomes the friendly `<account>.users.<suffix>`, stable across IPs and devices. Explicit VHOST personas still override it. |
 
 ## `[tls]`
 

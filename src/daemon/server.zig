@@ -1608,6 +1608,11 @@ pub const Config = struct {
     /// (real host shown). main derives this from `[server] cloak_secret`, or a
     /// random per-boot key when account/SASL features imply privacy is wanted.
     cloak_key: ?cloak.SecretKey = null,
+    /// Previous cloak key, kept live across a `[cloak] secret` rotation. New
+    /// cloaks always use `cloak_key`; WARD host/mask matching additionally tests
+    /// the cloak under this key so bans written before the rotation keep matching
+    /// during the grace window. Null = no rotation in progress.
+    cloak_prev_key: ?cloak.SecretKey = null,
     /// Network-identifying suffix for cloaked hosts (`[cloak] suffix`). IP
     /// cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname cloaks carry a
     /// `<suffix>-<token>` leading label. Borrowed; outlives the server.
@@ -4390,6 +4395,30 @@ pub const LinuxServer = struct {
         }
         if (self.lookupGeoAsn(gip).asn) |asn| geo.asn = asn;
         return geo;
+    }
+
+    /// Compute a client's visible host under the PREVIOUS cloak key (for ban
+    /// continuity across a key rotation), into `buf`. Returns null when there is
+    /// no previous key, no peer address, the client is on loopback, or the client
+    /// currently wears a key-free host (per-account cloak / explicit persona) —
+    /// in those cases the previous-key host is identical or irrelevant, so the
+    /// primary WARD check already covered it. Mirrors the IP-cloak branch of
+    /// applyVisibleHost, only with `cloak_prev_key`.
+    fn prevKeyCloakHost(self: *LinuxServer, conn: *ConnState, buf: []u8) ?[]const u8 {
+        const key = self.config.cloak_prev_key orelse return null;
+        // A logged-in client under account_cloak wears the key-free account host,
+        // which does not change with the key — nothing extra to match.
+        if (self.config.cloak_account and conn.session.account() != null) return null;
+        const addr = conn.peer_addr orelse return null;
+        var ipbuf: [cloak.max_cloak_len]u8 = undefined;
+        const ip_text = addrText(addr, &ipbuf) orelse return null;
+        if (std.mem.startsWith(u8, ip_text, "127.") or std.mem.eql(u8, ip_text, "0:0:0:0:0:0:0:1")) return null;
+        const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
+        const cloaked = if (self.config.cloak_opaque)
+            cloak.cloakOpaque(buf, &key, ip_text, opts)
+        else
+            cloak.cloak(buf, &key, ip_text, self.cloakGeo(ip_text), opts);
+        return cloaked catch null;
     }
 
     /// Derive the 16-byte network-wide IP-salt from the shared mesh secret. A
@@ -15409,7 +15438,25 @@ pub const LinuxServer = struct {
             .country = country,
             .asn = asn_str,
         };
-        const hit = self.warden.check(facets, self.nowMs()) orelse return false;
+        const hit = self.warden.check(facets, self.nowMs()) orelse blk: {
+            // Rotatable cloak key: bans written against the PREVIOUS key's cloak
+            // still reference old host/mask tokens. Re-check the host + mask facets
+            // recomputed under the previous key so those bans survive a rotation
+            // for a grace window. Only the key-derived facets differ; address /
+            // account / country / asn / certfp / realname are key-independent.
+            var prev_host_buf: [cloak.max_cloak_len]u8 = undefined;
+            const prev_host = self.prevKeyCloakHost(conn, &prev_host_buf) orelse return false;
+            var prev_mask_buf: [256]u8 = undefined;
+            const prev_mask = std.fmt.bufPrint(&prev_mask_buf, "{s}!{s}@{s}", .{
+                conn.session.displayName(),
+                conn.session.username(),
+                prev_host,
+            }) catch "";
+            var alt = facets;
+            alt.host = prev_host;
+            alt.mask = prev_mask;
+            break :blk self.warden.check(alt, self.nowMs()) orelse return false;
+        };
 
         switch (hit.action) {
             .quarantine => {
@@ -27517,6 +27564,34 @@ test "mesh WARD applies and removes via applyRemoteWard" {
     });
     try std.testing.expectEqual(@as(usize, 0), server.warden.count());
     try std.testing.expect(server.warden.check(.{ .mask = "bob!~b@host.evil.example" }, 100) == null);
+}
+
+test "rotatable cloak key: a ward on the old-key cloak misses the new-key cloak" {
+    // The premise behind enforceWard's previous-key fallback: rotating the cloak
+    // secret changes every client's IP cloak, so a WARD written against the OLD
+    // cloak no longer matches the NEW one. enforceWard therefore re-checks the
+    // host/mask facets recomputed under cloak_prev_key (mirroring prevKeyCloakHost).
+    var old_bytes: [cloak.key_len]u8 = undefined;
+    var new_bytes: [cloak.key_len]u8 = undefined;
+    @memset(&old_bytes, 0xA1);
+    @memset(&new_bytes, 0x5C);
+    const old_key = cloak.SecretKey.init(old_bytes);
+    const new_key = cloak.SecretKey.init(new_bytes);
+
+    var ob: [cloak.max_cloak_len]u8 = undefined;
+    var nb: [cloak.max_cloak_len]u8 = undefined;
+    const old_host = try cloak.cloak(&ob, &old_key, "198.51.100.7", cloak.Geo.none, .{});
+    const new_host = try cloak.cloak(&nb, &new_key, "198.51.100.7", cloak.Geo.none, .{});
+    try std.testing.expect(!std.mem.eql(u8, old_host, new_host));
+
+    var reg = warden.Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.add(.{ .match = .host, .pattern = old_host, .action = .expel, .reason = "rotate", .set_by = "oper" });
+
+    // The old-key host still hits the ban; the post-rotation new-key host does
+    // NOT — which is exactly why the server must also test the previous-key host.
+    try std.testing.expect(reg.check(.{ .host = old_host }, 100) != null);
+    try std.testing.expect(reg.check(.{ .host = new_host }, 100) == null);
 }
 
 // Build a relay PRIVMSG signed by `kp`, stamping the carried pubkey/sig into the
