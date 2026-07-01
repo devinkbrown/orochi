@@ -1612,6 +1612,15 @@ pub const Config = struct {
     /// cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname cloaks carry a
     /// `<suffix>-<token>` leading label. Borrowed; outlives the server.
     cloak_suffix: []const u8 = cloak.default_suffix,
+    /// Opaque IP cloak mode (`[cloak] mode = "opaque"`). When true, IP cloaks use
+    /// the single-token `cloakOpaque` form (no subnet hierarchy, no geo labels)
+    /// instead of the hierarchical, subnet-bannable form. Max privacy, at the
+    /// cost of subnet-bannability.
+    cloak_opaque: bool = false,
+    /// Per-account cloak (`[cloak] account_cloak`). When true, a logged-in
+    /// client's visible host is the friendly `<account>.users.<suffix>` — stable
+    /// across IPs/devices. Requires a cloak key; explicit VHOST personas win.
+    cloak_account: bool = false,
     /// Background forward-confirmed reverse-DNS resolver (owned by main). When
     /// set, each non-loopback client IP is resolved off the hot path and its
     /// confirmed hostname becomes the cloak base (so hosts show a cloaked
@@ -4325,17 +4334,34 @@ pub const LinuxServer = struct {
             return;
         }
         if (self.config.cloak_key) |key| {
+            var cbuf: [cloak.max_cloak_len]u8 = undefined;
+            // Per-account cloak: a logged-in client shows a stable, friendly
+            // `<account>.users.<suffix>` that follows them across IPs/devices.
+            // Explicit VHOST personas set the host directly (not recomputed here),
+            // so they still win. Falls through to the IP cloak on an unusable
+            // account label or for logged-out clients.
+            if (self.config.cloak_account) {
+                if (conn.session.account()) |acct| {
+                    if (cloak.cloakAccount(&cbuf, acct, self.config.cloak_suffix)) |ac| {
+                        conn.session.setVisibleHost(ac);
+                        return;
+                    } else |_| {}
+                }
+            }
             // Cloak the IP ITSELF — never the reverse-DNS name, which would leak
             // the ISP's registrable domain (`....comcast.net`). rDNS still resolves
             // (for the oper-only real-host WHOIS line); it just never feeds the
-            // public cloak. GeoIP country + ASN are mixed in as ban-able labels.
-            const geo = self.cloakGeo(ip_text);
-            var cbuf: [cloak.max_cloak_len]u8 = undefined;
-            const cloaked = cloak.cloak(&cbuf, &key, ip_text, geo, .{ .suffix = self.config.cloak_suffix }) catch {
+            // public cloak. Opaque mode emits one token over the whole address;
+            // hierarchical mode mixes in GeoIP country + ASN as ban-able labels.
+            const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
+            const cloaked = if (self.config.cloak_opaque)
+                cloak.cloakOpaque(&cbuf, &key, ip_text, opts)
+            else
+                cloak.cloak(&cbuf, &key, ip_text, self.cloakGeo(ip_text), opts);
+            conn.session.setVisibleHost(cloaked catch {
                 conn.session.setVisibleHost(ip_text);
                 return;
-            };
-            conn.session.setVisibleHost(cloaked);
+            });
         } else {
             // No cloak key configured: show the reverse-DNS name when the operator
             // enabled rDNS, else the raw IP (their explicit non-cloaking choice).
@@ -6401,9 +6427,11 @@ pub const LinuxServer = struct {
                 self.issueSessionTokenNotice(conn, "SASL") catch {};
             }
             if (conn.session.registered()) {
-                // Upgrade the cloak base to the forward-confirmed reverse-DNS
-                // hostname if the background resolver has finished by now (it was
-                // kicked off at connect); otherwise this re-applies the IP cloak.
+                // Re-apply the visible host now that the background resolver (kicked
+                // off at connect) has had the handshake window to finish. With a
+                // cloak key this re-cloaks the IP (rDNS never feeds the public cloak
+                // — that would leak the ISP domain); without one it picks up the
+                // forward-confirmed reverse-DNS name if the operator enabled rDNS.
                 self.applyVisibleHost(conn);
                 try self.registerConnNick(id, conn);
                 // Complete the registration burst after the 001-005 numerics
@@ -19602,6 +19630,10 @@ pub const LinuxServer = struct {
         }
         loginSession(conn, account);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
+        // Per-account cloak: switch the visible host to <account>.users.<suffix>
+        // now that the login is confirmed (post-registration path; the handshake
+        // path is handled by applyVisibleHost at registration).
+        self.maybeApplyAccountCloak(idFromToken(conn.token), conn);
         self.restoreAccountMetadata(conn, account);
         self.restoreAccountSilence(conn, account);
         var buf: [default_reply_bytes]u8 = undefined;
@@ -22455,6 +22487,23 @@ pub const LinuxServer = struct {
             if (!std.ascii.eqlIgnoreCase(acct, account)) continue;
             applyVhostLine(self, entry.id, c, new_host) catch {};
         }
+    }
+
+    /// When `[cloak] account_cloak` is on, (re)apply the friendly
+    /// `<account>.users.<suffix>` host after a post-registration login and fan the
+    /// resulting CHGHOST to common channels. Pre-registration logins are covered
+    /// by the registration-time `applyVisibleHost`, so this only fires once the
+    /// client is registered (and no-ops when the host already matches, so a
+    /// re-IDENTIFY to the same account does not emit a redundant CHGHOST).
+    fn maybeApplyAccountCloak(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        if (!self.config.cloak_account) return;
+        if (self.config.cloak_key == null) return;
+        if (!conn.session.registered()) return;
+        const acct = conn.session.account() orelse return;
+        var cbuf: [cloak.max_cloak_len]u8 = undefined;
+        const ac = cloak.cloakAccount(&cbuf, acct, self.config.cloak_suffix) catch return;
+        if (std.mem.eql(u8, conn.session.host(), ac)) return;
+        applyVhostLine(self, id, conn, ac) catch {};
     }
 
     /// Set a client's visible host and fan a CHGHOST out to common channels.

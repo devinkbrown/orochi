@@ -368,6 +368,13 @@ pub fn main(init: std.process.Init) !void {
         // Network-identifying cloak suffix (`[cloak] suffix`); borrowed from
         // the held config, which outlives the server.
         if (h.parsed.cloak.suffix) |suffix| srv_cfg.cloak_suffix = suffix;
+        // IP cloak granularity (`[cloak] mode`): "opaque" selects the single-token
+        // max-privacy form; anything else (incl. null) keeps the hierarchical,
+        // subnet-bannable default.
+        if (h.parsed.cloak.mode) |mode| srv_cfg.cloak_opaque = std.mem.eql(u8, mode, "opaque");
+        // Per-account cloak (`[cloak] account_cloak`): logged-in clients show
+        // <account>.users.<suffix>.
+        srv_cfg.cloak_account = h.parsed.cloak.account_cloak;
     }
     if (srv_cfg.cloak_key == null) {
         init.io.random(&cloak_key_bytes);

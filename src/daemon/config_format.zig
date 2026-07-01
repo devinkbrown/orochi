@@ -430,6 +430,15 @@ pub const Config = struct {
         /// in `.ip.<suffix>` / `.ip6.<suffix>`; hostname cloaks prefix their
         /// token label with `<suffix>-`). Null = the cloak module's default.
         suffix: ?[]const u8 = null,
+        /// IP cloak granularity. `"hierarchical"` (default) emits subnet-bannable
+        /// tokens plus `a<asn>.<cc>` geo labels; `"opaque"` emits a single token
+        /// over the whole address, so nothing about it leaks (not even country/
+        /// ASN or subnet membership) at the cost of not being subnet-bannable.
+        mode: ?[]const u8 = null,
+        /// When true, a logged-in client's visible host becomes the friendly
+        /// `<account>.users.<suffix>` — stable across IPs and devices. Explicit
+        /// VHOST personas set the host directly and still override it.
+        account_cloak: bool = false,
     };
 
     /// TLS listener settings. The live listener is wired elsewhere; this section
@@ -597,6 +606,7 @@ pub const Config = struct {
         allocator.free(self.geoip.asn_database);
         if (self.cloak.secret) |value| allocator.free(value);
         if (self.cloak.suffix) |value| allocator.free(value);
+        if (self.cloak.mode) |value| allocator.free(value);
         allocator.free(self.tls.dns_name);
         if (self.tls.cert_path) |value| allocator.free(value);
         if (self.tls.key_path) |value| allocator.free(value);
@@ -797,6 +807,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     // [cloak]
     try setOpt(allocator, resolver, doc.getString("cloak.secret"), &cfg.cloak.secret);
     try setOpt(allocator, resolver, doc.getString("cloak.suffix"), &cfg.cloak.suffix);
+    try setOpt(allocator, resolver, doc.getString("cloak.mode"), &cfg.cloak.mode);
+    if (doc.getBool("cloak.account_cloak")) |b| cfg.cloak.account_cloak = b;
 
     // [tls]
     if (doc.getBool("tls.enabled")) |b| cfg.tls.enabled = b;
@@ -1307,6 +1319,28 @@ test "parseToml: env: indirection resolves through the Resolver" {
     defer cfg.deinit(allocator);
     try testing.expectEqualStrings("s3kr3t", cfg.cloak.secret.?);
     try testing.expectEqualStrings("ircxnet", cfg.cloak.suffix.?);
+    // mode/account_cloak default when the keys are absent.
+    try testing.expect(cfg.cloak.mode == null);
+    try testing.expect(cfg.cloak.account_cloak == false);
+}
+
+test "parseToml: [cloak] mode and account_cloak parse" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[cloak]
+        \\secret = "s3kr3t"
+        \\mode = "opaque"
+        \\account_cloak = true
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqualStrings("opaque", cfg.cloak.mode.?);
+    try testing.expect(cfg.cloak.account_cloak == true);
 }
 
 test "parseToml: required fields and ranges are enforced" {
