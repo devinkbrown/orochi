@@ -21,6 +21,7 @@ pub const MeshEventKind = enum {
     oper_grant_revoke,
     route_change,
     resync,
+    remote_kill,
 };
 
 pub const MeshEvent = struct {
@@ -42,6 +43,7 @@ pub fn kindWord(k: MeshEventKind) []const u8 {
         .oper_grant_revoke => "oper-grant-revoke",
         .route_change => "route-change",
         .resync => "resync",
+        .remote_kill => "remote-kill",
     };
 }
 

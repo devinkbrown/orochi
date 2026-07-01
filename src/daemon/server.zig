@@ -11726,16 +11726,26 @@ pub const LinuxServer = struct {
         }
         for (payloads) |p| {
             const ev = kill_relay.decode(p) catch continue;
-            self.applyRemoteKill(ev);
+            // Bind the origin to the authenticated sending peer (kills are sent
+            // DIRECTLY origin→owner, single hop) rather than trusting the
+            // wire-supplied origin_server, which a compromised peer could spoof.
+            self.applyRemoteKill(ev, trustedOrigin(link, ev.origin_server));
         }
     }
 
-    fn applyRemoteKill(self: *LinuxServer, ev: kill_relay.KillRelay) void {
+    fn applyRemoteKill(self: *LinuxServer, ev: kill_relay.KillRelay, origin: []const u8) void {
         const wid = self.world.findNick(ev.target) orelse return;
         const tid = clientIdFromWorld(wid);
         const tconn = self.connFor(tid) orelse return;
         if (tconn.s2s != null or tconn.s2s_secured != null) return; // never a peer link
         if (tconn.closing) return;
+        // Local audit trail (queryable via MESH LOG) of the applied remote kill,
+        // tagged with the authenticated origin server so a cross-node kill of a
+        // user this node owns is traceable to its source — the origin's own
+        // OPER_EVENT fan carries the oper NOTICE, so this is a log, not a dup.
+        var detail_buf: [kill_relay.max_name_len + kill_relay.max_reason_len + 16]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "by {s}: {s}", .{ ev.killer, ev.reason }) catch ev.reason;
+        self.logMeshEvent(.remote_kill, if (origin.len != 0) origin else ev.target, detail);
         // The remote killer mask is both the KILL-line source and the close actor.
         self.performKillDisconnect(tid, ev.target, ev.killer, ev.killer, ev.reason) catch {};
     }
@@ -15324,7 +15334,8 @@ pub const LinuxServer = struct {
             const d = decodeObserveEvent(p) orelse continue;
             // Mesh-drained: deliver to THIS node's watchers across all shards
             // (reactor 0 owns the link; fan to the rest). Never re-broadcast.
-            self.deliverObserveLocal(d.origin, d.action, d.subject);
+            // Origin is the authenticated peer, not the spoofable wire field.
+            self.deliverObserveLocal(trustedOrigin(link, d.origin), d.action, d.subject);
         }
     }
 
@@ -22899,7 +22910,8 @@ pub const LinuxServer = struct {
             }
             const category = category_opt orelse continue;
             // Subject == message (callers that publish locally use the same).
-            self.deliverOperEventLocal(ev.origin_server, category, ev.message, ev.message);
+            // Origin is the authenticated peer, not the spoofable wire field.
+            self.deliverOperEventLocal(trustedOrigin(link, ev.origin_server), category, ev.message, ev.message);
         }
     }
 
@@ -25805,6 +25817,38 @@ fn emitPing(conn: *ConnState) void {
     var buf: [128]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "PING :{s}\r\n", .{protocol_inventory.currentServerName()}) catch return;
     appendToConn(conn, line) catch {};
+}
+
+/// Resolve the trustworthy origin-server name for a peer-drained kill/event.
+/// These frames are fanned DIRECTLY from origin to peer (single hop, never
+/// forwarded — see drainOperEvents/drainKills), so the origin IS the
+/// handshake-authenticated peer. Prefer that authenticated name over the wire
+/// `claimed` field (spoofable by a compromised peer); a disagreement is logged
+/// as a diagnostic but the authenticated name always wins. `link` is any peer
+/// link (plain/secured/substrate) exposing `remoteName()`.
+fn trustedOrigin(link: anytype, claimed: []const u8) []const u8 {
+    const authed = link.remoteName();
+    if (authed.len == 0) return claimed; // pre-handshake: nothing better to trust
+    if (claimed.len != 0 and !std.mem.eql(u8, claimed, authed))
+        srvLog("s2s: event origin mismatch (claimed '{s}', authenticated peer '{s}'); using authenticated", .{ claimed, authed });
+    return authed;
+}
+
+test "trustedOrigin binds a kill/event origin to the authenticated peer" {
+    const MockLink = struct {
+        name: []const u8,
+        pub fn remoteName(self: *const @This()) []const u8 {
+            return self.name;
+        }
+    };
+    // A spoofed wire origin is overridden by the authenticated peer name.
+    const peer = MockLink{ .name = "real.peer" };
+    try std.testing.expectEqualStrings("real.peer", trustedOrigin(&peer, "evil.spoof"));
+    // A matching claim yields the same authenticated name.
+    try std.testing.expectEqualStrings("real.peer", trustedOrigin(&peer, "real.peer"));
+    // Before the handshake has learned a name, fall back to the wire claim.
+    const pre = MockLink{ .name = "" };
+    try std.testing.expectEqualStrings("still.claimed", trustedOrigin(&pre, "still.claimed"));
 }
 
 /// True if `s` contains a tab, LF, or CR — any of which would corrupt the
