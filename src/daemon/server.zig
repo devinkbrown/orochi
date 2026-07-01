@@ -19060,8 +19060,14 @@ pub const LinuxServer = struct {
         // the IRCX command surface + PROP-change notifications "just work" without
         // an explicit IRCX command or a separate capability.
         conn.ircx = true;
-        // Locally-authorized opers mint a signed grant so peers recognize them.
-        if (from_local) self.mintOperGrant(account, privileges, class_name, title);
+        // Locally-authorized opers mint a signed grant so peers recognize them,
+        // and persist it so the operator is restored after a full restart (a USR2
+        // keeps the session's oper status; a cold restart does not) without waiting
+        // for a peer to re-propagate it.
+        if (from_local) {
+            self.mintOperGrant(account, privileges, class_name, title);
+            self.persistGrants();
+        }
         self.traceLog(.notice, .oper, "operator elevated via SASL account");
         // Wallops, oper notices, kills, etc. arrive as typed Event-Spine events,
         // but ONLY for the categories this oper presubscribed to (per the
@@ -19262,6 +19268,10 @@ pub const LinuxServer = struct {
         var it = self.oper_grants.liveIterator(now);
         while (it.next()) |g| {
             if (g.privilege_bits == 0) continue;
+            // Persist only grants THIS node issued. A peer's grants are re-learned
+            // when it relinks; re-minting them here on restart would resurrect ones
+            // the peer may have since revoked and mis-attribute their provenance.
+            if (!std.mem.eql(u8, g.issuer_node, protocol_inventory.currentServerName())) continue;
             // Skip any field carrying a separator byte (keeps the format simple).
             if (hasSep(g.account) or hasSep(g.class) or hasSep(g.title)) continue;
             const line = std.fmt.bufPrint(buf[len..], "{s}\t{d}\t{s}\t{s}\n", .{ g.account, g.privilege_bits, g.class, g.title }) catch break;
@@ -28767,6 +28777,60 @@ test "threaded server: STATS m reports per-command usage to an oper" {
     admin.reset();
     try writeAllFd(fd_admin, "STATS i\r\n");
     try recvUntil(&admin, " 219 Oper i ", 200);
+}
+
+test "threaded server: SASL oper elevation persists the grant to oper_grants_path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-grant-persist.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("admin", "correcthorse", &scratch);
+
+    var path_buf: [256]u8 = undefined;
+    const grants_path = try std.fmt.bufPrint(&path_buf, "/tmp/oro-grant-persist-{d}.tsv", .{platform.realtimeMillis()});
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, grants_path) catch {};
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+        .oper_grants_path = grants_path,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var admin = LiveClient{ .fd = fd };
+    try saslAdminPrelude(fd);
+    try writeAllFd(fd, "NICK Oper\r\nUSER oper 0 * :Oper\r\n");
+    try recvUntil(&admin, " 381 Oper ", 200);
+
+    // The SASL oper elevation must have written the local grant to the file, so a
+    // cold restart's loadGrants restores it (a `<account>\t<bits>\t…` TSV row).
+    const contents = std.Io.Dir.cwd().readFileAlloc(std.testing.io, grants_path, std.testing.allocator, .limited(4096)) catch |err| {
+        std.debug.print("grants file not written: {any}\n", .{err});
+        return error.TestUnexpectedResult;
+    };
+    defer std.testing.allocator.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "admin\t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "netadmin") != null);
 }
 
 test "threaded server: a joining network operator announces the derived +Y prefix to existing members" {
