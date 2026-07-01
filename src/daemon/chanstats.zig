@@ -731,6 +731,10 @@ fn deserialize(self: *ChanStats, data: []const u8) bool {
 
 fn loadChannel(self: *ChanStats, c: *Cursor) bool {
     const name = c.bytes() orelse return false;
+    // A snapshot with the same channel twice would double-append its days/
+    // topics/word_freq onto the existing agg (scalars would just overwrite).
+    // Reject the duplicate outright.
+    if (self.channels.contains(name)) return false;
     const agg = self.channel(name, 0) orelse return false;
     agg.first_seen = c.int(i64) orelse return false;
     agg.last_active = c.int(i64) orelse return false;
@@ -745,11 +749,15 @@ fn loadChannel(self: *ChanStats, c: *Cursor) bool {
     for (&agg.heatmap) |*row| for (row) |*cell| {
         cell.* = c.int(u64) orelse return false;
     };
+    // Counts come straight off disk: read every element (to keep the cursor
+    // aligned) but only KEEP up to the same cap the live recorders enforce, so
+    // a corrupt-but-parseable snapshot can't load a channel past its limits.
     const days_len = c.int(u32) orelse return false;
     var d: u32 = 0;
     while (d < days_len) : (d += 1) {
         const day = c.int(i64) orelse return false;
         const msgs = c.int(u64) orelse return false;
+        if (agg.days.items.len >= max_days_kept) continue;
         agg.days.append(self.allocator, .{ .day = day, .messages = msgs }) catch return false;
     }
     const users_len = c.int(u32) orelse return false;
@@ -778,8 +786,21 @@ fn loadChannel(self: *ChanStats, c: *Cursor) bool {
     while (wi < words_len) : (wi += 1) {
         const word = c.bytes() orelse return false;
         const cnt = c.int(u64) orelse return false;
-        const key = self.allocator.dupe(u8, word) catch return false;
-        agg.word_freq.put(self.allocator, key, cnt) catch self.allocator.free(key);
+        if (agg.word_freq.count() >= max_words_per_channel) continue;
+        // getOrPut, not put: a repeated word key in a hostile snapshot would
+        // otherwise orphan each duplicate dupe (put doesn't free the passed
+        // key on found_existing).
+        const gop = agg.word_freq.getOrPut(self.allocator, word) catch return false;
+        if (gop.found_existing) {
+            gop.value_ptr.* = cnt;
+        } else {
+            const key = self.allocator.dupe(u8, word) catch {
+                _ = agg.word_freq.remove(word);
+                return false;
+            };
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = cnt;
+        }
     }
     const topics_len = c.int(u32) orelse return false;
     var ti: u32 = 0;
@@ -787,6 +808,7 @@ fn loadChannel(self: *ChanStats, c: *Cursor) bool {
         const ts = c.int(i64) orelse return false;
         const setter = c.bytes() orelse return false;
         const topic = c.bytes() orelse return false;
+        if (agg.topics.items.len >= max_topics_kept) continue;
         const s = self.allocator.dupe(u8, setter) catch return false;
         const t = self.allocator.dupe(u8, topic) catch {
             self.allocator.free(s);

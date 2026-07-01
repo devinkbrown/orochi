@@ -33,7 +33,7 @@ pub const DispatchError = error{
 
 const SERVER_NAME = "orochi.local";
 const NETWORK_NAME = protocol_inventory.network_name;
-const SERVER_VERSION = "orochi-" ++ @import("build_info").git_commit;
+const SERVER_VERSION = "orochi-" ++ @import("build_info").version;
 const DEFAULT_HOST = "localhost";
 const MAX_PARAMS: usize = 15;
 const MAX_NICK_BYTES: usize = 64;

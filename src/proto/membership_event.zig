@@ -224,9 +224,13 @@ pub fn decode(bytes: []const u8) Error!MembershipEvent {
     if (channel.len == 0 or nick.len == 0) return error.NameTooLong;
     try validateLineField(channel, true);
     try validateLineField(nick, true);
-    try validateLineField(username, false);
+    // username (ident) and host are single tokens rendered straight into a
+    // `:nick!user@host` prefix on remote JOIN/NAMES — a space would split the
+    // prefix into spurious tokens on local clients. realname is GECOS, which
+    // legitimately contains spaces, so it stays space-permitting.
+    try validateLineField(username, true);
     try validateLineField(realname, false);
-    try validateLineField(host, false);
+    try validateLineField(host, true);
     try validateLineField(setter, true);
     try validateLineField(account, true);
     try validateLineField(real_host, true);

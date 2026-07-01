@@ -399,9 +399,10 @@ fn isMultilineOpen(parsed: *const irc_line.LineView) bool {
         std.mem.eql(u8, parsed.params[1], multiline.draft_multiline_batch);
 }
 
-// The IRC version token (RPL_MYINFO 004 / RPL_VERSION 351 / INFO) is the build's
-// git commit so `/version` traces straight back to the exact source revision.
-const server_version = "orochi-" ++ build_info.git_commit;
+// The IRC version token (RPL_MYINFO 004 / RPL_VERSION 351 / INFO) carries the
+// release semver plus the build's git commit ("orochi-0.1.0+8fba2c5") so
+// `/version` shows the release AND traces back to the exact source revision.
+const server_version = "orochi-" ++ build_info.version;
 /// Personalized default MOTD, expanded per connection by `motd_template`
 /// (operators override the whole thing via `[motd] text`). Conditional blocks
 /// begin right after the prior line so an inactive branch leaves no blank line.
@@ -15438,7 +15439,13 @@ pub const LinuxServer = struct {
             .country = country,
             .asn = asn_str,
         };
-        const hit = self.warden.check(facets, self.nowMs()) orelse blk: {
+        // Wards are stamped + expire on the WALL clock (addWardLive /
+        // applyRemoteWard use realtimeMillis, matching the WARD/TESTLINE oper
+        // commands). nowMs() is MONOTONIC (per-boot uptime); checking expiry
+        // against it would leave a wall-epoch expires_ms always in the "future"
+        // → a temporary ward would never expire for new connections.
+        const now_wall = platform.realtimeMillis();
+        const hit = self.warden.check(facets, now_wall) orelse blk: {
             // Rotatable cloak key: bans written against the PREVIOUS key's cloak
             // still reference old host/mask tokens. Re-check the host + mask facets
             // recomputed under the previous key so those bans survive a rotation
@@ -15455,7 +15462,7 @@ pub const LinuxServer = struct {
             var alt = facets;
             alt.host = prev_host;
             alt.mask = prev_mask;
-            break :blk self.warden.check(alt, self.nowMs()) orelse return false;
+            break :blk self.warden.check(alt, now_wall) orelse return false;
         };
 
         switch (hit.action) {
@@ -15508,7 +15515,9 @@ pub const LinuxServer = struct {
                     .action = .expel,
                     .reason = "DNSBL listed",
                     .set_by = "dnsbl",
-                    .created_ms = self.nowMs(),
+                    // Wall clock: created_ms is a wire field gossiped mesh-wide
+                    // and all ward timestamps live in the wall domain.
+                    .created_ms = platform.realtimeMillis(),
                     .expires_ms = 0,
                 }) catch {};
             }
@@ -25796,9 +25805,11 @@ fn emitPing(conn: *ConnState) void {
     appendToConn(conn, line) catch {};
 }
 
-/// True if `s` contains a tab or newline (a field separator for the grants file).
+/// True if `s` contains a tab, LF, or CR — any of which would corrupt the
+/// tab-separated, line-oriented grants file (loadGrants trims only line edges,
+/// so an embedded CR would round-trip into the field otherwise).
 fn hasSep(s: []const u8) bool {
-    return std.mem.indexOfScalar(u8, s, '\t') != null or std.mem.indexOfScalar(u8, s, '\n') != null;
+    return std.mem.indexOfAny(u8, s, "\t\n\r") != null;
 }
 
 /// Atomically-ish write `bytes` to `path` (O_CREAT|O_TRUNC, 0600) via raw

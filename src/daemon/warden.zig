@@ -382,6 +382,18 @@ fn enumFromByte(comptime E: type, raw: u8) WireError!E {
     return error.BadField;
 }
 
+/// Reject control bytes in a wire string field. `allow_space` distinguishes
+/// free-text fields (reason) from single tokens (pattern, set_by): a hostile
+/// peer's CR/LF here would otherwise be rendered verbatim into client-facing
+/// lines (the `ERROR :Closing Link … (Banned: <reason>)` close) — an IRC line
+/// injection — and a space in a token field splits it into spurious tokens.
+fn validateWireField(s: []const u8, allow_space: bool) WireError!void {
+    for (s) |c| {
+        if (c < 0x20 or c == 0x7f) return error.BadField;
+        if (!allow_space and c == ' ') return error.BadField;
+    }
+}
+
 /// Decode a mesh-WARD record. Returned string slices borrow `bytes`.
 pub fn decodeWire(bytes: []const u8) WireError!WireWard {
     if (bytes.len < 3) return error.Truncated;
@@ -395,6 +407,11 @@ pub fn decodeWire(bytes: []const u8) WireError!WireWard {
     const created_ms = try takeI64(bytes, &off);
     const expires_ms = try takeI64(bytes, &off);
     if (pattern.len == 0) return error.BadField;
+    // This is the hostile-peer surface: unlike the local WARD command (whose
+    // line parser already strips CRLF), these fields arrive raw off the mesh.
+    try validateWireField(pattern, false);
+    try validateWireField(set_by, false);
+    try validateWireField(reason, true);
     return .{
         .op = op,
         .match = match,
@@ -625,6 +642,45 @@ test "mesh ward wire rejects truncated, empty pattern, and bad enum" {
     // A pattern length that runs past the buffer is truncated.
     var short_pat: [5]u8 = .{ 0, @intFromEnum(Match.host), @intFromEnum(Action.expel), 10, 0 };
     try std.testing.expectError(error.Truncated, decodeWire(&short_pat));
+}
+
+test "mesh ward wire rejects control bytes / CRLF (line-injection guard)" {
+    var buf: [max_wire_len]u8 = undefined;
+    const base = WireWard{
+        .op = .add,
+        .match = .mask,
+        .pattern = "*!*@host",
+        .action = .expel,
+        .reason = "clean reason",
+        .set_by = "oper",
+        .created_ms = 0,
+        .expires_ms = 0,
+    };
+    // A CR/LF in the reason would be rendered verbatim into the client-facing
+    // `ERROR :Closing Link … (Banned: <reason>)` close — a line injection.
+    {
+        var w = base;
+        w.reason = "boom\r\n:evil 001 victim :pwned";
+        const wire = try encodeWire(w, &buf);
+        try std.testing.expectError(error.BadField, decodeWire(wire));
+    }
+    // A space in the single-token pattern/set_by fields is rejected too.
+    {
+        var w = base;
+        w.set_by = "op er";
+        const wire = try encodeWire(w, &buf);
+        try std.testing.expectError(error.BadField, decodeWire(wire));
+    }
+    // A NUL anywhere is a control byte.
+    {
+        var w = base;
+        w.pattern = "*!*@ho\x00st";
+        const wire = try encodeWire(w, &buf);
+        try std.testing.expectError(error.BadField, decodeWire(wire));
+    }
+    // The clean base still round-trips (guard doesn't over-reject).
+    const ok = try decodeWire(try encodeWire(base, &buf));
+    try std.testing.expectEqualStrings("clean reason", ok.reason);
 }
 
 test "no leak under churn" {

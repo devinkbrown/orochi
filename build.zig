@@ -81,7 +81,13 @@ pub fn build(b: *std.Build) void {
     // exactly which commit it was built from (banner + VERSION). Available to
     // module source as `@import("build_info").git_commit`.
     const build_info = b.addOptions();
-    build_info.addOption([]const u8, "git_commit", gitCommit(b));
+    const git = gitCommit(b);
+    build_info.addOption([]const u8, "git_commit", git);
+    // Composed release version "<semver>+<git-short-hash>" (semver build
+    // metadata), e.g. "0.1.0+8fba2c5" or "0.1.0+8fba2c5-dirty". The semver
+    // comes from build.zig.zon (single source of truth); the hash pins the
+    // exact commit. This is what the banner, 002/004, and RPL_VERSION report.
+    build_info.addOption([]const u8, "version", b.fmt("{s}+{s}", .{ manifestVersion(), git }));
     const build_info_mod = build_info.createModule();
     mod.addImport("build_info", build_info_mod);
 
@@ -337,6 +343,19 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+/// Extract the semantic version from build.zig.zon — the manifest is the single
+/// source of truth, embedded at comptime so the build script and the manifest
+/// can never drift. (A typed `@import` of the manifest would break whenever a
+/// field is added, e.g. the first dependency; a substring scan of the embedded
+/// text is immune to that.)
+fn manifestVersion() []const u8 {
+    const manifest = @embedFile("build.zig.zon");
+    const key = ".version = \"";
+    const start = (std.mem.indexOf(u8, manifest, key) orelse return "0.0.0") + key.len;
+    const end = std.mem.indexOfScalarPos(u8, manifest, start, '"') orelse return "0.0.0";
+    return manifest[start..end];
 }
 
 /// Capture the current git revision at configure time: the short commit hash,

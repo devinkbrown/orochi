@@ -143,9 +143,25 @@ pub const OroStore = struct {
         };
         errdefer store.deinit();
 
-        try store.replayFile(store.snapshot_path, .snapshot);
-        try store.replayFile(store.wal_path, .wal);
+        _ = try store.replayFile(store.snapshot_path, .snapshot);
+        const wal_good = try store.replayFile(store.wal_path, .wal);
         try store.ensureWal();
+        // A torn/corrupt WAL tail was tolerated by replay (crash mid-append).
+        // Truncate it away NOW: appending after the garbage would poison the
+        // log — on the NEXT open the bad bytes are no longer the final record,
+        // the tail tolerance no longer applies, and the store would refuse to
+        // open at all (live impact: the SASL account store silently disabled).
+        if (wal_good < store.wal_offset) {
+            const wal = store.wal_file.?;
+            try wal.setLength(store.io, wal_good);
+            try wal.sync(store.io);
+            store.wal_offset = wal_good;
+            try store.syncDir();
+        }
+        // Replay refuses a WAL larger than max_wal_bytes, so an uncompacted log
+        // eventually bricks the store at reboot — compact at open when the WAL
+        // has crossed the threshold (also bounds replay time).
+        try store.maybeCompact();
         return store;
     }
 
@@ -167,6 +183,11 @@ pub const OroStore = struct {
         try self.appendRecord(.put, store_family, key, value);
         try self.applyPut(store_family, key, value);
         try self.recordMutation(store_family, .put, key, value);
+        // AFTER the mutation is fully applied: the maps now include it, so a
+        // compaction snapshot captures it and truncating the WAL loses nothing.
+        // (Compacting inside appendRecord would snapshot maps that LACK the
+        // just-appended record, then truncate it away — losing the write.)
+        try self.maybeCompact();
     }
 
     pub fn get(self: *const OroStore, store_family: Family, key: []const u8) ?[]const u8 {
@@ -177,6 +198,7 @@ pub const OroStore = struct {
         try self.appendRecord(.delete, store_family, key, "");
         try self.applyDelete(store_family, key);
         try self.recordMutation(store_family, .delete, key, null);
+        try self.maybeCompact(); // after full apply — see put()
     }
 
     /// Writes current state to a snapshot and truncates the WAL.
@@ -213,6 +235,16 @@ pub const OroStore = struct {
         try self.syncDir();
     }
 
+    /// Compact once the WAL crosses half its replay limit: snapshot the full
+    /// state and truncate the log. Called after each COMPLETED mutation and at
+    /// open. Without this the WAL grows without bound — and because replay
+    /// refuses a WAL over max_wal_bytes, a long-lived store would eventually
+    /// fail to open at all.
+    fn maybeCompact(self: *OroStore) !void {
+        if (self.wal_offset < self.cfg.max_wal_bytes / 2) return;
+        try self.snapshotAndTruncate();
+    }
+
     pub fn changeCount(self: *const OroStore) usize {
         return self.changefeed.count;
     }
@@ -235,15 +267,21 @@ pub const OroStore = struct {
         wal,
     };
 
-    fn replayFile(self: *OroStore, path: []const u8, replay_kind: ReplayKind) !void {
+    /// Replay a snapshot or WAL file into the in-memory maps. Returns the
+    /// offset one past the LAST FULLY-APPLIED record: for a clean file that is
+    /// the file size; for a WAL with a tolerated torn/corrupt tail it is where
+    /// the bad tail starts, so the caller can truncate it away before
+    /// appending (appending after garbage would poison the log for the next
+    /// open, where the tail tolerance no longer applies).
+    fn replayFile(self: *OroStore, path: []const u8, replay_kind: ReplayKind) !u64 {
         var file = self.dir.openFile(self.io, path, .{ .mode = .read_only, .allow_directory = false }) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => return 0,
             else => return err,
         };
         defer file.close(self.io);
 
         const stat = try file.stat(self.io);
-        if (stat.size == 0) return;
+        if (stat.size == 0) return 0;
         if (replay_kind == .wal and stat.size > self.cfg.max_wal_bytes) return StoreError.RecordTooLarge;
 
         var offset: u64 = 0;
@@ -252,7 +290,7 @@ pub const OroStore = struct {
             const record_offset = offset;
             const header_len = try file.readPositionalAll(self.io, &header, offset);
             if (header_len != header.len) {
-                if (replay_kind == .wal) return;
+                if (replay_kind == .wal) return record_offset;
                 return StoreError.BadRecord;
             }
             offset += record_header_len;
@@ -263,7 +301,7 @@ pub const OroStore = struct {
 
             if (payload_len > self.cfg.max_record_bytes) return StoreError.RecordTooLarge;
             if (stat.size - offset < payload_len) {
-                if (replay_kind == .wal) return;
+                if (replay_kind == .wal) return record_offset;
                 return StoreError.BadRecord;
             }
 
@@ -271,24 +309,25 @@ pub const OroStore = struct {
             defer self.allocator.free(payload);
             const read_len = try file.readPositionalAll(self.io, payload, offset);
             if (read_len != payload.len) {
-                if (replay_kind == .wal) return;
+                if (replay_kind == .wal) return record_offset;
                 return StoreError.BadRecord;
             }
             if (checksum(payload) != expected_sum) {
-                if (replay_kind == .wal and record_end == stat.size) return;
+                if (replay_kind == .wal and record_end == stat.size) return record_offset;
                 return StoreError.ChecksumMismatch;
             }
             self.applyPayload(payload) catch |err| switch (err) {
                 StoreError.BadRecord,
                 StoreError.UnknownFamily,
                 StoreError.UnknownRecordKind,
-                => if (replay_kind == .wal and record_end == stat.size) return else return err,
+                => if (replay_kind == .wal and record_end == stat.size) return record_offset else return err,
                 else => return err,
             };
             if (replay_kind == .wal and isMutationPayload(payload)) self.next_seq += 1;
             offset = record_end;
             if (offset <= record_offset) return StoreError.BadRecord;
         }
+        return offset;
     }
 
     fn appendRecord(
@@ -715,6 +754,82 @@ test "checksum-bad final WAL record is ignored after replaying valid prefix" {
     defer store.deinit();
     try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
     try std.testing.expect(store.family(.accounts).get("bob") == null);
+}
+
+test "torn WAL tail is truncated at open so a later append cannot poison the log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "poison.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("alice", "ok");
+    }
+
+    // Crash mid-append: a garbage torn tail lands after the valid prefix.
+    {
+        var file = try tmp.dir.openFile(std.testing.io, "poison.wal", .{ .mode = .read_write, .allow_directory = false });
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        try file.writePositionalAll(std.testing.io, &.{ 9, 0, 0, 0, 0xDE, 0xAD }, stat.size);
+        try file.sync(std.testing.io);
+    }
+
+    // First reopen tolerates the tail — and must TRUNCATE it before serving,
+    // otherwise the append below lands after the garbage and the SECOND
+    // reopen fails outright (the bad bytes are then no longer the final
+    // record, so the tail tolerance no longer applies). This exact sequence
+    // used to brick the live SASL account store after a power loss.
+    {
+        var store = try openTestStore(tmp, "poison.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("bob", "also-ok");
+    }
+
+    var store = try openTestStore(tmp, "poison.wal");
+    defer store.deinit();
+    try std.testing.expectEqualStrings("ok", store.family(.accounts).get("alice").?);
+    try std.testing.expectEqualStrings("also-ok", store.family(.accounts).get("bob").?);
+}
+
+test "WAL compacts into the snapshot once it crosses half the replay limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Tiny WAL budget so a few puts cross the max_wal_bytes/2 threshold.
+    {
+        var store = try OroStore.openWithConfig(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            "compact.wal",
+            .{ .max_wal_bytes = 256 },
+        );
+        defer store.deinit();
+        var i: u8 = 0;
+        while (i < 8) : (i += 1) {
+            var key: [4]u8 = .{ 'k', '0' + i, 0, 0 };
+            try store.family(.accounts).put(key[0..2], "value-payload");
+        }
+        // The log must have been folded into the snapshot at least once —
+        // an uncompacted WAL here would exceed the whole 256-byte budget and
+        // the NEXT open would refuse to replay it (RecordTooLarge).
+        try std.testing.expect(store.wal_offset < 256);
+    }
+
+    var store = try OroStore.openWithConfig(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "compact.wal",
+        .{ .max_wal_bytes = 256 },
+    );
+    defer store.deinit();
+    var i: u8 = 0;
+    while (i < 8) : (i += 1) {
+        var key: [4]u8 = .{ 'k', '0' + i, 0, 0 };
+        try std.testing.expectEqualStrings("value-payload", store.family(.accounts).get(key[0..2]).?);
+    }
 }
 
 test "snapshot+truncate preserves data" {

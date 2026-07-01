@@ -239,6 +239,9 @@ const all_frame_types = [_]FrameType{
     .CHANNEL_MODE_STATE,
     .SESSION_MIGRATE,
     .ENTITY_PROP,
+    .CLONE_COUNT,
+    .OPER_EVENT,
+    .OBSERVE_EVENT,
     .KILL,
     .WARD,
 };
